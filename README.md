@@ -3,7 +3,7 @@
 Agent Symphony is a planned GitHub-native, multi-agent software delivery orchestrator inspired by [OpenAI Symphony](https://github.com/openai/symphony). Stakeholders define and prioritize work in GitHub Issues; an orchestrator coordinates agents through implementation, validation, documentation, pull-request review, and policy-controlled merge.
 
 > [!NOTE]
-> Issues #5 and #6 provide the GitHub App host boundary and configuration/diagnostic CLI shell. Scheduling, runtime lifecycle, pull-request automation, and merge behavior are not implemented yet.
+> GitHub intake, configuration, scheduling policy, and the local attempt runtime are implemented. Pull-request automation and merge behavior are not implemented yet.
 
 ## Planned MVP
 

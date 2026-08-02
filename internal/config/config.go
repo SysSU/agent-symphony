@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 )
 
 const DefaultPath = ".agent-symphony.yaml"
@@ -47,6 +49,7 @@ type CompletionPolicies struct {
 type Commands struct {
 	Implementation []string `json:"implementation"`
 	Reviewer       []string `json:"reviewer"`
+	Environment    []string `json:"environment_allowlist"`
 }
 
 type Status struct {
@@ -68,8 +71,11 @@ func Default(repository string) Config {
 		Concurrency:  1,
 		WorktreeRoot: ".worktrees",
 		DocsPaths:    []string{"README.md", "docs"},
-		Commands:     Commands{Implementation: []string{"codex", "exec"}, Reviewer: []string{"codex", "review"}},
-		Status:       Status{Format: "human", Color: "auto"},
+		Commands: Commands{
+			Implementation: []string{"codex", "exec"}, Reviewer: []string{"codex", "review"},
+			Environment: []string{"HOME", "LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"},
+		},
+		Status: Status{Format: "human", Color: "auto"},
 	}
 }
 
@@ -234,6 +240,14 @@ func (c Config) Validate() error {
 			}
 		}
 	}
+	for _, name := range c.Commands.Environment {
+		if !environmentName(name) {
+			problems = append(problems, "commands.environment_allowlist contains an invalid variable name")
+		}
+		if forbiddenAgentEnvironment(name) {
+			problems = append(problems, fmt.Sprintf("commands.environment_allowlist contains forbidden credential variable %q", name))
+		}
+	}
 	if c.Status.Format != "human" && c.Status.Format != "json" {
 		problems = append(problems, "status.format must be human or json")
 	}
@@ -244,6 +258,23 @@ func (c Config) Validate() error {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+func environmentName(name string) bool {
+	if name == "" || !(name[0] == '_' || name[0] >= 'A' && name[0] <= 'Z') {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if !(name[i] == '_' || name[i] >= 'A' && name[i] <= 'Z' || name[i] >= '0' && name[i] <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func forbiddenAgentEnvironment(name string) bool {
+	_, err := internalgithub.AgentEnvironmentWith(nil, name)
+	return err != nil
 }
 
 func repositoryPart(part string) bool {
