@@ -21,6 +21,7 @@ The browser dashboard, multi-repository orchestration, GitHub Projects synchroni
 ## Documentation
 
 - [Product Requirements Document](docs/PRD.md)
+- [MVP Architecture](docs/architecture.md)
 - [Agent development guidance](AGENTS.md)
 
 Durable project documentation belongs in `docs/`. BMAD working output belongs in `_bmad-output/` and is ignored by Git.
