@@ -268,6 +268,15 @@ func AttributedBody(issue, attempt int, message string) (string, error) {
 	}
 	return fmt.Sprintf("%s\n\n<!-- agent-symphony:issue:%d:attempt:%d -->", message, issue, attempt), nil
 }
+
+func AttemptMarker(issue, attempt int, branch, head string, pr int, outcome string) (string, error) {
+	want, err := AttemptBranchFromBranch(branch, issue, attempt)
+	if err != nil || branch != want || !regexpSHA.MatchString(head) || pr <= 0 || outcome != "review" {
+		return "", errors.New("attempt marker requires its deterministic branch, head, PR, and review outcome")
+	}
+	b, _ := json.Marshal(recoveryMarkerPayload{Version: 1, Issue: issue, Attempt: attempt, Branch: branch, Head: head, PR: pr, Outcome: outcome})
+	return recoveryMarkerPrefix + string(b) + "\n-->", nil
+}
 func hashJSON(v any) string {
 	b, _ := json.Marshal(v)
 	sum := sha256.Sum256(b)

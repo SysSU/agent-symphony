@@ -1,0 +1,130 @@
+package github
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestTerminalFailureRequiresStrictAppAuthorship(t *testing.T) {
+	marker, _ := TerminalFailureMarker(4, 2, time.Unix(10, 0))
+	api := fixtureAPI(t, map[string]any{"/repos/o/r/issues/4/comments?per_page=100&page=1": []any{
+		map[string]any{"body": marker, "user": map[string]any{"id": 42}},
+		map[string]any{"body": marker + "tamper", "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
+		map[string]any{"body": marker, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
+	}})
+	got, err := fetchTerminalFailure(context.Background(), api, PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}, 4)
+	if err != nil || got.Attempt != 2 {
+		t.Fatalf("terminal=%v err=%v", got, err)
+	}
+}
+
+func TestRetryMustFollowEveryTerminalFailure(t *testing.T) {
+	retry := &Provenance{Name: "retry", Value: "true", CreatedAt: time.Unix(20, 0)}
+	controls := Controls{Retry: true}
+	if retryAuthorizesFailure(controls, retry, terminalMarkerPayload{Attempt: 1, FailedAt: time.Unix(10, 0)}) != true {
+		t.Fatal("later retry did not authorize attempt 2")
+	}
+	if retryAuthorizesFailure(controls, retry, terminalMarkerPayload{Attempt: 2, FailedAt: time.Unix(30, 0)}) != false {
+		t.Fatal("timeless retry authorized attempt 3")
+	}
+	retry.CreatedAt = time.Unix(40, 0)
+	if !retryAuthorizesFailure(controls, retry, terminalMarkerPayload{Attempt: 2, FailedAt: time.Unix(30, 0)}) {
+		t.Fatal("fresh retry did not authorize attempt 3")
+	}
+}
+
+func TestFetchAttemptFactsPaginatesMarkersAndChecks(t *testing.T) {
+	branch, _ := AttemptBranch("o/r", 4, 2)
+	marker, _ := AttemptMarker(4, 2, branch, "ccccccc", 9, "review")
+	noise := make([]map[string]any, 100)
+	checks := make([]map[string]string, 100)
+	for i := range noise {
+		noise[i] = map[string]any{"body": "noise"}
+		checks[i] = map[string]string{"name": "check", "status": "completed", "conclusion": "success"}
+	}
+	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var body any
+		switch r.URL.Path + "?" + r.URL.RawQuery {
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1":
+			body = []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}}}
+		case "/repos/o/r/issues/4?":
+			body = map[string]any{"state": "open"}
+		case "/repos/o/r/issues/4/comments?per_page=100&page=1":
+			body = noise
+		case "/repos/o/r/issues/4/comments?per_page=100&page=2":
+			body = []any{map[string]any{"body": marker, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}}}
+		case "/repos/o/r/commits/ccccccc/check-runs?filter=latest&per_page=100&page=1":
+			body = map[string]any{"check_runs": checks}
+		case "/repos/o/r/commits/ccccccc/check-runs?filter=latest&per_page=100&page=2":
+			body = map[string]any{"check_runs": []any{map[string]string{"name": "later", "status": "completed", "conclusion": "success"}}}
+		default:
+			t.Fatalf("unexpected request %s", r.URL.String())
+		}
+		b, _ := json.Marshal(body)
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(b)))}, nil
+	})}}
+	facts, err := FetchAttemptFacts(context.Background(), api, "o/r", 7, 42)
+	if err != nil || len(facts) != 1 || facts[0].State != "review-ready" || len(facts[0].Checks) != 101 {
+		t.Fatalf("facts=%#v err=%v", facts, err)
+	}
+}
+
+func TestFetchAttemptFactsRequiresAppMarkerSnapshotAndSafeCompletion(t *testing.T) {
+	branch, _ := AttemptBranch("o/r", 4, 2)
+	marker, _ := AttemptMarker(4, 2, branch, "ccccccc", 9, "review")
+	responses := map[string]string{
+		"/repos/o/r/pulls": `[
+			{"number":8,"body":"agent-symphony:issue:4:attempt:1","state":"open","head":{"sha":"aaaaaaa","ref":"bad"},"base":{"sha":"bbbbbbb"},"user":{"id":9},"performed_via_github_app":{"id":7}},
+			{"number":9,"body":` + quoteJSON(marker) + `,"state":"open","head":{"sha":"ccccccc","ref":"` + branch + `"},"base":{"sha":"bbbbbbb"},"user":{"id":42},"performed_via_github_app":{"id":7}}
+		]`,
+		"/repos/o/r/issues/4":                   `{"state":"closed"}`,
+		"/repos/o/r/issues/4/comments":          `[{"body":` + quoteJSON(marker) + `,"user":{"id":42},"performed_via_github_app":{"id":7}}]`,
+		"/repos/o/r/commits/ccccccc/check-runs": `{"check_runs":[]}`,
+	}
+	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body, ok := responses[r.URL.Path]
+		if !ok {
+			t.Fatalf("unexpected request %s", r.URL.String())
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}}
+	facts, err := FetchAttemptFacts(context.Background(), api, "o/r", 7, 42)
+	if err != nil || len(facts) != 1 || facts[0].Attempt != 2 || facts[0].State != "blocked" {
+		t.Fatalf("facts=%#v err=%v", facts, err)
+	}
+}
+
+func TestFetchAttemptFactsRejectsTamperedMarkerBindings(t *testing.T) {
+	branch, _ := AttemptBranch("o/r", 4, 2)
+	valid, _ := AttemptMarker(4, 2, branch, "ccccccc", 9, "review")
+	for _, test := range []struct{ name, marker string }{
+		{"head", strings.Replace(valid, `"head":"ccccccc"`, `"head":"ddddddd"`, 1)},
+		{"pr", strings.Replace(valid, `"pr":9`, `"pr":10`, 1)},
+		{"outcome", strings.Replace(valid, `"outcome":"review"`, `"outcome":"failed"`, 1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			responses := map[string]string{
+				"/repos/o/r/pulls": `[{"number":9,"body":` + quoteJSON(test.marker) + `,"state":"open","head":{"sha":"ccccccc","ref":"` + branch + `"},"base":{"sha":"bbbbbbb"},"user":{"id":42},"performed_via_github_app":{"id":7}}]`,
+			}
+			api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(responses[r.URL.Path]))}, nil
+			})}}
+			facts, err := FetchAttemptFacts(context.Background(), api, "o/r", 7, 42)
+			if err != nil || len(facts) != 0 {
+				t.Fatalf("facts=%#v err=%v", facts, err)
+			}
+		})
+	}
+}
+
+func quoteJSON(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	value = strings.ReplaceAll(value, "\n", `\n`)
+	return `"` + value + `"`
+}

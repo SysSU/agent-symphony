@@ -16,6 +16,117 @@ import (
 	"time"
 )
 
+func TestFileRecoveryDurablyClaimsAndCompletesRuntimeHandoffs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.json")
+	recovery := &FileRecovery{Path: path}
+	state := PRState{Repository: "owner/repo", Number: 10, Issue: 4, Attempt: 2, HeadSHA: "abcdef1", ValidationQueuedSHA: "abcdef1", Facts: PRFacts{Feedback: []Feedback{{ID: 7, Source: feedbackInline, Execution: FeedbackClaimed, Delegated: true}}}}
+	if err := recovery.write([]PRState{state}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := recovery.ClaimHandoffs(context.Background())
+	if err != nil || len(got) != 1 || !got[0].Validation || len(got[0].Feedback) != 1 || got[0].Feedback[0].Execution != FeedbackInFlight {
+		t.Fatalf("got %#v err=%v", got, err)
+	}
+	resumed, err := recovery.ClaimHandoffs(context.Background())
+	if err != nil || len(resumed) != 1 || !resumed[0].Validation || len(resumed[0].Feedback) != 1 {
+		t.Fatalf("restart got %#v err=%v", resumed, err)
+	}
+	if err := recovery.CompleteHandoff(context.Background(), got[0]); err != nil {
+		t.Fatal(err)
+	}
+	done, err := recovery.ClaimHandoffs(context.Background())
+	if err != nil || len(done) != 0 {
+		t.Fatalf("completed got %#v err=%v", done, err)
+	}
+}
+
+func TestOwnedHandoffRedeliverySurvivesClaimAndPasteCrashes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.json")
+	r := &FileRecovery{Path: path}
+	state := PRState{Repository: "o/r", Number: 9, Issue: 4, Attempt: 2, HeadSHA: "abcdef1", ValidationQueuedSHA: "abcdef1", Facts: PRFacts{Feedback: []Feedback{{ID: 7, Source: feedbackInline, Execution: FeedbackClaimed, Delegated: true}}}}
+	if err := r.write([]PRState{state}); err != nil {
+		t.Fatal(err)
+	}
+	owners := map[string]bool{"o/r#4/2": true}
+	first, err := r.ClaimHandoffsFor(context.Background(), owners)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("claim=%#v err=%v", first, err)
+	}
+	for _, boundary := range []string{"after claim", "after buffer load", "after paste"} {
+		again, err := r.ClaimHandoffsFor(context.Background(), owners)
+		if err != nil || len(again) != 1 || again[0].Key != first[0].Key {
+			t.Fatalf("%s replay=%#v err=%v", boundary, again, err)
+		}
+	}
+	if err := r.ReceiptHandoff(context.Background(), first[0]); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := r.ClaimHandoffsFor(context.Background(), owners); err != nil || len(again) != 0 {
+		t.Fatalf("receipt replay=%#v err=%v", again, err)
+	}
+	if err := r.ReceiptHandoff(context.Background(), first[0]); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHandoffIdentityIncludesSequentialFeedbackAndValidationGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.json")
+	r := &FileRecovery{Path: path}
+	state := PRState{Repository: "o/r", Number: 9, Issue: 4, Attempt: 2, HeadSHA: "abcdef1", Facts: PRFacts{Feedback: []Feedback{{ID: 7, Source: feedbackInline, Execution: FeedbackClaimed}}}}
+	if err := r.write([]PRState{state}); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := r.ClaimHandoffs(context.Background())
+	if err := r.CompleteHandoff(context.Background(), first[0]); err != nil {
+		t.Fatal(err)
+	}
+	states, _ := r.read()
+	states[0].Facts.Feedback = append(states[0].Facts.Feedback, Feedback{ID: 8, Source: feedbackInline, Execution: FeedbackClaimed})
+	if err := r.write(states); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := r.ClaimHandoffs(context.Background())
+	if len(second) != 1 || second[0].Key == first[0].Key || len(second[0].Feedback) != 1 || second[0].Feedback[0].ID != 8 {
+		t.Fatalf("sequential handoff %#v", second)
+	}
+	if err := r.CompleteHandoff(context.Background(), second[0]); err != nil {
+		t.Fatal(err)
+	}
+	states, _ = r.read()
+	if err := r.QueueValidation(context.Background(), states[0]); err != nil {
+		t.Fatal(err)
+	}
+	validation1, _ := r.ClaimHandoffs(context.Background())
+	if err := r.CompleteHandoff(context.Background(), validation1[0]); err != nil {
+		t.Fatal(err)
+	}
+	states, _ = r.read()
+	if err := r.QueueValidation(context.Background(), states[0]); err != nil {
+		t.Fatal(err)
+	}
+	validation2, _ := r.ClaimHandoffs(context.Background())
+	if validation1[0].Key == validation2[0].Key || validation2[0].ValidationGeneration != validation1[0].ValidationGeneration+1 {
+		t.Fatalf("validation generations %#v %#v", validation1, validation2)
+	}
+}
+
+func TestIdenticalFeedbackOutcomeReplaySucceeds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.json")
+	r := &FileRecovery{Path: path}
+	state := PRState{Repository: "o/r", Number: 9, Issue: 4, Attempt: 2, HeadSHA: "abcdef1", Facts: PRFacts{Feedback: []Feedback{{ID: 7, Source: feedbackInline, Execution: FeedbackClaimed, Delegated: true}}}}
+	if err := r.write([]PRState{state}); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := r.ClaimHandoffsFor(context.Background(), map[string]bool{"o/r#4/2": true})
+	outcome := HandoffOutcome{Key: h[0].Key, Feedback: []FeedbackOutcome{{ID: 7, Source: feedbackInline, State: FeedbackAddressed, Evidence: "fixed"}}}
+	if err := r.CompleteHandoffOutcome(context.Background(), h[0], outcome); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.CompleteHandoffOutcome(context.Background(), h[0], outcome); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type recoveryStub struct {
 	state  PRState
 	claims int
@@ -424,7 +535,7 @@ func TestProductionAuthorizedControlsVerifyGitHubSnapshot(t *testing.T) {
 		}
 	}
 	source := GitHubPRSource{API: fixtureAPI(t, responses()), Config: cfg}
-	got, _, err := source.authorizedControls(context.Background(), 10)
+	got, _, _, err := source.authorizedControls(context.Background(), 10)
 	if err != nil || !reflect.DeepEqual(got, controls) {
 		t.Fatalf("controls=%#v err=%v", got, err)
 	}
@@ -450,7 +561,7 @@ func TestProductionAuthorizedControlsVerifyGitHubSnapshot(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			r := responses()
 			test.edit(r)
-			if _, _, err := (&GitHubPRSource{API: fixtureAPI(t, r), Config: cfg}).authorizedControls(context.Background(), 10); err == nil {
+			if _, _, _, err := (&GitHubPRSource{API: fixtureAPI(t, r), Config: cfg}).authorizedControls(context.Background(), 10); err == nil {
 				t.Fatal("tampered controls accepted")
 			}
 		})
@@ -510,6 +621,38 @@ func TestFileRecoveryDurablyQueuesFeedbackAndValidation(t *testing.T) {
 		if claimed, err := recovery.ClaimFeedback(context.Background(), state, Feedback{ID: 55}); err != nil || claimed {
 			t.Fatalf("%s feedback requeued: claimed=%v err=%v", disposition, claimed, err)
 		}
+	}
+}
+
+func TestHandoffOutcomeRequiresImmutableKeyAndEvidence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: "abcdef0", ValidationQueuedSHA: "abcdef0", Facts: PRFacts{Feedback: []Feedback{{ID: 55, Source: feedbackInline, Execution: FeedbackClaimed}}}}
+	b, _ := json.Marshal([]PRState{state})
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := &FileRecovery{Path: path}
+	handoffs, err := r.ClaimHandoffs(context.Background())
+	if err != nil || len(handoffs) != 1 || handoffs[0].Key == "" {
+		t.Fatalf("handoffs=%#v err=%v", handoffs, err)
+	}
+	if err := r.CompleteHandoffOutcome(context.Background(), handoffs[0], HandoffOutcome{Key: "wrong"}); err == nil {
+		t.Fatal("accepted wrong immutable key")
+	}
+	if err := r.CompleteHandoffOutcome(context.Background(), handoffs[0], HandoffOutcome{Key: handoffs[0].Key, Retryable: true, ValidationResult: "failed", ValidationEvidence: "outage"}); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := r.ClaimHandoffs(context.Background())
+	if err != nil || len(retry) != 1 || !retry[0].Validation {
+		t.Fatalf("retry=%#v err=%v", retry, err)
+	}
+	outcome := HandoffOutcome{Key: handoffs[0].Key, Feedback: []FeedbackOutcome{{ID: 55, Source: feedbackInline, State: FeedbackBlocked, Evidence: "cannot safely apply"}}, ValidationResult: "failed", ValidationEvidence: "go test failed"}
+	if err := r.CompleteHandoffOutcome(context.Background(), handoffs[0], outcome); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.PullRequestState(context.Background(), "o/r", 3, 10, 2, "abcdef0")
+	if err != nil || got.Facts.Feedback[0].State != FeedbackBlocked || got.Facts.Feedback[0].Execution != FeedbackCompleted || got.ValidationInFlightSHA != "" {
+		t.Fatalf("got=%#v err=%v", got, err)
 	}
 }
 

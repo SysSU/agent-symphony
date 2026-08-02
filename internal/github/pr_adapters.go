@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +45,178 @@ type PRAdapterConfig struct {
 
 // FileRecovery is the durable handoff from reconciliation to issue recovery.
 type FileRecovery struct{ Path string }
+
+type RecoveryHandoff struct {
+	Key                  string     `json:"key"`
+	Repository           string     `json:"repository"`
+	PR                   int        `json:"pr"`
+	Issue                int        `json:"issue"`
+	Attempt              int        `json:"attempt"`
+	HeadSHA              string     `json:"head_sha"`
+	Validation           bool       `json:"validation,omitempty"`
+	ValidationGeneration uint64     `json:"validation_generation,omitempty"`
+	Feedback             []Feedback `json:"feedback,omitempty"`
+}
+
+type FeedbackOutcome struct {
+	ID       int64         `json:"id"`
+	Source   string        `json:"source"`
+	State    FeedbackState `json:"state"`
+	Evidence string        `json:"evidence"`
+}
+type HandoffOutcome struct {
+	Key                string            `json:"key"`
+	Feedback           []FeedbackOutcome `json:"feedback,omitempty"`
+	ValidationResult   string            `json:"validation_result,omitempty"`
+	ValidationEvidence string            `json:"validation_evidence,omitempty"`
+	Retryable          bool              `json:"retryable,omitempty"`
+}
+
+func handoffKey(h RecoveryHandoff) string {
+	identities := make([]string, len(h.Feedback))
+	for i, feedback := range h.Feedback {
+		identities[i] = fmt.Sprintf("%s:%d", feedback.Source, feedback.ID)
+	}
+	slices.Sort(identities)
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d\x00%d\x00%s\x00%d\x00%s", h.Repository, h.PR, h.Issue, h.Attempt, h.HeadSHA, h.ValidationGeneration, strings.Join(identities, ",")))))
+}
+
+// ClaimHandoffs is the isolated runtime boundary for issue #4. Claims are
+// persisted before work is returned, so restart or duplicate reconciliation
+// cannot execute the same feedback twice.
+func (r *FileRecovery) ClaimHandoffs(ctx context.Context) ([]RecoveryHandoff, error) {
+	return r.ClaimHandoffsFor(ctx, nil)
+}
+
+// ClaimHandoffsFor atomically claims only attempts whose verified owner key is
+// present. A nil owner set retains the legacy all-owner adapter behavior.
+func (r *FileRecovery) ClaimHandoffsFor(_ context.Context, owners map[string]bool) ([]RecoveryHandoff, error) {
+	var handoffs []RecoveryHandoff
+	err := r.update(func(states []PRState) error {
+		for i := range states {
+			state := &states[i]
+			if owners != nil && !owners[fmt.Sprintf("%s#%d/%d", state.Repository, state.Issue, state.Attempt)] {
+				continue
+			}
+			validation := state.ValidationQueuedSHA == state.HeadSHA && state.HeadSHA != ""
+			if validation {
+				state.ValidationQueuedSHA, state.ValidationInFlightSHA = "", state.HeadSHA
+			}
+			validation = validation || state.ValidationInFlightSHA == state.HeadSHA && state.HeadSHA != ""
+			h := RecoveryHandoff{Repository: state.Repository, PR: state.Number, Issue: state.Issue, Attempt: state.Attempt, HeadSHA: state.HeadSHA, Validation: validation, ValidationGeneration: state.ValidationGeneration}
+			for j := range state.Facts.Feedback {
+				feedback := &state.Facts.Feedback[j]
+				if feedback.Execution != FeedbackClaimed && feedback.Execution != FeedbackInFlight {
+					continue
+				}
+				feedback.Execution = FeedbackInFlight
+				h.Feedback = append(h.Feedback, *feedback)
+			}
+			h.Key = handoffKey(h)
+			if state.HandoffReceipts[h.Key] {
+				continue
+			}
+			if h.Validation || len(h.Feedback) > 0 {
+				handoffs = append(handoffs, h)
+			}
+		}
+		return nil
+	})
+	return handoffs, err
+}
+
+// ReceiptHandoff records recipient acceptance before processing. Replays are
+// idempotent and ordinary reconciliation ticks no longer repaste the item.
+func (r *FileRecovery) ReceiptHandoff(_ context.Context, handoff RecoveryHandoff) error {
+	if handoff.Key == "" || handoff.Key != handoffKey(handoff) {
+		return errors.New("handoff immutable key mismatch")
+	}
+	return r.update(func(states []PRState) error {
+		for i := range states {
+			state := &states[i]
+			if state.Repository == handoff.Repository && state.Number == handoff.PR && state.Issue == handoff.Issue && state.Attempt == handoff.Attempt && state.HeadSHA == handoff.HeadSHA {
+				if state.HandoffReceipts == nil {
+					state.HandoffReceipts = map[string]bool{}
+				}
+				state.HandoffReceipts[handoff.Key] = true
+				return nil
+			}
+		}
+		return errors.New("recovered pull request attempt not found or head changed")
+	})
+}
+
+func (r *FileRecovery) CompleteHandoff(_ context.Context, handoff RecoveryHandoff) error {
+	return r.update(func(states []PRState) error {
+		for i := range states {
+			state := &states[i]
+			if state.Repository != handoff.Repository || state.Number != handoff.PR || state.Issue != handoff.Issue || state.Attempt != handoff.Attempt || state.HeadSHA != handoff.HeadSHA {
+				continue
+			}
+			if handoff.Validation && state.ValidationInFlightSHA == handoff.HeadSHA {
+				state.ValidationInFlightSHA = ""
+			}
+			for _, done := range handoff.Feedback {
+				for j := range state.Facts.Feedback {
+					if state.Facts.Feedback[j].identity() == done.identity() && state.Facts.Feedback[j].Execution == FeedbackInFlight {
+						state.Facts.Feedback[j].Execution = FeedbackCompleted
+					}
+				}
+			}
+			return nil
+		}
+		return errors.New("recovered pull request attempt not found or head changed")
+	})
+}
+
+// CompleteHandoffOutcome records only explicit, evidenced outcomes. Missing or
+// stale immutable keys fail closed and leave in-flight work retryable.
+func (r *FileRecovery) CompleteHandoffOutcome(_ context.Context, handoff RecoveryHandoff, outcome HandoffOutcome) error {
+	if handoff.Key == "" || outcome.Key != handoff.Key || handoff.Key != handoffKey(handoff) {
+		return errors.New("handoff immutable key mismatch")
+	}
+	return r.update(func(states []PRState) error {
+		for i := range states {
+			state := &states[i]
+			if state.Repository != handoff.Repository || state.Number != handoff.PR || state.Issue != handoff.Issue || state.Attempt != handoff.Attempt || state.HeadSHA != handoff.HeadSHA {
+				continue
+			}
+			if handoff.Validation {
+				if outcome.ValidationEvidence == "" || (outcome.ValidationResult != "passed" && outcome.ValidationResult != "failed" && outcome.ValidationResult != "blocked") {
+					return errors.New("validation outcome requires result and evidence")
+				}
+				if state.ValidationResult == outcome.ValidationResult && state.ValidationEvidence == outcome.ValidationEvidence && state.ValidationInFlightSHA == "" {
+					// Identical replay after persist/before outcome-file removal.
+				} else if state.ValidationInFlightSHA != handoff.HeadSHA {
+					return errors.New("validation outcome does not match in-flight work")
+				} else if !outcome.Retryable {
+					state.ValidationInFlightSHA = ""
+				}
+				state.ValidationResult, state.ValidationEvidence = outcome.ValidationResult, outcome.ValidationEvidence
+			}
+			for _, got := range outcome.Feedback {
+				if got.ID <= 0 || got.Evidence == "" || (got.State != FeedbackAddressed && got.State != FeedbackBlocked) {
+					return errors.New("feedback outcome requires addressed/blocked state and evidence")
+				}
+				matched := false
+				for j := range state.Facts.Feedback {
+					f := &state.Facts.Feedback[j]
+					if f.ID == got.ID && f.Source == got.Source && f.Execution == FeedbackCompleted && f.State == got.State && f.Evidence == got.Evidence {
+						matched = true
+					} else if f.ID == got.ID && f.Source == got.Source && f.Execution == FeedbackInFlight {
+						f.State, f.Execution, f.Evidence = got.State, FeedbackCompleted, got.Evidence
+						matched = true
+					}
+				}
+				if !matched {
+					return errors.New("feedback outcome does not match in-flight work")
+				}
+			}
+			return nil
+		}
+		return errors.New("recovered pull request attempt not found or head changed")
+	})
+}
 
 func (r *FileRecovery) PullRequestState(_ context.Context, repository string, number, issue, attempt int, head string) (PRState, error) {
 	states, err := r.read()
@@ -98,6 +271,7 @@ func (r *FileRecovery) QueueValidation(_ context.Context, state PRState) error {
 					return errors.New("validation head SHA is required")
 				}
 				states[i].ValidationQueuedSHA = state.HeadSHA
+				states[i].ValidationGeneration++
 				return nil
 			}
 		}
@@ -415,7 +589,7 @@ func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRSt
 		}
 		fresh := Feedback{ID: comment.ID, Source: comment.Source, ActorID: comment.User.ID, Body: comment.Body, CreatedAt: comment.CreatedAt, Authorized: authorized}
 		if old, ok := recovered[fresh.identity()]; ok {
-			fresh.Execution, fresh.Delegated = old.Execution, old.Delegated
+			fresh.Execution, fresh.Delegated, fresh.Evidence = old.Execution, old.Delegated, old.Evidence
 			if old.State == FeedbackAddressed || old.State == FeedbackBlocked {
 				state.PendingDispositions = append(state.PendingDispositions, old)
 			}
@@ -444,7 +618,7 @@ func (s *GitHubPRSource) readAuthorizedControls(ctx context.Context, issue int, 
 	if s.Config.ApprovalCommand == "" {
 		return nil
 	}
-	controls, humanReviewCleared, err := s.authorizedControls(ctx, issue)
+	controls, humanReviewCleared, _, err := s.authorizedControls(ctx, issue)
 	if err != nil {
 		return fmt.Errorf("fresh authorized issue controls: %w", err)
 	}
@@ -481,10 +655,10 @@ type bodyEdit struct {
 	}
 }
 
-func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Controls, bool, error) {
+func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Controls, bool, *Provenance, error) {
 	var issue issueControlRecord
 	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", s.Config.Repository, number), "", &issue); err != nil {
-		return Controls{}, false, err
+		return Controls{}, false, nil, err
 	}
 	labels := make([]string, len(issue.Labels))
 	for i := range issue.Labels {
@@ -494,11 +668,11 @@ func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Co
 	input := IssueInput{Number: number, NodeID: issue.NodeID, State: issue.State, Body: issue.Body, CreatedAt: issue.CreatedAt, AuthorID: issue.User.ID, Labels: labels}
 	events, err := s.issueTimeline(ctx, number)
 	if err != nil {
-		return Controls{}, false, err
+		return Controls{}, false, nil, err
 	}
 	comments, err := s.issueComments(ctx, number)
 	if err != nil {
-		return Controls{}, false, err
+		return Controls{}, false, nil, err
 	}
 	latestCommand, latestName := latestControlCommand(comments, s.Config.CancelCommand, s.Config.RetryCommand)
 	if latestCommand != nil {
@@ -510,7 +684,7 @@ func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Co
 			dependency, _ := strconv.Atoi(match[1])
 			var current struct{ State string }
 			if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", s.Config.Repository, dependency), "", &current); err != nil {
-				return Controls{}, false, err
+				return Controls{}, false, nil, err
 			}
 			completed[dependency] = current.State == "closed"
 		}
@@ -520,11 +694,11 @@ func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Co
 	anchorActor := 0
 	edit, err := s.latestBodyEdit(ctx, number)
 	if err != nil {
-		return Controls{}, false, err
+		return Controls{}, false, nil, err
 	}
 	if edit != nil {
 		if edit.ID == "" || edit.Editor.DatabaseID == nil || *edit.Editor.DatabaseID <= 0 || edit.EditedAt.IsZero() {
-			return Controls{}, false, errors.New("issue body edit is ambiguous")
+			return Controls{}, false, nil, errors.New("issue body edit is ambiguous")
 		}
 		anchor = Anchor{EditID: edit.ID, ChangedAt: edit.EditedAt}
 		anchorActor = *edit.Editor.DatabaseID
@@ -533,7 +707,7 @@ func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Co
 	provenanceControls.Cancelled, provenanceControls.Retry = false, false
 	currentProvenance, err := s.controlProvenance(issue, provenanceControls, events)
 	if err != nil {
-		return Controls{}, false, err
+		return Controls{}, false, nil, err
 	}
 	if latestCommand != nil {
 		applyControlCommandProvenance(currentProvenance, *latestCommand, latestName)
@@ -545,7 +719,7 @@ func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Co
 		parsed, err := ParseSnapshotComment(comment.Body, comment.User.ID, s.Config.AppActorID)
 		if err == nil && comment.App != nil && comment.App.ID == s.Config.AppID {
 			if found && comment.ID == snapshotCommentID {
-				return Controls{}, false, errors.New("duplicate control snapshot")
+				return Controls{}, false, nil, errors.New("duplicate control snapshot")
 			}
 			if !found || comment.ID > snapshotCommentID {
 				snapshot, snapshotCommentID, found = parsed, comment.ID, true
@@ -553,7 +727,7 @@ func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Co
 		}
 	}
 	if !found {
-		return Controls{}, false, errors.New("valid App-authored control snapshot is missing")
+		return Controls{}, false, nil, errors.New("valid App-authored control snapshot is missing")
 	}
 	provenance := currentProvenance
 	var approval struct {
@@ -564,10 +738,10 @@ func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Co
 		App       *struct{ ID int64 } `json:"performed_via_github_app"`
 	}
 	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/comments/%d", s.Config.Repository, snapshot.ApprovalID), "", &approval); err != nil {
-		return Controls{}, false, err
+		return Controls{}, false, nil, err
 	}
 	if approval.ID != snapshot.ApprovalID || approval.App != nil {
-		return Controls{}, false, errors.New("approval comment is missing or App-authored")
+		return Controls{}, false, nil, errors.New("approval comment is missing or App-authored")
 	}
 	authorized := map[int]bool{}
 	for _, actor := range append([]int{approval.User.ID, anchorActor}, provenanceActors(provenance)...) {
@@ -579,7 +753,7 @@ func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Co
 		}
 		permission, err := s.actorPermission(ctx, actor)
 		if err != nil {
-			return Controls{}, false, err
+			return Controls{}, false, nil, err
 		}
 		authorized[actor] = actor > 0 && actor != s.Config.AppActorID && (permission == "maintain" || permission == "admin")
 	}
@@ -589,9 +763,17 @@ func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Co
 	}
 	currentApproval := Approval{CommentID: approval.ID, ActorID: approval.User.ID, Body: approval.Body, CreatedAt: approval.CreatedAt}
 	if !snapshot.Valid(normalized.Controls, issue.Body, anchor, currentApproval, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] }) {
-		return Controls{}, false, errors.New("control snapshot is stale, tampered, unauthorized, or ambiguous")
+		return Controls{}, false, nil, errors.New("control snapshot is stale, tampered, unauthorized, or ambiguous")
 	}
-	return normalized.Controls, reviewRemovalMatches(provenance, events, s.Config.HumanReviewLabel), nil
+	var retry *Provenance
+	if normalized.Controls.Retry {
+		for i := range provenance {
+			if provenance[i].Name == "retry" && provenance[i].Value == "true" {
+				retry = &provenance[i]
+			}
+		}
+	}
+	return normalized.Controls, reviewRemovalMatches(provenance, events, s.Config.HumanReviewLabel), retry, nil
 }
 
 func reviewRemovalMatches(provenance []Provenance, events []issueTimelineEvent, label string) bool {

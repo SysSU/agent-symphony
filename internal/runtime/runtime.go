@@ -78,19 +78,21 @@ type Attempt struct {
 }
 
 type Manifest struct {
-	Version    int       `json:"version"`
-	Repository string    `json:"repository"`
-	Issue      int       `json:"issue"`
-	Attempt    int       `json:"attempt"`
-	Branch     string    `json:"branch"`
-	Worktree   string    `json:"worktree"`
-	Session    string    `json:"session"`
-	BaseSHA    string    `json:"base_sha"`
-	LogPath    string    `json:"log_path"`
-	State      string    `json:"state"`
-	Diagnostic string    `json:"diagnostic,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	Version             int       `json:"version"`
+	Repository          string    `json:"repository"`
+	Issue               int       `json:"issue"`
+	Attempt             int       `json:"attempt"`
+	Branch              string    `json:"branch"`
+	Worktree            string    `json:"worktree"`
+	Session             string    `json:"session"`
+	BaseSHA             string    `json:"base_sha"`
+	LogPath             string    `json:"log_path"`
+	State               string    `json:"state"`
+	Diagnostic          string    `json:"diagnostic,omitempty"`
+	ImplementationAgent string    `json:"implementation_agent,omitempty"`
+	ReviewAgent         string    `json:"review_agent,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 type Runtime struct {
@@ -271,6 +273,61 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 	return manifest, r.writeManifest(attempt, manifest)
 }
 
+// Deliver sends one coordinator-framed handoff through the verified worker
+// boundary. The coordinator never invokes the worker's tmux server directly.
+func (r *Runtime) Deliver(ctx context.Context, manifest Manifest, payload []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.VerifyWorker == nil {
+		return errors.New("worker identity verification hook is required")
+	}
+	if err := r.VerifyWorker(ctx); err != nil {
+		return fmt.Errorf("verify worker identity: %w", err)
+	}
+	attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: []string{"handoff"}}
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		return err
+	}
+	buffer := "as-handoff-" + fmt.Sprintf("%x", sha256.Sum256(payload))[:16]
+	if _, err := r.run(ctx, r.tmux(), []string{"load-buffer", "-b", buffer, "-"}, "", []string{}, bytes.NewReader(payload)); err != nil {
+		return err
+	}
+	if _, err := r.run(ctx, r.tmux(), []string{"paste-buffer", "-d", "-b", buffer, "-t", "=" + manifest.Session}, "", []string{}, nil); err != nil {
+		return err
+	}
+	_, err := r.run(ctx, r.tmux(), []string{"send-keys", "-t", "=" + manifest.Session, "Enter"}, "", []string{}, nil)
+	return err
+}
+
+// VerifyActive checks exact branch/head/session identity through the worker
+// boundary; it performs no coordinator-side worker command.
+func (r *Runtime) VerifyActive(ctx context.Context, manifest Manifest, head string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.VerifyWorker == nil {
+		return errors.New("worker identity verification hook is required")
+	}
+	if err := r.VerifyWorker(ctx); err != nil {
+		return fmt.Errorf("verify worker identity: %w", err)
+	}
+	attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: []string{"verify"}}
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		return err
+	}
+	branch, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "branch", "--show-current"}, "", nil, nil)
+	if err != nil || strings.TrimSpace(branch.Output) != manifest.Branch {
+		return errors.New("worktree branch does not match manifest")
+	}
+	got, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "rev-parse", "HEAD"}, "", nil, nil)
+	if err != nil || !strings.EqualFold(strings.TrimSpace(got.Output), head) {
+		return errors.New("worktree HEAD does not match GitHub")
+	}
+	if _, err := r.run(ctx, r.tmux(), []string{"has-session", "-t", "=" + manifest.Session}, "", nil, nil); err != nil {
+		return errors.New("exact tmux session is not live")
+	}
+	return nil
+}
+
 func (r *Runtime) Cancel(ctx context.Context, attempt Attempt, reason string) (Manifest, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -337,7 +394,10 @@ func (r *Runtime) identify(a Attempt) (Manifest, error) {
 	}
 	repoID := repoIdentifier(a.Repository)
 	name := fmt.Sprintf("%s-%d-%d", repoID, a.Issue, a.Number)
-	branch := fmt.Sprintf("agent-symphony/%s/%d-%d", repoID, a.Issue, a.Number)
+	branch, err := internalgithub.AttemptBranch(a.Repository, a.Issue, a.Number)
+	if err != nil {
+		return Manifest{}, err
+	}
 	session := "as-" + name
 	if len(name) > maxResourceName || len(branch) > maxResourceName || len(session) > maxResourceName {
 		return Manifest{}, fmt.Errorf("attempt resource name exceeds %d bytes", maxResourceName)
