@@ -1,0 +1,13 @@
+# GitHub App setup and security
+
+Issue #5 adds the host-side GitHub boundary; it does not start workers, create pull requests, schedule work, or merge.
+
+Create a single-repository GitHub App installation with metadata read, issues read/write, pull requests read/write, contents read/write, checks read/write, commit statuses read, and members read only when team authorization is enabled. Subscribe to issue, issue-comment, pull-request, pull-request-review/comment, check/status, push, installation, and repository-rule changes. Configure the webhook endpoint with a strong random secret and JSON delivery.
+
+Supply the App ID, installation ID, PEM private key, and webhook secret from coordinator-owned environment/secret storage. Never put them in `.agent-symphony.yaml`, Git, command arguments, worker environments, tmux, or logs. The host exchanges a short-lived App JWT for an installation token cached in coordinator memory until shortly before expiry. Agent environments start from a small safe allowlist; separately configured model credential variable names must be added explicitly, while unrelated inherited variables are excluded.
+
+Webhook requests are body-bounded, HMAC-SHA256 verified over exact bytes, and repository/installation bound. Accepted events are only reconciliation hints; a bounded delivery cache reduces duplicate reads, while authoritative periodic reads recover redelivery, reordering, eviction, and crash-after-acknowledgement. A full queue returns `503` so GitHub can retry.
+
+Issue controls require an open issue, readiness, exactly one P1-P3 label, the configured dependency section, resolved explicit dependencies, and a non-conflicting completion policy. Body controls are inert until a freshly authorized non-App actor posts the exact approval command. Each App snapshot binds the approved body/control hashes and exactly one authorized immutable provenance event for every current non-body control: readiness, priority, completion policy, open/closed state, cancellation, and retry. Snapshot construction and validation also require an authoritative timeline lookup to match each exact control name, value, event ID, and actor ID. Missing, invented, duplicate, extra, conflicting, edited, stale, closed, unauthorized, rate-limited, or permission-revoked state blocks mutation and requires reconciliation.
+
+Reads use conditional requests and bounded retry for transient/rate-limit responses. Mutations require issue/attempt attribution persisted in the GitHub body and are never blindly retried after an ambiguous result. Errors and diagnostics redact known and credential-shaped values.
