@@ -3,7 +3,7 @@
 Agent Symphony is a planned GitHub-native, multi-agent software delivery orchestrator inspired by [OpenAI Symphony](https://github.com/openai/symphony). Stakeholders define and prioritize work in GitHub Issues; an orchestrator coordinates agents through implementation, validation, documentation, pull-request review, and policy-controlled merge.
 
 > [!NOTE]
-> GitHub intake, configuration, scheduling policy, and the local attempt runtime are implemented. Pull-request automation and merge behavior are not implemented yet.
+> Issue #10 provides one-shot pull-request governance and durable file handoffs. Issue #4 still owns daemon scheduling, state production and consumption, runtime resumption, and end-to-end wiring; those capabilities are not yet available.
 
 ## Planned MVP
 
@@ -48,6 +48,7 @@ go build -o agent-symphony ./cmd/agent-symphony
 ./agent-symphony validate
 ./agent-symphony config view
 ./agent-symphony doctor
+./agent-symphony pr-governance --state /path/to/pr-state.json
 ```
 
 `init` derives `owner/repository` from the GitHub `origin` and creates `.agent-symphony.yaml` without overwriting an existing file. Configuration is JSON, which is a valid YAML 1.2 subset and allows strict stdlib-only parsing. Keep credentials outside this committed file. `doctor` may use `GITHUB_TOKEN` or `GH_TOKEN` for a read-only effective-access probe; it never prints the value.

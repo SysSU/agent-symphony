@@ -27,6 +27,42 @@ type Mutation struct {
 	Attempt int
 }
 
+// VerifyInstallation binds the supplied installation token to the configured App.
+func (a API) VerifyInstallation(ctx context.Context, appID int64) error {
+	var installation struct {
+		AppID int64 `json:"app_id"`
+	}
+	if _, _, err := a.Read(ctx, "/installation", "", &installation); err != nil {
+		return fmt.Errorf("verify GitHub App installation: %w", err)
+	}
+	if appID <= 0 || installation.AppID != appID {
+		return errors.New("GitHub installation token does not belong to the configured App")
+	}
+	return nil
+}
+
+type ambiguousMutationError struct{ error }
+
+type responseStatusError struct {
+	operation string
+	status    int
+	message   string
+}
+
+func (e *responseStatusError) Error() string {
+	return fmt.Sprintf("%s: %s", e.operation, e.message)
+}
+
+func isResponseStatus(err error, status int) bool {
+	var response *responseStatusError
+	return errors.As(err, &response) && response.status == status
+}
+
+func IsAmbiguousMutation(err error) bool {
+	var ambiguous *ambiguousMutationError
+	return errors.As(err, &ambiguous)
+}
+
 func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool, error) {
 	if !strings.HasPrefix(path, "/") {
 		return "", false, errors.New("GitHub API path must start with /")
@@ -69,6 +105,22 @@ func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool
 	}
 }
 
+func (a API) readGraphQL(ctx context.Context, payload, dst any) error {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	resp, err := a.do(ctx, http.MethodPost, "/graphql", "", b, Mutation{})
+	if err != nil {
+		return fmt.Errorf("GitHub GraphQL read: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return responseError("GitHub GraphQL read", resp)
+	}
+	return decodeJSON(resp.Body, dst)
+}
+
 func (a API) Mutate(ctx context.Context, method, path string, body any, attribution Mutation, dst any) error {
 	if attribution.Issue <= 0 || attribution.Attempt <= 0 {
 		return errors.New("GitHub mutation requires issue and attempt attribution")
@@ -85,14 +137,16 @@ func (a API) Mutate(ctx context.Context, method, path string, body any, attribut
 	}
 	resp, err := a.do(ctx, method, path, "", b, attribution)
 	if err != nil {
-		return fmt.Errorf("GitHub mutation outcome is ambiguous; reconcile issue #%d attempt %d: %w", attribution.Issue, attribution.Attempt, err)
+		return &ambiguousMutationError{fmt.Errorf("GitHub mutation outcome is ambiguous; reconcile issue #%d attempt %d: %w", attribution.Issue, attribution.Attempt, err)}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return responseError("GitHub mutation", resp)
 	}
 	if dst != nil && resp.StatusCode != http.StatusNoContent {
-		return decodeJSON(resp.Body, dst)
+		if err := decodeJSON(resp.Body, dst); err != nil {
+			return &ambiguousMutationError{fmt.Errorf("GitHub mutation outcome is ambiguous; reconcile issue #%d attempt %d: decode response: %w", attribution.Issue, attribution.Attempt, err)}
+		}
 	}
 	return nil
 }
@@ -164,5 +218,5 @@ func retryDelay(resp *http.Response, attempt int) time.Duration {
 
 func responseError(operation string, resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	return fmt.Errorf("%s: %s: %s", operation, resp.Status, Redact(string(body)))
+	return &responseStatusError{operation: operation, status: resp.StatusCode, message: fmt.Sprintf("%s: %s", resp.Status, Redact(string(body)))}
 }

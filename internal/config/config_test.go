@@ -56,7 +56,8 @@ func TestValidateRejectsUnsafePathsAndPolicy(t *testing.T) {
 	}{
 		{"traversal", func(c *Config) { c.WorktreeRoot = "../outside" }, "repository-relative"},
 		{"git metadata", func(c *Config) { c.DocsPaths = []string{".git/config"} }, "protected"},
-		{"bad policy", func(c *Config) { c.CompletionPolicies.Default = "force" }, "human-review or autonomous-merge"},
+		{"bad policy", func(c *Config) { c.CompletionPolicies.Default = "force" }, "must be human-review"},
+		{"autonomous default", func(c *Config) { c.CompletionPolicies.Default = "autonomous-merge" }, "must be human-review"},
 		{"unsafe command", func(c *Config) { c.Commands.Implementation = []string{"codex\nrm"} }, "unsafe argument"},
 		{"credential flag", func(c *Config) { c.Commands.Implementation = []string{"codex", "--token=canary"} }, "credential-shaped"},
 		{"credential assignment", func(c *Config) { c.Commands.Reviewer = []string{"codex", "API_KEY=canary"} }, "credential-shaped"},

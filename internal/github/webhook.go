@@ -152,15 +152,26 @@ func (c *DeliveryCache) Offer(id string, offer func() bool) (duplicate, accepted
 }
 
 type Reconciler struct {
-	Hints    chan Hint
-	FullRead func() error
+	Hints        chan Hint
+	FullRead     func() error
+	PullRequests *PRCoordinator
 }
 
 func (r Reconciler) RunOnce() error {
+	return r.runOnce(context.Background())
+}
+
+func (r Reconciler) runOnce(ctx context.Context) error {
 	if r.FullRead == nil {
 		return errors.New("reconciliation read is required")
 	}
-	return r.FullRead()
+	if err := r.FullRead(); err != nil {
+		return err
+	}
+	if r.PullRequests != nil {
+		return r.PullRequests.Reconcile(ctx)
+	}
+	return nil
 }
 
 func (r Reconciler) Run(ctx context.Context, interval time.Duration, failures chan<- error) {
@@ -170,7 +181,7 @@ func (r Reconciler) Run(ctx context.Context, interval time.Duration, failures ch
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	reconcile := func() {
-		if err := r.RunOnce(); err != nil && failures != nil {
+		if err := r.runOnce(ctx); err != nil && failures != nil {
 			select {
 			case failures <- err:
 			default:
