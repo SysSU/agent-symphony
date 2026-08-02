@@ -7,14 +7,14 @@
 
 Agent Symphony is one long-running Go process with a CLI mode. GitHub Issues, pull requests, reviews, checks, and repository rules are the durable workflow record. The process keeps only scheduling state in memory and bounded, reconstructible execution metadata on disk; it does not have a task database or a second workflow engine.
 
-Issue #10 implements only the one-shot PR-governance reconciliation and durable handoff boundary described here. Issue #4 owns daemon scheduling, state production and consumption, runtime resumption, and end-to-end wiring; those capabilities are not yet available.
+Issue #10 supplies PR governance and durable handoff state. Issue #4 integrates that state with bounded daemon scheduling, authoritative restart reconstruction, exact runtime monitoring, scoped handoff delivery, and evidenced outcome completion.
 
 The design follows the useful boundaries in the [OpenAI Symphony specification](https://github.com/openai/symphony/blob/main/SPEC.md): a single scheduling authority, a tracker adapter, deterministic workspaces, an agent runner, and an operator status surface. It deliberately differs in three places required by this product: GitHub owns the whole delivery lifecycle, portfolio policy is coordinator code rather than agent prompt logic, and agents never receive tracker credentials. The upstream Elixir implementation is a prototype; its in-memory blocked state and runtime dependency make it a reference, not the release base.
 
 ### Stack and release
 
 - **Go 1.26, pinned in `go.mod` and built with the latest 1.26 security patch.** Goroutines, `net/http`, `os/exec`, `crypto/hmac`, and `encoding/json` cover the daemon, webhook endpoint, process supervision, signature checks, and CLI. Add a dependency only where the standard library cannot safely implement a protocol (initially, none is required).
-- **One `agent-symphony` executable.** The same binary provides `init`, `validate`, `serve`, `stop`, `status`, `inspect`, `reconcile`, and `doctor`. `serve` owns orchestration; other commands use a local Unix socket and read-only GitHub queries. No language runtime, database, browser service, or container is required.
+- **One `agent-symphony` executable.** The same binary provides `init`, `validate`, `serve`, `status`, `list`, `inspect`, `reconcile`, `doctor`, and `pr-governance`. `serve` owns the periodic loop; production status and one-shot commands refresh from GitHub, while `--attempts` remains an offline diagnostic. No language runtime, database, browser service, or container is required.
 - **GitHub Releases** publish signed-tag build artifacts and SHA-256 checksums for `darwin/{arm64,amd64}` and `linux/{arm64,amd64}`. WSL2 uses the Linux artifact. Release CI runs unit tests, `go vet`, builds with `CGO_ENABLED=0`, smoke-tests each supported OS, and verifies a downloaded artifact against its checksum.
 - **External runtime prerequisites:** Git, tmux, configured coding-agent executables, repository access, GitHub connectivity, and one completed `agent-symphony install-host` run by a host administrator. `doctor` checks versions, provisioned identities, privilege rules, and behavior before `serve` accepts work. Package-manager and container distribution are post-MVP.
 
@@ -45,11 +45,11 @@ GitHub stores durable execution facts using machine-readable HTML markers in coo
 
 ```text
 <!-- agent-symphony:attempt:v1
-{"attempt":2,"branch":"agent-symphony/8-2","head":"...","pr":31,"outcome":"review"}
+{"version":1,"issue":8,"attempt":2,"branch":"agent-symphony/owner-repo-<hash>/8-2","head":"<commit-sha>","pr":31,"outcome":"review"}
 -->
 ```
 
-The marker schema is strict, size-bounded, and parsed only from the configured GitHub App identity. Human-readable text accompanies it. Attempt number is the next integer after the highest valid marker for the issue. Branch `agent-symphony/<issue>-<attempt>`, worktree `<root>/<owner>-<repo>-<issue>-<attempt>`, and tmux session `as-<repo-id>-<issue>-<attempt>` are deterministic. A PR contains `Closes #N` and the attempt marker. These identifiers make discovery possible without local files.
+The marker schema is strict, size-bounded, binds the issue, branch, exact head, PR, and outcome, and is parsed only from the configured GitHub App identity. Human-readable text accompanies it. Attempt number is the next integer after the highest valid marker for the issue. Branch `agent-symphony/<repo-id>/<issue>-<attempt>`, worktree `<root>/<repo-id>-<issue>-<attempt>`, and tmux session `as-<repo-id>-<issue>-<attempt>` are deterministic. A PR contains `Closes #N` and the attempt marker. These identifiers make discovery possible without local files.
 
 Issue/PR state, labels, comments, reviews, check runs, branch heads, and repository rules always beat local metadata. A contradiction blocks mutation, emits diagnostics, and requests reconciliation. Local files may never make completed work eligible again.
 
@@ -74,7 +74,9 @@ Startup reconstruction is always:
 3. Fetch open eligible issues, all open App-marked PRs, recent valid attempt/control snapshots, issue timeline provenance, reviews, checks, labels, branch heads, and merge/rules state.
 4. Scan only deterministic worktree/tmux names and bounded manifests for those attempts. Never adopt an unmarked branch, directory, process, or PR.
 5. Build the in-memory projection. If a GitHub-active attempt has a live matching tmux/worktree and manifest/head agreement, resume monitoring. Otherwise mark it orphaned/blocked in GitHub and either repair the same attempt when provably safe or create a new numbered attempt. Never attach to an unknown process.
-6. Reconcile terminal/closed work before dispatch, then evaluate the backlog. Target: complete within two minutes under normal API availability.
+6. Run the same authoritative reconciliation immediately at startup and at an interval no greater than 60 seconds, with a two-minute deadline around the entire cycle. A webhook is only an early wake-up hint. Only strict v1 attempt markers present on both the App-created PR and an App-authored issue snapshot, with matching App, actor, branch, issue, and attempt identities, are authoritative. Only a merged PR is completed; a separately closed issue/PR is blocked.
+7. Monitor exact live active and review-ready runtimes. Claim feedback and validation atomically only for verified owners, pass an immutable key and coordinator-owned outcome path to the runtime, and persist explicit evidenced outcomes before acknowledging/removing the outcome record. In-flight work is never pasted again by a later cycle.
+8. Reconcile terminal/closed work before dispatch, then evaluate the backlog. Target: complete within two minutes under normal API availability; timeout diagnostics identify the next bounded backoff cycle.
 
 ## Events, authentication, and authorization
 
@@ -149,7 +151,9 @@ These are projections, not durable workflow rows. GitHub facts define them: read
 
 The runtime seeds a worker-owned isolated local repository/worktree from the freshly fetched approved integration head, then invokes the exact provisioned implementation launch as `agent-symphony-worker`; that mode starts the named tmux session and deterministic primary command in the worktree. The prompt contains the issue contract, repository guidance, attempt identity, prior authorized feedback, allowed actions, and a required structured result. When policy requires independent review, the coordinator exports an immutable tree/diff into the snapshot root, then invokes the exact review launch as `agent-symphony-reviewer` with a distinct prompt; findings either return the attempt to the primary agent or permit validation. Process control uses process groups: graceful interrupt, bounded wait, then targeted kill of only that attempt. Attempts are retained for open PRs/rework and removed only after merge/abandonment is durable in GitHub.
 
-The worker exports a patch plus tree manifest; it never publishes. The coordinator validates paths, file types/modes, size bounds, base SHA, patch applicability, resulting tree hash, policy scope, and absence of secrets before applying the export in a coordinator-controlled publishing checkout. It then runs configured validation, checks documentation impact, commits/pushes the branch, creates/updates the one PR, and records evidence and material implementation decisions in the issue. The primary agent's structured result includes proposed issue-checklist completions; the credentialed coordinator verifies and applies those updates, satisfying FR25 without giving the agent GitHub access.
+The trusted worker boundary exports a bounded Git bundle plus immutable branch/head/base, clean-tree, result, and bundle-digest attestation; it never publishes. The coordinator imports into a temporary bare repository, rejects oversized objects, symlinks, result markers, invalid ancestry, or a changed head, and only then imports the verified head for push. Publication is reconstructed before each mutation from the deterministic App-owned branch/head, PR body marker, and issue comment marker, so ambiguous responses and crashes resume the missing phase instead of creating another PR.
+
+Feedback and validation identity includes immutable feedback source/ID values and a validation generation. The worker boundary atomically accepts each identity into its durable inbox/ledger and signals processing before acknowledging it; the coordinator records that acknowledgment but never writes a worker receipt. Terminal failures use a strict App-authored issue marker, which dispatch reconciliation reads as authoritative suppression until an authorized retry creates a later attempt. Every boundary adapter launch receives only the minimal platform environment (`PATH`, temporary-directory location, and Windows system root when present), never inherited coordinator credentials.
 
 ## Review, rate limits, and merge safety
 

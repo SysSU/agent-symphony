@@ -42,6 +42,7 @@ type Feedback struct {
 	Execution  FeedbackExecutionState
 	Authorized bool
 	Delegated  bool
+	Evidence   string
 }
 
 type PRFacts struct {
@@ -63,15 +64,18 @@ type PolicyResult struct {
 // PRState is reconstructed by PRSource from GitHub and issue #4's recovered
 // attempt state on every reconciliation. It is not coordinator-owned state.
 type PRState struct {
-	Repository, HeadSHA, CheckHead, ValidationQueuedSHA string
-	MergeAttemptSHA, MergePhase                         string
-	Number, Issue, Attempt                              int
-	CheckRunID                                          int64
-	ReviewLabelPresent                                  bool
-	Facts                                               PRFacts
-	Decisions                                           []Decision
-	PendingDispositions                                 []Feedback
-	ConfirmedDispositions                               []Feedback `json:"-"`
+	Repository, HeadSHA, CheckHead, ValidationQueuedSHA, ValidationInFlightSHA string
+	ValidationGeneration                                                       uint64 `json:"validation_generation,omitempty"`
+	ValidationResult, ValidationEvidence                                       string
+	MergeAttemptSHA, MergePhase                                                string
+	Number, Issue, Attempt                                                     int
+	CheckRunID                                                                 int64
+	ReviewLabelPresent                                                         bool
+	Facts                                                                      PRFacts
+	Decisions                                                                  []Decision
+	PendingDispositions                                                        []Feedback
+	ConfirmedDispositions                                                      []Feedback      `json:"-"`
+	HandoffReceipts                                                            map[string]bool `json:"handoff_receipts,omitempty"`
 }
 
 type Decision struct {
@@ -157,7 +161,7 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 		}
 	}
 	for _, feedback := range state.PendingDispositions {
-		body, err := FeedbackDispositionBody(state.Issue, state.Attempt, feedback, "")
+		body, err := FeedbackDispositionBody(state.Issue, state.Attempt, feedback, feedback.Evidence)
 		if err != nil {
 			return err
 		}
@@ -368,7 +372,21 @@ func PullRequestBody(issue, attempt int, validation, documentation, decisions st
 	if strings.TrimSpace(decisions) != "" {
 		body += "\n\n## Implementation decisions\n" + decisions
 	}
-	return AttributedBody(issue, attempt, body)
+	attributed, err := AttributedBody(issue, attempt, body)
+	if err != nil {
+		return "", err
+	}
+	return attributed, nil
+}
+
+// BindPullRequestBody adds the authoritative marker only after GitHub has
+// assigned the PR number and the published head is known.
+func BindPullRequestBody(body string, issue, attempt int, branch, head string, pr int) (string, error) {
+	marker, err := AttemptMarker(issue, attempt, branch, head, pr, "review")
+	if err != nil {
+		return "", err
+	}
+	return body + "\n\n" + marker, nil
 }
 
 type PullRequest struct {

@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,14 +15,20 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	"github.com/SysSU/agent-symphony/internal/orchestrator"
+	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
 const outputVersion = 1
@@ -45,6 +55,77 @@ type envelope struct {
 }
 
 type environmentToken string
+
+type workerBoundaryRunner struct{ Command string }
+type limitedBuffer struct {
+	bytes.Buffer
+	Limit int
+}
+
+func (w *limitedBuffer) Write(p []byte) (int, error) {
+	if w.Len()+len(p) > w.Limit {
+		return 0, errors.New("worker boundary response exceeds limit")
+	}
+	return w.Buffer.Write(p)
+}
+
+type boundaryCommand struct {
+	Name  string   `json:"name"`
+	Args  []string `json:"args,omitempty"`
+	Env   []string `json:"env,omitempty"`
+	Dir   string   `json:"dir,omitempty"`
+	Input []byte   `json:"input,omitempty"`
+}
+
+func (b workerBoundaryRunner) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if strings.TrimSpace(b.Command) == "" {
+		return agentruntime.Result{}, errors.New("AGENT_SYMPHONY_WORKER_BOUNDARY is required")
+	}
+	var input []byte
+	if command.Stdin != nil {
+		var err error
+		input, err = io.ReadAll(io.LimitReader(command.Stdin, 1<<20))
+		if err != nil {
+			return agentruntime.Result{}, err
+		}
+	}
+	payload, _ := json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{operation, boundaryCommand{command.Name, command.Args, command.Env, command.Dir, input}})
+	cmd := exec.CommandContext(ctx, b.Command)
+	cmd.Env = minimalBoundaryEnvironment()
+	cmd.Stdin = bytes.NewReader(payload)
+	out := limitedBuffer{Limit: 24 << 20}
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		return agentruntime.Result{}, fmt.Errorf("worker boundary %s: %w", operation, err)
+	}
+	var result agentruntime.Result
+	decoder := json.NewDecoder(bytes.NewReader(out.Bytes()))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil {
+		return agentruntime.Result{}, errors.New("worker boundary returned an invalid result")
+	}
+	if result.Code != 0 {
+		return result, fmt.Errorf("worker boundary command exited %d", result.Code)
+	}
+	return result, nil
+}
+
+func minimalBoundaryEnvironment() []string {
+	var env []string
+	for _, name := range []string{"PATH", "TMPDIR", "SYSTEMROOT"} {
+		if value := os.Getenv(name); value != "" {
+			env = append(env, name+"="+value)
+		}
+	}
+	return env
+}
+func (b workerBoundaryRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+	return b.call(ctx, "run", command)
+}
 
 func (t environmentToken) Token(context.Context) (internalgithub.InstallationToken, error) {
 	if t == "" {
@@ -82,11 +163,90 @@ func run(args []string, stdout, stderr io.Writer) int {
 	path := fs.String("config", config.DefaultPath, "configuration path")
 	jsonOutput := fs.Bool("json", false, "emit versioned JSON")
 	statePath := fs.String("state", "", "pull-request recovery state file")
+	attemptsPath := fs.String("attempts", "", "authoritative attempt facts file")
+	runtimeState := fs.String("runtime-state", "", "local runtime state root")
+	issueNumber := fs.Int("issue", 0, "issue number to inspect")
+	interval := fs.Duration("interval", orchestrator.MaxReconcileInterval, "serve reconciliation interval (maximum 60s)")
 	if err := fs.Parse(flagArgs); err != nil {
 		return misuse(stderr, wantsJSON, command, err.Error())
 	}
 
 	switch command {
+	case "serve":
+		if fs.NArg() != 0 || *statePath == "" || *runtimeState == "" {
+			return misuse(stderr, wantsJSON, command, "serve requires --state and --runtime-state")
+		}
+		if *interval <= 0 || *interval > orchestrator.MaxReconcileInterval {
+			return misuse(stderr, wantsJSON, command, "--interval must be greater than zero and no more than 60s")
+		}
+		lock, err := acquireDaemonLock(filepath.Join(*runtimeState, "daemon.lock"))
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		defer releaseDaemonLock(lock)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		reconcile := func(ctx context.Context) error {
+			_, err := reconcileGitHub(ctx, *path, *statePath, *runtimeState, true)
+			if err != nil {
+				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
+			}
+			return err
+		}
+		if err := orchestrator.ReconcileLoop(ctx, *interval, reconcile); err != nil && !errors.Is(err, context.Canceled) {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		return 0
+	case "status", "list", "inspect", "reconcile":
+		if fs.NArg() != 0 {
+			return misuse(stderr, wantsJSON, command, command+" accepts no positional arguments")
+		}
+		var statuses []orchestrator.RecoveryStatus
+		var err error
+		if *attemptsPath == "" {
+			if *statePath == "" || *runtimeState == "" {
+				return misuse(stderr, wantsJSON, command, command+" requires --state and --runtime-state unless --attempts is supplied")
+			}
+			statuses, err = reconcileGitHub(context.Background(), *path, *statePath, *runtimeState, command == "reconcile")
+		} else {
+			statuses, err = recoveryStatuses(*attemptsPath, *runtimeState)
+		}
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, internalgithub.Redact(err.Error()))
+		}
+		if command == "inspect" {
+			if *issueNumber <= 0 {
+				return misuse(stderr, wantsJSON, command, "inspect requires --issue")
+			}
+			statuses = slices.DeleteFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue != *issueNumber })
+			if len(statuses) == 0 {
+				return fail(stderr, *jsonOutput, command, "issue was not found in authoritative attempt facts")
+			}
+		}
+		if *jsonOutput {
+			return writeJSON(stdout, envelope{Version: outputVersion, Command: command, OK: true, Data: statuses})
+		}
+		for _, status := range statuses {
+			fmt.Fprintf(stdout, "%-11s %s#%d attempt %d", strings.ToUpper(status.State), status.Repository, status.Issue, status.Attempt)
+			if status.PR > 0 {
+				fmt.Fprintf(stdout, " PR #%d", status.PR)
+			}
+			fmt.Fprintln(stdout)
+			fmt.Fprintf(stdout, "  priority: P%d  dependencies: %v\n", status.Priority, status.Dependencies)
+			fmt.Fprintf(stdout, "  agents: implementation=%s review=%s\n", firstNonempty(status.ImplementationAgent, "-"), firstNonempty(status.ReviewAgent, "-"))
+			fmt.Fprintf(stdout, "  tmux: %s  worktree: %s\n", firstNonempty(status.Session, "-"), firstNonempty(status.Worktree, "-"))
+			fmt.Fprintf(stdout, "  branch: %s  head: %s  checks: %v\n", firstNonempty(status.Branch, "-"), firstNonempty(status.HeadSHA, "-"), status.Checks)
+			if len(status.Blockers) > 0 {
+				fmt.Fprintln(stdout, "  blockers: "+strings.Join(status.Blockers, "; "))
+			}
+			if status.Diagnostic != "" {
+				fmt.Fprintln(stdout, "  diagnostic: "+status.Diagnostic)
+			}
+			if status.Action != "" {
+				fmt.Fprintln(stdout, "  action: "+status.Action)
+			}
+		}
+		return 0
 	case "init":
 		if fs.NArg() != 0 {
 			return misuse(stderr, wantsJSON, command, "init accepts no positional arguments")
@@ -213,12 +373,837 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
+func acquireDaemonLock(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		return nil, errors.New("daemon lock must be a regular non-symlink file")
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, errors.New("another agent-symphony instance owns this runtime")
+	}
+	return f, nil
+}
+
+func releaseDaemonLock(f *os.File) { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }
+
+func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
+	started := time.Now()
+	ctx, cancel := context.WithDeadline(ctx, started.Add(2*time.Minute))
+	defer cancel()
+	c, err := config.Load(configPath)
+	if err != nil {
+		return nil, err
+	}
+	appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
+	if err != nil {
+		return nil, err
+	}
+	actorID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID")
+	if err != nil {
+		return nil, err
+	}
+	if actorID > int64(^uint(0)>>1) {
+		return nil, errors.New("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID is out of range")
+	}
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		return nil, errors.New("GITHUB_TOKEN is required")
+	}
+	api := internalgithub.API{BaseURL: githubAPI, Tokens: environmentToken(token), HTTP: githubClient}
+	if err := api.VerifyInstallation(ctx, appID); err != nil {
+		return nil, err
+	}
+	remote, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, appID, int(actorID))
+	if err != nil {
+		return nil, err
+	}
+	facts := make([]orchestrator.AttemptFact, len(remote))
+	for i, f := range remote {
+		facts[i] = orchestrator.AttemptFact{Repository: f.Repository, Issue: f.Issue, Attempt: f.Attempt, BaseSHA: f.BaseSHA, HeadSHA: f.HeadSHA, PR: f.PR, State: f.State, Checks: f.Checks}
+	}
+	prConfig := internalgithub.PRAdapterConfig{Repository: c.Repository, ReadyLabel: c.Labels.Ready, HumanReviewLabel: c.CompletionPolicies.HumanReview, AutonomousMergeLabel: c.CompletionPolicies.AutonomousMerge, MergeMethod: "squash", PriorityP1Label: c.Labels.PriorityP1, PriorityP2Label: c.Labels.PriorityP2, PriorityP3Label: c.Labels.PriorityP3, DependencySection: c.Dependencies.Section, DefaultCompletion: c.CompletionPolicies.Default, ApprovalCommand: "/agent-symphony approve", CancelCommand: "/agent-symphony cancel", RetryCommand: "/agent-symphony retry", AppID: appID, AppActorID: int(actorID)}
+	issues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, remote)
+	if err != nil {
+		return nil, err
+	}
+	root, err := config.GitRoot()
+	if err != nil {
+		return nil, err
+	}
+	boundary := workerBoundaryRunner{Command: os.Getenv("AGENT_SYMPHONY_WORKER_BOUNDARY")}
+	r := agentruntime.Runtime{Root: filepath.Join(root, c.WorktreeRoot), StateRoot: stateRoot, Source: root, Runner: boundary, AllowEnv: c.Commands.Environment, VerifyWorker: func(ctx context.Context) error {
+		_, err := boundary.call(ctx, "verify", agentruntime.Command{})
+		return err
+	}}
+	manifests, err := r.Discover()
+	if err != nil {
+		return nil, err
+	}
+	for i := range issues {
+		issues[i].Active = issues[i].Active || slices.ContainsFunc(manifests, func(m agentruntime.Manifest) bool {
+			return m.Repository == issues[i].Repository && m.Issue == issues[i].Issue && (m.State == "preparing" || m.State == "running")
+		})
+		for _, manifest := range manifests {
+			if manifest.Repository == issues[i].Repository && manifest.Issue == issues[i].Issue && (manifest.State == "failed" || manifest.State == "cancelled" || manifest.State == "completed") {
+				if issues[i].Retry {
+					issues[i].Attempt = max(issues[i].Attempt, manifest.Attempt+1)
+				} else {
+					issues[i].Eligible = false
+					issues[i].Blockers = append(issues[i].Blockers, "local terminal attempt awaits or has durable GitHub outcome")
+				}
+			}
+		}
+	}
+	statuses := orchestrator.Recover(facts, manifests)
+	statuses, decisions := joinIssueProjection(statuses, issues, c.Concurrency)
+	if !transition {
+		return statuses, nil
+	}
+	statuses = orchestrator.RecoverChecked(ctx, facts, manifests, func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
+		head := fact.HeadSHA
+		if head == "" {
+			head = fact.BaseSHA
+		}
+		return r.VerifyActive(ctx, manifest, head)
+	})
+	statuses, _ = joinIssueProjection(statuses, issues, c.Concurrency)
+	// Governance may mutate GitHub; production only runs it after the verified
+	// installation read and authoritative duplicate suppression above.
+	if slices.ContainsFunc(statuses, func(s orchestrator.RecoveryStatus) bool {
+		return s.State == "blocked" && strings.Contains(s.Diagnostic, "duplicate")
+	}) {
+		return statuses, nil
+	}
+	if err := internalgithub.RunPRReconciliation(ctx, api, prConfig, statePath); err != nil {
+		return statuses, err
+	}
+	if err := monitorAttempts(ctx, &r, statuses, manifests); err != nil {
+		return statuses, err
+	}
+	if err := monitorQueuedAttempts(ctx, api, &r, c, issues, manifests, remote); err != nil {
+		return statuses, err
+	}
+	if err := dispatchIssues(ctx, &r, c, issues, decisions); err != nil {
+		return statuses, err
+	}
+	if err := resumeHandoffs(ctx, &r, statePath, stateRoot, statuses, manifests); err != nil {
+		return statuses, err
+	}
+	if err := ctx.Err(); err != nil {
+		return statuses, fmt.Errorf("reconciliation exceeded the two-minute recovery target; retry on the next bounded backoff cycle: %w", err)
+	}
+	return statuses, nil
+}
+
+func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []internalgithub.RecoveryIssueFact, capacity int) ([]orchestrator.RecoveryStatus, []orchestrator.Decision) {
+	scheduled := make([]orchestrator.Issue, len(issues))
+	for i, issue := range issues {
+		scheduled[i] = orchestrator.Issue{Repository: issue.Repository, Number: issue.Issue, Priority: issue.Priority, CreatedAt: issue.CreatedAt, Dependencies: issue.Dependencies, Eligible: issue.Eligible, Blockers: issue.Blockers, Active: issue.Active, Completed: issue.Completed}
+	}
+	decisions := orchestrator.Schedule(scheduled, orchestrator.Capacity{Global: capacity, Repositories: map[string]int{}})
+	for _, issue := range issues {
+		found := false
+		for j := range statuses {
+			if statuses[j].Repository == issue.Repository && statuses[j].Issue == issue.Issue {
+				statuses[j].Priority, statuses[j].Dependencies = issue.Priority, issue.Dependencies
+				statuses[j].Blockers = append(statuses[j].Blockers, issue.Blockers...)
+				found = true
+			}
+		}
+		if found {
+			continue
+		}
+		decisionIndex := slices.IndexFunc(decisions, func(d orchestrator.Decision) bool { return d.Repository == issue.Repository && d.Number == issue.Issue })
+		if decisionIndex < 0 {
+			continue
+		}
+		decision := decisions[decisionIndex]
+		statuses = append(statuses, orchestrator.RecoveryStatus{Repository: issue.Repository, Issue: issue.Issue, Attempt: issue.Attempt, State: string(decision.State), Priority: issue.Priority, Dependencies: issue.Dependencies, Blockers: issue.Blockers, Action: decision.Explanation})
+	}
+	return statuses, decisions
+}
+
+func dispatchIssues(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, decisions []orchestrator.Decision) error {
+	for _, decision := range decisions {
+		if decision.State != orchestrator.Runnable {
+			continue
+		}
+		index := slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
+			return issue.Repository == decision.Repository && issue.Issue == decision.Number
+		})
+		if index < 0 {
+			return errors.New("scheduler returned an unknown issue")
+		}
+		issue := issues[index]
+		prompt := fmt.Sprintf("Repository: %s\nIssue: #%d\nAttempt: %d\n\n%s", issue.Repository, issue.Issue, issue.Attempt, issue.Body)
+		_, err := runtime.PrepareAndStart(ctx, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Context: prompt, Command: cfg.Commands.Implementation, Eligible: func() bool { return issue.Eligible }})
+		if err != nil {
+			return fmt.Errorf("dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
+		}
+	}
+	return nil
+}
+
+type workerResult struct {
+	Type          string `json:"type"`
+	Validation    string `json:"validation"`
+	Documentation string `json:"documentation"`
+	Decisions     string `json:"decisions,omitempty"`
+}
+
+type workerExport struct {
+	Type         string       `json:"type"`
+	Repository   string       `json:"repository"`
+	Branch       string       `json:"branch"`
+	BaseSHA      string       `json:"base_sha"`
+	HeadSHA      string       `json:"head_sha"`
+	BundleSHA256 string       `json:"bundle_sha256"`
+	Clean        bool         `json:"clean"`
+	Result       workerResult `json:"result"`
+	Bundle       string       `json:"bundle"`
+}
+
+func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, manifest agentruntime.Manifest) (workerResult, string, string, error) {
+	request, _ := json.Marshal(manifest)
+	response, err := boundary.call(ctx, "export", agentruntime.Command{Stdin: bytes.NewReader(request)})
+	if err != nil {
+		return workerResult{}, "", "", err
+	}
+	var exported workerExport
+	decoder := json.NewDecoder(strings.NewReader(response.Output))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&exported) != nil || decoder.Decode(&struct{}{}) != io.EOF || exported.Type != "agent-symphony-export-v1" || exported.Repository != manifest.Repository || exported.Branch != manifest.Branch || exported.BaseSHA != manifest.BaseSHA || !exported.Clean || exported.Result.Type != "agent-symphony-result-v1" || strings.TrimSpace(exported.Result.Validation) == "" || strings.TrimSpace(exported.Result.Documentation) == "" {
+		return workerResult{}, "", "", errors.New("worker boundary returned invalid attested metadata")
+	}
+	bundle, err := base64.StdEncoding.DecodeString(exported.Bundle)
+	if err != nil || len(bundle) == 0 || len(bundle) > 16<<20 || fmt.Sprintf("%x", sha256.Sum256(bundle)) != exported.BundleSHA256 {
+		return workerResult{}, "", "", errors.New("worker boundary returned invalid or oversized bundle")
+	}
+	temp, err := os.MkdirTemp("", "agent-symphony-import-")
+	if err != nil {
+		return workerResult{}, "", "", err
+	}
+	defer os.RemoveAll(temp)
+	bundlePath := filepath.Join(temp, "attempt.bundle")
+	if err := os.WriteFile(bundlePath, bundle, 0o600); err != nil {
+		return workerResult{}, "", "", err
+	}
+	if err := scanGit(ctx, temp, nil, []string{"bundle", "verify", bundlePath}, nil); err != nil {
+		return workerResult{}, "", "", errors.New("worker bundle verification failed")
+	}
+	importedRepo := filepath.Join(temp, "repository.git")
+	if err := scanGit(ctx, temp, nil, []string{"init", "--bare", importedRepo}, nil); err != nil {
+		return workerResult{}, "", "", fmt.Errorf("create temporary import repository: %w", err)
+	}
+	if err := preflightBundle(ctx, bundle, bundlePath, importedRepo); err != nil {
+		return workerResult{}, "", "", fmt.Errorf("worker bundle object bounds: %w", err)
+	}
+	if err := scanGit(ctx, importedRepo, nil, []string{"fetch", "--no-tags", bundlePath, exported.HeadSHA}, nil); err != nil {
+		return workerResult{}, "", "", fmt.Errorf("import worker bundle: %w", err)
+	}
+	head, err := gitSingleLine(ctx, importedRepo, "rev-parse", "FETCH_HEAD")
+	if err != nil || head != exported.HeadSHA || !regexp.MustCompile(`^[0-9a-f]{40,64}$`).MatchString(head) {
+		return workerResult{}, "", "", errors.New("imported worker head changed")
+	}
+	if err := scanGit(ctx, importedRepo, nil, []string{"merge-base", "--is-ancestor", manifest.BaseSHA, head}, nil); err != nil || strings.EqualFold(head, manifest.BaseSHA) {
+		return workerResult{}, "", "", errors.New("worker head is not a new descendant of approved base")
+	}
+	if err := validateWorkerTree(ctx, importedRepo, head); err != nil {
+		return workerResult{}, "", "", errors.New("worker bundle contains a symlink or result marker")
+	}
+	root, err := config.GitRoot()
+	if err != nil {
+		return workerResult{}, "", "", err
+	}
+	if err := scanGit(ctx, root, nil, []string{"fetch", "--no-tags", importedRepo, head}, nil); err != nil {
+		return workerResult{}, "", "", fmt.Errorf("import verified worker head: %w", err)
+	}
+	return exported.Result, head, root, nil
+}
+
+const (
+	preflightMaxObjects = 100000
+	preflightMaxBytes   = 32 << 20
+	preflightMaxObject  = 8 << 20
+	preflightMaxLine    = 1024
+	preflightMaxOutput  = 64 << 20
+	preflightMaxStderr  = 64 << 10
+	preflightMaxEntries = 100000
+)
+
+var preflightObjectID = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
+
+type cappedBuffer struct {
+	bytes.Buffer
+	limit int
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if remaining := b.limit - b.Len(); remaining > 0 {
+		_, _ = b.Buffer.Write(p[:min(len(p), remaining)])
+	}
+	return len(p), nil
+}
+
+func scanGit(ctx context.Context, repo string, stdin io.Reader, args []string, line func([]byte) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", repo}, args...)...)
+	cmd.Stdin = stdin
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr := cappedBuffer{limit: preflightMaxStderr}
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	abort := func(err error) error {
+		cancel()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return err
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, preflightMaxLine), preflightMaxLine)
+	var outputBytes int64
+	for scanner.Scan() {
+		outputBytes += int64(len(scanner.Bytes()) + 1)
+		if outputBytes > preflightMaxOutput {
+			return abort(errors.New("git output byte limit exceeded"))
+		}
+		if line != nil {
+			if err := line(scanner.Bytes()); err != nil {
+				return abort(err)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return abort(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+func gitSingleLine(ctx context.Context, repo string, args ...string) (string, error) {
+	var result string
+	err := scanGit(ctx, repo, nil, args, func(line []byte) error {
+		if result != "" {
+			return errors.New("unexpected multi-line git output")
+		}
+		result = string(line)
+		return nil
+	})
+	return result, err
+}
+
+func validateWorkerTree(ctx context.Context, repo, head string) error {
+	var count, total int64
+	return scanGit(ctx, repo, nil, []string{"ls-tree", "-rl", head}, func(line []byte) error {
+		count++
+		if count > preflightMaxEntries {
+			return errors.New("tree entry count exceeded")
+		}
+		tab := bytes.IndexByte(line, '\t')
+		if tab < 0 {
+			return errors.New("invalid tree entry")
+		}
+		fields, path := bytes.Fields(line[:tab]), line[tab+1:]
+		if len(fields) != 4 || (string(fields[0]) != "100644" && string(fields[0]) != "100755") || string(fields[1]) != "blob" || !preflightObjectID.Match(fields[2]) || len(path) == 0 || path[0] == '/' || bytes.ContainsAny(path, "\\\n\r") || string(path) != filepath.Clean(string(path)) {
+			return errors.New("invalid tree mode or path")
+		}
+		size, err := strconv.ParseInt(string(fields[3]), 10, 64)
+		if err != nil || size < 0 || size > preflightMaxObject || total > preflightMaxBytes-size {
+			return errors.New("tree declared size exceeded")
+		}
+		total += size
+		if bytes.Equal(path, []byte(".agent-symphony-result.json")) {
+			return errors.New("result marker present")
+		}
+		return nil
+	})
+}
+
+func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string) error {
+	start := bytes.Index(bundle, []byte("\nPACK"))
+	if start < 0 {
+		return errors.New("pack payload missing")
+	}
+	pack := filepath.Join(repo, "objects", "pack", "incoming.pack")
+	if err := os.WriteFile(pack, bundle[start+1:], 0o600); err != nil {
+		return err
+	}
+	if err := scanGit(ctx, repo, nil, []string{"index-pack", "--strict", pack}, nil); err != nil {
+		return errors.New("invalid pack")
+	}
+	var count, total int64
+	err := scanGit(ctx, repo, nil, []string{"verify-pack", "-v", strings.TrimSuffix(pack, ".pack") + ".idx"}, func(line []byte) error {
+		fields := bytes.Fields(line)
+		if len(fields) < 5 || !preflightObjectID.Match(fields[0]) {
+			return nil
+		}
+		count++
+		if count > preflightMaxObjects {
+			return errors.New("expanded object count or bytes exceeded")
+		}
+		size, parseErr := strconv.ParseInt(string(fields[2]), 10, 64)
+		if parseErr != nil || size < 0 || size > preflightMaxObject {
+			return errors.New("oversized expanded object")
+		}
+		total += size
+		if total > preflightMaxBytes {
+			return errors.New("expanded object count or bytes exceeded")
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("pack verification failed: %w", err)
+	}
+	if count == 0 {
+		return errors.New("empty pack")
+	}
+	var refs []string
+	err = scanGit(ctx, repo, nil, []string{"bundle", "list-heads", bundlePath}, func(line []byte) error {
+		if len(refs) >= 1024 {
+			return errors.New("bundle ref count exceeded")
+		}
+		fields := bytes.Fields(line)
+		if len(fields) != 2 || !preflightObjectID.Match(fields[0]) {
+			return errors.New("invalid bundle ref")
+		}
+		ref := fmt.Sprintf("refs/preflight/%d", len(refs))
+		if err := scanGit(ctx, repo, nil, []string{"update-ref", ref, string(fields[0])}, nil); err != nil {
+			return errors.New("bundle ref object missing")
+		}
+		refs = append(refs, ref)
+		return nil
+	})
+	if err != nil || len(refs) == 0 {
+		return errors.New("bundle refs missing")
+	}
+	objects, err := os.CreateTemp(repo, "preflight-objects-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(objects.Name())
+	defer objects.Close()
+	count = 0
+	err = scanGit(ctx, repo, nil, append([]string{"rev-list", "--objects"}, refs...), func(line []byte) error {
+		fields := bytes.Fields(line)
+		if len(fields) == 0 || !preflightObjectID.Match(fields[0]) {
+			return errors.New("malformed reachable object")
+		}
+		count++
+		if count > preflightMaxObjects {
+			return errors.New("reachable object count exceeded")
+		}
+		_, err := objects.Write(append(fields[0], '\n'))
+		return err
+	})
+	if err != nil || count == 0 {
+		return errors.New("bundle reachability failed")
+	}
+	if _, err := objects.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	count, total = 0, 0
+	err = scanGit(ctx, repo, objects, []string{"cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"}, func(line []byte) error {
+		fields := bytes.Fields(line)
+		if len(fields) != 3 {
+			return errors.New("reachable object batch check malformed")
+		}
+		count++
+		if count > preflightMaxObjects {
+			return errors.New("reachable expanded object bounds exceeded")
+		}
+		size, parseErr := strconv.ParseInt(string(fields[2]), 10, 64)
+		if parseErr != nil || size < 0 || size > preflightMaxObject || total > preflightMaxBytes-size {
+			return errors.New("reachable expanded object bounds exceeded")
+		}
+		total += size
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("reachable object batch check failed: %w", err)
+	}
+	return nil
+}
+
+func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact) error {
+	for _, manifest := range manifests {
+		if slices.ContainsFunc(remote, func(f internalgithub.RecoveryAttemptFact) bool {
+			return f.Repository == manifest.Repository && f.Issue == manifest.Issue && f.Attempt == manifest.Attempt
+		}) {
+			continue
+		}
+		index := slices.IndexFunc(issues, func(i internalgithub.RecoveryIssueFact) bool {
+			return i.Repository == manifest.Repository && i.Issue == manifest.Issue && i.Attempt == manifest.Attempt
+		})
+		if index < 0 {
+			continue
+		}
+		issue := issues[index]
+		current := manifest
+		if manifest.State == "preparing" || manifest.State == "running" {
+			var err error
+			current, err = runtime.Monitor(ctx, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Eligible: func() bool { return issue.Eligible }})
+			if err != nil {
+				return err
+			}
+		}
+		if current.State == "completed" {
+			if err := publishWorkerResult(ctx, api, cfg, issue, current); err != nil {
+				return durableAttemptFailure(ctx, api, issue, current, err)
+			}
+		} else if current.State == "failed" || current.State == "cancelled" {
+			if err := durableAttemptFailure(ctx, api, issue, current, errors.New(current.Diagnostic)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func publishWorkerResult(ctx context.Context, api internalgithub.API, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest) error {
+	boundary := workerBoundaryRunner{Command: os.Getenv("AGENT_SYMPHONY_WORKER_BOUNDARY")}
+	result, head, root, err := importWorkerExport(ctx, boundary, manifest)
+	if err != nil {
+		return err
+	}
+	run := func(dir string, args ...string) (string, error) {
+		out, err := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", dir}, args...)...).CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+	if _, err := run(root, "push", "origin", "FETCH_HEAD:refs/heads/"+manifest.Branch); err != nil {
+		return fmt.Errorf("publish verified worker head: %w", err)
+	}
+	body, err := internalgithub.PullRequestBody(issue.Issue, issue.Attempt, result.Validation, result.Documentation, result.Decisions)
+	if err != nil {
+		return err
+	}
+	mutation := internalgithub.Mutation{Issue: issue.Issue, Attempt: issue.Attempt}
+	appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
+	if err != nil {
+		return err
+	}
+	actorID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID")
+	if err != nil {
+		return err
+	}
+	pr, currentBody, err := internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, appID, int(actorID))
+	if err != nil {
+		return err
+	}
+	if pr.Number == 0 {
+		pr, err = api.CreatePullRequest(ctx, issue.Repository, issue.Title, manifest.Branch, issue.BaseBranch, body, mutation)
+		if err != nil {
+			// An ambiguous create is recovered by deterministic head lookup.
+			pr, currentBody, _ = internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, appID, int(actorID))
+			if pr.Number == 0 {
+				return err
+			}
+		}
+	}
+	bound, err := internalgithub.BindPullRequestBody(body, issue.Issue, issue.Attempt, manifest.Branch, head, pr.Number)
+	if err != nil {
+		return err
+	}
+	if currentBody != bound {
+		// Re-read before mutation so a restart or concurrent edit cannot create a second PR.
+		fresh, freshBody, findErr := internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, appID, int(actorID))
+		if findErr != nil || fresh.Number != pr.Number {
+			return errors.New("pull request identity changed before binding")
+		}
+		currentBody = freshBody
+	}
+	if currentBody != bound {
+		if err := api.UpdatePullRequest(ctx, issue.Repository, pr.Number, bound, mutation); err != nil {
+			return err
+		}
+	}
+	marker, _ := internalgithub.AttemptMarker(issue.Issue, issue.Attempt, manifest.Branch, head, pr.Number, "review")
+	comment, _ := internalgithub.AttributedBody(issue.Issue, issue.Attempt, "Attempt published for review.")
+	present, err := internalgithub.HasAttemptComment(ctx, api, issue.Repository, issue.Issue, marker, appID, int(actorID))
+	if err != nil {
+		return err
+	}
+	if present {
+		return nil
+	}
+	return api.CreateIssueComment(ctx, issue.Repository, issue.Issue, comment+"\n\n"+marker, mutation)
+}
+
+func durableAttemptFailure(ctx context.Context, api internalgithub.API, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, cause error) error {
+	body, err := internalgithub.AttributedBody(issue.Issue, issue.Attempt, "Attempt failed closed: "+internalgithub.Redact(cause.Error()))
+	if err != nil {
+		return err
+	}
+	marker, err := internalgithub.TerminalFailureMarker(issue.Issue, issue.Attempt, manifest.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
+	if err != nil {
+		return err
+	}
+	actorID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID")
+	if err != nil {
+		return err
+	}
+	present, err := internalgithub.HasAttemptComment(ctx, api, issue.Repository, issue.Issue, marker, appID, int(actorID))
+	if err != nil {
+		return err
+	}
+	if present {
+		return nil
+	}
+	if err := api.CreateIssueComment(ctx, issue.Repository, issue.Issue, body+"\n\n"+marker, internalgithub.Mutation{Issue: issue.Issue, Attempt: issue.Attempt}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest) error {
+	for _, status := range statuses {
+		if status.Action != "resume monitoring the matching attempt" {
+			continue
+		}
+		var base string
+		for _, manifest := range manifests {
+			if manifest.Repository == status.Repository && manifest.Issue == status.Issue && manifest.Attempt == status.Attempt {
+				base = manifest.BaseSHA
+				break
+			}
+		}
+		_, err := runtime.Monitor(ctx, agentruntime.Attempt{Repository: status.Repository, Issue: status.Issue, Number: status.Attempt, BaseSHA: base})
+		if err != nil {
+			return fmt.Errorf("monitor %s#%d attempt %d: %w", status.Repository, status.Issue, status.Attempt, err)
+		}
+	}
+	return nil
+}
+
+func resumeHandoffs(ctx context.Context, runtime *agentruntime.Runtime, statePath, stateRoot string, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest) error {
+	info, err := os.Lstat(statePath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("safe durable handoff state is unavailable")
+	}
+	live := map[string]agentruntime.Manifest{}
+	for _, status := range statuses {
+		if (status.State == "active" || status.State == "review-ready") && status.Action == "resume monitoring the matching attempt" {
+			for _, manifest := range manifests {
+				if manifest.Repository == status.Repository && manifest.Issue == status.Issue && manifest.Attempt == status.Attempt {
+					live[fmt.Sprintf("%s#%d/%d", status.Repository, status.Issue, status.Attempt)] = manifest
+				}
+			}
+		}
+	}
+	recovery := &internalgithub.FileRecovery{Path: statePath}
+	outcomeRoot := filepath.Join(stateRoot, "handoff-outcomes")
+	if err := os.MkdirAll(outcomeRoot, 0o700); err != nil {
+		return err
+	}
+	if err := completeHandoffOutcomes(ctx, recovery, outcomeRoot); err != nil {
+		return err
+	}
+	// Claim only after a safe owner is proven; otherwise work remains queued.
+	if len(live) == 0 {
+		return nil
+	}
+	owners := make(map[string]bool, len(live))
+	for key := range live {
+		owners[key] = true
+	}
+	handoffs, err := recovery.ClaimHandoffsFor(ctx, owners)
+	if err != nil {
+		return err
+	}
+	for _, handoff := range handoffs {
+		manifest, ok := live[fmt.Sprintf("%s#%d/%d", handoff.Repository, handoff.Issue, handoff.Attempt)]
+		if !ok {
+			return errors.New("claimed handoff has no verified owning runtime; refusing execution")
+		}
+		payload, _ := json.Marshal(struct {
+			Type, Key  string
+			PR         int
+			HeadSHA    string
+			Validation bool
+			Feedback   []internalgithub.Feedback
+		}{"agent-symphony-handoff-v1", handoff.Key, handoff.PR, handoff.HeadSHA, handoff.Validation, handoff.Feedback})
+		boundary, ok := runtime.Runner.(workerBoundaryRunner)
+		if !ok {
+			return errors.New("trusted boundary does not support durable handoff acceptance")
+		}
+		manifestBody, _ := json.Marshal(manifest)
+		outcomePath := filepath.Join(outcomeRoot, handoff.Key+".json")
+		outcomeToken := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+handoff.Key)))
+		request, _ := json.Marshal(struct {
+			Manifest     json.RawMessage `json:"manifest"`
+			Handoff      json.RawMessage `json:"handoff"`
+			OutcomePath  string          `json:"outcome_path"`
+			OutcomeToken string          `json:"outcome_token"`
+		}{manifestBody, payload, outcomePath, outcomeToken})
+		accepted, err := boundary.call(ctx, "accept-handoff", agentruntime.Command{Stdin: bytes.NewReader(request)})
+		var ack struct {
+			Type         string `json:"type"`
+			Key          string `json:"key"`
+			OutcomePath  string `json:"outcome_path"`
+			OutcomeToken string `json:"outcome_token"`
+		}
+		decoder := json.NewDecoder(strings.NewReader(accepted.Output))
+		decoder.DisallowUnknownFields()
+		if err != nil {
+			return fmt.Errorf("worker-owned handoff acceptance: %w", err)
+		}
+		if decoder.Decode(&ack) != nil || decoder.Decode(&struct{}{}) != io.EOF || ack.Type != "agent-symphony-handoff-accepted-v1" || ack.Key != handoff.Key || ack.OutcomePath != outcomePath || ack.OutcomeToken != outcomeToken {
+			return errors.New("worker-owned handoff acceptance binding mismatch")
+		}
+		if err := recovery.ReceiptHandoff(ctx, handoff); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeImmutable(path string, body []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		old, readErr := os.ReadFile(path)
+		if readErr == nil && bytes.Equal(old, body) {
+			return nil
+		}
+		return errors.New("immutable handoff inbox key collision")
+	}
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(body); err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func completeHandoffOutcomes(ctx context.Context, recovery *internalgithub.FileRecovery, root string) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	if len(entries) > 10000 {
+		return errors.New("handoff outcome count exceeded")
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return errors.New("unsafe handoff outcome file")
+		}
+		info, statErr := file.Stat()
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
+			file.Close()
+			return errors.New("unsafe or oversized handoff outcome file")
+		}
+		b, err := io.ReadAll(io.LimitReader(file, 1<<20+1))
+		closeErr := file.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		var record struct {
+			Handoff      internalgithub.RecoveryHandoff `json:"handoff"`
+			Outcome      internalgithub.HandoffOutcome  `json:"outcome"`
+			OutcomeToken string                         `json:"outcome_token"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(b))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&record); err != nil {
+			return fmt.Errorf("decode handoff outcome: %w", err)
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			return errors.New("handoff outcome contains trailing data")
+		}
+		wantName := record.Handoff.Key + ".json"
+		wantToken := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+record.Handoff.Key)))
+		if entry.Name() != wantName || record.Outcome.Key != record.Handoff.Key || record.OutcomeToken != wantToken {
+			return errors.New("handoff outcome destination or token mismatch")
+		}
+		if err := recovery.CompleteHandoffOutcome(ctx, record.Handoff, record.Outcome); err != nil {
+			return err
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func positiveEnvironmentInt64(name string) (int64, error) {
 	value, err := strconv.ParseInt(os.Getenv(name), 10, 64)
 	if err != nil || value <= 0 {
 		return 0, fmt.Errorf("%s must be a positive integer", name)
 	}
 	return value, nil
+}
+
+func recoveryStatuses(attemptsPath, stateRoot string) ([]orchestrator.RecoveryStatus, error) {
+	if attemptsPath == "" {
+		return nil, errors.New("--attempts is required")
+	}
+	info, err := os.Lstat(attemptsPath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("--attempts must name a regular non-symlink file")
+	}
+	b, err := os.ReadFile(attemptsPath)
+	if err != nil {
+		return nil, err
+	}
+	var facts []orchestrator.AttemptFact
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&facts); err != nil {
+		return nil, fmt.Errorf("read authoritative attempt facts: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, errors.New("authoritative attempt facts contain multiple JSON values")
+	}
+	sha := regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+	for _, fact := range facts {
+		if fact.Repository == "" || fact.Issue <= 0 || fact.Attempt <= 0 || !sha.MatchString(fact.BaseSHA) || !slices.Contains([]string{"queued", "active", "blocked", "review-ready", "completed", "failed", "cancelled"}, fact.State) {
+			return nil, errors.New("authoritative attempt facts contain an invalid identity, base SHA, or state")
+		}
+	}
+	var manifests []agentruntime.Manifest
+	if stateRoot != "" {
+		root, err := config.GitRoot()
+		if err != nil {
+			return nil, err
+		}
+		r := agentruntime.Runtime{Root: filepath.Join(root, ".worktrees"), StateRoot: stateRoot}
+		manifests, err = r.Discover()
+		if err != nil {
+			return nil, fmt.Errorf("discover local attempts: %w", err)
+		}
+	}
+	return orchestrator.Recover(facts, manifests), nil
 }
 
 func doctor(c config.Config) []diagnostic {
@@ -478,11 +1463,18 @@ commands:
   init          create .agent-symphony.yaml with safe defaults
   validate      validate configuration
   config view   print validated configuration
+  serve         reconcile at startup and at most every 60 seconds
+  status        show recovered work
+  list          alias for status
+  inspect       show one issue (--issue number)
+  reconcile     fetch GitHub facts and reconcile now
   doctor        diagnose local prerequisites and GitHub access
   diagnostics   alias for doctor
   pr-governance reconcile pull-request governance once
 
 options:
   --config path use another configuration file
+  --state path  durable PR-governance/handoff state
+  --runtime-state path  bounded runtime manifest root
   --json        emit a versioned JSON envelope`)
 }
