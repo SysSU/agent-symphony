@@ -13,6 +13,20 @@ GitHub Issues are the sole source of truth for implementation state.
 - Do not create local BMAD story files such as `docs/stories/*.story.md`; use the GitHub issue instead.
 - Use chat and messaging tools for discussion and notifications only. Record decisions in the GitHub issue before continuing implementation.
 
+## Isolated Worktrees
+
+All issue implementation must occur in a dedicated Git worktree. Keep the primary checkout for coordination, inspection, and integration only.
+
+- Create one branch and worktree per GitHub issue before editing files. Use a descriptive branch such as `issue-<number>-<slug>` and record the branch and worktree path in the issue when work starts.
+- Never implement two issues in the same worktree or let multiple agents edit the same worktree concurrently.
+- Base a worktree on the current approved integration branch. If required commits are unavailable locally, fetch them without overwriting local or unrelated work.
+- Create every issue worktree under `<project-root>/.worktrees/<issue-branch>`. Keep `.worktrees/` ignored by Git, and never create a worktree inside another issue worktree.
+- Run relevant validation inside the issue worktree. When authorized to publish changes, commit and push only the issue branch, then open or update its pull request. Never push issue changes directly to the integration branch.
+- Deliver every implementation change through a pull request before integration. Do not merge locally or bypass the pull request, required reviews, checks, or branch protections.
+- Before integration, reconcile dependencies and overlapping files with active issue branches. Do not merge around unresolved conflicts or required GitHub checks.
+- Remove a worktree only after its branch is safely integrated or explicitly abandoned and any needed evidence is preserved. Remove only the exact worktree created for the issue; never use broad cleanup commands.
+- The orchestrator may inspect every worktree, but implementation sub-agents must be scoped to their assigned issue worktree and tmux session.
+
 ## Working Rules
 
 - Understand the existing flow and search for established helpers and patterns before changing code.
