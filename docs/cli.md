@@ -46,7 +46,8 @@ Commands produce plain human-readable text by default and never depend on color.
   "docs_paths": ["README.md", "docs"],
   "commands": {
     "implementation": ["codex", "exec"],
-    "reviewer": ["codex", "review"]
+    "reviewer": ["codex", "review"],
+    "environment_allowlist": ["HOME", "LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"]
   },
   "status": {
     "format": "human",
@@ -55,7 +56,19 @@ Commands produce plain human-readable text by default and never depend on color.
 }
 ```
 
-Commands are argument arrays, not shell strings. Downstream runtime code can therefore execute the configured program without shell interpolation. Arguments or assignments shaped like tokens, passwords, private keys, API keys, credentials, or authorization values are rejected so `config view` cannot disclose them. Dependencies are explicit issue references under the configured issue-body section; issue parsing and enforcement belong to downstream intake/scheduler work. Completion defaults to human review. Raising concurrency only records policy; issue #6 does not dispatch work.
+Commands are argument arrays, not shell strings. Runtime code therefore executes the configured program without shell interpolation. `environment_allowlist` is the complete set of inherited variable names available to implementation/review processes; add model-provider credentials explicitly. GitHub, Git askpass, SSH-agent, and cloud credential variables are forbidden even when listed. Arguments or assignments shaped like tokens, passwords, private keys, API keys, credentials, or authorization values are rejected so `config view` cannot disclose them. Dependencies are explicit issue references under the configured issue-body section; issue parsing and enforcement belong to downstream intake/scheduler work. Completion defaults to human review.
+
+## Attempt runtime troubleshooting
+
+Local attempts use deterministic branch, directory, and tmux names. A manifest and retained agent output live below the coordinator state root; the manifest is diagnostic metadata, not workflow truth.
+
+The runtime must be given a non-nil worker-identity verification hook and fails closed before creating resources when it is absent or fails. This hook is the integration point for the already-provisioned `sudo` agent-host mode; installing or provisioning that host is outside the runtime. Environment inheritance happens only after verification through the shared agent environment filter. In particular, inherited `HOME` must be the worker account's home after the identity switch, never the coordinator's home.
+
+- If launch fails, inspect the manifest `diagnostic` and `agent.log`. Failed resources are retained intentionally.
+- If an attempt appears active after restart, compare its manifest, worktree HEAD, and `tmux has-session -t <session>` before resuming. Never attach to a session or directory whose deterministic identity does not match.
+- Cancellation sends `C-c`, waits briefly, then kills only the named attempt session. It does not remove the worktree, so partial work and diagnostics remain available.
+- An attempt worktree has no remote and a disabled local credential helper. A successful `git push` from it indicates a broken host boundary; stop serving work and rerun diagnostics.
+- “resources already exist” is a safety stop. Reconcile the recorded attempt instead of deleting or adopting resources by hand.
 
 Secrets—including GitHub tokens, App keys, webhook secrets, passwords, and credentials—are forbidden in configuration. Supply temporary diagnostic authentication through `GITHUB_TOKEN` or `GH_TOKEN`; full App credential handling belongs to GitHub integration.
 

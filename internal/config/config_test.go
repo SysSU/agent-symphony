@@ -60,6 +60,8 @@ func TestValidateRejectsUnsafePathsAndPolicy(t *testing.T) {
 		{"unsafe command", func(c *Config) { c.Commands.Implementation = []string{"codex\nrm"} }, "unsafe argument"},
 		{"credential flag", func(c *Config) { c.Commands.Implementation = []string{"codex", "--token=canary"} }, "credential-shaped"},
 		{"credential assignment", func(c *Config) { c.Commands.Reviewer = []string{"codex", "API_KEY=canary"} }, "credential-shaped"},
+		{"credential environment", func(c *Config) { c.Commands.Environment = []string{"GITHUB_TOKEN"} }, "forbidden credential"},
+		{"invalid environment", func(c *Config) { c.Commands.Environment = []string{"bad-name"} }, "invalid variable"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
