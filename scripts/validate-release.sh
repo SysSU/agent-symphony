@@ -11,6 +11,14 @@ go test -race ./...
 go vet ./...
 sh -n scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh
 ruby -e 'require "yaml"; YAML.parse_file(".github/workflows/release-validation.yml")'
+grep -qF 'wsl --install --distribution $distribution --web-download --no-launch' .github/workflows/release-validation.yml
+grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git ruby tmux' .github/workflows/release-validation.yml
+grep -qF "throw 'Failed to install WSL validation prerequisites'" .github/workflows/release-validation.yml
+grep -qF "\$goArchiveVersion = '1.26.0'" .github/workflows/release-validation.yml
+grep -qF 'https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz' .github/workflows/release-validation.yml
+grep -qF "'x86_64' { \$goArch = 'amd64'; \$goSHA256 = 'aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235' }" .github/workflows/release-validation.yml
+grep -qF "'aarch64' { \$goArch = 'arm64'; \$goSHA256 = 'bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd' }" .github/workflows/release-validation.yml
+grep -qF "sha256sum -c -" .github/workflows/release-validation.yml
 git diff --check
 CGO_ENABLED=0 go build -o "$tmp/agent-symphony" ./cmd/agent-symphony
 go test ./cmd/agent-symphony -run 'Test(PRGovernanceCommandWiresFakeGitHubAndRecoveryState|ProductionHandoffOutcomeIsCompletedWithoutRedelivery|DaemonLockIsSingleInstanceAndNoFollow)' -count=1

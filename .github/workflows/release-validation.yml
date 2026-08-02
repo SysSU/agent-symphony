@@ -32,20 +32,34 @@ jobs:
       - name: Validate on WSL2 native filesystem
         shell: pwsh
         run: |
-          $distribution = (wsl -l -q | Where-Object { $_.Trim() } | Select-Object -First 1).Trim()
-          $row = wsl -l -v | Where-Object { $_ -match [regex]::Escape($distribution) }
-          if ($row -notmatch '\s2\s*$') { throw "WSL distribution is not version 2: $row" }
+          $distribution = 'Ubuntu'
+          wsl --set-default-version 2
+          if ($LASTEXITCODE -ne 0) { throw 'WSL2 is unavailable on this runner' }
+          wsl --install --distribution $distribution --web-download --no-launch
+          if ($LASTEXITCODE -ne 0) { throw "Failed to install WSL distribution: $distribution" }
+          wsl -d $distribution -- true
+          if ($LASTEXITCODE -ne 0) { throw "Failed to initialize WSL distribution: $distribution" }
+          $rows = ((wsl --list --verbose) -join "`n") -replace "`0", ''
+          if ($rows -notmatch "(?m)^\s*\*?\s*$distribution\s+\S+\s+2\s*$") { throw "WSL distribution is not version 2:`n$rows" }
+          wsl -d $distribution -- bash -lc 'set -euo pipefail; sudo env DEBIAN_FRONTEND=noninteractive apt-get update; sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git ruby tmux'
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to install WSL validation prerequisites' }
           wsl -d $distribution -- bash -lc 'rm -rf ~/agent-symphony-ci && mkdir ~/agent-symphony-ci'
           tar -cf - --exclude=.git . | wsl -d $distribution -- bash -lc 'tar -xf - -C ~/agent-symphony-ci'
           wsl -d $distribution -- bash -lc "cd ~/agent-symphony-ci; git init -q; git remote add origin '$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git'; git add .; git -c user.name=ci -c user.email=ci@invalid commit -qm snapshot"
-          $goVersion = (Select-String '^go ([0-9.]+)' go.mod).Matches.Groups[1].Value
+          $goArchiveVersion = '1.26.0'
+          $goDirective = (Select-String '^go ([0-9.]+)$' go.mod).Matches.Groups[1].Value
+          $goDirectiveMatch = [regex]::Match($goDirective, '^(\d+)\.(\d+)(?:\.\d+)?$')
+          $goArchiveMatch = [regex]::Match($goArchiveVersion, '^(\d+)\.(\d+)\.\d+$')
+          if (!$goDirectiveMatch.Success -or !$goArchiveMatch.Success -or $goDirectiveMatch.Groups[1].Value -ne $goArchiveMatch.Groups[1].Value -or $goDirectiveMatch.Groups[2].Value -ne $goArchiveMatch.Groups[2].Value) {
+            throw "go.mod directive '$goDirective' does not match pinned Go archive $goArchiveVersion"
+          }
           $machine = (wsl -d $distribution -- uname -m).Trim()
           switch ($machine) {
             'x86_64' { $goArch = 'amd64'; $goSHA256 = 'aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235' }
             'aarch64' { $goArch = 'arm64'; $goSHA256 = 'bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd' }
             default { throw "Unsupported WSL architecture: $machine" }
           }
-          wsl -d $distribution -- bash -lc "set -e; curl -fsSLo /tmp/go.tgz https://go.dev/dl/go${goVersion}.linux-${goArch}.tar.gz; printf '%s  %s\n' '${goSHA256}' /tmp/go.tgz | sha256sum -c -; sudo rm -rf /usr/local/go; sudo tar -C /usr/local -xzf /tmp/go.tgz; cd ~/agent-symphony-ci; PATH=/usr/local/go/bin:`$PATH scripts/validate-release.sh 0.0.0-wsl"
+          wsl -d $distribution -- bash -lc "set -e; curl -fsSLo /tmp/go.tgz https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz; printf '%s  %s\n' '${goSHA256}' /tmp/go.tgz | sha256sum -c -; sudo rm -rf /usr/local/go; sudo tar -C /usr/local -xzf /tmp/go.tgz; cd ~/agent-symphony-ci; PATH=/usr/local/go/bin:`$PATH scripts/validate-release.sh 0.0.0-wsl"
 
   artifacts:
     runs-on: ubuntu-latest
