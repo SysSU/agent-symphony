@@ -20,7 +20,7 @@ All issue implementation must occur in a dedicated Git worktree. Keep the primar
 - Create one branch and worktree per GitHub issue before editing files. Use a descriptive branch such as `issue-<number>-<slug>` and record the branch and worktree path in the issue when work starts.
 - Never implement two issues in the same worktree or let multiple agents edit the same worktree concurrently.
 - Base a worktree on the current approved integration branch. If required commits are unavailable locally, fetch them without overwriting local or unrelated work.
-- Keep worktrees outside the primary checkout or in a configured ignored worktree root. Never nest a worktree inside another worktree.
+- Create every issue worktree under `<project-root>/.worktrees/<issue-branch>`. Keep `.worktrees/` ignored by Git, and never create a worktree inside another issue worktree.
 - Run relevant validation inside the issue worktree. When authorized to publish changes, commit and push only the issue branch, then open or update its pull request. Never push issue changes directly to the integration branch.
 - Deliver every implementation change through a pull request before integration. Do not merge locally or bypass the pull request, required reviews, checks, or branch protections.
 - Before integration, reconcile dependencies and overlapping files with active issue branches. Do not merge around unresolved conflicts or required GitHub checks.

@@ -4,4 +4,4 @@
 !.env.example
 _bmad-output/
 .cursor
-
+.worktrees/
