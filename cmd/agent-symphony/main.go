@@ -33,6 +33,8 @@ import (
 
 const outputVersion = 1
 
+var releaseMetadata = "agent-symphony-release-version:devel"
+
 var (
 	githubAPI    = "https://api.github.com"
 	githubClient = http.DefaultClient
@@ -139,6 +141,10 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 1 && args[0] == "--version" {
+		fmt.Fprintln(stdout, strings.TrimPrefix(releaseMetadata, "agent-symphony-release-version:"))
+		return 0
+	}
 	if len(args) == 0 {
 		usage(stdout)
 		return 0
@@ -167,6 +173,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	runtimeState := fs.String("runtime-state", "", "local runtime state root")
 	issueNumber := fs.Int("issue", 0, "issue number to inspect")
 	interval := fs.Duration("interval", orchestrator.MaxReconcileInterval, "serve reconciliation interval (maximum 60s)")
+	offline := fs.Bool("offline", false, "skip network diagnostics")
 	if err := fs.Parse(flagArgs); err != nil {
 		return misuse(stderr, wantsJSON, command, err.Error())
 	}
@@ -344,7 +351,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		diagnostics := doctor(c)
+		diagnostics := doctor(c, *offline)
 		ok := true
 		for _, d := range diagnostics {
 			if d.Status == "fail" {
@@ -1206,7 +1213,7 @@ func recoveryStatuses(attemptsPath, stateRoot string) ([]orchestrator.RecoverySt
 	return orchestrator.Recover(facts, manifests), nil
 }
 
-func doctor(c config.Config) []diagnostic {
+func doctor(c config.Config, offline bool) []diagnostic {
 	var result []diagnostic
 	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
 		result = append(result, diagnostic{"platform", "pass", runtime.GOOS + "/" + runtime.GOARCH, ""})
@@ -1250,7 +1257,11 @@ func doctor(c config.Config) []diagnostic {
 	} else {
 		result = append(result, diagnostic{"repository identity", "pass", repository, ""})
 	}
-	result = append(result, githubDiagnostics(c.Repository)...)
+	if offline {
+		result = append(result, diagnostic{"GitHub permissions", "warn", "offline: connectivity and effective access were not probed", "Run doctor without --offline before serving work."})
+	} else {
+		result = append(result, githubDiagnostics(c.Repository)...)
+	}
 	result = append(result, diagnostic{"host isolation", "warn", "worker/reviewer accounts, roots, sudo rules, and tmux canaries are not installed by issue #6", "A downstream install-host implementation must prove these boundaries before serve accepts work."})
 	result = append(result, diagnostic{"GitHub policy", "warn", "App webhook events, required policy check, and merge permissions are not configured by issue #6", "Complete GitHub App setup in the downstream integration issue before serving work."})
 	return result
