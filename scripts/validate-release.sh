@@ -19,6 +19,10 @@ grep -qF 'https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz' .githu
 grep -qF "'x86_64' { \$goArch = 'amd64'; \$goSHA256 = 'aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235' }" .github/workflows/release-validation.yml
 grep -qF "'aarch64' { \$goArch = 'arm64'; \$goSHA256 = 'bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd' }" .github/workflows/release-validation.yml
 grep -qF "sha256sum -c -" .github/workflows/release-validation.yml
+grep -qF "throw 'Failed to install pinned Go toolchain in WSL'" .github/workflows/release-validation.yml
+grep -qF "bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/go/bin:\$PATH scripts/validate-release.sh 0.0.0-wsl'" .github/workflows/release-validation.yml
+grep -qF "throw 'WSL release validation failed'" .github/workflows/release-validation.yml
+! grep -qF 'PATH=/usr/local/go/bin:`$PATH' .github/workflows/release-validation.yml
 git diff --check
 CGO_ENABLED=0 go build -o "$tmp/agent-symphony" ./cmd/agent-symphony
 go test ./cmd/agent-symphony -run 'Test(PRGovernanceCommandWiresFakeGitHubAndRecoveryState|ProductionHandoffOutcomeIsCompletedWithoutRedelivery|DaemonLockIsSingleInstanceAndNoFollow)' -count=1

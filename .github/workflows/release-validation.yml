@@ -59,7 +59,10 @@ jobs:
             'aarch64' { $goArch = 'arm64'; $goSHA256 = 'bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd' }
             default { throw "Unsupported WSL architecture: $machine" }
           }
-          wsl -d $distribution -- bash -lc "set -e; curl -fsSLo /tmp/go.tgz https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz; printf '%s  %s\n' '${goSHA256}' /tmp/go.tgz | sha256sum -c -; sudo rm -rf /usr/local/go; sudo tar -C /usr/local -xzf /tmp/go.tgz; cd ~/agent-symphony-ci; PATH=/usr/local/go/bin:`$PATH scripts/validate-release.sh 0.0.0-wsl"
+          wsl -d $distribution -- bash -lc "set -e; curl -fsSLo /tmp/go.tgz https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz; printf '%s  %s\n' '${goSHA256}' /tmp/go.tgz | sha256sum -c -; sudo rm -rf /usr/local/go; sudo tar -C /usr/local -xzf /tmp/go.tgz"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to install pinned Go toolchain in WSL' }
+          wsl -d $distribution -- bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/go/bin:$PATH scripts/validate-release.sh 0.0.0-wsl'
+          if ($LASTEXITCODE -ne 0) { throw 'WSL release validation failed' }
 
   artifacts:
     runs-on: ubuntu-latest
