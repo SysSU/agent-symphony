@@ -61,7 +61,7 @@ jobs:
           }
           wsl -d $distribution -- bash -lc "set -e; curl -fsSLo /tmp/go.tgz https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz; printf '%s  %s\n' '${goSHA256}' /tmp/go.tgz | sha256sum -c -; sudo rm -rf /usr/local/go; sudo tar -C /usr/local -xzf /tmp/go.tgz"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install pinned Go toolchain in WSL' }
-          wsl -d $distribution -- bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/go/bin:$PATH scripts/validate-release.sh 0.0.0-wsl'
+          wsl -d $distribution -- bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin scripts/validate-release.sh 0.0.0-wsl'
           if ($LASTEXITCODE -ne 0) { throw 'WSL release validation failed' }
 
   artifacts:
