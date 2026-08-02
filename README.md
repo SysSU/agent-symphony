@@ -3,7 +3,7 @@
 Agent Symphony is a planned GitHub-native, multi-agent software delivery orchestrator inspired by [OpenAI Symphony](https://github.com/openai/symphony). Stakeholders define and prioritize work in GitHub Issues; an orchestrator coordinates agents through implementation, validation, documentation, pull-request review, and policy-controlled merge.
 
 > [!NOTE]
-> Issue #6 provides the configuration and diagnostic CLI shell. Orchestration, GitHub App intake, scheduling, runtime lifecycle, and merge behavior are not implemented yet.
+> Issues #5 and #6 provide the GitHub App host boundary and configuration/diagnostic CLI shell. Scheduling, runtime lifecycle, pull-request automation, and merge behavior are not implemented yet.
 
 ## Planned MVP
 
@@ -22,6 +22,7 @@ The browser dashboard, multi-repository orchestration, GitHub Projects synchroni
 
 - [Product Requirements Document](docs/PRD.md)
 - [MVP Architecture](docs/architecture.md)
+- [GitHub App setup and security](docs/github-app.md)
 - [Agent development guidance](AGENTS.md)
 
 Durable project documentation belongs in `docs/`. BMAD working output belongs in `_bmad-output/` and is ignored by Git.
