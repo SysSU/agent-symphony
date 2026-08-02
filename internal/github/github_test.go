@@ -51,14 +51,16 @@ func httpResponse(status int, body string, headers http.Header) *http.Response {
 }
 
 func provenanceFor(controls Controls, actor int) []Provenance {
-	return []Provenance{
-		{Name: "ready", Value: fmt.Sprint(controls.Ready), EventID: 1, ActorID: actor},
-		{Name: "priority", Value: fmt.Sprint(controls.Priority), EventID: 2, ActorID: actor},
-		{Name: "completion", Value: controls.Completion, EventID: 3, ActorID: actor},
-		{Name: "closed", Value: fmt.Sprint(controls.Closed), EventID: 4, ActorID: actor},
-		{Name: "cancelled", Value: fmt.Sprint(controls.Cancelled), EventID: 5, ActorID: actor},
-		{Name: "retry", Value: fmt.Sprint(controls.Retry), EventID: 6, ActorID: actor},
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	result := []Provenance{
+		{Name: "ready", Value: fmt.Sprint(controls.Ready), Source: "timeline", EventID: 1, ActorID: actor, CreatedAt: now},
+		{Name: "priority", Value: fmt.Sprint(controls.Priority), Source: "timeline", EventID: 2, ActorID: actor, CreatedAt: now},
+		{Name: "completion", Value: controls.Completion, Source: "timeline", EventID: 3, ActorID: actor, CreatedAt: now},
+		{Name: "closed", Value: fmt.Sprint(controls.Closed), Source: "timeline", EventID: 4, ActorID: actor, CreatedAt: now},
+		{Name: "cancelled", Value: fmt.Sprint(controls.Cancelled), Source: "comment", EventID: 5, ActorID: actor, CreatedAt: now},
+		{Name: "retry", Value: fmt.Sprint(controls.Retry), Source: "comment", EventID: 6, ActorID: actor, CreatedAt: now},
 	}
+	return result
 }
 
 func timelineFor(provenance []Provenance) TimelineVerifier {
@@ -367,8 +369,12 @@ func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 		t.Fatal("edited command accepted")
 	}
 	comment := SnapshotComment(snapshot)
-	if parsed, err := ParseSnapshotComment(comment, 99, 99); err != nil || parsed.ControlsHash != snapshot.ControlsHash {
+	if parsed, err := ParseSnapshotComment(comment, 99, 99); err != nil || parsed.Version != 2 || parsed.ControlsHash != snapshot.ControlsHash || SnapshotComment(parsed) != comment {
 		t.Fatalf("parse snapshot: %#v %v", parsed, err)
+	}
+	legacy := strings.Replace(strings.Replace(comment, "controls:v2", "controls:v1", 1), `"version":2`, `"version":1`, 1)
+	if _, err := ParseSnapshotComment(legacy, 99, 99); err == nil {
+		t.Fatal("legacy v1 snapshot accepted")
 	}
 	if _, err := ParseSnapshotComment(comment, 4, 99); err == nil {
 		t.Fatal("non-App snapshot accepted")
@@ -450,6 +456,28 @@ func TestSnapshotRequiresExactCurrentNonBodyProvenance(t *testing.T) {
 				t.Fatal("invalid provenance accepted")
 			}
 		})
+	}
+}
+
+func TestCreationProvenanceAllowsOnlySafeDefaults(t *testing.T) {
+	now := time.Now().UTC()
+	anchor := Anchor{IssueNodeID: "I_5", CreatedAt: now, ChangedAt: now, AuthorID: 2}
+	approval := Approval{CommentID: 7, ActorID: 4, Body: "/approve", CreatedAt: now.Add(time.Second)}
+	controls := Controls{Completion: "human-review"}
+	provenance := []Provenance{
+		{Name: "ready", Value: "false", Source: "creation", ActorID: 2, CreatedAt: now},
+		{Name: "priority", Value: "0", Source: "creation", ActorID: 2, CreatedAt: now},
+		{Name: "completion", Value: "human-review", Source: "creation", ActorID: 2, CreatedAt: now},
+		{Name: "closed", Value: "false", Source: "creation", ActorID: 2, CreatedAt: now},
+		{Name: "cancelled", Value: "false", Source: "creation", ActorID: 2, CreatedAt: now},
+		{Name: "retry", Value: "false", Source: "creation", ActorID: 2, CreatedAt: now},
+	}
+	if _, err := NewSnapshot(controls, "body", anchor, approval, provenance, "/approve", func(id int) bool { return id == 4 }, timelineFor(provenance)); err != nil {
+		t.Fatal(err)
+	}
+	controls.Completion, provenance[2].Value = "autonomous-merge", "autonomous-merge"
+	if _, err := NewSnapshot(controls, "body", anchor, approval, provenance, "/approve", func(id int) bool { return id == 4 }, timelineFor(provenance)); err == nil {
+		t.Fatal("autonomous merge accepted as creation provenance")
 	}
 }
 

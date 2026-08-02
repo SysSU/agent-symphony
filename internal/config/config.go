@@ -210,8 +210,8 @@ func (c Config) Validate() error {
 	if c.Dependencies.Section == "" {
 		problems = append(problems, "dependencies.section must not be empty")
 	}
-	if c.CompletionPolicies.Default != "human-review" && c.CompletionPolicies.Default != "autonomous-merge" {
-		problems = append(problems, "completion_policies.default must be human-review or autonomous-merge")
+	if c.CompletionPolicies.Default != "human-review" {
+		problems = append(problems, "completion_policies.default must be human-review")
 	}
 	if c.Concurrency < 1 {
 		problems = append(problems, "concurrency must be at least 1")

@@ -155,7 +155,7 @@ func markdownSection(body, name string) (string, bool) {
 }
 
 type Anchor struct {
-	EditEventID int64     `json:"edit_event_id,omitempty"`
+	EditID      string    `json:"edit_id,omitempty"`
 	IssueNodeID string    `json:"issue_node_id,omitempty"`
 	CreatedAt   time.Time `json:"created_at,omitempty"`
 	ChangedAt   time.Time `json:"changed_at"`
@@ -164,8 +164,10 @@ type Anchor struct {
 
 type Provenance struct {
 	Name, Value string
+	Source      string
 	EventID     int64
 	ActorID     int
+	CreatedAt   time.Time
 }
 
 type Approval struct {
@@ -204,7 +206,11 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 	}
 	seen := make(map[string]bool, len(required))
 	for _, p := range provenance {
-		if p.EventID <= 0 || p.ActorID == 0 || !authorized(p.ActorID) || !timeline(p) {
+		creationDefault := p.Value == map[string]string{"ready": "false", "priority": "0", "completion": "human-review", "closed": "false", "cancelled": "false", "retry": "false"}[p.Name]
+		creation := p.Source == "creation" && creationDefault && p.EventID == 0 && p.ActorID == anchor.AuthorID && p.CreatedAt.Equal(anchor.CreatedAt)
+		mutationSource := p.Source == "timeline" && slices.Contains([]string{"ready", "priority", "completion", "closed"}, p.Name) || p.Source == "comment" && slices.Contains([]string{"cancelled", "retry"}, p.Name)
+		mutation := mutationSource && p.ActorID != 0 && !p.CreatedAt.IsZero() && authorized(p.ActorID) && timeline(p)
+		if !creation && !mutation {
 			return Snapshot{}, errors.New("control provenance is missing or unauthorized")
 		}
 		value, ok := required[p.Name]
@@ -218,7 +224,7 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 	}
 	canonical := slices.Clone(provenance)
 	slices.SortFunc(canonical, func(a, b Provenance) int { return strings.Compare(a.Name, b.Name) })
-	return Snapshot{Version: 1, ControlsHash: hashJSON(controls), BodyHash: bodyHash(body, anchor), Anchor: anchor, ApprovalID: approval.CommentID, ApprovalActor: approval.ActorID, Provenance: canonical}, nil
+	return Snapshot{Version: snapshotVersion, ControlsHash: hashJSON(controls), BodyHash: bodyHash(body, anchor), Anchor: anchor, ApprovalID: approval.CommentID, ApprovalActor: approval.ActorID, Provenance: canonical}, nil
 }
 
 func (s Snapshot) Valid(controls Controls, body string, anchor Anchor, approval Approval, provenance []Provenance, command string, authorized func(int) bool, timeline TimelineVerifier) bool {
@@ -227,10 +233,13 @@ func (s Snapshot) Valid(controls Controls, body string, anchor Anchor, approval 
 }
 
 func (a Anchor) valid() bool {
-	return !a.ChangedAt.IsZero() && (a.EditEventID > 0 || a.IssueNodeID != "" && !a.CreatedAt.IsZero() && a.AuthorID > 0)
+	return !a.ChangedAt.IsZero() && (a.EditID != "" || a.IssueNodeID != "" && !a.CreatedAt.IsZero() && a.AuthorID > 0)
 }
 
-const snapshotPrefix = "<!-- agent-symphony:controls:v1\n"
+const (
+	snapshotVersion = 2
+	snapshotPrefix  = "<!-- agent-symphony:controls:v2\n"
+)
 
 func SnapshotComment(snapshot Snapshot) string {
 	b, _ := json.Marshal(snapshot)
@@ -244,7 +253,7 @@ func ParseSnapshotComment(body string, authorID, appID int) (Snapshot, error) {
 	var snapshot Snapshot
 	dec := json.NewDecoder(strings.NewReader(strings.TrimSuffix(strings.TrimPrefix(body, snapshotPrefix), "\n-->")))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&snapshot); err != nil || snapshot.Version != 1 {
+	if err := dec.Decode(&snapshot); err != nil || snapshot.Version != snapshotVersion {
 		return Snapshot{}, errors.New("invalid control snapshot schema")
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {

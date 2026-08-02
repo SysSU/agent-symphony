@@ -7,6 +7,8 @@
 
 Agent Symphony is one long-running Go process with a CLI mode. GitHub Issues, pull requests, reviews, checks, and repository rules are the durable workflow record. The process keeps only scheduling state in memory and bounded, reconstructible execution metadata on disk; it does not have a task database or a second workflow engine.
 
+Issue #10 implements only the one-shot PR-governance reconciliation and durable handoff boundary described here. Issue #4 owns daemon scheduling, state production and consumption, runtime resumption, and end-to-end wiring; those capabilities are not yet available.
+
 The design follows the useful boundaries in the [OpenAI Symphony specification](https://github.com/openai/symphony/blob/main/SPEC.md): a single scheduling authority, a tracker adapter, deterministic workspaces, an agent runner, and an operator status surface. It deliberately differs in three places required by this product: GitHub owns the whole delivery lifecycle, portfolio policy is coordinator code rather than agent prompt logic, and agents never receive tracker credentials. The upstream Elixir implementation is a prototype; its in-memory blocked state and runtime dependency make it a reference, not the release base.
 
 ### Stack and release
@@ -92,7 +94,7 @@ Periodic full reconciliation (default 60 seconds, with jitter) and a manual `rec
 
 ### GitHub App and actor authorization
 
-The App uses a locally readable private key or OS credential store and exchanges its JWT for short-lived installation tokens in coordinator memory. Requested repository permissions are the least privilege needed by enabled MVP features: metadata read; issues read/write; pull requests read/write; contents read/write; checks read/write; commit statuses read; and members read only when organization/team authorization is configured. Setup fails if effective permissions are insufficient.
+The App uses a locally readable private key or OS credential store and exchanges its JWT for short-lived installation tokens in coordinator memory. Requested repository permissions are the least privilege needed by enabled MVP features: metadata read; administration read; issues read/write; pull requests read/write; contents read/write; checks read/write; commit statuses read; and members read only when organization/team authorization is configured. Setup fails if effective permissions are insufficient.
 
 Webhook signature proves GitHub delivery, not human authority. A control-changing event is accepted only when its actor is not the App/bot and a fresh GitHub permission/team query satisfies configured roles (default repository `maintain` or `admin`; review approval may separately allow `write`). The coordinator rechecks authorization at action time. Edits that remove readiness, close work, change review policy, cancel, retry, or authorize autonomous merge follow this rule. Unauthorized content is visible feedback at most; it cannot drive execution or policy.
 

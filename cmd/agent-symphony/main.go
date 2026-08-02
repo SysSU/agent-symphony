@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/SysSU/agent-symphony/internal/config"
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 )
 
 const outputVersion = 1
@@ -41,6 +42,15 @@ type envelope struct {
 	Data        any          `json:"data,omitempty"`
 	Diagnostics []diagnostic `json:"diagnostics,omitempty"`
 	Error       string       `json:"error,omitempty"`
+}
+
+type environmentToken string
+
+func (t environmentToken) Token(context.Context) (internalgithub.InstallationToken, error) {
+	if t == "" {
+		return internalgithub.InstallationToken{}, errors.New("GITHUB_TOKEN is required")
+	}
+	return internalgithub.InstallationToken{Value: string(t), ExpiresAt: time.Now().Add(time.Hour)}, nil
 }
 
 func main() {
@@ -71,6 +81,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(io.Discard)
 	path := fs.String("config", config.DefaultPath, "configuration path")
 	jsonOutput := fs.Bool("json", false, "emit versioned JSON")
+	statePath := fs.String("state", "", "pull-request recovery state file")
 	if err := fs.Parse(flagArgs); err != nil {
 		return misuse(stderr, wantsJSON, command, err.Error())
 	}
@@ -122,6 +133,49 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, string(b))
 		return 0
 
+	case "pr-governance":
+		if fs.NArg() != 0 {
+			return misuse(stderr, wantsJSON, command, "pr-governance accepts no positional arguments")
+		}
+		if *statePath == "" {
+			return fail(stderr, *jsonOutput, command, "--state is required")
+		}
+		if info, err := os.Lstat(*statePath); err != nil || !info.Mode().IsRegular() {
+			return fail(stderr, *jsonOutput, command, "--state must name an existing regular recovery file")
+		}
+		c, err := config.Load(*path)
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		actorID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID")
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		actor := int(actorID)
+		if int64(actor) != actorID {
+			return fail(stderr, *jsonOutput, command, "AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID is out of range")
+		}
+		token := os.Getenv("GITHUB_TOKEN")
+		if token == "" {
+			return fail(stderr, *jsonOutput, command, "GITHUB_TOKEN is required")
+		}
+		api := internalgithub.API{BaseURL: githubAPI, Tokens: environmentToken(token), HTTP: githubClient}
+		prConfig := internalgithub.PRAdapterConfig{
+			Repository: c.Repository, ReadyLabel: c.Labels.Ready, HumanReviewLabel: c.CompletionPolicies.HumanReview,
+			AutonomousMergeLabel: c.CompletionPolicies.AutonomousMerge, MergeMethod: "squash", PriorityP1Label: c.Labels.PriorityP1,
+			PriorityP2Label: c.Labels.PriorityP2, PriorityP3Label: c.Labels.PriorityP3, DependencySection: c.Dependencies.Section,
+			DefaultCompletion: c.CompletionPolicies.Default, ApprovalCommand: "/agent-symphony approve", CancelCommand: "/agent-symphony cancel",
+			RetryCommand: "/agent-symphony retry", AppID: appID, AppActorID: actor,
+		}
+		if err := internalgithub.RunPRReconciliation(context.Background(), api, prConfig, *statePath); err != nil {
+			return fail(stderr, *jsonOutput, command, internalgithub.Redact(err.Error()))
+		}
+		return success(stdout, *jsonOutput, command, map[string]string{"state": *statePath}, "pull-request governance reconciliation complete")
+
 	case "doctor", "diagnostics":
 		if fs.NArg() != 0 {
 			return misuse(stderr, wantsJSON, command, command+" accepts no positional arguments")
@@ -157,6 +211,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	default:
 		return misuse(stderr, wantsJSON, command, fmt.Sprintf("unknown command %q", command))
 	}
+}
+
+func positiveEnvironmentInt64(name string) (int64, error) {
+	value, err := strconv.ParseInt(os.Getenv(name), 10, 64)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return value, nil
 }
 
 func doctor(c config.Config) []diagnostic {
@@ -418,6 +480,7 @@ commands:
   config view   print validated configuration
   doctor        diagnose local prerequisites and GitHub access
   diagnostics   alias for doctor
+  pr-governance reconcile pull-request governance once
 
 options:
   --config path use another configuration file

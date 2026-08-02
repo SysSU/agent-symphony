@@ -10,12 +10,14 @@ agent-symphony validate [--config path] [--json]
 agent-symphony config view [--config path] [--json]
 agent-symphony doctor [--config path] [--json]
 agent-symphony diagnostics [--config path] [--json]
+agent-symphony pr-governance --state path [--config path] [--json]
 ```
 
 - `init` creates a new config with conservative defaults and refuses to overwrite a file. It requires a GitHub `origin` in the current repository.
 - `validate` requires the config file to be inside the resolved Git root. It rejects malformed input, duplicate JSON keys at any nesting depth, unknown keys, secret-shaped keys or command arguments, invalid policy values, duplicate/empty labels, unsafe command arguments, and paths that are absolute, traverse outside the repository, target Git metadata, or escape through symlinks. Worktree and documentation paths are always anchored at the Git root, not the config file's directory.
 - `config view` prints the validated configuration. Invalid or secret-bearing files are never echoed.
 - `doctor` and its `diagnostics` alias check the supported platform, WSL filesystem placement, Git, tmux, both configured commands, Git repository/remote identity, and GitHub connectivity/effective repository access.
+- `pr-governance` is issue #10's one-shot pull-request governance command. It reads an existing recovery-state JSON file and durably writes feedback and validation handoffs, then exits without starting an agent. Issue #4 still owns daemon scheduling, production and consumption of that state, runtime resumption, and end-to-end wiring; those capabilities are not yet available. The command also requires `GITHUB_TOKEN`, `AGENT_SYMPHONY_GITHUB_APP_ID`, and `AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID` in the environment. The token must be a short-lived installation token for that App and is never printed.
 
 Commands produce plain human-readable text by default and never depend on color. `NO_COLOR` is therefore honored without special handling. `--json` emits one JSON object with envelope `version: 1`, `command`, `ok`, and `data`, `diagnostics`, or `error` as applicable. A failing validation or diagnostic exits with status 1; command-line misuse exits with status 2.
 

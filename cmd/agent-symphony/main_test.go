@@ -128,6 +128,55 @@ func TestGitHubDiagnosticsUsesInjectedHTTPClient(t *testing.T) {
 	}
 }
 
+func TestPRGovernanceCommandWiresFakeGitHubAndRecoveryState(t *testing.T) {
+	root := gitRepository(t)
+	configPath := filepath.Join(root, config.DefaultPath)
+	if err := config.Write(configPath, config.Default("owner/repo")); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(root, "pr-state.json")
+	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GITHUB_TOKEN", "token-canary")
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "7")
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID", "42")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/installation" {
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"app_id":7}`)), Header: make(http.Header)}, nil
+		}
+		if r.URL.Path != "/repos/owner/repo/pulls" || r.Header.Get("Authorization") != "Bearer token-canary" {
+			t.Fatalf("unexpected request %s auth=%q", r.URL.String(), r.Header.Get("Authorization"))
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`[]`)), Header: make(http.Header)}, nil
+	})}
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI, githubClient = "https://example.invalid", client
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"pr-governance", "--config", configPath, "--state", statePath, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String()+stderr.String(), "token-canary") || !strings.Contains(stdout.String(), `"command":"pr-governance"`) {
+		t.Fatalf("unsafe or malformed output: %s%s", stdout.String(), stderr.String())
+	}
+}
+
+func TestPRGovernanceRejectsSymlinkState(t *testing.T) {
+	dir := t.TempDir()
+	target, link := filepath.Join(dir, "state.json"), filepath.Join(dir, "state-link.json")
+	if err := os.WriteFile(target, []byte("[]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"pr-governance", "--state", link}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "regular recovery file") {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
