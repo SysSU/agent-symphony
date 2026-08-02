@@ -124,6 +124,8 @@ Only the coordinator performs authenticated fetch, push, GitHub mutation, and me
 
 Priority is deterministic: P1 before P2 before P3, then oldest `created_at`, then issue number. Dependencies filter candidates before priority. Capacity and declared path-scope locks then select work. Rate limits and outages pause dispatch but do not reorder the queue. The coordinator records a concise human-readable reason for every non-runnable item.
 
+The scheduler is a pure recomputation over normalized current GitHub facts. It validates unknown, self, and cyclic dependencies; treats missing, invalid, and overlapping declared paths as conflicting; accounts for global and per-repository capacity; and returns an explanation with every projection. Exact duplicate inputs collapse, while contradictory snapshots for one issue block. It stores no webhook or cancellation history, so duplicate events and unrelated progress only affect the next projection when authoritative facts change.
+
 One attempt has these projected states:
 
 ```text
