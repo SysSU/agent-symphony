@@ -95,8 +95,11 @@ jobs:
           fetch-depth: 0
       - name: Require signed tag
         run: |
+          git fetch --no-tags origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          test "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" = tag
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           tag_commit=$(git rev-parse --verify "${GITHUB_REF_NAME}^{commit}")
+          test "$tag_commit" = "$GITHUB_SHA"
           git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main
           git show refs/remotes/origin/main:.github/release-signing-allowed-signers > "$RUNNER_TEMP/release-signing-allowed-signers"
           git config gpg.format ssh
