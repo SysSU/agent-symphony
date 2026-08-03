@@ -45,7 +45,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install WSL validation prerequisites' }
           wsl -d $distribution -- bash -lc 'rm -rf ~/agent-symphony-ci && mkdir ~/agent-symphony-ci'
           tar -cf - --exclude=.git . | wsl -d $distribution -- bash -lc 'tar -xf - -C ~/agent-symphony-ci'
-          wsl -d $distribution -- bash -lc "cd ~/agent-symphony-ci; chmod 0755 scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh; git init -q; git remote add origin '$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git'; git add .; git -c user.name=ci -c user.email=ci@invalid commit -qm snapshot"
+          wsl -d $distribution -- bash -lc "cd ~/agent-symphony-ci; chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh; git init -q; git remote add origin '$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git'; git add .; git -c user.name=ci -c user.email=ci@invalid commit -qm snapshot"
           $goArchiveVersion = '1.26.0'
           $goDirective = (Select-String '^go ([0-9.]+)$' go.mod).Matches.Groups[1].Value
           $goDirectiveMatch = [regex]::Match($goDirective, '^(\d+)\.(\d+)(?:\.\d+)?$')

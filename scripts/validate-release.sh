@@ -9,7 +9,8 @@ export GOMODCACHE="$tmp/go-mod-cache"
 
 go test -race ./...
 go vet ./...
-sh -n scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh
+sh -n scripts/*.sh
+scripts/credential-scan-test.sh
 for script in scripts/*.sh; do
   ! grep -q "$(printf '\r')" "$script"
   test "$(git check-attr eol -- "$script")" = "$script: eol: lf"
@@ -22,7 +23,7 @@ runs = workflow.fetch("jobs").fetch("wsl2").fetch("steps").map { |step| step["ru
 snapshots = runs.flat_map(&:lines).grep(/commit -qm snapshot/)
 abort "expected one WSL snapshot command" unless snapshots.length == 1
 commands = snapshots.first.match(/bash -lc "(.*)"\s*$/)&.captures&.first&.split(/;\s*/)
-chmod = "chmod 0755 scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh"
+chmod = "chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh"
 abort "invalid WSL snapshot chmod" unless File.read(path).scan(/\bchmod\b/).length == 1 && commands&.count(chmod) == 1
 index = commands.index(chmod)
 abort "WSL snapshot chmod must immediately precede git init" unless index && commands[index + 1] == "git init -q"
@@ -62,16 +63,15 @@ test "$("$tmp/agent-symphony_${version}_${host_os}_${host_arch}/agent-symphony" 
 go version -m "$tmp/agent-symphony_${version}_${host_os}_${host_arch}/agent-symphony" >/dev/null
 scripts/smoke-release.sh "$tmp/agent-symphony_${version}_${host_os}_${host_arch}/agent-symphony"
 
-credential_pattern='(github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]{20,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE'" KEY-----)"
 set +e
-find . \( -path './.git' -o -path './.worktrees' -o -path './dist' \) -prune -o -type f -print0 | xargs -0 grep -qEI "$credential_pattern" >/dev/null 2>&1
+scripts/credential-scan.sh .
 scan_status=$?
 set -e
-if test "$scan_status" -eq 0; then
+if test "$scan_status" -eq 1; then
   echo 'credential-shaped material found' >&2
   exit 1
 fi
-test "$scan_status" -eq 1 || { echo 'credential scan failed' >&2; exit 1; }
+test "$scan_status" -eq 0 || { echo 'credential scan failed' >&2; exit 1; }
 
 for doc in README.md docs/PRD.md docs/architecture.md docs/cli.md docs/setup.md docs/security.md docs/recovery.md docs/troubleshooting.md docs/release-validation.md; do
   test -s "$doc" || { echo "missing documentation: $doc" >&2; exit 1; }
