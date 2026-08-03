@@ -19,6 +19,12 @@ ruby <<'RUBY'
 require "yaml"
 path = ".github/workflows/release-validation.yml"
 workflow = YAML.parse_file(path).to_ruby
+release = workflow.fetch("jobs").fetch("release").fetch("steps").find { |step| step["name"] == "Require signed tag" }.fetch("run").lines.map(&:strip)
+fetch_tag = 'git fetch --no-tags origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"'
+check_tag = 'test "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" = tag'
+resolve_tag = 'tag_commit=$(git rev-parse --verify "${GITHUB_REF_NAME}^{commit}")'
+bind_tag = 'test "$tag_commit" = "$GITHUB_SHA"'
+abort "release must fetch, check, and bind the exact tag object" unless release.index(fetch_tag) == 0 && release.index(check_tag) == 1 && release.index(bind_tag) == release.index(resolve_tag) + 1
 runs = workflow.fetch("jobs").fetch("wsl2").fetch("steps").map { |step| step["run"] }.compact
 snapshots = runs.flat_map(&:lines).grep(/commit -qm snapshot/)
 abort "expected one WSL snapshot command" unless snapshots.length == 1
@@ -28,6 +34,15 @@ abort "invalid WSL snapshot chmod" unless File.read(path).scan(/\bchmod\b/).leng
 index = commands.index(chmod)
 abort "WSL snapshot chmod must immediately precede git init" unless index && commands[index + 1] == "git init -q"
 RUBY
+git -C "$tmp" init -q tag-binding
+git -C "$tmp/tag-binding" config user.name test
+git -C "$tmp/tag-binding" config user.email test@invalid
+git -C "$tmp/tag-binding" commit --allow-empty -qm first
+event_sha=$(git -C "$tmp/tag-binding" rev-parse HEAD)
+git -C "$tmp/tag-binding" tag -am first v0.0.0
+git -C "$tmp/tag-binding" commit --allow-empty -qm second
+git -C "$tmp/tag-binding" tag -fam moved v0.0.0
+! test "$(git -C "$tmp/tag-binding" rev-parse --verify 'v0.0.0^{commit}')" = "$event_sha"
 grep -qF 'wsl --install --distribution $distribution --web-download --no-launch' .github/workflows/release-validation.yml
 grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git ruby tmux' .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install WSL validation prerequisites'" .github/workflows/release-validation.yml
