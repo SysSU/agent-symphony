@@ -23,6 +23,8 @@ The browser dashboard, multi-repository orchestration, GitHub Projects synchroni
 - [Product Requirements Document](docs/PRD.md)
 - [MVP Architecture](docs/architecture.md)
 - [GitHub App setup and security](docs/github-app.md)
+- [Setup](docs/setup.md), [security](docs/security.md), [recovery](docs/recovery.md), and [troubleshooting](docs/troubleshooting.md)
+- [Release validation and pilot evidence](docs/release-validation.md)
 - [Agent development guidance](AGENTS.md)
 
 Durable project documentation belongs in `docs/`. BMAD working output belongs in `_bmad-output/` and is ignored by Git.
@@ -56,3 +58,7 @@ go build -o agent-symphony ./cmd/agent-symphony
 `init` derives `owner/repository` from the GitHub `origin` and creates `.agent-symphony.yaml` without overwriting an existing file. Configuration is JSON, which is a valid YAML 1.2 subset and allows strict stdlib-only parsing. Keep credentials outside this committed file. `doctor` may use `GITHUB_TOKEN` or `GH_TOKEN` for a read-only effective-access probe; it never prints the value.
 
 See the [CLI reference](docs/cli.md) for the schema, structured output, diagnostics, and current scope.
+
+## Release validation
+
+`scripts/validate-release.sh VERSION` runs race tests, vet, production-seam integration tests, cross-builds four runtime-independent binaries, proves archive reproducibility, strictly verifies each streamed archive and executable target, scans all regular candidate files (including ignored environment files) without printing matches, and checks the durable documentation set. It safely excludes only `.git`, `.worktrees`, and generated `dist`. It reports only the current host as locally passed. The GitHub Actions matrix supplies separate macOS, Linux, and WSL2 evidence; a release is not validated until all three jobs have links and successful results recorded in the pilot evidence template.

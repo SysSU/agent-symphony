@@ -8,8 +8,8 @@ The CLI provides configuration, diagnostics, production reconciliation, and rest
 agent-symphony init [--config path] [--json]
 agent-symphony validate [--config path] [--json]
 agent-symphony config view [--config path] [--json]
-agent-symphony doctor [--config path] [--json]
-agent-symphony diagnostics [--config path] [--json]
+agent-symphony doctor [--config path] [--offline] [--json]
+agent-symphony diagnostics [--config path] [--offline] [--json]
 agent-symphony pr-governance --state path [--config path] [--json]
 agent-symphony serve --state path --runtime-state path [--interval duration] [--config path]
 agent-symphony status --state path --runtime-state path [--json]
@@ -21,7 +21,7 @@ agent-symphony reconcile --state path --runtime-state path [--json]
 - `init` creates a new config with conservative defaults and refuses to overwrite a file. It requires a GitHub `origin` in the current repository.
 - `validate` requires the config file to be inside the resolved Git root. It rejects malformed input, duplicate JSON keys at any nesting depth, unknown keys, secret-shaped keys or command arguments, invalid policy values, duplicate/empty labels, unsafe command arguments, and paths that are absolute, traverse outside the repository, target Git metadata, or escape through symlinks. Worktree and documentation paths are always anchored at the Git root, not the config file's directory.
 - `config view` prints the validated configuration. Invalid or secret-bearing files are never echoed.
-- `doctor` and its `diagnostics` alias check the supported platform, WSL filesystem placement, Git, tmux, both configured commands, Git repository/remote identity, and GitHub connectivity/effective repository access.
+- `doctor` and its `diagnostics` alias check the supported platform, WSL filesystem placement, Git, tmux, both configured commands, Git repository/remote identity, and GitHub connectivity/effective repository access. `--offline` skips only the network probe and emits an explicit warning.
 - `pr-governance` is issue #10's one-shot pull-request governance command. It reads an existing recovery-state JSON file and durably writes feedback and validation handoffs. Recovery claims those handoffs before they cross into the isolated runtime. The command also requires `GITHUB_TOKEN`, `AGENT_SYMPHONY_GITHUB_APP_ID`, and `AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID` in the environment. The token must be a short-lived installation token for that App and is never printed.
 - `serve --state path --runtime-state path` verifies the installation token, acquires a non-following single-instance lock, reconciles immediately, and repeats at most every 60 seconds across bounded GitHub failures. Every cycle has a whole-cycle two-minute deadline. `reconcile` performs one production cycle; `status`, `list`, and `inspect` refresh and expose the same queued, active, blocked, review-ready, and completed projection. All require `GITHUB_TOKEN`, `AGENT_SYMPHONY_GITHUB_APP_ID`, and `AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID`. Supplying `--attempts path` selects the nonmutating offline diagnostic instead.
 
@@ -85,3 +85,7 @@ Secrets—including GitHub tokens, App keys, webhook secrets, passwords, and cre
 An unauthenticated probe can prove public GitHub connectivity but not write authority. An authenticated probe reports the repository access returned by GitHub, but cannot prove GitHub App-specific issue, pull-request, checks, webhook, repository-rules, or installation permissions. `doctor` reports those as actionable warnings.
 
 On WSL, diagnostics resolve the Git root, choose the longest containing entry from `/proc/mounts`, and reject `drvfs` or `9p` mounts. Host installation remains an administrator prerequisite; `serve` fails closed when its worker/runtime boundary cannot be verified.
+
+## Release commands
+
+`scripts/release.sh VERSION [OUTPUT_DIR]` creates reproducible no-CGO archives and `SHA256SUMS` without overwriting existing output. `scripts/validate-release.sh [VERSION]` runs the complete local release gate. These repository scripts are maintainer commands, not installed CLI subcommands.

@@ -429,6 +429,9 @@ No migration guide is required for the greenfield MVP.
 ### Platform Compatibility
 
 - All MVP CLI capabilities must pass release smoke tests on supported macOS, Linux, and WSL2 environments.
+- Cross-compilation establishes artifact availability and runtime independence; only execution on each target establishes platform smoke evidence.
+- Release candidates must be reproducible from a recorded source commit, self-contained, and accompanied by verified SHA-256 checksums.
+- Pilot completion requires durable issue, PR, CI, artifact, review, and timing evidence sufficient to calculate the stakeholder-intervention success rate; missing external evidence remains explicitly pending.
 - Paths, process handling, executable discovery, and signals must behave consistently across supported environments.
 - Unsupported operating systems or dependency versions must fail before work begins with corrective guidance.
 - The product must not require installation of its implementation-language runtime.

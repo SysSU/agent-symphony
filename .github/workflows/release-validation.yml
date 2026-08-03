@@ -1,0 +1,122 @@
+name: release-validation
+
+on:
+  pull_request:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: scripts/validate-release.sh 0.0.0-ci
+
+  wsl2:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate on WSL2 native filesystem
+        shell: pwsh
+        run: |
+          $distribution = 'Ubuntu'
+          wsl --set-default-version 2
+          if ($LASTEXITCODE -ne 0) { throw 'WSL2 is unavailable on this runner' }
+          wsl --install --distribution $distribution --web-download --no-launch
+          if ($LASTEXITCODE -ne 0) { throw "Failed to install WSL distribution: $distribution" }
+          wsl -d $distribution -- true
+          if ($LASTEXITCODE -ne 0) { throw "Failed to initialize WSL distribution: $distribution" }
+          $rows = ((wsl --list --verbose) -join "`n") -replace "`0", ''
+          if ($rows -notmatch "(?m)^\s*\*?\s*$distribution\s+\S+\s+2\s*$") { throw "WSL distribution is not version 2:`n$rows" }
+          wsl -d $distribution -- bash -lc 'set -euo pipefail; sudo env DEBIAN_FRONTEND=noninteractive apt-get update; sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git ruby tmux'
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to install WSL validation prerequisites' }
+          wsl -d $distribution -- bash -lc 'rm -rf ~/agent-symphony-ci && mkdir ~/agent-symphony-ci'
+          tar -cf - --exclude=.git . | wsl -d $distribution -- bash -lc 'tar -xf - -C ~/agent-symphony-ci'
+          wsl -d $distribution -- bash -lc "cd ~/agent-symphony-ci; chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh; git init -q; git remote add origin '$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git'; git add .; git -c user.name=ci -c user.email=ci@invalid commit -qm snapshot"
+          $goArchiveVersion = '1.26.0'
+          $goDirective = (Select-String '^go ([0-9.]+)$' go.mod).Matches.Groups[1].Value
+          $goDirectiveMatch = [regex]::Match($goDirective, '^(\d+)\.(\d+)(?:\.\d+)?$')
+          $goArchiveMatch = [regex]::Match($goArchiveVersion, '^(\d+)\.(\d+)\.\d+$')
+          if (!$goDirectiveMatch.Success -or !$goArchiveMatch.Success -or $goDirectiveMatch.Groups[1].Value -ne $goArchiveMatch.Groups[1].Value -or $goDirectiveMatch.Groups[2].Value -ne $goArchiveMatch.Groups[2].Value) {
+            throw "go.mod directive '$goDirective' does not match pinned Go archive $goArchiveVersion"
+          }
+          $machine = (wsl -d $distribution -- uname -m).Trim()
+          switch ($machine) {
+            'x86_64' { $goArch = 'amd64'; $goSHA256 = 'aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235' }
+            'aarch64' { $goArch = 'arm64'; $goSHA256 = 'bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd' }
+            default { throw "Unsupported WSL architecture: $machine" }
+          }
+          wsl -d $distribution -- bash -lc "set -e; curl -fsSLo /tmp/go.tgz https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz; printf '%s  %s\n' '${goSHA256}' /tmp/go.tgz | sha256sum -c -; sudo rm -rf /usr/local/go; sudo tar -C /usr/local -xzf /tmp/go.tgz"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to install pinned Go toolchain in WSL' }
+          wsl -d $distribution -- bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin scripts/validate-release.sh 0.0.0-wsl'
+          if ($LASTEXITCODE -ne 0) { throw 'WSL release validation failed' }
+
+  artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build release candidates
+        run: |
+          version=0.0.0-ci
+          case "$GITHUB_REF" in refs/tags/v*) version=${GITHUB_REF_NAME#v};; esac
+          SOURCE_DATE_EPOCH=0 scripts/release.sh "$version" dist
+      - run: go run ./tools/release -verify dist
+      - run: file dist/*.tar.gz && tar -tzf dist/*linux_amd64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-candidates
+          path: dist/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, wsl2, artifacts]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require signed tag
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          tag_commit=$(git rev-parse --verify "${GITHUB_REF_NAME}^{commit}")
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main
+          git show refs/remotes/origin/main:.github/release-signing-allowed-signers > "$RUNNER_TEMP/release-signing-allowed-signers"
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "$RUNNER_TEMP/release-signing-allowed-signers"
+          git verify-tag "${GITHUB_REF_NAME}"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidates
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --verify-tag --generate-notes
+      - name: Verify freshly downloaded release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir downloaded
+          gh release download "$GITHUB_REF_NAME" --dir downloaded
+          go run ./tools/release -verify downloaded
+          version=${GITHUB_REF_NAME#v}
+          tar -xzf "downloaded/agent-symphony_${version}_linux_amd64.tar.gz" -C downloaded
+          scripts/smoke-release.sh "downloaded/agent-symphony_${version}_linux_amd64/agent-symphony"
