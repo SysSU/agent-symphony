@@ -10,6 +10,10 @@ export GOMODCACHE="$tmp/go-mod-cache"
 go test -race ./...
 go vet ./...
 sh -n scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh
+for script in scripts/*.sh; do
+  ! grep -q "$(printf '\r')" "$script"
+  test "$(git check-attr eol -- "$script")" = "$script: eol: lf"
+done
 ruby <<'RUBY'
 require "yaml"
 path = ".github/workflows/release-validation.yml"
