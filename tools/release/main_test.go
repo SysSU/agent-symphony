@@ -76,7 +76,7 @@ func TestVerifyRequiresExactSafeReleaseSet(t *testing.T) {
 	}
 	for _, test := range []struct{ name, replacement string }{
 		{"absolute", "/tmp/archive"}, {"traversal", "../archive"},
-		{"duplicate", "agent-symphony_1.2.3_darwin_amd64.tar.gz"},
+		{"duplicate", ""},
 		{"missing", ""}, {"extra", "extra.tar.gz"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -89,6 +89,8 @@ func TestVerifyRequiresExactSafeReleaseSet(t *testing.T) {
 				lines = lines[:3]
 			case "extra":
 				lines = append(lines, lines[0][:64]+"  "+test.replacement)
+			case "duplicate":
+				lines[3] = lines[3][:64] + "  " + strings.Fields(lines[0])[1]
 			default:
 				lines[3] = lines[3][:64] + "  " + test.replacement
 			}
