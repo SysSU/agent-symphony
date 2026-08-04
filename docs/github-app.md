@@ -1,6 +1,6 @@
 # GitHub App setup and security
 
-Issue #5 adds the host-side GitHub boundary; it does not start workers, create pull requests, schedule work, or merge.
+This document covers the host-side GitHub boundary. It does not start workers, create pull requests, schedule work, or merge.
 
 For the step-by-step "create the App, install it, get credentials into the environment" walkthrough, see [Setup](setup.md#4-create-a-github-app). This document covers the exact permission/event list that walkthrough points to, plus the governance and credential-handling rules behind it.
 
@@ -19,20 +19,9 @@ Create a single-repository installation (not "all repositories") with exactly:
 | Commit statuses | Read |
 | Members | Read — only if team-based authorization is configured |
 
-Subscribe to these webhook events:
+These permissions govern API access and are required today: `reconcile`/`serve` read and write issues, PRs, contents, and checks directly through the API regardless of webhooks.
 
-- Issues
-- Issue comment
-- Pull request
-- Pull request review
-- Pull request review comment
-- Check run / Check suite
-- Status
-- Push
-- Installation
-- Repository rule
-
-Configure the webhook endpoint with a strong random secret and JSON delivery. A webhook endpoint is only required to run `serve`; `reconcile` and `doctor` don't need one, so a placeholder URL/secret is fine while testing one-shot.
+Leave **Active** unchecked under the Webhook section, and leave every event unsubscribed. The shipped `agent-symphony` binary does not currently bind an HTTP listener for webhook deliveries at all — `serve` runs the same reconciliation as `reconcile`, just on a repeating timer — so there is nothing to deliver to and nothing that reads the event subscription list. Event subscriptions only control what GitHub pushes to a webhook URL; they don't affect API access, so skipping them costs nothing right now.
 
 ## Pull-request governance
 
