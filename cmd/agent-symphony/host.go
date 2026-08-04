@@ -61,6 +61,71 @@ var (
 
 func nativeRoot(path string) string { return filepath.Join(hostRoot, path) }
 
+// hostIsolationInstalled reports whether install-host has ever provisioned the
+// advanced cross-UID boundary. Its absence is the sole signal that selects the
+// zero-admin default (local) boundary instead: running install-host is itself
+// the explicit opt-in into advanced mode, so there is exactly one source of
+// truth and no separate config flag is needed.
+func hostIsolationInstalled() bool {
+	_, err := hostLookupUser(workerUser)
+	return err == nil
+}
+
+func localAttemptRoot(stateRoot string) string  { return filepath.Join(stateRoot, "attempts") }
+func localSnapshotRoot(stateRoot string) string { return filepath.Join(stateRoot, "snapshots") }
+
+// ensureLocalRoot creates path as a private mode-0700 directory owned by the
+// current user when absent, or validates that an existing path is a
+// non-symlink directory with no group/world access. Unlike ensureHostRoot,
+// there is no separate identity to chown to: the coordinator and the local
+// boundary run as the same OS user.
+func ensureLocalRoot(path string) error {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("%s has conflicting type or mode", path)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	parent := filepath.Dir(path)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp(parent, ".agent-symphony-local-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	if err := os.Chmod(tmp, 0o700); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		if _, statErr := os.Stat(path); statErr == nil {
+			return ensureLocalRoot(path)
+		}
+		return err
+	}
+	return nil
+}
+
+// verifyLocalAccess is the local-mode counterpart to verifyHostAccess: it
+// proves the provisioned root is a private, writable directory rather than
+// running the cross-UID sudo allow/deny canary matrix, which has no meaning
+// when the coordinator and the boundary share one OS identity.
+func verifyLocalAccess(root string) error {
+	if err := ensureLocalRoot(root); err != nil {
+		return fmt.Errorf("provisioned local root: %w", err)
+	}
+	canary, err := os.MkdirTemp(root, ".doctor-local-")
+	if err != nil {
+		return fmt.Errorf("write provisioned local root: %w", err)
+	}
+	return os.RemoveAll(canary)
+}
+
 func installHost(coordinator string) error {
 	if hostGOOS != "linux" && hostGOOS != "darwin" {
 		return errors.New("host isolation supports macOS and Linux/WSL2 only")
@@ -524,6 +589,7 @@ func writeSudoers(coordinator, binary string) (bool, error) {
 }
 
 func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writer) error {
+	localRoot := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_LOCAL_ROOT"))
 	wantUser, wantGroup, root := workerUser, attemptGroup, "/var/lib/agent-symphony/attempts"
 	if hostGOOS == "darwin" {
 		root = "/var/db/agent-symphony/attempts"
@@ -534,19 +600,38 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 	} else if mode != "implementation" {
 		return errors.New("agent-host mode must be implementation or review")
 	}
-	root = nativeRoot(root)
-	u, err := hostLookupUser(wantUser)
-	if err != nil {
-		return err
-	}
-	g, err := hostLookupGroup(wantGroup)
-	if err != nil {
-		return err
-	}
-	uid, _ := strconv.Atoi(u.Uid)
-	gid, _ := strconv.Atoi(g.Gid)
-	if hostEUID() != uid || hostEGID() != gid {
-		return fmt.Errorf("agent-host must run as %s:%s", wantUser, wantGroup)
+	// AGENT_SYMPHONY_LOCAL_ROOT is only ever set by the coordinator's own
+	// implementationBoundary/reviewBoundary when install-host was never run;
+	// there is no separate OS identity to verify in that mode, only the same
+	// user the coordinator itself runs as.
+	var homeDir string
+	var err error
+	if localRoot != "" {
+		if !filepath.IsAbs(localRoot) {
+			return errors.New("local boundary root must be absolute")
+		}
+		root = localRoot
+		var current *user.User
+		if current, err = hostCurrentUser(); err != nil {
+			return err
+		}
+		homeDir = current.HomeDir
+	} else {
+		root = nativeRoot(root)
+		var u *user.User
+		var g *user.Group
+		if u, err = hostLookupUser(wantUser); err != nil {
+			return err
+		}
+		if g, err = hostLookupGroup(wantGroup); err != nil {
+			return err
+		}
+		uid, _ := strconv.Atoi(u.Uid)
+		gid, _ := strconv.Atoi(g.Gid)
+		if hostEUID() != uid || hostEGID() != gid {
+			return fmt.Errorf("agent-host must run as %s:%s", wantUser, wantGroup)
+		}
+		homeDir = u.HomeDir
 	}
 	var request struct {
 		Operation string          `json:"operation"`
@@ -564,7 +649,11 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 	var result agentruntime.Result
 	switch request.Operation {
 	case "verify":
-		if hostRoot == "" {
+		if localRoot != "" {
+			if err := verifyLocalAccess(root); err != nil {
+				return err
+			}
+		} else if hostRoot == "" {
 			var canary struct {
 				Deny     []string `json:"deny"`
 				Snapshot string   `json:"snapshot"`
@@ -588,7 +677,7 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if filterErr != nil {
 			return filterErr
 		}
-		env = append(env, "HOME="+u.HomeDir)
+		env = append(env, "HOME="+homeDir)
 		result, err = hostExecRunner(ctx, agentruntime.Command{Name: request.Command.Name, Args: request.Command.Args, Dir: request.Command.Dir, Env: env, Stdin: bytes.NewReader(request.Command.Input)})
 	case "export":
 		result.Output, err = exportAttempt(ctx, request.Command.Input, root)
@@ -943,7 +1032,10 @@ func belowRoot(path, root string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
 }
 
-func hostDiagnostic() diagnostic {
+func hostDiagnostic(stateRoot string) diagnostic {
+	if !hostIsolationInstalled() {
+		return localHostDiagnostic(stateRoot)
+	}
 	binary, err := hostExecutable()
 	if err != nil {
 		return diagnostic{"host isolation", "fail", err.Error(), "Install the current release with install-host."}
@@ -1040,6 +1132,22 @@ func hostDiagnostic() diagnostic {
 		}
 	}
 	return diagnostic{"host isolation", "pass", "current binary identities and exact managed sudo rules are installed", ""}
+}
+
+// localHostDiagnostic validates the zero-admin default boundary: a private
+// local root the coordinator can create and write to. It intentionally does
+// not attempt to prove OS-enforced isolation between the coordinator and the
+// agent process, because none exists in this mode — see docs/security.md.
+func localHostDiagnostic(stateRoot string) diagnostic {
+	if strings.TrimSpace(stateRoot) == "" {
+		return diagnostic{"host isolation", "fail", "runtime state root is required to provision the local attempt/snapshot roots", "Pass --runtime-state, or run install-host for the advanced host-isolated path."}
+	}
+	for _, root := range []string{localAttemptRoot(stateRoot), localSnapshotRoot(stateRoot)} {
+		if err := verifyLocalAccess(root); err != nil {
+			return diagnostic{"host isolation", "fail", err.Error(), "Repair " + root + " ownership and mode, or run install-host for the advanced host-isolated path."}
+		}
+	}
+	return diagnostic{"host isolation", "pass", "zero-admin default boundary is active: no separate OS identity, reduced isolation from the agent process", "Run install-host for OS-enforced isolation between the coordinator and the agent."}
 }
 
 func fileUID(info os.FileInfo) int {
