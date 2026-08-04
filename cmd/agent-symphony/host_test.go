@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
@@ -78,7 +79,12 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux is unavailable")
 	}
-	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	tmuxTmp, err := os.MkdirTemp("/tmp", "as-tmux-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmuxTmp) })
+	t.Setenv("TMUX_TMPDIR", tmuxTmp)
 
 	t.Run("findings persist without a separate signal", func(t *testing.T) {
 		oldExec := hostExecRunner
@@ -131,6 +137,15 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		bad := `{"type":"agent-symphony-result-v1","validation":"wrong-window","documentation":"wrong"}`
 		tmux(t, "new-session", "-d", "-x", "200", "-s", session, "-c", repo, "sh", "-c", "printf '%s\\n' '"+good+"'; sleep 30")
 		t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+session).Run() })
+		for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			out, _ := exec.Command("tmux", "capture-pane", "-p", "-t", agentruntime.PaneTarget(session), "-S", "-200").CombinedOutput()
+			if strings.Contains(string(out), good) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("pane zero did not emit result: %s", out)
+			}
+		}
 		tmux(t, "new-window", "-d", "-t", "="+session, "sh", "-c", "printf '%s\\n' '"+bad+"'; sleep 30")
 		tmux(t, "select-window", "-t", "="+session+":1")
 		manifest, _ := json.Marshal(agentruntime.Manifest{Repository: "o/r", Branch: branch, BaseSHA: "base", Worktree: repo, Session: session})
