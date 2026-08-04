@@ -51,7 +51,7 @@ That confirms the zero-admin default is working — no `install-host` step neede
 
 github.com → Settings → Developer settings → GitHub Apps → **New GitHub App**. Set the exact permissions and webhook events listed in [GitHub App setup](github-app.md#required-permissions-and-events). Generate a private key (downloads a `.pem`) and note the **App ID** shown on the app's settings page.
 
-A webhook URL/secret is only exercised if you run `serve`; a placeholder is fine while testing with `reconcile`.
+A webhook is only exercised if you run `serve`. If you're only testing with `reconcile`/`doctor`, uncheck **Active** under the Webhook section instead of entering a placeholder URL — GitHub won't require a URL or attempt any deliveries. Check it and fill in a real URL/secret only once you're ready to run `serve`.
 
 ## 5. Install the App
 

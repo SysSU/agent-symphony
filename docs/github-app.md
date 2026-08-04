@@ -32,7 +32,7 @@ Subscribe to these webhook events:
 - Installation
 - Repository rule
 
-Configure the webhook endpoint with a strong random secret and JSON delivery. A webhook endpoint is only required to run `serve`; `reconcile` and `doctor` don't need one, so a placeholder URL/secret is fine while testing one-shot.
+A webhook endpoint is only required to run `serve`; `reconcile` and `doctor` don't need one. If you're only running those, uncheck **Active** under the Webhook section when creating the App — GitHub then won't require a URL and won't attempt any deliveries. Only once you're running `serve` do you configure the webhook endpoint with a real reachable URL, a strong random secret, and JSON delivery.
 
 ## Pull-request governance
 
