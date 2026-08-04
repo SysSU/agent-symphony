@@ -19,7 +19,11 @@ Create a single-repository installation (not "all repositories") with exactly:
 | Commit statuses | Read |
 | Members | Read — only if team-based authorization is configured |
 
-Subscribe to these webhook events:
+These permissions govern API access and are required today: `reconcile`/`serve` read and write issues, PRs, contents, and checks directly through the API regardless of webhooks.
+
+Leave **Active** unchecked under the Webhook section, and leave every event unsubscribed. The shipped `agent-symphony` binary does not currently bind an HTTP listener for webhook deliveries at all — `serve` runs the same reconciliation as `reconcile`, just on a repeating timer — so there is nothing to deliver to and nothing that reads the event subscription list (tracked in [issue #31](https://github.com/SysSU/agent-symphony/issues/31)). Event subscriptions only control what GitHub pushes to a webhook URL; they don't affect API access, so skipping them costs nothing right now.
+
+Once #31 lands, this section will document the real production webhook URL/secret/JSON-delivery configuration and the specific events to subscribe to:
 
 - Issues
 - Issue comment
@@ -31,8 +35,6 @@ Subscribe to these webhook events:
 - Push
 - Installation
 - Repository rule
-
-Uncheck **Active** under the Webhook section when creating the App. The shipped `agent-symphony` binary does not currently bind an HTTP listener for webhook deliveries at all — `serve` runs the same reconciliation as `reconcile`, just on a repeating timer, and there is presently no URL to give GitHub regardless of which command you run (tracked in [issue #31](https://github.com/SysSU/agent-symphony/issues/31)). Unchecking Active means GitHub won't require a URL and won't attempt any deliveries. Once #31 lands, this section will document the real production URL/secret/JSON-delivery configuration for `serve`.
 
 ## Pull-request governance
 

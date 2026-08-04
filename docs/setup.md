@@ -49,9 +49,9 @@ That confirms the zero-admin default is working — no `install-host` step neede
 
 ## 4. Create a GitHub App
 
-github.com → Settings → Developer settings → GitHub Apps → **New GitHub App**. Set the exact permissions and webhook events listed in [GitHub App setup](github-app.md#required-permissions-and-events). Generate a private key (downloads a `.pem`) and note the **App ID** shown on the app's settings page.
+github.com → Settings → Developer settings → GitHub Apps → **New GitHub App**. Set the exact permissions listed in [GitHub App setup](github-app.md#required-permissions-and-events). Generate a private key (downloads a `.pem`) and note the **App ID** shown on the app's settings page.
 
-Uncheck **Active** under the Webhook section — leave it unchecked regardless of whether you plan to run `reconcile` or `serve`. The shipped binary does not yet listen for webhook deliveries at all (`serve` only polls GitHub on a timer; see [issue #31](https://github.com/SysSU/agent-symphony/issues/31)), so there is currently no URL to give it. Unchecking Active means GitHub won't require one and won't attempt any deliveries.
+Leave the Webhook section's **Active** unchecked, and leave every event unsubscribed — do this regardless of whether you plan to run `reconcile` or `serve`. The shipped binary does not yet listen for webhook deliveries at all (`serve` only polls GitHub on a timer; see [issue #31](https://github.com/SysSU/agent-symphony/issues/31)), so there is currently no URL to give it and nothing reads the event subscriptions either. Unchecking Active means GitHub won't require a URL and won't attempt any deliveries.
 
 ## 5. Install the App
 
