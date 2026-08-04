@@ -51,7 +51,7 @@ That confirms the zero-admin default is working — no `install-host` step neede
 
 github.com → Settings → Developer settings → GitHub Apps → **New GitHub App**. Set the exact permissions listed in [GitHub App setup](github-app.md#required-permissions-and-events). Generate a private key (downloads a `.pem`) and note the **App ID** shown on the app's settings page.
 
-Leave the Webhook section's **Active** unchecked, and leave every event unsubscribed — do this regardless of whether you plan to run `reconcile` or `serve`. The shipped binary does not yet listen for webhook deliveries at all (`serve` only polls GitHub on a timer; see [issue #31](https://github.com/SysSU/agent-symphony/issues/31)), so there is currently no URL to give it and nothing reads the event subscriptions either. Unchecking Active means GitHub won't require a URL and won't attempt any deliveries.
+Leave the Webhook section's **Active** unchecked, and leave every event unsubscribed — do this regardless of whether you plan to run `reconcile` or `serve`. The shipped binary does not yet listen for webhook deliveries at all (`serve` only polls GitHub on a timer), so there is currently no URL to give it and nothing reads the event subscriptions either. Unchecking Active means GitHub won't require a URL and won't attempt any deliveries.
 
 ## 5. Install the App
 
@@ -117,7 +117,7 @@ agent-symphony status --state ~/.local/state/agent-symphony/pr.json --runtime-st
 
 projects that same attempt as queued/active/blocked/review-ready/completed.
 
-For a persistent loop instead of a one-shot run, use `serve` in place of `reconcile` — see [CLI reference](cli.md). It runs the same reconciliation on a timer (at most every 60 seconds); it does not yet also listen for webhooks (see [issue #31](https://github.com/SysSU/agent-symphony/issues/31)), so nothing further is required from step 4 to run it.
+For a persistent loop instead of a one-shot run, use `serve` in place of `reconcile` — see [CLI reference](cli.md). It runs the same reconciliation on a timer (at most every 60 seconds); it does not yet also listen for webhooks, so nothing further is required from step 4 to run it.
 
 ## Advanced: host-isolated mode (optional)
 
