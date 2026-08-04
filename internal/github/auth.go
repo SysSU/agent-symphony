@@ -6,8 +6,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -110,6 +112,28 @@ func (s *InstallationTokens) Token(ctx context.Context) (InstallationToken, erro
 	}
 	s.cached = InstallationToken{Value: body.Token, ExpiresAt: body.ExpiresAt}
 	return s.cached, nil
+}
+
+// ParsePrivateKeyPEM parses a GitHub App private key. GitHub issues PKCS#1
+// ("BEGIN RSA PRIVATE KEY"); PKCS#8 ("BEGIN PRIVATE KEY") is also accepted
+// defensively since some key managers re-encode to it.
+func ParsePrivateKeyPEM(pemBytes []byte) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, errors.New("GitHub App private key is not valid PEM")
+	}
+	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse GitHub App private key: %w", err)
+	}
+	key, ok := parsed.(*rsa.PrivateKey)
+	if !ok {
+		return nil, errors.New("GitHub App private key must be RSA")
+	}
+	return key, nil
 }
 
 func decodeJSON(r io.Reader, dst any) error {

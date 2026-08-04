@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -100,6 +102,33 @@ func TestAppJWTAndInstallationExchange(t *testing.T) {
 	got, err := tokens.Token(context.Background())
 	if err != nil || got.Value != "installation-canary" {
 		t.Fatalf("got %#v, %v", got, err)
+	}
+}
+
+func TestParsePrivateKeyPEMAcceptsPKCS1AndRejectsGarbage(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	parsed, err := ParsePrivateKeyPEM(pemBytes)
+	if err != nil || parsed.N.Cmp(key.N) != 0 {
+		t.Fatalf("parsed=%#v err=%v", parsed, err)
+	}
+	pkcs8Bytes, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkcs8PEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8Bytes})
+	parsed, err = ParsePrivateKeyPEM(pkcs8PEM)
+	if err != nil || parsed.N.Cmp(key.N) != 0 {
+		t.Fatalf("pkcs8 parsed=%#v err=%v", parsed, err)
+	}
+	if _, err := ParsePrivateKeyPEM([]byte("not a pem file")); err == nil {
+		t.Fatal("garbage input accepted")
+	}
+	if _, err := ParsePrivateKeyPEM(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: []byte("not a key")})); err == nil {
+		t.Fatal("invalid key bytes accepted")
 	}
 }
 

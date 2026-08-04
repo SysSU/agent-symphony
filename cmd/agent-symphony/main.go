@@ -216,6 +216,44 @@ func (t environmentToken) Token(context.Context) (internalgithub.InstallationTok
 	return internalgithub.InstallationToken{Value: string(t), ExpiresAt: time.Now().Add(time.Hour)}, nil
 }
 
+// githubTokenSource resolves how the coordinator authenticates to the GitHub
+// API. When AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH and
+// AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID are both set, it mints and
+// auto-refreshes installation tokens from the App's own JWT — the only way to
+// run serve continuously, since installation tokens expire after an hour and
+// nothing can refresh a static GITHUB_TOKEN inside an already-running
+// process. Otherwise it falls back to a static GITHUB_TOKEN, sufficient for
+// short reconcile/doctor/pr-governance runs. Call this once per process
+// invocation, not once per reconcile cycle, so InstallationTokens' internal
+// cache is actually reused instead of re-minting a token every cycle.
+func githubTokenSource(appID int64) (internalgithub.TokenSource, error) {
+	keyPath := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH"))
+	installationRaw := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID"))
+	if keyPath == "" && installationRaw == "" {
+		token := os.Getenv("GITHUB_TOKEN")
+		if token == "" {
+			return nil, errors.New("GITHUB_TOKEN is required, or set AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH and AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID for auto-refreshing credentials")
+		}
+		return environmentToken(token), nil
+	}
+	if keyPath == "" || installationRaw == "" {
+		return nil, errors.New("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH and AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID must both be set")
+	}
+	installationID, err := strconv.ParseInt(installationRaw, 10, 64)
+	if err != nil || installationID <= 0 {
+		return nil, errors.New("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID must be a positive integer")
+	}
+	pemBytes, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read GitHub App private key: %w", err)
+	}
+	key, err := internalgithub.ParsePrivateKeyPEM(pemBytes)
+	if err != nil {
+		return nil, err
+	}
+	return &internalgithub.InstallationTokens{BaseURL: githubAPI, InstallationID: installationID, JWTs: internalgithub.AppJWT{AppID: strconv.FormatInt(appID, 10), Key: key}, HTTP: githubClient}, nil
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -296,6 +334,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return fail(stderr, *jsonOutput, command, err.Error())
 			}
 		}
+		appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		// Built once for the whole serve invocation, not once per reconcile
+		// cycle: InstallationTokens caches and only re-mints near real expiry.
+		tokens, err := githubTokenSource(appID)
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
 		lock, err := acquireDaemonLock(filepath.Join(*runtimeState, "daemon.lock"))
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
@@ -304,7 +352,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		reconcile := func(ctx context.Context) error {
-			_, err := reconcileGitHub(ctx, *path, *statePath, *runtimeState, true)
+			_, err := reconcileGitHub(ctx, *path, *statePath, *runtimeState, true, tokens)
 			if err != nil {
 				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
 			}
@@ -324,7 +372,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if *statePath == "" || *runtimeState == "" {
 				return misuse(stderr, wantsJSON, command, command+" requires --state and --runtime-state unless --attempts is supplied")
 			}
-			statuses, err = reconcileGitHub(context.Background(), *path, *statePath, *runtimeState, command == "reconcile")
+			appID, appErr := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
+			if appErr != nil {
+				return fail(stderr, *jsonOutput, command, appErr.Error())
+			}
+			tokens, tokenErr := githubTokenSource(appID)
+			if tokenErr != nil {
+				return fail(stderr, *jsonOutput, command, tokenErr.Error())
+			}
+			statuses, err = reconcileGitHub(context.Background(), *path, *statePath, *runtimeState, command == "reconcile", tokens)
 		} else {
 			statuses, err = recoveryStatuses(*attemptsPath, *runtimeState)
 		}
@@ -436,11 +492,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if int64(actor) != actorID {
 			return fail(stderr, *jsonOutput, command, "AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID is out of range")
 		}
-		token := os.Getenv("GITHUB_TOKEN")
-		if token == "" {
-			return fail(stderr, *jsonOutput, command, "GITHUB_TOKEN is required")
+		tokens, err := githubTokenSource(appID)
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		api := internalgithub.API{BaseURL: githubAPI, Tokens: environmentToken(token), HTTP: githubClient}
+		api := internalgithub.API{BaseURL: githubAPI, Tokens: tokens, HTTP: githubClient}
 		prConfig := internalgithub.PRAdapterConfig{
 			Repository: c.Repository, ReadyLabel: c.Labels.Ready, HumanReviewLabel: c.CompletionPolicies.HumanReview,
 			AutonomousMergeLabel: c.CompletionPolicies.AutonomousMerge, MergeMethod: "squash", PriorityP1Label: c.Labels.PriorityP1,
@@ -522,7 +578,7 @@ func acquireDaemonLock(path string) (*os.File, error) {
 
 func releaseDaemonLock(f *os.File) { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }
 
-func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
+func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool, tokens internalgithub.TokenSource) ([]orchestrator.RecoveryStatus, error) {
 	started := time.Now()
 	ctx, cancel := context.WithDeadline(ctx, started.Add(2*time.Minute))
 	defer cancel()
@@ -550,11 +606,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if actorID > int64(^uint(0)>>1) {
 		return nil, errors.New("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID is out of range")
 	}
-	token := os.Getenv("GITHUB_TOKEN")
-	if token == "" {
-		return nil, errors.New("GITHUB_TOKEN is required")
-	}
-	api := internalgithub.API{BaseURL: githubAPI, Tokens: environmentToken(token), HTTP: githubClient}
+	api := internalgithub.API{BaseURL: githubAPI, Tokens: tokens, HTTP: githubClient}
 	if err := api.VerifyInstallation(ctx, appID); err != nil {
 		return nil, err
 	}
