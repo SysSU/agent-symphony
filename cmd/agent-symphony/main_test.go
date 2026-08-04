@@ -190,7 +190,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	boundary := workerBoundaryRunner{Command: script}
 	runtimeState := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, nil); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, nil, state); err != nil {
 		log, _ := os.ReadFile(boundaryLog)
 		t.Fatalf("transient rework reached GitHub failure: %v\n%s", err, log)
 	}
@@ -201,7 +201,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 		t.Fatal("monitor did not recover worker receipt")
 	}
 	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, nil); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, nil, state); err != nil {
 		t.Fatalf("retry reached GitHub failure: %v", err)
 	}
 	storedBody, _ = os.ReadFile(manifestPath)
@@ -261,7 +261,7 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, pending, err := runIndependentReview(t.Context(), nil, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt}, workerBoundaryRunner{Command: script}, env, []string{"reviewer"}, issue, agentruntime.Manifest{}, source, head)
+	result, pending, err := runIndependentReview(t.Context(), nil, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt}, workerBoundaryRunner{Command: script}, env, []string{"reviewer"}, issue, agentruntime.Manifest{}, source, head, reviewSnapshotRoot)
 	if err != nil || !pending {
 		t.Fatal(err)
 	}
@@ -344,7 +344,7 @@ func TestReviewCleanupSurvivesRestartUntilSessionIsGone(t *testing.T) {
 			reviewSnapshotRoot = base
 			t.Cleanup(func() { reviewSnapshotRoot = oldRoot })
 			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
-			snapshot, session := reviewIdentity(attempt)
+			snapshot, session := reviewIdentity(attempt, reviewSnapshotRoot)
 			if err := os.Mkdir(snapshot, 0o550); err != nil {
 				t.Fatal(err)
 			}
@@ -368,7 +368,7 @@ func TestReviewCleanupSurvivesRestartUntilSessionIsGone(t *testing.T) {
 			}
 
 			runtimeState := &agentruntime.Runtime{StateRoot: state}
-			_, err := cleanupReviewOutcome(t.Context(), runtimeState, attempt, workerBoundaryRunner{Command: script}, nil, manifest)
+			_, err := cleanupReviewOutcome(t.Context(), runtimeState, attempt, workerBoundaryRunner{Command: script}, nil, manifest, reviewSnapshotRoot)
 			var stored agentruntime.Manifest
 			storedBody, readErr := os.ReadFile(manifestPath)
 			if readErr != nil || json.Unmarshal(storedBody, &stored) != nil {
@@ -384,7 +384,7 @@ func TestReviewCleanupSurvivesRestartUntilSessionIsGone(t *testing.T) {
 				if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '{\"Code\":0}'\n"), 0o700); err != nil {
 					t.Fatal(err)
 				}
-				_, err = cleanupReviewOutcome(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, workerBoundaryRunner{Command: script}, nil, stored)
+				_, err = cleanupReviewOutcome(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, workerBoundaryRunner{Command: script}, nil, stored, reviewSnapshotRoot)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -458,7 +458,7 @@ func TestRunningReviewUnobservableRebuildsWithoutDurableFailure(t *testing.T) {
 			runGit(t, source, "commit", "--allow-empty", "-m", "head")
 			head := runGit(t, source, "rev-parse", "HEAD")
 			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
-			snapshot, session := reviewIdentity(attempt)
+			snapshot, session := reviewIdentity(attempt, reviewSnapshotRoot)
 			if err := os.Mkdir(snapshot, 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -473,7 +473,7 @@ func TestRunningReviewUnobservableRebuildsWithoutDurableFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			boundary := &recoveringReviewBoundary{displayErr: test.err}
-			_, pending, err := runIndependentReview(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, manifest, source, head)
+			_, pending, err := runIndependentReview(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, manifest, source, head, reviewSnapshotRoot)
 			if err != nil || !pending || boundary.started != 1 {
 				t.Fatalf("pending=%v starts=%d err=%v", pending, boundary.started, err)
 			}
@@ -492,7 +492,7 @@ func TestReviewCleanupRejectsForeignOutsideAndSymlinkIdentity(t *testing.T) {
 	reviewSnapshotRoot = t.TempDir()
 	t.Cleanup(func() { reviewSnapshotRoot = oldRoot })
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
-	snapshot, session := reviewIdentity(attempt)
+	snapshot, session := reviewIdentity(attempt, reviewSnapshotRoot)
 	outside := filepath.Join(t.TempDir(), "outside")
 	if err := os.Mkdir(outside, 0o700); err != nil {
 		t.Fatal(err)
@@ -508,7 +508,7 @@ func TestReviewCleanupRejectsForeignOutsideAndSymlinkIdentity(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var boundary countingReviewBoundary
-			if err := cleanupReviewResources(t.Context(), &boundary, nil, attempt, test.snapshot, test.session); err == nil {
+			if err := cleanupReviewResources(t.Context(), &boundary, nil, attempt, test.snapshot, test.session, reviewSnapshotRoot); err == nil {
 				t.Fatal("unsafe cleanup identity accepted")
 			}
 			if boundary != 0 {
@@ -601,7 +601,7 @@ func TestPreparingReviewCleanupRetainsStateAndRetries(t *testing.T) {
 				ctx, cancel = context.WithTimeout(ctx, 50*time.Millisecond)
 				defer cancel()
 			}
-			_, pending, err := runIndependentReview(ctx, &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, manifest, source, head)
+			_, pending, err := runIndependentReview(ctx, &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, manifest, source, head, reviewSnapshotRoot)
 			if err != nil || !pending {
 				t.Fatalf("pending=%v err=%v", pending, err)
 			}
@@ -618,7 +618,7 @@ func TestPreparingReviewCleanupRetainsStateAndRetries(t *testing.T) {
 			}
 
 			boundary.block, boundary.err = false, nil
-			_, pending, err = runIndependentReview(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, stored, source, head)
+			_, pending, err = runIndependentReview(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, stored, source, head, reviewSnapshotRoot)
 			if err != nil || !pending {
 				t.Fatalf("retry pending=%v err=%v", pending, err)
 			}
@@ -659,7 +659,7 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	result, pending, err := runIndependentReview(ctx, &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, manifest, "", "head")
+	result, pending, err := runIndependentReview(ctx, &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, manifest, "", "head", reviewSnapshotRoot)
 	if err != nil || !pending || result.Status != "clean" || time.Since(started) > time.Second {
 		t.Fatalf("result=%#v pending=%v err=%v elapsed=%v", result, pending, err, time.Since(started))
 	}
@@ -684,7 +684,7 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	}
 
 	boundary.block = false
-	stored, err = cleanupReviewOutcome(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, stored)
+	stored, err = cleanupReviewOutcome(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, stored, reviewSnapshotRoot)
 	if err != nil || stored.ReviewSession != "" || stored.ReviewSnapshot != "" {
 		t.Fatalf("retry stored=%#v err=%v", stored, err)
 	}
@@ -760,7 +760,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	reviewSnapshotRoot = snapshotBase
 	t.Cleanup(func() { reviewSnapshotRoot = oldReviewRoot })
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
-	snapshot, session := reviewIdentity(attempt)
+	snapshot, session := reviewIdentity(attempt, reviewSnapshotRoot)
 	if err := os.Mkdir(snapshot, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -776,7 +776,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	}
 	runtimeState := &agentruntime.Runtime{StateRoot: state}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, BaseBranch: "main"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, nil); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, nil, state); err != nil {
 		t.Fatal(err)
 	}
 	storedBody, _ := os.ReadFile(manifestPath)
@@ -792,7 +792,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	if err := os.WriteFile(review, []byte("#!/bin/sh\nprintf '{\"Code\":0}'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, nil)
+	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, nil, state)
 	if err == nil || !strings.Contains(err.Error(), "AGENT_SYMPHONY_GITHUB_APP_ID") {
 		t.Fatalf("publication did not continue after cleanup: %v", err)
 	}

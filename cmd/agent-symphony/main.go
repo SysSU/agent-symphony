@@ -76,6 +76,7 @@ type environmentToken string
 type workerBoundaryRunner struct {
 	Command string
 	Args    []string
+	Env     []string
 }
 
 type boundaryCaller interface {
@@ -118,7 +119,7 @@ func (b workerBoundaryRunner) call(ctx context.Context, operation string, comman
 		Command   boundaryCommand `json:"command"`
 	}{operation, boundaryCommand{command.Name, command.Args, command.Env, command.Dir, input}})
 	cmd := exec.CommandContext(ctx, b.Command, b.Args...)
-	cmd.Env = minimalBoundaryEnvironment()
+	cmd.Env = append(minimalBoundaryEnvironment(), b.Env...)
 	cmd.Stdin = bytes.NewReader(payload)
 	out := limitedBuffer{Limit: 24 << 20}
 	cmd.Stdout = &out
@@ -154,20 +155,58 @@ func (b workerBoundaryRunner) Run(ctx context.Context, command agentruntime.Comm
 	return b.call(ctx, "run", command)
 }
 
-func implementationBoundary() workerBoundaryRunner {
+func implementationBoundary(stateRoot string) workerBoundaryRunner {
 	if command := os.Getenv("AGENT_SYMPHONY_WORKER_BOUNDARY"); command != "" {
 		return workerBoundaryRunner{Command: command}
 	}
 	binary, _ := os.Executable()
+	if !hostIsolationInstalled() {
+		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "implementation"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localAttemptRoot(stateRoot)}}
+	}
 	return workerBoundaryRunner{Command: "sudo", Args: []string{"-n", "-u", workerUser, "-g", attemptGroup, binary, "agent-host", "implementation"}}
 }
 
-func reviewBoundary() workerBoundaryRunner {
+func reviewBoundary(stateRoot string) workerBoundaryRunner {
 	if command := os.Getenv("AGENT_SYMPHONY_REVIEW_BOUNDARY"); command != "" {
 		return workerBoundaryRunner{Command: command}
 	}
 	binary, _ := os.Executable()
+	if !hostIsolationInstalled() {
+		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "review"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localSnapshotRoot(stateRoot)}}
+	}
 	return workerBoundaryRunner{Command: "sudo", Args: []string{"-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "review"}}
+}
+
+// productionAttemptRoot and productionSnapshotRoot are the single source of
+// truth for where implementation/review boundaries operate: the test seam
+// (reviewSnapshotRoot), then the zero-admin default under the runtime state
+// root, then the advanced host-isolated provisioned root.
+func productionAttemptRoot(stateRoot string) string {
+	if reviewSnapshotRoot != "" {
+		return filepath.Join(filepath.Dir(reviewSnapshotRoot), "attempts")
+	}
+	if !hostIsolationInstalled() {
+		return localAttemptRoot(stateRoot)
+	}
+	root := "/var/lib/agent-symphony/attempts"
+	if runtime.GOOS == "darwin" {
+		root = "/var/db/agent-symphony/attempts"
+	}
+	return root
+}
+
+func productionSnapshotRoot(stateRoot string) string {
+	if reviewSnapshotRoot != "" {
+		return reviewSnapshotRoot
+	}
+	if !hostIsolationInstalled() {
+		return localSnapshotRoot(stateRoot)
+	}
+	root := "/var/lib/agent-symphony/snapshots"
+	if runtime.GOOS == "darwin" {
+		root = "/var/db/agent-symphony/snapshots"
+	}
+	return root
 }
 
 func (t environmentToken) Token(context.Context) (internalgithub.InstallationToken, error) {
@@ -532,14 +571,8 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if err != nil {
 		return nil, err
 	}
-	boundary := implementationBoundary()
-	attemptRoot := "/var/lib/agent-symphony/attempts"
-	if runtime.GOOS == "darwin" {
-		attemptRoot = "/var/db/agent-symphony/attempts"
-	}
-	if reviewSnapshotRoot != "" { // test-host roots mirror both provisioned roots.
-		attemptRoot = filepath.Join(filepath.Dir(reviewSnapshotRoot), "attempts")
-	}
+	boundary := implementationBoundary(stateRoot)
+	attemptRoot := productionAttemptRoot(stateRoot)
 	source, err := seedAttemptSource(ctx, root, attemptRoot)
 	if err != nil {
 		return nil, err
@@ -593,7 +626,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if err := monitorAttempts(ctx, &r, statuses, manifests); err != nil {
 		return statuses, err
 	}
-	if err := monitorQueuedAttempts(ctx, api, &r, c, issues, manifests, remote); err != nil {
+	if err := monitorQueuedAttempts(ctx, api, &r, c, issues, manifests, remote, stateRoot); err != nil {
 		return statuses, err
 	}
 	if err := dispatchIssues(ctx, &r, c, issues, decisions); err != nil {
@@ -637,7 +670,11 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 }
 
 func seedAttemptSource(ctx context.Context, repository, attemptRoot string) (string, error) {
-	if err := os.MkdirAll(attemptRoot, 0o770); err != nil {
+	mode := os.FileMode(0o770)
+	if !hostIsolationInstalled() {
+		mode = 0o700
+	}
+	if err := os.MkdirAll(attemptRoot, mode); err != nil {
 		return "", fmt.Errorf("open provisioned attempt root: %w", err)
 	}
 	tmp, err := os.CreateTemp(attemptRoot, ".source-*.bundle")
@@ -971,7 +1008,7 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string
 	return nil
 }
 
-func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact) error {
+func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, stateRoot string) error {
 	for _, manifest := range manifests {
 		if slices.ContainsFunc(remote, func(f internalgithub.RecoveryAttemptFact) bool {
 			return f.Repository == manifest.Repository && f.Issue == manifest.Issue && f.Attempt == manifest.Attempt
@@ -994,7 +1031,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			}
 		}
 		if current.State == "completed" {
-			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current)
+			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot)
 			if err != nil {
 				return durableAttemptFailure(ctx, api, issue, current, err)
 			}
@@ -1010,8 +1047,9 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 	return nil
 }
 
-func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeState *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest) (bool, error) {
-	boundary := implementationBoundary()
+func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeState *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, stateRoot string) (bool, error) {
+	boundary := implementationBoundary(stateRoot)
+	snapshotRoot := productionSnapshotRoot(stateRoot)
 	reviewEnv, err := configuredAgentEnvironment(cfg.Commands.Environment)
 	if err != nil {
 		return false, err
@@ -1025,7 +1063,7 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: cfg.Commands.Implementation}
 	if (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued") && manifest.ReviewHead == head && (manifest.ReviewSnapshot != "" || manifest.ReviewSession != "") {
 		var cleanupErr error
-		manifest, cleanupErr = cleanupReviewOutcome(ctx, runtimeState, attempt, reviewBoundary(), reviewEnv, manifest)
+		manifest, cleanupErr = cleanupReviewOutcome(ctx, runtimeState, attempt, reviewBoundary(stateRoot), reviewEnv, manifest, snapshotRoot)
 		if cleanupErr != nil {
 			return true, nil
 		}
@@ -1034,7 +1072,7 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		return returnReviewFindings(ctx, runtimeState, boundary, attempt, manifest, head, manifest.ReviewFindings, cfg.Commands.Implementation)
 	}
 	if manifest.ReviewState != "clean" || manifest.ReviewHead != head {
-		review, pending, err = runIndependentReview(ctx, runtimeState, attempt, reviewBoundary(), reviewEnv, cfg.Commands.Reviewer, issue, manifest, root, head)
+		review, pending, err = runIndependentReview(ctx, runtimeState, attempt, reviewBoundary(stateRoot), reviewEnv, cfg.Commands.Reviewer, issue, manifest, root, head, snapshotRoot)
 	}
 	if err != nil {
 		return false, fmt.Errorf("independent review: %w", err)
@@ -1164,26 +1202,19 @@ func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtim
 	return false, nil
 }
 
-func cleanupReviewOutcome(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env []string, manifest agentruntime.Manifest) (agentruntime.Manifest, error) {
-	if err := cleanupReviewResources(ctx, boundary, env, attempt, manifest.ReviewSnapshot, manifest.ReviewSession); err != nil {
+func cleanupReviewOutcome(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env []string, manifest agentruntime.Manifest, snapshotRoot string) (agentruntime.Manifest, error) {
+	if err := cleanupReviewResources(ctx, boundary, env, attempt, manifest.ReviewSnapshot, manifest.ReviewSession, snapshotRoot); err != nil {
 		return manifest, err
 	}
 	return runtimeState.RecordReview(attempt, manifest.ReviewState, manifest.ReviewHead, "", "")
 }
 
-func reviewIdentity(attempt agentruntime.Attempt) (string, string) {
-	base := reviewSnapshotRoot
-	if base == "" {
-		base = "/var/lib/agent-symphony/snapshots"
-		if runtime.GOOS == "darwin" {
-			base = "/var/db/agent-symphony/snapshots"
-		}
-	}
-	return filepath.Join(base, fmt.Sprintf("%s-%d-%d", strings.ReplaceAll(attempt.Repository, "/", "-"), attempt.Issue, attempt.Number)), fmt.Sprintf("as-review-%d-%d", attempt.Issue, attempt.Number)
+func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, string) {
+	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", strings.ReplaceAll(attempt.Repository, "/", "-"), attempt.Issue, attempt.Number)), fmt.Sprintf("as-review-%d-%d", attempt.Issue, attempt.Number)
 }
 
-func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, snapshot, session string) error {
-	expectedSnapshot, expectedSession := reviewIdentity(attempt)
+func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, snapshot, session, snapshotRoot string) error {
+	expectedSnapshot, expectedSession := reviewIdentity(attempt, snapshotRoot)
 	if (snapshot != "" && snapshot != expectedSnapshot) || (session != "" && session != expectedSession) {
 		return errors.New("persisted reviewer cleanup identity mismatch")
 	}
@@ -1226,11 +1257,11 @@ type independentReviewResult struct {
 	Session  string   `json:"-"`
 }
 
-func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head string) (independentReviewResult, bool, error) {
+func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot string) (independentReviewResult, bool, error) {
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
 	}
-	snapshot, session := reviewIdentity(attempt)
+	snapshot, session := reviewIdentity(attempt, snapshotRoot)
 	if manifest.ReviewState == "running" && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
 		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_dead} #{pane_dead_status}"}, Dir: snapshot, Env: env})
 		if err == nil {
@@ -1265,11 +1296,11 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 					if err != nil {
 						return independentReviewResult{}, false, err
 					}
-					if _, err := cleanupReviewOutcome(ctx, runtimeState, attempt, boundary, env, persisted); err != nil {
+					if _, err := cleanupReviewOutcome(ctx, runtimeState, attempt, boundary, env, persisted, snapshotRoot); err != nil {
 						return parsed, true, nil
 					}
 				} else {
-					if err := cleanupReviewResources(ctx, boundary, env, attempt, snapshot, session); err != nil {
+					if err := cleanupReviewResources(ctx, boundary, env, attempt, snapshot, session, snapshotRoot); err != nil {
 						return parsed, true, nil
 					}
 				}
@@ -1282,7 +1313,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 			return independentReviewResult{}, false, err
 		}
 	}
-	if err := cleanupReviewResources(ctx, boundary, env, attempt, snapshot, session); err != nil {
+	if err := cleanupReviewResources(ctx, boundary, env, attempt, snapshot, session, snapshotRoot); err != nil {
 		return independentReviewResult{}, true, nil
 	}
 	if out, err := exec.CommandContext(ctx, "git", "clone", "--no-local", "--no-checkout", source, snapshot).CombinedOutput(); err != nil {
@@ -1301,7 +1332,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "update-ref", "-d", "refs/agent-symphony/attested-review").Run()
 	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "config", "--local", "credential.helper", "").Run()
 	reviewGID := -1
-	if reviewSnapshotRoot == "" {
+	if reviewSnapshotRoot == "" && hostIsolationInstalled() {
 		group, err := user.LookupGroup(snapshotGroup)
 		if err != nil {
 			return independentReviewResult{}, false, err
@@ -1665,6 +1696,28 @@ func recoveryStatuses(attemptsPath, stateRoot string) ([]orchestrator.RecoverySt
 	return orchestrator.Recover(facts, manifests), nil
 }
 
+// defaultStateRoot mirrors the state-root resolution documented in
+// docs/architecture.md for callers, such as doctor, that treat --runtime-state
+// as optional. serve/status/list/inspect/reconcile still require an explicit
+// --runtime-state and never fall back here.
+func defaultStateRoot() string {
+	if runtime.GOOS == "darwin" {
+		current, err := user.Current()
+		if err != nil {
+			return ""
+		}
+		return filepath.Join(current.HomeDir, "Library", "Application Support", "agent-symphony")
+	}
+	if value := os.Getenv("XDG_STATE_HOME"); value != "" {
+		return filepath.Join(value, "agent-symphony")
+	}
+	current, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(current.HomeDir, ".local", "state", "agent-symphony")
+}
+
 func doctor(c config.Config, offline bool, stateRoot string) []diagnostic {
 	var result []diagnostic
 	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
@@ -1672,16 +1725,11 @@ func doctor(c config.Config, offline bool, stateRoot string) []diagnostic {
 	} else {
 		result = append(result, diagnostic{"platform", "fail", runtime.GOOS + " is unsupported", "Use macOS, Linux, or WSL2."})
 	}
+	if stateRoot == "" {
+		stateRoot = defaultStateRoot()
+	}
 	if runningOnWSL() {
 		root, rootErr := config.GitRoot()
-		if stateRoot == "" {
-			stateRoot = os.Getenv("XDG_STATE_HOME")
-			if stateRoot == "" {
-				if current, err := user.Current(); err == nil {
-					stateRoot = filepath.Join(current.HomeDir, ".local", "state", "agent-symphony")
-				}
-			}
-		}
 		filesystem, _ := mountedFilesystem(root, "/proc/mounts")
 		validationErr := validateWSLFilesystem(root, filepath.Join(root, c.WorktreeRoot), stateRoot, "/proc/mounts")
 		if rootErr != nil || validationErr != nil {
@@ -1721,7 +1769,7 @@ func doctor(c config.Config, offline bool, stateRoot string) []diagnostic {
 	} else {
 		result = append(result, githubDiagnostics(c.Repository)...)
 	}
-	result = append(result, hostDiagnostic())
+	result = append(result, hostDiagnostic(stateRoot))
 	result = append(result, diagnostic{"GitHub policy", "warn", "App webhook events, required policy check, and merge permissions are not configured by issue #6", "Complete GitHub App setup in the downstream integration issue before serving work."})
 	return result
 }

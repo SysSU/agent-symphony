@@ -476,3 +476,136 @@ func TestBinarySubstitutionRollbackRemovesNewAuthority(t *testing.T) {
 		t.Fatalf("new sudo authority survived rollback: %v", err)
 	}
 }
+
+// fakeNoHostIsolation simulates a host where install-host has never been run,
+// which is the sole signal that selects the zero-admin default (local) boundary.
+func fakeNoHostIsolation(t *testing.T) {
+	t.Helper()
+	old := hostLookupUser
+	hostLookupUser = func(name string) (*user.User, error) {
+		if name == workerUser || name == reviewerUser {
+			return nil, errors.New("user: unknown user " + name)
+		}
+		return old(name)
+	}
+	t.Cleanup(func() { hostLookupUser = old })
+}
+
+func TestHostIsolationInstalledReflectsWorkerIdentityLookup(t *testing.T) {
+	fakeNoHostIsolation(t)
+	if hostIsolationInstalled() {
+		t.Fatal("expected host isolation to be reported as not installed")
+	}
+}
+
+func TestBoundarySelectionUsesLocalModeWhenHostIsolationIsNotInstalled(t *testing.T) {
+	fakeNoHostIsolation(t)
+	stateRoot := t.TempDir()
+	implementation := implementationBoundary(stateRoot)
+	if implementation.Command == "sudo" {
+		t.Fatalf("expected local boundary, got sudo: %#v", implementation)
+	}
+	if len(implementation.Args) != 2 || implementation.Args[0] != "agent-host" || implementation.Args[1] != "implementation" {
+		t.Fatalf("unexpected local implementation args: %#v", implementation.Args)
+	}
+	if want := "AGENT_SYMPHONY_LOCAL_ROOT=" + localAttemptRoot(stateRoot); !slices.Contains(implementation.Env, want) {
+		t.Fatalf("expected local root env %q, got %#v", want, implementation.Env)
+	}
+	review := reviewBoundary(stateRoot)
+	if review.Command == "sudo" {
+		t.Fatalf("expected local review boundary, got sudo: %#v", review)
+	}
+	if want := "AGENT_SYMPHONY_LOCAL_ROOT=" + localSnapshotRoot(stateRoot); !slices.Contains(review.Env, want) {
+		t.Fatalf("expected local snapshot root env %q, got %#v", want, review.Env)
+	}
+}
+
+func TestAgentHostLocalModeSkipsIdentityCheckAndUsesLocalRoot(t *testing.T) {
+	oldExec := hostExecRunner
+	t.Cleanup(func() { hostExecRunner = oldExec })
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		return agentruntime.Result{Output: strings.Join(command.Env, "|")}, nil
+	}
+	root := t.TempDir()
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
+	payload, _ := json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"run", boundaryCommand{Name: "git", Args: []string{"-C", root, "rev-parse", "HEAD"}, Dir: root, Env: []string{"MODEL_API_KEY=model-canary", "PATH=/bin"}}})
+	var out bytes.Buffer
+	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &out); err != nil {
+		t.Fatal(err)
+	}
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result agentruntime.Result
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil || !strings.Contains(result.Output, "MODEL_API_KEY=model-canary") || !strings.Contains(result.Output, "HOME="+current.HomeDir) || strings.Contains(result.Output, "GITHUB_TOKEN") {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}
+
+func TestAgentHostLocalModeVerifyProvisionsPrivateRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "attempts")
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
+	payload, _ := json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"verify", boundaryCommand{}})
+	var out bytes.Buffer
+	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &out); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("local root not provisioned: %v %#v", err, info)
+	}
+}
+
+func TestHostDiagnosticFallsBackToLocalModeWhenNotInstalled(t *testing.T) {
+	fakeNoHostIsolation(t)
+	stateRoot := t.TempDir()
+	d := hostDiagnostic(stateRoot)
+	if d.Status != "pass" || !strings.Contains(d.Message, "zero-admin") {
+		t.Fatalf("diagnostic=%#v", d)
+	}
+	for _, root := range []string{localAttemptRoot(stateRoot), localSnapshotRoot(stateRoot)} {
+		info, err := os.Stat(root)
+		if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+			t.Fatalf("local root %s not provisioned: %v", root, err)
+		}
+	}
+}
+
+func TestLocalHostDiagnosticRequiresRuntimeStateRoot(t *testing.T) {
+	fakeNoHostIsolation(t)
+	if d := hostDiagnostic(""); d.Status != "fail" {
+		t.Fatalf("expected fail without a runtime state root, got %#v", d)
+	}
+}
+
+func TestEnsureLocalRootRejectsGroupOrWorldAccessibleDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "attempts")
+	if err := os.Mkdir(path, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureLocalRoot(path); err == nil {
+		t.Fatal("expected rejection of group-accessible local root")
+	}
+}
+
+func TestEnsureLocalRootRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureLocalRoot(link); err == nil {
+		t.Fatal("expected rejection of symlinked local root")
+	}
+}

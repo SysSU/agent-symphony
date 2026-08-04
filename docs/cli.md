@@ -68,9 +68,9 @@ Commands are argument arrays, not shell strings. Runtime code therefore executes
 
 ## Attempt runtime troubleshooting
 
-Production attempts use deterministic branch, directory, and tmux names beneath the provisioned `/var/lib/agent-symphony/attempts` (Linux/WSL2) or `/var/db/agent-symphony/attempts` (macOS) root. `worktree_root` remains an offline/local configuration field and does not move production work outside that boundary. A manifest and retained agent output live below the coordinator state root; the manifest is diagnostic metadata, not workflow truth.
+Production attempts use deterministic branch, directory, and tmux names beneath a provisioned attempts root. By default that is a private (mode `0700`) `attempts` directory under the runtime state root (`--runtime-state`); under the optional advanced host-isolated mode (see [Setup](setup.md)) it is instead the provisioned `/var/lib/agent-symphony/attempts` (Linux/WSL2) or `/var/db/agent-symphony/attempts` (macOS) root. `worktree_root` remains an offline/local configuration field and does not move production work outside that boundary. A manifest and retained agent output live below the coordinator state root; the manifest is diagnostic metadata, not workflow truth.
 
-The runtime requires the provisioned worker-identity verification hook and fails closed before creating resources when it is absent or fails. Environment inheritance happens only after verification through the shared agent environment filter. `HOME` is forbidden in configured allowlists; the privileged boundary supplies the verified target account's home after the identity switch.
+The runtime requires the boundary's verification hook and fails closed before creating resources when it is absent or fails, in either mode. Environment inheritance happens only after verification through the shared agent environment filter. `HOME` is forbidden in configured allowlists; the boundary supplies the resolved account's home afterward — the coordinator's own home by default, or the provisioned worker/reviewer's home under advanced host isolation.
 
 - If launch fails, inspect the manifest `diagnostic` and `agent.log`. Failed resources are retained intentionally.
 - If an attempt appears active after restart, compare its manifest, worktree HEAD, and `tmux has-session -t <session>` before resuming. Never attach to a session or directory whose deterministic identity does not match.
@@ -84,11 +84,11 @@ Secrets—including GitHub tokens, App keys, webhook secrets, passwords, and cre
 
 An unauthenticated probe can prove public GitHub connectivity but not write authority. An authenticated probe reports the repository access returned by GitHub, but cannot prove GitHub App-specific issue, pull-request, checks, webhook, repository-rules, or installation permissions. `doctor` reports those as actionable warnings.
 
-On WSL, diagnostics resolve the Git root, choose the longest containing entry from `/proc/mounts`, and reject `drvfs` or `9p` mounts. Host installation remains an administrator prerequisite; `serve` fails closed when its worker/runtime boundary cannot be verified.
+On WSL, diagnostics resolve the Git root, choose the longest containing entry from `/proc/mounts`, and reject `drvfs` or `9p` mounts. `serve` fails closed when its runtime boundary cannot be verified, whether that boundary is the zero-admin default or an administrator-provisioned advanced host-isolated install.
 
 ## Release commands
 
 `scripts/release.sh VERSION [OUTPUT_DIR]` creates reproducible no-CGO archives and `SHA256SUMS` without overwriting existing output. `scripts/validate-release.sh [VERSION]` runs the complete local release gate. These repository scripts are maintainer commands, not installed CLI subcommands.
-# Host isolation
+# Host isolation (advanced, optional)
 
-`agent-symphony install-host --coordinator USER` provisions the documented macOS or Linux/WSL2 host boundary and must run as root from the installed versioned binary. `agent-symphony agent-host implementation|review` is the sudo-only bounded JSON adapter and is not an interactive operator command. Unsupported native Windows and WSL repositories under `/mnt/*` fail closed.
+By default no host isolation is installed: `agent-symphony agent-host implementation|review` runs as a plain, same-user subprocess of the coordinator, with no `sudo` and no separate OS identity — see [Setup](setup.md) and [Security](security.md). `agent-symphony install-host --coordinator USER` opts into the stronger advanced boundary; it provisions the documented macOS or Linux/WSL2 host boundary and must run as root from the installed versioned binary. Once installed, `agent-host` becomes the sudo-only bounded JSON adapter and is no longer an interactive operator command in either mode. Unsupported native Windows and WSL repositories under `/mnt/*` fail closed regardless of mode.
