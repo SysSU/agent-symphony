@@ -2,6 +2,38 @@
 
 Issue #5 adds the host-side GitHub boundary; it does not start workers, create pull requests, schedule work, or merge.
 
+For the step-by-step "create the App, install it, get credentials into the environment" walkthrough, see [Setup](setup.md#4-create-a-github-app). This document covers the exact permission/event list that walkthrough points to, plus the governance and credential-handling rules behind it.
+
+## Required permissions and events
+
+Create a single-repository installation (not "all repositories") with exactly:
+
+| Permission | Access |
+| --- | --- |
+| Metadata | Read |
+| Administration | Read |
+| Issues | Read & write |
+| Pull requests | Read & write |
+| Contents | Read & write |
+| Checks | Read & write |
+| Commit statuses | Read |
+| Members | Read — only if team-based authorization is configured |
+
+Subscribe to these webhook events:
+
+- Issues
+- Issue comment
+- Pull request
+- Pull request review
+- Pull request review comment
+- Check run / Check suite
+- Status
+- Push
+- Installation
+- Repository rule
+
+Configure the webhook endpoint with a strong random secret and JSON delivery. A webhook endpoint is only required to run `serve`; `reconcile` and `doctor` don't need one, so a placeholder URL/secret is fine while testing one-shot.
+
 ## Pull-request governance
 
 Agent-created pull requests link their issue and attempt and contain validation evidence, a documentation-impact assessment, and material implementation decisions. After validating a head, the coordinator posts the canonical `EvidenceBody` issue comment for validation or documentation. Reconciliation accepts a durable evidence fact only when the entire comment exactly equals that canonical body for the issue, attempt, kind, and current head, and every comment page confirms both the configured App actor and `performed_via_github_app`; local state is only a cache. The coordinator mirrors the authorized issue control snapshot's human-review policy onto the pull request and publishes the required `agent-symphony/policy` check for each head SHA. A force-push makes prior validation and documentation evidence stale.
@@ -10,9 +42,7 @@ Open agent pull requests must be reconciled for their entire lifetime. Only fres
 
 Autonomous merge uses the freshly observed head SHA and is attempted only after issue eligibility, feedback, reviews, required checks, branch currency and protection, App permission, path scope, and the policy check all permit it. A recovered dispatched merge is resolved only by `GET /repos/{owner}/{repo}/pulls/{pull_number}/merge`: 204 suppresses retry as merged, 404 records a definitive unmerged result that permits a later freshly gated attempt, and every other result remains suppressive. The coordinator never retries an ambiguous merge, bypasses protection, force-pushes, dismisses reviews, or uses admin merge.
 
-Create a single-repository GitHub App installation with metadata read, administration read, issues read/write, pull requests read/write, contents read/write, checks read/write, commit statuses read, and members read only when team authorization is enabled. Subscribe to issue, issue-comment, pull-request, pull-request-review/comment, check/status, push, installation, and repository-rule changes. Configure the webhook endpoint with a strong random secret and JSON delivery.
-
-Supply the App ID, installation ID, PEM private key, and webhook secret from coordinator-owned environment/secret storage. Never put them in `.agent-symphony.yaml`, Git, command arguments, worker environments, tmux, or logs. The host exchanges a short-lived App JWT for an installation token cached in coordinator memory until shortly before expiry. Agent environments start from a small safe allowlist; separately configured model credential variable names must be added explicitly, while unrelated inherited variables are excluded.
+Supply the App ID, installation ID, PEM private key, and webhook secret from coordinator-owned environment/secret storage. Never put them in `.agent-symphony.yaml`, Git, command arguments, worker environments, tmux, or logs. `internal/github` provides the App-JWT-to-installation-token exchange (`AppJWT`, `InstallationTokens`) as a library capability, but the shipped CLI commands (`serve`, `reconcile`, `status`, `pr-governance`, ...) consume an already-minted installation token directly through `GITHUB_TOKEN` — they do not perform that exchange themselves. See [Setup](setup.md#6-get-credentials-into-the-environment) for how to mint one. Agent environments start from a small safe allowlist; separately configured model credential variable names must be added explicitly, while unrelated inherited variables are excluded.
 
 Webhook requests are body-bounded, HMAC-SHA256 verified over exact bytes, and repository/installation bound. Accepted events are only reconciliation hints; a bounded delivery cache reduces duplicate reads, while authoritative periodic reads recover redelivery, reordering, eviction, and crash-after-acknowledgement. A full queue returns `503` so GitHub can retry.
 
