@@ -312,45 +312,25 @@ func TestQueuedReviewHandoffTransitionsAreDurableAndImmutable(t *testing.T) {
 }
 
 func TestStopInterruptsPaneZeroWhenAnotherPaneIsActive(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux is unavailable")
-	}
-	tmuxTmp := t.TempDir()
-	if err := os.Chmod(tmuxTmp, 0o700); err != nil {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TMUX_TMPDIR", tmuxTmp)
-	session := "stop-pane-zero"
-	testDir := t.TempDir()
-	ready, interrupted := filepath.Join(testDir, "ready"), filepath.Join(testDir, "interrupted")
-	if out, err := exec.Command("tmux", "new-session", "-d", "-s", session, "sh", "-c", `trap 'touch "$2"; exit' INT; touch "$1"; while :; do sleep 1; done`, "sh", ready, interrupted).CombinedOutput(); err != nil {
-		t.Fatalf("new tmux session: %v: %s", err, out)
-	}
-	t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+session).Run() })
-	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		if _, err := os.Stat(ready); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("pane 0.0 did not become ready")
-		}
-	}
-	if out, err := exec.Command("tmux", "set-option", "-w", "-t", PaneTarget(session), "remain-on-exit", "on").CombinedOutput(); err != nil {
-		t.Fatalf("set remain-on-exit: %v: %s", err, out)
-	}
-	if out, err := exec.Command("tmux", "split-window", "-d", "-t", PaneTarget(session), "sleep", "30").CombinedOutput(); err != nil {
-		t.Fatalf("split tmux window: %v: %s", err, out)
-	}
-	if out, err := exec.Command("tmux", "select-pane", "-t", "="+session+":0.1").CombinedOutput(); err != nil {
-		t.Fatalf("select second pane: %v: %s", err, out)
-	}
-
-	r := &Runtime{Tmux: "tmux", Runner: ExecRunner{}, StopWait: 2 * time.Second}
-	if err := r.stop(t.Context(), session); err != nil {
+	if err := r.stop(t.Context(), manifest.Session); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(interrupted); err != nil {
-		t.Fatalf("pane 0.0 did not receive C-c: %v", err)
+	interrupted := false
+	for _, command := range fake.seen {
+		if len(command.Args) > 0 && command.Args[0] == "send-keys" {
+			interrupted = true
+			if valueAfter(command.Args, "-t") != PaneTarget(manifest.Session) {
+				t.Fatalf("interrupt targeted %q, want %q", valueAfter(command.Args, "-t"), PaneTarget(manifest.Session))
+			}
+		}
+	}
+	if !interrupted {
+		t.Fatal("pane 0.0 did not receive C-c")
 	}
 }
 
