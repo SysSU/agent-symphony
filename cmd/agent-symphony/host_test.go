@@ -1,0 +1,463 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
+)
+
+func fakeHostIdentity(t *testing.T, uid, gid int) {
+	t.Helper()
+	oldEUID, oldEGID, oldUser, oldGroup, oldOutput := hostEUID, hostEGID, hostLookupUser, hostLookupGroup, hostOutput
+	hostEUID, hostEGID = func() int { return uid }, func() int { return gid }
+	hostLookupUser = func(name string) (*user.User, error) {
+		return &user.User{Username: name, Uid: "1234", Gid: "5678", HomeDir: "/var/lib/" + name}, nil
+	}
+	hostLookupGroup = func(name string) (*user.Group, error) { return &user.Group{Name: name, Gid: "5678"}, nil }
+	hostOutput = func(name string, args ...string) ([]byte, error) {
+		if name == "getent" {
+			if args[0] == "group" {
+				return []byte(args[len(args)-1] + ":x:5678:\n"), nil
+			}
+			account := args[len(args)-1]
+			return []byte(account + ":x:1234:5678::/var/lib/" + account + ":/usr/sbin/nologin\n"), nil
+		}
+		return []byte("5678\n"), nil
+	}
+	t.Cleanup(func() {
+		hostEUID, hostEGID, hostLookupUser, hostLookupGroup, hostOutput = oldEUID, oldEGID, oldUser, oldGroup, oldOutput
+	})
+}
+
+func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
+	fakeHostIdentity(t, 1234, 5678)
+	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner
+	hostGOOS = "linux"
+	hostRoot = t.TempDir()
+	t.Cleanup(func() { hostGOOS, hostRoot, hostExecRunner = oldGOOS, oldRoot, oldExec })
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		return agentruntime.Result{Output: strings.Join(command.Env, "|")}, nil
+	}
+	for mode, spec := range map[string]struct{ root, home string }{
+		"implementation": {"/var/lib/agent-symphony/attempts", "/var/lib/agent-symphony-worker"},
+		"review":         {"/var/lib/agent-symphony/snapshots", "/var/lib/agent-symphony-reviewer"},
+	} {
+		t.Run(mode, func(t *testing.T) {
+			dir := filepath.Join(nativeRoot(spec.root), "fake-test")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Skipf("cannot create fake boundary root: %v", err)
+			}
+			payload, _ := json.Marshal(struct {
+				Operation string          `json:"operation"`
+				Command   boundaryCommand `json:"command"`
+			}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=model-canary", "PATH=/bin"}}})
+			var out bytes.Buffer
+			if err := agentHost(t.Context(), mode, bytes.NewReader(payload), &out); err != nil {
+				t.Fatal(err)
+			}
+			var result agentruntime.Result
+			if err := json.Unmarshal(out.Bytes(), &result); err != nil || !strings.Contains(result.Output, "MODEL_API_KEY=model-canary") || !strings.Contains(result.Output, "HOME="+spec.home) || strings.Contains(result.Output, os.Getenv("HOME")) || strings.Contains(result.Output, "GITHUB_TOKEN") {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	t.Setenv("TMUX_TMPDIR", t.TempDir())
+
+	t.Run("findings persist without a separate signal", func(t *testing.T) {
+		oldExec := hostExecRunner
+		calls := 0
+		recipient := ""
+		hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+			calls++
+			if slices.Contains(command.Args, "show-options") {
+				return agentruntime.Result{Output: recipient}, nil
+			}
+			if slices.Contains(command.Args, "set-option") {
+				recipient = command.Args[len(command.Args)-1]
+			}
+			return agentruntime.Result{}, nil
+		}
+		t.Cleanup(func() { hostExecRunner = oldExec })
+		worktree := t.TempDir()
+		handoff := []byte(`{"type":"agent-symphony-handoff-v1","key":"pane-test"}`)
+		request, _ := json.Marshal(struct {
+			Manifest     agentruntime.Manifest `json:"manifest"`
+			Handoff      json.RawMessage       `json:"handoff"`
+			OutcomePath  string                `json:"outcome_path"`
+			OutcomeToken string                `json:"outcome_token"`
+			Command      []string              `json:"command"`
+		}{agentruntime.Manifest{Worktree: worktree, Session: "as-23-1", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, filepath.Join(worktree, "attempt.log.review-outcome"), "token", []string{"implementation"}})
+		if _, err := acceptHandoff(t.Context(), request, worktree); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := acceptHandoff(t.Context(), request, worktree); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 3 {
+			t.Fatalf("worker made %d tmux calls, want one lookup plus one two-step delivery", calls)
+		}
+		if _, err := os.ReadFile(filepath.Join(worktree, ".agent-symphony", "handoffs", "pane-test.json")); err != nil {
+			t.Fatalf("durable handoff: %v", err)
+		}
+	})
+
+	t.Run("export", func(t *testing.T) {
+		repo := t.TempDir()
+		for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"commit", "--allow-empty", "-m", "base"}} {
+			if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v: %s", args, err, out)
+			}
+		}
+		branch := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", repo, "branch", "--show-current"))))
+		session := "as-export-pane-test"
+		good := `{"type":"agent-symphony-result-v1","validation":"pane-zero","documentation":"done"}`
+		bad := `{"type":"agent-symphony-result-v1","validation":"wrong-window","documentation":"wrong"}`
+		tmux(t, "new-session", "-d", "-x", "200", "-s", session, "-c", repo, "sh", "-c", "printf '%s\\n' '"+good+"'; sleep 30")
+		t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+session).Run() })
+		tmux(t, "new-window", "-d", "-t", "="+session, "sh", "-c", "printf '%s\\n' '"+bad+"'; sleep 30")
+		tmux(t, "select-window", "-t", "="+session+":1")
+		manifest, _ := json.Marshal(agentruntime.Manifest{Repository: "o/r", Branch: branch, BaseSHA: "base", Worktree: repo, Session: session})
+		output, err := exportAttempt(t.Context(), manifest, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var exported workerExport
+		if err := json.Unmarshal([]byte(output), &exported); err != nil || exported.Result.Validation != "pane-zero" {
+			t.Fatalf("export=%#v err=%v", exported, err)
+		}
+	})
+}
+
+func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
+	for _, failure := range []string{"load-buffer", "submission", "receipt"} {
+		t.Run(failure, func(t *testing.T) {
+			oldExec, oldDirSync := hostExecRunner, immutableDirSync
+			t.Cleanup(func() { hostExecRunner, immutableDirSync = oldExec, oldDirSync })
+			worktree := t.TempDir()
+			handoff := []byte(`{"type":"agent-symphony-handoff-v1","key":"retry-key"}`)
+			request, _ := json.Marshal(struct {
+				Manifest     agentruntime.Manifest `json:"manifest"`
+				Handoff      json.RawMessage       `json:"handoff"`
+				OutcomePath  string                `json:"outcome_path"`
+				OutcomeToken string                `json:"outcome_token"`
+				Command      []string              `json:"command"`
+			}{agentruntime.Manifest{Worktree: worktree, Session: "as-retry", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, filepath.Join(worktree, "attempt.log.review-outcome"), "token", []string{"implementation"}})
+			recipient, deliveries, injected := "", 0, false
+			hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+				if slices.Contains(command.Args, "show-options") {
+					return agentruntime.Result{Output: recipient}, nil
+				}
+				if !injected && failure == "load-buffer" && slices.Contains(command.Args, "load-buffer") {
+					injected = true
+					return agentruntime.Result{}, errors.New("injected load failure")
+				}
+				if slices.Contains(command.Args, "set-option") {
+					if !injected && failure == "submission" {
+						injected = true
+						return agentruntime.Result{}, errors.New("injected submission failure")
+					}
+					recipient, deliveries = command.Args[len(command.Args)-1], deliveries+1
+				}
+				return agentruntime.Result{}, nil
+			}
+			immutableDirSync = func(dir string) error {
+				if !injected && failure == "receipt" && dir == worktree && recipient != "" {
+					injected = true
+					return errors.New("injected receipt sync failure")
+				}
+				return oldDirSync(dir)
+			}
+			if _, err := acceptHandoff(t.Context(), request, worktree); err == nil {
+				t.Fatal("injected failure succeeded")
+			}
+			if _, err := os.Stat(filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.json")); err != nil {
+				t.Fatalf("pending state lost: %v", err)
+			}
+			if _, err := acceptHandoff(t.Context(), request, worktree); err != nil {
+				t.Fatalf("restart retry: %v", err)
+			}
+			if deliveries != 1 {
+				t.Fatalf("deliveries=%d, want 1", deliveries)
+			}
+		})
+	}
+}
+
+func tmux(t *testing.T, args ...string) {
+	t.Helper()
+	if out, err := exec.Command("tmux", args...).CombinedOutput(); err != nil {
+		t.Fatalf("tmux %v: %v: %s", args, err, out)
+	}
+}
+
+func TestProductionSeedClonesThroughAgentHostBoundary(t *testing.T) {
+	fakeHostIdentity(t, 1234, 5678)
+	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner
+	hostGOOS, hostRoot, hostExecRunner = "linux", t.TempDir(), (agentruntime.ExecRunner{}).Run
+	t.Cleanup(func() { hostGOOS, hostRoot, hostExecRunner = oldGOOS, oldRoot, oldExec })
+	source := t.TempDir()
+	for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"commit", "--allow-empty", "-m", "base"}} {
+		if out, err := exec.Command("git", append([]string{"-C", source}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	root := nativeRoot("/var/lib/agent-symphony/attempts")
+	bundle, err := seedAttemptSource(t.Context(), source, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(bundle)
+	if err != nil || info.Mode().Perm() != 0o640 {
+		t.Fatalf("seed info=%v err=%v", info, err)
+	}
+	destination := filepath.Join(root, "production-attempt")
+	payload, _ := json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"run", boundaryCommand{Name: "git", Args: []string{"clone", "--no-local", "--no-checkout", bundle, destination}, Dir: root, Env: DefaultEnvironmentForTest()}})
+	var out bytes.Buffer
+	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &out); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, ".git")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func DefaultEnvironmentForTest() []string { return []string{"PATH=" + os.Getenv("PATH"), "LANG=C"} }
+
+func TestAgentHostRejectsWrongIdentityCredentialAndEscapingCommand(t *testing.T) {
+	fakeHostIdentity(t, 1, 2)
+	if err := agentHost(t.Context(), "implementation", strings.NewReader(`{"operation":"verify","command":{}}`), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "must run as") {
+		t.Fatalf("err=%v", err)
+	}
+	fakeHostIdentity(t, 1234, 5678)
+	for _, command := range []boundaryCommand{
+		{Name: "sh"},
+		{Name: filepath.Join(t.TempDir(), "git")},
+		{Name: "git", Dir: "/tmp"},
+		{Name: "git", Args: []string{"-C", "/tmp"}},
+		{Name: "git", Args: []string{"-C", "../../outside", "rev-parse", "HEAD"}, Dir: filepath.Join(nativeRoot("/var/lib/agent-symphony/attempts"), "inside")},
+		{Name: "git", Args: []string{"clone", "--no-local", "--no-checkout", "../../outside", "clone"}, Dir: filepath.Join(nativeRoot("/var/lib/agent-symphony/attempts"), "inside")},
+		{Name: "tmux", Args: []string{"-S", "../../outside/socket", "has-session", "-t", "=x"}, Dir: filepath.Join(nativeRoot("/var/lib/agent-symphony/attempts"), "inside")},
+		{Name: "tmux", Args: []string{"-f", "../../outside.conf", "new-session", "-d", "-s", "x", "-c", "."}, Dir: filepath.Join(nativeRoot("/var/lib/agent-symphony/attempts"), "inside")},
+		{Name: "git", Env: []string{"GITHUB_TOKEN=secret-canary"}},
+		{Name: "git", Env: []string{"HTTPS_PROXY=https://secret-canary@example.invalid"}},
+		{Name: "git", Env: []string{"HOME=/coordinator-home"}},
+	} {
+		payload, _ := json.Marshal(struct {
+			Operation string          `json:"operation"`
+			Command   boundaryCommand `json:"command"`
+		}{"run", command})
+		if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{}); err == nil {
+			t.Fatalf("accepted %#v", command)
+		}
+	}
+}
+
+func TestBoundaryRejectsSymlinkEscapeForMissingTarget(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if belowRoot(filepath.Join(root, "link", "missing"), root) {
+		t.Fatal("accepted path through symlinked ancestor")
+	}
+}
+
+func TestAgentHostRejectsEveryCLIFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"agent-host", "implementation", "--offline"}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "usage:") {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestProvisionIdentitiesReusesNativeCommandsAndRejectsConflict(t *testing.T) {
+	oldGOOS, oldRun, oldUser, oldGroup, oldOutput := hostGOOS, hostRun, hostLookupUser, hostLookupGroup, hostOutput
+	t.Cleanup(func() {
+		hostGOOS, hostRun, hostLookupUser, hostLookupGroup, hostOutput = oldGOOS, oldRun, oldUser, oldGroup, oldOutput
+	})
+	hostGOOS = "linux"
+	hostLookupUser = func(name string) (*user.User, error) {
+		return &user.User{Username: name, Uid: "100", Gid: "200", HomeDir: "/var/lib/" + name}, nil
+	}
+	hostLookupGroup = func(name string) (*user.Group, error) { return &user.Group{Name: name, Gid: "200"}, nil }
+	hostOutput = func(name string, args ...string) ([]byte, error) {
+		if name == "getent" {
+			if args[0] == "group" {
+				return []byte(args[len(args)-1] + ":x:200:\n"), nil
+			}
+			account := args[len(args)-1]
+			return []byte(account + ":x:100:200::/var/lib/" + account + ":/usr/sbin/nologin\n"), nil
+		}
+		return []byte("200\n"), nil
+	}
+	var calls []string
+	hostRun = func(name string, args ...string) error {
+		calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+		return nil
+	}
+	if err := provisionIdentities("coordinator"); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || calls[0] != "usermod --append --groups agent-symphony-attempt,agent-symphony-snapshot coordinator" {
+		t.Fatalf("calls=%v", calls)
+	}
+	hostLookupGroup = func(name string) (*user.Group, error) { return &user.Group{Name: name, Gid: "999"}, nil }
+	if err := provisionIdentities("coordinator"); err == nil || !strings.Contains(err.Error(), "conflicting") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestProvisionedIdentitiesRejectUIDAndGIDCollisions(t *testing.T) {
+	oldUser, oldGroup := hostLookupUser, hostLookupGroup
+	t.Cleanup(func() { hostLookupUser, hostLookupGroup = oldUser, oldGroup })
+
+	for _, test := range []struct {
+		name     string
+		userIDs  map[string]string
+		groupIDs map[string]string
+	}{
+		{"worker reviewer UID", map[string]string{"coordinator": "1000", workerUser: "1001", reviewerUser: "1001"}, map[string]string{attemptGroup: "2001", snapshotGroup: "2002"}},
+		{"attempt snapshot GID", map[string]string{"coordinator": "1000", workerUser: "1001", reviewerUser: "1002"}, map[string]string{attemptGroup: "2001", snapshotGroup: "2001"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hostLookupUser = func(name string) (*user.User, error) { return &user.User{Username: name, Uid: test.userIDs[name]}, nil }
+			hostLookupGroup = func(name string) (*user.Group, error) { return &user.Group{Name: name, Gid: test.groupIDs[name]}, nil }
+			if err := validateProvisionedIdentitySeparation("coordinator"); err == nil || !strings.Contains(err.Error(), "share") {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+func TestHostRootCreationRetriesAfterEveryMutationBoundary(t *testing.T) {
+	for _, failAt := range []int{1, 2, 3} {
+		t.Run(strconv.Itoa(failAt), func(t *testing.T) {
+			oldRun, oldUser, oldGroup := hostRun, hostLookupUser, hostLookupGroup
+			t.Cleanup(func() { hostRun, hostLookupUser, hostLookupGroup = oldRun, oldUser, oldGroup })
+			uid, gid := strconv.Itoa(os.Getuid()), strconv.Itoa(os.Getgid())
+			hostLookupUser = func(string) (*user.User, error) { return &user.User{Uid: uid}, nil }
+			hostLookupGroup = func(string) (*user.Group, error) { return &user.Group{Gid: gid}, nil }
+			calls := 0
+			hostRun = func(name string, args ...string) error {
+				calls++
+				if calls == failAt {
+					return os.ErrPermission
+				}
+				if name == "chmod" {
+					mode, _ := strconv.ParseUint(args[0], 8, 32)
+					return os.Chmod(args[1], os.FileMode(mode))
+				}
+				return nil
+			}
+			path := filepath.Join(t.TempDir(), "attempts")
+			if err := ensureHostRoot(path, "worker", "attempt", "2770"); err == nil {
+				t.Fatal("injected failure passed")
+			}
+			hostRun = func(name string, args ...string) error {
+				if name == "chmod" {
+					mode, _ := strconv.ParseUint(args[0], 8, 32)
+					return os.Chmod(args[1], os.FileMode(mode))
+				}
+				return nil
+			}
+			if err := ensureHostRoot(path, "worker", "attempt", "2770"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDarwinIdentityRecordRetriesAfterEveryDSCLMutation(t *testing.T) {
+	properties := [][2]string{{"UniqueID", "401"}, {"PrimaryGroupID", "402"}, {"NFSHomeDirectory", "/var/db/test"}, {"UserShell", "/usr/bin/false"}, {"IsHidden", "1"}}
+	for failAt := 1; failAt <= len(properties)+2; failAt++ {
+		t.Run(strconv.Itoa(failAt), func(t *testing.T) {
+			oldRun := hostRun
+			t.Cleanup(func() { hostRun = oldRun })
+			calls := 0
+			hostRun = func(string, ...string) error {
+				calls++
+				if calls == failAt {
+					return os.ErrPermission
+				}
+				return nil
+			}
+			if err := ensureDarwinRecord("/Users/test", properties); err == nil {
+				t.Fatal("injected failure passed")
+			}
+			hostRun = func(string, ...string) error { return nil }
+			if err := ensureDarwinRecord("/Users/test", properties); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	for failAt := 1; failAt <= 4; failAt++ {
+		t.Run("group-"+strconv.Itoa(failAt), func(t *testing.T) {
+			oldRun := hostRun
+			t.Cleanup(func() { hostRun = oldRun })
+			calls := 0
+			hostRun = func(string, ...string) error {
+				calls++
+				if calls == failAt {
+					return os.ErrPermission
+				}
+				return nil
+			}
+			if err := ensureDarwinRecord("/Groups/test", [][2]string{{"PrimaryGroupID", "402"}, {"Password", "*"}}); err == nil {
+				t.Fatal("injected failure passed")
+			}
+			hostRun = func(string, ...string) error { return nil }
+			if err := ensureDarwinRecord("/Groups/test", [][2]string{{"PrimaryGroupID", "402"}, {"Password", "*"}}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestBroadSudoAuthorityRejectsAnythingButManagedTuples(t *testing.T) {
+	binary := "/usr/local/libexec/agent-symphony/1/agent-symphony"
+	managed := []byte("    (agent-symphony-worker : agent-symphony-attempt) NOPASSWD: " + binary + " agent-host implementation\n    (agent-symphony-reviewer : agent-symphony-snapshot) NOPASSWD: " + binary + " agent-host review\n")
+	if !exactSudoAuthority(managed, binary) {
+		t.Fatal("managed tuple rejected")
+	}
+	for _, rule := range []string{
+		strings.Replace(string(managed), binary, "/old/agent-symphony", 1),
+		strings.Replace(string(managed), "agent-symphony-worker : agent-symphony-attempt", "root : agent-symphony-attempt", 1),
+		string(managed) + "(root) NOPASSWD: /usr/bin/id\n",
+	} {
+		if exactSudoAuthority([]byte(rule), binary) {
+			t.Fatalf("broad rule accepted: %s", rule)
+		}
+	}
+}
+
+func TestBinarySubstitutionRollbackRemovesNewAuthority(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-symphony")
+	if err := os.WriteFile(path, []byte("new privileged tuple"), 0o440); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollbackSudoers(path, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("new sudo authority survived rollback: %v", err)
+	}
+}

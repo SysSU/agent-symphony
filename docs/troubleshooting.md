@@ -6,3 +6,6 @@
 - feedback remains pending: verify immutable feedback ID, actor authorization, PR head, claim/outcome record, and the next reconciliation result.
 - merge remains gated: check current-head validation/docs evidence, actionable feedback, independent review, human-review-label removal by an authorized actor, required checks, approvals, branch currency, and protection.
 - checksum verification fails: discard the artifact and regenerate from a clean source commit with the same version and `SOURCE_DATE_EPOCH`.
+# Host isolation is missing or stale
+
+Install the current release at the documented root-owned mode-`0755` path and rerun `sudo <exact-binary> install-host --coordinator USER`. Do not broaden the managed sudo rule or add shell access. On WSL2, move the repository and all state out of `/mnt/*` before retrying. Conflicting pre-existing users, groups, ownership, or primary groups must be repaired explicitly; the installer will not weaken them.

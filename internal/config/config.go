@@ -73,7 +73,7 @@ func Default(repository string) Config {
 		DocsPaths:    []string{"README.md", "docs"},
 		Commands: Commands{
 			Implementation: []string{"codex", "exec"}, Reviewer: []string{"codex", "review"},
-			Environment: []string{"HOME", "LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"},
+			Environment: []string{"LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"},
 		},
 		Status: Status{Format: "human", Color: "auto"},
 	}

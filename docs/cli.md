@@ -55,7 +55,7 @@ Commands produce plain human-readable text by default and never depend on color.
   "commands": {
     "implementation": ["codex", "exec"],
     "reviewer": ["codex", "review"],
-    "environment_allowlist": ["HOME", "LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"]
+    "environment_allowlist": ["LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"]
   },
   "status": {
     "format": "human",
@@ -68,9 +68,9 @@ Commands are argument arrays, not shell strings. Runtime code therefore executes
 
 ## Attempt runtime troubleshooting
 
-Local attempts use deterministic branch, directory, and tmux names. A manifest and retained agent output live below the coordinator state root; the manifest is diagnostic metadata, not workflow truth.
+Production attempts use deterministic branch, directory, and tmux names beneath the provisioned `/var/lib/agent-symphony/attempts` (Linux/WSL2) or `/var/db/agent-symphony/attempts` (macOS) root. `worktree_root` remains an offline/local configuration field and does not move production work outside that boundary. A manifest and retained agent output live below the coordinator state root; the manifest is diagnostic metadata, not workflow truth.
 
-The runtime requires the provisioned worker-identity verification hook and fails closed before creating resources when it is absent or fails. Environment inheritance happens only after verification through the shared agent environment filter. In particular, inherited `HOME` must be the worker account's home after the identity switch, never the coordinator's home.
+The runtime requires the provisioned worker-identity verification hook and fails closed before creating resources when it is absent or fails. Environment inheritance happens only after verification through the shared agent environment filter. `HOME` is forbidden in configured allowlists; the privileged boundary supplies the verified target account's home after the identity switch.
 
 - If launch fails, inspect the manifest `diagnostic` and `agent.log`. Failed resources are retained intentionally.
 - If an attempt appears active after restart, compare its manifest, worktree HEAD, and `tmux has-session -t <session>` before resuming. Never attach to a session or directory whose deterministic identity does not match.
@@ -89,3 +89,6 @@ On WSL, diagnostics resolve the Git root, choose the longest containing entry fr
 ## Release commands
 
 `scripts/release.sh VERSION [OUTPUT_DIR]` creates reproducible no-CGO archives and `SHA256SUMS` without overwriting existing output. `scripts/validate-release.sh [VERSION]` runs the complete local release gate. These repository scripts are maintainer commands, not installed CLI subcommands.
+# Host isolation
+
+`agent-symphony install-host --coordinator USER` provisions the documented macOS or Linux/WSL2 host boundary and must run as root from the installed versioned binary. `agent-symphony agent-host implementation|review` is the sudo-only bounded JSON adapter and is not an interactive operator command. Unsupported native Windows and WSL repositories under `/mnt/*` fail closed.

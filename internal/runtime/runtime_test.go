@@ -70,6 +70,7 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 			return Result{}, errors.New("inexact tmux target")
 		}
 		session = strings.TrimPrefix(target, "=")
+		session = strings.TrimSuffix(session, ":0.0")
 	}
 	switch op {
 	case "has-session":
@@ -287,6 +288,72 @@ func TestConcurrentDisjointAttempts(t *testing.T) {
 	}
 }
 
+func TestQueuedReviewHandoffTransitionsAreDurableAndImmutable(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	if _, err := r.PrepareAndStart(t.Context(), attempt); err != nil {
+		t.Fatal(err)
+	}
+	findings := []string{"fix isolation"}
+	for _, transition := range []struct {
+		queued, acknowledged bool
+	}{{false, false}, {true, false}, {true, true}} {
+		if _, err := r.RecordReviewFindings(attempt, "abcdef1", findings, transition.queued, transition.acknowledged); err != nil {
+			t.Fatal(err)
+		}
+		restarted := &Runtime{StateRoot: r.StateRoot}
+		stored, err := readManifest(restarted.manifestPath(attempt))
+		if err != nil || stored.ReviewHandoffQueued != transition.queued || stored.ReviewHandoffAck != transition.acknowledged {
+			t.Fatalf("transition %#v was not durable: %#v err=%v", transition, stored, err)
+		}
+	}
+	if _, err := r.RecordReviewFindings(attempt, "abcdef1", []string{"different"}, true, true); err == nil {
+		t.Fatal("queued handoff was mutable")
+	}
+}
+
+func TestStopInterruptsPaneZeroWhenAnotherPaneIsActive(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	tmuxTmp := t.TempDir()
+	if err := os.Chmod(tmuxTmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMUX_TMPDIR", tmuxTmp)
+	session := "stop-pane-zero"
+	testDir := t.TempDir()
+	ready, interrupted := filepath.Join(testDir, "ready"), filepath.Join(testDir, "interrupted")
+	if out, err := exec.Command("tmux", "new-session", "-d", "-s", session, "sh", "-c", `trap 'touch "$2"; exit' INT; touch "$1"; while :; do sleep 1; done`, "sh", ready, interrupted).CombinedOutput(); err != nil {
+		t.Fatalf("new tmux session: %v: %s", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+session).Run() })
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pane 0.0 did not become ready")
+		}
+	}
+	if out, err := exec.Command("tmux", "set-option", "-w", "-t", PaneTarget(session), "remain-on-exit", "on").CombinedOutput(); err != nil {
+		t.Fatalf("set remain-on-exit: %v: %s", err, out)
+	}
+	if out, err := exec.Command("tmux", "split-window", "-d", "-t", PaneTarget(session), "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("split tmux window: %v: %s", err, out)
+	}
+	if out, err := exec.Command("tmux", "select-pane", "-t", "="+session+":0.1").CombinedOutput(); err != nil {
+		t.Fatalf("select second pane: %v: %s", err, out)
+	}
+
+	r := &Runtime{Tmux: "tmux", Runner: ExecRunner{}, StopWait: 2 * time.Second}
+	if err := r.stop(t.Context(), session); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(interrupted); err != nil {
+		t.Fatalf("pane 0.0 did not receive C-c: %v", err)
+	}
+}
+
 func TestWorkerIdentityFailsClosedBeforeMutation(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	r.VerifyWorker = nil
@@ -330,7 +397,7 @@ func TestExactTargetsExitCodesAndHistory(t *testing.T) {
 		if command.Name != "tmux" {
 			continue
 		}
-		if target := valueAfter(command.Args, "-t"); target != "" && target != "="+manifest.Session {
+		if target := valueAfter(command.Args, "-t"); target != "" && target != "="+manifest.Session && target != PaneTarget(manifest.Session) {
 			t.Fatalf("inexact target %q in %#v", target, command.Args)
 		}
 		if command.Args[0] == "set-option" && slices.Contains(command.Args, "history-limit") && slices.Contains(command.Args, historyLimit) {

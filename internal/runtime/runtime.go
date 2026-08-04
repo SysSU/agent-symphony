@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,8 +92,49 @@ type Manifest struct {
 	Diagnostic          string    `json:"diagnostic,omitempty"`
 	ImplementationAgent string    `json:"implementation_agent,omitempty"`
 	ReviewAgent         string    `json:"review_agent,omitempty"`
+	ReviewState         string    `json:"review_state,omitempty"`
+	ReviewHead          string    `json:"review_head,omitempty"`
+	ReviewSnapshot      string    `json:"review_snapshot,omitempty"`
+	ReviewSession       string    `json:"review_session,omitempty"`
+	ReviewFindings      []string  `json:"review_findings,omitempty"`
+	ReviewHandoffQueued bool      `json:"review_handoff_queued,omitempty"`
+	ReviewHandoffAck    bool      `json:"review_handoff_ack,omitempty"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+}
+
+func (r *Runtime) RecordReview(attempt Attempt, state, head, snapshot, session string) (Manifest, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	manifest.ReviewState, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = state, head, snapshot, session
+	if state != "findings-queued" {
+		manifest.ReviewFindings, manifest.ReviewHandoffQueued, manifest.ReviewHandoffAck = nil, false, false
+	}
+	manifest.UpdatedAt = time.Now().UTC()
+	return manifest, r.writeManifest(attempt, manifest)
+}
+
+func (r *Runtime) RecordReviewFindings(attempt Attempt, head string, findings []string, queued, acknowledged bool) (Manifest, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if manifest.ReviewHandoffQueued {
+		if manifest.ReviewHead != head || !slices.Equal(manifest.ReviewFindings, findings) {
+			return Manifest{}, errors.New("queued review handoff is immutable")
+		}
+		queued, acknowledged = true, manifest.ReviewHandoffAck || acknowledged
+	}
+	manifest.ReviewState, manifest.ReviewHead = "findings-queued", head
+	manifest.ReviewFindings, manifest.ReviewHandoffQueued, manifest.ReviewHandoffAck = append([]string(nil), findings...), queued, acknowledged
+	manifest.UpdatedAt = time.Now().UTC()
+	return manifest, r.writeManifest(attempt, manifest)
 }
 
 type Runtime struct {
@@ -104,12 +146,13 @@ type Runtime struct {
 	Runner    Runner
 	AllowEnv  []string
 	StopWait  time.Duration
-	// VerifyWorker must verify that execution is already inside the provisioned
-	// agent-host worker identity. HOME is inherited only after this succeeds and
-	// therefore means the worker's HOME, never the coordinator's.
+	// VerifyWorker verifies execution through the provisioned agent-host identity.
+	// agent-host supplies the target account HOME; the coordinator never does.
 	VerifyWorker func(context.Context) error
 	mu           sync.Mutex
 }
+
+func PaneTarget(session string) string { return "=" + session + ":0.0" }
 
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
 	r.mu.Lock()
@@ -199,7 +242,7 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	if _, err := r.run(ctx, r.tmux(), args, "", []string{}, nil); err != nil {
 		return failStop("launch tmux", err)
 	}
-	target := "=" + manifest.Session
+	target := PaneTarget(manifest.Session)
 	if _, err := r.run(ctx, r.tmux(), []string{"set-option", "-w", "-t", target, "remain-on-exit", "on"}, "", []string{}, nil); err != nil {
 		return failStop("configure tmux", err)
 	}
@@ -240,7 +283,7 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 	if attempt.Eligible != nil && !attempt.Eligible() {
 		return r.cancel(ctx, attempt, manifest, "attempt is no longer eligible")
 	}
-	result, runErr := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", "=" + manifest.Session, "#{pane_dead} #{pane_dead_status}"}, "", []string{}, nil)
+	result, runErr := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", PaneTarget(manifest.Session), "#{pane_dead} #{pane_dead_status}"}, "", []string{}, nil)
 	if runErr != nil {
 		return manifest, fmt.Errorf("observe tmux session: %w", runErr)
 	}
@@ -253,7 +296,7 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 		return manifest, fmt.Errorf("observe tmux session: invalid exit status %q", fields[1])
 	}
 	if fields[0] == "1" {
-		capture, captureErr := r.run(ctx, r.tmux(), []string{"capture-pane", "-p", "-S", "-", "-t", "=" + manifest.Session}, "", []string{}, nil)
+		capture, captureErr := r.run(ctx, r.tmux(), []string{"capture-pane", "-p", "-S", "-", "-t", PaneTarget(manifest.Session)}, "", []string{}, nil)
 		var logErr error
 		if captureErr == nil {
 			logErr = os.WriteFile(manifest.LogPath, []byte(capture.Output), 0o600)
@@ -292,10 +335,10 @@ func (r *Runtime) Deliver(ctx context.Context, manifest Manifest, payload []byte
 	if _, err := r.run(ctx, r.tmux(), []string{"load-buffer", "-b", buffer, "-"}, "", []string{}, bytes.NewReader(payload)); err != nil {
 		return err
 	}
-	if _, err := r.run(ctx, r.tmux(), []string{"paste-buffer", "-d", "-b", buffer, "-t", "=" + manifest.Session}, "", []string{}, nil); err != nil {
+	if _, err := r.run(ctx, r.tmux(), []string{"paste-buffer", "-d", "-b", buffer, "-t", PaneTarget(manifest.Session)}, "", []string{}, nil); err != nil {
 		return err
 	}
-	_, err := r.run(ctx, r.tmux(), []string{"send-keys", "-t", "=" + manifest.Session, "Enter"}, "", []string{}, nil)
+	_, err := r.run(ctx, r.tmux(), []string{"send-keys", "-t", PaneTarget(manifest.Session), "Enter"}, "", []string{}, nil)
 	return err
 }
 
@@ -668,8 +711,8 @@ func (r *Runtime) stop(ctx context.Context, session string) error {
 	} else if !live {
 		return nil
 	}
-	target := "=" + session
-	if _, err := r.run(ctx, r.tmux(), []string{"send-keys", "-t", target, "C-c"}, "", []string{}, nil); err != nil {
+	pane := PaneTarget(session)
+	if _, err := r.run(ctx, r.tmux(), []string{"send-keys", "-t", pane, "C-c"}, "", []string{}, nil); err != nil {
 		return err
 	}
 	want := r.StopWait
@@ -678,7 +721,7 @@ func (r *Runtime) stop(ctx context.Context, session string) error {
 	}
 	deadline := time.Now().Add(want)
 	for time.Now().Before(deadline) {
-		result, err := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", target, "#{pane_dead}"}, "", []string{}, nil)
+		result, err := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", pane, "#{pane_dead}"}, "", []string{}, nil)
 		if err != nil {
 			return err
 		}
@@ -691,7 +734,7 @@ func (r *Runtime) stop(ctx context.Context, session string) error {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	if _, err := r.run(ctx, r.tmux(), []string{"kill-session", "-t", target}, "", []string{}, nil); err != nil {
+	if _, err := r.run(ctx, r.tmux(), []string{"kill-session", "-t", "=" + session}, "", []string{}, nil); err != nil {
 		if live, probeErr := r.session(ctx, session); probeErr != nil || live {
 			return errors.Join(err, probeErr)
 		}

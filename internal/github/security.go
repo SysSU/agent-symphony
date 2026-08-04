@@ -23,7 +23,7 @@ func AgentEnvironment(environment []string) []string {
 }
 
 func AgentEnvironmentWith(environment []string, allowed ...string) ([]string, error) {
-	safe := map[string]bool{"PATH": true, "HOME": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "TERM": true, "COLORTERM": true, "NO_COLOR": true}
+	safe := map[string]bool{"PATH": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "TERM": true, "COLORTERM": true, "NO_COLOR": true}
 	for _, name := range allowed {
 		if reservedAgentVariable(name) && !modelCredentialVariable(name) {
 			return nil, errors.New("reserved credential or coordinator variable " + name + " cannot be allowed")
@@ -50,6 +50,9 @@ func modelCredentialVariable(name string) bool {
 
 func reservedAgentVariable(name string) bool {
 	upper := strings.ToUpper(name)
+	if upper == "HOME" {
+		return true
+	}
 	for _, prefix := range []string{"GITHUB_", "GH_", "SSH_", "AWS_", "AZURE_", "GOOGLE_", "GCP_", "CLOUD_", "OCI_", "CLOUDFLARE_", "DIGITALOCEAN_", "GIT_ASKPASS", "GIT_CONFIG", "APP_", "WEBHOOK_"} {
 		if strings.HasPrefix(upper, prefix) {
 			return true
