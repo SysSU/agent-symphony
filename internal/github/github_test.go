@@ -304,6 +304,28 @@ func TestWebhookMediaTypeAndRepositoryWideInstallationEvents(t *testing.T) {
 	}
 }
 
+func TestRepositoryIDFetchesAndRejectsInvalid(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/repos/o/r" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		return httpResponse(http.StatusOK, `{"id":4242}`, nil), nil
+	})}
+	api := API{BaseURL: "https://api.example.test", Tokens: tokenStub("token-canary"), HTTP: client}
+	id, err := api.RepositoryID(context.Background(), "o/r")
+	if err != nil || id != 4242 {
+		t.Fatalf("id=%d err=%v", id, err)
+	}
+
+	zeroClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return httpResponse(http.StatusOK, `{"id":0}`, nil), nil
+	})}
+	zeroAPI := API{BaseURL: "https://api.example.test", Tokens: tokenStub("token-canary"), HTTP: zeroClient}
+	if _, err := zeroAPI.RepositoryID(context.Background(), "o/r"); err == nil {
+		t.Fatal("accepted a zero repository ID")
+	}
+}
+
 func TestAPIReadRetriesMutationDoesNotAndRedacts(t *testing.T) {
 	var reads, writes atomic.Int32
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {

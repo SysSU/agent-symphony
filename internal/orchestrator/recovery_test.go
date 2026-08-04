@@ -46,7 +46,7 @@ func TestRecoverConflictingFactsFailClosed(t *testing.T) {
 func TestReconcileLoopRunsAtStartupAndRecoversAfterTransientOutage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
-	err := ReconcileLoop(ctx, time.Millisecond, func(context.Context) error {
+	err := ReconcileLoop(ctx, time.Millisecond, nil, func(context.Context) error {
 		calls++
 		if calls == 3 {
 			cancel()
@@ -58,6 +58,33 @@ func TestReconcileLoopRunsAtStartupAndRecoversAfterTransientOutage(t *testing.T)
 	})
 	if !errors.Is(err, context.Canceled) || calls != 3 {
 		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+}
+
+func TestReconcileLoopWakeTriggersExtraReconcileBetweenTicks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wake := make(chan struct{}, 1)
+	calls := make(chan int, 8)
+	count := 0
+	done := make(chan error, 1)
+	go func() {
+		done <- ReconcileLoop(ctx, MaxReconcileInterval, wake, func(context.Context) error {
+			count++
+			calls <- count
+			return nil
+		})
+	}()
+	if got := <-calls; got != 1 {
+		t.Fatalf("startup call = %d, want 1", got)
+	}
+	wake <- struct{}{}
+	if got := <-calls; got != 2 {
+		t.Fatalf("wake-triggered call = %d, want 2 (interval is the 60s max, so only a wake could cause this within the test)", got)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
 	}
 }
 
@@ -80,7 +107,7 @@ func TestRecoverBlocksFailedExactLivenessCheck(t *testing.T) {
 }
 
 func TestReconcileLoopRejectsSlowInterval(t *testing.T) {
-	if err := ReconcileLoop(context.Background(), 61*time.Second, func(context.Context) error { return nil }); err == nil {
+	if err := ReconcileLoop(context.Background(), 61*time.Second, nil, func(context.Context) error { return nil }); err == nil {
 		t.Fatal("accepted interval over 60 seconds")
 	}
 }

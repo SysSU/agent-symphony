@@ -178,7 +178,12 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 	return result
 }
 
-func ReconcileLoop(ctx context.Context, interval time.Duration, reconcile func(context.Context) error) error {
+// ReconcileLoop reconciles immediately, then repeats at most every interval.
+// wake is an optional early-wake-up hint source (typically a coalesced
+// webhook signal): a receive from it triggers an extra reconcile between
+// ticks without replacing periodic reconciliation as the authoritative
+// recovery path. A nil wake behaves exactly as ticker-only reconciliation.
+func ReconcileLoop(ctx context.Context, interval time.Duration, wake <-chan struct{}, reconcile func(context.Context) error) error {
 	if reconcile == nil {
 		return errors.New("reconcile function is required")
 	}
@@ -193,6 +198,8 @@ func ReconcileLoop(ctx context.Context, interval time.Duration, reconcile func(c
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			_ = reconcile(ctx)
+		case <-wake:
 			_ = reconcile(ctx)
 		}
 	}

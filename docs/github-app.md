@@ -19,9 +19,22 @@ Create a single-repository installation (not "all repositories") with exactly:
 | Commit statuses | Read |
 | Members | Read — only if team-based authorization is configured |
 
-These permissions govern API access and are required today: `reconcile`/`serve` read and write issues, PRs, contents, and checks directly through the API regardless of webhooks.
+These permissions govern API access and are required regardless of webhooks: `reconcile`/`serve` read and write issues, PRs, contents, and checks directly through the API.
 
-Leave **Active** unchecked under the Webhook section, and leave every event unsubscribed. The shipped `agent-symphony` binary does not currently bind an HTTP listener for webhook deliveries at all — `serve` runs the same reconciliation as `reconcile`, just on a repeating timer — so there is nothing to deliver to and nothing that reads the event subscription list. Event subscriptions only control what GitHub pushes to a webhook URL; they don't affect API access, so skipping them costs nothing right now.
+The webhook is optional and only relevant to `serve`. Periodic reconciliation (at most every 60 seconds) is always the authoritative recovery path; a configured webhook only wakes `serve` up sooner between polls — it never replaces polling.
+
+- **Testing with `reconcile`/`doctor`, or running `serve` without the optional webhook:** leave **Active** unchecked under the Webhook section and every event unsubscribed — there's nothing to deliver to.
+- **Running `serve` with the webhook enabled** (see [Setup](setup.md#8-optional-enable-the-webhook-for-serve)): check **Active**, point the URL at wherever `AGENT_SYMPHONY_WEBHOOK_ADDR` is reachable from GitHub, set the secret to the same value as `AGENT_SYMPHONY_WEBHOOK_SECRET`, and subscribe to:
+  - Issues
+  - Issue comment
+  - Pull request
+  - Pull request review
+  - Pull request review comment
+  - Check run / Check suite
+  - Status
+  - Push
+  - Installation
+  - Repository rule
 
 ## Pull-request governance
 

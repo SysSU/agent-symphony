@@ -51,7 +51,10 @@ That confirms the zero-admin default is working — no `install-host` step neede
 
 github.com → Settings → Developer settings → GitHub Apps → **New GitHub App**. Set the exact permissions listed in [GitHub App setup](github-app.md#required-permissions-and-events). Generate a private key (downloads a `.pem`) and note the **App ID** shown on the app's settings page.
 
-Leave the Webhook section's **Active** unchecked, and leave every event unsubscribed — do this regardless of whether you plan to run `reconcile` or `serve`. The shipped binary does not yet listen for webhook deliveries at all (`serve` only polls GitHub on a timer), so there is currently no URL to give it and nothing reads the event subscriptions either. Unchecking Active means GitHub won't require a URL and won't attempt any deliveries.
+The webhook is optional — periodic polling (at most every 60 seconds) is always the authoritative recovery path for `serve`, with or without one; a webhook only wakes it up sooner between polls. `reconcile`/`doctor` never use it at all.
+
+- **Testing with `reconcile`/`doctor`, or running `serve` without the optional webhook:** leave **Active** unchecked and every event unsubscribed — there's nothing to deliver to.
+- **Running `serve` with the webhook enabled:** check **Active**, and see step 8 for the URL/secret/events to configure — you'll need the address `serve` listens on first, which comes after step 6.
 
 ## 5. Install the App
 
@@ -137,7 +140,26 @@ agent-symphony status --state ~/.local/state/agent-symphony/pr.json --runtime-st
 
 projects that same attempt as queued/active/blocked/review-ready/completed.
 
-For a persistent loop instead of a one-shot run, use `serve` in place of `reconcile` — see [CLI reference](cli.md). It runs the same reconciliation on a timer (at most every 60 seconds); it does not yet also listen for webhooks, so nothing further is required from step 4 to run it.
+For a persistent loop instead of a one-shot run, use `serve` in place of `reconcile` — see [CLI reference](cli.md). It runs the same reconciliation on a timer (at most every 60 seconds) and needs nothing beyond what you already set up above.
+
+## 8. (optional) Enable the webhook for `serve`
+
+Periodic polling is always the authoritative recovery path — this step only makes `serve` react sooner between polls; skip it if the 60-second polling floor is fine for you.
+
+```sh
+export AGENT_SYMPHONY_WEBHOOK_ADDR=127.0.0.1:8443     # address agent-symphony listens on
+export AGENT_SYMPHONY_WEBHOOK_SECRET=<a strong random secret>
+export AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID=<installation id from step 5>   # required for the webhook regardless of which credential path from step 6 you used
+```
+
+`agent-symphony` speaks plain HTTP — put a reverse proxy in front of `AGENT_SYMPHONY_WEBHOOK_ADDR` to terminate TLS and expose it at a public URL GitHub can reach. Then, on the App's settings page:
+
+- Check **Active** under the Webhook section.
+- Webhook URL: the public URL your reverse proxy exposes.
+- Webhook secret: the exact same value as `AGENT_SYMPHONY_WEBHOOK_SECRET`.
+- Subscribe to: Issues, Issue comment, Pull request, Pull request review, Pull request review comment, Check run, Check suite, Status, Push, Installation, Repository rule.
+
+Run `serve` as normal after that — it binds `AGENT_SYMPHONY_WEBHOOK_ADDR` alongside its usual polling loop, and a valid signed delivery wakes the next reconcile immediately instead of waiting for the timer.
 
 ## Advanced: host-isolated mode (optional)
 
