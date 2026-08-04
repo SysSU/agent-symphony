@@ -32,7 +32,7 @@ Subscribe to these webhook events:
 - Installation
 - Repository rule
 
-A webhook endpoint is only required to run `serve`; `reconcile` and `doctor` don't need one. If you're only running those, uncheck **Active** under the Webhook section when creating the App — GitHub then won't require a URL and won't attempt any deliveries. Only once you're running `serve` do you configure the webhook endpoint with a real reachable URL, a strong random secret, and JSON delivery.
+Uncheck **Active** under the Webhook section when creating the App. The shipped `agent-symphony` binary does not currently bind an HTTP listener for webhook deliveries at all — `serve` runs the same reconciliation as `reconcile`, just on a repeating timer, and there is presently no URL to give GitHub regardless of which command you run (tracked in [issue #31](https://github.com/SysSU/agent-symphony/issues/31)). Unchecking Active means GitHub won't require a URL and won't attempt any deliveries. Once #31 lands, this section will document the real production URL/secret/JSON-delivery configuration for `serve`.
 
 ## Pull-request governance
 

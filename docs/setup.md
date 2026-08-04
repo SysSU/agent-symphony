@@ -51,7 +51,7 @@ That confirms the zero-admin default is working — no `install-host` step neede
 
 github.com → Settings → Developer settings → GitHub Apps → **New GitHub App**. Set the exact permissions and webhook events listed in [GitHub App setup](github-app.md#required-permissions-and-events). Generate a private key (downloads a `.pem`) and note the **App ID** shown on the app's settings page.
 
-A webhook is only exercised if you run `serve`. If you're only testing with `reconcile`/`doctor`, uncheck **Active** under the Webhook section instead of entering a placeholder URL — GitHub won't require a URL or attempt any deliveries. Check it and fill in a real URL/secret only once you're ready to run `serve`.
+Uncheck **Active** under the Webhook section — leave it unchecked regardless of whether you plan to run `reconcile` or `serve`. The shipped binary does not yet listen for webhook deliveries at all (`serve` only polls GitHub on a timer; see [issue #31](https://github.com/SysSU/agent-symphony/issues/31)), so there is currently no URL to give it. Unchecking Active means GitHub won't require one and won't attempt any deliveries.
 
 ## 5. Install the App
 
@@ -117,7 +117,7 @@ agent-symphony status --state ~/.local/state/agent-symphony/pr.json --runtime-st
 
 projects that same attempt as queued/active/blocked/review-ready/completed.
 
-For a persistent loop instead of a one-shot run, use `serve` in place of `reconcile` — see [CLI reference](cli.md) — which additionally needs the webhook endpoint from step 4 to actually be reachable.
+For a persistent loop instead of a one-shot run, use `serve` in place of `reconcile` — see [CLI reference](cli.md). It runs the same reconciliation on a timer (at most every 60 seconds); it does not yet also listen for webhooks (see [issue #31](https://github.com/SysSU/agent-symphony/issues/31)), so nothing further is required from step 4 to run it.
 
 ## Advanced: host-isolated mode (optional)
 
