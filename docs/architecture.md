@@ -7,7 +7,7 @@
 
 Agent Symphony is one long-running Go process with a CLI mode. GitHub Issues, pull requests, reviews, checks, and repository rules are the durable workflow record. The process keeps only scheduling state in memory and bounded, reconstructible execution metadata on disk; it does not have a task database or a second workflow engine.
 
-Issue #10 supplies PR governance and durable handoff state. Issue #4 integrates that state with bounded daemon scheduling, authoritative restart reconstruction, exact runtime monitoring, scoped handoff delivery, and evidenced outcome completion.
+PR governance and durable handoff state are integrated with bounded daemon scheduling, authoritative restart reconstruction, exact runtime monitoring, scoped handoff delivery, and evidenced outcome completion.
 
 The design follows the useful boundaries in the [OpenAI Symphony specification](https://github.com/openai/symphony/blob/main/SPEC.md): a single scheduling authority, a tracker adapter, deterministic workspaces, an agent runner, and an operator status surface. It deliberately differs in three places required by this product: GitHub owns the whole delivery lifecycle, portfolio policy is coordinator code rather than agent prompt logic, and agents never receive tracker credentials. The upstream Elixir implementation is a prototype; its in-memory blocked state and runtime dependency make it a reference, not the release base.
 
