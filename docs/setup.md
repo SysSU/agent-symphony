@@ -59,13 +59,41 @@ On the App's settings page → **Install App** → select the **one repository**
 
 ## 6. Get credentials into the environment
 
+Both paths below need two env vars first — get these regardless of which one you pick:
+
 ```sh
 export AGENT_SYMPHONY_GITHUB_APP_ID=<app id from step 4>
-export AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID=<the App's bot account user id, see below>
+export AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID=<app's bot account user id, see below>
+```
+
+`AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID` is the numeric user ID of the App's bot account — distinct from the App ID above:
+
+```sh
+curl -s "https://api.github.com/users/<app-slug>%5Bbot%5D" | jq .id
+```
+
+(`<app-slug>` is the URL-safe name you gave the App when creating it; `%5B`/`%5D` are the URL-encoded `[`/`]` around `bot`.)
+
+### Production: point `serve` at the PEM directly (recommended)
+
+A real installation token expires after 1 hour, hard limit, and nothing can refresh it inside an already-running process — so a static token cannot keep `serve` authenticated past that first hour. Give it the App's own credentials instead and it mints and refreshes its own tokens for as long as it runs:
+
+```sh
+export AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH=/path/to/private-key.pem   # from step 4
+export AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID=<installation id from step 5>
+```
+
+That's it — no token to mint or rotate by hand. Keep the PEM file readable only by the account running `agent-symphony` and never commit it.
+
+### Quick/testing: a hand-minted static token
+
+For a short one-off `reconcile`/`doctor` run — not `serve` — skip the PEM and supply an installation token directly:
+
+```sh
 export GITHUB_TOKEN=<a short-lived installation token, see below>
 ```
 
-`agent-symphony` does not mint installation tokens from the PEM itself — you supply one via `GITHUB_TOKEN`. For local testing, mint one with the App's JWT (standard GitHub App auth flow; needs `openssl`, `curl`, `jq`):
+Mint one with the App's JWT (standard GitHub App auth flow; needs `openssl`, `curl`, `jq`):
 
 ```sh
 APP_ID=<app id>
@@ -83,23 +111,15 @@ curl -s -X POST -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.gith
   "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" | jq -r .token
 ```
 
-The token expires in an hour; rerun this to get a fresh one. (Production deployments should mint tokens through your own secret-issuing process, not a hand-run script — never commit the PEM.)
+It expires in an hour; rerun this to get a fresh one. Fine for a quick check, not for anything long-running.
 
-Get `AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID` — the numeric user ID of the App's bot account, distinct from the App ID above:
-
-```sh
-curl -s "https://api.github.com/users/<app-slug>%5Bbot%5D" | jq .id
-```
-
-(`<app-slug>` is the URL-safe name you gave the App when creating it; `%5B`/`%5D` are the URL-encoded `[`/`]` around `bot`.)
-
-Confirm everything works:
+### Confirm it works
 
 ```sh
 agent-symphony doctor --runtime-state ~/.local/state/agent-symphony
 ```
 
-`GitHub permissions` should now `PASS`.
+`GitHub permissions` should now `PASS`, regardless of which of the two paths above you used.
 
 ## 7. Label a test issue and dispatch it
 

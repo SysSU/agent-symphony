@@ -3,13 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1233,4 +1238,123 @@ func runGit(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v: %s: %v", args, out, err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func TestGithubTokenSourceSelectsAppJWTOrStaticToken(t *testing.T) {
+	t.Run("neither configured requires GITHUB_TOKEN", func(t *testing.T) {
+		if _, err := githubTokenSource(42); err == nil {
+			t.Fatal("expected error without GITHUB_TOKEN or App credentials")
+		}
+	})
+	t.Run("static GITHUB_TOKEN", func(t *testing.T) {
+		t.Setenv("GITHUB_TOKEN", "static-canary")
+		tokens, err := githubTokenSource(42)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := tokens.(environmentToken); !ok {
+			t.Fatalf("expected environmentToken, got %T", tokens)
+		}
+	})
+	t.Run("only private key path set is an error", func(t *testing.T) {
+		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", "/nonexistent.pem")
+		if _, err := githubTokenSource(42); err == nil {
+			t.Fatal("expected error with only the private key path set")
+		}
+	})
+	t.Run("only installation ID set is an error", func(t *testing.T) {
+		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
+		if _, err := githubTokenSource(42); err == nil {
+			t.Fatal("expected error with only the installation ID set")
+		}
+	})
+	t.Run("non-numeric installation ID is an error", func(t *testing.T) {
+		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", "/nonexistent.pem")
+		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "not-a-number")
+		if _, err := githubTokenSource(42); err == nil {
+			t.Fatal("expected error with non-numeric installation ID")
+		}
+	})
+	t.Run("unreadable private key path is an error", func(t *testing.T) {
+		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", filepath.Join(t.TempDir(), "missing.pem"))
+		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
+		if _, err := githubTokenSource(42); err == nil {
+			t.Fatal("expected error for unreadable private key")
+		}
+	})
+	t.Run("valid PEM and installation ID build an auto-refreshing source", func(t *testing.T) {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pemPath := filepath.Join(t.TempDir(), "app.pem")
+		pemBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+		if err := os.WriteFile(pemPath, pemBytes, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", pemPath)
+		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
+		tokens, err := githubTokenSource(42)
+		if err != nil {
+			t.Fatal(err)
+		}
+		installTokens, ok := tokens.(*internalgithub.InstallationTokens)
+		if !ok {
+			t.Fatalf("expected *internalgithub.InstallationTokens, got %T", tokens)
+		}
+		if installTokens.InstallationID != 7 {
+			t.Fatalf("installation ID = %d, want 7", installTokens.InstallationID)
+		}
+		jwtSource, ok := installTokens.JWTs.(internalgithub.AppJWT)
+		if !ok || jwtSource.AppID != "42" || jwtSource.Key.N.Cmp(key.N) != 0 {
+			t.Fatalf("unexpected JWT source %#v", installTokens.JWTs)
+		}
+	})
+}
+
+func TestGithubTokenSourceEndToEndExchangeIsCachedAcrossCalls(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemPath := filepath.Join(t.TempDir(), "app.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	if err := os.WriteFile(pemPath, pemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", pemPath)
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
+
+	exchanges := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/app/installations/7/access_tokens" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if auth := r.Header.Get("Authorization"); !strings.HasPrefix(auth, "Bearer ey") {
+			t.Errorf("missing signed App JWT: %s", auth)
+		}
+		exchanges++
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintf(w, `{"token":"minted-canary-%d","expires_at":%q}`, exchanges, time.Now().Add(time.Hour).Format(time.RFC3339))
+	}))
+	defer server.Close()
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI, githubClient = server.URL, server.Client()
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+
+	tokens, err := githubTokenSource(42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := tokens.Token(context.Background())
+	if err != nil || first.Value != "minted-canary-1" {
+		t.Fatalf("first exchange: got %#v, %v", first, err)
+	}
+	second, err := tokens.Token(context.Background())
+	if err != nil || second.Value != "minted-canary-1" {
+		t.Fatalf("expected cached token reused, got %#v, %v", second, err)
+	}
+	if exchanges != 1 {
+		t.Fatalf("expected exactly one token exchange across two calls, got %d", exchanges)
+	}
 }
