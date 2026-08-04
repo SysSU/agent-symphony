@@ -70,6 +70,7 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 			return Result{}, errors.New("inexact tmux target")
 		}
 		session = strings.TrimPrefix(target, "=")
+		session = strings.TrimSuffix(session, ":0.0")
 	}
 	switch op {
 	case "has-session":
@@ -287,6 +288,52 @@ func TestConcurrentDisjointAttempts(t *testing.T) {
 	}
 }
 
+func TestQueuedReviewHandoffTransitionsAreDurableAndImmutable(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	if _, err := r.PrepareAndStart(t.Context(), attempt); err != nil {
+		t.Fatal(err)
+	}
+	findings := []string{"fix isolation"}
+	for _, transition := range []struct {
+		queued, acknowledged bool
+	}{{false, false}, {true, false}, {true, true}} {
+		if _, err := r.RecordReviewFindings(attempt, "abcdef1", findings, transition.queued, transition.acknowledged); err != nil {
+			t.Fatal(err)
+		}
+		restarted := &Runtime{StateRoot: r.StateRoot}
+		stored, err := readManifest(restarted.manifestPath(attempt))
+		if err != nil || stored.ReviewHandoffQueued != transition.queued || stored.ReviewHandoffAck != transition.acknowledged {
+			t.Fatalf("transition %#v was not durable: %#v err=%v", transition, stored, err)
+		}
+	}
+	if _, err := r.RecordReviewFindings(attempt, "abcdef1", []string{"different"}, true, true); err == nil {
+		t.Fatal("queued handoff was mutable")
+	}
+}
+
+func TestStopInterruptsPaneZeroWhenAnotherPaneIsActive(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.stop(t.Context(), manifest.Session); err != nil {
+		t.Fatal(err)
+	}
+	interrupted := false
+	for _, command := range fake.seen {
+		if len(command.Args) > 0 && command.Args[0] == "send-keys" {
+			interrupted = true
+			if valueAfter(command.Args, "-t") != PaneTarget(manifest.Session) {
+				t.Fatalf("interrupt targeted %q, want %q", valueAfter(command.Args, "-t"), PaneTarget(manifest.Session))
+			}
+		}
+	}
+	if !interrupted {
+		t.Fatal("pane 0.0 did not receive C-c")
+	}
+}
+
 func TestWorkerIdentityFailsClosedBeforeMutation(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	r.VerifyWorker = nil
@@ -330,7 +377,7 @@ func TestExactTargetsExitCodesAndHistory(t *testing.T) {
 		if command.Name != "tmux" {
 			continue
 		}
-		if target := valueAfter(command.Args, "-t"); target != "" && target != "="+manifest.Session {
+		if target := valueAfter(command.Args, "-t"); target != "" && target != "="+manifest.Session && target != PaneTarget(manifest.Session) {
 			t.Fatalf("inexact target %q in %#v", target, command.Args)
 		}
 		if command.Args[0] == "set-option" && slices.Contains(command.Args, "history-limit") && slices.Contains(command.Args, historyLimit) {

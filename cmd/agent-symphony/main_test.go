@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +40,262 @@ func TestWorkerBoundaryStripsCredentialCanaries(t *testing.T) {
 	}
 }
 
+func TestWriteImmutableRecoversAtEveryDurabilityBoundary(t *testing.T) {
+	origCreate, origWrite, origFileSync, origInstall, origDirSync := immutableCreate, immutableWrite, immutableFileSync, immutableInstall, immutableDirSync
+	t.Cleanup(func() {
+		immutableCreate, immutableWrite, immutableFileSync, immutableInstall, immutableDirSync = origCreate, origWrite, origFileSync, origInstall, origDirSync
+	})
+	body := []byte("complete binding")
+	for _, stage := range []string{"create", "write", "file-sync", "install", "dir-sync"} {
+		t.Run(stage, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "binding")
+			immutableCreate, immutableWrite, immutableFileSync, immutableInstall, immutableDirSync = origCreate, origWrite, origFileSync, origInstall, origDirSync
+			switch stage {
+			case "create":
+				immutableCreate = func(string, string) (*os.File, error) { return nil, errors.New("injected create") }
+			case "write":
+				immutableWrite = func(f *os.File, b []byte) error { _, _ = f.Write(b[:len(b)/2]); return errors.New("injected write") }
+			case "file-sync":
+				immutableFileSync = func(*os.File) error { return errors.New("injected file sync") }
+			case "install":
+				immutableInstall = func(string, string) error { return errors.New("injected install") }
+			case "dir-sync":
+				immutableDirSync = func(string) error { return errors.New("injected directory sync") }
+			}
+			if err := writeImmutable(path, body); err == nil {
+				t.Fatal("injected failure succeeded")
+			}
+			if stage != "dir-sync" {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("partial final exposed: %v", err)
+				}
+			}
+			immutableCreate, immutableWrite, immutableFileSync, immutableInstall, immutableDirSync = origCreate, origWrite, origFileSync, origInstall, origDirSync
+			if err := writeImmutable(path, body); err != nil {
+				t.Fatalf("restart recovery: %v", err)
+			}
+			got, _ := os.ReadFile(path)
+			if !bytes.Equal(got, body) {
+				t.Fatalf("final=%q", got)
+			}
+			if err := writeImmutable(path, []byte("different")); err == nil {
+				t.Fatal("mismatched immutable body accepted")
+			}
+		})
+	}
+}
+
+func TestReviewFindingsRecoversWorkerReceiptAfterCoordinatorRestart(t *testing.T) {
+	state, worktree := t.TempDir(), t.TempDir()
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+	head, key := "abcdef1", "independent-review-abcdef1"
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", Worktree: worktree, Session: "as-23-1", LogPath: filepath.Join(worktree, "attempt.log"), ReviewState: "findings-queued", ReviewHead: head, ReviewFindings: []string{"fix once"}, ReviewHandoffQueued: true}
+	sum := sha256.Sum256([]byte(attempt.Repository))
+	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ack, _ := json.Marshal(struct{ Type, Key, OutcomePath, OutcomeToken string }{"agent-symphony-handoff-executed-v1", key, manifest.LogPath + ".review-outcome", head})
+	result, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
+	calls, script := filepath.Join(worktree, "accepts"), filepath.Join(t.TempDir(), "boundary")
+	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\ncase \"$payload\" in *accept-handoff*) printf 'x\\n' >> %q;; esac\nprintf '%%s' '%s'\n", calls, result)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	boundary := workerBoundaryRunner{Command: script}
+
+	// The worker already accepted and executed before the coordinator crashed;
+	// the restarted coordinator recovers the bound receipt without rework.
+	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
+	pending, err := returnReviewFindings(t.Context(), restarted, boundary, attempt, manifest, head, manifest.ReviewFindings, []string{"implementation"})
+	if err != nil || pending {
+		t.Fatalf("receipt recovery pending=%v err=%v", pending, err)
+	}
+	storedBody, _ := os.ReadFile(manifestPath)
+	var stored agentruntime.Manifest
+	_ = json.Unmarshal(storedBody, &stored)
+	if !stored.ReviewHandoffAck {
+		t.Fatal("worker receipt was not acknowledged")
+	}
+	accepts, _ := os.ReadFile(calls)
+	if strings.Count(string(accepts), "x\n") != 1 {
+		t.Fatalf("accept calls=%q", accepts)
+	}
+}
+
+func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
+	coordinator, worker := gitRepository(t), gitRepository(t)
+	for _, repo := range []string{coordinator, worker} {
+		runGit(t, repo, "config", "user.email", "test@example.invalid")
+		runGit(t, repo, "config", "user.name", "test")
+	}
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "add", "file")
+	runGit(t, worker, "commit", "-m", "base")
+	base := runGit(t, worker, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("head"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "commit", "-am", "head")
+	head := runGit(t, worker, "rev-parse", "HEAD")
+	bundlePath := filepath.Join(t.TempDir(), "attempt.bundle")
+	runGit(t, worker, "bundle", "create", bundlePath, "--all")
+	bundle, _ := os.ReadFile(bundlePath)
+	realGit, _ := exec.LookPath("git")
+	verifyRepo := filepath.Join(t.TempDir(), "verify.git")
+	runGit(t, worker, "init", "--bare", verifyRepo)
+	gitWrapperDir := t.TempDir()
+	gitWrapper := filepath.Join(gitWrapperDir, "git")
+	gitWrapperBody := fmt.Sprintf("#!/bin/sh\ncase \" $* \" in\n  *\" bundle verify \"*) for last do :; done; exec %q --git-dir=%q bundle verify \"$last\";;\nesac\nexec %q \"$@\"\n", realGit, verifyRepo, realGit)
+	if err := os.WriteFile(gitWrapper, []byte(gitWrapperBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", gitWrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: "issue-23", BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "ok", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
+	exportedJSON, _ := json.Marshal(exported)
+	exportResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
+
+	state, worktree := t.TempDir(), t.TempDir()
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Branch: "issue-23", BaseSHA: base, State: "completed", Worktree: worktree, Session: "as-23-1", LogPath: filepath.Join(worktree, "attempt.log"), ReviewState: "findings-queued", ReviewHead: head, ReviewFindings: []string{"retry me"}, ReviewHandoffQueued: true}
+	sum := sha256.Sum256([]byte(attempt.Repository))
+	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ack, _ := json.Marshal(struct{ Type, Key, OutcomePath, OutcomeToken string }{"agent-symphony-handoff-executed-v1", "independent-review-" + head, manifest.LogPath + ".review-outcome", head})
+	ackResult, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
+	boundaryLog, script := filepath.Join(worktree, "boundary.log"), filepath.Join(t.TempDir(), "boundary")
+	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\nprintf '%%s\\n' \"$payload\" >> %q\ncase \"$payload\" in\n  *operation*export*) printf '%%s' '%s';;\n  *) printf '%%s' '%s';;\nesac\n", boundaryLog, exportResult, ackResult)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", script)
+	old, _ := os.Getwd()
+	if err := os.Chdir(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	boundary := workerBoundaryRunner{Command: script}
+	runtimeState := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true}
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, nil); err != nil {
+		log, _ := os.ReadFile(boundaryLog)
+		t.Fatalf("transient rework reached GitHub failure: %v\n%s", err, log)
+	}
+	storedBody, _ := os.ReadFile(manifestPath)
+	var stored agentruntime.Manifest
+	_ = json.Unmarshal(storedBody, &stored)
+	if !stored.ReviewHandoffAck {
+		t.Fatal("monitor did not recover worker receipt")
+	}
+	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, nil); err != nil {
+		t.Fatalf("retry reached GitHub failure: %v", err)
+	}
+	storedBody, _ = os.ReadFile(manifestPath)
+	_ = json.Unmarshal(storedBody, &stored)
+	log, _ := os.ReadFile(boundaryLog)
+	if strings.Count(string(log), "accept-handoff") != 1 {
+		t.Fatalf("handoff redelivered: %s", log)
+	}
+}
+
+func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) {
+	source := t.TempDir()
+	for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}} {
+		if out, err := exec.Command("git", append([]string{"-C", source}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", source, "add", ".").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, err := exec.Command("git", "-C", source, "commit", "-m", "base").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	head := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", source, "rev-parse", "HEAD"))))
+	imported := filepath.Join(t.TempDir(), "coordinator.git")
+	if out, err := exec.Command("git", "init", "--bare", imported).CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, err := exec.Command("git", "-C", imported, "fetch", "--no-tags", source, head).CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, _ := exec.Command("git", "-C", imported, "show-ref").Output(); len(bytes.TrimSpace(out)) != 0 {
+		t.Fatalf("attested object unexpectedly advertised: %s", out)
+	}
+	source = imported
+	script := filepath.Join(t.TempDir(), "review-boundary")
+	boundaryLog := filepath.Join(t.TempDir(), "boundary.log")
+	body := fmt.Sprintf("#!/bin/sh\ntee -a %q >/dev/null\nprintf '{\"Output\":\"1 0\",\"Code\":0,\"Exited\":false}'\n", boundaryLog)
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := reviewSnapshotRoot
+	reviewSnapshotRoot = t.TempDir()
+	t.Cleanup(func() { reviewSnapshotRoot = old })
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}
+	t.Setenv("OPENAI_API_KEY", "model-canary")
+	t.Setenv("GITHUB_TOKEN", "github-canary")
+	t.Setenv("SSH_AUTH_SOCK", "ssh-canary")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "cloud-canary")
+	t.Setenv("HTTPS_PROXY", "proxy-canary")
+	t.Setenv("APP_SECRET", "app-canary")
+	t.Setenv("HOME", "/coordinator-home")
+	env, err := configuredAgentEnvironment([]string{"OPENAI_API_KEY"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, pending, err := runIndependentReview(t.Context(), nil, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt}, workerBoundaryRunner{Command: script}, env, []string{"reviewer"}, issue, agentruntime.Manifest{}, source, head)
+	if err != nil || !pending {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(result.Snapshot, func(path string, entry os.DirEntry, err error) error {
+			if err == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+		_ = os.RemoveAll(result.Snapshot)
+	})
+	got := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", result.Snapshot, "rev-parse", "HEAD"))))
+	if got != head {
+		t.Fatalf("snapshot head=%s want=%s", got, head)
+	}
+	log, err := os.ReadFile(boundaryLog)
+	if err != nil || !strings.Contains(string(log), `"args":["send-keys","-t","=as-review-23-1:0.0","C-d"]`) {
+		t.Fatalf("review stdin was not submitted like runtime stdin: %s err=%v", log, err)
+	}
+	if !strings.Contains(string(log), `OPENAI_API_KEY=model-canary`) || slices.ContainsFunc([]string{"github-canary", "ssh-canary", "cloud-canary", "proxy-canary", "app-canary", "/coordinator-home"}, func(secret string) bool { return strings.Contains(string(log), secret) }) {
+		t.Fatalf("review boundary environment was not safely filtered: %s", log)
+	}
+}
+
+func mustOutput(t *testing.T, cmd *exec.Cmd) []byte {
+	t.Helper()
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
 func TestWorkerExportRejectsMaliciousOrOversizedBundleBeforeImport(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "boundary")
@@ -49,6 +308,502 @@ func TestWorkerExportRejectsMaliciousOrOversizedBundleBeforeImport(t *testing.T)
 	_, _, _, err := importWorkerExport(context.Background(), workerBoundaryRunner{Command: script}, agentruntime.Manifest{Repository: "o/r", Branch: "issue-4", BaseSHA: "abcdef1"})
 	if err == nil || !strings.Contains(err.Error(), "invalid or oversized bundle") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestStructuredReviewResultIsBoundedAndFindingsBlockClean(t *testing.T) {
+	clean, err := parseIndependentReview(`noise
+{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`)
+	if err != nil || clean.Status != "clean" {
+		t.Fatalf("clean=%#v err=%v", clean, err)
+	}
+	findings, err := parseIndependentReview(`{"type":"agent-symphony-review-v1","status":"findings","findings":["fix boundary"]}`)
+	if err != nil || len(findings.Findings) != 1 {
+		t.Fatalf("findings=%#v err=%v", findings, err)
+	}
+	if _, err := parseIndependentReview(`{"type":"agent-symphony-review-v1","status":"clean","findings":["hidden"]}`); err == nil {
+		t.Fatal("clean result carried findings")
+	}
+	if _, err := parseIndependentReview("{\"type\":\"agent-symphony-review-v1\",\"status\":\"findings\",\"findings\":[\"fix\"]}\n{\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]}"); err == nil {
+		t.Fatal("accepted multiple structured results")
+	}
+}
+
+func TestReviewCleanupSurvivesRestartUntilSessionIsGone(t *testing.T) {
+	for _, test := range []struct {
+		name, result string
+		transient    bool
+	}{
+		{"kill success", `{"Code":0,"Exited":false}`, false},
+		{"confirmed absence", `{"Code":1,"Exited":true}`, false},
+		{"transient failure", "", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state, base := t.TempDir(), t.TempDir()
+			oldRoot := reviewSnapshotRoot
+			reviewSnapshotRoot = base
+			t.Cleanup(func() { reviewSnapshotRoot = oldRoot })
+			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+			snapshot, session := reviewIdentity(attempt)
+			if err := os.Mkdir(snapshot, 0o550); err != nil {
+				t.Fatal(err)
+			}
+			manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "clean", ReviewHead: "head", ReviewSnapshot: snapshot, ReviewSession: session}
+			sum := sha256.Sum256([]byte(attempt.Repository))
+			manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
+			if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			body, _ := json.Marshal(manifest)
+			if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			script := filepath.Join(t.TempDir(), "boundary")
+			scriptBody := "#!/bin/sh\nexit 1\n"
+			if !test.transient {
+				scriptBody = "#!/bin/sh\nprintf '%s' '" + test.result + "'\n"
+			}
+			if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			runtimeState := &agentruntime.Runtime{StateRoot: state}
+			_, err := cleanupReviewOutcome(t.Context(), runtimeState, attempt, workerBoundaryRunner{Command: script}, nil, manifest)
+			var stored agentruntime.Manifest
+			storedBody, readErr := os.ReadFile(manifestPath)
+			if readErr != nil || json.Unmarshal(storedBody, &stored) != nil {
+				t.Fatal(readErr)
+			}
+			if test.transient {
+				if err == nil || stored.ReviewSession == "" {
+					t.Fatalf("cleanup err=%v stored=%#v", err, stored)
+				}
+				if _, statErr := os.Stat(snapshot); statErr != nil {
+					t.Fatalf("snapshot removed after ambiguous kill: %v", statErr)
+				}
+				if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '{\"Code\":0}'\n"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				_, err = cleanupReviewOutcome(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, workerBoundaryRunner{Command: script}, nil, stored)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			storedBody, _ = os.ReadFile(manifestPath)
+			stored = agentruntime.Manifest{}
+			_ = json.Unmarshal(storedBody, &stored)
+			if stored.ReviewSession != "" || stored.ReviewSnapshot != "" {
+				t.Fatalf("cleanup state retained after authoritative outcome: %#v", stored)
+			}
+			if _, err := os.Stat(snapshot); !os.IsNotExist(err) {
+				t.Fatalf("snapshot remains after cleanup: %v", err)
+			}
+		})
+	}
+}
+
+type blockingReviewBoundary struct {
+	block bool
+	done  chan struct{}
+	err   error
+}
+
+type countingReviewBoundary int
+
+func (b *countingReviewBoundary) call(context.Context, string, agentruntime.Command) (agentruntime.Result, error) {
+	*b++
+	return agentruntime.Result{}, nil
+}
+
+type recoveringReviewBoundary struct {
+	displayErr error
+	started    int
+}
+
+func (b *recoveringReviewBoundary) call(_ context.Context, _ string, command agentruntime.Command) (agentruntime.Result, error) {
+	if len(command.Args) > 0 && command.Args[0] == "display-message" && b.displayErr != nil {
+		err := b.displayErr
+		b.displayErr = nil
+		return agentruntime.Result{}, err
+	}
+	if len(command.Args) > 0 && command.Args[0] == "new-session" {
+		b.started++
+	}
+	return agentruntime.Result{}, nil
+}
+
+func TestRunningReviewUnobservableRebuildsWithoutDurableFailure(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{"absent tmux session", errors.New("tmux session absent")},
+		{"transient display failure", errors.New("temporary host restart")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state, source, base := t.TempDir(), t.TempDir(), t.TempDir()
+			reviewSnapshotRoot = base
+			t.Cleanup(func() {
+				reviewSnapshotRoot = ""
+				_ = filepath.WalkDir(base, func(path string, entry os.DirEntry, err error) error {
+					if err == nil && entry.IsDir() {
+						_ = os.Chmod(path, 0o700)
+					}
+					return nil
+				})
+			})
+			runGit(t, source, "init")
+			runGit(t, source, "config", "user.email", "test@example.invalid")
+			runGit(t, source, "config", "user.name", "test")
+			runGit(t, source, "commit", "--allow-empty", "-m", "head")
+			head := runGit(t, source, "rev-parse", "HEAD")
+			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+			snapshot, session := reviewIdentity(attempt)
+			if err := os.Mkdir(snapshot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "running", ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
+			sum := sha256.Sum256([]byte(attempt.Repository))
+			manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
+			if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			body, _ := json.Marshal(manifest)
+			if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			boundary := &recoveringReviewBoundary{displayErr: test.err}
+			_, pending, err := runIndependentReview(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, manifest, source, head)
+			if err != nil || !pending || boundary.started != 1 {
+				t.Fatalf("pending=%v starts=%d err=%v", pending, boundary.started, err)
+			}
+			storedBody, _ := os.ReadFile(manifestPath)
+			var stored agentruntime.Manifest
+			_ = json.Unmarshal(storedBody, &stored)
+			if stored.ReviewState != "running" || stored.ReviewHead != head || stored.Diagnostic != "" {
+				t.Fatalf("review was terminalized: %#v", stored)
+			}
+		})
+	}
+}
+
+func TestReviewCleanupRejectsForeignOutsideAndSymlinkIdentity(t *testing.T) {
+	oldRoot := reviewSnapshotRoot
+	reviewSnapshotRoot = t.TempDir()
+	t.Cleanup(func() { reviewSnapshotRoot = oldRoot })
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+	snapshot, session := reviewIdentity(attempt)
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.Mkdir(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(reviewSnapshotRoot, filepath.Base(snapshot))
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct{ name, snapshot, session string }{
+		{"foreign session", "", "as-review-99-1"},
+		{"outside root", outside, session},
+		{"symlink", link, session},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var boundary countingReviewBoundary
+			if err := cleanupReviewResources(t.Context(), &boundary, nil, attempt, test.snapshot, test.session); err == nil {
+				t.Fatal("unsafe cleanup identity accepted")
+			}
+			if boundary != 0 {
+				t.Fatal("cleanup boundary reached before validation")
+			}
+			if _, err := os.Stat(outside); err != nil {
+				t.Fatalf("outside path mutated: %v", err)
+			}
+		})
+	}
+}
+
+func (b *blockingReviewBoundary) call(ctx context.Context, _ string, command agentruntime.Command) (agentruntime.Result, error) {
+	if slices.Contains(command.Args, "display-message") {
+		return agentruntime.Result{Output: "1 0"}, nil
+	}
+	if slices.Contains(command.Args, "capture-pane") {
+		return agentruntime.Result{Output: `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`}, nil
+	}
+	if !b.block {
+		return agentruntime.Result{}, nil
+	}
+	if b.err != nil {
+		return agentruntime.Result{}, b.err
+	}
+	<-ctx.Done()
+	close(b.done)
+	return agentruntime.Result{}, ctx.Err()
+}
+
+func TestPreparingReviewCleanupRetainsStateAndRetries(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		preparing bool
+		transient bool
+	}{
+		{"fresh start cancellation", false, false},
+		{"preparing recovery ambiguity", true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state, source, base := t.TempDir(), t.TempDir(), t.TempDir()
+			reviewSnapshotRoot = base
+			t.Cleanup(func() {
+				reviewSnapshotRoot = ""
+				_ = filepath.WalkDir(base, func(path string, entry os.DirEntry, err error) error {
+					if err == nil && entry.IsDir() {
+						_ = os.Chmod(path, 0o700)
+					}
+					return nil
+				})
+			})
+			runGit(t, source, "init")
+			runGit(t, source, "config", "user.email", "test@example.invalid")
+			runGit(t, source, "config", "user.name", "test")
+			if err := os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, source, "add", "file")
+			runGit(t, source, "commit", "-m", "head")
+			head := runGit(t, source, "rev-parse", "HEAD")
+			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+			snapshot, session := filepath.Join(base, "o-r-23-1"), "as-review-23-1"
+			manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed"}
+			if test.preparing {
+				manifest.ReviewState, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = "preparing", head, snapshot, session
+			}
+			sum := sha256.Sum256([]byte(attempt.Repository))
+			manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
+			if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			body, _ := json.Marshal(manifest)
+			if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(snapshot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(snapshot, "retained")
+			if err := os.WriteFile(marker, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			boundary := &blockingReviewBoundary{block: true, done: make(chan struct{})}
+			ctx := t.Context()
+			if test.transient {
+				boundary.err = errors.New("transient boundary failure")
+			} else {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, 50*time.Millisecond)
+				defer cancel()
+			}
+			_, pending, err := runIndependentReview(ctx, &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, manifest, source, head)
+			if err != nil || !pending {
+				t.Fatalf("pending=%v err=%v", pending, err)
+			}
+			storedBody, err := os.ReadFile(manifestPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stored agentruntime.Manifest
+			if json.Unmarshal(storedBody, &stored) != nil || stored.ReviewState != "preparing" || stored.ReviewSnapshot != snapshot || stored.ReviewSession != session {
+				t.Fatalf("preparing state not retained: %#v", stored)
+			}
+			if _, err := os.Stat(marker); err != nil {
+				t.Fatalf("snapshot removed after ambiguous cleanup: %v", err)
+			}
+
+			boundary.block, boundary.err = false, nil
+			_, pending, err = runIndependentReview(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, stored, source, head)
+			if err != nil || !pending {
+				t.Fatalf("retry pending=%v err=%v", pending, err)
+			}
+			storedBody, _ = os.ReadFile(manifestPath)
+			stored = agentruntime.Manifest{}
+			_ = json.Unmarshal(storedBody, &stored)
+			if stored.ReviewState != "running" || stored.ReviewSnapshot != snapshot || stored.ReviewSession != session {
+				t.Fatalf("retry did not start reviewer: %#v", stored)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("retry did not replace retained snapshot: %v", err)
+			}
+		})
+	}
+}
+
+func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
+	state, base := t.TempDir(), t.TempDir()
+	reviewSnapshotRoot = base
+	t.Cleanup(func() { reviewSnapshotRoot = "" })
+	snapshot := filepath.Join(base, "o-r-23-1")
+	if err := os.Mkdir(snapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "running", ReviewHead: "head", ReviewSnapshot: snapshot, ReviewSession: "as-review-23-1"}
+	sum := sha256.Sum256([]byte(attempt.Repository))
+	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	boundary := &blockingReviewBoundary{block: true, done: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	result, pending, err := runIndependentReview(ctx, &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, manifest, "", "head")
+	if err != nil || !pending || result.Status != "clean" || time.Since(started) > time.Second {
+		t.Fatalf("result=%#v pending=%v err=%v elapsed=%v", result, pending, err, time.Since(started))
+	}
+	select {
+	case <-boundary.done:
+	default:
+		t.Fatal("boundary outlived cleanup cancellation")
+	}
+	storedBody, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored agentruntime.Manifest
+	if err := json.Unmarshal(storedBody, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.ReviewState != "clean" || stored.ReviewSession == "" || stored.ReviewSnapshot == "" {
+		t.Fatalf("cleanup discarded retry state: %#v", stored)
+	}
+	if _, err := os.Stat(snapshot); err != nil {
+		t.Fatalf("cleanup removed retained snapshot: %v", err)
+	}
+
+	boundary.block = false
+	stored, err = cleanupReviewOutcome(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, stored)
+	if err != nil || stored.ReviewSession != "" || stored.ReviewSnapshot != "" {
+		t.Fatalf("retry stored=%#v err=%v", stored, err)
+	}
+	if _, err := os.Stat(snapshot); !os.IsNotExist(err) {
+		t.Fatalf("retry retained snapshot: %v", err)
+	}
+}
+
+func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
+	coordinator, worker, remote := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
+	for _, repo := range []string{coordinator, worker} {
+		runGit(t, repo, "init")
+		runGit(t, repo, "config", "user.email", "test@example.invalid")
+		runGit(t, repo, "config", "user.name", "test")
+	}
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "add", "file")
+	runGit(t, worker, "commit", "-m", "base")
+	base := runGit(t, worker, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("head"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "commit", "-am", "head")
+	head := runGit(t, worker, "rev-parse", "HEAD")
+	bundlePath := filepath.Join(t.TempDir(), "attempt.bundle")
+	runGit(t, worker, "bundle", "create", bundlePath, "--all")
+	bundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyRepo := filepath.Join(t.TempDir(), "verify.git")
+	runGit(t, worker, "init", "--bare", verifyRepo)
+	gitWrapperDir := t.TempDir()
+	gitWrapper := filepath.Join(gitWrapperDir, "git")
+	gitWrapperBody := fmt.Sprintf("#!/bin/sh\ncase \" $* \" in\n  *\" bundle verify \"*) for last do :; done; exec %q --git-dir=%q bundle verify \"$last\";;\nesac\nexec %q \"$@\"\n", realGit, verifyRepo, realGit)
+	if err := os.WriteFile(gitWrapper, []byte(gitWrapperBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", gitWrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runGit(t, coordinator, "init", "--bare", remote)
+	runGit(t, coordinator, "remote", "add", "origin", remote)
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+
+	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: "issue-23", BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "ok", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
+	exportedJSON, _ := json.Marshal(exported)
+	boundaryResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
+	implementation := filepath.Join(t.TempDir(), "implementation-boundary")
+	if err := os.WriteFile(implementation, []byte("#!/bin/sh\nprintf '%s' '"+string(boundaryResult)+"'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	review := filepath.Join(t.TempDir(), "review-boundary")
+	if err := os.WriteFile(review, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", implementation)
+	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", review)
+
+	state, snapshotBase := t.TempDir(), t.TempDir()
+	oldReviewRoot := reviewSnapshotRoot
+	reviewSnapshotRoot = snapshotBase
+	t.Cleanup(func() { reviewSnapshotRoot = oldReviewRoot })
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+	snapshot, session := reviewIdentity(attempt)
+	if err := os.Mkdir(snapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Branch: "issue-23", BaseSHA: base, State: "completed", ReviewState: "clean", ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session, UpdatedAt: time.Now().UTC()}
+	sum := sha256.Sum256([]byte(attempt.Repository))
+	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtimeState := &agentruntime.Runtime{StateRoot: state}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, BaseBranch: "main"}
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, nil); err != nil {
+		t.Fatal(err)
+	}
+	storedBody, _ := os.ReadFile(manifestPath)
+	var stored agentruntime.Manifest
+	_ = json.Unmarshal(storedBody, &stored)
+	if stored.ReviewSession == "" {
+		t.Fatal("ambiguous cleanup discarded retry state")
+	}
+	if refs, _ := exec.Command("git", "-C", remote, "show-ref").Output(); len(bytes.TrimSpace(refs)) != 0 {
+		t.Fatalf("publication ran before authoritative cleanup: %s", refs)
+	}
+
+	if err := os.WriteFile(review, []byte("#!/bin/sh\nprintf '{\"Code\":0}'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, nil)
+	if err == nil || !strings.Contains(err.Error(), "AGENT_SYMPHONY_GITHUB_APP_ID") {
+		t.Fatalf("publication did not continue after cleanup: %v", err)
+	}
+	storedBody, _ = os.ReadFile(manifestPath)
+	stored = agentruntime.Manifest{}
+	_ = json.Unmarshal(storedBody, &stored)
+	if stored.ReviewSession != "" || stored.ReviewSnapshot != "" {
+		t.Fatalf("authoritative cleanup retained state: %#v", stored)
+	}
+	if refs := runGit(t, remote, "show-ref"); !strings.Contains(refs, "refs/heads/issue-23") {
+		t.Fatalf("publication did not proceed after cleanup: %s", refs)
 	}
 }
 
@@ -399,6 +1154,39 @@ func TestMountedFilesystemUsesLongestMatchingEntry(t *testing.T) {
 	filesystem, err := mountedFilesystem(mount, mounts)
 	if err != nil || filesystem != "9p" {
 		t.Fatalf("got %q, %v; want 9p", filesystem, err)
+	}
+}
+
+func TestWSLPreflightRejectsEveryWindowsMountedPathBeforeMountProbe(t *testing.T) {
+	for _, test := range []struct{ name, root, worktree, state string }{
+		{"repository", "/mnt/c/repo", "/tmp/worktrees", "/tmp/state"},
+		{"worktree", "/tmp/repo", "/mnt/c/worktrees", "/tmp/state"},
+		{"state", "/tmp/repo", "/tmp/worktrees", "/mnt/c/state"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateWSLFilesystem(test.root, test.worktree, test.state, filepath.Join(t.TempDir(), "missing-mounts")); err == nil || !strings.Contains(err.Error(), "Move all three paths") && !strings.Contains(err.Error(), "move all three paths") {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+func TestServeRejectsWSLStateBeforeCreatingDaemonLock(t *testing.T) {
+	root := gitRepository(t)
+	configPath := filepath.Join(root, ".agent-symphony.yaml")
+	if err := config.Write(configPath, config.Default("owner/repo")); err != nil {
+		t.Fatal(err)
+	}
+	oldWSL := runningOnWSL
+	runningOnWSL = func() bool { return true }
+	t.Cleanup(func() { runningOnWSL = oldWSL })
+	state := fmt.Sprintf("/mnt/agent-symphony-preflight-%d", time.Now().UnixNano())
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"serve", "--config", configPath, "--state", filepath.Join(root, "state.json"), "--runtime-state", state}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "move all three paths") {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Lstat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("serve mutated rejected runtime state: %v", err)
 	}
 }
 

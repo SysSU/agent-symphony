@@ -55,6 +55,8 @@ go build -o agent-symphony ./cmd/agent-symphony
 ./agent-symphony status --state /path/to/pr-state.json --runtime-state /path/to/state
 ```
 
+Before `serve`, install the release binary root-owned at `/usr/local/libexec/agent-symphony/<version>/agent-symphony`, then run `sudo .../agent-symphony install-host --coordinator "$USER"`. The coordinator uses the installed implementation and review `agent-host` sudo boundaries automatically; `AGENT_SYMPHONY_WORKER_BOUNDARY` and `AGENT_SYMPHONY_REVIEW_BOUNDARY` remain only test seams.
+
 `init` derives `owner/repository` from the GitHub `origin` and creates `.agent-symphony.yaml` without overwriting an existing file. Configuration is JSON, which is a valid YAML 1.2 subset and allows strict stdlib-only parsing. Keep credentials outside this committed file. `doctor` may use `GITHUB_TOKEN` or `GH_TOKEN` for a read-only effective-access probe; it never prints the value.
 
 See the [CLI reference](docs/cli.md) for the schema, structured output, diagnostics, and current scope.

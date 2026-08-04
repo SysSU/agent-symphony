@@ -422,6 +422,19 @@ func TestAgentEnvironmentRejectsReservedExplicitNames(t *testing.T) {
 	}
 }
 
+func TestAgentEnvironmentNeverCarriesCoordinatorHome(t *testing.T) {
+	env, err := AgentEnvironmentWith([]string{"HOME=/coordinator", "PATH=/bin"})
+	if err != nil || strings.Contains(strings.Join(env, "\n"), "HOME=") {
+		t.Fatalf("environment=%v err=%v", env, err)
+	}
+}
+
+func TestAgentEnvironmentRejectsConfiguredHome(t *testing.T) {
+	if _, err := AgentEnvironmentWith(nil, "HOME"); err == nil {
+		t.Fatal("configured HOME allowlist was accepted")
+	}
+}
+
 func TestSnapshotRequiresExactCurrentNonBodyProvenance(t *testing.T) {
 	controls := Controls{Ready: true, Priority: 1, Completion: "human-review"} // open, cancellation cleared, retry cleared
 	now := time.Now().UTC()

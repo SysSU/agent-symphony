@@ -22,6 +22,19 @@ func TestLoadAndValidate(t *testing.T) {
 	}
 }
 
+func TestDefaultAndConfiguredEnvironmentExcludeHome(t *testing.T) {
+	c := Default("owner/repo")
+	for _, name := range c.Commands.Environment {
+		if name == "HOME" {
+			t.Fatal("default allowlist contains HOME")
+		}
+	}
+	c.Commands.Environment = append(c.Commands.Environment, "HOME")
+	if err := c.Validate(); err == nil {
+		t.Fatal("configured HOME allowlist accepted")
+	}
+}
+
 func TestLoadRejectsUnknownKeysAndSecrets(t *testing.T) {
 	b, err := json.MarshalIndent(Default("owner/repo"), "", "  ")
 	if err != nil {

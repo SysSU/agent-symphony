@@ -6,7 +6,7 @@ Run `scripts/validate-release.sh VERSION`. It executes all tests with the race d
 
 Each archive contains one self-contained executable. WSL2 uses `linux_amd64`. Cross-compilation is not an OS smoke pass: the workflow's macOS, Ubuntu, and Windows/WSL2 jobs must each succeed and their immutable run URLs must be recorded.
 
-The packaged smoke runs the real binary for configuration/status/inspection and `doctor --offline`, requiring a passing platform diagnostic with only the three documented prerequisite warnings (the intentionally skipped GitHub permission probe, host isolation, and GitHub policy). It does not pretend to run a live GitHub App: `validate-release.sh` separately runs the production seams for `serve` locking, reconciliation/restart recovery, webhook admission/deduplication, PR governance, handoff recovery, and runtime lifecycle against fake GitHub/process boundaries. An online authenticated `doctor`, real App installation, host accounts/sudo isolation, tmux agents, GitHub mutations, and end-to-end pilot remain external gates below.
+The packaged smoke runs the real binary for configuration/status/inspection and `doctor --offline`, and proves `install-host` and `agent-host` dispatch without privileged mutation. A missing host installation is an expected diagnostic failure in the disposable smoke repository. `validate-release.sh` separately exercises fake host commands/filesystems plus the production seams for `serve`, recovery, governance, handoffs, and runtime lifecycle. An online authenticated `doctor`, real privileged installation, host canaries, GitHub mutations, and end-to-end pilot remain explicit external gates.
 
 ## Signed release tags
 

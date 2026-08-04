@@ -4,4 +4,6 @@ The coordinator owns GitHub credentials and policy mutations. Workers receive a 
 
 Before a pilot, verify the worker identity boundary, filesystem permissions, tmux history, retained logs, config, Git history, and release artifacts contain no credential. A clean pattern scan is supporting evidence, not proof that an unknown secret format was absent. Rotate any credential suspected of exposure and preserve only redacted incident evidence.
 
+`install-host` must run as root from the root-owned versioned release path. It writes only the two exact no-argument `agent-host` sudo tuples. `agent-host` rechecks its effective user and primary group, accepts one bounded JSON value, permits only Git/tmux execution below its provisioned root, and re-applies the shared credential environment filter. It never grants an agent GitHub authority.
+
 Webhook signatures authenticate delivery, while fresh GitHub permission checks authorize actors. Required checks, review state, current head, and branch protection are re-read before merge; the coordinator never uses an administrative bypass.
