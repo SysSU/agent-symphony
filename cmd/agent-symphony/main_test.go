@@ -3,16 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1356,5 +1359,134 @@ func TestGithubTokenSourceEndToEndExchangeIsCachedAcrossCalls(t *testing.T) {
 	}
 	if exchanges != 1 {
 		t.Fatalf("expected exactly one token exchange across two calls, got %d", exchanges)
+	}
+}
+
+func TestStartWebhookListenerValidatesConfig(t *testing.T) {
+	t.Run("neither set is a no-op", func(t *testing.T) {
+		wake, shutdown, err := startWebhookListener(context.Background(), internalgithub.API{}, "o/r", io.Discard)
+		if err != nil || wake != nil || shutdown == nil {
+			t.Fatalf("wake=%v shutdownIsNil=%v err=%v", wake, shutdown == nil, err)
+		}
+		if err := shutdown(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("only addr set is an error", func(t *testing.T) {
+		t.Setenv("AGENT_SYMPHONY_WEBHOOK_ADDR", "127.0.0.1:0")
+		if _, _, err := startWebhookListener(context.Background(), internalgithub.API{}, "o/r", io.Discard); err == nil {
+			t.Fatal("expected error with only addr set")
+		}
+	})
+	t.Run("only secret set is an error", func(t *testing.T) {
+		t.Setenv("AGENT_SYMPHONY_WEBHOOK_SECRET", "secret-canary")
+		if _, _, err := startWebhookListener(context.Background(), internalgithub.API{}, "o/r", io.Discard); err == nil {
+			t.Fatal("expected error with only secret set")
+		}
+	})
+	t.Run("missing installation ID is an error", func(t *testing.T) {
+		t.Setenv("AGENT_SYMPHONY_WEBHOOK_ADDR", "127.0.0.1:0")
+		t.Setenv("AGENT_SYMPHONY_WEBHOOK_SECRET", "secret-canary")
+		if _, _, err := startWebhookListener(context.Background(), internalgithub.API{}, "o/r", io.Discard); err == nil {
+			t.Fatal("expected error without installation ID")
+		}
+	})
+	t.Run("unbindable address is an error", func(t *testing.T) {
+		reserve, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reserve.Close()
+		t.Setenv("AGENT_SYMPHONY_WEBHOOK_ADDR", reserve.Addr().String())
+		t.Setenv("AGENT_SYMPHONY_WEBHOOK_SECRET", "secret-canary")
+		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
+		if _, _, err := startWebhookListener(context.Background(), internalgithub.API{}, "o/r", io.Discard); err == nil {
+			t.Fatal("expected error binding an already-held address")
+		}
+	})
+}
+
+func TestStartWebhookListenerDeliversWakeOnValidSignedWebhook(t *testing.T) {
+	reserve, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := reserve.Addr().String()
+	reserve.Close()
+
+	fakeGitHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r" {
+			t.Errorf("unexpected repository lookup path %s", r.URL.Path)
+		}
+		fmt.Fprint(w, `{"id":9999}`)
+	}))
+	defer fakeGitHub.Close()
+
+	t.Setenv("AGENT_SYMPHONY_WEBHOOK_ADDR", addr)
+	t.Setenv("AGENT_SYMPHONY_WEBHOOK_SECRET", "secret-canary")
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
+
+	api := internalgithub.API{BaseURL: fakeGitHub.URL, Tokens: environmentToken("test-token"), HTTP: fakeGitHub.Client()}
+	wake, shutdown, err := startWebhookListener(context.Background(), api, "o/r", io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wake == nil {
+		t.Fatal("expected a non-nil wake channel")
+	}
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := shutdown(shutdownCtx); err != nil {
+			t.Error(err)
+		}
+	})
+
+	body := []byte(`{"installation":{"id":7},"repository":{"id":9999},"issue":{"number":42}}`)
+	mac := hmac.New(sha256.New, []byte("secret-canary"))
+	mac.Write(body)
+	signature := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Event", "issues")
+	req.Header.Set("X-GitHub-Delivery", "delivery-1")
+	req.Header.Set("X-Hub-Signature-256", signature)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("webhook POST status = %d, want 202", resp.StatusCode)
+	}
+
+	select {
+	case <-wake:
+	case <-time.After(2 * time.Second):
+		t.Fatal("wake channel never received a signal from the valid webhook")
+	}
+
+	// A second delivery with a bad signature must be rejected and must not wake again.
+	badReq, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/", bytes.NewReader(body))
+	badReq.Header.Set("Content-Type", "application/json")
+	badReq.Header.Set("X-GitHub-Event", "issues")
+	badReq.Header.Set("X-GitHub-Delivery", "delivery-2")
+	badReq.Header.Set("X-Hub-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
+	badResp, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badResp.Body.Close()
+	if badResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("bad signature status = %d, want 401", badResp.StatusCode)
+	}
+	select {
+	case <-wake:
+		t.Fatal("wake fired for an invalid signature")
+	case <-time.After(100 * time.Millisecond):
 	}
 }

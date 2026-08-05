@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -254,6 +255,64 @@ func githubTokenSource(appID int64) (internalgithub.TokenSource, error) {
 	return &internalgithub.InstallationTokens{BaseURL: githubAPI, InstallationID: installationID, JWTs: internalgithub.AppJWT{AppID: strconv.FormatInt(appID, 10), Key: key}, HTTP: githubClient}, nil
 }
 
+// startWebhookListener starts an HTTP server that turns valid signed GitHub
+// webhook deliveries into a coalesced early-wake signal for serve's
+// reconcile loop. It only starts when both AGENT_SYMPHONY_WEBHOOK_ADDR and
+// AGENT_SYMPHONY_WEBHOOK_SECRET are set; without them it returns a nil wake
+// channel and a no-op shutdown, and serve continues to rely on periodic
+// polling alone exactly as it always has. Periodic reconciliation remains
+// the authoritative recovery path either way — a webhook only wakes it up
+// sooner; it never replaces it.
+func startWebhookListener(ctx context.Context, api internalgithub.API, repository string, stderr io.Writer) (<-chan struct{}, func(context.Context) error, error) {
+	noop := func(context.Context) error { return nil }
+	addr := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_WEBHOOK_ADDR"))
+	secret := os.Getenv("AGENT_SYMPHONY_WEBHOOK_SECRET")
+	if addr == "" && secret == "" {
+		return nil, noop, nil
+	}
+	if addr == "" || secret == "" {
+		return nil, nil, errors.New("AGENT_SYMPHONY_WEBHOOK_ADDR and AGENT_SYMPHONY_WEBHOOK_SECRET must both be set")
+	}
+	installationID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID")
+	if err != nil {
+		return nil, nil, fmt.Errorf("webhook requires %w", err)
+	}
+	// Cheap local checks before any network round-trip: fail fast on an
+	// unbindable address rather than waiting on a retried API call first.
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("webhook listener: %w", err)
+	}
+	repositoryID, err := api.RepositoryID(ctx, repository)
+	if err != nil {
+		_ = listener.Close()
+		return nil, nil, err
+	}
+	hints := make(chan internalgithub.Hint, 64)
+	wake := make(chan struct{}, 1)
+	go func() {
+		for range hints {
+			select {
+			case wake <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	handler := internalgithub.Webhook{Secret: []byte(secret), RepositoryID: repositoryID, InstallationID: installationID, Hints: hints, Deliveries: internalgithub.NewDeliveryCache(1024)}
+	server := &http.Server{Handler: handler}
+	go func() {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintln(stderr, "webhook listener: "+err.Error())
+		}
+	}()
+	shutdown := func(shutdownCtx context.Context) error {
+		err := server.Shutdown(shutdownCtx)
+		close(hints) // safe only after Shutdown returns: no handler can still be sending
+		return err
+	}
+	return wake, shutdown, nil
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -321,17 +380,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if *interval <= 0 || *interval > orchestrator.MaxReconcileInterval {
 			return misuse(stderr, wantsJSON, command, "--interval must be greater than zero and no more than 60s")
 		}
+		c, err := config.Load(*path)
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
 		if runningOnWSL() {
-			c, err := config.Load(*path)
-			if err != nil {
-				return fail(stderr, *jsonOutput, command, err.Error())
+			root, rootErr := config.GitRoot()
+			if rootErr == nil {
+				rootErr = validateWSLFilesystem(root, filepath.Join(root, c.WorktreeRoot), *runtimeState, "/proc/mounts")
 			}
-			root, err := config.GitRoot()
-			if err == nil {
-				err = validateWSLFilesystem(root, filepath.Join(root, c.WorktreeRoot), *runtimeState, "/proc/mounts")
-			}
-			if err != nil {
-				return fail(stderr, *jsonOutput, command, err.Error())
+			if rootErr != nil {
+				return fail(stderr, *jsonOutput, command, rootErr.Error())
 			}
 		}
 		appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
@@ -351,6 +410,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		defer releaseDaemonLock(lock)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
+		api := internalgithub.API{BaseURL: githubAPI, Tokens: tokens, HTTP: githubClient}
+		wake, shutdownWebhook, err := startWebhookListener(ctx, api, c.Repository, stderr)
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = shutdownWebhook(shutdownCtx)
+		}()
 		reconcile := func(ctx context.Context) error {
 			_, err := reconcileGitHub(ctx, *path, *statePath, *runtimeState, true, tokens)
 			if err != nil {
@@ -358,7 +427,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			}
 			return err
 		}
-		if err := orchestrator.ReconcileLoop(ctx, *interval, reconcile); err != nil && !errors.Is(err, context.Canceled) {
+		if err := orchestrator.ReconcileLoop(ctx, *interval, wake, reconcile); err != nil && !errors.Is(err, context.Canceled) {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		return 0
@@ -1822,7 +1891,7 @@ func doctor(c config.Config, offline bool, stateRoot string) []diagnostic {
 		result = append(result, githubDiagnostics(c.Repository)...)
 	}
 	result = append(result, hostDiagnostic(stateRoot))
-	result = append(result, diagnostic{"GitHub policy", "warn", "App webhook events, required policy check, and merge permissions are not configured by issue #6", "Complete GitHub App setup in the downstream integration issue before serving work."})
+	result = append(result, diagnostic{"GitHub policy", "warn", "the required agent-symphony/policy check and merge-permission gating are not yet implemented", "Configure branch protection manually until the policy check exists; an optional webhook listener for early wake-up can be configured with AGENT_SYMPHONY_WEBHOOK_ADDR/AGENT_SYMPHONY_WEBHOOK_SECRET, but periodic reconciliation remains the authoritative recovery path either way."})
 	return result
 }
 

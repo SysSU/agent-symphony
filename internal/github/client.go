@@ -41,6 +41,21 @@ func (a API) VerifyInstallation(ctx context.Context, appID int64) error {
 	return nil
 }
 
+// RepositoryID fetches the numeric GitHub repository ID for "owner/repo",
+// used to scope webhook delivery validation to the exact configured repository.
+func (a API) RepositoryID(ctx context.Context, repository string) (int64, error) {
+	var repo struct {
+		ID int64 `json:"id"`
+	}
+	if _, _, err := a.Read(ctx, "/repos/"+repository, "", &repo); err != nil {
+		return 0, fmt.Errorf("fetch GitHub repository ID: %w", err)
+	}
+	if repo.ID <= 0 {
+		return 0, errors.New("GitHub repository ID is invalid")
+	}
+	return repo.ID, nil
+}
+
 type ambiguousMutationError struct{ error }
 
 type responseStatusError struct {
