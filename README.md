@@ -3,7 +3,7 @@
 Agent Symphony is a planned GitHub-native, multi-agent software delivery orchestrator inspired by [OpenAI Symphony](https://github.com/openai/symphony). Stakeholders define and prioritize work in GitHub Issues; an orchestrator coordinates agents through implementation, validation, documentation, pull-request review, and policy-controlled merge.
 
 > [!NOTE]
-> Restart recovery joins authoritative attempt facts to bounded runtime manifests, prevents active/completed redispatch, and exposes corrective status. Issue #10's feedback and validation handoffs are claimed durably through the same recovery boundary.
+> Restart recovery joins authoritative attempt facts to bounded runtime manifests, prevents active/completed redispatch, and exposes corrective status. Feedback and validation handoffs are claimed durably through the same recovery boundary.
 
 ## Planned MVP
 
