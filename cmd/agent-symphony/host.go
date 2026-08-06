@@ -921,7 +921,11 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if _, err := run("merge-base", "--is-ancestor", manifest.BaseSHA, "HEAD"); err != nil {
 		return "", errors.New("export head does not descend from base")
 	}
-	result, err := readWorkerResult(manifest.Worktree)
+	resultPath := agentruntime.ResultPath(want.Worktree)
+	if !belowRoot(resultPath, root) {
+		return "", errors.New("worker result path escapes provisioned root")
+	}
+	result, err := readWorkerResult(resultPath)
 	if err != nil {
 		return "", err
 	}
@@ -1017,11 +1021,10 @@ func parseWorkerResult(body []byte) (workerResult, error) {
 	return result, nil
 }
 
-func readWorkerResult(worktree string) (workerResult, error) {
+func readWorkerResult(path string) (workerResult, error) {
 	const maxBytes = 64 << 10
-	path := filepath.Join(worktree, workerResultPath)
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > maxBytes {
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > maxBytes {
 		return workerResult{}, errors.New("worker result is invalid")
 	}
 	f, err := os.Open(path)
@@ -1030,16 +1033,14 @@ func readWorkerResult(worktree string) (workerResult, error) {
 	}
 	opened, statErr := f.Stat()
 	body, readErr := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	final, finalStatErr := f.Stat()
 	closeErr := f.Close()
-	if statErr != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) || readErr != nil || closeErr != nil || len(body) > maxBytes {
+	if statErr != nil || finalStatErr != nil || !opened.Mode().IsRegular() || !final.Mode().IsRegular() || !os.SameFile(info, opened) || !os.SameFile(opened, final) || opened.Size() != final.Size() || !opened.ModTime().Equal(final.ModTime()) || readErr != nil || closeErr != nil || len(body) > maxBytes {
 		return workerResult{}, errors.New("worker result is invalid")
 	}
 	result, err := parseWorkerResult(body)
 	if err != nil {
 		return workerResult{}, err
-	}
-	if err := os.Remove(path); err != nil {
-		return workerResult{}, errors.New("worker result could not be removed")
 	}
 	return result, nil
 }

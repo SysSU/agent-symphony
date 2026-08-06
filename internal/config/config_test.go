@@ -11,7 +11,7 @@ import (
 
 func TestLoadAndValidate(t *testing.T) {
 	c := Default("owner/repo")
-	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "--sandbox", "workspace-write", "--output-last-message", ".agent-symphony-result.json"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "review"}) {
+	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "--sandbox", "workspace-write"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "review"}) {
 		t.Fatalf("unexpected default commands: %#v", c.Commands)
 	}
 	c.Commands.Implementation = []string{"custom-agent", "--flag"}

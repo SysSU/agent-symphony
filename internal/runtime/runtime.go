@@ -23,11 +23,11 @@ import (
 )
 
 const (
-	manifestVersion  = 1
-	maxResourceName  = 64
-	maxPathLength    = 4096
-	historyLimit     = "5000"
-	WorkerResultPath = ".agent-symphony-result.json"
+	manifestVersion    = 1
+	maxResourceName    = 64
+	maxPathLength      = 4096
+	historyLimit       = "5000"
+	workerResultSuffix = ".result.json"
 )
 
 var component = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
@@ -155,17 +155,25 @@ type Runtime struct {
 
 func PaneTarget(session string) string { return "=" + session + ":0.0" }
 
+func ResultPath(worktree string) string { return worktree + workerResultSuffix }
+
 // PromptCommand starts command with the named tmux buffer connected to stdin.
-func PromptCommand(tmux, buffer string, command []string) []string {
-	const script = `tmux=$1; buffer=$2; shift 2
+// When resultPath is nonempty, the wrapper captures only stdout in a private file.
+func PromptCommand(tmux, buffer, resultPath string, command []string) []string {
+	const script = `tmux=$1; buffer=$2; result=$3; shift 3
 TMPDIR=/tmp; export TMPDIR
 prompt=$(umask 077; mktemp "$TMPDIR/agent-symphony-prompt.XXXXXX") || exit
 cleanup() { status=$?; trap - EXIT; rm -f "$prompt" || status=1; exit "$status"; }
 trap cleanup EXIT
 "$tmux" save-buffer -b "$buffer" "$prompt" &&
 "$tmux" delete-buffer -b "$buffer" &&
-"$@" <"$prompt"`
-	return append([]string{"sh", "-c", script, "agent-symphony-prompt", tmux, buffer}, command...)
+if [ -n "$result" ]; then
+  umask 077; set -C; exec 3>"$result" || exit; set +C
+  "$@" <"$prompt" >&3
+else
+  "$@" <"$prompt"
+fi`
+	return append([]string{"sh", "-c", script, "agent-symphony-prompt", tmux, buffer, resultPath}, command...)
 }
 
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
@@ -205,6 +213,11 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
 		return Manifest{}, fmt.Errorf("worktree already exists: %s", manifest.Worktree)
 	}
+	if _, err := os.Lstat(ResultPath(manifest.Worktree)); err == nil {
+		return Manifest{}, fmt.Errorf("worker result already exists: %s", ResultPath(manifest.Worktree))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Manifest{}, err
+	}
 	if live, err := r.session(ctx, manifest.Session); err != nil {
 		return Manifest{}, err
 	} else if live {
@@ -237,11 +250,6 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	}
 	if err := git("checkout", "--detach", attempt.BaseSHA); err != nil {
 		return fail("checkout base", err)
-	}
-	if _, err := os.Lstat(filepath.Join(manifest.Worktree, WorkerResultPath)); err == nil {
-		return fail("validate base", errors.New("base contains reserved worker result artifact"))
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fail("validate base", err)
 	}
 	if err := git("switch", "-c", manifest.Branch); err != nil {
 		return fail("create branch", err)
@@ -278,7 +286,7 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	}
 	command := attempt.Command
 	if attempt.Context != "" {
-		command = PromptCommand(r.tmux(), manifest.Session, command)
+		command = PromptCommand(r.tmux(), manifest.Session, ResultPath(manifest.Worktree), command)
 	}
 	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
 		return failStop("start agent", err)
@@ -485,7 +493,7 @@ func AttemptIdentity(root string, a Attempt) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	if len(worktree) > maxPathLength {
+	if len(worktree) > maxPathLength || len(ResultPath(worktree)) > maxPathLength {
 		return Manifest{}, fmt.Errorf("attempt path must be absolute and at most %d bytes", maxPathLength)
 	}
 	return Manifest{Version: manifestVersion, Repository: a.Repository, Issue: a.Issue, Attempt: a.Number,

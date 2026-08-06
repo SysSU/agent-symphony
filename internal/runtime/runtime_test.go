@@ -149,7 +149,7 @@ func TestLifecycleCreatesUncredentialedRepositoryAndPreservesPrimary(t *testing.
 	if manifest.State != "running" || fake.buffers[manifest.Session] != attempt.Context {
 		t.Fatalf("unexpected launch: %#v, %#v", manifest, fake.sessions[manifest.Session])
 	}
-	want := PromptCommand("tmux", manifest.Session, attempt.Command)
+	want := PromptCommand("tmux", manifest.Session, ResultPath(manifest.Worktree), attempt.Command)
 	if !slices.Equal(fake.sessions[manifest.Session].agent, want) {
 		t.Fatalf("agent command = %#v, want %#v", fake.sessions[manifest.Session].agent, want)
 	}
@@ -209,16 +209,17 @@ func TestValidationTraversalExistingAndLaunchFailureDiagnostics(t *testing.T) {
 	}
 }
 
-func TestTrackedBaseResultArtifactBlocksLaunch(t *testing.T) {
-	r, fake, attempt, primary := testRuntime(t)
-	if err := os.WriteFile(filepath.Join(primary, WorkerResultPath), []byte(`{"type":"agent-symphony-result-v1","validation":"stale","documentation":"stale"}`), 0o600); err != nil {
+func TestStaleWorkerResultBlocksLaunch(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	identity, err := AttemptIdentity(r.Root, attempt)
+	if err != nil {
 		t.Fatal(err)
 	}
-	runGit(t, primary, "add", WorkerResultPath)
-	runGit(t, primary, "commit", "-qm", "stale result")
-	attempt.BaseSHA = gitOutput(t, primary, "rev-parse", "HEAD")
+	if err := os.WriteFile(ResultPath(identity.Worktree), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	manifest, err := r.PrepareAndStart(t.Context(), attempt)
-	if err == nil || manifest.State != "failed" || !strings.Contains(err.Error(), "reserved worker result") {
+	if err == nil || manifest.State != "" || !strings.Contains(err.Error(), "worker result already exists") {
 		t.Fatalf("manifest=%#v err=%v", manifest, err)
 	}
 	if len(fake.sessions) != 0 {
@@ -313,6 +314,15 @@ func TestConcurrentDisjointAttempts(t *testing.T) {
 
 func TestPromptCommandProvidesStdinBeforeFastConsumerStarts(t *testing.T) {
 	dir := t.TempDir()
+	workspace := filepath.Join(dir, "attempt")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resultPath := ResultPath(workspace)
+	canary := filepath.Join(dir, "outside-canary")
+	if err := os.WriteFile(canary, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	private := t.TempDir()
 	if err := os.WriteFile(filepath.Join(private, "coordinator-canary"), []byte("do not expose"), 0o600); err != nil {
 		t.Fatal(err)
@@ -331,11 +341,35 @@ func TestPromptCommandProvidesStdinBeforeFastConsumerStarts(t *testing.T) {
 	if err := os.WriteFile(tmux, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	command := PromptCommand(tmux, "prompt-buffer", []string{"sh", "-c", `input=$(cat); test "$input" = "$1" && test "$TMPDIR" = /tmp`, "consumer", "line one\nline two"})
+	result := `{"type":"agent-symphony-result-v1","validation":"tests passed","documentation":"none"}`
+	consumer := `input=$(cat) || exit
+test "$input" = "$1" && test "$TMPDIR" = /tmp || exit
+ln -s "$2" .agent-symphony-result.json || exit
+printf '%s\n' progress >&2
+printf '%s\n%s\n' "$3" "$3" >&2
+printf %s "$3"`
+	command := PromptCommand(tmux, "prompt-buffer", resultPath, []string{"sh", "-c", consumer, "consumer", "line one\nline two", canary, result})
 	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Dir = workspace
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_PROMPT=" + prompt, "FAKE_SPOOL=" + spoolRecord, "TMPDIR=" + private}
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("fast stdin consumer: %v: %s", err, out)
+	}
+	if !strings.Contains(string(out), "progress") || strings.Count(string(out), result) != 2 {
+		t.Fatalf("stderr diagnostics were not preserved: %q", out)
+	}
+	if got, err := os.ReadFile(resultPath); err != nil || string(got) != result {
+		t.Fatalf("captured stdout = %q, %v", got, err)
+	}
+	if info, err := os.Stat(resultPath); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("result mode = %v, %v", info, err)
+	}
+	if got, err := os.ReadFile(canary); err != nil || string(got) != "unchanged" {
+		t.Fatalf("outside canary changed: %q, %v", got, err)
+	}
+	if target, err := os.Readlink(filepath.Join(workspace, ".agent-symphony-result.json")); err != nil || target != canary {
+		t.Fatalf("workspace symlink = %q, %v", target, err)
 	}
 	spool, err := os.ReadFile(spoolRecord)
 	if err != nil {
@@ -354,7 +388,8 @@ func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(dir, "consumer-ran")
-	command := PromptCommand(tmux, "missing-buffer", []string{"sh", "-c", `touch "$1"`, "consumer", marker})
+	resultPath := filepath.Join(dir, "attempt.result.json")
+	command := PromptCommand(tmux, "missing-buffer", resultPath, []string{"sh", "-c", `touch "$1"`, "consumer", marker})
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_SPOOL=" + spoolRecord}
 	if err := cmd.Run(); err == nil {
@@ -362,6 +397,9 @@ func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("consumer ran after buffer read failure: %v", err)
+	}
+	if _, err := os.Stat(resultPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("result was opened after buffer read failure: %v", err)
 	}
 	spool, err := os.ReadFile(spoolRecord)
 	if err != nil {

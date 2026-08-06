@@ -850,10 +850,8 @@ func dispatchIssues(ctx context.Context, runtime *agentruntime.Runtime, cfg conf
 }
 
 func implementationPrompt(issue internalgithub.RecoveryIssueFact) string {
-	return fmt.Sprintf("Repository: %s\nIssue: #%d\nAttempt: %d\n\n%s\n\nCompletion contract: Make your final response exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence. The configured implementation command must save that entire response to %s; the default Codex command does this with --output-last-message. Do not wrap it in Markdown fences or create another result object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.Body, workerResultPath)
+	return fmt.Sprintf("Repository: %s\nIssue: #%d\nAttempt: %d\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Agent Symphony captures stdout outside the worktree. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.Body)
 }
-
-const workerResultPath = agentruntime.WorkerResultPath
 
 type workerResult struct {
 	Type          string `json:"type"`
@@ -1031,9 +1029,6 @@ func validateWorkerTree(ctx context.Context, repo, head string) error {
 			return errors.New("tree declared size exceeded")
 		}
 		total += size
-		if bytes.Equal(path, []byte(workerResultPath)) {
-			return errors.New("result marker present")
-		}
 		return nil
 	})
 }
@@ -1504,7 +1499,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"load-buffer", "-b", session, "-"}, Dir: snapshot, Env: env, Stdin: strings.NewReader(prompt)}); err != nil {
 		return independentReviewResult{}, false, err
 	}
-	command = agentruntime.PromptCommand("tmux", session, command)
+	command = agentruntime.PromptCommand("tmux", session, "", command)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}

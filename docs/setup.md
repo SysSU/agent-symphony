@@ -30,7 +30,7 @@ agent-symphony validate    # checks it
 
 Open `.agent-symphony.yaml` and adjust two things for your setup:
 
-- `commands.implementation` / `commands.reviewer` — the coding-agent CLI to run (defaults to `codex exec --sandbox workspace-write --output-last-message .agent-symphony-result.json` for noninteractive source edits and structured completion evidence, plus read-only `codex review`). Custom implementation commands must write their entire final `agent-symphony-result-v1` JSON response to that same repository-relative path. Agent Symphony validates and removes the artifact before committing completed source edits through its bounded implementation worker, so the agent does not need access to protected Git metadata.
+- `commands.implementation` / `commands.reviewer` — the coding-agent CLI to run (defaults to `codex exec --sandbox workspace-write` for noninteractive source edits plus read-only `codex review`). Agent Symphony redirects implementation stdout to a private result file outside the assigned worktree while stderr stays in tmux; default and custom implementations must therefore emit exactly one bounded `agent-symphony-result-v1` JSON object on stdout and send progress to stderr. The retained result supports export retries and never enters the source commit.
 - `commands.environment_allowlist` — add any model-provider credential variable name your agent needs (e.g. `OPENAI_API_KEY`). GitHub/SSH/cloud credential variables are rejected here even if listed; see [CLI reference](cli.md#configuration) for the full schema and why.
 
 ## 3. Run doctor offline

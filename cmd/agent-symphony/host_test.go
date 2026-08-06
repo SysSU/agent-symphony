@@ -158,10 +158,11 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		validation := "pane-zero-" + strings.Repeat("v", 240)
 		good := fmt.Sprintf(`{"type":"agent-symphony-result-v1","validation":%q,"documentation":"done"}`, validation)
 		bad := `{"type":"agent-symphony-result-v1","validation":"wrong-window","documentation":"wrong"}`
-		if err := os.WriteFile(filepath.Join(identity.Worktree, workerResultPath), []byte(good), 0o600); err != nil {
+		resultPath := agentruntime.ResultPath(identity.Worktree)
+		if err := os.WriteFile(resultPath, []byte(good), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		tmux(t, "new-session", "-d", "-x", "80", "-s", identity.Session, "-c", identity.Worktree, "sh", "-c", "printf '%s\\n%s\\n' '"+good+"' '"+good+"'; sleep 30")
+		tmux(t, "new-session", "-d", "-x", "80", "-s", identity.Session, "-c", identity.Worktree, "sh", "-c", "printf 'prompt echo\\n%s\\n%s\\n' '"+good+"' '"+good+"' >&2; sleep 30")
 		t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+identity.Session).Run() })
 		for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 			out, _ := exec.Command("tmux", "capture-pane", "-p", "-J", "-t", agentruntime.PaneTarget(identity.Session), "-S", "-200").CombinedOutput()
@@ -204,6 +205,23 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 				}
 			})
 		}
+		badTMP := filepath.Join(t.TempDir(), "missing")
+		t.Setenv("TMPDIR", badTMP)
+		if _, err := call("implementation", manifest); err == nil {
+			t.Fatal("post-commit export failure was not injected")
+		}
+		if _, err := os.Lstat(resultPath); err != nil {
+			t.Fatalf("result was consumed after failed export: %v", err)
+		}
+		committedHead := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "rev-parse", "HEAD"))))
+		if committedHead == base {
+			t.Fatal("injected failure happened before the worker commit")
+		}
+		if status := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "status", "--porcelain")))); status != "" {
+			t.Fatalf("worktree remained dirty after commit: %q", status)
+		}
+
+		t.Setenv("TMPDIR", t.TempDir())
 		result, err := call("implementation", manifest)
 		if err != nil {
 			t.Fatal(err)
@@ -212,8 +230,19 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != validation || exported.HeadSHA == base {
 			t.Fatalf("export=%#v err=%v", exported, err)
 		}
-		if _, err := os.Lstat(filepath.Join(identity.Worktree, workerResultPath)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("result artifact remained after export: %v", err)
+		second, err := call("implementation", manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var repeated workerExport
+		if err := json.Unmarshal([]byte(second.Output), &repeated); err != nil {
+			t.Fatal(err)
+		}
+		if repeated.HeadSHA != exported.HeadSHA || repeated.BundleSHA256 != exported.BundleSHA256 || repeated.Result != exported.Result {
+			t.Fatalf("retry changed export metadata: first=%#v repeated=%#v", exported, repeated)
+		}
+		if got, err := os.ReadFile(resultPath); err != nil || string(got) != good {
+			t.Fatalf("retained result = %q, %v", got, err)
 		}
 		if _, err := call("review", manifest); err == nil {
 			t.Fatal("review boundary accepted implementation export")
@@ -249,27 +278,38 @@ func TestWorkerResultArtifactFailsClosed(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()
+			path := filepath.Join(dir, "attempt.result.json")
 			if test.body != "" {
-				if err := os.WriteFile(filepath.Join(dir, workerResultPath), []byte(test.body), 0o600); err != nil {
+				if err := os.WriteFile(path, []byte(test.body), 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if result, err := readWorkerResult(dir); err == nil {
+			if result, err := readWorkerResult(path); err == nil {
 				t.Fatalf("result=%#v", result)
 			}
 		})
 	}
 	t.Run("symlink", func(t *testing.T) {
 		dir := t.TempDir()
+		path := filepath.Join(dir, "attempt.result.json")
 		target := filepath.Join(t.TempDir(), "result")
 		if err := os.WriteFile(target, []byte(valid), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(target, filepath.Join(dir, workerResultPath)); err != nil {
+		if err := os.Symlink(target, path); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := readWorkerResult(dir); err == nil {
+		if _, err := readWorkerResult(path); err == nil {
 			t.Fatal("symlink result was accepted")
+		}
+	})
+	t.Run("world readable", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "attempt.result.json")
+		if err := os.WriteFile(path, []byte(valid), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readWorkerResult(path); err == nil {
+			t.Fatal("world-readable result was accepted")
 		}
 	})
 }
