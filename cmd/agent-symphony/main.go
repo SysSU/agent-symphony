@@ -840,13 +840,17 @@ func dispatchIssues(ctx context.Context, runtime *agentruntime.Runtime, cfg conf
 			return errors.New("scheduler returned an unknown issue")
 		}
 		issue := issues[index]
-		prompt := fmt.Sprintf("Repository: %s\nIssue: #%d\nAttempt: %d\n\n%s", issue.Repository, issue.Issue, issue.Attempt, issue.Body)
+		prompt := implementationPrompt(issue)
 		_, err := runtime.PrepareAndStart(ctx, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Context: prompt, Command: cfg.Commands.Implementation, Eligible: func() bool { return issue.Eligible }})
 		if err != nil {
 			return fmt.Errorf("dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
 		}
 	}
 	return nil
+}
+
+func implementationPrompt(issue internalgithub.RecoveryIssueFact) string {
+	return fmt.Sprintf("Repository: %s\nIssue: #%d\nAttempt: %d\n\n%s\n\nCompletion contract: As your final output, emit exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence. Do not wrap it in Markdown fences or emit another result line.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.Body)
 }
 
 type workerResult struct {

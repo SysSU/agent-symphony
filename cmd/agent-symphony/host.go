@@ -921,21 +921,13 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if _, err := run("merge-base", "--is-ancestor", manifest.BaseSHA, "HEAD"); err != nil {
 		return "", errors.New("export head does not descend from base")
 	}
-	log, err := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-S", "-", "-t", agentruntime.PaneTarget(manifest.Session)).Output()
+	log, err := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-J", "-S", "-", "-t", agentruntime.PaneTarget(manifest.Session)).Output()
 	if err != nil {
 		return "", errors.New("worker result is unavailable")
 	}
-	var result workerResult
-	for _, line := range bytes.Split(log, []byte{'\n'}) {
-		var candidate workerResult
-		rd := json.NewDecoder(bytes.NewReader(line))
-		rd.DisallowUnknownFields()
-		if rd.Decode(&candidate) == nil && rd.Decode(&struct{}{}) == io.EOF && candidate.Type == "agent-symphony-result-v1" {
-			result = candidate
-		}
-	}
-	if result.Type != "agent-symphony-result-v1" || strings.TrimSpace(result.Validation) == "" || strings.TrimSpace(result.Documentation) == "" {
-		return "", errors.New("worker result is invalid")
+	result, err := parseWorkerResult(log)
+	if err != nil {
+		return "", err
 	}
 	status, err := run("status", "--porcelain")
 	if err != nil {
@@ -1017,6 +1009,39 @@ func validAttemptGitDir(worktree, gitDir, root string) bool {
 		linked = filepath.Join(gitDir, linked)
 	}
 	return samePath(declared, gitDir) && samePath(linked, dotGit)
+}
+
+func parseWorkerResult(log []byte) (workerResult, error) {
+	const maxLine = 64 << 10
+	var result workerResult
+	found := false
+	for _, line := range bytes.Split(log, []byte{'\n'}) {
+		claimsResult := bytes.Contains(line, []byte("agent-symphony-result-v1"))
+		if len(line) > maxLine {
+			if claimsResult {
+				return workerResult{}, errors.New("worker result is invalid")
+			}
+			continue
+		}
+		var candidate workerResult
+		rd := json.NewDecoder(bytes.NewReader(line))
+		rd.DisallowUnknownFields()
+		if rd.Decode(&candidate) != nil || rd.Decode(&struct{}{}) != io.EOF || candidate.Type != "agent-symphony-result-v1" {
+			if claimsResult {
+				return workerResult{}, errors.New("worker result is invalid")
+			}
+			continue
+		}
+		if found {
+			return workerResult{}, errors.New("worker result is invalid")
+		}
+		found = true
+		result = candidate
+	}
+	if !found || strings.TrimSpace(result.Validation) == "" || strings.TrimSpace(result.Documentation) == "" {
+		return workerResult{}, errors.New("worker result is invalid")
+	}
+	return result, nil
 }
 
 func acceptHandoff(ctx context.Context, input []byte, root string) (string, error) {

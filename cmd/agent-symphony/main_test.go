@@ -33,6 +33,24 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
+func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T) {
+	issue := internalgithub.RecoveryIssueFact{Repository: "owner/repo", Issue: 56, Attempt: 3, Body: "## Context\nunique issue contract\n\n## Validation\ngo test ./..."}
+	prompt := implementationPrompt(issue)
+	for _, want := range []string{"Repository: owner/repo", "Issue: #56", "Attempt: 3", issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt omitted %q: %s", want, prompt)
+		}
+	}
+	if strings.Count(prompt, issue.Body) != 1 || strings.Contains(prompt, "GITHUB_TOKEN") || strings.Contains(prompt, "PRIVATE_KEY") {
+		t.Fatalf("prompt changed issue content or named a credential: %s", prompt)
+	}
+	line := prompt[strings.LastIndex(prompt, "\n")+1:]
+	result, err := parseWorkerResult([]byte(line))
+	if err != nil || result.Validation == "" || result.Documentation == "" {
+		t.Fatalf("documented result was rejected: %#v, %v", result, err)
+	}
+}
+
 func TestWorkerBoundaryStripsCredentialCanaries(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "boundary")

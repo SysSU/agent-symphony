@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
@@ -154,12 +155,13 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(identity.Worktree, "README.md"), []byte("base\nchanged\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		good := `{"type":"agent-symphony-result-v1","validation":"pane-zero","documentation":"done"}`
+		validation := "pane-zero-" + strings.Repeat("v", 240)
+		good := fmt.Sprintf(`{"type":"agent-symphony-result-v1","validation":%q,"documentation":"done"}`, validation)
 		bad := `{"type":"agent-symphony-result-v1","validation":"wrong-window","documentation":"wrong"}`
-		tmux(t, "new-session", "-d", "-x", "200", "-s", identity.Session, "-c", identity.Worktree, "sh", "-c", "printf '%s\\n' '"+good+"'; sleep 30")
+		tmux(t, "new-session", "-d", "-x", "80", "-s", identity.Session, "-c", identity.Worktree, "sh", "-c", "printf '%s\\n' '"+good+"'; sleep 30")
 		t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+identity.Session).Run() })
 		for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-			out, _ := exec.Command("tmux", "capture-pane", "-p", "-t", agentruntime.PaneTarget(identity.Session), "-S", "-200").CombinedOutput()
+			out, _ := exec.Command("tmux", "capture-pane", "-p", "-J", "-t", agentruntime.PaneTarget(identity.Session), "-S", "-200").CombinedOutput()
 			if strings.Contains(string(out), good) {
 				break
 			}
@@ -204,7 +206,7 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 			t.Fatal(err)
 		}
 		var exported workerExport
-		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != "pane-zero" || exported.HeadSHA == base {
+		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != validation || exported.HeadSHA == base {
 			t.Fatalf("export=%#v err=%v", exported, err)
 		}
 		if _, err := call("review", manifest); err == nil {
@@ -220,6 +222,36 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 			t.Fatalf("primary worktree moved from %s to %s", base, got)
 		}
 	})
+}
+
+func TestWorkerResultParserFailsClosed(t *testing.T) {
+	valid := `{"type":"agent-symphony-result-v1","validation":"go test ./... passed","documentation":"none"}`
+	malformed := `{"type":"agent-symphony-result-v1","validation":`
+	unknown := `{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none","extra":true}`
+	oversized := `{"type":"agent-symphony-result-v1","validation":"` + strings.Repeat("x", 64<<10) + `","documentation":"none"}`
+	for _, test := range []struct {
+		name string
+		log  string
+		ok   bool
+	}{
+		{"compliant amid logs", "ordinary output\n" + valid + "\ndone", true},
+		{"missing", "ordinary output only", false},
+		{"malformed", malformed, false},
+		{"malformed then valid", malformed + "\n" + valid, false},
+		{"unknown field", unknown, false},
+		{"unknown field then valid", unknown + "\n" + valid, false},
+		{"empty validation", `{"type":"agent-symphony-result-v1","validation":" ","documentation":"none"}`, false},
+		{"empty documentation", `{"type":"agent-symphony-result-v1","validation":"ok","documentation":" "}`, false},
+		{"ambiguous", valid + "\n" + valid, false},
+		{"oversized", oversized, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := parseWorkerResult([]byte(test.log))
+			if (err == nil) != test.ok || test.ok && (result.Validation == "" || result.Documentation == "") {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+		})
+	}
 }
 
 func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
