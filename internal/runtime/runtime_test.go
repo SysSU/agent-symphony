@@ -296,46 +296,62 @@ func TestConcurrentDisjointAttempts(t *testing.T) {
 
 func TestPromptCommandProvidesStdinBeforeFastConsumerStarts(t *testing.T) {
 	dir := t.TempDir()
+	private := t.TempDir()
+	if err := os.WriteFile(filepath.Join(private, "coordinator-canary"), []byte("do not expose"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(private, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(private, 0o700) })
 	prompt := filepath.Join(dir, "prompt")
 	if err := os.WriteFile(prompt, []byte("line one\nline two"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	tmux := filepath.Join(dir, "tmux")
-	script := "#!/bin/sh\ncase $1 in\nsave-buffer) cp \"$FAKE_PROMPT\" \"$4\";;\ndelete-buffer) exit 0;;\n*) exit 2;;\nesac\n"
+	spoolRecord := filepath.Join(dir, "spool-path")
+	script := "#!/bin/sh\ncase $1 in\nsave-buffer) printf %s \"$4\" >\"$FAKE_SPOOL\"; cp \"$FAKE_PROMPT\" \"$4\";;\ndelete-buffer) exit 0;;\n*) exit 2;;\nesac\n"
 	if err := os.WriteFile(tmux, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	command := PromptCommand(tmux, "prompt-buffer", []string{"sh", "-c", `input=$(cat); test "$input" = "$1"`, "consumer", "line one\nline two"})
+	command := PromptCommand(tmux, "prompt-buffer", []string{"sh", "-c", `input=$(cat); test "$input" = "$1" && test "$TMPDIR" = /tmp`, "consumer", "line one\nline two"})
 	cmd := exec.Command(command[0], command[1:]...)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_PROMPT=" + prompt, "TMPDIR=" + dir}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_PROMPT=" + prompt, "FAKE_SPOOL=" + spoolRecord, "TMPDIR=" + private}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("fast stdin consumer: %v: %s", err, out)
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil || len(entries) != 2 {
-		t.Fatalf("prompt spool was not removed: %#v, %v", entries, err)
+	spool, err := os.ReadFile(spoolRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(string(spool)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("prompt spool was not removed: %v", err)
 	}
 }
 
 func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
 	dir := t.TempDir()
 	tmux := filepath.Join(dir, "tmux")
-	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nexit 23\n"), 0o700); err != nil {
+	spoolRecord := filepath.Join(dir, "spool-path")
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf %s \"$4\" >\"$FAKE_SPOOL\"\nexit 23\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(dir, "consumer-ran")
 	command := PromptCommand(tmux, "missing-buffer", []string{"sh", "-c", `touch "$1"`, "consumer", marker})
 	cmd := exec.Command(command[0], command[1:]...)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "TMPDIR=" + dir}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_SPOOL=" + spoolRecord}
 	if err := cmd.Run(); err == nil {
 		t.Fatal("buffer read failure was masked")
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("consumer ran after buffer read failure: %v", err)
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("failed prompt spool was not removed: %#v, %v", entries, err)
+	spool, err := os.ReadFile(spoolRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(string(spool)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed prompt spool was not removed: %v", err)
 	}
 }
 
