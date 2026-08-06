@@ -878,7 +878,7 @@ func (s *GitHubPRSource) latestBodyEdit(ctx context.Context, number int) (*bodyE
 	if len(parts) != 2 {
 		return nil, errors.New("invalid repository")
 	}
-	payload := map[string]any{"query": `query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){userContentEdits(last:1){nodes{id editedAt editor{__typename ... on Bot{databaseId} ... on EnterpriseUserAccount{databaseId} ... on Mannequin{databaseId} ... on Organization{databaseId} ... on User{databaseId}}}}}}}`, "variables": map[string]any{"owner": parts[0], "repo": parts[1], "number": number}}
+	payload := map[string]any{"query": `query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){userContentEdits(last:1){nodes{id editedAt editor{__typename ... on Bot{databaseId} ... on Mannequin{databaseId} ... on Organization{databaseId} ... on User{databaseId}}}}}}}`, "variables": map[string]any{"owner": parts[0], "repo": parts[1], "number": number}}
 	var response struct {
 		Data struct {
 			Repository struct {
@@ -902,7 +902,7 @@ func (s *GitHubPRSource) latestBodyEdit(ctx context.Context, number int) (*bodyE
 	if len(nodes) != 1 {
 		return nil, errors.New("issue body edit is ambiguous")
 	}
-	if !slices.Contains([]string{"Bot", "EnterpriseUserAccount", "Mannequin", "Organization", "User"}, nodes[0].Editor.Type) || nodes[0].Editor.DatabaseID == nil || *nodes[0].Editor.DatabaseID <= 0 {
+	if !slices.Contains([]string{"Bot", "Mannequin", "Organization", "User"}, nodes[0].Editor.Type) || nodes[0].Editor.DatabaseID == nil || *nodes[0].Editor.DatabaseID <= 0 {
 		return nil, errors.New("issue body editor identity is missing or unsupported")
 	}
 	return &nodes[0], nil
