@@ -56,7 +56,8 @@ var (
 		}
 		return nil
 	}
-	hostRoot = ""
+	hostReviewResultOpen = syscall.Open
+	hostRoot             = ""
 )
 
 func nativeRoot(path string) string { return filepath.Join(hostRoot, path) }
@@ -588,6 +589,55 @@ func writeSudoers(coordinator, binary string) (bool, error) {
 	return errors.Is(statErr, os.ErrNotExist), os.Rename(name, path)
 }
 
+type reviewResultRequest struct {
+	Repository string `json:"repository"`
+	Issue      int    `json:"issue"`
+	Attempt    int    `json:"attempt"`
+	Head       string `json:"head"`
+}
+
+const (
+	maxReviewResultSize     = 64 << 10
+	reviewResultInvalidCode = 65
+)
+
+func readReviewResult(input []byte, root string) (string, error) {
+	var request reviewResultRequest
+	decoder := json.NewDecoder(bytes.NewReader(input))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&request) != nil || decoder.Decode(&struct{}{}) != io.EOF || request.Issue <= 0 || request.Attempt <= 0 || !preflightObjectID.MatchString(request.Head) {
+		return "", errors.New("invalid review result request")
+	}
+	parts := strings.Split(request.Repository, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || len(request.Repository) > 256 || strings.ContainsAny(request.Repository, "\\\x00\r\n") {
+		return "", errors.New("invalid review result request")
+	}
+	snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+	path := reviewResultPath(snapshot, request.Head)
+	if !belowRoot(path, root) {
+		return "", errors.New("review result path escapes snapshot root")
+	}
+	listed, err := os.Lstat(path)
+	if err != nil || !listed.Mode().IsRegular() || listed.Size() <= 0 || listed.Size() > maxReviewResultSize {
+		return "", errors.New("review result artifact is missing, unsafe, or oversized")
+	}
+	fd, err := hostReviewResultOpen(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", errors.New("open review result artifact without following links")
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(listed, opened) || opened.Size() <= 0 || opened.Size() > maxReviewResultSize {
+		return "", errors.New("review result artifact changed during validation")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, maxReviewResultSize+1))
+	if err != nil || len(body) == 0 || len(body) > maxReviewResultSize {
+		return "", errors.New("review result artifact is missing or oversized")
+	}
+	return string(body), nil
+}
+
 func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writer) error {
 	localRoot := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_LOCAL_ROOT"))
 	wantUser, wantGroup, root := workerUser, attemptGroup, "/var/lib/agent-symphony/attempts"
@@ -689,6 +739,14 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return errors.New("review boundary cannot accept implementation handoffs")
 		}
 		result.Output, err = acceptHandoff(ctx, request.Command.Input, root)
+	case "review-result":
+		if mode != "review" {
+			return errors.New("implementation boundary cannot read review results")
+		}
+		result.Output, err = readReviewResult(request.Command.Input, root)
+		if err != nil {
+			result = agentruntime.Result{Output: "review result artifact is invalid", Code: reviewResultInvalidCode, Exited: true}
+		}
 	default:
 		return errors.New("unsupported boundary operation")
 	}

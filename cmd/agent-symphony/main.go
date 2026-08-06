@@ -1349,7 +1349,7 @@ func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtim
 }
 
 func cleanupReviewOutcome(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env []string, manifest agentruntime.Manifest, snapshotRoot string) (agentruntime.Manifest, error) {
-	if err := cleanupReviewResources(ctx, boundary, env, attempt, manifest.ReviewSnapshot, manifest.ReviewSession, snapshotRoot); err != nil {
+	if err := cleanupReviewResources(ctx, boundary, env, attempt, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession, snapshotRoot); err != nil {
 		return manifest, err
 	}
 	return runtimeState.RecordReview(attempt, manifest.ReviewState, manifest.ReviewHead, "", "")
@@ -1359,7 +1359,12 @@ func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, 
 	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", strings.ReplaceAll(attempt.Repository, "/", "-"), attempt.Issue, attempt.Number)), fmt.Sprintf("as-review-%d-%d", attempt.Issue, attempt.Number)
 }
 
-func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, snapshot, session, snapshotRoot string) error {
+func reviewResultPath(snapshot, head string) string {
+	sum := sha256.Sum256([]byte(head))
+	return filepath.Join(fmt.Sprintf("%s.result-%x", snapshot, sum[:8]), "result.json")
+}
+
+func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, snapshot, session, snapshotRoot string) error {
 	expectedSnapshot, expectedSession := reviewIdentity(attempt, snapshotRoot)
 	if (snapshot != "" && snapshot != expectedSnapshot) || (session != "" && session != expectedSession) {
 		return errors.New("persisted reviewer cleanup identity mismatch")
@@ -1380,6 +1385,15 @@ func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []
 		if err != nil && !(result.Exited && result.Code == 1) {
 			return err
 		}
+	}
+	resultPath := reviewResultPath(expectedSnapshot, head)
+	resultRoot := filepath.Dir(resultPath)
+	if info, err := os.Lstat(resultRoot); err == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || os.RemoveAll(resultRoot) != nil {
+			return errors.New("review result cleanup path is invalid")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	if snapshot != "" {
 		_ = filepath.WalkDir(snapshot, func(path string, entry os.DirEntry, err error) error {
@@ -1403,9 +1417,16 @@ type independentReviewResult struct {
 	Session  string   `json:"-"`
 }
 
+func reviewPrompt(issue internalgithub.RecoveryIssueFact, base string) string {
+	return fmt.Sprintf("Review only the exact attested change at %s..HEAD for issue #%d attempt %d. Inspect that entire diff and its affected code for correctness, regressions, security, and missing behavioral tests. Make the entire final response exactly one bounded JSON object on stdout: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings. Do not wrap it in Markdown, emit prose, or emit another object.\n\n%s", base, issue.Issue, issue.Attempt, issue.Body)
+}
+
 func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot string) (independentReviewResult, bool, error) {
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
+	}
+	if !preflightObjectID.MatchString(attempt.BaseSHA) {
+		return independentReviewResult{}, false, errors.New("review base is missing or invalid")
 	}
 	snapshot, session := reviewIdentity(attempt, snapshotRoot)
 	if manifest.ReviewState == "running" && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
@@ -1424,11 +1445,15 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 			} else if status != 0 {
 				return independentReviewResult{}, false, fmt.Errorf("reviewer exited %d", status)
 			} else {
-				capture, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"capture-pane", "-p", "-S", "-", "-t", agentruntime.PaneTarget(session)}, Dir: snapshot, Env: env})
+				request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Head: head})
+				artifact, err := boundary.call(ctx, "review-result", agentruntime.Command{Stdin: bytes.NewReader(request)})
 				if err != nil {
+					if artifact.Exited && artifact.Code == reviewResultInvalidCode {
+						return independentReviewResult{}, false, err
+					}
 					return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
 				}
-				parsed, err := parseIndependentReview(capture.Output)
+				parsed, err := parseIndependentReview(artifact.Output)
 				if err != nil {
 					return independentReviewResult{}, false, err
 				}
@@ -1446,7 +1471,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 						return parsed, true, nil
 					}
 				} else {
-					if err := cleanupReviewResources(ctx, boundary, env, attempt, snapshot, session, snapshotRoot); err != nil {
+					if err := cleanupReviewResources(ctx, boundary, env, attempt, head, snapshot, session, snapshotRoot); err != nil {
 						return parsed, true, nil
 					}
 				}
@@ -1459,7 +1484,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 			return independentReviewResult{}, false, err
 		}
 	}
-	if err := cleanupReviewResources(ctx, boundary, env, attempt, snapshot, session, snapshotRoot); err != nil {
+	if err := cleanupReviewResources(ctx, boundary, env, attempt, head, snapshot, session, snapshotRoot); err != nil {
 		return independentReviewResult{}, true, nil
 	}
 	if out, err := exec.CommandContext(ctx, "git", "clone", "--no-local", "--no-checkout", source, snapshot).CombinedOutput(); err != nil {
@@ -1473,6 +1498,9 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	}
 	if got, err := gitSingleLine(ctx, snapshot, "rev-parse", "HEAD"); err != nil || got != head {
 		return independentReviewResult{}, false, errors.New("review snapshot HEAD differs from attested worker head")
+	}
+	if err := scanGit(ctx, snapshot, nil, []string{"merge-base", "--is-ancestor", attempt.BaseSHA, "HEAD"}, nil); err != nil || strings.EqualFold(attempt.BaseSHA, head) {
+		return independentReviewResult{}, false, errors.New("review base is unavailable or not an ancestor of attested HEAD")
 	}
 	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "remote", "remove", "origin").Run()
 	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "update-ref", "-d", "refs/agent-symphony/attested-review").Run()
@@ -1501,6 +1529,12 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	}); err != nil {
 		return independentReviewResult{}, false, err
 	}
+	resultPath := reviewResultPath(snapshot, head)
+	resultRoot := filepath.Dir(resultPath)
+	if err := os.Mkdir(resultRoot, 0o770); err != nil || reviewGID >= 0 && os.Chown(resultRoot, -1, reviewGID) != nil || os.Chmod(resultRoot, 0o770) != nil {
+		_ = os.RemoveAll(resultRoot)
+		return independentReviewResult{}, false, errors.New("prepare review result artifact")
+	}
 	args := []string{"new-session", "-d", "-s", session, "-c", snapshot}
 	for _, value := range env {
 		args = append(args, "-e", value)
@@ -1511,7 +1545,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-w", "-t", agentruntime.PaneTarget(session), "remain-on-exit", "on"}, Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
-	prompt := fmt.Sprintf("Review issue #%d attempt %d at the exact checked-out HEAD. Output exactly one bounded JSON line: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings.\n\n%s", issue.Issue, issue.Attempt, issue.Body)
+	prompt := reviewPrompt(issue, attempt.BaseSHA)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"load-buffer", "-b", session, "-"}, Dir: snapshot, Env: env, Stdin: strings.NewReader(prompt)}); err != nil {
 		return independentReviewResult{}, false, err
 	}
@@ -1519,7 +1553,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if err != nil {
 		return independentReviewResult{}, false, err
 	}
-	command = agentruntime.PromptCommand(binary, "tmux", session, "", command)
+	command = agentruntime.PromptCommand(binary, "tmux", session, resultPath, command)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
@@ -1537,31 +1571,24 @@ func configuredAgentEnvironment(allow []string) ([]string, error) {
 }
 
 func parseIndependentReview(output string) (independentReviewResult, error) {
-	if len(output) > 64<<10 {
-		return independentReviewResult{}, errors.New("review result exceeds 64 KiB")
+	if len(output) == 0 || len(output) > maxReviewResultSize {
+		return independentReviewResult{}, errors.New("review result is missing or exceeds 64 KiB")
 	}
-	var found *independentReviewResult
-	for _, line := range strings.Split(output, "\n") {
-		var candidate independentReviewResult
-		d := json.NewDecoder(strings.NewReader(line))
-		d.DisallowUnknownFields()
-		if d.Decode(&candidate) == nil && d.Decode(&struct{}{}) == io.EOF && candidate.Type == "agent-symphony-review-v1" {
-			if found != nil {
-				return independentReviewResult{}, errors.New("reviewer returned multiple structured results")
-			}
-			copy := candidate
-			found = &copy
-		}
-	}
-	if found == nil || (found.Status != "clean" && found.Status != "findings") || (found.Status == "clean") != (len(found.Findings) == 0) || len(found.Findings) > 100 {
+	var result independentReviewResult
+	d := json.NewDecoder(strings.NewReader(output))
+	d.DisallowUnknownFields()
+	if d.Decode(&result) != nil || d.Decode(&struct{}{}) != io.EOF || result.Type != "agent-symphony-review-v1" {
 		return independentReviewResult{}, errors.New("reviewer returned invalid structured clean/findings result")
 	}
-	for _, finding := range found.Findings {
+	if (result.Status != "clean" && result.Status != "findings") || (result.Status == "clean") != (len(result.Findings) == 0) || len(result.Findings) > 100 {
+		return independentReviewResult{}, errors.New("reviewer returned invalid structured clean/findings result")
+	}
+	for _, finding := range result.Findings {
 		if strings.TrimSpace(finding) == "" || len(finding) > 4096 {
 			return independentReviewResult{}, errors.New("review finding is invalid or oversized")
 		}
 	}
-	return *found, nil
+	return result, nil
 }
 
 func durableAttemptFailure(ctx context.Context, api internalgithub.API, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, cause error) error {
