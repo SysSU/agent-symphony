@@ -34,7 +34,7 @@ done
 grep -q '"issue":9' inspect.json
 grep -q '"diagnostics"' doctor.json
 grep -q '"name":"platform","status":"pass"' doctor.json
-grep -q '"name":"host isolation","status":"fail"' doctor.json
+grep -q '"name":"host isolation","status":"pass"' doctor.json
 warnings=$(grep -o '"status":"warn"' doctor.json | wc -l | tr -d ' ')
 test "$warnings" -eq 2
 grep -q '"name":"GitHub permissions","status":"warn"' doctor.json
