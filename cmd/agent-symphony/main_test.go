@@ -1054,8 +1054,8 @@ func TestPRGovernanceCommandWiresFakeGitHubAndRecoveryState(t *testing.T) {
 	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "7")
 	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID", "42")
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/installation" {
-			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"app_id":7}`)), Header: make(http.Header)}, nil
+		if r.URL.Path == "/installation/repositories" {
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"repositories":[{"full_name":"owner/repo"}]}`)), Header: make(http.Header)}, nil
 		}
 		if r.URL.Path != "/repos/owner/repo/pulls" || r.Header.Get("Authorization") != "Bearer token-canary" {
 			t.Fatalf("unexpected request %s auth=%q", r.URL.String(), r.Header.Get("Authorization"))
@@ -1315,7 +1315,7 @@ func TestGithubTokenSourceSelectsAppJWTOrStaticToken(t *testing.T) {
 	})
 }
 
-func TestGithubTokenSourceEndToEndExchangeIsCachedAcrossCalls(t *testing.T) {
+func TestGithubTokenSourceEndToEndVerificationUsesSupportedEndpoint(t *testing.T) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -1328,17 +1328,26 @@ func TestGithubTokenSourceEndToEndExchangeIsCachedAcrossCalls(t *testing.T) {
 	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", pemPath)
 	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
 
-	exchanges := 0
+	exchanges, verifications := 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/app/installations/7/access_tokens" || r.Method != http.MethodPost {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/7/access_tokens":
+			if auth := r.Header.Get("Authorization"); !strings.HasPrefix(auth, "Bearer ey") {
+				t.Errorf("missing signed App JWT: %s", auth)
+			}
+			exchanges++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"token":"minted-canary-%d","expires_at":%q}`, exchanges, time.Now().Add(time.Hour).Format(time.RFC3339))
+		case r.Method == http.MethodGet && r.URL.Path == "/installation/repositories":
+			if auth := r.Header.Get("Authorization"); auth != "Bearer minted-canary-1" {
+				t.Errorf("installation verification auth = %q", auth)
+			}
+			verifications++
+			fmt.Fprint(w, `{"repositories":[{"full_name":"owner/repo"}]}`)
+		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusNotFound)
 		}
-		if auth := r.Header.Get("Authorization"); !strings.HasPrefix(auth, "Bearer ey") {
-			t.Errorf("missing signed App JWT: %s", auth)
-		}
-		exchanges++
-		w.WriteHeader(http.StatusCreated)
-		fmt.Fprintf(w, `{"token":"minted-canary-%d","expires_at":%q}`, exchanges, time.Now().Add(time.Hour).Format(time.RFC3339))
 	}))
 	defer server.Close()
 	oldAPI, oldClient := githubAPI, githubClient
@@ -1349,16 +1358,18 @@ func TestGithubTokenSourceEndToEndExchangeIsCachedAcrossCalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := tokens.Token(context.Background())
-	if err != nil || first.Value != "minted-canary-1" {
-		t.Fatalf("first exchange: got %#v, %v", first, err)
+	api := internalgithub.API{BaseURL: githubAPI, Tokens: tokens, HTTP: githubClient}
+	if err := api.VerifyInstallation(context.Background(), 42, "owner/repo"); err != nil {
+		t.Fatal(err)
 	}
-	second, err := tokens.Token(context.Background())
-	if err != nil || second.Value != "minted-canary-1" {
-		t.Fatalf("expected cached token reused, got %#v, %v", second, err)
+	if err := api.VerifyInstallation(context.Background(), 42, "owner/repo"); err != nil {
+		t.Fatal(err)
 	}
 	if exchanges != 1 {
-		t.Fatalf("expected exactly one token exchange across two calls, got %d", exchanges)
+		t.Fatalf("token exchanges = %d, want 1", exchanges)
+	}
+	if verifications != 2 {
+		t.Fatalf("installation verifications = %d, want 2", verifications)
 	}
 }
 
