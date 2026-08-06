@@ -542,8 +542,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if *statePath == "" {
 			return fail(stderr, *jsonOutput, command, "--state is required")
 		}
-		if info, err := os.Lstat(*statePath); err != nil || !info.Mode().IsRegular() {
-			return fail(stderr, *jsonOutput, command, "--state must name an existing regular recovery file")
+		if info, err := os.Lstat(*statePath); err == nil && !info.Mode().IsRegular() || err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fail(stderr, *jsonOutput, command, "--state must name a regular recovery file or an absent file in an existing directory")
 		}
 		c, err := config.Load(*path)
 		if err != nil {

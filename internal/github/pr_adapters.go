@@ -386,6 +386,13 @@ func RunPRReconciliation(ctx context.Context, api API, cfg PRAdapterConfig, stat
 	if err := api.VerifyInstallation(ctx, cfg.AppID, cfg.Repository); err != nil {
 		return err
 	}
+	if _, err := os.Lstat(statePath); errors.Is(err, os.ErrNotExist) {
+		if err := recovery.write([]PRState{}); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
 	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery}
 	reconciler, err := NewPRReconciler(api, cfg, recovery, func() error {
 		states, err := recovery.read()
