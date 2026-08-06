@@ -40,6 +40,7 @@ var releaseMetadata = "agent-symphony-release-version:devel"
 var (
 	githubAPI          = "https://api.github.com"
 	githubClient       = http.DefaultClient
+	reconcileGitHubRun = reconcileGitHub
 	reviewSnapshotRoot = ""
 	runningOnWSL       = func() bool { return runtime.GOOS == "linux" && isWSL() }
 	immutableCreate    = os.CreateTemp
@@ -449,7 +450,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if tokenErr != nil {
 				return fail(stderr, *jsonOutput, command, tokenErr.Error())
 			}
-			statuses, err = reconcileGitHub(context.Background(), *path, *statePath, *runtimeState, command == "reconcile", tokens)
+			if command == "reconcile" {
+				lock, lockErr := acquireDaemonLock(filepath.Join(*runtimeState, "daemon.lock"))
+				if lockErr != nil {
+					return fail(stderr, *jsonOutput, command, lockErr.Error())
+				}
+				defer releaseDaemonLock(lock)
+			}
+			statuses, err = reconcileGitHubRun(context.Background(), *path, *statePath, *runtimeState, command == "reconcile", tokens)
 		} else {
 			statuses, err = recoveryStatuses(*attemptsPath, *runtimeState)
 		}

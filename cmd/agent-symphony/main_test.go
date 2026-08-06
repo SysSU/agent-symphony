@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1141,6 +1142,52 @@ func TestDaemonLockIsSingleInstanceAndNoFollow(t *testing.T) {
 	if lock, err := acquireDaemonLock(link); err == nil {
 		releaseDaemonLock(lock)
 		t.Fatal("followed symlink lock")
+	}
+}
+
+func TestConcurrentOneShotReconcileRunsOneMutation(t *testing.T) {
+	runtimeState := t.TempDir()
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "7")
+	t.Setenv("GITHUB_TOKEN", "token")
+	original := reconcileGitHubRun
+	t.Cleanup(func() { reconcileGitHubRun = original })
+	started, release := make(chan struct{}, 2), make(chan struct{})
+	var snapshots, dispatches atomic.Int32
+	reconcileGitHubRun = func(context.Context, string, string, string, bool, internalgithub.TokenSource) ([]orchestrator.RecoveryStatus, error) {
+		snapshots.Add(1)
+		dispatches.Add(1)
+		started <- struct{}{}
+		<-release
+		return nil, nil
+	}
+	runOnce := func() int {
+		return run([]string{"reconcile", "--state", filepath.Join(runtimeState, "pr.json"), "--runtime-state", runtimeState}, io.Discard, io.Discard)
+	}
+	first := make(chan int, 1)
+	go func() { first <- runOnce() }()
+	<-started
+	second := make(chan int, 1)
+	go func() { second <- runOnce() }()
+	select {
+	case <-started:
+		close(release)
+		<-first
+		<-second
+		t.Fatal("concurrent reconcile entered the snapshot and dispatch transition")
+	case code := <-second:
+		if code != 1 {
+			close(release)
+			<-first
+			t.Fatalf("concurrent reconcile exit=%d, want 1", code)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		<-first
+		t.Fatal("concurrent reconcile did not fail fast on daemon lock")
+	}
+	close(release)
+	if code := <-first; code != 0 || snapshots.Load() != 1 || dispatches.Load() != 1 {
+		t.Fatalf("first exit=%d snapshots=%d dispatches=%d", code, snapshots.Load(), dispatches.Load())
 	}
 }
 
