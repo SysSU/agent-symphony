@@ -156,7 +156,13 @@ func PaneTarget(session string) string { return "=" + session + ":0.0" }
 
 // PromptCommand starts command with the named tmux buffer connected to stdin.
 func PromptCommand(tmux, buffer string, command []string) []string {
-	const script = `tmux=$1; buffer=$2; shift 2; { "$tmux" save-buffer -b "$buffer" -; "$tmux" delete-buffer -b "$buffer"; } | exec "$@"`
+	const script = `tmux=$1; buffer=$2; shift 2
+prompt=$(umask 077; mktemp "${TMPDIR:-/tmp}/agent-symphony-prompt.XXXXXX") || exit
+cleanup() { status=$?; trap - EXIT; rm -f "$prompt" || status=1; exit "$status"; }
+trap cleanup EXIT
+"$tmux" save-buffer -b "$buffer" "$prompt" &&
+"$tmux" delete-buffer -b "$buffer" &&
+"$@" <"$prompt"`
 	return append([]string{"sh", "-c", script, "agent-symphony-prompt", tmux, buffer}, command...)
 }
 

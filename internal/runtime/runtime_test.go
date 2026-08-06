@@ -301,15 +301,41 @@ func TestPromptCommandProvidesStdinBeforeFastConsumerStarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmux := filepath.Join(dir, "tmux")
-	script := "#!/bin/sh\ncase $1 in\nsave-buffer) cat \"$FAKE_PROMPT\";;\ndelete-buffer) exit 0;;\n*) exit 2;;\nesac\n"
+	script := "#!/bin/sh\ncase $1 in\nsave-buffer) cp \"$FAKE_PROMPT\" \"$4\";;\ndelete-buffer) exit 0;;\n*) exit 2;;\nesac\n"
 	if err := os.WriteFile(tmux, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	command := PromptCommand(tmux, "prompt-buffer", []string{"sh", "-c", `input=$(cat); test "$input" = "$1"`, "consumer", "line one\nline two"})
 	cmd := exec.Command(command[0], command[1:]...)
-	cmd.Env = append(os.Environ(), "FAKE_PROMPT="+prompt)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_PROMPT=" + prompt, "TMPDIR=" + dir}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("fast stdin consumer: %v: %s", err, out)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("prompt spool was not removed: %#v, %v", entries, err)
+	}
+}
+
+func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
+	dir := t.TempDir()
+	tmux := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nexit 23\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "consumer-ran")
+	command := PromptCommand(tmux, "missing-buffer", []string{"sh", "-c", `touch "$1"`, "consumer", marker})
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "TMPDIR=" + dir}
+	if err := cmd.Run(); err == nil {
+		t.Fatal("buffer read failure was masked")
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("consumer ran after buffer read failure: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("failed prompt spool was not removed: %#v, %v", entries, err)
 	}
 }
 
