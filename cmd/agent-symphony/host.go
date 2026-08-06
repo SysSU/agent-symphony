@@ -71,7 +71,7 @@ func hostIsolationInstalled() bool {
 	return err == nil
 }
 
-func localAttemptRoot(stateRoot string) string  { return filepath.Join(stateRoot, "attempts") }
+func localAttemptRoot(stateRoot string) string  { return filepath.Join(stateRoot, "worktrees") }
 func localSnapshotRoot(stateRoot string) string { return filepath.Join(stateRoot, "snapshots") }
 
 // ensureLocalRoot creates path as a private mode-0700 directory owned by the

@@ -502,6 +502,15 @@ func manifestPaths(root, attempts string) ([]string, error) {
 	var paths []string
 	for _, repository := range repositories {
 		repositoryPath := filepath.Join(attempts, repository.Name())
+		if repository.Name() == "source.bundle" && repository.Type()&os.ModeSymlink == 0 {
+			info, err := repository.Info()
+			if err != nil {
+				return nil, err
+			}
+			if info.Mode().IsRegular() {
+				continue
+			}
+		}
 		if repository.Type()&os.ModeSymlink != 0 || !repository.IsDir() {
 			return nil, fmt.Errorf("state repository component must be a non-symlink directory: %s", repositoryPath)
 		}

@@ -256,6 +256,55 @@ func TestProductionSeedClonesThroughAgentHostBoundary(t *testing.T) {
 	}
 }
 
+func TestLocalSeedAndDiscoveryUseSeparateRoots(t *testing.T) {
+	fakeNoHostIsolation(t)
+	source := t.TempDir()
+	for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"commit", "--allow-empty", "-m", "base"}} {
+		if out, err := exec.Command("git", append([]string{"-C", source}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	stateRoot := t.TempDir()
+	worktreeRoot := productionAttemptRoot(stateRoot)
+	bundle, err := seedAttemptSource(t.Context(), source, worktreeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(bundle) != filepath.Join(stateRoot, "worktrees") {
+		t.Fatalf("bundle shares recovery root: %s", bundle)
+	}
+	attempts := filepath.Join(stateRoot, "attempts")
+	if err := os.Mkdir(attempts, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(attempts, "source.bundle")
+	if err := os.WriteFile(legacy, []byte("legacy bundle"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	runtime := agentruntime.Runtime{Root: worktreeRoot, StateRoot: stateRoot}
+	if manifests, err := runtime.Discover(); err != nil || len(manifests) != 0 {
+		t.Fatalf("discover seeded layout = %#v, %v", manifests, err)
+	}
+	if err := os.WriteFile(filepath.Join(attempts, "unexpected"), []byte("bad"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Discover(); err == nil || !strings.Contains(err.Error(), "non-symlink directory") {
+		t.Fatalf("unexpected state file accepted: %v", err)
+	}
+	if err := os.Remove(filepath.Join(attempts, "unexpected")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(bundle, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Discover(); err == nil || !strings.Contains(err.Error(), "non-symlink directory") {
+		t.Fatalf("legacy bundle symlink accepted: %v", err)
+	}
+}
+
 func DefaultEnvironmentForTest() []string { return []string{"PATH=" + os.Getenv("PATH"), "LANG=C"} }
 
 func TestAgentHostRejectsWrongIdentityCredentialAndEscapingCommand(t *testing.T) {

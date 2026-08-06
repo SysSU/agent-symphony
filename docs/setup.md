@@ -132,7 +132,7 @@ On the repository, open an issue and add two labels: `agent-ready` and one of `p
 agent-symphony reconcile --state ~/.local/state/agent-symphony/pr.json --runtime-state ~/.local/state/agent-symphony
 ```
 
-**You should see:** the command exits `0`, and a new directory appears under `~/.local/state/agent-symphony/attempts/` for that issue — your configured coding-agent command running under your own OS user against a private, isolated worktree, with no GitHub/SSH/cloud credentials in its environment.
+**You should see:** the command exits `0`, and a new directory appears under `~/.local/state/agent-symphony/worktrees/` for that issue — your configured coding-agent command running under your own OS user against a private, isolated worktree, with no GitHub/SSH/cloud credentials in its environment. Recovery manifests and retained logs remain under `~/.local/state/agent-symphony/attempts/`.
 
 ```sh
 agent-symphony status --state ~/.local/state/agent-symphony/pr.json --runtime-state ~/.local/state/agent-symphony
