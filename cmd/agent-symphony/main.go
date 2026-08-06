@@ -688,7 +688,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		facts[i] = orchestrator.AttemptFact{Repository: f.Repository, Issue: f.Issue, Attempt: f.Attempt, BaseSHA: f.BaseSHA, HeadSHA: f.HeadSHA, PR: f.PR, State: f.State, Checks: f.Checks}
 	}
 	prConfig := internalgithub.PRAdapterConfig{Repository: c.Repository, ReadyLabel: c.Labels.Ready, HumanReviewLabel: c.CompletionPolicies.HumanReview, AutonomousMergeLabel: c.CompletionPolicies.AutonomousMerge, MergeMethod: "squash", PriorityP1Label: c.Labels.PriorityP1, PriorityP2Label: c.Labels.PriorityP2, PriorityP3Label: c.Labels.PriorityP3, DependencySection: c.Dependencies.Section, DefaultCompletion: c.CompletionPolicies.Default, ApprovalCommand: "/agent-symphony approve", CancelCommand: "/agent-symphony cancel", RetryCommand: "/agent-symphony retry", AppID: appID, AppActorID: int(actorID)}
-	issues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, remote)
+	issues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, remote, transition)
 	if err != nil {
 		return nil, err
 	}

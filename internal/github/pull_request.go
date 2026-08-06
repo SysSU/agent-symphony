@@ -411,6 +411,25 @@ func (a API) CreateIssueComment(ctx context.Context, repository string, number i
 	return a.Mutate(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", repository, number), map[string]string{"body": body}, attribution, nil)
 }
 
+func (a API) createControlSnapshot(ctx context.Context, repository string, issue int, body string) error {
+	if repository == "" || issue <= 0 {
+		return errors.New("control snapshot requires repository and issue attribution")
+	}
+	if _, err := ParseSnapshotComment(body, 1, 1); err != nil {
+		return err
+	}
+	b, _ := json.Marshal(map[string]string{"body": body})
+	resp, err := a.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", repository, issue), "", b, Mutation{Issue: issue})
+	if err != nil {
+		return &ambiguousMutationError{fmt.Errorf("GitHub control snapshot outcome is ambiguous; reconcile issue #%d: %w", issue, err)}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return responseError("GitHub control snapshot", resp)
+	}
+	return nil
+}
+
 // SyncReviewLabel applies only a known state transition, so reconciliation is idempotent.
 func (a API) SyncReviewLabel(ctx context.Context, repository string, number int, label string, current, required bool, attribution Mutation) error {
 	if label == "" || number <= 0 || current == required {

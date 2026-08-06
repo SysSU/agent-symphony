@@ -209,7 +209,7 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 		creationDefault := p.Value == map[string]string{"ready": "false", "priority": "0", "completion": "human-review", "closed": "false", "cancelled": "false", "retry": "false"}[p.Name]
 		creation := p.Source == "creation" && creationDefault && p.EventID == 0 && p.ActorID == anchor.AuthorID && p.CreatedAt.Equal(anchor.CreatedAt)
 		mutationSource := p.Source == "timeline" && slices.Contains([]string{"ready", "priority", "completion", "closed"}, p.Name) || p.Source == "comment" && slices.Contains([]string{"cancelled", "retry"}, p.Name)
-		mutation := mutationSource && p.ActorID != 0 && !p.CreatedAt.IsZero() && authorized(p.ActorID) && timeline(p)
+		mutation := mutationSource && p.ActorID != 0 && !p.CreatedAt.IsZero() && approval.CreatedAt.After(p.CreatedAt) && authorized(p.ActorID) && timeline(p)
 		if !creation && !mutation {
 			return Snapshot{}, errors.New("control provenance is missing or unauthorized")
 		}

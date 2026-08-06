@@ -663,6 +663,10 @@ type bodyEdit struct {
 }
 
 func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Controls, bool, *Provenance, error) {
+	return s.authorizedControlsWithIntake(ctx, number, false)
+}
+
+func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, number int, intake bool) (Controls, bool, *Provenance, error) {
 	var issue issueControlRecord
 	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", s.Config.Repository, number), "", &issue); err != nil {
 		return Controls{}, false, nil, err
@@ -733,22 +737,46 @@ func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Co
 			}
 		}
 	}
-	if !found {
+	if !found && !intake {
 		return Controls{}, false, nil, errors.New("valid App-authored control snapshot is missing")
 	}
 	provenance := currentProvenance
+	approvalID := snapshot.ApprovalID
+	if !found {
+		if !normalized.Ready {
+			return Controls{}, false, nil, errors.New("issue controls are not eligible for approval")
+		}
+		changedAt := anchor.ChangedAt
+		for _, p := range provenance {
+			if p.CreatedAt.After(changedAt) {
+				changedAt = p.CreatedAt
+			}
+		}
+		var latest *issueCommentRecord
+		for i := range comments {
+			comment := &comments[i]
+			if comment.Body == s.Config.ApprovalCommand && comment.App == nil && comment.CreatedAt.Equal(comment.UpdatedAt) && comment.CreatedAt.After(changedAt) && (latest == nil || comment.CreatedAt.After(latest.CreatedAt) || comment.CreatedAt.Equal(latest.CreatedAt) && comment.ID > latest.ID) {
+				latest = comment
+			}
+		}
+		if latest == nil {
+			return Controls{}, false, nil, errors.New("fresh exact approval command is missing")
+		}
+		approvalID = latest.ID
+	}
 	var approval struct {
 		ID        int64
 		Body      string
 		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
 		User      struct{ ID int }
 		App       *struct{ ID int64 } `json:"performed_via_github_app"`
 	}
-	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/comments/%d", s.Config.Repository, snapshot.ApprovalID), "", &approval); err != nil {
+	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/comments/%d", s.Config.Repository, approvalID), "", &approval); err != nil {
 		return Controls{}, false, nil, err
 	}
-	if approval.ID != snapshot.ApprovalID || approval.App != nil {
-		return Controls{}, false, nil, errors.New("approval comment is missing or App-authored")
+	if approval.ID != approvalID || approval.Body != s.Config.ApprovalCommand || approval.App != nil || approval.CreatedAt.IsZero() || !approval.CreatedAt.Equal(approval.UpdatedAt) {
+		return Controls{}, false, nil, errors.New("approval comment is missing, edited, or App-authored")
 	}
 	authorized := map[int]bool{}
 	for _, actor := range append([]int{approval.User.ID, anchorActor}, provenanceActors(provenance)...) {
@@ -769,6 +797,21 @@ func (s *GitHubPRSource) authorizedControls(ctx context.Context, number int) (Co
 		timeline[p] = true
 	}
 	currentApproval := Approval{CommentID: approval.ID, ActorID: approval.User.ID, Body: approval.Body, CreatedAt: approval.CreatedAt}
+	if !found {
+		created, err := NewSnapshot(normalized.Controls, issue.Body, anchor, currentApproval, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] })
+		if err != nil {
+			return Controls{}, false, nil, err
+		}
+		mutationErr := s.API.createControlSnapshot(ctx, s.Config.Repository, number, SnapshotComment(created))
+		controls, reviewCleared, retry, readErr := s.authorizedControls(ctx, number)
+		if readErr == nil {
+			return controls, reviewCleared, retry, nil
+		}
+		if mutationErr != nil {
+			return Controls{}, false, nil, mutationErr
+		}
+		return Controls{}, false, nil, fmt.Errorf("authoritative control snapshot reread: %w", readErr)
+	}
 	if !snapshot.Valid(normalized.Controls, issue.Body, anchor, currentApproval, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] }) {
 		return Controls{}, false, nil, errors.New("control snapshot is stale, tampered, unauthorized, or ambiguous")
 	}
