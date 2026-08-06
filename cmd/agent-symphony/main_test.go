@@ -288,8 +288,9 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 		t.Fatalf("snapshot head=%s want=%s", got, head)
 	}
 	log, err := os.ReadFile(boundaryLog)
-	if err != nil || !strings.Contains(string(log), `"args":["send-keys","-t","=as-review-23-1:0.0","C-d"]`) {
-		t.Fatalf("review stdin was not submitted like runtime stdin: %s err=%v", log, err)
+	load, start := strings.Index(string(log), `"args":["load-buffer"`), strings.Index(string(log), `"args":["respawn-pane"`)
+	if err != nil || load < 0 || start < load || !strings.Contains(string(log), "save-buffer") {
+		t.Fatalf("review stdin was not loaded before reviewer start: %s err=%v", log, err)
 	}
 	if !strings.Contains(string(log), `OPENAI_API_KEY=model-canary`) || slices.ContainsFunc([]string{"github-canary", "ssh-canary", "cloud-canary", "proxy-canary", "app-canary", "/coordinator-home"}, func(secret string) bool { return strings.Contains(string(log), secret) }) {
 		t.Fatalf("review boundary environment was not safely filtered: %s", log)

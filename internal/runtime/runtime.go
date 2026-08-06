@@ -154,6 +154,12 @@ type Runtime struct {
 
 func PaneTarget(session string) string { return "=" + session + ":0.0" }
 
+// PromptCommand starts command with the named tmux buffer connected to stdin.
+func PromptCommand(tmux, buffer string, command []string) []string {
+	const script = `tmux=$1; buffer=$2; shift 2; { "$tmux" save-buffer -b "$buffer" -; "$tmux" delete-buffer -b "$buffer"; } | exec "$@"`
+	return append([]string{"sh", "-c", script, "agent-symphony-prompt", tmux, buffer}, command...)
+}
+
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -252,19 +258,17 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	if _, err := r.run(ctx, r.tmux(), []string{"set-option", "-w", "-t", target, "history-limit", historyLimit}, "", []string{}, nil); err != nil {
 		return failStop("configure tmux history", err)
 	}
-	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, attempt.Command...), "", []string{}, nil); err != nil {
-		return failStop("start agent", err)
-	}
 	if attempt.Context != "" {
 		if _, err := r.run(ctx, r.tmux(), []string{"load-buffer", "-b", manifest.Session, "-"}, "", []string{}, strings.NewReader(attempt.Context)); err != nil {
 			return failStop("load agent context", err)
 		}
-		if _, err := r.run(ctx, r.tmux(), []string{"paste-buffer", "-d", "-b", manifest.Session, "-t", target}, "", []string{}, nil); err != nil {
-			return failStop("send agent context", err)
-		}
-		if _, err := r.run(ctx, r.tmux(), []string{"send-keys", "-t", target, "C-d"}, "", []string{}, nil); err != nil {
-			return failStop("close agent context", err)
-		}
+	}
+	command := attempt.Command
+	if attempt.Context != "" {
+		command = PromptCommand(r.tmux(), manifest.Session, command)
+	}
+	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
+		return failStop("start agent", err)
 	}
 	manifest.State, manifest.UpdatedAt = "running", time.Now().UTC()
 	return manifest, r.writeManifest(attempt, manifest)
