@@ -1494,17 +1494,12 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-w", "-t", agentruntime.PaneTarget(session), "remain-on-exit", "on"}, Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
-	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
-		return independentReviewResult{}, false, err
-	}
 	prompt := fmt.Sprintf("Review issue #%d attempt %d at the exact checked-out HEAD. Output exactly one bounded JSON line: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings.\n\n%s", issue.Issue, issue.Attempt, issue.Body)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"load-buffer", "-b", session, "-"}, Dir: snapshot, Env: env, Stdin: strings.NewReader(prompt)}); err != nil {
 		return independentReviewResult{}, false, err
 	}
-	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"paste-buffer", "-d", "-b", session, "-t", agentruntime.PaneTarget(session)}, Dir: snapshot, Env: env}); err != nil {
-		return independentReviewResult{}, false, err
-	}
-	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"send-keys", "-t", agentruntime.PaneTarget(session), "C-d"}, Dir: snapshot, Env: env}); err != nil {
+	command = agentruntime.PromptCommand("tmux", session, command)
+	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
 	if runtimeState != nil {

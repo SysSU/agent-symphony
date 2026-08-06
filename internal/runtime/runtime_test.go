@@ -92,7 +92,7 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 			return Result{}, errors.New("missing respawn command separator")
 		}
 		f.sessions[session].agent = slices.Clone(command.Args[separator+1:])
-		if f.sessions[session].agent[0] == "fast-exit" {
+		if slices.Contains(f.sessions[session].agent, "fast-exit") {
 			f.sessions[session].dead, f.sessions[session].status = true, 42
 		}
 	case "load-buffer":
@@ -146,8 +146,12 @@ func TestLifecycleCreatesUncredentialedRepositoryAndPreservesPrimary(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.State != "running" || fake.sessions[manifest.Session].context != attempt.Context {
+	if manifest.State != "running" || fake.buffers[manifest.Session] != attempt.Context {
 		t.Fatalf("unexpected launch: %#v, %#v", manifest, fake.sessions[manifest.Session])
+	}
+	want := PromptCommand("tmux", manifest.Session, attempt.Command)
+	if !slices.Equal(fake.sessions[manifest.Session].agent, want) {
+		t.Fatalf("agent command = %#v, want %#v", fake.sessions[manifest.Session].agent, want)
 	}
 	if got := gitOutput(t, manifest.Worktree, "remote"); got != "" {
 		t.Fatalf("agent repository has remote %q", got)
@@ -283,10 +287,71 @@ func TestConcurrentDisjointAttempts(t *testing.T) {
 	if len(fake.sessions) != 2 {
 		t.Fatalf("sessions = %d, want 2", len(fake.sessions))
 	}
-	for name, session := range fake.sessions {
-		if session.context == "" {
+	for name := range fake.sessions {
+		if fake.buffers[name] == "" {
 			t.Fatalf("session %s lost context", name)
 		}
+	}
+}
+
+func TestPromptCommandProvidesStdinBeforeFastConsumerStarts(t *testing.T) {
+	dir := t.TempDir()
+	private := t.TempDir()
+	if err := os.WriteFile(filepath.Join(private, "coordinator-canary"), []byte("do not expose"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(private, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(private, 0o700) })
+	prompt := filepath.Join(dir, "prompt")
+	if err := os.WriteFile(prompt, []byte("line one\nline two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tmux := filepath.Join(dir, "tmux")
+	spoolRecord := filepath.Join(dir, "spool-path")
+	script := "#!/bin/sh\ncase $1 in\nsave-buffer) printf %s \"$4\" >\"$FAKE_SPOOL\"; cp \"$FAKE_PROMPT\" \"$4\";;\ndelete-buffer) exit 0;;\n*) exit 2;;\nesac\n"
+	if err := os.WriteFile(tmux, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := PromptCommand(tmux, "prompt-buffer", []string{"sh", "-c", `input=$(cat); test "$input" = "$1" && test "$TMPDIR" = /tmp`, "consumer", "line one\nline two"})
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_PROMPT=" + prompt, "FAKE_SPOOL=" + spoolRecord, "TMPDIR=" + private}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fast stdin consumer: %v: %s", err, out)
+	}
+	spool, err := os.ReadFile(spoolRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(string(spool)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("prompt spool was not removed: %v", err)
+	}
+}
+
+func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
+	dir := t.TempDir()
+	tmux := filepath.Join(dir, "tmux")
+	spoolRecord := filepath.Join(dir, "spool-path")
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf %s \"$4\" >\"$FAKE_SPOOL\"\nexit 23\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "consumer-ran")
+	command := PromptCommand(tmux, "missing-buffer", []string{"sh", "-c", `touch "$1"`, "consumer", marker})
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_SPOOL=" + spoolRecord}
+	if err := cmd.Run(); err == nil {
+		t.Fatal("buffer read failure was masked")
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("consumer ran after buffer read failure: %v", err)
+	}
+	spool, err := os.ReadFile(spoolRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(string(spool)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed prompt spool was not removed: %v", err)
 	}
 }
 
