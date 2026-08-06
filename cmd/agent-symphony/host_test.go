@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
@@ -125,13 +126,33 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 	})
 
 	t.Run("export", func(t *testing.T) {
-		repo := t.TempDir()
-		for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"commit", "--allow-empty", "-m", "base"}} {
-			if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+		root := t.TempDir()
+		primary := filepath.Join(root, "primary")
+		if err := os.Mkdir(primary, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}} {
+			if out, err := exec.Command("git", append([]string{"-C", primary}, args...)...).CombinedOutput(); err != nil {
 				t.Fatalf("git %v: %v: %s", args, err, out)
 			}
 		}
-		branch := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", repo, "branch", "--show-current"))))
+		if err := os.WriteFile(filepath.Join(primary, "README.md"), []byte("base\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"add", "README.md"}, {"commit", "-m", "base"}} {
+			if out, err := exec.Command("git", append([]string{"-C", primary}, args...)...).CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v: %s", args, err, out)
+			}
+		}
+		base := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", primary, "rev-parse", "HEAD"))))
+		branch, _ := internalgithub.AttemptBranch("o/r", 23, 1)
+		repo := filepath.Join(root, "attempt")
+		if out, err := exec.Command("git", "-C", primary, "worktree", "add", "-b", branch, repo).CombinedOutput(); err != nil {
+			t.Fatalf("git worktree: %v: %s", err, out)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("base\nchanged\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		session := "as-export-pane-test"
 		good := `{"type":"agent-symphony-result-v1","validation":"pane-zero","documentation":"done"}`
 		bad := `{"type":"agent-symphony-result-v1","validation":"wrong-window","documentation":"wrong"}`
@@ -148,14 +169,35 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		}
 		tmux(t, "new-window", "-d", "-t", "="+session, "sh", "-c", "printf '%s\\n' '"+bad+"'; sleep 30")
 		tmux(t, "select-window", "-t", "="+session+":1")
-		manifest, _ := json.Marshal(agentruntime.Manifest{Repository: "o/r", Branch: branch, BaseSHA: "base", Worktree: repo, Session: session})
-		output, err := exportAttempt(t.Context(), manifest, repo)
-		if err != nil {
+		manifest, _ := json.Marshal(agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, State: "completed", Branch: branch, BaseSHA: base, Worktree: repo, Session: session})
+		t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
+		request, _ := json.Marshal(struct {
+			Operation string          `json:"operation"`
+			Command   boundaryCommand `json:"command"`
+		}{"export", boundaryCommand{Input: manifest}})
+		var boundary bytes.Buffer
+		if err := agentHost(t.Context(), "implementation", bytes.NewReader(request), &boundary); err != nil {
+			t.Fatal(err)
+		}
+		var result agentruntime.Result
+		if err := json.Unmarshal(boundary.Bytes(), &result); err != nil {
 			t.Fatal(err)
 		}
 		var exported workerExport
-		if err := json.Unmarshal([]byte(output), &exported); err != nil || exported.Result.Validation != "pane-zero" {
+		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != "pane-zero" || exported.HeadSHA == base {
 			t.Fatalf("export=%#v err=%v", exported, err)
+		}
+		if err := agentHost(t.Context(), "review", bytes.NewReader(request), &bytes.Buffer{}); err == nil {
+			t.Fatal("review boundary accepted implementation export")
+		}
+		if status := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", repo, "status", "--porcelain")))); status != "" {
+			t.Fatalf("committed worktree remains dirty: %q", status)
+		}
+		if got := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", repo, "show", "HEAD:README.md")))); got != "base\nchanged" {
+			t.Fatalf("committed content = %q", got)
+		}
+		if got := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", primary, "rev-parse", "HEAD")))); got != base {
+			t.Fatalf("primary worktree moved from %s to %s", base, got)
 		}
 	})
 }
