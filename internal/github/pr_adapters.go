@@ -741,89 +741,97 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 		return Controls{}, false, nil, errors.New("valid App-authored control snapshot is missing")
 	}
 	provenance := currentProvenance
-	approvalID := snapshot.ApprovalID
-	if !found {
-		if !normalized.Ready {
-			return Controls{}, false, nil, errors.New("issue controls are not eligible for approval")
-		}
-		changedAt := anchor.ChangedAt
-		for _, p := range provenance {
-			if p.CreatedAt.After(changedAt) {
-				changedAt = p.CreatedAt
-			}
-		}
-		var latest *issueCommentRecord
-		for i := range comments {
-			comment := &comments[i]
-			if comment.Body == s.Config.ApprovalCommand && comment.App == nil && comment.CreatedAt.Equal(comment.UpdatedAt) && comment.CreatedAt.After(changedAt) && (latest == nil || comment.CreatedAt.After(latest.CreatedAt) || comment.CreatedAt.Equal(latest.CreatedAt) && comment.ID > latest.ID) {
-				latest = comment
-			}
-		}
-		if latest == nil {
-			return Controls{}, false, nil, errors.New("fresh exact approval command is missing")
-		}
-		approvalID = latest.ID
-	}
-	var approval struct {
-		ID        int64
-		Body      string
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		User      struct{ ID int }
-		App       *struct{ ID int64 } `json:"performed_via_github_app"`
-	}
-	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/comments/%d", s.Config.Repository, approvalID), "", &approval); err != nil {
-		return Controls{}, false, nil, err
-	}
-	if approval.ID != approvalID || approval.Body != s.Config.ApprovalCommand || approval.App != nil || approval.CreatedAt.IsZero() || !approval.CreatedAt.Equal(approval.UpdatedAt) {
-		return Controls{}, false, nil, errors.New("approval comment is missing, edited, or App-authored")
-	}
 	authorized := map[int]bool{}
-	for _, actor := range append([]int{approval.User.ID, anchorActor}, provenanceActors(provenance)...) {
-		if actor == 0 {
-			continue
-		}
-		if _, ok := authorized[actor]; ok {
-			continue
-		}
-		permission, err := s.actorPermission(ctx, actor)
-		if err != nil {
-			return Controls{}, false, nil, err
-		}
-		authorized[actor] = actor > 0 && actor != s.Config.AppActorID && (permission == "maintain" || permission == "admin")
-	}
 	timeline := make(map[Provenance]bool, len(provenance))
 	for _, p := range provenance {
 		timeline[p] = true
 	}
-	currentApproval := Approval{CommentID: approval.ID, ActorID: approval.User.ID, Body: approval.Body, CreatedAt: approval.CreatedAt}
-	if !found {
-		created, err := NewSnapshot(normalized.Controls, issue.Body, anchor, currentApproval, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] })
-		if err != nil {
-			return Controls{}, false, nil, err
+	readApproval := func(id int64) (Approval, error) {
+		var approval struct {
+			ID        int64
+			Body      string
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			User      struct{ ID int }
+			App       *struct{ ID int64 } `json:"performed_via_github_app"`
 		}
-		mutationErr := s.API.createControlSnapshot(ctx, s.Config.Repository, number, SnapshotComment(created))
-		controls, reviewCleared, retry, readErr := s.authorizedControls(ctx, number)
-		if readErr == nil {
-			return controls, reviewCleared, retry, nil
+		if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/comments/%d", s.Config.Repository, id), "", &approval); err != nil {
+			return Approval{}, err
 		}
-		if mutationErr != nil {
-			return Controls{}, false, nil, mutationErr
+		if approval.ID != id || approval.Body != s.Config.ApprovalCommand || approval.App != nil || approval.CreatedAt.IsZero() || !approval.CreatedAt.Equal(approval.UpdatedAt) {
+			return Approval{}, errors.New("approval comment is missing, edited, or App-authored")
 		}
-		return Controls{}, false, nil, fmt.Errorf("authoritative control snapshot reread: %w", readErr)
-	}
-	if !snapshot.Valid(normalized.Controls, issue.Body, anchor, currentApproval, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] }) {
-		return Controls{}, false, nil, errors.New("control snapshot is stale, tampered, unauthorized, or ambiguous")
-	}
-	var retry *Provenance
-	if normalized.Controls.Retry {
-		for i := range provenance {
-			if provenance[i].Name == "retry" && provenance[i].Value == "true" {
-				retry = &provenance[i]
+		for _, actor := range append([]int{approval.User.ID, anchorActor}, provenanceActors(provenance)...) {
+			if actor == 0 {
+				continue
 			}
+			if _, ok := authorized[actor]; ok {
+				continue
+			}
+			permission, err := s.actorPermission(ctx, actor)
+			if err != nil {
+				return Approval{}, err
+			}
+			authorized[actor] = actor != s.Config.AppActorID && (permission == "maintain" || permission == "admin")
+		}
+		return Approval{CommentID: approval.ID, ActorID: approval.User.ID, Body: approval.Body, CreatedAt: approval.CreatedAt}, nil
+	}
+	if found {
+		approval, err := readApproval(snapshot.ApprovalID)
+		if err == nil && snapshot.Valid(normalized.Controls, issue.Body, anchor, approval, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] }) {
+			var retry *Provenance
+			if normalized.Controls.Retry {
+				for i := range provenance {
+					if provenance[i].Name == "retry" && provenance[i].Value == "true" {
+						retry = &provenance[i]
+					}
+				}
+			}
+			return normalized.Controls, reviewRemovalMatches(provenance, events, s.Config.HumanReviewLabel), retry, nil
+		}
+		if !intake {
+			if err != nil {
+				return Controls{}, false, nil, err
+			}
+			return Controls{}, false, nil, errors.New("control snapshot is stale, tampered, unauthorized, or ambiguous")
 		}
 	}
-	return normalized.Controls, reviewRemovalMatches(provenance, events, s.Config.HumanReviewLabel), retry, nil
+	if !normalized.Ready {
+		return Controls{}, false, nil, errors.New("issue controls are not eligible for approval")
+	}
+	changedAt := anchor.ChangedAt
+	for _, p := range provenance {
+		if p.CreatedAt.After(changedAt) {
+			changedAt = p.CreatedAt
+		}
+	}
+	var latest *issueCommentRecord
+	for i := range comments {
+		comment := &comments[i]
+		if comment.Body == s.Config.ApprovalCommand && comment.App == nil && comment.CreatedAt.Equal(comment.UpdatedAt) && comment.CreatedAt.After(changedAt) && (!found || comment.ID > snapshotCommentID) && (latest == nil || comment.CreatedAt.After(latest.CreatedAt) || comment.CreatedAt.Equal(latest.CreatedAt) && comment.ID > latest.ID) {
+			latest = comment
+		}
+	}
+	if latest == nil {
+		return Controls{}, false, nil, errors.New("fresh exact approval command is missing")
+	}
+	approval, err := readApproval(latest.ID)
+	if err != nil {
+		return Controls{}, false, nil, err
+	}
+	created, err := NewSnapshot(normalized.Controls, issue.Body, anchor, approval, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] })
+	if err != nil {
+		return Controls{}, false, nil, err
+	}
+	mutationErr := s.API.createControlSnapshot(ctx, s.Config.Repository, number, SnapshotComment(created))
+	controls, reviewCleared, retry, readErr := s.authorizedControls(ctx, number)
+	if readErr == nil {
+		return controls, reviewCleared, retry, nil
+	}
+	if mutationErr != nil {
+		return Controls{}, false, nil, mutationErr
+	}
+	return Controls{}, false, nil, fmt.Errorf("authoritative control snapshot reread: %w", readErr)
 }
 
 func reviewRemovalMatches(provenance []Provenance, events []issueTimelineEvent, label string) bool {
