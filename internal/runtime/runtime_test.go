@@ -429,6 +429,9 @@ func TestPromptCommandBoundsStdoutAndPreservesExitStatus(t *testing.T) {
 	if got, err := os.ReadFile(exitResult); err != nil || string(got) != "ok" {
 		t.Fatalf("consumer stdout = %q, %v", got, err)
 	}
+	if code, err := run("", []string{"sh", "-c", `exit 23`}); err != nil || code != 23 {
+		t.Fatalf("reviewer exit status = %d, %v", code, err)
+	}
 
 	boundedResult := filepath.Join(dir, "bounded.result.json")
 	unrelated := exec.Command("sleep", "5")
@@ -537,7 +540,7 @@ func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
 				resultPath = filepath.Join(dir, "completed.result.json")
 				output = `{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none"}`
 			}
-			command := []string{"sh", "-c", `(exec >/dev/null 2>&1; sleep 0.5; printf late >"$1") & echo $! >"$2"; printf %s "$3"`, "consumer", marker, pidPath, output}
+			command := []string{"sh", "-c", `(sleep 5; printf late >"$1") & echo $! >"$2"; printf %s "$3"`, "consumer", marker, pidPath, output}
 			unrelated := exec.Command("sleep", "5")
 			if err := unrelated.Start(); err != nil {
 				t.Fatal(err)
@@ -545,7 +548,9 @@ func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
 			t.Cleanup(func() { _ = unrelated.Process.Kill(); _ = unrelated.Wait() })
 			var stdout strings.Builder
 			started := time.Now()
-			code, err := captureWorker(t.Context(), tmux, "prompt-buffer", resultPath, command, &stdout, io.Discard, dir)
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			code, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, io.Discard, dir)
 			if err != nil || code != 0 || time.Since(started) > 2*time.Second {
 				t.Fatalf("completion: code=%d elapsed=%v err=%v", code, time.Since(started), err)
 			}
@@ -566,7 +571,7 @@ func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
 			if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
 				t.Fatalf("unrelated process group was terminated: %v", err)
 			}
-			time.Sleep(700 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("late descendant mutated workspace: %v", err)
 			}

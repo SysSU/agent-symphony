@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -8,13 +9,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
-	"time"
 )
 
 // ErrWorkerResultOverflow means the configured command exceeded the capture ceiling.
 var ErrWorkerResultOverflow = errors.New("worker stdout exceeds 64 KiB")
+
+// The wrapper pins the process-group identity until its parent signals the group.
+const workerWrapper = `"$@" 3>&- 4>&-
+code=$?
+printf '%d\n' "$code" >&3
+IFS= read -r _ <&4`
 
 // CaptureWorker runs command with a tmux prompt and bounded result channel.
 func CaptureWorker(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer) (int, error) {
@@ -49,105 +56,147 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 		return 1, err
 	}
 
-	child := exec.Command(command[0], command[1:]...)
+	if _, err := exec.LookPath(command[0]); err != nil {
+		return 1, err
+	}
+	statusReader, statusWriter, err := os.Pipe()
+	if err != nil {
+		return 1, err
+	}
+	defer statusReader.Close()
+	defer statusWriter.Close()
+	holdReader, holdWriter, err := os.Pipe()
+	if err != nil {
+		return 1, err
+	}
+	defer holdReader.Close()
+	defer holdWriter.Close()
+
+	args := append([]string{"-c", workerWrapper, "agent-symphony-worker"}, command...)
+	child := exec.Command("/bin/sh", args...)
 	child.Stdin, child.Stderr, child.Env = prompt, stderr, captureEnvironment(os.Environ())
+	child.ExtraFiles = []*os.File{statusWriter, holdReader}
 	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var result *os.File
+	var pipe io.ReadCloser
 	if resultPath == "" {
 		child.Stdout = stdout
-		if err := child.Start(); err != nil {
+	} else {
+		result, err = os.OpenFile(resultPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return 1, fmt.Errorf("create worker result: %w", err)
+		}
+		defer result.Close()
+		pipe, err = child.StdoutPipe()
+		if err != nil {
 			return 1, err
 		}
-		stopCancel := context.AfterFunc(ctx, func() { killProcessGroup(child) })
-		waitErr := child.Wait()
-		stopCancel()
-		cleanupErr := terminateProcessGroup(child)
+	}
+	if err := child.Start(); err != nil {
+		return 1, err
+	}
+	statusWriter.Close()
+	holdReader.Close()
+	type completion struct {
+		code int
+		err  error
+	}
+	completed := make(chan completion, 1)
+	go func(destination chan<- completion) {
+		code, err := readWorkerStatus(statusReader)
+		destination <- completion{code: code, err: err}
+	}(completed)
+	if resultPath == "" {
+		var finished completion
+		select {
+		case finished = <-completed:
+		case <-ctx.Done():
+		}
+		cleanupErr := killProcessGroup(child)
+		_ = child.Wait()
 		if ctx.Err() != nil {
 			return 1, ctx.Err()
 		}
 		if cleanupErr != nil {
 			return 1, cleanupErr
 		}
-		if waitErr != nil {
-			return processExitCode(waitErr), nil
+		if finished.err != nil {
+			return 1, fmt.Errorf("read worker status: %w", finished.err)
 		}
-		return 0, nil
+		return finished.code, nil
 	}
 
-	result, err := os.OpenFile(resultPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return 1, fmt.Errorf("create worker result: %w", err)
+	captured := make(chan error, 1)
+	go func() { captured <- captureWorkerOutput(result, pipe) }()
+	var finished completion
+	var captureErr error
+	for completed != nil && captureErr == nil {
+		select {
+		case finished = <-completed:
+			completed = nil
+		case captureErr = <-captured:
+			captured = nil
+		case <-ctx.Done():
+			completed = nil
+		}
 	}
-	defer result.Close()
-	pipe, err := child.StdoutPipe()
-	if err != nil {
-		return 1, err
+	cleanupErr := killProcessGroup(child)
+	if captured != nil {
+		captureErr = <-captured
 	}
-	if err := child.Start(); err != nil {
-		return 1, err
-	}
-	stopCancel := context.AfterFunc(ctx, func() { killProcessGroup(child) })
-	killAndWait := func() {
-		stopCancel()
-		killProcessGroup(child)
-		_ = child.Wait()
-		_ = terminateProcessGroup(child)
-	}
-	if _, err := io.Copy(result, io.LimitReader(pipe, WorkerResultMaxBytes)); err != nil {
-		killAndWait()
-		return 1, fmt.Errorf("capture worker stdout: %w", err)
-	}
-	var extra [1]byte
-	n, readErr := pipe.Read(extra[:])
-	if n != 0 {
-		killAndWait()
-		return 1, ErrWorkerResultOverflow
-	}
-	if readErr != nil && !errors.Is(readErr, io.EOF) {
-		killAndWait()
-		return 1, fmt.Errorf("capture worker stdout: %w", readErr)
-	}
-	waitErr := child.Wait()
-	stopCancel()
-	cleanupErr := terminateProcessGroup(child)
+	_ = child.Wait()
 	if ctx.Err() != nil {
 		return 1, ctx.Err()
 	}
 	if cleanupErr != nil {
 		return 1, cleanupErr
 	}
+	if captureErr != nil {
+		return 1, captureErr
+	}
+	if finished.err != nil {
+		return 1, fmt.Errorf("read worker status: %w", finished.err)
+	}
 	if err := result.Sync(); err != nil {
 		return 1, err
 	}
-	if waitErr != nil {
-		return processExitCode(waitErr), nil
-	}
-	return 0, nil
+	return finished.code, nil
 }
 
-func killProcessGroup(command *exec.Cmd) {
+func killProcessGroup(command *exec.Cmd) error {
 	if command.Process != nil {
-		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
-	}
-}
-
-func terminateProcessGroup(command *exec.Cmd) error {
-	if command.Process == nil {
-		return nil
-	}
-	group := -command.Process.Pid
-	if err := syscall.Kill(group, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return err
-	}
-	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		if err := syscall.Kill(group, 0); errors.Is(err, syscall.ESRCH) {
-			return nil
-		} else if err != nil {
+		if err := syscall.Kill(-command.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 			return err
 		}
-		if time.Now().After(deadline) {
-			return errors.New("worker process group did not terminate")
-		}
 	}
+	return nil
+}
+
+func readWorkerStatus(reader io.Reader) (int, error) {
+	line, err := bufio.NewReader(reader).ReadString('\n')
+	if err != nil {
+		return 0, err
+	}
+	code, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil || code < 0 || code > 255 {
+		return 0, errors.New("invalid worker exit status")
+	}
+	return code, nil
+}
+
+func captureWorkerOutput(result io.Writer, pipe io.Reader) error {
+	if _, err := io.Copy(result, io.LimitReader(pipe, WorkerResultMaxBytes)); err != nil {
+		return fmt.Errorf("capture worker stdout: %w", err)
+	}
+	var extra [1]byte
+	n, err := pipe.Read(extra[:])
+	if n != 0 {
+		return ErrWorkerResultOverflow
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("capture worker stdout: %w", err)
+	}
+	return nil
 }
 
 func captureEnvironment(env []string) []string {
@@ -158,12 +207,4 @@ func captureEnvironment(env []string) []string {
 		}
 	}
 	return append(filtered, "TMPDIR=/tmp")
-}
-
-func processExitCode(err error) int {
-	var exit *exec.ExitError
-	if errors.As(err, &exit) && exit.ExitCode() > 0 {
-		return exit.ExitCode()
-	}
-	return 1
 }
