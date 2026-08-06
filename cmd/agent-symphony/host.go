@@ -1022,9 +1022,8 @@ func parseWorkerResult(body []byte) (workerResult, error) {
 }
 
 func readWorkerResult(path string) (workerResult, error) {
-	const maxBytes = 64 << 10
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > maxBytes {
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > agentruntime.WorkerResultMaxBytes {
 		return workerResult{}, errors.New("worker result is invalid")
 	}
 	f, err := os.Open(path)
@@ -1032,10 +1031,10 @@ func readWorkerResult(path string) (workerResult, error) {
 		return workerResult{}, errors.New("worker result is invalid")
 	}
 	opened, statErr := f.Stat()
-	body, readErr := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	body, readErr := io.ReadAll(io.LimitReader(f, agentruntime.WorkerResultMaxBytes+1))
 	final, finalStatErr := f.Stat()
 	closeErr := f.Close()
-	if statErr != nil || finalStatErr != nil || !opened.Mode().IsRegular() || !final.Mode().IsRegular() || !os.SameFile(info, opened) || !os.SameFile(opened, final) || opened.Size() != final.Size() || !opened.ModTime().Equal(final.ModTime()) || readErr != nil || closeErr != nil || len(body) > maxBytes {
+	if statErr != nil || finalStatErr != nil || !opened.Mode().IsRegular() || !final.Mode().IsRegular() || !os.SameFile(info, opened) || !os.SameFile(opened, final) || opened.Size() != final.Size() || !opened.ModTime().Equal(final.ModTime()) || readErr != nil || closeErr != nil || len(body) > agentruntime.WorkerResultMaxBytes {
 		return workerResult{}, errors.New("worker result is invalid")
 	}
 	result, err := parseWorkerResult(body)

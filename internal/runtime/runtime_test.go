@@ -380,6 +380,57 @@ printf %s "$3"`
 	}
 }
 
+func TestPromptCommandBoundsStdoutAndPreservesExitStatus(t *testing.T) {
+	dir := t.TempDir()
+	prompt := filepath.Join(dir, "prompt")
+	if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tmux := filepath.Join(dir, "tmux")
+	spoolRecord := filepath.Join(dir, "spool-path")
+	script := "#!/bin/sh\ncase $1 in\nsave-buffer) printf %s \"$4\" >\"$FAKE_SPOOL\"; cp \"$FAKE_PROMPT\" \"$4\";;\ndelete-buffer) exit 0;;\n*) exit 2;;\nesac\n"
+	if err := os.WriteFile(tmux, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run := func(resultPath string, command []string) error {
+		t.Helper()
+		wrapped := PromptCommand(tmux, "prompt-buffer", resultPath, command)
+		cmd := exec.Command(wrapped[0], wrapped[1:]...)
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_PROMPT=" + prompt, "FAKE_SPOOL=" + spoolRecord}
+		return cmd.Run()
+	}
+
+	exitResult := filepath.Join(dir, "exit.result.json")
+	err := run(exitResult, []string{"sh", "-c", `cat >/dev/null; printf ok; exit 23`})
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 23 {
+		t.Fatalf("consumer exit status = %v", err)
+	}
+	if got, err := os.ReadFile(exitResult); err != nil || string(got) != "ok" {
+		t.Fatalf("consumer stdout = %q, %v", got, err)
+	}
+
+	boundedResult := filepath.Join(dir, "bounded.result.json")
+	marker := filepath.Join(dir, "producer-finished")
+	err = run(boundedResult, []string{"sh", "-c", `cat >/dev/null; yes x && touch "$1"`, "producer", marker})
+	if err == nil {
+		t.Fatal("over-limit producer succeeded")
+	}
+	if info, err := os.Stat(boundedResult); err != nil || info.Size() != WorkerResultMaxBytes {
+		t.Fatalf("bounded result size = %v, %v", info, err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("over-limit producer continued: %v", err)
+	}
+	spool, err := os.ReadFile(spoolRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(string(spool)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("prompt spool was not removed: %v", err)
+	}
+}
+
 func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
 	dir := t.TempDir()
 	tmux := filepath.Join(dir, "tmux")

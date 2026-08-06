@@ -22,6 +22,9 @@ import (
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 )
 
+// WorkerResultMaxBytes is the hard implementation stdout capture ceiling.
+const WorkerResultMaxBytes = 64 << 10
+
 const (
 	manifestVersion    = 1
 	maxResourceName    = 64
@@ -160,20 +163,29 @@ func ResultPath(worktree string) string { return worktree + workerResultSuffix }
 // PromptCommand starts command with the named tmux buffer connected to stdin.
 // When resultPath is nonempty, the wrapper captures only stdout in a private file.
 func PromptCommand(tmux, buffer, resultPath string, command []string) []string {
-	const script = `tmux=$1; buffer=$2; result=$3; shift 3
+	const script = `tmux=$1; buffer=$2; result=$3; limit=$4; shift 4
 TMPDIR=/tmp; export TMPDIR
 prompt=$(umask 077; mktemp "$TMPDIR/agent-symphony-prompt.XXXXXX") || exit
-cleanup() { status=$?; trap - EXIT; rm -f "$prompt" || status=1; exit "$status"; }
+command_status=
+overflow=
+cleanup() { status=$?; trap - EXIT; rm -f "$prompt" || status=1; [ -z "$command_status" ] || rm -f "$command_status" || status=1; [ -z "$overflow" ] || rm -f "$overflow" || status=1; exit "$status"; }
 trap cleanup EXIT
 "$tmux" save-buffer -b "$buffer" "$prompt" &&
 "$tmux" delete-buffer -b "$buffer" &&
 if [ -n "$result" ]; then
   umask 077; set -C; exec 3>"$result" || exit; set +C
-  "$@" <"$prompt" >&3
+  command_status=$(umask 077; mktemp "$TMPDIR/agent-symphony-status.XXXXXX") || exit
+  overflow=$(umask 077; mktemp "$TMPDIR/agent-symphony-overflow.XXXXXX") || exit
+  ("$@" <"$prompt"; printf '%s\n' "$?" >"$command_status") |
+    (dd bs=1 count="$limit" >&3 2>/dev/null; copy_status=$?; dd bs=1 count=1 of="$overflow" 2>/dev/null; [ "$copy_status" -eq 0 ] && [ ! -s "$overflow" ])
+  capture_status=$?
+  status=$(cat "$command_status") || exit
+  if [ "$status" -ne 0 ]; then exit "$status"; fi
+  exit "$capture_status"
 else
   "$@" <"$prompt"
 fi`
-	return append([]string{"sh", "-c", script, "agent-symphony-prompt", tmux, buffer, resultPath}, command...)
+	return append([]string{"sh", "-c", script, "agent-symphony-prompt", tmux, buffer, resultPath, strconv.Itoa(WorkerResultMaxBytes)}, command...)
 }
 
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {

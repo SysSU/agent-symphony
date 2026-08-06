@@ -263,7 +263,7 @@ func TestWorkerResultArtifactFailsClosed(t *testing.T) {
 	valid := `{"type":"agent-symphony-result-v1","validation":"go test ./... passed","documentation":"none"}`
 	malformed := `{"type":"agent-symphony-result-v1","validation":`
 	unknown := `{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none","extra":true}`
-	oversized := `{"type":"agent-symphony-result-v1","validation":"` + strings.Repeat("x", 64<<10) + `","documentation":"none"}`
+	oversized := `{"type":"agent-symphony-result-v1","validation":"` + strings.Repeat("x", agentruntime.WorkerResultMaxBytes) + `","documentation":"none"}`
 	for _, test := range []struct {
 		name, body string
 	}{
@@ -274,6 +274,7 @@ func TestWorkerResultArtifactFailsClosed(t *testing.T) {
 		{"empty validation", `{"type":"agent-symphony-result-v1","validation":" ","documentation":"none"}`},
 		{"empty documentation", `{"type":"agent-symphony-result-v1","validation":"ok","documentation":" "}`},
 		{"multiple objects", valid + "\n" + valid},
+		{"capture ceiling truncated", strings.Repeat("x", agentruntime.WorkerResultMaxBytes)},
 		{"oversized", oversized},
 	} {
 		t.Run(test.name, func(t *testing.T) {
