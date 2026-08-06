@@ -214,7 +214,8 @@ func TestAgentFailureCancelAndIneligibility(t *testing.T) {
 	fake.sessions[manifest.Session].dead = true
 	fake.sessions[manifest.Session].status = 7
 	fake.sessions[manifest.Session].output = "useful failure output\n"
-	manifest, err = r.Monitor(context.Background(), attempt)
+	recovered := Attempt{Repository: attempt.Repository, Issue: attempt.Issue, Number: attempt.Number, BaseSHA: attempt.BaseSHA}
+	manifest, err = r.Monitor(context.Background(), recovered)
 	if err != nil || manifest.State != "failed" || !strings.Contains(manifest.Diagnostic, "status 7") {
 		t.Fatalf("monitor = %#v, %v", manifest, err)
 	}
@@ -227,7 +228,8 @@ func TestAgentFailureCancelAndIneligibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest2, err = r2.Cancel(context.Background(), attempt2, "issue closed")
+	recovered2 := Attempt{Repository: attempt2.Repository, Issue: attempt2.Issue, Number: attempt2.Number, BaseSHA: attempt2.BaseSHA}
+	manifest2, err = r2.Cancel(context.Background(), recovered2, "issue closed")
 	if _, live := fake2.sessions[manifest2.Session]; err != nil || manifest2.State != "cancelled" || live {
 		t.Fatalf("cancel = %#v, %v", manifest2, err)
 	}
@@ -351,6 +353,11 @@ func TestWorkerIdentityFailsClosedBeforeMutation(t *testing.T) {
 		t.Fatalf("failed hook = %v", err)
 	}
 	r.VerifyWorker = func(context.Context) error { return nil }
+	missingCommand := attempt
+	missingCommand.Command = nil
+	if _, err := r.PrepareAndStart(context.Background(), missingCommand); err == nil || !strings.Contains(err.Error(), "command") {
+		t.Fatalf("missing command = %v", err)
+	}
 	r.AllowEnv = []string{"GITHUB_TOKEN"}
 	if _, err := r.PrepareAndStart(context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "environment") {
 		t.Fatalf("environment filtering error = %v", err)

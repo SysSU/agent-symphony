@@ -166,6 +166,9 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	if err := r.VerifyWorker(ctx); err != nil {
 		return Manifest{}, fmt.Errorf("verify worker identity: %w", err)
 	}
+	if len(attempt.Command) == 0 || strings.TrimSpace(attempt.Command[0]) == "" {
+		return Manifest{}, errors.New("attempt command is required")
+	}
 	env, err := internalgithub.AgentEnvironmentWith(append(os.Environ(), attempt.Env...), r.AllowEnv...)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("build worker environment: %w", err)
@@ -327,7 +330,7 @@ func (r *Runtime) Deliver(ctx context.Context, manifest Manifest, payload []byte
 	if err := r.VerifyWorker(ctx); err != nil {
 		return fmt.Errorf("verify worker identity: %w", err)
 	}
-	attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: []string{"handoff"}}
+	attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
 	if err := r.validateManifest(attempt, manifest); err != nil {
 		return err
 	}
@@ -353,7 +356,7 @@ func (r *Runtime) VerifyActive(ctx context.Context, manifest Manifest, head stri
 	if err := r.VerifyWorker(ctx); err != nil {
 		return fmt.Errorf("verify worker identity: %w", err)
 	}
-	attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: []string{"verify"}}
+	attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
 	if err := r.validateManifest(attempt, manifest); err != nil {
 		return err
 	}
@@ -416,7 +419,7 @@ func (r *Runtime) Discover() ([]Manifest, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", path, err)
 		}
-		attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: []string{"validate"}}
+		attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
 		if err := r.validateManifest(attempt, manifest); err != nil {
 			return nil, fmt.Errorf("validate %s: %w", path, err)
 		}
@@ -432,8 +435,8 @@ func (r *Runtime) Discover() ([]Manifest, error) {
 
 func (r *Runtime) identify(a Attempt) (Manifest, error) {
 	parts := strings.Split(a.Repository, "/")
-	if len(parts) != 2 || !component.MatchString(parts[0]) || !component.MatchString(parts[1]) || a.Issue < 1 || a.Number < 1 || !commitID.MatchString(a.BaseSHA) || len(a.Command) == 0 || strings.TrimSpace(a.Command[0]) == "" {
-		return Manifest{}, fmt.Errorf("invalid attempt identity, base SHA, or command")
+	if len(parts) != 2 || !component.MatchString(parts[0]) || !component.MatchString(parts[1]) || a.Issue < 1 || a.Number < 1 || !commitID.MatchString(a.BaseSHA) {
+		return Manifest{}, fmt.Errorf("invalid attempt identity or base SHA")
 	}
 	repoID := repoIdentifier(a.Repository)
 	name := fmt.Sprintf("%s-%d-%d", repoID, a.Issue, a.Number)
