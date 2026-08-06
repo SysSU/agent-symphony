@@ -147,6 +147,7 @@ type Runtime struct {
 	Source    string
 	Git       string
 	Tmux      string
+	Helper    string
 	Runner    Runner
 	AllowEnv  []string
 	StopWait  time.Duration
@@ -160,32 +161,9 @@ func PaneTarget(session string) string { return "=" + session + ":0.0" }
 
 func ResultPath(worktree string) string { return worktree + workerResultSuffix }
 
-// PromptCommand starts command with the named tmux buffer connected to stdin.
-// When resultPath is nonempty, the wrapper captures only stdout in a private file.
-func PromptCommand(tmux, buffer, resultPath string, command []string) []string {
-	const script = `tmux=$1; buffer=$2; result=$3; limit=$4; shift 4
-TMPDIR=/tmp; export TMPDIR
-prompt=$(umask 077; mktemp "$TMPDIR/agent-symphony-prompt.XXXXXX") || exit
-command_status=
-overflow=
-cleanup() { status=$?; trap - EXIT; rm -f "$prompt" || status=1; [ -z "$command_status" ] || rm -f "$command_status" || status=1; [ -z "$overflow" ] || rm -f "$overflow" || status=1; exit "$status"; }
-trap cleanup EXIT
-"$tmux" save-buffer -b "$buffer" "$prompt" &&
-"$tmux" delete-buffer -b "$buffer" &&
-if [ -n "$result" ]; then
-  umask 077; set -C; exec 3>"$result" || exit; set +C
-  command_status=$(umask 077; mktemp "$TMPDIR/agent-symphony-status.XXXXXX") || exit
-  overflow=$(umask 077; mktemp "$TMPDIR/agent-symphony-overflow.XXXXXX") || exit
-  ("$@" <"$prompt"; printf '%s\n' "$?" >"$command_status") |
-    (dd bs=1 count="$limit" >&3 2>/dev/null; copy_status=$?; dd bs=1 count=1 of="$overflow" 2>/dev/null; [ "$copy_status" -eq 0 ] && [ ! -s "$overflow" ])
-  capture_status=$?
-  status=$(cat "$command_status") || exit
-  if [ "$status" -ne 0 ]; then exit "$status"; fi
-  exit "$capture_status"
-else
-  "$@" <"$prompt"
-fi`
-	return append([]string{"sh", "-c", script, "agent-symphony-prompt", tmux, buffer, resultPath, strconv.Itoa(WorkerResultMaxBytes)}, command...)
+// PromptCommand runs command through the descriptor-owning capture helper.
+func PromptCommand(helper, tmux, buffer, resultPath string, command []string) []string {
+	return append([]string{helper, "worker-capture", tmux, buffer, resultPath, "--"}, command...)
 }
 
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
@@ -202,6 +180,9 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	}
 	if len(attempt.Command) == 0 || strings.TrimSpace(attempt.Command[0]) == "" {
 		return Manifest{}, errors.New("attempt command is required")
+	}
+	if attempt.Context != "" && strings.TrimSpace(r.Helper) == "" {
+		return Manifest{}, errors.New("attempt capture helper is required")
 	}
 	env, err := internalgithub.AgentEnvironmentWith(append(os.Environ(), attempt.Env...), r.AllowEnv...)
 	if err != nil {
@@ -298,7 +279,7 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	}
 	command := attempt.Command
 	if attempt.Context != "" {
-		command = PromptCommand(r.tmux(), manifest.Session, ResultPath(manifest.Worktree), command)
+		command = PromptCommand(r.Helper, r.tmux(), manifest.Session, ResultPath(manifest.Worktree), command)
 	}
 	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
 		return failStop("start agent", err)

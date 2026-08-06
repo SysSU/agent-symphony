@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -149,7 +150,7 @@ func TestLifecycleCreatesUncredentialedRepositoryAndPreservesPrimary(t *testing.
 	if manifest.State != "running" || fake.buffers[manifest.Session] != attempt.Context {
 		t.Fatalf("unexpected launch: %#v, %#v", manifest, fake.sessions[manifest.Session])
 	}
-	want := PromptCommand("tmux", manifest.Session, ResultPath(manifest.Worktree), attempt.Command)
+	want := PromptCommand(r.Helper, "tmux", manifest.Session, ResultPath(manifest.Worktree), attempt.Command)
 	if !slices.Equal(fake.sessions[manifest.Session].agent, want) {
 		t.Fatalf("agent command = %#v, want %#v", fake.sessions[manifest.Session].agent, want)
 	}
@@ -336,28 +337,37 @@ func TestPromptCommandProvidesStdinBeforeFastConsumerStarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmux := filepath.Join(dir, "tmux")
-	spoolRecord := filepath.Join(dir, "spool-path")
-	script := "#!/bin/sh\ncase $1 in\nsave-buffer) printf %s \"$4\" >\"$FAKE_SPOOL\"; cp \"$FAKE_PROMPT\" \"$4\";;\ndelete-buffer) exit 0;;\n*) exit 2;;\nesac\n"
+	deleted := filepath.Join(dir, "buffer-deleted")
+	script := "#!/bin/sh\ncase $1 in\nsave-buffer) cat \"$FAKE_PROMPT\";;\ndelete-buffer) : >\"$FAKE_DELETED\";;\n*) exit 2;;\nesac\n"
 	if err := os.WriteFile(tmux, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
+	}
+	t.Setenv("FAKE_PROMPT", prompt)
+	t.Setenv("FAKE_DELETED", deleted)
+	t.Setenv("TMPDIR", private)
+	tempDir := t.TempDir()
+	for _, name := range []string{"agent-symphony-status.attack", "agent-symphony-overflow.attack"} {
+		if err := os.Symlink(canary, filepath.Join(tempDir, name)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	result := `{"type":"agent-symphony-result-v1","validation":"tests passed","documentation":"none"}`
 	consumer := `input=$(cat) || exit
 test "$input" = "$1" && test "$TMPDIR" = /tmp || exit
-ln -s "$2" .agent-symphony-result.json || exit
+test -e "$2" || exit
+test -z "$(find "$3" -name 'agent-symphony-prompt-*' -print -quit)" || exit
+ln -s "$4" "$5" || exit
 printf '%s\n' progress >&2
-printf '%s\n%s\n' "$3" "$3" >&2
-printf %s "$3"`
-	command := PromptCommand(tmux, "prompt-buffer", resultPath, []string{"sh", "-c", consumer, "consumer", "line one\nline two", canary, result})
-	cmd := exec.Command(command[0], command[1:]...)
-	cmd.Dir = workspace
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_PROMPT=" + prompt, "FAKE_SPOOL=" + spoolRecord, "TMPDIR=" + private}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("fast stdin consumer: %v: %s", err, out)
+printf '%s\n%s\n' "$6" "$6" >&2
+printf %s "$6"`
+	workspaceLink := filepath.Join(workspace, ".agent-symphony-result.json")
+	var diagnostics strings.Builder
+	code, err := captureWorker(t.Context(), tmux, "prompt-buffer", resultPath, []string{"sh", "-c", consumer, "consumer", "line one\nline two", deleted, tempDir, canary, workspaceLink, result}, io.Discard, &diagnostics, tempDir)
+	if err != nil || code != 0 {
+		t.Fatalf("fast stdin consumer: code=%d err=%v diagnostics=%s", code, err, diagnostics.String())
 	}
-	if !strings.Contains(string(out), "progress") || strings.Count(string(out), result) != 2 {
-		t.Fatalf("stderr diagnostics were not preserved: %q", out)
+	if !strings.Contains(diagnostics.String(), "progress") || strings.Count(diagnostics.String(), result) != 2 {
+		t.Fatalf("stderr diagnostics were not preserved: %q", diagnostics.String())
 	}
 	if got, err := os.ReadFile(resultPath); err != nil || string(got) != result {
 		t.Fatalf("captured stdout = %q, %v", got, err)
@@ -368,15 +378,29 @@ printf %s "$3"`
 	if got, err := os.ReadFile(canary); err != nil || string(got) != "unchanged" {
 		t.Fatalf("outside canary changed: %q, %v", got, err)
 	}
-	if target, err := os.Readlink(filepath.Join(workspace, ".agent-symphony-result.json")); err != nil || target != canary {
+	if target, err := os.Readlink(workspaceLink); err != nil || target != canary {
 		t.Fatalf("workspace symlink = %q, %v", target, err)
 	}
-	spool, err := os.ReadFile(spoolRecord)
-	if err != nil {
+	for _, name := range []string{"agent-symphony-status.attack", "agent-symphony-overflow.attack"} {
+		if target, err := os.Readlink(filepath.Join(tempDir, name)); err != nil || target != canary {
+			t.Fatalf("scratch canary link = %q, %v", target, err)
+		}
+	}
+	attackedResult := filepath.Join(dir, "attacked.result.json")
+	if err := os.Symlink(canary, attackedResult); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(string(spool)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("prompt spool was not removed: %v", err)
+	if code, err := captureWorker(t.Context(), tmux, "prompt-buffer", attackedResult, []string{"sh", "-c", `printf replaced`}, io.Discard, io.Discard, tempDir); err == nil || code == 0 {
+		t.Fatalf("result symlink was accepted: code=%d err=%v", code, err)
+	}
+	if got, err := os.ReadFile(canary); err != nil || string(got) != "unchanged" {
+		t.Fatalf("result symlink canary changed: %q, %v", got, err)
+	}
+
+	var reviewerOut strings.Builder
+	code, err = captureWorker(t.Context(), tmux, "prompt-buffer", "", []string{"sh", "-c", `test "$TMPDIR" = /tmp && test "$(cat)" = "$1" && printf reviewer`, "reviewer", "line one\nline two"}, &reviewerOut, io.Discard, tempDir)
+	if err != nil || code != 0 || reviewerOut.String() != "reviewer" {
+		t.Fatalf("reviewer capture: code=%d output=%q err=%v", code, reviewerOut.String(), err)
 	}
 }
 
@@ -387,63 +411,121 @@ func TestPromptCommandBoundsStdoutAndPreservesExitStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmux := filepath.Join(dir, "tmux")
-	spoolRecord := filepath.Join(dir, "spool-path")
-	script := "#!/bin/sh\ncase $1 in\nsave-buffer) printf %s \"$4\" >\"$FAKE_SPOOL\"; cp \"$FAKE_PROMPT\" \"$4\";;\ndelete-buffer) exit 0;;\n*) exit 2;;\nesac\n"
+	script := "#!/bin/sh\ncase $1 in\nsave-buffer) cat \"$FAKE_PROMPT\";;\ndelete-buffer) exit 0;;\n*) exit 2;;\nesac\n"
 	if err := os.WriteFile(tmux, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	run := func(resultPath string, command []string) error {
+	t.Setenv("FAKE_PROMPT", prompt)
+	run := func(resultPath string, command []string) (int, error) {
 		t.Helper()
-		wrapped := PromptCommand(tmux, "prompt-buffer", resultPath, command)
-		cmd := exec.Command(wrapped[0], wrapped[1:]...)
-		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_PROMPT=" + prompt, "FAKE_SPOOL=" + spoolRecord}
-		return cmd.Run()
+		return captureWorker(t.Context(), tmux, "prompt-buffer", resultPath, command, io.Discard, io.Discard, dir)
 	}
 
 	exitResult := filepath.Join(dir, "exit.result.json")
-	err := run(exitResult, []string{"sh", "-c", `cat >/dev/null; printf ok; exit 23`})
-	var exit *exec.ExitError
-	if !errors.As(err, &exit) || exit.ExitCode() != 23 {
-		t.Fatalf("consumer exit status = %v", err)
+	code, err := run(exitResult, []string{"sh", "-c", `cat >/dev/null; printf ok; exit 23`})
+	if err != nil || code != 23 {
+		t.Fatalf("consumer exit status = %d, %v", code, err)
 	}
 	if got, err := os.ReadFile(exitResult); err != nil || string(got) != "ok" {
 		t.Fatalf("consumer stdout = %q, %v", got, err)
 	}
 
 	boundedResult := filepath.Join(dir, "bounded.result.json")
-	marker := filepath.Join(dir, "producer-finished")
-	err = run(boundedResult, []string{"sh", "-c", `cat >/dev/null; yes x && touch "$1"`, "producer", marker})
-	if err == nil {
-		t.Fatal("over-limit producer succeeded")
+	unrelated := exec.Command("sleep", "5")
+	if err := unrelated.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unrelated.Process.Kill(); _ = unrelated.Wait() })
+	started := time.Now()
+	code, err = run(boundedResult, []string{"sh", "-c", `trap '' PIPE TERM; while :; do printf x || :; done`})
+	if !errors.Is(err, ErrWorkerResultOverflow) || code == 0 || time.Since(started) > 2*time.Second {
+		t.Fatalf("over-limit producer: code=%d elapsed=%v err=%v", code, time.Since(started), err)
 	}
 	if info, err := os.Stat(boundedResult); err != nil || info.Size() != WorkerResultMaxBytes {
 		t.Fatalf("bounded result size = %v, %v", info, err)
 	}
-	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("over-limit producer continued: %v", err)
+	if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("unrelated process group was terminated: %v", err)
 	}
-	spool, err := os.ReadFile(spoolRecord)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(string(spool)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("prompt spool was not removed: %v", err)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "agent-symphony-prompt-") {
+			t.Fatalf("prompt scratch remained visible: %s", entry.Name())
+		}
+	}
+}
+
+func TestCaptureWorkerCancellationKillsAndReapsChildGroup(t *testing.T) {
+	for _, captureResult := range []bool{true, false} {
+		t.Run(strconv.FormatBool(captureResult), func(t *testing.T) {
+			dir := t.TempDir()
+			prompt := filepath.Join(dir, "prompt")
+			if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tmux := filepath.Join(dir, "tmux")
+			if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; *) exit 2;; esac\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("FAKE_PROMPT", prompt)
+			pidPath := filepath.Join(dir, "descendant.pid")
+			resultPath := ""
+			if captureResult {
+				resultPath = filepath.Join(dir, "cancelled.result.json")
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() {
+				_, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, []string{"sh", "-c", `trap '' INT TERM; sleep 30 & echo $! >"$1"; wait`, "consumer", pidPath}, io.Discard, io.Discard, dir)
+				done <- err
+			}()
+			var pid int
+			for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+				body, err := os.ReadFile(pidPath)
+				if err == nil && strings.TrimSpace(string(body)) != "" {
+					pid, err = strconv.Atoi(strings.TrimSpace(string(body)))
+					if err != nil {
+						t.Fatal(err)
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("child descendant did not start")
+				}
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("capture cancellation = %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("capture cancellation did not return promptly")
+			}
+			for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+				if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("child descendant %d survived cancellation", pid)
+				}
+			}
+		})
 	}
 }
 
 func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
 	dir := t.TempDir()
 	tmux := filepath.Join(dir, "tmux")
-	spoolRecord := filepath.Join(dir, "spool-path")
-	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf %s \"$4\" >\"$FAKE_SPOOL\"\nexit 23\n"), 0o700); err != nil {
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nexit 23\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(dir, "consumer-ran")
 	resultPath := filepath.Join(dir, "attempt.result.json")
-	command := PromptCommand(tmux, "missing-buffer", resultPath, []string{"sh", "-c", `touch "$1"`, "consumer", marker})
-	cmd := exec.Command(command[0], command[1:]...)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_SPOOL=" + spoolRecord}
-	if err := cmd.Run(); err == nil {
+	if _, err := captureWorker(t.Context(), tmux, "missing-buffer", resultPath, []string{"sh", "-c", `touch "$1"`, "consumer", marker}, io.Discard, io.Discard, dir); err == nil {
 		t.Fatal("buffer read failure was masked")
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
@@ -452,12 +534,14 @@ func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
 	if _, err := os.Stat(resultPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("result was opened after buffer read failure: %v", err)
 	}
-	spool, err := os.ReadFile(spoolRecord)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(string(spool)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("failed prompt spool was not removed: %v", err)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "agent-symphony-prompt-") {
+			t.Fatalf("failed prompt scratch remained visible: %s", entry.Name())
+		}
 	}
 }
 
@@ -803,7 +887,7 @@ func testRuntime(t *testing.T) (*Runtime, *fakeRunner, Attempt, string) {
 		t.Fatal(err)
 	}
 	fake := newFakeRunner()
-	r := &Runtime{Root: root, StateRoot: state, Source: primary, Git: "git", Tmux: "tmux", Runner: fake, AllowEnv: []string{"PATH"}, StopWait: time.Millisecond, VerifyWorker: func(context.Context) error { return nil }}
+	r := &Runtime{Root: root, StateRoot: state, Source: primary, Git: "git", Tmux: "tmux", Helper: "agent-symphony-helper", Runner: fake, AllowEnv: []string{"PATH"}, StopWait: time.Millisecond, VerifyWorker: func(context.Context) error { return nil }}
 	attempt := Attempt{Repository: "owner/repo", Issue: 3, Number: 1, BaseSHA: sha, Context: "issue context\n", Command: []string{"fake-agent"}}
 	return r, fake, attempt, primary
 }
