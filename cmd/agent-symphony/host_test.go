@@ -125,20 +125,41 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 	})
 
 	t.Run("export", func(t *testing.T) {
-		repo := t.TempDir()
-		for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"commit", "--allow-empty", "-m", "base"}} {
-			if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+		root := t.TempDir()
+		primary := filepath.Join(root, "primary")
+		if err := os.Mkdir(primary, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}} {
+			if out, err := exec.Command("git", append([]string{"-C", primary}, args...)...).CombinedOutput(); err != nil {
 				t.Fatalf("git %v: %v: %s", args, err, out)
 			}
 		}
-		branch := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", repo, "branch", "--show-current"))))
-		session := "as-export-pane-test"
+		if err := os.WriteFile(filepath.Join(primary, "README.md"), []byte("base\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"add", "README.md"}, {"commit", "-m", "base"}} {
+			if out, err := exec.Command("git", append([]string{"-C", primary}, args...)...).CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v: %s", args, err, out)
+			}
+		}
+		base := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", primary, "rev-parse", "HEAD"))))
+		identity, err := agentruntime.AttemptIdentity(root, agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: base})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("git", "-C", primary, "worktree", "add", "-b", identity.Branch, identity.Worktree).CombinedOutput(); err != nil {
+			t.Fatalf("git worktree: %v: %s", err, out)
+		}
+		if err := os.WriteFile(filepath.Join(identity.Worktree, "README.md"), []byte("base\nchanged\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		good := `{"type":"agent-symphony-result-v1","validation":"pane-zero","documentation":"done"}`
 		bad := `{"type":"agent-symphony-result-v1","validation":"wrong-window","documentation":"wrong"}`
-		tmux(t, "new-session", "-d", "-x", "200", "-s", session, "-c", repo, "sh", "-c", "printf '%s\\n' '"+good+"'; sleep 30")
-		t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+session).Run() })
+		tmux(t, "new-session", "-d", "-x", "200", "-s", identity.Session, "-c", identity.Worktree, "sh", "-c", "printf '%s\\n' '"+good+"'; sleep 30")
+		t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+identity.Session).Run() })
 		for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-			out, _ := exec.Command("tmux", "capture-pane", "-p", "-t", agentruntime.PaneTarget(session), "-S", "-200").CombinedOutput()
+			out, _ := exec.Command("tmux", "capture-pane", "-p", "-t", agentruntime.PaneTarget(identity.Session), "-S", "-200").CombinedOutput()
 			if strings.Contains(string(out), good) {
 				break
 			}
@@ -146,16 +167,57 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 				t.Fatalf("pane zero did not emit result: %s", out)
 			}
 		}
-		tmux(t, "new-window", "-d", "-t", "="+session, "sh", "-c", "printf '%s\\n' '"+bad+"'; sleep 30")
-		tmux(t, "select-window", "-t", "="+session+":1")
-		manifest, _ := json.Marshal(agentruntime.Manifest{Repository: "o/r", Branch: branch, BaseSHA: "base", Worktree: repo, Session: session})
-		output, err := exportAttempt(t.Context(), manifest, repo)
+		tmux(t, "new-window", "-d", "-t", "="+identity.Session, "sh", "-c", "printf '%s\\n' '"+bad+"'; sleep 30")
+		tmux(t, "select-window", "-t", "="+identity.Session+":1")
+		manifest := identity
+		manifest.State = "completed"
+		t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
+		call := func(mode string, candidate agentruntime.Manifest) (agentruntime.Result, error) {
+			body, _ := json.Marshal(candidate)
+			request, _ := json.Marshal(struct {
+				Operation string          `json:"operation"`
+				Command   boundaryCommand `json:"command"`
+			}{"export", boundaryCommand{Input: body}})
+			var boundary bytes.Buffer
+			err := agentHost(t.Context(), mode, bytes.NewReader(request), &boundary)
+			var result agentruntime.Result
+			if err == nil {
+				err = json.Unmarshal(boundary.Bytes(), &result)
+			}
+			return result, err
+		}
+		for name, edit := range map[string]func(*agentruntime.Manifest){
+			"sibling worktree": func(m *agentruntime.Manifest) { m.Worktree = primary },
+			"wrong session":    func(m *agentruntime.Manifest) { m.Session = "as-sibling" },
+			"invalid base":     func(m *agentruntime.Manifest) { m.BaseSHA = "not-a-commit" },
+		} {
+			t.Run(name, func(t *testing.T) {
+				candidate := manifest
+				edit(&candidate)
+				if _, err := call("implementation", candidate); err == nil {
+					t.Fatal("forged manifest was accepted")
+				}
+			})
+		}
+		result, err := call("implementation", manifest)
 		if err != nil {
 			t.Fatal(err)
 		}
 		var exported workerExport
-		if err := json.Unmarshal([]byte(output), &exported); err != nil || exported.Result.Validation != "pane-zero" {
+		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != "pane-zero" || exported.HeadSHA == base {
 			t.Fatalf("export=%#v err=%v", exported, err)
+		}
+		if _, err := call("review", manifest); err == nil {
+			t.Fatal("review boundary accepted implementation export")
+		}
+		if status := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "status", "--porcelain")))); status != "" {
+			t.Fatalf("committed worktree remains dirty: %q", status)
+		}
+		if got := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "show", "HEAD:README.md")))); got != "base\nchanged" {
+			t.Fatalf("committed content = %q", got)
+		}
+		if got := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", primary, "rev-parse", "HEAD")))); got != base {
+			t.Fatalf("primary worktree moved from %s to %s", base, got)
 		}
 	})
 }

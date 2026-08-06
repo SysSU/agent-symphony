@@ -53,7 +53,7 @@ Commands produce plain human-readable text by default and never depend on color.
   "worktree_root": ".worktrees",
   "docs_paths": ["README.md", "docs"],
   "commands": {
-    "implementation": ["codex", "exec"],
+    "implementation": ["codex", "exec", "--sandbox", "workspace-write"],
     "reviewer": ["codex", "review"],
     "environment_allowlist": ["LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"]
   },
@@ -64,7 +64,7 @@ Commands produce plain human-readable text by default and never depend on color.
 }
 ```
 
-Commands are argument arrays, not shell strings. Runtime code therefore executes the configured program without shell interpolation. `environment_allowlist` is the complete set of inherited variable names available to implementation/review processes; add model-provider credentials explicitly. GitHub, Git askpass, SSH-agent, and cloud credential variables are forbidden even when listed. Arguments or assignments shaped like tokens, passwords, private keys, API keys, credentials, or authorization values are rejected so `config view` cannot disclose them. Dependencies are explicit issue references under the configured issue-body section; issue parsing and enforcement belong to downstream intake/scheduler work. Completion defaults to human review.
+Commands are argument arrays, not shell strings. Runtime code therefore executes the configured program without shell interpolation. The default noninteractive Codex implementation command uses `workspace-write` for source edits in its assigned worktree; it does not need access to protected Git metadata. After successful completion, the bounded implementation worker requires the exact shared deterministic branch, worktree, and session plus a contained Git directory, commit-format base ancestry, absent remotes and credential helpers, and structured result before committing any dirty tree for export. The default `codex review` remains read-only. Explicit command arrays replace these defaults unchanged. `environment_allowlist` is the complete set of inherited variable names available to implementation/review processes; add model-provider credentials explicitly. GitHub, Git askpass, SSH-agent, and cloud credential variables are forbidden even when listed. Arguments or assignments shaped like tokens, passwords, private keys, API keys, credentials, or authorization values are rejected so `config view` cannot disclose them. Dependencies are explicit issue references under the configured issue-body section; issue parsing and enforcement belong to downstream intake/scheduler work. Completion defaults to human review.
 
 ## Attempt runtime troubleshooting
 

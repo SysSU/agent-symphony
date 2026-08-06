@@ -680,6 +680,9 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		env = append(env, "HOME="+homeDir)
 		result, err = hostExecRunner(ctx, agentruntime.Command{Name: request.Command.Name, Args: request.Command.Args, Dir: request.Command.Dir, Env: env, Stdin: bytes.NewReader(request.Command.Input)})
 	case "export":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot export implementation attempts")
+		}
 		result.Output, err = exportAttempt(ctx, request.Command.Input, root)
 	case "accept-handoff":
 		if mode != "implementation" {
@@ -884,24 +887,39 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	var manifest agentruntime.Manifest
 	d := json.NewDecoder(bytes.NewReader(input))
 	d.DisallowUnknownFields()
-	if d.Decode(&manifest) != nil || d.Decode(&struct{}{}) != io.EOF || manifest.Worktree == "" || !belowRoot(manifest.Worktree, root) {
+	if d.Decode(&manifest) != nil || d.Decode(&struct{}{}) != io.EOF {
+		return "", errors.New("invalid export manifest")
+	}
+	want, identityErr := agentruntime.AttemptIdentity(root, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA})
+	if identityErr != nil || manifest.Version != want.Version || manifest.State != "completed" || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session {
 		return "", errors.New("invalid export manifest")
 	}
 	run := func(args ...string) (string, error) {
-		out, err := exec.CommandContext(ctx, "git", append([]string{"-C", manifest.Worktree}, args...)...).CombinedOutput()
+		cmd := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", manifest.Worktree}, args...)...)
+		cmd.Env = append(minimalBoundaryEnvironment(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
+		out, err := cmd.CombinedOutput()
 		return strings.TrimSpace(string(out)), err
 	}
-	head, err := run("rev-parse", "HEAD")
-	if err != nil {
-		return "", err
+	top, err := run("rev-parse", "--show-toplevel")
+	if err != nil || !samePath(top, manifest.Worktree) {
+		return "", errors.New("export worktree identity changed")
+	}
+	gitDir, err := run("rev-parse", "--absolute-git-dir")
+	if err != nil || !validAttemptGitDir(manifest.Worktree, gitDir, root) {
+		return "", errors.New("export git directory escapes provisioned root")
 	}
 	branch, err := run("branch", "--show-current")
 	if err != nil || branch != manifest.Branch {
 		return "", errors.New("export branch changed")
 	}
-	status, err := run("status", "--porcelain")
-	if err != nil || status != "" {
-		return "", errors.New("export worktree is not clean")
+	if remote, err := run("remote"); err != nil || remote != "" {
+		return "", errors.New("export worktree has a remote")
+	}
+	if helper, err := run("config", "--get-all", "credential.helper"); err != nil && !isExitCode(err, 1) || helper != "" {
+		return "", errors.New("export worktree has a credential helper")
+	}
+	if _, err := run("merge-base", "--is-ancestor", manifest.BaseSHA, "HEAD"); err != nil {
+		return "", errors.New("export head does not descend from base")
 	}
 	log, err := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-S", "-", "-t", agentruntime.PaneTarget(manifest.Session)).Output()
 	if err != nil {
@@ -919,6 +937,32 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if result.Type != "agent-symphony-result-v1" || strings.TrimSpace(result.Validation) == "" || strings.TrimSpace(result.Documentation) == "" {
 		return "", errors.New("worker result is invalid")
 	}
+	status, err := run("status", "--porcelain")
+	if err != nil {
+		return "", errors.New("inspect export worktree")
+	}
+	if status != "" {
+		if _, err := run("add", "--all"); err != nil {
+			return "", fmt.Errorf("stage worker changes: %w", err)
+		}
+		if _, err := run("diff", "--cached", "--quiet"); err == nil || !isExitCode(err, 1) {
+			return "", errors.New("worker changes could not be staged")
+		}
+		message := fmt.Sprintf("agent-symphony: issue #%d attempt %d", manifest.Issue, manifest.Attempt)
+		if _, err := run("-c", "user.name=Agent Symphony", "-c", "user.email=agent-symphony@localhost", "-c", "commit.gpgSign=false", "commit", "--no-verify", "-m", message); err != nil {
+			return "", fmt.Errorf("commit worker changes: %w", err)
+		}
+	}
+	head, err := run("rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	if branch, err := run("branch", "--show-current"); err != nil || branch != manifest.Branch {
+		return "", errors.New("export branch changed")
+	}
+	if status, err := run("status", "--porcelain"); err != nil || status != "" {
+		return "", errors.New("export worktree is not clean")
+	}
 	tmp, err := os.CreateTemp("", "agent-symphony-export-*.bundle")
 	if err != nil {
 		return "", err
@@ -926,8 +970,8 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	name := tmp.Name()
 	tmp.Close()
 	defer os.Remove(name)
-	if out, err := exec.CommandContext(ctx, "git", "-C", manifest.Worktree, "bundle", "create", name, "HEAD").CombinedOutput(); err != nil {
-		return "", fmt.Errorf("create export bundle: %w: %s", err, strings.TrimSpace(string(out)))
+	if out, err := run("bundle", "create", name, "HEAD"); err != nil {
+		return "", fmt.Errorf("create export bundle: %w: %s", err, out)
 	}
 	bundle, err := os.ReadFile(name)
 	if err != nil || len(bundle) > 16<<20 {
@@ -936,6 +980,43 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	exported := workerExport{Type: "agent-symphony-export-v1", Repository: manifest.Repository, Branch: manifest.Branch, BaseSHA: manifest.BaseSHA, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: result, Bundle: base64.StdEncoding.EncodeToString(bundle)}
 	b, _ := json.Marshal(exported)
 	return string(b), nil
+}
+
+func samePath(left, right string) bool {
+	left, leftErr := filepath.EvalSymlinks(left)
+	right, rightErr := filepath.EvalSymlinks(right)
+	return leftErr == nil && rightErr == nil && left == right
+}
+
+func validAttemptGitDir(worktree, gitDir, root string) bool {
+	dotGit := filepath.Join(worktree, ".git")
+	info, err := os.Lstat(dotGit)
+	if err != nil || !belowRoot(gitDir, root) {
+		return false
+	}
+	if info.IsDir() {
+		return samePath(dotGit, gitDir)
+	}
+	if !info.Mode().IsRegular() || info.Size() > 4096 {
+		return false
+	}
+	body, err := os.ReadFile(dotGit)
+	declared := strings.TrimSpace(strings.TrimPrefix(string(body), "gitdir:"))
+	if err != nil || !strings.HasPrefix(string(body), "gitdir:") || declared == "" {
+		return false
+	}
+	if !filepath.IsAbs(declared) {
+		declared = filepath.Join(worktree, declared)
+	}
+	backlink, err := os.ReadFile(filepath.Join(gitDir, "gitdir"))
+	linked := strings.TrimSpace(string(backlink))
+	if err != nil || len(backlink) > 4096 || linked == "" {
+		return false
+	}
+	if !filepath.IsAbs(linked) {
+		linked = filepath.Join(gitDir, linked)
+	}
+	return samePath(declared, gitDir) && samePath(linked, dotGit)
 }
 
 func acceptHandoff(ctx context.Context, input []byte, root string) (string, error) {

@@ -4,20 +4,26 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
 
 func TestLoadAndValidate(t *testing.T) {
+	c := Default("owner/repo")
+	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "--sandbox", "workspace-write"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "review"}) {
+		t.Fatalf("unexpected default commands: %#v", c.Commands)
+	}
+	c.Commands.Implementation = []string{"custom-agent", "--flag"}
 	path := filepath.Join(t.TempDir(), DefaultPath)
-	if err := Write(path, Default("owner/repo")); err != nil {
+	if err := Write(path, c); err != nil {
 		t.Fatal(err)
 	}
 	c, err := load(path, filepath.Dir(path))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Repository != "owner/repo" || c.Concurrency != 1 || c.CompletionPolicies.Default != "human-review" {
+	if c.Repository != "owner/repo" || c.Concurrency != 1 || c.CompletionPolicies.Default != "human-review" || !slices.Equal(c.Commands.Implementation, []string{"custom-agent", "--flag"}) {
 		t.Fatalf("unexpected defaults: %#v", c)
 	}
 }
