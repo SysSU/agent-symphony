@@ -30,7 +30,7 @@ agent-symphony validate    # checks it
 
 Open `.agent-symphony.yaml` and adjust two things for your setup:
 
-- `commands.implementation` / `commands.reviewer` — the coding-agent CLI to run (defaults to `codex exec` / `codex review`).
+- `commands.implementation` / `commands.reviewer` — the coding-agent CLI to run (defaults to `codex exec --sandbox workspace-write` for noninteractive edits in the assigned worktree and read-only `codex review`).
 - `commands.environment_allowlist` — add any model-provider credential variable name your agent needs (e.g. `OPENAI_API_KEY`). GitHub/SSH/cloud credential variables are rejected here even if listed; see [CLI reference](cli.md#configuration) for the full schema and why.
 
 ## 3. Run doctor offline
