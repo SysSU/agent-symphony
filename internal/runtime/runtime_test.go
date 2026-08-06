@@ -517,6 +517,63 @@ func TestCaptureWorkerCancellationKillsAndReapsChildGroup(t *testing.T) {
 	}
 }
 
+func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
+	for _, captureResult := range []bool{true, false} {
+		t.Run(strconv.FormatBool(captureResult), func(t *testing.T) {
+			dir := t.TempDir()
+			prompt := filepath.Join(dir, "prompt")
+			if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tmux := filepath.Join(dir, "tmux")
+			if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; *) exit 2;; esac\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("FAKE_PROMPT", prompt)
+			marker := filepath.Join(dir, "late-marker")
+			pidPath := filepath.Join(dir, "descendant.pid")
+			resultPath, output := "", "reviewer"
+			if captureResult {
+				resultPath = filepath.Join(dir, "completed.result.json")
+				output = `{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none"}`
+			}
+			command := []string{"sh", "-c", `(exec >/dev/null 2>&1; sleep 0.5; printf late >"$1") & echo $! >"$2"; printf %s "$3"`, "consumer", marker, pidPath, output}
+			unrelated := exec.Command("sleep", "5")
+			if err := unrelated.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = unrelated.Process.Kill(); _ = unrelated.Wait() })
+			var stdout strings.Builder
+			started := time.Now()
+			code, err := captureWorker(t.Context(), tmux, "prompt-buffer", resultPath, command, &stdout, io.Discard, dir)
+			if err != nil || code != 0 || time.Since(started) > 2*time.Second {
+				t.Fatalf("completion: code=%d elapsed=%v err=%v", code, time.Since(started), err)
+			}
+			if !captureResult && stdout.String() != output {
+				t.Fatalf("reviewer output = %q", stdout.String())
+			}
+			body, err := os.ReadFile(pidPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, err := strconv.Atoi(strings.TrimSpace(string(body)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+				t.Fatalf("descendant %d survived helper completion: %v", pid, err)
+			}
+			if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
+				t.Fatalf("unrelated process group was terminated: %v", err)
+			}
+			time.Sleep(700 * time.Millisecond)
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("late descendant mutated workspace: %v", err)
+			}
+		})
+	}
+}
+
 func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
 	dir := t.TempDir()
 	tmux := filepath.Join(dir, "tmux")

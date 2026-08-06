@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // ErrWorkerResultOverflow means the configured command exceeded the capture ceiling.
@@ -59,8 +60,12 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 		stopCancel := context.AfterFunc(ctx, func() { killProcessGroup(child) })
 		waitErr := child.Wait()
 		stopCancel()
+		cleanupErr := terminateProcessGroup(child)
 		if ctx.Err() != nil {
 			return 1, ctx.Err()
+		}
+		if cleanupErr != nil {
+			return 1, cleanupErr
 		}
 		if waitErr != nil {
 			return processExitCode(waitErr), nil
@@ -85,6 +90,7 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 		stopCancel()
 		killProcessGroup(child)
 		_ = child.Wait()
+		_ = terminateProcessGroup(child)
 	}
 	if _, err := io.Copy(result, io.LimitReader(pipe, WorkerResultMaxBytes)); err != nil {
 		killAndWait()
@@ -102,8 +108,12 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 	}
 	waitErr := child.Wait()
 	stopCancel()
+	cleanupErr := terminateProcessGroup(child)
 	if ctx.Err() != nil {
 		return 1, ctx.Err()
+	}
+	if cleanupErr != nil {
+		return 1, cleanupErr
 	}
 	if err := result.Sync(); err != nil {
 		return 1, err
@@ -117,6 +127,26 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 func killProcessGroup(command *exec.Cmd) {
 	if command.Process != nil {
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+	}
+}
+
+func terminateProcessGroup(command *exec.Cmd) error {
+	if command.Process == nil {
+		return nil
+	}
+	group := -command.Process.Pid
+	if err := syscall.Kill(group, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if err := syscall.Kill(group, 0); errors.Is(err, syscall.ESRCH) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return errors.New("worker process group did not terminate")
+		}
 	}
 }
 
