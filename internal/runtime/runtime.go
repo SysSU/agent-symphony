@@ -445,6 +445,22 @@ func (r *Runtime) Discover() ([]Manifest, error) {
 }
 
 func (r *Runtime) identify(a Attempt) (Manifest, error) {
+	manifest, err := AttemptIdentity(r.Root, a)
+	if err != nil {
+		return Manifest{}, err
+	}
+	repoID := repoIdentifier(a.Repository)
+	logPath := filepath.Join(r.StateRoot, "attempts", repoID, fmt.Sprintf("%d-%d", a.Issue, a.Number), "agent.log")
+	if !filepath.IsAbs(r.StateRoot) || len(logPath) > maxPathLength {
+		return Manifest{}, fmt.Errorf("attempt path must be absolute and at most %d bytes", maxPathLength)
+	}
+	now := time.Now().UTC()
+	manifest.LogPath, manifest.CreatedAt, manifest.UpdatedAt = logPath, now, now
+	return manifest, nil
+}
+
+// AttemptIdentity returns the exact boundary-visible resources for an attempt.
+func AttemptIdentity(root string, a Attempt) (Manifest, error) {
 	parts := strings.Split(a.Repository, "/")
 	if len(parts) != 2 || !component.MatchString(parts[0]) || !component.MatchString(parts[1]) || a.Issue < 1 || a.Number < 1 || !commitID.MatchString(a.BaseSHA) {
 		return Manifest{}, fmt.Errorf("invalid attempt identity or base SHA")
@@ -459,18 +475,15 @@ func (r *Runtime) identify(a Attempt) (Manifest, error) {
 	if len(name) > maxResourceName || len(branch) > maxResourceName || len(session) > maxResourceName {
 		return Manifest{}, fmt.Errorf("attempt resource name exceeds %d bytes", maxResourceName)
 	}
-	worktree, err := below(r.Root, name)
+	worktree, err := below(root, name)
 	if err != nil {
 		return Manifest{}, err
 	}
-	logPath := filepath.Join(r.StateRoot, "attempts", repoID, fmt.Sprintf("%d-%d", a.Issue, a.Number), "agent.log")
-	if !filepath.IsAbs(r.StateRoot) || len(worktree) > maxPathLength || len(logPath) > maxPathLength {
+	if len(worktree) > maxPathLength {
 		return Manifest{}, fmt.Errorf("attempt path must be absolute and at most %d bytes", maxPathLength)
 	}
-	now := time.Now().UTC()
 	return Manifest{Version: manifestVersion, Repository: a.Repository, Issue: a.Issue, Attempt: a.Number,
-		Branch: branch, Worktree: worktree, Session: session, BaseSHA: a.BaseSHA,
-		LogPath: logPath, CreatedAt: now, UpdatedAt: now}, nil
+		Branch: branch, Worktree: worktree, Session: session, BaseSHA: a.BaseSHA}, nil
 }
 
 func repoIdentifier(repository string) string {

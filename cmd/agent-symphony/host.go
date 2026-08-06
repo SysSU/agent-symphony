@@ -890,8 +890,8 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if d.Decode(&manifest) != nil || d.Decode(&struct{}{}) != io.EOF {
 		return "", errors.New("invalid export manifest")
 	}
-	wantBranch, branchErr := internalgithub.AttemptBranch(manifest.Repository, manifest.Issue, manifest.Attempt)
-	if branchErr != nil || manifest.Version != 1 || manifest.State != "completed" || manifest.Branch != wantBranch || manifest.Worktree == "" || !belowRoot(manifest.Worktree, root) || !validTmuxTarget(agentruntime.PaneTarget(manifest.Session), true) {
+	want, identityErr := agentruntime.AttemptIdentity(root, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA})
+	if identityErr != nil || manifest.Version != want.Version || manifest.State != "completed" || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session {
 		return "", errors.New("invalid export manifest")
 	}
 	run := func(args ...string) (string, error) {
