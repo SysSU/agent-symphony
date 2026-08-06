@@ -383,7 +383,7 @@ func RunPRReconciliation(ctx context.Context, api API, cfg PRAdapterConfig, stat
 		return err
 	}
 	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
-	if err := api.VerifyInstallation(ctx, cfg.AppID); err != nil {
+	if err := api.VerifyInstallation(ctx, cfg.AppID, cfg.Repository); err != nil {
 		return err
 	}
 	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery}

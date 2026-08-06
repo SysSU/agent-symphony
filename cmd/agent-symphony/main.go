@@ -676,7 +676,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		return nil, errors.New("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID is out of range")
 	}
 	api := internalgithub.API{BaseURL: githubAPI, Tokens: tokens, HTTP: githubClient}
-	if err := api.VerifyInstallation(ctx, appID); err != nil {
+	if err := api.VerifyInstallation(ctx, appID, c.Repository); err != nil {
 		return nil, err
 	}
 	remote, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, appID, int(actorID))

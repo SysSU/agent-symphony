@@ -392,7 +392,7 @@ func TestRunPRReconciliationConstructsAndExecutes(t *testing.T) {
 	if err := os.WriteFile(path, []byte("[]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	api := fixtureAPI(t, map[string]any{"/installation": map[string]any{"app_id": 7}, "/repos/o/r/pulls?state=open&per_page=100&page=1": []any{}})
+	api := fixtureAPI(t, map[string]any{"/installation/repositories?per_page=100&page=1": map[string]any{"repositories": []any{map[string]any{"full_name": "o/r"}}}, "/repos/o/r/pulls?state=open&per_page=100&page=1": []any{}})
 	cfg := productionPRConfig()
 	if err := RunPRReconciliation(context.Background(), api, cfg, path); err != nil {
 		t.Fatal(err)
@@ -409,10 +409,14 @@ func TestRunPRReconciliationConstructsAndExecutes(t *testing.T) {
 	}
 }
 
-func TestInstallationTokenMustMatchConfiguredApp(t *testing.T) {
-	api := fixtureAPI(t, map[string]any{"/installation": map[string]any{"app_id": 8}})
-	if err := api.VerifyInstallation(context.Background(), 7); err == nil {
-		t.Fatal("token for another App was accepted")
+func TestInstallationTokenMustAccessConfiguredRepository(t *testing.T) {
+	api := fixtureAPI(t, map[string]any{"/installation/repositories?per_page=100&page=1": map[string]any{"repositories": []any{map[string]any{"full_name": "other/repo"}}}})
+	if err := api.VerifyInstallation(context.Background(), 7, "o/r"); err == nil {
+		t.Fatal("token for another installation was accepted")
+	}
+	api = API{Tokens: &InstallationTokens{JWTs: AppJWT{AppID: "8"}}}
+	if err := api.VerifyInstallation(context.Background(), 7, "o/r"); err == nil {
+		t.Fatal("credentials for another App were accepted")
 	}
 }
 
@@ -424,8 +428,8 @@ func TestRunPRReconciliationSerializesWholeRun(t *testing.T) {
 	var mu sync.Mutex
 	inFlight, overlap, pulls := 0, false, 0
 	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/installation" {
-			return httpResponse(http.StatusOK, `{"app_id":7}`, nil), nil
+		if r.URL.Path == "/installation/repositories" {
+			return httpResponse(http.StatusOK, `{"repositories":[{"full_name":"o/r"}]}`, nil), nil
 		}
 		mu.Lock()
 		inFlight++
@@ -462,8 +466,8 @@ func TestRunPRReconciliationFailsBeforePRsWhenIssuePreflightFails(t *testing.T) 
 	pulls := 0
 	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/installation":
-			return httpResponse(http.StatusOK, `{"app_id":7}`, nil), nil
+		case "/installation/repositories":
+			return httpResponse(http.StatusOK, `{"repositories":[{"full_name":"o/r"}]}`, nil), nil
 		case "/repos/o/r/issues/10":
 			return httpResponse(http.StatusForbidden, `{"message":"denied"}`, nil), nil
 		default:

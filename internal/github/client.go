@@ -27,18 +27,38 @@ type Mutation struct {
 	Attempt int
 }
 
-// VerifyInstallation binds the supplied installation token to the configured App.
-func (a API) VerifyInstallation(ctx context.Context, appID int64) error {
-	var installation struct {
-		AppID int64 `json:"app_id"`
+// VerifyInstallation binds the supplied installation token to the configured
+// App credentials and repository using GitHub's supported installation-token API.
+func (a API) VerifyInstallation(ctx context.Context, appID int64, repository string) error {
+	if appID <= 0 || repository == "" {
+		return errors.New("GitHub App and repository are required")
 	}
-	if _, _, err := a.Read(ctx, "/installation", "", &installation); err != nil {
-		return fmt.Errorf("verify GitHub App installation: %w", err)
+	if tokens, ok := a.Tokens.(*InstallationTokens); ok {
+		app, ok := tokens.JWTs.(AppJWT)
+		if !ok || app.AppID != strconv.FormatInt(appID, 10) {
+			return errors.New("GitHub installation credentials do not belong to the configured App")
+		}
 	}
-	if appID <= 0 || installation.AppID != appID {
-		return errors.New("GitHub installation token does not belong to the configured App")
+	for page := 1; ; page++ {
+		var installation struct {
+			Repositories []struct {
+				FullName string `json:"full_name"`
+			} `json:"repositories"`
+		}
+		path := fmt.Sprintf("/installation/repositories?per_page=100&page=%d", page)
+		if _, _, err := a.Read(ctx, path, "", &installation); err != nil {
+			return fmt.Errorf("verify GitHub App installation: %w", err)
+		}
+		for _, repo := range installation.Repositories {
+			if strings.EqualFold(repo.FullName, repository) {
+				return nil
+			}
+		}
+		if len(installation.Repositories) < 100 {
+			break
+		}
 	}
-	return nil
+	return errors.New("GitHub installation token cannot access the configured repository")
 }
 
 // RepositoryID fetches the numeric GitHub repository ID for "owner/repo",
