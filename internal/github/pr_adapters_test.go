@@ -541,7 +541,7 @@ func TestProductionAuthorizedControlsVerifyGitHubSnapshot(t *testing.T) {
 			"/repos/o/r/issues/10": map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 9}, "labels": []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}, map[string]any{"name": "auto"}}},
 			"/repos/o/r/issues/10/timeline?per_page=100&page=1": events,
 			"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{map[string]any{"id": 60, "body": SnapshotComment(snapshot), "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}}},
-			"/repos/o/r/issues/comments/50":                     map[string]any{"id": 50, "body": "/approve", "created_at": now.Add(time.Minute), "user": map[string]any{"id": 5}},
+			"/repos/o/r/issues/comments/50":                     map[string]any{"id": 50, "body": "/approve", "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 5}},
 			"/user/5":                                           map[string]any{"login": "owner"},
 			"/repos/o/r/collaborators/owner/permission":         map[string]any{"permission": "maintain"},
 		}
@@ -1015,10 +1015,13 @@ func TestLatestBodyEditUsesGraphQLUserContentEditShape(t *testing.T) {
 		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		for _, fragment := range []string{"... on Bot{databaseId}", "... on EnterpriseUserAccount{databaseId}", "... on Mannequin{databaseId}", "... on Organization{databaseId}", "... on User{databaseId}"} {
+		for _, fragment := range []string{"... on Bot{databaseId}", "... on Mannequin{databaseId}", "... on Organization{databaseId}", "... on User{databaseId}"} {
 			if !strings.Contains(payload.Query, fragment) {
 				t.Fatalf("query lacks %s: %s", fragment, payload.Query)
 			}
+		}
+		if strings.Contains(payload.Query, "... on EnterpriseUserAccount{databaseId}") {
+			t.Fatalf("query requests unsupported enterprise databaseId: %s", payload.Query)
 		}
 		return httpResponse(http.StatusOK, `{"data":{"repository":{"issue":{"userContentEdits":{"nodes":[{"id":"UCE_1","editedAt":"2026-08-02T01:00:00Z","editor":{"__typename":"User","databaseId":5}}]}}}}}`, nil), nil
 	})}}
@@ -1034,7 +1037,7 @@ func TestLatestBodyEditRejectsGraphQLErrorsAndUnsafeEditors(t *testing.T) {
 		"graphql error": map[string]any{"errors": []any{map[string]any{"message": "bad query"}}},
 		"missing id":    map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{map[string]any{"id": "UCE_1", "editedAt": "2026-08-02T01:00:00Z", "editor": map[string]any{"__typename": "User"}}}}}}}},
 		"zero id":       map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{map[string]any{"id": "UCE_1", "editedAt": "2026-08-02T01:00:00Z", "editor": map[string]any{"__typename": "User", "databaseId": 0}}}}}}}},
-		"unsupported":   map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{map[string]any{"id": "UCE_1", "editedAt": "2026-08-02T01:00:00Z", "editor": map[string]any{"__typename": "Unknown", "databaseId": 5}}}}}}}},
+		"unsupported":   map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{map[string]any{"id": "UCE_1", "editedAt": "2026-08-02T01:00:00Z", "editor": map[string]any{"__typename": "EnterpriseUserAccount"}}}}}}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			source := GitHubPRSource{API: fixtureAPI(t, map[string]any{"/graphql": response}), Config: PRAdapterConfig{Repository: "o/r"}}

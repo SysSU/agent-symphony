@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,116 @@ func TestRetryMustFollowEveryTerminalFailure(t *testing.T) {
 	retry.CreatedAt = time.Unix(40, 0)
 	if !retryAuthorizesFailure(controls, retry, terminalMarkerPayload{Attempt: 2, FailedAt: time.Unix(30, 0)}) {
 		t.Fatal("fresh retry did not authorize attempt 3")
+	}
+}
+
+func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	body := "## Context\nx\n## Acceptance Criteria\nx\n## Tasks\nx\n## Validation\nx\n## Dependencies\nnone\n"
+	var snapshotBodies []string
+	changed, approved := false, false
+	posts := 0
+	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		comments := []any{map[string]any{"id": 50, "body": "/approve", "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 5}}}
+		for i, snapshotBody := range snapshotBodies {
+			createdAt := now.Add(time.Duration(2+i*2) * time.Minute)
+			comments = append(comments, map[string]any{"id": 60 + i*20, "body": snapshotBody, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}})
+		}
+		if approved {
+			comments = append(comments, map[string]any{"id": 70, "body": "/approve", "created_at": now.Add(4 * time.Minute), "updated_at": now.Add(4 * time.Minute), "user": map[string]any{"id": 5}})
+		}
+		var response any
+		switch r.Method + " " + r.URL.RequestURI() {
+		case "GET /repos/o/r":
+			response = map[string]any{"default_branch": "main"}
+		case "GET /repos/o/r/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": "abcdef0"}}
+		case "GET /repos/o/r/issues?state=open&per_page=100&page=1":
+			response = []any{map[string]any{"number": 10, "title": "approved", "body": body, "created_at": now}}
+		case "GET /repos/o/r/issues/10":
+			priority := "P1"
+			if changed {
+				priority = "P2"
+			}
+			response = map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 9}, "labels": []any{map[string]any{"name": "ready"}, map[string]any{"name": priority}}}
+		case "GET /repos/o/r/issues/10/timeline?per_page=100&page=1":
+			events := []any{
+				map[string]any{"id": 20, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": 5}},
+				map[string]any{"id": 21, "event": "labeled", "label": map[string]any{"name": "P1"}, "created_at": now.Add(2 * time.Second), "actor": map[string]any{"id": 5}},
+			}
+			if changed {
+				events = append(events,
+					map[string]any{"id": 22, "event": "unlabeled", "label": map[string]any{"name": "P1"}, "created_at": now.Add(3 * time.Minute), "actor": map[string]any{"id": 5}},
+					map[string]any{"id": 23, "event": "labeled", "label": map[string]any{"name": "P2"}, "created_at": now.Add(3 * time.Minute), "actor": map[string]any{"id": 5}},
+				)
+			}
+			response = events
+		case "GET /repos/o/r/issues/10/comments?per_page=100&page=1":
+			response = comments
+		case "POST /graphql":
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+		case "GET /repos/o/r/issues/comments/50":
+			response = comments[0]
+		case "GET /repos/o/r/issues/comments/70":
+			response = comments[len(comments)-1]
+		case "GET /user/5":
+			response = map[string]any{"login": "owner"}
+		case "GET /repos/o/r/collaborators/owner/permission":
+			response = map[string]any{"permission": "maintain"}
+		case "POST /repos/o/r/issues/10/comments":
+			if r.Header.Get("X-Agent-Symphony-Issue") != "10" || r.Header.Get("X-Agent-Symphony-Attempt") != "0" {
+				t.Fatalf("missing pre-attempt attribution headers: %v", r.Header)
+			}
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil {
+				t.Fatal("invalid snapshot request")
+			}
+			if _, err := ParseSnapshotComment(payload.Body, 42, 42); err != nil {
+				t.Fatalf("non-canonical snapshot: %v", err)
+			}
+			snapshotBodies, posts = append(snapshotBodies, payload.Body), posts+1
+			if posts == 1 {
+				return nil, io.ErrUnexpectedEOF // GitHub accepted it, but the response was lost.
+			}
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		encoded, _ := json.Marshal(response)
+		return httpResponse(http.StatusOK, string(encoded), nil), nil
+	})}}
+	cfg := productionPRConfig()
+	readOnly, err := FetchIssueFacts(context.Background(), api, cfg, nil, false)
+	if err != nil || len(readOnly) != 1 || readOnly[0].Eligible || posts != 0 {
+		t.Fatalf("read-only facts=%#v posts=%d err=%v", readOnly, posts, err)
+	}
+	for range 2 {
+		facts, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+		if err != nil || len(facts) != 1 || !facts[0].Eligible || facts[0].Priority != 1 || len(facts[0].Blockers) != 0 {
+			t.Fatalf("facts=%#v err=%v", facts, err)
+		}
+	}
+	if posts != 1 {
+		t.Fatalf("snapshot posts=%d, want 1", posts)
+	}
+	changed = true
+	stale, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || len(stale) != 1 || stale[0].Eligible || posts != 1 || !slices.Contains(stale[0].Blockers, "fresh exact approval command is missing") {
+		t.Fatalf("stale facts=%#v posts=%d err=%v", stale, posts, err)
+	}
+	approved = true
+	readOnly, err = FetchIssueFacts(context.Background(), api, cfg, nil, false)
+	if err != nil || len(readOnly) != 1 || readOnly[0].Eligible || posts != 1 {
+		t.Fatalf("changed read-only facts=%#v posts=%d err=%v", readOnly, posts, err)
+	}
+	for range 2 {
+		facts, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+		if err != nil || len(facts) != 1 || !facts[0].Eligible || facts[0].Priority != 2 || len(facts[0].Blockers) != 0 {
+			t.Fatalf("changed facts=%#v err=%v", facts, err)
+		}
+	}
+	if posts != 2 {
+		t.Fatalf("replacement snapshot posts=%d, want 2 total", posts)
 	}
 }
 

@@ -101,8 +101,9 @@ type RecoveryIssueFact struct {
 }
 
 // FetchIssueFacts returns the authorized issue-control projection used by both
-// scheduling and read-only status. Local manifests never participate.
-func FetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts []RecoveryAttemptFact) ([]RecoveryIssueFact, error) {
+// scheduling and read-only status. Intake permits the reconciliation command
+// to create a missing control snapshot; status calls remain read-only.
+func FetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts []RecoveryAttemptFact, intake bool) ([]RecoveryIssueFact, error) {
 	var repository struct {
 		DefaultBranch string `json:"default_branch"`
 	}
@@ -149,7 +150,7 @@ func FetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			if terminal.Attempt >= next[issue.Number] {
 				next[issue.Number] = terminal.Attempt + 1
 			}
-			controls, _, retry, err := source.authorizedControls(ctx, issue.Number)
+			controls, _, retry, err := source.authorizedControlsWithIntake(ctx, issue.Number, intake)
 			if err != nil {
 				result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: max(1, next[issue.Number]), Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Blockers: []string{err.Error()}, Active: active[issue.Number], Completed: completed[issue.Number]})
 				continue

@@ -497,6 +497,11 @@ func TestSnapshotRequiresExactCurrentNonBodyProvenance(t *testing.T) {
 	if _, err := NewSnapshot(controls, "body", anchor, approval, valid, "/approve", authorized, timeline); err != nil {
 		t.Fatalf("reopened/cleared controls rejected: %v", err)
 	}
+	changedAfterApproval := slices.Clone(valid)
+	changedAfterApproval[0].CreatedAt = approval.CreatedAt.Add(time.Second)
+	if _, err := NewSnapshot(controls, "body", anchor, approval, changedAfterApproval, "/approve", authorized, timelineFor(changedAfterApproval)); err == nil {
+		t.Fatal("approval predating current controls accepted")
+	}
 	if _, err := NewSnapshot(controls, "body", anchor, approval, valid, "/approve", authorized, nil); err == nil {
 		t.Fatal("nil timeline verifier accepted")
 	}
