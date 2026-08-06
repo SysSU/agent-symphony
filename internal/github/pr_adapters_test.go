@@ -389,19 +389,26 @@ func TestPullRequestMergedFieldIsRequired(t *testing.T) {
 
 func TestRunPRReconciliationConstructsAndExecutes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(path, []byte("[]\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	api := fixtureAPI(t, map[string]any{"/installation/repositories?per_page=100&page=1": map[string]any{"repositories": []any{map[string]any{"full_name": "o/r"}}}, "/repos/o/r/pulls?state=open&per_page=100&page=1": []any{}})
 	cfg := productionPRConfig()
 	if err := RunPRReconciliation(context.Background(), api, cfg, path); err != nil {
 		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("initialized state info=%v err=%v", info, err)
+	}
+	if states, err := (&FileRecovery{Path: path}).read(); err != nil || len(states) != 0 {
+		t.Fatalf("initialized state=%#v err=%v", states, err)
 	}
 	if err := os.WriteFile(path, []byte("not json\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := RunPRReconciliation(context.Background(), api, cfg, path); err == nil {
 		t.Fatal("production reconciliation skipped its authoritative recovery-state read")
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "not json\n" {
+		t.Fatalf("invalid state was replaced: %q err=%v", b, err)
 	}
 	cfg.ApprovalCommand = ""
 	if err := RunPRReconciliation(context.Background(), api, cfg, path); err == nil {
@@ -422,9 +429,6 @@ func TestInstallationTokenMustAccessConfiguredRepository(t *testing.T) {
 
 func TestRunPRReconciliationSerializesWholeRun(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(path, []byte("[]\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	var mu sync.Mutex
 	inFlight, overlap, pulls := 0, false, 0
 	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -453,6 +457,9 @@ func TestRunPRReconciliationSerializesWholeRun(t *testing.T) {
 	}
 	if overlap || pulls != 2 {
 		t.Fatalf("overlap=%v pull reads=%d", overlap, pulls)
+	}
+	if states, err := (&FileRecovery{Path: path}).read(); err != nil || len(states) != 0 {
+		t.Fatalf("concurrent initial state=%#v err=%v", states, err)
 	}
 }
 

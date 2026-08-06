@@ -1047,9 +1047,6 @@ func TestPRGovernanceCommandWiresFakeGitHubAndRecoveryState(t *testing.T) {
 		t.Fatal(err)
 	}
 	statePath := filepath.Join(root, "pr-state.json")
-	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	t.Setenv("GITHUB_TOKEN", "token-canary")
 	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "7")
 	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID", "42")
@@ -1071,6 +1068,9 @@ func TestPRGovernanceCommandWiresFakeGitHubAndRecoveryState(t *testing.T) {
 	}
 	if strings.Contains(stdout.String()+stderr.String(), "token-canary") || !strings.Contains(stdout.String(), `"command":"pr-governance"`) {
 		t.Fatalf("unsafe or malformed output: %s%s", stdout.String(), stderr.String())
+	}
+	if info, err := os.Lstat(statePath); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("initialized state info=%v err=%v", info, err)
 	}
 }
 
