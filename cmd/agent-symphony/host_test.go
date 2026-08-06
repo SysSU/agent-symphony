@@ -158,7 +158,10 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		validation := "pane-zero-" + strings.Repeat("v", 240)
 		good := fmt.Sprintf(`{"type":"agent-symphony-result-v1","validation":%q,"documentation":"done"}`, validation)
 		bad := `{"type":"agent-symphony-result-v1","validation":"wrong-window","documentation":"wrong"}`
-		tmux(t, "new-session", "-d", "-x", "80", "-s", identity.Session, "-c", identity.Worktree, "sh", "-c", "printf '%s\\n' '"+good+"'; sleep 30")
+		if err := os.WriteFile(filepath.Join(identity.Worktree, workerResultPath), []byte(good), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		tmux(t, "new-session", "-d", "-x", "80", "-s", identity.Session, "-c", identity.Worktree, "sh", "-c", "printf '%s\\n%s\\n' '"+good+"' '"+good+"'; sleep 30")
 		t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+identity.Session).Run() })
 		for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 			out, _ := exec.Command("tmux", "capture-pane", "-p", "-J", "-t", agentruntime.PaneTarget(identity.Session), "-S", "-200").CombinedOutput()
@@ -209,6 +212,9 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != validation || exported.HeadSHA == base {
 			t.Fatalf("export=%#v err=%v", exported, err)
 		}
+		if _, err := os.Lstat(filepath.Join(identity.Worktree, workerResultPath)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("result artifact remained after export: %v", err)
+		}
 		if _, err := call("review", manifest); err == nil {
 			t.Fatal("review boundary accepted implementation export")
 		}
@@ -224,34 +230,48 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 	})
 }
 
-func TestWorkerResultParserFailsClosed(t *testing.T) {
+func TestWorkerResultArtifactFailsClosed(t *testing.T) {
 	valid := `{"type":"agent-symphony-result-v1","validation":"go test ./... passed","documentation":"none"}`
 	malformed := `{"type":"agent-symphony-result-v1","validation":`
 	unknown := `{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none","extra":true}`
 	oversized := `{"type":"agent-symphony-result-v1","validation":"` + strings.Repeat("x", 64<<10) + `","documentation":"none"}`
 	for _, test := range []struct {
-		name string
-		log  string
-		ok   bool
+		name, body string
 	}{
-		{"compliant amid logs", "ordinary output\n" + valid + "\ndone", true},
-		{"missing", "ordinary output only", false},
-		{"malformed", malformed, false},
-		{"malformed then valid", malformed + "\n" + valid, false},
-		{"unknown field", unknown, false},
-		{"unknown field then valid", unknown + "\n" + valid, false},
-		{"empty validation", `{"type":"agent-symphony-result-v1","validation":" ","documentation":"none"}`, false},
-		{"empty documentation", `{"type":"agent-symphony-result-v1","validation":"ok","documentation":" "}`, false},
-		{"ambiguous", valid + "\n" + valid, false},
-		{"oversized", oversized, false},
+		{"missing", ""},
+		{"malformed", malformed},
+		{"malformed then valid", malformed + "\n" + valid},
+		{"unknown field", unknown},
+		{"empty validation", `{"type":"agent-symphony-result-v1","validation":" ","documentation":"none"}`},
+		{"empty documentation", `{"type":"agent-symphony-result-v1","validation":"ok","documentation":" "}`},
+		{"multiple objects", valid + "\n" + valid},
+		{"oversized", oversized},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			result, err := parseWorkerResult([]byte(test.log))
-			if (err == nil) != test.ok || test.ok && (result.Validation == "" || result.Documentation == "") {
-				t.Fatalf("result=%#v err=%v", result, err)
+			dir := t.TempDir()
+			if test.body != "" {
+				if err := os.WriteFile(filepath.Join(dir, workerResultPath), []byte(test.body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if result, err := readWorkerResult(dir); err == nil {
+				t.Fatalf("result=%#v", result)
 			}
 		})
 	}
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(t.TempDir(), "result")
+		if err := os.WriteFile(target, []byte(valid), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(dir, workerResultPath)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readWorkerResult(dir); err == nil {
+			t.Fatal("symlink result was accepted")
+		}
+	})
 }
 
 func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {

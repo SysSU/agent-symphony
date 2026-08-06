@@ -23,10 +23,11 @@ import (
 )
 
 const (
-	manifestVersion = 1
-	maxResourceName = 64
-	maxPathLength   = 4096
-	historyLimit    = "5000"
+	manifestVersion  = 1
+	maxResourceName  = 64
+	maxPathLength    = 4096
+	historyLimit     = "5000"
+	WorkerResultPath = ".agent-symphony-result.json"
 )
 
 var component = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
@@ -236,6 +237,11 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	}
 	if err := git("checkout", "--detach", attempt.BaseSHA); err != nil {
 		return fail("checkout base", err)
+	}
+	if _, err := os.Lstat(filepath.Join(manifest.Worktree, WorkerResultPath)); err == nil {
+		return fail("validate base", errors.New("base contains reserved worker result artifact"))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fail("validate base", err)
 	}
 	if err := git("switch", "-c", manifest.Branch); err != nil {
 		return fail("create branch", err)

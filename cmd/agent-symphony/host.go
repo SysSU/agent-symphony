@@ -921,11 +921,7 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if _, err := run("merge-base", "--is-ancestor", manifest.BaseSHA, "HEAD"); err != nil {
 		return "", errors.New("export head does not descend from base")
 	}
-	log, err := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-J", "-S", "-", "-t", agentruntime.PaneTarget(manifest.Session)).Output()
-	if err != nil {
-		return "", errors.New("worker result is unavailable")
-	}
-	result, err := parseWorkerResult(log)
+	result, err := readWorkerResult(manifest.Worktree)
 	if err != nil {
 		return "", err
 	}
@@ -1011,35 +1007,39 @@ func validAttemptGitDir(worktree, gitDir, root string) bool {
 	return samePath(declared, gitDir) && samePath(linked, dotGit)
 }
 
-func parseWorkerResult(log []byte) (workerResult, error) {
-	const maxLine = 64 << 10
+func parseWorkerResult(body []byte) (workerResult, error) {
 	var result workerResult
-	found := false
-	for _, line := range bytes.Split(log, []byte{'\n'}) {
-		claimsResult := bytes.Contains(line, []byte("agent-symphony-result-v1"))
-		if len(line) > maxLine {
-			if claimsResult {
-				return workerResult{}, errors.New("worker result is invalid")
-			}
-			continue
-		}
-		var candidate workerResult
-		rd := json.NewDecoder(bytes.NewReader(line))
-		rd.DisallowUnknownFields()
-		if rd.Decode(&candidate) != nil || rd.Decode(&struct{}{}) != io.EOF || candidate.Type != "agent-symphony-result-v1" {
-			if claimsResult {
-				return workerResult{}, errors.New("worker result is invalid")
-			}
-			continue
-		}
-		if found {
-			return workerResult{}, errors.New("worker result is invalid")
-		}
-		found = true
-		result = candidate
-	}
-	if !found || strings.TrimSpace(result.Validation) == "" || strings.TrimSpace(result.Documentation) == "" {
+	rd := json.NewDecoder(bytes.NewReader(body))
+	rd.DisallowUnknownFields()
+	if rd.Decode(&result) != nil || rd.Decode(&struct{}{}) != io.EOF || result.Type != "agent-symphony-result-v1" || strings.TrimSpace(result.Validation) == "" || strings.TrimSpace(result.Documentation) == "" {
 		return workerResult{}, errors.New("worker result is invalid")
+	}
+	return result, nil
+}
+
+func readWorkerResult(worktree string) (workerResult, error) {
+	const maxBytes = 64 << 10
+	path := filepath.Join(worktree, workerResultPath)
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxBytes {
+		return workerResult{}, errors.New("worker result is invalid")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return workerResult{}, errors.New("worker result is invalid")
+	}
+	opened, statErr := f.Stat()
+	body, readErr := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	closeErr := f.Close()
+	if statErr != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) || readErr != nil || closeErr != nil || len(body) > maxBytes {
+		return workerResult{}, errors.New("worker result is invalid")
+	}
+	result, err := parseWorkerResult(body)
+	if err != nil {
+		return workerResult{}, err
+	}
+	if err := os.Remove(path); err != nil {
+		return workerResult{}, errors.New("worker result could not be removed")
 	}
 	return result, nil
 }

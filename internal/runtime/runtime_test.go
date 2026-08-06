@@ -209,6 +209,23 @@ func TestValidationTraversalExistingAndLaunchFailureDiagnostics(t *testing.T) {
 	}
 }
 
+func TestTrackedBaseResultArtifactBlocksLaunch(t *testing.T) {
+	r, fake, attempt, primary := testRuntime(t)
+	if err := os.WriteFile(filepath.Join(primary, WorkerResultPath), []byte(`{"type":"agent-symphony-result-v1","validation":"stale","documentation":"stale"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, primary, "add", WorkerResultPath)
+	runGit(t, primary, "commit", "-qm", "stale result")
+	attempt.BaseSHA = gitOutput(t, primary, "rev-parse", "HEAD")
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err == nil || manifest.State != "failed" || !strings.Contains(err.Error(), "reserved worker result") {
+		t.Fatalf("manifest=%#v err=%v", manifest, err)
+	}
+	if len(fake.sessions) != 0 {
+		t.Fatalf("agent launched with stale result: %#v", fake.sessions)
+	}
+}
+
 func TestAgentFailureCancelAndIneligibility(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	manifest, err := r.PrepareAndStart(context.Background(), attempt)

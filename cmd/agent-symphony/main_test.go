@@ -36,7 +36,7 @@ import (
 func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T) {
 	issue := internalgithub.RecoveryIssueFact{Repository: "owner/repo", Issue: 56, Attempt: 3, Body: "## Context\nunique issue contract\n\n## Validation\ngo test ./..."}
 	prompt := implementationPrompt(issue)
-	for _, want := range []string{"Repository: owner/repo", "Issue: #56", "Attempt: 3", issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation"} {
+	for _, want := range []string{"Repository: owner/repo", "Issue: #56", "Attempt: 3", issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", workerResultPath, "--output-last-message"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt omitted %q: %s", want, prompt)
 		}
@@ -891,6 +891,21 @@ func TestWorkerTreeRejectsSharedSubtreeRecursiveOutputAmplification(t *testing.T
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	err := validateWorkerTree(t.Context(), dir, strings.Repeat("0", 40))
 	if err == nil || !strings.Contains(err.Error(), "tree entry count exceeded") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestWorkerTreeRejectsCommittedResultArtifact(t *testing.T) {
+	repo := gitRepository(t)
+	runGit(t, repo, "config", "user.email", "test@example.invalid")
+	runGit(t, repo, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(repo, workerResultPath), []byte(`{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", workerResultPath)
+	runGit(t, repo, "commit", "-m", "result marker")
+	err := validateWorkerTree(t.Context(), repo, runGit(t, repo, "rev-parse", "HEAD"))
+	if err == nil || !strings.Contains(err.Error(), "result marker") {
 		t.Fatalf("err=%v", err)
 	}
 }

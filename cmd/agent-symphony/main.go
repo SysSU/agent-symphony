@@ -850,8 +850,10 @@ func dispatchIssues(ctx context.Context, runtime *agentruntime.Runtime, cfg conf
 }
 
 func implementationPrompt(issue internalgithub.RecoveryIssueFact) string {
-	return fmt.Sprintf("Repository: %s\nIssue: #%d\nAttempt: %d\n\n%s\n\nCompletion contract: As your final output, emit exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence. Do not wrap it in Markdown fences or emit another result line.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.Body)
+	return fmt.Sprintf("Repository: %s\nIssue: #%d\nAttempt: %d\n\n%s\n\nCompletion contract: Make your final response exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence. The configured implementation command must save that entire response to %s; the default Codex command does this with --output-last-message. Do not wrap it in Markdown fences or create another result object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.Body, workerResultPath)
 }
+
+const workerResultPath = agentruntime.WorkerResultPath
 
 type workerResult struct {
 	Type          string `json:"type"`
@@ -1029,7 +1031,7 @@ func validateWorkerTree(ctx context.Context, repo, head string) error {
 			return errors.New("tree declared size exceeded")
 		}
 		total += size
-		if bytes.Equal(path, []byte(".agent-symphony-result.json")) {
+		if bytes.Equal(path, []byte(workerResultPath)) {
 			return errors.New("result marker present")
 		}
 		return nil
