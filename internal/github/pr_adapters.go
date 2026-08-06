@@ -957,6 +957,9 @@ func (s *GitHubPRSource) issueTimeline(ctx context.Context, number int) ([]issue
 			return nil, err
 		}
 		for _, event := range batch {
+			if !slices.Contains([]string{"labeled", "unlabeled", "closed", "reopened"}, event.Event) {
+				continue
+			}
 			if event.ID <= 0 || seen[event.ID] {
 				return nil, errors.New("issue timeline contains a missing or duplicate immutable ID")
 			}

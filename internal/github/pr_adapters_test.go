@@ -518,6 +518,7 @@ func TestProductionAuthorizedControlsVerifyGitHubSnapshot(t *testing.T) {
 	anchor := Anchor{IssueNodeID: "I_10", CreatedAt: now, ChangedAt: now, AuthorID: 9}
 	approval := Approval{CommentID: 50, ActorID: 5, Body: "/approve", CreatedAt: now.Add(time.Minute)}
 	events := []map[string]any{
+		{"id": nil, "node_id": nil, "event": "cross-referenced"},
 		{"id": int64(20), "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now, "actor": map[string]any{"id": 5}},
 		{"id": int64(21), "event": "labeled", "label": map[string]any{"name": "P1"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": 5}},
 		{"id": int64(22), "event": "labeled", "label": map[string]any{"name": "auto"}, "created_at": now.Add(2 * time.Second), "actor": map[string]any{"id": 5}},
