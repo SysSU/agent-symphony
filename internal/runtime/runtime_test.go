@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -149,7 +151,7 @@ func TestLifecycleCreatesUncredentialedRepositoryAndPreservesPrimary(t *testing.
 	if manifest.State != "running" || fake.buffers[manifest.Session] != attempt.Context {
 		t.Fatalf("unexpected launch: %#v, %#v", manifest, fake.sessions[manifest.Session])
 	}
-	want := PromptCommand("tmux", manifest.Session, attempt.Command)
+	want := PromptCommand(r.Helper, "tmux", manifest.Session, ResultPath(manifest.Worktree), attempt.Command)
 	if !slices.Equal(fake.sessions[manifest.Session].agent, want) {
 		t.Fatalf("agent command = %#v, want %#v", fake.sessions[manifest.Session].agent, want)
 	}
@@ -206,6 +208,24 @@ func TestValidationTraversalExistingAndLaunchFailureDiagnostics(t *testing.T) {
 	stored, readErr := readManifest(r.manifestPath(attempt))
 	if readErr != nil || stored.Diagnostic != manifest.Diagnostic {
 		t.Fatalf("stored diagnostic = %#v, %v", stored, readErr)
+	}
+}
+
+func TestStaleWorkerResultBlocksLaunch(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	identity, err := AttemptIdentity(r.Root, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ResultPath(identity.Worktree), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err == nil || manifest.State != "" || !strings.Contains(err.Error(), "worker result already exists") {
+		t.Fatalf("manifest=%#v err=%v", manifest, err)
+	}
+	if len(fake.sessions) != 0 {
+		t.Fatalf("agent launched with stale result: %#v", fake.sessions)
 	}
 }
 
@@ -296,6 +316,15 @@ func TestConcurrentDisjointAttempts(t *testing.T) {
 
 func TestPromptCommandProvidesStdinBeforeFastConsumerStarts(t *testing.T) {
 	dir := t.TempDir()
+	workspace := filepath.Join(dir, "attempt")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resultPath := ResultPath(workspace)
+	canary := filepath.Join(dir, "outside-canary")
+	if err := os.WriteFile(canary, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	private := t.TempDir()
 	if err := os.WriteFile(filepath.Join(private, "coordinator-canary"), []byte("do not expose"), 0o600); err != nil {
 		t.Fatal(err)
@@ -309,49 +338,456 @@ func TestPromptCommandProvidesStdinBeforeFastConsumerStarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmux := filepath.Join(dir, "tmux")
-	spoolRecord := filepath.Join(dir, "spool-path")
-	script := "#!/bin/sh\ncase $1 in\nsave-buffer) printf %s \"$4\" >\"$FAKE_SPOOL\"; cp \"$FAKE_PROMPT\" \"$4\";;\ndelete-buffer) exit 0;;\n*) exit 2;;\nesac\n"
+	deleted := filepath.Join(dir, "buffer-deleted")
+	script := "#!/bin/sh\ncase $1 in\nsave-buffer) cat \"$FAKE_PROMPT\";;\ndelete-buffer) : >\"$FAKE_DELETED\";;\n*) exit 2;;\nesac\n"
 	if err := os.WriteFile(tmux, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	command := PromptCommand(tmux, "prompt-buffer", []string{"sh", "-c", `input=$(cat); test "$input" = "$1" && test "$TMPDIR" = /tmp`, "consumer", "line one\nline two"})
-	cmd := exec.Command(command[0], command[1:]...)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_PROMPT=" + prompt, "FAKE_SPOOL=" + spoolRecord, "TMPDIR=" + private}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("fast stdin consumer: %v: %s", err, out)
+	t.Setenv("FAKE_PROMPT", prompt)
+	t.Setenv("FAKE_DELETED", deleted)
+	t.Setenv("TMPDIR", private)
+	tempDir := t.TempDir()
+	for _, name := range []string{"agent-symphony-status.attack", "agent-symphony-overflow.attack"} {
+		if err := os.Symlink(canary, filepath.Join(tempDir, name)); err != nil {
+			t.Fatal(err)
+		}
 	}
-	spool, err := os.ReadFile(spoolRecord)
+	result := `{"type":"agent-symphony-result-v1","validation":"tests passed","documentation":"none"}`
+	consumer := `input=$(cat) || exit
+test "$input" = "$1" && test "$TMPDIR" = /tmp || exit
+test -e "$2" || exit
+test -z "$(find "$3" -name 'agent-symphony-prompt-*' -print -quit)" || exit
+ln -s "$4" "$5" || exit
+printf '%s\n' progress >&2
+printf '%s\n%s\n' "$6" "$6" >&2
+printf %s "$6"`
+	workspaceLink := filepath.Join(workspace, ".agent-symphony-result.json")
+	var diagnostics strings.Builder
+	code, err := captureWorker(t.Context(), tmux, "prompt-buffer", resultPath, []string{"sh", "-c", consumer, "consumer", "line one\nline two", deleted, tempDir, canary, workspaceLink, result}, io.Discard, &diagnostics, tempDir)
+	if err != nil || code != 0 {
+		t.Fatalf("fast stdin consumer: code=%d err=%v diagnostics=%s", code, err, diagnostics.String())
+	}
+	if !strings.Contains(diagnostics.String(), "progress") || strings.Count(diagnostics.String(), result) != 2 {
+		t.Fatalf("stderr diagnostics were not preserved: %q", diagnostics.String())
+	}
+	if got, err := os.ReadFile(resultPath); err != nil || string(got) != result {
+		t.Fatalf("captured stdout = %q, %v", got, err)
+	}
+	if info, err := os.Stat(resultPath); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("result mode = %v, %v", info, err)
+	}
+	if got, err := os.ReadFile(canary); err != nil || string(got) != "unchanged" {
+		t.Fatalf("outside canary changed: %q, %v", got, err)
+	}
+	if target, err := os.Readlink(workspaceLink); err != nil || target != canary {
+		t.Fatalf("workspace symlink = %q, %v", target, err)
+	}
+	for _, name := range []string{"agent-symphony-status.attack", "agent-symphony-overflow.attack"} {
+		if target, err := os.Readlink(filepath.Join(tempDir, name)); err != nil || target != canary {
+			t.Fatalf("scratch canary link = %q, %v", target, err)
+		}
+	}
+	attackedResult := filepath.Join(dir, "attacked.result.json")
+	if err := os.Symlink(canary, attackedResult); err != nil {
+		t.Fatal(err)
+	}
+	if code, err := captureWorker(t.Context(), tmux, "prompt-buffer", attackedResult, []string{"sh", "-c", `printf replaced`}, io.Discard, io.Discard, tempDir); err == nil || code == 0 {
+		t.Fatalf("result symlink was accepted: code=%d err=%v", code, err)
+	}
+	if got, err := os.ReadFile(canary); err != nil || string(got) != "unchanged" {
+		t.Fatalf("result symlink canary changed: %q, %v", got, err)
+	}
+
+	var reviewerOut strings.Builder
+	code, err = captureWorker(t.Context(), tmux, "prompt-buffer", "", []string{"sh", "-c", `test "$TMPDIR" = /tmp && test "$(cat)" = "$1" && printf reviewer`, "reviewer", "line one\nline two"}, &reviewerOut, io.Discard, tempDir)
+	if err != nil || code != 0 || reviewerOut.String() != "reviewer" {
+		t.Fatalf("reviewer capture: code=%d output=%q err=%v", code, reviewerOut.String(), err)
+	}
+}
+
+func TestPromptCommandBoundsStdoutAndPreservesExitStatus(t *testing.T) {
+	dir := t.TempDir()
+	prompt := filepath.Join(dir, "prompt")
+	if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tmux := filepath.Join(dir, "tmux")
+	script := "#!/bin/sh\ncase $1 in\nsave-buffer) cat \"$FAKE_PROMPT\";;\ndelete-buffer) exit 0;;\n*) exit 2;;\nesac\n"
+	if err := os.WriteFile(tmux, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_PROMPT", prompt)
+	run := func(resultPath string, command []string) (int, error) {
+		t.Helper()
+		return captureWorker(t.Context(), tmux, "prompt-buffer", resultPath, command, io.Discard, io.Discard, dir)
+	}
+
+	exitResult := filepath.Join(dir, "exit.result.json")
+	code, err := run(exitResult, []string{"sh", "-c", `cat >/dev/null; printf ok; exit 23`})
+	if err != nil || code != 23 {
+		t.Fatalf("consumer exit status = %d, %v", code, err)
+	}
+	if got, err := os.ReadFile(exitResult); err != nil || string(got) != "ok" {
+		t.Fatalf("consumer stdout = %q, %v", got, err)
+	}
+	if code, err := run("", []string{"sh", "-c", `exit 23`}); err != nil || code != 23 {
+		t.Fatalf("reviewer exit status = %d, %v", code, err)
+	}
+
+	boundedResult := filepath.Join(dir, "bounded.result.json")
+	unrelated := exec.Command("sleep", "5")
+	if err := unrelated.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unrelated.Process.Kill(); _ = unrelated.Wait() })
+	started := time.Now()
+	code, err = run(boundedResult, []string{"sh", "-c", `trap '' PIPE TERM; while :; do printf x || :; done`})
+	if !errors.Is(err, ErrWorkerResultOverflow) || code == 0 || time.Since(started) > 2*time.Second {
+		t.Fatalf("over-limit producer: code=%d elapsed=%v err=%v", code, time.Since(started), err)
+	}
+	if info, err := os.Stat(boundedResult); err != nil || info.Size() != WorkerResultMaxBytes {
+		t.Fatalf("bounded result size = %v, %v", info, err)
+	}
+	if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("unrelated process group was terminated: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(string(spool)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("prompt spool was not removed: %v", err)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "agent-symphony-prompt-") {
+			t.Fatalf("prompt scratch remained visible: %s", entry.Name())
+		}
 	}
+}
+
+func TestCaptureWorkerCancellationKillsAndReapsChildGroup(t *testing.T) {
+	for _, captureResult := range []bool{true, false} {
+		t.Run(strconv.FormatBool(captureResult), func(t *testing.T) {
+			dir := t.TempDir()
+			prompt := filepath.Join(dir, "prompt")
+			if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tmux := filepath.Join(dir, "tmux")
+			if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; *) exit 2;; esac\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("FAKE_PROMPT", prompt)
+			pidPath := filepath.Join(dir, "descendant.pid")
+			resultPath := ""
+			if captureResult {
+				resultPath = filepath.Join(dir, "cancelled.result.json")
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() {
+				_, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, []string{"sh", "-c", `trap '' INT TERM; sleep 30 & echo $! >"$1"; wait`, "consumer", pidPath}, io.Discard, io.Discard, dir)
+				done <- err
+			}()
+			var pid int
+			for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+				body, err := os.ReadFile(pidPath)
+				if err == nil && strings.TrimSpace(string(body)) != "" {
+					pid, err = strconv.Atoi(strings.TrimSpace(string(body)))
+					if err != nil {
+						t.Fatal(err)
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("child descendant did not start")
+				}
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("capture cancellation = %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("capture cancellation did not return promptly")
+			}
+			for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+				if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("child descendant %d survived cancellation", pid)
+				}
+			}
+		})
+	}
+}
+
+func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
+	for _, captureResult := range []bool{true, false} {
+		t.Run(strconv.FormatBool(captureResult), func(t *testing.T) {
+			dir := t.TempDir()
+			prompt := filepath.Join(dir, "prompt")
+			if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tmux := filepath.Join(dir, "tmux")
+			if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; *) exit 2;; esac\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("FAKE_PROMPT", prompt)
+			marker := filepath.Join(dir, "late-marker")
+			resultPath, output := "", "reviewer"
+			if captureResult {
+				resultPath = filepath.Join(dir, "completed.result.json")
+				output = `{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none"}`
+			}
+			t.Setenv("AGENT_SYMPHONY_IN_GROUP_MARKER", marker)
+			t.Setenv("AGENT_SYMPHONY_IN_GROUP_OUTPUT", output)
+			identityBase := filepath.Join(dir, "identity")
+			t.Setenv("AGENT_SYMPHONY_IN_GROUP_IDENTITY", identityBase)
+			trigger := filepath.Join(dir, "post-return-trigger")
+			t.Setenv("AGENT_SYMPHONY_IN_GROUP_TRIGGER", trigger)
+			command := []string{os.Args[0], "-test.run=^TestCaptureWorkerInGroupStdoutHelper$"}
+			unrelated := exec.Command("sleep", "5")
+			if err := unrelated.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = unrelated.Process.Kill(); _ = unrelated.Wait() })
+			var stdout strings.Builder
+			devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer devNull.Close()
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			code, captureErr := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir)
+			configuredBody, err := os.ReadFile(identityBase + ".configured")
+			if err != nil {
+				t.Fatal(err)
+			}
+			childBody, err := os.ReadFile(identityBase + ".child")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wrapperPID, wrapperPGID, helperPID, helperPGID, childPID, childPGID int
+			if _, err := fmt.Sscanf(string(configuredBody), "%d %d %d %d", &wrapperPID, &wrapperPGID, &helperPID, &helperPGID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fmt.Sscanf(string(childBody), "%d %d", &childPID, &childPGID); err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("worker identities: wrapper=%d/%d helper=%d/%d child=%d/%d", wrapperPID, wrapperPGID, helperPID, helperPGID, childPID, childPGID)
+			if wrapperPID == helperPID || helperPID == childPID || helperPGID != wrapperPGID || childPGID != wrapperPGID {
+				t.Fatalf("worker identities: wrapper=%d/%d helper=%d/%d child=%d/%d", wrapperPID, wrapperPGID, helperPID, helperPGID, childPID, childPGID)
+			}
+			if captureErr != nil || code != 0 {
+				t.Fatalf("completion: code=%d err=%v", code, captureErr)
+			}
+			if !captureResult && stdout.String() != output {
+				t.Fatalf("reviewer output = %q", stdout.String())
+			}
+			if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
+				t.Fatalf("unrelated process group was terminated: %v", err)
+			}
+			if err := os.WriteFile(trigger, []byte("go"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+				if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("late descendant mutated workspace: %v", err)
+				}
+				if time.Now().After(deadline) {
+					break
+				}
+			}
+		})
+	}
+}
+
+func TestCaptureWorkerInGroupStdoutHelper(t *testing.T) {
+	marker := os.Getenv("AGENT_SYMPHONY_IN_GROUP_MARKER")
+	if marker == "" {
+		return
+	}
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		os.Exit(2)
+	}
+	wrapperPID := os.Getppid()
+	wrapperPGID, err := syscall.Getpgid(wrapperPID)
+	if err != nil {
+		os.Exit(2)
+	}
+	identityBase := os.Getenv("AGENT_SYMPHONY_IN_GROUP_IDENTITY")
+	configuredIdentity := fmt.Sprintf("%d %d %d %d", wrapperPID, wrapperPGID, os.Getpid(), syscall.Getpgrp())
+	if err := os.WriteFile(identityBase+".configured", []byte(configuredIdentity), 0o600); err != nil {
+		os.Exit(2)
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestCaptureWorkerLateMarkerHelper$")
+	child.Env = append(os.Environ(), "AGENT_SYMPHONY_LATE_MARKER_CHILD="+identityBase+".child")
+	child.Stdout, child.Stderr = os.Stdout, devNull
+	if err := child.Start(); err != nil {
+		os.Exit(2)
+	}
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if body, err := os.ReadFile(identityBase + ".child"); err == nil && len(body) != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			os.Exit(2)
+		}
+	}
+	if _, err := io.WriteString(os.Stdout, os.Getenv("AGENT_SYMPHONY_IN_GROUP_OUTPUT")); err != nil {
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func TestCaptureWorkerLateMarkerHelper(t *testing.T) {
+	identityPath := os.Getenv("AGENT_SYMPHONY_LATE_MARKER_CHILD")
+	if identityPath == "" {
+		return
+	}
+	identity := fmt.Sprintf("%d %d", os.Getpid(), syscall.Getpgrp())
+	if err := os.WriteFile(identityPath, []byte(identity), 0o600); err != nil {
+		os.Exit(2)
+	}
+	trigger := os.Getenv("AGENT_SYMPHONY_IN_GROUP_TRIGGER")
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(trigger); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			os.Exit(2)
+		}
+	}
+	if err := os.WriteFile(os.Getenv("AGENT_SYMPHONY_IN_GROUP_MARKER"), []byte("late"), 0o600); err != nil {
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func TestCaptureWorkerEscapedStdoutFailsPromptly(t *testing.T) {
+	for _, captureResult := range []bool{true, false} {
+		for _, cancelWorker := range []bool{true, false} {
+			t.Run(fmt.Sprintf("result=%t/cancel=%t", captureResult, cancelWorker), func(t *testing.T) {
+				dir := t.TempDir()
+				prompt := filepath.Join(dir, "prompt")
+				if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				tmux := filepath.Join(dir, "tmux")
+				if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; *) exit 2;; esac\n"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("FAKE_PROMPT", prompt)
+				pidPath := filepath.Join(dir, "escaped.pid")
+				t.Setenv("AGENT_SYMPHONY_ESCAPE_STDOUT", pidPath)
+				resultPath, output := "", "reviewer"
+				if captureResult {
+					resultPath = filepath.Join(dir, "escaped.result.json")
+					output = `{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none"}`
+				}
+				mode := "normal"
+				if cancelWorker {
+					mode = "cancel"
+				}
+				command := []string{"sh", "-c", `set +m; "$1" -test.run=^TestCaptureWorkerEscapedStdoutHelper$ 2>/dev/null & while test ! -s "$4"; do sleep 0.01; done; printf %s "$2"; test "$3" = normal || sleep 30`, "consumer", os.Args[0], output, mode, pidPath}
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				type outcome struct {
+					code int
+					err  error
+				}
+				var stdout strings.Builder
+				devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer devNull.Close()
+				done := make(chan outcome, 1)
+				started := time.Now()
+				go func() {
+					code, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir)
+					done <- outcome{code: code, err: err}
+				}()
+				var pid int
+				for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+					body, err := os.ReadFile(pidPath)
+					if err == nil && strings.TrimSpace(string(body)) != "" {
+						pid, err = strconv.Atoi(strings.TrimSpace(string(body)))
+						if err != nil {
+							t.Fatal(err)
+						}
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("escaped stdout holder did not start")
+					}
+				}
+				t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+				if cancelWorker {
+					cancel()
+				}
+				select {
+				case got := <-done:
+					if got.code == 0 || time.Since(started) > 2*time.Second {
+						t.Fatalf("escaped capture: code=%d elapsed=%v err=%v", got.code, time.Since(started), got.err)
+					}
+					if cancelWorker && !errors.Is(got.err, context.Canceled) {
+						t.Fatalf("escaped cancellation = %v", got.err)
+					}
+					if !cancelWorker && !errors.Is(got.err, ErrWorkerOutputOpen) {
+						t.Fatalf("escaped completion = %v", got.err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("escaped stdout holder blocked helper return")
+				}
+			})
+		}
+	}
+}
+
+func TestCaptureWorkerEscapedStdoutHelper(t *testing.T) {
+	pidPath := os.Getenv("AGENT_SYMPHONY_ESCAPE_STDOUT")
+	if pidPath == "" {
+		return
+	}
+	if _, err := syscall.Setsid(); err != nil {
+		os.Exit(2)
+	}
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		os.Exit(2)
+	}
+	time.Sleep(30 * time.Second)
+	os.Exit(0)
 }
 
 func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
 	dir := t.TempDir()
 	tmux := filepath.Join(dir, "tmux")
-	spoolRecord := filepath.Join(dir, "spool-path")
-	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf %s \"$4\" >\"$FAKE_SPOOL\"\nexit 23\n"), 0o700); err != nil {
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nexit 23\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(dir, "consumer-ran")
-	command := PromptCommand(tmux, "missing-buffer", []string{"sh", "-c", `touch "$1"`, "consumer", marker})
-	cmd := exec.Command(command[0], command[1:]...)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "FAKE_SPOOL=" + spoolRecord}
-	if err := cmd.Run(); err == nil {
+	resultPath := filepath.Join(dir, "attempt.result.json")
+	if _, err := captureWorker(t.Context(), tmux, "missing-buffer", resultPath, []string{"sh", "-c", `touch "$1"`, "consumer", marker}, io.Discard, io.Discard, dir); err == nil {
 		t.Fatal("buffer read failure was masked")
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("consumer ran after buffer read failure: %v", err)
 	}
-	spool, err := os.ReadFile(spoolRecord)
+	if _, err := os.Stat(resultPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("result was opened after buffer read failure: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(string(spool)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("failed prompt spool was not removed: %v", err)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "agent-symphony-prompt-") {
+			t.Fatalf("failed prompt scratch remained visible: %s", entry.Name())
+		}
 	}
 }
 
@@ -697,7 +1133,7 @@ func testRuntime(t *testing.T) (*Runtime, *fakeRunner, Attempt, string) {
 		t.Fatal(err)
 	}
 	fake := newFakeRunner()
-	r := &Runtime{Root: root, StateRoot: state, Source: primary, Git: "git", Tmux: "tmux", Runner: fake, AllowEnv: []string{"PATH"}, StopWait: time.Millisecond, VerifyWorker: func(context.Context) error { return nil }}
+	r := &Runtime{Root: root, StateRoot: state, Source: primary, Git: "git", Tmux: "tmux", Helper: "agent-symphony-helper", Runner: fake, AllowEnv: []string{"PATH"}, StopWait: time.Millisecond, VerifyWorker: func(context.Context) error { return nil }}
 	attempt := Attempt{Repository: "owner/repo", Issue: 3, Number: 1, BaseSHA: sha, Context: "issue context\n", Command: []string{"fake-agent"}}
 	return r, fake, attempt, primary
 }

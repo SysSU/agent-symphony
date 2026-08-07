@@ -328,6 +328,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	command := args[0]
+	if command == "worker-capture" {
+		if len(args) < 6 || args[4] != "--" {
+			return misuse(stderr, false, command, "invalid internal worker capture invocation")
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		code, err := agentruntime.CaptureWorker(ctx, args[1], args[2], args[3], args[5:], stdout, stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "error: "+err.Error())
+		}
+		return code
+	}
 	wantsJSON := hasJSONFlag(args[1:])
 	if command == "help" || command == "--help" || command == "-h" {
 		if len(args) != 1 {
@@ -701,12 +713,16 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		return nil, err
 	}
 	boundary := implementationBoundary(stateRoot)
+	binary, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
 	attemptRoot := productionAttemptRoot(stateRoot)
 	source, err := seedAttemptSource(ctx, root, attemptRoot)
 	if err != nil {
 		return nil, err
 	}
-	r := agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Runner: boundary, AllowEnv: c.Commands.Environment, VerifyWorker: func(ctx context.Context) error {
+	r := agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Helper: binary, Runner: boundary, AllowEnv: c.Commands.Environment, VerifyWorker: func(ctx context.Context) error {
 		_, err := boundary.call(ctx, "verify", agentruntime.Command{})
 		return err
 	}}
@@ -840,13 +856,17 @@ func dispatchIssues(ctx context.Context, runtime *agentruntime.Runtime, cfg conf
 			return errors.New("scheduler returned an unknown issue")
 		}
 		issue := issues[index]
-		prompt := fmt.Sprintf("Repository: %s\nIssue: #%d\nAttempt: %d\n\n%s", issue.Repository, issue.Issue, issue.Attempt, issue.Body)
+		prompt := implementationPrompt(issue)
 		_, err := runtime.PrepareAndStart(ctx, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Context: prompt, Command: cfg.Commands.Implementation, Eligible: func() bool { return issue.Eligible }})
 		if err != nil {
 			return fmt.Errorf("dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
 		}
 	}
 	return nil
+}
+
+func implementationPrompt(issue internalgithub.RecoveryIssueFact) string {
+	return fmt.Sprintf("Repository: %s\nIssue: #%d\nAttempt: %d\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Agent Symphony captures stdout outside the worktree. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.Body)
 }
 
 type workerResult struct {
@@ -1025,9 +1045,6 @@ func validateWorkerTree(ctx context.Context, repo, head string) error {
 			return errors.New("tree declared size exceeded")
 		}
 		total += size
-		if bytes.Equal(path, []byte(".agent-symphony-result.json")) {
-			return errors.New("result marker present")
-		}
 		return nil
 	})
 }
@@ -1498,7 +1515,11 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"load-buffer", "-b", session, "-"}, Dir: snapshot, Env: env, Stdin: strings.NewReader(prompt)}); err != nil {
 		return independentReviewResult{}, false, err
 	}
-	command = agentruntime.PromptCommand("tmux", session, command)
+	binary, err := os.Executable()
+	if err != nil {
+		return independentReviewResult{}, false, err
+	}
+	command = agentruntime.PromptCommand(binary, "tmux", session, "", command)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}

@@ -22,11 +22,15 @@ import (
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 )
 
+// WorkerResultMaxBytes is the hard implementation stdout capture ceiling.
+const WorkerResultMaxBytes = 64 << 10
+
 const (
-	manifestVersion = 1
-	maxResourceName = 64
-	maxPathLength   = 4096
-	historyLimit    = "5000"
+	manifestVersion    = 1
+	maxResourceName    = 64
+	maxPathLength      = 4096
+	historyLimit       = "5000"
+	workerResultSuffix = ".result.json"
 )
 
 var component = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
@@ -143,6 +147,7 @@ type Runtime struct {
 	Source    string
 	Git       string
 	Tmux      string
+	Helper    string
 	Runner    Runner
 	AllowEnv  []string
 	StopWait  time.Duration
@@ -154,17 +159,11 @@ type Runtime struct {
 
 func PaneTarget(session string) string { return "=" + session + ":0.0" }
 
-// PromptCommand starts command with the named tmux buffer connected to stdin.
-func PromptCommand(tmux, buffer string, command []string) []string {
-	const script = `tmux=$1; buffer=$2; shift 2
-TMPDIR=/tmp; export TMPDIR
-prompt=$(umask 077; mktemp "$TMPDIR/agent-symphony-prompt.XXXXXX") || exit
-cleanup() { status=$?; trap - EXIT; rm -f "$prompt" || status=1; exit "$status"; }
-trap cleanup EXIT
-"$tmux" save-buffer -b "$buffer" "$prompt" &&
-"$tmux" delete-buffer -b "$buffer" &&
-"$@" <"$prompt"`
-	return append([]string{"sh", "-c", script, "agent-symphony-prompt", tmux, buffer}, command...)
+func ResultPath(worktree string) string { return worktree + workerResultSuffix }
+
+// PromptCommand runs command through the descriptor-owning capture helper.
+func PromptCommand(helper, tmux, buffer, resultPath string, command []string) []string {
+	return append([]string{helper, "worker-capture", tmux, buffer, resultPath, "--"}, command...)
 }
 
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
@@ -181,6 +180,9 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	}
 	if len(attempt.Command) == 0 || strings.TrimSpace(attempt.Command[0]) == "" {
 		return Manifest{}, errors.New("attempt command is required")
+	}
+	if attempt.Context != "" && strings.TrimSpace(r.Helper) == "" {
+		return Manifest{}, errors.New("attempt capture helper is required")
 	}
 	env, err := internalgithub.AgentEnvironmentWith(append(os.Environ(), attempt.Env...), r.AllowEnv...)
 	if err != nil {
@@ -203,6 +205,11 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	}
 	if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
 		return Manifest{}, fmt.Errorf("worktree already exists: %s", manifest.Worktree)
+	}
+	if _, err := os.Lstat(ResultPath(manifest.Worktree)); err == nil {
+		return Manifest{}, fmt.Errorf("worker result already exists: %s", ResultPath(manifest.Worktree))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Manifest{}, err
 	}
 	if live, err := r.session(ctx, manifest.Session); err != nil {
 		return Manifest{}, err
@@ -272,7 +279,7 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	}
 	command := attempt.Command
 	if attempt.Context != "" {
-		command = PromptCommand(r.tmux(), manifest.Session, command)
+		command = PromptCommand(r.Helper, r.tmux(), manifest.Session, ResultPath(manifest.Worktree), command)
 	}
 	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
 		return failStop("start agent", err)
@@ -479,7 +486,7 @@ func AttemptIdentity(root string, a Attempt) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	if len(worktree) > maxPathLength {
+	if len(worktree) > maxPathLength || len(ResultPath(worktree)) > maxPathLength {
 		return Manifest{}, fmt.Errorf("attempt path must be absolute and at most %d bytes", maxPathLength)
 	}
 	return Manifest{Version: manifestVersion, Repository: a.Repository, Issue: a.Issue, Attempt: a.Number,

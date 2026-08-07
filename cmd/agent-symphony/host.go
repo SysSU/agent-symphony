@@ -921,21 +921,13 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if _, err := run("merge-base", "--is-ancestor", manifest.BaseSHA, "HEAD"); err != nil {
 		return "", errors.New("export head does not descend from base")
 	}
-	log, err := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-S", "-", "-t", agentruntime.PaneTarget(manifest.Session)).Output()
+	resultPath := agentruntime.ResultPath(want.Worktree)
+	if !belowRoot(resultPath, root) {
+		return "", errors.New("worker result path escapes provisioned root")
+	}
+	result, err := readWorkerResult(resultPath)
 	if err != nil {
-		return "", errors.New("worker result is unavailable")
-	}
-	var result workerResult
-	for _, line := range bytes.Split(log, []byte{'\n'}) {
-		var candidate workerResult
-		rd := json.NewDecoder(bytes.NewReader(line))
-		rd.DisallowUnknownFields()
-		if rd.Decode(&candidate) == nil && rd.Decode(&struct{}{}) == io.EOF && candidate.Type == "agent-symphony-result-v1" {
-			result = candidate
-		}
-	}
-	if result.Type != "agent-symphony-result-v1" || strings.TrimSpace(result.Validation) == "" || strings.TrimSpace(result.Documentation) == "" {
-		return "", errors.New("worker result is invalid")
+		return "", err
 	}
 	status, err := run("status", "--porcelain")
 	if err != nil {
@@ -1017,6 +1009,39 @@ func validAttemptGitDir(worktree, gitDir, root string) bool {
 		linked = filepath.Join(gitDir, linked)
 	}
 	return samePath(declared, gitDir) && samePath(linked, dotGit)
+}
+
+func parseWorkerResult(body []byte) (workerResult, error) {
+	var result workerResult
+	rd := json.NewDecoder(bytes.NewReader(body))
+	rd.DisallowUnknownFields()
+	if rd.Decode(&result) != nil || rd.Decode(&struct{}{}) != io.EOF || result.Type != "agent-symphony-result-v1" || strings.TrimSpace(result.Validation) == "" || strings.TrimSpace(result.Documentation) == "" {
+		return workerResult{}, errors.New("worker result is invalid")
+	}
+	return result, nil
+}
+
+func readWorkerResult(path string) (workerResult, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > agentruntime.WorkerResultMaxBytes {
+		return workerResult{}, errors.New("worker result is invalid")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return workerResult{}, errors.New("worker result is invalid")
+	}
+	opened, statErr := f.Stat()
+	body, readErr := io.ReadAll(io.LimitReader(f, agentruntime.WorkerResultMaxBytes+1))
+	final, finalStatErr := f.Stat()
+	closeErr := f.Close()
+	if statErr != nil || finalStatErr != nil || !opened.Mode().IsRegular() || !final.Mode().IsRegular() || !os.SameFile(info, opened) || !os.SameFile(opened, final) || opened.Size() != final.Size() || !opened.ModTime().Equal(final.ModTime()) || readErr != nil || closeErr != nil || len(body) > agentruntime.WorkerResultMaxBytes {
+		return workerResult{}, errors.New("worker result is invalid")
+	}
+	result, err := parseWorkerResult(body)
+	if err != nil {
+		return workerResult{}, err
+	}
+	return result, nil
 }
 
 func acceptHandoff(ctx context.Context, input []byte, root string) (string, error) {

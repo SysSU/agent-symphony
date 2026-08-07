@@ -33,6 +33,48 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
+func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T) {
+	issue := internalgithub.RecoveryIssueFact{Repository: "owner/repo", Issue: 56, Attempt: 3, Body: "## Context\nunique issue contract\n\n## Validation\ngo test ./..."}
+	prompt := implementationPrompt(issue)
+	for _, want := range []string{"Repository: owner/repo", "Issue: #56", "Attempt: 3", issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "stdout", "stderr", "outside the worktree"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt omitted %q: %s", want, prompt)
+		}
+	}
+	if strings.Count(prompt, issue.Body) != 1 || strings.Contains(prompt, "GITHUB_TOKEN") || strings.Contains(prompt, "PRIVATE_KEY") {
+		t.Fatalf("prompt changed issue content or named a credential: %s", prompt)
+	}
+	line := prompt[strings.LastIndex(prompt, "\n")+1:]
+	result, err := parseWorkerResult([]byte(line))
+	if err != nil || result.Validation == "" || result.Documentation == "" {
+		t.Fatalf("documented result was rejected: %#v, %v", result, err)
+	}
+}
+
+func TestWorkerCaptureInternalCLI(t *testing.T) {
+	dir := t.TempDir()
+	prompt := filepath.Join(dir, "prompt")
+	if err := os.WriteFile(prompt, []byte("issue prompt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tmux := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; *) exit 2;; esac\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_PROMPT", prompt)
+	t.Setenv("TMPDIR", filepath.Join(dir, "inaccessible"))
+	resultPath := filepath.Join(dir, "attempt.result.json")
+	result := `{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none"}`
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"worker-capture", tmux, "prompt-buffer", resultPath, "--", "sh", "-c", `test "$(cat)" = "$1" && test "$TMPDIR" = /tmp && printf %s "$2"`, "consumer", "issue prompt", result}, &stdout, &stderr)
+	if code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if got, err := os.ReadFile(resultPath); err != nil || string(got) != result {
+		t.Fatalf("result=%q err=%v", got, err)
+	}
+}
+
 func TestWorkerBoundaryStripsCredentialCanaries(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "boundary")
@@ -289,7 +331,7 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	}
 	log, err := os.ReadFile(boundaryLog)
 	load, start := strings.Index(string(log), `"args":["load-buffer"`), strings.Index(string(log), `"args":["respawn-pane"`)
-	if err != nil || load < 0 || start < load || !strings.Contains(string(log), "save-buffer") {
+	if err != nil || load < 0 || start < load || !strings.Contains(string(log), "worker-capture") {
 		t.Fatalf("review stdin was not loaded before reviewer start: %s err=%v", log, err)
 	}
 	if !strings.Contains(string(log), `OPENAI_API_KEY=model-canary`) || slices.ContainsFunc([]string{"github-canary", "ssh-canary", "cloud-canary", "proxy-canary", "app-canary", "/coordinator-home"}, func(secret string) bool { return strings.Contains(string(log), secret) }) {
