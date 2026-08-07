@@ -302,25 +302,37 @@ func TestBotFeedbackRejectedOnListAndRefetch(t *testing.T) {
 	}
 }
 
-func TestClassicProtection404ContinuesToRules(t *testing.T) {
-	responses := map[string]any{
-		"/repos/o/r/pulls/3":                                               map[string]any{"number": 3, "state": "open", "merged": false, "body": "<!-- agent-symphony:issue:10:attempt:2 -->", "mergeable": true, "head": map[string]any{"sha": "abc"}, "base": map[string]any{"ref": "main"}},
-		"/repos/o/r/issues/10":                                             map[string]any{"state": "open", "labels": []any{}},
-		"/repos/o/r/issues/10/comments?per_page=100&page=1":                []any{},
-		"/repos/o/r/branches/main/protection":                              fixtureHTTP{http.StatusNotFound, `{"message":"Branch not protected"}`},
-		"/repos/o/r/rules/branches/main?per_page=100&page=1":               []any{map[string]any{"type": "required_status_checks", "parameters": map[string]any{"required_status_checks": []any{map[string]any{"context": PolicyCheck, "integration_id": 7}}}}},
-		"/repos/o/r/commits/abc/check-runs?filter=all&per_page=100&page=1": map[string]any{"check_runs": []any{}},
-		"/repos/o/r/commits/abc/statuses?per_page=100&page=1":              []any{},
-		"/repos/o/r": map[string]any{"permissions": map[string]any{"push": true}},
-		"/repos/o/r/issues/3/comments?per_page=100&page=1": []any{},
-		"/repos/o/r/pulls/3/comments?per_page=100&page=1":  []any{},
-		"/repos/o/r/pulls/3/reviews?per_page=100&page=1":   []any{},
-		"/graphql": map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviewDecision": nil}}}},
-	}
-	source := GitHubPRSource{API: fixtureAPI(t, responses), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}, Recovery: &recoveryStub{state: PRState{}}}
-	state, err := source.FreshPullRequest(context.Background(), 3)
-	if err != nil || !state.Facts.BranchProtectionAllows || !state.Facts.PolicyCheckRequired {
-		t.Fatalf("facts=%#v err=%v", state.Facts, err)
+func TestClassicProtectionUnavailableContinuesToRulesFailClosedAndIdempotent(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		protection fixtureHTTP
+		allows     bool
+	}{
+		{"404 means unprotected", fixtureHTTP{http.StatusNotFound, `{"message":"Branch not protected"}`}, true},
+		{"private plan unavailable", fixtureHTTP{http.StatusForbidden, `{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"403"}`}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			responses := map[string]any{
+				"/repos/o/r/pulls/3":                                               map[string]any{"number": 3, "state": "open", "merged": false, "body": "<!-- agent-symphony:issue:10:attempt:2 -->", "mergeable": true, "head": map[string]any{"sha": "abc"}, "base": map[string]any{"ref": "main"}},
+				"/repos/o/r/issues/10":                                             map[string]any{"state": "open", "labels": []any{}},
+				"/repos/o/r/issues/10/comments?per_page=100&page=1":                []any{},
+				"/repos/o/r/branches/main/protection":                              test.protection,
+				"/repos/o/r/rules/branches/main?per_page=100&page=1":               []any{map[string]any{"type": "required_status_checks", "parameters": map[string]any{"required_status_checks": []any{map[string]any{"context": PolicyCheck, "integration_id": 7}}}}},
+				"/repos/o/r/commits/abc/check-runs?filter=all&per_page=100&page=1": map[string]any{"check_runs": []any{}},
+				"/repos/o/r/commits/abc/statuses?per_page=100&page=1":              []any{},
+				"/repos/o/r": map[string]any{"permissions": map[string]any{"push": true}},
+				"/repos/o/r/issues/3/comments?per_page=100&page=1": []any{},
+				"/repos/o/r/pulls/3/comments?per_page=100&page=1":  []any{},
+				"/repos/o/r/pulls/3/reviews?per_page=100&page=1":   []any{},
+				"/graphql": map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviewDecision": nil}}}},
+			}
+			source := GitHubPRSource{API: fixtureAPI(t, responses), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}, Recovery: &recoveryStub{state: PRState{}}}
+			first, err := source.FreshPullRequest(context.Background(), 3)
+			second, again := source.FreshPullRequest(context.Background(), 3)
+			if err != nil || again != nil || first.Facts.BranchProtectionAllows != test.allows || !first.Facts.PolicyCheckRequired || !reflect.DeepEqual(first, second) {
+				t.Fatalf("first=%#v second=%#v err=%v again=%v", first, second, err, again)
+			}
+		})
 	}
 }
 
@@ -365,16 +377,21 @@ func TestClassicProtectionPreservesZeroApprovalCount(t *testing.T) {
 	}
 }
 
-func TestClassicProtectionNon404Fails(t *testing.T) {
-	responses := map[string]any{
-		"/repos/o/r/pulls/3":                                map[string]any{"number": 3, "state": "open", "merged": false, "body": "<!-- agent-symphony:issue:10:attempt:2 -->", "mergeable": true, "head": map[string]any{"sha": "abc"}, "base": map[string]any{"ref": "main"}},
-		"/repos/o/r/issues/10":                              map[string]any{"state": "open", "labels": []any{}},
-		"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{},
-		"/repos/o/r/branches/main/protection":               fixtureHTTP{http.StatusForbidden, `{"message":"forbidden"}`},
-	}
-	source := GitHubPRSource{API: fixtureAPI(t, responses), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}, Recovery: &recoveryStub{state: PRState{}}}
-	if _, err := source.FreshPullRequest(context.Background(), 3); err == nil {
-		t.Fatal("non-404 protection failure was ignored")
+func TestClassicProtectionOtherForbiddenResponsesFail(t *testing.T) {
+	for _, body := range []string{
+		`{"message":"forbidden"}`,
+		`{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","documentation_url":"https://docs.github.com/rest/branches/branch-protection/other","status":"403"}`,
+	} {
+		responses := map[string]any{
+			"/repos/o/r/pulls/3":                                map[string]any{"number": 3, "state": "open", "merged": false, "body": "<!-- agent-symphony:issue:10:attempt:2 -->", "mergeable": true, "head": map[string]any{"sha": "abc"}, "base": map[string]any{"ref": "main"}},
+			"/repos/o/r/issues/10":                              map[string]any{"state": "open", "labels": []any{}},
+			"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{},
+			"/repos/o/r/branches/main/protection":               fixtureHTTP{http.StatusForbidden, body},
+		}
+		source := GitHubPRSource{API: fixtureAPI(t, responses), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}, Recovery: &recoveryStub{state: PRState{}}}
+		if _, err := source.FreshPullRequest(context.Background(), 3); err == nil {
+			t.Fatalf("unrelated protection failure was ignored: %s", body)
+		}
 	}
 }
 

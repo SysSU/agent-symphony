@@ -42,6 +42,14 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+type readErrorAfterBody struct{ body string }
+
+func (r *readErrorAfterBody) Read(p []byte) (int, error) {
+	n := copy(p, r.body)
+	r.body = r.body[n:]
+	return n, errors.New("response read failed")
+}
+
 func httpResponse(status int, body string, headers http.Header) *http.Response {
 	normalized := make(http.Header)
 	for name, values := range headers {
@@ -50,6 +58,18 @@ func httpResponse(status int, body string, headers http.Header) *http.Response {
 		}
 	}
 	return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d %s", status, http.StatusText(status)), Header: normalized, Body: io.NopCloser(strings.NewReader(body))}
+}
+
+func TestClassicProtectionUnavailableRequiresCompleteBoundedJSON(t *testing.T) {
+	body := `{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"403"}`
+	for _, response := range []*http.Response{
+		{StatusCode: http.StatusForbidden, Status: "403 Forbidden", Body: io.NopCloser(&readErrorAfterBody{body: body})},
+		httpResponse(http.StatusForbidden, body+strings.Repeat(" ", 4096), nil),
+	} {
+		if isClassicProtectionUnavailable(responseError("GitHub read", response)) {
+			t.Fatal("incomplete or oversized response was trusted")
+		}
+	}
 }
 
 func provenanceFor(controls Controls, actor int) []Provenance {

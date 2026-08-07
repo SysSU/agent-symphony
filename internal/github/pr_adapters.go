@@ -610,15 +610,22 @@ func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRSt
 			LastPush     bool `json:"require_last_push_approval"`
 		} `json:"required_pull_request_reviews"`
 	}
-	if _, _, err := s.API.Read(ctx, "/repos/"+s.Config.Repository+"/branches/"+url.PathEscape(pull.Base.Ref)+"/protection", "", &protection); err != nil && !isResponseStatus(err, http.StatusNotFound) {
-		return PRState{}, err
+	classicProtectionKnown := true
+	if _, _, err := s.API.Read(ctx, "/repos/"+s.Config.Repository+"/branches/"+url.PathEscape(pull.Base.Ref)+"/protection", "", &protection); err != nil {
+		switch {
+		case isResponseStatus(err, http.StatusNotFound):
+		case isClassicProtectionUnavailable(err):
+			classicProtectionKnown = false
+		default:
+			return PRState{}, err
+		}
 	}
 	required := protection.RequiredStatusChecks.Checks
 	for _, context := range protection.RequiredStatusChecks.Contexts {
 		required = append(required, requiredCheck{Context: context})
 	}
 	state.Facts.BaseRequiresCurrent = protection.RequiredStatusChecks.Strict
-	state.Facts.BranchProtectionAllows = true
+	state.Facts.BranchProtectionAllows = classicProtectionKnown
 	reviewCount, dismissStale := 0, false
 	if protection.RequiredPullRequestReviews != nil {
 		p := protection.RequiredPullRequestReviews
@@ -678,6 +685,13 @@ func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRSt
 		state.Facts.Feedback = append(state.Facts.Feedback, fresh)
 	}
 	return state, nil
+}
+
+func isClassicProtectionUnavailable(err error) bool {
+	var response *responseStatusError
+	return errors.As(err, &response) && response.structured && response.status == http.StatusForbidden &&
+		response.githubMessage == "Upgrade to GitHub Pro or make this repository public to enable this feature." &&
+		response.documentationURL == "https://docs.github.com/rest/branches/branch-protection#get-branch-protection"
 }
 
 func findFeedback(feedback []Feedback, identity string) (Feedback, bool) {
