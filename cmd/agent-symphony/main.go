@@ -748,21 +748,8 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		issues[i].Active = issues[i].Active || slices.ContainsFunc(manifests, func(m agentruntime.Manifest) bool {
 			return m.Repository == issues[i].Repository && m.Issue == issues[i].Issue && (m.State == "preparing" || m.State == "running")
 		})
-		for _, manifest := range manifests {
-			if manifest.Repository == issues[i].Repository && manifest.Issue == issues[i].Issue && (manifest.State == "failed" || manifest.State == "cancelled" || manifest.State == "completed") {
-				bound := issues[i].ActiveAttempt != nil && issues[i].ActiveAttempt.Attempt == manifest.Attempt
-				if bound {
-					continue
-				}
-				if issues[i].Retry && issues[i].Attempt > manifest.Attempt {
-					issues[i].Attempt = max(issues[i].Attempt, manifest.Attempt+1)
-				} else {
-					issues[i].Eligible = false
-					issues[i].Blockers = append(issues[i].Blockers, "local terminal attempt awaits or has durable GitHub outcome")
-				}
-			}
-		}
 	}
+	addTerminalAttemptBlockers(issues, manifests, facts)
 	statuses := orchestrator.Recover(facts, manifests)
 	statuses, decisions := joinIssueProjection(statuses, issues, c.Concurrency)
 	if !transition {
@@ -802,6 +789,28 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		return statuses, fmt.Errorf("reconciliation exceeded the two-minute recovery target; retry on the next bounded backoff cycle: %w", err)
 	}
 	return statuses, nil
+}
+
+func addTerminalAttemptBlockers(issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, facts []orchestrator.AttemptFact) {
+	for i := range issues {
+		for _, manifest := range manifests {
+			if manifest.Repository == issues[i].Repository && manifest.Issue == issues[i].Issue && (manifest.State == "failed" || manifest.State == "cancelled" || manifest.State == "completed") {
+				bound := issues[i].ActiveAttempt != nil && issues[i].ActiveAttempt.Attempt == manifest.Attempt
+				published := slices.ContainsFunc(facts, func(fact orchestrator.AttemptFact) bool {
+					return orchestrator.MatchesPublishedAttempt(manifest, fact)
+				})
+				if bound || published {
+					continue
+				}
+				if issues[i].Retry && issues[i].Attempt > manifest.Attempt {
+					issues[i].Attempt = max(issues[i].Attempt, manifest.Attempt+1)
+				} else {
+					issues[i].Eligible = false
+					issues[i].Blockers = append(issues[i].Blockers, "local terminal attempt awaits or has durable GitHub outcome")
+				}
+			}
+		}
+	}
 }
 
 func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []internalgithub.RecoveryIssueFact, capacity int) ([]orchestrator.RecoveryStatus, []orchestrator.Decision) {

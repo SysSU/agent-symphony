@@ -54,6 +54,15 @@ type RecoveryStatus struct {
 
 type RuntimeCheck func(context.Context, agentruntime.Manifest, AttemptFact) error
 
+// MatchesPublishedAttempt joins a completed local attempt to its exact durable
+// pull request identity. Published work no longer depends on live worker state.
+func MatchesPublishedAttempt(manifest agentruntime.Manifest, fact AttemptFact) bool {
+	return manifest.State == "completed" && fact.PR > 0 &&
+		(fact.State == "active" || fact.State == "review-ready" || fact.State == "completed") &&
+		manifest.Repository == fact.Repository && manifest.Issue == fact.Issue && manifest.Attempt == fact.Attempt &&
+		manifest.BaseSHA == fact.BaseSHA && manifest.ReviewHead != "" && manifest.ReviewHead == fact.HeadSHA
+}
+
 // ExactRuntimeCheck refuses to adopt a manifest unless the named directory,
 // checked-out branch/HEAD, and exact tmux session all still agree.
 func ExactRuntimeCheck(ctx context.Context, manifest agentruntime.Manifest, fact AttemptFact) error {
@@ -150,6 +159,8 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 				status.State, status.Diagnostic, status.Action = "failed", manifest.Diagnostic, "inspect the retained log and retry with a new attempt"
 			case fact.State == "active" && fact.PR == 0 && manifest.State == "completed":
 				status.Action = "resume publication of the matching completed attempt"
+			case MatchesPublishedAttempt(manifest, fact):
+				status.Action = "monitor the matching published pull request"
 			case (fact.State == "active" || fact.State == "review-ready") && manifest.State == "running" && check != nil && check(ctx, manifest, fact) == nil:
 				status.Action = "resume monitoring the matching attempt"
 			case fact.State == "active" || fact.State == "review-ready":
