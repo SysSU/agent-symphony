@@ -1985,6 +1985,24 @@ func tmuxDiagnostic() diagnostic {
 func githubDiagnostics(repository string) []diagnostic {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if firstNonempty(os.Getenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH"), os.Getenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID")) != "" {
+		appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
+		if err != nil {
+			return []diagnostic{{"GitHub connectivity", "fail", err.Error(), "Set matching AGENT_SYMPHONY_GITHUB_APP_ID, AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH, and AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID values."}}
+		}
+		tokens, err := githubTokenSource(appID)
+		if err != nil {
+			return []diagnostic{{"GitHub connectivity", "fail", err.Error(), "Set matching AGENT_SYMPHONY_GITHUB_APP_ID, AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH, and AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID values."}}
+		}
+		api := internalgithub.API{BaseURL: githubAPI, Tokens: tokens, HTTP: githubClient}
+		if err := api.VerifyInstallation(ctx, appID, repository); err != nil {
+			return []diagnostic{{"GitHub connectivity", "fail", err.Error(), "Verify the configured GitHub App installation includes this repository."}}
+		}
+		return []diagnostic{
+			{"GitHub connectivity", "pass", "connected to " + repository, ""},
+			{"GitHub permissions", "warn", "configured GitHub App installation can access the repository", "Verify issue, pull-request, checks, webhook, rules, and installation permissions in GitHub."},
+		}
+	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, githubAPI+"/repos/"+repository, nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")

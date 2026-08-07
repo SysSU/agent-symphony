@@ -1467,10 +1467,15 @@ func TestConfigViewDoesNotEchoCredentialArgument(t *testing.T) {
 	}
 }
 
-func TestGitHubDiagnosticsUsesInjectedHTTPClient(t *testing.T) {
+func TestGitHubDiagnosticsPreservesTokenOnlyAuthentication(t *testing.T) {
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "42")
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", "")
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "")
+	t.Setenv("GITHUB_TOKEN", "token-canary")
+	t.Setenv("GH_TOKEN", "")
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path != "/repos/owner/repo" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
+		if r.URL.Path != "/repos/owner/repo" || r.Header.Get("Authorization") != "Bearer token-canary" {
+			t.Fatalf("unexpected request %s auth=%q", r.URL.Path, r.Header.Get("Authorization"))
 		}
 		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"permissions":{"pull":true}}`)), Header: make(http.Header)}, nil
 	})}
@@ -1481,6 +1486,85 @@ func TestGitHubDiagnosticsUsesInjectedHTTPClient(t *testing.T) {
 	if len(got) != 2 || got[0].Status != "pass" || got[1].Status != "warn" {
 		t.Fatalf("unexpected diagnostics: %#v", got)
 	}
+}
+
+func TestGitHubDiagnosticsVerifiesConfiguredAppInstallation(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemPath := filepath.Join(t.TempDir(), "app.pem")
+	if err := os.WriteFile(pemPath, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "42")
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", pemPath)
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
+	t.Setenv("GITHUB_TOKEN", "ignored-token-canary")
+
+	installedRepository := "owner/repo"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/7/access_tokens":
+			if auth := r.Header.Get("Authorization"); !strings.HasPrefix(auth, "Bearer ey") {
+				t.Errorf("missing signed App JWT: %q", auth)
+			}
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"token":"installation-diagnostic-canary","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339))
+		case r.Method == http.MethodGet && r.URL.Path == "/installation/repositories":
+			if auth := r.Header.Get("Authorization"); auth != "Bearer installation-diagnostic-canary" {
+				t.Errorf("installation verification auth = %q", auth)
+			}
+			fmt.Fprintf(w, `{"repositories":[{"full_name":%q}]}`, installedRepository)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI, githubClient = server.URL, server.Client()
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+
+	got := githubDiagnostics("owner/repo")
+	if len(got) != 2 || got[0].Status != "pass" || got[1].Status != "warn" || !strings.Contains(got[1].Message, "installation can access") {
+		t.Fatalf("unexpected diagnostics: %#v", got)
+	}
+	if strings.Contains(fmt.Sprint(got), "installation-diagnostic-canary") || strings.Contains(fmt.Sprint(got), "ignored-token-canary") {
+		t.Fatalf("diagnostics exposed credentials: %#v", got)
+	}
+	installedRepository = "other/repo"
+	got = githubDiagnostics("owner/repo")
+	if len(got) != 1 || got[0].Status != "fail" || !strings.Contains(got[0].Message, "cannot access") {
+		t.Fatalf("inaccessible repository diagnostics: %#v", got)
+	}
+}
+
+func TestGitHubDiagnosticsFailsClosedForInvalidAppCredentials(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "fallback-token-canary")
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "42")
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", "/missing-key.pem")
+	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "")
+
+	t.Run("partial configuration", func(t *testing.T) {
+		got := githubDiagnostics("owner/repo")
+		if len(got) != 1 || got[0].Status != "fail" || !strings.Contains(got[0].Message, "must both be set") {
+			t.Fatalf("unexpected diagnostics: %#v", got)
+		}
+	})
+
+	t.Run("malformed private key", func(t *testing.T) {
+		pemPath := filepath.Join(t.TempDir(), "bad.pem")
+		if err := os.WriteFile(pemPath, []byte("private-key-canary"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", pemPath)
+		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
+		got := githubDiagnostics("owner/repo")
+		if len(got) != 1 || got[0].Status != "fail" || strings.Contains(fmt.Sprint(got), "private-key-canary") {
+			t.Fatalf("unsafe or unexpected diagnostics: %#v", got)
+		}
+	})
 }
 
 func TestPRGovernanceCommandWiresFakeGitHubAndRecoveryState(t *testing.T) {
