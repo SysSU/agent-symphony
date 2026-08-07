@@ -397,7 +397,7 @@ func FetchAttemptFacts(ctx context.Context, api API, repository string, appID in
 			}
 			issue, attempt := marker.Issue, marker.Attempt
 			wantBranch, err := AttemptBranch(repository, issue, attempt)
-			if err != nil || marker.Branch != wantBranch || marker.Branch != pull.Head.Ref || marker.Head != pull.Head.SHA || marker.PR != pull.Number || pull.User.ID != appActorID || pull.PerformedViaGitHubApp == nil || pull.PerformedViaGitHubApp.ID != appID {
+			if err != nil || marker.Branch != wantBranch || marker.Branch != pull.Head.Ref || marker.Head != pull.Head.SHA || marker.PR != pull.Number || pull.User.ID != appActorID || pull.PerformedViaGitHubApp != nil && pull.PerformedViaGitHubApp.ID != appID {
 				continue
 			}
 			if pull.Number < 1 || issue < 1 || attempt < 1 || pull.Head.SHA == "" || pull.Base.SHA == "" {
@@ -502,9 +502,7 @@ func FindPublishedAttempt(ctx context.Context, api API, repository, branch, head
 			User   struct {
 				ID int `json:"id"`
 			} `json:"user"`
-			App *struct {
-				ID int64 `json:"id"`
-			} `json:"performed_via_github_app"`
+			App  *struct{ ID int64 }       `json:"performed_via_github_app"`
 			Head struct{ SHA, Ref string } `json:"head"`
 		}
 		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100&page=%d", repository, page), "", &pulls); err != nil {
@@ -514,7 +512,7 @@ func FindPublishedAttempt(ctx context.Context, api API, repository, branch, head
 			if pull.Head.Ref != branch || pull.Head.SHA != head {
 				continue
 			}
-			if pull.User.ID != appActorID || pull.App == nil || pull.App.ID != appID {
+			if pull.User.ID != appActorID || pull.App != nil && pull.App.ID != appID {
 				return found, "", errors.New("deterministic attempt branch is owned by an untrusted pull request")
 			}
 			if found.Number != 0 && found.Number != pull.Number {
