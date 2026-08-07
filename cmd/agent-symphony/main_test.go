@@ -199,16 +199,6 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	bundlePath := filepath.Join(t.TempDir(), "attempt.bundle")
 	runGit(t, worker, "bundle", "create", bundlePath, "--all")
 	bundle, _ := os.ReadFile(bundlePath)
-	realGit, _ := exec.LookPath("git")
-	verifyRepo := filepath.Join(t.TempDir(), "verify.git")
-	runGit(t, worker, "init", "--bare", verifyRepo)
-	gitWrapperDir := t.TempDir()
-	gitWrapper := filepath.Join(gitWrapperDir, "git")
-	gitWrapperBody := fmt.Sprintf("#!/bin/sh\ncase \" $* \" in\n  *\" bundle verify \"*) for last do :; done; exec %q --git-dir=%q bundle verify \"$last\";;\nesac\nexec %q \"$@\"\n", realGit, verifyRepo, realGit)
-	if err := os.WriteFile(gitWrapper, []byte(gitWrapperBody), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", gitWrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: "issue-23", BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "ok", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
 	exportedJSON, _ := json.Marshal(exported)
 	exportResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
@@ -691,6 +681,78 @@ func TestWorkerExportRejectsMaliciousOrOversizedBundleBeforeImport(t *testing.T)
 	}
 }
 
+func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
+	coordinator, worker := t.TempDir(), t.TempDir()
+	for _, repo := range []string{coordinator, worker} {
+		runGit(t, repo, "init")
+		runGit(t, repo, "config", "user.email", "test@example.invalid")
+		runGit(t, repo, "config", "user.name", "test")
+	}
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "add", "file")
+	runGit(t, worker, "commit", "-m", "base")
+	base := runGit(t, worker, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("head"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "commit", "-am", "head")
+	intermediate := runGit(t, worker, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("tip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "commit", "-am", "tip")
+	head := runGit(t, worker, "rev-parse", "HEAD")
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+
+	manifest := agentruntime.Manifest{Repository: "o/r", Branch: "issue-61", BaseSHA: base}
+	importBundle := func(claimedHead string, revisions ...string) (workerResult, string, string, error) {
+		bundlePath := filepath.Join(t.TempDir(), "attempt.bundle")
+		runGit(t, worker, append([]string{"bundle", "create", bundlePath}, revisions...)...)
+		bundle, err := os.ReadFile(bundlePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exported := workerExport{Type: "agent-symphony-export-v1", Repository: manifest.Repository, Branch: manifest.Branch, BaseSHA: base, HeadSHA: claimedHead, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "ok", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
+		exportedJSON, _ := json.Marshal(exported)
+		boundaryJSON, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
+		script := filepath.Join(t.TempDir(), "boundary")
+		if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' '"+string(boundaryJSON)+"'\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return importWorkerExport(t.Context(), workerBoundaryRunner{Command: script}, manifest)
+	}
+
+	if _, _, _, err := importBundle(head, "HEAD", "^"+base); err == nil || !strings.Contains(err.Error(), "worker bundle verification failed") {
+		t.Fatalf("prerequisite-dependent bundle err=%v", err)
+	}
+	if err := exec.Command("git", "-C", coordinator, "cat-file", "-e", head).Run(); err == nil {
+		t.Fatal("failed import changed the configured repository")
+	}
+	if _, _, _, err := importBundle(intermediate, "HEAD"); err == nil || !strings.Contains(err.Error(), "worker head is not advertised by bundle") {
+		t.Fatalf("unadvertised intermediate head err=%v", err)
+	}
+	if err := exec.Command("git", "-C", coordinator, "cat-file", "-e", intermediate).Run(); err == nil {
+		t.Fatal("unadvertised head changed the configured repository")
+	}
+	result, importedHead, root, err := importBundle(head, "HEAD")
+	resolvedCoordinator, resolveErr := filepath.EvalSymlinks(coordinator)
+	if err != nil || resolveErr != nil || result.Validation != "ok" || importedHead != head || root != resolvedCoordinator {
+		t.Fatalf("result=%#v head=%q root=%q err=%v", result, importedHead, root, err)
+	}
+	if err := exec.Command("git", "-C", coordinator, "cat-file", "-e", head).Run(); err != nil {
+		t.Fatalf("verified head was not imported: %v", err)
+	}
+}
+
 func TestStructuredReviewResultIsBoundedAndFindingsBlockClean(t *testing.T) {
 	clean, err := parseIndependentReview(`{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`)
 	if err != nil || clean.Status != "clean" {
@@ -1119,19 +1181,6 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	verifyRepo := filepath.Join(t.TempDir(), "verify.git")
-	runGit(t, worker, "init", "--bare", verifyRepo)
-	gitWrapperDir := t.TempDir()
-	gitWrapper := filepath.Join(gitWrapperDir, "git")
-	gitWrapperBody := fmt.Sprintf("#!/bin/sh\ncase \" $* \" in\n  *\" bundle verify \"*) for last do :; done; exec %q --git-dir=%q bundle verify \"$last\";;\nesac\nexec %q \"$@\"\n", realGit, verifyRepo, realGit)
-	if err := os.WriteFile(gitWrapper, []byte(gitWrapperBody), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", gitWrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runGit(t, coordinator, "init", "--bare", remote)
 	runGit(t, coordinator, "remote", "add", "origin", remote)
 	old, err := os.Getwd()
