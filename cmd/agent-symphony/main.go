@@ -913,12 +913,23 @@ func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, mani
 	if err := os.WriteFile(bundlePath, bundle, 0o600); err != nil {
 		return workerResult{}, "", "", err
 	}
-	if err := scanGit(ctx, temp, nil, []string{"bundle", "verify", bundlePath}, nil); err != nil {
-		return workerResult{}, "", "", errors.New("worker bundle verification failed")
-	}
 	importedRepo := filepath.Join(temp, "repository.git")
 	if err := scanGit(ctx, temp, nil, []string{"init", "--bare", importedRepo}, nil); err != nil {
 		return workerResult{}, "", "", fmt.Errorf("create temporary import repository: %w", err)
+	}
+	if err := scanGit(ctx, importedRepo, nil, []string{"bundle", "verify", bundlePath}, nil); err != nil {
+		return workerResult{}, "", "", errors.New("worker bundle verification failed")
+	}
+	advertised := false
+	if err := scanGit(ctx, importedRepo, nil, []string{"bundle", "list-heads", bundlePath}, func(line []byte) error {
+		fields := bytes.Fields(line)
+		if len(fields) != 2 || !preflightObjectID.Match(fields[0]) {
+			return errors.New("invalid bundle ref")
+		}
+		advertised = advertised || string(fields[0]) == exported.HeadSHA
+		return nil
+	}); err != nil || !advertised {
+		return workerResult{}, "", "", errors.New("worker head is not advertised by bundle")
 	}
 	if err := preflightBundle(ctx, bundle, bundlePath, importedRepo); err != nil {
 		return workerResult{}, "", "", fmt.Errorf("worker bundle object bounds: %w", err)
