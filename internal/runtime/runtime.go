@@ -308,15 +308,11 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 	if runErr != nil {
 		return manifest, fmt.Errorf("observe tmux session: %w", runErr)
 	}
-	fields := strings.Fields(result.Output)
-	if len(fields) != 2 || (fields[0] != "0" && fields[0] != "1") {
-		return manifest, fmt.Errorf("observe tmux session: invalid pane status %q", strings.TrimSpace(result.Output))
+	dead, status, err := ParsePaneStatus(result.Output)
+	if err != nil {
+		return manifest, fmt.Errorf("observe tmux session: %w", err)
 	}
-	status, err := strconv.Atoi(fields[1])
-	if err != nil || status < 0 {
-		return manifest, fmt.Errorf("observe tmux session: invalid exit status %q", fields[1])
-	}
-	if fields[0] == "1" {
+	if dead {
 		capture, captureErr := r.run(ctx, r.tmux(), []string{"capture-pane", "-p", "-S", "-", "-t", PaneTarget(manifest.Session)}, "", []string{}, nil)
 		var logErr error
 		if captureErr == nil {
@@ -335,6 +331,22 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 	}
 	manifest.UpdatedAt = time.Now().UTC()
 	return manifest, r.writeManifest(attempt, manifest)
+}
+
+// ParsePaneStatus parses tmux's pane_dead and pane_dead_status format.
+func ParsePaneStatus(output string) (bool, int, error) {
+	fields := strings.Fields(output)
+	if len(fields) == 1 && fields[0] == "0" {
+		return false, 0, nil
+	}
+	if len(fields) != 2 || fields[0] != "1" {
+		return false, 0, fmt.Errorf("invalid pane status %q", strings.TrimSpace(output))
+	}
+	status, err := strconv.Atoi(fields[1])
+	if err != nil || status < 0 {
+		return false, 0, fmt.Errorf("invalid exit status %q", fields[1])
+	}
+	return true, status, nil
 }
 
 // Deliver sends one coordinator-framed handoff through the verified worker
