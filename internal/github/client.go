@@ -79,9 +79,9 @@ func (a API) RepositoryID(ctx context.Context, repository string) (int64, error)
 type ambiguousMutationError struct{ error }
 
 type responseStatusError struct {
-	operation string
-	status    int
-	message   string
+	operation, message, githubMessage, documentationURL string
+	status                                              int
+	structured                                          bool
 }
 
 func (e *responseStatusError) Error() string {
@@ -252,6 +252,12 @@ func retryDelay(resp *http.Response, attempt int) time.Duration {
 }
 
 func responseError(operation string, resp *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	return &responseStatusError{operation: operation, status: resp.StatusCode, message: fmt.Sprintf("%s: %s", resp.Status, Redact(string(body)))}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4097))
+	var details struct {
+		Message          string `json:"message"`
+		DocumentationURL string `json:"documentation_url"`
+	}
+	structured := readErr == nil && len(body) <= 4096 && json.Unmarshal(body, &details) == nil
+	body = body[:min(len(body), 4096)]
+	return &responseStatusError{operation: operation, status: resp.StatusCode, message: fmt.Sprintf("%s: %s", resp.Status, Redact(string(body))), githubMessage: details.Message, documentationURL: details.DocumentationURL, structured: structured}
 }

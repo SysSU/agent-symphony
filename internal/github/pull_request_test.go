@@ -65,6 +65,14 @@ func TestEvaluatePRGovernance(t *testing.T) {
 	if got := EvaluatePR(facts); got.Merge || got.CheckConclusion != "success" {
 		t.Fatalf("human completion should be ready but not merged: %#v", got)
 	}
+	facts.BranchProtectionAllows = false
+	if got := EvaluatePR(facts); got.Merge || got.CheckConclusion != "failure" || !slices.Contains(got.MergeBlockers, "branch protection does not allow merge") {
+		t.Fatalf("unknown protection was not a policy blocker: %#v", got)
+	}
+	facts.NeedsHumanReview = true
+	if got := EvaluatePR(facts); got.Merge || got.CheckStatus != "in_progress" || !slices.Contains(got.MergeBlockers, "branch protection does not allow merge") {
+		t.Fatalf("human review did not remain safely pending: %#v", got)
+	}
 }
 
 func TestActionableFeedbackLifetimeAuthorizationAndState(t *testing.T) {
