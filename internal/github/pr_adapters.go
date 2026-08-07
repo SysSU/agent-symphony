@@ -614,7 +614,7 @@ func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRSt
 	if _, _, err := s.API.Read(ctx, "/repos/"+s.Config.Repository+"/branches/"+url.PathEscape(pull.Base.Ref)+"/protection", "", &protection); err != nil {
 		switch {
 		case isResponseStatus(err, http.StatusNotFound):
-		case isClassicProtectionUnavailable(err):
+		case isBranchProtectionUnavailable(err, classicProtectionDocumentationURL):
 			classicProtectionKnown = false
 		default:
 			return PRState{}, err
@@ -687,11 +687,16 @@ func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRSt
 	return state, nil
 }
 
-func isClassicProtectionUnavailable(err error) bool {
+const (
+	classicProtectionDocumentationURL = "https://docs.github.com/rest/branches/branch-protection#get-branch-protection"
+	branchRulesDocumentationURL       = "https://docs.github.com/rest/repos/rules#get-rules-for-a-branch"
+)
+
+func isBranchProtectionUnavailable(err error, documentationURL string) bool {
 	var response *responseStatusError
 	return errors.As(err, &response) && response.structured && response.status == http.StatusForbidden &&
 		response.githubMessage == "Upgrade to GitHub Pro or make this repository public to enable this feature." &&
-		response.documentationURL == "https://docs.github.com/rest/branches/branch-protection#get-branch-protection"
+		response.documentationURL == documentationURL
 }
 
 func findFeedback(feedback []Feedback, identity string) (Feedback, bool) {
@@ -1206,6 +1211,10 @@ func (s *GitHubPRSource) readRules(ctx context.Context, branch string, required 
 		}
 		path := fmt.Sprintf("/repos/%s/rules/branches/%s?per_page=100&page=%d", s.Config.Repository, url.PathEscape(branch), page)
 		if _, _, err := s.API.Read(ctx, path, "", &rules); err != nil {
+			if isBranchProtectionUnavailable(err, branchRulesDocumentationURL) {
+				facts.BranchProtectionAllows = false
+				return nil
+			}
 			return err
 		}
 		for _, rule := range rules {
