@@ -231,6 +231,37 @@ func (r *FileRecovery) PullRequestState(_ context.Context, repository string, nu
 	}
 	return PRState{}, errors.New("recovered pull request attempt not found")
 }
+
+func (r *FileRecovery) hydrateAttempts(repository string, facts []RecoveryAttemptFact) error {
+	return r.updateStates(func(states []PRState) ([]PRState, error) {
+		for _, fact := range facts {
+			if fact.State != "active" && fact.State != "review-ready" {
+				continue
+			}
+			if fact.Repository != repository || fact.PR < 1 || fact.Issue < 1 || fact.Attempt < 1 || !regexpSHA.MatchString(fact.HeadSHA) {
+				return nil, errors.New("authoritative pull request attempt has invalid identity")
+			}
+			found := false
+			for _, state := range states {
+				samePR := state.Repository == fact.Repository && state.Number == fact.PR
+				sameAttempt := state.Repository == fact.Repository && state.Issue == fact.Issue && state.Attempt == fact.Attempt
+				if !samePR && !sameAttempt {
+					continue
+				}
+				if !samePR || !sameAttempt || state.HeadSHA != fact.HeadSHA {
+					return nil, errors.New("authoritative pull request attempt conflicts with recovery state")
+				}
+				found = true
+				break
+			}
+			if !found {
+				states = append(states, PRState{Repository: fact.Repository, Number: fact.PR, Issue: fact.Issue, Attempt: fact.Attempt, HeadSHA: fact.HeadSHA})
+			}
+		}
+		return states, nil
+	})
+}
+
 func (r *FileRecovery) ClaimFeedback(_ context.Context, state PRState, feedback Feedback) (bool, error) {
 	claimed := false
 	err := r.update(func(states []PRState) error {
@@ -284,6 +315,12 @@ func sameAttempt(a, b PRState) bool {
 }
 
 func (r *FileRecovery) update(change func([]PRState) error) error {
+	return r.updateStates(func(states []PRState) ([]PRState, error) {
+		return states, change(states)
+	})
+}
+
+func (r *FileRecovery) updateStates(change func([]PRState) ([]PRState, error)) error {
 	lock, err := openRegular(r.Path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
@@ -297,7 +334,8 @@ func (r *FileRecovery) update(change func([]PRState) error) error {
 	if err != nil {
 		return err
 	}
-	if err := change(states); err != nil {
+	states, err = change(states)
+	if err != nil {
 		return err
 	}
 	return r.write(states)
@@ -393,14 +431,30 @@ func RunPRReconciliation(ctx context.Context, api API, cfg PRAdapterConfig, stat
 	} else if err != nil {
 		return err
 	}
-	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery}
-	reconciler, err := NewPRReconciler(api, cfg, recovery, func() error {
+	attempts, err := FetchAttemptFacts(ctx, api, cfg.Repository, cfg.AppID, cfg.AppActorID)
+	if err != nil {
+		return err
+	}
+	if err := recovery.hydrateAttempts(cfg.Repository, attempts); err != nil {
+		return err
+	}
+	authorized := make(map[int]RecoveryAttemptFact, len(attempts))
+	for _, attempt := range attempts {
+		if attempt.State == "active" || attempt.State == "review-ready" {
+			authorized[attempt.PR] = attempt
+		}
+	}
+	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery, Attempts: authorized}
+	reconciler, err := NewPRReconciler(api, cfg, recovery, authorized, func() error {
 		states, err := recovery.read()
 		if err != nil {
 			return err
 		}
 		seen := map[int]bool{}
 		for _, state := range states {
+			if _, ok := authorized[state.Number]; !ok {
+				continue
+			}
 			if state.Repository != cfg.Repository || state.Issue <= 0 {
 				return errors.New("recovery state contains an invalid issue identity")
 			}
@@ -449,17 +503,26 @@ type GitHubPRSource struct {
 	API      API
 	Config   PRAdapterConfig
 	Recovery AttemptRecovery
+	Attempts map[int]RecoveryAttemptFact
 }
 
-func NewPRReconciler(api API, cfg PRAdapterConfig, recovery AttemptRecovery, fullRead func() error) (Reconciler, error) {
-	if cfg.Repository == "" || cfg.ReadyLabel == "" || cfg.HumanReviewLabel == "" || cfg.AutonomousMergeLabel == "" || cfg.MergeMethod == "" || cfg.PriorityP1Label == "" || cfg.PriorityP2Label == "" || cfg.PriorityP3Label == "" || cfg.DependencySection == "" || cfg.DefaultCompletion == "" || cfg.ApprovalCommand == "" || cfg.CancelCommand == "" || cfg.RetryCommand == "" || cfg.CancelCommand == cfg.RetryCommand || cfg.AppID <= 0 || cfg.AppActorID <= 0 || recovery == nil || fullRead == nil {
+func NewPRReconciler(api API, cfg PRAdapterConfig, recovery AttemptRecovery, attempts map[int]RecoveryAttemptFact, fullRead func() error) (Reconciler, error) {
+	if cfg.Repository == "" || cfg.ReadyLabel == "" || cfg.HumanReviewLabel == "" || cfg.AutonomousMergeLabel == "" || cfg.MergeMethod == "" || cfg.PriorityP1Label == "" || cfg.PriorityP2Label == "" || cfg.PriorityP3Label == "" || cfg.DependencySection == "" || cfg.DefaultCompletion == "" || cfg.ApprovalCommand == "" || cfg.CancelCommand == "" || cfg.RetryCommand == "" || cfg.CancelCommand == cfg.RetryCommand || cfg.AppID <= 0 || cfg.AppActorID <= 0 || recovery == nil || attempts == nil || fullRead == nil {
 		return Reconciler{}, errors.New("PR reconciliation requires repository policy, recovery, and issue reconciliation")
 	}
-	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery}
+	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery, Attempts: attempts}
 	return Reconciler{FullRead: fullRead, PullRequests: &PRCoordinator{API: api, Source: source, Signals: RecoverySignals{recovery}, ReviewLabel: cfg.HumanReviewLabel, MergeMethod: cfg.MergeMethod}}, nil
 }
 
 func (s *GitHubPRSource) OpenPullRequests(ctx context.Context) ([]int, error) {
+	if s.Attempts != nil {
+		numbers := make([]int, 0, len(s.Attempts))
+		for number := range s.Attempts {
+			numbers = append(numbers, number)
+		}
+		slices.Sort(numbers)
+		return numbers, nil
+	}
 	var numbers []int
 	for page := 1; ; page++ {
 		var pulls []struct {
@@ -488,8 +551,8 @@ func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRSt
 		MergeableState   string `json:"mergeable_state"`
 		Draft, Mergeable bool
 		Merged           *bool
-		Head             struct{ SHA string } `json:"head"`
-		Base             struct{ Ref string } `json:"base"`
+		Head             struct{ SHA, Ref string } `json:"head"`
+		Base             struct{ Ref string }      `json:"base"`
 		Labels           []struct{ Name string }
 	}
 	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/pulls/%d", s.Config.Repository, number), "", &pull); err != nil {
@@ -497,6 +560,12 @@ func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRSt
 	}
 	if pull.Merged == nil {
 		return PRState{}, errors.New("pull request merged state is missing")
+	}
+	verified, requireVerified := s.Attempts[number]
+	strict, strictErr := parseAttemptMarker(pull.Body)
+	branch, branchErr := AttemptBranch(s.Config.Repository, verified.Issue, verified.Attempt)
+	if requireVerified && (strictErr != nil || branchErr != nil || strict.Issue != verified.Issue || strict.Attempt != verified.Attempt || strict.Branch != branch || strict.Head != verified.HeadSHA || strict.PR != verified.PR || strict.Outcome != "review" || pull.Head.SHA != verified.HeadSHA || pull.Head.Ref != branch) {
+		return PRState{}, errors.New("pull request no longer matches its authoritative attempt binding")
 	}
 	marker := attemptMarker.FindStringSubmatch(pull.Body)
 	if len(marker) != 3 {
@@ -1162,6 +1231,8 @@ func (s *GitHubPRSource) readIssueComments(ctx context.Context, issue, attempt i
 		state FeedbackState
 	}{}
 	decisionBodies := make(map[string]int, len(state.Decisions))
+	verified, requireVerified := s.Attempts[state.Number]
+	authoritative := false
 	for i, decision := range state.Decisions {
 		body, err := AttributedBody(issue, attempt, fmt.Sprintf("Implementation decision %s\n\n%s", decision.ID, decision.Body))
 		if err == nil {
@@ -1180,6 +1251,11 @@ func (s *GitHubPRSource) readIssueComments(ctx context.Context, issue, attempt i
 			return err
 		}
 		for _, comment := range comments {
+			if requireVerified && comment.App != nil && comment.App.ID == s.Config.AppID && comment.User.ID == s.Config.AppActorID {
+				got, err := parseAttemptMarker(comment.Body)
+				branch, branchErr := AttemptBranch(s.Config.Repository, verified.Issue, verified.Attempt)
+				authoritative = authoritative || err == nil && branchErr == nil && got.Issue == verified.Issue && got.Attempt == verified.Attempt && got.Branch == branch && got.Head == verified.HeadSHA && got.PR == verified.PR && got.Outcome == "review"
+			}
 			match := mergeMarker.FindStringSubmatch(comment.Body)
 			attributed := strings.Contains(comment.Body, marker) && comment.App != nil && comment.App.ID == s.Config.AppID && comment.User.ID == s.Config.AppActorID && s.Config.AppID > 0 && s.Config.AppActorID > 0
 			if len(match) == 3 && attributed {
@@ -1219,6 +1295,9 @@ func (s *GitHubPRSource) readIssueComments(ctx context.Context, issue, attempt i
 			}
 		}
 		if len(comments) < 100 {
+			if requireVerified && !authoritative {
+				return errors.New("authoritative App issue marker is missing or changed")
+			}
 			for i := range state.Facts.Feedback {
 				if disposition, ok := feedbackDispositions[state.Facts.Feedback[i].identity()]; ok {
 					state.ConfirmedDispositions = append(state.ConfirmedDispositions, Feedback{ID: state.Facts.Feedback[i].ID, Source: state.Facts.Feedback[i].Source, State: disposition.state})
