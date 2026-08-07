@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -73,6 +74,121 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 				t.Fatalf("result=%#v err=%v", result, err)
 			}
 		})
+	}
+}
+
+func TestReviewResultArtifactFailsClosed(t *testing.T) {
+	const valid = `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`
+	request := reviewResultRequest{Repository: "o/r", Issue: 23, Attempt: 1, Head: strings.Repeat("a", 40)}
+	requestBody, _ := json.Marshal(request)
+
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, string, string)
+		valid bool
+	}{
+		{"valid", func(t *testing.T, path, _ string) { mustWriteFile(t, path, valid) }, true},
+		{"missing", func(*testing.T, string, string) {}, false},
+		{"malformed", func(t *testing.T, path, _ string) { mustWriteFile(t, path, `{`) }, false},
+		{"unknown field", func(t *testing.T, path, _ string) {
+			mustWriteFile(t, path, `{"type":"agent-symphony-review-v1","status":"clean","findings":[],"unknown":true}`)
+		}, false},
+		{"oversized", func(t *testing.T, path, _ string) { mustWriteFile(t, path, strings.Repeat("x", maxReviewResultSize+1)) }, false},
+		{"symlink", func(t *testing.T, path, root string) {
+			target := filepath.Join(root, "external-result")
+			mustWriteFile(t, target, valid)
+			if err := os.MkdirAll(filepath.Dir(path), 0o770); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"stale head", func(t *testing.T, _ string, root string) {
+			snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+			mustWriteFile(t, reviewResultPath(snapshot, strings.Repeat("b", 40)), valid)
+		}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+			path := reviewResultPath(snapshot, request.Head)
+			test.setup(t, path, root)
+			output, err := readReviewResult(requestBody, root)
+			if err == nil {
+				_, err = parseIndependentReview(output)
+			}
+			if test.valid && err != nil {
+				t.Fatalf("valid result rejected: %v", err)
+			}
+			if !test.valid && err == nil {
+				t.Fatal("unsafe result accepted")
+			}
+		})
+	}
+
+	t.Run("substitution", func(t *testing.T) {
+		root := t.TempDir()
+		snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+		path := reviewResultPath(snapshot, request.Head)
+		mustWriteFile(t, path, valid)
+		oldOpen := hostReviewResultOpen
+		hostReviewResultOpen = func(candidate string, flags int, mode uint32) (int, error) {
+			if err := os.Rename(candidate, candidate+".replaced"); err != nil {
+				return -1, err
+			}
+			mustWriteFile(t, candidate, valid)
+			return syscall.Open(candidate, flags, mode)
+		}
+		t.Cleanup(func() { hostReviewResultOpen = oldOpen })
+		if _, err := readReviewResult(requestBody, root); err == nil {
+			t.Fatal("substituted result accepted")
+		}
+	})
+
+	root := t.TempDir()
+	snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+	mustWriteFile(t, reviewResultPath(snapshot, request.Head), valid)
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
+	operation, _ := json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"review-result", boundaryCommand{Input: requestBody}})
+	for _, mode := range []string{"review", "implementation"} {
+		var output bytes.Buffer
+		err := agentHost(t.Context(), mode, bytes.NewReader(operation), &output)
+		if mode == "review" && err != nil {
+			t.Fatalf("review boundary rejected result: %v", err)
+		}
+		if mode == "implementation" && err == nil {
+			t.Fatal("implementation boundary read review result")
+		}
+	}
+
+	missingRequest := request
+	missingRequest.Head = strings.Repeat("b", 40)
+	missingBody, _ := json.Marshal(missingRequest)
+	invalidOperation, _ := json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"review-result", boundaryCommand{Input: missingBody}})
+	var output bytes.Buffer
+	if err := agentHost(t.Context(), "review", bytes.NewReader(invalidOperation), &output); err != nil {
+		t.Fatalf("invalid artifact was not encoded: %v", err)
+	}
+	var result agentruntime.Result
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil || !result.Exited || result.Code != reviewResultInvalidCode || result.Output != "review result artifact is invalid" {
+		t.Fatalf("invalid artifact result=%#v err=%v", result, err)
+	}
+}
+
+func mustWriteFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o660); err != nil {
+		t.Fatal(err)
 	}
 }
 

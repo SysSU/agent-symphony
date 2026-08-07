@@ -279,6 +279,13 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	if out, err := exec.Command("git", "-C", source, "commit", "-m", "base").CombinedOutput(); err != nil {
 		t.Fatal(string(out))
 	}
+	base := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", source, "rev-parse", "HEAD"))))
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", source, "commit", "-am", "change").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
 	head := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", source, "rev-parse", "HEAD"))))
 	imported := filepath.Join(t.TempDir(), "coordinator.git")
 	if out, err := exec.Command("git", "init", "--bare", imported).CombinedOutput(); err != nil {
@@ -312,7 +319,7 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, pending, err := runIndependentReview(t.Context(), nil, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt}, workerBoundaryRunner{Command: script}, env, []string{"reviewer"}, issue, agentruntime.Manifest{}, source, head, reviewSnapshotRoot)
+	result, pending, err := runIndependentReview(t.Context(), nil, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: base}, workerBoundaryRunner{Command: script}, env, []string{"reviewer", "--custom"}, issue, agentruntime.Manifest{}, source, head, reviewSnapshotRoot)
 	if err != nil || !pending {
 		t.Fatal(err)
 	}
@@ -329,6 +336,19 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	if got != head {
 		t.Fatalf("snapshot head=%s want=%s", got, head)
 	}
+	if info, err := os.Stat(result.Snapshot); err != nil || info.Mode().Perm() != 0o550 {
+		t.Fatalf("snapshot mode=%v err=%v", info.Mode().Perm(), err)
+	}
+	if info, err := os.Stat(filepath.Join(result.Snapshot, "file")); err != nil || info.Mode().Perm() != 0o440 {
+		t.Fatalf("snapshot file mode=%v err=%v", info.Mode().Perm(), err)
+	}
+	resultPath := reviewResultPath(result.Snapshot, head)
+	if info, err := os.Stat(filepath.Dir(resultPath)); err != nil || info.Mode().Perm() != 0o770 {
+		t.Fatalf("review result directory=%v err=%v", info, err)
+	}
+	if _, err := os.Stat(resultPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("review result existed before capture: %v", err)
+	}
 	log, err := os.ReadFile(boundaryLog)
 	load, start := strings.Index(string(log), `"args":["load-buffer"`), strings.Index(string(log), `"args":["respawn-pane"`)
 	if err != nil || load < 0 || start < load || !strings.Contains(string(log), "worker-capture") {
@@ -336,6 +356,297 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	}
 	if !strings.Contains(string(log), `OPENAI_API_KEY=model-canary`) || slices.ContainsFunc([]string{"github-canary", "ssh-canary", "cloud-canary", "proxy-canary", "app-canary", "/coordinator-home"}, func(secret string) bool { return strings.Contains(string(log), secret) }) {
 		t.Fatalf("review boundary environment was not safely filtered: %s", log)
+	}
+	if !strings.Contains(string(log), `"reviewer","--custom"`) || strings.Contains(string(log), "--output-last-message") {
+		t.Fatalf("custom reviewer command or result environment changed: %s", log)
+	}
+}
+
+type artifactReviewBoundary struct {
+	root          string
+	terminal      string
+	captureCalls  int
+	respawn       []string
+	respawns      int
+	failReads     int
+	invalidReads  int
+	resultContent string
+}
+
+func (b *artifactReviewBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if operation == "review-result" {
+		if b.invalidReads > 0 {
+			b.invalidReads--
+			return agentruntime.Result{Output: "review result artifact is invalid", Code: reviewResultInvalidCode, Exited: true}, errors.New("review result artifact invalid")
+		}
+		if b.failReads > 0 {
+			b.failReads--
+			return agentruntime.Result{}, errors.New("transient review result read")
+		}
+		input, _ := io.ReadAll(command.Stdin)
+		output, err := readReviewResult(input, b.root)
+		return agentruntime.Result{Output: output}, err
+	}
+	if slices.Contains(command.Args, "display-message") {
+		return agentruntime.Result{Output: "1 0"}, nil
+	}
+	if slices.Contains(command.Args, "capture-pane") {
+		b.captureCalls++
+		return agentruntime.Result{Output: b.terminal}, nil
+	}
+	if slices.Contains(command.Args, "respawn-pane") {
+		b.respawn = slices.Clone(command.Args)
+		b.respawns++
+		for _, path := range command.Args {
+			if strings.HasPrefix(path, b.root+string(filepath.Separator)) && strings.Contains(filepath.Base(filepath.Dir(path)), ".result-") {
+				if err := os.WriteFile(path, []byte(b.resultContent), 0o660); err != nil {
+					return agentruntime.Result{}, err
+				}
+			}
+		}
+	}
+	return agentruntime.Result{}, nil
+}
+
+func TestIndependentReviewIgnoresEchoedAndDuplicatedTerminalResult(t *testing.T) {
+	source, root := t.TempDir(), t.TempDir()
+	runGit(t, source, "init")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "config", "user.name", "test")
+	runGit(t, source, "commit", "--allow-empty", "-m", "base")
+	base := runGit(t, source, "rev-parse", "HEAD")
+	runGit(t, source, "commit", "--allow-empty", "-m", "head")
+	head := runGit(t, source, "rev-parse", "HEAD")
+	const clean = `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`
+	boundary := &artifactReviewBoundary{
+		root:          root,
+		resultContent: `{`,
+		terminal:      "prompt example: " + clean + "\n" + clean + "\n" + clean,
+	}
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: base}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "review this"}
+	defaultReviewer := config.Default(attempt.Repository).Commands.Reviewer
+	started, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, defaultReviewer, issue, agentruntime.Manifest{}, source, head, root)
+	if err != nil || !pending {
+		t.Fatalf("start pending=%v err=%v", pending, err)
+	}
+	if slices.Contains(boundary.respawn, "review") || slices.Contains(boundary.respawn, "--output-last-message") || !slices.Contains(boundary.respawn, reviewResultPath(started.Snapshot, head)) || !slices.Contains(boundary.respawn, "--sandbox") || !slices.Contains(boundary.respawn, "read-only") || !slices.Contains(boundary.respawn, "-") {
+		t.Fatalf("default reviewer did not receive result artifact: %q", boundary.respawn)
+	}
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	if _, _, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, defaultReviewer, issue, manifest, source, head, root); err == nil {
+		t.Fatal("malformed artifact was accepted")
+	}
+	resultPath := reviewResultPath(started.Snapshot, head)
+	if _, err := os.Stat(resultPath); err != nil {
+		t.Fatalf("artifact was not preserved for retry: %v", err)
+	}
+	if err := os.WriteFile(resultPath, []byte(clean), 0o660); err != nil {
+		t.Fatal(err)
+	}
+	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, defaultReviewer, issue, manifest, source, head, root)
+	if err != nil || pending || result.Status != "clean" {
+		t.Fatalf("result=%#v pending=%v err=%v", result, pending, err)
+	}
+	if boundary.captureCalls != 0 {
+		t.Fatalf("tmux transcript was captured %d times", boundary.captureCalls)
+	}
+}
+
+func TestReviewResultReadFailureRetriesWithoutRespawningReviewer(t *testing.T) {
+	source, root := t.TempDir(), t.TempDir()
+	runGit(t, source, "init")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "config", "user.name", "test")
+	runGit(t, source, "commit", "--allow-empty", "-m", "base")
+	base := runGit(t, source, "rev-parse", "HEAD")
+	runGit(t, source, "commit", "--allow-empty", "-m", "head")
+	head := runGit(t, source, "rev-parse", "HEAD")
+	boundary := &artifactReviewBoundary{root: root, failReads: 1, resultContent: `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`}
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: base}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number}
+	command := config.Default(attempt.Repository).Commands.Reviewer
+	started, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, command, issue, agentruntime.Manifest{}, source, head, root)
+	if err != nil || !pending {
+		t.Fatalf("start pending=%v err=%v", pending, err)
+	}
+	defer func() {
+		_ = cleanupReviewResources(t.Context(), boundary, nil, attempt, head, started.Snapshot, started.Session, root)
+	}()
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	if _, pending, err = runIndependentReview(t.Context(), nil, attempt, boundary, nil, command, issue, manifest, source, head, root); err != nil || !pending {
+		t.Fatalf("transient read pending=%v err=%v", pending, err)
+	}
+	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, command, issue, manifest, source, head, root)
+	if err != nil || pending || result.Status != "clean" || boundary.respawns != 1 {
+		t.Fatalf("result=%#v pending=%v respawns=%d err=%v", result, pending, boundary.respawns, err)
+	}
+}
+
+func TestInvalidReviewArtifactFailsWithoutRespawningReviewer(t *testing.T) {
+	source, root := t.TempDir(), t.TempDir()
+	runGit(t, source, "init")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "config", "user.name", "test")
+	runGit(t, source, "commit", "--allow-empty", "-m", "base")
+	base := runGit(t, source, "rev-parse", "HEAD")
+	runGit(t, source, "commit", "--allow-empty", "-m", "head")
+	head := runGit(t, source, "rev-parse", "HEAD")
+	boundary := &artifactReviewBoundary{root: root, invalidReads: 1, resultContent: `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`}
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 24, Number: 1, BaseSHA: base}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number}
+	command := config.Default(attempt.Repository).Commands.Reviewer
+	started, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, command, issue, agentruntime.Manifest{}, source, head, root)
+	if err != nil || !pending {
+		t.Fatalf("start pending=%v err=%v", pending, err)
+	}
+	defer func() {
+		_ = cleanupReviewResources(t.Context(), boundary, nil, attempt, head, started.Snapshot, started.Session, root)
+	}()
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	if _, pending, err = runIndependentReview(t.Context(), nil, attempt, boundary, nil, command, issue, manifest, source, head, root); err == nil || pending || boundary.respawns != 1 {
+		t.Fatalf("invalid artifact pending=%v respawns=%d err=%v", pending, boundary.respawns, err)
+	}
+}
+
+func TestReviewCaptureHelperRoutesOnlyStdoutToArtifact(t *testing.T) {
+	dir := t.TempDir()
+	tmux := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase \"$1\" in\nsave-buffer) printf 'review prompt';;\ndelete-buffer) :;;\n*) exit 1;;\nesac\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resultRoot := filepath.Join(dir, "result")
+	if err := os.Mkdir(resultRoot, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	resultPath := filepath.Join(resultRoot, "result.json")
+	var stdout, stderr bytes.Buffer
+	code, err := agentruntime.CaptureWorker(t.Context(), tmux, "buffer", resultPath, []string{"sh", "-c", `test "$(cat)" = "review prompt" || exit 9; printf '{"type":"agent-symphony-review-v1","status":"clean","findings":[]}'; printf 'diagnostic' >&2`}, &stdout, &stderr)
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	body, err := os.ReadFile(resultPath)
+	if err != nil || string(body) != `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}` || stdout.Len() != 0 || stderr.String() != "diagnostic" {
+		t.Fatalf("artifact=%q stdout=%q stderr=%q err=%v", body, stdout.String(), stderr.String(), err)
+	}
+}
+
+func TestDefaultReviewerProductionShapeUsesExactDiffAndRejectsProse(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	dir := t.TempDir()
+	codex := filepath.Join(dir, "codex")
+	const script = `#!/bin/sh
+test "$#" -eq 4 && test "$1" = exec && test "$2" = --sandbox && test "$3" = read-only && test "$4" = - || exit 20
+prompt=$(cat) || exit 21
+printf '%s' "$prompt" | grep -F "$FAKE_REVIEW_BASE..HEAD" >/dev/null || exit 22
+diff=$(git -C "$FAKE_REVIEW_REPO" diff --no-ext-diff "$FAKE_REVIEW_BASE" HEAD) || exit 23
+printf '%s' "$diff" | grep -F '+first implementation commit' >/dev/null || exit 24
+printf '%s' "$diff" | grep -F '+second implementation commit' >/dev/null || exit 25
+printf x >>"$FAKE_REVIEW_COUNT"
+printf '%s' "$FAKE_REVIEW_OUTPUT"
+printf 'review diagnostic\n' >&2`
+	if err := os.WriteFile(codex, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tmuxRoot, err := os.MkdirTemp("/tmp", "agent-symphony-review-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmuxRoot) })
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_PANE", "")
+	t.Setenv("TMUX_TMPDIR", tmuxRoot)
+	bootstrap := exec.Command("tmux", "-f", "/dev/null", "new-session", "-d", "-s", "agent-symphony-test-bootstrap")
+	if output, err := bootstrap.CombinedOutput(); err != nil {
+		t.Fatalf("start isolated tmux server: %v: %s", err, output)
+	}
+	t.Cleanup(func() {
+		command := exec.Command("tmux", "kill-session", "-t", "=agent-symphony-test-bootstrap")
+		_ = command.Run()
+	})
+	source := t.TempDir()
+	runGit(t, source, "init")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("before\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "file")
+	runGit(t, source, "commit", "-m", "base")
+	base := runGit(t, source, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(source, "first"), []byte("first implementation commit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "first")
+	runGit(t, source, "commit", "-m", "first implementation commit")
+	if err := os.WriteFile(filepath.Join(source, "second"), []byte("second implementation commit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "second")
+	runGit(t, source, "commit", "-m", "second implementation commit")
+	t.Setenv("FAKE_REVIEW_REPO", source)
+	t.Setenv("FAKE_REVIEW_BASE", base)
+	defaultReviewer := config.Default("o/r").Commands.Reviewer
+
+	for i, test := range []struct {
+		name, output string
+		wantErr      bool
+	}{
+		{"strict result", `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`, false},
+		{"prose", `No findings.`, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			count := filepath.Join(dir, fmt.Sprintf("count-%d", i))
+			t.Setenv("FAKE_REVIEW_COUNT", count)
+			t.Setenv("FAKE_REVIEW_OUTPUT", test.output)
+			buffer := fmt.Sprintf("review-%d", i)
+			load := exec.Command("tmux", "load-buffer", "-b", buffer, "-")
+			load.Stdin = strings.NewReader(reviewPrompt(internalgithub.RecoveryIssueFact{Issue: 23 + i, Attempt: 1, Body: "Review the change."}, base))
+			if output, err := load.CombinedOutput(); err != nil {
+				t.Fatalf("load real tmux prompt: %v: %s", err, output)
+			}
+			resultRoot := filepath.Join(dir, fmt.Sprintf("result-%d", i))
+			if err := os.Mkdir(resultRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			resultPath := filepath.Join(resultRoot, "result.json")
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			code, err := agentruntime.CaptureWorker(ctx, "tmux", buffer, resultPath, defaultReviewer, io.Discard, io.Discard)
+			if err != nil || code != 0 {
+				t.Fatalf("default reviewer capture code=%d err=%v", code, err)
+			}
+			body, err := os.ReadFile(resultPath)
+			_, parseErr := parseIndependentReview(string(body))
+			if err != nil || (parseErr != nil) != test.wantErr {
+				t.Fatalf("result=%q read=%v parse=%v", body, err, parseErr)
+			}
+			if body, err := os.ReadFile(count); err != nil || string(body) != "x" {
+				t.Fatalf("default reviewer runs=%q err=%v", body, err)
+			}
+		})
+	}
+}
+
+func TestIndependentReviewRequiresAvailableApprovedBase(t *testing.T) {
+	source := t.TempDir()
+	runGit(t, source, "init")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "config", "user.name", "test")
+	runGit(t, source, "commit", "--allow-empty", "-m", "head")
+	head := runGit(t, source, "rev-parse", "HEAD")
+	for i, test := range []struct {
+		base          string
+		boundaryCalls countingReviewBoundary
+	}{{"", 0}, {strings.Repeat("b", 40), 1}} {
+		var boundary countingReviewBoundary
+		_, pending, err := runIndependentReview(t.Context(), nil, agentruntime.Attempt{Repository: "o/r", Issue: 30 + i, Number: 1, BaseSHA: test.base}, &boundary, nil, []string{"reviewer"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 30 + i, Attempt: 1}, agentruntime.Manifest{}, source, head, t.TempDir())
+		if err == nil || pending || boundary != test.boundaryCalls {
+			t.Fatalf("base=%q pending=%v boundary=%d err=%v", test.base, pending, boundary, err)
+		}
 	}
 }
 
@@ -364,8 +675,7 @@ func TestWorkerExportRejectsMaliciousOrOversizedBundleBeforeImport(t *testing.T)
 }
 
 func TestStructuredReviewResultIsBoundedAndFindingsBlockClean(t *testing.T) {
-	clean, err := parseIndependentReview(`noise
-{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`)
+	clean, err := parseIndependentReview(`{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`)
 	if err != nil || clean.Status != "clean" {
 		t.Fatalf("clean=%#v err=%v", clean, err)
 	}
@@ -378,6 +688,12 @@ func TestStructuredReviewResultIsBoundedAndFindingsBlockClean(t *testing.T) {
 	}
 	if _, err := parseIndependentReview("{\"type\":\"agent-symphony-review-v1\",\"status\":\"findings\",\"findings\":[\"fix\"]}\n{\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]}"); err == nil {
 		t.Fatal("accepted multiple structured results")
+	}
+	if _, err := parseIndependentReview(`{"type":"agent-symphony-review-v1","status":"clean","findings":[],"extra":true}`); err == nil {
+		t.Fatal("accepted unknown field")
+	}
+	if _, err := parseIndependentReview(strings.Repeat("x", maxReviewResultSize+1)); err == nil {
+		t.Fatal("accepted oversized result")
 	}
 }
 
@@ -507,9 +823,11 @@ func TestRunningReviewUnobservableRebuildsWithoutDurableFailure(t *testing.T) {
 			runGit(t, source, "init")
 			runGit(t, source, "config", "user.email", "test@example.invalid")
 			runGit(t, source, "config", "user.name", "test")
+			runGit(t, source, "commit", "--allow-empty", "-m", "base")
+			baseSHA := runGit(t, source, "rev-parse", "HEAD")
 			runGit(t, source, "commit", "--allow-empty", "-m", "head")
 			head := runGit(t, source, "rev-parse", "HEAD")
-			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: baseSHA}
 			snapshot, session := reviewIdentity(attempt, reviewSnapshotRoot)
 			if err := os.Mkdir(snapshot, 0o700); err != nil {
 				t.Fatal(err)
@@ -560,7 +878,7 @@ func TestReviewCleanupRejectsForeignOutsideAndSymlinkIdentity(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var boundary countingReviewBoundary
-			if err := cleanupReviewResources(t.Context(), &boundary, nil, attempt, test.snapshot, test.session, reviewSnapshotRoot); err == nil {
+			if err := cleanupReviewResources(t.Context(), &boundary, nil, attempt, strings.Repeat("a", 40), test.snapshot, test.session, reviewSnapshotRoot); err == nil {
 				t.Fatal("unsafe cleanup identity accepted")
 			}
 			if boundary != 0 {
@@ -573,11 +891,11 @@ func TestReviewCleanupRejectsForeignOutsideAndSymlinkIdentity(t *testing.T) {
 	}
 }
 
-func (b *blockingReviewBoundary) call(ctx context.Context, _ string, command agentruntime.Command) (agentruntime.Result, error) {
+func (b *blockingReviewBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
 	if slices.Contains(command.Args, "display-message") {
 		return agentruntime.Result{Output: "1 0"}, nil
 	}
-	if slices.Contains(command.Args, "capture-pane") {
+	if operation == "review-result" {
 		return agentruntime.Result{Output: `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`}, nil
 	}
 	if !b.block {
@@ -615,13 +933,15 @@ func TestPreparingReviewCleanupRetainsStateAndRetries(t *testing.T) {
 			runGit(t, source, "init")
 			runGit(t, source, "config", "user.email", "test@example.invalid")
 			runGit(t, source, "config", "user.name", "test")
+			runGit(t, source, "commit", "--allow-empty", "-m", "base")
+			baseSHA := runGit(t, source, "rev-parse", "HEAD")
 			if err := os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			runGit(t, source, "add", "file")
 			runGit(t, source, "commit", "-m", "head")
 			head := runGit(t, source, "rev-parse", "HEAD")
-			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: baseSHA}
 			snapshot, session := filepath.Join(base, "o-r-23-1"), "as-review-23-1"
 			manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed"}
 			if test.preparing {
@@ -695,7 +1015,14 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	if err := os.Mkdir(snapshot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+	resultPath := reviewResultPath(snapshot, "head")
+	if err := os.MkdirAll(filepath.Dir(resultPath), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(resultPath, []byte(`{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`), 0o660); err != nil {
+		t.Fatal(err)
+	}
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
 	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "running", ReviewHead: "head", ReviewSnapshot: snapshot, ReviewSession: "as-review-23-1"}
 	sum := sha256.Sum256([]byte(attempt.Repository))
 	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
@@ -734,6 +1061,9 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	if _, err := os.Stat(snapshot); err != nil {
 		t.Fatalf("cleanup removed retained snapshot: %v", err)
 	}
+	if _, err := os.Stat(resultPath); err != nil {
+		t.Fatalf("cleanup removed result before durable acknowledgment: %v", err)
+	}
 
 	boundary.block = false
 	stored, err = cleanupReviewOutcome(t.Context(), &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, stored, reviewSnapshotRoot)
@@ -742,6 +1072,9 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	}
 	if _, err := os.Stat(snapshot); !os.IsNotExist(err) {
 		t.Fatalf("retry retained snapshot: %v", err)
+	}
+	if _, err := os.Stat(resultPath); !os.IsNotExist(err) {
+		t.Fatalf("retry retained result artifact: %v", err)
 	}
 }
 
