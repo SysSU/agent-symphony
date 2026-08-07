@@ -241,7 +241,7 @@ func TestFetchAttemptFactsPaginatesMarkersAndChecks(t *testing.T) {
 		var body any
 		switch r.URL.Path + "?" + r.URL.RawQuery {
 		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1":
-			body = []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}}}
+			body = []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}, "performed_via_github_app": nil}}
 		case "/repos/o/r/issues/4?":
 			body = map[string]any{"state": "open"}
 		case "/repos/o/r/issues/4/comments?per_page=100&page=1":
@@ -270,7 +270,7 @@ func TestFetchAttemptFactsRequiresAppMarkerSnapshotAndSafeCompletion(t *testing.
 	responses := map[string]string{
 		"/repos/o/r/pulls": `[
 			{"number":8,"body":"agent-symphony:issue:4:attempt:1","state":"open","head":{"sha":"aaaaaaa","ref":"bad"},"base":{"sha":"bbbbbbb"},"user":{"id":9},"performed_via_github_app":{"id":7}},
-			{"number":9,"body":` + quoteJSON(marker) + `,"state":"open","head":{"sha":"ccccccc","ref":"` + branch + `"},"base":{"sha":"bbbbbbb"},"user":{"id":42},"performed_via_github_app":{"id":7}}
+			{"number":9,"body":` + quoteJSON(marker) + `,"state":"open","head":{"sha":"ccccccc","ref":"` + branch + `"},"base":{"sha":"bbbbbbb"},"user":{"id":42},"performed_via_github_app":null}
 		]`,
 		"/repos/o/r/issues/4":                   `{"state":"closed"}`,
 		"/repos/o/r/issues/4/comments":          `[{"body":` + quoteJSON(marker) + `,"user":{"id":42},"performed_via_github_app":{"id":7}}]`,
@@ -289,6 +289,72 @@ func TestFetchAttemptFactsRequiresAppMarkerSnapshotAndSafeCompletion(t *testing.
 	}
 }
 
+func TestFindPublishedAttemptRecoversBotPRWithoutAppAttribution(t *testing.T) {
+	branch, _ := AttemptBranch("o/r", 4, 2)
+	pull := map[string]any{"number": 9, "body": "pre-bind", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "user": map[string]any{"id": 42}, "performed_via_github_app": nil}
+	pulls := []any{pull}
+	api := fixtureAPI(t, map[string]any{"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": pulls})
+	for range 2 {
+		pr, body, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 7, 42)
+		if err != nil || pr.Number != 9 || body != "pre-bind" {
+			t.Fatalf("pr=%#v body=%q err=%v", pr, body, err)
+		}
+	}
+
+	pull["user"] = map[string]any{"id": 9}
+	if _, _, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 7, 42); err == nil {
+		t.Fatal("foreign actor owned deterministic pull request")
+	}
+	pull["user"] = map[string]any{"id": 42}
+	pull["performed_via_github_app"] = map[string]any{"id": 8}
+	if _, _, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 7, 42); err == nil {
+		t.Fatal("foreign App owned deterministic pull request")
+	}
+	pull["performed_via_github_app"] = nil
+	for _, identity := range []map[string]any{{"sha": "ddddddd", "ref": branch}, {"sha": "ccccccc", "ref": "other"}} {
+		pull["head"] = identity
+		pr, _, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 7, 42)
+		if err != nil || pr.Number != 0 {
+			t.Fatalf("mismatched head was recovered: pr=%#v err=%v", pr, err)
+		}
+	}
+}
+
+func TestFetchAttemptFactsRejectsForeignPRActorAndCommentApp(t *testing.T) {
+	branch, _ := AttemptBranch("o/r", 4, 2)
+	marker, _ := AttemptMarker(4, 2, branch, "ccccccc", 9, "review")
+	for _, test := range []struct {
+		name         string
+		pullActor    int
+		pullApp      int64
+		commentActor int
+		commentApp   int64
+	}{
+		{name: "foreign PR actor", pullActor: 9, commentActor: 42, commentApp: 7},
+		{name: "foreign PR App", pullActor: 42, pullApp: 8, commentActor: 42, commentApp: 7},
+		{name: "foreign comment actor", pullActor: 42, commentActor: 9, commentApp: 7},
+		{name: "foreign comment App", pullActor: 42, commentActor: 42, commentApp: 8},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var pullApp any
+			if test.pullApp != 0 {
+				pullApp = map[string]any{"id": test.pullApp}
+			}
+			responses := map[string]any{
+				"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": test.pullActor}, "performed_via_github_app": pullApp}},
+			}
+			if test.pullActor == 42 && test.pullApp == 0 {
+				responses["/repos/o/r/issues/4"] = map[string]any{"state": "open"}
+				responses["/repos/o/r/issues/4/comments?per_page=100&page=1"] = []any{map[string]any{"body": marker, "user": map[string]any{"id": test.commentActor}, "performed_via_github_app": map[string]any{"id": test.commentApp}}}
+			}
+			facts, err := FetchAttemptFacts(context.Background(), fixtureAPI(t, responses), "o/r", 7, 42)
+			if err != nil || len(facts) != 0 {
+				t.Fatalf("facts=%#v err=%v", facts, err)
+			}
+		})
+	}
+}
+
 func TestFetchAttemptFactsRejectsTamperedMarkerBindings(t *testing.T) {
 	branch, _ := AttemptBranch("o/r", 4, 2)
 	valid, _ := AttemptMarker(4, 2, branch, "ccccccc", 9, "review")
@@ -299,7 +365,7 @@ func TestFetchAttemptFactsRejectsTamperedMarkerBindings(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			responses := map[string]string{
-				"/repos/o/r/pulls": `[{"number":9,"body":` + quoteJSON(test.marker) + `,"state":"open","head":{"sha":"ccccccc","ref":"` + branch + `"},"base":{"sha":"bbbbbbb"},"user":{"id":42},"performed_via_github_app":{"id":7}}]`,
+				"/repos/o/r/pulls": `[{"number":9,"body":` + quoteJSON(test.marker) + `,"state":"open","head":{"sha":"ccccccc","ref":"` + branch + `"},"base":{"sha":"bbbbbbb"},"user":{"id":42},"performed_via_github_app":null}]`,
 			}
 			api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(responses[r.URL.Path]))}, nil
