@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 )
 
 const recoveryMarkerPrefix = "<!-- agent-symphony:attempt:v1\n"
 const terminalMarkerPrefix = "<!-- agent-symphony:terminal:v1\n"
+const activeMarkerPrefix = "<!-- agent-symphony:active-attempt:v1\n"
 const recoveryPageLimit = 10
 
 type recoveryMarkerPayload struct {
@@ -28,6 +30,42 @@ type terminalMarkerPayload struct {
 	Version, Issue, Attempt int
 	Outcome                 string
 	FailedAt                time.Time `json:"failed_at"`
+}
+
+type activeMarkerPayload struct {
+	Version int    `json:"version"`
+	Issue   int    `json:"issue"`
+	Attempt int    `json:"attempt"`
+	Branch  string `json:"branch"`
+	BaseSHA string `json:"base_sha"`
+}
+
+func ActiveAttemptMarker(repository string, issue, attempt int, baseSHA string) (string, error) {
+	branch, err := AttemptBranch(repository, issue, attempt)
+	if err != nil || !regexpSHA.MatchString(baseSHA) {
+		return "", errors.New("active attempt marker requires its deterministic branch and approved base")
+	}
+	b, _ := json.Marshal(activeMarkerPayload{Version: 1, Issue: issue, Attempt: attempt, Branch: branch, BaseSHA: baseSHA})
+	return activeMarkerPrefix + string(b) + "\n-->", nil
+}
+
+func parseActiveAttemptMarker(body string) (activeMarkerPayload, error) {
+	start := strings.Index(body, activeMarkerPrefix)
+	if start < 0 || len(body) > 64<<10 || strings.Count(body, activeMarkerPrefix) != 1 {
+		return activeMarkerPayload{}, errors.New("active attempt marker is missing or duplicated")
+	}
+	rest := body[start+len(activeMarkerPrefix):]
+	end := strings.Index(rest, "\n-->")
+	if end < 0 || strings.TrimSpace(rest[end+4:]) != "" {
+		return activeMarkerPayload{}, errors.New("active attempt marker is malformed")
+	}
+	var marker activeMarkerPayload
+	decoder := json.NewDecoder(strings.NewReader(rest[:end]))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&marker) != nil || decoder.Decode(&struct{}{}) != io.EOF || marker.Version != 1 || marker.Issue < 1 || marker.Attempt < 1 || marker.Branch == "" || !regexpSHA.MatchString(marker.BaseSHA) {
+		return activeMarkerPayload{}, errors.New("active attempt marker is invalid")
+	}
+	return marker, nil
 }
 
 func TerminalFailureMarker(issue, attempt int, failedAt time.Time) (string, error) {
@@ -98,6 +136,8 @@ type RecoveryIssueFact struct {
 	Dependencies                                  []int
 	Blockers                                      []string
 	Eligible, Active, Completed, Retry, Cancelled bool
+	DispatchAuthorized                            bool
+	ActiveAttempt                                 *RecoveryAttemptFact
 }
 
 // FetchIssueFacts returns the authorized issue-control projection used by both
@@ -143,19 +183,49 @@ func FetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			if issue.PullRequest != nil {
 				continue
 			}
+			bindings, bindingConflict, err := fetchActiveAttempts(ctx, api, cfg, issue.Number)
+			if err != nil {
+				return nil, err
+			}
 			terminal, err := fetchTerminalFailure(ctx, api, cfg, issue.Number)
 			if err != nil {
 				return nil, err
+			}
+			var binding activeMarkerPayload
+			for _, candidate := range bindings {
+				bindingFinal := slices.ContainsFunc(attempts, func(attempt RecoveryAttemptFact) bool {
+					return attempt.Issue == issue.Number && attempt.Attempt == candidate.Attempt
+				})
+				if terminal.Attempt >= candidate.Attempt || bindingFinal {
+					continue
+				}
+				if binding.Attempt != 0 {
+					bindingConflict = true
+					continue
+				}
+				binding = candidate
+			}
+			if binding.Attempt >= next[issue.Number] {
+				next[issue.Number] = binding.Attempt + 1
 			}
 			if terminal.Attempt >= next[issue.Number] {
 				next[issue.Number] = terminal.Attempt + 1
 			}
 			controls, _, retry, err := source.authorizedControlsWithIntake(ctx, issue.Number, intake)
 			if err != nil {
-				result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: max(1, next[issue.Number]), Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Blockers: []string{err.Error()}, Active: active[issue.Number], Completed: completed[issue.Number]})
+				attempt := max(1, next[issue.Number])
+				var activeAttempt *RecoveryAttemptFact
+				if binding.Attempt > 0 {
+					attempt = binding.Attempt
+					activeAttempt = &RecoveryAttemptFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: "active"}
+				}
+				result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Blockers: []string{err.Error()}, Active: active[issue.Number] || binding.Attempt > 0 || bindingConflict, Completed: completed[issue.Number], ActiveAttempt: activeAttempt})
 				continue
 			}
 			blockers := []string{}
+			if bindingConflict {
+				blockers = append(blockers, "active attempt marker is foreign, malformed, or contradictory")
+			}
 			for _, dependency := range controls.Dependencies {
 				if !completed[dependency] {
 					blockers = append(blockers, fmt.Sprintf("dependency #%d is incomplete", dependency))
@@ -164,14 +234,104 @@ func FetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			if terminal.Attempt > 0 && !retryAuthorizesFailure(controls, retry, terminal) {
 				blockers = append(blockers, fmt.Sprintf("attempt %d has an App-authored terminal failure requiring a later authorized retry", terminal.Attempt))
 			}
-			eligible := controls.Ready && !controls.Closed && !controls.Cancelled && len(blockers) == 0 && !active[issue.Number] && !completed[issue.Number]
-			result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: max(1, next[issue.Number]), Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, Blockers: blockers, Eligible: eligible, Active: active[issue.Number], Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled})
+			authorized := controls.Ready && !controls.Closed && !controls.Cancelled && len(blockers) == 0
+			bound := binding.Attempt > 0
+			attempt := max(1, next[issue.Number])
+			var activeAttempt *RecoveryAttemptFact
+			if bound {
+				attempt = binding.Attempt
+				activeAttempt = &RecoveryAttemptFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: "active"}
+			}
+			isActive := active[issue.Number] || bound || bindingConflict
+			eligible := authorized && !isActive && !completed[issue.Number]
+			result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, DispatchAuthorized: authorized, ActiveAttempt: activeAttempt})
 		}
 		if len(issues) < 100 {
 			return result, nil
 		}
 	}
 	return nil, errors.New("open issues exceed bounded recovery limit")
+}
+
+func fetchActiveAttempts(ctx context.Context, api API, cfg PRAdapterConfig, issue int) ([]activeMarkerPayload, bool, error) {
+	found := map[int]activeMarkerPayload{}
+	conflict := false
+	for page := 1; page <= recoveryPageLimit; page++ {
+		var comments []struct {
+			Body string              `json:"body"`
+			User struct{ ID int }    `json:"user"`
+			App  *struct{ ID int64 } `json:"performed_via_github_app"`
+		}
+		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100&page=%d", cfg.Repository, issue, page), "", &comments); err != nil {
+			return nil, false, err
+		}
+		for _, comment := range comments {
+			if !strings.Contains(comment.Body, activeMarkerPrefix) {
+				continue
+			}
+			marker, err := parseActiveAttemptMarker(comment.Body)
+			branch, branchErr := AttemptBranch(cfg.Repository, marker.Issue, marker.Attempt)
+			trusted := comment.User.ID == cfg.AppActorID && comment.App != nil && comment.App.ID == cfg.AppID && cfg.AppID > 0 && cfg.AppActorID > 0
+			if err != nil || marker.Issue != issue || branchErr != nil || marker.Branch != branch || !trusted {
+				conflict = true
+				continue
+			}
+			if previous, ok := found[marker.Attempt]; ok && previous != marker {
+				conflict = true
+				continue
+			}
+			found[marker.Attempt] = marker
+		}
+		if len(comments) < 100 {
+			markers := make([]activeMarkerPayload, 0, len(found))
+			for _, marker := range found {
+				markers = append(markers, marker)
+			}
+			slices.SortFunc(markers, func(a, b activeMarkerPayload) int { return a.Attempt - b.Attempt })
+			return markers, conflict, nil
+		}
+	}
+	return nil, false, errors.New("issue comments exceed bounded recovery limit")
+}
+
+func EnsureActiveAttempt(ctx context.Context, api API, cfg PRAdapterConfig, issue, attempt int, baseSHA string) error {
+	marker, err := ActiveAttemptMarker(cfg.Repository, issue, attempt, baseSHA)
+	if err != nil {
+		return err
+	}
+	check := func() (bool, error) {
+		found, conflict, err := fetchActiveAttempts(ctx, api, cfg, issue)
+		if err != nil {
+			return false, err
+		}
+		if conflict {
+			return false, errors.New("active attempt marker conflicts with dispatch")
+		}
+		present := false
+		for _, marker := range found {
+			if marker.Attempt > attempt || marker.Attempt == attempt && marker.BaseSHA != baseSHA {
+				return false, errors.New("active attempt marker conflicts with dispatch")
+			}
+			present = present || marker.Attempt == attempt
+		}
+		return present, nil
+	}
+	if present, err := check(); err != nil || present {
+		return err
+	}
+	message, _ := AttributedBody(issue, attempt, "Attempt bound for execution.")
+	createErr := api.CreateIssueComment(ctx, cfg.Repository, issue, message+"\n\n"+marker, Mutation{Issue: issue, Attempt: attempt})
+	present, confirmErr := check()
+	if confirmErr != nil {
+		return confirmErr
+	}
+	if present {
+		return nil
+	}
+	if createErr != nil {
+		return createErr
+	}
+	return errors.New("active attempt marker creation was not observable")
 }
 
 func retryAuthorizesFailure(controls Controls, retry *Provenance, terminal terminalMarkerPayload) bool {

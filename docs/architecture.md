@@ -45,12 +45,16 @@ An eligible issue is open, has the configured ready label, has exactly one P1-P3
 GitHub stores durable execution facts using machine-readable HTML markers in coordinator-authored issue comments and PR bodies:
 
 ```text
+<!-- agent-symphony:active-attempt:v1
+{"version":1,"issue":8,"attempt":2,"branch":"agent-symphony/owner-repo-<hash>/8-2","base_sha":"<approved-base-sha>"}
+-->
+
 <!-- agent-symphony:attempt:v1
 {"version":1,"issue":8,"attempt":2,"branch":"agent-symphony/owner-repo-<hash>/8-2","head":"<commit-sha>","pr":31,"outcome":"review"}
 -->
 ```
 
-The marker schema is strict, size-bounded, binds the issue, branch, exact head, PR, and outcome, and is parsed only from the configured GitHub App identity. Human-readable text accompanies it. Attempt number is the next integer after the highest valid marker for the issue. Branch `agent-symphony/<repo-id>/<issue>-<attempt>`, worktree `<root>/<repo-id>-<issue>-<attempt>`, and tmux session `as-<repo-id>-<issue>-<attempt>` are deterministic. A PR contains `Closes #N` and the attempt marker. These identifiers make discovery possible without local files.
+The marker schemas are strict and size-bounded and are parsed only from the configured GitHub App identity. Dispatch persists the active marker before local mutation; it binds the approved base and deterministic branch until a matching final PR marker or terminal marker supersedes it. Human-readable text accompanies each marker. Attempt number is the next integer after the highest valid marker for the issue. Branch `agent-symphony/<repo-id>/<issue>-<attempt>`, worktree `<root>/<repo-id>-<issue>-<attempt>`, and tmux session `as-<repo-id>-<issue>-<attempt>` are deterministic. A PR contains `Closes #N` and the final attempt marker. These identifiers make discovery possible without local files.
 
 Issue/PR state, labels, comments, reviews, check runs, branch heads, and repository rules always beat local metadata. A contradiction blocks mutation, emits diagnostics, and requests reconciliation. Local files may never make completed work eligible again.
 

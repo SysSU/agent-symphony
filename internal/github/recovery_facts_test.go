@@ -24,6 +24,73 @@ func TestTerminalFailureRequiresStrictAppAuthorship(t *testing.T) {
 	}
 }
 
+func TestEnsureActiveAttemptIsStrictAppAuthoredAndIdempotent(t *testing.T) {
+	marker, err := ActiveAttemptMarker("o/r", 4, 2, "abcdef0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var comments []map[string]any
+	posts := 0
+	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.Method {
+		case http.MethodGet:
+			body, _ := json.Marshal(comments)
+			return httpResponse(http.StatusOK, string(body), nil), nil
+		case http.MethodPost:
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil || !strings.Contains(payload.Body, marker) {
+				t.Fatal("dispatch did not persist the active marker")
+			}
+			comments = append(comments, map[string]any{"body": payload.Body, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}})
+			posts++
+			if posts == 1 {
+				return nil, io.ErrUnexpectedEOF // GitHub accepted it; the response was lost.
+			}
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		default:
+			t.Fatalf("unexpected request %s", r.Method)
+		}
+		return nil, nil
+	})}}
+	cfg := PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}
+	for range 2 {
+		if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if posts != 1 {
+		t.Fatalf("marker posts=%d, want 1", posts)
+	}
+	comments = append(comments, map[string]any{"body": marker, "user": map[string]any{"id": 9}, "performed_via_github_app": map[string]any{"id": 7}})
+	if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0"); err == nil || posts != 1 {
+		t.Fatalf("foreign marker err=%v posts=%d", err, posts)
+	}
+}
+
+func TestActiveAttemptMarkerRejectsHostileAndContradictoryComments(t *testing.T) {
+	first, _ := ActiveAttemptMarker("o/r", 4, 2, "abcdef0")
+	second, _ := ActiveAttemptMarker("o/r", 4, 2, "abcdef1")
+	for _, test := range []struct {
+		name     string
+		comments []any
+	}{
+		{"malformed", []any{map[string]any{"body": activeMarkerPrefix + `{}`, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}}}},
+		{"foreign", []any{map[string]any{"body": first, "user": map[string]any{"id": 9}, "performed_via_github_app": map[string]any{"id": 7}}}},
+		{"contradictory", []any{
+			map[string]any{"body": first, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
+			map[string]any{"body": second, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := fixtureAPI(t, map[string]any{"/repos/o/r/issues/4/comments?per_page=100&page=1": test.comments})
+			_, conflict, err := fetchActiveAttempts(context.Background(), api, PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}, 4)
+			if err != nil || !conflict {
+				t.Fatalf("conflict=%v err=%v", conflict, err)
+			}
+		})
+	}
+}
+
 func TestRetryMustFollowEveryTerminalFailure(t *testing.T) {
 	retry := &Provenance{Name: "retry", Value: "true", CreatedAt: time.Unix(20, 0)}
 	controls := Controls{Retry: true}
@@ -146,6 +213,18 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	}
 	if posts != 2 {
 		t.Fatalf("replacement snapshot posts=%d, want 2 total", posts)
+	}
+	marker, _ := ActiveAttemptMarker("o/r", 10, 2, "abcdef0")
+	snapshotBodies = append(snapshotBodies, marker)
+	bound, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || len(bound) != 1 || bound[0].Eligible || !bound[0].Active || !bound[0].DispatchAuthorized || bound[0].Attempt != 2 || bound[0].ActiveAttempt == nil || bound[0].ActiveAttempt.BaseSHA != "abcdef0" {
+		t.Fatalf("bound facts=%#v err=%v", bound, err)
+	}
+	terminal, _ := TerminalFailureMarker(10, 2, now.Add(20*time.Minute))
+	snapshotBodies = append(snapshotBodies, terminal)
+	failed, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || len(failed) != 1 || failed[0].Active || failed[0].ActiveAttempt != nil || failed[0].Attempt != 3 || len(failed[0].Blockers) == 0 {
+		t.Fatalf("terminal transition facts=%#v err=%v", failed, err)
 	}
 }
 

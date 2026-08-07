@@ -712,6 +712,14 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if err != nil {
 		return nil, err
 	}
+	for i := range issues {
+		if binding := issues[i].ActiveAttempt; binding != nil && !slices.ContainsFunc(remote, func(f internalgithub.RecoveryAttemptFact) bool {
+			return f.Repository == binding.Repository && f.Issue == binding.Issue && f.Attempt == binding.Attempt
+		}) {
+			remote = append(remote, *binding)
+			facts = append(facts, orchestrator.AttemptFact{Repository: binding.Repository, Issue: binding.Issue, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: binding.State})
+		}
+	}
 	boundary := implementationBoundary(stateRoot)
 	binary, err := os.Executable()
 	if err != nil {
@@ -730,13 +738,23 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if err != nil {
 		return nil, err
 	}
+	if transition {
+		manifests, err = resumeBoundAttempts(ctx, &r, c, issues, manifests, remote)
+		if err != nil {
+			return nil, err
+		}
+	}
 	for i := range issues {
 		issues[i].Active = issues[i].Active || slices.ContainsFunc(manifests, func(m agentruntime.Manifest) bool {
 			return m.Repository == issues[i].Repository && m.Issue == issues[i].Issue && (m.State == "preparing" || m.State == "running")
 		})
 		for _, manifest := range manifests {
 			if manifest.Repository == issues[i].Repository && manifest.Issue == issues[i].Issue && (manifest.State == "failed" || manifest.State == "cancelled" || manifest.State == "completed") {
-				if issues[i].Retry {
+				bound := issues[i].ActiveAttempt != nil && issues[i].ActiveAttempt.Attempt == manifest.Attempt
+				if bound {
+					continue
+				}
+				if issues[i].Retry && issues[i].Attempt > manifest.Attempt {
 					issues[i].Attempt = max(issues[i].Attempt, manifest.Attempt+1)
 				} else {
 					issues[i].Eligible = false
@@ -768,13 +786,13 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if err := internalgithub.RunPRReconciliation(ctx, api, prConfig, statePath); err != nil {
 		return statuses, err
 	}
-	if err := monitorAttempts(ctx, &r, statuses, manifests); err != nil {
+	if err := monitorAttempts(ctx, &r, statuses, manifests, issues); err != nil {
 		return statuses, err
 	}
 	if err := monitorQueuedAttempts(ctx, api, &r, c, issues, manifests, remote, stateRoot); err != nil {
 		return statuses, err
 	}
-	if err := dispatchIssues(ctx, &r, c, issues, decisions); err != nil {
+	if err := dispatchIssues(ctx, api, &r, c, prConfig, issues, decisions); err != nil {
 		return statuses, err
 	}
 	if err := resumeHandoffs(ctx, &r, statePath, stateRoot, statuses, manifests); err != nil {
@@ -844,7 +862,33 @@ func seedAttemptSource(ctx context.Context, repository, attemptRoot string) (str
 	return path, nil
 }
 
-func dispatchIssues(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, decisions []orchestrator.Decision) error {
+func startIssueAttempt(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact) (agentruntime.Manifest, error) {
+	prompt := implementationPrompt(issue)
+	return runtime.PrepareAndStart(ctx, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Context: prompt, Command: cfg.Commands.Implementation, Eligible: func() bool { return issue.DispatchAuthorized }})
+}
+
+func resumeBoundAttempts(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact) ([]agentruntime.Manifest, error) {
+	for _, issue := range issues {
+		binding := issue.ActiveAttempt
+		remoteConflict := slices.ContainsFunc(remote, func(fact internalgithub.RecoveryAttemptFact) bool {
+			return fact.PR > 0 && fact.Repository == issue.Repository && fact.Issue == issue.Issue && (fact.State == "active" || fact.State == "review-ready" || fact.State == "completed")
+		})
+		if binding == nil || !issue.DispatchAuthorized || remoteConflict || slices.ContainsFunc(manifests, func(manifest agentruntime.Manifest) bool {
+			return manifest.Repository == binding.Repository && manifest.Issue == binding.Issue && manifest.Attempt == binding.Attempt
+		}) {
+			continue
+		}
+		issue.Attempt, issue.BaseSHA = binding.Attempt, binding.BaseSHA
+		manifest, err := startIssueAttempt(ctx, runtime, cfg, issue)
+		if err != nil {
+			return manifests, fmt.Errorf("resume bound %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
+		}
+		manifests = append(manifests, manifest)
+	}
+	return manifests, nil
+}
+
+func dispatchIssues(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, prConfig internalgithub.PRAdapterConfig, issues []internalgithub.RecoveryIssueFact, decisions []orchestrator.Decision) error {
 	for _, decision := range decisions {
 		if decision.State != orchestrator.Runnable {
 			continue
@@ -856,9 +900,11 @@ func dispatchIssues(ctx context.Context, runtime *agentruntime.Runtime, cfg conf
 			return errors.New("scheduler returned an unknown issue")
 		}
 		issue := issues[index]
-		prompt := implementationPrompt(issue)
-		_, err := runtime.PrepareAndStart(ctx, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Context: prompt, Command: cfg.Commands.Implementation, Eligible: func() bool { return issue.Eligible }})
-		if err != nil {
+		if err := internalgithub.EnsureActiveAttempt(ctx, api, prConfig, issue.Issue, issue.Attempt, issue.BaseSHA); err != nil {
+			return fmt.Errorf("bind dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
+		}
+		issue.DispatchAuthorized = issue.Eligible
+		if _, err := startIssueAttempt(ctx, runtime, cfg, issue); err != nil {
 			return fmt.Errorf("dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
 		}
 	}
@@ -1167,9 +1213,10 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string
 
 func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, stateRoot string) error {
 	for _, manifest := range manifests {
-		if slices.ContainsFunc(remote, func(f internalgithub.RecoveryAttemptFact) bool {
+		remoteIndex := slices.IndexFunc(remote, func(f internalgithub.RecoveryAttemptFact) bool {
 			return f.Repository == manifest.Repository && f.Issue == manifest.Issue && f.Attempt == manifest.Attempt
-		}) {
+		})
+		if remoteIndex < 0 || remote[remoteIndex].PR > 0 || remote[remoteIndex].BaseSHA != manifest.BaseSHA {
 			continue
 		}
 		index := slices.IndexFunc(issues, func(i internalgithub.RecoveryIssueFact) bool {
@@ -1179,13 +1226,12 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			continue
 		}
 		issue := issues[index]
+		if !issue.DispatchAuthorized {
+			continue
+		}
 		current := manifest
 		if manifest.State == "preparing" || manifest.State == "running" {
-			var err error
-			current, err = runtime.Monitor(ctx, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Eligible: func() bool { return issue.Eligible }})
-			if err != nil {
-				return err
-			}
+			continue // monitorAttempts owns live bound attempts from the same snapshot.
 		}
 		if current.State == "completed" {
 			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot)
@@ -1628,7 +1674,7 @@ func durableAttemptFailure(ctx context.Context, api internalgithub.API, issue in
 	return nil
 }
 
-func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest) error {
+func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, issues []internalgithub.RecoveryIssueFact) error {
 	for _, status := range statuses {
 		if status.Action != "resume monitoring the matching attempt" {
 			continue
@@ -1640,7 +1686,10 @@ func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuse
 				break
 			}
 		}
-		_, err := runtime.Monitor(ctx, agentruntime.Attempt{Repository: status.Repository, Issue: status.Issue, Number: status.Attempt, BaseSHA: base})
+		authorized := slices.ContainsFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
+			return issue.Repository == status.Repository && issue.Issue == status.Issue && issue.DispatchAuthorized
+		})
+		_, err := runtime.Monitor(ctx, agentruntime.Attempt{Repository: status.Repository, Issue: status.Issue, Number: status.Attempt, BaseSHA: base, Eligible: func() bool { return authorized }})
 		if err != nil {
 			return fmt.Errorf("monitor %s#%d attempt %d: %w", status.Repository, status.Issue, status.Attempt, err)
 		}

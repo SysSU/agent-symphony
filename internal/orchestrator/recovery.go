@@ -148,6 +148,8 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 				status.State, status.Blockers, status.Diagnostic, status.Action = "blocked", []string{"runtime base mismatch"}, "local base does not match GitHub", "preserve diagnostics and create a new traceable attempt"
 			case manifest.State == "failed":
 				status.State, status.Diagnostic, status.Action = "failed", manifest.Diagnostic, "inspect the retained log and retry with a new attempt"
+			case fact.State == "active" && fact.PR == 0 && manifest.State == "completed":
+				status.Action = "resume publication of the matching completed attempt"
 			case (fact.State == "active" || fact.State == "review-ready") && manifest.State == "running" && check != nil && check(ctx, manifest, fact) == nil:
 				status.Action = "resume monitoring the matching attempt"
 			case fact.State == "active" || fact.State == "review-ready":

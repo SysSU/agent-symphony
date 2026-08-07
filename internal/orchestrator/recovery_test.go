@@ -106,6 +106,15 @@ func TestRecoverBlocksFailedExactLivenessCheck(t *testing.T) {
 	}
 }
 
+func TestRecoverActiveBindingRetainsCompletedAttemptForPublication(t *testing.T) {
+	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "active"}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "completed", Session: "as-o-r-4-2", ReviewState: "running"}
+	got := RecoverChecked(context.Background(), []AttemptFact{fact}, []agentruntime.Manifest{manifest}, func(context.Context, agentruntime.Manifest, AttemptFact) error { return nil })
+	if len(got) != 1 || got[0].State != "active" || got[0].Action != "resume publication of the matching completed attempt" {
+		t.Fatalf("got %#v", got)
+	}
+}
+
 func TestReconcileLoopRejectsSlowInterval(t *testing.T) {
 	if err := ReconcileLoop(context.Background(), 61*time.Second, nil, func(context.Context) error { return nil }); err == nil {
 		t.Fatal("accepted interval over 60 seconds")
