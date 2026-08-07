@@ -302,14 +302,20 @@ func TestBotFeedbackRejectedOnListAndRefetch(t *testing.T) {
 	}
 }
 
-func TestClassicProtectionUnavailableContinuesToRulesFailClosedAndIdempotent(t *testing.T) {
+func TestUnavailableBranchProtectionContinuesFailClosedAndIdempotent(t *testing.T) {
+	unavailable := fixtureHTTP{http.StatusForbidden, `{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","documentation_url":"https://docs.github.com/rest/repos/rules#get-rules-for-a-branch","status":"403"}`}
+	available := []any{map[string]any{"type": "required_status_checks", "parameters": map[string]any{"required_status_checks": []any{map[string]any{"context": PolicyCheck, "integration_id": 7}}}}}
 	for _, test := range []struct {
 		name       string
 		protection fixtureHTTP
+		rules      any
 		allows     bool
+		policy     bool
 	}{
-		{"404 means unprotected", fixtureHTTP{http.StatusNotFound, `{"message":"Branch not protected"}`}, true},
-		{"private plan unavailable", fixtureHTTP{http.StatusForbidden, `{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"403"}`}, false},
+		{"available after classic 404", fixtureHTTP{http.StatusNotFound, `{"message":"Branch not protected"}`}, available, true, true},
+		{"available after classic unavailable", fixtureHTTP{http.StatusForbidden, `{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"403"}`}, available, false, true},
+		{"unavailable after classic 404", fixtureHTTP{http.StatusNotFound, `{"message":"Branch not protected"}`}, unavailable, false, false},
+		{"unavailable after classic unavailable", fixtureHTTP{http.StatusForbidden, `{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"403"}`}, unavailable, false, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			responses := map[string]any{
@@ -317,7 +323,7 @@ func TestClassicProtectionUnavailableContinuesToRulesFailClosedAndIdempotent(t *
 				"/repos/o/r/issues/10":                                             map[string]any{"state": "open", "labels": []any{}},
 				"/repos/o/r/issues/10/comments?per_page=100&page=1":                []any{},
 				"/repos/o/r/branches/main/protection":                              test.protection,
-				"/repos/o/r/rules/branches/main?per_page=100&page=1":               []any{map[string]any{"type": "required_status_checks", "parameters": map[string]any{"required_status_checks": []any{map[string]any{"context": PolicyCheck, "integration_id": 7}}}}},
+				"/repos/o/r/rules/branches/main?per_page=100&page=1":               test.rules,
 				"/repos/o/r/commits/abc/check-runs?filter=all&per_page=100&page=1": map[string]any{"check_runs": []any{}},
 				"/repos/o/r/commits/abc/statuses?per_page=100&page=1":              []any{},
 				"/repos/o/r": map[string]any{"permissions": map[string]any{"push": true}},
@@ -329,8 +335,11 @@ func TestClassicProtectionUnavailableContinuesToRulesFailClosedAndIdempotent(t *
 			source := GitHubPRSource{API: fixtureAPI(t, responses), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}, Recovery: &recoveryStub{state: PRState{}}}
 			first, err := source.FreshPullRequest(context.Background(), 3)
 			second, again := source.FreshPullRequest(context.Background(), 3)
-			if err != nil || again != nil || first.Facts.BranchProtectionAllows != test.allows || !first.Facts.PolicyCheckRequired || !reflect.DeepEqual(first, second) {
+			if err != nil || again != nil || first.Facts.BranchProtectionAllows != test.allows || !reflect.DeepEqual(first, second) {
 				t.Fatalf("first=%#v second=%#v err=%v again=%v", first, second, err, again)
+			}
+			if first.Facts.PolicyCheckRequired != test.policy {
+				t.Fatalf("available rules were not evaluated: %#v", first.Facts)
 			}
 		})
 	}
@@ -381,6 +390,7 @@ func TestClassicProtectionOtherForbiddenResponsesFail(t *testing.T) {
 	for _, body := range []string{
 		`{"message":"forbidden"}`,
 		`{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","documentation_url":"https://docs.github.com/rest/branches/branch-protection/other","status":"403"}`,
+		`{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","documentation_url":"https://docs.github.com/rest/repos/rules#get-rules-for-a-branch","status":"403"}`,
 	} {
 		responses := map[string]any{
 			"/repos/o/r/pulls/3":                                map[string]any{"number": 3, "state": "open", "merged": false, "body": "<!-- agent-symphony:issue:10:attempt:2 -->", "mergeable": true, "head": map[string]any{"sha": "abc"}, "base": map[string]any{"ref": "main"}},
@@ -392,6 +402,54 @@ func TestClassicProtectionOtherForbiddenResponsesFail(t *testing.T) {
 		if _, err := source.FreshPullRequest(context.Background(), 3); err == nil {
 			t.Fatalf("unrelated protection failure was ignored: %s", body)
 		}
+	}
+}
+
+func TestRulesUnavailableRejectsAllOtherFailures(t *testing.T) {
+	message := "Upgrade to GitHub Pro or make this repository public to enable this feature."
+	documentationURL := "https://docs.github.com/rest/repos/rules#get-rules-for-a-branch"
+	body := fmt.Sprintf(`{"message":%q,"documentation_url":%q,"status":"403"}`, message, documentationURL)
+	for _, test := range []struct {
+		name string
+		api  API
+	}{
+		{"generic 403", fixtureAPI(t, map[string]any{"/repos/o/r/rules/branches/main?per_page=100&page=1": fixtureHTTP{http.StatusForbidden, `{"message":"forbidden"}`}})},
+		{"lookalike URL", fixtureAPI(t, map[string]any{"/repos/o/r/rules/branches/main?per_page=100&page=1": fixtureHTTP{http.StatusForbidden, strings.Replace(body, documentationURL, documentationURL+"-lookalike", 1)}})},
+		{"classic URL", fixtureAPI(t, map[string]any{"/repos/o/r/rules/branches/main?per_page=100&page=1": fixtureHTTP{http.StatusForbidden, strings.Replace(body, documentationURL, classicProtectionDocumentationURL, 1)}})},
+		{"authentication", fixtureAPI(t, map[string]any{"/repos/o/r/rules/branches/main?per_page=100&page=1": fixtureHTTP{http.StatusUnauthorized, body}})},
+		{"malformed", fixtureAPI(t, map[string]any{"/repos/o/r/rules/branches/main?per_page=100&page=1": fixtureHTTP{http.StatusForbidden, "not json"}})},
+		{"oversized", fixtureAPI(t, map[string]any{"/repos/o/r/rules/branches/main?per_page=100&page=1": fixtureHTTP{http.StatusForbidden, body + strings.Repeat(" ", 4096)}})},
+		{"read failure", API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusForbidden, Status: "403 Forbidden", Body: io.NopCloser(&readErrorAfterBody{body: body})}, nil
+		})}}},
+		{"transport failure", API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("connection reset")
+		})}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			facts := PRFacts{BranchProtectionAllows: true}
+			source := GitHubPRSource{API: test.api, Config: PRAdapterConfig{Repository: "o/r"}}
+			if err := source.readRules(context.Background(), "main", nil, new(int), new(bool), &facts); err == nil || !facts.BranchProtectionAllows {
+				t.Fatalf("failure was ignored or changed protection: facts=%#v err=%v", facts, err)
+			}
+		})
+	}
+}
+
+func TestReadRulesAvailablePaginationUnchanged(t *testing.T) {
+	first := make([]any, 100)
+	for i := range first {
+		first[i] = map[string]any{"type": "required_status_checks", "parameters": map[string]any{"required_status_checks": []any{map[string]any{"context": fmt.Sprintf("check-%d", i)}}}}
+	}
+	source := GitHubPRSource{API: fixtureAPI(t, map[string]any{
+		"/repos/o/r/rules/branches/main?per_page=100&page=1": first,
+		"/repos/o/r/rules/branches/main?per_page=100&page=2": []any{map[string]any{"type": "pull_request", "parameters": map[string]any{"required_approving_review_count": 2, "dismiss_stale_reviews_on_push": true, "require_code_owner_review": true, "require_last_push_approval": true}}},
+	}), Config: PRAdapterConfig{Repository: "o/r"}}
+	var required []requiredCheck
+	count, dismissStale := 0, false
+	facts := PRFacts{BranchProtectionAllows: true}
+	if err := source.readRules(context.Background(), "main", &required, &count, &dismissStale, &facts); err != nil || len(required) != 100 || count != 2 || !dismissStale || !facts.CodeOwnerApprovalRequired || !facts.LastPushApprovalRequired || !facts.BranchProtectionAllows {
+		t.Fatalf("required=%d count=%d dismiss=%v facts=%#v err=%v", len(required), count, dismissStale, facts, err)
 	}
 }
 
