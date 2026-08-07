@@ -115,6 +115,49 @@ func TestRecoverActiveBindingRetainsCompletedAttemptForPublication(t *testing.T)
 	}
 }
 
+func TestRecoverPublishedAttemptUsesDurablePRInsteadOfWorkerLiveness(t *testing.T) {
+	for _, state := range []string{"active", "review-ready"} {
+		t.Run(state, func(t *testing.T) {
+			fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", PR: 9, State: state}
+			manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "completed", ReviewState: "clean", ReviewHead: "bbbbbbb", Session: "dead"}
+			checked := false
+			got := RecoverChecked(t.Context(), []AttemptFact{fact}, []agentruntime.Manifest{manifest}, func(context.Context, agentruntime.Manifest, AttemptFact) error {
+				checked = true
+				return errors.New("dead")
+			})
+			if checked || len(got) != 1 || got[0].State != state || got[0].PR != 9 || got[0].Action != "monitor the matching published pull request" || len(got[0].Blockers) != 0 {
+				t.Fatalf("checked=%v got=%#v", checked, got)
+			}
+		})
+	}
+}
+
+func TestRecoverPublishedAttemptIdentityMismatchFailsClosed(t *testing.T) {
+	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", PR: 9, State: "active"}
+	for _, manifest := range []agentruntime.Manifest{
+		{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "wrong00", State: "completed", ReviewHead: "bbbbbbb", Session: "dead"},
+		{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "completed", ReviewHead: "force00", Session: "dead"},
+	} {
+		got := RecoverChecked(t.Context(), []AttemptFact{fact}, []agentruntime.Manifest{manifest}, func(context.Context, agentruntime.Manifest, AttemptFact) error { return errors.New("dead") })
+		if len(got) != 1 || got[0].State != "blocked" || len(got[0].Blockers) == 0 {
+			t.Fatalf("manifest=%#v got=%#v", manifest, got)
+		}
+	}
+}
+
+func TestRecoverRunningPublishedAttemptStillRequiresLiveness(t *testing.T) {
+	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", PR: 9, State: "active"}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "running", Session: "live"}
+	checked := false
+	got := RecoverChecked(t.Context(), []AttemptFact{fact}, []agentruntime.Manifest{manifest}, func(context.Context, agentruntime.Manifest, AttemptFact) error {
+		checked = true
+		return nil
+	})
+	if !checked || len(got) != 1 || got[0].State != "active" || got[0].Action != "resume monitoring the matching attempt" {
+		t.Fatalf("checked=%v got=%#v", checked, got)
+	}
+}
+
 func TestReconcileLoopRejectsSlowInterval(t *testing.T) {
 	if err := ReconcileLoop(context.Background(), 61*time.Second, nil, func(context.Context) error { return nil }); err == nil {
 		t.Fatal("accepted interval over 60 seconds")

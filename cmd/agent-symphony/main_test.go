@@ -323,6 +323,36 @@ func TestBoundAttemptSuppressesRestartDispatchAcrossWorkerAndReviewStates(t *tes
 	}
 }
 
+func TestPublishedAttemptSuppressesLocalTerminalIssueBlockerOnlyOnExactIdentity(t *testing.T) {
+	baseIssue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", State: "completed", ReviewState: "clean", ReviewHead: "bbbbbbb"}
+	exact := orchestrator.AttemptFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", PR: 7, State: "review-ready"}
+	for _, test := range []struct {
+		name    string
+		state   string
+		base    string
+		head    string
+		pr      int
+		blocked bool
+	}{
+		{name: "published active", state: "active", base: "aaaaaaa", head: "bbbbbbb", pr: 7},
+		{name: "published review ready", state: "review-ready", base: "aaaaaaa", head: "bbbbbbb", pr: 7},
+		{name: "mismatched base", state: "review-ready", base: "wrong00", head: "bbbbbbb", pr: 7, blocked: true},
+		{name: "force pushed head", state: "review-ready", base: "aaaaaaa", head: "force00", pr: 7, blocked: true},
+		{name: "unbound", state: "review-ready", base: "aaaaaaa", head: "bbbbbbb", blocked: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			issues := []internalgithub.RecoveryIssueFact{baseIssue}
+			fact := exact
+			fact.State, fact.BaseSHA, fact.HeadSHA, fact.PR = test.state, test.base, test.head, test.pr
+			addTerminalAttemptBlockers(issues, []agentruntime.Manifest{manifest}, []orchestrator.AttemptFact{fact})
+			if got := slices.Contains(issues[0].Blockers, "local terminal attempt awaits or has durable GitHub outcome"); got != test.blocked || issues[0].Eligible == test.blocked {
+				t.Fatalf("issue=%#v", issues[0])
+			}
+		})
+	}
+}
+
 func TestRevokedBoundAttemptCancelsWorkerAndSuppressesPublication(t *testing.T) {
 	state, root := t.TempDir(), t.TempDir()
 	state, _ = filepath.EvalSymlinks(state)
