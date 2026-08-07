@@ -111,7 +111,7 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 			if s.dead {
 				return Result{Output: "1 " + strconv.Itoa(s.status)}, nil
 			}
-			return Result{Output: "0 0"}, nil
+			return Result{Output: "0 \n"}, nil
 		}
 		if s.dead {
 			return Result{Output: "1"}, nil
@@ -129,6 +129,32 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 		}
 	}
 	return Result{}, nil
+}
+
+func TestParsePaneStatus(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		output  string
+		dead    bool
+		status  int
+		wantErr string
+	}{
+		{name: "live blank status", output: "0 \n"},
+		{name: "dead zero", output: "1 0\n", dead: true},
+		{name: "dead nonzero", output: "1 127\n", dead: true, status: 127},
+		{name: "live with status", output: "0 0\n", wantErr: "invalid pane status"},
+		{name: "dead blank status", output: "1 \n", wantErr: "invalid pane status"},
+		{name: "negative exit", output: "1 -1\n", wantErr: "invalid exit status"},
+		{name: "unknown state", output: "2 0\n", wantErr: "invalid pane status"},
+		{name: "empty", wantErr: "invalid pane status"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dead, status, err := ParsePaneStatus(test.output)
+			if dead != test.dead || status != test.status || test.wantErr == "" && err != nil || test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("ParsePaneStatus(%q) = %v, %d, %v", test.output, dead, status, err)
+			}
+		})
+	}
 }
 
 func valueAfter(args []string, flag string) string {

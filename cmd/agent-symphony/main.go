@@ -1432,15 +1432,11 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if manifest.ReviewState == "running" && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
 		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_dead} #{pane_dead_status}"}, Dir: snapshot, Env: env})
 		if err == nil {
-			fields := strings.Fields(result.Output)
-			if len(fields) == 2 && fields[0] == "0" {
+			dead, status, statusErr := agentruntime.ParsePaneStatus(result.Output)
+			if statusErr == nil && !dead {
 				return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
 			}
-			status, statusErr := 0, errors.New("invalid pane status")
-			if len(fields) == 2 {
-				status, statusErr = strconv.Atoi(fields[1])
-			}
-			if len(fields) != 2 || fields[0] != "1" || statusErr != nil || status < 0 {
+			if statusErr != nil {
 				// The reviewer is temporarily unobservable; rebuild below.
 			} else if status != 0 {
 				return independentReviewResult{}, false, fmt.Errorf("reviewer exited %d", status)

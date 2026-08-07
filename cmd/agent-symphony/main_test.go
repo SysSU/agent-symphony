@@ -365,6 +365,7 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 type artifactReviewBoundary struct {
 	root          string
 	terminal      string
+	paneOutput    string
 	captureCalls  int
 	respawn       []string
 	respawns      int
@@ -388,6 +389,9 @@ func (b *artifactReviewBoundary) call(_ context.Context, operation string, comma
 		return agentruntime.Result{Output: output}, err
 	}
 	if slices.Contains(command.Args, "display-message") {
+		if b.paneOutput != "" {
+			return agentruntime.Result{Output: b.paneOutput}, nil
+		}
 		return agentruntime.Result{Output: "1 0"}, nil
 	}
 	if slices.Contains(command.Args, "capture-pane") {
@@ -406,6 +410,19 @@ func (b *artifactReviewBoundary) call(_ context.Context, operation string, comma
 		}
 	}
 	return agentruntime.Result{}, nil
+}
+
+func TestRunningReviewAcceptsBlankLivePaneStatus(t *testing.T) {
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
+	head, root := strings.Repeat("b", 40), t.TempDir()
+	snapshot, session := reviewIdentity(attempt, root)
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
+	boundary := &artifactReviewBoundary{paneOutput: "0 \n"}
+
+	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, []string{"reviewer"}, internalgithub.RecoveryIssueFact{}, manifest, "", head, root)
+	if err != nil || !pending || result.Snapshot != snapshot || result.Session != session || boundary.respawns != 0 {
+		t.Fatalf("result=%#v pending=%v respawns=%d err=%v", result, pending, boundary.respawns, err)
+	}
 }
 
 func TestIndependentReviewIgnoresEchoedAndDuplicatedTerminalResult(t *testing.T) {
