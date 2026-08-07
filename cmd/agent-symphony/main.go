@@ -739,7 +739,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		return nil, err
 	}
 	if transition {
-		manifests, err = resumeBoundAttempts(ctx, &r, c, issues, manifests)
+		manifests, err = resumeBoundAttempts(ctx, &r, c, issues, manifests, remote)
 		if err != nil {
 			return nil, err
 		}
@@ -786,7 +786,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if err := internalgithub.RunPRReconciliation(ctx, api, prConfig, statePath); err != nil {
 		return statuses, err
 	}
-	if err := monitorAttempts(ctx, &r, statuses, manifests); err != nil {
+	if err := monitorAttempts(ctx, &r, statuses, manifests, issues); err != nil {
 		return statuses, err
 	}
 	if err := monitorQueuedAttempts(ctx, api, &r, c, issues, manifests, remote, stateRoot); err != nil {
@@ -867,10 +867,13 @@ func startIssueAttempt(ctx context.Context, runtime *agentruntime.Runtime, cfg c
 	return runtime.PrepareAndStart(ctx, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Context: prompt, Command: cfg.Commands.Implementation, Eligible: func() bool { return issue.DispatchAuthorized }})
 }
 
-func resumeBoundAttempts(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest) ([]agentruntime.Manifest, error) {
+func resumeBoundAttempts(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact) ([]agentruntime.Manifest, error) {
 	for _, issue := range issues {
 		binding := issue.ActiveAttempt
-		if binding == nil || !issue.DispatchAuthorized || slices.ContainsFunc(manifests, func(manifest agentruntime.Manifest) bool {
+		remoteConflict := slices.ContainsFunc(remote, func(fact internalgithub.RecoveryAttemptFact) bool {
+			return fact.PR > 0 && fact.Repository == issue.Repository && fact.Issue == issue.Issue && (fact.State == "active" || fact.State == "review-ready" || fact.State == "completed")
+		})
+		if binding == nil || !issue.DispatchAuthorized || remoteConflict || slices.ContainsFunc(manifests, func(manifest agentruntime.Manifest) bool {
 			return manifest.Repository == binding.Repository && manifest.Issue == binding.Issue && manifest.Attempt == binding.Attempt
 		}) {
 			continue
@@ -1223,6 +1226,9 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			continue
 		}
 		issue := issues[index]
+		if !issue.DispatchAuthorized {
+			continue
+		}
 		current := manifest
 		if manifest.State == "preparing" || manifest.State == "running" {
 			continue // monitorAttempts owns live bound attempts from the same snapshot.
@@ -1668,7 +1674,7 @@ func durableAttemptFailure(ctx context.Context, api internalgithub.API, issue in
 	return nil
 }
 
-func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest) error {
+func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, issues []internalgithub.RecoveryIssueFact) error {
 	for _, status := range statuses {
 		if status.Action != "resume monitoring the matching attempt" {
 			continue
@@ -1680,7 +1686,10 @@ func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuse
 				break
 			}
 		}
-		_, err := runtime.Monitor(ctx, agentruntime.Attempt{Repository: status.Repository, Issue: status.Issue, Number: status.Attempt, BaseSHA: base})
+		authorized := slices.ContainsFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
+			return issue.Repository == status.Repository && issue.Issue == status.Issue && issue.DispatchAuthorized
+		})
+		_, err := runtime.Monitor(ctx, agentruntime.Attempt{Repository: status.Repository, Issue: status.Issue, Number: status.Attempt, BaseSHA: base, Eligible: func() bool { return authorized }})
 		if err != nil {
 			return fmt.Errorf("monitor %s#%d attempt %d: %w", status.Repository, status.Issue, status.Attempt, err)
 		}

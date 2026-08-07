@@ -217,7 +217,7 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	marker, _ := ActiveAttemptMarker("o/r", 10, 2, "abcdef0")
 	snapshotBodies = append(snapshotBodies, marker)
 	bound, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || len(bound) != 1 || bound[0].Eligible || !bound[0].Active || bound[0].Attempt != 2 || bound[0].ActiveAttempt == nil || bound[0].ActiveAttempt.BaseSHA != "abcdef0" {
+	if err != nil || len(bound) != 1 || bound[0].Eligible || !bound[0].Active || !bound[0].DispatchAuthorized || bound[0].Attempt != 2 || bound[0].ActiveAttempt == nil || bound[0].ActiveAttempt.BaseSHA != "abcdef0" {
 		t.Fatalf("bound facts=%#v err=%v", bound, err)
 	}
 	terminal, _ := TerminalFailureMarker(10, 2, now.Add(20*time.Minute))

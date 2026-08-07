@@ -33,6 +33,34 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
+type revokedAttemptRunner struct{ live, interrupted bool }
+
+func (r *revokedAttemptRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+	if len(command.Args) == 0 {
+		return agentruntime.Result{}, errors.New("missing tmux operation")
+	}
+	switch command.Args[0] {
+	case "has-session":
+		if r.live {
+			return agentruntime.Result{}, nil
+		}
+		return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
+	case "send-keys":
+		r.interrupted = true
+		return agentruntime.Result{}, nil
+	case "display-message":
+		if !r.interrupted {
+			return agentruntime.Result{Output: "0"}, nil
+		}
+		return agentruntime.Result{Output: "1"}, nil
+	case "kill-session":
+		r.live = false
+		return agentruntime.Result{}, nil
+	default:
+		return agentruntime.Result{}, fmt.Errorf("unexpected tmux operation %q", command.Args[0])
+	}
+}
+
 func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T) {
 	issue := internalgithub.RecoveryIssueFact{Repository: "owner/repo", Issue: 56, Attempt: 3, Body: "## Context\nunique issue contract\n\n## Validation\ngo test ./..."}
 	prompt := implementationPrompt(issue)
@@ -230,7 +258,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chdir(old) })
 	boundary := workerBoundaryRunner{Command: script}
 	runtimeState := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
-	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: base, State: "active"}}
 	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, state); err != nil {
 		log, _ := os.ReadFile(boundaryLog)
@@ -271,7 +299,7 @@ func TestBoundAttemptSuppressesRestartDispatchAcrossWorkerAndReviewStates(t *tes
 		manifests := []agentruntime.Manifest{test.manifest}
 		for range 2 {
 			var err error
-			manifests, err = resumeBoundAttempts(t.Context(), nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, manifests)
+			manifests, err = resumeBoundAttempts(t.Context(), nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, manifests, nil)
 			if err != nil || len(manifests) != 1 {
 				t.Fatalf("state=%s review=%s manifests=%#v err=%v", test.manifest.State, test.manifest.ReviewState, manifests, err)
 			}
@@ -285,9 +313,57 @@ func TestBoundAttemptSuppressesRestartDispatchAcrossWorkerAndReviewStates(t *tes
 			t.Fatalf("preparing attempt did not fail closed: %#v", statuses)
 		}
 	}
+	conflictingRemote := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 3, PR: 31, State: "active"}}
+	if manifests, err := resumeBoundAttempts(t.Context(), nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, nil, conflictingRemote); err != nil || len(manifests) != 0 {
+		t.Fatalf("contradictory remote attempt was resumed: manifests=%#v err=%v", manifests, err)
+	}
 	orphan := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 3, BaseSHA: "aaaaaaa", State: "completed"}
 	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{orphan}, nil, ""); err != nil {
 		t.Fatalf("genuine orphan was not preserved: %v", err)
+	}
+}
+
+func TestRevokedBoundAttemptCancelsWorkerAndSuppressesPublication(t *testing.T) {
+	state, root := t.TempDir(), t.TempDir()
+	state, _ = filepath.EvalSymlinks(state)
+	root, _ = filepath.EvalSymlinks(root)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 4, BaseSHA: "abcdef0"}
+	manifest, err := agentruntime.AttemptIdentity(root, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.State = "running"
+	sum := sha256.Sum256([]byte(attempt.Repository))
+	manifest.LogPath = filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-4", "agent.log")
+	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &revokedAttemptRunner{live: true}
+	runtimeState := &agentruntime.Runtime{Root: root, StateRoot: state, Tmux: "tmux", Runner: runner, StopWait: time.Millisecond}
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 23, Attempt: 4, Action: "resume monitoring the matching attempt"}
+	authorized := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 4, DispatchAuthorized: true}
+	if err := monitorAttempts(t.Context(), runtimeState, []orchestrator.RecoveryStatus{status}, []agentruntime.Manifest{manifest}, []internalgithub.RecoveryIssueFact{authorized}); err != nil || !runner.live {
+		t.Fatalf("authorized worker did not continue: live=%v err=%v", runner.live, err)
+	}
+	revoked := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 4}
+	if err := monitorAttempts(t.Context(), runtimeState, []orchestrator.RecoveryStatus{status}, []agentruntime.Manifest{manifest}, []internalgithub.RecoveryIssueFact{revoked}); err != nil {
+		t.Fatal(err)
+	}
+	storedBody, _ := os.ReadFile(manifestPath)
+	var stored agentruntime.Manifest
+	if json.Unmarshal(storedBody, &stored) != nil || stored.State != "cancelled" || runner.live {
+		t.Fatalf("revoked worker continued: manifest=%#v live=%v", stored, runner.live)
+	}
+	completed := manifest
+	completed.State = "completed"
+	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 4, BaseSHA: attempt.BaseSHA, State: "active"}}
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{revoked}, []agentruntime.Manifest{completed}, bound, ""); err != nil {
+		t.Fatalf("revoked completed attempt reached publication: %v", err)
 	}
 }
 
@@ -1264,7 +1340,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtimeState := &agentruntime.Runtime{StateRoot: state}
-	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, BaseBranch: "main"}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true, BaseBranch: "main"}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: base, State: "active"}}
 	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, state); err != nil {
 		t.Fatal(err)
