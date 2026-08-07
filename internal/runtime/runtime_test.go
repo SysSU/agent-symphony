@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -534,49 +535,177 @@ func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
 			}
 			t.Setenv("FAKE_PROMPT", prompt)
 			marker := filepath.Join(dir, "late-marker")
-			pidPath := filepath.Join(dir, "descendant.pid")
 			resultPath, output := "", "reviewer"
 			if captureResult {
 				resultPath = filepath.Join(dir, "completed.result.json")
 				output = `{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none"}`
 			}
-			command := []string{"sh", "-c", `(sleep 5; printf late >"$1") & echo $! >"$2"; printf %s "$3"`, "consumer", marker, pidPath, output}
+			t.Setenv("AGENT_SYMPHONY_IN_GROUP_MARKER", marker)
+			t.Setenv("AGENT_SYMPHONY_IN_GROUP_OUTPUT", output)
+			command := []string{os.Args[0], "-test.run=^TestCaptureWorkerInGroupStdoutHelper$"}
 			unrelated := exec.Command("sleep", "5")
 			if err := unrelated.Start(); err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = unrelated.Process.Kill(); _ = unrelated.Wait() })
 			var stdout strings.Builder
+			devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer devNull.Close()
 			started := time.Now()
 			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 			defer cancel()
-			code, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, io.Discard, dir)
-			if err != nil || code != 0 || time.Since(started) > 2*time.Second {
+			code, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir)
+			if err != nil || code != 0 || time.Since(started) > 2500*time.Millisecond {
 				t.Fatalf("completion: code=%d elapsed=%v err=%v", code, time.Since(started), err)
 			}
 			if !captureResult && stdout.String() != output {
 				t.Fatalf("reviewer output = %q", stdout.String())
 			}
-			body, err := os.ReadFile(pidPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			pid, err := strconv.Atoi(strings.TrimSpace(string(body)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-				t.Fatalf("descendant %d survived helper completion: %v", pid, err)
-			}
 			if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
 				t.Fatalf("unrelated process group was terminated: %v", err)
 			}
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(1200 * time.Millisecond)
 			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("late descendant mutated workspace: %v", err)
 			}
 		})
 	}
+}
+
+func TestCaptureWorkerInGroupStdoutHelper(t *testing.T) {
+	marker := os.Getenv("AGENT_SYMPHONY_IN_GROUP_MARKER")
+	if marker == "" {
+		return
+	}
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		os.Exit(2)
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestCaptureWorkerLateMarkerHelper$")
+	child.Env = append(os.Environ(), "AGENT_SYMPHONY_LATE_MARKER_CHILD=1")
+	child.Stdout, child.Stderr = os.Stdout, devNull
+	group, err := syscall.Getpgid(os.Getppid())
+	if err != nil {
+		os.Exit(2)
+	}
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: group}
+	if err := child.Start(); err != nil {
+		os.Exit(2)
+	}
+	if _, err := io.WriteString(os.Stdout, os.Getenv("AGENT_SYMPHONY_IN_GROUP_OUTPUT")); err != nil {
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func TestCaptureWorkerLateMarkerHelper(t *testing.T) {
+	if os.Getenv("AGENT_SYMPHONY_LATE_MARKER_CHILD") == "" {
+		return
+	}
+	time.Sleep(time.Second)
+	if err := os.WriteFile(os.Getenv("AGENT_SYMPHONY_IN_GROUP_MARKER"), []byte("late"), 0o600); err != nil {
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func TestCaptureWorkerEscapedStdoutFailsPromptly(t *testing.T) {
+	for _, captureResult := range []bool{true, false} {
+		for _, cancelWorker := range []bool{true, false} {
+			t.Run(fmt.Sprintf("result=%t/cancel=%t", captureResult, cancelWorker), func(t *testing.T) {
+				dir := t.TempDir()
+				prompt := filepath.Join(dir, "prompt")
+				if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				tmux := filepath.Join(dir, "tmux")
+				if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; *) exit 2;; esac\n"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("FAKE_PROMPT", prompt)
+				pidPath := filepath.Join(dir, "escaped.pid")
+				t.Setenv("AGENT_SYMPHONY_ESCAPE_STDOUT", pidPath)
+				resultPath, output := "", "reviewer"
+				if captureResult {
+					resultPath = filepath.Join(dir, "escaped.result.json")
+					output = `{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none"}`
+				}
+				mode := "normal"
+				if cancelWorker {
+					mode = "cancel"
+				}
+				command := []string{"sh", "-c", `set +m; "$1" -test.run=^TestCaptureWorkerEscapedStdoutHelper$ 2>/dev/null & while test ! -s "$4"; do sleep 0.01; done; printf %s "$2"; test "$3" = normal || sleep 30`, "consumer", os.Args[0], output, mode, pidPath}
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				type outcome struct {
+					code int
+					err  error
+				}
+				var stdout strings.Builder
+				devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer devNull.Close()
+				done := make(chan outcome, 1)
+				started := time.Now()
+				go func() {
+					code, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir)
+					done <- outcome{code: code, err: err}
+				}()
+				var pid int
+				for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+					body, err := os.ReadFile(pidPath)
+					if err == nil && strings.TrimSpace(string(body)) != "" {
+						pid, err = strconv.Atoi(strings.TrimSpace(string(body)))
+						if err != nil {
+							t.Fatal(err)
+						}
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("escaped stdout holder did not start")
+					}
+				}
+				t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+				if cancelWorker {
+					cancel()
+				}
+				select {
+				case got := <-done:
+					if got.code == 0 || time.Since(started) > 2*time.Second {
+						t.Fatalf("escaped capture: code=%d elapsed=%v err=%v", got.code, time.Since(started), got.err)
+					}
+					if cancelWorker && !errors.Is(got.err, context.Canceled) {
+						t.Fatalf("escaped cancellation = %v", got.err)
+					}
+					if !cancelWorker && !errors.Is(got.err, ErrWorkerOutputOpen) {
+						t.Fatalf("escaped completion = %v", got.err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("escaped stdout holder blocked helper return")
+				}
+			})
+		}
+	}
+}
+
+func TestCaptureWorkerEscapedStdoutHelper(t *testing.T) {
+	pidPath := os.Getenv("AGENT_SYMPHONY_ESCAPE_STDOUT")
+	if pidPath == "" {
+		return
+	}
+	if _, err := syscall.Setsid(); err != nil {
+		os.Exit(2)
+	}
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		os.Exit(2)
+	}
+	time.Sleep(30 * time.Second)
+	os.Exit(0)
 }
 
 func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {

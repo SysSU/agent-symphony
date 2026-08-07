@@ -12,13 +12,21 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
-// ErrWorkerResultOverflow means the configured command exceeded the capture ceiling.
-var ErrWorkerResultOverflow = errors.New("worker stdout exceeds 64 KiB")
+var (
+	// ErrWorkerResultOverflow means the configured command exceeded the capture ceiling.
+	ErrWorkerResultOverflow = errors.New("worker stdout exceeds 64 KiB")
+	// ErrWorkerOutputOpen means an out-of-group process retained the worker output descriptor.
+	ErrWorkerOutputOpen = errors.New("worker stdout remained open after process-group termination")
+)
+
+const workerCaptureDrainTimeout = 500 * time.Millisecond
 
 // The wrapper pins the process-group identity until its parent signals the group.
-const workerWrapper = `"$@" 3>&- 4>&-
+const workerWrapper = `set +m
+"$@" 3>&- 4>&-
 code=$?
 printf '%d\n' "$code" >&3
 IFS= read -r _ <&4`
@@ -78,21 +86,28 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 	child.ExtraFiles = []*os.File{statusWriter, holdReader}
 	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var result *os.File
-	var pipe io.ReadCloser
-	if resultPath == "" {
-		child.Stdout = stdout
-	} else {
+	if resultPath != "" {
 		result, err = os.OpenFile(resultPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return 1, fmt.Errorf("create worker result: %w", err)
 		}
 		defer result.Close()
-		pipe, err = child.StdoutPipe()
-		if err != nil {
-			return 1, err
-		}
+	}
+	workerOutput, err := child.StdoutPipe()
+	if err != nil {
+		return 1, err
+	}
+	pipe, ok := workerOutput.(*os.File)
+	if !ok {
+		return 1, errors.New("worker stdout pipe is not an OS file")
 	}
 	if err := child.Start(); err != nil {
+		return 1, err
+	}
+	pipeFD := int(pipe.Fd())
+	if err := syscall.SetNonblock(pipeFD, true); err != nil {
+		_ = killProcessGroup(child)
+		_ = child.Wait()
 		return 1, err
 	}
 	statusWriter.Close()
@@ -106,13 +121,23 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 		code, err := readWorkerStatus(statusReader)
 		destination <- completion{code: code, err: err}
 	}(completed)
-	if resultPath == "" {
+	stopped := make(chan struct{})
+	captured := make(chan error, 1)
+	destination, bounded := stdout, false
+	if resultPath != "" {
+		destination, bounded = result, true
+	}
+	go func() { captured <- captureWorkerOutput(destination, pipeFD, stopped, bounded) }()
+	if !bounded {
 		var finished completion
 		select {
 		case finished = <-completed:
 		case <-ctx.Done():
 		}
 		cleanupErr := killProcessGroup(child)
+		close(stopped)
+		captureErr := <-captured
+		_ = pipe.Close()
 		_ = child.Wait()
 		if ctx.Err() != nil {
 			return 1, ctx.Err()
@@ -120,14 +145,15 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 		if cleanupErr != nil {
 			return 1, cleanupErr
 		}
+		if captureErr != nil {
+			return 1, captureErr
+		}
 		if finished.err != nil {
 			return 1, fmt.Errorf("read worker status: %w", finished.err)
 		}
 		return finished.code, nil
 	}
 
-	captured := make(chan error, 1)
-	go func() { captured <- captureWorkerOutput(result, pipe) }()
 	var finished completion
 	var captureErr error
 	for completed != nil && captureErr == nil {
@@ -141,9 +167,11 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 		}
 	}
 	cleanupErr := killProcessGroup(child)
+	close(stopped)
 	if captured != nil {
 		captureErr = <-captured
 	}
+	_ = pipe.Close()
 	_ = child.Wait()
 	if ctx.Err() != nil {
 		return 1, ctx.Err()
@@ -184,19 +212,59 @@ func readWorkerStatus(reader io.Reader) (int, error) {
 	return code, nil
 }
 
-func captureWorkerOutput(result io.Writer, pipe io.Reader) error {
-	if _, err := io.Copy(result, io.LimitReader(pipe, WorkerResultMaxBytes)); err != nil {
-		return fmt.Errorf("capture worker stdout: %w", err)
+func captureWorkerOutput(result io.Writer, pipeFD int, stopped <-chan struct{}, bounded bool) error {
+	var buffer [32 << 10]byte
+	written := 0
+	var stopDeadline time.Time
+	for {
+		if stopDeadline.IsZero() {
+			select {
+			case <-stopped:
+				stopDeadline = time.Now().Add(workerCaptureDrainTimeout)
+			default:
+			}
+		} else if time.Now().After(stopDeadline) {
+			return ErrWorkerOutputOpen
+		}
+		n, err := syscall.Read(pipeFD, buffer[:])
+		if n > 0 {
+			if bounded && written+n > WorkerResultMaxBytes {
+				n = WorkerResultMaxBytes - written
+				if n > 0 {
+					if count, writeErr := result.Write(buffer[:n]); writeErr != nil {
+						return fmt.Errorf("capture worker stdout: %w", writeErr)
+					} else if count != n {
+						return fmt.Errorf("capture worker stdout: %w", io.ErrShortWrite)
+					}
+				}
+				return ErrWorkerResultOverflow
+			}
+			written += n
+			if count, writeErr := result.Write(buffer[:n]); writeErr != nil {
+				return fmt.Errorf("capture worker stdout: %w", writeErr)
+			} else if count != n {
+				return fmt.Errorf("capture worker stdout: %w", io.ErrShortWrite)
+			}
+		}
+		if n == 0 && err == nil {
+			return nil
+		}
+		if err == nil || errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if !errors.Is(err, syscall.EAGAIN) && !errors.Is(err, syscall.EWOULDBLOCK) {
+			return fmt.Errorf("capture worker stdout: %w", err)
+		}
+		if stopDeadline.IsZero() {
+			select {
+			case <-stopped:
+				stopDeadline = time.Now().Add(workerCaptureDrainTimeout)
+			case <-time.After(5 * time.Millisecond):
+			}
+		} else {
+			time.Sleep(5 * time.Millisecond)
+		}
 	}
-	var extra [1]byte
-	n, err := pipe.Read(extra[:])
-	if n != 0 {
-		return ErrWorkerResultOverflow
-	}
-	if err != nil && !errors.Is(err, io.EOF) {
-		return fmt.Errorf("capture worker stdout: %w", err)
-	}
-	return nil
 }
 
 func captureEnvironment(env []string) []string {
