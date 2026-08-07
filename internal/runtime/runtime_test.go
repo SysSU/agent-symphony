@@ -576,7 +576,6 @@ func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
 			if _, err := fmt.Sscanf(string(childBody), "%d %d", &childPID, &childPGID); err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
 			t.Logf("worker identities: wrapper=%d/%d helper=%d/%d child=%d/%d", wrapperPID, wrapperPGID, helperPID, helperPGID, childPID, childPGID)
 			if wrapperPID == helperPID || helperPID == childPID || helperPGID != wrapperPGID || childPGID != wrapperPGID {
 				t.Fatalf("worker identities: wrapper=%d/%d helper=%d/%d child=%d/%d", wrapperPID, wrapperPGID, helperPID, helperPGID, childPID, childPGID)
@@ -593,7 +592,7 @@ func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
 			if err := os.WriteFile(trigger, []byte("go"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			for deadline := time.Now().Add(500 * time.Millisecond); ; time.Sleep(10 * time.Millisecond) {
+			for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 				if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("late descendant mutated workspace: %v", err)
 				}
