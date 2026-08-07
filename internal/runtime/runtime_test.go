@@ -542,6 +542,10 @@ func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
 			}
 			t.Setenv("AGENT_SYMPHONY_IN_GROUP_MARKER", marker)
 			t.Setenv("AGENT_SYMPHONY_IN_GROUP_OUTPUT", output)
+			identityBase := filepath.Join(dir, "identity")
+			t.Setenv("AGENT_SYMPHONY_IN_GROUP_IDENTITY", identityBase)
+			trigger := filepath.Join(dir, "post-return-trigger")
+			t.Setenv("AGENT_SYMPHONY_IN_GROUP_TRIGGER", trigger)
 			command := []string{os.Args[0], "-test.run=^TestCaptureWorkerInGroupStdoutHelper$"}
 			unrelated := exec.Command("sleep", "5")
 			if err := unrelated.Start(); err != nil {
@@ -554,12 +558,31 @@ func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer devNull.Close()
-			started := time.Now()
 			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 			defer cancel()
-			code, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir)
-			if err != nil || code != 0 || time.Since(started) > 2500*time.Millisecond {
-				t.Fatalf("completion: code=%d elapsed=%v err=%v", code, time.Since(started), err)
+			code, captureErr := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir)
+			configuredBody, err := os.ReadFile(identityBase + ".configured")
+			if err != nil {
+				t.Fatal(err)
+			}
+			childBody, err := os.ReadFile(identityBase + ".child")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wrapperPID, wrapperPGID, helperPID, helperPGID, childPID, childPGID int
+			if _, err := fmt.Sscanf(string(configuredBody), "%d %d %d %d", &wrapperPID, &wrapperPGID, &helperPID, &helperPGID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fmt.Sscanf(string(childBody), "%d %d", &childPID, &childPGID); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+			t.Logf("worker identities: wrapper=%d/%d helper=%d/%d child=%d/%d", wrapperPID, wrapperPGID, helperPID, helperPGID, childPID, childPGID)
+			if wrapperPID == helperPID || helperPID == childPID || helperPGID != wrapperPGID || childPGID != wrapperPGID {
+				t.Fatalf("worker identities: wrapper=%d/%d helper=%d/%d child=%d/%d", wrapperPID, wrapperPGID, helperPID, helperPGID, childPID, childPGID)
+			}
+			if captureErr != nil || code != 0 {
+				t.Fatalf("completion: code=%d err=%v", code, captureErr)
 			}
 			if !captureResult && stdout.String() != output {
 				t.Fatalf("reviewer output = %q", stdout.String())
@@ -567,9 +590,16 @@ func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
 			if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
 				t.Fatalf("unrelated process group was terminated: %v", err)
 			}
-			time.Sleep(1200 * time.Millisecond)
-			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("late descendant mutated workspace: %v", err)
+			if err := os.WriteFile(trigger, []byte("go"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for deadline := time.Now().Add(500 * time.Millisecond); ; time.Sleep(10 * time.Millisecond) {
+				if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("late descendant mutated workspace: %v", err)
+				}
+				if time.Now().After(deadline) {
+					break
+				}
 			}
 		})
 	}
@@ -584,16 +614,29 @@ func TestCaptureWorkerInGroupStdoutHelper(t *testing.T) {
 	if err != nil {
 		os.Exit(2)
 	}
-	child := exec.Command(os.Args[0], "-test.run=^TestCaptureWorkerLateMarkerHelper$")
-	child.Env = append(os.Environ(), "AGENT_SYMPHONY_LATE_MARKER_CHILD=1")
-	child.Stdout, child.Stderr = os.Stdout, devNull
-	group, err := syscall.Getpgid(os.Getppid())
+	wrapperPID := os.Getppid()
+	wrapperPGID, err := syscall.Getpgid(wrapperPID)
 	if err != nil {
 		os.Exit(2)
 	}
-	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: group}
+	identityBase := os.Getenv("AGENT_SYMPHONY_IN_GROUP_IDENTITY")
+	configuredIdentity := fmt.Sprintf("%d %d %d %d", wrapperPID, wrapperPGID, os.Getpid(), syscall.Getpgrp())
+	if err := os.WriteFile(identityBase+".configured", []byte(configuredIdentity), 0o600); err != nil {
+		os.Exit(2)
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestCaptureWorkerLateMarkerHelper$")
+	child.Env = append(os.Environ(), "AGENT_SYMPHONY_LATE_MARKER_CHILD="+identityBase+".child")
+	child.Stdout, child.Stderr = os.Stdout, devNull
 	if err := child.Start(); err != nil {
 		os.Exit(2)
+	}
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if body, err := os.ReadFile(identityBase + ".child"); err == nil && len(body) != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			os.Exit(2)
+		}
 	}
 	if _, err := io.WriteString(os.Stdout, os.Getenv("AGENT_SYMPHONY_IN_GROUP_OUTPUT")); err != nil {
 		os.Exit(2)
@@ -602,10 +645,23 @@ func TestCaptureWorkerInGroupStdoutHelper(t *testing.T) {
 }
 
 func TestCaptureWorkerLateMarkerHelper(t *testing.T) {
-	if os.Getenv("AGENT_SYMPHONY_LATE_MARKER_CHILD") == "" {
+	identityPath := os.Getenv("AGENT_SYMPHONY_LATE_MARKER_CHILD")
+	if identityPath == "" {
 		return
 	}
-	time.Sleep(time.Second)
+	identity := fmt.Sprintf("%d %d", os.Getpid(), syscall.Getpgrp())
+	if err := os.WriteFile(identityPath, []byte(identity), 0o600); err != nil {
+		os.Exit(2)
+	}
+	trigger := os.Getenv("AGENT_SYMPHONY_IN_GROUP_TRIGGER")
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(trigger); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			os.Exit(2)
+		}
+	}
 	if err := os.WriteFile(os.Getenv("AGENT_SYMPHONY_IN_GROUP_MARKER"), []byte("late"), 0o600); err != nil {
 		os.Exit(2)
 	}
