@@ -799,7 +799,7 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 		if edit.ID == "" || edit.Editor.DatabaseID == nil || *edit.Editor.DatabaseID <= 0 || edit.EditedAt.IsZero() {
 			return Controls{}, false, nil, errors.New("issue body edit is ambiguous")
 		}
-		anchor = Anchor{EditID: edit.ID, ChangedAt: edit.EditedAt}
+		anchor = Anchor{EditID: edit.ID, IssueNodeID: issue.NodeID, CreatedAt: issue.CreatedAt, ChangedAt: edit.EditedAt, AuthorID: issue.User.ID}
 		anchorActor = *edit.Editor.DatabaseID
 	}
 	provenanceControls := normalized.Controls
@@ -834,6 +834,24 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 	for _, p := range provenance {
 		timeline[p] = true
 	}
+	authorizeActors := func(extra ...int) error {
+		actors := append([]int{anchorActor}, provenanceActors(provenance)...)
+		actors = append(actors, extra...)
+		for _, actor := range actors {
+			if actor == 0 {
+				continue
+			}
+			if _, ok := authorized[actor]; ok {
+				continue
+			}
+			permission, err := s.actorPermission(ctx, actor)
+			if err != nil {
+				return err
+			}
+			authorized[actor] = actor != s.Config.AppActorID && (permission == "maintain" || permission == "admin")
+		}
+		return nil
+	}
 	readApproval := func(id int64) (Approval, error) {
 		var approval struct {
 			ID        int64
@@ -849,23 +867,22 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 		if approval.ID != id || approval.Body != s.Config.ApprovalCommand || approval.App != nil || approval.CreatedAt.IsZero() || !approval.CreatedAt.Equal(approval.UpdatedAt) {
 			return Approval{}, errors.New("approval comment is missing, edited, or App-authored")
 		}
-		for _, actor := range append([]int{approval.User.ID, anchorActor}, provenanceActors(provenance)...) {
-			if actor == 0 {
-				continue
-			}
-			if _, ok := authorized[actor]; ok {
-				continue
-			}
-			permission, err := s.actorPermission(ctx, actor)
-			if err != nil {
-				return Approval{}, err
-			}
-			authorized[actor] = actor != s.Config.AppActorID && (permission == "maintain" || permission == "admin")
+		if err := authorizeActors(approval.User.ID); err != nil {
+			return Approval{}, err
 		}
 		return Approval{CommentID: approval.ID, ActorID: approval.User.ID, Body: approval.Body, CreatedAt: approval.CreatedAt}, nil
 	}
 	if found {
-		approval, err := readApproval(snapshot.ApprovalID)
+		var approval Approval
+		if snapshot.ApprovalID == 0 {
+			if normalized.Controls.Completion == "autonomous-merge" {
+				err = authorizeActors()
+			} else {
+				err = errors.New("label-only authorization requires autonomous merge")
+			}
+		} else {
+			approval, err = readApproval(snapshot.ApprovalID)
+		}
 		if err == nil && snapshot.Valid(normalized.Controls, issue.Body, anchor, approval, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] }) {
 			var retry *Provenance
 			if normalized.Controls.Retry {
@@ -887,23 +904,41 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 	if !normalized.Ready {
 		return Controls{}, false, nil, errors.New("issue controls are not eligible for approval")
 	}
-	changedAt := anchor.ChangedAt
-	for _, p := range provenance {
-		if p.CreatedAt.After(changedAt) {
-			changedAt = p.CreatedAt
+	latestApproval := func() *issueCommentRecord {
+		changedAt := anchor.ChangedAt
+		for _, p := range provenance {
+			if p.CreatedAt.After(changedAt) {
+				changedAt = p.CreatedAt
+			}
 		}
-	}
-	var latest *issueCommentRecord
-	for i := range comments {
-		comment := &comments[i]
-		if comment.Body == s.Config.ApprovalCommand && comment.App == nil && comment.CreatedAt.Equal(comment.UpdatedAt) && comment.CreatedAt.After(changedAt) && (!found || comment.ID > snapshotCommentID) && (latest == nil || comment.CreatedAt.After(latest.CreatedAt) || comment.CreatedAt.Equal(latest.CreatedAt) && comment.ID > latest.ID) {
-			latest = comment
+		var latest *issueCommentRecord
+		for i := range comments {
+			comment := &comments[i]
+			if comment.Body == s.Config.ApprovalCommand && comment.App == nil && comment.CreatedAt.Equal(comment.UpdatedAt) && comment.CreatedAt.After(changedAt) && (!found || comment.ID > snapshotCommentID) && (latest == nil || comment.CreatedAt.After(latest.CreatedAt) || comment.CreatedAt.Equal(latest.CreatedAt) && comment.ID > latest.ID) {
+				latest = comment
+			}
 		}
+		return latest
 	}
-	if latest == nil {
-		return Controls{}, false, nil, errors.New("fresh exact approval command is missing")
+	var approval Approval
+	if normalized.Controls.Completion == "autonomous-merge" {
+		if err := authorizeActors(); err != nil {
+			return Controls{}, false, nil, err
+		}
+		if _, labelErr := NewSnapshot(normalized.Controls, issue.Body, anchor, approval, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] }); labelErr != nil {
+			latest := latestApproval()
+			if latest == nil {
+				return Controls{}, false, nil, labelErr
+			}
+			approval, err = readApproval(latest.ID)
+		}
+	} else {
+		latest := latestApproval()
+		if latest == nil {
+			return Controls{}, false, nil, errors.New("fresh exact approval command is missing")
+		}
+		approval, err = readApproval(latest.ID)
 	}
-	approval, err := readApproval(latest.ID)
 	if err != nil {
 		return Controls{}, false, nil, err
 	}

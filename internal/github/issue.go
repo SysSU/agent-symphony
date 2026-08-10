@@ -193,7 +193,8 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 	if authorized == nil || timeline == nil {
 		return Snapshot{}, errors.New("actor authorizer and authoritative timeline verifier are required")
 	}
-	if !anchor.valid() || approval.CommentID <= 0 || approval.Body != command || !approval.CreatedAt.After(anchor.ChangedAt) || approval.ActorID == 0 || !authorized(approval.ActorID) {
+	labelOnly := controls.Completion == "autonomous-merge" && approval == (Approval{})
+	if !anchor.valid() || !labelOnly && (approval.CommentID <= 0 || approval.Body != command || !approval.CreatedAt.After(anchor.ChangedAt) || approval.ActorID == 0 || !authorized(approval.ActorID)) {
 		return Snapshot{}, errors.New("approval command is missing, stale, edited, or unauthorized")
 	}
 	required := map[string]string{
@@ -205,13 +206,17 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 		"retry":      strconv.FormatBool(controls.Retry),
 	}
 	seen := make(map[string]bool, len(required))
+	var autonomous Provenance
 	for _, p := range provenance {
 		creationDefault := p.Value == map[string]string{"ready": "false", "priority": "0", "completion": "human-review", "closed": "false", "cancelled": "false", "retry": "false"}[p.Name]
 		creation := p.Source == "creation" && creationDefault && p.EventID == 0 && p.ActorID == anchor.AuthorID && p.CreatedAt.Equal(anchor.CreatedAt)
 		mutationSource := p.Source == "timeline" && slices.Contains([]string{"ready", "priority", "completion", "closed"}, p.Name) || p.Source == "comment" && slices.Contains([]string{"cancelled", "retry"}, p.Name)
-		mutation := mutationSource && p.ActorID != 0 && !p.CreatedAt.IsZero() && approval.CreatedAt.After(p.CreatedAt) && authorized(p.ActorID) && timeline(p)
+		mutation := mutationSource && p.ActorID != 0 && !p.CreatedAt.IsZero() && (labelOnly || approval.CreatedAt.After(p.CreatedAt)) && authorized(p.ActorID) && timeline(p)
 		if !creation && !mutation {
 			return Snapshot{}, errors.New("control provenance is missing or unauthorized")
+		}
+		if p.Name == "completion" {
+			autonomous = p
 		}
 		value, ok := required[p.Name]
 		if !ok || seen[p.Name] || p.Value != value {
@@ -221,6 +226,16 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 	}
 	if len(seen) != len(required) {
 		return Snapshot{}, errors.New("current non-body control provenance is missing")
+	}
+	if labelOnly {
+		if autonomous.Source != "timeline" || autonomous.Value != "autonomous-merge" || autonomous.CreatedAt.Before(anchor.ChangedAt) || autonomous.CreatedAt.Equal(anchor.ChangedAt) && anchor.EditID != "" {
+			return Snapshot{}, errors.New("autonomous label does not authorize the current issue body")
+		}
+		for _, p := range provenance {
+			if slices.Contains([]string{"ready", "priority"}, p.Name) && (p.CreatedAt.After(autonomous.CreatedAt) || p.CreatedAt.Equal(autonomous.CreatedAt) && p.EventID > autonomous.EventID) {
+				return Snapshot{}, errors.New("autonomous label does not authorize the current issue controls")
+			}
+		}
 	}
 	canonical := slices.Clone(provenance)
 	slices.SortFunc(canonical, func(a, b Provenance) int { return strings.Compare(a.Name, b.Name) })

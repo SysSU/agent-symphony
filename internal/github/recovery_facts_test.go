@@ -228,6 +228,126 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	}
 }
 
+func TestFetchIssueFactsAutonomousLabelsAuthorizeWithoutApproval(t *testing.T) {
+	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	body := "## Context\nx\n## Acceptance Criteria\nx\n## Tasks\nx\n## Validation\nx\n## Dependencies\nnone\n"
+	var snapshots []string
+	autonomous, edited, priorityChanged, approved := true, false, false, false
+	actor, posts := 5, 0
+	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		currentBody := body
+		if edited {
+			currentBody += "later edit\n"
+		}
+		comments := make([]any, len(snapshots))
+		for i, snapshot := range snapshots {
+			comments[i] = map[string]any{"id": 60 + i, "body": snapshot, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}}
+		}
+		if approved {
+			comments = append(comments, map[string]any{"id": 70, "body": "/approve", "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 5}})
+		}
+		events := []any{
+			map[string]any{"id": 20, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now, "actor": map[string]any{"id": actor}},
+			map[string]any{"id": 21, "event": "labeled", "label": map[string]any{"name": "P1"}, "created_at": now, "actor": map[string]any{"id": actor}},
+			map[string]any{"id": 22, "event": "labeled", "label": map[string]any{"name": "auto"}, "created_at": now, "actor": map[string]any{"id": actor}},
+		}
+		labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}, map[string]any{"name": "auto"}}
+		if priorityChanged {
+			events = append(events,
+				map[string]any{"id": 24, "event": "unlabeled", "label": map[string]any{"name": "P1"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": actor}},
+				map[string]any{"id": 25, "event": "labeled", "label": map[string]any{"name": "P2"}, "created_at": now.Add(2 * time.Second), "actor": map[string]any{"id": actor}},
+			)
+			labels[1] = map[string]any{"name": "P2"}
+		}
+		if !autonomous {
+			events = append(events, map[string]any{"id": 23, "event": "unlabeled", "label": map[string]any{"name": "auto"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": actor}})
+			labels = labels[:2]
+		}
+		var response any
+		switch r.Method + " " + r.URL.RequestURI() {
+		case "GET /repos/o/r":
+			response = map[string]any{"default_branch": "main"}
+		case "GET /repos/o/r/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": "abcdef0"}}
+		case "GET /repos/o/r/issues?state=open&per_page=100&page=1":
+			response = []any{map[string]any{"number": 10, "title": "label-only", "body": currentBody, "created_at": now}}
+		case "GET /repos/o/r/issues/10":
+			response = map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": currentBody, "created_at": now, "user": map[string]any{"id": 9}, "labels": labels}
+		case "GET /repos/o/r/issues/10/timeline?per_page=100&page=1":
+			response = events
+		case "GET /repos/o/r/issues/10/comments?per_page=100&page=1":
+			response = comments
+		case "GET /repos/o/r/issues/comments/70":
+			response = comments[len(comments)-1]
+		case "POST /graphql":
+			nodes := []any{}
+			if edited {
+				nodes = append(nodes, map[string]any{"id": "UCE_1", "editedAt": now.Add(2 * time.Second), "editor": map[string]any{"__typename": "User", "databaseId": 5}})
+			}
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": nodes}}}}}
+		case "GET /user/5", "GET /user/42":
+			response = map[string]any{"login": "owner"}
+		case "GET /repos/o/r/collaborators/owner/permission":
+			response = map[string]any{"permission": "maintain"}
+		case "POST /repos/o/r/issues/10/comments":
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil {
+				t.Fatal("invalid snapshot request")
+			}
+			snapshot, err := ParseSnapshotComment(payload.Body, 42, 42)
+			if err != nil || !approved && (snapshot.ApprovalID != 0 || snapshot.ApprovalActor != 0) || approved && (snapshot.ApprovalID != 70 || snapshot.ApprovalActor != 5) {
+				t.Fatalf("label-only snapshot=%#v err=%v", snapshot, err)
+			}
+			snapshots, posts = append(snapshots, payload.Body), posts+1
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		encoded, _ := json.Marshal(response)
+		return httpResponse(http.StatusOK, string(encoded), nil), nil
+	})}}
+	cfg := productionPRConfig()
+
+	facts, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || len(facts) != 1 || !facts[0].Eligible || !facts[0].DispatchAuthorized || posts != 1 {
+		t.Fatalf("autonomous facts=%#v posts=%d err=%v", facts, posts, err)
+	}
+	facts, err = FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || !facts[0].Eligible || posts != 1 {
+		t.Fatalf("restored autonomous facts=%#v posts=%d err=%v", facts, posts, err)
+	}
+
+	edited = true
+	facts, err = FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || facts[0].Eligible || posts != 1 || !slices.Contains(facts[0].Blockers, "autonomous label does not authorize the current issue body") {
+		t.Fatalf("edited facts=%#v posts=%d err=%v", facts, posts, err)
+	}
+
+	edited, priorityChanged = false, true
+	facts, err = FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || facts[0].Eligible || posts != 1 || !slices.Contains(facts[0].Blockers, "autonomous label does not authorize the current issue controls") {
+		t.Fatalf("changed-priority facts=%#v posts=%d err=%v", facts, posts, err)
+	}
+
+	approved = true
+	facts, err = FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || !facts[0].Eligible || posts != 2 {
+		t.Fatalf("explicit autonomous approval facts=%#v posts=%d err=%v", facts, posts, err)
+	}
+
+	snapshots, approved, priorityChanged, autonomous = nil, false, false, false
+	facts, err = FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || facts[0].Eligible || posts != 2 || !slices.Contains(facts[0].Blockers, "fresh exact approval command is missing") {
+		t.Fatalf("human-review facts=%#v posts=%d err=%v", facts, posts, err)
+	}
+
+	snapshots, autonomous, actor = nil, true, 42
+	facts, err = FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || facts[0].Eligible || posts != 2 || !slices.Contains(facts[0].Blockers, "control provenance is missing or unauthorized") {
+		t.Fatalf("App-authored facts=%#v posts=%d err=%v", facts, posts, err)
+	}
+}
+
 func TestFetchAttemptFactsPaginatesMarkersAndChecks(t *testing.T) {
 	branch, _ := AttemptBranch("o/r", 4, 2)
 	marker, _ := AttemptMarker(4, 2, branch, "ccccccc", 9, "review")
