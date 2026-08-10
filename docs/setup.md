@@ -126,7 +126,12 @@ agent-symphony doctor --runtime-state ~/.local/state/agent-symphony
 
 ## 7. Label a test issue and dispatch it
 
-On the repository, open an issue and add two labels: `agent-ready` and one of `priority:P1` / `priority:P2` / `priority:P3` (exact text comes from `.agent-symphony.yaml`'s `labels` section — the defaults from a fresh `init` match those shown here).
+On the repository, open an issue and add `agent-ready` plus exactly one of `priority:P1` / `priority:P2` / `priority:P3` (exact text comes from `.agent-symphony.yaml`; fresh `init` defaults match those shown here). Then choose one completion path:
+
+- For unattended completion, also add `autonomous-merge`. These three labels are the authorization; do not post `/agent-symphony approve`. `serve` can dispatch the issue and merge its pull request only after the existing review, check, scope, governance, and branch-protection gates pass.
+- For human review, omit `autonomous-merge` and post the exact `/agent-symphony approve` comment from an authorized account. The pull request remains subject to human-review policy.
+
+Changing the issue body or readiness/priority labels after label-only authorization blocks execution until an authorized actor removes and reapplies `autonomous-merge`. Removing readiness, autonomous completion, or the sole priority label also blocks execution.
 
 ```sh
 agent-symphony reconcile --state ~/.local/state/agent-symphony/pr.json --runtime-state ~/.local/state/agent-symphony
