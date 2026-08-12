@@ -16,7 +16,7 @@ Agent Symphony is a planned GitHub-native, multi-agent software delivery orchest
 - Restart-safe reconciliation and terminal-based operational status
 - macOS, Linux, and Windows through WSL
 
-The browser dashboard, multi-repository orchestration, GitHub Projects synchronization, and inferred dependencies are post-MVP work.
+Independent one-repository daemons may share a host when each uses distinct state paths; shared resource names include the repository identity. A single daemon still manages exactly one repository. The browser dashboard, multi-repository orchestration, GitHub Projects synchronization, and inferred dependencies are post-MVP work.
 
 ## Documentation
 

@@ -88,6 +88,28 @@ agent-symphony serve \
   --runtime-state ~/.local/state/agent-symphony
 ```
 
+## Multiple repositories on one host
+
+Run one separately supervised process from each repository checkout and give each repository its own state directory. These are two independent service commands, not a single shell sequence:
+
+```sh
+cd /path/to/first-repository
+agent-symphony serve \
+  --state ~/.local/state/agent-symphony/first/pr.json \
+  --runtime-state ~/.local/state/agent-symphony/first
+```
+
+```sh
+cd /path/to/second-repository
+agent-symphony serve \
+  --state ~/.local/state/agent-symphony/second/pr.json \
+  --runtime-state ~/.local/state/agent-symphony/second
+```
+
+Each process still manages only its configured repository. The daemons share the authenticated GitHub CLI account and, in advanced mode, the provisioned worker/reviewer identities; source bundle, worktree, review snapshot, and tmux session names include the repository identity. Concurrency remains per daemon, so size the sum of their configured capacities for the host.
+
+Before upgrading an existing installation to the first release with repository-namespaced reviewer sessions, let active independent reviews finish and reconcile their cleanup. Implementation attempt identities are unchanged.
+
 ## Advanced: host-isolated mode
 
 The default boundary runs implementation and review processes as the coordinator's operating-system user while filtering their environment, remotes, and credential helpers. For OS-enforced separation, install a versioned release as root and provision the fixed worker and reviewer identities:

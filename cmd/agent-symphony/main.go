@@ -587,7 +587,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if len(issues) > 0 {
 		baseBranch, baseSHA = issues[0].BaseBranch, issues[0].BaseSHA
 	}
-	source, err := seedAttemptSource(ctx, root, attemptRoot, baseBranch, baseSHA)
+	source, err := seedAttemptSource(ctx, root, c.Repository, attemptRoot, baseBranch, baseSHA)
 	if err != nil {
 		return nil, err
 	}
@@ -788,7 +788,7 @@ func writeStatusSnapshot(stateRoot string, statuses []orchestrator.RecoveryStatu
 	return os.Rename(tmpName, path)
 }
 
-func seedAttemptSource(ctx context.Context, repository, attemptRoot, baseBranch, baseSHA string) (string, error) {
+func seedAttemptSource(ctx context.Context, checkout, repositoryName, attemptRoot, baseBranch, baseSHA string) (string, error) {
 	mode := os.FileMode(0o770)
 	if !hostIsolationInstalled() {
 		mode = 0o700
@@ -804,12 +804,12 @@ func seedAttemptSource(ctx context.Context, repository, attemptRoot, baseBranch,
 			return "", fmt.Errorf("validate worker source branch: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 		remoteRef := "refs/remotes/origin/" + baseBranch
-		if exec.CommandContext(ctx, "git", "-C", repository, "merge-base", "--is-ancestor", baseSHA, remoteRef).Run() != nil {
+		if exec.CommandContext(ctx, "git", "-C", checkout, "merge-base", "--is-ancestor", baseSHA, remoteRef).Run() != nil {
 			refspec := "+refs/heads/" + baseBranch + ":" + remoteRef
-			if out, err := exec.CommandContext(ctx, "git", "-C", repository, "fetch", "--no-tags", "origin", refspec).CombinedOutput(); err != nil {
+			if out, err := exec.CommandContext(ctx, "git", "-C", checkout, "fetch", "--no-tags", "origin", refspec).CombinedOutput(); err != nil {
 				return "", fmt.Errorf("refresh worker source base: %w: %s", err, strings.TrimSpace(string(out)))
 			}
-			if err := exec.CommandContext(ctx, "git", "-C", repository, "merge-base", "--is-ancestor", baseSHA, remoteRef).Run(); err != nil {
+			if err := exec.CommandContext(ctx, "git", "-C", checkout, "merge-base", "--is-ancestor", baseSHA, remoteRef).Run(); err != nil {
 				return "", errors.New("refreshed worker source does not contain the selected base")
 			}
 		}
@@ -823,13 +823,13 @@ func seedAttemptSource(ctx context.Context, repository, attemptRoot, baseBranch,
 		return "", err
 	}
 	defer os.Remove(name)
-	if out, err := exec.CommandContext(ctx, "git", "-C", repository, "bundle", "create", name, "--all").CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "git", "-C", checkout, "bundle", "create", name, "--all").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("seed worker source bundle: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	if err := os.Chmod(name, 0o640); err != nil {
 		return "", err
 	}
-	path := filepath.Join(attemptRoot, "source.bundle")
+	path := filepath.Join(attemptRoot, internalgithub.RepositoryIdentifier(repositoryName)+".source.bundle")
 	if err := os.Rename(name, path); err != nil {
 		return "", err
 	}
@@ -1386,7 +1386,9 @@ func cleanupReviewOutcome(ctx context.Context, runtimeState *agentruntime.Runtim
 }
 
 func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, string) {
-	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", strings.ReplaceAll(attempt.Repository, "/", "-"), attempt.Issue, attempt.Number)), fmt.Sprintf("as-review-%d-%d", attempt.Issue, attempt.Number)
+	repository := internalgithub.RepositoryIdentifier(attempt.Repository)
+	sum := sha256.Sum256([]byte(attempt.Repository))
+	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", repository, attempt.Issue, attempt.Number)), fmt.Sprintf("as-r-%x-%d-%d", sum[:8], attempt.Issue, attempt.Number)
 }
 
 func reviewResultPath(snapshot, head string) string {

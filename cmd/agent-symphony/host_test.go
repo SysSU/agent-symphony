@@ -647,9 +647,19 @@ func TestProductionSeedClonesThroughAgentHostBoundary(t *testing.T) {
 		}
 	}
 	root := nativeRoot("/var/lib/agent-symphony/attempts")
-	bundle, err := seedAttemptSource(t.Context(), source, root, "", "")
+	bundle, err := seedAttemptSource(t.Context(), source, "o/r", root, "", "")
 	if err != nil {
 		t.Fatal(err)
+	}
+	otherBundle, err := seedAttemptSource(t.Context(), source, "other/r", root, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle == otherBundle {
+		t.Fatal("different repositories shared a source bundle")
+	}
+	if _, err := os.Stat(bundle); err != nil {
+		t.Fatalf("first repository bundle was replaced: %v", err)
 	}
 	info, err := os.Stat(bundle)
 	if err != nil || info.Mode().Perm() != 0o640 {
@@ -698,7 +708,7 @@ func TestProductionSeedFetchesSelectedBaseWithoutMovingCheckout(t *testing.T) {
 	run(publisher, "push", "origin", "main")
 	selectedBase := run(publisher, "rev-parse", "HEAD")
 
-	bundle, err := seedAttemptSource(t.Context(), coordinator, t.TempDir(), "main", selectedBase)
+	bundle, err := seedAttemptSource(t.Context(), coordinator, "o/r", t.TempDir(), "main", selectedBase)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -722,7 +732,7 @@ func TestLocalSeedAndDiscoveryUseSeparateRoots(t *testing.T) {
 	}
 	stateRoot := t.TempDir()
 	worktreeRoot := productionAttemptRoot(stateRoot)
-	bundle, err := seedAttemptSource(t.Context(), source, worktreeRoot, "", "")
+	bundle, err := seedAttemptSource(t.Context(), source, "o/r", worktreeRoot, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

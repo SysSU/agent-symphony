@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 )
 
 type fakeRunner struct {
@@ -967,7 +969,7 @@ func TestStateContainmentRejectsEscapes(t *testing.T) {
 		if err := os.Mkdir(filepath.Join(r.StateRoot, "attempts"), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(t.TempDir(), filepath.Join(r.StateRoot, "attempts", repoIdentifier(attempt.Repository))); err != nil {
+		if err := os.Symlink(t.TempDir(), filepath.Join(r.StateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository))); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := r.PrepareAndStart(context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "symlink") {
@@ -987,7 +989,7 @@ func TestStateContainmentRejectsEscapes(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(outside, "3-1", "manifest.json"), []byte("{}"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(outside, filepath.Join(attempts, repoIdentifier(attempt.Repository))); err != nil {
+		if err := os.Symlink(outside, filepath.Join(attempts, internalgithub.RepositoryIdentifier(attempt.Repository))); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := r.Discover(); err == nil || !strings.Contains(err.Error(), "symlink") {
@@ -1090,7 +1092,7 @@ func TestRepositoryIdentityAndCaseCollision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(r.manifestPath(first), repoIdentifier(first.Repository)) || !strings.Contains(manifest.Session, repoIdentifier(first.Repository)) {
+	if !strings.Contains(r.manifestPath(first), internalgithub.RepositoryIdentifier(first.Repository)) || !strings.Contains(manifest.Session, internalgithub.RepositoryIdentifier(first.Repository)) {
 		t.Fatalf("repository identity missing: %#v", manifest)
 	}
 	second := first
