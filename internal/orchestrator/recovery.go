@@ -124,7 +124,7 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 	for _, fact := range unique {
 		key := attemptKey(fact.Repository, fact.Issue, fact.Attempt)
 		if conflicting[key] {
-			result = append(result, RecoveryStatus{Repository: fact.Repository, Issue: fact.Issue, Attempt: fact.Attempt, State: "conflicting", Diagnostic: "GitHub reports contradictory attempt facts", Action: "repair the App-authored attempt markers, then reconcile"})
+			result = append(result, RecoveryStatus{Repository: fact.Repository, Issue: fact.Issue, Attempt: fact.Attempt, State: "conflicting", Diagnostic: "GitHub reports contradictory attempt facts", Action: "repair the coordinator-authored attempt markers, then reconcile"})
 			continue
 		}
 		status := RecoveryStatus{Repository: fact.Repository, Issue: fact.Issue, Attempt: fact.Attempt, State: fact.State, PR: fact.PR, HeadSHA: fact.HeadSHA, Priority: fact.Priority, Dependencies: fact.Dependencies, Checks: fact.Checks}
@@ -140,7 +140,7 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 		}
 		issueConflict = active > 1 || (active > 0 && completed > 0) || completed > 1
 		if issueConflict {
-			status.State, status.Blockers, status.Diagnostic, status.Action = "blocked", []string{"conflicting authoritative attempts"}, "GitHub reports duplicate active/completed attempts for this issue", "repair App-authored markers; dispatch is suppressed"
+			status.State, status.Blockers, status.Diagnostic, status.Action = "blocked", []string{"conflicting authoritative attempts"}, "GitHub reports duplicate active/completed attempts for this issue", "repair coordinator-authored markers; dispatch is suppressed"
 		}
 		for i, manifest := range local {
 			if manifest.Repository != fact.Repository || manifest.Issue != fact.Issue || manifest.Attempt != fact.Attempt {
@@ -192,11 +192,7 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 }
 
 // ReconcileLoop reconciles immediately, then repeats at most every interval.
-// wake is an optional early-wake-up hint source (typically a coalesced
-// webhook signal): a receive from it triggers an extra reconcile between
-// ticks without replacing periodic reconciliation as the authoritative
-// recovery path. A nil wake behaves exactly as ticker-only reconciliation.
-func ReconcileLoop(ctx context.Context, interval time.Duration, wake <-chan struct{}, reconcile func(context.Context) error) error {
+func ReconcileLoop(ctx context.Context, interval time.Duration, reconcile func(context.Context) error) error {
 	if reconcile == nil {
 		return errors.New("reconcile function is required")
 	}
@@ -211,8 +207,6 @@ func ReconcileLoop(ctx context.Context, interval time.Duration, wake <-chan stru
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			_ = reconcile(ctx)
-		case <-wake:
 			_ = reconcile(ctx)
 		}
 	}

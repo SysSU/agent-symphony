@@ -39,8 +39,7 @@ type PRAdapterConfig struct {
 	Repository, ReadyLabel, HumanReviewLabel, AutonomousMergeLabel, MergeMethod string
 	PriorityP1Label, PriorityP2Label, PriorityP3Label, DependencySection        string
 	DefaultCompletion, ApprovalCommand, CancelCommand, RetryCommand             string
-	AppID                                                                       int64
-	AppActorID                                                                  int
+	ActorID                                                                     int
 }
 
 // FileRecovery is the durable handoff from reconciliation to issue recovery.
@@ -421,7 +420,7 @@ func RunPRReconciliation(ctx context.Context, api API, cfg PRAdapterConfig, stat
 		return err
 	}
 	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
-	if err := api.VerifyInstallation(ctx, cfg.AppID, cfg.Repository); err != nil {
+	if err := api.VerifyRepository(ctx, cfg.Repository); err != nil {
 		return err
 	}
 	if _, err := os.Lstat(statePath); errors.Is(err, os.ErrNotExist) {
@@ -431,7 +430,7 @@ func RunPRReconciliation(ctx context.Context, api API, cfg PRAdapterConfig, stat
 	} else if err != nil {
 		return err
 	}
-	attempts, err := FetchAttemptFacts(ctx, api, cfg.Repository, cfg.AppID, cfg.AppActorID)
+	attempts, err := FetchAttemptFacts(ctx, api, cfg.Repository, cfg.ActorID)
 	if err != nil {
 		return err
 	}
@@ -507,11 +506,11 @@ type GitHubPRSource struct {
 }
 
 func NewPRReconciler(api API, cfg PRAdapterConfig, recovery AttemptRecovery, attempts map[int]RecoveryAttemptFact, fullRead func() error) (Reconciler, error) {
-	if cfg.Repository == "" || cfg.ReadyLabel == "" || cfg.HumanReviewLabel == "" || cfg.AutonomousMergeLabel == "" || cfg.MergeMethod == "" || cfg.PriorityP1Label == "" || cfg.PriorityP2Label == "" || cfg.PriorityP3Label == "" || cfg.DependencySection == "" || cfg.DefaultCompletion == "" || cfg.ApprovalCommand == "" || cfg.CancelCommand == "" || cfg.RetryCommand == "" || cfg.CancelCommand == cfg.RetryCommand || cfg.AppID <= 0 || cfg.AppActorID <= 0 || recovery == nil || attempts == nil || fullRead == nil {
+	if cfg.Repository == "" || cfg.ReadyLabel == "" || cfg.HumanReviewLabel == "" || cfg.AutonomousMergeLabel == "" || cfg.MergeMethod == "" || cfg.PriorityP1Label == "" || cfg.PriorityP2Label == "" || cfg.PriorityP3Label == "" || cfg.DependencySection == "" || cfg.DefaultCompletion == "" || cfg.ApprovalCommand == "" || cfg.CancelCommand == "" || cfg.RetryCommand == "" || cfg.CancelCommand == cfg.RetryCommand || cfg.ActorID <= 0 || recovery == nil || attempts == nil || fullRead == nil {
 		return Reconciler{}, errors.New("PR reconciliation requires repository policy, recovery, and issue reconciliation")
 	}
 	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery, Attempts: attempts}
-	return Reconciler{FullRead: fullRead, PullRequests: &PRCoordinator{API: api, Source: source, Signals: RecoverySignals{recovery}, ReviewLabel: cfg.HumanReviewLabel, MergeMethod: cfg.MergeMethod}}, nil
+	return Reconciler{FullRead: fullRead, PullRequests: &PRCoordinator{API: api, Source: source, Signals: RecoverySignals{recovery}, ReviewLabel: cfg.HumanReviewLabel, MergeMethod: cfg.MergeMethod, ActorID: cfg.ActorID}}, nil
 }
 
 func (s *GitHubPRSource) OpenPullRequests(ctx context.Context) ([]int, error) {
@@ -639,9 +638,7 @@ func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRSt
 	if err := s.readApprovals(ctx, number, &state.Facts); err != nil {
 		return PRState{}, err
 	}
-	state.Facts.PolicyCheckRequired = slices.ContainsFunc(required, func(r requiredCheck) bool {
-		return r.Context == PolicyCheck && (r.AppID == 0 || r.AppID == s.Config.AppID)
-	})
+	state.Facts.PolicyCheckRequired = slices.ContainsFunc(required, func(r requiredCheck) bool { return r.Context == PolicyCheck && r.AppID == 0 })
 	if err := s.readReviews(ctx, number, &state.Facts); err != nil {
 		return PRState{}, err
 	}
@@ -663,7 +660,7 @@ func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRSt
 	}
 	state.Facts.Feedback = make([]Feedback, 0, len(comments))
 	for _, comment := range comments {
-		if strings.TrimSpace(comment.Body) == "" || comment.User.ID == s.Config.AppActorID || comment.App != nil {
+		if strings.TrimSpace(comment.Body) == "" {
 			continue
 		}
 		authorized, err := s.actorAuthorized(ctx, comment.User.ID)
@@ -815,8 +812,8 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 	var snapshotCommentID int64
 	found := false
 	for _, comment := range comments {
-		parsed, err := ParseSnapshotComment(comment.Body, comment.User.ID, s.Config.AppActorID)
-		if err == nil && comment.App != nil && comment.App.ID == s.Config.AppID {
+		parsed, err := ParseSnapshotComment(comment.Body, comment.User.ID, s.Config.ActorID)
+		if err == nil {
 			if found && comment.ID == snapshotCommentID {
 				return Controls{}, false, nil, errors.New("duplicate control snapshot")
 			}
@@ -826,7 +823,7 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 		}
 	}
 	if !found && !intake {
-		return Controls{}, false, nil, errors.New("valid App-authored control snapshot is missing")
+		return Controls{}, false, nil, errors.New("valid coordinator-authored control snapshot is missing")
 	}
 	provenance := currentProvenance
 	authorized := map[int]bool{}
@@ -848,7 +845,7 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 			if err != nil {
 				return err
 			}
-			authorized[actor] = actor != s.Config.AppActorID && (permission == "maintain" || permission == "admin")
+			authorized[actor] = permission == "maintain" || permission == "admin"
 		}
 		return nil
 	}
@@ -859,13 +856,12 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 			CreatedAt time.Time `json:"created_at"`
 			UpdatedAt time.Time `json:"updated_at"`
 			User      struct{ ID int }
-			App       *struct{ ID int64 } `json:"performed_via_github_app"`
 		}
 		if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/comments/%d", s.Config.Repository, id), "", &approval); err != nil {
 			return Approval{}, err
 		}
-		if approval.ID != id || approval.Body != s.Config.ApprovalCommand || approval.App != nil || approval.CreatedAt.IsZero() || !approval.CreatedAt.Equal(approval.UpdatedAt) {
-			return Approval{}, errors.New("approval comment is missing, edited, or App-authored")
+		if approval.ID != id || approval.Body != s.Config.ApprovalCommand || approval.CreatedAt.IsZero() || !approval.CreatedAt.Equal(approval.UpdatedAt) {
+			return Approval{}, errors.New("approval comment is missing or edited")
 		}
 		if err := authorizeActors(approval.User.ID); err != nil {
 			return Approval{}, err
@@ -914,7 +910,7 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 		var latest *issueCommentRecord
 		for i := range comments {
 			comment := &comments[i]
-			if comment.Body == s.Config.ApprovalCommand && comment.App == nil && comment.CreatedAt.Equal(comment.UpdatedAt) && comment.CreatedAt.After(changedAt) && (!found || comment.ID > snapshotCommentID) && (latest == nil || comment.CreatedAt.After(latest.CreatedAt) || comment.CreatedAt.Equal(latest.CreatedAt) && comment.ID > latest.ID) {
+			if comment.Body == s.Config.ApprovalCommand && comment.CreatedAt.Equal(comment.UpdatedAt) && comment.CreatedAt.After(changedAt) && (!found || comment.ID > snapshotCommentID) && (latest == nil || comment.CreatedAt.After(latest.CreatedAt) || comment.CreatedAt.Equal(latest.CreatedAt) && comment.ID > latest.ID) {
 				latest = comment
 			}
 		}
@@ -982,7 +978,7 @@ func latestControlCommand(comments []issueCommentRecord, cancel, retry string) (
 	for i := range comments {
 		c := &comments[i]
 		name := map[string]string{cancel: "cancelled", retry: "retry"}[c.Body]
-		if name != "" && c.App == nil && c.CreatedAt.Equal(c.UpdatedAt) && (latest == nil || c.CreatedAt.After(latest.CreatedAt) || c.CreatedAt.Equal(latest.CreatedAt) && c.ID > latest.ID) {
+		if name != "" && c.CreatedAt.Equal(c.UpdatedAt) && (latest == nil || c.CreatedAt.After(latest.CreatedAt) || c.CreatedAt.Equal(latest.CreatedAt) && c.ID > latest.ID) {
 			latest, latestName = c, name
 		}
 	}
@@ -1098,7 +1094,6 @@ type issueCommentRecord struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	User      struct{ ID int }
-	App       *struct{ ID int64 } `json:"performed_via_github_app"`
 }
 
 func (s *GitHubPRSource) issueComments(ctx context.Context, number int) ([]issueCommentRecord, error) {
@@ -1195,7 +1190,6 @@ type feedbackRecord struct {
 	CreatedAt time.Time `json:"created_at"`
 	Submitted time.Time `json:"submitted_at"`
 	User      struct{ ID int }
-	App       *struct{ ID int64 } `json:"performed_via_github_app"`
 }
 
 func (s *GitHubPRSource) readFeedback(ctx context.Context, number int) ([]feedbackRecord, error) {
@@ -1218,7 +1212,9 @@ func (s *GitHubPRSource) readFeedback(ctx context.Context, number int) ([]feedba
 					batch[i].CreatedAt = batch[i].Submitted
 				}
 			}
-			batch = slices.DeleteFunc(batch, func(f feedbackRecord) bool { return f.User.ID == s.Config.AppActorID || f.App != nil })
+			batch = slices.DeleteFunc(batch, func(f feedbackRecord) bool {
+				return f.User.ID == s.Config.ActorID && coordinatorArtifact(f.Body)
+			})
 			all = append(all, batch...)
 			if !fullPage {
 				break
@@ -1302,20 +1298,19 @@ func (s *GitHubPRSource) readIssueComments(ctx context.Context, issue, attempt i
 			ID   int64
 			Body string
 			User struct{ ID int }
-			App  *struct{ ID int64 } `json:"performed_via_github_app"`
 		}
 		path := fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100&page=%d", s.Config.Repository, issue, page)
 		if _, _, err := s.API.Read(ctx, path, "", &comments); err != nil {
 			return err
 		}
 		for _, comment := range comments {
-			if requireVerified && comment.App != nil && comment.App.ID == s.Config.AppID && comment.User.ID == s.Config.AppActorID {
+			if requireVerified && comment.User.ID == s.Config.ActorID {
 				got, err := parseAttemptMarker(comment.Body)
 				branch, branchErr := AttemptBranch(s.Config.Repository, verified.Issue, verified.Attempt)
 				authoritative = authoritative || err == nil && branchErr == nil && got.Issue == verified.Issue && got.Attempt == verified.Attempt && got.Branch == branch && got.Head == verified.HeadSHA && got.PR == verified.PR && got.Outcome == "review"
 			}
 			match := mergeMarker.FindStringSubmatch(comment.Body)
-			attributed := strings.Contains(comment.Body, marker) && comment.App != nil && comment.App.ID == s.Config.AppID && comment.User.ID == s.Config.AppActorID && s.Config.AppID > 0 && s.Config.AppActorID > 0
+			attributed := strings.Contains(comment.Body, marker) && comment.User.ID == s.Config.ActorID && s.Config.ActorID > 0
 			if len(match) == 3 && attributed {
 				if old, ok := latest[match[1]]; !ok || comment.ID > old.id {
 					latest[match[1]] = disposition{comment.ID, match[2]}
@@ -1354,7 +1349,7 @@ func (s *GitHubPRSource) readIssueComments(ctx context.Context, issue, attempt i
 		}
 		if len(comments) < 100 {
 			if requireVerified && !authoritative {
-				return errors.New("authoritative App issue marker is missing or changed")
+				return errors.New("authoritative coordinator issue marker is missing or changed")
 			}
 			for i := range state.Facts.Feedback {
 				if disposition, ok := feedbackDispositions[state.Facts.Feedback[i].identity()]; ok {
@@ -1437,23 +1432,31 @@ func (s *GitHubPRSource) readRequiredChecks(ctx context.Context, head string, re
 			break
 		}
 	}
-	if policy, ok := checks[fmt.Sprintf("%s\x00%d", PolicyCheck, s.Config.AppID)]; ok {
-		state.CheckRunID, state.CheckHead = policy.id, head
+	type commitStatus struct {
+		ok, set bool
+		state   string
+		actor   int
 	}
-	statuses := map[string]bool{}
+	statuses := map[string]commitStatus{}
 	for page := 1; ; page++ {
-		var body []struct{ Context, State string }
+		var body []struct {
+			Context, State string
+			Creator        struct{ ID int }
+		}
 		if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/commits/%s/statuses?per_page=100&page=%d", s.Config.Repository, head, page), "", &body); err != nil {
 			return err
 		}
 		for _, status := range body {
-			if _, seen := statuses[status.Context]; !seen {
-				statuses[status.Context] = status.State == "success"
+			if current := statuses[status.Context]; !current.set {
+				statuses[status.Context] = commitStatus{ok: status.State == "success", set: true, state: status.State, actor: status.Creator.ID}
 			}
 		}
 		if len(body) < 100 {
 			break
 		}
+	}
+	if policy := statuses[PolicyCheck]; policy.set && policy.actor == s.Config.ActorID {
+		state.CheckHead, state.PolicyStatus = head, policy.state
 	}
 	facts.RequiredChecksPass = true
 	for _, want := range required {
@@ -1472,7 +1475,7 @@ func (s *GitHubPRSource) readRequiredChecks(ctx context.Context, head string, re
 		}
 		ok := checkOK && got.ok
 		if want.AppID == 0 && !checkOK {
-			ok = statuses[want.Context]
+			ok = statuses[want.Context].ok
 		}
 		if !ok {
 			facts.RequiredChecksPass = false
@@ -1487,7 +1490,6 @@ func (s *GitHubPRSource) FreshFeedback(ctx context.Context, state PRState, feedb
 		Body      string
 		CreatedAt time.Time `json:"created_at"`
 		User      struct{ ID int }
-		App       *struct{ ID int64 } `json:"performed_via_github_app"`
 	}
 	var path string
 	switch feedback.Source {
@@ -1503,7 +1505,7 @@ func (s *GitHubPRSource) FreshFeedback(ctx context.Context, state PRState, feedb
 	if _, _, err := s.API.Read(ctx, path, "", &comment); err != nil {
 		return Feedback{}, err
 	}
-	if comment.User.ID == s.Config.AppActorID || comment.App != nil {
+	if comment.User.ID == s.Config.ActorID && coordinatorArtifact(comment.Body) {
 		return Feedback{ID: comment.ID, Source: feedback.Source, ActorID: comment.User.ID, Body: comment.Body, CreatedAt: comment.CreatedAt}, nil
 	}
 	authorized, err := s.actorAuthorized(ctx, comment.User.ID)
@@ -1513,6 +1515,13 @@ func (s *GitHubPRSource) FreshFeedback(ctx context.Context, state PRState, feedb
 func exactAttemptMarker(body string) bool {
 	match := attemptMarker.FindAllStringSubmatch(body, -1)
 	return len(match) == 1 && strings.Contains(body, "<!-- "+match[0][0]+" -->")
+}
+
+func coordinatorArtifact(body string) bool {
+	if _, err := ParseSnapshotComment(body, 1, 1); err == nil {
+		return true
+	}
+	return exactAttemptMarker(body)
 }
 
 func (s *GitHubPRSource) actorAuthorized(ctx context.Context, actorID int) (bool, error) {

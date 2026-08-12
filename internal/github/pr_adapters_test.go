@@ -159,8 +159,8 @@ func TestGitHubPRSourcePaginatesAndFailsClosed(t *testing.T) {
 		"/repos/o/r/issues/10/comments?per_page=100&page=1": comments,
 		"/repos/o/r/issues/10/comments?per_page=100&page=2": []any{
 			map[string]any{"id": 1, "body": "Merge attempt for head `forged00`: **prepared**.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}},
-			map[string]any{"id": 2, "body": "Merge attempt for head `badcafe`: **prepared**.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 99}, "performed_via_github_app": map[string]any{"id": 7}},
-			map[string]any{"id": 3, "body": "Merge attempt for head `abcdef0`: **prepared**.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
+			map[string]any{"id": 2, "body": "Merge attempt for head `badcafe`: **prepared**.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 99}},
+			map[string]any{"id": 3, "body": "Merge attempt for head `abcdef0`: **prepared**.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}},
 		},
 		"/repos/o/r/branches/main/protection": map[string]any{"required_status_checks": map[string]any{"strict": true, "checks": []any{map[string]any{"context": PolicyCheck, "app_id": 7}, map[string]any{"context": "build", "app_id": 8}, map[string]any{"context": "legacy", "app_id": 0}}}, "required_pull_request_reviews": map[string]any{"dismiss_stale_reviews": true, "required_approving_review_count": 2, "require_code_owner_reviews": true, "require_last_push_approval": true}},
 		"/graphql":                            map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviewDecision": nil}}}},
@@ -182,7 +182,7 @@ func TestGitHubPRSourcePaginatesAndFailsClosed(t *testing.T) {
 	}
 	api := fixtureAPI(t, responses)
 	recovery := &recoveryStub{state: PRState{Facts: PRFacts{ValidationSHA: "abcdef0", DocumentationSHA: "abcdef0", Feedback: []Feedback{{ID: 55, State: FeedbackAddressed, Delegated: true}}}}}
-	source := GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r", ReadyLabel: "ready", AutonomousMergeLabel: "auto", HumanReviewLabel: "review", AppID: 7, AppActorID: 42}, Recovery: recovery}
+	source := GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r", ReadyLabel: "ready", AutonomousMergeLabel: "auto", HumanReviewLabel: "review", ActorID: 42}, Recovery: recovery}
 	state, err := source.FreshPullRequest(context.Background(), 3)
 	if err != nil {
 		t.Fatal(err)
@@ -198,20 +198,15 @@ func TestFeedbackDispositionRequiresFreshCanonicalGitHubConfirmation(t *testing.
 	for _, test := range []struct {
 		name string
 		body string
-		app  bool
 		want bool
 	}{
-		{"canonical", body, true, true},
-		{"non canonical", "prefix" + body, true, false},
-		{"not App authored", body, false, false},
+		{"canonical", body, true},
+		{"non canonical", "prefix" + body, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			comment := map[string]any{"id": 9, "body": test.body, "user": map[string]any{"id": 42}}
-			if test.app {
-				comment["performed_via_github_app"] = map[string]any{"id": 7}
-			}
 			state := PRState{HeadSHA: "abcdef0", Facts: PRFacts{Feedback: []Feedback{feedback}}}
-			source := GitHubPRSource{API: fixtureAPI(t, map[string]any{"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{comment}}), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}}
+			source := GitHubPRSource{API: fixtureAPI(t, map[string]any{"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{comment}}), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
 			if err := source.readIssueComments(context.Background(), 10, 2, &state); err != nil || (len(state.ConfirmedDispositions) == 1) != test.want {
 				t.Fatalf("state=%#v err=%v", state, err)
 			}
@@ -265,7 +260,7 @@ func TestHumanReviewRemovalRequiresExactVerifiedCompletionProvenance(t *testing.
 	}
 }
 
-func TestIssueEvidenceRequiresAppAttributionAndAllPages(t *testing.T) {
+func TestIssueEvidenceRequiresCoordinatorAttributionAndAllPages(t *testing.T) {
 	first := make([]map[string]any, 100)
 	for i := range first {
 		first[i] = map[string]any{"id": i + 1, "body": "noise"}
@@ -274,37 +269,48 @@ func TestIssueEvidenceRequiresAppAttributionAndAllPages(t *testing.T) {
 	source := GitHubPRSource{API: fixtureAPI(t, map[string]any{
 		"/repos/o/r/issues/10/comments?per_page=100&page=1": first,
 		"/repos/o/r/issues/10/comments?per_page=100&page=2": []any{
-			map[string]any{"id": 101, "body": "Agent Symphony validation evidence for head `abcdef0`.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
-			map[string]any{"id": 102, "body": "Agent Symphony documentation evidence for head `abcdef0`.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
+			map[string]any{"id": 101, "body": "Agent Symphony validation evidence for head `abcdef0`.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}},
+			map[string]any{"id": 102, "body": "Agent Symphony documentation evidence for head `abcdef0`.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}},
 		},
-	}), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}}
+	}), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
 	state := PRState{HeadSHA: "abcdef0", Facts: PRFacts{ValidationSHA: "local", DocumentationSHA: "local"}}
 	if err := source.readIssueComments(context.Background(), 10, 2, &state); err != nil || state.Facts.ValidationSHA != "abcdef0" || state.Facts.DocumentationSHA != "abcdef0" {
 		t.Fatalf("facts=%#v err=%v", state.Facts, err)
 	}
 }
 
-func TestBotFeedbackRejectedOnListAndRefetch(t *testing.T) {
+func TestSameUserFeedbackAllowedAndCoordinatorArtifactsFiltered(t *testing.T) {
+	artifact, _ := AttributedBody(9, 1, "Attempt published for review.")
 	source := GitHubPRSource{API: fixtureAPI(t, map[string]any{
-		"/repos/o/r/issues/3/comments?per_page=100&page=1": []any{map[string]any{"id": 1, "body": "bot", "user": map[string]any{"id": 42}}, map[string]any{"id": 2, "body": "app", "user": map[string]any{"id": 5}, "performed_via_github_app": map[string]any{"id": 7}}},
-		"/repos/o/r/pulls/3/comments?per_page=100&page=1":  []any{},
-		"/repos/o/r/pulls/3/reviews?per_page=100&page=1":   []any{},
+		"/repos/o/r/issues/3/comments?per_page=100&page=1": []any{
+			map[string]any{"id": 1, "body": "please fix this", "user": map[string]any{"id": 42}},
+			map[string]any{"id": 2, "body": artifact, "user": map[string]any{"id": 42}},
+		},
+		"/repos/o/r/pulls/3/comments?per_page=100&page=1": []any{},
+		"/repos/o/r/pulls/3/reviews?per_page=100&page=1":  []any{},
 		"/graphql":                     map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviewDecision": nil}}}},
-		"/repos/o/r/issues/comments/1": map[string]any{"id": 1, "body": "bot", "user": map[string]any{"id": 42}},
-	}), Config: PRAdapterConfig{Repository: "o/r", AppActorID: 42}}
+		"/repos/o/r/issues/comments/1": map[string]any{"id": 1, "body": "please fix this", "user": map[string]any{"id": 42}},
+		"/repos/o/r/issues/comments/2": map[string]any{"id": 2, "body": artifact, "user": map[string]any{"id": 42}},
+		"/user/42":                     map[string]any{"login": "coordinator"},
+		"/repos/o/r/collaborators/coordinator/permission": map[string]any{"permission": "admin"},
+	}), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
 	comments, err := source.readFeedback(context.Background(), 3)
-	if err != nil || len(comments) != 0 {
+	if err != nil || len(comments) != 1 || comments[0].ID != 1 {
 		t.Fatalf("comments=%#v err=%v", comments, err)
 	}
 	fresh, err := source.FreshFeedback(context.Background(), PRState{Repository: "o/r", Number: 3}, Feedback{ID: 1, Source: feedbackConversation})
-	if err != nil || fresh.Authorized {
+	if err != nil || !fresh.Authorized {
 		t.Fatalf("fresh=%#v err=%v", fresh, err)
+	}
+	fresh, err = source.FreshFeedback(context.Background(), PRState{Repository: "o/r", Number: 3}, Feedback{ID: 2, Source: feedbackConversation})
+	if err != nil || fresh.Authorized {
+		t.Fatalf("artifact=%#v err=%v", fresh, err)
 	}
 }
 
 func TestUnavailableBranchProtectionContinuesFailClosedAndIdempotent(t *testing.T) {
 	unavailable := fixtureHTTP{http.StatusForbidden, `{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","documentation_url":"https://docs.github.com/rest/repos/rules#get-rules-for-a-branch","status":"403"}`}
-	available := []any{map[string]any{"type": "required_status_checks", "parameters": map[string]any{"required_status_checks": []any{map[string]any{"context": PolicyCheck, "integration_id": 7}}}}}
+	available := []any{map[string]any{"type": "required_status_checks", "parameters": map[string]any{"required_status_checks": []any{map[string]any{"context": PolicyCheck, "integration_id": 0}}}}}
 	for _, test := range []struct {
 		name       string
 		protection fixtureHTTP
@@ -332,7 +338,7 @@ func TestUnavailableBranchProtectionContinuesFailClosedAndIdempotent(t *testing.
 				"/repos/o/r/pulls/3/reviews?per_page=100&page=1":   []any{},
 				"/graphql": map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviewDecision": nil}}}},
 			}
-			source := GitHubPRSource{API: fixtureAPI(t, responses), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}, Recovery: &recoveryStub{state: PRState{}}}
+			source := GitHubPRSource{API: fixtureAPI(t, responses), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}, Recovery: &recoveryStub{state: PRState{}}}
 			first, err := source.FreshPullRequest(context.Background(), 3)
 			second, again := source.FreshPullRequest(context.Background(), 3)
 			if err != nil || again != nil || first.Facts.BranchProtectionAllows != test.allows || !reflect.DeepEqual(first, second) {
@@ -398,7 +404,7 @@ func TestClassicProtectionOtherForbiddenResponsesFail(t *testing.T) {
 			"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{},
 			"/repos/o/r/branches/main/protection":               fixtureHTTP{http.StatusForbidden, body},
 		}
-		source := GitHubPRSource{API: fixtureAPI(t, responses), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}, Recovery: &recoveryStub{state: PRState{}}}
+		source := GitHubPRSource{API: fixtureAPI(t, responses), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}, Recovery: &recoveryStub{state: PRState{}}}
 		if _, err := source.FreshPullRequest(context.Background(), 3); err == nil {
 			t.Fatalf("unrelated protection failure was ignored: %s", body)
 		}
@@ -419,10 +425,10 @@ func TestRulesUnavailableRejectsAllOtherFailures(t *testing.T) {
 		{"authentication", fixtureAPI(t, map[string]any{"/repos/o/r/rules/branches/main?per_page=100&page=1": fixtureHTTP{http.StatusUnauthorized, body}})},
 		{"malformed", fixtureAPI(t, map[string]any{"/repos/o/r/rules/branches/main?per_page=100&page=1": fixtureHTTP{http.StatusForbidden, "not json"}})},
 		{"oversized", fixtureAPI(t, map[string]any{"/repos/o/r/rules/branches/main?per_page=100&page=1": fixtureHTTP{http.StatusForbidden, body + strings.Repeat(" ", 4096)}})},
-		{"read failure", API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		{"read failure", API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return &http.Response{StatusCode: http.StatusForbidden, Status: "403 Forbidden", Body: io.NopCloser(&readErrorAfterBody{body: body})}, nil
 		})}}},
-		{"transport failure", API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		{"transport failure", API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return nil, fmt.Errorf("connection reset")
 		})}}},
 	} {
@@ -464,7 +470,7 @@ func TestPullRequestMergedFieldIsRequired(t *testing.T) {
 
 func TestRunPRReconciliationConstructsAndExecutes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	api := fixtureAPI(t, map[string]any{"/installation/repositories?per_page=100&page=1": map[string]any{"repositories": []any{map[string]any{"full_name": "o/r"}}}, "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": []any{}, "/repos/o/r/pulls?state=open&per_page=100&page=1": []any{}})
+	api := fixtureAPI(t, map[string]any{"/repos/o/r": map[string]any{"full_name": "o/r", "permissions": map[string]any{"pull": true}}, "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": []any{}, "/repos/o/r/pulls?state=open&per_page=100&page=1": []any{}})
 	cfg := productionPRConfig()
 	if err := RunPRReconciliation(context.Background(), api, cfg, path); err != nil {
 		t.Fatal(err)
@@ -525,12 +531,12 @@ func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t 
 			marker, _ := AttemptMarker(10, 2, branch, "abcdef0", 3, "review")
 			prBody := "Closes #10\n\n<!-- agent-symphony:issue:10:attempt:2 -->\n\n" + marker
 			comments := []any{
-				map[string]any{"id": 60, "body": SnapshotComment(snapshot), "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
-				map[string]any{"id": 61, "body": marker, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
+				map[string]any{"id": 60, "body": SnapshotComment(snapshot), "user": map[string]any{"id": 42}},
+				map[string]any{"id": 61, "body": marker, "user": map[string]any{"id": 42}},
 			}
 			responses := map[string]any{
-				"/installation/repositories?per_page=100&page=1":                             map[string]any{"repositories": []any{map[string]any{"full_name": "o/r"}}},
-				"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": []any{map[string]any{"number": 3, "body": prBody, "state": "open", "head": map[string]any{"sha": "abcdef0", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}, "performed_via_github_app": nil}},
+				"/repos/o/r": map[string]any{"full_name": "o/r", "permissions": map[string]any{"pull": true, "push": true}},
+				"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": []any{map[string]any{"number": 3, "body": prBody, "state": "open", "head": map[string]any{"sha": "abcdef0", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}}},
 				"/repos/o/r/pulls?state=open&per_page=100&page=1":                            []any{map[string]any{"number": 3, "body": prBody}},
 				"/repos/o/r/issues/10": map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 5}, "labels": []any{map[string]any{"name": "ready"}, map[string]any{"name": "P3"}}},
 				"/repos/o/r/issues/10/timeline?per_page=100&page=1": []any{
@@ -541,18 +547,19 @@ func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t 
 				"/user/5":                       map[string]any{"login": "owner"},
 				"/repos/o/r/collaborators/owner/permission":                               map[string]any{"permission": "maintain"},
 				"/repos/o/r/commits/abcdef0/check-runs?filter=latest&per_page=100&page=1": map[string]any{"check_runs": []any{}},
+				"/repos/o/r/commits/abcdef0/check-runs?filter=all&per_page=100&page=1":    map[string]any{"check_runs": []any{}},
+				"/repos/o/r/commits/abcdef0/status":                                       map[string]any{"statuses": []any{}},
 				"/repos/o/r/branches/main/protection":                                     fixtureHTTP{http.StatusNotFound, `{"message":"not protected"}`},
 				"/repos/o/r/rules/branches/main?per_page=100&page=1":                      []any{},
 				"/repos/o/r/commits/abcdef0/statuses?per_page=100&page=1":                 []any{},
-				"/repos/o/r": map[string]any{"permissions": map[string]any{"push": true}},
-				"/repos/o/r/issues/3/comments?per_page=100&page=1": []any{},
-				"/repos/o/r/pulls/3/comments?per_page=100&page=1":  []any{},
-				"/repos/o/r/pulls/3/reviews?per_page=100&page=1":   []any{},
+				"/repos/o/r/issues/3/comments?per_page=100&page=1":                        []any{},
+				"/repos/o/r/pulls/3/comments?per_page=100&page=1":                         []any{},
+				"/repos/o/r/pulls/3/reviews?per_page=100&page=1":                          []any{},
 				"/graphql": map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}, "pullRequest": map[string]any{"reviewDecision": nil}}}},
 			}
 			labelPresent, checkCreated, dropMarkerAfterFetch := false, false, false
 			freshMutation, commentReads, labelPosts, policyMutations := "", 0, 0, 0
-			api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				switch req.Method + " " + req.URL.RequestURI() {
 				case "GET /repos/o/r/pulls/3":
 					labels := []any{}
@@ -579,22 +586,19 @@ func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t 
 					}
 					b, _ := json.Marshal(current)
 					return httpResponse(http.StatusOK, string(b), nil), nil
-				case "GET /repos/o/r/commits/abcdef0/check-runs?filter=all&per_page=100&page=1":
-					checks := []any{}
+				case "GET /repos/o/r/commits/abcdef0/statuses?per_page=100&page=1":
+					statuses := []any{}
 					if checkCreated {
-						checks = append(checks, map[string]any{"id": 44, "name": PolicyCheck, "status": "in_progress", "app": map[string]any{"id": 7}})
+						statuses = append(statuses, map[string]any{"context": PolicyCheck, "state": "pending", "creator": map[string]any{"id": 42}})
 					}
-					b, _ := json.Marshal(map[string]any{"check_runs": checks})
+					b, _ := json.Marshal(statuses)
 					return httpResponse(http.StatusOK, string(b), nil), nil
 				case "POST /repos/o/r/issues/3/labels":
 					labelPresent, labelPosts = true, labelPosts+1
 					return httpResponse(http.StatusOK, `[]`, nil), nil
-				case "POST /repos/o/r/check-runs":
+				case "POST /repos/o/r/statuses/abcdef0":
 					checkCreated, policyMutations = true, policyMutations+1
-					return httpResponse(http.StatusCreated, `{"id":44}`, nil), nil
-				case "PATCH /repos/o/r/check-runs/44":
-					policyMutations++
-					return httpResponse(http.StatusOK, `{"id":44}`, nil), nil
+					return httpResponse(http.StatusCreated, `{}`, nil), nil
 				}
 				value, ok := responses[req.URL.RequestURI()]
 				if !ok {
@@ -635,24 +639,13 @@ func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t 
 	}
 }
 
-func TestInstallationTokenMustAccessConfiguredRepository(t *testing.T) {
-	api := fixtureAPI(t, map[string]any{"/installation/repositories?per_page=100&page=1": map[string]any{"repositories": []any{map[string]any{"full_name": "other/repo"}}}})
-	if err := api.VerifyInstallation(context.Background(), 7, "o/r"); err == nil {
-		t.Fatal("token for another installation was accepted")
-	}
-	api = API{Tokens: &InstallationTokens{JWTs: AppJWT{AppID: "8"}}}
-	if err := api.VerifyInstallation(context.Background(), 7, "o/r"); err == nil {
-		t.Fatal("credentials for another App were accepted")
-	}
-}
-
 func TestRunPRReconciliationSerializesWholeRun(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	var mu sync.Mutex
 	inFlight, overlap, pulls := 0, false, 0
-	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/installation/repositories" {
-			return httpResponse(http.StatusOK, `{"repositories":[{"full_name":"o/r"}]}`, nil), nil
+	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/repos/o/r" {
+			return httpResponse(http.StatusOK, `{"full_name":"o/r","permissions":{"pull":true}}`, nil), nil
 		}
 		mu.Lock()
 		inFlight++
@@ -690,10 +683,10 @@ func TestRunPRReconciliationIgnoresUnverifiedDurableState(t *testing.T) {
 		t.Fatal(err)
 	}
 	pulls := 0
-	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/installation/repositories":
-			return httpResponse(http.StatusOK, `{"repositories":[{"full_name":"o/r"}]}`, nil), nil
+		case "/repos/o/r":
+			return httpResponse(http.StatusOK, `{"full_name":"o/r","permissions":{"pull":true}}`, nil), nil
 		case "/repos/o/r/issues/10":
 			return httpResponse(http.StatusForbidden, `{"message":"denied"}`, nil), nil
 		default:
@@ -711,9 +704,9 @@ func TestRunPRReconciliationIgnoresUnverifiedDurableState(t *testing.T) {
 func TestIssueCommentsRecoverExactDecisionAndIgnoreAmbiguousText(t *testing.T) {
 	want, _ := AttributedBody(10, 2, "Implementation decision d1\n\nkeep it small")
 	source := GitHubPRSource{API: fixtureAPI(t, map[string]any{"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{
-		map[string]any{"id": 1, "body": "Implementation decision d1 keep it small <!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
-		map[string]any{"id": 2, "body": want, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
-	}}), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}}
+		map[string]any{"id": 1, "body": "Implementation decision d1 keep it small <!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}},
+		map[string]any{"id": 2, "body": want, "user": map[string]any{"id": 42}},
+	}}), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
 	state := PRState{HeadSHA: "abcdef0", Decisions: []Decision{{ID: "d1", Body: "keep it small"}, {ID: "d2", Body: "keep it small"}}}
 	if err := source.readIssueComments(context.Background(), 10, 2, &state); err != nil {
 		t.Fatal(err)
@@ -724,7 +717,7 @@ func TestIssueCommentsRecoverExactDecisionAndIgnoreAmbiguousText(t *testing.T) {
 }
 
 func productionPRConfig() PRAdapterConfig {
-	return PRAdapterConfig{Repository: "o/r", ReadyLabel: "ready", HumanReviewLabel: "review", AutonomousMergeLabel: "auto", MergeMethod: "squash", PriorityP1Label: "P1", PriorityP2Label: "P2", PriorityP3Label: "P3", DependencySection: "Dependencies", DefaultCompletion: "human-review", ApprovalCommand: "/approve", CancelCommand: "/cancel", RetryCommand: "/retry", AppID: 7, AppActorID: 42}
+	return PRAdapterConfig{Repository: "o/r", ReadyLabel: "ready", HumanReviewLabel: "review", AutonomousMergeLabel: "auto", MergeMethod: "squash", PriorityP1Label: "P1", PriorityP2Label: "P2", PriorityP3Label: "P3", DependencySection: "Dependencies", DefaultCompletion: "human-review", ApprovalCommand: "/approve", CancelCommand: "/cancel", RetryCommand: "/retry", ActorID: 42}
 }
 
 func TestProductionAuthorizedControlsVerifyGitHubSnapshot(t *testing.T) {
@@ -761,7 +754,7 @@ func TestProductionAuthorizedControlsVerifyGitHubSnapshot(t *testing.T) {
 			"/graphql":             map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}},
 			"/repos/o/r/issues/10": map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 9}, "labels": []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}, map[string]any{"name": "auto"}}},
 			"/repos/o/r/issues/10/timeline?per_page=100&page=1": events,
-			"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{map[string]any{"id": 60, "body": SnapshotComment(snapshot), "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}}},
+			"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{map[string]any{"id": 60, "body": SnapshotComment(snapshot), "user": map[string]any{"id": 42}}},
 			"/repos/o/r/issues/comments/50":                     map[string]any{"id": 50, "body": "/approve", "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 5}},
 			"/user/5":                                           map[string]any{"login": "owner"},
 			"/repos/o/r/collaborators/owner/permission":         map[string]any{"permission": "maintain"},
@@ -787,8 +780,8 @@ func TestProductionAuthorizedControlsVerifyGitHubSnapshot(t *testing.T) {
 			r["/repos/o/r/collaborators/owner/permission"].(map[string]any)["permission"] = "write"
 		}},
 		{"edited issue body", func(r map[string]any) { r["/repos/o/r/issues/10"].(map[string]any)["body"] = body + "tampered" }},
-		{"non App snapshot", func(r map[string]any) {
-			r["/repos/o/r/issues/10/comments?per_page=100&page=1"].([]any)[0].(map[string]any)["performed_via_github_app"] = nil
+		{"foreign coordinator snapshot", func(r map[string]any) {
+			r["/repos/o/r/issues/10/comments?per_page=100&page=1"].([]any)[0].(map[string]any)["user"] = map[string]any{"id": 41}
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -805,7 +798,9 @@ func TestIssueEvidenceRequiresExactCanonicalBody(t *testing.T) {
 	canonical, _ := EvidenceBody(10, 2, "validation", "abcdef0")
 	for _, body := range []string{"prefix" + canonical, canonical + "suffix", strings.Replace(canonical, "validation", "validation and documentation", 1)} {
 		t.Run(body[:min(12, len(body))], func(t *testing.T) {
-			source := GitHubPRSource{API: fixtureAPI(t, map[string]any{"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{map[string]any{"id": 1, "body": body, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}}}}), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}}
+			source := GitHubPRSource{API: fixtureAPI(t, map[string]any{
+				"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{map[string]any{"id": 1, "body": body, "user": map[string]any{"id": 42}}},
+			}), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
 			state := PRState{HeadSHA: "abcdef0"}
 			if err := source.readIssueComments(context.Background(), 10, 2, &state); err != nil || state.Facts.ValidationSHA != "" || state.Facts.DocumentationSHA != "" {
 				t.Fatalf("facts=%#v err=%v", state.Facts, err)
@@ -999,7 +994,7 @@ func TestFileRecoveryCorruptTerminalFeedbackCannotBecomeAuthoritative(t *testing
 		t.Fatalf("recovery must preserve queue data for publication: %#v err=%v", got, err)
 	}
 	// GitHubPRSource resets this local terminal value to pending unless an exact
-	// App-authored canonical comment confirms it; covered above.
+	// A coordinator-authored canonical comment confirms it; covered above.
 }
 
 func TestFileRecoveryRejectsSymlinkState(t *testing.T) {
@@ -1077,7 +1072,7 @@ func TestReviewDecisionPassBlockUnknown(t *testing.T) {
 		{"unknown", `{"data":{"repository":{"pullRequest":{"reviewDecision":null}}}}`, ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			source := GitHubPRSource{API: API{BaseURL: "https://example.test", Tokens: tokenStub("token"), HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			source := GitHubPRSource{API: API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 				return httpResponse(http.StatusOK, test.response, nil), nil
 			})}}, Config: PRAdapterConfig{Repository: "o/r"}}
 			got, err := source.readReviewDecision(context.Background(), 3)
@@ -1125,15 +1120,15 @@ func TestGraphQLReviewDecisionErrorFailsClosed(t *testing.T) {
 
 func TestLatestAttributedMergeDispositionWins(t *testing.T) {
 	comments := []any{
-		map[string]any{"id": 2, "body": "Merge attempt for head `abcdef0`: **resolved**.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
-		map[string]any{"id": 1, "body": "Merge attempt for head `abcdef0`: **prepared**.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
+		map[string]any{"id": 2, "body": "Merge attempt for head `abcdef0`: **resolved**.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}},
+		map[string]any{"id": 1, "body": "Merge attempt for head `abcdef0`: **prepared**.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}},
 	}
-	source := GitHubPRSource{API: fixtureAPI(t, map[string]any{"/repos/o/r/issues/10/comments?per_page=100&page=1": comments}), Config: PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}}
+	source := GitHubPRSource{API: fixtureAPI(t, map[string]any{"/repos/o/r/issues/10/comments?per_page=100&page=1": comments}), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
 	state := PRState{HeadSHA: "abcdef0"}
 	if err := source.readIssueComments(context.Background(), 10, 2, &state); err != nil || state.MergeAttemptSHA != "" {
 		t.Fatalf("state=%#v err=%v", state, err)
 	}
-	comments = append(comments, map[string]any{"id": 3, "body": "Merge attempt for head `abcdef0`: **prepared**.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}})
+	comments = append(comments, map[string]any{"id": 3, "body": "Merge attempt for head `abcdef0`: **prepared**.\n\n<!-- agent-symphony:issue:10:attempt:2 -->", "user": map[string]any{"id": 42}})
 	source.API = fixtureAPI(t, map[string]any{"/repos/o/r/issues/10/comments?per_page=100&page=1": comments})
 	if err := source.readIssueComments(context.Background(), 10, 2, &state); err != nil || state.MergeAttemptSHA != "abcdef0" {
 		t.Fatalf("state=%#v err=%v", state, err)
@@ -1219,7 +1214,7 @@ type fixtureHTTP struct {
 
 func fixtureAPI(t *testing.T, responses map[string]any) API {
 	t.Helper()
-	return API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	return API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		value, ok := responses[req.URL.RequestURI()]
 		if !ok {
 			return nil, fmt.Errorf("unexpected fixture request %s", req.URL.RequestURI())
@@ -1257,9 +1252,9 @@ func TestCheckRunsKeepNewestSameContextAndAppAcrossPages(t *testing.T) {
 			map[string]any{"id": 250, "name": PolicyCheck, "status": "completed", "conclusion": "success", "completed_at": "2026-08-02T01:00:00Z", "app": map[string]any{"id": 7}},
 		}},
 		"/repos/o/r/commits/abc/statuses?per_page=100&page=1": []any{},
-	}), Config: PRAdapterConfig{Repository: "o/r", AppID: 7}}
+	}), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
 	state := PRState{}
-	if err := source.readRequiredChecks(context.Background(), "abc", []requiredCheck{{Context: "ci", AppID: 8}}, &state); err != nil || state.Facts.RequiredChecksPass || state.CheckRunID != 300 || state.CheckHead != "abc" {
+	if err := source.readRequiredChecks(context.Background(), "abc", []requiredCheck{{Context: "ci", AppID: 8}}, &state); err != nil || state.Facts.RequiredChecksPass || state.CheckHead != "" {
 		t.Fatalf("state=%#v err=%v", state, err)
 	}
 }
@@ -1287,7 +1282,7 @@ func TestCheckRunsUseImmutableIDAndFailClosedOnDuplicate(t *testing.T) {
 }
 
 func TestLatestBodyEditUsesGraphQLUserContentEditShape(t *testing.T) {
-	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		var payload struct{ Query string }
 		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
@@ -1335,10 +1330,6 @@ func TestLatestControlCommandWinsAcrossCancelAndRetry(t *testing.T) {
 	comment, name := latestControlCommand(comments, "/cancel", "/retry")
 	if comment == nil || comment.ID != 10 || name != "cancelled" {
 		t.Fatalf("winner=%#v %q", comment, name)
-	}
-	comment.App = &struct{ ID int64 }{ID: 7}
-	if next, nextName := latestControlCommand(comments, "/cancel", "/retry"); next == nil || next.ID != 9 || nextName != "retry" {
-		t.Fatalf("fallback=%#v %q", next, nextName)
 	}
 }
 

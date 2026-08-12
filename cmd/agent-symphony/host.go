@@ -928,7 +928,7 @@ func reservedHostEnvironment(name string) bool {
 	if upper == "HOME" {
 		return true
 	}
-	for _, part := range []string{"TOKEN", "SECRET", "PASSWORD", "PASSWD", "PRIVATE_KEY", "PRIVATE-KEY", "CREDENTIAL", "AUTHORIZATION", "GITHUB_PAT", "WEBHOOK"} {
+	for _, part := range []string{"TOKEN", "SECRET", "PASSWORD", "PASSWD", "PRIVATE_KEY", "PRIVATE-KEY", "CREDENTIAL", "AUTHORIZATION", "GITHUB_PAT"} {
 		if strings.Contains(upper, part) {
 			return true
 		}

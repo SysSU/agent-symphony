@@ -19,7 +19,7 @@ Bootstrap uses the maintainer public key already pinned on protected `main`; the
 | Gate | Automated proof | External proof still required |
 | --- | --- | --- |
 | two independent concurrent issues; P1-P3/dependencies | scheduler race/unit tests use disjoint scopes, capacity, priority, and explicit dependency facts | pilot issue/attempt/PR links and timestamps |
-| duplicate webhook/restart | delivery-cache, recovery, attempt-marker, feedback-claim, and PR-governance tests | pilot delivery/restart timestamps and resulting single attempt/PR |
+| repeated polling/restart | recovery, attempt-marker, feedback-claim, and PR-governance tests | pilot restart timestamps and resulting single attempt/PR |
 | long-lived feedback and human review | immutable feedback/outcome and current-head governance tests | authorized comment, independent review, label-removal, checks, and merge links |
 | credential exclusion | environment/redaction/runtime tests plus all-regular-candidate-file scan | redacted worker/log/tmux/artifact scan records and rotation confirmation if needed |
 | macOS/Linux/WSL2 | native CI matrix and WSL2 execution job | successful run URLs; local cross-build alone is insufficient |
@@ -38,7 +38,7 @@ WSL2 CI run/job/result:
 Independent issues (issue -> attempt -> PR, start/end timestamps):
 Observed maximum concurrency and configured capacity:
 P1/P2/P3 and dependency ordering (issue links + dispatch timestamps):
-Duplicate delivery IDs/restart time -> single attempt/PR evidence:
+Repeated reconciliation/restart time -> single attempt/PR evidence:
 Long-lived PR dates; authorized feedback IDs and dispositions:
 Independent review result; human-review label removal event; required checks; merge:
 Credential scan commands, scopes, timestamps, redacted results:

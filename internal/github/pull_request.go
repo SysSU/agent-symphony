@@ -64,18 +64,17 @@ type PolicyResult struct {
 // PRState is reconstructed by PRSource from GitHub and issue #4's recovered
 // attempt state on every reconciliation. It is not coordinator-owned state.
 type PRState struct {
-	Repository, HeadSHA, CheckHead, ValidationQueuedSHA, ValidationInFlightSHA string
-	ValidationGeneration                                                       uint64 `json:"validation_generation,omitempty"`
-	ValidationResult, ValidationEvidence                                       string
-	MergeAttemptSHA, MergePhase                                                string
-	Number, Issue, Attempt                                                     int
-	CheckRunID                                                                 int64
-	ReviewLabelPresent                                                         bool
-	Facts                                                                      PRFacts
-	Decisions                                                                  []Decision
-	PendingDispositions                                                        []Feedback
-	ConfirmedDispositions                                                      []Feedback      `json:"-"`
-	HandoffReceipts                                                            map[string]bool `json:"handoff_receipts,omitempty"`
+	Repository, HeadSHA, CheckHead, PolicyStatus, ValidationQueuedSHA, ValidationInFlightSHA string
+	ValidationGeneration                                                                     uint64 `json:"validation_generation,omitempty"`
+	ValidationResult, ValidationEvidence                                                     string
+	MergeAttemptSHA, MergePhase                                                              string
+	Number, Issue, Attempt                                                                   int
+	ReviewLabelPresent                                                                       bool
+	Facts                                                                                    PRFacts
+	Decisions                                                                                []Decision
+	PendingDispositions                                                                      []Feedback
+	ConfirmedDispositions                                                                    []Feedback      `json:"-"`
+	HandoffReceipts                                                                          map[string]bool `json:"handoff_receipts,omitempty"`
 }
 
 type Decision struct {
@@ -87,6 +86,26 @@ type PRSource interface {
 	OpenPullRequests(context.Context) ([]int, error)
 	FreshPullRequest(context.Context, int) (PRState, error)
 	FreshFeedback(context.Context, PRState, Feedback) (Feedback, error)
+}
+
+type Reconciler struct {
+	FullRead     func() error
+	PullRequests *PRCoordinator
+}
+
+func (r Reconciler) RunOnce() error { return r.runOnce(context.Background()) }
+
+func (r Reconciler) runOnce(ctx context.Context) error {
+	if r.FullRead == nil {
+		return errors.New("reconciliation read is required")
+	}
+	if err := r.FullRead(); err != nil {
+		return err
+	}
+	if r.PullRequests != nil {
+		return r.PullRequests.Reconcile(ctx)
+	}
+	return nil
 }
 
 // PRSignals hands work to the existing attempt/recovery owner. Implementations
@@ -102,6 +121,7 @@ type PRCoordinator struct {
 	Signals     PRSignals
 	ReviewLabel string
 	MergeMethod string
+	ActorID     int
 }
 
 // Reconcile discovers every open PR and derives all effects from fresh facts.
@@ -207,12 +227,25 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 		return errors.New("pull request identity changed during reconciliation")
 	}
 	result := EvaluatePR(state.Facts)
-	checkID := state.CheckRunID
-	if state.CheckHead != state.HeadSHA {
-		checkID = 0
+	if status := policyStatus(result); state.CheckHead != state.HeadSHA || state.PolicyStatus != status {
+		if err := c.API.PublishPolicyStatus(ctx, state.Repository, state.HeadSHA, result, attribution); err != nil {
+			return err
+		}
 	}
-	if err := c.API.UpsertPolicyCheck(ctx, state.Repository, checkID, state.HeadSHA, result, attribution); err != nil {
-		return err
+	if !result.Merge && result.CheckStatus == "completed" && c.ActorID > 0 {
+		body, err := PolicyFailureBody(state.Issue, state.Attempt, state.HeadSHA, state.ValidationResult, result.MergeBlockers)
+		if err != nil {
+			return err
+		}
+		present, err := HasAttemptComment(ctx, c.API, state.Repository, state.Number, body, c.ActorID)
+		if err != nil {
+			return err
+		}
+		if !present {
+			if err := c.API.CreateIssueComment(ctx, state.Repository, state.Number, body, attribution); err != nil {
+				return err
+			}
+		}
 	}
 	if !result.Merge {
 		return nil
@@ -313,14 +346,8 @@ func EvaluatePR(f PRFacts) PolicyResult {
 	if f.BranchModifiedOutsideAttempt {
 		mergeBlockers = append(mergeBlockers, "attempt branch was modified outside the attempt")
 	}
-	if !f.PolicyCheckRequired {
-		mergeBlockers = append(mergeBlockers, "repository rules do not require the policy check")
-	}
 	if !f.MergePermission {
-		mergeBlockers = append(mergeBlockers, "App merge permission is unavailable")
-	}
-	if !f.BranchProtectionAllows {
-		mergeBlockers = append(mergeBlockers, "branch protection does not allow merge")
+		mergeBlockers = append(mergeBlockers, "merge permission is unavailable")
 	}
 	result := PolicyResult{CheckStatus: "completed", Reasons: reasons, MergeBlockers: mergeBlockers}
 	if f.NeedsHumanReview {
@@ -463,6 +490,20 @@ func EvidenceBody(issue, attempt int, kind, head string) (string, error) {
 	return AttributedBody(issue, attempt, fmt.Sprintf("Agent Symphony %s evidence for head `%s`.", kind, head))
 }
 
+func PolicyFailureBody(issue, attempt int, head, validation string, blockers []string) (string, error) {
+	if !regexpSHA.MatchString(head) || len(blockers) == 0 || validation != "" && !slices.Contains([]string{"passed", "failed", "blocked"}, validation) {
+		return "", errors.New("policy failure comment requires a head SHA and blockers")
+	}
+	blockers = slices.Clone(blockers)
+	slices.Sort(blockers)
+	blockers = slices.Compact(blockers)
+	message := fmt.Sprintf("Agent Symphony could not resolve policy for head `%s`:\n\n- %s", head, strings.Join(blockers, "\n- "))
+	if validation != "" {
+		message += "\n\nThe remediation validation attempt ended as **" + validation + "**."
+	}
+	return AttributedBody(issue, attempt, message)
+}
+
 func (a API) PublishEvidence(ctx context.Context, repository string, issue int, kind, head string, attribution Mutation) error {
 	body, err := EvidenceBody(issue, attribution.Attempt, kind, head)
 	if err != nil || issue != attribution.Issue {
@@ -474,37 +515,55 @@ func (a API) PublishEvidence(ctx context.Context, repository string, issue int, 
 	return a.CreateIssueComment(ctx, repository, issue, body, attribution)
 }
 
-var regexpSHA = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
-
-func (a API) PublishPolicyCheck(ctx context.Context, repository, head string, result PolicyResult, attribution Mutation) error {
-	return a.UpsertPolicyCheck(ctx, repository, 0, head, result, attribution)
+func (a API) EnsureEvidence(ctx context.Context, repository string, issue, attempt int, head string, actorID int) error {
+	if actorID <= 0 {
+		return errors.New("evidence publication requires the coordinator actor")
+	}
+	attribution := Mutation{Issue: issue, Attempt: attempt}
+	for _, kind := range []string{"validation", "documentation"} {
+		body, err := EvidenceBody(issue, attempt, kind, head)
+		if err != nil {
+			return err
+		}
+		present, err := HasAttemptComment(ctx, a, repository, issue, body, actorID)
+		if err != nil {
+			return err
+		}
+		if !present {
+			if err := a.PublishEvidence(ctx, repository, issue, kind, head, attribution); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
-// UpsertPolicyCheck updates the reconciled check-run identity, or creates it when absent.
-func (a API) UpsertPolicyCheck(ctx context.Context, repository string, checkRunID int64, head string, result PolicyResult, attribution Mutation) error {
+var regexpSHA = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+
+func (a API) PublishPolicyStatus(ctx context.Context, repository, head string, result PolicyResult, attribution Mutation) error {
 	if repository == "" || head == "" {
-		return errors.New("policy check repository and head SHA are required")
+		return errors.New("policy status repository and head SHA are required")
 	}
-	marker := fmt.Sprintf("<!-- agent-symphony:issue:%d:attempt:%d -->", attribution.Issue, attribution.Attempt)
 	summary := "Policy satisfied."
 	if len(result.MergeBlockers) > 0 {
 		summary = strings.Join(result.MergeBlockers, "; ")
 	}
-	method, path := http.MethodPost, "/repos/"+repository+"/check-runs"
-	if checkRunID > 0 {
-		method, path = http.MethodPatch, fmt.Sprintf("/repos/%s/check-runs/%d", repository, checkRunID)
+	description := fmt.Sprintf("issue #%d attempt %d: %s", attribution.Issue, attribution.Attempt, summary)
+	if len(description) > 140 {
+		description = description[:137] + "..."
 	}
-	body := map[string]any{
-		"name": PolicyCheck, "status": result.CheckStatus,
-		"output": map[string]string{"title": "Agent Symphony policy", "summary": summary + "\n\n" + marker},
+	body := map[string]string{"context": PolicyCheck, "state": policyStatus(result), "description": description}
+	return a.mutateAttributed(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/statuses/%s", repository, head), body, attribution)
+}
+
+func policyStatus(result PolicyResult) string {
+	if result.CheckStatus != "completed" {
+		return "pending"
 	}
-	if result.CheckConclusion != "" {
-		body["conclusion"] = result.CheckConclusion
+	if result.CheckConclusion == "success" {
+		return "success"
 	}
-	if checkRunID == 0 {
-		body["head_sha"] = head
-	}
-	return a.mutateAttributed(ctx, method, path, body, attribution)
+	return "failure"
 }
 
 func (a API) MergePullRequest(ctx context.Context, repository string, number int, expectedHead, method string, attribution Mutation) error {

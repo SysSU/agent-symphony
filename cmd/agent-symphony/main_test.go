@@ -3,24 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -1389,7 +1382,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, state)
-	if err == nil || !strings.Contains(err.Error(), "AGENT_SYMPHONY_GITHUB_APP_ID") {
+	if err == nil || !strings.Contains(err.Error(), "authenticate GitHub CLI") {
 		t.Fatalf("publication did not continue after cleanup: %v", err)
 	}
 	storedBody, _ = os.ReadFile(manifestPath)
@@ -1496,6 +1489,37 @@ func TestQueuedIssueProjectionIsReadOnlyAndAuthoritative(t *testing.T) {
 	statuses, decisions := joinIssueProjection(nil, issues, 1)
 	if len(statuses) != 1 || statuses[0].State != string(orchestrator.Blocked) || statuses[0].Priority != 1 || len(statuses[0].Dependencies) != 1 || len(statuses[0].Blockers) != 1 || statuses[0].Action == "" || len(decisions) != 1 {
 		t.Fatalf("statuses=%#v decisions=%#v", statuses, decisions)
+	}
+}
+
+func TestIssueProjectionCarriesDeclaredPaths(t *testing.T) {
+	now := time.Unix(1, 0)
+	issues := []internalgithub.RecoveryIssueFact{
+		{Repository: "o/r", Issue: 11, Attempt: 1, Priority: 3, CreatedAt: now, Paths: []string{"docs/low.md"}, Eligible: true},
+		{Repository: "o/r", Issue: 12, Attempt: 1, Priority: 2, CreatedAt: now.Add(time.Second), Paths: []string{"docs/shared.md"}, Eligible: true},
+		{Repository: "o/r", Issue: 13, Attempt: 1, Priority: 1, CreatedAt: now.Add(2 * time.Second), Paths: []string{"docs/shared.md"}, Eligible: true},
+		{Repository: "o/r", Issue: 14, Attempt: 1, Priority: 2, CreatedAt: now.Add(3 * time.Second), Paths: []string{"docs/disjoint.md"}, Eligible: true},
+	}
+	statuses, _ := joinIssueProjection(nil, issues, 2)
+	byIssue := map[int]orchestrator.RecoveryStatus{}
+	for _, status := range statuses {
+		byIssue[status.Issue] = status
+	}
+	if byIssue[13].State != string(orchestrator.Runnable) || byIssue[14].State != string(orchestrator.Runnable) ||
+		byIssue[12].State != string(orchestrator.Queued) || !strings.Contains(byIssue[12].Action, "#13") ||
+		byIssue[11].State != string(orchestrator.Queued) || !strings.Contains(byIssue[11].Action, "capacity") {
+		t.Fatalf("initial scheduling=%#v", statuses)
+	}
+
+	issues[2].Active = true
+	issues[3].Completed = true
+	statuses, _ = joinIssueProjection(nil, issues, 2)
+	byIssue = map[int]orchestrator.RecoveryStatus{}
+	for _, status := range statuses {
+		byIssue[status.Issue] = status
+	}
+	if byIssue[12].State != string(orchestrator.Queued) || !strings.Contains(byIssue[12].Action, "#13") || byIssue[11].State != string(orchestrator.Runnable) {
+		t.Fatalf("released slot scheduling=%#v", statuses)
 	}
 }
 
@@ -1612,104 +1636,31 @@ func TestConfigViewDoesNotEchoCredentialArgument(t *testing.T) {
 	}
 }
 
-func TestGitHubDiagnosticsPreservesTokenOnlyAuthentication(t *testing.T) {
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "42")
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", "")
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "")
-	t.Setenv("GITHUB_TOKEN", "token-canary")
-	t.Setenv("GH_TOKEN", "")
+func TestGitHubDiagnosticsVerifiesCLIIdentityAndRepository(t *testing.T) {
+	dir := t.TempDir()
+	gh := filepath.Join(dir, "gh")
+	if err := os.WriteFile(gh, []byte("#!/bin/sh\necho 'gh version 2.0.0'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path != "/repos/owner/repo" || r.Header.Get("Authorization") != "Bearer token-canary" {
-			t.Fatalf("unexpected request %s auth=%q", r.URL.Path, r.Header.Get("Authorization"))
+		switch r.URL.Path {
+		case "/user":
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"id":42,"login":"coordinator"}`)), Header: make(http.Header)}, nil
+		case "/repos/owner/repo":
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"full_name":"owner/repo","permissions":{"pull":true,"push":true}}`)), Header: make(http.Header)}, nil
+		default:
+			t.Fatalf("unexpected request %s", r.URL.Path)
+			return nil, nil
 		}
-		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"permissions":{"pull":true}}`)), Header: make(http.Header)}, nil
 	})}
 	oldAPI, oldClient := githubAPI, githubClient
 	githubAPI, githubClient = "https://example.invalid", client
 	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
 	got := githubDiagnostics("owner/repo")
-	if len(got) != 2 || got[0].Status != "pass" || got[1].Status != "warn" {
+	if len(got) != 3 || got[0].Status != "pass" || got[1].Status != "pass" || got[2].Status != "pass" || !strings.Contains(got[0].Message, "authenticated as coordinator") {
 		t.Fatalf("unexpected diagnostics: %#v", got)
 	}
-}
-
-func TestGitHubDiagnosticsVerifiesConfiguredAppInstallation(t *testing.T) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pemPath := filepath.Join(t.TempDir(), "app.pem")
-	if err := os.WriteFile(pemPath, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "42")
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", pemPath)
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
-	t.Setenv("GITHUB_TOKEN", "ignored-token-canary")
-
-	installedRepository := "owner/repo"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/7/access_tokens":
-			if auth := r.Header.Get("Authorization"); !strings.HasPrefix(auth, "Bearer ey") {
-				t.Errorf("missing signed App JWT: %q", auth)
-			}
-			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintf(w, `{"token":"installation-diagnostic-canary","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339))
-		case r.Method == http.MethodGet && r.URL.Path == "/installation/repositories":
-			if auth := r.Header.Get("Authorization"); auth != "Bearer installation-diagnostic-canary" {
-				t.Errorf("installation verification auth = %q", auth)
-			}
-			fmt.Fprintf(w, `{"repositories":[{"full_name":%q}]}`, installedRepository)
-		default:
-			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-	oldAPI, oldClient := githubAPI, githubClient
-	githubAPI, githubClient = server.URL, server.Client()
-	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
-
-	got := githubDiagnostics("owner/repo")
-	if len(got) != 2 || got[0].Status != "pass" || got[1].Status != "warn" || !strings.Contains(got[1].Message, "installation can access") {
-		t.Fatalf("unexpected diagnostics: %#v", got)
-	}
-	if strings.Contains(fmt.Sprint(got), "installation-diagnostic-canary") || strings.Contains(fmt.Sprint(got), "ignored-token-canary") {
-		t.Fatalf("diagnostics exposed credentials: %#v", got)
-	}
-	installedRepository = "other/repo"
-	got = githubDiagnostics("owner/repo")
-	if len(got) != 1 || got[0].Status != "fail" || !strings.Contains(got[0].Message, "cannot access") {
-		t.Fatalf("inaccessible repository diagnostics: %#v", got)
-	}
-}
-
-func TestGitHubDiagnosticsFailsClosedForInvalidAppCredentials(t *testing.T) {
-	t.Setenv("GITHUB_TOKEN", "fallback-token-canary")
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "42")
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", "/missing-key.pem")
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "")
-
-	t.Run("partial configuration", func(t *testing.T) {
-		got := githubDiagnostics("owner/repo")
-		if len(got) != 1 || got[0].Status != "fail" || !strings.Contains(got[0].Message, "must both be set") {
-			t.Fatalf("unexpected diagnostics: %#v", got)
-		}
-	})
-
-	t.Run("malformed private key", func(t *testing.T) {
-		pemPath := filepath.Join(t.TempDir(), "bad.pem")
-		if err := os.WriteFile(pemPath, []byte("private-key-canary"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", pemPath)
-		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
-		got := githubDiagnostics("owner/repo")
-		if len(got) != 1 || got[0].Status != "fail" || strings.Contains(fmt.Sprint(got), "private-key-canary") {
-			t.Fatalf("unsafe or unexpected diagnostics: %#v", got)
-		}
-	})
 }
 
 func TestPRGovernanceCommandWiresFakeGitHubAndRecoveryState(t *testing.T) {
@@ -1719,17 +1670,18 @@ func TestPRGovernanceCommandWiresFakeGitHubAndRecoveryState(t *testing.T) {
 		t.Fatal(err)
 	}
 	statePath := filepath.Join(root, "pr-state.json")
-	t.Setenv("GITHUB_TOKEN", "token-canary")
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "7")
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID", "42")
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/installation/repositories" {
-			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"repositories":[{"full_name":"owner/repo"}]}`)), Header: make(http.Header)}, nil
+		switch r.URL.Path {
+		case "/user":
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"id":42,"login":"coordinator"}`)), Header: make(http.Header)}, nil
+		case "/repos/owner/repo":
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"full_name":"owner/repo","permissions":{"pull":true}}`)), Header: make(http.Header)}, nil
+		case "/repos/owner/repo/pulls":
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`[]`)), Header: make(http.Header)}, nil
+		default:
+			t.Fatalf("unexpected request %s", r.URL.String())
+			return nil, nil
 		}
-		if r.URL.Path != "/repos/owner/repo/pulls" || r.Header.Get("Authorization") != "Bearer token-canary" {
-			t.Fatalf("unexpected request %s auth=%q", r.URL.String(), r.Header.Get("Authorization"))
-		}
-		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`[]`)), Header: make(http.Header)}, nil
 	})}
 	oldAPI, oldClient := githubAPI, githubClient
 	githubAPI, githubClient = "https://example.invalid", client
@@ -1794,6 +1746,33 @@ func TestStatusRejectsUnknownFieldsAndDoesNotEchoSecret(t *testing.T) {
 	}
 }
 
+func TestWriteStatusSnapshotPersistsBlockers(t *testing.T) {
+	root := t.TempDir()
+	want := []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 9, Attempt: 1, State: "blocked", Blockers: []string{"exactly one priority label is required"}}}
+	if err := writeStatusSnapshot(root, want); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "status.json")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		UpdatedAt time.Time                     `json:"updated_at"`
+		Statuses  []orchestrator.RecoveryStatus `json:"statuses"`
+	}
+	if json.Unmarshal(body, &got) != nil || got.UpdatedAt.IsZero() || !reflect.DeepEqual(got.Statuses, want) {
+		t.Fatalf("status snapshot=%#v", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("status mode=%v", info.Mode())
+	}
+}
+
 func TestDaemonLockIsSingleInstanceAndNoFollow(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.lock")
@@ -1818,13 +1797,11 @@ func TestDaemonLockIsSingleInstanceAndNoFollow(t *testing.T) {
 
 func TestConcurrentOneShotReconcileRunsOneMutation(t *testing.T) {
 	runtimeState := t.TempDir()
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_ID", "7")
-	t.Setenv("GITHUB_TOKEN", "token")
 	original := reconcileGitHubRun
 	t.Cleanup(func() { reconcileGitHubRun = original })
 	started, release := make(chan struct{}, 2), make(chan struct{})
 	var snapshots, dispatches atomic.Int32
-	reconcileGitHubRun = func(context.Context, string, string, string, bool, internalgithub.TokenSource) ([]orchestrator.RecoveryStatus, error) {
+	reconcileGitHubRun = func(context.Context, string, string, string, bool) ([]orchestrator.RecoveryStatus, error) {
 		snapshots.Add(1)
 		dispatches.Add(1)
 		started <- struct{}{}
@@ -1959,263 +1936,4 @@ func runGit(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v: %s: %v", args, out, err)
 	}
 	return strings.TrimSpace(string(out))
-}
-
-func TestGithubTokenSourceSelectsAppJWTOrStaticToken(t *testing.T) {
-	t.Run("neither configured requires GITHUB_TOKEN", func(t *testing.T) {
-		if _, err := githubTokenSource(42); err == nil {
-			t.Fatal("expected error without GITHUB_TOKEN or App credentials")
-		}
-	})
-	t.Run("static GITHUB_TOKEN", func(t *testing.T) {
-		t.Setenv("GITHUB_TOKEN", "static-canary")
-		tokens, err := githubTokenSource(42)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, ok := tokens.(environmentToken); !ok {
-			t.Fatalf("expected environmentToken, got %T", tokens)
-		}
-	})
-	t.Run("only private key path set is an error", func(t *testing.T) {
-		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", "/nonexistent.pem")
-		if _, err := githubTokenSource(42); err == nil {
-			t.Fatal("expected error with only the private key path set")
-		}
-	})
-	t.Run("only installation ID set is an error", func(t *testing.T) {
-		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
-		if _, err := githubTokenSource(42); err == nil {
-			t.Fatal("expected error with only the installation ID set")
-		}
-	})
-	t.Run("non-numeric installation ID is an error", func(t *testing.T) {
-		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", "/nonexistent.pem")
-		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "not-a-number")
-		if _, err := githubTokenSource(42); err == nil {
-			t.Fatal("expected error with non-numeric installation ID")
-		}
-	})
-	t.Run("unreadable private key path is an error", func(t *testing.T) {
-		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", filepath.Join(t.TempDir(), "missing.pem"))
-		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
-		if _, err := githubTokenSource(42); err == nil {
-			t.Fatal("expected error for unreadable private key")
-		}
-	})
-	t.Run("valid PEM and installation ID build an auto-refreshing source", func(t *testing.T) {
-		key, err := rsa.GenerateKey(rand.Reader, 2048)
-		if err != nil {
-			t.Fatal(err)
-		}
-		pemPath := filepath.Join(t.TempDir(), "app.pem")
-		pemBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-		if err := os.WriteFile(pemPath, pemBytes, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", pemPath)
-		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
-		tokens, err := githubTokenSource(42)
-		if err != nil {
-			t.Fatal(err)
-		}
-		installTokens, ok := tokens.(*internalgithub.InstallationTokens)
-		if !ok {
-			t.Fatalf("expected *internalgithub.InstallationTokens, got %T", tokens)
-		}
-		if installTokens.InstallationID != 7 {
-			t.Fatalf("installation ID = %d, want 7", installTokens.InstallationID)
-		}
-		jwtSource, ok := installTokens.JWTs.(internalgithub.AppJWT)
-		if !ok || jwtSource.AppID != "42" || jwtSource.Key.N.Cmp(key.N) != 0 {
-			t.Fatalf("unexpected JWT source %#v", installTokens.JWTs)
-		}
-	})
-}
-
-func TestGithubTokenSourceEndToEndVerificationUsesSupportedEndpoint(t *testing.T) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pemPath := filepath.Join(t.TempDir(), "app.pem")
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	if err := os.WriteFile(pemPath, pemBytes, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH", pemPath)
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
-
-	exchanges, verifications := 0, 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/7/access_tokens":
-			if auth := r.Header.Get("Authorization"); !strings.HasPrefix(auth, "Bearer ey") {
-				t.Errorf("missing signed App JWT: %s", auth)
-			}
-			exchanges++
-			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintf(w, `{"token":"minted-canary-%d","expires_at":%q}`, exchanges, time.Now().Add(time.Hour).Format(time.RFC3339))
-		case r.Method == http.MethodGet && r.URL.Path == "/installation/repositories":
-			if auth := r.Header.Get("Authorization"); auth != "Bearer minted-canary-1" {
-				t.Errorf("installation verification auth = %q", auth)
-			}
-			verifications++
-			fmt.Fprint(w, `{"repositories":[{"full_name":"owner/repo"}]}`)
-		default:
-			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
-			http.Error(w, "unexpected request", http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-	oldAPI, oldClient := githubAPI, githubClient
-	githubAPI, githubClient = server.URL, server.Client()
-	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
-
-	tokens, err := githubTokenSource(42)
-	if err != nil {
-		t.Fatal(err)
-	}
-	api := internalgithub.API{BaseURL: githubAPI, Tokens: tokens, HTTP: githubClient}
-	if err := api.VerifyInstallation(context.Background(), 42, "owner/repo"); err != nil {
-		t.Fatal(err)
-	}
-	if err := api.VerifyInstallation(context.Background(), 42, "owner/repo"); err != nil {
-		t.Fatal(err)
-	}
-	if exchanges != 1 {
-		t.Fatalf("token exchanges = %d, want 1", exchanges)
-	}
-	if verifications != 2 {
-		t.Fatalf("installation verifications = %d, want 2", verifications)
-	}
-}
-
-func TestStartWebhookListenerValidatesConfig(t *testing.T) {
-	t.Run("neither set is a no-op", func(t *testing.T) {
-		wake, shutdown, err := startWebhookListener(context.Background(), internalgithub.API{}, "o/r", io.Discard)
-		if err != nil || wake != nil || shutdown == nil {
-			t.Fatalf("wake=%v shutdownIsNil=%v err=%v", wake, shutdown == nil, err)
-		}
-		if err := shutdown(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("only addr set is an error", func(t *testing.T) {
-		t.Setenv("AGENT_SYMPHONY_WEBHOOK_ADDR", "127.0.0.1:0")
-		if _, _, err := startWebhookListener(context.Background(), internalgithub.API{}, "o/r", io.Discard); err == nil {
-			t.Fatal("expected error with only addr set")
-		}
-	})
-	t.Run("only secret set is an error", func(t *testing.T) {
-		t.Setenv("AGENT_SYMPHONY_WEBHOOK_SECRET", "secret-canary")
-		if _, _, err := startWebhookListener(context.Background(), internalgithub.API{}, "o/r", io.Discard); err == nil {
-			t.Fatal("expected error with only secret set")
-		}
-	})
-	t.Run("missing installation ID is an error", func(t *testing.T) {
-		t.Setenv("AGENT_SYMPHONY_WEBHOOK_ADDR", "127.0.0.1:0")
-		t.Setenv("AGENT_SYMPHONY_WEBHOOK_SECRET", "secret-canary")
-		if _, _, err := startWebhookListener(context.Background(), internalgithub.API{}, "o/r", io.Discard); err == nil {
-			t.Fatal("expected error without installation ID")
-		}
-	})
-	t.Run("unbindable address is an error", func(t *testing.T) {
-		reserve, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer reserve.Close()
-		t.Setenv("AGENT_SYMPHONY_WEBHOOK_ADDR", reserve.Addr().String())
-		t.Setenv("AGENT_SYMPHONY_WEBHOOK_SECRET", "secret-canary")
-		t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
-		if _, _, err := startWebhookListener(context.Background(), internalgithub.API{}, "o/r", io.Discard); err == nil {
-			t.Fatal("expected error binding an already-held address")
-		}
-	})
-}
-
-func TestStartWebhookListenerDeliversWakeOnValidSignedWebhook(t *testing.T) {
-	reserve, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := reserve.Addr().String()
-	reserve.Close()
-
-	fakeGitHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/o/r" {
-			t.Errorf("unexpected repository lookup path %s", r.URL.Path)
-		}
-		fmt.Fprint(w, `{"id":9999}`)
-	}))
-	defer fakeGitHub.Close()
-
-	t.Setenv("AGENT_SYMPHONY_WEBHOOK_ADDR", addr)
-	t.Setenv("AGENT_SYMPHONY_WEBHOOK_SECRET", "secret-canary")
-	t.Setenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID", "7")
-
-	api := internalgithub.API{BaseURL: fakeGitHub.URL, Tokens: environmentToken("test-token"), HTTP: fakeGitHub.Client()}
-	wake, shutdown, err := startWebhookListener(context.Background(), api, "o/r", io.Discard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if wake == nil {
-		t.Fatal("expected a non-nil wake channel")
-	}
-	t.Cleanup(func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := shutdown(shutdownCtx); err != nil {
-			t.Error(err)
-		}
-	})
-
-	body := []byte(`{"installation":{"id":7},"repository":{"id":9999},"issue":{"number":42}}`)
-	mac := hmac.New(sha256.New, []byte("secret-canary"))
-	mac.Write(body)
-	signature := "sha256=" + hex.EncodeToString(mac.Sum(nil))
-
-	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-GitHub-Event", "issues")
-	req.Header.Set("X-GitHub-Delivery", "delivery-1")
-	req.Header.Set("X-Hub-Signature-256", signature)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("webhook POST status = %d, want 202", resp.StatusCode)
-	}
-
-	select {
-	case <-wake:
-	case <-time.After(2 * time.Second):
-		t.Fatal("wake channel never received a signal from the valid webhook")
-	}
-
-	// A second delivery with a bad signature must be rejected and must not wake again.
-	badReq, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/", bytes.NewReader(body))
-	badReq.Header.Set("Content-Type", "application/json")
-	badReq.Header.Set("X-GitHub-Event", "issues")
-	badReq.Header.Set("X-GitHub-Delivery", "delivery-2")
-	badReq.Header.Set("X-Hub-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
-	badResp, err := http.DefaultClient.Do(badReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	badResp.Body.Close()
-	if badResp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("bad signature status = %d, want 401", badResp.StatusCode)
-	}
-	select {
-	case <-wake:
-		t.Fatal("wake fired for an invalid signature")
-	case <-time.After(100 * time.Millisecond):
-	}
 }

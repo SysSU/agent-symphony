@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -16,7 +18,6 @@ import (
 
 type API struct {
 	BaseURL string
-	Tokens  TokenSource
 	HTTP    *http.Client
 	Sleep   func(context.Context, time.Duration) error
 	Retries int
@@ -27,53 +28,76 @@ type Mutation struct {
 	Attempt int
 }
 
-// VerifyInstallation binds the supplied installation token to the configured
-// App credentials and repository using GitHub's supported installation-token API.
-func (a API) VerifyInstallation(ctx context.Context, appID int64, repository string) error {
-	if appID <= 0 || repository == "" {
-		return errors.New("GitHub App and repository are required")
-	}
-	if tokens, ok := a.Tokens.(*InstallationTokens); ok {
-		app, ok := tokens.JWTs.(AppJWT)
-		if !ok || app.AppID != strconv.FormatInt(appID, 10) {
-			return errors.New("GitHub installation credentials do not belong to the configured App")
-		}
-	}
-	for page := 1; ; page++ {
-		var installation struct {
-			Repositories []struct {
-				FullName string `json:"full_name"`
-			} `json:"repositories"`
-		}
-		path := fmt.Sprintf("/installation/repositories?per_page=100&page=%d", page)
-		if _, _, err := a.Read(ctx, path, "", &installation); err != nil {
-			return fmt.Errorf("verify GitHub App installation: %w", err)
-		}
-		for _, repo := range installation.Repositories {
-			if strings.EqualFold(repo.FullName, repository) {
-				return nil
-			}
-		}
-		if len(installation.Repositories) < 100 {
-			break
-		}
-	}
-	return errors.New("GitHub installation token cannot access the configured repository")
+type AuthenticatedUser struct {
+	ID    int
+	Login string
 }
 
-// RepositoryID fetches the numeric GitHub repository ID for "owner/repo",
-// used to scope webhook delivery validation to the exact configured repository.
-func (a API) RepositoryID(ctx context.Context, repository string) (int64, error) {
+func (a API) AuthenticatedUser(ctx context.Context) (AuthenticatedUser, error) {
+	var user AuthenticatedUser
+	if _, _, err := a.Read(ctx, "/user", "", &user); err != nil {
+		return user, fmt.Errorf("authenticate GitHub CLI: %w", err)
+	}
+	if user.ID <= 0 || strings.TrimSpace(user.Login) == "" {
+		return user, errors.New("GitHub CLI returned an invalid authenticated user")
+	}
+	return user, nil
+}
+
+func (a API) VerifyRepository(ctx context.Context, repository string) error {
+	if repository == "" {
+		return errors.New("GitHub repository is required")
+	}
 	var repo struct {
-		ID int64 `json:"id"`
+		FullName    string `json:"full_name"`
+		Permissions struct{ Pull bool }
 	}
 	if _, _, err := a.Read(ctx, "/repos/"+repository, "", &repo); err != nil {
-		return 0, fmt.Errorf("fetch GitHub repository ID: %w", err)
+		return fmt.Errorf("verify GitHub CLI repository access: %w", err)
 	}
-	if repo.ID <= 0 {
-		return 0, errors.New("GitHub repository ID is invalid")
+	if !strings.EqualFold(repo.FullName, repository) || !repo.Permissions.Pull {
+		return errors.New("authenticated GitHub CLI account cannot access the configured repository")
 	}
-	return repo.ID, nil
+	return nil
+}
+
+type CLITransport struct{ Path string }
+
+func (t CLITransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	path := t.Path
+	if path == "" {
+		path = "gh"
+	}
+	endpoint := req.URL.RequestURI()
+	if req.URL.Path == "/graphql" {
+		endpoint = "graphql"
+	}
+	args := []string{"api", "--include", "--method", req.Method, endpoint}
+	for name, values := range req.Header {
+		for _, value := range values {
+			args = append(args, "--header", name+":"+value)
+		}
+	}
+	if req.Body != nil {
+		args = append(args, "--input", "-")
+	}
+	cmd := exec.CommandContext(req.Context(), path, args...)
+	cmd.Stdin = req.Body
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, runErr := cmd.Output()
+	resp, parseErr := http.ReadResponse(bufio.NewReader(bytes.NewReader(stdout)), req)
+	if parseErr == nil {
+		return resp, nil
+	}
+	if runErr != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = runErr.Error()
+		}
+		return nil, fmt.Errorf("GitHub CLI API: %s", Redact(detail))
+	}
+	return nil, fmt.Errorf("parse GitHub CLI response: %w", parseErr)
 }
 
 type ambiguousMutationError struct{ error }
@@ -187,18 +211,14 @@ func (a API) Mutate(ctx context.Context, method, path string, body any, attribut
 }
 
 func (a API) do(ctx context.Context, method, path, etag string, body []byte, attribution Mutation) (*http.Response, error) {
-	if a.Tokens == nil {
-		return nil, errors.New("GitHub installation token source is required")
+	var input io.Reader
+	if body != nil {
+		input = bytes.NewReader(body)
 	}
-	token, err := a.Tokens.Token(ctx)
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(a.BaseURL, "/")+path, input)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(a.BaseURL, "/")+path, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token.Value)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	if body != nil {
@@ -260,4 +280,23 @@ func responseError(operation string, resp *http.Response) error {
 	structured := readErr == nil && len(body) <= 4096 && json.Unmarshal(body, &details) == nil
 	body = body[:min(len(body), 4096)]
 	return &responseStatusError{operation: operation, status: resp.StatusCode, message: fmt.Sprintf("%s: %s", resp.Status, Redact(string(body))), githubMessage: details.Message, documentationURL: details.DocumentationURL, structured: structured}
+}
+
+func decodeJSON(r io.Reader, dst any) error {
+	const maxJSONBody = 1 << 20
+	b, err := io.ReadAll(io.LimitReader(r, maxJSONBody+1))
+	if err != nil {
+		return err
+	}
+	if len(b) > maxJSONBody {
+		return errors.New("JSON body exceeds 1 MiB limit")
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("trailing JSON data")
+	}
+	return nil
 }

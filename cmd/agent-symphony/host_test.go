@@ -505,7 +505,7 @@ func TestProductionSeedClonesThroughAgentHostBoundary(t *testing.T) {
 		}
 	}
 	root := nativeRoot("/var/lib/agent-symphony/attempts")
-	bundle, err := seedAttemptSource(t.Context(), source, root)
+	bundle, err := seedAttemptSource(t.Context(), source, root, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,6 +527,49 @@ func TestProductionSeedClonesThroughAgentHostBoundary(t *testing.T) {
 	}
 }
 
+func TestProductionSeedFetchesSelectedBaseWithoutMovingCheckout(t *testing.T) {
+	fakeNoHostIsolation(t)
+	run := func(dir string, args ...string) string {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	remote, coordinator, publisher := t.TempDir(), t.TempDir(), t.TempDir()
+	run(remote, "init", "--bare")
+	run(coordinator, "init")
+	run(coordinator, "checkout", "-b", "main")
+	run(coordinator, "config", "user.email", "test@example.invalid")
+	run(coordinator, "config", "user.name", "test")
+	run(coordinator, "commit", "--allow-empty", "-m", "base")
+	run(coordinator, "remote", "add", "origin", remote)
+	run(coordinator, "push", "-u", "origin", "main")
+	coordinatorHead := run(coordinator, "rev-parse", "HEAD")
+	if out, err := exec.Command("git", "clone", "--branch", "main", remote, publisher).CombinedOutput(); err != nil {
+		t.Fatalf("clone publisher: %v: %s", err, out)
+	}
+	run(publisher, "config", "user.email", "test@example.invalid")
+	run(publisher, "config", "user.name", "test")
+	run(publisher, "commit", "--allow-empty", "-m", "advanced base")
+	run(publisher, "push", "origin", "main")
+	selectedBase := run(publisher, "rev-parse", "HEAD")
+
+	bundle, err := seedAttemptSource(t.Context(), coordinator, t.TempDir(), "main", selectedBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := run(coordinator, "rev-parse", "HEAD"); got != coordinatorHead {
+		t.Fatalf("coordinator checkout moved from %s to %s", coordinatorHead, got)
+	}
+	clone := filepath.Join(t.TempDir(), "worker")
+	if out, err := exec.Command("git", "clone", "--no-checkout", bundle, clone).CombinedOutput(); err != nil {
+		t.Fatalf("clone seed: %v: %s", err, out)
+	}
+	run(clone, "cat-file", "-e", selectedBase+"^{commit}")
+}
+
 func TestLocalSeedAndDiscoveryUseSeparateRoots(t *testing.T) {
 	fakeNoHostIsolation(t)
 	source := t.TempDir()
@@ -537,7 +580,7 @@ func TestLocalSeedAndDiscoveryUseSeparateRoots(t *testing.T) {
 	}
 	stateRoot := t.TempDir()
 	worktreeRoot := productionAttemptRoot(stateRoot)
-	bundle, err := seedAttemptSource(t.Context(), source, worktreeRoot)
+	bundle, err := seedAttemptSource(t.Context(), source, worktreeRoot, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
