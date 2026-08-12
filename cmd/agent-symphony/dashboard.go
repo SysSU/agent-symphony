@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -41,6 +43,8 @@ type dashboardServer struct {
 	ctx       context.Context
 	stateRoot string
 	tmux      string
+	allowNet  bool
+	password  string
 	cleanup   func(context.Context, string, agentruntime.Manifest) error
 	mu        *sync.Mutex
 	localMu   sync.Mutex
@@ -67,12 +71,16 @@ func newDashboardHandler(ctx context.Context, stateRoot, tmux string) http.Handl
 }
 
 func newDashboardHandlerWithMutex(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex) http.Handler {
+	return newDashboardHandlerWithOptions(ctx, stateRoot, tmux, operationMu, false, "")
+}
+
+func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, allowNet bool, password string) http.Handler {
 	assets, err := fs.Sub(dashboardFiles, "dashboard/out")
 	if err != nil {
 		panic(err)
 	}
 	static := http.FileServer(http.FS(assets))
-	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, mu: operationMu}
+	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, mu: operationMu}
 	server.cleanup = server.cleanupAttempt
 	return server.handler(static)
 }
@@ -82,8 +90,11 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		if !dashboardHostAllowed(r.Host) {
+		if !dashboardHostAllowed(r.Host, s.allowNet) {
 			http.Error(w, "dashboard requires a loopback host", http.StatusForbidden)
+			return
+		}
+		if !s.authenticate(w, r) {
 			return
 		}
 		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" {
@@ -109,6 +120,20 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		}
 		static.ServeHTTP(w, r)
 	})
+}
+
+func (s *dashboardServer) authenticate(w http.ResponseWriter, r *http.Request) bool {
+	if s.password == "" {
+		return true
+	}
+	username, password, ok := r.BasicAuth()
+	want, got := sha256.Sum256([]byte(s.password)), sha256.Sum256([]byte(password))
+	if !ok || username != "agent-symphony" || subtle.ConstantTimeCompare(want[:], got[:]) != 1 {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Agent Symphony", charset="UTF-8"`)
+		http.Error(w, "dashboard authentication required", http.StatusUnauthorized)
+		return false
+	}
+	return true
 }
 
 func serveDashboardJSON(w http.ResponseWriter, r *http.Request, path string, limit int64, missing, unavailable string) {
@@ -337,10 +362,13 @@ func (s *dashboardServer) cleanupAttempt(ctx context.Context, action string, man
 
 func sameDashboardOrigin(r *http.Request) bool {
 	origin, err := url.Parse(r.Header.Get("Origin"))
-	return err == nil && origin.Scheme == "http" && dashboardHostAllowed(r.Host) && strings.EqualFold(origin.Host, r.Host)
+	return err == nil && origin.Scheme == "http" && strings.EqualFold(origin.Host, r.Host)
 }
 
-func dashboardHostAllowed(value string) bool {
+func dashboardHostAllowed(value string, allowNet bool) bool {
+	if allowNet {
+		return strings.TrimSpace(value) != ""
+	}
 	host := value
 	if parsed, _, err := net.SplitHostPort(value); err == nil {
 		host = parsed
@@ -474,22 +502,30 @@ func (s *dashboardServer) terminalStatus(issue, attempt int) (orchestrator.Recov
 	return s.projectedStatus(issue, attempt)
 }
 
-func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, log io.Writer) (string, error) {
+func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, allowNet bool, password string, log io.Writer) (string, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", fmt.Errorf("dashboard address: %w", err)
 	}
-	if host != "localhost" {
+	loopback := host == "localhost"
+	if !loopback {
 		ip := net.ParseIP(host)
-		if ip == nil || !ip.IsLoopback() {
+		loopback = ip != nil && ip.IsLoopback()
+		if !loopback && !allowNet {
 			return "", errors.New("dashboard address must use localhost or a loopback IP")
 		}
+	}
+	if allowNet && password == "" {
+		return "", errors.New("--dashboard-password is required with --allow-unsafe-dashboard-network")
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return "", fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
-	server := &http.Server{Handler: newDashboardHandlerWithMutex(ctx, stateRoot, "tmux", operationMu), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
+	if allowNet {
+		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password may be visible in process listings, and anyone with it can use terminals and cleanup controls")
+	}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)

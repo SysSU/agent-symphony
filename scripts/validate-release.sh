@@ -3,7 +3,7 @@ set -eu
 
 version=${1:-0.0.0-local}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/agent-symphony-release.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+trap 'chmod -R u+w "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT HUP INT TERM
 export GOCACHE="$tmp/go-cache"
 export GOMODCACHE="$tmp/go-mod-cache"
 

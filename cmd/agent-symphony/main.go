@@ -259,6 +259,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	issueNumber := fs.Int("issue", 0, "issue number to inspect")
 	interval := fs.Duration("interval", orchestrator.MaxReconcileInterval, "serve reconciliation interval (maximum 60s)")
 	dashboardAddress := fs.String("dashboard-address", "127.0.0.1:8080", "dashboard loopback listen address")
+	allowUnsafeDashboardNetwork := fs.Bool("allow-unsafe-dashboard-network", false, "allow password-protected dashboard access outside loopback")
+	dashboardPassword := fs.String("dashboard-password", "", "dashboard HTTP Basic authentication password")
 	offline := fs.Bool("offline", false, "skip network diagnostics")
 	coordinator := fs.String("coordinator", "", "coordinator OS user")
 	if err := fs.Parse(flagArgs); err != nil {
@@ -289,6 +291,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if *interval <= 0 || *interval > orchestrator.MaxReconcileInterval {
 			return misuse(stderr, wantsJSON, command, "--interval must be greater than zero and no more than 60s")
 		}
+		if *allowUnsafeDashboardNetwork && *dashboardPassword == "" {
+			return misuse(stderr, wantsJSON, command, "--dashboard-password is required with --allow-unsafe-dashboard-network")
+		}
 		c, err := config.Load(*path)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
@@ -317,7 +322,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		operationMu := &sync.Mutex{}
-		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, stderr)
+		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, *allowUnsafeDashboardNetwork, *dashboardPassword, stderr)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
@@ -2212,6 +2217,8 @@ options:
   --config path use another configuration file
   --state path  durable PR-governance/handoff state
   --runtime-state path  bounded runtime manifest root
-  --dashboard-address address  loopback dashboard address (serve only)
+  --dashboard-address address  dashboard listen address (serve only; loopback by default)
+  --allow-unsafe-dashboard-network  permit non-loopback dashboard binding (requires password)
+  --dashboard-password password  HTTP Basic password; username is agent-symphony
   --json        emit a versioned JSON envelope`)
 }

@@ -28,6 +28,7 @@ jobs:
           cache-dependency-path: cmd/agent-symphony/dashboard/package-lock.json
       - run: scripts/build-dashboard.sh
       - run: git diff --exit-code -- cmd/agent-symphony/dashboard/out
+      - run: rm -rf cmd/agent-symphony/dashboard/node_modules
       - run: go test -race ./...
       - run: go vet ./...
       - run: scripts/validate-release.sh 0.0.0-ci

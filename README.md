@@ -56,7 +56,7 @@ go build -o agent-symphony ./cmd/agent-symphony
 ./agent-symphony status --state /path/to/pr-state.json --runtime-state /path/to/state
 ```
 
-`serve` prints the per-repository dashboard URL. The dashboard separates current and completed attempts, opens an exact live tmux session in the browser, archives completed local resources, and abandons explicitly selected orphaned local attempts. It binds to loopback only; do not place it behind a public proxy.
+`serve` prints the per-repository dashboard URL. The dashboard separates current and completed attempts, opens an exact live tmux session in the browser, archives completed local resources, and abandons explicitly selected orphaned local attempts. It binds to loopback by default. Non-loopback access requires `--allow-unsafe-dashboard-network` and a nonempty `--dashboard-password`; the HTTP Basic username is `agent-symphony`. This direct HTTP mode is unencrypted, exposes the password to network observers, and grants terminal and cleanup access to anyone who knows it. Use it only on a trusted network, or carry it over an encrypted VPN or tunnel.
 
 Before `serve`, install the release binary root-owned at `/usr/local/libexec/agent-symphony/<version>/agent-symphony`, then run `sudo .../agent-symphony install-host --coordinator "$USER"`. The coordinator uses the installed implementation and review `agent-host` sudo boundaries automatically; `AGENT_SYMPHONY_WORKER_BOUNDARY` and `AGENT_SYMPHONY_REVIEW_BOUNDARY` remain only test seams.
 

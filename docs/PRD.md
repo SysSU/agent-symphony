@@ -59,7 +59,7 @@ Users manage intent, priority, and governance rather than agent sessions. Execut
 - **Complexity:** Low regulatory complexity with high technical risk around autonomous changes, permissions, concurrency, and recovery
 - **Context:** Greenfield
 - **Primary interface:** GitHub Issues and pull requests
-- **Secondary interface:** CLI operational status and a loopback per-repository browser dashboard
+- **Secondary interface:** CLI operational status and a loopback-by-default per-repository browser dashboard
 
 ## Success Criteria
 
@@ -239,7 +239,7 @@ The MVP should reuse Symphony's proven boundaries where practical and validate t
 
 ### Project-Type Overview
 
-Agent Symphony is a terminal-first orchestration service operated through a cross-platform CLI and a per-repository loopback dashboard. The MVP supports macOS, Linux, and Windows through WSL. It integrates with GitHub, Git, tmux, and local worktrees.
+Agent Symphony is a terminal-first orchestration service operated through a cross-platform CLI and a per-repository loopback-by-default dashboard. The MVP supports macOS, Linux, and Windows through WSL. It integrates with GitHub, Git, tmux, and local worktrees.
 
 ### Platform and Installation
 
@@ -393,7 +393,7 @@ No migration guide is required for the greenfield MVP.
 - **FR60:** A stakeholder can attach an in-browser terminal to an exact projected live tmux session without creating a session or arbitrary command.
 - **FR61:** A stakeholder can archive a completed attempt by confirming cleanup of its exact local worktree, local branch, worker result, and tmux session while retaining diagnostic metadata.
 - **FR62:** A stakeholder can abandon a selected orphaned attempt by confirming cleanup of its exact local resources and retained manifest/log.
-- **FR63:** Dashboard terminal and cleanup controls are restricted to loopback, same-origin requests and server-resolved deterministic attempt identity.
+- **FR63:** Dashboard terminal and cleanup controls default to loopback and always require same-origin requests and server-resolved deterministic attempt identity; non-loopback binding requires an explicit unsafe-network opt-in and password authentication on every route.
 
 ## Non-Functional Requirements
 

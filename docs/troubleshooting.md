@@ -7,7 +7,8 @@
 - merge remains gated: check current-head validation/docs evidence, actionable feedback, independent review, human-review-label removal by an authorized actor, required checks, approvals, branch currency, and protection.
 - checksum verification fails: discard the artifact and regenerate from a clean source commit with the same version and `SOURCE_DATE_EPOCH`.
 - `host isolation` fails in the zero-admin default: repair the `attempts`/`snapshots` directories under the runtime state root so they are non-symlink, mode `0700`, and owned by the account running `agent-symphony`, or pass a `--runtime-state` that account can write to. This never requires `install-host`.
-- the dashboard does not start: choose an unused localhost or loopback address with `--dashboard-address`; non-loopback addresses are rejected.
+- the dashboard does not start: choose an unused localhost or loopback address with `--dashboard-address`. A non-loopback address additionally requires both `--allow-unsafe-dashboard-network` and a nonempty `--dashboard-password`.
+- the remote dashboard cannot be reached: verify the daemon warning says unsafe network access is enabled, connect to the host's real IP rather than `0.0.0.0`, and narrowly allow the selected TCP port through the host firewall. HTTP Basic username is `agent-symphony`; direct HTTP is unencrypted.
 - Archive or Abandon is refused: refresh the projection and verify the card is still completed or orphaned and its branch, worktree, session, and retained manifest match exactly. Do not delete around an identity mismatch.
 # Host isolation is missing or stale (advanced mode only)
 

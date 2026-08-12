@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -101,12 +102,12 @@ func TestDashboardRejectsNonLoopbackRequestHost(t *testing.T) {
 }
 
 func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, io.Discard); err == nil {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, false, "", io.Discard); err == nil {
 		t.Fatal("non-loopback dashboard address accepted")
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	var log bytes.Buffer
-	url, err := startDashboard(ctx, "127.0.0.1:0", t.TempDir(), nil, &log)
+	url, err := startDashboard(ctx, "127.0.0.1:0", t.TempDir(), nil, false, "", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,6 +127,98 @@ func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("dashboard remained available after cancellation")
+}
+
+func TestDashboardUnsafeNetworkRequiresPassword(t *testing.T) {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "--dashboard-password is required") {
+		t.Fatalf("unsafe dashboard without password error=%v", err)
+	}
+
+	password := "test-dashboard-password"
+	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, true, password)
+	for _, test := range []struct {
+		name, method, path, username, password string
+		status                                 int
+	}{
+		{"missing credentials", http.MethodGet, "/", "", "", http.StatusUnauthorized},
+		{"wrong username", http.MethodGet, "/", "operator", password, http.StatusUnauthorized},
+		{"wrong password", http.MethodGet, "/", "agent-symphony", "wrong", http.StatusUnauthorized},
+		{"correct credentials", http.MethodGet, "/", "agent-symphony", password, http.StatusOK},
+		{"protected action", http.MethodPost, "/actions/abandon?issue=1&attempt=1", "", "", http.StatusUnauthorized},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, "http://192.0.2.10:8080"+test.path, nil)
+			if test.username != "" {
+				request.SetBasicAuth(test.username, test.password)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.status {
+				t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+			}
+			if test.status == http.StatusUnauthorized && response.Header().Get("WWW-Authenticate") == "" {
+				t.Fatal("authentication challenge is missing")
+			}
+		})
+	}
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/terminal?issue=1&attempt=1"
+	if connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}}); err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
+		if connection != nil {
+			connection.CloseNow()
+		}
+		t.Fatalf("unauthenticated terminal response=%v err=%v", response, err)
+	}
+	authorized := httptest.NewRequest(http.MethodGet, server.URL, nil)
+	authorized.Header.Set("Origin", server.URL)
+	authorized.SetBasicAuth("agent-symphony", password)
+	if connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: authorized.Header}); err == nil || response == nil || response.StatusCode != http.StatusNotFound {
+		if connection != nil {
+			connection.CloseNow()
+		}
+		t.Fatalf("authenticated terminal response=%v err=%v", response, err)
+	}
+}
+
+func TestDashboardUnsafeNetworkBindingWarnsAndAcceptsAuthentication(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var log bytes.Buffer
+	boundURL, err := startDashboard(ctx, "0.0.0.0:0", t.TempDir(), nil, true, "test-dashboard-password", &log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(boundURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://127.0.0.1:"+port, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.SetBasicAuth("agent-symphony", "test-dashboard-password")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("dashboard response=%v err=%v", response, err)
+	}
+	response.Body.Close()
+	if !strings.Contains(log.String(), "WARNING: unsafe dashboard network access enabled") || !strings.Contains(log.String(), "unencrypted") {
+		t.Fatalf("unsafe dashboard warning=%q", log.String())
+	}
+}
+
+func TestServeUnsafeNetworkFlagRequiresPassword(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"serve", "--state", "pr-state.json", "--runtime-state", t.TempDir(), "--allow-unsafe-dashboard-network"}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "--dashboard-password is required with --allow-unsafe-dashboard-network") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
 }
 
 func TestDashboardArchivesCompletedAndAbandonsOrphanedAttempts(t *testing.T) {

@@ -93,7 +93,20 @@ agent-symphony serve \
   --dashboard-address 127.0.0.1:8080
 ```
 
-Open the dashboard URL printed by `serve`. Keep it on loopback; it provides terminal access and confirmed cleanup controls for exact projected attempts.
+Open the dashboard URL printed by `serve`. It stays on loopback by default because it provides terminal access and confirmed cleanup controls for exact projected attempts.
+
+To opt into direct access from another machine on a trusted network, bind a non-loopback address and supply the required password:
+
+```sh
+agent-symphony serve \
+  --state ~/.local/state/agent-symphony/pr.json \
+  --runtime-state ~/.local/state/agent-symphony \
+  --dashboard-address 0.0.0.0:8080 \
+  --allow-unsafe-dashboard-network \
+  --dashboard-password "$AGENT_SYMPHONY_DASHBOARD_PASSWORD"
+```
+
+The HTTP Basic username is `agent-symphony`. This mode is deliberately named unsafe: HTTP does not encrypt the password or terminal traffic, the expanded password can be visible in process listings, and the dashboard has powerful local controls. Restrict the port with the host firewall and use a long, unique password. Use an encrypted VPN or tunnel instead on an untrusted network.
 
 ## Multiple repositories on one host
 
