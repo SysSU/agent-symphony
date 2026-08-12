@@ -37,6 +37,7 @@ All issue implementation must occur in a dedicated Git worktree. Keep the primar
 - Preserve unrelated user changes and untracked files. Never use destructive Git commands or broad cleanup operations to resolve conflicts.
 - Run the smallest relevant build, lint, and test checks before finishing, and report the actual results.
 - Tests should verify behavior, branching, validation, side effects, or failure handling—not constants, type-only exports, or trivial re-exports.
+- Write documentation in plain English. Be direct and concise, cut filler, prefer common words to jargon, and briefly define any technical term readers need.
 
 ## BMAD Artifacts
 

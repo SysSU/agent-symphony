@@ -42,7 +42,7 @@ Keep the issue current during development, link its pull request, and record val
 
 ## Getting Started
 
-Go 1.26 is required to build from source. The resulting executable uses GitHub CLI for GitHub authentication and API access; operators also need Git, tmux, configured implementation/reviewer executables, and repository access.
+Go 1.26 is required to build from source. To run Agent Symphony, install Git, tmux, GitHub CLI, and Codex (or another coding agent), and make sure you can access the repository.
 
 ```sh
 go build -o agent-symphony ./cmd/agent-symphony
@@ -57,7 +57,7 @@ go build -o agent-symphony ./cmd/agent-symphony
 
 Before `serve`, install the release binary root-owned at `/usr/local/libexec/agent-symphony/<version>/agent-symphony`, then run `sudo .../agent-symphony install-host --coordinator "$USER"`. The coordinator uses the installed implementation and review `agent-host` sudo boundaries automatically; `AGENT_SYMPHONY_WORKER_BOUNDARY` and `AGENT_SYMPHONY_REVIEW_BOUNDARY` remain only test seams.
 
-Authenticate first with `gh auth login`. `init` derives `owner/repository` from the GitHub `origin` and creates `.agent-symphony.yaml` without overwriting an existing file. Configuration is JSON, which is a valid YAML 1.2 subset and allows strict stdlib-only parsing. Agent Symphony does not accept GitHub credentials in its configuration or environment.
+Authenticate GitHub CLI with `gh auth login`; for non-interactive use, `GH_TOKEN` or `GITHUB_TOKEN` may authenticate `gh` instead. `init` derives `owner/repository` from the GitHub `origin` and creates `.agent-symphony.yaml` without overwriting an existing file. Configuration is JSON, which is a valid YAML 1.2 subset and allows strict stdlib-only parsing. Agent Symphony does not parse or store GitHub credentials.
 
 See the [CLI reference](docs/cli.md) for the schema, structured output, diagnostics, and current scope.
 
