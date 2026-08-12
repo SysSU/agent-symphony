@@ -1,5 +1,7 @@
 # Release validation and pilot evidence
 
+For the step-by-step maintainer workflow, see [Releasing Agent Symphony](releases.md). This document defines the validation policy and evidence that workflow must preserve.
+
 ## Reproduce a candidate
 
 Run `scripts/validate-release.sh VERSION`. It executes all tests with the race detector, `go vet`, a no-CGO build, focused orchestration/security checks, two byte-identical four-target builds, SHA-256 verification, a scan of every regular candidate file (including ignored and untracked files), and documentation-presence checks. `scripts/release.sh VERSION OUTPUT` refuses to overwrite an output directory and emits four `agent-symphony_VERSION_OS_ARCH.tar.gz` archives plus `SHA256SUMS`.
