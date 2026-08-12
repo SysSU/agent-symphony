@@ -28,6 +28,23 @@ import (
 
 type revokedAttemptRunner struct{ live, interrupted bool }
 
+type cleanupBoundary struct {
+	manifests []agentruntime.Manifest
+	err       error
+}
+
+func (b *cleanupBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if operation != "cleanup" {
+		return agentruntime.Result{}, fmt.Errorf("unexpected operation %q", operation)
+	}
+	var manifest agentruntime.Manifest
+	if err := json.NewDecoder(command.Stdin).Decode(&manifest); err != nil {
+		return agentruntime.Result{}, err
+	}
+	b.manifests = append(b.manifests, manifest)
+	return agentruntime.Result{}, b.err
+}
+
 func (r *revokedAttemptRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if len(command.Args) == 0 {
 		return agentruntime.Result{}, errors.New("missing tmux operation")
@@ -343,6 +360,28 @@ func TestPublishedAttemptSuppressesLocalTerminalIssueBlockerOnlyOnExactIdentity(
 				t.Fatalf("issue=%#v", issues[0])
 			}
 		})
+	}
+}
+
+func TestCompletedAttemptCleanupRequiresExactPublishedIdentity(t *testing.T) {
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", State: "completed", ReviewHead: "bbbbbbb"}
+	exact := orchestrator.AttemptFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", PR: 7, State: "completed"}
+	boundary := &cleanupBoundary{}
+	facts := []orchestrator.AttemptFact{
+		{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", PR: 7, State: "review-ready"},
+		{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", HeadSHA: "wrong00", PR: 7, State: "completed"},
+		exact,
+	}
+	if err := cleanupCompletedAttempts(t.Context(), boundary, facts, []agentruntime.Manifest{manifest}); err != nil {
+		t.Fatal(err)
+	}
+	if len(boundary.manifests) != 1 || !reflect.DeepEqual(boundary.manifests[0], manifest) {
+		t.Fatalf("cleaned manifests = %#v", boundary.manifests)
+	}
+
+	boundary.err = errors.New("injected cleanup failure")
+	if err := cleanupCompletedAttempts(t.Context(), boundary, []orchestrator.AttemptFact{exact}, []agentruntime.Manifest{manifest}); err == nil || !strings.Contains(err.Error(), "o/r#23 attempt 1") {
+		t.Fatalf("cleanup failure = %v", err)
 	}
 }
 

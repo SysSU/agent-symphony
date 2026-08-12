@@ -734,6 +734,11 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return errors.New("review boundary cannot export implementation attempts")
 		}
 		result.Output, err = exportAttempt(ctx, request.Command.Input, root)
+	case "cleanup":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot clean implementation attempts")
+		}
+		err = cleanupAttempt(ctx, request.Command.Input, root)
 	case "accept-handoff":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot accept implementation handoffs")
@@ -754,6 +759,96 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		return err
 	}
 	return json.NewEncoder(output).Encode(result)
+}
+
+func cleanupAttempt(ctx context.Context, input []byte, root string) error {
+	var manifest agentruntime.Manifest
+	decoder := json.NewDecoder(bytes.NewReader(input))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("invalid cleanup manifest")
+	}
+	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
+	want, err := agentruntime.AttemptIdentity(root, attempt)
+	if err != nil || manifest.Version != want.Version || manifest.State != "completed" || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session || !preflightObjectID.MatchString(manifest.ReviewHead) {
+		return errors.New("invalid cleanup manifest")
+	}
+
+	worktreeInfo, worktreeErr := os.Lstat(want.Worktree)
+	if worktreeErr != nil && !errors.Is(worktreeErr, os.ErrNotExist) {
+		return worktreeErr
+	}
+	if worktreeErr == nil {
+		if !worktreeInfo.IsDir() || worktreeInfo.Mode()&os.ModeSymlink != 0 {
+			return errors.New("cleanup worktree is not a non-symlink directory")
+		}
+		run := func(args ...string) (string, error) {
+			command := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", want.Worktree}, args...)...)
+			command.Env = append(minimalBoundaryEnvironment(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
+			out, err := command.CombinedOutput()
+			return strings.TrimSpace(string(out)), err
+		}
+		top, topErr := run("rev-parse", "--show-toplevel")
+		gitDir, gitDirErr := run("rev-parse", "--absolute-git-dir")
+		branch, branchErr := run("branch", "--show-current")
+		head, headErr := run("rev-parse", "HEAD")
+		if topErr != nil || !samePath(top, want.Worktree) || gitDirErr != nil || !validAttemptGitDir(want.Worktree, gitDir, root) || branchErr != nil || branch != want.Branch || headErr != nil || head != manifest.ReviewHead {
+			return errors.New("cleanup worktree identity changed")
+		}
+	}
+
+	resultPath := agentruntime.ResultPath(want.Worktree)
+	resultInfo, resultErr := os.Lstat(resultPath)
+	if resultErr != nil && !errors.Is(resultErr, os.ErrNotExist) {
+		return resultErr
+	}
+	if resultErr == nil && (!resultInfo.Mode().IsRegular() || resultInfo.Mode()&os.ModeSymlink != 0) {
+		return errors.New("cleanup result is not a regular non-symlink file")
+	}
+	if err := stopAttemptSession(ctx, want.Session); err != nil {
+		return err
+	}
+	if worktreeErr == nil {
+		if err := os.RemoveAll(want.Worktree); err != nil {
+			return err
+		}
+	}
+	if resultErr == nil {
+		if err := os.Remove(resultPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func stopAttemptSession(ctx context.Context, session string) error {
+	probe := func() (bool, error) {
+		result, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + session}})
+		if err == nil {
+			return true, nil
+		}
+		if result.Exited && result.Code == 1 {
+			return false, nil
+		}
+		return false, err
+	}
+	live, err := probe()
+	if err != nil || !live {
+		return err
+	}
+	if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", "=" + session}}); err != nil {
+		if live, probeErr := probe(); probeErr != nil || live {
+			return errors.Join(err, probeErr)
+		}
+	}
+	live, err = probe()
+	if err != nil {
+		return err
+	}
+	if live {
+		return errors.New("tmux session remained after cleanup")
+	}
+	return nil
 }
 
 func verifyHostAccess(root, mode string, deny []string, snapshot string) error {

@@ -87,6 +87,7 @@ The runtime requires the boundary's verification hook and fails closed before cr
 - If launch fails, inspect the manifest `diagnostic` and `agent.log`. Failed resources are retained intentionally.
 - If an attempt appears active after restart, compare its manifest, worktree HEAD, and `tmux has-session -t <session>` before resuming. Never attach to a session or directory whose deterministic identity does not match.
 - Cancellation sends `C-c`, waits briefly, then kills only the named attempt session. It does not remove the worktree, so partial work and diagnostics remain available.
+- A durably merged PR removes the exact verified attempt clone (including its local branch), worker result, and named tmux session during reconciliation. Its recovery manifest and diagnostic log remain available.
 - An attempt worktree has no remote and a disabled local credential helper. A successful `git push` from it indicates a broken host boundary; stop serving work and rerun diagnostics.
 - “resources already exist” is a safety stop. Reconcile the recorded attempt instead of deleting or adopting resources by hand.
 

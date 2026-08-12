@@ -493,6 +493,148 @@ func tmux(t *testing.T, args ...string) {
 	}
 }
 
+func cleanupTestManifest(t *testing.T, root string) agentruntime.Manifest {
+	t.Helper()
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
+	manifest, err := agentruntime.AttemptIdentity(root, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-b", manifest.Branch}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"commit", "--allow-empty", "-m", "attempt"}} {
+		if out, err := exec.Command("git", append([]string{"-C", manifest.Worktree}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	manifest.State = "completed"
+	manifest.ReviewHead = runGit(t, manifest.Worktree, "rev-parse", "HEAD")
+	return manifest
+}
+
+func TestCleanupAttemptRemovesOnlyVerifiedRuntimeResources(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := cleanupTestManifest(t, root)
+	resultPath := agentruntime.ResultPath(manifest.Worktree)
+	mustWriteFile(t, resultPath, `{"type":"agent-symphony-result-v1"}`)
+	logPath := filepath.Join(t.TempDir(), "agent.log")
+	mustWriteFile(t, logPath, "retained diagnostics")
+	manifest.LogPath = logPath
+	body, _ := json.Marshal(manifest)
+
+	oldExec := hostExecRunner
+	live, kills := true, 0
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		switch command.Args[0] {
+		case "has-session":
+			if live {
+				return agentruntime.Result{}, nil
+			}
+			return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
+		case "kill-session":
+			live, kills = false, kills+1
+			return agentruntime.Result{}, nil
+		default:
+			return agentruntime.Result{}, fmt.Errorf("unexpected tmux command %v", command.Args)
+		}
+	}
+	t.Cleanup(func() { hostExecRunner = oldExec })
+
+	for range 2 {
+		if err := cleanupAttempt(t.Context(), body, root); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if kills != 1 {
+		t.Fatalf("tmux kills = %d, want 1", kills)
+	}
+	for _, path := range []string{manifest.Worktree, resultPath} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("cleanup retained %s: %v", path, err)
+		}
+	}
+	if got, err := os.ReadFile(logPath); err != nil || string(got) != "retained diagnostics" {
+		t.Fatalf("diagnostics = %q, %v", got, err)
+	}
+}
+
+func TestCleanupAttemptRejectsSubstitutedResources(t *testing.T) {
+	oldExec := hostExecRunner
+	hostExecRunner = func(context.Context, agentruntime.Command) (agentruntime.Result, error) {
+		return agentruntime.Result{}, errors.New("tmux must not be reached")
+	}
+	t.Cleanup(func() { hostExecRunner = oldExec })
+
+	t.Run("worktree symlink", func(t *testing.T) {
+		root, _ := filepath.EvalSymlinks(t.TempDir())
+		attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
+		manifest, _ := agentruntime.AttemptIdentity(root, attempt)
+		manifest.State, manifest.ReviewHead = "completed", strings.Repeat("b", 40)
+		external := t.TempDir()
+		canary := filepath.Join(external, "canary")
+		mustWriteFile(t, canary, "unchanged")
+		if err := os.Symlink(external, manifest.Worktree); err != nil {
+			t.Fatal(err)
+		}
+		body, _ := json.Marshal(manifest)
+		if err := cleanupAttempt(t.Context(), body, root); err == nil || !strings.Contains(err.Error(), "non-symlink") {
+			t.Fatalf("substituted worktree cleanup = %v", err)
+		}
+		if got, err := os.ReadFile(canary); err != nil || string(got) != "unchanged" {
+			t.Fatalf("outside canary = %q, %v", got, err)
+		}
+	})
+
+	t.Run("worktree file", func(t *testing.T) {
+		root, _ := filepath.EvalSymlinks(t.TempDir())
+		attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
+		manifest, _ := agentruntime.AttemptIdentity(root, attempt)
+		manifest.State, manifest.ReviewHead = "completed", strings.Repeat("b", 40)
+		mustWriteFile(t, manifest.Worktree, "not a repository")
+		body, _ := json.Marshal(manifest)
+		if err := cleanupAttempt(t.Context(), body, root); err == nil || !strings.Contains(err.Error(), "non-symlink directory") {
+			t.Fatalf("non-directory worktree cleanup = %v", err)
+		}
+		if got, err := os.ReadFile(manifest.Worktree); err != nil || string(got) != "not a repository" {
+			t.Fatalf("worktree file = %q, %v", got, err)
+		}
+	})
+
+	t.Run("head mismatch", func(t *testing.T) {
+		root, _ := filepath.EvalSymlinks(t.TempDir())
+		manifest := cleanupTestManifest(t, root)
+		manifest.ReviewHead = strings.Repeat("b", 40)
+		body, _ := json.Marshal(manifest)
+		if err := cleanupAttempt(t.Context(), body, root); err == nil || !strings.Contains(err.Error(), "identity changed") {
+			t.Fatalf("mismatched head cleanup = %v", err)
+		}
+		if _, err := os.Stat(manifest.Worktree); err != nil {
+			t.Fatalf("mismatched worktree removed: %v", err)
+		}
+	})
+
+	t.Run("result symlink", func(t *testing.T) {
+		root, _ := filepath.EvalSymlinks(t.TempDir())
+		manifest := cleanupTestManifest(t, root)
+		canary := filepath.Join(t.TempDir(), "canary")
+		mustWriteFile(t, canary, "unchanged")
+		if err := os.Symlink(canary, agentruntime.ResultPath(manifest.Worktree)); err != nil {
+			t.Fatal(err)
+		}
+		body, _ := json.Marshal(manifest)
+		if err := cleanupAttempt(t.Context(), body, root); err == nil || !strings.Contains(err.Error(), "cleanup result") {
+			t.Fatalf("substituted result cleanup = %v", err)
+		}
+		if got, err := os.ReadFile(canary); err != nil || string(got) != "unchanged" {
+			t.Fatalf("result canary = %q, %v", got, err)
+		}
+	})
+}
+
 func TestProductionSeedClonesThroughAgentHostBoundary(t *testing.T) {
 	fakeHostIdentity(t, 1234, 5678)
 	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner
