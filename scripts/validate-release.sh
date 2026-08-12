@@ -88,7 +88,7 @@ if test "$scan_status" -eq 1; then
 fi
 test "$scan_status" -eq 0 || { echo 'credential scan failed' >&2; exit 1; }
 
-for doc in README.md docs/PRD.md docs/architecture.md docs/cli.md docs/setup.md docs/security.md docs/recovery.md docs/troubleshooting.md docs/release-validation.md; do
+for doc in README.md docs/PRD.md docs/architecture.md docs/cli.md docs/setup.md docs/security.md docs/recovery.md docs/troubleshooting.md docs/releases.md docs/release-validation.md; do
   test -s "$doc" || { echo "missing documentation: $doc" >&2; exit 1; }
 done
 

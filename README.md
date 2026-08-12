@@ -24,7 +24,7 @@ Independent one-repository daemons may share a host when each uses distinct stat
 - [MVP Architecture](docs/architecture.md)
 - [GitHub CLI integration](docs/github-cli.md)
 - [Setup](docs/setup.md), [security](docs/security.md), [recovery](docs/recovery.md), and [troubleshooting](docs/troubleshooting.md)
-- [Release validation and pilot evidence](docs/release-validation.md)
+- [Release runbook](docs/releases.md) and [release validation and pilot evidence](docs/release-validation.md)
 - [Agent development guidance](AGENTS.md)
 
 Durable project documentation belongs in `docs/`. BMAD working output belongs in `_bmad-output/` and is ignored by Git.
@@ -64,3 +64,5 @@ See the [CLI reference](docs/cli.md) for the schema, structured output, diagnost
 ## Release validation
 
 `scripts/validate-release.sh VERSION` runs race tests, vet, production-seam integration tests, cross-builds four runtime-independent binaries, proves archive reproducibility, strictly verifies each streamed archive and executable target, scans all regular candidate files (including ignored environment files) without printing matches, and checks the durable documentation set. It safely excludes only `.git`, `.worktrees`, and generated `dist`. It reports only the current host as locally passed. The GitHub Actions matrix supplies separate macOS, Linux, and WSL2 evidence; a release is not validated until all three jobs have links and successful results recorded in the pilot evidence template.
+
+Maintainers create official releases by following the [release runbook](docs/releases.md). Official artifacts come only from the signed-tag workflow, not from pull-request artifact downloads.
