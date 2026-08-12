@@ -1127,7 +1127,7 @@ func TestReviewCleanupRejectsForeignOutsideAndSymlinkIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, test := range []struct{ name, snapshot, session string }{
-		{"foreign session", "", "as-review-99-1"},
+		{"foreign session", "", "as-r-foreign-99-1"},
 		{"outside root", outside, session},
 		{"symlink", link, session},
 	} {
@@ -1143,6 +1143,30 @@ func TestReviewCleanupRejectsForeignOutsideAndSymlinkIdentity(t *testing.T) {
 				t.Fatalf("outside path mutated: %v", err)
 			}
 		})
+	}
+}
+
+func TestReviewIdentitySeparatesRepositories(t *testing.T) {
+	root := t.TempDir()
+	first := agentruntime.Attempt{Repository: "a-b/c", Issue: 23, Number: 1}
+	second := agentruntime.Attempt{Repository: "a/b-c", Issue: 23, Number: 1}
+	firstSnapshot, firstSession := reviewIdentity(first, root)
+	secondSnapshot, secondSession := reviewIdentity(second, root)
+	if firstSnapshot == secondSnapshot || firstSession == secondSession {
+		t.Fatalf("review identities collide: %q %q", firstSnapshot, firstSession)
+	}
+	largest := first
+	largest.Issue, largest.Number = int(^uint(0)>>1), int(^uint(0)>>1)
+	_, largestSession := reviewIdentity(largest, root)
+	if len(largestSession) > 64 {
+		t.Fatalf("review session exceeds runtime limit: %q", largestSession)
+	}
+	var boundary countingReviewBoundary
+	if err := cleanupReviewResources(t.Context(), &boundary, nil, first, strings.Repeat("a", 40), secondSnapshot, secondSession, root); err == nil {
+		t.Fatal("cleanup accepted another repository identity")
+	}
+	if boundary != 0 {
+		t.Fatal("cleanup boundary reached for another repository")
 	}
 }
 
@@ -1197,7 +1221,7 @@ func TestPreparingReviewCleanupRetainsStateAndRetries(t *testing.T) {
 			runGit(t, source, "commit", "-m", "head")
 			head := runGit(t, source, "rev-parse", "HEAD")
 			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: baseSHA}
-			snapshot, session := filepath.Join(base, "o-r-23-1"), "as-review-23-1"
+			snapshot, session := reviewIdentity(attempt, base)
 			manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed"}
 			if test.preparing {
 				manifest.ReviewState, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = "preparing", head, snapshot, session
@@ -1266,7 +1290,8 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	state, base := t.TempDir(), t.TempDir()
 	reviewSnapshotRoot = base
 	t.Cleanup(func() { reviewSnapshotRoot = "" })
-	snapshot := filepath.Join(base, "o-r-23-1")
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
+	snapshot, session := reviewIdentity(attempt, base)
 	if err := os.Mkdir(snapshot, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1277,8 +1302,7 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	if err := os.WriteFile(resultPath, []byte(`{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`), 0o660); err != nil {
 		t.Fatal(err)
 	}
-	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
-	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "running", ReviewHead: "head", ReviewSnapshot: snapshot, ReviewSession: "as-review-23-1"}
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "running", ReviewHead: "head", ReviewSnapshot: snapshot, ReviewSession: session}
 	sum := sha256.Sum256([]byte(attempt.Repository))
 	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {

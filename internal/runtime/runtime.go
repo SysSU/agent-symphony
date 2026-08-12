@@ -468,7 +468,7 @@ func (r *Runtime) identify(a Attempt) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	repoID := repoIdentifier(a.Repository)
+	repoID := internalgithub.RepositoryIdentifier(a.Repository)
 	logPath := filepath.Join(r.StateRoot, "attempts", repoID, fmt.Sprintf("%d-%d", a.Issue, a.Number), "agent.log")
 	if !filepath.IsAbs(r.StateRoot) || len(logPath) > maxPathLength {
 		return Manifest{}, fmt.Errorf("attempt path must be absolute and at most %d bytes", maxPathLength)
@@ -484,7 +484,7 @@ func AttemptIdentity(root string, a Attempt) (Manifest, error) {
 	if len(parts) != 2 || !component.MatchString(parts[0]) || !component.MatchString(parts[1]) || a.Issue < 1 || a.Number < 1 || !commitID.MatchString(a.BaseSHA) {
 		return Manifest{}, fmt.Errorf("invalid attempt identity or base SHA")
 	}
-	repoID := repoIdentifier(a.Repository)
+	repoID := internalgithub.RepositoryIdentifier(a.Repository)
 	name := fmt.Sprintf("%s-%d-%d", repoID, a.Issue, a.Number)
 	branch, err := internalgithub.AttemptBranch(a.Repository, a.Issue, a.Number)
 	if err != nil {
@@ -503,15 +503,6 @@ func AttemptIdentity(root string, a Attempt) (Manifest, error) {
 	}
 	return Manifest{Version: manifestVersion, Repository: a.Repository, Issue: a.Issue, Attempt: a.Number,
 		Branch: branch, Worktree: worktree, Session: session, BaseSHA: a.BaseSHA}, nil
-}
-
-func repoIdentifier(repository string) string {
-	slug := strings.ToLower(strings.ReplaceAll(repository, "/", "-"))
-	if len(slug) > 40 {
-		slug = strings.TrimRight(slug[:40], ".-_")
-	}
-	sum := sha256.Sum256([]byte(repository))
-	return fmt.Sprintf("%s-%x", slug, sum[:6])
 }
 
 func (r *Runtime) rejectCaseCollision(repository string) error {
@@ -617,7 +608,7 @@ func below(root, name string) (string, error) {
 }
 
 func (r *Runtime) manifestPath(a Attempt) string {
-	return filepath.Join(r.StateRoot, "attempts", repoIdentifier(a.Repository), fmt.Sprintf("%d-%d", a.Issue, a.Number), "manifest.json")
+	return filepath.Join(r.StateRoot, "attempts", internalgithub.RepositoryIdentifier(a.Repository), fmt.Sprintf("%d-%d", a.Issue, a.Number), "manifest.json")
 }
 
 func (r *Runtime) writeManifest(a Attempt, manifest Manifest) error {

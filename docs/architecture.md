@@ -1,7 +1,7 @@
 # MVP Architecture
 
 **Status:** Proposed for MVP implementation  
-**Scope:** one repository, one orchestrator instance, macOS, Linux, and WSL2
+**Scope:** one repository per orchestrator instance, multiple independent instances per host, macOS, Linux, and WSL2
 
 ## Decision summary
 
@@ -21,7 +21,7 @@ The design follows the useful boundaries in the [OpenAI Symphony specification](
 
 ## System boundaries and ownership
 
-There is one coordinator loop. It refreshes authoritative GitHub state at startup, on each polling interval, and for explicit CLI reconciliation, then makes every transition. This preserves upstream Symphony's single-writer property without adopting OTP or a workflow framework.
+There is one coordinator loop per repository. It refreshes authoritative GitHub state at startup, on each polling interval, and for explicit CLI reconciliation, then makes every transition. Independent repository loops may share a host but not state paths; source bundle, worktree, snapshot, and tmux session names include the repository identity. This preserves upstream Symphony's single-writer property without adopting OTP or a workflow framework.
 
 | Boundary | Owns | Must not own |
 | --- | --- | --- |
@@ -156,7 +156,7 @@ any nonterminal -> failed (bounded retries exhausted)
 
 These are projections, not durable workflow rows. GitHub facts define them: ready issue/no marker is `eligible`; valid marker plus local preparation is `claimed/preparing`; live matching session is `running`; agent outcome/validation comment is `validating/publishing`; open PR and review/check facts define `review`, `rework`, and `merge-check`; merged/closed PR defines terminal state. `blocked`, `failed`, and `cancelled` require a coordinator comment/check outcome. Only the coordinator transitions the projection.
 
-The runtime writes a credential-free source bundle inside the provisioned attempt root, then the worker boundary creates its isolated repository/worktree there and invokes the exact implementation launch as `agent-symphony-worker`; that mode starts the named tmux session and deterministic primary command in the worktree. The prompt contains the issue's arbitrary title/body, repository guidance, attempt identity, prior authorized feedback, allowed actions, and a required structured result. Independent review checks out the exact attested worker object in an immutable snapshot, persists its head/session state across reconciliation cycles, and requires a bounded structured clean/findings result. Findings enter the existing durable implementation handoff/rework lifecycle; only clean review permits publication. Process control uses process groups: graceful interrupt, bounded wait, then targeted kill of only that attempt. Attempts are retained for open PRs/rework. After fresh GitHub facts report an exact published attempt as merged, the implementation boundary verifies its deterministic branch and head, kills only its named tmux session, and removes its clone and worker result; the recovery manifest and diagnostic log remain retained.
+The runtime writes a credential-free source bundle whose name includes the repository identity inside the provisioned attempt root, then the worker boundary creates its isolated repository/worktree there and invokes the exact implementation launch as `agent-symphony-worker`; that mode starts the named tmux session and deterministic primary command in the worktree. The prompt contains the issue's arbitrary title/body, repository guidance, attempt identity, prior authorized feedback, allowed actions, and a required structured result. Independent review checks out the exact attested worker object in an immutable snapshot and tmux session whose names include the repository identity, persists its head/session state across reconciliation cycles, and requires a bounded structured clean/findings result. Findings enter the existing durable implementation handoff/rework lifecycle; only clean review permits publication. Process control uses process groups: graceful interrupt, bounded wait, then targeted kill of only that attempt. Attempts are retained for open PRs/rework. After fresh GitHub facts report an exact published attempt as merged, the implementation boundary verifies its deterministic branch and head, kills only its named tmux session, and removes its clone and worker result; the recovery manifest and diagnostic log remain retained.
 
 The trusted worker boundary exports a bounded Git bundle plus immutable branch/head/base, clean-tree, result, and bundle-digest attestation; it never publishes. The coordinator imports into a temporary bare repository, rejects oversized objects, symlinks, result markers, invalid ancestry, or a changed head, and only then imports the verified head for push. Publication is reconstructed before each mutation from the deterministic coordinator-owned branch/head, PR body marker, and issue comment marker, so ambiguous responses and crashes resume the missing phase instead of creating another PR.
 
