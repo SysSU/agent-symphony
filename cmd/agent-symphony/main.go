@@ -11,7 +11,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,7 +38,7 @@ var releaseMetadata = "agent-symphony-release-version:devel"
 
 var (
 	githubAPI          = "https://api.github.com"
-	githubClient       = http.DefaultClient
+	githubClient       = &http.Client{Transport: internalgithub.CLITransport{}}
 	reconcileGitHubRun = reconcileGitHub
 	reviewSnapshotRoot = ""
 	runningOnWSL       = func() bool { return runtime.GOOS == "linux" && isWSL() }
@@ -72,8 +71,6 @@ type envelope struct {
 	Diagnostics []diagnostic `json:"diagnostics,omitempty"`
 	Error       string       `json:"error,omitempty"`
 }
-
-type environmentToken string
 
 type workerBoundaryRunner struct {
 	Command string
@@ -211,109 +208,6 @@ func productionSnapshotRoot(stateRoot string) string {
 	return root
 }
 
-func (t environmentToken) Token(context.Context) (internalgithub.InstallationToken, error) {
-	if t == "" {
-		return internalgithub.InstallationToken{}, errors.New("GITHUB_TOKEN is required")
-	}
-	return internalgithub.InstallationToken{Value: string(t), ExpiresAt: time.Now().Add(time.Hour)}, nil
-}
-
-// githubTokenSource resolves how the coordinator authenticates to the GitHub
-// API. When AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH and
-// AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID are both set, it mints and
-// auto-refreshes installation tokens from the App's own JWT — the only way to
-// run serve continuously, since installation tokens expire after an hour and
-// nothing can refresh a static GITHUB_TOKEN inside an already-running
-// process. Otherwise it falls back to a static GITHUB_TOKEN, sufficient for
-// short reconcile/doctor/pr-governance runs. Call this once per process
-// invocation, not once per reconcile cycle, so InstallationTokens' internal
-// cache is actually reused instead of re-minting a token every cycle.
-func githubTokenSource(appID int64) (internalgithub.TokenSource, error) {
-	keyPath := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH"))
-	installationRaw := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID"))
-	if keyPath == "" && installationRaw == "" {
-		token := os.Getenv("GITHUB_TOKEN")
-		if token == "" {
-			return nil, errors.New("GITHUB_TOKEN is required, or set AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH and AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID for auto-refreshing credentials")
-		}
-		return environmentToken(token), nil
-	}
-	if keyPath == "" || installationRaw == "" {
-		return nil, errors.New("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH and AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID must both be set")
-	}
-	installationID, err := strconv.ParseInt(installationRaw, 10, 64)
-	if err != nil || installationID <= 0 {
-		return nil, errors.New("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID must be a positive integer")
-	}
-	pemBytes, err := os.ReadFile(keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("read GitHub App private key: %w", err)
-	}
-	key, err := internalgithub.ParsePrivateKeyPEM(pemBytes)
-	if err != nil {
-		return nil, err
-	}
-	return &internalgithub.InstallationTokens{BaseURL: githubAPI, InstallationID: installationID, JWTs: internalgithub.AppJWT{AppID: strconv.FormatInt(appID, 10), Key: key}, HTTP: githubClient}, nil
-}
-
-// startWebhookListener starts an HTTP server that turns valid signed GitHub
-// webhook deliveries into a coalesced early-wake signal for serve's
-// reconcile loop. It only starts when both AGENT_SYMPHONY_WEBHOOK_ADDR and
-// AGENT_SYMPHONY_WEBHOOK_SECRET are set; without them it returns a nil wake
-// channel and a no-op shutdown, and serve continues to rely on periodic
-// polling alone exactly as it always has. Periodic reconciliation remains
-// the authoritative recovery path either way — a webhook only wakes it up
-// sooner; it never replaces it.
-func startWebhookListener(ctx context.Context, api internalgithub.API, repository string, stderr io.Writer) (<-chan struct{}, func(context.Context) error, error) {
-	noop := func(context.Context) error { return nil }
-	addr := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_WEBHOOK_ADDR"))
-	secret := os.Getenv("AGENT_SYMPHONY_WEBHOOK_SECRET")
-	if addr == "" && secret == "" {
-		return nil, noop, nil
-	}
-	if addr == "" || secret == "" {
-		return nil, nil, errors.New("AGENT_SYMPHONY_WEBHOOK_ADDR and AGENT_SYMPHONY_WEBHOOK_SECRET must both be set")
-	}
-	installationID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID")
-	if err != nil {
-		return nil, nil, fmt.Errorf("webhook requires %w", err)
-	}
-	// Cheap local checks before any network round-trip: fail fast on an
-	// unbindable address rather than waiting on a retried API call first.
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("webhook listener: %w", err)
-	}
-	repositoryID, err := api.RepositoryID(ctx, repository)
-	if err != nil {
-		_ = listener.Close()
-		return nil, nil, err
-	}
-	hints := make(chan internalgithub.Hint, 64)
-	wake := make(chan struct{}, 1)
-	go func() {
-		for range hints {
-			select {
-			case wake <- struct{}{}:
-			default:
-			}
-		}
-	}()
-	handler := internalgithub.Webhook{Secret: []byte(secret), RepositoryID: repositoryID, InstallationID: installationID, Hints: hints, Deliveries: internalgithub.NewDeliveryCache(1024)}
-	server := &http.Server{Handler: handler}
-	go func() {
-		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Fprintln(stderr, "webhook listener: "+err.Error())
-		}
-	}()
-	shutdown := func(shutdownCtx context.Context) error {
-		err := server.Shutdown(shutdownCtx)
-		close(hints) // safe only after Shutdown returns: no handler can still be sending
-		return err
-	}
-	return wake, shutdown, nil
-}
-
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -406,14 +300,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return fail(stderr, *jsonOutput, command, rootErr.Error())
 			}
 		}
-		appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
-		if err != nil {
+		api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
+		if _, err := api.AuthenticatedUser(context.Background()); err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		// Built once for the whole serve invocation, not once per reconcile
-		// cycle: InstallationTokens caches and only re-mints near real expiry.
-		tokens, err := githubTokenSource(appID)
-		if err != nil {
+		if err := api.VerifyRepository(context.Background(), c.Repository); err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		lock, err := acquireDaemonLock(filepath.Join(*runtimeState, "daemon.lock"))
@@ -423,24 +314,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		defer releaseDaemonLock(lock)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		api := internalgithub.API{BaseURL: githubAPI, Tokens: tokens, HTTP: githubClient}
-		wake, shutdownWebhook, err := startWebhookListener(ctx, api, c.Repository, stderr)
-		if err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
-		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = shutdownWebhook(shutdownCtx)
-		}()
 		reconcile := func(ctx context.Context) error {
-			_, err := reconcileGitHub(ctx, *path, *statePath, *runtimeState, true, tokens)
+			_, err := reconcileGitHub(ctx, *path, *statePath, *runtimeState, true)
 			if err != nil {
 				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
 			}
 			return err
 		}
-		if err := orchestrator.ReconcileLoop(ctx, *interval, wake, reconcile); err != nil && !errors.Is(err, context.Canceled) {
+		if err := orchestrator.ReconcileLoop(ctx, *interval, reconcile); err != nil && !errors.Is(err, context.Canceled) {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		return 0
@@ -454,14 +335,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if *statePath == "" || *runtimeState == "" {
 				return misuse(stderr, wantsJSON, command, command+" requires --state and --runtime-state unless --attempts is supplied")
 			}
-			appID, appErr := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
-			if appErr != nil {
-				return fail(stderr, *jsonOutput, command, appErr.Error())
-			}
-			tokens, tokenErr := githubTokenSource(appID)
-			if tokenErr != nil {
-				return fail(stderr, *jsonOutput, command, tokenErr.Error())
-			}
 			if command == "reconcile" {
 				lock, lockErr := acquireDaemonLock(filepath.Join(*runtimeState, "daemon.lock"))
 				if lockErr != nil {
@@ -469,7 +342,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 				}
 				defer releaseDaemonLock(lock)
 			}
-			statuses, err = reconcileGitHubRun(context.Background(), *path, *statePath, *runtimeState, command == "reconcile", tokens)
+			statuses, err = reconcileGitHubRun(context.Background(), *path, *statePath, *runtimeState, command == "reconcile")
 		} else {
 			statuses, err = recoveryStatuses(*attemptsPath, *runtimeState)
 		}
@@ -569,29 +442,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
+		api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
+		user, err := api.AuthenticatedUser(context.Background())
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		actorID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID")
-		if err != nil {
+		if err := api.VerifyRepository(context.Background(), c.Repository); err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		actor := int(actorID)
-		if int64(actor) != actorID {
-			return fail(stderr, *jsonOutput, command, "AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID is out of range")
-		}
-		tokens, err := githubTokenSource(appID)
-		if err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
-		api := internalgithub.API{BaseURL: githubAPI, Tokens: tokens, HTTP: githubClient}
 		prConfig := internalgithub.PRAdapterConfig{
 			Repository: c.Repository, ReadyLabel: c.Labels.Ready, HumanReviewLabel: c.CompletionPolicies.HumanReview,
 			AutonomousMergeLabel: c.CompletionPolicies.AutonomousMerge, MergeMethod: "squash", PriorityP1Label: c.Labels.PriorityP1,
 			PriorityP2Label: c.Labels.PriorityP2, PriorityP3Label: c.Labels.PriorityP3, DependencySection: c.Dependencies.Section,
 			DefaultCompletion: c.CompletionPolicies.Default, ApprovalCommand: "/agent-symphony approve", CancelCommand: "/agent-symphony cancel",
-			RetryCommand: "/agent-symphony retry", AppID: appID, AppActorID: actor,
+			RetryCommand: "/agent-symphony retry", ActorID: user.ID,
 		}
 		if err := internalgithub.RunPRReconciliation(context.Background(), api, prConfig, *statePath); err != nil {
 			return fail(stderr, *jsonOutput, command, internalgithub.Redact(err.Error()))
@@ -667,7 +531,7 @@ func acquireDaemonLock(path string) (*os.File, error) {
 
 func releaseDaemonLock(f *os.File) { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }
 
-func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool, tokens internalgithub.TokenSource) ([]orchestrator.RecoveryStatus, error) {
+func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
 	started := time.Now()
 	ctx, cancel := context.WithDeadline(ctx, started.Add(2*time.Minute))
 	defer cancel()
@@ -684,22 +548,15 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 			return nil, err
 		}
 	}
-	appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
+	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
+	user, err := api.AuthenticatedUser(ctx)
 	if err != nil {
 		return nil, err
 	}
-	actorID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID")
-	if err != nil {
+	if err := api.VerifyRepository(ctx, c.Repository); err != nil {
 		return nil, err
 	}
-	if actorID > int64(^uint(0)>>1) {
-		return nil, errors.New("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID is out of range")
-	}
-	api := internalgithub.API{BaseURL: githubAPI, Tokens: tokens, HTTP: githubClient}
-	if err := api.VerifyInstallation(ctx, appID, c.Repository); err != nil {
-		return nil, err
-	}
-	remote, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, appID, int(actorID))
+	remote, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -707,7 +564,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	for i, f := range remote {
 		facts[i] = orchestrator.AttemptFact{Repository: f.Repository, Issue: f.Issue, Attempt: f.Attempt, BaseSHA: f.BaseSHA, HeadSHA: f.HeadSHA, PR: f.PR, State: f.State, Checks: f.Checks}
 	}
-	prConfig := internalgithub.PRAdapterConfig{Repository: c.Repository, ReadyLabel: c.Labels.Ready, HumanReviewLabel: c.CompletionPolicies.HumanReview, AutonomousMergeLabel: c.CompletionPolicies.AutonomousMerge, MergeMethod: "squash", PriorityP1Label: c.Labels.PriorityP1, PriorityP2Label: c.Labels.PriorityP2, PriorityP3Label: c.Labels.PriorityP3, DependencySection: c.Dependencies.Section, DefaultCompletion: c.CompletionPolicies.Default, ApprovalCommand: "/agent-symphony approve", CancelCommand: "/agent-symphony cancel", RetryCommand: "/agent-symphony retry", AppID: appID, AppActorID: int(actorID)}
+	prConfig := internalgithub.PRAdapterConfig{Repository: c.Repository, ReadyLabel: c.Labels.Ready, HumanReviewLabel: c.CompletionPolicies.HumanReview, AutonomousMergeLabel: c.CompletionPolicies.AutonomousMerge, MergeMethod: "squash", PriorityP1Label: c.Labels.PriorityP1, PriorityP2Label: c.Labels.PriorityP2, PriorityP3Label: c.Labels.PriorityP3, DependencySection: c.Dependencies.Section, DefaultCompletion: c.CompletionPolicies.Default, ApprovalCommand: "/agent-symphony approve", CancelCommand: "/agent-symphony cancel", RetryCommand: "/agent-symphony retry", ActorID: user.ID}
 	issues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, remote, transition)
 	if err != nil {
 		return nil, err
@@ -726,7 +583,11 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		return nil, err
 	}
 	attemptRoot := productionAttemptRoot(stateRoot)
-	source, err := seedAttemptSource(ctx, root, attemptRoot)
+	baseBranch, baseSHA := "", ""
+	if len(issues) > 0 {
+		baseBranch, baseSHA = issues[0].BaseBranch, issues[0].BaseSHA
+	}
+	source, err := seedAttemptSource(ctx, root, attemptRoot, baseBranch, baseSHA)
 	if err != nil {
 		return nil, err
 	}
@@ -753,7 +614,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	statuses := orchestrator.Recover(facts, manifests)
 	statuses, decisions := joinIssueProjection(statuses, issues, c.Concurrency)
 	if !transition {
-		return statuses, nil
+		return statuses, writeStatusSnapshot(stateRoot, statuses)
 	}
 	statuses = orchestrator.RecoverChecked(ctx, facts, manifests, func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
 		head := fact.HeadSHA
@@ -763,12 +624,18 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		return r.VerifyActive(ctx, manifest, head)
 	})
 	statuses, _ = joinIssueProjection(statuses, issues, c.Concurrency)
-	// Governance may mutate GitHub; production only runs it after the verified
-	// installation read and authoritative duplicate suppression above.
+	if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
+		return statuses, err
+	}
+	// Governance may mutate GitHub only after authenticated repository access
+	// and authoritative duplicate suppression above.
 	if slices.ContainsFunc(statuses, func(s orchestrator.RecoveryStatus) bool {
 		return s.State == "blocked" && strings.Contains(s.Diagnostic, "duplicate")
 	}) {
 		return statuses, nil
+	}
+	if err := ensurePublishedEvidence(ctx, api, facts, manifests, user.ID); err != nil {
+		return statuses, err
 	}
 	if err := internalgithub.RunPRReconciliation(ctx, api, prConfig, statePath); err != nil {
 		return statuses, err
@@ -789,6 +656,23 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		return statuses, fmt.Errorf("reconciliation exceeded the two-minute recovery target; retry on the next bounded backoff cycle: %w", err)
 	}
 	return statuses, nil
+}
+
+func ensurePublishedEvidence(ctx context.Context, api internalgithub.API, facts []orchestrator.AttemptFact, manifests []agentruntime.Manifest, actorID int) error {
+	for _, fact := range facts {
+		if fact.State != "active" && fact.State != "review-ready" {
+			continue
+		}
+		if !slices.ContainsFunc(manifests, func(manifest agentruntime.Manifest) bool {
+			return orchestrator.MatchesPublishedAttempt(manifest, fact)
+		}) {
+			continue
+		}
+		if err := api.EnsureEvidence(ctx, fact.Repository, fact.Issue, fact.Attempt, fact.HeadSHA, actorID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func addTerminalAttemptBlockers(issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, facts []orchestrator.AttemptFact) {
@@ -816,7 +700,7 @@ func addTerminalAttemptBlockers(issues []internalgithub.RecoveryIssueFact, manif
 func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []internalgithub.RecoveryIssueFact, capacity int) ([]orchestrator.RecoveryStatus, []orchestrator.Decision) {
 	scheduled := make([]orchestrator.Issue, len(issues))
 	for i, issue := range issues {
-		scheduled[i] = orchestrator.Issue{Repository: issue.Repository, Number: issue.Issue, Priority: issue.Priority, CreatedAt: issue.CreatedAt, Dependencies: issue.Dependencies, Eligible: issue.Eligible, Blockers: issue.Blockers, Active: issue.Active, Completed: issue.Completed}
+		scheduled[i] = orchestrator.Issue{Repository: issue.Repository, Number: issue.Issue, Priority: issue.Priority, CreatedAt: issue.CreatedAt, Dependencies: issue.Dependencies, Paths: issue.Paths, Eligible: issue.Eligible, Blockers: issue.Blockers, Active: issue.Active, Completed: issue.Completed}
 	}
 	decisions := orchestrator.Schedule(scheduled, orchestrator.Capacity{Global: capacity, Repositories: map[string]int{}})
 	for _, issue := range issues {
@@ -841,13 +725,72 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 	return statuses, decisions
 }
 
-func seedAttemptSource(ctx context.Context, repository, attemptRoot string) (string, error) {
+func writeStatusSnapshot(stateRoot string, statuses []orchestrator.RecoveryStatus) error {
+	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(stateRoot, "status.json")
+	if info, err := os.Lstat(path); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
+		return errors.New("status state must be a regular non-symlink file")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	body, err := json.MarshalIndent(struct {
+		UpdatedAt time.Time                     `json:"updated_at"`
+		Statuses  []orchestrator.RecoveryStatus `json:"statuses"`
+	}{time.Now().UTC(), statuses}, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(stateRoot, ".status-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(body, '\n')); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func seedAttemptSource(ctx context.Context, repository, attemptRoot, baseBranch, baseSHA string) (string, error) {
 	mode := os.FileMode(0o770)
 	if !hostIsolationInstalled() {
 		mode = 0o700
 	}
 	if err := os.MkdirAll(attemptRoot, mode); err != nil {
 		return "", fmt.Errorf("open provisioned attempt root: %w", err)
+	}
+	if baseBranch != "" || baseSHA != "" {
+		if baseBranch == "" || !preflightObjectID.MatchString(baseSHA) {
+			return "", errors.New("seed worker source requires a valid base branch and commit")
+		}
+		if out, err := exec.CommandContext(ctx, "git", "check-ref-format", "--branch", baseBranch).CombinedOutput(); err != nil {
+			return "", fmt.Errorf("validate worker source branch: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		remoteRef := "refs/remotes/origin/" + baseBranch
+		if exec.CommandContext(ctx, "git", "-C", repository, "merge-base", "--is-ancestor", baseSHA, remoteRef).Run() != nil {
+			refspec := "+refs/heads/" + baseBranch + ":" + remoteRef
+			if out, err := exec.CommandContext(ctx, "git", "-C", repository, "fetch", "--no-tags", "origin", refspec).CombinedOutput(); err != nil {
+				return "", fmt.Errorf("refresh worker source base: %w: %s", err, strings.TrimSpace(string(out)))
+			}
+			if err := exec.CommandContext(ctx, "git", "-C", repository, "merge-base", "--is-ancestor", baseSHA, remoteRef).Run(); err != nil {
+				return "", errors.New("refreshed worker source does not contain the selected base")
+			}
+		}
 	}
 	tmp, err := os.CreateTemp(attemptRoot, ".source-*.bundle")
 	if err != nil {
@@ -1305,7 +1248,7 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		}
 	}
 	run := func(dir string, args ...string) (string, error) {
-		out, err := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", dir}, args...)...).CombinedOutput()
+		out, err := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "-C", dir}, args...)...).CombinedOutput()
 		return strings.TrimSpace(string(out)), err
 	}
 	if _, err := run(root, "push", "origin", "FETCH_HEAD:refs/heads/"+manifest.Branch); err != nil {
@@ -1316,15 +1259,11 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		return false, err
 	}
 	mutation := internalgithub.Mutation{Issue: issue.Issue, Attempt: issue.Attempt}
-	appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
+	user, err := api.AuthenticatedUser(ctx)
 	if err != nil {
 		return false, err
 	}
-	actorID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID")
-	if err != nil {
-		return false, err
-	}
-	pr, currentBody, err := internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, appID, int(actorID))
+	pr, currentBody, err := internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, user.ID)
 	if err != nil {
 		return false, err
 	}
@@ -1332,7 +1271,7 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		pr, err = api.CreatePullRequest(ctx, issue.Repository, issue.Title, manifest.Branch, issue.BaseBranch, body, mutation)
 		if err != nil {
 			// An ambiguous create is recovered by deterministic head lookup.
-			pr, currentBody, _ = internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, appID, int(actorID))
+			pr, currentBody, _ = internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, user.ID)
 			if pr.Number == 0 {
 				return false, err
 			}
@@ -1344,7 +1283,7 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 	}
 	if currentBody != bound {
 		// Re-read before mutation so a restart or concurrent edit cannot create a second PR.
-		fresh, freshBody, findErr := internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, appID, int(actorID))
+		fresh, freshBody, findErr := internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, user.ID)
 		if findErr != nil || fresh.Number != pr.Number {
 			return false, errors.New("pull request identity changed before binding")
 		}
@@ -1355,9 +1294,12 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 			return false, err
 		}
 	}
+	if err := api.EnsureEvidence(ctx, issue.Repository, issue.Issue, issue.Attempt, head, user.ID); err != nil {
+		return false, err
+	}
 	marker, _ := internalgithub.AttemptMarker(issue.Issue, issue.Attempt, manifest.Branch, head, pr.Number, "review")
 	comment, _ := internalgithub.AttributedBody(issue.Issue, issue.Attempt, "Attempt published for review.")
-	present, err := internalgithub.HasAttemptComment(ctx, api, issue.Repository, issue.Issue, marker, appID, int(actorID))
+	present, err := internalgithub.HasAttemptComment(ctx, api, issue.Repository, issue.Issue, marker, user.ID)
 	if err != nil {
 		return false, err
 	}
@@ -1662,15 +1604,11 @@ func durableAttemptFailure(ctx context.Context, api internalgithub.API, issue in
 	if err != nil {
 		return err
 	}
-	appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
+	user, err := api.AuthenticatedUser(ctx)
 	if err != nil {
 		return err
 	}
-	actorID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ACTOR_ID")
-	if err != nil {
-		return err
-	}
-	present, err := internalgithub.HasAttemptComment(ctx, api, issue.Repository, issue.Issue, marker, appID, int(actorID))
+	present, err := internalgithub.HasAttemptComment(ctx, api, issue.Repository, issue.Issue, marker, user.ID)
 	if err != nil {
 		return err
 	}
@@ -1883,14 +1821,6 @@ func completeHandoffOutcomes(ctx context.Context, recovery *internalgithub.FileR
 	return nil
 }
 
-func positiveEnvironmentInt64(name string) (int64, error) {
-	value, err := strconv.ParseInt(os.Getenv(name), 10, 64)
-	if err != nil || value <= 0 {
-		return 0, fmt.Errorf("%s must be a positive integer", name)
-	}
-	return value, nil
-}
-
 func recoveryStatuses(attemptsPath, stateRoot string) ([]orchestrator.RecoveryStatus, error) {
 	if attemptsPath == "" {
 		return nil, errors.New("--attempts is required")
@@ -2007,7 +1937,6 @@ func doctor(c config.Config, offline bool, stateRoot string) []diagnostic {
 		result = append(result, githubDiagnostics(c.Repository)...)
 	}
 	result = append(result, hostDiagnostic(stateRoot))
-	result = append(result, diagnostic{"GitHub policy", "warn", "the required agent-symphony/policy check and merge-permission gating are not yet implemented", "Configure branch protection manually until the policy check exists; an optional webhook listener for early wake-up can be configured with AGENT_SYMPHONY_WEBHOOK_ADDR/AGENT_SYMPHONY_WEBHOOK_SECRET, but periodic reconciliation remains the authoritative recovery path either way."})
 	return result
 }
 
@@ -2043,47 +1972,27 @@ func tmuxDiagnostic() diagnostic {
 func githubDiagnostics(repository string) []diagnostic {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if firstNonempty(os.Getenv("AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH"), os.Getenv("AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID")) != "" {
-		appID, err := positiveEnvironmentInt64("AGENT_SYMPHONY_GITHUB_APP_ID")
-		if err != nil {
-			return []diagnostic{{"GitHub connectivity", "fail", err.Error(), "Set matching AGENT_SYMPHONY_GITHUB_APP_ID, AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH, and AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID values."}}
-		}
-		tokens, err := githubTokenSource(appID)
-		if err != nil {
-			return []diagnostic{{"GitHub connectivity", "fail", err.Error(), "Set matching AGENT_SYMPHONY_GITHUB_APP_ID, AGENT_SYMPHONY_GITHUB_APP_PRIVATE_KEY_PATH, and AGENT_SYMPHONY_GITHUB_APP_INSTALLATION_ID values."}}
-		}
-		api := internalgithub.API{BaseURL: githubAPI, Tokens: tokens, HTTP: githubClient}
-		if err := api.VerifyInstallation(ctx, appID, repository); err != nil {
-			return []diagnostic{{"GitHub connectivity", "fail", err.Error(), "Verify the configured GitHub App installation includes this repository."}}
-		}
-		return []diagnostic{
-			{"GitHub connectivity", "pass", "connected to " + repository, ""},
-			{"GitHub permissions", "warn", "configured GitHub App installation can access the repository", "Verify issue, pull-request, checks, webhook, rules, and installation permissions in GitHub."},
-		}
-	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, githubAPI+"/repos/"+repository, nil)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	if token := firstNonempty(os.Getenv("GITHUB_TOKEN"), os.Getenv("GH_TOKEN")); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := githubClient.Do(req)
+	path, err := exec.LookPath("gh")
 	if err != nil {
-		return []diagnostic{{"GitHub connectivity", "fail", err.Error(), "Check DNS, proxy, and access to api.github.com."}}
+		return []diagnostic{{"GitHub CLI", "fail", "gh was not found", "Install GitHub CLI and run gh auth login."}}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return []diagnostic{{"GitHub connectivity", "fail", resp.Status, "Check repository name and provide GITHUB_TOKEN or GH_TOKEN for private repositories."}}
+	version, err := exec.CommandContext(ctx, path, "--version").Output()
+	if err != nil {
+		return []diagnostic{{"GitHub CLI", "fail", internalgithub.Redact(err.Error()), "Repair GitHub CLI and run gh auth login."}}
+	}
+	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
+	user, err := api.AuthenticatedUser(ctx)
+	if err != nil {
+		return []diagnostic{{"GitHub CLI", "fail", internalgithub.Redact(err.Error()), "Run gh auth login and retry."}}
+	}
+	if err := api.VerifyRepository(ctx, repository); err != nil {
+		return []diagnostic{{"GitHub connectivity", "fail", internalgithub.Redact(err.Error()), "Grant the authenticated gh account access to " + repository + "."}}
 	}
 	var body struct {
 		Permissions map[string]bool `json:"permissions"`
 	}
-	_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body)
-	if len(body.Permissions) == 0 {
-		return []diagnostic{
-			{"GitHub connectivity", "pass", "connected to " + repository, ""},
-			{"GitHub permissions", "warn", "effective repository permissions are unavailable without authenticated metadata", "Set GITHUB_TOKEN or GH_TOKEN for this read-only probe; downstream App setup must still verify feature-specific permissions."},
-		}
+	if _, _, err := api.Read(ctx, "/repos/"+repository, "", &body); err != nil {
+		return []diagnostic{{"GitHub permissions", "fail", internalgithub.Redact(err.Error()), "Grant the authenticated gh account repository access."}}
 	}
 	var granted []string
 	for _, name := range []string{"admin", "maintain", "push", "triage", "pull"} {
@@ -2092,8 +2001,9 @@ func githubDiagnostics(repository string) []diagnostic {
 		}
 	}
 	return []diagnostic{
+		{"GitHub CLI", "pass", strings.Split(strings.TrimSpace(string(version)), "\n")[0] + "; authenticated as " + user.Login, ""},
 		{"GitHub connectivity", "pass", "connected to " + repository, ""},
-		{"GitHub permissions", "warn", "effective repository access: " + strings.Join(granted, ", "), "Downstream App setup must verify issue, pull-request, checks, webhook, rules, and installation permissions."},
+		{"GitHub permissions", "pass", "effective repository access: " + strings.Join(granted, ", "), ""},
 	}
 }
 

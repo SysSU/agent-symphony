@@ -25,7 +25,6 @@ type IssueInput struct {
 type ContractConfig struct {
 	Ready, P1, P2, P3 string
 	DependencySection string
-	RequiredSections  []string
 	DefaultCompletion string
 	HumanReview       string
 	AutonomousMerge   string
@@ -65,16 +64,6 @@ func NormalizeIssue(issue IssueInput, cfg ContractConfig, completed map[int]bool
 	if !result.Controls.Ready {
 		result.Blockers = append(result.Blockers, "readiness label is missing")
 	}
-	required := cfg.RequiredSections
-	if len(required) == 0 {
-		required = []string{"Context", "Acceptance Criteria", "Tasks", "Validation"}
-	}
-	for _, name := range required {
-		section, ok := markdownSection(issue.Body, name)
-		if !ok || strings.TrimSpace(section) == "" {
-			result.Blockers = append(result.Blockers, "required "+strings.ToLower(name)+" section is missing or empty")
-		}
-	}
 	for priority, label := range map[int]string{1: cfg.P1, 2: cfg.P2, 3: cfg.P3} {
 		if slices.Contains(issue.Labels, label) {
 			if result.Controls.Priority != 0 {
@@ -86,10 +75,7 @@ func NormalizeIssue(issue IssueInput, cfg ContractConfig, completed map[int]bool
 	if result.Controls.Priority == 0 {
 		result.Blockers = append(result.Blockers, "exactly one priority label is required")
 	}
-	section, ok := markdownSection(issue.Body, cfg.DependencySection)
-	if !ok {
-		result.Blockers = append(result.Blockers, "required dependencies section is missing")
-	} else {
+	if section, ok := markdownSection(issue.Body, cfg.DependencySection); ok {
 		for _, match := range issueReference.FindAllStringSubmatch(section, -1) {
 			n, _ := strconv.Atoi(match[1])
 			if n == issue.Number {
@@ -125,8 +111,8 @@ type PermissionAuthorizer interface {
 	Permission(actorID int) (string, error)
 }
 
-func AuthorizedControlActor(actorID, appID int, authorizer PermissionAuthorizer) (bool, error) {
-	if actorID <= 0 || actorID == appID || authorizer == nil {
+func AuthorizedControlActor(actorID int, authorizer PermissionAuthorizer) (bool, error) {
+	if actorID <= 0 || authorizer == nil {
 		return false, nil
 	}
 	permission, err := authorizer.Permission(actorID)
@@ -152,6 +138,24 @@ func markdownSection(body, name string) (string, bool) {
 		return strings.Join(lines[start:], "\n"), true
 	}
 	return "", false
+}
+
+func IssuePaths(body string) []string {
+	section, ok := markdownSection(body, "Paths")
+	if !ok {
+		return nil
+	}
+	var paths []string
+	for _, line := range strings.Split(section, "\n") {
+		path := strings.TrimSpace(line)
+		path = strings.TrimSpace(strings.TrimPrefix(path, "-"))
+		path = strings.Trim(path, "`")
+		if path != "" {
+			paths = append(paths, path)
+		}
+	}
+	slices.Sort(paths)
+	return slices.Compact(paths)
 }
 
 type Anchor struct {
@@ -231,11 +235,6 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 		if autonomous.Source != "timeline" || autonomous.Value != "autonomous-merge" || autonomous.CreatedAt.Before(anchor.ChangedAt) || autonomous.CreatedAt.Equal(anchor.ChangedAt) && anchor.EditID != "" {
 			return Snapshot{}, errors.New("autonomous label does not authorize the current issue body")
 		}
-		for _, p := range provenance {
-			if slices.Contains([]string{"ready", "priority"}, p.Name) && (p.CreatedAt.After(autonomous.CreatedAt) || p.CreatedAt.Equal(autonomous.CreatedAt) && p.EventID > autonomous.EventID) {
-				return Snapshot{}, errors.New("autonomous label does not authorize the current issue controls")
-			}
-		}
 	}
 	canonical := slices.Clone(provenance)
 	slices.SortFunc(canonical, func(a, b Provenance) int { return strings.Compare(a.Name, b.Name) })
@@ -261,9 +260,9 @@ func SnapshotComment(snapshot Snapshot) string {
 	return snapshotPrefix + string(b) + "\n-->"
 }
 
-func ParseSnapshotComment(body string, authorID, appID int) (Snapshot, error) {
-	if authorID != appID || !strings.HasPrefix(body, snapshotPrefix) || len(body) > 16<<10 || !strings.HasSuffix(body, "\n-->") {
-		return Snapshot{}, errors.New("invalid or non-App control snapshot")
+func ParseSnapshotComment(body string, authorID, coordinatorID int) (Snapshot, error) {
+	if authorID != coordinatorID || !strings.HasPrefix(body, snapshotPrefix) || len(body) > 16<<10 || !strings.HasSuffix(body, "\n-->") {
+		return Snapshot{}, errors.New("invalid or non-coordinator control snapshot")
 	}
 	var snapshot Snapshot
 	dec := json.NewDecoder(strings.NewReader(strings.TrimSuffix(strings.TrimPrefix(body, snapshotPrefix), "\n-->")))

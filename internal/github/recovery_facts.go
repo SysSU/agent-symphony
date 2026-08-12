@@ -121,7 +121,7 @@ func parseAttemptMarker(body string) (recoveryMarkerPayload, error) {
 }
 
 // FetchAttemptFacts reconstructs attempts from current marked PRs and their
-// current issue/head/check facts. It never uses webhook payloads or local state.
+// current issue/head/check facts. It never uses local state.
 type RecoveryAttemptFact struct {
 	Repository              string
 	Issue, Attempt, PR      int
@@ -134,6 +134,7 @@ type RecoveryIssueFact struct {
 	Issue, Attempt, Priority                      int
 	CreatedAt                                     time.Time
 	Dependencies                                  []int
+	Paths                                         []string
 	Blockers                                      []string
 	Eligible, Active, Completed, Retry, Cancelled bool
 	DispatchAuthorized                            bool
@@ -232,7 +233,7 @@ func FetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 				}
 			}
 			if terminal.Attempt > 0 && !retryAuthorizesFailure(controls, retry, terminal) {
-				blockers = append(blockers, fmt.Sprintf("attempt %d has an App-authored terminal failure requiring a later authorized retry", terminal.Attempt))
+				blockers = append(blockers, fmt.Sprintf("attempt %d has a coordinator-authored terminal failure requiring a later authorized retry", terminal.Attempt))
 			}
 			authorized := controls.Ready && !controls.Closed && !controls.Cancelled && len(blockers) == 0
 			bound := binding.Attempt > 0
@@ -244,7 +245,7 @@ func FetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			}
 			isActive := active[issue.Number] || bound || bindingConflict
 			eligible := authorized && !isActive && !completed[issue.Number]
-			result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, DispatchAuthorized: authorized, ActiveAttempt: activeAttempt})
+			result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, DispatchAuthorized: authorized, ActiveAttempt: activeAttempt})
 		}
 		if len(issues) < 100 {
 			return result, nil
@@ -258,9 +259,8 @@ func fetchActiveAttempts(ctx context.Context, api API, cfg PRAdapterConfig, issu
 	conflict := false
 	for page := 1; page <= recoveryPageLimit; page++ {
 		var comments []struct {
-			Body string              `json:"body"`
-			User struct{ ID int }    `json:"user"`
-			App  *struct{ ID int64 } `json:"performed_via_github_app"`
+			Body string           `json:"body"`
+			User struct{ ID int } `json:"user"`
 		}
 		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100&page=%d", cfg.Repository, issue, page), "", &comments); err != nil {
 			return nil, false, err
@@ -271,7 +271,7 @@ func fetchActiveAttempts(ctx context.Context, api API, cfg PRAdapterConfig, issu
 			}
 			marker, err := parseActiveAttemptMarker(comment.Body)
 			branch, branchErr := AttemptBranch(cfg.Repository, marker.Issue, marker.Attempt)
-			trusted := comment.User.ID == cfg.AppActorID && comment.App != nil && comment.App.ID == cfg.AppID && cfg.AppID > 0 && cfg.AppActorID > 0
+			trusted := comment.User.ID == cfg.ActorID && cfg.ActorID > 0
 			if err != nil || marker.Issue != issue || branchErr != nil || marker.Branch != branch || !trusted {
 				conflict = true
 				continue
@@ -346,15 +346,12 @@ func fetchTerminalFailure(ctx context.Context, api API, cfg PRAdapterConfig, iss
 			User struct {
 				ID int `json:"id"`
 			} `json:"user"`
-			App *struct {
-				ID int64 `json:"id"`
-			} `json:"performed_via_github_app"`
 		}
 		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100&page=%d", cfg.Repository, issue, page), "", &comments); err != nil {
 			return terminalMarkerPayload{}, err
 		}
 		for _, comment := range comments {
-			if marker, err := parseTerminalMarker(comment.Body); err == nil && marker.Issue == issue && comment.User.ID == cfg.AppActorID && comment.App != nil && comment.App.ID == cfg.AppID {
+			if marker, err := parseTerminalMarker(comment.Body); err == nil && marker.Issue == issue && comment.User.ID == cfg.ActorID {
 				if marker.FailedAt.After(latest.FailedAt) || marker.FailedAt.Equal(latest.FailedAt) && marker.Attempt > latest.Attempt {
 					latest = marker
 				}
@@ -367,7 +364,7 @@ func fetchTerminalFailure(ctx context.Context, api API, cfg PRAdapterConfig, iss
 	return terminalMarkerPayload{}, errors.New("issue comments exceed bounded recovery limit")
 }
 
-func FetchAttemptFacts(ctx context.Context, api API, repository string, appID int64, appActorID int) ([]RecoveryAttemptFact, error) {
+func FetchAttemptFacts(ctx context.Context, api API, repository string, actorID int) ([]RecoveryAttemptFact, error) {
 	var facts []RecoveryAttemptFact
 	for page := 1; ; page++ {
 		var pulls []struct {
@@ -377,9 +374,6 @@ func FetchAttemptFacts(ctx context.Context, api API, repository string, appID in
 			User        struct {
 				ID int `json:"id"`
 			} `json:"user"`
-			PerformedViaGitHubApp *struct {
-				ID int64 `json:"id"`
-			} `json:"performed_via_github_app"`
 			Head struct {
 				SHA, Ref string
 			} `json:"head"`
@@ -397,7 +391,7 @@ func FetchAttemptFacts(ctx context.Context, api API, repository string, appID in
 			}
 			issue, attempt := marker.Issue, marker.Attempt
 			wantBranch, err := AttemptBranch(repository, issue, attempt)
-			if err != nil || marker.Branch != wantBranch || marker.Branch != pull.Head.Ref || marker.Head != pull.Head.SHA || marker.PR != pull.Number || pull.User.ID != appActorID || pull.PerformedViaGitHubApp != nil && pull.PerformedViaGitHubApp.ID != appID {
+			if err != nil || marker.Branch != wantBranch || marker.Branch != pull.Head.Ref || marker.Head != pull.Head.SHA || marker.PR != pull.Number || pull.User.ID != actorID {
 				continue
 			}
 			if pull.Number < 1 || issue < 1 || attempt < 1 || pull.Head.SHA == "" || pull.Base.SHA == "" {
@@ -415,9 +409,6 @@ func FetchAttemptFacts(ctx context.Context, api API, repository string, appID in
 				User struct {
 					ID int `json:"id"`
 				} `json:"user"`
-				PerformedViaGitHubApp *struct {
-					ID int64 `json:"id"`
-				} `json:"performed_via_github_app"`
 			}
 			for commentPage := 1; commentPage <= recoveryPageLimit; commentPage++ {
 				var page []struct {
@@ -425,9 +416,6 @@ func FetchAttemptFacts(ctx context.Context, api API, repository string, appID in
 					User struct {
 						ID int `json:"id"`
 					} `json:"user"`
-					PerformedViaGitHubApp *struct {
-						ID int64 `json:"id"`
-					} `json:"performed_via_github_app"`
 				}
 				if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100&page=%d", repository, issue, commentPage), "", &page); err != nil {
 					return nil, err
@@ -441,15 +429,27 @@ func FetchAttemptFacts(ctx context.Context, api API, repository string, appID in
 				}
 			}
 			authoritative := false
+			boundBase := ""
+			baseConflict := false
 			for _, comment := range comments {
+				if comment.User.ID != actorID {
+					continue
+				}
 				got, err := parseAttemptMarker(comment.Body)
-				if err == nil && got == marker && comment.User.ID == appActorID && comment.PerformedViaGitHubApp != nil && comment.PerformedViaGitHubApp.ID == appID {
+				if err == nil && got == marker {
 					authoritative = true
-					break
+				}
+				binding, err := parseActiveAttemptMarker(comment.Body)
+				if err == nil && binding.Issue == issue && binding.Attempt == attempt && binding.Branch == wantBranch {
+					baseConflict = boundBase != "" && boundBase != binding.BaseSHA
+					boundBase = binding.BaseSHA
 				}
 			}
-			if !authoritative {
+			if !authoritative || baseConflict {
 				continue
+			}
+			if boundBase == "" { // Compatibility with attempts published before active bindings existed.
+				boundBase = pull.Base.SHA
 			}
 			state := "active"
 			if pull.MergedAt != nil {
@@ -479,10 +479,21 @@ func FetchAttemptFacts(ctx context.Context, api API, repository string, appID in
 				checks = append(checks, run.Name+":"+run.Status+":"+run.Conclusion)
 				checksPass = checksPass && run.Status == "completed" && (run.Conclusion == "success" || run.Conclusion == "neutral" || run.Conclusion == "skipped")
 			}
+			var statuses struct {
+				Statuses []struct{ Context, State string }
+			}
+			if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/commits/%s/status", repository, pull.Head.SHA), "", &statuses); err != nil {
+				return nil, err
+			}
+			checksPass = checksPass || len(statuses.Statuses) > 0
+			for _, status := range statuses.Statuses {
+				checks = append(checks, status.Context+":"+status.State)
+				checksPass = checksPass && status.State == "success"
+			}
 			if state == "active" && checksPass {
 				state = "review-ready"
 			}
-			facts = append(facts, RecoveryAttemptFact{Repository: repository, Issue: issue, Attempt: attempt, BaseSHA: pull.Base.SHA, HeadSHA: pull.Head.SHA, PR: pull.Number, State: state, Checks: checks})
+			facts = append(facts, RecoveryAttemptFact{Repository: repository, Issue: issue, Attempt: attempt, BaseSHA: boundBase, HeadSHA: pull.Head.SHA, PR: pull.Number, State: state, Checks: checks})
 		}
 		if len(pulls) < 100 {
 			return facts, nil
@@ -492,7 +503,7 @@ func FetchAttemptFacts(ctx context.Context, api API, repository string, appID in
 
 // FindPublishedAttempt reconstructs publication even while the PR body or issue
 // comment is still missing after a crash.
-func FindPublishedAttempt(ctx context.Context, api API, repository, branch, head string, appID int64, appActorID int) (PullRequest, string, error) {
+func FindPublishedAttempt(ctx context.Context, api API, repository, branch, head string, actorID int) (PullRequest, string, error) {
 	var found PullRequest
 	var body string
 	for page := 1; page <= recoveryPageLimit; page++ {
@@ -502,7 +513,6 @@ func FindPublishedAttempt(ctx context.Context, api API, repository, branch, head
 			User   struct {
 				ID int `json:"id"`
 			} `json:"user"`
-			App  *struct{ ID int64 }       `json:"performed_via_github_app"`
 			Head struct{ SHA, Ref string } `json:"head"`
 		}
 		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100&page=%d", repository, page), "", &pulls); err != nil {
@@ -512,7 +522,7 @@ func FindPublishedAttempt(ctx context.Context, api API, repository, branch, head
 			if pull.Head.Ref != branch || pull.Head.SHA != head {
 				continue
 			}
-			if pull.User.ID != appActorID || pull.App != nil && pull.App.ID != appID {
+			if pull.User.ID != actorID {
 				return found, "", errors.New("deterministic attempt branch is owned by an untrusted pull request")
 			}
 			if found.Number != 0 && found.Number != pull.Number {
@@ -527,22 +537,19 @@ func FindPublishedAttempt(ctx context.Context, api API, repository, branch, head
 	return found, body, errors.New("pull requests exceed bounded recovery limit")
 }
 
-func HasAttemptComment(ctx context.Context, api API, repository string, issue int, marker string, appID int64, appActorID int) (bool, error) {
+func HasAttemptComment(ctx context.Context, api API, repository string, issue int, marker string, actorID int) (bool, error) {
 	for page := 1; page <= recoveryPageLimit; page++ {
 		var comments []struct {
 			Body string `json:"body"`
 			User struct {
 				ID int `json:"id"`
 			} `json:"user"`
-			App *struct {
-				ID int64 `json:"id"`
-			} `json:"performed_via_github_app"`
 		}
 		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100&page=%d", repository, issue, page), "", &comments); err != nil {
 			return false, err
 		}
 		for _, comment := range comments {
-			if strings.Contains(comment.Body, marker) && comment.User.ID == appActorID && comment.App != nil && comment.App.ID == appID {
+			if strings.Contains(comment.Body, marker) && comment.User.ID == actorID {
 				return true, nil
 			}
 		}

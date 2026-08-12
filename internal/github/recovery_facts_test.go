@@ -11,27 +11,27 @@ import (
 	"time"
 )
 
-func TestTerminalFailureRequiresStrictAppAuthorship(t *testing.T) {
+func TestTerminalFailureRequiresStrictCoordinatorAuthorship(t *testing.T) {
 	marker, _ := TerminalFailureMarker(4, 2, time.Unix(10, 0))
 	api := fixtureAPI(t, map[string]any{"/repos/o/r/issues/4/comments?per_page=100&page=1": []any{
 		map[string]any{"body": marker, "user": map[string]any{"id": 42}},
-		map[string]any{"body": marker + "tamper", "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
-		map[string]any{"body": marker, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
+		map[string]any{"body": marker + "tamper", "user": map[string]any{"id": 42}},
+		map[string]any{"body": marker, "user": map[string]any{"id": 42}},
 	}})
-	got, err := fetchTerminalFailure(context.Background(), api, PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}, 4)
+	got, err := fetchTerminalFailure(context.Background(), api, PRAdapterConfig{Repository: "o/r", ActorID: 42}, 4)
 	if err != nil || got.Attempt != 2 {
 		t.Fatalf("terminal=%v err=%v", got, err)
 	}
 }
 
-func TestEnsureActiveAttemptIsStrictAppAuthoredAndIdempotent(t *testing.T) {
+func TestEnsureActiveAttemptIsStrictCoordinatorAuthoredAndIdempotent(t *testing.T) {
 	marker, err := ActiveAttemptMarker("o/r", 4, 2, "abcdef0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var comments []map[string]any
 	posts := 0
-	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.Method {
 		case http.MethodGet:
 			body, _ := json.Marshal(comments)
@@ -41,7 +41,7 @@ func TestEnsureActiveAttemptIsStrictAppAuthoredAndIdempotent(t *testing.T) {
 			if json.NewDecoder(r.Body).Decode(&payload) != nil || !strings.Contains(payload.Body, marker) {
 				t.Fatal("dispatch did not persist the active marker")
 			}
-			comments = append(comments, map[string]any{"body": payload.Body, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}})
+			comments = append(comments, map[string]any{"body": payload.Body, "user": map[string]any{"id": 42}})
 			posts++
 			if posts == 1 {
 				return nil, io.ErrUnexpectedEOF // GitHub accepted it; the response was lost.
@@ -52,7 +52,7 @@ func TestEnsureActiveAttemptIsStrictAppAuthoredAndIdempotent(t *testing.T) {
 		}
 		return nil, nil
 	})}}
-	cfg := PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}
+	cfg := PRAdapterConfig{Repository: "o/r", ActorID: 42}
 	for range 2 {
 		if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0"); err != nil {
 			t.Fatal(err)
@@ -61,7 +61,7 @@ func TestEnsureActiveAttemptIsStrictAppAuthoredAndIdempotent(t *testing.T) {
 	if posts != 1 {
 		t.Fatalf("marker posts=%d, want 1", posts)
 	}
-	comments = append(comments, map[string]any{"body": marker, "user": map[string]any{"id": 9}, "performed_via_github_app": map[string]any{"id": 7}})
+	comments = append(comments, map[string]any{"body": marker, "user": map[string]any{"id": 9}})
 	if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0"); err == nil || posts != 1 {
 		t.Fatalf("foreign marker err=%v posts=%d", err, posts)
 	}
@@ -74,16 +74,16 @@ func TestActiveAttemptMarkerRejectsHostileAndContradictoryComments(t *testing.T)
 		name     string
 		comments []any
 	}{
-		{"malformed", []any{map[string]any{"body": activeMarkerPrefix + `{}`, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}}}},
-		{"foreign", []any{map[string]any{"body": first, "user": map[string]any{"id": 9}, "performed_via_github_app": map[string]any{"id": 7}}}},
+		{"malformed", []any{map[string]any{"body": activeMarkerPrefix + `{}`, "user": map[string]any{"id": 42}}}},
+		{"foreign", []any{map[string]any{"body": first, "user": map[string]any{"id": 9}}}},
 		{"contradictory", []any{
-			map[string]any{"body": first, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
-			map[string]any{"body": second, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}},
+			map[string]any{"body": first, "user": map[string]any{"id": 42}},
+			map[string]any{"body": second, "user": map[string]any{"id": 42}},
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			api := fixtureAPI(t, map[string]any{"/repos/o/r/issues/4/comments?per_page=100&page=1": test.comments})
-			_, conflict, err := fetchActiveAttempts(context.Background(), api, PRAdapterConfig{Repository: "o/r", AppID: 7, AppActorID: 42}, 4)
+			_, conflict, err := fetchActiveAttempts(context.Background(), api, PRAdapterConfig{Repository: "o/r", ActorID: 42}, 4)
 			if err != nil || !conflict {
 				t.Fatalf("conflict=%v err=%v", conflict, err)
 			}
@@ -108,15 +108,15 @@ func TestRetryMustFollowEveryTerminalFailure(t *testing.T) {
 
 func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
-	body := "## Context\nx\n## Acceptance Criteria\nx\n## Tasks\nx\n## Validation\nx\n## Dependencies\nnone\n"
+	body := "arbitrary issue body without structured sections"
 	var snapshotBodies []string
 	changed, approved := false, false
 	posts := 0
-	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		comments := []any{map[string]any{"id": 50, "body": "/approve", "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 5}}}
 		for i, snapshotBody := range snapshotBodies {
 			createdAt := now.Add(time.Duration(2+i*2) * time.Minute)
-			comments = append(comments, map[string]any{"id": 60 + i*20, "body": snapshotBody, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}})
+			comments = append(comments, map[string]any{"id": 60 + i*20, "body": snapshotBody, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
 		}
 		if approved {
 			comments = append(comments, map[string]any{"id": 70, "body": "/approve", "created_at": now.Add(4 * time.Minute), "updated_at": now.Add(4 * time.Minute), "user": map[string]any{"id": 5}})
@@ -234,14 +234,14 @@ func TestFetchIssueFactsAutonomousLabelsAuthorizeWithoutApproval(t *testing.T) {
 	var snapshots []string
 	autonomous, edited, priorityChanged, approved := true, false, false, false
 	actor, posts := 5, 0
-	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		currentBody := body
 		if edited {
 			currentBody += "later edit\n"
 		}
 		comments := make([]any, len(snapshots))
 		for i, snapshot := range snapshots {
-			comments[i] = map[string]any{"id": 60 + i, "body": snapshot, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}}
+			comments[i] = map[string]any{"id": 60 + i, "body": snapshot, "user": map[string]any{"id": 42}}
 		}
 		if approved {
 			comments = append(comments, map[string]any{"id": 70, "body": "/approve", "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 5}})
@@ -325,7 +325,7 @@ func TestFetchIssueFactsAutonomousLabelsAuthorizeWithoutApproval(t *testing.T) {
 
 	edited, priorityChanged = false, true
 	facts, err = FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || facts[0].Eligible || posts != 1 || !slices.Contains(facts[0].Blockers, "autonomous label does not authorize the current issue controls") {
+	if err != nil || !facts[0].Eligible || posts != 2 || len(facts[0].Blockers) != 0 {
 		t.Fatalf("changed-priority facts=%#v posts=%d err=%v", facts, posts, err)
 	}
 
@@ -343,131 +343,122 @@ func TestFetchIssueFactsAutonomousLabelsAuthorizeWithoutApproval(t *testing.T) {
 
 	snapshots, autonomous, actor = nil, true, 42
 	facts, err = FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || facts[0].Eligible || posts != 2 || !slices.Contains(facts[0].Blockers, "control provenance is missing or unauthorized") {
-		t.Fatalf("App-authored facts=%#v posts=%d err=%v", facts, posts, err)
+	if err != nil || !facts[0].Eligible || posts != 3 {
+		t.Fatalf("same-user facts=%#v posts=%d err=%v", facts, posts, err)
 	}
 }
 
 func TestFetchAttemptFactsPaginatesMarkersAndChecks(t *testing.T) {
 	branch, _ := AttemptBranch("o/r", 4, 2)
 	marker, _ := AttemptMarker(4, 2, branch, "ccccccc", 9, "review")
+	binding, _ := ActiveAttemptMarker("o/r", 4, 2, "aaaaaaa")
 	noise := make([]map[string]any, 100)
 	checks := make([]map[string]string, 100)
 	for i := range noise {
 		noise[i] = map[string]any{"body": "noise"}
 		checks[i] = map[string]string{"name": "check", "status": "completed", "conclusion": "success"}
 	}
-	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		var body any
 		switch r.URL.Path + "?" + r.URL.RawQuery {
 		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1":
-			body = []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}, "performed_via_github_app": nil}}
+			body = []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}}}
 		case "/repos/o/r/issues/4?":
 			body = map[string]any{"state": "open"}
 		case "/repos/o/r/issues/4/comments?per_page=100&page=1":
 			body = noise
 		case "/repos/o/r/issues/4/comments?per_page=100&page=2":
-			body = []any{map[string]any{"body": marker, "user": map[string]any{"id": 42}, "performed_via_github_app": map[string]any{"id": 7}}}
+			body = []any{map[string]any{"body": binding, "user": map[string]any{"id": 42}}, map[string]any{"body": marker, "user": map[string]any{"id": 42}}}
 		case "/repos/o/r/commits/ccccccc/check-runs?filter=latest&per_page=100&page=1":
 			body = map[string]any{"check_runs": checks}
 		case "/repos/o/r/commits/ccccccc/check-runs?filter=latest&per_page=100&page=2":
 			body = map[string]any{"check_runs": []any{map[string]string{"name": "later", "status": "completed", "conclusion": "success"}}}
+		case "/repos/o/r/commits/ccccccc/status?":
+			body = map[string]any{"statuses": []any{}}
 		default:
 			t.Fatalf("unexpected request %s", r.URL.String())
 		}
 		b, _ := json.Marshal(body)
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(b)))}, nil
 	})}}
-	facts, err := FetchAttemptFacts(context.Background(), api, "o/r", 7, 42)
-	if err != nil || len(facts) != 1 || facts[0].State != "review-ready" || len(facts[0].Checks) != 101 {
+	facts, err := FetchAttemptFacts(context.Background(), api, "o/r", 42)
+	if err != nil || len(facts) != 1 || facts[0].BaseSHA != "aaaaaaa" || facts[0].State != "review-ready" || len(facts[0].Checks) != 101 {
 		t.Fatalf("facts=%#v err=%v", facts, err)
 	}
 }
 
-func TestFetchAttemptFactsRequiresAppMarkerSnapshotAndSafeCompletion(t *testing.T) {
+func TestFetchAttemptFactsRequiresCoordinatorMarkerAndSafeCompletion(t *testing.T) {
 	branch, _ := AttemptBranch("o/r", 4, 2)
 	marker, _ := AttemptMarker(4, 2, branch, "ccccccc", 9, "review")
 	responses := map[string]string{
 		"/repos/o/r/pulls": `[
-			{"number":8,"body":"agent-symphony:issue:4:attempt:1","state":"open","head":{"sha":"aaaaaaa","ref":"bad"},"base":{"sha":"bbbbbbb"},"user":{"id":9},"performed_via_github_app":{"id":7}},
-			{"number":9,"body":` + quoteJSON(marker) + `,"state":"open","head":{"sha":"ccccccc","ref":"` + branch + `"},"base":{"sha":"bbbbbbb"},"user":{"id":42},"performed_via_github_app":null}
+			{"number":8,"body":"agent-symphony:issue:4:attempt:1","state":"open","head":{"sha":"aaaaaaa","ref":"bad"},"base":{"sha":"bbbbbbb"},"user":{"id":9}},
+			{"number":9,"body":` + quoteJSON(marker) + `,"state":"open","head":{"sha":"ccccccc","ref":"` + branch + `"},"base":{"sha":"bbbbbbb"},"user":{"id":42}}
 		]`,
 		"/repos/o/r/issues/4":                   `{"state":"closed"}`,
-		"/repos/o/r/issues/4/comments":          `[{"body":` + quoteJSON(marker) + `,"user":{"id":42},"performed_via_github_app":{"id":7}}]`,
+		"/repos/o/r/issues/4/comments":          `[{"body":` + quoteJSON(marker) + `,"user":{"id":42}}]`,
 		"/repos/o/r/commits/ccccccc/check-runs": `{"check_runs":[]}`,
+		"/repos/o/r/commits/ccccccc/status":     `{"statuses":[]}`,
 	}
-	api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		body, ok := responses[r.URL.Path]
 		if !ok {
 			t.Fatalf("unexpected request %s", r.URL.String())
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 	})}}
-	facts, err := FetchAttemptFacts(context.Background(), api, "o/r", 7, 42)
+	facts, err := FetchAttemptFacts(context.Background(), api, "o/r", 42)
 	if err != nil || len(facts) != 1 || facts[0].Attempt != 2 || facts[0].State != "blocked" {
 		t.Fatalf("facts=%#v err=%v", facts, err)
 	}
 }
 
-func TestFindPublishedAttemptRecoversBotPRWithoutAppAttribution(t *testing.T) {
+func TestFindPublishedAttemptRequiresCoordinatorPR(t *testing.T) {
 	branch, _ := AttemptBranch("o/r", 4, 2)
-	pull := map[string]any{"number": 9, "body": "pre-bind", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "user": map[string]any{"id": 42}, "performed_via_github_app": nil}
+	pull := map[string]any{"number": 9, "body": "pre-bind", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "user": map[string]any{"id": 42}}
 	pulls := []any{pull}
 	api := fixtureAPI(t, map[string]any{"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": pulls})
 	for range 2 {
-		pr, body, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 7, 42)
+		pr, body, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 42)
 		if err != nil || pr.Number != 9 || body != "pre-bind" {
 			t.Fatalf("pr=%#v body=%q err=%v", pr, body, err)
 		}
 	}
 
 	pull["user"] = map[string]any{"id": 9}
-	if _, _, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 7, 42); err == nil {
+	if _, _, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 42); err == nil {
 		t.Fatal("foreign actor owned deterministic pull request")
 	}
 	pull["user"] = map[string]any{"id": 42}
-	pull["performed_via_github_app"] = map[string]any{"id": 8}
-	if _, _, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 7, 42); err == nil {
-		t.Fatal("foreign App owned deterministic pull request")
-	}
-	pull["performed_via_github_app"] = nil
 	for _, identity := range []map[string]any{{"sha": "ddddddd", "ref": branch}, {"sha": "ccccccc", "ref": "other"}} {
 		pull["head"] = identity
-		pr, _, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 7, 42)
+		pr, _, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 42)
 		if err != nil || pr.Number != 0 {
 			t.Fatalf("mismatched head was recovered: pr=%#v err=%v", pr, err)
 		}
 	}
 }
 
-func TestFetchAttemptFactsRejectsForeignPRActorAndCommentApp(t *testing.T) {
+func TestFetchAttemptFactsRejectsForeignActors(t *testing.T) {
 	branch, _ := AttemptBranch("o/r", 4, 2)
 	marker, _ := AttemptMarker(4, 2, branch, "ccccccc", 9, "review")
 	for _, test := range []struct {
 		name         string
 		pullActor    int
-		pullApp      int64
 		commentActor int
-		commentApp   int64
 	}{
-		{name: "foreign PR actor", pullActor: 9, commentActor: 42, commentApp: 7},
-		{name: "foreign PR App", pullActor: 42, pullApp: 8, commentActor: 42, commentApp: 7},
-		{name: "foreign comment actor", pullActor: 42, commentActor: 9, commentApp: 7},
-		{name: "foreign comment App", pullActor: 42, commentActor: 42, commentApp: 8},
+		{name: "foreign PR actor", pullActor: 9, commentActor: 42},
+		{name: "foreign comment actor", pullActor: 42, commentActor: 9},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			var pullApp any
-			if test.pullApp != 0 {
-				pullApp = map[string]any{"id": test.pullApp}
-			}
 			responses := map[string]any{
-				"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": test.pullActor}, "performed_via_github_app": pullApp}},
+				"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": test.pullActor}}},
 			}
-			if test.pullActor == 42 && test.pullApp == 0 {
+			if test.pullActor == 42 {
 				responses["/repos/o/r/issues/4"] = map[string]any{"state": "open"}
-				responses["/repos/o/r/issues/4/comments?per_page=100&page=1"] = []any{map[string]any{"body": marker, "user": map[string]any{"id": test.commentActor}, "performed_via_github_app": map[string]any{"id": test.commentApp}}}
+				responses["/repos/o/r/issues/4/comments?per_page=100&page=1"] = []any{map[string]any{"body": marker, "user": map[string]any{"id": test.commentActor}}}
 			}
-			facts, err := FetchAttemptFacts(context.Background(), fixtureAPI(t, responses), "o/r", 7, 42)
+			facts, err := FetchAttemptFacts(context.Background(), fixtureAPI(t, responses), "o/r", 42)
 			if err != nil || len(facts) != 0 {
 				t.Fatalf("facts=%#v err=%v", facts, err)
 			}
@@ -485,12 +476,12 @@ func TestFetchAttemptFactsRejectsTamperedMarkerBindings(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			responses := map[string]string{
-				"/repos/o/r/pulls": `[{"number":9,"body":` + quoteJSON(test.marker) + `,"state":"open","head":{"sha":"ccccccc","ref":"` + branch + `"},"base":{"sha":"bbbbbbb"},"user":{"id":42},"performed_via_github_app":null}]`,
+				"/repos/o/r/pulls": `[{"number":9,"body":` + quoteJSON(test.marker) + `,"state":"open","head":{"sha":"ccccccc","ref":"` + branch + `"},"base":{"sha":"bbbbbbb"},"user":{"id":42}}]`,
 			}
-			api := API{BaseURL: "https://example.test", Tokens: tokenStub("token"), Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(responses[r.URL.Path]))}, nil
 			})}}
-			facts, err := FetchAttemptFacts(context.Background(), api, "o/r", 7, 42)
+			facts, err := FetchAttemptFacts(context.Background(), api, "o/r", 42)
 			if err != nil || len(facts) != 0 {
 				t.Fatalf("facts=%#v err=%v", facts, err)
 			}

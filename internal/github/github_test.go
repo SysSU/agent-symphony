@@ -2,33 +2,18 @@ package github
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/base64"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
-
-type jwtStub string
-
-func (j jwtStub) JWT(time.Time) (string, error) { return string(j), nil }
-
-type tokenStub string
-
-func (t tokenStub) Token(context.Context) (InstallationToken, error) {
-	return InstallationToken{Value: string(t), ExpiresAt: time.Now().Add(time.Hour)}, nil
-}
 
 type permissionStub string
 
@@ -48,6 +33,30 @@ func (r *readErrorAfterBody) Read(p []byte) (int, error) {
 	n := copy(p, r.body)
 	r.body = r.body[n:]
 	return n, errors.New("response read failed")
+}
+
+func TestCLITransportUsesGitHubCLIAuthenticatedSession(t *testing.T) {
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args")
+	ghPath := filepath.Join(dir, "gh")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GH_ARGS_FILE\"\nprintf 'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n{\"id\":42,\"login\":\"coordinator\"}'\n"
+	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GH_ARGS_FILE", argsPath)
+	api := API{BaseURL: "https://api.github.com", HTTP: &http.Client{Transport: CLITransport{Path: ghPath}}}
+	user, err := api.AuthenticatedUser(context.Background())
+	if err != nil || user.ID != 42 || user.Login != "coordinator" {
+		t.Fatalf("user=%#v err=%v", user, err)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Fields(string(args))
+	if len(got) != 9 || !slices.Equal(got[:5], []string{"api", "--include", "--method", "GET", "/user"}) || !slices.Contains(got, "Accept:application/vnd.github+json") || !slices.Contains(got, "X-Github-Api-Version:2022-11-28") {
+		t.Fatalf("gh args = %#v", got)
+	}
 }
 
 func httpResponse(status int, body string, headers http.Header) *http.Response {
@@ -114,98 +123,8 @@ func timelineFor(provenance []Provenance) TimelineVerifier {
 	return func(event Provenance) bool { return events[event] }
 }
 
-func TestAppJWTAndInstallationExchange(t *testing.T) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Date(2026, 8, 2, 1, 2, 3, 0, time.UTC)
-	token, err := (AppJWT{AppID: "42", Key: key}).JWT(now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		t.Fatalf("invalid JWT %q", token)
-	}
-	claims, _ := base64.RawURLEncoding.DecodeString(parts[1])
-	if !strings.Contains(string(claims), `"iss":"42"`) {
-		t.Fatalf("claims %s", claims)
-	}
-
-	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path != "/app/installations/7/access_tokens" || r.Header.Get("Authorization") != "Bearer app-jwt" {
-			t.Errorf("bad request %#v", r)
-		}
-		return httpResponse(http.StatusCreated, fmt.Sprintf(`{"token":"installation-canary","expires_at":%q}`, now.Add(time.Hour).Format(time.RFC3339)), nil), nil
-	})}
-	tokens := &InstallationTokens{BaseURL: "https://api.example.test", InstallationID: 7, JWTs: jwtStub("app-jwt"), HTTP: client, Now: func() time.Time { return now }}
-	got, err := tokens.Token(context.Background())
-	if err != nil || got.Value != "installation-canary" {
-		t.Fatalf("got %#v, %v", got, err)
-	}
-}
-
-func TestParsePrivateKeyPEMAcceptsPKCS1AndRejectsGarbage(t *testing.T) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	parsed, err := ParsePrivateKeyPEM(pemBytes)
-	if err != nil || parsed.N.Cmp(key.N) != 0 {
-		t.Fatalf("parsed=%#v err=%v", parsed, err)
-	}
-	pkcs8Bytes, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pkcs8PEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8Bytes})
-	parsed, err = ParsePrivateKeyPEM(pkcs8PEM)
-	if err != nil || parsed.N.Cmp(key.N) != 0 {
-		t.Fatalf("pkcs8 parsed=%#v err=%v", parsed, err)
-	}
-	if _, err := ParsePrivateKeyPEM([]byte("not a pem file")); err == nil {
-		t.Fatal("garbage input accepted")
-	}
-	if _, err := ParsePrivateKeyPEM(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: []byte("not a key")})); err == nil {
-		t.Fatal("invalid key bytes accepted")
-	}
-}
-
-func TestInstallationTokenCacheIsConcurrentAndRefreshesNearExpiry(t *testing.T) {
-	var exchanges atomic.Int32
-	now := time.Date(2026, 8, 2, 1, 2, 3, 0, time.UTC)
-	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		n := exchanges.Add(1)
-		return httpResponse(http.StatusCreated, fmt.Sprintf(`{"token":"token-%d","expires_at":%q}`, n, now.Add(2*time.Minute).Format(time.RFC3339)), nil), nil
-	})}
-	tokens := &InstallationTokens{BaseURL: "https://api.example.test", InstallationID: 7, JWTs: jwtStub("jwt"), HTTP: client, Now: func() time.Time { return now }}
-	var group sync.WaitGroup
-	for range 20 {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			if _, err := tokens.Token(context.Background()); err != nil {
-				t.Error(err)
-			}
-		}()
-	}
-	group.Wait()
-	if exchanges.Load() != 1 {
-		t.Fatalf("got %d exchanges, want 1", exchanges.Load())
-	}
-	now = now.Add(70 * time.Second)
-	if _, err := tokens.Token(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if exchanges.Load() != 2 {
-		t.Fatalf("near-expiry token was not refreshed: %d exchanges", exchanges.Load())
-	}
-}
-
-func TestDecodeRejectsTrailingAPIAndTokenJSON(t *testing.T) {
-	api := API{BaseURL: "https://api.example.test", Tokens: tokenStub("token"), HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+func TestDecodeRejectsTrailingAndOversizedJSON(t *testing.T) {
+	api := API{BaseURL: "https://api.example.test", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return httpResponse(http.StatusOK, `{"ok":true}{"extra":true}`, nil), nil
 	})}}
 	var result struct {
@@ -214,165 +133,14 @@ func TestDecodeRejectsTrailingAPIAndTokenJSON(t *testing.T) {
 	if _, _, err := api.Read(context.Background(), "/read", "", &result); err == nil {
 		t.Fatal("trailing API JSON accepted")
 	}
-	now := time.Now()
-	tokens := &InstallationTokens{BaseURL: "https://api.example.test", InstallationID: 7, JWTs: jwtStub("jwt"), Now: func() time.Time { return now }, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		body := fmt.Sprintf(`{"token":"value","expires_at":%q}{}`, now.Add(time.Hour).Format(time.RFC3339))
-		return httpResponse(http.StatusCreated, body, nil), nil
-	})}}
-	if _, err := tokens.Token(context.Background()); err == nil {
-		t.Fatal("trailing installation-token JSON accepted")
-	}
 	if err := decodeJSON(strings.NewReader(strings.Repeat(" ", (1<<20)+1)), &result); err == nil {
 		t.Fatal("over-limit JSON accepted")
-	}
-}
-
-func TestWebhookSecurityQueueAndDuplicate(t *testing.T) {
-	secret, body := []byte("hook-canary"), []byte(`{"installation":{"id":7},"repository":{"id":9},"issue":{"number":5}}`)
-	hints := make(chan Hint, 1)
-	handler := Webhook{Secret: secret, RepositoryID: 9, InstallationID: 7, MaxBody: 256, Hints: hints, Deliveries: NewDeliveryCache(2)}
-	request := func(delivery, signature string, content []byte) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(content)))
-		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("X-GitHub-Event", "issues")
-		r.Header.Set("X-GitHub-Delivery", delivery)
-		r.Header.Set("X-Hub-Signature-256", signature)
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, r)
-		return w
-	}
-	if got := request("one", "sha256=00", body).Code; got != http.StatusUnauthorized {
-		t.Fatalf("bad signature: %d", got)
-	}
-	if got := request("one", SignWebhook(secret, body), body).Code; got != http.StatusAccepted {
-		t.Fatalf("valid: %d", got)
-	}
-	if got := request("one", SignWebhook(secret, body), body).Code; got != http.StatusAccepted {
-		t.Fatalf("duplicate: %d", got)
-	}
-	if len(hints) != 1 {
-		t.Fatalf("want one hint, got %d", len(hints))
-	}
-	if got := request("queue-full", SignWebhook(secret, body), body).Code; got != http.StatusServiceUnavailable {
-		t.Fatalf("full queue: %d", got)
-	}
-	other := []byte(`{"installation":{"id":7},"repository":{"id":8}}`)
-	if got := request("two", SignWebhook(secret, other), other).Code; got != http.StatusBadRequest {
-		t.Fatalf("target: %d", got)
-	}
-	large := []byte(strings.Repeat("x", 300))
-	if got := request("large", SignWebhook(secret, large), large).Code; got != http.StatusRequestEntityTooLarge {
-		t.Fatalf("large: %d", got)
-	}
-}
-
-func TestWebhookConcurrentDuplicateAdmissionAndFailedOffer(t *testing.T) {
-	secret, body := []byte("secret"), []byte(`{"installation":{"id":7},"repository":{"id":9}}`)
-	hints := make(chan Hint, 1)
-	handler := Webhook{Secret: secret, RepositoryID: 9, InstallationID: 7, Hints: hints, Deliveries: NewDeliveryCache(2)}
-	request := func(delivery string) int {
-		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(body)))
-		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("X-GitHub-Event", "issues")
-		r.Header.Set("X-GitHub-Delivery", delivery)
-		r.Header.Set("X-Hub-Signature-256", SignWebhook(secret, body))
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, r)
-		return w.Code
-	}
-	var group sync.WaitGroup
-	for range 20 {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			if got := request("same"); got != http.StatusAccepted {
-				t.Errorf("status %d", got)
-			}
-		}()
-	}
-	group.Wait()
-	if len(hints) != 1 {
-		t.Fatalf("got %d hints, want 1", len(hints))
-	}
-	if got := request("retry"); got != http.StatusServiceUnavailable {
-		t.Fatalf("full queue status %d", got)
-	}
-	<-hints
-	if got := request("retry"); got != http.StatusAccepted {
-		t.Fatalf("failed offer was cached: %d", got)
-	}
-}
-
-func TestWebhookMediaTypeAndRepositoryWideInstallationEvents(t *testing.T) {
-	secret := []byte("secret")
-	request := func(event, contentType string, body []byte) (int, Hint) {
-		hints := make(chan Hint, 1)
-		handler := Webhook{Secret: secret, RepositoryID: 9, InstallationID: 7, Hints: hints}
-		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(body)))
-		r.Header.Set("Content-Type", contentType)
-		r.Header.Set("X-GitHub-Event", event)
-		r.Header.Set("X-GitHub-Delivery", event)
-		r.Header.Set("X-Hub-Signature-256", SignWebhook(secret, body))
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, r)
-		select {
-		case hint := <-hints:
-			return w.Code, hint
-		default:
-			return w.Code, Hint{}
-		}
-	}
-	repositoryBody := []byte(`{"installation":{"id":7},"repository":{"id":9}}`)
-	if code, _ := request("issues", "application/json-patch+json", repositoryBody); code != http.StatusUnsupportedMediaType {
-		t.Fatalf("prefixed media type accepted: %d", code)
-	}
-	if code, _ := request("issues", "application/json; charset=utf-8", repositoryBody); code != http.StatusAccepted {
-		t.Fatalf("valid parameterized media type rejected: %d", code)
-	}
-	installationBody := []byte(`{"installation":{"id":7}}`)
-	for _, event := range []string{"installation", "installation_repositories"} {
-		code, hint := request(event, "application/json", installationBody)
-		if code != http.StatusAccepted || hint.RepositoryID != 9 {
-			t.Fatalf("%s: code=%d hint=%#v", event, code, hint)
-		}
-	}
-	if code, _ := request("issues", "application/json", installationBody); code != http.StatusBadRequest {
-		t.Fatalf("repository-less issue accepted: %d", code)
-	}
-	mismatch := []byte(`{"installation":{"id":7},"repository":{"id":8}}`)
-	if code, _ := request("installation", "application/json", mismatch); code != http.StatusBadRequest {
-		t.Fatalf("mismatched installation repository accepted: %d", code)
-	}
-}
-
-func TestRepositoryIDFetchesAndRejectsInvalid(t *testing.T) {
-	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path != "/repos/o/r" {
-			t.Errorf("unexpected path %s", r.URL.Path)
-		}
-		return httpResponse(http.StatusOK, `{"id":4242}`, nil), nil
-	})}
-	api := API{BaseURL: "https://api.example.test", Tokens: tokenStub("token-canary"), HTTP: client}
-	id, err := api.RepositoryID(context.Background(), "o/r")
-	if err != nil || id != 4242 {
-		t.Fatalf("id=%d err=%v", id, err)
-	}
-
-	zeroClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return httpResponse(http.StatusOK, `{"id":0}`, nil), nil
-	})}
-	zeroAPI := API{BaseURL: "https://api.example.test", Tokens: tokenStub("token-canary"), HTTP: zeroClient}
-	if _, err := zeroAPI.RepositoryID(context.Background(), "o/r"); err == nil {
-		t.Fatal("accepted a zero repository ID")
 	}
 }
 
 func TestAPIReadRetriesMutationDoesNotAndRedacts(t *testing.T) {
 	var reads, writes atomic.Int32
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.Header.Get("Authorization") != "Bearer token-canary" {
-			t.Error("missing auth")
-		}
 		if r.Method == http.MethodGet {
 			if reads.Add(1) == 1 {
 				return httpResponse(http.StatusServiceUnavailable, "transient", http.Header{"Retry-After": []string{"0"}}), nil
@@ -382,7 +150,7 @@ func TestAPIReadRetriesMutationDoesNotAndRedacts(t *testing.T) {
 		writes.Add(1)
 		return httpResponse(http.StatusServiceUnavailable, `token=server-canary`, nil), nil
 	})}
-	api := API{BaseURL: "https://api.example.test", Tokens: tokenStub("token-canary"), HTTP: client, Sleep: func(context.Context, time.Duration) error { return nil }}
+	api := API{BaseURL: "https://api.example.test", HTTP: client, Sleep: func(context.Context, time.Duration) error { return nil }}
 	var result struct {
 		OK bool `json:"ok"`
 	}
@@ -413,6 +181,14 @@ func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 	normalized := NormalizeIssue(issue, cfg, map[int]bool{3: true})
 	if !normalized.Ready || normalized.Controls.Priority != 1 || normalized.Controls.Completion != "autonomous-merge" {
 		t.Fatalf("normalized %#v", normalized)
+	}
+	arbitrary := NormalizeIssue(IssueInput{Number: 6, State: "open", Body: "any unstructured text", Labels: []string{"ready", "P1", "auto"}}, cfg, nil)
+	if !arbitrary.Ready || len(arbitrary.Blockers) != 0 || len(arbitrary.Controls.Dependencies) != 0 {
+		t.Fatalf("arbitrary body was restricted: %#v", arbitrary)
+	}
+	paths := IssuePaths("arbitrary text\n\n## Paths\n- `docs/coordination-a.md`\n- README.md\n- README.md\n")
+	if !slices.Equal(paths, []string{"README.md", "docs/coordination-a.md"}) || IssuePaths("arbitrary text") != nil {
+		t.Fatalf("issue paths=%#v", paths)
 	}
 	issue.Labels = append(issue.Labels, "P2")
 	if got := NormalizeIssue(issue, cfg, map[int]bool{3: true}); got.Ready {
@@ -469,7 +245,7 @@ func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 		t.Fatal("legacy v1 snapshot accepted")
 	}
 	if _, err := ParseSnapshotComment(comment, 4, 99); err == nil {
-		t.Fatal("non-App snapshot accepted")
+		t.Fatal("non-coordinator snapshot accepted")
 	}
 	trailing := strings.TrimSuffix(comment, "\n-->") + `{}` + "\n-->"
 	if _, err := ParseSnapshotComment(trailing, 99, 99); err == nil {
@@ -478,13 +254,13 @@ func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 	if update, err := AttributedBody(5, 1, "validation passed"); err != nil || !strings.Contains(update, "issue:5:attempt:1") {
 		t.Fatalf("attribution %q %v", update, err)
 	}
-	if ok, err := AuthorizedControlActor(4, 99, permissionStub("maintain")); err != nil || !ok {
+	if ok, err := AuthorizedControlActor(4, permissionStub("maintain")); err != nil || !ok {
 		t.Fatalf("authorized actor: %v %v", ok, err)
 	}
-	if ok, _ := AuthorizedControlActor(99, 99, permissionStub("admin")); ok {
-		t.Fatal("App actor authorized its own control")
+	if ok, err := AuthorizedControlActor(99, permissionStub("admin")); err != nil || !ok {
+		t.Fatalf("same-user authorization rejected: %v %v", ok, err)
 	}
-	if ok, err := AuthorizedControlActor(4, 99, permissionError{}); err == nil || ok {
+	if ok, err := AuthorizedControlActor(4, permissionError{}); err == nil || ok {
 		t.Fatalf("lookup error authorized actor: %v %v", ok, err)
 	}
 
@@ -502,7 +278,7 @@ func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 }
 
 func TestAgentEnvironmentRejectsReservedExplicitNames(t *testing.T) {
-	for _, name := range []string{"GITHUB_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID", "AZURE_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDFLARE_API_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "FTP_PROXY", "APP_PEM", "MY_APP_KEY", "WEBHOOK_SECRET", "RANDOM_PASSWORD"} {
+	for _, name := range []string{"GITHUB_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID", "AZURE_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDFLARE_API_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "FTP_PROXY", "APP_PEM", "MY_APP_KEY", "RANDOM_PASSWORD"} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := AgentEnvironmentWith([]string{name + "=value"}, name); err == nil {
 				t.Fatalf("reserved name %s accepted", name)
@@ -599,33 +375,4 @@ func TestReconcilerRequiresAuthoritativeRead(t *testing.T) {
 	if err := (Reconciler{FullRead: func() error { return want }}).RunOnce(); !errors.Is(err, want) {
 		t.Fatalf("got %v", err)
 	}
-}
-
-func TestReconcilerReadsImmediatelyAndOnHint(t *testing.T) {
-	hints := make(chan Hint, 1)
-	var reads atomic.Int32
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		(Reconciler{Hints: hints, FullRead: func() error { reads.Add(1); return nil }}).Run(ctx, time.Hour, nil)
-		close(done)
-	}()
-	deadline := time.After(time.Second)
-	for reads.Load() < 1 {
-		select {
-		case <-deadline:
-			t.Fatal("initial reconciliation did not run")
-		default:
-		}
-	}
-	hints <- Hint{Issue: 5}
-	for reads.Load() < 2 {
-		select {
-		case <-deadline:
-			t.Fatal("hint reconciliation did not run")
-		default:
-		}
-	}
-	cancel()
-	<-done
 }

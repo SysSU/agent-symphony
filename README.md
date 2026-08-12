@@ -22,7 +22,7 @@ The browser dashboard, multi-repository orchestration, GitHub Projects synchroni
 
 - [Product Requirements Document](docs/PRD.md)
 - [MVP Architecture](docs/architecture.md)
-- [GitHub App setup and security](docs/github-app.md)
+- [GitHub CLI integration](docs/github-cli.md)
 - [Setup](docs/setup.md), [security](docs/security.md), [recovery](docs/recovery.md), and [troubleshooting](docs/troubleshooting.md)
 - [Release validation and pilot evidence](docs/release-validation.md)
 - [Agent development guidance](AGENTS.md)
@@ -42,7 +42,7 @@ Keep the issue current during development, link its pull request, and record val
 
 ## Getting Started
 
-Go 1.26 is required to build from source. The resulting executable is self-contained; operators also need Git, tmux, configured implementation/reviewer executables, repository access, and GitHub connectivity.
+Go 1.26 is required to build from source. The resulting executable uses GitHub CLI for GitHub authentication and API access; operators also need Git, tmux, configured implementation/reviewer executables, and repository access.
 
 ```sh
 go build -o agent-symphony ./cmd/agent-symphony
@@ -57,7 +57,7 @@ go build -o agent-symphony ./cmd/agent-symphony
 
 Before `serve`, install the release binary root-owned at `/usr/local/libexec/agent-symphony/<version>/agent-symphony`, then run `sudo .../agent-symphony install-host --coordinator "$USER"`. The coordinator uses the installed implementation and review `agent-host` sudo boundaries automatically; `AGENT_SYMPHONY_WORKER_BOUNDARY` and `AGENT_SYMPHONY_REVIEW_BOUNDARY` remain only test seams.
 
-`init` derives `owner/repository` from the GitHub `origin` and creates `.agent-symphony.yaml` without overwriting an existing file. Configuration is JSON, which is a valid YAML 1.2 subset and allows strict stdlib-only parsing. Keep credentials outside this committed file. `doctor` may use `GITHUB_TOKEN` or `GH_TOKEN` for a read-only effective-access probe; it never prints the value.
+Authenticate first with `gh auth login`. `init` derives `owner/repository` from the GitHub `origin` and creates `.agent-symphony.yaml` without overwriting an existing file. Configuration is JSON, which is a valid YAML 1.2 subset and allows strict stdlib-only parsing. Agent Symphony does not accept GitHub credentials in its configuration or environment.
 
 See the [CLI reference](docs/cli.md) for the schema, structured output, diagnostics, and current scope.
 

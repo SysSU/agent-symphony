@@ -53,7 +53,7 @@ func reservedAgentVariable(name string) bool {
 	if upper == "HOME" {
 		return true
 	}
-	for _, prefix := range []string{"GITHUB_", "GH_", "SSH_", "AWS_", "AZURE_", "GOOGLE_", "GCP_", "CLOUD_", "OCI_", "CLOUDFLARE_", "DIGITALOCEAN_", "GIT_ASKPASS", "GIT_CONFIG", "APP_", "WEBHOOK_"} {
+	for _, prefix := range []string{"GITHUB_", "GH_", "SSH_", "AWS_", "AZURE_", "GOOGLE_", "GCP_", "CLOUD_", "OCI_", "CLOUDFLARE_", "DIGITALOCEAN_", "GIT_ASKPASS", "GIT_CONFIG", "APP_"} {
 		if strings.HasPrefix(upper, prefix) {
 			return true
 		}
@@ -61,7 +61,7 @@ func reservedAgentVariable(name string) bool {
 	if strings.HasSuffix(upper, "_PROXY") {
 		return true
 	}
-	for _, part := range []string{"TOKEN", "SECRET", "PASSWORD", "PASSWD", "PRIVATE_KEY", "PRIVATE-KEY", "CREDENTIAL", "API_KEY", "API-KEY", "ACCESS_KEY", "APP_KEY", "AUTHORIZATION", "GITHUB_PAT", "WEBHOOK"} {
+	for _, part := range []string{"TOKEN", "SECRET", "PASSWORD", "PASSWD", "PRIVATE_KEY", "PRIVATE-KEY", "CREDENTIAL", "API_KEY", "API-KEY", "ACCESS_KEY", "APP_KEY", "AUTHORIZATION", "GITHUB_PAT"} {
 		if strings.Contains(upper, part) {
 			return true
 		}

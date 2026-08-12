@@ -95,7 +95,7 @@ Users manage intent, priority, and governance rather than agent sessions. Execut
 - 100% of execution attempts originate from an eligible GitHub issue.
 - 100% of active attempts appear in CLI status with issue, agent, tmux, worktree, and PR data when available.
 - 100% of merged agent PRs satisfy configured completion policy.
-- 100% of webhook redeliveries and restart recovery scenarios avoid duplicate dispatch.
+- 100% of repeated polling and restart recovery scenarios avoid duplicate dispatch.
 - At least two independent issues can execute concurrently in the MVP.
 - Blocked or failed work is reflected in GitHub and CLI status within one minute.
 - Documentation-impact validation runs for every agent-created PR.
@@ -104,11 +104,11 @@ Users manage intent, priority, and governance rather than agent sessions. Execut
 
 **MVP approach:** Problem-solving MVP. Prove that one orchestrator can safely take a prioritized GitHub backlog through multi-agent implementation, review, documentation, and merge with minimal stakeholder supervision.
 
-**Resource requirements:** One experienced systems developer familiar with GitHub Apps, Git, process supervision, and CLI tooling; one pilot repository; stakeholder access for workflow validation and review-policy testing.
+**Resource requirements:** One experienced systems developer familiar with GitHub CLI, Git, process supervision, and CLI tooling; one pilot repository; stakeholder access for workflow validation and review-policy testing.
 
 ### MVP - Minimum Viable Product
 
-- One configured GitHub repository and GitHub App installation.
+- One configured GitHub repository accessible through an authenticated GitHub CLI session.
 - GitHub Issue intake using configurable readiness, priority P1-P3, and completion-policy metadata.
 - Backlog reconciliation, dependency-aware prioritization, and safe parallel dispatch.
 - Orchestrator-created sub-agents in isolated Git worktrees and tmux sessions.
@@ -121,7 +121,7 @@ Users manage intent, priority, and governance rather than agent sessions. Execut
 
 ### Growth Features (Post-MVP)
 
-- Multiple repositories per GitHub App installation.
+- Multiple repositories per coordinator instance.
 - GitHub Projects priority and status synchronization.
 - Improved dependency inference and workload forecasting.
 - Configurable agent roles, models, concurrency limits, and execution policies.
@@ -220,7 +220,7 @@ The MVP should reuse Symphony's proven boundaries where practical and validate t
 - Run mixed backlogs containing P1-P3, dependent, conflicting, and independent issues.
 - Verify deterministic priority ordering, correct dependency handling, and explainable parallelization decisions.
 - Measure avoided conflicts and correct prioritization alongside throughput.
-- Test cyclic dependencies, contradictory priorities, duplicate webhook deliveries, stale review comments, force-pushed branches, revoked permissions, and issues modifying overlapping files.
+- Test cyclic dependencies, contradictory priorities, repeated reconciliation, stale review comments, force-pushed branches, revoked permissions, and issues modifying overlapping files.
 - Leave a review-gated PR open, then submit authorized feedback after an extended delay and confirm contextual resumption.
 - Restart the orchestrator during active work and verify no duplicate attempts or PRs.
 - Compare stakeholder supervision time against manually coordinated agent runs.
@@ -255,7 +255,7 @@ Agent Symphony is a terminal-first orchestration service operated through a cros
 The CLI must support:
 
 - Initializing and validating repository configuration
-- Installing or verifying GitHub App connectivity
+- Verifying GitHub CLI authentication and repository connectivity
 - Starting, stopping, and inspecting the orchestrator
 - Listing queued, active, blocked, review-ready, and completed work
 - Inspecting an issue's agents, tmux sessions, worktrees, branch, PR, checks, and blockers
@@ -278,7 +278,7 @@ The CLI must not bypass GitHub issue readiness, review, or merge policies.
 Repository documentation must include:
 
 - Installation and prerequisites
-- GitHub App setup and least-privilege permissions
+- GitHub CLI authentication and least-privilege account permissions
 - Minimal configuration example
 - Issue metadata and lifecycle examples
 - Human-review and autonomous-merge examples
@@ -293,7 +293,7 @@ No migration guide is required for the greenfield MVP.
 
 - Keep GitHub authoritative and reconstruct orchestration state from GitHub plus bounded local execution metadata.
 - Hold GitHub credentials in the orchestrator boundary; do not expose them to sub-agents.
-- Use GitHub webhooks for prompt response and periodic reconciliation for missed or delayed events.
+- Poll current GitHub state at startup and at intervals no greater than 60 seconds.
 - Preserve deterministic issue-to-attempt, worktree, branch, tmux-session, and PR relationships.
 - Keep the Phase 2 browser dashboard read-only.
 - Treat macOS, Linux, and WSL path and process behavior as explicit compatibility requirements.
@@ -316,7 +316,7 @@ No migration guide is required for the greenfield MVP.
 - **FR4:** A stakeholder can declare dependencies between issues.
 - **FR5:** A stakeholder can require human review for an issue.
 - **FR6:** A stakeholder can allow policy-controlled merge for an issue.
-- **FR7:** The system can validate that an issue contains the required context, acceptance criteria, task checklist, and validation expectations before execution.
+- **FR7:** The system accepts arbitrary issue-body text while validating label, authorization, dependency, and lifecycle eligibility separately.
 - **FR8:** The system can record execution status, blockers, scope changes, decisions, validation evidence, and completion in GitHub.
 - **FR9:** The system can restrict control actions to authorized GitHub actors.
 
@@ -327,7 +327,7 @@ No migration guide is required for the greenfield MVP.
 - **FR12:** The orchestrator can prevent dependent work from starting before prerequisites are satisfied.
 - **FR13:** The orchestrator can identify issues that are explicitly safe to execute concurrently.
 - **FR14:** The orchestrator can serialize or block work when safe concurrency cannot be established.
-- **FR15:** The orchestrator can explain why an issue is queued, running, blocked, or serialized.
+- **FR15:** The orchestrator can explain why an issue is queued, running, blocked, or serialized and persist the latest blocker projection in coordinator state.
 - **FR16:** The orchestrator can enforce configurable global and repository execution limits.
 - **FR17:** The orchestrator can reevaluate the backlog when relevant GitHub state changes.
 - **FR18:** The orchestrator can continue eligible work while unrelated work is blocked.
@@ -384,14 +384,14 @@ No migration guide is required for the greenfield MVP.
 - **FR54:** A stakeholder can start, stop, and inspect the orchestrator through a CLI.
 - **FR55:** A stakeholder can receive human-readable status and diagnostics.
 - **FR56:** Automation can consume structured status and diagnostics.
-- **FR57:** A stakeholder can verify GitHub App connectivity and effective repository permissions.
+- **FR57:** A stakeholder can verify GitHub CLI authentication, identity, connectivity, and effective repository permissions.
 - **FR58:** The system can identify unsupported platform or dependency conditions with corrective guidance.
 
 ## Non-Functional Requirements
 
 ### Performance
 
-- GitHub webhook events must be acknowledged within 10 seconds.
+- The continuous coordinator must poll GitHub at intervals no greater than 60 seconds.
 - Relevant issue or PR changes must appear in CLI status within 60 seconds under normal GitHub API availability.
 - Authorized actionable PR feedback must enter the execution queue within 60 seconds.
 - CLI status and inspection commands must return within two seconds for a repository containing up to 100 active or eligible issues, excluding GitHub network latency.
@@ -399,9 +399,9 @@ No migration guide is required for the greenfield MVP.
 
 ### Security
 
-- Every webhook payload must pass signature verification before processing.
-- GitHub App permissions must be limited to capabilities required by enabled features.
-- Installation tokens and other credentials must never enter sub-agent environments, committed files, tmux history, or logs.
+- Every GitHub API response must be treated as untrusted input and validated at the integration boundary.
+- The authenticated GitHub CLI account must have only the repository permissions required by enabled features.
+- GitHub CLI credentials must never enter sub-agent environments, committed files, tmux history, or logs.
 - Secrets must be redacted from diagnostics and error output.
 - Only authorized GitHub actors may change execution, review, or completion policy.
 - Repository permissions, required Checks, reviews, and branch protections must be reevaluated immediately before merge.
@@ -410,13 +410,13 @@ No migration guide is required for the greenfield MVP.
 
 ### Reliability and Recovery
 
-- Reprocessing the same GitHub delivery must not create another attempt, branch, worktree, tmux session, or PR.
+- Repeating reconciliation over unchanged GitHub state must not create another attempt, branch, worktree, tmux session, or PR.
 - After restart, the orchestrator must reconcile active state within two minutes under normal GitHub API availability.
 - Restart recovery must not redispatch active or completed work.
 - A process failure must not damage the primary repository working tree.
 - Failed or blocked attempts must preserve enough context for diagnosis and safe retry.
 - Lost or contradictory state must reduce autonomy and require reconciliation rather than silently continuing.
-- Periodic reconciliation must recover events missed by webhook delivery.
+- Periodic reconciliation must discover GitHub changes made between polls.
 
 ### Capacity and Scalability
 
