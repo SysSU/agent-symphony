@@ -2,17 +2,17 @@
 
 This walkthrough goes from a fresh machine to a working `reconcile`.
 
-## Minimum requirements
+## What you need
 
-- macOS, Linux, or WSL2, with repositories and runtime state on the Linux filesystem rather than `/mnt/c`.
-- The Agent Symphony release binary, Git, tmux, and GitHub CLI authenticated with `gh auth login` or an optional `GH_TOKEN`/`GITHUB_TOKEN`.
-- A GitHub repository with an `origin` remote and sufficient access for the configured workflow.
-- Working implementation/reviewer executables and any model-provider credentials they require.
-- Go 1.26 only when building from source; release users do not need Go.
+- macOS, Linux, or WSL2.
+- Agent Symphony, Git, tmux, and GitHub CLI.
+- Access to the GitHub repository and a completed `gh auth login`.
+- Codex set up, or another coding agent if you prefer.
+- Go 1.26 only if you build Agent Symphony yourself.
 
 ## 1. Install Agent Symphony and prerequisites
 
-Install Git, tmux, [GitHub CLI](https://cli.github.com/), and the configured implementation/reviewer executables. Download the Agent Symphony release archive matching the host (`darwin` or `linux`, `amd64` or `arm64`; WSL2 uses `linux_amd64`) and verify it:
+Install Git, tmux, [GitHub CLI](https://cli.github.com/), and Codex (or the coding agent you plan to use). Download the Agent Symphony release archive matching the host (`darwin` or `linux`, `amd64` or `arm64`; WSL2 uses `linux_amd64`) and verify it:
 
 ```sh
 grep "  agent-symphony_VERSION_OS_ARCH.tar.gz$" SHA256SUMS | shasum -a 256 -c -
@@ -29,7 +29,7 @@ go build -o agent-symphony ./cmd/agent-symphony
 
 ## 2. Authenticate GitHub CLI
 
-Authenticate the same operating-system account that will run Agent Symphony:
+Sign in with the GitHub account Agent Symphony should use:
 
 ```sh
 gh auth login
@@ -37,7 +37,7 @@ gh auth status
 gh repo view OWNER/REPOSITORY
 ```
 
-That account is the coordinator identity. It needs repository access for the issues, pull requests, reviews, statuses, rules, and mutations enabled by your policy. No Agent Symphony identity variables are required. For non-interactive use, `gh` can instead read `GH_TOKEN` or `GITHUB_TOKEN`; Agent Symphony does not parse or store it. See [GitHub CLI integration](github-cli.md).
+Agent Symphony uses that account to work with issues and pull requests. For unattended setups, `gh` can read `GH_TOKEN` or `GITHUB_TOKEN` instead; Agent Symphony does not store it. See [GitHub CLI integration](github-cli.md).
 
 ## 3. Initialize the repository
 
@@ -49,7 +49,7 @@ agent-symphony init
 agent-symphony validate
 ```
 
-Edit `.agent-symphony.yaml` to select the implementation and reviewer commands and add only the model-provider environment variable names those commands require. GitHub, Git askpass, SSH-agent, and cloud credential variables are rejected. See the [CLI reference](cli.md#configuration) for the full schema.
+The defaults use Codex. If you use another coding agent, update the `commands` section in `.agent-symphony.yaml` and list any API key variable it needs. See the [CLI reference](cli.md#configuration) for the full schema.
 
 ## 4. Run diagnostics
 

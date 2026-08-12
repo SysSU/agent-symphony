@@ -42,7 +42,7 @@ Keep the issue current during development, link its pull request, and record val
 
 ## Getting Started
 
-Go 1.26 is required to build from source. The resulting executable uses GitHub CLI for GitHub authentication and API access; operators also need Git, tmux, configured implementation/reviewer executables, and repository access.
+Go 1.26 is required to build from source. To run Agent Symphony, install Git, tmux, GitHub CLI, and Codex (or another coding agent), and make sure you can access the repository.
 
 ```sh
 go build -o agent-symphony ./cmd/agent-symphony
