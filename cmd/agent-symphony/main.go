@@ -634,6 +634,9 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	}) {
 		return statuses, nil
 	}
+	if err := cleanupCompletedAttempts(ctx, boundary, facts, manifests); err != nil {
+		return statuses, err
+	}
 	if err := ensurePublishedEvidence(ctx, api, facts, manifests, user.ID); err != nil {
 		return statuses, err
 	}
@@ -656,6 +659,25 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		return statuses, fmt.Errorf("reconciliation exceeded the two-minute recovery target; retry on the next bounded backoff cycle: %w", err)
 	}
 	return statuses, nil
+}
+
+func cleanupCompletedAttempts(ctx context.Context, boundary boundaryCaller, facts []orchestrator.AttemptFact, manifests []agentruntime.Manifest) error {
+	for _, fact := range facts {
+		if fact.State != "completed" {
+			continue
+		}
+		index := slices.IndexFunc(manifests, func(manifest agentruntime.Manifest) bool {
+			return orchestrator.MatchesPublishedAttempt(manifest, fact)
+		})
+		if index < 0 {
+			continue
+		}
+		body, _ := json.Marshal(manifests[index])
+		if _, err := boundary.call(ctx, "cleanup", agentruntime.Command{Stdin: bytes.NewReader(body)}); err != nil {
+			return fmt.Errorf("clean up completed %s#%d attempt %d: %w", fact.Repository, fact.Issue, fact.Attempt, err)
+		}
+	}
+	return nil
 }
 
 func ensurePublishedEvidence(ctx context.Context, api internalgithub.API, facts []orchestrator.AttemptFact, manifests []agentruntime.Manifest, actorID int) error {
