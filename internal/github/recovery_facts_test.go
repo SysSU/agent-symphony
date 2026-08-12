@@ -358,10 +358,16 @@ func TestFetchAttemptFactsPaginatesMarkersAndChecks(t *testing.T) {
 		noise[i] = map[string]any{"body": "noise"}
 		checks[i] = map[string]string{"name": "check", "status": "completed", "conclusion": "success"}
 	}
+	pulls := make([]map[string]any, recoveryPullsPerPage)
+	for i := range pulls {
+		pulls[i] = map[string]any{"body": "noise"}
+	}
 	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		var body any
 		switch r.URL.Path + "?" + r.URL.RawQuery {
-		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1":
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1":
+			body = pulls
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=2":
 			body = []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}}}
 		case "/repos/o/r/issues/4?":
 			body = map[string]any{"state": "open"}
@@ -416,8 +422,11 @@ func TestFetchAttemptFactsRequiresCoordinatorMarkerAndSafeCompletion(t *testing.
 func TestFindPublishedAttemptRequiresCoordinatorPR(t *testing.T) {
 	branch, _ := AttemptBranch("o/r", 4, 2)
 	pull := map[string]any{"number": 9, "body": "pre-bind", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "user": map[string]any{"id": 42}}
-	pulls := []any{pull}
-	api := fixtureAPI(t, map[string]any{"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": pulls})
+	pulls := make([]any, recoveryPullsPerPage)
+	api := fixtureAPI(t, map[string]any{
+		"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1": pulls,
+		"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=2": []any{pull},
+	})
 	for range 2 {
 		pr, body, err := FindPublishedAttempt(context.Background(), api, "o/r", branch, "ccccccc", 42)
 		if err != nil || pr.Number != 9 || body != "pre-bind" {
@@ -452,7 +461,7 @@ func TestFetchAttemptFactsRejectsForeignActors(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			responses := map[string]any{
-				"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": test.pullActor}}},
+				"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1": []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": test.pullActor}}},
 			}
 			if test.pullActor == 42 {
 				responses["/repos/o/r/issues/4"] = map[string]any{"state": "open"}

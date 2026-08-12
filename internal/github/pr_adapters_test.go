@@ -470,7 +470,7 @@ func TestPullRequestMergedFieldIsRequired(t *testing.T) {
 
 func TestRunPRReconciliationConstructsAndExecutes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	api := fixtureAPI(t, map[string]any{"/repos/o/r": map[string]any{"full_name": "o/r", "permissions": map[string]any{"pull": true}}, "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": []any{}, "/repos/o/r/pulls?state=open&per_page=100&page=1": []any{}})
+	api := fixtureAPI(t, map[string]any{"/repos/o/r": map[string]any{"full_name": "o/r", "permissions": map[string]any{"pull": true}}, "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1": []any{}, "/repos/o/r/pulls?state=open&per_page=100&page=1": []any{}})
 	cfg := productionPRConfig()
 	if err := RunPRReconciliation(context.Background(), api, cfg, path); err != nil {
 		t.Fatal(err)
@@ -536,8 +536,8 @@ func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t 
 			}
 			responses := map[string]any{
 				"/repos/o/r": map[string]any{"full_name": "o/r", "permissions": map[string]any{"pull": true, "push": true}},
-				"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1": []any{map[string]any{"number": 3, "body": prBody, "state": "open", "head": map[string]any{"sha": "abcdef0", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}}},
-				"/repos/o/r/pulls?state=open&per_page=100&page=1":                            []any{map[string]any{"number": 3, "body": prBody}},
+				"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1": []any{map[string]any{"number": 3, "body": prBody, "state": "open", "head": map[string]any{"sha": "abcdef0", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}}},
+				"/repos/o/r/pulls?state=open&per_page=100&page=1":                           []any{map[string]any{"number": 3, "body": prBody}},
 				"/repos/o/r/issues/10": map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 5}, "labels": []any{map[string]any{"name": "ready"}, map[string]any{"name": "P3"}}},
 				"/repos/o/r/issues/10/timeline?per_page=100&page=1": []any{
 					map[string]any{"id": 20, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now, "actor": map[string]any{"id": 5}},
