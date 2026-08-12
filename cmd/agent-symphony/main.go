@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -257,6 +258,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	runtimeState := fs.String("runtime-state", "", "local runtime state root")
 	issueNumber := fs.Int("issue", 0, "issue number to inspect")
 	interval := fs.Duration("interval", orchestrator.MaxReconcileInterval, "serve reconciliation interval (maximum 60s)")
+	dashboardAddress := fs.String("dashboard-address", "127.0.0.1:8080", "dashboard loopback listen address")
 	offline := fs.Bool("offline", false, "skip network diagnostics")
 	coordinator := fs.String("coordinator", "", "coordinator OS user")
 	if err := fs.Parse(flagArgs); err != nil {
@@ -314,7 +316,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		defer releaseDaemonLock(lock)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
+		operationMu := &sync.Mutex{}
+		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, stderr)
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
 		reconcile := func(ctx context.Context) error {
+			operationMu.Lock()
+			defer operationMu.Unlock()
 			_, err := reconcileGitHub(ctx, *path, *statePath, *runtimeState, true)
 			if err != nil {
 				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
@@ -729,7 +739,7 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 		found := false
 		for j := range statuses {
 			if statuses[j].Repository == issue.Repository && statuses[j].Issue == issue.Issue {
-				statuses[j].Priority, statuses[j].Dependencies = issue.Priority, issue.Dependencies
+				statuses[j].Title, statuses[j].Priority, statuses[j].Dependencies = issue.Title, issue.Priority, issue.Dependencies
 				statuses[j].Blockers = append(statuses[j].Blockers, issue.Blockers...)
 				found = true
 			}
@@ -742,7 +752,7 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 			continue
 		}
 		decision := decisions[decisionIndex]
-		statuses = append(statuses, orchestrator.RecoveryStatus{Repository: issue.Repository, Issue: issue.Issue, Attempt: issue.Attempt, State: string(decision.State), Priority: issue.Priority, Dependencies: issue.Dependencies, Blockers: issue.Blockers, Action: decision.Explanation})
+		statuses = append(statuses, orchestrator.RecoveryStatus{Repository: issue.Repository, Issue: issue.Issue, Title: issue.Title, Attempt: issue.Attempt, State: string(decision.State), Priority: issue.Priority, Dependencies: issue.Dependencies, Blockers: issue.Blockers, Action: decision.Explanation})
 	}
 	return statuses, decisions
 }
@@ -2202,5 +2212,6 @@ options:
   --config path use another configuration file
   --state path  durable PR-governance/handoff state
   --runtime-state path  bounded runtime manifest root
+  --dashboard-address address  loopback dashboard address (serve only)
   --json        emit a versioned JSON envelope`)
 }

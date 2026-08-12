@@ -865,6 +865,29 @@ func TestStopInterruptsPaneZeroWhenAnotherPaneIsActive(t *testing.T) {
 	}
 }
 
+func TestForgetRemovesOnlyCleanedAttemptRecord(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Forget(manifest); err == nil || !strings.Contains(err.Error(), "resource still exists") {
+		t.Fatalf("forgot live resources: %v", err)
+	}
+	if err := os.RemoveAll(manifest.Worktree); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Forget(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(manifest.LogPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("attempt record remains: %v", err)
+	}
+	if manifests, err := r.Discover(); err != nil || len(manifests) != 0 {
+		t.Fatalf("discover after forget = %#v, %v", manifests, err)
+	}
+}
+
 func TestWorkerIdentityFailsClosedBeforeMutation(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	r.VerifyWorker = nil

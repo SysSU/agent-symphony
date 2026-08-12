@@ -10,6 +10,8 @@ export GOMODCACHE="$tmp/go-mod-cache"
 go test -race ./...
 go vet ./...
 sh -n scripts/*.sh
+test -s cmd/agent-symphony/dashboard/out/index.html
+test -s cmd/agent-symphony/dashboard/package-lock.json
 scripts/credential-scan-test.sh
 for script in scripts/*.sh; do
   ! grep -q "$(printf '\r')" "$script"

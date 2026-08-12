@@ -35,6 +35,7 @@ type AttemptFact struct {
 type RecoveryStatus struct {
 	Repository          string   `json:"repository"`
 	Issue               int      `json:"issue"`
+	Title               string   `json:"title,omitempty"`
 	Attempt             int      `json:"attempt"`
 	State               string   `json:"state"`
 	Branch              string   `json:"branch,omitempty"`

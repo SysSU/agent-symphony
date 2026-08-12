@@ -13,3 +13,9 @@ Before a pilot, verify the worker identity boundary, filesystem permissions, tmu
 `install-host` must run as root from the root-owned versioned release path. It writes only the two exact no-argument `agent-host` sudo tuples. `agent-host` rechecks its effective user and primary group in advanced mode; in the zero-admin default it instead runs as a plain subprocess of the coordinator, with no separate identity to verify. Either way it accepts one bounded JSON value, permits only Git/tmux execution below its provisioned root, and re-applies the shared credential environment filter. It never grants an agent GitHub authority.
 
 Fresh GitHub permission checks authorize actors. Required checks, commit statuses, review state, current head, and any available branch protection are re-read before merge; the coordinator never uses an administrative bypass.
+
+## Local dashboard boundary
+
+The per-repository dashboard binds only to localhost or a loopback IP. It is an operator surface, not a remotely authenticated service; do not expose or reverse-proxy it to another host. Static Next.js assets are embedded in the Go binary, `status.json` and `dashboard-state.json` are bounded non-symlink files, and the browser receives no credentials or feedback bodies.
+
+Terminal and cleanup requests require the dashboard origin and re-resolve issue/attempt numbers against the current bounded projection. The browser cannot name a tmux session, worktree, branch, path, or command. Terminal input and resize messages are size-bounded. Archive accepts only an exact completed attempt and preserves its diagnostic manifest/log; Abandon accepts only an exact orphaned attempt and deletes its local record only after boundary cleanup succeeds. The server rejects ambiguous attempts, state changes, projected/local identity drift, unsafe files, and non-loopback listening.

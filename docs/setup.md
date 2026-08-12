@@ -9,6 +9,7 @@ This walkthrough goes from a fresh machine to a working `reconcile`.
 - Access to the GitHub repository and a completed `gh auth login`.
 - Codex set up, or another coding agent if you prefer.
 - Go 1.26 only if you build Agent Symphony yourself.
+- Node.js 20.9 or newer only if you rebuild the committed Next.js dashboard export.
 
 ## 1. Install Agent Symphony and prerequisites
 
@@ -24,8 +25,11 @@ agent-symphony --help
 On Linux, `sha256sum -c SHA256SUMS` can verify the downloads. On WSL2, keep the repository and state on the Linux filesystem, never under `/mnt/c`. Contributors can instead build with the Go version pinned in `go.mod`:
 
 ```sh
+scripts/build-dashboard.sh
 go build -o agent-symphony ./cmd/agent-symphony
 ```
+
+Released binaries already contain the dashboard and do not need Node.js at runtime.
 
 ## 2. Authenticate GitHub CLI
 
@@ -85,8 +89,11 @@ For continuous operation, use `serve`; it reconciles immediately and then polls 
 ```sh
 agent-symphony serve \
   --state ~/.local/state/agent-symphony/pr.json \
-  --runtime-state ~/.local/state/agent-symphony
+  --runtime-state ~/.local/state/agent-symphony \
+  --dashboard-address 127.0.0.1:8080
 ```
+
+Open the dashboard URL printed by `serve`. Keep it on loopback; it provides terminal access and confirmed cleanup controls for exact projected attempts.
 
 ## Multiple repositories on one host
 
@@ -96,14 +103,16 @@ Run one separately supervised process from each repository checkout and give eac
 cd /path/to/first-repository
 agent-symphony serve \
   --state ~/.local/state/agent-symphony/first/pr.json \
-  --runtime-state ~/.local/state/agent-symphony/first
+  --runtime-state ~/.local/state/agent-symphony/first \
+  --dashboard-address 127.0.0.1:8081
 ```
 
 ```sh
 cd /path/to/second-repository
 agent-symphony serve \
   --state ~/.local/state/agent-symphony/second/pr.json \
-  --runtime-state ~/.local/state/agent-symphony/second
+  --runtime-state ~/.local/state/agent-symphony/second \
+  --dashboard-address 127.0.0.1:8082
 ```
 
 Each process still manages only its configured repository. The daemons share the authenticated GitHub CLI account and, in advanced mode, the provisioned worker/reviewer identities; source bundle, worktree, review snapshot, and tmux session names include the repository identity. Concurrency remains per daemon, so size the sum of their configured capacities for the host.

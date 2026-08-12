@@ -5,3 +5,5 @@
 _bmad-output/
 .cursor
 .worktrees/
+cmd/agent-symphony/dashboard/.next/
+cmd/agent-symphony/dashboard/node_modules/

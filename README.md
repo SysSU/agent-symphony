@@ -14,9 +14,10 @@ Agent Symphony is a planned GitHub-native, multi-agent software delivery orchest
 - Human-review gates and repository-policy-controlled merge
 - Living documentation updated with implementation changes
 - Restart-safe reconciliation and terminal-based operational status
+- Per-repository browser dashboard with exact tmux-session access and bounded archive/abandon controls
 - macOS, Linux, and Windows through WSL
 
-Independent one-repository daemons may share a host when each uses distinct state paths; shared resource names include the repository identity. A single daemon still manages exactly one repository. The browser dashboard, multi-repository orchestration, GitHub Projects synchronization, and inferred dependencies are post-MVP work.
+Independent one-repository daemons may share a host when each uses distinct state paths and dashboard addresses; shared resource names include the repository identity. A single daemon and dashboard still manage exactly one repository. A centralized dashboard, multi-repository orchestration, GitHub Projects synchronization, and inferred dependencies are post-MVP work.
 
 ## Documentation
 
@@ -42,7 +43,7 @@ Keep the issue current during development, link its pull request, and record val
 
 ## Getting Started
 
-Go 1.26 is required to build from source. To run Agent Symphony, install Git, tmux, GitHub CLI, and Codex (or another coding agent), and make sure you can access the repository.
+Go 1.26 is required to build from source. Node.js 20.9 or newer is needed only when rebuilding the committed Next.js dashboard assets with `scripts/build-dashboard.sh`. To run Agent Symphony, install Git, tmux, GitHub CLI, and Codex (or another coding agent), and make sure you can access the repository.
 
 ```sh
 go build -o agent-symphony ./cmd/agent-symphony
@@ -51,9 +52,11 @@ go build -o agent-symphony ./cmd/agent-symphony
 ./agent-symphony config view
 ./agent-symphony doctor
 ./agent-symphony pr-governance --state /path/to/pr-state.json
-./agent-symphony serve --state /path/to/pr-state.json --runtime-state /path/to/state
+./agent-symphony serve --state /path/to/pr-state.json --runtime-state /path/to/state --dashboard-address 127.0.0.1:8080
 ./agent-symphony status --state /path/to/pr-state.json --runtime-state /path/to/state
 ```
+
+`serve` prints the per-repository dashboard URL. The dashboard separates current and completed attempts, opens an exact live tmux session in the browser, archives completed local resources, and abandons explicitly selected orphaned local attempts. It binds to loopback only; do not place it behind a public proxy.
 
 Before `serve`, install the release binary root-owned at `/usr/local/libexec/agent-symphony/<version>/agent-symphony`, then run `sudo .../agent-symphony install-host --coordinator "$USER"`. The coordinator uses the installed implementation and review `agent-host` sudo boundaries automatically; `AGENT_SYMPHONY_WORKER_BOUNDARY` and `AGENT_SYMPHONY_REVIEW_BOUNDARY` remain only test seams.
 
