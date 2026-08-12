@@ -15,6 +15,7 @@ const recoveryMarkerPrefix = "<!-- agent-symphony:attempt:v1\n"
 const terminalMarkerPrefix = "<!-- agent-symphony:terminal:v1\n"
 const activeMarkerPrefix = "<!-- agent-symphony:active-attempt:v1\n"
 const recoveryPageLimit = 10
+const recoveryPullsPerPage = 25
 
 type recoveryMarkerPayload struct {
 	Version int    `json:"version"`
@@ -381,7 +382,7 @@ func FetchAttemptFacts(ctx context.Context, api API, repository string, actorID 
 				SHA string `json:"sha"`
 			} `json:"base"`
 		}
-		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100&page=%d", repository, page), "", &pulls); err != nil {
+		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=%d&page=%d", repository, recoveryPullsPerPage, page), "", &pulls); err != nil {
 			return nil, err
 		}
 		for _, pull := range pulls {
@@ -495,7 +496,7 @@ func FetchAttemptFacts(ctx context.Context, api API, repository string, actorID 
 			}
 			facts = append(facts, RecoveryAttemptFact{Repository: repository, Issue: issue, Attempt: attempt, BaseSHA: boundBase, HeadSHA: pull.Head.SHA, PR: pull.Number, State: state, Checks: checks})
 		}
-		if len(pulls) < 100 {
+		if len(pulls) < recoveryPullsPerPage {
 			return facts, nil
 		}
 	}
@@ -515,7 +516,7 @@ func FindPublishedAttempt(ctx context.Context, api API, repository, branch, head
 			} `json:"user"`
 			Head struct{ SHA, Ref string } `json:"head"`
 		}
-		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100&page=%d", repository, page), "", &pulls); err != nil {
+		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=%d&page=%d", repository, recoveryPullsPerPage, page), "", &pulls); err != nil {
 			return found, "", err
 		}
 		for _, pull := range pulls {
@@ -530,7 +531,7 @@ func FindPublishedAttempt(ctx context.Context, api API, repository, branch, head
 			}
 			found, body = PullRequest{Number: pull.Number}, pull.Body
 		}
-		if len(pulls) < 100 {
+		if len(pulls) < recoveryPullsPerPage {
 			return found, body, nil
 		}
 	}
