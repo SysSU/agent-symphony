@@ -2,6 +2,14 @@
 
 This walkthrough goes from a fresh machine to a working `reconcile`.
 
+## Minimum requirements
+
+- macOS, Linux, or WSL2, with repositories and runtime state on the Linux filesystem rather than `/mnt/c`.
+- The Agent Symphony release binary, Git, tmux, and GitHub CLI authenticated with `gh auth login` or an optional `GH_TOKEN`/`GITHUB_TOKEN`.
+- A GitHub repository with an `origin` remote and sufficient access for the configured workflow.
+- Working implementation/reviewer executables and any model-provider credentials they require.
+- Go 1.26 only when building from source; release users do not need Go.
+
 ## 1. Install Agent Symphony and prerequisites
 
 Install Git, tmux, [GitHub CLI](https://cli.github.com/), and the configured implementation/reviewer executables. Download the Agent Symphony release archive matching the host (`darwin` or `linux`, `amd64` or `arm64`; WSL2 uses `linux_amd64`) and verify it:
