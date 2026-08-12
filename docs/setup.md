@@ -29,7 +29,7 @@ gh auth status
 gh repo view OWNER/REPOSITORY
 ```
 
-That account is the coordinator identity. It needs repository access for the issues, pull requests, reviews, statuses, rules, and mutations enabled by your policy. There are no Agent Symphony GitHub credentials or identity environment variables to configure. See [GitHub CLI integration](github-cli.md).
+That account is the coordinator identity. It needs repository access for the issues, pull requests, reviews, statuses, rules, and mutations enabled by your policy. No Agent Symphony identity variables are required. For non-interactive use, `gh` can instead read `GH_TOKEN` or `GITHUB_TOKEN`; Agent Symphony does not parse or store it. See [GitHub CLI integration](github-cli.md).
 
 ## 3. Initialize the repository
 

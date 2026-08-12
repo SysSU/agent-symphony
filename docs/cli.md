@@ -90,7 +90,7 @@ The runtime requires the boundary's verification hook and fails closed before cr
 - An attempt worktree has no remote and a disabled local credential helper. A successful `git push` from it indicates a broken host boundary; stop serving work and rerun diagnostics.
 - “resources already exist” is a safety stop. Reconcile the recorded attempt instead of deleting or adopting resources by hand.
 
-Secrets—including GitHub tokens, passwords, and credentials—are forbidden in configuration. Authenticate the coordinator with `gh auth login`; workers and reviewers do not inherit that session through their environment or Git configuration.
+Secrets—including GitHub tokens, passwords, and credentials—are forbidden in configuration. Authenticate GitHub CLI with `gh auth login` or, optionally, let `gh` read `GH_TOKEN` or `GITHUB_TOKEN` from the coordinator environment. Agent Symphony does not parse or store those values; workers and reviewers do not inherit them or the stored CLI session.
 
 ## Diagnostic boundaries
 
