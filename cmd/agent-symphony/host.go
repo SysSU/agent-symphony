@@ -739,6 +739,11 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return errors.New("review boundary cannot clean implementation attempts")
 		}
 		err = cleanupAttempt(ctx, request.Command.Input, root)
+	case "abandon":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot abandon implementation attempts")
+		}
+		err = abandonAttempt(ctx, request.Command.Input, root)
 	case "accept-handoff":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot accept implementation handoffs")
@@ -762,16 +767,26 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 }
 
 func cleanupAttempt(ctx context.Context, input []byte, root string) error {
+	return removeAttemptResources(ctx, input, root, true)
+}
+
+func abandonAttempt(ctx context.Context, input []byte, root string) error {
+	return removeAttemptResources(ctx, input, root, false)
+}
+
+func removeAttemptResources(ctx context.Context, input []byte, root string, completed bool) error {
 	var manifest agentruntime.Manifest
 	decoder := json.NewDecoder(bytes.NewReader(input))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return errors.New("invalid cleanup manifest")
+		return errors.New("invalid attempt manifest")
 	}
 	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
 	want, err := agentruntime.AttemptIdentity(root, attempt)
-	if err != nil || manifest.Version != want.Version || manifest.State != "completed" || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session || !preflightObjectID.MatchString(manifest.ReviewHead) {
-		return errors.New("invalid cleanup manifest")
+	validState := manifest.State == "preparing" || manifest.State == "running" || manifest.State == "completed" || manifest.State == "failed" || manifest.State == "cancelled"
+	if err != nil || manifest.Version != want.Version || !validState || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session ||
+		(completed && (manifest.State != "completed" || !preflightObjectID.MatchString(manifest.ReviewHead))) {
+		return errors.New("invalid attempt manifest")
 	}
 
 	worktreeInfo, worktreeErr := os.Lstat(want.Worktree)
@@ -790,10 +805,15 @@ func cleanupAttempt(ctx context.Context, input []byte, root string) error {
 		}
 		top, topErr := run("rev-parse", "--show-toplevel")
 		gitDir, gitDirErr := run("rev-parse", "--absolute-git-dir")
-		branch, branchErr := run("branch", "--show-current")
-		head, headErr := run("rev-parse", "HEAD")
-		if topErr != nil || !samePath(top, want.Worktree) || gitDirErr != nil || !validAttemptGitDir(want.Worktree, gitDir, root) || branchErr != nil || branch != want.Branch || headErr != nil || head != manifest.ReviewHead {
-			return errors.New("cleanup worktree identity changed")
+		if topErr != nil || !samePath(top, want.Worktree) || gitDirErr != nil || !validAttemptGitDir(want.Worktree, gitDir, root) {
+			return errors.New("attempt worktree identity changed")
+		}
+		if completed {
+			branch, branchErr := run("branch", "--show-current")
+			head, headErr := run("rev-parse", "HEAD")
+			if branchErr != nil || branch != want.Branch || headErr != nil || head != manifest.ReviewHead {
+				return errors.New("cleanup worktree identity changed")
+			}
 		}
 	}
 

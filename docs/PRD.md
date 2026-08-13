@@ -42,7 +42,7 @@ The orchestrator continuously evaluates the backlog, prioritizes work from P1 th
 
 GitHub Issues are the exclusive work-intake mechanism and single source of truth for requirements, decisions, implementation state, progress, validation evidence, and completion. Pull requests, reviews, checks, and branch protections govern delivery. Merge is permitted only when repository-required checks, reviews, permissions, and protections are satisfied.
 
-MVP CLI status exposes the backlog, active and queued work, dependencies, agents, tmux sessions, worktrees, issues, pull requests, checks, blockers, and expected next actions. A Phase 2 read-only browser dashboard presents the same operational view without creating or mutating work items. The orchestrator recovers from restarts without duplicating active or completed work.
+MVP CLI status exposes the backlog, active and queued work, dependencies, agents, tmux sessions, worktrees, issues, pull requests, checks, blockers, and expected next actions. A per-repository browser dashboard presents the same projection, attaches to exact live tmux sessions, and provides confirmed cleanup of exact completed or orphaned local attempts without mutating GitHub work policy. The orchestrator recovers from restarts without duplicating active or completed work.
 
 Documentation is part of the definition of done. Every pull request assesses documentation impact and updates affected PRDs, `README.md`, and durable project documentation in the same branch. Documentation remains versioned in the repository, defaults to `/docs`, and supports configurable repository-local paths.
 
@@ -59,7 +59,7 @@ Users manage intent, priority, and governance rather than agent sessions. Execut
 - **Complexity:** Low regulatory complexity with high technical risk around autonomous changes, permissions, concurrency, and recovery
 - **Context:** Greenfield
 - **Primary interface:** GitHub Issues and pull requests
-- **Secondary interface:** CLI operational status; read-only browser dashboard in Phase 2
+- **Secondary interface:** CLI operational status and a loopback-by-default per-repository browser dashboard
 
 ## Success Criteria
 
@@ -233,13 +233,13 @@ The MVP should reuse Symphony's proven boundaries where practical and validate t
 - If autonomous merge confidence is insufficient, default to human review.
 - If multi-agent coordination creates excessive conflicts, cap concurrency per repository.
 - If long-lived execution state cannot be safely resumed, reconstruct from GitHub and start a new traceable attempt.
-- Keep GitHub authoritative; do not introduce a parallel task database or mutable dashboard.
+- Keep GitHub authoritative; dashboard presentation state may hide locally archived/abandoned cards but must not become a parallel task database or GitHub workflow mutation surface.
 
 ## Developer Tool Specific Requirements
 
 ### Project-Type Overview
 
-Agent Symphony is a terminal-first orchestration service operated through a cross-platform CLI. The MVP supports macOS, Linux, and Windows through WSL. It integrates with GitHub, Git, tmux, and local worktrees. Phase 2 adds a read-only browser dashboard.
+Agent Symphony is a terminal-first orchestration service operated through a cross-platform CLI and a per-repository loopback-by-default dashboard. The MVP supports macOS, Linux, and Windows through WSL. It integrates with GitHub, Git, tmux, and local worktrees.
 
 ### Platform and Installation
 
@@ -295,7 +295,7 @@ No migration guide is required for the greenfield MVP.
 - Hold GitHub credentials in the orchestrator boundary; do not expose them to sub-agents.
 - Poll current GitHub state at startup and at intervals no greater than 60 seconds.
 - Preserve deterministic issue-to-attempt, worktree, branch, tmux-session, and PR relationships.
-- Keep the Phase 2 browser dashboard read-only.
+- Limit dashboard mutations to confirmed cleanup of exact projected local resources; never mutate GitHub issue, PR, review, check, or merge policy from the dashboard.
 - Treat macOS, Linux, and WSL path and process behavior as explicit compatibility requirements.
 
 ### Implementation Considerations
@@ -386,6 +386,14 @@ No migration guide is required for the greenfield MVP.
 - **FR56:** Automation can consume structured status and diagnostics.
 - **FR57:** A stakeholder can verify GitHub CLI authentication, identity, connectivity, and effective repository permissions.
 - **FR58:** The system can identify unsupported platform or dependency conditions with corrective guidance.
+
+### Per-Repository Dashboard
+
+- **FR59:** A stakeholder can inspect the current status projection in a browser dashboard owned by one repository daemon.
+- **FR60:** A stakeholder can attach an in-browser terminal to an exact projected live tmux session without creating a session or arbitrary command.
+- **FR61:** A stakeholder can archive a completed attempt by confirming cleanup of its exact local worktree, local branch, worker result, and tmux session while retaining diagnostic metadata.
+- **FR62:** A stakeholder can abandon a selected orphaned attempt by confirming cleanup of its exact local resources and retained manifest/log.
+- **FR63:** Dashboard terminal and cleanup controls default to loopback and always require same-origin requests and server-resolved deterministic attempt identity; non-loopback binding requires an explicit unsafe-network opt-in and password authentication on every route.
 
 ## Non-Functional Requirements
 

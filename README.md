@@ -8,6 +8,7 @@ Agent Symphony is a GitHub-native, multi-agent software delivery orchestrator in
 - Prioritizes work and respects readiness, dependency, and completion policies
 - Runs agents safely in isolated Git worktrees and tmux sessions
 - Handles pull-request feedback and validation across multiple agent runs
+- Provides a per-repository browser dashboard for monitoring attempts, opening live tmux sessions, and cleaning up local resources
 - Supports human-review gates and repository-policy-controlled merge
 - Keeps project documentation aligned with implementation changes
 - Recovers safely after restarts and reports operational status in the terminal
@@ -38,6 +39,8 @@ agent-symphony status \
   --state ~/.local/state/agent-symphony/pr.json \
   --runtime-state ~/.local/state/agent-symphony
 ```
+
+`serve` prints the dashboard URL. It is reachable only from the local computer by default; read the [security guide](docs/security.md) before enabling network access.
 
 See the [setup guide](docs/setup.md) for installation, configuration, and your first issue.
 
