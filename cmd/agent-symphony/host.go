@@ -1227,12 +1227,15 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 	}
 	d := json.NewDecoder(bytes.NewReader(input))
 	d.DisallowUnknownFields()
-	if d.Decode(&request) != nil || d.Decode(&struct{}{}) != io.EOF || !belowRoot(request.Manifest.Worktree, root) || request.OutcomePath != request.Manifest.LogPath+".review-outcome" || !belowRoot(request.OutcomePath, request.Manifest.Worktree) || request.OutcomeToken == "" || len(request.Command) == 0 {
+	if d.Decode(&request) != nil || d.Decode(&struct{}{}) != io.EOF || !belowRoot(request.Manifest.Worktree, root) || request.OutcomeToken == "" || len(request.Command) == 0 {
 		return "", errors.New("invalid handoff request")
 	}
 	var h struct{ Type, Key string }
 	if json.Unmarshal(request.Handoff, &h) != nil || h.Type != "agent-symphony-handoff-v1" || h.Key == "" || filepath.Base(h.Key) != h.Key || strings.ContainsAny(h.Key, "/\\\x00\r\n") {
 		return "", errors.New("invalid handoff identity")
+	}
+	if request.OutcomePath != handoffReceiptPath(request.Manifest.Worktree, h.Key) || !belowRoot(request.OutcomePath, request.Manifest.Worktree) {
+		return "", errors.New("invalid handoff receipt path")
 	}
 	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
 	if err := os.MkdirAll(inbox, 0o700); err != nil {
@@ -1248,7 +1251,12 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 	if err := writeImmutable(filepath.Join(inbox, h.Key+".json"), binding); err != nil {
 		return "", err
 	}
-	ack, _ := json.Marshal(struct{ Type, Key, OutcomePath, OutcomeToken string }{"agent-symphony-handoff-executed-v1", h.Key, request.OutcomePath, request.OutcomeToken})
+	ack, _ := json.Marshal(struct {
+		Type         string `json:"type"`
+		Key          string `json:"key"`
+		OutcomePath  string `json:"outcome_path"`
+		OutcomeToken string `json:"outcome_token"`
+	}{"agent-symphony-handoff-executed-v1", h.Key, request.OutcomePath, request.OutcomeToken})
 	if body, err := os.ReadFile(request.OutcomePath); err == nil && bytes.Equal(body, ack) {
 		return string(ack), nil
 	} else if err == nil || !errors.Is(err, os.ErrNotExist) {
@@ -1277,6 +1285,10 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 		return "", err
 	}
 	return string(ack), nil
+}
+
+func handoffReceiptPath(worktree, key string) string {
+	return filepath.Join(worktree, ".agent-symphony", "handoffs", key+".receipt")
 }
 
 func belowRoot(path, root string) bool {

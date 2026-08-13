@@ -667,7 +667,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if err := dispatchIssues(ctx, api, &r, c, prConfig, issues, decisions); err != nil {
 		return statuses, err
 	}
-	if err := resumeHandoffs(ctx, &r, statePath, stateRoot, statuses, manifests); err != nil {
+	if err := resumeHandoffs(ctx, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
 		return statuses, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -1347,7 +1347,8 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 }
 
 func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtime, boundary workerBoundaryRunner, attempt agentruntime.Attempt, manifest agentruntime.Manifest, head string, findings, command []string) (bool, error) {
-	key, outcomePath := "independent-review-"+head, manifest.LogPath+".review-outcome"
+	key := "independent-review-" + head
+	outcomePath := handoffReceiptPath(manifest.Worktree, key)
 	handoff, _ := json.Marshal(struct{ Type, Key, Findings string }{"agent-symphony-handoff-v1", key, strings.Join(findings, "\n")})
 	accept := func() error {
 		request, _ := json.Marshal(struct {
@@ -1683,10 +1684,13 @@ func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuse
 	return nil
 }
 
-func resumeHandoffs(ctx context.Context, runtime *agentruntime.Runtime, statePath, stateRoot string, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest) error {
+func resumeHandoffs(ctx context.Context, boundary boundaryCaller, statePath, stateRoot string, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, command []string) error {
 	info, err := os.Lstat(statePath)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("safe durable handoff state is unavailable")
+	}
+	if len(command) == 0 {
+		return errors.New("implementation command is missing")
 	}
 	live := map[string]agentruntime.Manifest{}
 	for _, status := range statuses {
@@ -1730,19 +1734,16 @@ func resumeHandoffs(ctx context.Context, runtime *agentruntime.Runtime, statePat
 			Validation bool
 			Feedback   []internalgithub.Feedback
 		}{"agent-symphony-handoff-v1", handoff.Key, handoff.PR, handoff.HeadSHA, handoff.Validation, handoff.Feedback})
-		boundary, ok := runtime.Runner.(workerBoundaryRunner)
-		if !ok {
-			return errors.New("trusted boundary does not support durable handoff acceptance")
-		}
 		manifestBody, _ := json.Marshal(manifest)
-		outcomePath := filepath.Join(outcomeRoot, handoff.Key+".json")
+		outcomePath := handoffReceiptPath(manifest.Worktree, handoff.Key)
 		outcomeToken := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+handoff.Key)))
 		request, _ := json.Marshal(struct {
 			Manifest     json.RawMessage `json:"manifest"`
 			Handoff      json.RawMessage `json:"handoff"`
 			OutcomePath  string          `json:"outcome_path"`
 			OutcomeToken string          `json:"outcome_token"`
-		}{manifestBody, payload, outcomePath, outcomeToken})
+			Command      []string        `json:"command"`
+		}{manifestBody, payload, outcomePath, outcomeToken, command})
 		accepted, err := boundary.call(ctx, "accept-handoff", agentruntime.Command{Stdin: bytes.NewReader(request)})
 		var ack struct {
 			Type         string `json:"type"`

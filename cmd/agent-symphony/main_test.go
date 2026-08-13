@@ -33,6 +33,20 @@ type cleanupBoundary struct {
 	err       error
 }
 
+type directHandoffBoundary struct{ root string }
+
+func (b *directHandoffBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if operation != "accept-handoff" {
+		return agentruntime.Result{}, fmt.Errorf("unexpected operation %q", operation)
+	}
+	body, err := io.ReadAll(command.Stdin)
+	if err != nil {
+		return agentruntime.Result{}, err
+	}
+	out, err := acceptHandoff(ctx, body, b.root)
+	return agentruntime.Result{Output: out}, err
+}
+
 func (b *cleanupBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
 	if operation != "cleanup" {
 		return agentruntime.Result{}, fmt.Errorf("unexpected operation %q", operation)
@@ -189,7 +203,7 @@ func TestReviewFindingsRecoversWorkerReceiptAfterCoordinatorRestart(t *testing.T
 		t.Fatal(err)
 	}
 
-	ack, _ := json.Marshal(struct{ Type, Key, OutcomePath, OutcomeToken string }{"agent-symphony-handoff-executed-v1", key, manifest.LogPath + ".review-outcome", head})
+	ack, _ := json.Marshal(struct{ Type, Key, OutcomePath, OutcomeToken string }{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(manifest.Worktree, key), head})
 	result, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
 	calls, script := filepath.Join(worktree, "accepts"), filepath.Join(t.TempDir(), "boundary")
 	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\ncase \"$payload\" in *accept-handoff*) printf 'x\\n' >> %q;; esac\nprintf '%%s' '%s'\n", calls, result)
@@ -253,7 +267,8 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ack, _ := json.Marshal(struct{ Type, Key, OutcomePath, OutcomeToken string }{"agent-symphony-handoff-executed-v1", "independent-review-" + head, manifest.LogPath + ".review-outcome", head})
+	key := "independent-review-" + head
+	ack, _ := json.Marshal(struct{ Type, Key, OutcomePath, OutcomeToken string }{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(manifest.Worktree, key), head})
 	ackResult, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
 	boundaryLog, script := filepath.Join(worktree, "boundary.log"), filepath.Join(t.TempDir(), "boundary")
 	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\nprintf '%%s\\n' \"$payload\" >> %q\ncase \"$payload\" in\n  *operation*export*) printf '%%s' '%s';;\n  *) printf '%%s' '%s';;\nesac\n", boundaryLog, exportResult, ackResult)
@@ -1626,6 +1641,51 @@ func TestProductionHandoffOutcomeIsCompletedWithoutRedelivery(t *testing.T) {
 	}
 	if again, err := recovery.ClaimHandoffsFor(t.Context(), map[string]bool{"o/r#4/2": true}); err != nil || len(again) != 0 {
 		t.Fatalf("redelivered=%#v err=%v", again, err)
+	}
+}
+
+func TestResumeHandoffsDeliversConfiguredImplementationCommand(t *testing.T) {
+	root, stateRoot := t.TempDir(), t.TempDir()
+	worktree := filepath.Join(root, "attempt")
+	if err := os.MkdirAll(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(stateRoot, "state.json")
+	state := []internalgithub.PRState{{Repository: "o/r", Number: 3, Issue: 4, Attempt: 2, HeadSHA: "abcdef0", Facts: internalgithub.PRFacts{Feedback: []internalgithub.Feedback{{ID: 55, Source: "conversation", Execution: internalgithub.FeedbackClaimed}}}}}
+	body, _ := json.Marshal(state)
+	if err := os.WriteFile(statePath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, Worktree: worktree, Session: "as-4-2", LogPath: filepath.Join(worktree, "attempt.log")}
+	statuses := []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 4, Attempt: 2, State: "review-ready", Action: "resume monitoring the matching attempt"}}
+
+	oldExec := hostExecRunner
+	var respawn []string
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		if slices.Contains(command.Args, "show-options") {
+			return agentruntime.Result{}, errors.New("not delivered")
+		}
+		if slices.Contains(command.Args, "respawn-pane") {
+			respawn = slices.Clone(command.Args)
+		}
+		return agentruntime.Result{}, nil
+	}
+	t.Cleanup(func() { hostExecRunner = oldExec })
+
+	command := []string{"implementation", "--flag"}
+	boundary := &directHandoffBoundary{root: root}
+	if err := resumeHandoffs(t.Context(), boundary, statePath, stateRoot, statuses, []agentruntime.Manifest{manifest}, command); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(respawn, command[0]) || !slices.Contains(respawn, command[1]) {
+		t.Fatalf("respawn omitted implementation command: %q", respawn)
+	}
+	entries, err := os.ReadDir(filepath.Join(worktree, ".agent-symphony", "handoffs"))
+	if err != nil || !slices.ContainsFunc(entries, func(entry os.DirEntry) bool { return strings.HasSuffix(entry.Name(), ".receipt") }) {
+		t.Fatalf("handoff receipt missing: entries=%v err=%v", entries, err)
+	}
+	if again, err := (&internalgithub.FileRecovery{Path: statePath}).ClaimHandoffsFor(t.Context(), map[string]bool{"o/r#4/2": true}); err != nil || len(again) != 0 {
+		t.Fatalf("handoff redelivered: handoffs=%#v err=%v", again, err)
 	}
 }
 
