@@ -463,6 +463,47 @@ func (r *Runtime) Discover() ([]Manifest, error) {
 	return manifests, nil
 }
 
+// Forget removes one exact retained attempt record after its worker resources
+// have already been cleaned up by the implementation boundary.
+func (r *Runtime) Forget(manifest Manifest) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.canonicalizeStateRoot(); err != nil {
+		return err
+	}
+	attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		return err
+	}
+	stored, err := r.readManifest(attempt)
+	if err != nil {
+		return err
+	}
+	if err := r.validateManifest(attempt, stored); err != nil {
+		return err
+	}
+	for _, path := range []string{stored.Worktree, ResultPath(stored.Worktree)} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			if err == nil {
+				return fmt.Errorf("attempt worker resource still exists: %s", path)
+			}
+			return err
+		}
+	}
+	dir := filepath.Dir(r.manifestPath(attempt))
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("attempt record is not a non-symlink directory")
+	}
+	if err := rejectSymlinkPath(r.StateRoot, dir, false); err != nil {
+		return err
+	}
+	return os.RemoveAll(dir)
+}
+
 func (r *Runtime) identify(a Attempt) (Manifest, error) {
 	manifest, err := AttemptIdentity(r.Root, a)
 	if err != nil {

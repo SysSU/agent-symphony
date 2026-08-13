@@ -1,0 +1,115 @@
+:root {
+  color-scheme: light;
+  --ink: #182124;
+  --muted: #667579;
+  --line: #d9e0df;
+  --paper: #ffffff;
+  --ground: #f2f5f3;
+  --accent: #176b5d;
+  --warn: #9a5b00;
+  --bad: #a53232;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background: var(--ground);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+body.terminalOpen { overflow: hidden; }
+
+a { color: var(--accent); }
+a:focus-visible { outline: 3px solid #75b8ad; outline-offset: 3px; }
+
+main { width: min(1120px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0 72px; }
+
+.hero {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 32px;
+  margin-bottom: 32px;
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+h1 { margin: 0; overflow-wrap: anywhere; font-size: clamp(2rem, 5vw, 3.7rem); letter-spacing: -0.055em; }
+.freshness { margin: 10px 0 0; color: var(--muted); }
+
+.counts { display: flex; flex-wrap: wrap; justify-content: end; gap: 8px; }
+.count { min-width: 84px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); }
+.count strong, .count span { display: block; }
+.count strong { font-size: 1.35rem; }
+.count span { margin-top: 2px; color: var(--muted); font-size: 0.72rem; text-transform: uppercase; }
+
+.tabs { display: flex; gap: 8px; margin-bottom: 18px; border-bottom: 1px solid var(--line); }
+.tabs button { padding: 12px 14px; border: 0; border-bottom: 3px solid transparent; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-weight: 750; }
+.tabs button[aria-selected="true"] { border-bottom-color: var(--accent); color: var(--ink); }
+.tabs button:focus-visible { outline: 3px solid #75b8ad; outline-offset: 2px; }
+.tabs span { display: inline-block; min-width: 1.5rem; margin-left: 4px; padding: 2px 6px; border-radius: 999px; background: #e4eae8; font-size: 0.75rem; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr)); gap: 16px; }
+.card { min-width: 0; padding: 22px; border: 1px solid var(--line); border-radius: 16px; background: var(--paper); box-shadow: 0 7px 24px rgb(20 40 35 / 5%); }
+.cardHeader { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.issue { color: var(--ink); font-size: 1.05rem; font-weight: 750; text-decoration: none; }
+.issue:hover { text-decoration: underline; }
+.identity { margin: 6px 0 0; color: var(--muted); font-size: 0.85rem; }
+
+.state { flex: none; padding: 5px 8px; border-radius: 999px; background: #e7efed; color: var(--accent); font-size: 0.7rem; font-weight: 800; text-transform: uppercase; }
+.state-blocked, .state-failed, .state-conflicting { background: #fae7e4; color: var(--bad); }
+.state-queued, .state-eligible { background: #fff1d5; color: var(--warn); }
+
+dl { display: grid; gap: 12px; margin: 20px 0 0; }
+.detail { display: grid; grid-template-columns: 92px 1fr; gap: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+dt { color: var(--muted); font-size: 0.74rem; font-weight: 700; text-transform: uppercase; }
+dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+code { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.82rem; }
+.terminalLink { max-width: 100%; padding: 0; border: 0; background: transparent; color: var(--accent); cursor: pointer; text-align: left; text-decoration: underline; text-underline-offset: 3px; }
+.terminalLink code { white-space: normal; }
+.terminalLink:focus-visible { outline: 3px solid #75b8ad; outline-offset: 3px; }
+.line { display: block; }
+.line + .line { margin-top: 5px; }
+.notice { padding: 18px; border: 1px dashed #aebbb8; border-radius: 14px; background: var(--paper); color: var(--muted); }
+.cardActions { display: flex; justify-content: end; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.cardActions button { padding: 9px 12px; border: 1px solid; border-radius: 9px; background: transparent; cursor: pointer; font: inherit; font-weight: 750; }
+.cardActions button:disabled { cursor: wait; opacity: 0.6; }
+.cardActions button:focus-visible { outline: 3px solid #75b8ad; outline-offset: 2px; }
+.secondaryAction { border-color: #7b8986 !important; color: var(--ink); }
+.dangerAction { border-color: #d6a4a0 !important; color: var(--bad); }
+
+.terminalBackdrop { position: fixed; z-index: 10; inset: 0; display: grid; place-items: center; padding: 24px; background: rgb(8 14 15 / 72%); }
+.terminalPanel { display: flex; width: min(1100px, 100%); height: min(760px, 90vh); flex-direction: column; overflow: hidden; border: 1px solid #354345; border-radius: 16px; background: #101719; box-shadow: 0 24px 80px rgb(0 0 0 / 45%); color: #e8efed; }
+.terminalPanel > header { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 16px 18px; border-bottom: 1px solid #354345; }
+.terminalPanel h2 { max-width: min(75vw, 850px); margin: 0; overflow: hidden; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9rem; text-overflow: ellipsis; white-space: nowrap; }
+.terminalPanel button { padding: 8px 12px; border: 1px solid #697779; border-radius: 8px; background: transparent; color: #e8efed; cursor: pointer; }
+.terminalPanel button:focus-visible { outline: 3px solid #69c4b2; outline-offset: 2px; }
+.terminal { min-height: 0; flex: 1; padding: 12px; }
+.terminal .xterm { height: 100%; }
+
+@media (max-width: 680px) {
+  main { width: min(100% - 24px, 1120px); padding-top: 28px; }
+  .hero { align-items: start; flex-direction: column; gap: 20px; }
+  .hero > div { min-width: 0; max-width: 100%; }
+  h1 { max-width: 100%; word-break: break-word; }
+  .counts { justify-content: start; }
+  .grid { grid-template-columns: minmax(0, 1fr); width: 100%; }
+  .card { width: 100%; max-width: 100%; padding: 18px; }
+  .cardHeader { flex-direction: column-reverse; }
+  .detail { grid-template-columns: 1fr; gap: 5px; }
+  code { word-break: break-all; }
+  .terminalBackdrop { padding: 0; }
+  .terminalPanel { width: 100%; height: 100%; border: 0; border-radius: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { scroll-behavior: auto !important; }
+}

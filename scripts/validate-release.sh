@@ -3,13 +3,15 @@ set -eu
 
 version=${1:-0.0.0-local}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/agent-symphony-release.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+trap 'chmod -R u+w "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT HUP INT TERM
 export GOCACHE="$tmp/go-cache"
 export GOMODCACHE="$tmp/go-mod-cache"
 
 go test -race ./...
 go vet ./...
 sh -n scripts/*.sh
+test -s cmd/agent-symphony/dashboard/out/index.html
+test -s cmd/agent-symphony/dashboard/package-lock.json
 scripts/credential-scan-test.sh
 for script in scripts/*.sh; do
   ! grep -q "$(printf '\r')" "$script"

@@ -562,6 +562,34 @@ func TestCleanupAttemptRemovesOnlyVerifiedRuntimeResources(t *testing.T) {
 	}
 }
 
+func TestAbandonAttemptAcceptsExactFailedWorktreeWithoutWeakeningCleanup(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := cleanupTestManifest(t, root)
+	manifest.State, manifest.ReviewHead = "failed", ""
+	runGit(t, manifest.Worktree, "switch", "-c", "partially-prepared")
+	body, _ := json.Marshal(manifest)
+	if err := cleanupAttempt(t.Context(), body, root); err == nil {
+		t.Fatal("completed cleanup accepted a failed manifest")
+	}
+	oldExec := hostExecRunner
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		if len(command.Args) > 0 && command.Args[0] == "has-session" {
+			return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
+		}
+		return agentruntime.Result{}, fmt.Errorf("unexpected tmux command %v", command.Args)
+	}
+	t.Cleanup(func() { hostExecRunner = oldExec })
+	if err := abandonAttempt(t.Context(), body, root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("abandon retained worktree: %v", err)
+	}
+}
+
 func TestCleanupAttemptRejectsSubstitutedResources(t *testing.T) {
 	oldExec := hostExecRunner
 	hostExecRunner = func(context.Context, agentruntime.Command) (agentruntime.Result, error) {
