@@ -65,10 +65,12 @@ The GitHub CLI, connectivity, and permissions diagnostics should pass and identi
 
 ## 5. Label a test issue and reconcile
 
-Open an issue with any body text and add `agent-ready` plus exactly one configured priority label. The same GitHub account authenticated by `gh` may create the issue, apply labels, approve it, and leave feedback. Then choose one completion path:
+Open an issue with any body text and add `agent-ready` plus exactly one configured priority label. Apply `agent-ready` after the final body edit; that label authorizes dispatch and pull-request creation. Then choose one completion path:
 
 - For unattended completion, also add `autonomous-merge`.
-- For human review, omit that label and post the exact `/agent-symphony approve` comment from an authorized account.
+- For normal GitHub review and manual merge, omit `autonomous-merge`; Agent Symphony leaves the pull request open.
+
+The optional `needs-human-review` label adds an explicit review-policy label and pending Check, but it is not required to keep a non-autonomous pull request open.
 
 See [Issue eligibility and recorded blockers](cli.md#issue-eligibility-and-recorded-blockers) for every remaining dispatch and merge restriction. The latest blockers are persisted at `<runtime-state>/status.json`.
 

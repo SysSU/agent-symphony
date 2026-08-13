@@ -110,16 +110,13 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
 	body := "arbitrary issue body without structured sections"
 	var snapshotBodies []string
-	changed, approved := false, false
+	changed := false
 	posts := 0
 	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		comments := []any{map[string]any{"id": 50, "body": "/approve", "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 5}}}
 		for i, snapshotBody := range snapshotBodies {
 			createdAt := now.Add(time.Duration(2+i*2) * time.Minute)
 			comments = append(comments, map[string]any{"id": 60 + i*20, "body": snapshotBody, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
-		}
-		if approved {
-			comments = append(comments, map[string]any{"id": 70, "body": "/approve", "created_at": now.Add(4 * time.Minute), "updated_at": now.Add(4 * time.Minute), "user": map[string]any{"id": 5}})
 		}
 		var response any
 		switch r.Method + " " + r.URL.RequestURI() {
@@ -153,8 +150,6 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
 		case "GET /repos/o/r/issues/comments/50":
 			response = comments[0]
-		case "GET /repos/o/r/issues/comments/70":
-			response = comments[len(comments)-1]
 		case "GET /user/5":
 			response = map[string]any{"login": "owner"}
 		case "GET /repos/o/r/collaborators/owner/permission":
@@ -196,13 +191,12 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 		t.Fatalf("snapshot posts=%d, want 1", posts)
 	}
 	changed = true
-	stale, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || len(stale) != 1 || stale[0].Eligible || posts != 1 || !slices.Contains(stale[0].Blockers, "fresh exact approval command is missing") {
-		t.Fatalf("stale facts=%#v posts=%d err=%v", stale, posts, err)
+	changedFacts, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || len(changedFacts) != 1 || !changedFacts[0].Eligible || changedFacts[0].Priority != 2 || posts != 2 || len(changedFacts[0].Blockers) != 0 {
+		t.Fatalf("changed facts=%#v posts=%d err=%v", changedFacts, posts, err)
 	}
-	approved = true
 	readOnly, err = FetchIssueFacts(context.Background(), api, cfg, nil, false)
-	if err != nil || len(readOnly) != 1 || readOnly[0].Eligible || posts != 1 {
+	if err != nil || len(readOnly) != 1 || !readOnly[0].Eligible || readOnly[0].Priority != 2 || posts != 2 {
 		t.Fatalf("changed read-only facts=%#v posts=%d err=%v", readOnly, posts, err)
 	}
 	for range 2 {
@@ -319,7 +313,7 @@ func TestFetchIssueFactsAutonomousLabelsAuthorizeWithoutApproval(t *testing.T) {
 
 	edited = true
 	facts, err = FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || facts[0].Eligible || posts != 1 || !slices.Contains(facts[0].Blockers, "autonomous label does not authorize the current issue body") {
+	if err != nil || facts[0].Eligible || posts != 1 || !slices.Contains(facts[0].Blockers, "ready label does not authorize the current issue body") {
 		t.Fatalf("edited facts=%#v posts=%d err=%v", facts, posts, err)
 	}
 
@@ -337,13 +331,13 @@ func TestFetchIssueFactsAutonomousLabelsAuthorizeWithoutApproval(t *testing.T) {
 
 	snapshots, approved, priorityChanged, autonomous = nil, false, false, false
 	facts, err = FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || facts[0].Eligible || posts != 2 || !slices.Contains(facts[0].Blockers, "fresh exact approval command is missing") {
+	if err != nil || !facts[0].Eligible || !facts[0].DispatchAuthorized || posts != 3 || len(facts[0].Blockers) != 0 {
 		t.Fatalf("human-review facts=%#v posts=%d err=%v", facts, posts, err)
 	}
 
 	snapshots, autonomous, actor = nil, true, 42
 	facts, err = FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || !facts[0].Eligible || posts != 3 {
+	if err != nil || !facts[0].Eligible || posts != 4 {
 		t.Fatalf("same-user facts=%#v posts=%d err=%v", facts, posts, err)
 	}
 }

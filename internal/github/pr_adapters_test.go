@@ -241,22 +241,26 @@ func TestAuthorizedControlsFailClosedWithoutProductionConfiguration(t *testing.T
 	}
 }
 
-func TestHumanReviewRemovalRequiresExactVerifiedCompletionProvenance(t *testing.T) {
+func TestHumanReviewLabelRequiresExactVerifiedCompletionProvenance(t *testing.T) {
 	now := time.Now()
-	events := []issueTimelineEvent{{ID: 7, Event: "unlabeled", CreatedAt: now}}
+	events := []issueTimelineEvent{{ID: 7, Event: "labeled", CreatedAt: now}}
 	events[0].Actor.ID = 5
 	events[0].Label.Name = "review"
 	verified := []Provenance{{Name: "completion", Value: "human-review", Source: "timeline", EventID: 7, ActorID: 5, CreatedAt: now}}
-	if !reviewRemovalMatches(verified, events, "review") {
-		t.Fatal("exact authorized removal did not clear review")
+	if !reviewLabelMatches(verified, events, "review") {
+		t.Fatal("exact authorized label did not require review")
 	}
 	for _, provenance := range [][]Provenance{
 		{{Name: "completion", Value: "human-review", Source: "creation", ActorID: 9, CreatedAt: now}},
 		{{Name: "completion", Value: "human-review", Source: "timeline", EventID: 6, ActorID: 5, CreatedAt: now}},
 	} {
-		if reviewRemovalMatches(provenance, events, "review") {
-			t.Fatalf("unverified or stale removal cleared review: %#v", provenance)
+		if reviewLabelMatches(provenance, events, "review") {
+			t.Fatalf("absent or stale label required review: %#v", provenance)
 		}
+	}
+	events[0].Event = "unlabeled"
+	if reviewLabelMatches(verified, events, "review") {
+		t.Fatal("verified label removal still required review")
 	}
 }
 
@@ -558,7 +562,8 @@ func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t 
 				"/graphql": map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}, "pullRequest": map[string]any{"reviewDecision": nil}}}},
 			}
 			labelPresent, checkCreated, dropMarkerAfterFetch := false, false, false
-			freshMutation, commentReads, labelPosts, policyMutations := "", 0, 0, 0
+			freshMutation, policyComment := "", ""
+			commentReads, labelPosts, policyMutations := 0, 0, 0
 			api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				switch req.Method + " " + req.URL.RequestURI() {
 				case "GET /repos/o/r/pulls/3":
@@ -599,6 +604,19 @@ func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t 
 				case "POST /repos/o/r/statuses/abcdef0":
 					checkCreated, policyMutations = true, policyMutations+1
 					return httpResponse(http.StatusCreated, `{}`, nil), nil
+				case "GET /repos/o/r/issues/3/comments?per_page=100&page=1":
+					if policyComment == "" {
+						return httpResponse(http.StatusOK, `[]`, nil), nil
+					}
+					body, _ := json.Marshal([]any{map[string]any{"body": policyComment, "user": map[string]any{"id": 42}}})
+					return httpResponse(http.StatusOK, string(body), nil), nil
+				case "POST /repos/o/r/issues/3/comments":
+					var payload struct{ Body string }
+					if json.NewDecoder(req.Body).Decode(&payload) != nil {
+						t.Fatal("invalid policy comment")
+					}
+					policyComment = payload.Body
+					return httpResponse(http.StatusCreated, `{}`, nil), nil
 				}
 				value, ok := responses[req.URL.RequestURI()]
 				if !ok {
@@ -616,18 +634,18 @@ func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t 
 				}
 			}
 			states, err := (&FileRecovery{Path: path}).read()
-			if err != nil || len(states) != 1 || states[0].Number != 3 || states[0].Issue != 10 || states[0].Attempt != 2 || states[0].HeadSHA != "abcdef0" || labelPosts != 1 {
+			if err != nil || len(states) != 1 || states[0].Number != 3 || states[0].Issue != 10 || states[0].Attempt != 2 || states[0].HeadSHA != "abcdef0" || labelPosts != 0 {
 				t.Fatalf("states=%#v label posts=%d err=%v", states, labelPosts, err)
 			}
 			labelPresent, dropMarkerAfterFetch, commentReads = false, true, 0
 			beforePolicy := policyMutations
-			if err := RunPRReconciliation(context.Background(), api, cfg, path); err == nil || labelPosts != 1 || policyMutations != beforePolicy {
+			if err := RunPRReconciliation(context.Background(), api, cfg, path); err == nil || labelPosts != 0 || policyMutations != beforePolicy {
 				t.Fatalf("post-fetch App marker removal governed PR: label posts=%d policy mutations=%d err=%v", labelPosts, policyMutations-beforePolicy, err)
 			}
 			dropMarkerAfterFetch = false
 			for _, freshMutation = range []string{"marker head", "head SHA", "head ref"} {
 				beforePolicy = policyMutations
-				if err := RunPRReconciliation(context.Background(), api, cfg, path); err == nil || labelPosts != 1 || policyMutations != beforePolicy {
+				if err := RunPRReconciliation(context.Background(), api, cfg, path); err == nil || labelPosts != 0 || policyMutations != beforePolicy {
 					t.Fatalf("%s drift governed PR: label posts=%d policy mutations=%d err=%v", freshMutation, labelPosts, policyMutations-beforePolicy, err)
 				}
 			}

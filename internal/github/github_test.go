@@ -345,6 +345,32 @@ func TestSnapshotRequiresExactCurrentNonBodyProvenance(t *testing.T) {
 	}
 }
 
+func TestReadyLabelAuthorizesCurrentBodyWithoutApproval(t *testing.T) {
+	controls := Controls{Ready: true, Priority: 1, Completion: "human-review"}
+	now := time.Now().UTC()
+	anchor := Anchor{IssueNodeID: "I_5", CreatedAt: now, ChangedAt: now, AuthorID: 2}
+	provenance := provenanceFor(controls, 4)
+	for i := range provenance {
+		provenance[i].CreatedAt = now.Add(time.Second)
+	}
+	snapshot, err := NewSnapshot(controls, "body", anchor, Approval{}, provenance, "/approve", func(id int) bool { return id == 4 }, timelineFor(provenance))
+	if err != nil || snapshot.ApprovalID != 0 || snapshot.ApprovalActor != 0 {
+		t.Fatalf("label-only snapshot=%#v err=%v", snapshot, err)
+	}
+	anchor.ChangedAt = now.Add(2 * time.Second)
+	anchor.EditID = "edit"
+	if _, err := NewSnapshot(controls, "body", anchor, Approval{}, provenance, "/approve", func(id int) bool { return id == 4 }, timelineFor(provenance)); err == nil || !strings.Contains(err.Error(), "ready label") {
+		t.Fatalf("stale ready label err=%v", err)
+	}
+	controls.Completion = "autonomous-merge"
+	provenance[0].CreatedAt = now.Add(3 * time.Second)
+	provenance[2].Value = "autonomous-merge"
+	provenance[2].CreatedAt = now.Add(time.Second)
+	if _, err := NewSnapshot(controls, "body", anchor, Approval{}, provenance, "/approve", func(id int) bool { return id == 4 }, timelineFor(provenance)); err == nil || !strings.Contains(err.Error(), "autonomous label") {
+		t.Fatalf("stale autonomous label err=%v", err)
+	}
+}
+
 func TestCreationProvenanceAllowsOnlySafeDefaults(t *testing.T) {
 	now := time.Now().UTC()
 	anchor := Anchor{IssueNodeID: "I_5", CreatedAt: now, ChangedAt: now, AuthorID: 2}

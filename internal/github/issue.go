@@ -197,7 +197,7 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 	if authorized == nil || timeline == nil {
 		return Snapshot{}, errors.New("actor authorizer and authoritative timeline verifier are required")
 	}
-	labelOnly := controls.Completion == "autonomous-merge" && approval == (Approval{})
+	labelOnly := approval == (Approval{})
 	if !anchor.valid() || !labelOnly && (approval.CommentID <= 0 || approval.Body != command || !approval.CreatedAt.After(anchor.ChangedAt) || approval.ActorID == 0 || !authorized(approval.ActorID)) {
 		return Snapshot{}, errors.New("approval command is missing, stale, edited, or unauthorized")
 	}
@@ -210,7 +210,7 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 		"retry":      strconv.FormatBool(controls.Retry),
 	}
 	seen := make(map[string]bool, len(required))
-	var autonomous Provenance
+	var ready, autonomous Provenance
 	for _, p := range provenance {
 		creationDefault := p.Value == map[string]string{"ready": "false", "priority": "0", "completion": "human-review", "closed": "false", "cancelled": "false", "retry": "false"}[p.Name]
 		creation := p.Source == "creation" && creationDefault && p.EventID == 0 && p.ActorID == anchor.AuthorID && p.CreatedAt.Equal(anchor.CreatedAt)
@@ -219,7 +219,9 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 		if !creation && !mutation {
 			return Snapshot{}, errors.New("control provenance is missing or unauthorized")
 		}
-		if p.Name == "completion" {
+		if p.Name == "ready" {
+			ready = p
+		} else if p.Name == "completion" {
 			autonomous = p
 		}
 		value, ok := required[p.Name]
@@ -232,7 +234,10 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 		return Snapshot{}, errors.New("current non-body control provenance is missing")
 	}
 	if labelOnly {
-		if autonomous.Source != "timeline" || autonomous.Value != "autonomous-merge" || autonomous.CreatedAt.Before(anchor.ChangedAt) || autonomous.CreatedAt.Equal(anchor.ChangedAt) && anchor.EditID != "" {
+		if ready.Source != "timeline" || ready.Value != "true" || ready.CreatedAt.Before(anchor.ChangedAt) || ready.CreatedAt.Equal(anchor.ChangedAt) && anchor.EditID != "" {
+			return Snapshot{}, errors.New("ready label does not authorize the current issue body")
+		}
+		if controls.Completion == "autonomous-merge" && (autonomous.Source != "timeline" || autonomous.Value != "autonomous-merge" || autonomous.CreatedAt.Before(anchor.ChangedAt) || autonomous.CreatedAt.Equal(anchor.ChangedAt) && anchor.EditID != "") {
 			return Snapshot{}, errors.New("autonomous label does not authorize the current issue body")
 		}
 	}

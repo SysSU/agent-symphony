@@ -710,12 +710,12 @@ func (s *GitHubPRSource) readAuthorizedControls(ctx context.Context, issue int, 
 	if s.Config.ApprovalCommand == "" {
 		return nil
 	}
-	controls, humanReviewCleared, _, err := s.authorizedControls(ctx, issue)
+	controls, humanReviewRequired, _, err := s.authorizedControls(ctx, issue)
 	if err != nil {
 		return fmt.Errorf("fresh authorized issue controls: %w", err)
 	}
 	facts.IssueEligible = facts.IssueOpen && controls.Ready
-	facts.NeedsHumanReview = controls.Completion == "human-review" && !humanReviewCleared
+	facts.NeedsHumanReview = controls.Completion == "human-review" && humanReviewRequired
 	facts.AutonomousMerge = controls.Completion == "autonomous-merge"
 	return nil
 }
@@ -871,11 +871,7 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 	if found {
 		var approval Approval
 		if snapshot.ApprovalID == 0 {
-			if normalized.Controls.Completion == "autonomous-merge" {
-				err = authorizeActors()
-			} else {
-				err = errors.New("label-only authorization requires autonomous merge")
-			}
+			err = authorizeActors()
 		} else {
 			approval, err = readApproval(snapshot.ApprovalID)
 		}
@@ -888,7 +884,7 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 					}
 				}
 			}
-			return normalized.Controls, reviewRemovalMatches(provenance, events, s.Config.HumanReviewLabel), retry, nil
+			return normalized.Controls, reviewLabelMatches(provenance, events, s.Config.HumanReviewLabel), retry, nil
 		}
 		if !intake {
 			if err != nil {
@@ -898,54 +894,19 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 		}
 	}
 	if !normalized.Ready {
-		return Controls{}, false, nil, errors.New("issue controls are not eligible for approval")
+		return Controls{}, false, nil, errors.New("issue controls are not eligible for dispatch")
 	}
-	latestApproval := func() *issueCommentRecord {
-		changedAt := anchor.ChangedAt
-		for _, p := range provenance {
-			if p.CreatedAt.After(changedAt) {
-				changedAt = p.CreatedAt
-			}
-		}
-		var latest *issueCommentRecord
-		for i := range comments {
-			comment := &comments[i]
-			if comment.Body == s.Config.ApprovalCommand && comment.CreatedAt.Equal(comment.UpdatedAt) && comment.CreatedAt.After(changedAt) && (!found || comment.ID > snapshotCommentID) && (latest == nil || comment.CreatedAt.After(latest.CreatedAt) || comment.CreatedAt.Equal(latest.CreatedAt) && comment.ID > latest.ID) {
-				latest = comment
-			}
-		}
-		return latest
-	}
-	var approval Approval
-	if normalized.Controls.Completion == "autonomous-merge" {
-		if err := authorizeActors(); err != nil {
-			return Controls{}, false, nil, err
-		}
-		if _, labelErr := NewSnapshot(normalized.Controls, issue.Body, anchor, approval, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] }); labelErr != nil {
-			latest := latestApproval()
-			if latest == nil {
-				return Controls{}, false, nil, labelErr
-			}
-			approval, err = readApproval(latest.ID)
-		}
-	} else {
-		latest := latestApproval()
-		if latest == nil {
-			return Controls{}, false, nil, errors.New("fresh exact approval command is missing")
-		}
-		approval, err = readApproval(latest.ID)
-	}
-	if err != nil {
+	if err := authorizeActors(); err != nil {
 		return Controls{}, false, nil, err
 	}
-	created, err := NewSnapshot(normalized.Controls, issue.Body, anchor, approval, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] })
+	created, err := NewSnapshot(normalized.Controls, issue.Body, anchor, Approval{}, provenance, s.Config.ApprovalCommand, func(actor int) bool { return authorized[actor] }, func(p Provenance) bool { return timeline[p] })
 	if err != nil {
 		return Controls{}, false, nil, err
 	}
 	mutationErr := s.API.createControlSnapshot(ctx, s.Config.Repository, number, SnapshotComment(created))
-	controls, reviewCleared, retry, readErr := s.authorizedControls(ctx, number)
+	controls, reviewRequired, retry, readErr := s.authorizedControls(ctx, number)
 	if readErr == nil {
-		return controls, reviewCleared, retry, nil
+		return controls, reviewRequired, retry, nil
 	}
 	if mutationErr != nil {
 		return Controls{}, false, nil, mutationErr
@@ -953,11 +914,11 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 	return Controls{}, false, nil, fmt.Errorf("authoritative control snapshot reread: %w", readErr)
 }
 
-func reviewRemovalMatches(provenance []Provenance, events []issueTimelineEvent, label string) bool {
+func reviewLabelMatches(provenance []Provenance, events []issueTimelineEvent, label string) bool {
 	for _, p := range provenance {
 		if p.Name == "completion" && p.Source == "timeline" {
 			return slices.ContainsFunc(events, func(e issueTimelineEvent) bool {
-				return e.ID == p.EventID && e.Event == "unlabeled" && e.Label.Name == label
+				return e.ID == p.EventID && e.Event == "labeled" && e.Label.Name == label
 			})
 		}
 	}
