@@ -226,7 +226,7 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 			OutcomePath  string                `json:"outcome_path"`
 			OutcomeToken string                `json:"outcome_token"`
 			Command      []string              `json:"command"`
-		}{agentruntime.Manifest{Worktree: worktree, Session: "as-23-1", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, filepath.Join(worktree, "attempt.log.review-outcome"), "token", []string{"implementation"}})
+		}{agentruntime.Manifest{Worktree: worktree, Session: "as-23-1", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, handoffReceiptPath(worktree, "pane-test"), "token", []string{"implementation"}})
 		if _, err := acceptHandoff(t.Context(), request, worktree); err != nil {
 			t.Fatal(err)
 		}
@@ -444,7 +444,7 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 				OutcomePath  string                `json:"outcome_path"`
 				OutcomeToken string                `json:"outcome_token"`
 				Command      []string              `json:"command"`
-			}{agentruntime.Manifest{Worktree: worktree, Session: "as-retry", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, filepath.Join(worktree, "attempt.log.review-outcome"), "token", []string{"implementation"}})
+			}{agentruntime.Manifest{Worktree: worktree, Session: "as-retry", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, handoffReceiptPath(worktree, "retry-key"), "token", []string{"implementation"}})
 			recipient, deliveries, injected := "", 0, false
 			hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 				if slices.Contains(command.Args, "show-options") {
@@ -464,7 +464,7 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 				return agentruntime.Result{}, nil
 			}
 			immutableDirSync = func(dir string) error {
-				if !injected && failure == "receipt" && dir == worktree && recipient != "" {
+				if !injected && failure == "receipt" && dir == filepath.Join(worktree, ".agent-symphony", "handoffs") && recipient != "" {
 					injected = true
 					return errors.New("injected receipt sync failure")
 				}
