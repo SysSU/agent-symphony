@@ -9,7 +9,7 @@ Agent Symphony is a GitHub-native, multi-agent software delivery orchestrator in
 - Runs agents safely in isolated Git worktrees and tmux sessions
 - Handles pull-request feedback and validation across multiple agent runs
 - Provides a per-repository browser dashboard for monitoring attempts, opening live tmux sessions, and cleaning up local resources
-- Supports human-review gates and repository-policy-controlled merge
+- Leaves non-autonomous pull requests open for review and supports explicit autonomous merge
 - Keeps project documentation aligned with implementation changes
 - Recovers safely after restarts and reports operational status in the terminal
 - Runs on macOS, Linux, and Windows through WSL2

@@ -12,7 +12,7 @@ Before a pilot, verify the worker identity boundary, filesystem permissions, tmu
 
 `install-host` must run as root from the root-owned versioned release path. It writes only the two exact no-argument `agent-host` sudo tuples. `agent-host` rechecks its effective user and primary group in advanced mode; in the zero-admin default it instead runs as a plain subprocess of the coordinator, with no separate identity to verify. Either way it accepts one bounded JSON value, permits only Git/tmux execution below its provisioned root, and re-applies the shared credential environment filter. It never grants an agent GitHub authority.
 
-Fresh GitHub permission checks authorize actors. Required checks, commit statuses, review state, current head, and any available branch protection are re-read before merge; the coordinator never uses an administrative bypass.
+Fresh GitHub permission checks authorize actors. `agent-ready` authorizes dispatch only when it follows the latest body edit; `autonomous-merge` is a separate opt-in that must satisfy the same boundary. Without `autonomous-merge`, the coordinator never submits a merge. Required checks, commit statuses, review state, current head, and any available branch protection are re-read before an autonomous merge; the coordinator never uses an administrative bypass.
 
 ## Local dashboard boundary
 

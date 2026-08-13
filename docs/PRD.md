@@ -159,11 +159,11 @@ This journey requires bulk backlog evaluation, priority scheduling, dependency a
 
 ### Journey 2: Reviewing Sensitive Work
 
-Alex marks an issue `needs-human-review`. When the orchestrator opens the PR, it applies the same label and publishes a required review-policy Check. The PR cannot merge while that label remains, regardless of otherwise successful validation.
+Alex omits `autonomous-merge`. The orchestrator opens the PR, continues handling authorized feedback, and leaves the PR open for normal GitHub review and manual merge. No extra label or issue approval comment is required.
 
 The orchestrator continuously reconciles open agent PRs. When an authorized stakeholder posts an actionable review comment, the orchestrator promptly attaches it to the existing issue and execution context, then delegates the change to the appropriate sub-agent. This remains active for the full lifetime of the PR, even if new feedback arrives weeks later.
 
-The sub-agent updates code, tests, and affected documentation in the same worktree and PR. The orchestrator responds to or resolves handled feedback and reruns relevant validation. After stakeholders finish reviewing, they remove `needs-human-review`; the required Check passes only if all other completion conditions are satisfied, allowing normal repository merge policy to proceed.
+The sub-agent updates code, tests, and affected documentation in the same worktree and PR. The orchestrator responds to or resolves handled feedback and reruns relevant validation. Stakeholders review and merge through normal GitHub controls. Repositories that want an additional explicit gate may still apply `needs-human-review`; the orchestrator mirrors it to the PR and keeps its policy Check pending until removal.
 
 This journey requires synchronized issue and PR review labels, an enforceable required Check, long-lived PR monitoring, authorized feedback handling, preserved execution context, documentation gating, validation evidence, and branch-protection compliance.
 
