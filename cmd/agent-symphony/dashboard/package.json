@@ -2,7 +2,8 @@
   "name": "agent-symphony-dashboard",
   "private": true,
   "scripts": {
-    "build": "next build"
+    "build": "next build",
+    "test": "node --test app/health.test.mjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "0.11.0",
