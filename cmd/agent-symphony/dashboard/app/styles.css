@@ -6,6 +6,7 @@
   --paper: #ffffff;
   --ground: #f2f5f3;
   --accent: #176b5d;
+  --good: #176b3a;
   --warn: #9a5b00;
   --bad: #a53232;
 }
@@ -50,6 +51,17 @@ h1 { margin: 0; overflow-wrap: anywhere; font-size: clamp(2rem, 5vw, 3.7rem); le
 .count strong, .count span { display: block; }
 .count strong { font-size: 1.35rem; }
 .count span { margin-top: 2px; color: var(--muted); font-size: 0.72rem; text-transform: uppercase; }
+
+.health { display: flex; align-items: start; gap: 12px; margin-bottom: 24px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); }
+.healthDot { flex: none; width: 12px; height: 12px; margin-top: 5px; border-radius: 50%; background: var(--muted); }
+.health h2 { margin: 0; font-size: 1rem; }
+.health p { margin: 4px 0 0; color: var(--muted); }
+.health-good { border-color: #a8cdb4; background: #edf8f0; }
+.health-good .healthDot { background: var(--good); box-shadow: 0 0 0 4px rgb(23 107 58 / 12%); }
+.health-attention, .health-stale { border-color: #dfc28d; background: #fff8e9; }
+.health-attention .healthDot, .health-stale .healthDot { background: var(--warn); box-shadow: 0 0 0 4px rgb(154 91 0 / 12%); }
+.health-unavailable { border-color: #dbaca8; background: #fff0ee; }
+.health-unavailable .healthDot { background: var(--bad); box-shadow: 0 0 0 4px rgb(165 50 50 / 12%); }
 
 .tabs { display: flex; gap: 8px; margin-bottom: 18px; border-bottom: 1px solid var(--line); }
 .tabs button { padding: 12px 14px; border: 0; border-bottom: 3px solid transparent; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-weight: 750; }
@@ -101,6 +113,7 @@ code { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo
   .hero > div { min-width: 0; max-width: 100%; }
   h1 { max-width: 100%; word-break: break-word; }
   .counts { justify-content: start; }
+  .health { padding: 14px; }
   .grid { grid-template-columns: minmax(0, 1fr); width: 100%; }
   .card { width: 100%; max-width: 100%; padding: 18px; }
   .cardHeader { flex-direction: column-reverse; }

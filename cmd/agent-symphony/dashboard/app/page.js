@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { overallHealth } from "./health.mjs";
+
 const refreshEvery = 5000;
 
 function githubURL(repository, kind, number) {
@@ -277,6 +279,7 @@ export default function Dashboard() {
   const current = statuses.filter((status) => status.state !== "completed");
   const completed = statuses.filter((status) => status.state === "completed");
   const visible = tab === "completed" ? completed : current;
+  const health = overallHealth(snapshot, error, statuses, now);
 
   return (
     <main>
@@ -298,7 +301,14 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {error ? <p className="notice" role="status">{error}</p> : null}
+      <section className={`health health-${health.state}`} role="status" aria-live="polite" aria-atomic="true">
+        <span className="healthDot" aria-hidden="true" />
+        <div>
+          <h2>{health.title}</h2>
+          <p>{health.detail}</p>
+        </div>
+      </section>
+
       {actionNotice ? <p className="notice" role="status">{actionNotice}</p> : null}
       {!error && snapshot && statuses.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
 
