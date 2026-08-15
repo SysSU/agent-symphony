@@ -329,7 +329,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		recoverAttempt := func(ctx context.Context, issue, attempt int) error {
 			return recoverDashboardAttempt(ctx, *path, *statePath, *runtimeState, issue, attempt)
 		}
-		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, recoverAttempt, *allowUnsafeDashboardNetwork, *dashboardPassword, stderr)
+		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, recoverAttempt, agent, *allowUnsafeDashboardNetwork, *dashboardPassword, stderr)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}

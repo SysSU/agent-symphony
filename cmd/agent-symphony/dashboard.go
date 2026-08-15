@@ -24,6 +24,7 @@ import (
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
+	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 	"github.com/coder/websocket"
 	"github.com/creack/pty"
@@ -40,15 +41,16 @@ const (
 var dashboardFiles embed.FS
 
 type dashboardServer struct {
-	ctx       context.Context
-	stateRoot string
-	tmux      string
-	allowNet  bool
-	password  string
-	cleanup   func(context.Context, string, agentruntime.Manifest) error
-	recover   func(context.Context, int, int) error
-	mu        *sync.Mutex
-	localMu   sync.Mutex
+	ctx          context.Context
+	stateRoot    string
+	tmux         string
+	allowNet     bool
+	password     string
+	orchestrator orchestratoragent.Service
+	cleanup      func(context.Context, string, agentruntime.Manifest) error
+	recover      func(context.Context, int, int) error
+	mu           *sync.Mutex
+	localMu      sync.Mutex
 }
 
 type dashboardHiddenAttempt struct {
@@ -72,16 +74,16 @@ func newDashboardHandler(ctx context.Context, stateRoot, tmux string) http.Handl
 }
 
 func newDashboardHandlerWithMutex(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex) http.Handler {
-	return newDashboardHandlerWithOptions(ctx, stateRoot, tmux, operationMu, nil, false, "")
+	return newDashboardHandlerWithOptions(ctx, stateRoot, tmux, operationMu, nil, nil, false, "")
 }
 
-func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, allowNet bool, password string) http.Handler {
+func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
 	assets, err := fs.Sub(dashboardFiles, "dashboard/out")
 	if err != nil {
 		panic(err)
 	}
 	static := http.FileServer(http.FS(assets))
-	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, mu: operationMu, recover: recover}
+	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, mu: operationMu}
 	server.cleanup = server.cleanupAttempt
 	return server.handler(static)
 }
@@ -102,6 +104,10 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 			s.serveAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/"))
 			return
 		}
+		if strings.HasPrefix(r.URL.Path, "/actions/orchestrator/") {
+			s.serveOrchestratorAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/orchestrator/"))
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -115,12 +121,45 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 			s.serveState(w, r)
 			return
 		}
+		if r.URL.Path == "/orchestrator.json" {
+			s.serveOrchestratorStatus(w, r)
+			return
+		}
+		if r.URL.Path == "/orchestrator/terminal" {
+			s.serveOrchestratorTerminal(w, r)
+			return
+		}
 		if r.URL.Path == "/terminal" {
 			s.serveTerminal(w, r)
 			return
 		}
 		static.ServeHTTP(w, r)
 	})
+}
+
+func (s *dashboardServer) serveOrchestratorStatus(w http.ResponseWriter, r *http.Request) {
+	status := orchestratoragent.Status{Version: 1, UpdatedAt: time.Now().UTC(), State: "disabled"}
+	if s.orchestrator != nil {
+		var err error
+		status, err = s.orchestrator.Status(r.Context())
+		if err != nil {
+			http.Error(w, "orchestrator status is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		status.Diagnostic = internalgithub.Redact(status.Diagnostic)
+	}
+	body, err := json.Marshal(status)
+	if err != nil {
+		http.Error(w, "orchestrator status is unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write(body)
+	}
 }
 
 func (s *dashboardServer) authenticate(w http.ResponseWriter, r *http.Request) bool {
@@ -376,6 +415,90 @@ func (s *dashboardServer) cleanupAttempt(ctx context.Context, action string, man
 	return err
 }
 
+func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http.Request, action string) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "action requires POST", http.StatusMethodNotAllowed)
+		return
+	}
+	if !sameDashboardOrigin(r) {
+		http.Error(w, "action requires the dashboard origin", http.StatusForbidden)
+		return
+	}
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 || !slices.Contains([]string{"recover", "clear", "rebuild", "investigate"}, action) {
+		http.Error(w, "invalid orchestrator action", http.StatusBadRequest)
+		return
+	}
+	if s.orchestrator == nil {
+		http.Error(w, "orchestrator is disabled", http.StatusConflict)
+		return
+	}
+	issue, attempt := 0, 0
+	if action == "investigate" {
+		var issueErr, attemptErr error
+		issue, issueErr = strconv.Atoi(r.URL.Query().Get("issue"))
+		attempt, attemptErr = strconv.Atoi(r.URL.Query().Get("attempt"))
+		query := r.URL.Query()
+		if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || len(query) != 2 || len(query["issue"]) != 1 || len(query["attempt"]) != 1 {
+			http.Error(w, "invalid orchestrator action", http.StatusBadRequest)
+			return
+		}
+	} else if len(r.URL.Query()) != 0 {
+		http.Error(w, "invalid orchestrator action", http.StatusBadRequest)
+		return
+	}
+	operationMu := s.mu
+	if operationMu == nil {
+		operationMu = &s.localMu
+	}
+	if !operationMu.TryLock() {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
+		return
+	}
+	defer operationMu.Unlock()
+
+	var result orchestratoragent.Status
+	var err error
+	switch action {
+	case "recover":
+		result, err = s.orchestrator.Recover(r.Context())
+	case "clear":
+		result, err = s.orchestrator.Clear(r.Context())
+	case "rebuild":
+		result, err = s.orchestrator.Rebuild(r.Context())
+	case "investigate":
+		orchestratorStatus, statusErr := s.orchestrator.Status(r.Context())
+		if statusErr != nil || !orchestratorStatus.Enabled || orchestratorStatus.State != "running" {
+			http.Error(w, "orchestrator is not running", http.StatusConflict)
+			return
+		}
+		status, statusErr := s.projectedStatus(issue, attempt)
+		if statusErr != nil || !orchestratorAttentionState(status.State) {
+			http.Error(w, "attempt is not eligible for investigation", http.StatusConflict)
+			return
+		}
+		result, err = s.orchestrator.Investigate(r.Context(), status.Issue, status.Attempt)
+	}
+	if err != nil {
+		http.Error(w, "orchestrator action was refused", http.StatusConflict)
+		return
+	}
+	result.Diagnostic = internalgithub.Redact(result.Diagnostic)
+	body, _ := json.Marshal(struct {
+		OK     bool                     `json:"ok"`
+		Status orchestratoragent.Status `json:"status"`
+	}{true, result})
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func orchestratorAttentionState(state string) bool {
+	return slices.Contains([]string{"blocked", "failed", "conflicting", "orphaned"}, state)
+}
+
 func sameDashboardOrigin(r *http.Request) bool {
 	origin, err := url.Parse(r.Header.Get("Origin"))
 	return err == nil && origin.Scheme == "http" && strings.EqualFold(origin.Host, r.Host)
@@ -397,6 +520,18 @@ func dashboardHostAllowed(value string, allowNet bool) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+func dashboardRequestLoopback(r *http.Request) bool {
+	if !dashboardHostAllowed(r.Host, false) {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
 func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "terminal requires GET", http.StatusMethodNotAllowed)
@@ -413,7 +548,36 @@ func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "terminal session is not available", http.StatusNotFound)
 		return
 	}
-	if exec.CommandContext(r.Context(), s.tmux, "has-session", "-t", "="+status.Session).Run() != nil {
+	s.serveTerminalSession(w, r, status.Session)
+}
+
+func (s *dashboardServer) serveOrchestratorTerminal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "terminal requires GET", http.StatusMethodNotAllowed)
+		return
+	}
+	if !sameDashboardOrigin(r) {
+		http.Error(w, "terminal requires the dashboard origin", http.StatusForbidden)
+		return
+	}
+	if !dashboardRequestLoopback(r) {
+		http.Error(w, "orchestrator terminal requires loopback access", http.StatusForbidden)
+		return
+	}
+	if s.orchestrator == nil {
+		http.Error(w, "orchestrator terminal is not available", http.StatusNotFound)
+		return
+	}
+	target, err := s.orchestrator.AttachTarget(r.Context())
+	if err != nil || target.Session == "" || strings.ContainsAny(target.Session, "\x00\r\n") {
+		http.Error(w, "orchestrator terminal is not available", http.StatusConflict)
+		return
+	}
+	s.serveTerminalSession(w, r, target.Session)
+}
+
+func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Request, session string) {
+	if exec.CommandContext(r.Context(), s.tmux, "has-session", "-t", "="+session).Run() != nil {
 		http.Error(w, "terminal session is not running", http.StatusConflict)
 		return
 	}
@@ -425,7 +589,7 @@ func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request) 
 	conn.SetReadLimit(maxTerminalInputBytes)
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
-	command := exec.CommandContext(ctx, s.tmux, "attach-session", "-t", "="+status.Session)
+	command := exec.CommandContext(ctx, s.tmux, "attach-session", "-t", "="+session)
 	command.Env = append(os.Environ(), "TERM=xterm-256color")
 	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 24, Cols: 80})
 	if err != nil {
@@ -518,7 +682,7 @@ func (s *dashboardServer) terminalStatus(issue, attempt int) (orchestrator.Recov
 	return s.projectedStatus(issue, attempt)
 }
 
-func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, allowNet bool, password string, log io.Writer) (string, error) {
+func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", fmt.Errorf("dashboard address: %w", err)
@@ -538,7 +702,7 @@ func startDashboard(ctx context.Context, address, stateRoot string, operationMu 
 	if err != nil {
 		return "", fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
-	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, recover, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, recover, service, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
 		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password may be visible in process listings, and anyone with it can use terminals and cleanup controls")
 	}

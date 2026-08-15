@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { overallHealth } from "./health.mjs";
+import { canInvestigate, orchestratorPresentation, overallHealth } from "./health.mjs";
 
 const refreshEvery = 5000;
 
@@ -39,9 +39,12 @@ function Detail({ label, children }) {
   );
 }
 
-function TerminalPanel({ status, onClose }) {
+function TerminalPanel({ config, onClose }) {
   const container = useRef(null);
   const closeButton = useRef(null);
+  const panel = useRef(null);
+  const opener = useRef(null);
+  const [connection, setConnection] = useState("Connecting…");
 
   useEffect(() => {
     let disposed = false;
@@ -71,18 +74,23 @@ function TerminalPanel({ status, onClose }) {
       terminal.focus();
 
       const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const query = new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) });
-      socket = new WebSocket(`${scheme}//${window.location.host}/terminal?${query}`);
+      socket = new WebSocket(`${scheme}//${window.location.host}${config.endpoint}`);
       socket.binaryType = "arraybuffer";
       const sendSize = () => {
         if (socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: "resize", cols: terminal.cols, rows: terminal.rows }));
         }
       };
-      socket.addEventListener("open", sendSize);
+      socket.addEventListener("open", () => {
+        setConnection("Connected");
+        sendSize();
+      });
       socket.addEventListener("message", (event) => terminal.write(new Uint8Array(event.data)));
       socket.addEventListener("close", (event) => {
-        terminal.writeln(`\r\n\x1b[33mTerminal disconnected${event.reason ? `: ${event.reason}` : "."}\x1b[0m`);
+        if (disposed) return;
+        const message = `Terminal disconnected${event.reason ? `: ${event.reason}` : "."}`;
+        setConnection(message);
+        terminal.writeln(`\r\n\x1b[33m${message}\x1b[0m`);
       });
       input = terminal.onData((data) => {
         if (socket.readyState === WebSocket.OPEN) socket.send(new TextEncoder().encode(data));
@@ -95,40 +103,66 @@ function TerminalPanel({ status, onClose }) {
     }
 
     connect().catch(() => {
+      setConnection("Terminal failed to load.");
       if (container.current) container.current.textContent = "Terminal failed to load.";
     });
+    opener.current = document.activeElement;
     closeButton.current?.focus();
-    const escape = (event) => { if (event.key === "Escape") onClose(); };
-    window.addEventListener("keydown", escape);
+    const keyboard = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab" || !panel.current) return;
+      const focusable = [...panel.current.querySelectorAll("button, [href], input, textarea, [tabindex]:not([tabindex='-1'])")]
+        .filter((element) => !element.disabled && element.getAttribute("aria-hidden") !== "true");
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!panel.current.contains(document.activeElement)) {
+        event.preventDefault();
+        first.focus();
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", keyboard);
     document.body.classList.add("terminalOpen");
     return () => {
       disposed = true;
-      window.removeEventListener("keydown", escape);
+      window.removeEventListener("keydown", keyboard);
       document.body.classList.remove("terminalOpen");
       resizeObserver?.disconnect();
       input?.dispose();
       socket?.close();
       terminal?.dispose();
+      opener.current?.focus();
     };
-  }, [onClose, status.attempt, status.issue]);
+  }, [config.endpoint, onClose]);
 
   return (
-    <div className="terminalBackdrop" role="dialog" aria-modal="true" aria-labelledby="terminalTitle">
-      <section className="terminalPanel">
+    <div className="terminalBackdrop" role="dialog" aria-modal="true" aria-labelledby="terminalTitle" aria-describedby="terminalConnection">
+      <section className="terminalPanel" ref={panel}>
         <header>
           <div>
-            <p className="eyebrow">tmux session</p>
-            <h2 id="terminalTitle">{status.session}</h2>
+            <p className="eyebrow">{config.eyebrow}</p>
+            <h2 id="terminalTitle">{config.title}</h2>
+            <p className="terminalConnection" id="terminalConnection" role="status" aria-live="polite">{connection}</p>
           </div>
           <button ref={closeButton} type="button" onClick={onClose}>Close</button>
         </header>
-        <div className="terminal" ref={container} aria-label={`Terminal for ${status.session}`} />
+        <div className="terminal" ref={container} aria-label={`Terminal for ${config.title}`} />
       </section>
     </div>
   );
 }
 
-function StatusCard({ status, onOpenTerminal, onAction, busy, waiting }) {
+function StatusCard({ status, onOpenTerminal, onAction, onInvestigate, investigationEnabled, investigationBusy, busy, investigating, waiting }) {
   const issueURL = githubURL(status.repository, "issues", status.issue);
   const prURL = githubURL(status.repository, "pull", status.pr);
   const issueLabel = status.title ? `#${status.issue} ${status.title}` : `Issue #${status.issue}`;
@@ -172,19 +206,80 @@ function StatusCard({ status, onOpenTerminal, onAction, busy, waiting }) {
         <Detail label="Diagnostic">{status.diagnostic}</Detail>
         <Detail label="Next action">{status.next_action}</Detail>
       </dl>
-      {status.state === "completed" || status.state === "orphaned" || status.retryable ? (
-		<footer className="cardActions">
-		  <button
-			className={status.state === "completed" ? "secondaryAction" : "dangerAction"}
-			type="button"
-			disabled={busy}
-			onClick={() => onAction(status.retryable ? "recover" : status.state === "completed" ? "archive" : "abandon", status)}
-		  >
-			{waiting ? "Waiting for reconciliation…" : busy ? "Working…" : status.retryable ? "Recover attempt" : status.state === "completed" ? "Archive" : "Abandon attempt"}
-		  </button>
+      {status.state === "completed" || status.state === "orphaned" || status.retryable || investigationEnabled && canInvestigate(status) ? (
+        <footer className="cardActions">
+          {investigationEnabled && canInvestigate(status) ? (
+            <button className="primaryAction" type="button" disabled={investigationBusy} onClick={() => onInvestigate(status)}>
+              {investigating ? "Requesting…" : "Ask orchestrator to investigate"}
+            </button>
+          ) : null}
+          {status.state === "completed" || status.state === "orphaned" || status.retryable ? (
+            <button
+              className={status.state === "completed" ? "secondaryAction" : "dangerAction"}
+              type="button"
+              disabled={busy}
+              onClick={() => onAction(status.retryable ? "recover" : status.state === "completed" ? "archive" : "abandon", status)}
+            >
+              {waiting ? "Waiting for reconciliation…" : busy ? "Working…" : status.retryable ? "Recover attempt" : status.state === "completed" ? "Archive" : "Abandon attempt"}
+            </button>
+          ) : null}
         </footer>
       ) : null}
     </article>
+  );
+}
+
+function Timestamp({ value }) {
+  if (!value || value.startsWith("0001-")) return "—";
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? <time dateTime={value}>{parsed.toLocaleString()}</time> : "—";
+}
+
+function OrchestratorCard({ status, error, busy, onAction, onOpenTerminal }) {
+  const presentation = orchestratorPresentation(status, error);
+  const enabled = Boolean(status?.enabled);
+  const working = Boolean(busy);
+
+  return (
+    <section className="orchestratorCard" aria-labelledby="orchestratorTitle">
+      <header className="cardHeader">
+        <div>
+          <p className="eyebrow">Supervised agent</p>
+          <h2 id="orchestratorTitle">Orchestrator</h2>
+          <p className="identity">Long-lived operator and diagnostic console</p>
+        </div>
+        <span className={`state state-${presentation.state}`} role="status" aria-live="polite">{presentation.label}</span>
+      </header>
+      <dl>
+        <Detail label="tmux session">
+          {status?.session ? (
+            <button className="terminalLink" type="button" disabled={status.state !== "running"} onClick={onOpenTerminal}>
+              <code>{status.session}</code>
+            </button>
+          ) : "—"}
+        </Detail>
+        <Detail label="Context">{status?.generation ? `Generation ${status.generation} · ${status.context_mode || "unknown"}` : "—"}</Detail>
+        <Detail label="Started"><Timestamp value={status?.started_at} /></Detail>
+        <Detail label="Rebuilt"><Timestamp value={status?.rebuilt_at} /></Detail>
+        <Detail label="Last healthy"><Timestamp value={status?.last_healthy_at} /></Detail>
+        <Detail label="Retry"><Timestamp value={status?.retry_at} /></Detail>
+        <Detail label="Pending notices">{String(status?.pending_attention ?? 0)}</Detail>
+        <Detail label="Diagnostic">{error || status?.diagnostic}</Detail>
+        <Detail label="Next action">{status?.next_action}</Detail>
+      </dl>
+      {enabled ? (
+        <footer className="cardActions orchestratorActions">
+          <button className="primaryAction" type="button" disabled={status.state !== "running" || working} onClick={onOpenTerminal}>Open terminal</button>
+          <button className="secondaryAction" type="button" disabled={working} onClick={() => onAction("recover")}>{busy === "recover" ? "Recovering…" : "Recover/restart"}</button>
+          <button className="dangerAction" type="button" disabled={working} onClick={() => onAction("clear")}>{busy === "clear" ? "Clearing…" : "Clear context"}</button>
+          <button className="secondaryAction" type="button" disabled={working} onClick={() => onAction("rebuild")}>{busy === "rebuild" ? "Rebuilding…" : "Rebuild context"}</button>
+        </footer>
+      ) : status ? (
+        <p className="orchestratorDisabled">Configure an orchestrator command to enable this console.</p>
+      ) : (
+        <p className="orchestratorDisabled">{error || "Loading orchestrator status…"}</p>
+      )}
+    </section>
   );
 }
 
@@ -198,15 +293,25 @@ export default function Dashboard() {
   const [now, setNow] = useState(Date.now());
   const [tab, setTab] = useState("current");
   const [terminal, setTerminal] = useState(null);
+  const [orchestratorStatus, setOrchestratorStatus] = useState(null);
+  const [orchestratorError, setOrchestratorError] = useState("");
+  const [orchestratorBusy, setOrchestratorBusy] = useState("");
+  const [investigating, setInvestigating] = useState("");
   const closeTerminal = useCallback(() => setTerminal(null), []);
 
   useEffect(() => {
     let active = true;
     async function refresh() {
       try {
-        const [response, stateResponse] = await Promise.all([
+        const orchestratorRequest = fetch("/orchestrator.json", { cache: "no-store" })
+          .then(async (response) => response.ok
+            ? { status: await response.json(), error: "" }
+            : { status: null, error: (await response.text()).trim() || `Orchestrator status failed (${response.status})` })
+          .catch(() => ({ status: null, error: "Orchestrator status is unavailable" }));
+        const [response, stateResponse, orchestratorResult] = await Promise.all([
           fetch("/status.json", { cache: "no-store" }),
           fetch("/dashboard-state.json", { cache: "no-store" }),
+          orchestratorRequest,
         ]);
         if (!response.ok) throw new Error(response.status === 404 ? "Waiting for the first reconciliation" : `Status request failed (${response.status})`);
         if (!stateResponse.ok) throw new Error(`Dashboard state request failed (${stateResponse.status})`);
@@ -214,6 +319,8 @@ export default function Dashboard() {
         if (active) {
           setSnapshot(next);
           setDashboardState(nextState);
+          setOrchestratorStatus(orchestratorResult.status);
+          setOrchestratorError(orchestratorResult.error);
           setError("");
           setNow(Date.now());
         }
@@ -266,6 +373,37 @@ export default function Dashboard() {
     }
   }, []);
 
+  const performOrchestratorAction = useCallback(async (action, status) => {
+    const confirmations = {
+      recover: "Recover or restart the orchestrator?\n\nThis ensures the supervised tmux session is running. The current context is kept when it can be adopted safely.",
+      clear: "Clear orchestrator context?\n\nThis discards the current conversation and relaunches with role and safety rules only.",
+      rebuild: "Rebuild orchestrator context?\n\nThis discards the current conversation and relaunches from a fresh authoritative projection.",
+    };
+    if (confirmations[action] && !window.confirm(confirmations[action])) return;
+    const key = status ? attemptKey(status) : action;
+    setOrchestratorBusy(action);
+    if (action === "investigate") setInvestigating(key);
+    setActionNotice("");
+    try {
+      const query = status ? `?${new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) })}` : "";
+      const response = await fetch(`/actions/orchestrator/${action}${query}`, { method: "POST" });
+      if (!response.ok) throw new Error((await response.text()).trim() || `Orchestrator ${action} failed (${response.status})`);
+      const result = await response.json();
+      if (result.status) {
+        setOrchestratorStatus(result.status);
+        setOrchestratorError("");
+      }
+      setActionNotice(action === "investigate"
+        ? `Asked the orchestrator to investigate issue #${status.issue}, attempt ${status.attempt}.`
+        : `Orchestrator ${action} requested.`);
+    } catch (reason) {
+      setActionNotice(reason instanceof Error ? reason.message : `Orchestrator ${action} failed.`);
+    } finally {
+      setOrchestratorBusy("");
+      setInvestigating("");
+    }
+  }, []);
+
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
@@ -283,6 +421,14 @@ export default function Dashboard() {
   const completed = statuses.filter((status) => status.state === "completed");
   const visible = tab === "completed" ? completed : current;
   const health = overallHealth(snapshot, error, statuses, now);
+  const openAttemptTerminal = useCallback((status) => {
+    const query = new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) });
+    setTerminal({ endpoint: `/terminal?${query}`, title: status.session, eyebrow: "tmux session" });
+  }, []);
+  const openOrchestratorTerminal = useCallback(() => {
+    if (!orchestratorStatus?.session) return;
+    setTerminal({ endpoint: "/orchestrator/terminal", title: orchestratorStatus.session, eyebrow: "orchestrator tmux session" });
+  }, [orchestratorStatus?.session]);
 
   return (
     <main>
@@ -311,6 +457,14 @@ export default function Dashboard() {
           <p>{health.detail}</p>
         </div>
       </section>
+
+      <OrchestratorCard
+        status={orchestratorStatus}
+        error={orchestratorError}
+        busy={orchestratorBusy}
+        onAction={(action) => performOrchestratorAction(action)}
+        onOpenTerminal={openOrchestratorTerminal}
+      />
 
       {actionNotice ? <p className="notice" role="status">{actionNotice}</p> : null}
       {!error && snapshot && statuses.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
@@ -345,14 +499,18 @@ export default function Dashboard() {
           <StatusCard
             key={`${status.repository}-${status.issue}-${status.attempt}`}
             status={status}
-            onOpenTerminal={setTerminal}
+            onOpenTerminal={openAttemptTerminal}
             onAction={performAction}
+            onInvestigate={(status) => performOrchestratorAction("investigate", status)}
+            investigationEnabled={Boolean(orchestratorStatus?.enabled && orchestratorStatus.state === "running")}
+            investigationBusy={Boolean(orchestratorBusy)}
             busy={busy === attemptKey(status)}
+            investigating={investigating === attemptKey(status)}
             waiting={waiting && busy === attemptKey(status)}
           />
         ))}
       </section>
-      {terminal ? <TerminalPanel status={terminal} onClose={closeTerminal} /> : null}
+      {terminal ? <TerminalPanel config={terminal} onClose={closeTerminal} /> : null}
     </main>
   );
 }
