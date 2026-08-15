@@ -41,6 +41,7 @@ func TestDashboardServesEmbeddedNextPageAndStatus(t *testing.T) {
 	}{
 		{http.MethodGet, "/", http.StatusOK, "Agent Symphony"},
 		{http.MethodGet, "/status.json", http.StatusOK, want},
+		{http.MethodGet, "/orchestrator.json", http.StatusOK, `"state":"disabled"`},
 		{http.MethodHead, "/status.json", http.StatusOK, ""},
 		{http.MethodPost, "/status.json", http.StatusMethodNotAllowed, "method not allowed"},
 	} {
@@ -210,6 +211,191 @@ func TestDashboardUnsafeNetworkBindingWarnsAndAcceptsAuthentication(t *testing.T
 	response.Body.Close()
 	if !strings.Contains(log.String(), "WARNING: unsafe dashboard network access enabled") || !strings.Contains(log.String(), "unencrypted") {
 		t.Fatalf("unsafe dashboard warning=%q", log.String())
+	}
+}
+
+type fakeDashboardOrchestrator struct {
+	status  dashboardOrchestratorStatus
+	target  dashboardOrchestratorAttachTarget
+	err     error
+	actions []string
+}
+
+func (f *fakeDashboardOrchestrator) Status(context.Context) (dashboardOrchestratorStatus, error) {
+	return f.status, f.err
+}
+func (f *fakeDashboardOrchestrator) AttachTarget(context.Context) (dashboardOrchestratorAttachTarget, error) {
+	return f.target, f.err
+}
+func (f *fakeDashboardOrchestrator) action(name string) (dashboardOrchestratorStatus, error) {
+	f.actions = append(f.actions, name)
+	if name == "clear" || name == "rebuild" {
+		f.status.Generation++
+		f.status.ContextMode = name
+		f.status.RebuiltAt = time.Now().UTC()
+	}
+	if name == "recover" {
+		f.status.State = "running"
+	}
+	return f.status, f.err
+}
+func (f *fakeDashboardOrchestrator) Recover(context.Context) (dashboardOrchestratorStatus, error) {
+	return f.action("recover")
+}
+func (f *fakeDashboardOrchestrator) Clear(context.Context) (dashboardOrchestratorStatus, error) {
+	return f.action("clear")
+}
+func (f *fakeDashboardOrchestrator) Rebuild(context.Context) (dashboardOrchestratorStatus, error) {
+	return f.action("rebuild")
+}
+func (f *fakeDashboardOrchestrator) Investigate(_ context.Context, issue, attempt int) (dashboardOrchestratorStatus, error) {
+	return f.action(fmt.Sprintf("investigate:%d:%d", issue, attempt))
+}
+
+func TestDashboardOrchestratorStatusAndActions(t *testing.T) {
+	root := t.TempDir()
+	statuses := []orchestrator.RecoveryStatus{
+		{Repository: "o/r", Issue: 31, Attempt: 2, State: "blocked", Session: "as-" + internalgithub.RepositoryIdentifier("o/r") + "-31-2"},
+		{Repository: "o/r", Issue: 32, Attempt: 1, State: "active", Session: "as-" + internalgithub.RepositoryIdentifier("o/r") + "-32-1"},
+	}
+	if err := writeStatusSnapshot(root, statuses); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	service := &fakeDashboardOrchestrator{status: dashboardOrchestratorStatus{Version: 1, UpdatedAt: now, Enabled: true, State: "running", Session: "as-o-test", Generation: 2, ContextMode: "rebuild", RebuiltAt: now, Diagnostic: "password=hunter2", NextAction: "none"}}
+	operationMu := &sync.Mutex{}
+	handler := newDashboardHandlerWithOrchestrator(t.Context(), root, "tmux", operationMu, false, "", service)
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator.json", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"generation":2`) || strings.Contains(response.Body.String(), "hunter2") {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	post := func(path, origin string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1"+path, nil)
+		request.Header.Set("Origin", origin)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/orchestrator/recover", io.NopCloser(strings.NewReader("x")))
+	request.ContentLength = -1
+	request.Header.Set("Origin", "http://127.0.0.1")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("unknown-length body status=%d", response.Code)
+	}
+	request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/orchestrator/recover", nil)
+	request.TransferEncoding = []string{"chunked"}
+	request.Header.Set("Origin", "http://127.0.0.1")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("transfer-encoded body status=%d", response.Code)
+	}
+	if got := post("/actions/orchestrator/recover", "https://evil.example"); got.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin recover status=%d", got.Code)
+	}
+	if got := post("/actions/orchestrator/recover?command=sh", "http://127.0.0.1"); got.Code != http.StatusBadRequest {
+		t.Fatalf("caller-selected command status=%d", got.Code)
+	}
+	if got := post("/actions/orchestrator/investigate?issue=32&attempt=1", "http://127.0.0.1"); got.Code != http.StatusConflict {
+		t.Fatalf("ineligible investigate status=%d body=%q", got.Code, got.Body.String())
+	}
+	service.status.State = "starting"
+	if got := post("/actions/orchestrator/investigate?issue=31&attempt=2", "http://127.0.0.1"); got.Code != http.StatusConflict {
+		t.Fatalf("non-running investigate status=%d body=%q", got.Code, got.Body.String())
+	}
+	service.status.State = "running"
+	operationMu.Lock()
+	got := post("/actions/orchestrator/recover", "http://127.0.0.1")
+	operationMu.Unlock()
+	if got.Code != http.StatusServiceUnavailable || got.Header().Get("Retry-After") != "1" {
+		t.Fatalf("busy recover status=%d retry=%q", got.Code, got.Header().Get("Retry-After"))
+	}
+	if got := post("/actions/orchestrator/recover", "http://127.0.0.1"); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"ok":true`) {
+		t.Fatalf("recover status=%d body=%q", got.Code, got.Body.String())
+	}
+	if got := post("/actions/orchestrator/investigate?issue=31&attempt=2", "http://127.0.0.1"); got.Code != http.StatusOK {
+		t.Fatalf("investigate status=%d body=%q", got.Code, got.Body.String())
+	}
+	if strings.Join(service.actions, ",") != "recover,investigate:31:2" {
+		t.Fatalf("actions=%v", service.actions)
+	}
+}
+
+func TestDashboardOrchestratorClearAndRebuildAreBodylessPOSTsWithContextTransitions(t *testing.T) {
+	service := &fakeDashboardOrchestrator{status: dashboardOrchestratorStatus{Version: 1, Enabled: true, State: "running", Generation: 4, ContextMode: "rebuild"}}
+	handler := newDashboardHandlerWithOrchestrator(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, false, "", service)
+
+	for _, action := range []string{"clear", "rebuild"} {
+		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/actions/orchestrator/"+action, nil)
+		request.Header.Set("Origin", "http://127.0.0.1")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("GET %s status=%d", action, response.Code)
+		}
+
+		before := service.status.Generation
+		request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/orchestrator/"+action, nil)
+		request.Header.Set("Origin", "http://127.0.0.1")
+		response = httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		var result struct {
+			OK     bool                        `json:"ok"`
+			Status dashboardOrchestratorStatus `json:"status"`
+		}
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil || !result.OK {
+			t.Fatalf("POST %s status=%d body=%q", action, response.Code, response.Body.String())
+		}
+		if result.Status.Generation != before+1 || result.Status.ContextMode != action || result.Status.RebuiltAt.IsZero() {
+			t.Fatalf("POST %s status=%+v", action, result.Status)
+		}
+	}
+	if strings.Join(service.actions, ",") != "clear,rebuild" {
+		t.Fatalf("actions=%v", service.actions)
+	}
+}
+
+func TestDashboardOrchestratorTerminalIsExactAndLoopbackOnly(t *testing.T) {
+	root := t.TempDir()
+	session := "as-o-test-repository"
+	service := &fakeDashboardOrchestrator{target: dashboardOrchestratorAttachTarget{Session: session}}
+	script := filepath.Join(t.TempDir(), "tmux")
+	body := "#!/bin/sh\ncase $1 in\n" +
+		"has-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\";;\n" +
+		"attach-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\" || exit 2; printf 'orchestrator-ready\\r\\n'; sleep 30;;\n" +
+		"*) exit 2;;\nesac\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("EXPECTED_SESSION", session)
+
+	unsafe := newDashboardHandlerWithOrchestrator(t.Context(), root, script, &sync.Mutex{}, true, "password", service)
+	request := httptest.NewRequest(http.MethodGet, "http://192.0.2.10/orchestrator/terminal", nil)
+	request.Header.Set("Origin", "http://192.0.2.10")
+	request.SetBasicAuth("agent-symphony", "password")
+	response := httptest.NewRecorder()
+	unsafe.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback orchestrator terminal status=%d", response.Code)
+	}
+
+	server := httptest.NewServer(newDashboardHandlerWithOrchestrator(t.Context(), root, script, &sync.Mutex{}, false, "", service))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/orchestrator/terminal"
+	connection, responseHTTP, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
+	if err != nil {
+		t.Fatalf("terminal dial response=%v err=%v", responseHTTP, err)
+	}
+	defer connection.CloseNow()
+	kind, message, err := connection.Read(t.Context())
+	if err != nil || kind != websocket.MessageBinary || !strings.Contains(string(message), "orchestrator-ready") {
+		t.Fatalf("terminal kind=%v output=%q err=%v", kind, message, err)
 	}
 }
 
