@@ -376,6 +376,11 @@ func TestPublishedAttemptSuppressesLocalTerminalIssueBlockerOnlyOnExactIdentity(
 			}
 		})
 	}
+	paired := []internalgithub.RecoveryIssueFact{{Repository: "o/r", Issue: 23, Attempt: 2, Eligible: true, RecoveryAuthorized: true, RecoveryAttempt: 1, TerminalAttempts: []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", State: "failed"}}}}
+	addTerminalAttemptBlockers(paired, []agentruntime.Manifest{manifest}, []orchestrator.AttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", State: "failed"}})
+	if len(paired[0].Blockers) != 0 || !paired[0].RecoveryAuthorized {
+		t.Fatalf("paired terminal was blocked: %#v", paired[0])
+	}
 }
 
 func TestCompletedAttemptCleanupRequiresExactPublishedIdentity(t *testing.T) {
@@ -933,6 +938,10 @@ func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
 	}
 	if err := exec.Command("git", "-C", coordinator, "cat-file", "-e", intermediate).Run(); err == nil {
 		t.Fatal("unadvertised head changed the configured repository")
+	}
+	runGit(t, worker, "branch", "unchanged", base)
+	if _, _, _, err := importBundle(base, "unchanged"); err == nil || !strings.Contains(err.Error(), "worker produced no repository changes") {
+		t.Fatalf("unchanged worker head err=%v", err)
 	}
 	result, importedHead, root, err := importBundle(head, "HEAD")
 	resolvedCoordinator, resolveErr := filepath.EvalSymlinks(coordinator)
@@ -1570,6 +1579,24 @@ func TestQueuedIssueProjectionIsReadOnlyAndAuthoritative(t *testing.T) {
 	}
 }
 
+func TestIssueProjectionAllowsOnlyLatestUnblockedTerminalRecovery(t *testing.T) {
+	statuses := []orchestrator.RecoveryStatus{
+		{Repository: "o/r", Issue: 4, Attempt: 1, State: "failed", Retryable: true},
+		{Repository: "o/r", Issue: 4, Attempt: 2, State: "failed", Retryable: true},
+	}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 4, RecoveryAuthorized: true, RecoveryAttempt: 2, TerminalAttempts: []internalgithub.RecoveryAttemptFact{{Attempt: 1}, {Attempt: 2}}}
+	got, _ := joinIssueProjection(statuses, []internalgithub.RecoveryIssueFact{issue}, 1)
+	if got[0].Retryable || !got[1].Retryable {
+		t.Fatalf("retry projection=%#v", got)
+	}
+	issue.RecoveryAuthorized = false
+	issue.Blockers = []string{"dependency #3 is incomplete"}
+	got, _ = joinIssueProjection(statuses, []internalgithub.RecoveryIssueFact{issue}, 1)
+	if got[0].Retryable || got[1].Retryable {
+		t.Fatalf("blocked retry projection=%#v", got)
+	}
+}
+
 func TestIssueProjectionCarriesDeclaredPaths(t *testing.T) {
 	now := time.Unix(1, 0)
 	issues := []internalgithub.RecoveryIssueFact{
@@ -1959,6 +1986,128 @@ func TestConcurrentOneShotReconcileRunsOneMutation(t *testing.T) {
 	close(release)
 	if code := <-first; code != 0 || snapshots.Load() != 1 || dispatches.Load() != 1 {
 		t.Fatalf("first exit=%d snapshots=%d dispatches=%d", code, snapshots.Load(), dispatches.Load())
+	}
+}
+
+func TestRecoverDashboardFailedAttemptRequestsRetryOnceAndPreservesResources(t *testing.T) {
+	root := gitRepository(t)
+	configPath := filepath.Join(root, config.DefaultPath)
+	if err := config.Write(configPath, config.Default("o/r")); err != nil {
+		t.Fatal(err)
+	}
+	stateRoot := filepath.Join(root, "state")
+	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldReviewRoot := reviewSnapshotRoot
+	reviewSnapshotRoot = filepath.Join(stateRoot, "snapshots")
+	t.Cleanup(func() { reviewSnapshotRoot = oldReviewRoot })
+	manifest := writeDashboardManifest(t, stateRoot, 24, 2, "failed")
+	want, err := agentruntime.AttemptIdentity(productionAttemptRoot(stateRoot), agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedStateRoot, err := filepath.EvalSymlinks(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want.LogPath = filepath.Join(resolvedStateRoot, "attempts", internalgithub.RepositoryIdentifier(manifest.Repository), fmt.Sprintf("%d-%d", manifest.Issue, manifest.Attempt), "agent.log")
+	want.State, want.Diagnostic = manifest.State, manifest.Diagnostic
+	want.CreatedAt, want.UpdatedAt = manifest.CreatedAt, manifest.UpdatedAt
+	manifest = want
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	status := orchestrator.RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "failed", Branch: manifest.Branch, Worktree: manifest.Worktree, Session: manifest.Session, Retryable: true}
+	oldReconcile := reconcileGitHubRun
+	reconcileGitHubRun = func(context.Context, string, string, string, bool) ([]orchestrator.RecoveryStatus, error) {
+		return []orchestrator.RecoveryStatus{status}, nil
+	}
+	t.Cleanup(func() { reconcileGitHubRun = oldReconcile })
+
+	failedAt := time.Unix(10, 0).UTC()
+	active, _ := internalgithub.ActiveAttemptMarker(manifest.Repository, manifest.Issue, manifest.Attempt, manifest.BaseSHA)
+	terminal, _ := internalgithub.TerminalFailureMarker(manifest.Issue, manifest.Attempt, failedAt)
+	comments := []map[string]any{
+		{"id": 1, "body": active, "created_at": failedAt.Add(-time.Minute), "updated_at": failedAt.Add(-time.Minute), "user": map[string]any{"id": 42}},
+		{"id": 2, "body": terminal, "created_at": failedAt, "updated_at": failedAt, "user": map[string]any{"id": 42}},
+	}
+	posts := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var response any
+		switch r.Method + " " + r.URL.RequestURI() {
+		case "GET /user":
+			response = map[string]any{"id": 42, "login": "coordinator"}
+		case "GET /repos/o/r/issues/24/comments?per_page=100&page=1":
+			response = comments
+		case "GET /user/42":
+			response = map[string]any{"login": "coordinator"}
+		case "GET /repos/o/r/collaborators/coordinator/permission":
+			response = map[string]any{"permission": "admin"}
+		case "POST /repos/o/r/issues/24/comments":
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil || payload.Body != "/agent-symphony retry" {
+				t.Fatalf("retry body=%q", payload.Body)
+			}
+			posts++
+			createdAt := failedAt.Add(time.Minute)
+			comments = append(comments, map[string]any{"id": 3, "body": payload.Body, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
+			response = map[string]any{}
+		default:
+			t.Fatalf("unexpected request %s", r.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI, githubClient = "https://example.invalid", client
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	for range 2 {
+		if err := recoverDashboardAttempt(t.Context(), configPath, filepath.Join(stateRoot, "pr.json"), stateRoot, 24, 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if posts != 1 {
+		t.Fatalf("retry posts=%d", posts)
+	}
+	for _, path := range []string{manifest.Worktree, manifest.LogPath, filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("recovery removed %s: %v", path, err)
+		}
+	}
+}
+
+func TestRecoverDashboardRejectsUnsafeOrStaleStatusBeforeMutation(t *testing.T) {
+	root := gitRepository(t)
+	configPath := filepath.Join(root, config.DefaultPath)
+	if err := config.Write(configPath, config.Default("o/r")); err != nil {
+		t.Fatal(err)
+	}
+	oldReconcile, oldAPI, oldClient := reconcileGitHubRun, githubAPI, githubClient
+	t.Cleanup(func() { reconcileGitHubRun, githubAPI, githubClient = oldReconcile, oldAPI, oldClient })
+	requests := 0
+	githubAPI = "https://example.invalid"
+	githubClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		requests++
+		return nil, errors.New("unexpected mutation path")
+	})}
+	for _, status := range []orchestrator.RecoveryStatus{
+		{Repository: "o/r", Issue: 24, Attempt: 2, State: "blocked", Blockers: []string{"runtime worktree unsafe"}},
+		{Repository: "o/r", Issue: 24, Attempt: 2, State: "failed"},
+	} {
+		reconcileGitHubRun = func(context.Context, string, string, string, bool) ([]orchestrator.RecoveryStatus, error) {
+			return []orchestrator.RecoveryStatus{status}, nil
+		}
+		if err := recoverDashboardAttempt(t.Context(), configPath, filepath.Join(root, "pr.json"), filepath.Join(root, "state"), 24, 2); err == nil {
+			t.Fatalf("unsafe/stale status was recoverable: %#v", status)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("unsafe/stale recovery made %d GitHub requests", requests)
 	}
 }
 

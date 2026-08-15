@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -73,9 +74,69 @@ func TestRecoverBlocksIssueLevelDuplicateAndPreservesCompletedAuthority(t *testi
 func TestRecoverBlocksFailedExactLivenessCheck(t *testing.T) {
 	facts := []AttemptFact{{Repository: "o/r", Issue: 4, Attempt: 1, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", State: "active"}}
 	local := []agentruntime.Manifest{{Repository: "o/r", Issue: 4, Attempt: 1, BaseSHA: "aaaaaaa", State: "running", Worktree: "/missing", Branch: "wrong", Session: "dead"}}
-	got := RecoverChecked(context.Background(), facts, local, func(context.Context, agentruntime.Manifest, AttemptFact) error { return errors.New("dead") })
-	if len(got) != 1 || got[0].State != "blocked" || got[0].Action == "" {
+	calls := 0
+	got := RecoverChecked(context.Background(), facts, local, func(context.Context, agentruntime.Manifest, AttemptFact) error {
+		calls++
+		return errors.New("exact tmux session is not live")
+	})
+	if len(got) != 1 || got[0].State != "blocked" || got[0].Diagnostic != "exact tmux session is not live" || !got[0].Retryable || got[0].Action == "" || calls != 1 {
 		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestRecoverUnsafeWorktreeChecksAreDistinctAndNotRetryable(t *testing.T) {
+	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 1, BaseSHA: "aaaaaaa", State: "active"}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 1, BaseSHA: "aaaaaaa", State: "running", Session: "named"}
+	for _, test := range []struct {
+		err     error
+		blocker string
+	}{
+		{agentruntime.ErrWorktreeMissing, "runtime worktree missing"},
+		{agentruntime.ErrWorktreeUnsafe, "runtime worktree unsafe"},
+		{agentruntime.ErrWorktreeNonCanonical, "runtime worktree noncanonical"},
+	} {
+		got := RecoverChecked(t.Context(), []AttemptFact{fact}, []agentruntime.Manifest{manifest}, func(context.Context, agentruntime.Manifest, AttemptFact) error { return test.err })
+		if len(got) != 1 || got[0].Retryable || !slices.Equal(got[0].Blockers, []string{test.blocker}) {
+			t.Fatalf("err=%v got=%#v", test.err, got)
+		}
+	}
+}
+
+func TestRecoverTerminalFactJoinsRetainedFailure(t *testing.T) {
+	fact := AttemptFact{Repository: "o/r", Issue: 13, Attempt: 1, BaseSHA: "aaaaaaa", State: "failed"}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 13, Attempt: 1, BaseSHA: "aaaaaaa", State: "failed", Diagnostic: "worker produced no repository changes"}
+	got := Recover([]AttemptFact{fact}, []agentruntime.Manifest{manifest})
+	if len(got) != 1 || got[0].State != "failed" || got[0].Diagnostic != manifest.Diagnostic || !got[0].Retryable {
+		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestRecoverTerminalFactDoesNotRetryNonterminalLocalRuntime(t *testing.T) {
+	fact := AttemptFact{Repository: "o/r", Issue: 13, Attempt: 1, BaseSHA: "aaaaaaa", State: "failed"}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 13, Attempt: 1, BaseSHA: "aaaaaaa", State: "running"}
+	got := Recover([]AttemptFact{fact}, []agentruntime.Manifest{manifest})
+	if len(got) != 1 || got[0].Retryable || got[0].Action != "terminalize the matching local runtime before requesting a retry" {
+		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestRecoverOnlyLatestUncontestedFailureIsRetryable(t *testing.T) {
+	facts := []AttemptFact{
+		{Repository: "o/r", Issue: 13, Attempt: 1, BaseSHA: "aaaaaaa", State: "failed"},
+		{Repository: "o/r", Issue: 13, Attempt: 2, BaseSHA: "bbbbbbb", State: "failed"},
+	}
+	local := []agentruntime.Manifest{
+		{Repository: "o/r", Issue: 13, Attempt: 1, BaseSHA: "aaaaaaa", State: "failed"},
+		{Repository: "o/r", Issue: 13, Attempt: 2, BaseSHA: "bbbbbbb", State: "failed"},
+	}
+	got := Recover(facts, local)
+	if len(got) != 2 || got[0].State != "failed" || got[0].Retryable || !got[1].Retryable {
+		t.Fatalf("got %#v", got)
+	}
+	facts = append(facts, AttemptFact{Repository: "o/r", Issue: 13, Attempt: 3, BaseSHA: "ccccccc", State: "active"})
+	got = Recover(facts, local)
+	if got[0].Retryable || got[1].Retryable {
+		t.Fatalf("newer authority left failure retryable: %#v", got)
 	}
 }
 
