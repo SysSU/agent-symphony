@@ -25,21 +25,28 @@ import (
 )
 
 const (
-	workerUser    = "agent-symphony-worker"
-	reviewerUser  = "agent-symphony-reviewer"
-	attemptGroup  = "agent-symphony-attempt"
-	snapshotGroup = "agent-symphony-snapshot"
+	workerUser             = "agent-symphony-worker"
+	reviewerUser           = "agent-symphony-reviewer"
+	attemptGroup           = "agent-symphony-attempt"
+	snapshotGroup          = "agent-symphony-snapshot"
+	orchestratorLaunchFile = "orchestrator-launch.json"
 )
 
 var (
-	hostGOOS        = runtime.GOOS
-	hostEUID        = os.Geteuid
-	hostEGID        = os.Getegid
-	hostExecutable  = os.Executable
-	hostLookupUser  = user.Lookup
-	hostLookupGroup = user.LookupGroup
-	hostCurrentUser = user.Current
-	hostRun         = func(name string, args ...string) error {
+	hostGOOS            = runtime.GOOS
+	hostEUID            = os.Geteuid
+	hostEGID            = os.Getegid
+	hostExecutable      = os.Executable
+	hostLookupUser      = user.Lookup
+	hostLookupGroup     = user.LookupGroup
+	hostCurrentUser     = user.Current
+	hostGetwd           = os.Getwd
+	hostOrchestratorRun = func(ctx context.Context, command agentruntime.Command) error {
+		cmd := exec.CommandContext(ctx, command.Name, command.Args...)
+		cmd.Dir, cmd.Env, cmd.Stdin, cmd.Stdout, cmd.Stderr = command.Dir, command.Env, os.Stdin, os.Stdout, os.Stderr
+		return cmd.Run()
+	}
+	hostRun = func(name string, args ...string) error {
 		out, err := exec.Command(name, args...).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(string(out)))
@@ -261,16 +268,23 @@ func restoreSudoers(path string, body []byte) error {
 func installableSudoAuthority(body []byte, binary string) bool {
 	for _, line := range strings.Split(string(body), "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "(") {
-			return exactSudoAuthority(body, binary)
+			return exactSudoAuthority(body, binary) || exactSudoAuthorityFor(body, binary, false)
 		}
 	}
 	return true
 }
 
 func exactSudoAuthority(body []byte, binary string) bool {
+	return exactSudoAuthorityFor(body, binary, true)
+}
+
+func exactSudoAuthorityFor(body []byte, binary string, orchestrator bool) bool {
 	want := map[string]bool{
 		workerUser + ":" + attemptGroup + "\x00" + binary + " agent-host implementation": false,
 		reviewerUser + ":" + snapshotGroup + "\x00" + binary + " agent-host review":      false,
+	}
+	if orchestrator {
+		want[reviewerUser+":"+snapshotGroup+"\x00"+binary+" agent-host orchestrator"] = false
 	}
 	for _, line := range strings.Split(string(body), "\n") {
 		line = strings.TrimSpace(line)
@@ -291,7 +305,8 @@ func exactSudoAuthority(body []byte, binary string) bool {
 		}
 		want[key] = true
 	}
-	return want[workerUser+":"+attemptGroup+"\x00"+binary+" agent-host implementation"] && want[reviewerUser+":"+snapshotGroup+"\x00"+binary+" agent-host review"]
+	valid := want[workerUser+":"+attemptGroup+"\x00"+binary+" agent-host implementation"] && want[reviewerUser+":"+snapshotGroup+"\x00"+binary+" agent-host review"]
+	return valid && (!orchestrator || want[reviewerUser+":"+snapshotGroup+"\x00"+binary+" agent-host orchestrator"])
 }
 
 func validateInstalledBinary(binary string) error {
@@ -556,7 +571,7 @@ func parseDSCLRecord(body []byte) map[string]string {
 }
 
 func writeSudoers(coordinator, binary string) (bool, error) {
-	body := fmt.Sprintf("# managed by agent-symphony; rerun install-host after upgrades\n%s ALL=(%s:%s) NOPASSWD: %s agent-host implementation\n%s ALL=(%s:%s) NOPASSWD: %s agent-host review\n", coordinator, workerUser, attemptGroup, binary, coordinator, reviewerUser, snapshotGroup, binary)
+	body := fmt.Sprintf("# managed by agent-symphony; rerun install-host after upgrades\n%s ALL=(%s:%s) NOPASSWD: %s agent-host implementation\n%s ALL=(%s:%s) NOPASSWD: %s agent-host review\n%s ALL=(%s:%s) NOPASSWD: %s agent-host orchestrator\n", coordinator, workerUser, attemptGroup, binary, coordinator, reviewerUser, snapshotGroup, binary, coordinator, reviewerUser, snapshotGroup, binary)
 	dir, path := nativeRoot("/etc/sudoers.d"), nativeRoot("/etc/sudoers.d/agent-symphony")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return false, err
@@ -638,17 +653,74 @@ func readReviewResult(input []byte, root string) (string, error) {
 	return string(body), nil
 }
 
+func runHostOrchestrator(ctx context.Context, root, home string) error {
+	dir, err := hostGetwd()
+	if err != nil || !belowRoot(dir, root) || !strings.HasPrefix(filepath.Base(dir), "orchestrator-") {
+		return errors.New("orchestrator workspace is outside the reviewer boundary")
+	}
+	path := filepath.Join(dir, orchestratorLaunchFile)
+	listed, err := os.Lstat(path)
+	if err != nil || !listed.Mode().IsRegular() || listed.Mode()&os.ModeSymlink != 0 || listed.Mode().Perm() != 0o440 || fileGID(listed) != hostEGID() || listed.Size() <= 0 || listed.Size() > 128<<10 {
+		return errors.New("orchestrator launch contract is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(listed, opened) || opened.Mode().Perm() != 0o440 || fileGID(opened) != hostEGID() {
+		return errors.New("orchestrator launch contract changed while opening")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, 128<<10+1))
+	if err != nil || len(body) > 128<<10 {
+		return errors.New("orchestrator launch contract is oversized")
+	}
+	var launch struct {
+		Version int      `json:"version"`
+		Command []string `json:"command"`
+		Context string   `json:"context"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&launch) != nil || decoder.Decode(&struct{}{}) != io.EOF || launch.Version != 1 || len(launch.Command) == 0 || len(launch.Command) > 128 || strings.TrimSpace(launch.Command[0]) == "" || len(launch.Context) == 0 || len(launch.Context) > 64<<10 {
+		return errors.New("invalid orchestrator launch contract")
+	}
+	for _, arg := range launch.Command {
+		if strings.ContainsAny(arg, "\x00\r\n") || credentialShapedArgument(arg) {
+			return errors.New("unsafe orchestrator command argument")
+		}
+	}
+	env, err := internalgithub.AgentEnvironmentWith(os.Environ())
+	if err != nil {
+		return err
+	}
+	env = append(env, "HOME="+home)
+	return hostOrchestratorRun(ctx, agentruntime.Command{Name: launch.Command[0], Args: append(launch.Command[1:], launch.Context), Dir: dir, Env: env})
+}
+
+func credentialShapedArgument(value string) bool {
+	lower := strings.ToLower(value)
+	for _, part := range []string{"authorization", "token", "secret", "password", "passwd", "private_key", "private-key", "credential", "api_key", "api-key", "github_pat"} {
+		if strings.Contains(lower, part) {
+			return true
+		}
+	}
+	return false
+}
+
 func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writer) error {
 	localRoot := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_LOCAL_ROOT"))
 	wantUser, wantGroup, root := workerUser, attemptGroup, "/var/lib/agent-symphony/attempts"
 	if hostGOOS == "darwin" {
 		root = "/var/db/agent-symphony/attempts"
 	}
-	if mode == "review" {
+	orchestratorMode := mode == "orchestrator"
+	if mode == "review" || orchestratorMode {
 		wantUser, wantGroup = reviewerUser, snapshotGroup
 		root = strings.Replace(root, "attempts", "snapshots", 1)
 	} else if mode != "implementation" {
-		return errors.New("agent-host mode must be implementation or review")
+		return errors.New("agent-host mode must be implementation, review, or orchestrator")
 	}
 	// AGENT_SYMPHONY_LOCAL_ROOT is only ever set by the coordinator's own
 	// implementationBoundary/reviewBoundary when install-host was never run;
@@ -682,6 +754,9 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return fmt.Errorf("agent-host must run as %s:%s", wantUser, wantGroup)
 		}
 		homeDir = u.HomeDir
+	}
+	if orchestratorMode {
+		return runHostOrchestrator(ctx, root, homeDir)
 	}
 	var request struct {
 		Operation string          `json:"operation"`

@@ -278,7 +278,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return success(stdout, *jsonOutput, command, nil, "host isolation installed")
 	case "agent-host":
 		if fs.NArg() != 1 || fs.NFlag() != 0 {
-			return misuse(stderr, wantsJSON, command, "usage: agent-symphony agent-host implementation|review")
+			return misuse(stderr, wantsJSON, command, "usage: agent-symphony agent-host implementation|review|orchestrator")
 		}
 		if err := agentHost(context.Background(), fs.Arg(0), os.Stdin, stdout); err != nil {
 			return fail(stderr, false, command, err.Error())
@@ -321,6 +321,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		defer releaseDaemonLock(lock)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
+		agent, err := newOrchestratorAgent(c, *runtimeState)
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
 		operationMu := &sync.Mutex{}
 		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, *allowUnsafeDashboardNetwork, *dashboardPassword, stderr)
 		if err != nil {
@@ -330,9 +334,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 		reconcile := func(ctx context.Context) error {
 			operationMu.Lock()
 			defer operationMu.Unlock()
-			_, err := reconcileGitHub(ctx, *path, *statePath, *runtimeState, true)
+			statuses, err := reconcileGitHub(ctx, *path, *statePath, *runtimeState, true)
 			if err != nil {
 				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
+			}
+			var agentErr error
+			if err == nil {
+				_, agentErr = agent.Observe(ctx, statuses)
+			} else {
+				_, agentErr = agent.Recover(ctx)
+			}
+			if agentErr != nil {
+				fmt.Fprintln(stderr, "orchestrator agent: "+internalgithub.Redact(agentErr.Error()))
 			}
 			return err
 		}

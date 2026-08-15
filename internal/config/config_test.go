@@ -14,6 +14,9 @@ func TestLoadAndValidate(t *testing.T) {
 	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "--sandbox", "workspace-write"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "exec", "--sandbox", "read-only", "-"}) {
 		t.Fatalf("unexpected default commands: %#v", c.Commands)
 	}
+	if c.Commands.Orchestrator != nil {
+		t.Fatalf("orchestrator must be opt-in, got %#v", c.Commands.Orchestrator)
+	}
 	c.Commands.Implementation = []string{"custom-agent", "--flag"}
 	path := filepath.Join(t.TempDir(), DefaultPath)
 	if err := Write(path, c); err != nil {
@@ -80,6 +83,9 @@ func TestValidateRejectsUnsafePathsAndPolicy(t *testing.T) {
 		{"unsafe command", func(c *Config) { c.Commands.Implementation = []string{"codex\nrm"} }, "unsafe argument"},
 		{"credential flag", func(c *Config) { c.Commands.Implementation = []string{"codex", "--token=canary"} }, "credential-shaped"},
 		{"credential assignment", func(c *Config) { c.Commands.Reviewer = []string{"codex", "API_KEY=canary"} }, "credential-shaped"},
+		{"empty orchestrator", func(c *Config) { c.Commands.Orchestrator = []string{} }, "must contain an executable"},
+		{"unsafe orchestrator", func(c *Config) { c.Commands.Orchestrator = []string{"codex", "bad\narg"} }, "unsafe argument"},
+		{"credential orchestrator", func(c *Config) { c.Commands.Orchestrator = []string{"codex", "--password=canary"} }, "credential-shaped"},
 		{"credential environment", func(c *Config) { c.Commands.Environment = []string{"GITHUB_TOKEN"} }, "forbidden credential"},
 		{"invalid environment", func(c *Config) { c.Commands.Environment = []string{"bad-name"} }, "invalid variable"},
 	}

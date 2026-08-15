@@ -1,0 +1,87 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+
+	"github.com/SysSU/agent-symphony/internal/config"
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
+	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
+)
+
+func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratoragent.Supervisor, error) {
+	workspace := filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-"+internalgithub.RepositoryIdentifier(cfg.Repository))
+	agent := &orchestratoragent.Supervisor{
+		Root:       stateRoot,
+		Workspace:  workspace,
+		Repository: cfg.Repository,
+		Command:    cfg.Commands.Orchestrator,
+		Launcher:   orchestratorBoundaryCommand(),
+		Runner:     agentruntime.ExecRunner{},
+	}
+	if cfg.Commands.Orchestrator == nil {
+		return agent, nil
+	}
+	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
+	if err != nil {
+		return nil, err
+	}
+	agent.Env = env
+	if !hostIsolationInstalled() {
+		agent.Env = append(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+productionSnapshotRoot(stateRoot))
+	}
+	if hostIsolationInstalled() {
+		group, err := hostLookupGroup(snapshotGroup)
+		if err != nil {
+			return nil, fmt.Errorf("resolve orchestrator boundary group: %w", err)
+		}
+		gid, err := strconv.Atoi(group.Gid)
+		if err != nil || prepareOrchestratorWorkspace(workspace, gid) != nil {
+			return nil, fmt.Errorf("prepare orchestrator reviewer boundary")
+		}
+	} else if err := os.MkdirAll(workspace, 0o750); err != nil {
+		return nil, fmt.Errorf("prepare orchestrator workspace: %w", err)
+	}
+	return agent, nil
+}
+
+func prepareOrchestratorWorkspace(path string, gid int) error {
+	if err := os.MkdirAll(path, 0o750); err != nil {
+		return err
+	}
+	listed, err := os.Lstat(path)
+	if err != nil || !listed.IsDir() || listed.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("orchestrator workspace is unsafe")
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	opened, err := dir.Stat()
+	if err != nil || !os.SameFile(listed, opened) {
+		return fmt.Errorf("orchestrator workspace changed while opening")
+	}
+	if err := dir.Chown(-1, gid); err != nil {
+		return err
+	}
+	if err := dir.Chmod(os.ModeSetgid | 0o750); err != nil {
+		return err
+	}
+	current, err := os.Lstat(path)
+	if err != nil || !os.SameFile(opened, current) || current.Mode()&(os.ModePerm|os.ModeSetgid) != os.ModeSetgid|0o750 || fileGID(current) != gid {
+		return fmt.Errorf("orchestrator workspace ownership or mode is unsafe")
+	}
+	return nil
+}
+
+func orchestratorBoundaryCommand() []string {
+	binary, _ := os.Executable()
+	if !hostIsolationInstalled() {
+		return []string{binary, "agent-host", "orchestrator"}
+	}
+	return []string{"sudo", "-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "orchestrator"}
+}
