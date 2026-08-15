@@ -326,7 +326,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		operationMu := &sync.Mutex{}
-		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, *allowUnsafeDashboardNetwork, *dashboardPassword, stderr)
+		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, agent, *allowUnsafeDashboardNetwork, *dashboardPassword, stderr)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}

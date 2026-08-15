@@ -22,6 +22,7 @@ import (
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
+	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 	"github.com/coder/websocket"
 )
@@ -103,12 +104,13 @@ func TestDashboardRejectsNonLoopbackRequestHost(t *testing.T) {
 }
 
 func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, false, "", io.Discard); err == nil {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, false, "", io.Discard); err == nil {
 		t.Fatal("non-loopback dashboard address accepted")
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	var log bytes.Buffer
-	url, err := startDashboard(ctx, "127.0.0.1:0", t.TempDir(), nil, false, "", &log)
+	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running", Session: "as-o-test"}}
+	url, err := startDashboard(ctx, "127.0.0.1:0", t.TempDir(), nil, service, false, "", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +119,15 @@ func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
 		t.Fatalf("dashboard response=%v err=%v", response, err)
 	}
 	response.Body.Close()
+	response, err = http.Get(url + "/orchestrator.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	response.Body.Close()
+	if readErr != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(body), `"session":"as-o-test"`) {
+		t.Fatalf("orchestrator response=%q status=%d err=%v", body, response.StatusCode, readErr)
+	}
 	cancel()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -131,7 +142,7 @@ func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
 }
 
 func TestDashboardUnsafeNetworkRequiresPassword(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "--dashboard-password is required") {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "--dashboard-password is required") {
 		t.Fatalf("unsafe dashboard without password error=%v", err)
 	}
 
@@ -187,7 +198,7 @@ func TestDashboardUnsafeNetworkBindingWarnsAndAcceptsAuthentication(t *testing.T
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var log bytes.Buffer
-	boundURL, err := startDashboard(ctx, "0.0.0.0:0", t.TempDir(), nil, true, "test-dashboard-password", &log)
+	boundURL, err := startDashboard(ctx, "0.0.0.0:0", t.TempDir(), nil, nil, true, "test-dashboard-password", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,19 +226,19 @@ func TestDashboardUnsafeNetworkBindingWarnsAndAcceptsAuthentication(t *testing.T
 }
 
 type fakeDashboardOrchestrator struct {
-	status  dashboardOrchestratorStatus
-	target  dashboardOrchestratorAttachTarget
+	status  orchestratoragent.Status
+	target  orchestratoragent.AttachTarget
 	err     error
 	actions []string
 }
 
-func (f *fakeDashboardOrchestrator) Status(context.Context) (dashboardOrchestratorStatus, error) {
+func (f *fakeDashboardOrchestrator) Status(context.Context) (orchestratoragent.Status, error) {
 	return f.status, f.err
 }
-func (f *fakeDashboardOrchestrator) AttachTarget(context.Context) (dashboardOrchestratorAttachTarget, error) {
+func (f *fakeDashboardOrchestrator) AttachTarget(context.Context) (orchestratoragent.AttachTarget, error) {
 	return f.target, f.err
 }
-func (f *fakeDashboardOrchestrator) action(name string) (dashboardOrchestratorStatus, error) {
+func (f *fakeDashboardOrchestrator) action(name string) (orchestratoragent.Status, error) {
 	f.actions = append(f.actions, name)
 	if name == "clear" || name == "rebuild" {
 		f.status.Generation++
@@ -239,16 +250,16 @@ func (f *fakeDashboardOrchestrator) action(name string) (dashboardOrchestratorSt
 	}
 	return f.status, f.err
 }
-func (f *fakeDashboardOrchestrator) Recover(context.Context) (dashboardOrchestratorStatus, error) {
+func (f *fakeDashboardOrchestrator) Recover(context.Context) (orchestratoragent.Status, error) {
 	return f.action("recover")
 }
-func (f *fakeDashboardOrchestrator) Clear(context.Context) (dashboardOrchestratorStatus, error) {
+func (f *fakeDashboardOrchestrator) Clear(context.Context) (orchestratoragent.Status, error) {
 	return f.action("clear")
 }
-func (f *fakeDashboardOrchestrator) Rebuild(context.Context) (dashboardOrchestratorStatus, error) {
+func (f *fakeDashboardOrchestrator) Rebuild(context.Context) (orchestratoragent.Status, error) {
 	return f.action("rebuild")
 }
-func (f *fakeDashboardOrchestrator) Investigate(_ context.Context, issue, attempt int) (dashboardOrchestratorStatus, error) {
+func (f *fakeDashboardOrchestrator) Investigate(_ context.Context, issue, attempt int) (orchestratoragent.Status, error) {
 	return f.action(fmt.Sprintf("investigate:%d:%d", issue, attempt))
 }
 
@@ -262,7 +273,7 @@ func TestDashboardOrchestratorStatusAndActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	service := &fakeDashboardOrchestrator{status: dashboardOrchestratorStatus{Version: 1, UpdatedAt: now, Enabled: true, State: "running", Session: "as-o-test", Generation: 2, ContextMode: "rebuild", RebuiltAt: now, Diagnostic: "password=hunter2", NextAction: "none"}}
+	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, UpdatedAt: now, Enabled: true, State: "running", Session: "as-o-test", Generation: 2, ContextMode: "rebuild", RebuiltAt: now, Diagnostic: "password=hunter2", NextAction: "none"}}
 	operationMu := &sync.Mutex{}
 	handler := newDashboardHandlerWithOrchestrator(t.Context(), root, "tmux", operationMu, false, "", service)
 
@@ -328,7 +339,7 @@ func TestDashboardOrchestratorStatusAndActions(t *testing.T) {
 }
 
 func TestDashboardOrchestratorClearAndRebuildAreBodylessPOSTsWithContextTransitions(t *testing.T) {
-	service := &fakeDashboardOrchestrator{status: dashboardOrchestratorStatus{Version: 1, Enabled: true, State: "running", Generation: 4, ContextMode: "rebuild"}}
+	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running", Generation: 4, ContextMode: "rebuild"}}
 	handler := newDashboardHandlerWithOrchestrator(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, false, "", service)
 
 	for _, action := range []string{"clear", "rebuild"} {
@@ -346,8 +357,8 @@ func TestDashboardOrchestratorClearAndRebuildAreBodylessPOSTsWithContextTransiti
 		response = httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
 		var result struct {
-			OK     bool                        `json:"ok"`
-			Status dashboardOrchestratorStatus `json:"status"`
+			OK     bool                     `json:"ok"`
+			Status orchestratoragent.Status `json:"status"`
 		}
 		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil || !result.OK {
 			t.Fatalf("POST %s status=%d body=%q", action, response.Code, response.Body.String())
@@ -364,7 +375,7 @@ func TestDashboardOrchestratorClearAndRebuildAreBodylessPOSTsWithContextTransiti
 func TestDashboardOrchestratorTerminalIsExactAndLoopbackOnly(t *testing.T) {
 	root := t.TempDir()
 	session := "as-o-test-repository"
-	service := &fakeDashboardOrchestrator{target: dashboardOrchestratorAttachTarget{Session: session}}
+	service := &fakeDashboardOrchestrator{target: orchestratoragent.AttachTarget{Session: session}}
 	script := filepath.Join(t.TempDir(), "tmux")
 	body := "#!/bin/sh\ncase $1 in\n" +
 		"has-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\";;\n" +

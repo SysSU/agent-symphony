@@ -24,6 +24,7 @@ import (
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
+	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 	"github.com/coder/websocket"
 	"github.com/creack/pty"
@@ -45,40 +46,10 @@ type dashboardServer struct {
 	tmux         string
 	allowNet     bool
 	password     string
-	orchestrator dashboardOrchestrator
+	orchestrator orchestratoragent.Service
 	cleanup      func(context.Context, string, agentruntime.Manifest) error
 	mu           *sync.Mutex
 	localMu      sync.Mutex
-}
-
-type dashboardOrchestrator interface {
-	Status(context.Context) (dashboardOrchestratorStatus, error)
-	AttachTarget(context.Context) (dashboardOrchestratorAttachTarget, error)
-	Recover(context.Context) (dashboardOrchestratorStatus, error)
-	Clear(context.Context) (dashboardOrchestratorStatus, error)
-	Rebuild(context.Context) (dashboardOrchestratorStatus, error)
-	Investigate(context.Context, int, int) (dashboardOrchestratorStatus, error)
-}
-
-type dashboardOrchestratorStatus struct {
-	Version          int       `json:"version"`
-	UpdatedAt        time.Time `json:"updated_at"`
-	Enabled          bool      `json:"enabled"`
-	State            string    `json:"state"`
-	Session          string    `json:"session,omitempty"`
-	Generation       int       `json:"generation,omitempty"`
-	ContextMode      string    `json:"context_mode,omitempty"`
-	StartedAt        time.Time `json:"started_at,omitempty"`
-	RebuiltAt        time.Time `json:"rebuilt_at,omitempty"`
-	LastHealthyAt    time.Time `json:"last_healthy_at,omitempty"`
-	RetryAt          time.Time `json:"retry_at,omitempty"`
-	PendingAttention int       `json:"pending_attention,omitempty"`
-	Diagnostic       string    `json:"diagnostic,omitempty"`
-	NextAction       string    `json:"next_action"`
-}
-
-type dashboardOrchestratorAttachTarget struct {
-	Session string `json:"session"`
 }
 
 type dashboardHiddenAttempt struct {
@@ -109,7 +80,7 @@ func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string,
 	return newDashboardHandlerWithOrchestrator(ctx, stateRoot, tmux, operationMu, allowNet, password, nil)
 }
 
-func newDashboardHandlerWithOrchestrator(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, allowNet bool, password string, service dashboardOrchestrator) http.Handler {
+func newDashboardHandlerWithOrchestrator(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, allowNet bool, password string, service orchestratoragent.Service) http.Handler {
 	assets, err := fs.Sub(dashboardFiles, "dashboard/out")
 	if err != nil {
 		panic(err)
@@ -170,7 +141,7 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 }
 
 func (s *dashboardServer) serveOrchestratorStatus(w http.ResponseWriter, r *http.Request) {
-	status := dashboardOrchestratorStatus{Version: 1, UpdatedAt: time.Now().UTC(), State: "disabled"}
+	status := orchestratoragent.Status{Version: 1, UpdatedAt: time.Now().UTC(), State: "disabled"}
 	if s.orchestrator != nil {
 		var err error
 		status, err = s.orchestrator.Status(r.Context())
@@ -475,7 +446,7 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 	}
 	defer operationMu.Unlock()
 
-	var result dashboardOrchestratorStatus
+	var result orchestratoragent.Status
 	var err error
 	switch action {
 	case "recover":
@@ -503,8 +474,8 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 	}
 	result.Diagnostic = internalgithub.Redact(result.Diagnostic)
 	body, _ := json.Marshal(struct {
-		OK     bool                        `json:"ok"`
-		Status dashboardOrchestratorStatus `json:"status"`
+		OK     bool                     `json:"ok"`
+		Status orchestratoragent.Status `json:"status"`
 	}{true, result})
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
@@ -699,7 +670,7 @@ func (s *dashboardServer) terminalStatus(issue, attempt int) (orchestrator.Recov
 	return s.projectedStatus(issue, attempt)
 }
 
-func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, allowNet bool, password string, log io.Writer) (string, error) {
+func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", fmt.Errorf("dashboard address: %w", err)
@@ -719,7 +690,7 @@ func startDashboard(ctx context.Context, address, stateRoot string, operationMu 
 	if err != nil {
 		return "", fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
-	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: newDashboardHandlerWithOrchestrator(ctx, stateRoot, "tmux", operationMu, allowNet, password, service), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
 		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password may be visible in process listings, and anyone with it can use terminals and cleanup controls")
 	}
