@@ -174,6 +174,70 @@ func TestAPIReadRetriesMutationDoesNotAndRedacts(t *testing.T) {
 	}
 }
 
+func TestAPIReadPersistsETagAndBody(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "github-etag-cache.json")
+	cache, err := LoadReadCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := API{BaseURL: "https://api.example.test", Cache: cache, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got := r.Header.Get("If-None-Match"); got != "" {
+			t.Fatalf("first request sent ETag %q", got)
+		}
+		return httpResponse(http.StatusOK, `{"ok":true}`, http.Header{"ETag": []string{`"v1"`}}), nil
+	})}}
+	var first struct {
+		OK bool `json:"ok"`
+	}
+	if etag, changed, err := api.Read(context.Background(), "/read?stable=true", "", &first); err != nil || !changed || !first.OK || etag != `"v1"` {
+		t.Fatalf("first read: etag=%q changed=%v result=%#v err=%v", etag, changed, first, err)
+	}
+	if err := cache.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Lstat(path); err != nil || info.Mode().Perm() != 0o600 || !info.Mode().IsRegular() {
+		t.Fatalf("cache mode: info=%v err=%v", info, err)
+	}
+
+	cache, err = LoadReadCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api = API{BaseURL: "https://api.example.test", Cache: cache, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got := r.Header.Get("If-None-Match"); got != `"v1"` {
+			t.Fatalf("restart request ETag = %q", got)
+		}
+		return httpResponse(http.StatusNotModified, "", nil), nil
+	})}}
+	var second struct {
+		OK bool `json:"ok"`
+	}
+	if etag, changed, err := api.Read(context.Background(), "/read?stable=true", "", &second); err != nil || changed || !second.OK || etag != `"v1"` {
+		t.Fatalf("restart read: etag=%q changed=%v result=%#v err=%v", etag, changed, second, err)
+	}
+}
+
+func TestReadCacheRejectsUnsafeState(t *testing.T) {
+	dir := t.TempDir()
+	malformed := filepath.Join(dir, "malformed.json")
+	if err := os.WriteFile(malformed, []byte(`{"version":1,"entries":{"/read":{"etag":"bad\nheader","body":{}}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadReadCache(malformed); err == nil {
+		t.Fatal("malformed cache accepted")
+	}
+	target, link := filepath.Join(dir, "target.json"), filepath.Join(dir, "link.json")
+	if err := os.WriteFile(target, []byte(`{"version":1,"entries":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadReadCache(link); err == nil {
+		t.Fatal("symlink cache accepted")
+	}
+}
+
 func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 	cfg := ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", DependencySection: "Dependencies", HumanReview: "human", AutonomousMerge: "auto"}
 	body := "## Context\nfix intake\n## Acceptance Criteria\n- [ ] safe\n## Tasks\n- [ ] implement\n## Validation\ngo test\n## Dependencies\n- #3\n"

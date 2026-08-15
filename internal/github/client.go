@@ -19,9 +19,12 @@ import (
 type API struct {
 	BaseURL string
 	HTTP    *http.Client
+	Cache   *ReadCache
 	Sleep   func(context.Context, time.Duration) error
 	Retries int
 }
+
+const maxJSONBody = 1 << 20
 
 type Mutation struct {
 	Issue   int
@@ -126,6 +129,11 @@ func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool
 	if !strings.HasPrefix(path, "/") {
 		return "", false, errors.New("GitHub API path must start with /")
 	}
+	var cached readCacheEntry
+	if etag == "" && a.Cache != nil {
+		cached, _ = a.Cache.get(path)
+		etag = cached.ETag
+	}
 	retries := a.Retries
 	if retries == 0 {
 		retries = 3
@@ -134,14 +142,30 @@ func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool
 		resp, err := a.do(ctx, http.MethodGet, path, etag, nil, Mutation{})
 		if err == nil && resp.StatusCode == http.StatusNotModified {
 			resp.Body.Close()
-			return resp.Header.Get("ETag"), false, nil
+			if len(cached.Body) > 0 {
+				if err := decodeJSON(bytes.NewReader(cached.Body), dst); err != nil {
+					return "", false, fmt.Errorf("decode cached GitHub read: %w", err)
+				}
+			}
+			responseETag := resp.Header.Get("ETag")
+			if responseETag == "" {
+				responseETag = etag
+			}
+			return responseETag, false, nil
 		}
 		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			defer resp.Body.Close()
-			if err := decodeJSON(resp.Body, dst); err != nil {
+			var body bytes.Buffer
+			if err := decodeJSON(io.TeeReader(resp.Body, &body), dst); err != nil {
 				return "", false, fmt.Errorf("decode GitHub read: %w", err)
 			}
-			return resp.Header.Get("ETag"), true, nil
+			responseETag := resp.Header.Get("ETag")
+			if a.Cache != nil {
+				if err := a.Cache.put(path, responseETag, body.Bytes()); err != nil {
+					return "", false, fmt.Errorf("cache GitHub read: %w", err)
+				}
+			}
+			return responseETag, true, nil
 		}
 		if err == nil && !transient(resp) {
 			defer resp.Body.Close()
@@ -283,7 +307,6 @@ func responseError(operation string, resp *http.Response) error {
 }
 
 func decodeJSON(r io.Reader, dst any) error {
-	const maxJSONBody = 1 << 20
 	b, err := io.ReadAll(io.LimitReader(r, maxJSONBody+1))
 	if err != nil {
 		return err

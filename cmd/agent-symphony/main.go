@@ -546,10 +546,22 @@ func acquireDaemonLock(path string) (*os.File, error) {
 
 func releaseDaemonLock(f *os.File) { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }
 
-func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
+func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool) (result []orchestrator.RecoveryStatus, resultErr error) {
 	started := time.Now()
 	ctx, cancel := context.WithDeadline(ctx, started.Add(2*time.Minute))
 	defer cancel()
+	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if resultErr != nil {
+			return
+		}
+		if err := cache.Save(); err != nil {
+			resultErr = err
+		}
+	}()
 	c, err := config.Load(configPath)
 	if err != nil {
 		return nil, err
@@ -563,7 +575,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 			return nil, err
 		}
 	}
-	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
+	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient, Cache: cache}
 	user, err := api.AuthenticatedUser(ctx)
 	if err != nil {
 		return nil, err
