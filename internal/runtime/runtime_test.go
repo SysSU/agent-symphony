@@ -948,6 +948,37 @@ func TestExactTargetsExitCodesAndHistory(t *testing.T) {
 	}
 }
 
+func TestVerifyActiveAcceptsOnlyApprovedUnpublishedAncestryOrPublishedHead(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.VerifyActive(t.Context(), manifest, attempt.BaseSHA); err != nil {
+		t.Fatalf("base HEAD: %v", err)
+	}
+	runGit(t, manifest.Worktree, "config", "user.email", "test@example.invalid")
+	runGit(t, manifest.Worktree, "config", "user.name", "Test")
+	runGit(t, manifest.Worktree, "commit", "--allow-empty", "-qm", "descendant")
+	descendant := gitOutput(t, manifest.Worktree, "rev-parse", "HEAD")
+	if err := r.VerifyActive(t.Context(), manifest, attempt.BaseSHA); err != nil {
+		t.Fatalf("unpublished descendant: %v", err)
+	}
+	if err := r.VerifyActive(t.Context(), manifest, descendant); err != nil {
+		t.Fatalf("published exact head: %v", err)
+	}
+	runGit(t, manifest.Worktree, "commit", "--allow-empty", "-qm", "later")
+	if err := r.VerifyActive(t.Context(), manifest, descendant); err == nil || !strings.Contains(err.Error(), "does not match GitHub") {
+		t.Fatalf("published head drift: %v", err)
+	}
+	runGit(t, manifest.Worktree, "checkout", "--orphan", "unrelated")
+	runGit(t, manifest.Worktree, "commit", "--allow-empty", "-qm", "unrelated")
+	runGit(t, manifest.Worktree, "branch", "-M", manifest.Branch)
+	if err := r.VerifyActive(t.Context(), manifest, attempt.BaseSHA); err == nil || !strings.Contains(err.Error(), "not descended") {
+		t.Fatalf("unrelated unpublished head: %v", err)
+	}
+}
+
 func TestLaunchConfiguresEmptySessionBeforeAgentAndRetainsFastExit(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	attempt.Command = []string{"fast-exit"}

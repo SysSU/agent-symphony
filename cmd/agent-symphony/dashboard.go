@@ -46,6 +46,7 @@ type dashboardServer struct {
 	allowNet  bool
 	password  string
 	cleanup   func(context.Context, string, agentruntime.Manifest) error
+	recover   func(context.Context, int, int) error
 	mu        *sync.Mutex
 	localMu   sync.Mutex
 }
@@ -71,16 +72,16 @@ func newDashboardHandler(ctx context.Context, stateRoot, tmux string) http.Handl
 }
 
 func newDashboardHandlerWithMutex(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex) http.Handler {
-	return newDashboardHandlerWithOptions(ctx, stateRoot, tmux, operationMu, false, "")
+	return newDashboardHandlerWithOptions(ctx, stateRoot, tmux, operationMu, nil, false, "")
 }
 
-func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, allowNet bool, password string) http.Handler {
+func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, allowNet bool, password string) http.Handler {
 	assets, err := fs.Sub(dashboardFiles, "dashboard/out")
 	if err != nil {
 		panic(err)
 	}
 	static := http.FileServer(http.FS(assets))
-	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, mu: operationMu}
+	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, mu: operationMu, recover: recover}
 	server.cleanup = server.cleanupAttempt
 	return server.handler(static)
 }
@@ -97,7 +98,7 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		if !s.authenticate(w, r) {
 			return
 		}
-		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" {
+		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/recover" {
 			s.serveAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/"))
 			return
 		}
@@ -272,7 +273,7 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 	}
 	issue, issueErr := strconv.Atoi(r.URL.Query().Get("issue"))
 	attempt, attemptErr := strconv.Atoi(r.URL.Query().Get("attempt"))
-	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || (action != "archive" && action != "abandon") {
+	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || (action != "archive" && action != "abandon" && action != "recover") {
 		http.Error(w, "invalid action", http.StatusBadRequest)
 		return
 	}
@@ -287,6 +288,21 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 	}
 	defer operationMu.Unlock()
 	status, err := s.projectedStatus(issue, attempt)
+	if action == "recover" {
+		if err != nil || !status.Retryable || status.PR > 0 || s.recover == nil {
+			http.Error(w, "attempt is not eligible for recovery", http.StatusConflict)
+			return
+		}
+		if err := s.recover(r.Context(), issue, attempt); err != nil {
+			http.Error(w, internalgithub.Redact(err.Error()), http.StatusConflict)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+		return
+	}
 	wantState := "completed"
 	if action == "abandon" {
 		wantState = "orphaned"
@@ -502,7 +518,7 @@ func (s *dashboardServer) terminalStatus(issue, attempt int) (orchestrator.Recov
 	return s.projectedStatus(issue, attempt)
 }
 
-func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, allowNet bool, password string, log io.Writer) (string, error) {
+func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, allowNet bool, password string, log io.Writer) (string, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", fmt.Errorf("dashboard address: %w", err)
@@ -522,7 +538,7 @@ func startDashboard(ctx context.Context, address, stateRoot string, operationMu 
 	if err != nil {
 		return "", fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
-	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, recover, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
 		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password may be visible in process listings, and anyone with it can use terminals and cleanup controls")
 	}

@@ -322,7 +322,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		operationMu := &sync.Mutex{}
-		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, *allowUnsafeDashboardNetwork, *dashboardPassword, stderr)
+		recoverAttempt := func(ctx context.Context, issue, attempt int) error {
+			return recoverDashboardAttempt(ctx, *path, *statePath, *runtimeState, issue, attempt)
+		}
+		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, recoverAttempt, *allowUnsafeDashboardNetwork, *dashboardPassword, stderr)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
@@ -589,7 +592,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	}
 	facts := make([]orchestrator.AttemptFact, len(remote))
 	for i, f := range remote {
-		facts[i] = orchestrator.AttemptFact{Repository: f.Repository, Issue: f.Issue, Attempt: f.Attempt, BaseSHA: f.BaseSHA, HeadSHA: f.HeadSHA, PR: f.PR, State: f.State, Checks: f.Checks}
+		facts[i] = orchestrator.AttemptFact{Repository: f.Repository, Issue: f.Issue, Attempt: f.Attempt, BaseSHA: f.BaseSHA, HeadSHA: f.HeadSHA, PR: f.PR, State: f.State, Checks: f.Checks, Diagnostic: f.Diagnostic}
 	}
 	prConfig := internalgithub.PRAdapterConfig{Repository: c.Repository, ReadyLabel: c.Labels.Ready, HumanReviewLabel: c.CompletionPolicies.HumanReview, AutonomousMergeLabel: c.CompletionPolicies.AutonomousMerge, MergeMethod: "squash", PriorityP1Label: c.Labels.PriorityP1, PriorityP2Label: c.Labels.PriorityP2, PriorityP3Label: c.Labels.PriorityP3, DependencySection: c.Dependencies.Section, DefaultCompletion: c.CompletionPolicies.Default, ApprovalCommand: "/agent-symphony approve", CancelCommand: "/agent-symphony cancel", RetryCommand: "/agent-symphony retry", ActorID: user.ID}
 	issues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, remote, transition)
@@ -601,7 +604,15 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 			return f.Repository == binding.Repository && f.Issue == binding.Issue && f.Attempt == binding.Attempt
 		}) {
 			remote = append(remote, *binding)
-			facts = append(facts, orchestrator.AttemptFact{Repository: binding.Repository, Issue: binding.Issue, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: binding.State})
+			facts = append(facts, orchestrator.AttemptFact{Repository: binding.Repository, Issue: binding.Issue, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: binding.State, Diagnostic: binding.Diagnostic})
+		}
+		for _, binding := range issues[i].TerminalAttempts {
+			if slices.ContainsFunc(facts, func(f orchestrator.AttemptFact) bool {
+				return f.Repository == binding.Repository && f.Issue == binding.Issue && f.Attempt == binding.Attempt && f.BaseSHA == binding.BaseSHA && f.State == binding.State
+			}) {
+				continue
+			}
+			facts = append(facts, orchestrator.AttemptFact{Repository: binding.Repository, Issue: binding.Issue, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: binding.State, Diagnostic: binding.Diagnostic})
 		}
 	}
 	boundary := implementationBoundary(stateRoot)
@@ -638,21 +649,19 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		})
 	}
 	addTerminalAttemptBlockers(issues, manifests, facts)
-	statuses := orchestrator.Recover(facts, manifests)
-	statuses, decisions := joinIssueProjection(statuses, issues, c.Concurrency)
-	if !transition {
-		return statuses, writeStatusSnapshot(stateRoot, statuses)
-	}
-	statuses = orchestrator.RecoverChecked(ctx, facts, manifests, func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
+	statuses := orchestrator.RecoverChecked(ctx, facts, manifests, func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
 		head := fact.HeadSHA
 		if head == "" {
 			head = fact.BaseSHA
 		}
 		return r.VerifyActive(ctx, manifest, head)
 	})
-	statuses, _ = joinIssueProjection(statuses, issues, c.Concurrency)
+	statuses, decisions := joinIssueProjection(statuses, issues, c.Concurrency)
 	if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
 		return statuses, err
+	}
+	if !transition {
+		return statuses, nil
 	}
 	// Governance may mutate GitHub only after authenticated repository access
 	// and authoritative duplicate suppression above.
@@ -728,7 +737,9 @@ func addTerminalAttemptBlockers(issues []internalgithub.RecoveryIssueFact, manif
 	for i := range issues {
 		for _, manifest := range manifests {
 			if manifest.Repository == issues[i].Repository && manifest.Issue == issues[i].Issue && (manifest.State == "failed" || manifest.State == "cancelled" || manifest.State == "completed") {
-				bound := issues[i].ActiveAttempt != nil && issues[i].ActiveAttempt.Attempt == manifest.Attempt
+				bound := (issues[i].ActiveAttempt != nil && issues[i].ActiveAttempt.Attempt == manifest.Attempt) || slices.ContainsFunc(issues[i].TerminalAttempts, func(attempt internalgithub.RecoveryAttemptFact) bool {
+					return attempt.Attempt == manifest.Attempt
+				})
 				published := slices.ContainsFunc(facts, func(fact orchestrator.AttemptFact) bool {
 					return orchestrator.MatchesPublishedAttempt(manifest, fact)
 				})
@@ -739,6 +750,7 @@ func addTerminalAttemptBlockers(issues []internalgithub.RecoveryIssueFact, manif
 					issues[i].Attempt = max(issues[i].Attempt, manifest.Attempt+1)
 				} else {
 					issues[i].Eligible = false
+					issues[i].RecoveryAuthorized = false
 					issues[i].Blockers = append(issues[i].Blockers, "local terminal attempt awaits or has durable GitHub outcome")
 				}
 			}
@@ -758,6 +770,11 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 			if statuses[j].Repository == issue.Repository && statuses[j].Issue == issue.Issue {
 				statuses[j].Title, statuses[j].Priority, statuses[j].Dependencies = issue.Title, issue.Priority, issue.Dependencies
 				statuses[j].Blockers = append(statuses[j].Blockers, issue.Blockers...)
+				if statuses[j].State == "failed" {
+					statuses[j].Retryable = statuses[j].Retryable && issue.RecoveryAuthorized && issue.RecoveryAttempt == statuses[j].Attempt
+				} else {
+					statuses[j].Retryable = statuses[j].Retryable && issue.RecoveryAuthorized
+				}
 				found = true
 			}
 		}
@@ -988,7 +1005,10 @@ func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, mani
 	if err != nil || head != exported.HeadSHA || !regexp.MustCompile(`^[0-9a-f]{40,64}$`).MatchString(head) {
 		return workerResult{}, "", "", errors.New("imported worker head changed")
 	}
-	if err := scanGit(ctx, importedRepo, nil, []string{"merge-base", "--is-ancestor", manifest.BaseSHA, head}, nil); err != nil || strings.EqualFold(head, manifest.BaseSHA) {
+	if strings.EqualFold(head, manifest.BaseSHA) {
+		return workerResult{}, "", "", errors.New("worker produced no repository changes")
+	}
+	if err := scanGit(ctx, importedRepo, nil, []string{"merge-base", "--is-ancestor", manifest.BaseSHA, head}, nil); err != nil {
 		return workerResult{}, "", "", errors.New("worker head is not a new descendant of approved base")
 	}
 	if err := validateWorkerTree(ctx, importedRepo, head); err != nil {
@@ -1671,6 +1691,60 @@ func durableAttemptFailure(ctx context.Context, api internalgithub.API, issue in
 		return err
 	}
 	return nil
+}
+
+func recoverDashboardAttempt(ctx context.Context, configPath, statePath, stateRoot string, issueNumber, attemptNumber int) error {
+	if issueNumber < 1 || attemptNumber < 1 {
+		return errors.New("invalid recovery attempt")
+	}
+	statuses, err := reconcileGitHubRun(ctx, configPath, statePath, stateRoot, false)
+	if err != nil {
+		return err
+	}
+	c, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	matches := slices.DeleteFunc(slices.Clone(statuses), func(status orchestrator.RecoveryStatus) bool {
+		return status.Repository != c.Repository || status.Issue != issueNumber || status.Attempt != attemptNumber
+	})
+	if len(matches) != 1 || !matches[0].Retryable || matches[0].PR > 0 || (matches[0].State != "failed" && matches[0].State != "blocked") {
+		return errors.New("fresh authoritative state does not permit recovery")
+	}
+	status := matches[0]
+	if status.State == "blocked" && !slices.Equal(status.Blockers, []string{"runtime liveness mismatch"}) {
+		return errors.New("only an exact runtime liveness mismatch can be recovered")
+	}
+	boundary := implementationBoundary(stateRoot)
+	runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot, Runner: boundary}
+	manifests, err := runtimeState.Discover()
+	if err != nil {
+		return err
+	}
+	local := slices.DeleteFunc(slices.Clone(manifests), func(manifest agentruntime.Manifest) bool {
+		return manifest.Repository != c.Repository || manifest.Issue != issueNumber || manifest.Attempt != attemptNumber
+	})
+	if len(local) != 1 || local[0].Branch != status.Branch || local[0].Worktree != status.Worktree || local[0].Session != status.Session {
+		return errors.New("local attempt identity no longer matches the fresh projection")
+	}
+	manifest := local[0]
+	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
+	user, err := api.AuthenticatedUser(ctx)
+	if err != nil {
+		return err
+	}
+	prConfig := internalgithub.PRAdapterConfig{Repository: c.Repository, CancelCommand: "/agent-symphony cancel", RetryCommand: "/agent-symphony retry", ActorID: user.ID}
+	if status.State == "blocked" {
+		manifest, err = runtimeState.Cancel(ctx, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}, "dashboard recovery: "+status.Diagnostic)
+		if err != nil {
+			return err
+		}
+		issue := internalgithub.RecoveryIssueFact{Repository: c.Repository, Issue: issueNumber, Attempt: attemptNumber}
+		if err := durableAttemptFailure(ctx, api, issue, manifest, errors.New(status.Diagnostic)); err != nil {
+			return err
+		}
+	}
+	return internalgithub.EnsureRetryCommand(ctx, api, prConfig, issueNumber, attemptNumber)
 }
 
 func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, issues []internalgithub.RecoveryIssueFact) error {

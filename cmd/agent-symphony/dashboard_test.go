@@ -102,12 +102,12 @@ func TestDashboardRejectsNonLoopbackRequestHost(t *testing.T) {
 }
 
 func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, false, "", io.Discard); err == nil {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, false, "", io.Discard); err == nil {
 		t.Fatal("non-loopback dashboard address accepted")
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	var log bytes.Buffer
-	url, err := startDashboard(ctx, "127.0.0.1:0", t.TempDir(), nil, false, "", &log)
+	url, err := startDashboard(ctx, "127.0.0.1:0", t.TempDir(), nil, nil, false, "", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,12 +130,12 @@ func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
 }
 
 func TestDashboardUnsafeNetworkRequiresPassword(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "--dashboard-password is required") {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "--dashboard-password is required") {
 		t.Fatalf("unsafe dashboard without password error=%v", err)
 	}
 
 	password := "test-dashboard-password"
-	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, true, password)
+	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, true, password)
 	for _, test := range []struct {
 		name, method, path, username, password string
 		status                                 int
@@ -186,7 +186,7 @@ func TestDashboardUnsafeNetworkBindingWarnsAndAcceptsAuthentication(t *testing.T
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var log bytes.Buffer
-	boundURL, err := startDashboard(ctx, "0.0.0.0:0", t.TempDir(), nil, true, "test-dashboard-password", &log)
+	boundURL, err := startDashboard(ctx, "0.0.0.0:0", t.TempDir(), nil, nil, true, "test-dashboard-password", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,6 +312,51 @@ func TestDashboardCleanupRejectsProjectionIdentityDrift(t *testing.T) {
 	server.handler(http.FileServer(http.FS(assets))).ServeHTTP(response, request)
 	if response.Code != http.StatusConflict || called {
 		t.Fatalf("identity drift status=%d cleanup_called=%v", response.Code, called)
+	}
+}
+
+func TestDashboardRecoverRequiresSameOriginFreshRetryableProjection(t *testing.T) {
+	root := t.TempDir()
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 24, Attempt: 2, State: "failed", Retryable: true, Session: "as-" + internalgithub.RepositoryIdentifier("o/r") + "-24-2"}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	operationMu := &sync.Mutex{}
+	calls := 0
+	server := &dashboardServer{ctx: t.Context(), stateRoot: root, tmux: "tmux", mu: operationMu, recover: func(_ context.Context, issue, attempt int) error {
+		calls++
+		if issue != 24 || attempt != 2 {
+			t.Fatalf("recovered %d/%d", issue, attempt)
+		}
+		return nil
+	}}
+	assets, _ := fs.Sub(dashboardFiles, "dashboard/out")
+	handler := server.handler(http.FileServer(http.FS(assets)))
+	request := func(origin string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/recover?issue=24&attempt=2", nil)
+		r.Header.Set("Origin", origin)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	if response := request("https://evil.example"); response.Code != http.StatusForbidden || calls != 0 {
+		t.Fatalf("cross-origin status=%d calls=%d", response.Code, calls)
+	}
+	operationMu.Lock()
+	busy := request("http://127.0.0.1")
+	operationMu.Unlock()
+	if busy.Code != http.StatusServiceUnavailable || calls != 0 {
+		t.Fatalf("busy status=%d calls=%d", busy.Code, calls)
+	}
+	if response := request("http://127.0.0.1"); response.Code != http.StatusOK || calls != 1 {
+		t.Fatalf("recover status=%d body=%q calls=%d", response.Code, response.Body.String(), calls)
+	}
+	status.Retryable = false
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	if response := request("http://127.0.0.1"); response.Code != http.StatusConflict || calls != 1 {
+		t.Fatalf("stale status=%d calls=%d", response.Code, calls)
 	}
 }
 
