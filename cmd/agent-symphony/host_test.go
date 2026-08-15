@@ -77,6 +77,85 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 	}
 }
 
+func TestReviewerBoundaryAllowsOnlyExactOrchestratorTmuxLaunch(t *testing.T) {
+	fakeHostIdentity(t, 1234, 5678)
+	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner
+	hostGOOS, hostRoot = "linux", t.TempDir()
+	t.Cleanup(func() { hostGOOS, hostRoot, hostExecRunner = oldGOOS, oldRoot, oldExec })
+	root := nativeRoot("/var/lib/agent-symphony/snapshots")
+	dir := filepath.Join(root, "orchestrator-owner-repo")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	var launched agentruntime.Command
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		launched = command
+		return agentruntime.Result{}, nil
+	}
+	request := func(target string, env []string) error {
+		payload, _ := json.Marshal(struct {
+			Operation string          `json:"operation"`
+			Command   boundaryCommand `json:"command"`
+		}{"run", boundaryCommand{Name: "tmux", Args: []string{"respawn-pane", "-k", "-t", target, "--", "operator-agent", "sanitized context"}, Dir: dir, Env: env}})
+		return agentHost(t.Context(), "review", bytes.NewReader(payload), &bytes.Buffer{})
+	}
+	if err := request("=as-o-owner-repo:0.0", []string{"MODEL_API_KEY=model-canary", "PATH=/bin"}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(launched.Env, "|")
+	if !strings.Contains(joined, "HOME=/var/lib/agent-symphony-reviewer") || strings.Contains(joined, "GITHUB_TOKEN") {
+		t.Fatalf("unsafe orchestrator environment: %s", joined)
+	}
+	for _, target := range []string{"as-o-owner-repo:0.0", "=as-o-owner-repo:1.0", "=../../foreign:0.0"} {
+		if err := request(target, []string{"PATH=/bin"}); err == nil {
+			t.Fatalf("unsafe orchestrator target accepted: %q", target)
+		}
+	}
+	if err := request("=as-o-owner-repo:0.0", []string{"GH_TOKEN=secret"}); err == nil {
+		t.Fatal("orchestrator launch accepted GitHub credentials")
+	}
+}
+
+func TestHostOrchestratorLaunchContractIsReadOnlyAndCredentialFiltered(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "orchestrator-owner-repo")
+	if err := os.Mkdir(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	launch, _ := json.Marshal(struct {
+		Version int      `json:"version"`
+		Command []string `json:"command"`
+		Context string   `json:"context"`
+	}{1, []string{"operator-agent", "--read-only"}, "sanitized context"})
+	path := filepath.Join(dir, orchestratorLaunchFile)
+	if err := os.WriteFile(path, launch, 0o440); err != nil {
+		t.Fatal(err)
+	}
+	oldGetwd, oldRun, oldEGID := hostGetwd, hostOrchestratorRun, hostEGID
+	hostGetwd = func() (string, error) { return dir, nil }
+	t.Cleanup(func() { hostGetwd, hostOrchestratorRun, hostEGID = oldGetwd, oldRun, oldEGID })
+	t.Setenv("GH_TOKEN", "github-canary")
+	var got agentruntime.Command
+	hostOrchestratorRun = func(_ context.Context, command agentruntime.Command) error { got = command; return nil }
+	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home"); err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "operator-agent" || !slices.Equal(got.Args, []string{"--read-only", "sanitized context"}) || !slices.Contains(got.Env, "HOME=/reviewer-home") || slices.ContainsFunc(got.Env, func(value string) bool { return strings.HasPrefix(value, "GH_TOKEN=") }) {
+		t.Fatalf("unsafe launch: %#v", got)
+	}
+	hostEGID = func() int { return oldEGID() + 1 }
+	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home"); err == nil {
+		t.Fatal("launch contract outside the reviewer snapshot group was accepted")
+	}
+	hostEGID = oldEGID
+	if err := os.Chmod(path, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home"); err == nil {
+		t.Fatal("writable launch contract accepted")
+	}
+}
+
 func TestReviewResultArtifactFailsClosed(t *testing.T) {
 	const valid = `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`
 	request := reviewResultRequest{Repository: "o/r", Issue: 23, Attempt: 1, Head: strings.Repeat("a", 40)}
@@ -992,9 +1071,13 @@ func TestDarwinIdentityRecordRetriesAfterEveryDSCLMutation(t *testing.T) {
 
 func TestBroadSudoAuthorityRejectsAnythingButManagedTuples(t *testing.T) {
 	binary := "/usr/local/libexec/agent-symphony/1/agent-symphony"
-	managed := []byte("    (agent-symphony-worker : agent-symphony-attempt) NOPASSWD: " + binary + " agent-host implementation\n    (agent-symphony-reviewer : agent-symphony-snapshot) NOPASSWD: " + binary + " agent-host review\n")
+	managed := []byte("    (agent-symphony-worker : agent-symphony-attempt) NOPASSWD: " + binary + " agent-host implementation\n    (agent-symphony-reviewer : agent-symphony-snapshot) NOPASSWD: " + binary + " agent-host review\n    (agent-symphony-reviewer : agent-symphony-snapshot) NOPASSWD: " + binary + " agent-host orchestrator\n")
 	if !exactSudoAuthority(managed, binary) {
 		t.Fatal("managed tuple rejected")
+	}
+	legacy := []byte("    (agent-symphony-worker : agent-symphony-attempt) NOPASSWD: " + binary + " agent-host implementation\n    (agent-symphony-reviewer : agent-symphony-snapshot) NOPASSWD: " + binary + " agent-host review\n")
+	if exactSudoAuthority(legacy, binary) || !installableSudoAuthority(legacy, binary) {
+		t.Fatal("safe pre-orchestrator rules cannot be upgraded")
 	}
 	for _, rule := range []string{
 		strings.Replace(string(managed), binary, "/old/agent-symphony", 1),

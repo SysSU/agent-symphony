@@ -147,3 +147,5 @@ sudo /usr/local/libexec/agent-symphony/VERSION/agent-symphony \
 ```
 
 Rerun `install-host` after every binary upgrade. `doctor` and `serve` automatically require the stricter boundary once it is installed. The boundary environment variables are test seams, not production setup.
+
+The advisory orchestrator is disabled by default. Enable it by adding a prompt-accepting interactive `commands.orchestrator` array, for example `["codex", "--sandbox", "read-only", "--ask-for-approval", "never", "--no-alt-screen"]`. Rerun `validate` and `doctor`. Advanced installations must rerun `install-host` after upgrading so the exact reviewer-identity orchestrator rule is installed.

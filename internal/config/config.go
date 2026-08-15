@@ -49,6 +49,7 @@ type CompletionPolicies struct {
 type Commands struct {
 	Implementation []string `json:"implementation"`
 	Reviewer       []string `json:"reviewer"`
+	Orchestrator   []string `json:"orchestrator,omitempty"`
 	Environment    []string `json:"environment_allowlist"`
 }
 
@@ -237,6 +238,19 @@ func (c Config) Validate() error {
 			}
 			if secretName(arg) != "" {
 				problems = append(problems, "commands."+name+" contains a credential-shaped argument")
+			}
+		}
+	}
+	if c.Commands.Orchestrator != nil {
+		if len(c.Commands.Orchestrator) == 0 || strings.TrimSpace(c.Commands.Orchestrator[0]) == "" {
+			problems = append(problems, "commands.orchestrator must contain an executable when configured")
+		}
+		for _, arg := range c.Commands.Orchestrator {
+			if strings.ContainsRune(arg, 0) || strings.ContainsAny(arg, "\r\n") {
+				problems = append(problems, "commands.orchestrator contains an unsafe argument")
+			}
+			if secretName(arg) != "" {
+				problems = append(problems, "commands.orchestrator contains a credential-shaped argument")
 			}
 		}
 	}
