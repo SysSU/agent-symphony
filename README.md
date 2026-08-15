@@ -47,6 +47,7 @@ See the [setup guide](docs/setup.md) for installation, configuration, and your f
 ## Documentation
 
 - [Setup](docs/setup.md)
+- [GitHub controls](docs/github-controls.md)
 - [CLI reference](docs/cli.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Security](docs/security.md)
