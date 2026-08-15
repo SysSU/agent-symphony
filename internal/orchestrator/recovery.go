@@ -30,6 +30,7 @@ type AttemptFact struct {
 	Priority     int      `json:"priority,omitempty"`
 	Dependencies []int    `json:"dependencies,omitempty"`
 	Checks       []string `json:"checks,omitempty"`
+	Diagnostic   string   `json:"diagnostic,omitempty"`
 }
 
 type RecoveryStatus struct {
@@ -51,6 +52,7 @@ type RecoveryStatus struct {
 	Blockers            []string `json:"blockers,omitempty"`
 	Diagnostic          string   `json:"diagnostic,omitempty"`
 	Action              string   `json:"next_action,omitempty"`
+	Retryable           bool     `json:"retryable,omitempty"`
 }
 
 type RuntimeCheck func(context.Context, agentruntime.Manifest, AttemptFact) error
@@ -68,12 +70,15 @@ func MatchesPublishedAttempt(manifest agentruntime.Manifest, fact AttemptFact) b
 // checked-out branch/HEAD, and exact tmux session all still agree.
 func ExactRuntimeCheck(ctx context.Context, manifest agentruntime.Manifest, fact AttemptFact) error {
 	info, err := os.Lstat(manifest.Worktree)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("worktree is missing or is a symlink")
+	if err != nil {
+		return agentruntime.ErrWorktreeMissing
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return agentruntime.ErrWorktreeUnsafe
 	}
 	abs, err := filepath.Abs(manifest.Worktree)
 	if err != nil || abs != filepath.Clean(manifest.Worktree) {
-		return errors.New("worktree path is not canonical")
+		return agentruntime.ErrWorktreeNonCanonical
 	}
 	run := func(name string, args ...string) (string, error) {
 		out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
@@ -84,12 +89,16 @@ func ExactRuntimeCheck(ctx context.Context, manifest agentruntime.Manifest, fact
 		return errors.New("worktree branch does not match manifest")
 	}
 	head, err := run("git", "-C", manifest.Worktree, "rev-parse", "HEAD")
-	wantHead := fact.HeadSHA
-	if wantHead == "" {
-		wantHead = fact.BaseSHA
+	if err != nil {
+		return errors.New("worktree HEAD is unreadable")
 	}
-	if err != nil || !strings.EqualFold(head, wantHead) {
+	if fact.HeadSHA != "" && !strings.EqualFold(head, fact.HeadSHA) {
 		return errors.New("worktree HEAD does not match GitHub")
+	}
+	if fact.HeadSHA == "" && !strings.EqualFold(head, fact.BaseSHA) {
+		if _, err := run("git", "-C", manifest.Worktree, "merge-base", "--is-ancestor", fact.BaseSHA, head); err != nil {
+			return errors.New("worktree HEAD is not descended from the approved base")
+		}
 	}
 	if _, err := run("tmux", "has-session", "-t", "="+manifest.Session); err != nil {
 		return errors.New("exact tmux session is not live")
@@ -128,20 +137,25 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 			result = append(result, RecoveryStatus{Repository: fact.Repository, Issue: fact.Issue, Attempt: fact.Attempt, State: "conflicting", Diagnostic: "GitHub reports contradictory attempt facts", Action: "repair the coordinator-authored attempt markers, then reconcile"})
 			continue
 		}
-		status := RecoveryStatus{Repository: fact.Repository, Issue: fact.Issue, Attempt: fact.Attempt, State: fact.State, PR: fact.PR, HeadSHA: fact.HeadSHA, Priority: fact.Priority, Dependencies: fact.Dependencies, Checks: fact.Checks}
+		status := RecoveryStatus{Repository: fact.Repository, Issue: fact.Issue, Attempt: fact.Attempt, State: fact.State, PR: fact.PR, HeadSHA: fact.HeadSHA, Priority: fact.Priority, Dependencies: fact.Dependencies, Checks: fact.Checks, Diagnostic: fact.Diagnostic}
 		issueConflict := false
-		active, completed := 0, 0
+		active, completed, latestAttempt := 0, 0, fact.Attempt
+		retryConflict := false
 		for _, other := range issueFacts[fmt.Sprintf("%s#%d", fact.Repository, fact.Issue)] {
+			latestAttempt = max(latestAttempt, other.Attempt)
 			if other.State == "active" || other.State == "review-ready" {
 				active++
 			}
 			if other.State == "completed" {
 				completed++
 			}
+			if other.Attempt != fact.Attempt && other.State != "failed" || conflicting[attemptKey(other.Repository, other.Issue, other.Attempt)] {
+				retryConflict = true
+			}
 		}
 		issueConflict = active > 1 || (active > 0 && completed > 0) || completed > 1
 		if issueConflict {
-			status.State, status.Blockers, status.Diagnostic, status.Action = "blocked", []string{"conflicting authoritative attempts"}, "GitHub reports duplicate active/completed attempts for this issue", "repair coordinator-authored markers; dispatch is suppressed"
+			status.State, status.Blockers, status.Diagnostic, status.Action, status.Retryable = "blocked", []string{"conflicting authoritative attempts"}, "GitHub reports duplicate active/completed attempts for this issue", "repair coordinator-authored markers; dispatch is suppressed", false
 		}
 		for i, manifest := range local {
 			if manifest.Repository != fact.Repository || manifest.Issue != fact.Issue || manifest.Attempt != fact.Attempt {
@@ -150,22 +164,42 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 			used[i] = true
 			status.Branch, status.Worktree, status.Session = manifest.Branch, manifest.Worktree, manifest.Session
 			status.ImplementationAgent, status.ReviewAgent = manifest.ImplementationAgent, manifest.ReviewAgent
+			var checkErr error
+			if (fact.State == "active" || fact.State == "review-ready") && manifest.State == "running" && check != nil {
+				checkErr = check(ctx, manifest, fact)
+			}
 			switch {
 			case fact.State == "completed":
-				status.State, status.Diagnostic, status.Action = "completed", "", "none; completed work must not be redispatched"
+				status.State, status.Diagnostic, status.Action, status.Retryable = "completed", "", "none; completed work must not be redispatched", false
 			case issueConflict:
 			case manifest.BaseSHA != fact.BaseSHA:
-				status.State, status.Blockers, status.Diagnostic, status.Action = "blocked", []string{"runtime base mismatch"}, "local base does not match GitHub", "preserve diagnostics and create a new traceable attempt"
+				status.State, status.Blockers, status.Diagnostic, status.Action, status.Retryable = "blocked", []string{"runtime base mismatch"}, "local base does not match GitHub", "preserve diagnostics and create a new traceable attempt", false
+			case fact.State == "failed":
+				status.Retryable = fact.Attempt == latestAttempt && !retryConflict && (manifest.State == "failed" || manifest.State == "cancelled" || manifest.State == "completed")
+				if status.Retryable {
+					status.Action = "recover this failed attempt to request a new attempt"
+				} else {
+					status.Action = "terminalize the matching local runtime before requesting a retry"
+				}
+				if manifest.State == "failed" {
+					status.Diagnostic = manifest.Diagnostic
+				}
 			case manifest.State == "failed":
 				status.State, status.Diagnostic, status.Action = "failed", manifest.Diagnostic, "inspect the retained log and retry with a new attempt"
 			case fact.State == "active" && fact.PR == 0 && manifest.State == "completed":
 				status.Action = "resume publication of the matching completed attempt"
 			case MatchesPublishedAttempt(manifest, fact):
 				status.Action = "monitor the matching published pull request"
-			case (fact.State == "active" || fact.State == "review-ready") && manifest.State == "running" && check != nil && check(ctx, manifest, fact) == nil:
+			case (fact.State == "active" || fact.State == "review-ready") && manifest.State == "running" && check != nil && checkErr == nil:
 				status.Action = "resume monitoring the matching attempt"
+			case (fact.State == "active" || fact.State == "review-ready") && runtimeWorktreeBlocker(checkErr) != "":
+				status.State, status.Blockers, status.Diagnostic, status.Action, status.Retryable = "blocked", []string{runtimeWorktreeBlocker(checkErr)}, checkErr.Error(), "repair or reconstruct the exact worktree; automatic recovery is suppressed", false
 			case fact.State == "active" || fact.State == "review-ready":
-				status.State, status.Blockers, status.Diagnostic, status.Action = "blocked", []string{"runtime liveness mismatch"}, "GitHub says active but exact worktree HEAD/branch/tmux liveness did not match", "resume only after exact resource identity agrees; otherwise create a new attempt"
+				diagnostic := "local attempt is not running"
+				if checkErr != nil {
+					diagnostic = checkErr.Error()
+				}
+				status.State, status.Blockers, status.Diagnostic, status.Action, status.Retryable = "blocked", []string{"runtime liveness mismatch"}, diagnostic, "recover this attempt or restore its exact runtime resources", true
 			}
 			break
 		}
@@ -190,6 +224,19 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 		return a.Attempt - b.Attempt
 	})
 	return result
+}
+
+func runtimeWorktreeBlocker(err error) string {
+	switch {
+	case errors.Is(err, agentruntime.ErrWorktreeMissing):
+		return "runtime worktree missing"
+	case errors.Is(err, agentruntime.ErrWorktreeUnsafe):
+		return "runtime worktree unsafe"
+	case errors.Is(err, agentruntime.ErrWorktreeNonCanonical):
+		return "runtime worktree noncanonical"
+	default:
+		return ""
+	}
 }
 
 // ReconcileLoop reconciles immediately, then repeats at most every interval.

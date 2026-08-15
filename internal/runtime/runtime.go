@@ -157,6 +157,12 @@ type Runtime struct {
 	mu           sync.Mutex
 }
 
+var (
+	ErrWorktreeMissing      = errors.New("worktree is missing")
+	ErrWorktreeUnsafe       = errors.New("worktree is not a safe directory")
+	ErrWorktreeNonCanonical = errors.New("worktree path is not canonical")
+)
+
 func PaneTarget(session string) string { return "=" + session + ":0.0" }
 
 func ResultPath(worktree string) string { return worktree + workerResultSuffix }
@@ -390,13 +396,33 @@ func (r *Runtime) VerifyActive(ctx context.Context, manifest Manifest, head stri
 	if err := r.validateManifest(attempt, manifest); err != nil {
 		return err
 	}
+	info, err := os.Lstat(manifest.Worktree)
+	if err != nil {
+		return ErrWorktreeMissing
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return ErrWorktreeUnsafe
+	}
+	abs, err := filepath.Abs(manifest.Worktree)
+	if err != nil || abs != filepath.Clean(manifest.Worktree) {
+		return ErrWorktreeNonCanonical
+	}
 	branch, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "branch", "--show-current"}, "", nil, nil)
 	if err != nil || strings.TrimSpace(branch.Output) != manifest.Branch {
 		return errors.New("worktree branch does not match manifest")
 	}
 	got, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "rev-parse", "HEAD"}, "", nil, nil)
-	if err != nil || !strings.EqualFold(strings.TrimSpace(got.Output), head) {
-		return errors.New("worktree HEAD does not match GitHub")
+	if err != nil {
+		return errors.New("worktree HEAD is unreadable")
+	}
+	current := strings.TrimSpace(got.Output)
+	if !strings.EqualFold(current, head) {
+		if !strings.EqualFold(head, manifest.BaseSHA) {
+			return errors.New("worktree HEAD does not match GitHub")
+		}
+		if _, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "merge-base", "--is-ancestor", manifest.BaseSHA, current}, "", nil, nil); err != nil {
+			return errors.New("worktree HEAD is not descended from the approved base")
+		}
 	}
 	if _, err := r.run(ctx, r.tmux(), []string{"has-session", "-t", "=" + manifest.Session}, "", nil, nil); err != nil {
 		return errors.New("exact tmux session is not live")
