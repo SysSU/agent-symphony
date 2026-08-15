@@ -18,9 +18,16 @@ func TestTerminalFailureRequiresStrictCoordinatorAuthorship(t *testing.T) {
 		map[string]any{"body": marker + "tamper", "user": map[string]any{"id": 42}},
 		map[string]any{"body": marker, "user": map[string]any{"id": 42}},
 	}})
-	got, err := fetchTerminalFailure(context.Background(), api, PRAdapterConfig{Repository: "o/r", ActorID: 42}, 4)
-	if err != nil || got.Attempt != 2 {
-		t.Fatalf("terminal=%v err=%v", got, err)
+	got, conflicts, err := fetchTerminalFailures(context.Background(), api, PRAdapterConfig{Repository: "o/r", ActorID: 42}, 4)
+	if err != nil || !conflicts.Any || len(got) != 1 || got[0].Attempt != 2 {
+		t.Fatalf("terminal=%v conflicts=%v err=%v", got, conflicts, err)
+	}
+}
+
+func TestTerminalFailureRejectsDuplicatePrefix(t *testing.T) {
+	marker, _ := TerminalFailureMarker(4, 2, time.Unix(10, 0))
+	if _, err := parseTerminalMarker(marker + "\n" + marker); err == nil {
+		t.Fatal("duplicate terminal prefix was accepted")
 	}
 }
 
@@ -67,6 +74,71 @@ func TestEnsureActiveAttemptIsStrictCoordinatorAuthoredAndIdempotent(t *testing.
 	}
 }
 
+func TestEnsureRetryCommandIsAuthorizedExactAndIdempotent(t *testing.T) {
+	failedAt := time.Unix(10, 0).UTC()
+	active, _ := ActiveAttemptMarker("o/r", 4, 2, "abcdef0")
+	terminal, _ := TerminalFailureMarker(4, 2, failedAt)
+	comments := []map[string]any{
+		{"id": 1, "body": active, "created_at": failedAt.Add(-time.Minute), "updated_at": failedAt.Add(-time.Minute), "user": map[string]any{"id": 42}},
+		{"id": 2, "body": terminal, "created_at": failedAt, "updated_at": failedAt, "user": map[string]any{"id": 42}},
+	}
+	posts := 0
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var response any
+		switch r.Method + " " + r.URL.RequestURI() {
+		case "GET /repos/o/r/issues/4/comments?per_page=100&page=1":
+			response = comments
+		case "GET /user/42":
+			response = map[string]any{"login": "coordinator"}
+		case "GET /repos/o/r/collaborators/coordinator/permission":
+			response = map[string]any{"permission": "maintain"}
+		case "POST /repos/o/r/issues/4/comments":
+			if r.Header.Get("X-Agent-Symphony-Issue") != "4" || r.Header.Get("X-Agent-Symphony-Attempt") != "2" {
+				t.Fatalf("missing retry attribution: %v", r.Header)
+			}
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil || payload.Body != "/retry" {
+				t.Fatalf("retry body=%q", payload.Body)
+			}
+			posts++
+			createdAt := failedAt.Add(time.Minute)
+			comments = append(comments, map[string]any{"id": 3, "body": payload.Body, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
+			return nil, io.ErrUnexpectedEOF // Accepted; response lost.
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return httpResponse(http.StatusOK, string(body), nil), nil
+	})}}
+	cfg := PRAdapterConfig{Repository: "o/r", ActorID: 42, CancelCommand: "/cancel", RetryCommand: "/retry"}
+	for range 2 {
+		if err := EnsureRetryCommand(t.Context(), api, cfg, 4, 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if posts != 1 {
+		t.Fatalf("retry posts=%d", posts)
+	}
+}
+
+func TestEnsureRetryCommandRejectsNewerOrUnterminalizedBinding(t *testing.T) {
+	failedAt := time.Unix(10, 0).UTC()
+	active, _ := ActiveAttemptMarker("o/r", 4, 2, "abcdef0")
+	terminal, _ := TerminalFailureMarker(4, 2, failedAt)
+	for _, extraAttempt := range []int{1, 3} {
+		extra, _ := ActiveAttemptMarker("o/r", 4, extraAttempt, "abcdef0")
+		api := fixtureAPI(t, map[string]any{"/repos/o/r/issues/4/comments?per_page=100&page=1": []any{
+			map[string]any{"body": active, "user": map[string]any{"id": 42}},
+			map[string]any{"body": terminal, "user": map[string]any{"id": 42}},
+			map[string]any{"body": extra, "user": map[string]any{"id": 42}},
+		}})
+		cfg := PRAdapterConfig{Repository: "o/r", ActorID: 42, RetryCommand: "/retry"}
+		if err := EnsureRetryCommand(t.Context(), api, cfg, 4, 2); err == nil {
+			t.Fatalf("attempt %d binding did not block retry", extraAttempt)
+		}
+	}
+}
+
 func TestActiveAttemptMarkerRejectsHostileAndContradictoryComments(t *testing.T) {
 	first, _ := ActiveAttemptMarker("o/r", 4, 2, "abcdef0")
 	second, _ := ActiveAttemptMarker("o/r", 4, 2, "abcdef1")
@@ -83,9 +155,9 @@ func TestActiveAttemptMarkerRejectsHostileAndContradictoryComments(t *testing.T)
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			api := fixtureAPI(t, map[string]any{"/repos/o/r/issues/4/comments?per_page=100&page=1": test.comments})
-			_, conflict, err := fetchActiveAttempts(context.Background(), api, PRAdapterConfig{Repository: "o/r", ActorID: 42}, 4)
-			if err != nil || !conflict {
-				t.Fatalf("conflict=%v err=%v", conflict, err)
+			_, conflicts, err := fetchActiveAttempts(context.Background(), api, PRAdapterConfig{Repository: "o/r", ActorID: 42}, 4)
+			if err != nil || !conflicts.Any {
+				t.Fatalf("conflicts=%v err=%v", conflicts, err)
 			}
 		})
 	}
@@ -215,10 +287,30 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 		t.Fatalf("bound facts=%#v err=%v", bound, err)
 	}
 	terminal, _ := TerminalFailureMarker(10, 2, now.Add(20*time.Minute))
-	snapshotBodies = append(snapshotBodies, terminal)
+	snapshotBodies = append(snapshotBodies, "Attempt failed closed: worker produced no repository changes\n\n"+terminal)
 	failed, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || len(failed) != 1 || failed[0].Active || failed[0].ActiveAttempt != nil || failed[0].Attempt != 3 || len(failed[0].Blockers) == 0 {
+	if err != nil || len(failed) != 1 || failed[0].Active || failed[0].ActiveAttempt != nil || len(failed[0].TerminalAttempts) != 1 || failed[0].TerminalAttempts[0].Attempt != 2 || failed[0].TerminalAttempts[0].BaseSHA != "abcdef0" || failed[0].TerminalAttempts[0].Diagnostic != "worker produced no repository changes" || failed[0].RecoveryAttempt != 2 || !failed[0].RecoveryAuthorized || failed[0].Attempt != 3 || len(failed[0].Blockers) == 0 {
 		t.Fatalf("terminal transition facts=%#v err=%v", failed, err)
+	}
+	third, _ := ActiveAttemptMarker("o/r", 10, 3, "abcdef0")
+	thirdTerminal, _ := TerminalFailureMarker(10, 3, now.Add(30*time.Minute))
+	snapshotBodies = append(snapshotBodies, third, "Attempt failed closed: newer failure\n\n"+thirdTerminal)
+	history, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || len(history) != 1 || len(history[0].TerminalAttempts) != 2 || history[0].TerminalAttempts[0].Attempt != 2 || history[0].TerminalAttempts[1].Attempt != 3 || history[0].RecoveryAttempt != 3 || !history[0].RecoveryAuthorized {
+		t.Fatalf("terminal history=%#v err=%v", history, err)
+	}
+}
+
+func TestContradictoryTerminalMarkersDoNotProjectFailedAttempt(t *testing.T) {
+	first, _ := TerminalFailureMarker(4, 2, time.Unix(10, 0))
+	second, _ := TerminalFailureMarker(4, 2, time.Unix(20, 0))
+	api := fixtureAPI(t, map[string]any{"/repos/o/r/issues/4/comments?per_page=100&page=1": []any{
+		map[string]any{"body": first, "user": map[string]any{"id": 42}},
+		map[string]any{"body": second, "user": map[string]any{"id": 42}},
+	}})
+	_, conflicts, err := fetchTerminalFailures(context.Background(), api, PRAdapterConfig{Repository: "o/r", ActorID: 42}, 4)
+	if err != nil || !conflicts.Any || !conflicts.Attempts[2] {
+		t.Fatalf("conflicts=%v err=%v", conflicts, err)
 	}
 }
 

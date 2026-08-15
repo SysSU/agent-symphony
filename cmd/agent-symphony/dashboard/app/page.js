@@ -172,16 +172,16 @@ function StatusCard({ status, onOpenTerminal, onAction, busy, waiting }) {
         <Detail label="Diagnostic">{status.diagnostic}</Detail>
         <Detail label="Next action">{status.next_action}</Detail>
       </dl>
-      {status.state === "completed" || status.state === "orphaned" ? (
-        <footer className="cardActions">
-          <button
-            className={status.state === "orphaned" ? "dangerAction" : "secondaryAction"}
-            type="button"
-            disabled={busy}
-            onClick={() => onAction(status.state === "completed" ? "archive" : "abandon", status)}
-          >
-            {waiting ? "Waiting for reconciliation…" : busy ? "Working…" : status.state === "completed" ? "Archive" : "Abandon attempt"}
-          </button>
+      {status.state === "completed" || status.state === "orphaned" || status.retryable ? (
+		<footer className="cardActions">
+		  <button
+			className={status.state === "completed" ? "secondaryAction" : "dangerAction"}
+			type="button"
+			disabled={busy}
+			onClick={() => onAction(status.retryable ? "recover" : status.state === "completed" ? "archive" : "abandon", status)}
+		  >
+			{waiting ? "Waiting for reconciliation…" : busy ? "Working…" : status.retryable ? "Recover attempt" : status.state === "completed" ? "Archive" : "Abandon attempt"}
+		  </button>
         </footer>
       ) : null}
     </article>
@@ -230,9 +230,11 @@ export default function Dashboard() {
   }, []);
 
   const performAction = useCallback(async (action, status) => {
-    const verb = action === "archive" ? "Archive" : "Abandon";
+    const verb = action === "archive" ? "Archive" : action === "recover" ? "Recover" : "Abandon";
     const consequence = action === "archive"
       ? "This stops its tmux session if needed, deletes its local worktree, and hides it from Completed."
+      : action === "recover"
+        ? "If the attempt is stuck, this stops only its named tmux session. It preserves the worktree and diagnostics, records the failure on GitHub, and requests a new attempt."
       : "This stops its tmux session and permanently deletes its local worktree, log, and retained attempt record.";
     if (!window.confirm(`${verb} issue #${status.issue}, attempt ${status.attempt}?\n\n${consequence}`)) return;
     const key = attemptKey(status);
@@ -254,7 +256,8 @@ export default function Dashboard() {
       const stateResponse = await fetch("/dashboard-state.json", { cache: "no-store" });
       if (!stateResponse.ok) throw new Error(`${verb} finished, but dashboard state could not be refreshed.`);
       setDashboardState(await stateResponse.json());
-      setActionNotice(`${action === "archive" ? "Archived" : "Abandoned"} issue #${status.issue}, attempt ${status.attempt}.`);
+      const finished = action === "archive" ? "Archived" : action === "recover" ? "Recovery requested for" : "Abandoned";
+      setActionNotice(`${finished} issue #${status.issue}, attempt ${status.attempt}.`);
     } catch (reason) {
       setActionNotice(reason instanceof Error ? reason.message : `${verb} failed.`);
     } finally {
