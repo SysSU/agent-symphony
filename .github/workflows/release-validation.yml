@@ -48,7 +48,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Failed to initialize WSL distribution: $distribution" }
           $rows = ((wsl --list --verbose) -join "`n") -replace "`0", ''
           if ($rows -notmatch "(?m)^\s*\*?\s*$distribution\s+\S+\s+2\s*$") { throw "WSL distribution is not version 2:`n$rows" }
-          wsl -d $distribution -- bash -lc 'set -euo pipefail; sudo env DEBIAN_FRONTEND=noninteractive apt-get update; sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git ruby tmux'
+          wsl -d $distribution -- bash -lc 'set -euo pipefail; sudo env DEBIAN_FRONTEND=noninteractive apt-get update; sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git nodejs npm ruby tmux'
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install WSL validation prerequisites' }
           wsl -d $distribution -- bash -lc 'rm -rf ~/agent-symphony-ci && mkdir ~/agent-symphony-ci'
           git archive --format=tar HEAD | wsl -d $distribution -- bash -lc 'tar -xf - -C ~/agent-symphony-ci'
