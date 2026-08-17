@@ -7,7 +7,8 @@ This runbook creates an official GitHub Release. Pull-request artifacts are test
 You need:
 
 - repository administrator access;
-- Git, GitHub CLI, Go, and the repository's build tools;
+- Git, GitHub CLI, Go 1.26, Ruby, and tmux;
+- Node.js 20.9 or newer and npm when dashboard sources or lockfiles changed;
 - the SSH private key that matches an entry in `.github/release-signing-allowed-signers`;
 - a clean checkout of protected `main` containing every change intended for the release.
 
@@ -28,7 +29,7 @@ Agent Symphony uses semantic versions. While the project is below `1.0.0`, use a
 Use the version without `v` in build commands and with `v` in the Git tag. For example:
 
 ```sh
-version=0.2.0
+version=X.Y.Z
 ```
 
 ## 2. Merge the release changes
@@ -51,6 +52,13 @@ test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
 ```
 
 ## 3. Validate the exact release commit
+
+If dashboard sources or lockfiles changed, rebuild the committed export and confirm the rebuild is clean:
+
+```sh
+scripts/build-dashboard.sh
+git diff --exit-code -- cmd/agent-symphony/dashboard/out
+```
 
 Run the complete local release gate from the clean `main` checkout:
 

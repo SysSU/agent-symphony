@@ -5,27 +5,36 @@ The CLI provides configuration, diagnostics, production reconciliation, and rest
 ## Commands
 
 ```text
+agent-symphony help
+agent-symphony --help
+agent-symphony -h
+agent-symphony --version
+agent-symphony install-host --coordinator user [--json]
+agent-symphony agent-host implementation|review|orchestrator
 agent-symphony init [--config path] [--json]
 agent-symphony validate [--config path] [--json]
 agent-symphony config view [--config path] [--json]
-agent-symphony doctor [--config path] [--offline] [--json]
-agent-symphony diagnostics [--config path] [--offline] [--json]
+agent-symphony doctor [--config path] [--runtime-state path] [--offline] [--json]
+agent-symphony diagnostics [--config path] [--runtime-state path] [--offline] [--json]
 agent-symphony pr-governance --state path [--config path] [--json]
 agent-symphony serve --state path --runtime-state path [--interval duration] [--dashboard-address address] [--allow-unsafe-dashboard-network --dashboard-password password] [--config path]
-agent-symphony status --state path --runtime-state path [--json]
-agent-symphony list --state path --runtime-state path [--json]
-agent-symphony inspect --issue number --state path --runtime-state path [--json]
-agent-symphony reconcile --state path --runtime-state path [--json]
+agent-symphony status (--state path --runtime-state path | --attempts path [--runtime-state path]) [--config path] [--json]
+agent-symphony list (--state path --runtime-state path | --attempts path [--runtime-state path]) [--config path] [--json]
+agent-symphony inspect --issue number (--state path --runtime-state path | --attempts path [--runtime-state path]) [--config path] [--json]
+agent-symphony reconcile (--state path --runtime-state path | --attempts path [--runtime-state path]) [--config path] [--json]
 ```
 
+- `help`, `--help`, and `-h` print the command summary. `--version` prints the release version.
+- `install-host` provisions the optional advanced host-isolation boundary. Run it as root from the exact installed binary and repeat it after each binary upgrade.
+- `agent-host` is the internal boundary adapter for implementation, review, and orchestrator processes. It is not an interactive operator command.
 - `init` creates a new config with conservative defaults and refuses to overwrite a file. It requires a GitHub `origin` in the current repository.
 - `validate` requires the config file to be inside the resolved Git root. It rejects malformed input, duplicate JSON keys at any nesting depth, unknown keys, secret-shaped keys or command arguments, invalid policy values, duplicate/empty labels, unsafe command arguments, and paths that are absolute, traverse outside the repository, target Git metadata, or escape through symlinks. Worktree and documentation paths are always anchored at the Git root, not the config file's directory.
 - `config view` prints the validated configuration. Invalid or secret-bearing files are never echoed.
-- `doctor` and its `diagnostics` alias check the supported platform, WSL filesystem placement, Git, tmux, both configured commands, Git repository/remote identity, GitHub CLI authentication, and effective repository access. `--offline` skips only the GitHub probe and emits an explicit warning.
+- `doctor` and its `diagnostics` alias check the supported platform, WSL filesystem placement, Git, tmux, configured agent commands, Git repository/remote identity, GitHub CLI authentication, and effective repository access. `--runtime-state` selects the state root to check. `--offline` skips only the GitHub probe and emits an explicit warning.
 - `pr-governance` is a one-shot pull-request governance command. It creates an empty private recovery-state JSON file when the named file is absent, then durably writes feedback and validation handoffs. Recovery claims those handoffs before they cross into the isolated runtime. All GitHub reads and writes use the authenticated `gh` session.
 - `serve --state path --runtime-state path` verifies the authenticated GitHub CLI account and repository, acquires a non-following single-instance lock for that runtime state, reconciles immediately, and polls at most every 60 seconds across bounded GitHub failures. It also serves that repository's dashboard at `--dashboard-address` (default `127.0.0.1:8080`). Localhost or a loopback IP is required unless `--allow-unsafe-dashboard-network` is set; that opt-in requires a nonempty `--dashboard-password` and protects every dashboard route with HTTP Basic authentication using username `agent-symphony`. A password may also protect loopback without the unsafe flag. Every cycle has a whole-cycle two-minute deadline. `reconcile` performs one production cycle; `status`, `list`, and `inspect` refresh and expose the same queued, active, blocked, review-ready, and completed projection. Supplying `--attempts path` selects the nonmutating offline diagnostic. No GitHub credential or identity environment variables are required or read. Independent repository daemons on one host must use distinct `--state`, `--runtime-state`, and dashboard addresses.
 
-Unsafe network mode serves plain HTTP: the password and terminal traffic are not encrypted, the password value can be visible in process listings, and anyone with it can use terminal and cleanup controls. Use it only on a trusted network with host-level firewall rules, or carry it over an encrypted VPN or tunnel.
+Unsafe network mode serves plain HTTP: the password and terminal traffic are not encrypted, the password value can be visible in process listings, and anyone with it can use the dashboard's terminal, recovery, and cleanup controls. Use it only on a trusted network with host-level firewall rules, or carry it over an encrypted VPN or tunnel.
 
 ## Issue eligibility and recorded blockers
 
@@ -33,9 +42,24 @@ Issue bodies may contain arbitrary text, including no Markdown sections. A confi
 
 Dispatch requires an open, non-cancelled issue with `agent-ready` applied after the latest body edit, exactly one configured P1-P3 label, and no conflicting completion labels. Every actor changing those controls must currently have repository `maintain` or `admin` permission; the authenticated coordinator account is allowed. `autonomous-merge` is the explicit opt-in for coordinator-managed merge and must also follow the latest body edit. Without it, Agent Symphony creates the pull request but never merges it. `needs-human-review` remains available as an optional explicit PR label and pending policy Check; it is not required for the default non-autonomous path. An existing active/completed attempt, contradictory markers, unresolved dependencies, terminal failure without an authorized retry, or exhausted concurrency also prevents dispatch. Coordinator marker syntax is reserved and exact coordinator artifacts are not treated as human feedback.
 
-Every refresh atomically writes the current projection to `<runtime-state>/status.json` with mode `0600`. It includes a timestamp, issue state, blockers, diagnostics, and next action, and is also exposed by `status` and `inspect`. This is the latest state snapshot, not an append-only history.
+Every refresh calculates a **status projection**: the current view built from GitHub and local runtime facts. It atomically writes that view to `<runtime-state>/status.json` with mode `0600`. The file includes a timestamp, issue state, blockers, diagnostics, and next action, and the same fields appear in `status` and `inspect`. This is the latest snapshot, not an append-only history.
 
-The dashboard reads that snapshot every five seconds. Current and completed attempts use separate tabs. Clicking a tmux name attaches an xterm.js terminal to only that exact projected, live session; closing the browser detaches that client without ending the worker. Archive is available only for a completed projection and reuses completed-attempt cleanup before adding a local hidden-card marker to `<runtime-state>/dashboard-state.json`. Abandon is available only for an orphaned projection; it stops the exact session, removes the deterministic worktree/result and retained manifest/log, then hides the stale card. Both controls require browser confirmation and a same-origin POST. The browser supplies only issue/attempt numbers; paths, branches, sessions, commands, and GitHub workflow state are never accepted from it.
+## Status and next actions
+
+Read `blockers` first, then `diagnostic`, then `action`. The human output uses those names; JSON uses `blockers`, `diagnostic`, and `next_action`.
+
+| State | Meaning | Operator response |
+| --- | --- | --- |
+| `queued` or `runnable` | Work is waiting or eligible to start. | Follow `action`; resolve any listed blocker or wait for capacity. |
+| `active` or `review-ready` | The exact attempt is running or its pull request is in review. | Wait, inspect the named tmux session, or review the linked GitHub work. |
+| `blocked` or `conflicting` | Identity, policy, dependency, or runtime facts prevent safe mutation. | Follow `blockers` and `diagnostic`; repair the authoritative fact, then reconcile. |
+| `failed` | The attempt ended with retained diagnostics. | Inspect the log. Use **Recover attempt** only when the latest attempt is marked retryable. |
+| `orphaned` | Local resources have no matching authoritative GitHub attempt. | Compare exact identities. Use **Abandon attempt** only when the resources are confirmed stale. |
+| `completed` or `cancelled` | The attempt is terminal. | Archive a completed card if desired. Cancelled work remains ineligible until its controls change. |
+
+Do not infer safety from the state name alone. The exact `action` and identity checks govern recovery and cleanup; see [Recovery](recovery.md).
+
+The dashboard reads that snapshot every five seconds. Current and completed attempts use separate tabs. Clicking a tmux name attaches an xterm.js terminal to only that exact projected, live session; closing the browser detaches that client without ending the worker. Archive is available only for a completed projection and reuses completed-attempt cleanup before adding a local hidden-card marker to `<runtime-state>/dashboard-state.json`. Abandon is available only for an orphaned projection; it stops the exact session, removes the deterministic worktree/result and retained manifest/log, then hides the stale card. Recover is the only attempt-dashboard action that writes GitHub: after fresh permission and identity checks, it may mark an exact stuck attempt failed and post the fixed retry control. All three controls require browser confirmation and a same-origin POST. The browser supplies only issue/attempt numbers; paths, branches, sessions, commands, and arbitrary GitHub policy are never accepted from it. See [Recovery](recovery.md).
 
 When the optional supervised orchestrator agent is configured, its dashboard card shows lifecycle and context health and opens the exact server-selected tmux session. Recover keeps an adoptable live conversation, while Clear context and Rebuild context explicitly start a new generation. Attention cards can enqueue one structured, deduplicated investigation notice for their current issue and attempt; the orchestrator remains advisory and cannot directly schedule, mark, publish, or merge GitHub work. Orchestrator actions use the same reconciliation lock and origin checks as other dashboard controls. Its interactive terminal is available only from a loopback browser request, including when unsafe network dashboard access is enabled.
 
@@ -85,7 +109,13 @@ Commands produce plain human-readable text by default and never depend on color.
 
 `commands.orchestrator` is optional. Omitting it disables the long-lived advisory agent, so upgrades do not unexpectedly start a model or add cost. When configured, Agent Symphony appends bounded generated context as the command's final argument. The command must accept an initial prompt there. The agent cannot replace coordinator workflow decisions or receive GitHub, SSH-agent, cloud, token, password, private-key, or authorization credentials.
 
-Commands are argument arrays, not shell strings. Runtime code therefore executes the configured program without shell interpolation. The default noninteractive Codex implementation command uses `workspace-write` for source edits. A descriptor-owning boundary helper removes the delivered prompt's temporary name before launch and captures implementation or review stdout concurrently through an exclusively created private result file outside the assigned worktree or immutable snapshot; stderr remains in tmux for diagnostics. The entire stdout of default or custom implementation commands must be one `agent-symphony-result-v1` JSON object no larger than 64 KiB; reviewers must emit one bounded `agent-symphony-review-v1` object. A boundary-owned process-group leader remains alive after the configured command exits. On completion, overflow, or cancellation, the helper terminates only that still-owned group, drains the bounded capture, and then reaps its leader. If an out-of-group process keeps stdout open past the bounded drain, the helper closes its read side and fails the attempt; it does not claim to contain escaped processes. Results are retained for retry-safe export or review outcome persistence and never enter the source tree. The bounded implementation worker also requires the exact shared deterministic branch, worktree, and session plus a contained Git directory, commit-format base ancestry, and absent remotes and credential helpers. The default reviewer uses plain `codex exec --sandbox read-only -`, because Codex's built-in review subcommand owns its output format and cannot satisfy the strict result contract. Its prompt scopes review to the complete validated approved-base-through-attested-`HEAD` range, including preserved multi-commit custom-agent histories. Explicit reviewer arrays replace the default arguments unchanged; merged terminal output is never parsed as a result. Both paths normalize the child `TMPDIR` to `/tmp`. `environment_allowlist` is the complete set of inherited variable names available to implementation/review processes; add model-provider credentials explicitly. GitHub, Git askpass, SSH-agent, and cloud credential variables are forbidden even when listed. Arguments or assignments shaped like tokens, passwords, private keys, API keys, credentials, or authorization values are rejected so `config view` cannot disclose them. Dependencies are explicit issue references under the optional configured issue-body section. Completion defaults to human review.
+Commands are argument arrays, not shell strings, so runtime code does not use shell interpolation. The default noninteractive Codex implementation command uses `workspace-write` for source edits.
+
+The boundary helper captures implementation or review stdout in an exclusively created private result file outside the worktree or snapshot; stderr remains in tmux for diagnostics. An implementation must return one `agent-symphony-result-v1` JSON object no larger than 64 KiB. A reviewer must return one bounded `agent-symphony-review-v1` object. The helper owns the process group, stops only that group on completion, overflow, or cancellation, and fails boundedly if an escaped process keeps stdout open. Results remain outside the source tree for safe export and retry.
+
+The implementation boundary requires the exact deterministic branch, worktree, and session, a contained Git directory, valid base ancestry, and no remotes or credential helpers. The default reviewer uses `codex exec --sandbox read-only -`; explicit reviewer arrays replace those arguments unchanged. Review covers the complete approved-base-through-attested-`HEAD` range, and terminal transcript text is never parsed as the result.
+
+Both boundaries set child `TMPDIR` to `/tmp`. `environment_allowlist` is the complete set of inherited variable names for implementation and review; add model-provider credentials explicitly. GitHub, Git askpass, SSH-agent, and cloud credential variables remain forbidden. Secret-shaped arguments and assignments are rejected so `config view` cannot disclose them. Dependencies are explicit issue references under the optional configured body section. Completion defaults to human review.
 
 ## Attempt runtime troubleshooting
 
@@ -111,6 +141,6 @@ On WSL, diagnostics resolve the Git root, choose the longest containing entry fr
 ## Release commands
 
 `scripts/release.sh VERSION [OUTPUT_DIR]` creates reproducible no-CGO archives and `SHA256SUMS` without overwriting existing output. `scripts/validate-release.sh [VERSION]` runs the complete local release gate. These repository scripts are maintainer commands, not installed CLI subcommands.
-# Host isolation (advanced, optional)
+## Host isolation (advanced, optional)
 
-By default no host isolation is installed: `agent-symphony agent-host implementation|review` runs as a plain, same-user subprocess of the coordinator, with no `sudo` and no separate OS identity — see [Setup](setup.md) and [Security](security.md). `agent-symphony install-host --coordinator USER` opts into the stronger advanced boundary; it provisions the documented macOS or Linux/WSL2 host boundary and must run as root from the installed versioned binary. Once installed, `agent-host` becomes the sudo-only bounded JSON adapter and is no longer an interactive operator command in either mode. Unsupported native Windows and WSL repositories under `/mnt/*` fail closed regardless of mode.
+By default no host isolation is installed: `agent-symphony agent-host implementation|review|orchestrator` runs as a plain, same-user subprocess of the coordinator, with no `sudo` and no separate OS identity — see [Setup](setup.md) and [Security](security.md). `agent-symphony install-host --coordinator USER` opts into the stronger advanced boundary; it provisions the documented macOS or Linux/WSL2 host boundary and must run as root from the installed versioned binary. Once installed, `agent-host` becomes the sudo-only bounded JSON adapter and is no longer an interactive operator command in either mode. Unsupported native Windows and WSL repositories under `/mnt/*` fail closed regardless of mode.
