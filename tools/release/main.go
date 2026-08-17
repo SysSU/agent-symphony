@@ -229,7 +229,7 @@ func verifyArchive(path, expectedName, goos, goarch, version string) error {
 	}
 	payload, err := io.ReadAll(tmp)
 	if err != nil || !bytes.Contains(payload, []byte("agent-symphony-release-version:"+version)) {
-		return fmt.Errorf("Go executable lacks release version metadata %q", version)
+		return fmt.Errorf("go executable lacks release version metadata %q", version)
 	}
 	if _, err := tr.Next(); err != io.EOF {
 		if err == nil {
@@ -275,7 +275,7 @@ func verifyBuildInfo(info *buildinfo.BuildInfo, goos, goarch, version string) er
 		}
 	}
 	if len(want) != 0 {
-		return fmt.Errorf("Go build metadata does not match release %s for %s/%s", version, goos, goarch)
+		return fmt.Errorf("go build metadata does not match release %s for %s/%s", version, goos, goarch)
 	}
 	return nil
 }
