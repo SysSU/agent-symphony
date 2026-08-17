@@ -35,6 +35,7 @@ All issue implementation must occur in a dedicated Git worktree. Keep the primar
 - Validate untrusted data at system boundaries, including requests, external APIs, storage, environment variables, and configuration.
 - Do not hide type, lint, or build failures with suppression comments. If a verified tool limitation requires one, make it narrow and explain why.
 - Preserve unrelated user changes and untracked files. Never use destructive Git commands or broad cleanup operations to resolve conflicts.
+- Before committing code changes, run `scripts/lint.sh` and resolve every failure.
 - Run the smallest relevant build, lint, and test checks before finishing, and report the actual results.
 - Tests should verify behavior, branching, validation, side effects, or failure handling—not constants, type-only exports, or trivial re-exports.
 - Write documentation in plain English. Be direct and concise, cut filler, prefer common words to jargon, and briefly define any technical term readers need.

@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
-cd "$(dirname "$0")/../cmd/agent-symphony/dashboard"
-npm ci
+root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+"$root/scripts/lint.sh"
+cd "$root/cmd/agent-symphony/dashboard"
+npm run test
 npm run build

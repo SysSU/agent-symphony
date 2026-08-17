@@ -8,7 +8,8 @@ export GOCACHE="$tmp/go-cache"
 export GOMODCACHE="$tmp/go-mod-cache"
 
 go test -race ./...
-go vet ./...
+scripts/lint.sh
+rm -rf cmd/agent-symphony/dashboard/node_modules
 sh -n scripts/*.sh
 test -s cmd/agent-symphony/dashboard/out/index.html
 test -s cmd/agent-symphony/dashboard/package-lock.json
@@ -31,7 +32,7 @@ runs = workflow.fetch("jobs").fetch("wsl2").fetch("steps").map { |step| step["ru
 snapshots = runs.flat_map(&:lines).grep(/commit -qm snapshot/)
 abort "expected one WSL snapshot command" unless snapshots.length == 1
 commands = snapshots.first.match(/bash -lc "(.*)"\s*$/)&.captures&.first&.split(/;\s*/)
-chmod = "chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh"
+chmod = "chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh"
 abort "invalid WSL snapshot chmod" unless File.read(path).scan(/\bchmod\b/).length == 1 && commands&.count(chmod) == 1
 index = commands.index(chmod)
 abort "WSL snapshot chmod must immediately precede git init" unless index && commands[index + 1] == "git init -q"
@@ -46,7 +47,7 @@ git -C "$tmp/tag-binding" commit --allow-empty -qm second
 git -C "$tmp/tag-binding" tag -fam moved v0.0.0
 ! test "$(git -C "$tmp/tag-binding" rev-parse --verify 'v0.0.0^{commit}')" = "$event_sha"
 grep -qF 'wsl --install --distribution $distribution --web-download --no-launch' .github/workflows/release-validation.yml
-grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git ruby tmux' .github/workflows/release-validation.yml
+grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git nodejs npm ruby tmux' .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install WSL validation prerequisites'" .github/workflows/release-validation.yml
 grep -qF "\$goArchiveVersion = '1.26.0'" .github/workflows/release-validation.yml
 grep -qF 'https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz' .github/workflows/release-validation.yml
