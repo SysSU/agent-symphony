@@ -6,23 +6,26 @@ This walkthrough goes from a fresh machine to a working `reconcile`.
 
 - macOS, Linux, or WSL2.
 - Agent Symphony, Git, tmux, and GitHub CLI.
-- Access to the GitHub repository and a completed `gh auth login`.
+- A GitHub account with `maintain` or `admin` permission on the repository, and a completed `gh auth login`.
 - Codex set up, or another coding agent if you prefer.
 - Go 1.26 only if you build Agent Symphony yourself.
 - Node.js 20.9 or newer only if you rebuild the committed Next.js dashboard export.
 
 ## 1. Install Agent Symphony and prerequisites
 
-Install Git, tmux, [GitHub CLI](https://cli.github.com/), and Codex (or the coding agent you plan to use). Download the Agent Symphony release archive matching the host (`darwin` or `linux`, `amd64` or `arm64`; WSL2 uses `linux_amd64`) and verify it:
+Install Git, tmux, [GitHub CLI](https://cli.github.com/), and Codex (or the coding agent you plan to use). Download `SHA256SUMS` and the Agent Symphony archive matching the host from [GitHub Releases](https://github.com/SysSU/agent-symphony/releases) (`darwin` or `linux`, `amd64` or `arm64`; WSL2 uses `linux_amd64`), then verify it:
 
 ```sh
 grep "  agent-symphony_VERSION_OS_ARCH.tar.gz$" SHA256SUMS | shasum -a 256 -c -
 tar -xzf agent-symphony_VERSION_OS_ARCH.tar.gz
+mkdir -p ~/.local/bin
 install -m 0755 agent-symphony_VERSION_OS_ARCH/agent-symphony ~/.local/bin/agent-symphony
+export PATH="$HOME/.local/bin:$PATH"
+command -v agent-symphony
 agent-symphony --help
 ```
 
-On Linux, `sha256sum -c SHA256SUMS` can verify the downloads. On WSL2, keep the repository and state on the Linux filesystem, never under `/mnt/c`. Contributors can instead build with the Go version pinned in `go.mod`:
+Add `$HOME/.local/bin` to your shell startup file if it is not already on `PATH`. On Linux, replace the first command with `grep "  agent-symphony_VERSION_OS_ARCH.tar.gz$" SHA256SUMS | sha256sum -c -`. On WSL2, keep the repository and state on the Linux filesystem, never under `/mnt/c`. Contributors can instead build with the Go version pinned in `go.mod`:
 
 ```sh
 scripts/build-dashboard.sh
@@ -55,6 +58,21 @@ agent-symphony validate
 
 The defaults use Codex. If you use another coding agent, update the `commands` section in `.agent-symphony.yaml` and list any API key variable it needs. See the [CLI reference](cli.md#configuration) for the full schema.
 
+### Create the default labels
+
+Create any missing control labels. If the repository already uses one of these names, keep it and skip that command.
+
+```sh
+gh label create agent-ready --color 0E8A16 --description "Ready for Agent Symphony"
+gh label create "priority:P1" --color B60205 --description "Highest Agent Symphony priority"
+gh label create "priority:P2" --color D97706 --description "Middle Agent Symphony priority"
+gh label create "priority:P3" --color FBCA04 --description "Lowest Agent Symphony priority"
+gh label create needs-human-review --color D93F0B --description "Require explicit human review"
+gh label create autonomous-merge --color 5319E7 --description "Allow policy-controlled autonomous merge"
+```
+
+If you change the names in `.agent-symphony.yaml`, create those names instead. See [GitHub controls](github-controls.md) for their meaning.
+
 ## 4. Run diagnostics
 
 ```sh
@@ -86,6 +104,8 @@ agent-symphony status \
   --runtime-state ~/.local/state/agent-symphony
 ```
 
+Success means the issue appears in the status output and its `action` explains the next step. If it does not start, use its `blockers`, `diagnostic`, and `action` fields with the [status interpretation guide](cli.md#status-and-next-actions).
+
 For continuous operation, use `serve`; it reconciles immediately and then polls GitHub at most every 60 seconds:
 
 ```sh
@@ -95,7 +115,9 @@ agent-symphony serve \
   --dashboard-address 127.0.0.1:8080
 ```
 
-Open the dashboard URL printed by `serve`. It stays on loopback by default because it provides terminal access and confirmed cleanup controls for exact projected attempts.
+Open the dashboard URL printed by `serve`. It stays on loopback by default because it provides terminal access plus confirmed recovery and cleanup controls for exact attempts shown in current status.
+
+See [Recovery](recovery.md) before using Recover, Archive, or Abandon.
 
 To opt into direct access from another machine on a trusted network, bind a non-loopback address and supply the required password:
 
@@ -109,6 +131,10 @@ agent-symphony serve \
 ```
 
 The HTTP Basic username is `agent-symphony`. This mode is deliberately named unsafe: HTTP does not encrypt the password or terminal traffic, the expanded password can be visible in process listings, and the dashboard has powerful local controls. Restrict the port with the host firewall and use a long, unique password. Use an encrypted VPN or tunnel instead on an untrusted network.
+
+## Stop the daemon
+
+Press `Ctrl-C` in the terminal running `serve`. A service manager should send `SIGTERM`. Agent Symphony stops the reconciliation loop and dashboard, and the next start reconstructs state from GitHub and the local runtime records.
 
 ## Multiple repositories on one host
 

@@ -56,4 +56,6 @@ See the [setup guide](docs/setup.md) for installation, configuration, and your f
 - [Product requirements](docs/PRD.md)
 - [Releases](https://github.com/SysSU/agent-symphony/releases)
 
+Documentation on `main` describes `main`. For an installed release, read the documentation at its matching [Git tag](https://github.com/SysSU/agent-symphony/tags).
+
 See [AGENTS.md](AGENTS.md) for contributor guidance.

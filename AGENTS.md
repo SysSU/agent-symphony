@@ -48,6 +48,7 @@ All issue implementation must occur in a dedicated Git worktree. Keep the primar
 ## Git and Shared Resources
 
 - Do not commit, merge, push, or rewrite history unless the user explicitly requests it.
+- Follow the [release runbook](docs/releases.md) and [release validation policy](docs/release-validation.md) when preparing a release.
 - Use clear conventional commit messages when asked to commit. Do not add AI attribution or AI co-author lines.
 - Never use blanket `pkill`, `killall`, or similar broad process termination. Target only processes started for this task.
 - Avoid starting development servers unless verification needs one. Use an available non-default port when other agents may be active, and stop the server when finished.
