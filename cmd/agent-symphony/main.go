@@ -1268,12 +1268,9 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			continue // monitorAttempts owns live bound attempts from the same snapshot.
 		}
 		if current.State == "completed" {
-			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot)
+			_, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot)
 			if err != nil {
 				return durableAttemptFailure(ctx, api, issue, current, err)
-			}
-			if pending {
-				continue
 			}
 		} else if current.State == "failed" || current.State == "cancelled" {
 			if err := durableAttemptFailure(ctx, api, issue, current, errors.New(current.Diagnostic)); err != nil {

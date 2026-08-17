@@ -44,6 +44,16 @@ agent-symphony status \
 
 See the [setup guide](docs/setup.md) for installation, configuration, and your first issue.
 
+## Development
+
+Run the repository lint gate before review:
+
+```sh
+scripts/lint.sh
+```
+
+It checks Go formatting, `go vet`, the pinned Staticcheck tool, and dashboard ESLint rules after installing the exact locked development dependencies.
+
 ## Documentation
 
 - [Setup](docs/setup.md)
