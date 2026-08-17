@@ -42,7 +42,7 @@ The orchestrator continuously evaluates the backlog, prioritizes work from P1 th
 
 GitHub Issues are the exclusive work-intake mechanism and single source of truth for requirements, decisions, implementation state, progress, validation evidence, and completion. Pull requests, reviews, checks, and branch protections govern delivery. Merge is permitted only when repository-required checks, reviews, permissions, and protections are satisfied.
 
-MVP CLI status exposes the backlog, active and queued work, dependencies, agents, tmux sessions, worktrees, issues, pull requests, checks, blockers, and expected next actions. A per-repository browser dashboard presents the same projection, attaches to exact live tmux sessions, and provides confirmed cleanup of exact completed or orphaned local attempts without mutating GitHub work policy. The orchestrator recovers from restarts without duplicating active or completed work.
+MVP CLI status exposes the backlog, active and queued work, dependencies, agents, tmux sessions, worktrees, issues, pull requests, checks, blockers, and expected next actions. A per-repository browser dashboard presents the same projection, attaches to exact live tmux sessions, provides confirmed cleanup of exact completed or orphaned local attempts, and offers one narrow recovery action for the latest eligible failed or stuck attempt. The orchestrator recovers from restarts without duplicating active or completed work.
 
 Documentation is part of the definition of done. Every pull request assesses documentation impact and updates affected PRDs, `README.md`, and durable project documentation in the same branch. Documentation remains versioned in the repository, defaults to `/docs`, and supports configurable repository-local paths.
 
@@ -233,7 +233,7 @@ The MVP should reuse Symphony's proven boundaries where practical and validate t
 - If autonomous merge confidence is insufficient, default to human review.
 - If multi-agent coordination creates excessive conflicts, cap concurrency per repository.
 - If long-lived execution state cannot be safely resumed, reconstruct from GitHub and start a new traceable attempt.
-- Keep GitHub authoritative; dashboard presentation state may hide locally archived/abandoned cards but must not become a parallel task database or GitHub workflow mutation surface.
+- Keep GitHub authoritative. Dashboard presentation state may hide locally archived or abandoned cards but must not become a parallel task database. Only the separately defined Recover action may write its fixed retry control.
 
 ## Developer Tool Specific Requirements
 
@@ -295,7 +295,7 @@ No migration guide is required for the greenfield MVP.
 - Hold GitHub credentials in the orchestrator boundary; do not expose them to sub-agents.
 - Poll current GitHub state at startup and at intervals no greater than 60 seconds.
 - Preserve deterministic issue-to-attempt, worktree, branch, tmux-session, and PR relationships.
-- Limit dashboard mutations to confirmed cleanup of exact projected local resources; never mutate GitHub issue, PR, review, check, or merge policy from the dashboard.
+- Limit dashboard GitHub mutation to the permission-gated **Recover attempt** action: revalidate one exact retryable attempt, mark a stuck runtime failed when needed, and post the fixed retry control. Archive, Abandon, and orchestrator actions remain local and cannot alter GitHub policy.
 - Treat macOS, Linux, and WSL path and process behavior as explicit compatibility requirements.
 
 ### Implementation Considerations
@@ -393,7 +393,8 @@ No migration guide is required for the greenfield MVP.
 - **FR60:** A stakeholder can attach an in-browser terminal to an exact projected live tmux session without creating a session or arbitrary command.
 - **FR61:** A stakeholder can archive a completed attempt by confirming cleanup of its exact local worktree, local branch, worker result, and tmux session while retaining diagnostic metadata.
 - **FR62:** A stakeholder can abandon a selected orphaned attempt by confirming cleanup of its exact local resources and retained manifest/log.
-- **FR63:** Dashboard terminal and cleanup controls default to loopback and always require same-origin requests and server-resolved deterministic attempt identity; non-loopback binding requires an explicit unsafe-network opt-in and password authentication on every route.
+- **FR63:** Dashboard terminal, recovery, and cleanup controls default to loopback and always require same-origin requests and server-resolved deterministic attempt identity; non-loopback binding requires an explicit unsafe-network opt-in and password authentication on every route.
+- **FR64:** A stakeholder can recover only the latest eligible failed or stuck attempt after fresh permission, state, and identity checks; recovery preserves diagnostics and may post only the fixed retry control.
 
 ## Non-Functional Requirements
 

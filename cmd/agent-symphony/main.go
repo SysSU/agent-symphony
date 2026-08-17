@@ -2300,25 +2300,33 @@ func usage(w io.Writer) {
 
 commands:
 	install-host  provision the native worker/reviewer boundary (run as root)
-	agent-host    execute the installed implementation or review boundary
+	agent-host    execute the implementation, review, or orchestrator boundary
 	init          create .agent-symphony.yaml with safe defaults
-  validate      validate configuration
-  config view   print validated configuration
-  serve         reconcile at startup and at most every 60 seconds
-  status        show recovered work
-  list          alias for status
-  inspect       show one issue (--issue number)
-  reconcile     fetch GitHub facts and reconcile now
-  doctor        diagnose local prerequisites and GitHub access
-  diagnostics   alias for doctor
-  pr-governance reconcile pull-request governance once
+	validate      validate configuration
+	config view   print validated configuration
+	serve         reconcile at startup and at most every 60 seconds
+	status        show recovered work
+	list          alias for status
+	inspect       show one issue (--issue number)
+	reconcile     fetch GitHub facts and reconcile now
+	doctor        diagnose local prerequisites and GitHub access
+	diagnostics   alias for doctor
+	pr-governance reconcile pull-request governance once
+	help          show this help
 
 options:
-  --config path use another configuration file
-  --state path  durable PR-governance/handoff state
-  --runtime-state path  bounded runtime manifest root
-  --dashboard-address address  dashboard listen address (serve only; loopback by default)
-  --allow-unsafe-dashboard-network  permit non-loopback dashboard binding (requires password)
-  --dashboard-password password  HTTP Basic password; username is agent-symphony
-  --json        emit a versioned JSON envelope`)
+	--config path use another configuration file
+	--state path  durable PR-governance/handoff state
+	--runtime-state path  bounded runtime manifest root
+	--attempts path  offline authoritative attempt facts
+	--issue number  issue to inspect
+	--interval duration  serve reconciliation interval (maximum 60s)
+	--dashboard-address address  dashboard listen address (serve only; loopback by default)
+	--allow-unsafe-dashboard-network  permit non-loopback dashboard binding (requires password)
+	--dashboard-password password  HTTP Basic password; username is agent-symphony
+	--offline     skip the GitHub probe in doctor or diagnostics
+	--coordinator user  coordinator OS user for install-host
+	--json        emit a versioned JSON envelope
+	-h, --help    show this help (top level only)
+	--version     show the release version`)
 }

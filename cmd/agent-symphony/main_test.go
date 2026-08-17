@@ -35,6 +35,21 @@ type cleanupBoundary struct {
 
 type directHandoffBoundary struct{ root string }
 
+func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--help"}, &stdout, &stderr); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("help code=%d stderr=%q", code, stderr.String())
+	}
+	for _, want := range []string{
+		"install-host", "agent-host", "init", "validate", "config view", "serve", "status", "list", "inspect", "reconcile", "doctor", "diagnostics", "pr-governance", "help",
+		"--config", "--state", "--runtime-state", "--attempts", "--issue", "--interval", "--dashboard-address", "--allow-unsafe-dashboard-network", "--dashboard-password", "--offline", "--coordinator", "--json", "--help", "--version",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("help is missing %q", want)
+		}
+	}
+}
+
 func (b *directHandoffBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
 	if operation != "accept-handoff" {
 		return agentruntime.Result{}, fmt.Errorf("unexpected operation %q", operation)

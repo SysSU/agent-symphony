@@ -31,8 +31,10 @@ After posting a control comment, wait for the next `serve` cycle or run `agent-s
 
 Edit the issue body before applying `agent-ready`. If an already-ready issue body changes, reapply `agent-ready`; reapply `autonomous-merge` too when autonomous completion is still intended.
 
-## Dashboard cleanup is separate
+## Dashboard actions are separate
 
 Dashboard **Archive** and **Abandon** are local cleanup actions, not GitHub issue controls. Archive applies only to completed attempts. Abandon applies only to orphaned attempts and removes the exact local attempt resources and retained record; it does not post a cancel or retry comment or change issue labels.
+
+**Recover attempt** is the narrow exception. After confirmation, the server revalidates the exact latest retryable attempt. It may stop and mark a stuck attempt failed, then post the fixed `/agent-symphony retry` control. The dashboard never accepts arbitrary comments or policy changes.
 
 See the [CLI reference](cli.md#issue-eligibility-and-recorded-blockers) for dispatch and merge restrictions and [Recovery](recovery.md) for orphan handling.

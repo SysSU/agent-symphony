@@ -9,7 +9,8 @@
 - `host isolation` fails in the zero-admin default: repair the `attempts`/`snapshots` directories under the runtime state root so they are non-symlink, mode `0700`, and owned by the account running `agent-symphony`, or pass a `--runtime-state` that account can write to. This never requires `install-host`.
 - the dashboard does not start: choose an unused localhost or loopback address with `--dashboard-address`. A non-loopback address additionally requires both `--allow-unsafe-dashboard-network` and a nonempty `--dashboard-password`.
 - the remote dashboard cannot be reached: verify the daemon warning says unsafe network access is enabled, connect to the host's real IP rather than `0.0.0.0`, and narrowly allow the selected TCP port through the host firewall. HTTP Basic username is `agent-symphony`; direct HTTP is unencrypted.
-- Archive or Abandon is refused: refresh the projection and verify the card is still completed or orphaned and its branch, worktree, session, and retained manifest match exactly. Do not delete around an identity mismatch.
-# Host isolation is missing or stale (advanced mode only)
+- Archive, Abandon, or Recover is refused: refresh status and verify the card still has the required state and its branch, worktree, session, and retained manifest match exactly. Recover also requires the latest retryable attempt. Do not delete around an identity mismatch; see [Recovery](recovery.md).
+
+## Host isolation is missing or stale (advanced mode only)
 
 This only applies once `install-host` has been run at least once; the zero-admin default never requires it. Install the current release at the documented root-owned mode-`0755` path and rerun `sudo <exact-binary> install-host --coordinator USER`. Do not broaden the managed sudo rule or add shell access. On WSL2, move the repository and all state out of `/mnt/*` before retrying. Conflicting pre-existing users, groups, ownership, or primary groups must be repaired explicitly; the installer will not weaken them.
