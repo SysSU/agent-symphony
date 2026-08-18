@@ -1177,12 +1177,12 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	status, err := run("status", "--porcelain")
+	status, err := run("status", "--porcelain", "--", ".", ":(exclude).agent-symphony")
 	if err != nil {
 		return "", errors.New("inspect export worktree")
 	}
 	if status != "" {
-		if _, err := run("add", "--all"); err != nil {
+		if _, err := run("add", "--all", "--", ".", ":(exclude).agent-symphony"); err != nil {
 			return "", fmt.Errorf("stage worker changes: %w", err)
 		}
 		if _, err := run("diff", "--cached", "--quiet"); err == nil || !isExitCode(err, 1) {
@@ -1200,7 +1200,7 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if branch, err := run("branch", "--show-current"); err != nil || branch != manifest.Branch {
 		return "", errors.New("export branch changed")
 	}
-	if status, err := run("status", "--porcelain"); err != nil || status != "" {
+	if status, err := run("status", "--porcelain", "--", ".", ":(exclude).agent-symphony"); err != nil || status != "" {
 		return "", errors.New("export worktree is not clean")
 	}
 	tmp, err := os.CreateTemp("", "agent-symphony-export-*.bundle")
@@ -1347,13 +1347,28 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 		}
 		return string(ack), nil
 	}
+	resultPath := agentruntime.ResultPath(request.Manifest.Worktree)
+	if !belowRoot(resultPath, root) {
+		return "", errors.New("handoff result path escapes provisioned root")
+	}
+	if info, err := os.Lstat(resultPath); err == nil {
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return "", errors.New("handoff result is not a regular non-symlink file")
+		}
+		if err := os.Remove(resultPath); err != nil {
+			return "", err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
 	helper, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	command := agentruntime.PromptCommand(helper, "tmux", buffer, "", request.Command)
+	command := agentruntime.PromptCommand(helper, "tmux", buffer, resultPath, request.Command)
+	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony feedback handoff in the current worktree. Current source refs are available under refs/remotes/agent-symphony/. Do not push or use GitHub credentials; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", request.Handoff)
 	commands := []agentruntime.Command{
-		{Name: "tmux", Args: []string{"load-buffer", "-b", buffer, "-"}, Dir: request.Manifest.Worktree, Stdin: bytes.NewReader(request.Handoff)},
+		{Name: "tmux", Args: []string{"load-buffer", "-b", buffer, "-"}, Dir: request.Manifest.Worktree, Stdin: bytes.NewReader(prompt)},
 		{Name: "tmux", Args: append(append([]string{"respawn-pane", "-k", "-t", pane, "--"}, command...), ";", "set-option", "-p", "-t", pane, option, recipient), Dir: request.Manifest.Worktree},
 	}
 	for _, command := range commands {

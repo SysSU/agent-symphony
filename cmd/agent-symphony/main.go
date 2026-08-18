@@ -683,7 +683,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	}) {
 		return statuses, nil
 	}
-	if err := resumeHandoffs(ctx, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
+	if err := resumeHandoffs(ctx, &r, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
 		return statuses, err
 	}
 	if err := cleanupCompletedAttempts(ctx, boundary, facts, manifests); err != nil {
@@ -698,7 +698,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if err := monitorAttempts(ctx, &r, statuses, manifests, issues); err != nil {
 		return statuses, err
 	}
-	if err := monitorQueuedAttempts(ctx, api, &r, c, issues, manifests, remote, stateRoot); err != nil {
+	if err := monitorQueuedAttempts(ctx, api, &r, c, issues, manifests, remote, statePath, stateRoot); err != nil {
 		return statuses, err
 	}
 	if err := dispatchIssues(ctx, api, &r, c, prConfig, issues, decisions); err != nil {
@@ -1128,7 +1128,7 @@ func validateWorkerTree(ctx context.Context, repo, head string) error {
 			return errors.New("invalid tree entry")
 		}
 		fields, path := bytes.Fields(line[:tab]), line[tab+1:]
-		if len(fields) != 4 || (string(fields[0]) != "100644" && string(fields[0]) != "100755") || string(fields[1]) != "blob" || !preflightObjectID.Match(fields[2]) || len(path) == 0 || path[0] == '/' || bytes.ContainsAny(path, "\\\n\r") || string(path) != filepath.Clean(string(path)) {
+		if len(fields) != 4 || (string(fields[0]) != "100644" && string(fields[0]) != "100755") || string(fields[1]) != "blob" || !preflightObjectID.Match(fields[2]) || len(path) == 0 || path[0] == '/' || bytes.ContainsAny(path, "\\\n\r") || string(path) != filepath.Clean(string(path)) || string(path) == ".agent-symphony" || strings.HasPrefix(string(path), ".agent-symphony/") {
 			return errors.New("invalid tree mode or path")
 		}
 		size, err := strconv.ParseInt(string(fields[3]), 10, 64)
@@ -1245,13 +1245,38 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string
 	return nil
 }
 
-func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, stateRoot string) error {
+func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, statePath, stateRoot string) error {
+	recovery := &internalgithub.FileRecovery{Path: statePath}
 	for _, manifest := range manifests {
+		var prepared internalgithub.PreparedPublication
+		preparedOK := false
+		if statePath != "" {
+			var err error
+			prepared, preparedOK, err = recovery.PreparedHandoffPublication(ctx, manifest.Repository, manifest.Issue, manifest.Attempt)
+			if err != nil {
+				return err
+			}
+		}
 		remoteIndex := slices.IndexFunc(remote, func(f internalgithub.RecoveryAttemptFact) bool {
 			return f.Repository == manifest.Repository && f.Issue == manifest.Issue && f.Attempt == manifest.Attempt
 		})
-		if remoteIndex < 0 || remote[remoteIndex].PR > 0 || remote[remoteIndex].BaseSHA != manifest.BaseSHA {
+		if !preparedOK && (remoteIndex < 0 || remote[remoteIndex].BaseSHA != manifest.BaseSHA) {
 			continue
+		}
+		var handoff internalgithub.RecoveryHandoff
+		if preparedOK {
+			handoff = prepared.Handoff
+		} else if remote[remoteIndex].PR > 0 {
+			published := remote[remoteIndex]
+			var received bool
+			var err error
+			handoff, received, err = recovery.ReceivedHandoff(ctx, manifest.Repository, published.PR, manifest.Issue, manifest.Attempt, published.HeadSHA)
+			if err != nil {
+				return err
+			}
+			if !received {
+				continue
+			}
 		}
 		index := slices.IndexFunc(issues, func(i internalgithub.RecoveryIssueFact) bool {
 			return i.Repository == manifest.Repository && i.Issue == manifest.Issue && i.Attempt == manifest.Attempt
@@ -1268,9 +1293,31 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			continue // monitorAttempts owns live bound attempts from the same snapshot.
 		}
 		if current.State == "completed" {
-			_, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot)
+			var completed internalgithub.PreparedPublication
+			var prepare func(string) error
+			if handoff.PR > 0 {
+				prepare = func(head string) error {
+					outcome := internalgithub.HandoffOutcome{Key: handoff.Key}
+					if handoff.Validation {
+						outcome.ValidationResult = "blocked"
+						outcome.ValidationEvidence = "pull request head changed to " + head + "; validation must run against the published feedback head"
+					}
+					for _, feedback := range handoff.Feedback {
+						outcome.Feedback = append(outcome.Feedback, internalgithub.FeedbackOutcome{ID: feedback.ID, Source: feedback.Source, State: internalgithub.FeedbackAddressed, Evidence: "published in head " + head})
+					}
+					completed = internalgithub.PreparedPublication{Handoff: handoff, Outcome: outcome, HeadSHA: head}
+					return recovery.PrepareHandoffPublication(ctx, handoff, head, outcome)
+				}
+			}
+			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot, prepare)
 			if err != nil {
 				return durableAttemptFailure(ctx, api, issue, current, err)
+			}
+			if pending || handoff.PR == 0 {
+				continue
+			}
+			if err := recovery.CompleteHandoffPublication(ctx, completed); err != nil {
+				return err
 			}
 		} else if current.State == "failed" || current.State == "cancelled" {
 			if err := durableAttemptFailure(ctx, api, issue, current, errors.New(current.Diagnostic)); err != nil {
@@ -1281,7 +1328,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 	return nil
 }
 
-func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeState *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, stateRoot string) (bool, error) {
+func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeState *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, stateRoot string, preparePublication func(string) error) (bool, error) {
 	boundary := implementationBoundary(stateRoot)
 	snapshotRoot := productionSnapshotRoot(stateRoot)
 	reviewEnv, err := configuredAgentEnvironment(cfg.Commands.Environment)
@@ -1329,6 +1376,11 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 	run := func(dir string, args ...string) (string, error) {
 		out, err := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "-C", dir}, args...)...).CombinedOutput()
 		return strings.TrimSpace(string(out)), err
+	}
+	if preparePublication != nil {
+		if err := preparePublication(head); err != nil {
+			return false, err
+		}
 	}
 	if _, err := run(root, "push", "origin", "FETCH_HEAD:refs/heads/"+manifest.Branch); err != nil {
 		return false, fmt.Errorf("publish verified worker head: %w", err)
@@ -1759,7 +1811,7 @@ func recoverDashboardAttempt(ctx context.Context, configPath, statePath, stateRo
 
 func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, issues []internalgithub.RecoveryIssueFact) error {
 	for _, status := range statuses {
-		if status.Action != "resume monitoring the matching attempt" {
+		if status.Action != "resume monitoring the matching attempt" && status.Action != "monitor the matching published pull request" {
 			continue
 		}
 		var base string
@@ -1780,7 +1832,7 @@ func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuse
 	return nil
 }
 
-func resumeHandoffs(ctx context.Context, boundary boundaryCaller, statePath, stateRoot string, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, command []string) error {
+func resumeHandoffs(ctx context.Context, runtimeState *agentruntime.Runtime, boundary boundaryCaller, statePath, stateRoot string, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, command []string) error {
 	info, err := os.Lstat(statePath)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("safe durable handoff state is unavailable")
@@ -1822,6 +1874,12 @@ func resumeHandoffs(ctx context.Context, boundary boundaryCaller, statePath, sta
 		manifest, ok := live[fmt.Sprintf("%s#%d/%d", handoff.Repository, handoff.Issue, handoff.Attempt)]
 		if !ok {
 			return errors.New("claimed handoff has no verified owning runtime; refusing execution")
+		}
+		if runtimeState != nil {
+			manifest, err = runtimeState.ResumeHandoff(ctx, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA})
+			if err != nil {
+				return err
+			}
 		}
 		payload, _ := json.Marshal(struct {
 			Type, Key  string
