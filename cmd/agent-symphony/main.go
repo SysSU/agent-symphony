@@ -329,14 +329,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		recoverAttempt := func(ctx context.Context, issue, attempt int) error {
 			return recoverDashboardAttempt(ctx, *path, *statePath, *runtimeState, issue, attempt)
 		}
-		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, recoverAttempt, agent, *allowUnsafeDashboardNetwork, *dashboardPassword, stderr)
-		if err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
-		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
 		reconcile := func(ctx context.Context) error {
-			operationMu.Lock()
-			defer operationMu.Unlock()
 			statuses, err := reconcileGitHub(ctx, *path, *statePath, *runtimeState, true)
 			if err != nil {
 				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
@@ -352,7 +345,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 			}
 			return err
 		}
-		if err := orchestrator.ReconcileLoop(ctx, *interval, reconcile); err != nil && !errors.Is(err, context.Canceled) {
+		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, recoverAttempt, reconcile, agent, *allowUnsafeDashboardNetwork, *dashboardPassword, stderr)
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
+		lockedReconcile := func(ctx context.Context) error {
+			operationMu.Lock()
+			defer operationMu.Unlock()
+			return reconcile(ctx)
+		}
+		if err := orchestrator.ReconcileLoop(ctx, *interval, lockedReconcile); err != nil && !errors.Is(err, context.Canceled) {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		return 0

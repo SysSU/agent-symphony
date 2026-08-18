@@ -113,13 +113,13 @@ func TestDashboardRejectsNonLoopbackRequestHost(t *testing.T) {
 }
 
 func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, false, "", io.Discard); err == nil {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, false, "", io.Discard); err == nil {
 		t.Fatal("non-loopback dashboard address accepted")
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	var log bytes.Buffer
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running", Session: "as-o-test"}}
-	url, err := startDashboard(ctx, "127.0.0.1:0", t.TempDir(), nil, nil, service, false, "", &log)
+	url, err := startDashboard(ctx, "127.0.0.1:0", t.TempDir(), nil, nil, nil, service, false, "", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,12 +151,12 @@ func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
 }
 
 func TestDashboardUnsafeNetworkRequiresPassword(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "--dashboard-password is required") {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "--dashboard-password is required") {
 		t.Fatalf("unsafe dashboard without password error=%v", err)
 	}
 
 	password := "test-dashboard-password"
-	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, true, password)
+	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, nil, true, password)
 	for _, test := range []struct {
 		name, method, path, username, password string
 		status                                 int
@@ -207,7 +207,7 @@ func TestDashboardUnsafeNetworkBindingWarnsAndAcceptsAuthentication(t *testing.T
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var log bytes.Buffer
-	boundURL, err := startDashboard(ctx, "0.0.0.0:0", t.TempDir(), nil, nil, nil, true, "test-dashboard-password", &log)
+	boundURL, err := startDashboard(ctx, "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, true, "test-dashboard-password", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,6 +231,58 @@ func TestDashboardUnsafeNetworkBindingWarnsAndAcceptsAuthentication(t *testing.T
 	response.Body.Close()
 	if !strings.Contains(log.String(), "WARNING: unsafe dashboard network access enabled") || !strings.Contains(log.String(), "unencrypted") {
 		t.Fatalf("unsafe dashboard warning=%q", log.String())
+	}
+}
+
+func TestDashboardReconcileActionRunsUnderSharedLock(t *testing.T) {
+	operationMu := &sync.Mutex{}
+	calls := 0
+	failing := false
+	server := &dashboardServer{mu: operationMu, reconcile: func(context.Context) error {
+		if operationMu.TryLock() {
+			operationMu.Unlock()
+			t.Fatal("reconciliation ran outside the shared operation lock")
+		}
+		calls++
+		if failing {
+			return errors.New("token=canary")
+		}
+		return nil
+	}}
+	handler := server.handler(http.NotFoundHandler())
+	request := func(method, path, origin string, body io.Reader) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "http://127.0.0.1"+path, body)
+		r.Header.Set("Origin", origin)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+
+	if response := request(http.MethodGet, "/actions/reconcile", "http://127.0.0.1", nil); response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != "POST" {
+		t.Fatalf("GET status=%d allow=%q", response.Code, response.Header().Get("Allow"))
+	}
+	if response := request(http.MethodPost, "/actions/reconcile", "https://evil.example", nil); response.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin status=%d", response.Code)
+	}
+	if response := request(http.MethodPost, "/actions/reconcile", "http://127.0.0.1", strings.NewReader("payload")); response.Code != http.StatusBadRequest {
+		t.Fatalf("request body status=%d", response.Code)
+	}
+	if response := request(http.MethodPost, "/actions/reconcile?again=1", "http://127.0.0.1", nil); response.Code != http.StatusBadRequest {
+		t.Fatalf("query status=%d", response.Code)
+	}
+	operationMu.Lock()
+	busy := request(http.MethodPost, "/actions/reconcile", "http://127.0.0.1", nil)
+	operationMu.Unlock()
+	if busy.Code != http.StatusServiceUnavailable || busy.Header().Get("Retry-After") != "1" || calls != 0 {
+		t.Fatalf("busy status=%d retry=%q calls=%d", busy.Code, busy.Header().Get("Retry-After"), calls)
+	}
+	if response := request(http.MethodPost, "/actions/reconcile", "http://127.0.0.1", nil); response.Code != http.StatusNoContent || calls != 1 {
+		t.Fatalf("success status=%d body=%q calls=%d", response.Code, response.Body.String(), calls)
+	}
+	failing = true
+	response := request(http.MethodPost, "/actions/reconcile", "http://127.0.0.1", nil)
+	if response.Code != http.StatusInternalServerError || strings.Contains(response.Body.String(), "canary") || !strings.Contains(response.Body.String(), "[REDACTED]") || calls != 2 {
+		t.Fatalf("failure status=%d body=%q calls=%d", response.Code, response.Body.String(), calls)
 	}
 }
 
@@ -284,7 +336,7 @@ func TestDashboardOrchestratorStatusAndActions(t *testing.T) {
 	now := time.Now().UTC()
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, UpdatedAt: now, Enabled: true, State: "running", Session: "as-o-test", Generation: 2, ContextMode: "rebuild", RebuiltAt: now, Diagnostic: "password=hunter2", NextAction: "none"}}
 	operationMu := &sync.Mutex{}
-	handler := newDashboardHandlerWithOptions(t.Context(), root, "tmux", operationMu, nil, service, false, "")
+	handler := newDashboardHandlerWithOptions(t.Context(), root, "tmux", operationMu, nil, nil, service, false, "")
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator.json", nil)
 	response := httptest.NewRecorder()
@@ -353,7 +405,7 @@ func TestDashboardRemoteProxyInvestigationRequiresExactForwardedOrigin(t *testin
 		t.Fatal(err)
 	}
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running"}}
-	handler := newDashboardHandlerWithOptions(t.Context(), root, "tmux", &sync.Mutex{}, nil, service, false, "password")
+	handler := newDashboardHandlerWithOptions(t.Context(), root, "tmux", &sync.Mutex{}, nil, nil, service, false, "password")
 	request := func(origin, forwardedHost, forwardedProto, login, remoteAddr string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/orchestrator/investigate?issue=31&attempt=2", nil)
 		r.Header.Set("Origin", origin)
@@ -394,7 +446,7 @@ func TestDashboardRemoteProxyInvestigationRequiresExactForwardedOrigin(t *testin
 
 func TestDashboardOrchestratorClearAndRebuildAreBodylessPOSTsWithContextTransitions(t *testing.T) {
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running", Generation: 4, ContextMode: "rebuild"}}
-	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, service, false, "")
+	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, service, false, "")
 
 	for _, action := range []string{"clear", "rebuild"} {
 		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/actions/orchestrator/"+action, nil)
@@ -440,7 +492,7 @@ func TestDashboardOrchestratorTerminalIsExactAndLoopbackOnly(t *testing.T) {
 	}
 	t.Setenv("EXPECTED_SESSION", session)
 
-	unsafe := newDashboardHandlerWithOptions(t.Context(), root, script, &sync.Mutex{}, nil, service, true, "password")
+	unsafe := newDashboardHandlerWithOptions(t.Context(), root, script, &sync.Mutex{}, nil, nil, service, true, "password")
 	request := httptest.NewRequest(http.MethodGet, "http://192.0.2.10/orchestrator/terminal", nil)
 	request.Header.Set("Origin", "http://192.0.2.10")
 	request.SetBasicAuth("agent-symphony", "password")
@@ -450,7 +502,7 @@ func TestDashboardOrchestratorTerminalIsExactAndLoopbackOnly(t *testing.T) {
 		t.Fatalf("non-loopback orchestrator terminal status=%d", response.Code)
 	}
 
-	server := httptest.NewServer(newDashboardHandlerWithOptions(t.Context(), root, script, &sync.Mutex{}, nil, service, false, ""))
+	server := httptest.NewServer(newDashboardHandlerWithOptions(t.Context(), root, script, &sync.Mutex{}, nil, nil, service, false, ""))
 	defer server.Close()
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/orchestrator/terminal"
 	connection, responseHTTP, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})

@@ -53,9 +53,13 @@ h1 { margin: 0; overflow-wrap: anywhere; font-size: clamp(2rem, 5vw, 3.7rem); le
 .count span { margin-top: 2px; color: var(--muted); font-size: 0.72rem; text-transform: uppercase; }
 
 .health { display: flex; align-items: start; gap: 12px; margin-bottom: 24px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); }
+.health > div { flex: 1 1 240px; }
 .healthDot { flex: none; width: 12px; height: 12px; margin-top: 5px; border-radius: 50%; background: var(--muted); }
 .health h2 { margin: 0; font-size: 1rem; }
 .health p { margin: 4px 0 0; color: var(--muted); }
+.checkNow { flex: none; padding: 9px 12px; border: 1px solid var(--accent); border-radius: 9px; background: var(--accent); color: #fff; cursor: pointer; font: inherit; font-weight: 750; }
+.checkNow:disabled { cursor: wait; opacity: 0.6; }
+.checkNow:focus-visible { outline: 3px solid #75b8ad; outline-offset: 2px; }
 .health-good { border-color: #a8cdb4; background: #edf8f0; }
 .health-good .healthDot { background: var(--good); box-shadow: 0 0 0 4px rgb(23 107 58 / 12%); }
 .health-attention, .health-stale { border-color: #dfc28d; background: #fff8e9; }
