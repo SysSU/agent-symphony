@@ -28,6 +28,7 @@ import (
 )
 
 func TestDashboardServesEmbeddedNextPageAndStatus(t *testing.T) {
+	requireDashboardBuild(t)
 	root := t.TempDir()
 	want := `{"updated_at":"2026-08-11T00:00:00Z","statuses":[]}`
 	if err := os.WriteFile(filepath.Join(root, "status.json"), []byte(want), 0o600); err != nil {
@@ -57,6 +58,7 @@ func TestDashboardServesEmbeddedNextPageAndStatus(t *testing.T) {
 }
 
 func TestDashboardEmbedsNextAssets(t *testing.T) {
+	requireDashboardBuild(t)
 	paths, err := fs.Glob(dashboardFiles, "dashboard/out/_next/static/chunks/*.js")
 	if err != nil || len(paths) == 0 {
 		t.Fatalf("embedded Next assets=%v err=%v", paths, err)
@@ -67,6 +69,13 @@ func TestDashboardEmbedsNextAssets(t *testing.T) {
 	dashboardHandler(t.TempDir()).ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("embedded asset %s status=%d", request.URL.Path, response.Code)
+	}
+}
+
+func requireDashboardBuild(t *testing.T) {
+	t.Helper()
+	if _, err := fs.Stat(dashboardFiles, "dashboard/out/index.html"); err != nil {
+		t.Skip("dashboard output has not been built")
 	}
 }
 

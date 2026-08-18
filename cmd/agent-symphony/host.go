@@ -1347,9 +1347,14 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 		}
 		return string(ack), nil
 	}
+	helper, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	command := agentruntime.PromptCommand(helper, "tmux", buffer, "", request.Command)
 	commands := []agentruntime.Command{
 		{Name: "tmux", Args: []string{"load-buffer", "-b", buffer, "-"}, Dir: request.Manifest.Worktree, Stdin: bytes.NewReader(request.Handoff)},
-		{Name: "tmux", Args: append(append([]string{"respawn-pane", "-k", "-t", pane, "--"}, request.Command...), ";", "paste-buffer", "-d", "-b", buffer, "-t", pane, ";", "send-keys", "-t", pane, "Enter", ";", "set-option", "-p", "-t", pane, option, recipient), Dir: request.Manifest.Worktree},
+		{Name: "tmux", Args: append(append([]string{"respawn-pane", "-k", "-t", pane, "--"}, command...), ";", "set-option", "-p", "-t", pane, option, recipient), Dir: request.Manifest.Worktree},
 	}
 	for _, command := range commands {
 		if _, err := hostExecRunner(ctx, command); err != nil {

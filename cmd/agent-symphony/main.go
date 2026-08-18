@@ -683,6 +683,9 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	}) {
 		return statuses, nil
 	}
+	if err := resumeHandoffs(ctx, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
+		return statuses, err
+	}
 	if err := cleanupCompletedAttempts(ctx, boundary, facts, manifests); err != nil {
 		return statuses, err
 	}
@@ -699,9 +702,6 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		return statuses, err
 	}
 	if err := dispatchIssues(ctx, api, &r, c, prConfig, issues, decisions); err != nil {
-		return statuses, err
-	}
-	if err := resumeHandoffs(ctx, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
 		return statuses, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -1790,7 +1790,7 @@ func resumeHandoffs(ctx context.Context, boundary boundaryCaller, statePath, sta
 	}
 	live := map[string]agentruntime.Manifest{}
 	for _, status := range statuses {
-		if (status.State == "active" || status.State == "review-ready") && status.Action == "resume monitoring the matching attempt" {
+		if (status.State == "active" || status.State == "review-ready") && (status.Action == "resume monitoring the matching attempt" || status.Action == "monitor the matching published pull request") {
 			for _, manifest := range manifests {
 				if manifest.Repository == status.Repository && manifest.Issue == status.Issue && manifest.Attempt == status.Attempt {
 					live[fmt.Sprintf("%s#%d/%d", status.Repository, status.Issue, status.Attempt)] = manifest
