@@ -347,6 +347,51 @@ func TestDashboardOrchestratorStatusAndActions(t *testing.T) {
 	}
 }
 
+func TestDashboardRemoteProxyInvestigationRequiresExactForwardedOrigin(t *testing.T) {
+	root := t.TempDir()
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 31, Attempt: 2, State: "blocked", Session: "as-" + internalgithub.RepositoryIdentifier("o/r") + "-31-2"}}); err != nil {
+		t.Fatal(err)
+	}
+	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running"}}
+	handler := newDashboardHandlerWithOptions(t.Context(), root, "tmux", &sync.Mutex{}, nil, service, false, "password")
+	request := func(origin, forwardedHost, forwardedProto, login, remoteAddr string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/orchestrator/investigate?issue=31&attempt=2", nil)
+		r.Header.Set("Origin", origin)
+		r.Header.Set("X-Forwarded-Host", forwardedHost)
+		r.Header.Set("X-Forwarded-Proto", forwardedProto)
+		r.Header.Set("Tailscale-User-Login", login)
+		r.RemoteAddr = remoteAddr
+		r.SetBasicAuth("agent-symphony", "password")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, r)
+		return response
+	}
+
+	if got := request("https://machine.example.ts.net", "machine.example.ts.net", "https", "user@example.com", "127.0.0.1:54321"); got.Code != http.StatusOK {
+		t.Fatalf("remote proxy investigation status=%d body=%q", got.Code, got.Body.String())
+	}
+	for _, test := range []struct {
+		name, origin, forwardedHost, forwardedProto, login, remoteAddr string
+	}{
+		{"mismatched origin", "https://other.example.ts.net", "machine.example.ts.net", "https", "user@example.com", "127.0.0.1:54321"},
+		{"spoofed proxy headers", "https://machine.example.ts.net", "machine.example.ts.net", "https", "", "127.0.0.1:54321"},
+		{"spoofed proxy identity", "https://machine.example.ts.net", "machine.example.ts.net", "https", "user@example.com", "192.0.2.10:54321"},
+		{"mismatched scheme", "https://machine.example.ts.net", "machine.example.ts.net", "http", "user@example.com", "127.0.0.1:54321"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := request(test.origin, test.forwardedHost, test.forwardedProto, test.login, test.remoteAddr); got.Code != http.StatusForbidden {
+				t.Fatalf("status=%d body=%q", got.Code, got.Body.String())
+			}
+		})
+	}
+	if got := request("http://127.0.0.1", "", "", "", "127.0.0.1:54321"); got.Code != http.StatusOK {
+		t.Fatalf("localhost investigation status=%d body=%q", got.Code, got.Body.String())
+	}
+	if strings.Join(service.actions, ",") != "investigate:31:2,investigate:31:2" {
+		t.Fatalf("actions=%v", service.actions)
+	}
+}
+
 func TestDashboardOrchestratorClearAndRebuildAreBodylessPOSTsWithContextTransitions(t *testing.T) {
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running", Generation: 4, ContextMode: "rebuild"}}
 	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, service, false, "")
