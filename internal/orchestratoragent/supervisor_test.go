@@ -195,6 +195,7 @@ func TestLaunchContractUsesFixedBoundaryCommand(t *testing.T) {
 	now := time.Date(2026, 8, 15, 1, 2, 3, 0, time.UTC)
 	runner := &fakeRunner{}
 	agent := newTestSupervisor(t, runner, &now)
+	agent.Command = []string{"agent", "--workspace", "{orchestrator_workspace}"}
 	agent.Launcher = []string{"agent-symphony", "agent-host", "orchestrator"}
 	agent.projectionKnown = true
 	if _, err := agent.Recover(context.Background()); err != nil {
@@ -218,8 +219,33 @@ func TestLaunchContractUsesFixedBoundaryCommand(t *testing.T) {
 	path := filepath.Join(agent.Workspace, "orchestrator-launch.json")
 	body, err := os.ReadFile(path)
 	info, statErr := os.Stat(path)
-	if err != nil || statErr != nil || info.Mode().Perm() != 0o440 || !strings.Contains(string(body), `"command": [`) || !strings.Contains(string(body), `"context":`) {
+	if err != nil || statErr != nil || info.Mode().Perm() != 0o440 || !strings.Contains(string(body), `"command": [`) || !strings.Contains(string(body), agent.Workspace) || strings.Contains(string(body), "{orchestrator_workspace}") || !strings.Contains(string(body), `"context":`) {
 		t.Fatalf("launch contract body=%q mode=%v read=%v stat=%v", body, info.Mode(), err, statErr)
+	}
+}
+
+func TestLaunchExpandsOrchestratorWorkspaceWithoutChangingConfiguredCommand(t *testing.T) {
+	now := time.Date(2026, 8, 15, 1, 2, 3, 0, time.UTC)
+	runner := &fakeRunner{}
+	agent := newTestSupervisor(t, runner, &now)
+	configured := `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`
+	agent.Command = []string{"codex", "-c", configured}
+	agent.projectionKnown = true
+	if _, err := agent.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	index := slices.IndexFunc(runner.commands, func(command agentruntime.Command) bool {
+		return len(command.Args) > 0 && command.Args[0] == "respawn-pane"
+	})
+	if index < 0 {
+		t.Fatalf("missing respawn command: %#v", runner.commands)
+	}
+	want := `projects={"` + agent.Workspace + `"={trust_level="trusted"}}`
+	if !slices.Contains(runner.commands[index].Args, want) {
+		t.Fatalf("workspace override not expanded: %#v", runner.commands[index])
+	}
+	if agent.Command[2] != configured {
+		t.Fatalf("configured command mutated: %#v", agent.Command)
 	}
 }
 
