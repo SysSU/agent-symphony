@@ -683,6 +683,9 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	}) {
 		return statuses, nil
 	}
+	if err := resumeHandoffs(ctx, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
+		return statuses, err
+	}
 	if err := cleanupCompletedAttempts(ctx, boundary, facts, manifests); err != nil {
 		return statuses, err
 	}
@@ -699,9 +702,6 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		return statuses, err
 	}
 	if err := dispatchIssues(ctx, api, &r, c, prConfig, issues, decisions); err != nil {
-		return statuses, err
-	}
-	if err := resumeHandoffs(ctx, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
 		return statuses, err
 	}
 	if err := ctx.Err(); err != nil {
