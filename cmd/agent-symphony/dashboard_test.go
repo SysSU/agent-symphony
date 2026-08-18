@@ -410,6 +410,40 @@ func TestDashboardOrchestratorTerminalIsExactAndLoopbackOnly(t *testing.T) {
 	}
 }
 
+func TestDashboardOriginAcceptsExactHTTPAndHTTPSHosts(t *testing.T) {
+	for _, origin := range []string{"http://localhost:8080", "https://machine.example.ts.net"} {
+		request := httptest.NewRequest(http.MethodGet, origin+"/orchestrator/terminal", nil)
+		request.Header.Set("Origin", origin)
+		if !sameDashboardOrigin(request) {
+			t.Errorf("exact origin %q was rejected", origin)
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "https://machine.example.ts.net/orchestrator/terminal", nil)
+	request.Header.Set("Origin", "https://other.example.ts.net")
+	if sameDashboardOrigin(request) {
+		t.Fatal("mismatched origin was accepted")
+	}
+}
+
+func TestDashboardLoopbackRequestAcceptsTailscaleServeIdentity(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "https://machine.example.ts.net/orchestrator/terminal", nil)
+	request.RemoteAddr = "127.0.0.1:54321"
+	if dashboardRequestLoopback(request) {
+		t.Fatal("non-loopback Host without Tailscale identity was accepted")
+	}
+
+	request.Header.Set("Tailscale-User-Login", "user@example.com")
+	if !dashboardRequestLoopback(request) {
+		t.Fatal("loopback Tailscale Serve request was rejected")
+	}
+
+	request.RemoteAddr = "192.0.2.10:54321"
+	if dashboardRequestLoopback(request) {
+		t.Fatal("non-loopback peer with spoofed Tailscale identity was accepted")
+	}
+}
+
 func TestServeUnsafeNetworkFlagRequiresPassword(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"serve", "--state", "pr-state.json", "--runtime-state", t.TempDir(), "--allow-unsafe-dashboard-network"}, &stdout, &stderr)
