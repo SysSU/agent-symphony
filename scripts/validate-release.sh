@@ -7,11 +7,15 @@ trap 'chmod -R u+w "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT HUP INT TERM
 export GOCACHE="$tmp/go-cache"
 export GOMODCACHE="$tmp/go-mod-cache"
 
+scripts/build-dashboard.sh
+rm -rf cmd/agent-symphony/dashboard/node_modules
 go test -race ./...
 scripts/lint.sh
 rm -rf cmd/agent-symphony/dashboard/node_modules
 sh -n scripts/*.sh
 test -s cmd/agent-symphony/dashboard/out/index.html
+test "$(git ls-files cmd/agent-symphony/dashboard/out | grep -vc '/.gitkeep$' || true)" -eq 0
+git check-ignore -q cmd/agent-symphony/dashboard/out/index.html
 test -s cmd/agent-symphony/dashboard/package-lock.json
 scripts/credential-scan-test.sh
 for script in scripts/*.sh; do
@@ -47,14 +51,17 @@ git -C "$tmp/tag-binding" commit --allow-empty -qm second
 git -C "$tmp/tag-binding" tag -fam moved v0.0.0
 ! test "$(git -C "$tmp/tag-binding" rev-parse --verify 'v0.0.0^{commit}')" = "$event_sha"
 grep -qF 'wsl --install --distribution $distribution --web-download --no-launch' .github/workflows/release-validation.yml
-grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git nodejs npm ruby tmux' .github/workflows/release-validation.yml
+grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git ruby tmux xz-utils' .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install WSL validation prerequisites'" .github/workflows/release-validation.yml
 grep -qF "\$goArchiveVersion = '1.26.0'" .github/workflows/release-validation.yml
 grep -qF 'https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz' .github/workflows/release-validation.yml
-grep -qF "'x86_64' { \$goArch = 'amd64'; \$goSHA256 = 'aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235' }" .github/workflows/release-validation.yml
-grep -qF "'aarch64' { \$goArch = 'arm64'; \$goSHA256 = 'bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd' }" .github/workflows/release-validation.yml
 grep -qF "sha256sum -c -" .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install pinned Go toolchain in WSL'" .github/workflows/release-validation.yml
+grep -qF "\$nodeVersion = '22.15.1'" .github/workflows/release-validation.yml
+grep -qF 'https://nodejs.org/dist/v${nodeVersion}/node-v${nodeVersion}-linux-${nodeArch}.tar.xz' .github/workflows/release-validation.yml
+grep -qF "'x86_64' { \$goArch = 'amd64'; \$goSHA256 = 'aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235'; \$nodeArch = 'x64'; \$nodeSHA256 = '7dca2ab34ec817aa4781e2e99dfd34d349eff9be86e5d5fbaa7e96cae8ee3179' }" .github/workflows/release-validation.yml
+grep -qF "'aarch64' { \$goArch = 'arm64'; \$goSHA256 = 'bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd'; \$nodeArch = 'arm64'; \$nodeSHA256 = 'f4ae8ddf7487dfaf7da92fef463ee55cc29d8772d62891361dc3fc8b8e469205' }" .github/workflows/release-validation.yml
+grep -qF "throw 'Failed to install pinned Node.js toolchain in WSL'" .github/workflows/release-validation.yml
 grep -qF "bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin scripts/validate-release.sh 0.0.0-wsl'" .github/workflows/release-validation.yml
 grep -qF "throw 'WSL release validation failed'" .github/workflows/release-validation.yml
 ! grep -F '$PATH' .github/workflows/release-validation.yml | grep -qF 'scripts/validate-release.sh 0.0.0-wsl'
