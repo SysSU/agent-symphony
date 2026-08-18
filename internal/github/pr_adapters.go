@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -69,6 +70,12 @@ type HandoffOutcome struct {
 	ValidationResult   string            `json:"validation_result,omitempty"`
 	ValidationEvidence string            `json:"validation_evidence,omitempty"`
 	Retryable          bool              `json:"retryable,omitempty"`
+}
+
+type PreparedPublication struct {
+	Handoff RecoveryHandoff `json:"handoff"`
+	Outcome HandoffOutcome  `json:"outcome"`
+	HeadSHA string          `json:"head_sha"`
 }
 
 func handoffKey(h RecoveryHandoff) string {
@@ -157,13 +164,7 @@ func (r *FileRecovery) ReceivedHandoff(_ context.Context, repository string, pr,
 		if state.Repository != repository || state.Number != pr || state.Issue != issue || state.Attempt != attempt || state.HeadSHA != head {
 			continue
 		}
-		handoff := RecoveryHandoff{Repository: repository, PR: pr, Issue: issue, Attempt: attempt, HeadSHA: head, Validation: state.ValidationInFlightSHA == head && head != "", ValidationGeneration: state.ValidationGeneration}
-		for _, feedback := range state.Facts.Feedback {
-			if feedback.Execution == FeedbackInFlight {
-				handoff.Feedback = append(handoff.Feedback, feedback)
-			}
-		}
-		handoff.Key = handoffKey(handoff)
+		handoff := receivedHandoff(*state)
 		received := (handoff.Validation || len(handoff.Feedback) > 0) && state.HandoffReceipts[handoff.Key]
 		return handoff, received, nil
 	}
@@ -205,40 +206,149 @@ func (r *FileRecovery) CompleteHandoffOutcome(_ context.Context, handoff Recover
 			if state.Repository != handoff.Repository || state.Number != handoff.PR || state.Issue != handoff.Issue || state.Attempt != handoff.Attempt || state.HeadSHA != handoff.HeadSHA {
 				continue
 			}
-			if handoff.Validation {
-				if outcome.ValidationEvidence == "" || (outcome.ValidationResult != "passed" && outcome.ValidationResult != "failed" && outcome.ValidationResult != "blocked") {
-					return errors.New("validation outcome requires result and evidence")
-				}
-				if state.ValidationResult == outcome.ValidationResult && state.ValidationEvidence == outcome.ValidationEvidence && state.ValidationInFlightSHA == "" {
-					// Identical replay after persist/before outcome-file removal.
-				} else if state.ValidationInFlightSHA != handoff.HeadSHA {
-					return errors.New("validation outcome does not match in-flight work")
-				} else if !outcome.Retryable {
-					state.ValidationInFlightSHA = ""
-				}
-				state.ValidationResult, state.ValidationEvidence = outcome.ValidationResult, outcome.ValidationEvidence
+			return applyHandoffOutcome(state, handoff, outcome)
+		}
+		return errors.New("recovered pull request attempt not found or head changed")
+	})
+}
+
+func receivedHandoff(state PRState) RecoveryHandoff {
+	handoff := RecoveryHandoff{Repository: state.Repository, PR: state.Number, Issue: state.Issue, Attempt: state.Attempt, HeadSHA: state.HeadSHA, Validation: state.ValidationInFlightSHA == state.HeadSHA && state.HeadSHA != "", ValidationGeneration: state.ValidationGeneration}
+	for _, feedback := range state.Facts.Feedback {
+		if feedback.Execution == FeedbackInFlight {
+			handoff.Feedback = append(handoff.Feedback, feedback)
+		}
+	}
+	handoff.Key = handoffKey(handoff)
+	return handoff
+}
+
+func applyHandoffOutcome(state *PRState, handoff RecoveryHandoff, outcome HandoffOutcome) error {
+	if handoff.Validation {
+		if outcome.ValidationEvidence == "" || (outcome.ValidationResult != "passed" && outcome.ValidationResult != "failed" && outcome.ValidationResult != "blocked") {
+			return errors.New("validation outcome requires result and evidence")
+		}
+		if state.ValidationResult == outcome.ValidationResult && state.ValidationEvidence == outcome.ValidationEvidence && state.ValidationInFlightSHA == "" {
+			// Identical replay after persist/before outcome-file removal.
+		} else if state.ValidationInFlightSHA != handoff.HeadSHA {
+			return errors.New("validation outcome does not match in-flight work")
+		} else if !outcome.Retryable {
+			state.ValidationInFlightSHA = ""
+		}
+		state.ValidationResult, state.ValidationEvidence = outcome.ValidationResult, outcome.ValidationEvidence
+	}
+	for _, got := range outcome.Feedback {
+		if got.ID <= 0 || got.Evidence == "" || (got.State != FeedbackAddressed && got.State != FeedbackBlocked) {
+			return errors.New("feedback outcome requires addressed/blocked state and evidence")
+		}
+		matched := false
+		for j := range state.Facts.Feedback {
+			feedback := &state.Facts.Feedback[j]
+			if feedback.ID == got.ID && feedback.Source == got.Source && feedback.Execution == FeedbackCompleted && feedback.State == got.State && feedback.Evidence == got.Evidence {
+				matched = true
+			} else if feedback.ID == got.ID && feedback.Source == got.Source && feedback.Execution == FeedbackInFlight {
+				feedback.State, feedback.Execution, feedback.Evidence = got.State, FeedbackCompleted, got.Evidence
+				matched = true
 			}
-			for _, got := range outcome.Feedback {
-				if got.ID <= 0 || got.Evidence == "" || (got.State != FeedbackAddressed && got.State != FeedbackBlocked) {
-					return errors.New("feedback outcome requires addressed/blocked state and evidence")
-				}
-				matched := false
-				for j := range state.Facts.Feedback {
-					f := &state.Facts.Feedback[j]
-					if f.ID == got.ID && f.Source == got.Source && f.Execution == FeedbackCompleted && f.State == got.State && f.Evidence == got.Evidence {
-						matched = true
-					} else if f.ID == got.ID && f.Source == got.Source && f.Execution == FeedbackInFlight {
-						f.State, f.Execution, f.Evidence = got.State, FeedbackCompleted, got.Evidence
-						matched = true
-					}
-				}
-				if !matched {
-					return errors.New("feedback outcome does not match in-flight work")
+		}
+		if !matched {
+			return errors.New("feedback outcome does not match in-flight work")
+		}
+	}
+	return nil
+}
+
+// PrepareHandoffPublication durably binds the exact reviewed head and outcome
+// before any remote mutation so a coordinator restart can safely retry.
+func (r *FileRecovery) PrepareHandoffPublication(_ context.Context, handoff RecoveryHandoff, head string, outcome HandoffOutcome) error {
+	if !regexpSHA.MatchString(head) || handoff.Key == "" || handoff.Key != handoffKey(handoff) || outcome.Key != handoff.Key {
+		return errors.New("prepared publication identity is invalid")
+	}
+	return r.update(func(states []PRState) error {
+		for i := range states {
+			state := &states[i]
+			if state.Repository != handoff.Repository || state.Number != handoff.PR || state.Issue != handoff.Issue || state.Attempt != handoff.Attempt || state.HeadSHA != handoff.HeadSHA {
+				continue
+			}
+			received := receivedHandoff(*state)
+			if !state.HandoffReceipts[handoff.Key] || !reflect.DeepEqual(received, handoff) {
+				return errors.New("prepared publication does not match received handoff")
+			}
+			candidate := *state
+			candidate.Facts.Feedback = slices.Clone(state.Facts.Feedback)
+			if err := applyHandoffOutcome(&candidate, handoff, outcome); err != nil {
+				return err
+			}
+			if handoff.Validation && candidate.ValidationInFlightSHA != "" {
+				return errors.New("prepared publication cannot retain in-flight validation")
+			}
+			for _, expected := range handoff.Feedback {
+				if !slices.ContainsFunc(candidate.Facts.Feedback, func(feedback Feedback) bool {
+					return feedback.identity() == expected.identity() && feedback.Execution == FeedbackCompleted && (feedback.State == FeedbackAddressed || feedback.State == FeedbackBlocked) && feedback.Evidence != ""
+				}) {
+					return errors.New("prepared publication requires an outcome for every feedback item")
 				}
 			}
+			prepared := &PreparedPublication{Handoff: handoff, Outcome: outcome, HeadSHA: head}
+			if state.PreparedPublication != nil && !reflect.DeepEqual(state.PreparedPublication, prepared) {
+				return errors.New("different publication is already prepared")
+			}
+			state.PreparedPublication = prepared
 			return nil
 		}
 		return errors.New("recovered pull request attempt not found or head changed")
+	})
+}
+
+// PreparedHandoffPublication returns only a locally prepared transition whose
+// old handoff and receipt still match durable state.
+func (r *FileRecovery) PreparedHandoffPublication(_ context.Context, repository string, issue, attempt int) (PreparedPublication, bool, error) {
+	states, err := r.read()
+	if err != nil {
+		return PreparedPublication{}, false, err
+	}
+	for _, state := range states {
+		if state.Repository != repository || state.Issue != issue || state.Attempt != attempt || state.PreparedPublication == nil {
+			continue
+		}
+		prepared := *state.PreparedPublication
+		if !regexpSHA.MatchString(prepared.HeadSHA) || !state.HandoffReceipts[prepared.Handoff.Key] || !reflect.DeepEqual(receivedHandoff(state), prepared.Handoff) {
+			return PreparedPublication{}, false, errors.New("prepared publication no longer matches durable handoff")
+		}
+		return prepared, true, nil
+	}
+	return PreparedPublication{}, false, nil
+}
+
+func completePreparedPublication(state *PRState, prepared PreparedPublication) error {
+	if state.PreparedPublication == nil || !reflect.DeepEqual(*state.PreparedPublication, prepared) || !regexpSHA.MatchString(prepared.HeadSHA) || !state.HandoffReceipts[prepared.Handoff.Key] || !reflect.DeepEqual(receivedHandoff(*state), prepared.Handoff) {
+		return errors.New("prepared publication no longer matches durable handoff")
+	}
+	if err := applyHandoffOutcome(state, prepared.Handoff, prepared.Outcome); err != nil {
+		return err
+	}
+	state.HeadSHA = prepared.HeadSHA
+	state.CheckHead, state.PolicyStatus = "", ""
+	state.ValidationQueuedSHA, state.ValidationInFlightSHA, state.ValidationResult, state.ValidationEvidence = "", "", "", ""
+	state.MergeAttemptSHA, state.MergePhase = "", ""
+	state.Facts.HeadSHA, state.Facts.ValidationSHA, state.Facts.DocumentationSHA = "", "", ""
+	state.Facts.BranchModifiedOutsideAttempt = false
+	state.PendingDispositions, state.ConfirmedDispositions = nil, nil
+	state.PreparedPublication = nil
+	return nil
+}
+
+// CompleteHandoffPublication atomically records feedback outcomes and advances
+// every head-bound recovery field after remote publication succeeds.
+func (r *FileRecovery) CompleteHandoffPublication(_ context.Context, prepared PreparedPublication) error {
+	return r.update(func(states []PRState) error {
+		for i := range states {
+			state := &states[i]
+			if state.Repository == prepared.Handoff.Repository && state.Number == prepared.Handoff.PR && state.Issue == prepared.Handoff.Issue && state.Attempt == prepared.Handoff.Attempt {
+				return completePreparedPublication(state, prepared)
+			}
+		}
+		return errors.New("recovered pull request attempt not found")
 	})
 }
 
@@ -266,14 +376,23 @@ func (r *FileRecovery) hydrateAttempts(repository string, facts []RecoveryAttemp
 				return nil, errors.New("authoritative pull request attempt has invalid identity")
 			}
 			found := false
-			for _, state := range states {
+			for i := range states {
+				state := &states[i]
 				samePR := state.Repository == fact.Repository && state.Number == fact.PR
 				sameAttempt := state.Repository == fact.Repository && state.Issue == fact.Issue && state.Attempt == fact.Attempt
 				if !samePR && !sameAttempt {
 					continue
 				}
-				if !samePR || !sameAttempt || state.HeadSHA != fact.HeadSHA {
+				if !samePR || !sameAttempt {
 					return nil, errors.New("authoritative pull request attempt conflicts with recovery state")
+				}
+				if state.HeadSHA != fact.HeadSHA {
+					if state.PreparedPublication == nil || state.PreparedPublication.HeadSHA != fact.HeadSHA {
+						return nil, errors.New("authoritative pull request attempt conflicts with recovery state")
+					}
+					if err := completePreparedPublication(state, *state.PreparedPublication); err != nil {
+						return nil, err
+					}
 				}
 				found = true
 				break

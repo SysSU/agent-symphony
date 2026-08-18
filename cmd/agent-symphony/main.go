@@ -1248,15 +1248,26 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string
 func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, statePath, stateRoot string) error {
 	recovery := &internalgithub.FileRecovery{Path: statePath}
 	for _, manifest := range manifests {
+		var prepared internalgithub.PreparedPublication
+		preparedOK := false
+		if statePath != "" {
+			var err error
+			prepared, preparedOK, err = recovery.PreparedHandoffPublication(ctx, manifest.Repository, manifest.Issue, manifest.Attempt)
+			if err != nil {
+				return err
+			}
+		}
 		remoteIndex := slices.IndexFunc(remote, func(f internalgithub.RecoveryAttemptFact) bool {
 			return f.Repository == manifest.Repository && f.Issue == manifest.Issue && f.Attempt == manifest.Attempt
 		})
-		if remoteIndex < 0 || remote[remoteIndex].BaseSHA != manifest.BaseSHA {
+		if !preparedOK && (remoteIndex < 0 || remote[remoteIndex].BaseSHA != manifest.BaseSHA) {
 			continue
 		}
-		published := remote[remoteIndex]
 		var handoff internalgithub.RecoveryHandoff
-		if published.PR > 0 {
+		if preparedOK {
+			handoff = prepared.Handoff
+		} else if remote[remoteIndex].PR > 0 {
+			published := remote[remoteIndex]
 			var received bool
 			var err error
 			handoff, received, err = recovery.ReceivedHandoff(ctx, manifest.Repository, published.PR, manifest.Issue, manifest.Attempt, published.HeadSHA)
@@ -1282,30 +1293,30 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			continue // monitorAttempts owns live bound attempts from the same snapshot.
 		}
 		if current.State == "completed" {
-			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot)
+			var completed internalgithub.PreparedPublication
+			var prepare func(string) error
+			if handoff.PR > 0 {
+				prepare = func(head string) error {
+					outcome := internalgithub.HandoffOutcome{Key: handoff.Key}
+					if handoff.Validation {
+						outcome.ValidationResult = "blocked"
+						outcome.ValidationEvidence = "pull request head changed to " + head + "; validation must run against the published feedback head"
+					}
+					for _, feedback := range handoff.Feedback {
+						outcome.Feedback = append(outcome.Feedback, internalgithub.FeedbackOutcome{ID: feedback.ID, Source: feedback.Source, State: internalgithub.FeedbackAddressed, Evidence: "published in head " + head})
+					}
+					completed = internalgithub.PreparedPublication{Handoff: handoff, Outcome: outcome, HeadSHA: head}
+					return recovery.PrepareHandoffPublication(ctx, handoff, head, outcome)
+				}
+			}
+			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot, prepare)
 			if err != nil {
 				return durableAttemptFailure(ctx, api, issue, current, err)
 			}
-			if pending || published.PR == 0 {
+			if pending || handoff.PR == 0 {
 				continue
 			}
-			root, err := config.GitRoot()
-			if err != nil {
-				return err
-			}
-			head, err := gitSingleLine(ctx, root, "rev-parse", "FETCH_HEAD")
-			if err != nil || !preflightObjectID.MatchString(head) {
-				return errors.New("published feedback head is unavailable")
-			}
-			outcome := internalgithub.HandoffOutcome{Key: handoff.Key}
-			if handoff.Validation {
-				outcome.ValidationResult = "blocked"
-				outcome.ValidationEvidence = "pull request head changed to " + head + "; validation must run against the published feedback head"
-			}
-			for _, feedback := range handoff.Feedback {
-				outcome.Feedback = append(outcome.Feedback, internalgithub.FeedbackOutcome{ID: feedback.ID, Source: feedback.Source, State: internalgithub.FeedbackAddressed, Evidence: "published in head " + head})
-			}
-			if err := recovery.CompleteHandoffOutcome(ctx, handoff, outcome); err != nil {
+			if err := recovery.CompleteHandoffPublication(ctx, completed); err != nil {
 				return err
 			}
 		} else if current.State == "failed" || current.State == "cancelled" {
@@ -1317,7 +1328,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 	return nil
 }
 
-func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeState *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, stateRoot string) (bool, error) {
+func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeState *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, stateRoot string, preparePublication func(string) error) (bool, error) {
 	boundary := implementationBoundary(stateRoot)
 	snapshotRoot := productionSnapshotRoot(stateRoot)
 	reviewEnv, err := configuredAgentEnvironment(cfg.Commands.Environment)
@@ -1365,6 +1376,11 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 	run := func(dir string, args ...string) (string, error) {
 		out, err := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "-C", dir}, args...)...).CombinedOutput()
 		return strings.TrimSpace(string(out)), err
+	}
+	if preparePublication != nil {
+		if err := preparePublication(head); err != nil {
+			return false, err
+		}
 	}
 	if _, err := run(root, "push", "origin", "FETCH_HEAD:refs/heads/"+manifest.Branch); err != nil {
 		return false, fmt.Errorf("publish verified worker head: %w", err)
