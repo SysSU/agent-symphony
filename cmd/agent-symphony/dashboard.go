@@ -501,7 +501,7 @@ func orchestratorAttentionState(state string) bool {
 
 func sameDashboardOrigin(r *http.Request) bool {
 	origin, err := url.Parse(r.Header.Get("Origin"))
-	return err == nil && origin.Scheme == "http" && strings.EqualFold(origin.Host, r.Host)
+	return err == nil && (origin.Scheme == "http" || origin.Scheme == "https") && strings.EqualFold(origin.Host, r.Host)
 }
 
 func dashboardHostAllowed(value string, allowNet bool) bool {
@@ -521,15 +521,15 @@ func dashboardHostAllowed(value string, allowNet bool) bool {
 }
 
 func dashboardRequestLoopback(r *http.Request) bool {
-	if !dashboardHostAllowed(r.Host, false) {
-		return false
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	ip := net.ParseIP(strings.Trim(host, "[]"))
-	return ip != nil && ip.IsLoopback()
+	if ip == nil || !ip.IsLoopback() {
+		return false
+	}
+	return dashboardHostAllowed(r.Host, false) || strings.TrimSpace(r.Header.Get("Tailscale-User-Login")) != ""
 }
 
 func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request) {
