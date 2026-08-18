@@ -68,9 +68,9 @@ jobs:
           wsl -d $distribution -- bash -lc "set -e; curl -fsSLo /tmp/go.tgz https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz; printf '%s  %s\n' '${goSHA256}' /tmp/go.tgz | sha256sum -c -; sudo rm -rf /usr/local/go; sudo tar -C /usr/local -xzf /tmp/go.tgz"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install pinned Go toolchain in WSL' }
           $nodeVersion = '22.15.1'
-          wsl -d $distribution -- bash -lc "set -e; curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v${nodeVersion}/node-v${nodeVersion}-linux-${nodeArch}.tar.xz; printf '%s  %s\n' '${nodeSHA256}' /tmp/node.tar.xz | sha256sum -c -; sudo rm -rf /usr/local/lib/node-v${nodeVersion}-linux-${nodeArch}; sudo tar -C /usr/local/lib -xJf /tmp/node.tar.xz; for tool in node npm npx corepack; do sudo ln -sfn /usr/local/lib/node-v${nodeVersion}-linux-${nodeArch}/bin/`$tool /usr/local/bin/`$tool; done"
+          wsl -d $distribution -- bash -lc "set -e; curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v${nodeVersion}/node-v${nodeVersion}-linux-${nodeArch}.tar.xz; printf '%s  %s\n' '${nodeSHA256}' /tmp/node.tar.xz | sha256sum -c -; sudo rm -rf /usr/local/node; sudo mkdir /usr/local/node; sudo tar -C /usr/local/node --strip-components=1 -xJf /tmp/node.tar.xz"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install pinned Node.js toolchain in WSL' }
-          wsl -d $distribution -- bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin scripts/validate-release.sh 0.0.0-wsl'
+          wsl -d $distribution -- bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin scripts/validate-release.sh 0.0.0-wsl'
           if ($LASTEXITCODE -ne 0) { throw 'WSL release validation failed' }
 
   artifacts:
