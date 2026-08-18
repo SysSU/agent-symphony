@@ -73,8 +73,9 @@ type PRState struct {
 	Facts                                                                                    PRFacts
 	Decisions                                                                                []Decision
 	PendingDispositions                                                                      []Feedback
-	ConfirmedDispositions                                                                    []Feedback      `json:"-"`
-	HandoffReceipts                                                                          map[string]bool `json:"handoff_receipts,omitempty"`
+	ConfirmedDispositions                                                                    []Feedback           `json:"-"`
+	HandoffReceipts                                                                          map[string]bool      `json:"handoff_receipts,omitempty"`
+	PreparedPublication                                                                      *PreparedPublication `json:"prepared_publication,omitempty"`
 }
 
 type Decision struct {

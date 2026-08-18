@@ -4,7 +4,7 @@
   "scripts": {
     "build": "next build",
     "lint": "eslint --max-warnings 0 .",
-    "test": "node --test app/health.test.mjs"
+    "test": "node --test app/*.test.mjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "0.11.0",

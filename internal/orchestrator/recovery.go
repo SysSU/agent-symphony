@@ -256,6 +256,7 @@ func ReconcileLoop(ctx context.Context, interval time.Duration, reconcile func(c
 			return ctx.Err()
 		case <-ticker.C:
 			_ = reconcile(ctx)
+			ticker.Reset(interval)
 		}
 	}
 }
