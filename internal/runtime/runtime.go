@@ -141,6 +141,36 @@ func (r *Runtime) RecordReviewFindings(attempt Attempt, head string, findings []
 	return manifest, r.writeManifest(attempt, manifest)
 }
 
+// ResumeHandoff refreshes source refs and returns a completed attempt to the
+// normal monitored worker lifecycle without granting the worker a remote.
+func (r *Runtime) ResumeHandoff(ctx context.Context, attempt Attempt) (Manifest, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.canonicalizeStateRoot(); err != nil {
+		return Manifest{}, err
+	}
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		return Manifest{}, err
+	}
+	if manifest.State != "completed" && manifest.State != "running" {
+		return Manifest{}, fmt.Errorf("cannot resume handoff from %s attempt", manifest.State)
+	}
+	if manifest.State == "completed" {
+		if strings.TrimSpace(r.Source) == "" {
+			return Manifest{}, errors.New("handoff source bundle is required")
+		}
+		if _, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "fetch", "--no-tags", r.Source, "+refs/heads/*:refs/remotes/agent-symphony/*"}, "", nil, nil); err != nil {
+			return Manifest{}, fmt.Errorf("refresh handoff source refs: %w", err)
+		}
+	}
+	manifest.State, manifest.Diagnostic, manifest.UpdatedAt = "running", "", time.Now().UTC()
+	return manifest, r.writeManifest(attempt, manifest)
+}
+
 type Runtime struct {
 	Root      string
 	StateRoot string
