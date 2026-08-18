@@ -62,6 +62,39 @@ func TestReconcileLoopRunsAtStartupAndRecoversAfterTransientOutage(t *testing.T)
 	}
 }
 
+func TestReconcileLoopWaitsAfterSlowCycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const interval = 20 * time.Millisecond
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	var completed time.Time
+	var wait time.Duration
+	calls := 0
+	go func() {
+		done <- ReconcileLoop(ctx, interval, func(context.Context) error {
+			calls++
+			switch calls {
+			case 1:
+				close(started)
+				<-release
+				completed = time.Now()
+			case 2:
+				wait = time.Since(completed)
+				cancel()
+			}
+			return nil
+		})
+	}()
+	<-started
+	time.Sleep(2 * interval)
+	close(release)
+	if err := <-done; !errors.Is(err, context.Canceled) || calls != 2 || wait < interval {
+		t.Fatalf("calls=%d wait=%s err=%v", calls, wait, err)
+	}
+}
+
 func TestRecoverBlocksIssueLevelDuplicateAndPreservesCompletedAuthority(t *testing.T) {
 	facts := []AttemptFact{{Repository: "o/r", Issue: 4, Attempt: 1, BaseSHA: "aaaaaaa", State: "completed"}, {Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "bbbbbbb", State: "active"}}
 	local := []agentruntime.Manifest{{Repository: "o/r", Issue: 4, Attempt: 1, BaseSHA: "wrong00", State: "failed"}}
