@@ -1510,6 +1510,17 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	if refs := runGit(t, remote, "show-ref"); !strings.Contains(refs, "refs/heads/issue-23") {
 		t.Fatalf("publication did not proceed after cleanup: %s", refs)
 	}
+	prepared, ok, err := recovery.PreparedHandoffPublication(t.Context(), "o/r", 23, 1)
+	if err != nil || !ok || prepared.HeadSHA != head {
+		t.Fatalf("publication was not durably prepared: prepared=%#v ok=%v err=%v", prepared, ok, err)
+	}
+	if err := recovery.CompleteHandoffPublication(t.Context(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := recovery.PullRequestState(t.Context(), "o/r", 7, 23, 1, head)
+	if err != nil || completed.HeadSHA != head || completed.Facts.Feedback[0].Execution != internalgithub.FeedbackCompleted || completed.Facts.Feedback[0].State != internalgithub.FeedbackAddressed {
+		t.Fatalf("completed publication=%#v err=%v", completed, err)
+	}
 }
 
 func TestBundlePreflightRejectsCompressedSmallExpandedLargeDeletedHistory(t *testing.T) {
