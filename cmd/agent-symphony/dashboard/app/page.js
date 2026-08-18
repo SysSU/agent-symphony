@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { OrchestratorCard, StatusCard } from "./_components/status-card";
+import ReconcileButton from "./_components/reconcile-button";
 import TerminalPanel from "./_components/terminal-panel";
 import { overallHealth } from "./health.mjs";
 
@@ -194,6 +195,7 @@ export default function Dashboard() {
           <h2>{health.title}</h2>
           <p>{health.detail}</p>
         </div>
+        <ReconcileButton onNotice={setActionNotice} onSnapshot={setSnapshot} />
       </section>
 
       <OrchestratorCard

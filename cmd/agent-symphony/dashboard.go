@@ -49,6 +49,7 @@ type dashboardServer struct {
 	orchestrator orchestratoragent.Service
 	cleanup      func(context.Context, string, agentruntime.Manifest) error
 	recover      func(context.Context, int, int) error
+	reconcile    func(context.Context) error
 	mu           *sync.Mutex
 	localMu      sync.Mutex
 }
@@ -74,16 +75,16 @@ func newDashboardHandler(ctx context.Context, stateRoot, tmux string) http.Handl
 }
 
 func newDashboardHandlerWithMutex(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex) http.Handler {
-	return newDashboardHandlerWithOptions(ctx, stateRoot, tmux, operationMu, nil, nil, false, "")
+	return newDashboardHandlerWithOptions(ctx, stateRoot, tmux, operationMu, nil, nil, nil, false, "")
 }
 
-func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
+func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
 	assets, err := fs.Sub(dashboardFiles, "dashboard/out")
 	if err != nil {
 		panic(err)
 	}
 	static := http.FileServer(http.FS(assets))
-	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, mu: operationMu}
+	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, reconcile: reconcile, mu: operationMu}
 	server.cleanup = server.cleanupAttempt
 	return server.handler(static)
 }
@@ -102,6 +103,10 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		}
 		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/recover" {
 			s.serveAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/"))
+			return
+		}
+		if r.URL.Path == "/actions/reconcile" {
+			s.serveReconcileAction(w, r)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/actions/orchestrator/") {
@@ -135,6 +140,41 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		}
 		static.ServeHTTP(w, r)
 	})
+}
+
+func (s *dashboardServer) serveReconcileAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "action requires POST", http.StatusMethodNotAllowed)
+		return
+	}
+	if !sameDashboardOrigin(r) {
+		http.Error(w, "action requires the dashboard origin", http.StatusForbidden)
+		return
+	}
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 || len(r.URL.Query()) != 0 {
+		http.Error(w, "invalid reconciliation action", http.StatusBadRequest)
+		return
+	}
+	if s.reconcile == nil {
+		http.Error(w, "reconciliation is unavailable", http.StatusConflict)
+		return
+	}
+	operationMu := s.mu
+	if operationMu == nil {
+		operationMu = &s.localMu
+	}
+	if !operationMu.TryLock() {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
+		return
+	}
+	defer operationMu.Unlock()
+	if err := s.reconcile(r.Context()); err != nil {
+		http.Error(w, internalgithub.Redact(err.Error()), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *dashboardServer) serveOrchestratorStatus(w http.ResponseWriter, r *http.Request) {
@@ -682,7 +722,7 @@ func (s *dashboardServer) terminalStatus(issue, attempt int) (orchestrator.Recov
 	return s.projectedStatus(issue, attempt)
 }
 
-func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
+func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", fmt.Errorf("dashboard address: %w", err)
@@ -702,7 +742,7 @@ func startDashboard(ctx context.Context, address, stateRoot string, operationMu 
 	if err != nil {
 		return "", fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
-	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, recover, service, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, recover, reconcile, service, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
 		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password may be visible in process listings, and anyone with it can use terminals and cleanup controls")
 	}
