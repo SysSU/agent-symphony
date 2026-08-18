@@ -286,12 +286,14 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		oldExec := hostExecRunner
 		calls := 0
 		recipient := ""
+		var submission agentruntime.Command
 		hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 			calls++
 			if slices.Contains(command.Args, "show-options") {
 				return agentruntime.Result{Output: recipient}, nil
 			}
 			if slices.Contains(command.Args, "set-option") {
+				submission = command
 				recipient = command.Args[len(command.Args)-1]
 			}
 			return agentruntime.Result{}, nil
@@ -314,6 +316,9 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		}
 		if calls != 3 {
 			t.Fatalf("worker made %d tmux calls, want one lookup plus one two-step delivery", calls)
+		}
+		if !slices.Contains(submission.Args, "worker-capture") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
+			t.Fatalf("handoff did not use the stdin capture helper: %#v", submission.Args)
 		}
 		if _, err := os.ReadFile(filepath.Join(worktree, ".agent-symphony", "handoffs", "pane-test.json")); err != nil {
 			t.Fatalf("durable handoff: %v", err)
