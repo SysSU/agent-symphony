@@ -541,7 +541,13 @@ func orchestratorAttentionState(state string) bool {
 
 func sameDashboardOrigin(r *http.Request) bool {
 	origin, err := url.Parse(r.Header.Get("Origin"))
-	return err == nil && (origin.Scheme == "http" || origin.Scheme == "https") && strings.EqualFold(origin.Host, r.Host)
+	if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") {
+		return false
+	}
+	return strings.EqualFold(origin.Host, r.Host) ||
+		(strings.TrimSpace(r.Header.Get("Tailscale-User-Login")) != "" && dashboardRequestLoopback(r) &&
+			strings.EqualFold(origin.Host, strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))) &&
+			strings.EqualFold(origin.Scheme, strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))))
 }
 
 func dashboardHostAllowed(value string, allowNet bool) bool {

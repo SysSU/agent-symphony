@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-const wait = () => new Promise((resolve) => setTimeout(resolve, 1000));
+import { postWithReconciliationRetry } from "../actions.mjs";
 
 export default function ReconcileButton({ onNotice, onSnapshot }) {
   const [checking, setChecking] = useState(false);
@@ -11,14 +11,7 @@ export default function ReconcileButton({ onNotice, onSnapshot }) {
     setChecking(true);
     onNotice("");
     try {
-      let response;
-      do {
-        response = await fetch("/actions/reconcile", { method: "POST" });
-        if (response.status === 503) {
-          await response.text();
-          await wait();
-        }
-      } while (response.status === 503);
+      const response = await postWithReconciliationRetry("/actions/reconcile");
       if (!response.ok) throw new Error((await response.text()).trim() || `Reconciliation failed (${response.status})`);
       const status = await fetch("/status.json", { cache: "no-store" });
       if (!status.ok) throw new Error(`Reconciliation completed, but status refresh failed (${status.status})`);

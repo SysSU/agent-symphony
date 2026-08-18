@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { OrchestratorCard, StatusCard } from "./_components/status-card";
 import ReconcileButton from "./_components/reconcile-button";
+import { postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
 import { overallHealth } from "./health.mjs";
 
@@ -89,15 +90,10 @@ export default function Dashboard() {
     setActionNotice("");
     try {
       const query = new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) });
-      let response;
-      do {
-        response = await fetch(`/actions/${action}?${query}`, { method: "POST" });
-        if (response.status === 503) {
-          await response.text();
-          setWaiting(true);
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-        }
-      } while (response.status === 503);
+      const response = await postWithReconciliationRetry(`/actions/${action}?${query}`, async () => {
+        setWaiting(true);
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      });
       if (!response.ok) throw new Error((await response.text()).trim() || `${verb} failed (${response.status})`);
       const stateResponse = await fetch("/dashboard-state.json", { cache: "no-store" });
       if (!stateResponse.ok) throw new Error(`${verb} finished, but dashboard state could not be refreshed.`);
@@ -125,7 +121,7 @@ export default function Dashboard() {
     setActionNotice("");
     try {
       const query = status ? `?${new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) })}` : "";
-      const response = await fetch(`/actions/orchestrator/${action}${query}`, { method: "POST" });
+      const response = await postWithReconciliationRetry(`/actions/orchestrator/${action}${query}`);
       if (!response.ok) throw new Error((await response.text()).trim() || `Orchestrator ${action} failed (${response.status})`);
       const result = await response.json();
       if (result.status) {
