@@ -318,13 +318,17 @@ func (s *Supervisor) start(ctx context.Context, state persisted) (persisted, err
 			return s.failed(state, err)
 		}
 	}
-	command := append(slices.Clone(s.Command), string(contextBody))
+	configuredCommand := slices.Clone(s.Command)
+	for index := range configuredCommand {
+		configuredCommand[index] = strings.ReplaceAll(configuredCommand[index], "{orchestrator_workspace}", s.Workspace)
+	}
+	command := append(slices.Clone(configuredCommand), string(contextBody))
 	if len(s.Launcher) > 0 {
 		launch, err := json.MarshalIndent(struct {
 			Version int      `json:"version"`
 			Command []string `json:"command"`
 			Context string   `json:"context"`
-		}{stateVersion, s.Command, string(contextBody)}, "", "  ")
+		}{stateVersion, configuredCommand, string(contextBody)}, "", "  ")
 		if err != nil {
 			_ = s.stop(ctx, state.Session)
 			return s.failed(state, err)

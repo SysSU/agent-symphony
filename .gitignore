@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+/.agent-symphony.yaml
+/agent-symphony
 _bmad-output/
 .cursor
 .worktrees/
