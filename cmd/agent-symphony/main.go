@@ -1790,7 +1790,7 @@ func resumeHandoffs(ctx context.Context, boundary boundaryCaller, statePath, sta
 	}
 	live := map[string]agentruntime.Manifest{}
 	for _, status := range statuses {
-		if (status.State == "active" || status.State == "review-ready") && status.Action == "resume monitoring the matching attempt" {
+		if (status.State == "active" || status.State == "review-ready") && (status.Action == "resume monitoring the matching attempt" || status.Action == "monitor the matching published pull request") {
 			for _, manifest := range manifests {
 				if manifest.Repository == status.Repository && manifest.Issue == status.Issue && manifest.Attempt == status.Attempt {
 					live[fmt.Sprintf("%s#%d/%d", status.Repository, status.Issue, status.Attempt)] = manifest

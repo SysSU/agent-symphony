@@ -1699,7 +1699,7 @@ func TestResumeHandoffsDeliversConfiguredImplementationCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, Worktree: worktree, Session: "as-4-2", LogPath: filepath.Join(worktree, "attempt.log")}
-	statuses := []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 4, Attempt: 2, State: "review-ready", Action: "resume monitoring the matching attempt"}}
+	statuses := []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 4, Attempt: 2, State: "review-ready", Action: "monitor the matching published pull request"}}
 
 	oldExec := hostExecRunner
 	var respawn []string
