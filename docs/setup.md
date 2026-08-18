@@ -9,7 +9,7 @@ This walkthrough goes from a fresh machine to a working `reconcile`.
 - A GitHub account with `maintain` or `admin` permission on the repository, and a completed `gh auth login`.
 - Codex set up, or another coding agent if you prefer.
 - Go 1.26 only if you build Agent Symphony yourself.
-- Node.js 20.9 or newer only if you rebuild the committed Next.js dashboard export.
+- Node.js 20.9 or newer only if you build Agent Symphony from source.
 
 ## 1. Install Agent Symphony and prerequisites
 

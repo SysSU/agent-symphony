@@ -8,7 +8,7 @@ You need:
 
 - repository administrator access;
 - Git, GitHub CLI, Go 1.26, Ruby, and tmux;
-- Node.js 20.9 or newer and npm when dashboard sources or lockfiles changed;
+- Node.js 20.9 or newer and npm;
 - the SSH private key that matches an entry in `.github/release-signing-allowed-signers`;
 - a clean checkout of protected `main` containing every change intended for the release.
 
@@ -53,20 +53,13 @@ test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
 
 ## 3. Validate the exact release commit
 
-If dashboard sources or lockfiles changed, rebuild the committed export and confirm the rebuild is clean:
-
-```sh
-scripts/build-dashboard.sh
-git diff --exit-code -- cmd/agent-symphony/dashboard/out
-```
-
 Run the complete local release gate from the clean `main` checkout:
 
 ```sh
 scripts/validate-release.sh "$version"
 ```
 
-This runs race tests, vet, security and workflow checks, reproducible builds, archive verification, packaged smoke tests, and the credential scan. A local pass does not replace the native macOS, Linux, and WSL2 jobs that run again for the tag.
+This generates the untracked dashboard export, then runs race tests, vet, security and workflow checks, reproducible builds, archive verification, packaged smoke tests, and the credential scan. A local pass does not replace the native macOS, Linux, and WSL2 jobs that run again for the tag.
 
 ## 4. Configure SSH tag signing
 
