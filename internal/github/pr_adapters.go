@@ -145,6 +145,31 @@ func (r *FileRecovery) ReceiptHandoff(_ context.Context, handoff RecoveryHandoff
 	})
 }
 
+// ReceivedHandoff returns the exact in-flight feedback accepted by a matching
+// worker so the coordinator can complete it only after publishing the result.
+func (r *FileRecovery) ReceivedHandoff(_ context.Context, repository string, pr, issue, attempt int, head string) (RecoveryHandoff, bool, error) {
+	states, err := r.read()
+	if err != nil {
+		return RecoveryHandoff{}, false, err
+	}
+	for i := range states {
+		state := &states[i]
+		if state.Repository != repository || state.Number != pr || state.Issue != issue || state.Attempt != attempt || state.HeadSHA != head {
+			continue
+		}
+		handoff := RecoveryHandoff{Repository: repository, PR: pr, Issue: issue, Attempt: attempt, HeadSHA: head, Validation: state.ValidationInFlightSHA == head && head != "", ValidationGeneration: state.ValidationGeneration}
+		for _, feedback := range state.Facts.Feedback {
+			if feedback.Execution == FeedbackInFlight {
+				handoff.Feedback = append(handoff.Feedback, feedback)
+			}
+		}
+		handoff.Key = handoffKey(handoff)
+		received := (handoff.Validation || len(handoff.Feedback) > 0) && state.HandoffReceipts[handoff.Key]
+		return handoff, received, nil
+	}
+	return RecoveryHandoff{}, false, nil
+}
+
 func (r *FileRecovery) CompleteHandoff(_ context.Context, handoff RecoveryHandoff) error {
 	return r.update(func(states []PRState) error {
 		for i := range states {

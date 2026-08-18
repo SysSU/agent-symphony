@@ -300,7 +300,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	runtimeState := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: base, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, state); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, "", state); err != nil {
 		log, _ := os.ReadFile(boundaryLog)
 		t.Fatalf("transient rework reached GitHub failure: %v\n%s", err, log)
 	}
@@ -311,7 +311,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 		t.Fatal("monitor did not recover worker receipt")
 	}
 	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, state); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, "", state); err != nil {
 		t.Fatalf("retry reached GitHub failure: %v", err)
 	}
 	storedBody, _ = os.ReadFile(manifestPath)
@@ -358,7 +358,7 @@ func TestBoundAttemptSuppressesRestartDispatchAcrossWorkerAndReviewStates(t *tes
 		t.Fatalf("contradictory remote attempt was resumed: manifests=%#v err=%v", manifests, err)
 	}
 	orphan := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 3, BaseSHA: "aaaaaaa", State: "completed"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{orphan}, nil, ""); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{orphan}, nil, "", ""); err != nil {
 		t.Fatalf("genuine orphan was not preserved: %v", err)
 	}
 }
@@ -459,7 +459,7 @@ func TestRevokedBoundAttemptCancelsWorkerAndSuppressesPublication(t *testing.T) 
 	completed := manifest
 	completed.State = "completed"
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 4, BaseSHA: attempt.BaseSHA, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{revoked}, []agentruntime.Manifest{completed}, bound, ""); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{revoked}, []agentruntime.Manifest{completed}, bound, "", ""); err != nil {
 		t.Fatalf("revoked completed attempt reached publication: %v", err)
 	}
 }
@@ -1446,6 +1446,20 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", review)
 
 	state, snapshotBase := t.TempDir(), t.TempDir()
+	recoveryPath := filepath.Join(t.TempDir(), "pr.json")
+	recoveryState := []internalgithub.PRState{{Repository: "o/r", Number: 7, Issue: 23, Attempt: 1, HeadSHA: base, Facts: internalgithub.PRFacts{Feedback: []internalgithub.Feedback{{ID: 55, Source: "conversation", Execution: internalgithub.FeedbackClaimed}}}}}
+	recoveryBody, _ := json.Marshal(recoveryState)
+	if err := os.WriteFile(recoveryPath, recoveryBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recovery := &internalgithub.FileRecovery{Path: recoveryPath}
+	handoffs, err := recovery.ClaimHandoffsFor(t.Context(), map[string]bool{"o/r#23/1": true})
+	if err != nil || len(handoffs) != 1 {
+		t.Fatalf("handoffs=%#v err=%v", handoffs, err)
+	}
+	if err := recovery.ReceiptHandoff(t.Context(), handoffs[0]); err != nil {
+		t.Fatal(err)
+	}
 	oldReviewRoot := reviewSnapshotRoot
 	reviewSnapshotRoot = snapshotBase
 	t.Cleanup(func() { reviewSnapshotRoot = oldReviewRoot })
@@ -1466,8 +1480,8 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	}
 	runtimeState := &agentruntime.Runtime{StateRoot: state}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true, BaseBranch: "main"}
-	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: base, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, state); err != nil {
+	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "active"}}
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, recoveryPath, state); err != nil {
 		t.Fatal(err)
 	}
 	storedBody, _ := os.ReadFile(manifestPath)
@@ -1483,7 +1497,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	if err := os.WriteFile(review, []byte("#!/bin/sh\nprintf '{\"Code\":0}'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, state)
+	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, recoveryPath, state)
 	if err == nil || !strings.Contains(err.Error(), "authenticate GitHub CLI") {
 		t.Fatalf("publication did not continue after cleanup: %v", err)
 	}
@@ -1703,6 +1717,7 @@ func TestResumeHandoffsDeliversConfiguredImplementationCommand(t *testing.T) {
 
 	oldExec := hostExecRunner
 	var respawn []string
+	var prompt string
 	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 		if slices.Contains(command.Args, "show-options") {
 			return agentruntime.Result{}, errors.New("not delivered")
@@ -1710,17 +1725,24 @@ func TestResumeHandoffsDeliversConfiguredImplementationCommand(t *testing.T) {
 		if slices.Contains(command.Args, "respawn-pane") {
 			respawn = slices.Clone(command.Args)
 		}
+		if slices.Contains(command.Args, "load-buffer") {
+			body, _ := io.ReadAll(command.Stdin)
+			prompt = string(body)
+		}
 		return agentruntime.Result{}, nil
 	}
 	t.Cleanup(func() { hostExecRunner = oldExec })
 
 	command := []string{"implementation", "--flag"}
 	boundary := &directHandoffBoundary{root: root}
-	if err := resumeHandoffs(t.Context(), boundary, statePath, stateRoot, statuses, []agentruntime.Manifest{manifest}, command); err != nil {
+	if err := resumeHandoffs(t.Context(), nil, boundary, statePath, stateRoot, statuses, []agentruntime.Manifest{manifest}, command); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(respawn, command[0]) || !slices.Contains(respawn, command[1]) {
 		t.Fatalf("respawn omitted implementation command: %q", respawn)
+	}
+	if !slices.Contains(respawn, agentruntime.ResultPath(worktree)) || !strings.Contains(prompt, "agent-symphony-result-v1") || !strings.Contains(prompt, "refs/remotes/agent-symphony/") {
+		t.Fatalf("handoff omitted capture contract: respawn=%q prompt=%q", respawn, prompt)
 	}
 	entries, err := os.ReadDir(filepath.Join(worktree, ".agent-symphony", "handoffs"))
 	if err != nil || !slices.ContainsFunc(entries, func(entry os.DirEntry) bool { return strings.HasSuffix(entry.Name(), ".receipt") }) {

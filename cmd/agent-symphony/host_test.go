@@ -299,7 +299,11 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 			return agentruntime.Result{}, nil
 		}
 		t.Cleanup(func() { hostExecRunner = oldExec })
-		worktree := t.TempDir()
+		root := t.TempDir()
+		worktree := filepath.Join(root, "attempt")
+		if err := os.Mkdir(worktree, 0o700); err != nil {
+			t.Fatal(err)
+		}
 		handoff := []byte(`{"type":"agent-symphony-handoff-v1","key":"pane-test"}`)
 		request, _ := json.Marshal(struct {
 			Manifest     agentruntime.Manifest `json:"manifest"`
@@ -308,10 +312,10 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 			OutcomeToken string                `json:"outcome_token"`
 			Command      []string              `json:"command"`
 		}{agentruntime.Manifest{Worktree: worktree, Session: "as-23-1", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, handoffReceiptPath(worktree, "pane-test"), "token", []string{"implementation"}})
-		if _, err := acceptHandoff(t.Context(), request, worktree); err != nil {
+		if _, err := acceptHandoff(t.Context(), request, root); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := acceptHandoff(t.Context(), request, worktree); err != nil {
+		if _, err := acceptHandoff(t.Context(), request, root); err != nil {
 			t.Fatal(err)
 		}
 		if calls != 3 {
@@ -355,6 +359,7 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(identity.Worktree, "README.md"), []byte("base\nchanged\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
+		mustWriteFile(t, filepath.Join(identity.Worktree, ".agent-symphony", "handoffs", "receipt.json"), "metadata")
 		validation := "pane-zero-" + strings.Repeat("v", 240)
 		good := fmt.Sprintf(`{"type":"agent-symphony-result-v1","validation":%q,"documentation":"done"}`, validation)
 		bad := `{"type":"agent-symphony-result-v1","validation":"wrong-window","documentation":"wrong"}`
@@ -417,7 +422,7 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if committedHead == base {
 			t.Fatal("injected failure happened before the worker commit")
 		}
-		if status := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "status", "--porcelain")))); status != "" {
+		if status := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "status", "--porcelain", "--", ".", ":(exclude).agent-symphony")))); status != "" {
 			t.Fatalf("worktree remained dirty after commit: %q", status)
 		}
 
@@ -447,8 +452,11 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if _, err := call("review", manifest); err == nil {
 			t.Fatal("review boundary accepted implementation export")
 		}
-		if status := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "status", "--porcelain")))); status != "" {
+		if status := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "status", "--porcelain", "--", ".", ":(exclude).agent-symphony")))); status != "" {
 			t.Fatalf("committed worktree remains dirty: %q", status)
+		}
+		if got := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "ls-tree", "-r", "--name-only", "HEAD", "--", ".agent-symphony")))); got != "" {
+			t.Fatalf("handoff metadata committed: %q", got)
 		}
 		if got := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "show", "HEAD:README.md")))); got != "base\nchanged" {
 			t.Fatalf("committed content = %q", got)
@@ -520,7 +528,11 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			oldExec, oldDirSync := hostExecRunner, immutableDirSync
 			t.Cleanup(func() { hostExecRunner, immutableDirSync = oldExec, oldDirSync })
-			worktree := t.TempDir()
+			root := t.TempDir()
+			worktree := filepath.Join(root, "attempt")
+			if err := os.Mkdir(worktree, 0o700); err != nil {
+				t.Fatal(err)
+			}
 			handoff := []byte(`{"type":"agent-symphony-handoff-v1","key":"retry-key"}`)
 			request, _ := json.Marshal(struct {
 				Manifest     agentruntime.Manifest `json:"manifest"`
@@ -554,13 +566,13 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 				}
 				return oldDirSync(dir)
 			}
-			if _, err := acceptHandoff(t.Context(), request, worktree); err == nil {
+			if _, err := acceptHandoff(t.Context(), request, root); err == nil {
 				t.Fatal("injected failure succeeded")
 			}
 			if _, err := os.Stat(filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.json")); err != nil {
 				t.Fatalf("pending state lost: %v", err)
 			}
-			if _, err := acceptHandoff(t.Context(), request, worktree); err != nil {
+			if _, err := acceptHandoff(t.Context(), request, root); err != nil {
 				t.Fatalf("restart retry: %v", err)
 			}
 			if deliveries != 1 {

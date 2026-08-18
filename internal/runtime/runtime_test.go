@@ -221,6 +221,35 @@ func TestLifecycleCreatesUncredentialedRepositoryAndPreservesPrimary(t *testing.
 	}
 }
 
+func TestResumeHandoffRefreshesTrustedSourceRefs(t *testing.T) {
+	r, fake, attempt, primary := testRuntime(t)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(primary, "README"), []byte("new source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, primary, "add", "README")
+	runGit(t, primary, "commit", "-qm", "new source")
+	want := gitOutput(t, primary, "rev-parse", "HEAD")
+	branch := gitOutput(t, primary, "branch", "--show-current")
+	fake.sessions[manifest.Session].dead = true
+	if _, err := r.Monitor(t.Context(), attempt); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := r.ResumeHandoff(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.State != "running" || gitOutput(t, resumed.Worktree, "rev-parse", "refs/remotes/agent-symphony/"+branch) != want {
+		t.Fatalf("resumed=%#v source=%s", resumed, want)
+	}
+	if got := gitOutput(t, resumed.Worktree, "remote"); got != "" {
+		t.Fatalf("worker remote=%q", got)
+	}
+}
+
 func TestValidationTraversalExistingAndLaunchFailureDiagnostics(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	bad := attempt

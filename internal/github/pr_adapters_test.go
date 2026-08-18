@@ -61,6 +61,10 @@ func TestOwnedHandoffRedeliverySurvivesClaimAndPasteCrashes(t *testing.T) {
 	if err := r.ReceiptHandoff(context.Background(), first[0]); err != nil {
 		t.Fatal(err)
 	}
+	received, ok, err := r.ReceivedHandoff(context.Background(), "o/r", 9, 4, 2, "abcdef1")
+	if err != nil || !ok || received.Key != first[0].Key || received.Validation != first[0].Validation || !reflect.DeepEqual(received.Feedback, first[0].Feedback) {
+		t.Fatalf("received=%#v ok=%v err=%v", received, ok, err)
+	}
 	if again, err := r.ClaimHandoffsFor(context.Background(), owners); err != nil || len(again) != 0 {
 		t.Fatalf("receipt replay=%#v err=%v", again, err)
 	}
