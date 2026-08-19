@@ -110,6 +110,14 @@ type handoffReceipt struct {
 	OutcomeToken string `json:"outcome_token"`
 }
 
+type handoffRequest struct {
+	Manifest     agentruntime.Manifest `json:"manifest"`
+	Handoff      json.RawMessage       `json:"handoff"`
+	OutcomePath  string                `json:"outcome_path"`
+	OutcomeToken string                `json:"outcome_token"`
+	Command      []string              `json:"command"`
+}
+
 func (b workerBoundaryRunner) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
 	if strings.TrimSpace(b.Command) == "" {
 		return agentruntime.Result{}, errors.New("AGENT_SYMPHONY_WORKER_BOUNDARY is required")
@@ -995,7 +1003,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		}
 		return matchesOperatorMessageBinding(proposal, expected, currentIssues, attempts), nil
 	}
-	if err := monitorQueuedAttempts(ctx, api, &r, c, freshIssues, refreshedManifests, freshRemote, statePath, stateRoot); err != nil {
+	if err := monitorQueuedAttempts(ctx, api, &r, c, freshIssues, refreshedManifests, freshRemote, operatorMessages, statePath, stateRoot); err != nil {
 		return statuses, err
 	}
 	validatedManifests, err := r.Discover()
@@ -1555,7 +1563,7 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string
 	return nil
 }
 
-func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, statePath, stateRoot string) error {
+func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, operatorMessages map[string][]internalgithub.OperatorMessage, statePath, stateRoot string) error {
 	recovery := &internalgithub.FileRecovery{Path: statePath}
 	for _, manifest := range manifests {
 		var prepared internalgithub.PreparedPublication
@@ -1586,11 +1594,13 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 		if !preparedOK && (bound.Repository != manifest.Repository || bound.Issue != manifest.Issue || bound.Attempt != manifest.Attempt || bound.BaseSHA != manifest.BaseSHA) {
 			continue
 		}
-		operatorReceipts, err := receivedOperatorMessageReceipts(manifest)
-		if err != nil {
-			return err
-		}
-		var handoff internalgithub.RecoveryHandoff
+		operatorDelivered := slices.ContainsFunc(operatorMessages[fmt.Sprintf("%s#%d/%d", manifest.Repository, manifest.Issue, manifest.Attempt)], func(message internalgithub.OperatorMessage) bool {
+			return message.State == "delivered"
+		})
+		var (
+			handoff internalgithub.RecoveryHandoff
+			err     error
+		)
 		if preparedOK {
 			handoff = prepared.Handoff
 		} else if bound.PR > 0 {
@@ -1601,7 +1611,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 				return err
 			}
 			if !received {
-				if len(operatorReceipts) == 0 {
+				if !operatorDelivered {
 					continue
 				}
 				handoff = internalgithub.RecoveryHandoff{}
@@ -1637,11 +1647,6 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			}
 			if pending {
 				continue
-			}
-			for _, receipt := range operatorReceipts {
-				if err := os.Rename(receipt, strings.TrimSuffix(receipt, ".receipt")+".published"); err != nil {
-					return err
-				}
 			}
 			if handoff.PR == 0 {
 				continue
@@ -2271,12 +2276,46 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 			outcomePath := handoffReceiptPath(manifest.Worktree, handoffKey)
 			outcomeToken := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+handoffKey)))
 			expectedReceipt := handoffReceipt{"agent-symphony-handoff-executed-v1", handoffKey, outcomePath, outcomeToken}
+			payload, _ := json.Marshal(struct {
+				Type, Key, Kind, Repository, Message string
+				Issue, Attempt                       int
+			}{"agent-symphony-handoff-v1", handoffKey, "operator-message", message.Repository, message.Message, message.Issue, message.Attempt})
+			requestBody := func(manifest agentruntime.Manifest) []byte {
+				request, _ := json.Marshal(handoffRequest{manifest, payload, outcomePath, outcomeToken, command})
+				return request
+			}
+			verifyDelivery := func(manifest agentruntime.Manifest) (bool, error) {
+				if message.State != "claimed" {
+					return false, nil
+				}
+				observed, verifyErr := boundary.call(ctx, "verify-handoff", agentruntime.Command{Stdin: bytes.NewReader(requestBody(manifest))})
+				if verifyErr != nil {
+					return false, fmt.Errorf("verify claimed operator message delivery: %w", verifyErr)
+				}
+				if observed.Output != "" {
+					var receipt handoffReceipt
+					decoder := json.NewDecoder(strings.NewReader(observed.Output))
+					decoder.DisallowUnknownFields()
+					if decoder.Decode(&receipt) != nil || decoder.Decode(&struct{}{}) != io.EOF || receipt != expectedReceipt {
+						return false, errors.New("verified operator message receipt binding mismatch")
+					}
+					return true, nil
+				}
+				return false, nil
+			}
 			switch manifest.State {
 			case "preparing":
 				continue // The accepted message remains durably queued.
 			case "running":
-				if message.State == "queued" || !exactHandoffReceipt(outcomePath, expectedReceipt) {
+				if message.State == "queued" {
 					continue // A running pane is busy unless this exact delivery already owns it.
+				}
+				verified, verifyErr := verifyDelivery(manifest)
+				if verifyErr != nil {
+					return verifyErr
+				}
+				if !verified {
+					continue
 				}
 				if err := recordOperatorOutcome(ctx, api, cfg, message, "delivered", ""); err != nil {
 					return err
@@ -2360,19 +2399,18 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 			if err != nil {
 				return err
 			}
-			payload, _ := json.Marshal(struct {
-				Type, Key, Kind, Repository, Message string
-				Issue, Attempt                       int
-			}{"agent-symphony-handoff-v1", handoffKey, "operator-message", message.Repository, message.Message, message.Issue, message.Attempt})
-			manifestBody, _ := json.Marshal(resumed)
-			request, _ := json.Marshal(struct {
-				Manifest     json.RawMessage `json:"manifest"`
-				Handoff      json.RawMessage `json:"handoff"`
-				OutcomePath  string          `json:"outcome_path"`
-				OutcomeToken string          `json:"outcome_token"`
-				Command      []string        `json:"command"`
-			}{manifestBody, payload, outcomePath, outcomeToken, command})
-			accepted, err := boundary.call(ctx, "accept-handoff", agentruntime.Command{Stdin: bytes.NewReader(request)})
+			verified, verifyErr := verifyDelivery(resumed)
+			if verifyErr != nil {
+				return verifyErr
+			}
+			if verified {
+				if err := recordOperatorOutcome(ctx, api, cfg, message, "delivered", ""); err != nil {
+					return err
+				}
+				started[key] = true
+				continue
+			}
+			accepted, err := boundary.call(ctx, "accept-operator-handoff", agentruntime.Command{Stdin: bytes.NewReader(requestBody(resumed))})
 			if err != nil {
 				return fmt.Errorf("worker-owned operator message acceptance: %w", err)
 			}
@@ -2390,41 +2428,6 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 		messages[key] = queued
 	}
 	return nil
-}
-
-func exactHandoffReceipt(path string, want handoffReceipt) bool {
-	body, err := os.ReadFile(path)
-	expected, _ := json.Marshal(want)
-	return err == nil && bytes.Equal(body, expected)
-}
-
-func receivedOperatorMessageReceipts(manifest agentruntime.Manifest) ([]string, error) {
-	dir := filepath.Join(manifest.Worktree, ".agent-symphony", "handoffs")
-	entries, err := os.ReadDir(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var receipts []string
-	for _, entry := range entries {
-		name := entry.Name()
-		if !strings.HasPrefix(name, "operator-message-") || !strings.HasSuffix(name, ".receipt") {
-			continue
-		}
-		if !entry.Type().IsRegular() {
-			return nil, errors.New("operator message receipt is not a regular file")
-		}
-		key := strings.TrimSuffix(name, ".receipt")
-		path := filepath.Join(dir, name)
-		token := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+key)))
-		if !exactHandoffReceipt(path, handoffReceipt{"agent-symphony-handoff-executed-v1", key, path, token}) {
-			return nil, errors.New("operator message receipt binding mismatch")
-		}
-		receipts = append(receipts, path)
-	}
-	return receipts, nil
 }
 
 func recordOperatorOutcome(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, message *internalgithub.OperatorMessage, state, diagnostic string) error {

@@ -55,7 +55,10 @@ type operatorMessageStore struct {
 	outcomePosts    int
 }
 
-func (b *refusingHandoffBoundary) call(context.Context, string, agentruntime.Command) (agentruntime.Result, error) {
+func (b *refusingHandoffBoundary) call(_ context.Context, operation string, _ agentruntime.Command) (agentruntime.Result, error) {
+	if operation == "verify-handoff" {
+		return agentruntime.Result{}, nil
+	}
 	b.calls++
 	return agentruntime.Result{}, errors.New("handoff must remain queued")
 }
@@ -67,7 +70,7 @@ func (b *crashingHandoffBoundary) call(ctx context.Context, operation string, co
 		return agentruntime.Result{}, errors.New("injected crash after resume")
 	}
 	result, err := b.direct.call(ctx, operation, command)
-	if err == nil && b.after > 0 {
+	if err == nil && b.after > 0 && operation == "accept-operator-handoff" {
 		b.after--
 		return agentruntime.Result{}, errors.New("injected crash after worker receipt")
 	}
@@ -399,7 +402,7 @@ func TestClaimedOperatorMessageDoesNotInterruptCompetingHandoff(t *testing.T) {
 	respawns := 0
 	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 		if len(command.Args) > 0 && command.Args[0] == "show-options" {
-			return agentruntime.Result{}, errors.New("different handoff")
+			return agentruntime.Result{Output: "different handoff"}, nil
 		}
 		if len(command.Args) > 0 && command.Args[0] == "respawn-pane" {
 			respawns++
@@ -427,7 +430,7 @@ func TestClaimedOperatorMessageDoesNotInterruptCompetingHandoff(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if boundary.calls != calls || respawns != 1 || messages[key][0].State != "claimed" || runner.dead {
+	if boundary.calls != calls+1 || respawns != 1 || messages[key][0].State != "claimed" || runner.dead {
 		t.Fatalf("competing live turn was interrupted: calls=%d respawns=%d message=%#v", boundary.calls, respawns, messages[key][0])
 	}
 	statuses := []orchestrator.RecoveryStatus{{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number}}
@@ -451,6 +454,16 @@ func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.
 			}
 			key := fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number)
 			messages := map[string][]internalgithub.OperatorMessage{key: {message}}
+			handoffKey := "operator-message-" + message.ID
+			forgedPath := handoffReceiptPath(manifest.Worktree, handoffKey)
+			if err := os.MkdirAll(filepath.Dir(forgedPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			forgedToken := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+handoffKey)))
+			forged, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", handoffKey, forgedPath, forgedToken})
+			if err := os.WriteFile(forgedPath, forged, 0o600); err != nil {
+				t.Fatal(err)
+			}
 			bound := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
 			issues := []internalgithub.RecoveryIssueFact{{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &bound}}
 			remote := []internalgithub.RecoveryAttemptFact{bound}
@@ -469,13 +482,17 @@ func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.
 				store.outcomeFailures = 1
 			}
 			oldExec := hostExecRunner
-			respawns := 0
+			respawns, recipient := 0, ""
 			hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 				if len(command.Args) > 0 && command.Args[0] == "show-options" {
-					return agentruntime.Result{}, errors.New("not yet delivered")
+					if recipient == "" {
+						return agentruntime.Result{}, nil
+					}
+					return agentruntime.Result{Output: recipient}, nil
 				}
 				if len(command.Args) > 0 && command.Args[0] == "respawn-pane" {
 					respawns++
+					recipient = command.Args[len(command.Args)-1]
 				}
 				return agentruntime.Result{}, nil
 			}
@@ -490,6 +507,11 @@ func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.
 			if err != nil || len(recovered) != 1 || recovered[0].State != "claimed" {
 				t.Fatalf("durable claim=%#v err=%v", recovered, err)
 			}
+			if stage == "after worker receipt" {
+				if err := os.RemoveAll(filepath.Join(manifest.Worktree, ".agent-symphony", "handoffs")); err != nil {
+					t.Fatal(err)
+				}
+			}
 			messages[key] = recovered
 			current, err := runtimeState.Discover()
 			if err != nil || len(current) != 1 || current[0].State != "running" {
@@ -502,7 +524,7 @@ func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.
 				}); err != nil {
 					t.Fatal(err)
 				}
-				if boundary.calls != calls || respawns != 0 || messages[key][0].State != "claimed" {
+				if boundary.calls != calls+1 || respawns != 0 || messages[key][0].State != "claimed" {
 					t.Fatalf("unowned running pane was reused: calls=%d respawns=%d message=%#v", boundary.calls, respawns, messages[key][0])
 				}
 				runner.dead = true
@@ -719,14 +741,21 @@ func TestOperatorMessageTerminalStateWinsAtAcceptanceBoundary(t *testing.T) {
 }
 
 func (b *directHandoffBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
-	if operation != "accept-handoff" {
-		return agentruntime.Result{}, fmt.Errorf("unexpected operation %q", operation)
-	}
 	body, err := io.ReadAll(command.Stdin)
 	if err != nil {
 		return agentruntime.Result{}, err
 	}
-	out, err := acceptHandoff(ctx, body, b.root)
+	var out string
+	switch operation {
+	case "accept-handoff":
+		out, err = acceptHandoff(ctx, body, b.root)
+	case "accept-operator-handoff":
+		out, err = acceptOperatorHandoff(ctx, body, b.root)
+	case "verify-handoff":
+		out, err = verifyHandoff(ctx, body, b.root)
+	default:
+		return agentruntime.Result{}, fmt.Errorf("unexpected operation %q", operation)
+	}
 	return agentruntime.Result{Output: out}, err
 }
 
@@ -1045,7 +1074,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	runtimeState := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: base, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, "", state); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", state); err != nil {
 		log, _ := os.ReadFile(boundaryLog)
 		t.Fatalf("transient rework reached GitHub failure: %v\n%s", err, log)
 	}
@@ -1059,7 +1088,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 		t.Fatalf("acknowledged handoff state=%q, want running", stored.State)
 	}
 	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, "", state); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, "", state); err != nil {
 		t.Fatalf("retry reached GitHub failure: %v", err)
 	}
 	storedBody, _ = os.ReadFile(manifestPath)
@@ -1110,7 +1139,7 @@ func TestCompletedTurnContractFailureIsPreservedBeforeFollowUp(t *testing.T) {
 			boundFact := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
 			bound := []internalgithub.RecoveryAttemptFact{boundFact}
 			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &boundFact}
-			err := monitorQueuedAttempts(t.Context(), api, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, "", runtimeState.StateRoot)
+			err := monitorQueuedAttempts(t.Context(), api, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", runtimeState.StateRoot)
 			message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Do not mask the preceding result.")
 			message.State = "claimed"
 			messages := map[string][]internalgithub.OperatorMessage{fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number): {message}}
@@ -1186,9 +1215,10 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	if err := os.MkdirAll(filepath.Dir(receiptPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	token := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+key)))
-	receipt, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, receiptPath, token})
-	if err := os.WriteFile(receiptPath, receipt, 0o600); err != nil {
+	if err := os.WriteFile(receiptPath, []byte("malformed worker receipt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(receiptPath), "operator-message-forged.receipt"), []byte(`{"type":"agent-symphony-handoff-executed-v1"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1244,7 +1274,9 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worker, BaseSHA: base, State: "completed", ReviewState: "clean", ReviewHead: head, UpdatedAt: time.Now().UTC()}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Title: "Operator follow-up", BaseBranch: "main", DispatchAuthorized: true}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "review-ready"}}
-	if err := monitorQueuedAttempts(t.Context(), api, &agentruntime.Runtime{}, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, recoveryPath, t.TempDir()); err != nil {
+	message.State = "delivered"
+	operatorMessages := map[string][]internalgithub.OperatorMessage{"o/r#23/1": {message}}
+	if err := monitorQueuedAttempts(t.Context(), api, &agentruntime.Runtime{}, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, operatorMessages, recoveryPath, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != head {
@@ -1252,12 +1284,6 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	}
 	if !strings.Contains(pullBody, head) || len(comments) != 3 {
 		t.Fatalf("pull request was not fully updated: body=%q comments=%#v", pullBody, comments)
-	}
-	if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
-		t.Fatalf("published operator receipt remains active: %v", err)
-	}
-	if _, err := os.Stat(strings.TrimSuffix(receiptPath, ".receipt") + ".published"); err != nil {
-		t.Fatalf("published operator receipt was not archived: %v", err)
 	}
 }
 
@@ -1470,7 +1496,7 @@ func TestBoundAttemptSuppressesRestartDispatchAcrossWorkerAndReviewStates(t *tes
 		t.Fatalf("contradictory remote attempt was resumed: manifests=%#v err=%v", manifests, err)
 	}
 	orphan := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 3, BaseSHA: "aaaaaaa", State: "completed"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{orphan}, nil, "", ""); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{orphan}, nil, nil, "", ""); err != nil {
 		t.Fatalf("genuine orphan was not preserved: %v", err)
 	}
 }
@@ -1571,7 +1597,7 @@ func TestRevokedBoundAttemptCancelsWorkerAndSuppressesPublication(t *testing.T) 
 	completed := manifest
 	completed.State = "completed"
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 4, BaseSHA: attempt.BaseSHA, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{revoked}, []agentruntime.Manifest{completed}, bound, "", ""); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{revoked}, []agentruntime.Manifest{completed}, bound, nil, "", ""); err != nil {
 		t.Fatalf("revoked completed attempt reached publication: %v", err)
 	}
 }
@@ -2593,7 +2619,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	runtimeState := &agentruntime.Runtime{StateRoot: state}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true, BaseBranch: "main"}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, recoveryPath, state); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, recoveryPath, state); err != nil {
 		t.Fatal(err)
 	}
 	storedBody, _ := os.ReadFile(manifestPath)
@@ -2609,7 +2635,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	if err := os.WriteFile(review, []byte("#!/bin/sh\nprintf '{\"Code\":0}'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, recoveryPath, state)
+	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, recoveryPath, state)
 	if err == nil || !strings.Contains(err.Error(), "authenticate GitHub CLI") {
 		t.Fatalf("publication did not continue after cleanup: %v", err)
 	}

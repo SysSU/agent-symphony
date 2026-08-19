@@ -867,6 +867,16 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return errors.New("review boundary cannot accept implementation handoffs")
 		}
 		result.Output, err = acceptHandoff(ctx, request.Command.Input, root)
+	case "accept-operator-handoff":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot accept operator handoffs")
+		}
+		result.Output, err = acceptOperatorHandoff(ctx, request.Command.Input, root)
+	case "verify-handoff":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot verify implementation handoffs")
+		}
+		result.Output, err = verifyHandoff(ctx, request.Command.Input, root)
 	case "review-result":
 		if mode != "review" {
 			return errors.New("implementation boundary cannot read review results")
@@ -1336,30 +1346,24 @@ func readWorkerResult(path string) (workerResult, error) {
 	return result, nil
 }
 
-func acceptHandoff(ctx context.Context, input []byte, root string) (string, error) {
-	var request struct {
-		Manifest     agentruntime.Manifest `json:"manifest"`
-		Handoff      json.RawMessage       `json:"handoff"`
-		OutcomePath  string                `json:"outcome_path"`
-		OutcomeToken string                `json:"outcome_token"`
-		Command      []string              `json:"command"`
-	}
+func decodeHandoffRequest(input []byte, root string) (handoffRequest, struct{ Type, Key string }, error) {
+	var request handoffRequest
 	d := json.NewDecoder(bytes.NewReader(input))
 	d.DisallowUnknownFields()
 	if d.Decode(&request) != nil || d.Decode(&struct{}{}) != io.EOF || !belowRoot(request.Manifest.Worktree, root) || request.OutcomeToken == "" || len(request.Command) == 0 {
-		return "", errors.New("invalid handoff request")
+		return request, struct{ Type, Key string }{}, errors.New("invalid handoff request")
 	}
 	var h struct{ Type, Key string }
 	if json.Unmarshal(request.Handoff, &h) != nil || h.Type != "agent-symphony-handoff-v1" || h.Key == "" || filepath.Base(h.Key) != h.Key || strings.ContainsAny(h.Key, "/\\\x00\r\n") {
-		return "", errors.New("invalid handoff identity")
+		return request, h, errors.New("invalid handoff identity")
 	}
 	if request.OutcomePath != handoffReceiptPath(request.Manifest.Worktree, h.Key) || !belowRoot(request.OutcomePath, request.Manifest.Worktree) {
-		return "", errors.New("invalid handoff receipt path")
+		return request, h, errors.New("invalid handoff receipt path")
 	}
-	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
-	if err := os.MkdirAll(inbox, 0o700); err != nil {
-		return "", err
-	}
+	return request, h, nil
+}
+
+func handoffBinding(request handoffRequest) ([]byte, string) {
 	binding, _ := json.Marshal(struct {
 		State                      string
 		Worktree, Session, LogPath string
@@ -1367,6 +1371,55 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 		OutcomePath, OutcomeToken  string
 		Command                    []string
 	}{"pending", request.Manifest.Worktree, request.Manifest.Session, request.Manifest.LogPath, request.Handoff, request.OutcomePath, request.OutcomeToken, request.Command})
+	return binding, fmt.Sprintf("%x", sha256.Sum256(binding))
+}
+
+func verifyHandoff(ctx context.Context, input []byte, root string) (string, error) {
+	request, h, err := decodeHandoffRequest(input, root)
+	if err != nil {
+		return "", err
+	}
+	_, recipient := handoffBinding(request)
+	option := "@agent-symphony-handoff-" + recipient[:16]
+	observed, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"show-options", "-pqv", "-t", agentruntime.PaneTarget(request.Manifest.Session), option}, Dir: request.Manifest.Worktree})
+	if err != nil {
+		return "", fmt.Errorf("verify handoff launch identity: %w", err)
+	}
+	if strings.TrimSpace(observed.Output) != recipient {
+		return "", nil
+	}
+	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", h.Key, request.OutcomePath, request.OutcomeToken})
+	return string(ack), nil
+}
+
+func acceptOperatorHandoff(ctx context.Context, input []byte, root string) (string, error) {
+	request, h, err := decodeHandoffRequest(input, root)
+	if err != nil {
+		return "", err
+	}
+	var operator struct{ Kind string }
+	if json.Unmarshal(request.Handoff, &operator) != nil || operator.Kind != "operator-message" {
+		return "", errors.New("invalid operator handoff")
+	}
+	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
+	for _, suffix := range []string{".json", ".receipt", ".launching", ".launched"} {
+		if err := os.RemoveAll(filepath.Join(inbox, h.Key+suffix)); err != nil {
+			return "", err
+		}
+	}
+	return acceptHandoff(ctx, input, root)
+}
+
+func acceptHandoff(ctx context.Context, input []byte, root string) (string, error) {
+	request, h, err := decodeHandoffRequest(input, root)
+	if err != nil {
+		return "", err
+	}
+	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
+	if err := os.MkdirAll(inbox, 0o700); err != nil {
+		return "", err
+	}
+	binding, recipient := handoffBinding(request)
 	if err := writeImmutable(filepath.Join(inbox, h.Key+".json"), binding); err != nil {
 		return "", err
 	}
@@ -1377,7 +1430,7 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 		return "", errors.New("handoff receipt binding mismatch")
 	}
 	buffer := "as-handoff-" + fmt.Sprintf("%x", sha256.Sum256(request.Handoff))[:16]
-	pane, recipient := agentruntime.PaneTarget(request.Manifest.Session), fmt.Sprintf("%x", sha256.Sum256(binding))
+	pane := agentruntime.PaneTarget(request.Manifest.Session)
 	option := "@agent-symphony-handoff-" + recipient[:16]
 	observed, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"show-options", "-pqv", "-t", pane, option}, Dir: request.Manifest.Worktree})
 	if err == nil && strings.TrimSpace(observed.Output) == recipient {

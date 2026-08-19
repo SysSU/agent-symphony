@@ -66,7 +66,7 @@ func (ExecRunner) Run(ctx context.Context, command Command) (Result, error) {
 		bounded := tailBuffer{limit: command.MaxOutputBytes}
 		cmd.Stdout, cmd.Stderr = &bounded, &bounded
 		err = cmd.Run()
-		out = bounded.body
+		out = bounded.bytes()
 	} else {
 		out, err = cmd.CombinedOutput()
 	}
@@ -82,11 +82,14 @@ func (ExecRunner) Run(ctx context.Context, command Command) (Result, error) {
 }
 
 type tailBuffer struct {
+	mu    sync.Mutex
 	body  []byte
 	limit int
 }
 
 func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	n := len(p)
 	if n >= b.limit {
 		b.body = append(b.body[:0], p[n-b.limit:]...)
@@ -98,6 +101,12 @@ func (b *tailBuffer) Write(p []byte) (int, error) {
 	}
 	b.body = append(b.body, p...)
 	return n, nil
+}
+
+func (b *tailBuffer) bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.body...)
 }
 
 type Attempt struct {

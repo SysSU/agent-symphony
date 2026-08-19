@@ -56,6 +56,20 @@ func TestExecRunnerBoundsOutputToTail(t *testing.T) {
 	}
 }
 
+func TestExecRunnerCapturesConcurrentStdoutAndStderr(t *testing.T) {
+	result, err := (ExecRunner{}).Run(t.Context(), Command{
+		Name:           "sh",
+		Args:           []string{"-c", `(i=0; while [ "$i" -lt 1000 ]; do printf 'stdout-%04d\n' "$i"; i=$((i+1)); done) & (i=0; while [ "$i" -lt 1000 ]; do printf 'stderr-%04d\n' "$i" >&2; i=$((i+1)); done) & wait`},
+		MaxOutputBytes: 64 << 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Output, "stdout-") || !strings.Contains(result.Output, "stderr-") {
+		t.Fatalf("concurrent capture omitted a stream: %q", result.Output)
+	}
+}
+
 func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
