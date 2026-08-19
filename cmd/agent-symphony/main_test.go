@@ -430,6 +430,11 @@ func TestClaimedOperatorMessageDoesNotInterruptCompetingHandoff(t *testing.T) {
 	if boundary.calls != calls || respawns != 1 || messages[key][0].State != "claimed" || runner.dead {
 		t.Fatalf("competing live turn was interrupted: calls=%d respawns=%d message=%#v", boundary.calls, respawns, messages[key][0])
 	}
+	statuses := []orchestrator.RecoveryStatus{{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number}}
+	attachOperatorMessageStatuses(statuses, messages)
+	if len(statuses[0].OperatorMessages) != 1 || statuses[0].OperatorMessages[0].State != "queued" {
+		t.Fatalf("restart claim leaked internal dashboard state: %#v", statuses[0].OperatorMessages)
+	}
 }
 
 func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.T) {
@@ -808,7 +813,7 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 	}
 }
 
-func TestWorkerCaptureInternalCLI(t *testing.T) {
+func TestWorkerCaptureInternalCLIAndHandoffPreStartRecovery(t *testing.T) {
 	dir := t.TempDir()
 	prompt := filepath.Join(dir, "prompt")
 	if err := os.WriteFile(prompt, []byte("issue prompt"), 0o600); err != nil {
@@ -841,6 +846,16 @@ func TestWorkerCaptureInternalCLI(t *testing.T) {
 		t.Fatalf("replacement result=%q err=%v", got, err)
 	}
 	launchedPath := filepath.Join(dir, "handoff.launched")
+	code = run([]string{"worker-capture-handoff", tmux, "prompt-buffer", resultPath, launchedPath, "recipient", "signal-name", "--", "agent-symphony-missing-worker-command"}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("pre-start handoff failure succeeded")
+	}
+	for _, path := range []string{launchedPath, signalPath} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("pre-start failure acknowledged launch at %s: %v", path, err)
+		}
+	}
+	stderr.Reset()
 	code = run([]string{"worker-capture-handoff", tmux, "prompt-buffer", resultPath, launchedPath, "recipient", "signal-name", "--", "sh", "-c", `printf %s "$1"`, "consumer", result}, &stdout, &stderr)
 	if code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
 		t.Fatalf("handoff code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())

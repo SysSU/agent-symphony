@@ -237,8 +237,8 @@ func PromptCommand(helper, tmux, buffer, resultPath string, command []string) []
 	return append([]string{helper, "worker-capture", tmux, buffer, resultPath, "--"}, command...)
 }
 
-// HandoffPromptCommand records and signals worker-owned launch before the
-// replacement worker consumes the prompt.
+// HandoffPromptCommand records and signals worker-owned launch after the
+// replacement worker starts.
 func HandoffPromptCommand(helper, tmux, buffer, resultPath, launchedPath, recipient, signal string, command []string) []string {
 	return append([]string{helper, "worker-capture-handoff", tmux, buffer, resultPath, launchedPath, recipient, signal, "--"}, command...)
 }

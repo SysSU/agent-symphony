@@ -39,10 +39,20 @@ func CaptureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 // CaptureWorkerReplacingResult atomically replaces an earlier result only
 // after the follow-up worker has completed and its output is durable.
 func CaptureWorkerReplacingResult(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer) (int, error) {
-	return captureWorker(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", true)
+	return captureWorkerAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", true, nil)
 }
 
 func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, tempDir string, replace bool) (int, error) {
+	return captureWorkerAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, tempDir, replace, nil)
+}
+
+// CaptureWorkerReplacingResultAfterStart acknowledges a handoff only after its
+// replacement worker has started successfully.
+func CaptureWorkerReplacingResultAfterStart(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, afterStart func() error) (int, error) {
+	return captureWorkerAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", true, afterStart)
+}
+
+func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, tempDir string, replace bool, afterStart func() error) (int, error) {
 	if tmux == "" || buffer == "" || len(command) == 0 || command[0] == "" || (resultPath != "" && !filepath.IsAbs(resultPath)) {
 		return 1, errors.New("invalid worker capture request")
 	}
@@ -123,6 +133,13 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 	}
 	if err := child.Start(); err != nil {
 		return 1, err
+	}
+	if afterStart != nil {
+		if err := afterStart(); err != nil {
+			_ = killProcessGroup(child)
+			_ = child.Wait()
+			return 1, err
+		}
 	}
 	pipeFD := int(pipe.Fd())
 	if err := syscall.SetNonblock(pipeFD, true); err != nil {

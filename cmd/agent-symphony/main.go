@@ -267,16 +267,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if len(args) < 9 || args[7] != "--" {
 				return misuse(stderr, false, command, "invalid internal worker capture invocation")
 			}
-			if err := writeImmutable(args[4], []byte(args[5])); err != nil {
-				fmt.Fprintln(stderr, "error: "+err.Error())
-				return 1
-			}
-			if err := exec.CommandContext(context.Background(), args[1], "wait-for", "-S", args[6]).Run(); err != nil {
-				fmt.Fprintln(stderr, "launch signal: "+err.Error())
-			}
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			code, err := agentruntime.CaptureWorkerReplacingResult(ctx, args[1], args[2], args[3], args[8:], stdout, stderr)
+			code, err := agentruntime.CaptureWorkerReplacingResultAfterStart(ctx, args[1], args[2], args[3], args[8:], stdout, stderr, func() error {
+				if err := writeImmutable(args[4], []byte(args[5])); err != nil {
+					return err
+				}
+				if err := exec.CommandContext(context.Background(), args[1], "wait-for", "-S", args[6]).Run(); err != nil {
+					fmt.Fprintln(stderr, "launch signal: "+err.Error())
+				}
+				return nil
+			})
 			if err != nil {
 				fmt.Fprintln(stderr, "error: "+err.Error())
 			}
@@ -2202,7 +2203,11 @@ func attachOperatorMessageStatuses(statuses []orchestrator.RecoveryStatus, messa
 		statuses[i].OperatorMessages = nil
 		key := fmt.Sprintf("%s#%d/%d", statuses[i].Repository, statuses[i].Issue, statuses[i].Attempt)
 		for _, message := range messages[key] {
-			statuses[i].OperatorMessages = append(statuses[i].OperatorMessages, orchestrator.OperatorMessageStatus{ID: message.ID, State: message.State, UpdatedAt: message.UpdatedAt, Diagnostic: message.Diagnostic})
+			state := message.State
+			if state == "claimed" {
+				state = "queued"
+			}
+			statuses[i].OperatorMessages = append(statuses[i].OperatorMessages, orchestrator.OperatorMessageStatus{ID: message.ID, State: state, UpdatedAt: message.UpdatedAt, Diagnostic: message.Diagnostic})
 		}
 	}
 }
