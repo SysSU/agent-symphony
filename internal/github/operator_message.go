@@ -17,6 +17,7 @@ import (
 const (
 	OperatorMessageMaxBytes     = 8 << 10
 	operatorMessageMarkerPrefix = "<!-- agent-symphony:operator-message:v1\n"
+	operatorClaimMarkerPrefix   = "<!-- agent-symphony:operator-message-claim:v1\n"
 	operatorOutcomeMarkerPrefix = "<!-- agent-symphony:operator-message-outcome:v1\n"
 )
 
@@ -48,6 +49,13 @@ type operatorMessageOutcome struct {
 	ID         string `json:"id"`
 	State      string `json:"state"`
 	Diagnostic string `json:"diagnostic,omitempty"`
+}
+
+type operatorMessageClaim struct {
+	Version int    `json:"version"`
+	Issue   int    `json:"issue"`
+	Attempt int    `json:"attempt"`
+	ID      string `json:"id"`
 }
 
 func PrepareOperatorMessage(repository string, issue, attempt int, message string) (OperatorMessage, error) {
@@ -96,6 +104,17 @@ func parseOperatorOutcomeMarker(body string) (operatorMessageOutcome, error) {
 	return outcome, nil
 }
 
+func parseOperatorClaimMarker(body string) (operatorMessageClaim, error) {
+	var claim operatorMessageClaim
+	if err := parseBoundedMarker(body, operatorClaimMarkerPrefix, &claim); err != nil {
+		return claim, err
+	}
+	if claim.Version != 1 || claim.Issue < 1 || claim.Attempt < 1 || len(claim.ID) != 64 || !regexpSHA.MatchString(claim.ID) {
+		return operatorMessageClaim{}, errors.New("operator message claim marker is invalid")
+	}
+	return claim, nil
+}
+
 func parseBoundedMarker(body, prefix string, dst any) error {
 	start := strings.Index(body, prefix)
 	if start < 0 || len(body) > 64<<10 || strings.Count(body, prefix) != 1 {
@@ -119,6 +138,8 @@ func FetchOperatorMessages(ctx context.Context, api API, cfg PRAdapterConfig, is
 		return nil, errors.New("operator message lookup requires repository, actor, and issue")
 	}
 	messages := map[string]OperatorMessage{}
+	claims := map[string]operatorMessageClaim{}
+	claimTimes := map[string]time.Time{}
 	outcomes := map[string]operatorMessageOutcome{}
 	outcomeTimes := map[string]time.Time{}
 	for page := 1; page <= recoveryPageLimit; page++ {
@@ -156,10 +177,24 @@ func FetchOperatorMessages(ctx context.Context, api API, cfg PRAdapterConfig, is
 				outcomes[outcome.ID] = outcome
 				outcomeTimes[outcome.ID] = comment.CreatedAt.UTC()
 			}
+			if strings.Contains(comment.Body, operatorClaimMarkerPrefix) {
+				claim, err := parseOperatorClaimMarker(comment.Body)
+				if err != nil || claim.Issue != issue {
+					return nil, errors.New("trusted operator message claim marker is invalid")
+				}
+				if prior, ok := claims[claim.ID]; ok && prior != claim {
+					return nil, errors.New("operator message claim is contradictory")
+				}
+				claims[claim.ID] = claim
+				claimTimes[claim.ID] = comment.CreatedAt.UTC()
+			}
 		}
 		if len(comments) < 100 {
 			result := make([]OperatorMessage, 0, len(messages))
 			for _, message := range messages {
+				if claim, ok := claims[message.ID]; ok && claim.Attempt == message.Attempt {
+					message.State, message.UpdatedAt = "claimed", claimTimes[message.ID]
+				}
 				if outcome, ok := outcomes[message.ID]; ok && outcome.Attempt == message.Attempt {
 					message.State, message.Diagnostic = outcome.State, outcome.Diagnostic
 					message.UpdatedAt = outcomeTimes[message.ID]
@@ -171,6 +206,46 @@ func FetchOperatorMessages(ctx context.Context, api API, cfg PRAdapterConfig, is
 		}
 	}
 	return nil, errors.New("issue comments exceed bounded recovery limit")
+}
+
+func RecordOperatorMessageClaim(ctx context.Context, api API, cfg PRAdapterConfig, message OperatorMessage) (OperatorMessage, error) {
+	messages, err := FetchOperatorMessages(ctx, api, cfg, message.Issue)
+	if err != nil {
+		return OperatorMessage{}, err
+	}
+	for _, existing := range messages {
+		if existing.ID != message.ID {
+			continue
+		}
+		if existing.Attempt != message.Attempt || existing.Message != message.Message {
+			return OperatorMessage{}, errors.New("operator message claim identity changed")
+		}
+		if existing.State == "claimed" {
+			return existing, nil
+		}
+		if existing.State != "queued" {
+			return OperatorMessage{}, errors.New("operator message already has a terminal outcome")
+		}
+		claim := operatorMessageClaim{Version: 1, Issue: message.Issue, Attempt: message.Attempt, ID: message.ID}
+		b, _ := json.Marshal(claim)
+		marker := operatorClaimMarkerPrefix + string(b) + "\n-->"
+		body, _ := AttributedBody(message.Issue, message.Attempt, "Operator message delivery claimed for the exact active attempt.")
+		createErr := api.CreateIssueComment(ctx, cfg.Repository, message.Issue, body+"\n\n"+marker, Mutation{Issue: message.Issue, Attempt: message.Attempt})
+		confirmed, confirmErr := FetchOperatorMessages(ctx, api, cfg, message.Issue)
+		if confirmErr != nil {
+			return OperatorMessage{}, confirmErr
+		}
+		for _, candidate := range confirmed {
+			if candidate.ID == message.ID && candidate.State == "claimed" {
+				return candidate, nil
+			}
+		}
+		if createErr != nil {
+			return OperatorMessage{}, createErr
+		}
+		return OperatorMessage{}, errors.New("operator message claim was not observable")
+	}
+	return OperatorMessage{}, errors.New("operator message is not durably accepted")
 }
 
 func slicesSortOperatorMessages(messages []OperatorMessage) {
@@ -231,7 +306,7 @@ func RecordOperatorMessageOutcome(ctx context.Context, api API, cfg PRAdapterCon
 		if existing.Attempt != message.Attempt || existing.Message != message.Message {
 			return errors.New("operator message outcome identity changed")
 		}
-		if existing.State != "queued" {
+		if existing.State != "queued" && existing.State != "claimed" {
 			if existing.State == state && existing.Diagnostic == diagnostic {
 				return nil
 			}

@@ -65,17 +65,24 @@ func TestOperatorMessageRecordingIsRestartSafeAndDeduplicated(t *testing.T) {
 	if _, err := RecordOperatorMessage(t.Context(), api, cfg, message); err != nil || posts != 1 {
 		t.Fatalf("duplicate created another comment: posts=%d err=%v", posts, err)
 	}
+	claimed, err := RecordOperatorMessageClaim(t.Context(), api, cfg, accepted)
+	if err != nil || claimed.State != "claimed" || posts != 2 {
+		t.Fatalf("claim=%#v posts=%d err=%v", claimed, posts, err)
+	}
 
-	// A new API value models daemon restart; GitHub comments alone recover the queue.
+	// A new API value models daemon restart; GitHub comments alone recover the claim.
 	restarted := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: transport}}
 	recovered, err := FetchOperatorMessages(t.Context(), restarted, cfg, 13)
-	if err != nil || len(recovered) != 1 || recovered[0].ID != message.ID || recovered[0].State != "queued" {
+	if err != nil || len(recovered) != 1 || recovered[0].ID != message.ID || recovered[0].State != "claimed" {
 		t.Fatalf("recovered=%#v err=%v", recovered, err)
 	}
-	if err := RecordOperatorMessageOutcome(t.Context(), restarted, cfg, recovered[0], "delivered", ""); err != nil || posts != 2 {
+	if _, err := RecordOperatorMessageClaim(t.Context(), restarted, cfg, recovered[0]); err != nil || posts != 2 {
+		t.Fatalf("duplicate claim posts=%d err=%v", posts, err)
+	}
+	if err := RecordOperatorMessageOutcome(t.Context(), restarted, cfg, recovered[0], "delivered", ""); err != nil || posts != 3 {
 		t.Fatalf("record outcome posts=%d err=%v", posts, err)
 	}
-	if err := RecordOperatorMessageOutcome(t.Context(), restarted, cfg, recovered[0], "delivered", ""); err != nil || posts != 2 {
+	if err := RecordOperatorMessageOutcome(t.Context(), restarted, cfg, recovered[0], "delivered", ""); err != nil || posts != 3 {
 		t.Fatalf("duplicate outcome posts=%d err=%v", posts, err)
 	}
 	final, err := FetchOperatorMessages(t.Context(), restarted, cfg, 13)

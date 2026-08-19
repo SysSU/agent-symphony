@@ -703,7 +703,7 @@ func runHostOrchestrator(ctx context.Context, root, home string, local bool) err
 	return hostOrchestratorRun(ctx, agentruntime.Command{Name: launch.Command[0], Args: append(launch.Command[1:], launch.Context), Dir: dir, Env: env})
 }
 
-func writeHostOrchestratorProposal(root string, input io.Reader) error {
+func writeHostOrchestratorProposal(root string, input io.Reader, output io.Writer) error {
 	dir, err := hostGetwd()
 	if err != nil || !belowRoot(dir, root) || !strings.HasPrefix(filepath.Base(dir), "orchestrator-") {
 		return errors.New("orchestrator workspace is outside the reviewer boundary")
@@ -728,26 +728,7 @@ func writeHostOrchestratorProposal(root string, input io.Reader) error {
 		return err
 	}
 	canonical, _ := json.Marshal(proposal)
-	path := filepath.Join(dir, orchestratoragent.MessageProposalFileName)
-	listed, err := os.Lstat(path)
-	if err != nil || !listed.Mode().IsRegular() || listed.Mode()&os.ModeSymlink != 0 || listed.Mode().Perm() != 0o660 || fileGID(listed) != hostEGID() {
-		return errors.New("orchestrator proposal contract is unsafe")
-	}
-	file, err := os.OpenFile(path, syscall.O_WRONLY|syscall.O_TRUNC|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return errors.New("open fixed orchestrator proposal contract")
-	}
-	opened, statErr := file.Stat()
-	if statErr != nil || !os.SameFile(listed, opened) || opened.Mode().Perm() != 0o660 || fileGID(opened) != hostEGID() {
-		file.Close()
-		return errors.New("orchestrator proposal contract changed while opening")
-	}
-	if _, err = file.Write(append(canonical, '\n')); err == nil {
-		err = file.Sync()
-	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
+	_, err = fmt.Fprintln(output, orchestratoragent.MessageProposalPrefix+base64.StdEncoding.EncodeToString(canonical))
 	return err
 }
 
@@ -815,7 +796,7 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		return runHostOrchestrator(ctx, root, homeDir, localRoot != "")
 	}
 	if orchestratorProposalMode {
-		return writeHostOrchestratorProposal(root, input)
+		return writeHostOrchestratorProposal(root, input, output)
 	}
 	var request struct {
 		Operation string          `json:"operation"`

@@ -3,6 +3,7 @@ package orchestratoragent
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -23,6 +24,7 @@ type fakeRunner struct {
 	starts     int
 	notices    []string
 	commands   []agentruntime.Command
+	pane       string
 }
 
 func (f *fakeRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
@@ -36,6 +38,8 @@ func (f *fakeRunner) Run(_ context.Context, command agentruntime.Command) (agent
 			return agentruntime.Result{Exited: true, Code: 1}, errors.New("missing")
 		}
 		return agentruntime.Result{Output: "0\n"}, nil
+	case "capture-pane":
+		return agentruntime.Result{Output: f.pane}, nil
 	case "new-session":
 		f.starts++
 		if f.failStarts > 0 {
@@ -83,11 +87,8 @@ func TestMessageProposalIsExactBoundedAndConsumable(t *testing.T) {
 	if _, err := agent.MessageProposal(t.Context()); !errors.Is(err, ErrNoMessageProposal) {
 		t.Fatalf("empty proposal err=%v", err)
 	}
-	path := filepath.Join(agent.Workspace, MessageProposalFileName)
 	body, _ := json.Marshal(MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Message: "Run the focused test."})
-	if err := os.WriteFile(path, body, 0o660); err != nil {
-		t.Fatal(err)
-	}
+	agent.Runner.(*fakeRunner).pane = MessageProposalPrefix + base64.StdEncoding.EncodeToString(body) + "\n"
 	proposal, err := agent.MessageProposal(t.Context())
 	if err != nil || proposal.Binding == "" || proposal.Message != "Run the focused test." {
 		t.Fatalf("proposal=%#v err=%v", proposal, err)
@@ -102,9 +103,7 @@ func TestMessageProposalIsExactBoundedAndConsumable(t *testing.T) {
 		t.Fatalf("consumed proposal err=%v", err)
 	}
 	body, _ = json.Marshal(MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Message: strings.Repeat("x", 8193)})
-	if err := os.WriteFile(path, body, 0o660); err != nil {
-		t.Fatal(err)
-	}
+	agent.Runner.(*fakeRunner).pane = MessageProposalPrefix + base64.StdEncoding.EncodeToString(body) + "\n"
 	if _, err := agent.MessageProposal(t.Context()); err == nil {
 		t.Fatal("oversized message proposal accepted")
 	}

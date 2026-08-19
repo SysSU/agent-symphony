@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,41 +22,31 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
-func TestHostOrchestratorProposalWritesOnlyTheFixedValidatedContract(t *testing.T) {
+func TestHostOrchestratorProposalEmitsOnlyTheFixedValidatedFrame(t *testing.T) {
 	root := t.TempDir()
 	workspace := filepath.Join(root, "orchestrator-test")
 	if err := os.Mkdir(workspace, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(workspace, orchestratoragent.MessageProposalFileName)
-	if err := os.WriteFile(path, nil, 0o660); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(path, 0o660); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldGetwd, oldEGID := hostGetwd, hostEGID
+	oldGetwd := hostGetwd
 	hostGetwd = func() (string, error) { return workspace, nil }
-	hostEGID = func() int { return fileGID(info) }
-	t.Cleanup(func() { hostGetwd, hostEGID = oldGetwd, oldEGID })
+	t.Cleanup(func() { hostGetwd = oldGetwd })
 	proposal := `{"version":1,"repository":"o/r","issue":131,"attempt":3,"message":"Run the focused test."}`
-	if err := writeHostOrchestratorProposal(root, strings.NewReader(proposal)); err != nil {
+	var output bytes.Buffer
+	if err := writeHostOrchestratorProposal(root, strings.NewReader(proposal), &output); err != nil {
 		t.Fatal(err)
 	}
-	written, err := os.ReadFile(path)
-	if err != nil || strings.TrimSpace(string(written)) != proposal {
-		t.Fatalf("written=%q err=%v", written, err)
+	frame := strings.TrimSpace(output.String())
+	written, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(frame, orchestratoragent.MessageProposalPrefix))
+	if err != nil || string(written) != proposal || !strings.HasPrefix(frame, orchestratoragent.MessageProposalPrefix) {
+		t.Fatalf("frame=%q decoded=%q err=%v", frame, written, err)
 	}
-	if err := writeHostOrchestratorProposal(root, strings.NewReader(`{"version":1,"repository":"o/r","issue":131,"attempt":3,"message":"changed","command":"tmux"}`)); err == nil {
+	output.Reset()
+	if err := writeHostOrchestratorProposal(root, strings.NewReader(`{"version":1,"repository":"o/r","issue":131,"attempt":3,"message":"changed","command":"tmux"}`), &output); err == nil {
 		t.Fatal("arbitrary proposal field accepted")
 	}
-	unchanged, _ := os.ReadFile(path)
-	if !bytes.Equal(unchanged, written) {
-		t.Fatalf("invalid proposal changed fixed file: %q", unchanged)
+	if output.Len() != 0 {
+		t.Fatalf("invalid proposal emitted output: %q", output.String())
 	}
 }
 
