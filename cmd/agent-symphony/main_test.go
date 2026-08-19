@@ -268,7 +268,7 @@ func TestOperatorMessageAcceptanceBindingRejectsRemoteRaces(t *testing.T) {
 	}
 }
 
-func TestOperatorMessageConfirmationVerifiesThroughImplementationBoundary(t *testing.T) {
+func TestOperatorMessageConfirmationAcceptsOwnedRunningAdvancedHead(t *testing.T) {
 	stateRoot := t.TempDir()
 	snapshotRoot := filepath.Join(t.TempDir(), "snapshots")
 	oldSnapshotRoot := reviewSnapshotRoot
@@ -287,7 +287,7 @@ func TestOperatorMessageConfirmationVerifiesThroughImplementationBoundary(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest.State = "completed"
+	manifest.State = "running"
 	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "131-3", "agent.log")
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
 		t.Fatal(err)
@@ -303,14 +303,19 @@ case "$payload" in
   *) output='' ;;
 esac
 printf '{"Output":"%%s","Code":0,"Exited":false}' "$output"
-`, logPath, manifest.Branch, attempt.BaseSHA)
+`, logPath, manifest.Branch, strings.Repeat("c", 40))
 	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", script)
 	runtimeState = newOperatorMessageRuntime(stateRoot)
-	if err := runtimeState.VerifyActive(t.Context(), manifest, attempt.BaseSHA); err != nil {
-		t.Fatalf("confirmation runtime rejected verified target: %v", err)
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Message: "Queue behind the running turn."}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true}
+	remote := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, PR: 7, BaseSHA: attempt.BaseSHA, HeadSHA: strings.Repeat("b", 40), State: "review-ready"}
+	if err := validateOperatorMessageTarget(t.Context(), proposal, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{remote}, []agentruntime.Manifest{manifest}, func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
+		return verifyOperatorMessageRuntime(ctx, &runtimeState, manifest, fact)
+	}); err != nil {
+		t.Fatalf("confirmation rejected the owned advanced-head running target: %v", err)
 	}
 	logBody, err := os.ReadFile(logPath)
 	if err != nil {
@@ -318,6 +323,9 @@ printf '{"Output":"%%s","Code":0,"Exited":false}' "$output"
 	}
 	if !bytes.Contains(logBody, []byte(`"operation":"verify"`)) || !bytes.Contains(logBody, []byte(`"operation":"run"`)) {
 		t.Fatalf("confirmation runtime did not use both boundary hooks: %s", logBody)
+	}
+	if bytes.Contains(logBody, []byte(`rev-parse`)) {
+		t.Fatalf("busy confirmation compared mutable HEAD: %s", logBody)
 	}
 }
 
@@ -995,6 +1003,125 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	}
 	if strings.Count(string(log), `"operation":"export"`) != 1 {
 		t.Fatalf("live follow-up was exported: %s", log)
+	}
+}
+
+func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testing.T) {
+	coordinator, worker, remote := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
+	for _, repo := range []string{coordinator, worker} {
+		runGit(t, repo, "init")
+		runGit(t, repo, "config", "user.email", "test@example.invalid")
+		runGit(t, repo, "config", "user.name", "test")
+	}
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "add", "file")
+	runGit(t, worker, "commit", "-m", "base")
+	base := runGit(t, worker, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("operator follow-up"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "commit", "-am", "operator follow-up")
+	head := runGit(t, worker, "rev-parse", "HEAD")
+	branch, _ := internalgithub.AttemptBranch("o/r", 23, 1)
+	runGit(t, coordinator, "init", "--bare", remote)
+	runGit(t, worker, "push", remote, base+":refs/heads/"+branch)
+	runGit(t, coordinator, "remote", "add", "origin", remote)
+
+	bundlePath := filepath.Join(t.TempDir(), "attempt.bundle")
+	runGit(t, worker, "bundle", "create", bundlePath, "--all")
+	bundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: branch, BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "focused tests passed", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
+	exportedJSON, _ := json.Marshal(exported)
+	boundaryResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
+	implementation := filepath.Join(t.TempDir(), "implementation-boundary")
+	if err := os.WriteFile(implementation, []byte("#!/bin/sh\nprintf '%s' '"+string(boundaryResult)+"'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", implementation)
+
+	message, _ := internalgithub.PrepareOperatorMessage("o/r", 23, 1, "Apply the follow-up.")
+	key := "operator-message-" + message.ID
+	receiptPath := handoffReceiptPath(worker, key)
+	if err := os.MkdirAll(filepath.Dir(receiptPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	token := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+key)))
+	receipt, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, receiptPath, token})
+	if err := os.WriteFile(receiptPath, receipt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	recoveryPath := filepath.Join(t.TempDir(), "pr.json")
+	recoveryBody, _ := json.Marshal([]internalgithub.PRState{{Repository: "o/r", Number: 7, Issue: 23, Attempt: 1, HeadSHA: base}})
+	if err := os.WriteFile(recoveryPath, recoveryBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var pullBody string
+	var comments []map[string]any
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		var body []byte
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/user":
+			body = []byte(`{"id":42,"login":"coordinator"}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/pulls":
+			body, _ = json.Marshal([]map[string]any{{"number": 7, "body": pullBody, "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": branch}}})
+		case request.Method == http.MethodPatch && request.URL.Path == "/repos/o/r/pulls/7":
+			var input struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			pullBody = input.Body
+			body = []byte(`{}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues/23/comments":
+			body, _ = json.Marshal(comments)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/o/r/issues/23/comments":
+			var input struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			comments = append(comments, map[string]any{"body": input.Body, "user": map[string]any{"id": 42}})
+			status, body = http.StatusCreated, []byte(`{}`)
+		default:
+			t.Fatalf("unexpected GitHub request %s %s", request.Method, request.URL.String())
+		}
+		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d", status), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}}
+
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worker, BaseSHA: base, State: "completed", ReviewState: "clean", ReviewHead: head, UpdatedAt: time.Now().UTC()}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Title: "Operator follow-up", BaseBranch: "main", DispatchAuthorized: true}
+	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "review-ready"}}
+	if err := monitorQueuedAttempts(t.Context(), api, &agentruntime.Runtime{}, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, recoveryPath, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != head {
+		t.Fatalf("published head=%s want %s; body=%q comments=%#v", got, head, pullBody, comments)
+	}
+	if !strings.Contains(pullBody, head) || len(comments) != 3 {
+		t.Fatalf("pull request was not fully updated: body=%q comments=%#v", pullBody, comments)
+	}
+	if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
+		t.Fatalf("published operator receipt remains active: %v", err)
+	}
+	if _, err := os.Stat(strings.TrimSuffix(receiptPath, ".receipt") + ".published"); err != nil {
+		t.Fatalf("published operator receipt was not archived: %v", err)
 	}
 }
 

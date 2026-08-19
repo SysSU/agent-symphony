@@ -570,15 +570,22 @@ func confirmOperatorMessage(ctx context.Context, configPath, stateRoot string, p
 		return internalgithub.OperatorMessage{}, err
 	}
 	if err := validateOperatorMessageTarget(ctx, proposal, issues, remote, manifests, func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
-		head := fact.HeadSHA
-		if head == "" {
-			head = fact.BaseSHA
-		}
-		return runtimeState.VerifyActive(ctx, manifest, head)
+		return verifyOperatorMessageRuntime(ctx, &runtimeState, manifest, fact)
 	}); err != nil {
 		return internalgithub.OperatorMessage{}, err
 	}
 	return internalgithub.RecordOperatorMessage(ctx, api, prConfig, message)
+}
+
+func verifyOperatorMessageRuntime(ctx context.Context, runtimeState *agentruntime.Runtime, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
+	if manifest.State == "running" {
+		return runtimeState.VerifyOwned(ctx, manifest)
+	}
+	head := fact.HeadSHA
+	if head == "" {
+		head = fact.BaseSHA
+	}
+	return runtimeState.VerifyActive(ctx, manifest, head)
 }
 
 func newOperatorMessageRuntime(stateRoot string) agentruntime.Runtime {
@@ -1497,19 +1504,25 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 		if !preparedOK && (remoteIndex < 0 || remote[remoteIndex].BaseSHA != manifest.BaseSHA) {
 			continue
 		}
+		operatorReceipts, err := receivedOperatorMessageReceipts(manifest)
+		if err != nil {
+			return err
+		}
 		var handoff internalgithub.RecoveryHandoff
 		if preparedOK {
 			handoff = prepared.Handoff
 		} else if remote[remoteIndex].PR > 0 {
 			published := remote[remoteIndex]
 			var received bool
-			var err error
 			handoff, received, err = recovery.ReceivedHandoff(ctx, manifest.Repository, published.PR, manifest.Issue, manifest.Attempt, published.HeadSHA)
 			if err != nil {
 				return err
 			}
 			if !received {
-				continue
+				if len(operatorReceipts) == 0 {
+					continue
+				}
+				handoff = internalgithub.RecoveryHandoff{}
 			}
 		}
 		index := slices.IndexFunc(issues, func(i internalgithub.RecoveryIssueFact) bool {
@@ -1547,7 +1560,15 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			if err != nil {
 				return durableAttemptFailure(ctx, api, issue, current, err)
 			}
-			if pending || handoff.PR == 0 {
+			if pending {
+				continue
+			}
+			for _, receipt := range operatorReceipts {
+				if err := os.Rename(receipt, strings.TrimSuffix(receipt, ".receipt")+".published"); err != nil {
+					return err
+				}
+			}
+			if handoff.PR == 0 {
 				continue
 			}
 			if err := recovery.CompleteHandoffPublication(ctx, completed); err != nil {
@@ -2296,6 +2317,35 @@ func exactHandoffReceipt(path string, want handoffReceipt) bool {
 	body, err := os.ReadFile(path)
 	expected, _ := json.Marshal(want)
 	return err == nil && bytes.Equal(body, expected)
+}
+
+func receivedOperatorMessageReceipts(manifest agentruntime.Manifest) ([]string, error) {
+	dir := filepath.Join(manifest.Worktree, ".agent-symphony", "handoffs")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var receipts []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "operator-message-") || !strings.HasSuffix(name, ".receipt") {
+			continue
+		}
+		if !entry.Type().IsRegular() {
+			return nil, errors.New("operator message receipt is not a regular file")
+		}
+		key := strings.TrimSuffix(name, ".receipt")
+		path := filepath.Join(dir, name)
+		token := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+key)))
+		if !exactHandoffReceipt(path, handoffReceipt{"agent-symphony-handoff-executed-v1", key, path, token}) {
+			return nil, errors.New("operator message receipt binding mismatch")
+		}
+		receipts = append(receipts, path)
+	}
+	return receipts, nil
 }
 
 func recordOperatorOutcome(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, message *internalgithub.OperatorMessage, state, diagnostic string) error {
