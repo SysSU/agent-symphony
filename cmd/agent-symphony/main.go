@@ -629,7 +629,13 @@ func validateOperatorMessageTarget(ctx context.Context, proposal orchestratorage
 	}) {
 		facts = append(facts, orchestrator.AttemptFact{Repository: binding.Repository, Issue: binding.Issue, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, HeadSHA: binding.HeadSHA, PR: binding.PR, State: binding.State, Checks: binding.Checks, Diagnostic: binding.Diagnostic})
 	}
-	statuses := orchestrator.RecoverChecked(ctx, facts, []agentruntime.Manifest{manifest}, check)
+	factIndex := slices.IndexFunc(facts, func(fact orchestrator.AttemptFact) bool {
+		return fact.Repository == proposal.Repository && fact.Issue == proposal.Issue && fact.Attempt == proposal.Attempt
+	})
+	if factIndex < 0 || check == nil || check(ctx, manifest, facts[factIndex]) != nil {
+		return errors.New("operator message target does not have a verified exact runtime owner")
+	}
+	statuses := orchestrator.RecoverChecked(ctx, facts, []agentruntime.Manifest{manifest}, func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil })
 	statusIndex := slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool {
 		return status.Repository == proposal.Repository && status.Issue == proposal.Issue && status.Attempt == proposal.Attempt
 	})
@@ -926,20 +932,20 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		}
 		return matchesOperatorMessageBinding(proposal, expected, currentIssues, attempts), nil
 	}
-	if err := resumeOperatorMessages(ctx, api, prConfig, &r, boundary, freshIssues, freshRemote, refreshedManifests, operatorMessages, c.Commands.Implementation, operatorCheck, refreshOperatorTarget, acceptOperatorTarget); err != nil {
+	if err := monitorQueuedAttempts(ctx, api, &r, c, freshIssues, refreshedManifests, freshRemote, statePath, stateRoot); err != nil {
+		return statuses, err
+	}
+	validatedManifests, err := r.Discover()
+	if err != nil {
+		return statuses, err
+	}
+	if err := resumeOperatorMessages(ctx, api, prConfig, &r, boundary, freshIssues, freshRemote, validatedManifests, operatorMessages, c.Commands.Implementation, operatorCheck, refreshOperatorTarget, acceptOperatorTarget); err != nil {
 		attachOperatorMessageStatuses(statuses, operatorMessages)
 		_ = writeStatusSnapshot(stateRoot, statuses)
 		return statuses, err
 	}
 	attachOperatorMessageStatuses(statuses, operatorMessages)
 	if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
-		return statuses, err
-	}
-	afterMessages, err := r.Discover()
-	if err != nil {
-		return statuses, err
-	}
-	if err := monitorQueuedAttempts(ctx, api, &r, c, freshIssues, afterMessages, freshRemote, statePath, stateRoot); err != nil {
 		return statuses, err
 	}
 	if err := dispatchIssues(ctx, api, &r, c, prConfig, issues, decisions); err != nil {
@@ -1564,7 +1570,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			}
 			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot, prepare)
 			if err != nil {
-				return durableAttemptFailure(ctx, api, issue, current, err)
+				return errors.Join(err, durableAttemptFailure(ctx, api, issue, current, err))
 			}
 			if pending {
 				continue

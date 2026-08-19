@@ -45,6 +45,7 @@ type crashingHandoffBoundary struct {
 
 type operatorMessageRunner struct {
 	dead         bool
+	missing      bool
 	branch, head string
 }
 
@@ -90,6 +91,11 @@ func (r *operatorMessageRunner) Run(_ context.Context, command agentruntime.Comm
 		return agentruntime.Result{}, nil
 	}
 	switch command.Args[0] {
+	case "has-session":
+		if r.missing {
+			return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
+		}
+		return agentruntime.Result{}, nil
 	case "display-message":
 		if r.dead {
 			return agentruntime.Result{Output: "1 0"}, nil
@@ -235,6 +241,31 @@ func TestOperatorMessageTargetValidationRejectsStaleAndTerminalAttempts(t *testi
 		t.Run(name, func(t *testing.T) {
 			if err := validateOperatorMessageTarget(t.Context(), proposal, input.issues, input.remote, input.manifests, check); err == nil {
 				t.Fatal("unsafe target accepted")
+			}
+		})
+	}
+}
+
+func TestOperatorMessageTargetValidationVerifiesCompletedRuntimeResources(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(agentruntime.Manifest, *operatorMessageRunner)
+	}{
+		{"missing worktree", func(manifest agentruntime.Manifest, _ *operatorMessageRunner) { _ = os.RemoveAll(manifest.Worktree) }},
+		{"mismatched branch", func(_ agentruntime.Manifest, runner *operatorMessageRunner) { runner.branch = "wrong-branch" }},
+		{"missing session", func(_ agentruntime.Manifest, runner *operatorMessageRunner) { runner.missing = true }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
+			test.mutate(manifest, runner)
+			bound := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
+			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &bound}
+			proposal := orchestratoragent.MessageProposal{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Message: "message"}
+			err := validateOperatorMessageTarget(t.Context(), proposal, []internalgithub.RecoveryIssueFact{issue}, nil, []agentruntime.Manifest{manifest}, func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
+				return verifyOperatorMessageRuntime(ctx, runtimeState, manifest, fact)
+			})
+			if err == nil || !strings.Contains(err.Error(), "verified exact runtime owner") {
+				t.Fatalf("completed target with invalid runtime accepted: %v", err)
 			}
 		})
 	}
@@ -1003,6 +1034,75 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	}
 	if strings.Count(string(log), `"operation":"export"`) != 1 {
 		t.Fatalf("live follow-up was exported: %s", log)
+	}
+}
+
+func TestCompletedTurnContractFailureIsPreservedBeforeFollowUp(t *testing.T) {
+	for _, test := range []struct {
+		name, result, export string
+	}{
+		{name: "missing", export: ""},
+		{name: "malformed", result: "not-json", export: "{"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtimeState, attempt, manifest, _ := operatorMessageRuntime(t)
+			resultPath := agentruntime.ResultPath(manifest.Worktree)
+			if test.result != "" {
+				if err := os.WriteFile(resultPath, []byte(test.result), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			boundaryResult, _ := json.Marshal(agentruntime.Result{Output: test.export})
+			boundary := filepath.Join(t.TempDir(), "boundary")
+			if err := os.WriteFile(boundary, []byte("#!/bin/sh\nprintf '%s' '"+string(boundaryResult)+"'\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", boundary)
+
+			api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				status, body := http.StatusOK, []byte(`[]`)
+				switch {
+				case request.Method == http.MethodGet && request.URL.Path == "/user":
+					body = []byte(`{"id":42,"login":"coordinator"}`)
+				case request.Method == http.MethodPost && request.URL.Path == "/repos/o/r/issues/131/comments":
+					status, body = http.StatusCreated, []byte(`{}`)
+				case request.Method != http.MethodGet || request.URL.Path != "/repos/o/r/issues/131/comments":
+					t.Fatalf("unexpected GitHub request %s %s", request.Method, request.URL.String())
+				}
+				return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d", status), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+			})}}
+			boundFact := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
+			bound := []internalgithub.RecoveryAttemptFact{boundFact}
+			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &boundFact}
+			err := monitorQueuedAttempts(t.Context(), api, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, "", runtimeState.StateRoot)
+			message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Do not mask the preceding result.")
+			message.State = "claimed"
+			messages := map[string][]internalgithub.OperatorMessage{fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number): {message}}
+			followUp := &refusingHandoffBoundary{}
+			if err == nil {
+				refresh := func(context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
+					current, discoverErr := runtimeState.Discover()
+					return []internalgithub.RecoveryIssueFact{issue}, bound, current, discoverErr
+				}
+				err = resumeOperatorMessages(t.Context(), api, internalgithub.PRAdapterConfig{}, runtimeState, followUp, []internalgithub.RecoveryIssueFact{issue}, bound, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
+					return true, nil
+				})
+			}
+			if err == nil || !strings.Contains(err.Error(), "invalid attested metadata") {
+				t.Fatalf("invalid completed result did not stop reconciliation: %v", err)
+			}
+			if followUp.calls != 0 {
+				t.Fatal("queued operator message replaced the invalid completed result")
+			}
+			body, readErr := os.ReadFile(resultPath)
+			if test.result == "" {
+				if !errors.Is(readErr, os.ErrNotExist) {
+					t.Fatalf("missing result was replaced: %v", readErr)
+				}
+			} else if readErr != nil || string(body) != test.result {
+				t.Fatalf("malformed result was not preserved: %q %v", body, readErr)
+			}
+		})
 	}
 }
 
