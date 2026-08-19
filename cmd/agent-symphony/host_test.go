@@ -18,9 +18,31 @@ import (
 	"testing"
 	"time"
 
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
+
+type agentHostRuntimeRunner struct{}
+
+func (agentHostRuntimeRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+	payload, _ := json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"run", boundaryCommand{Name: command.Name, Args: command.Args, Env: command.Env, Dir: command.Dir}})
+	var output bytes.Buffer
+	if err := agentHost(ctx, "implementation", bytes.NewReader(payload), &output); err != nil {
+		return agentruntime.Result{}, err
+	}
+	var result agentruntime.Result
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		return agentruntime.Result{}, err
+	}
+	if result.Code != 0 {
+		return result, fmt.Errorf("agent-host command exited %d", result.Code)
+	}
+	return result, nil
+}
 
 func TestHostOrchestratorProposalEmitsOnlyTheFixedValidatedFrame(t *testing.T) {
 	root := t.TempDir()
@@ -873,6 +895,71 @@ func TestProductionSeedClonesThroughAgentHostBoundary(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(destination, ".git")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResumeHandoffFetchesThroughAgentHostBoundary(t *testing.T) {
+	oldExec := hostExecRunner
+	hostExecRunner = (agentruntime.ExecRunner{}).Run
+	t.Cleanup(func() { hostExecRunner = oldExec })
+
+	stateRoot := t.TempDir()
+	stateRoot, _ = filepath.EvalSymlinks(stateRoot)
+	root := filepath.Join(stateRoot, "worktrees")
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
+	source := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"commit", "--allow-empty", "-m", "base"}} {
+		if out, err := exec.Command("git", append([]string{"-C", source}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	base := runGit(t, source, "rev-parse", "HEAD")
+	bundle, err := seedAttemptSource(t.Context(), source, "o/r", root, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 4, Number: 2, BaseSHA: base}
+	manifest, err := agentruntime.AttemptIdentity(root, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "clone", "--no-local", "--no-checkout", bundle, manifest.Worktree).CombinedOutput(); err != nil {
+		t.Fatalf("clone attempt: %v: %s", err, out)
+	}
+	runGit(t, manifest.Worktree, "checkout", "--detach", base)
+	runGit(t, manifest.Worktree, "switch", "-c", manifest.Branch)
+	runGit(t, manifest.Worktree, "remote", "remove", "origin")
+
+	runGit(t, source, "commit", "--allow-empty", "-m", "handoff source")
+	want := runGit(t, source, "rev-parse", "HEAD")
+	branch := runGit(t, source, "branch", "--show-current")
+	if _, err := seedAttemptSource(t.Context(), source, "o/r", root, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest.State = "completed"
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "4-2", "agent.log")
+	manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runtimeState := agentruntime.Runtime{Root: root, StateRoot: stateRoot, Source: bundle, Runner: agentHostRuntimeRunner{}}
+	resumed, err := runtimeState.ResumeHandoff(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := runGit(t, manifest.Worktree, "rev-parse", "refs/remotes/agent-symphony/"+branch); resumed.State != "running" || got != want {
+		t.Fatalf("resumed=%#v fetched=%s want=%s", resumed, got, want)
+	}
+	if validGitBoundaryArgs([]string{"-C", manifest.Worktree, "fetch", "--no-tags", filepath.Join(t.TempDir(), "outside.source.bundle"), "+refs/heads/*:refs/remotes/agent-symphony/*"}, root, root) ||
+		validGitBoundaryArgs([]string{"-C", manifest.Worktree, "fetch", "--no-tags", bundle, "+refs/heads/*:refs/remotes/origin/*"}, root, root) {
+		t.Fatal("handoff fetch allowlist accepted a source escape or alternate refspec")
 	}
 }
 
