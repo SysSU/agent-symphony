@@ -1125,6 +1125,179 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	}
 }
 
+func TestReconcilePublishesCompletedUnpublishedAttemptFromIssueBinding(t *testing.T) {
+	coordinator, worker, remote := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
+	for _, repo := range []string{coordinator, worker} {
+		runGit(t, repo, "init")
+		runGit(t, repo, "config", "user.email", "test@example.invalid")
+		runGit(t, repo, "config", "user.name", "test")
+	}
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "add", "file")
+	runGit(t, worker, "commit", "-m", "base")
+	base := runGit(t, worker, "rev-parse", "HEAD")
+	runGit(t, coordinator, "init", "--bare", remote)
+	runGit(t, worker, "push", remote, base+":refs/heads/main")
+	runGit(t, coordinator, "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("completed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "commit", "-am", "completed")
+	head := runGit(t, worker, "rev-parse", "HEAD")
+	branch, _ := internalgithub.AttemptBranch("o/r", 23, 1)
+
+	bundlePath := filepath.Join(t.TempDir(), "attempt.bundle")
+	runGit(t, worker, "bundle", "create", bundlePath, "--all")
+	bundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: branch, BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "focused tests passed", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
+	exportedJSON, _ := json.Marshal(exported)
+	boundaryResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
+	implementation := filepath.Join(t.TempDir(), "implementation-boundary")
+	if err := os.WriteFile(implementation, []byte("#!/bin/sh\nprintf '%s' '"+string(boundaryResult)+"'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", implementation)
+
+	issueCreated := time.Date(2026, 8, 19, 1, 0, 0, 0, time.UTC)
+	activeMarker, err := internalgithub.ActiveAttemptMarker("o/r", 23, 1, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pullBody string
+	created := false
+	comments := []map[string]any{{"id": 1, "body": activeMarker, "created_at": issueCreated, "updated_at": issueCreated, "user": map[string]any{"id": 42}}}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		var body []byte
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/user":
+			body = []byte(`{"id":42,"login":"coordinator"}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/user/42":
+			body = []byte(`{"login":"coordinator"}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r":
+			body = []byte(`{"full_name":"o/r","default_branch":"main","permissions":{"pull":true}}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/branches/main":
+			body, _ = json.Marshal(map[string]any{"commit": map[string]any{"sha": base}})
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues":
+			body, _ = json.Marshal([]map[string]any{{"number": 23, "title": "Completed attempt", "body": "Publish the completed work.", "created_at": issueCreated}})
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues/23":
+			body, _ = json.Marshal(map[string]any{"number": 23, "node_id": "issue-node", "state": "open", "body": "Publish the completed work.", "created_at": issueCreated, "user": map[string]any{"id": 42}, "labels": []map[string]any{{"name": "agent-ready"}, {"name": "priority:P1"}}})
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues/23/timeline":
+			body, _ = json.Marshal([]map[string]any{
+				{"id": 11, "event": "labeled", "created_at": issueCreated.Add(time.Minute), "actor": map[string]any{"id": 42}, "label": map[string]any{"name": "agent-ready"}},
+				{"id": 12, "event": "labeled", "created_at": issueCreated.Add(2 * time.Minute), "actor": map[string]any{"id": 42}, "label": map[string]any{"name": "priority:P1"}},
+			})
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/collaborators/coordinator/permission":
+			body = []byte(`{"permission":"admin"}`)
+		case request.Method == http.MethodPost && request.URL.Path == "/graphql":
+			body = []byte(`{"data":{"repository":{"issue":{"userContentEdits":{"nodes":[]}}}}}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/pulls":
+			var pulls []map[string]any
+			if created {
+				pulls = append(pulls, map[string]any{"number": 7, "body": pullBody, "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": branch}})
+			}
+			body, _ = json.Marshal(pulls)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/o/r/pulls":
+			var input struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			created, pullBody = true, input.Body
+			status, body = http.StatusCreated, []byte(`{"number":7}`)
+		case request.Method == http.MethodPatch && request.URL.Path == "/repos/o/r/pulls/7":
+			var input struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			pullBody, body = input.Body, []byte(`{}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues/23/comments":
+			body, _ = json.Marshal(comments)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/o/r/issues/23/comments":
+			var input struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			createdAt := issueCreated.Add(time.Duration(len(comments)) * time.Minute)
+			comments = append(comments, map[string]any{"id": len(comments) + 1, "body": input.Body, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
+			status, body = http.StatusCreated, []byte(`{}`)
+		default:
+			t.Fatalf("unexpected GitHub request %s %s", request.Method, request.URL.String())
+		}
+		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d", status), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	configPath := filepath.Join(coordinator, config.DefaultPath)
+	if err := config.Write(configPath, config.Default("o/r")); err != nil {
+		t.Fatal(err)
+	}
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshotRoot := reviewSnapshotRoot
+	reviewSnapshotRoot = filepath.Join(t.TempDir(), "snapshots")
+	t.Cleanup(func() { reviewSnapshotRoot = oldSnapshotRoot })
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: base}
+	attemptRoot := productionAttemptRoot(stateRoot)
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier("o/r"), "23-1", "agent.log")
+	manifest.State, manifest.ReviewState, manifest.ReviewHead = "completed", "clean", head
+	manifest.CreatedAt, manifest.UpdatedAt = issueCreated, issueCreated
+	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifestBody, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, manifestBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI, githubClient = "https://example.test", client
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	statePath := filepath.Join(stateRoot, "pr.json")
+	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := reconcileGitHub(t.Context(), configPath, statePath, stateRoot, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatalf("completed unpublished attempt was not published: statuses=%#v comments=%#v", statuses, comments)
+	}
+	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != head {
+		t.Fatalf("published head=%s want %s", got, head)
+	}
+	if !created || !strings.Contains(pullBody, head) || len(comments) != 5 {
+		t.Fatalf("publication incomplete: created=%v body=%q comments=%#v", created, pullBody, comments)
+	}
+}
+
 func TestBoundAttemptSuppressesRestartDispatchAcrossWorkerAndReviewStates(t *testing.T) {
 	binding := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 23, Attempt: 4, BaseSHA: "abcdef0", State: "active"}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 4, Priority: 1, CreatedAt: time.Unix(1, 0), Active: true, DispatchAuthorized: true, ActiveAttempt: &binding}

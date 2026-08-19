@@ -1501,7 +1501,20 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 		remoteIndex := slices.IndexFunc(remote, func(f internalgithub.RecoveryAttemptFact) bool {
 			return f.Repository == manifest.Repository && f.Issue == manifest.Issue && f.Attempt == manifest.Attempt
 		})
-		if !preparedOK && (remoteIndex < 0 || remote[remoteIndex].BaseSHA != manifest.BaseSHA) {
+		issueIndex := slices.IndexFunc(issues, func(i internalgithub.RecoveryIssueFact) bool {
+			return i.Repository == manifest.Repository && i.Issue == manifest.Issue && i.Attempt == manifest.Attempt
+		})
+		if issueIndex < 0 {
+			continue
+		}
+		issue := issues[issueIndex]
+		var bound internalgithub.RecoveryAttemptFact
+		if remoteIndex >= 0 {
+			bound = remote[remoteIndex]
+		} else if issue.ActiveAttempt != nil {
+			bound = *issue.ActiveAttempt
+		}
+		if !preparedOK && (bound.Repository != manifest.Repository || bound.Issue != manifest.Issue || bound.Attempt != manifest.Attempt || bound.BaseSHA != manifest.BaseSHA) {
 			continue
 		}
 		operatorReceipts, err := receivedOperatorMessageReceipts(manifest)
@@ -1511,8 +1524,8 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 		var handoff internalgithub.RecoveryHandoff
 		if preparedOK {
 			handoff = prepared.Handoff
-		} else if remote[remoteIndex].PR > 0 {
-			published := remote[remoteIndex]
+		} else if bound.PR > 0 {
+			published := bound
 			var received bool
 			handoff, received, err = recovery.ReceivedHandoff(ctx, manifest.Repository, published.PR, manifest.Issue, manifest.Attempt, published.HeadSHA)
 			if err != nil {
@@ -1525,13 +1538,6 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 				handoff = internalgithub.RecoveryHandoff{}
 			}
 		}
-		index := slices.IndexFunc(issues, func(i internalgithub.RecoveryIssueFact) bool {
-			return i.Repository == manifest.Repository && i.Issue == manifest.Issue && i.Attempt == manifest.Attempt
-		})
-		if index < 0 {
-			continue
-		}
-		issue := issues[index]
 		if !issue.DispatchAuthorized {
 			continue
 		}

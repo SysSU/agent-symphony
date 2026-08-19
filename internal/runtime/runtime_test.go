@@ -42,6 +42,20 @@ func newFakeRunner() *fakeRunner {
 	return &fakeRunner{sessions: map[string]*fakeSession{}, buffers: map[string]string{}, failCode: map[string]int{}}
 }
 
+func TestExecRunnerBoundsOutputToTail(t *testing.T) {
+	result, err := (ExecRunner{}).Run(t.Context(), Command{
+		Name:           "sh",
+		Args:           []string{"-c", "printf prefix; printf '%*s' 1048576 ''; printf tail"},
+		MaxOutputBytes: 128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Output) != 128 || !strings.HasSuffix(result.Output, "tail") || strings.Contains(result.Output, "prefix") {
+		t.Fatalf("bounded output length=%d suffix=%q", len(result.Output), result.Output[len(result.Output)-8:])
+	}
+}
+
 func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

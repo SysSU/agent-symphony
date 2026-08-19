@@ -31,6 +31,8 @@ const (
 	maxNoticeBytes        = 16 << 10
 	maxDiagnosticBytes    = 1024
 	maxProposalBytes      = 64 << 10
+	maxProposalFrameBytes = len(MessageProposalPrefix) + (maxProposalBytes+2)/3*4 + 1
+	maxPaneCaptureBytes   = 2 * maxProposalFrameBytes
 	historyLimit          = "65536"
 	MessageProposalPrefix = "AGENT_SYMPHONY_MESSAGE_PROPOSAL_V1:"
 )
@@ -461,7 +463,11 @@ func (s *Supervisor) run(ctx context.Context, name string, args []string, input 
 	if runner == nil {
 		runner = agentruntime.ExecRunner{}
 	}
-	result, err := runner.Run(ctx, agentruntime.Command{Name: name, Args: args, Dir: s.Workspace, Env: s.Env, Stdin: input})
+	command := agentruntime.Command{Name: name, Args: args, Dir: s.Workspace, Env: s.Env, Stdin: input}
+	if name == "tmux" && len(args) > 0 && args[0] == "capture-pane" {
+		command.MaxOutputBytes = maxPaneCaptureBytes
+	}
+	result, err := runner.Run(ctx, command)
 	if err != nil {
 		return result, fmt.Errorf("%s %q: %w", name, args, err)
 	}

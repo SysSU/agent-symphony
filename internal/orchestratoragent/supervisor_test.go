@@ -40,7 +40,11 @@ func (f *fakeRunner) Run(_ context.Context, command agentruntime.Command) (agent
 		}
 		return agentruntime.Result{Output: "0\n"}, nil
 	case "capture-pane":
-		return agentruntime.Result{Output: f.pane}, nil
+		pane := f.pane
+		if command.MaxOutputBytes > 0 && len(pane) > command.MaxOutputBytes {
+			pane = pane[len(pane)-command.MaxOutputBytes:]
+		}
+		return agentruntime.Result{Output: pane}, nil
 	case "new-session":
 		f.starts++
 		if f.failStarts > 0 {
@@ -107,6 +111,26 @@ func TestMessageProposalIsExactBoundedAndConsumable(t *testing.T) {
 	agent.Runner.(*fakeRunner).pane = MessageProposalPrefix + base64.StdEncoding.EncodeToString(body) + "\n"
 	if _, err := agent.MessageProposal(t.Context()); err == nil {
 		t.Fatal("oversized message proposal accepted")
+	}
+}
+
+func TestMessageProposalBoundsOversizedPaneToMaximumFrameTail(t *testing.T) {
+	now := time.Date(2026, 8, 19, 1, 2, 3, 0, time.UTC)
+	runner := &fakeRunner{}
+	agent := newTestSupervisor(t, runner, &now)
+	if _, err := agent.Observe(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Message: "publish this"})
+	frame := MessageProposalPrefix + base64.StdEncoding.EncodeToString(body) + "\n"
+	runner.pane = strings.Repeat("noise\n", maxPaneCaptureBytes) + frame
+	proposal, err := agent.MessageProposal(t.Context())
+	if err != nil || proposal.Message != "publish this" {
+		t.Fatalf("proposal=%#v err=%v", proposal, err)
+	}
+	command := runner.commands[len(runner.commands)-1]
+	if command.MaxOutputBytes != maxPaneCaptureBytes {
+		t.Fatalf("capture limit=%d want %d", command.MaxOutputBytes, maxPaneCaptureBytes)
 	}
 }
 
