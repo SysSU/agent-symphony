@@ -850,19 +850,25 @@ func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
 
 func TestQueuedReviewHandoffTransitionsAreDurableAndImmutable(t *testing.T) {
 	r, _, attempt, _ := testRuntime(t)
-	if _, err := r.PrepareAndStart(t.Context(), attempt); err != nil {
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.State = "completed"
+	if err := r.writeManifest(attempt, manifest); err != nil {
 		t.Fatal(err)
 	}
 	findings := []string{"fix isolation"}
 	for _, transition := range []struct {
 		queued, acknowledged bool
-	}{{false, false}, {true, false}, {true, true}} {
+		state                string
+	}{{false, false, "completed"}, {true, false, "completed"}, {true, true, "running"}} {
 		if _, err := r.RecordReviewFindings(attempt, "abcdef1", findings, transition.queued, transition.acknowledged); err != nil {
 			t.Fatal(err)
 		}
 		restarted := &Runtime{StateRoot: r.StateRoot}
 		stored, err := readManifest(restarted.manifestPath(attempt))
-		if err != nil || stored.ReviewHandoffQueued != transition.queued || stored.ReviewHandoffAck != transition.acknowledged {
+		if err != nil || stored.ReviewHandoffQueued != transition.queued || stored.ReviewHandoffAck != transition.acknowledged || stored.State != transition.state {
 			t.Fatalf("transition %#v was not durable: %#v err=%v", transition, stored, err)
 		}
 	}
