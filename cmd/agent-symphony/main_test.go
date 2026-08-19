@@ -439,6 +439,35 @@ func TestMergedAttemptRejectsPendingOperatorMessageBeforeDelivery(t *testing.T) 
 	}
 }
 
+func TestOperatorMessageOutcomeFailureAfterCleanupIsRecoveredOnRestart(t *testing.T) {
+	store := &operatorMessageStore{}
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: store.roundTrip(t)}}
+	cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}
+	message, _ := internalgithub.PrepareOperatorMessage("o/r", 131, 3, "Reject this after the merged runtime is cleaned up.")
+	if _, err := internalgithub.RecordOperatorMessage(t.Context(), api, cfg, message); err != nil {
+		t.Fatal(err)
+	}
+	terminal := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 131, Attempt: 3, State: "completed", PR: 99}}
+	messages, err := fetchOperatorMessages(t.Context(), api, cfg, nil, terminal, nil)
+	if err != nil || len(messages["o/r#131/3"]) != 1 {
+		t.Fatalf("message was not rediscovered after cleanup: messages=%#v err=%v", messages, err)
+	}
+	store.outcomeFailures = 1
+	if err := resumeOperatorMessages(t.Context(), api, cfg, nil, &refusingHandoffBoundary{}, nil, terminal, nil, messages, []string{"implementation"}, nil, nil, nil); err == nil {
+		t.Fatal("injected outcome failure did not stop reconciliation")
+	}
+	messages, err = fetchOperatorMessages(t.Context(), api, cfg, nil, terminal, nil)
+	if err != nil || len(messages["o/r#131/3"]) != 1 || messages["o/r#131/3"][0].State != "queued" {
+		t.Fatalf("restart did not recover unresolved message: messages=%#v err=%v", messages, err)
+	}
+	if err := resumeOperatorMessages(t.Context(), api, cfg, nil, &refusingHandoffBoundary{}, nil, terminal, nil, messages, []string{"implementation"}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if messages["o/r#131/3"][0].State != "rejected" || store.outcomePosts != 1 {
+		t.Fatalf("recovered outcome=%#v posts=%d", messages["o/r#131/3"][0], store.outcomePosts)
+	}
+}
+
 func TestOperatorMessageTerminalStateWinsAfterDurableClaimBeforeAcceptance(t *testing.T) {
 	comments := []map[string]any{}
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {

@@ -30,7 +30,7 @@ const (
 	maxContextBytes       = 64 << 10
 	maxNoticeBytes        = 16 << 10
 	maxDiagnosticBytes    = 1024
-	maxProposalBytes      = 16 << 10
+	maxProposalBytes      = 64 << 10
 	historyLimit          = "5000"
 	MessageProposalPrefix = "AGENT_SYMPHONY_MESSAGE_PROPOSAL_V1:"
 )

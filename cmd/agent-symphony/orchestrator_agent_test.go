@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/SysSU/agent-symphony/internal/config"
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
@@ -72,6 +73,20 @@ func TestConfiguredReadOnlyOrchestratorProposesThroughCapturedOutput(t *testing.
 	got, err := agent.MessageProposal(t.Context())
 	if err != nil || got.Binding == "" || got.Message != proposal.Message {
 		t.Fatalf("proposal=%#v err=%v", got, err)
+	}
+	proposal.Message = strings.Repeat("<", internalgithub.OperatorMessageMaxBytes)
+	body, _ = json.Marshal(proposal)
+	if len(body) <= 16<<10 {
+		t.Fatalf("maximum escaped proposal did not exercise the transport bound: %d bytes", len(body))
+	}
+	pane.Reset()
+	if err := writeHostOrchestratorProposal(productionSnapshotRoot(stateRoot), bytes.NewReader(body), &pane); err != nil {
+		t.Fatal(err)
+	}
+	runner.pane = pane.String()
+	got, err = agent.MessageProposal(t.Context())
+	if err != nil || got.Message != proposal.Message {
+		t.Fatalf("maximum escaped proposal length=%d err=%v", len(got.Message), err)
 	}
 	launch, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratorLaunchFile))
 	if err != nil || !strings.Contains(string(launch), `"--sandbox"`) || !strings.Contains(string(launch), `"read-only"`) {

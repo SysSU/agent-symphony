@@ -786,7 +786,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		return r.VerifyActive(ctx, manifest, head)
 	})
 	statuses, decisions := joinIssueProjection(statuses, issues, c.Concurrency)
-	operatorMessages, err := fetchOperatorMessages(ctx, api, prConfig, manifests)
+	operatorMessages, err := fetchOperatorMessages(ctx, api, prConfig, issues, remote, manifests)
 	if err != nil {
 		return statuses, err
 	}
@@ -2017,21 +2017,37 @@ func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuse
 	return nil
 }
 
-func fetchOperatorMessages(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, manifests []agentruntime.Manifest) (map[string][]internalgithub.OperatorMessage, error) {
+func fetchOperatorMessages(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, issues []internalgithub.RecoveryIssueFact, attempts []internalgithub.RecoveryAttemptFact, manifests []agentruntime.Manifest) (map[string][]internalgithub.OperatorMessage, error) {
 	result := map[string][]internalgithub.OperatorMessage{}
 	seen := map[int]bool{}
-	for _, manifest := range manifests {
-		if manifest.Repository != cfg.Repository || seen[manifest.Issue] {
-			continue
+	fetch := func(repository string, issue int) error {
+		if repository != cfg.Repository || seen[issue] {
+			return nil
 		}
-		seen[manifest.Issue] = true
-		messages, err := internalgithub.FetchOperatorMessages(ctx, api, cfg, manifest.Issue)
+		seen[issue] = true
+		messages, err := internalgithub.FetchOperatorMessages(ctx, api, cfg, issue)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, message := range messages {
 			key := fmt.Sprintf("%s#%d/%d", message.Repository, message.Issue, message.Attempt)
 			result[key] = append(result[key], message)
+		}
+		return nil
+	}
+	for _, issue := range issues {
+		if err := fetch(issue.Repository, issue.Issue); err != nil {
+			return nil, err
+		}
+	}
+	for _, attempt := range attempts {
+		if err := fetch(attempt.Repository, attempt.Issue); err != nil {
+			return nil, err
+		}
+	}
+	for _, manifest := range manifests {
+		if err := fetch(manifest.Repository, manifest.Issue); err != nil {
+			return nil, err
 		}
 	}
 	return result, nil

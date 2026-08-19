@@ -708,8 +708,8 @@ func writeHostOrchestratorProposal(root string, input io.Reader, output io.Write
 	if err != nil || !belowRoot(dir, root) || !strings.HasPrefix(filepath.Base(dir), "orchestrator-") {
 		return errors.New("orchestrator workspace is outside the reviewer boundary")
 	}
-	body, err := io.ReadAll(io.LimitReader(input, 16<<10+1))
-	if err != nil || len(body) == 0 || len(body) > 16<<10 {
+	body, err := io.ReadAll(io.LimitReader(input, 64<<10+1))
+	if err != nil || len(body) == 0 || len(body) > 64<<10 {
 		return errors.New("invalid bounded orchestrator proposal")
 	}
 	var proposal struct {
