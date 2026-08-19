@@ -17,8 +17,47 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
+
+func TestHostOrchestratorProposalWritesOnlyTheFixedValidatedContract(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "orchestrator-test")
+	if err := os.Mkdir(workspace, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(workspace, orchestratoragent.MessageProposalFileName)
+	if err := os.WriteFile(path, nil, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldGetwd, oldEGID := hostGetwd, hostEGID
+	hostGetwd = func() (string, error) { return workspace, nil }
+	hostEGID = func() int { return fileGID(info) }
+	t.Cleanup(func() { hostGetwd, hostEGID = oldGetwd, oldEGID })
+	proposal := `{"version":1,"repository":"o/r","issue":131,"attempt":3,"message":"Run the focused test."}`
+	if err := writeHostOrchestratorProposal(root, strings.NewReader(proposal)); err != nil {
+		t.Fatal(err)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil || strings.TrimSpace(string(written)) != proposal {
+		t.Fatalf("written=%q err=%v", written, err)
+	}
+	if err := writeHostOrchestratorProposal(root, strings.NewReader(`{"version":1,"repository":"o/r","issue":131,"attempt":3,"message":"changed","command":"tmux"}`)); err == nil {
+		t.Fatal("arbitrary proposal field accepted")
+	}
+	unchanged, _ := os.ReadFile(path)
+	if !bytes.Equal(unchanged, written) {
+		t.Fatalf("invalid proposal changed fixed file: %q", unchanged)
+	}
+}
 
 func fakeHostIdentity(t *testing.T, uid, gid int) {
 	t.Helper()
@@ -137,21 +176,21 @@ func TestHostOrchestratorLaunchContractIsReadOnlyAndCredentialFiltered(t *testin
 	t.Setenv("GH_TOKEN", "github-canary")
 	var got agentruntime.Command
 	hostOrchestratorRun = func(_ context.Context, command agentruntime.Command) error { got = command; return nil }
-	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home"); err != nil {
+	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err != nil {
 		t.Fatal(err)
 	}
 	if got.Name != "operator-agent" || !slices.Equal(got.Args, []string{"--read-only", "sanitized context"}) || !slices.Contains(got.Env, "HOME=/reviewer-home") || slices.ContainsFunc(got.Env, func(value string) bool { return strings.HasPrefix(value, "GH_TOKEN=") }) {
 		t.Fatalf("unsafe launch: %#v", got)
 	}
 	hostEGID = func() int { return oldEGID() + 1 }
-	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home"); err == nil {
+	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err == nil {
 		t.Fatal("launch contract outside the reviewer snapshot group was accepted")
 	}
 	hostEGID = oldEGID
 	if err := os.Chmod(path, 0o660); err != nil {
 		t.Fatal(err)
 	}
-	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home"); err == nil {
+	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err == nil {
 		t.Fatal("writable launch contract accepted")
 	}
 }

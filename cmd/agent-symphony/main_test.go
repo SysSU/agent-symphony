@@ -23,6 +23,7 @@ import (
 	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
+	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
@@ -34,6 +35,13 @@ type cleanupBoundary struct {
 }
 
 type directHandoffBoundary struct{ root string }
+
+type refusingHandoffBoundary struct{ calls int }
+
+func (b *refusingHandoffBoundary) call(context.Context, string, agentruntime.Command) (agentruntime.Result, error) {
+	b.calls++
+	return agentruntime.Result{}, errors.New("handoff must remain queued")
+}
 
 func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
 	var stdout, stderr bytes.Buffer
@@ -47,6 +55,101 @@ func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("help is missing %q", want)
 		}
+	}
+}
+
+func TestOperatorMessageQueuesBehindRunningTurnWithoutInterruptingIt(t *testing.T) {
+	message, _ := internalgithub.PrepareOperatorMessage("o/r", 131, 3, "Run the focused test.")
+	key := "o/r#131/3"
+	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
+	bound := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, State: "active"}
+	issues := []internalgithub.RecoveryIssueFact{{Repository: "o/r", Issue: 131, Attempt: 3, DispatchAuthorized: true, ActiveAttempt: &bound}}
+	manifests := []agentruntime.Manifest{{Repository: "o/r", Issue: 131, Attempt: 3, State: "running"}}
+	boundary := &refusingHandoffBoundary{}
+	if err := resumeOperatorMessages(t.Context(), internalgithub.API{}, internalgithub.PRAdapterConfig{}, nil, boundary, issues, nil, manifests, messages, []string{"implementation"}); err != nil {
+		t.Fatal(err)
+	}
+	if boundary.calls != 0 || messages[key][0].State != "queued" {
+		t.Fatalf("running turn was interrupted: calls=%d message=%#v", boundary.calls, messages[key][0])
+	}
+	statuses := []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 131, Attempt: 3}}
+	attachOperatorMessageStatuses(statuses, messages)
+	body, _ := json.Marshal(statuses)
+	if bytes.Contains(body, []byte(message.Message)) || !bytes.Contains(body, []byte(message.ID)) || !bytes.Contains(body, []byte(`"state":"queued"`)) {
+		t.Fatalf("dashboard status exposed content or omitted outcome: %s", body)
+	}
+}
+
+func TestOperatorMessageTargetValidationRejectsStaleAndTerminalAttempts(t *testing.T) {
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "message"}
+	bound := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, State: "active"}
+	activeIssue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 131, Attempt: 3, DispatchAuthorized: true, ActiveAttempt: &bound}
+	running := agentruntime.Manifest{Repository: "o/r", Issue: 131, Attempt: 3, State: "running"}
+	if err := validateOperatorMessageTarget(proposal, []internalgithub.RecoveryIssueFact{activeIssue}, nil, []agentruntime.Manifest{running}); err != nil {
+		t.Fatalf("active target rejected: %v", err)
+	}
+	cancelled := activeIssue
+	cancelled.Cancelled, cancelled.DispatchAuthorized = true, false
+	wrong := bound
+	wrong.Attempt = 2
+	mismatched := activeIssue
+	mismatched.ActiveAttempt = &wrong
+	for name, input := range map[string]struct {
+		issues    []internalgithub.RecoveryIssueFact
+		remote    []internalgithub.RecoveryAttemptFact
+		manifests []agentruntime.Manifest
+	}{
+		"missing":    {nil, nil, nil},
+		"mismatched": {[]internalgithub.RecoveryIssueFact{mismatched}, nil, []agentruntime.Manifest{running}},
+		"cancelled":  {[]internalgithub.RecoveryIssueFact{cancelled}, nil, []agentruntime.Manifest{running}},
+		"merged":     {[]internalgithub.RecoveryIssueFact{activeIssue}, []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 131, Attempt: 3, State: "completed"}}, []agentruntime.Manifest{running}},
+		"terminal":   {[]internalgithub.RecoveryIssueFact{activeIssue}, nil, []agentruntime.Manifest{{Repository: "o/r", Issue: 131, Attempt: 3, State: "failed"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateOperatorMessageTarget(proposal, input.issues, input.remote, input.manifests); err == nil {
+				t.Fatal("unsafe target accepted")
+			}
+		})
+	}
+}
+
+func TestMergedAttemptRejectsPendingOperatorMessageBeforeDelivery(t *testing.T) {
+	comments := []map[string]any{}
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodGet {
+			body, _ := json.Marshal(comments)
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+		}
+		var input struct {
+			Body string `json:"body"`
+		}
+		body, _ := io.ReadAll(request.Body)
+		if json.Unmarshal(body, &input) != nil {
+			t.Fatal("invalid comment mutation")
+		}
+		comments = append(comments, map[string]any{"body": input.Body, "created_at": time.Now().UTC(), "user": map[string]any{"id": 42}})
+		return &http.Response{StatusCode: http.StatusCreated, Status: "201 Created", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+	})
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: transport}}
+	cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}
+	message, _ := internalgithub.PrepareOperatorMessage("o/r", 131, 3, "Do not outlive the merge.")
+	message, err := internalgithub.RecordOperatorMessage(t.Context(), api, cfg, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "o/r#131/3"
+	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
+	remote := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 131, Attempt: 3, State: "completed", PR: 99}}
+	boundary := &refusingHandoffBoundary{}
+	if err := resumeOperatorMessages(t.Context(), api, cfg, nil, boundary, nil, remote, nil, messages, []string{"implementation"}); err != nil {
+		t.Fatal(err)
+	}
+	if boundary.calls != 0 || messages[key][0].State != "rejected" {
+		t.Fatalf("merged message delivered: calls=%d message=%#v", boundary.calls, messages[key][0])
+	}
+	recovered, err := internalgithub.FetchOperatorMessages(t.Context(), api, cfg, 131)
+	if err != nil || len(recovered) != 1 || recovered[0].State != "rejected" {
+		t.Fatalf("durable rejection=%#v err=%v", recovered, err)
 	}
 }
 

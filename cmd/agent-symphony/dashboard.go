@@ -47,11 +47,18 @@ type dashboardServer struct {
 	allowNet     bool
 	password     string
 	orchestrator orchestratoragent.Service
+	messages     orchestratorMessageService
 	cleanup      func(context.Context, string, agentruntime.Manifest) error
 	recover      func(context.Context, int, int) error
 	reconcile    func(context.Context) error
 	mu           *sync.Mutex
 	localMu      sync.Mutex
+}
+
+type orchestratorMessageService interface {
+	MessageProposal(context.Context) (orchestratoragent.MessageProposal, error)
+	ConsumeMessageProposal(context.Context, string) error
+	ConfirmMessage(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error)
 }
 
 type dashboardHiddenAttempt struct {
@@ -85,6 +92,7 @@ func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string,
 	}
 	static := http.FileServer(http.FS(assets))
 	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, reconcile: reconcile, mu: operationMu}
+	server.messages, _ = service.(orchestratorMessageService)
 	server.cleanup = server.cleanupAttempt
 	return server.handler(static)
 }
@@ -130,6 +138,10 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 			s.serveOrchestratorStatus(w, r)
 			return
 		}
+		if r.URL.Path == "/orchestrator/proposal.json" {
+			s.serveOrchestratorProposal(w, r)
+			return
+		}
 		if r.URL.Path == "/orchestrator/terminal" {
 			s.serveOrchestratorTerminal(w, r)
 			return
@@ -140,6 +152,40 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		}
 		static.ServeHTTP(w, r)
 	})
+}
+
+func (s *dashboardServer) serveOrchestratorProposal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.password == "" {
+		http.Error(w, "worker message confirmation requires dashboard authentication", http.StatusForbidden)
+		return
+	}
+	if s.messages == nil {
+		http.Error(w, "orchestrator message proposals are unavailable", http.StatusConflict)
+		return
+	}
+	proposal, err := s.messages.MessageProposal(r.Context())
+	if errors.Is(err, orchestratoragent.ErrNoMessageProposal) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err != nil {
+		http.Error(w, "orchestrator message proposal is invalid", http.StatusUnprocessableEntity)
+		return
+	}
+	body, _ := json.Marshal(proposal)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write(body)
+	}
 }
 
 func (s *dashboardServer) serveReconcileAction(w http.ResponseWriter, r *http.Request) {
@@ -465,6 +511,10 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 		http.Error(w, "action requires the dashboard origin", http.StatusForbidden)
 		return
 	}
+	if action == "message-confirm" || action == "message-cancel" {
+		s.serveOrchestratorMessageAction(w, r, action)
+		return
+	}
 	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 || !slices.Contains([]string{"recover", "clear", "rebuild", "investigate"}, action) {
 		http.Error(w, "invalid orchestrator action", http.StatusBadRequest)
 		return
@@ -529,6 +579,74 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 		OK     bool                     `json:"ok"`
 		Status orchestratoragent.Status `json:"status"`
 	}{true, result})
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func (s *dashboardServer) serveOrchestratorMessageAction(w http.ResponseWriter, r *http.Request, action string) {
+	if s.password == "" {
+		http.Error(w, "worker message confirmation requires dashboard authentication", http.StatusForbidden)
+		return
+	}
+	if s.messages == nil || r.Header.Get("Content-Type") != "application/json" || len(r.URL.Query()) != 0 || len(r.TransferEncoding) != 0 || r.ContentLength <= 0 || r.ContentLength > maxTerminalInputBytes {
+		http.Error(w, "invalid orchestrator message action", http.StatusBadRequest)
+		return
+	}
+	var submitted orchestratoragent.MessageProposal
+	decoder := json.NewDecoder(io.LimitReader(r.Body, maxTerminalInputBytes+1))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&submitted) != nil || decoder.Decode(&struct{}{}) != io.EOF || submitted.Binding == "" {
+		http.Error(w, "invalid orchestrator message action", http.StatusBadRequest)
+		return
+	}
+	current, err := s.messages.MessageProposal(r.Context())
+	if err != nil || current != submitted {
+		http.Error(w, "orchestrator message proposal changed before confirmation", http.StatusConflict)
+		return
+	}
+	operationMu := s.mu
+	if operationMu == nil {
+		operationMu = &s.localMu
+	}
+	if !operationMu.TryLock() {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
+		return
+	}
+	defer operationMu.Unlock()
+	// Re-read under the coordinator operation lock so confirmation binds the
+	// exact bytes the operator reviewed, not a replaced proposal.
+	current, err = s.messages.MessageProposal(r.Context())
+	if err != nil || current != submitted {
+		http.Error(w, "orchestrator message proposal changed before confirmation", http.StatusConflict)
+		return
+	}
+	if action == "message-cancel" {
+		if err := s.messages.ConsumeMessageProposal(r.Context(), submitted.Binding); err != nil {
+			http.Error(w, "orchestrator message cancellation failed", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	message, err := s.messages.ConfirmMessage(r.Context(), submitted)
+	if err != nil {
+		http.Error(w, internalgithub.Redact(err.Error()), http.StatusConflict)
+		return
+	}
+	if err := s.messages.ConsumeMessageProposal(r.Context(), submitted.Binding); err != nil {
+		http.Error(w, "message was recorded, but the proposal could not be cleared", http.StatusInternalServerError)
+		return
+	}
+	body, _ := json.Marshal(struct {
+		ID         string `json:"id"`
+		Repository string `json:"repository"`
+		Issue      int    `json:"issue"`
+		Attempt    int    `json:"attempt"`
+		State      string `json:"state"`
+	}{message.ID, message.Repository, message.Issue, message.Attempt, message.State})
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

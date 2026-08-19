@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,15 +13,37 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
+type dashboardOrchestratorService struct {
+	orchestratoragent.Service
+	supervisor *orchestratoragent.Supervisor
+	confirm    func(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error)
+}
+
+func (s dashboardOrchestratorService) MessageProposal(ctx context.Context) (orchestratoragent.MessageProposal, error) {
+	return s.supervisor.MessageProposal(ctx)
+}
+
+func (s dashboardOrchestratorService) ConsumeMessageProposal(ctx context.Context, binding string) error {
+	return s.supervisor.ConsumeMessageProposal(ctx, binding)
+}
+
+func (s dashboardOrchestratorService) ConfirmMessage(ctx context.Context, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
+	if s.confirm == nil {
+		return internalgithub.OperatorMessage{}, fmt.Errorf("operator message confirmation is unavailable")
+	}
+	return s.confirm(ctx, proposal)
+}
+
 func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratoragent.Supervisor, error) {
 	workspace := filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-"+internalgithub.RepositoryIdentifier(cfg.Repository))
 	agent := &orchestratoragent.Supervisor{
-		Root:       stateRoot,
-		Workspace:  workspace,
-		Repository: cfg.Repository,
-		Command:    cfg.Commands.Orchestrator,
-		Launcher:   orchestratorBoundaryCommand(),
-		Runner:     agentruntime.ExecRunner{},
+		Root:            stateRoot,
+		Workspace:       workspace,
+		Repository:      cfg.Repository,
+		Command:         cfg.Commands.Orchestrator,
+		Launcher:        orchestratorBoundaryCommand(),
+		ProposalCommand: orchestratorProposalCommand(),
+		Runner:          agentruntime.ExecRunner{},
 	}
 	if cfg.Commands.Orchestrator == nil {
 		return agent, nil
@@ -46,6 +69,11 @@ func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratorage
 		return nil, fmt.Errorf("prepare orchestrator workspace: %w", err)
 	}
 	return agent, nil
+}
+
+func orchestratorProposalCommand() []string {
+	binary, _ := os.Executable()
+	return []string{binary, "agent-host", "orchestrator-proposal"}
 }
 
 func prepareOrchestratorWorkspace(path string, gid int) error {

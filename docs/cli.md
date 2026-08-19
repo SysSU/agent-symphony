@@ -10,7 +10,7 @@ agent-symphony --help
 agent-symphony -h
 agent-symphony --version
 agent-symphony install-host --coordinator user [--json]
-agent-symphony agent-host implementation|review|orchestrator
+agent-symphony agent-host implementation|review|orchestrator|orchestrator-proposal
 agent-symphony init [--config path] [--json]
 agent-symphony validate [--config path] [--json]
 agent-symphony config view [--config path] [--json]
@@ -26,7 +26,7 @@ agent-symphony reconcile (--state path --runtime-state path | --attempts path [-
 
 - `help`, `--help`, and `-h` print the command summary. `--version` prints the release version.
 - `install-host` provisions the optional advanced host-isolation boundary. Run it as root from the exact installed binary and repeat it after each binary upgrade.
-- `agent-host` is the internal boundary adapter for implementation, review, and orchestrator processes. It is not an interactive operator command.
+- `agent-host` is the internal boundary adapter for implementation, review, and orchestrator processes. `orchestrator-proposal` accepts only the bounded proposal JSON on standard input and truncates the one pre-created proposal file. These are not interactive operator commands.
 - `init` creates a new config with conservative defaults and refuses to overwrite a file. It requires a GitHub `origin` in the current repository.
 - `validate` requires the config file to be inside the resolved Git root. It rejects malformed input, duplicate JSON keys at any nesting depth, unknown keys, secret-shaped keys or command arguments, invalid policy values, duplicate/empty labels, unsafe command arguments, and paths that are absolute, traverse outside the repository, target Git metadata, or escape through symlinks. Worktree and documentation paths are always anchored at the Git root, not the config file's directory.
 - `config view` prints the validated configuration. Invalid or secret-bearing files are never echoed.
@@ -59,9 +59,23 @@ Read `blockers` first, then `diagnostic`, then `action`. The human output uses t
 
 Do not infer safety from the state name alone. The exact `action` and identity checks govern recovery and cleanup; see [Recovery](recovery.md).
 
-The dashboard reads that snapshot every five seconds. Current and completed attempts use separate tabs. Clicking a tmux name attaches an xterm.js terminal to only that exact projected, live session; closing the browser detaches that client without ending the worker. Archive is available only for a completed projection and reuses completed-attempt cleanup before adding a local hidden-card marker to `<runtime-state>/dashboard-state.json`. Abandon is available only for an orphaned projection; it stops the exact session, removes the deterministic worktree/result and retained manifest/log, then hides the stale card. Recover is the only attempt-dashboard action that writes GitHub: after fresh permission and identity checks, it may mark an exact stuck attempt failed and post the fixed retry control. All three controls require browser confirmation and a same-origin POST. The browser supplies only issue/attempt numbers; paths, branches, sessions, commands, and arbitrary GitHub policy are never accepted from it. See [Recovery](recovery.md).
+The dashboard reads that snapshot every five seconds. Current and completed attempts use separate tabs. Clicking a tmux name attaches an xterm.js terminal to only that exact projected, live session; closing the browser detaches that client without ending the worker. Archive is available only for a completed projection and reuses completed-attempt cleanup before adding a local hidden-card marker to `<runtime-state>/dashboard-state.json`. Abandon is available only for an orphaned projection; it stops the exact session, removes the deterministic worktree/result and retained manifest/log, then hides the stale card. Recover revalidates one exact stuck attempt, may mark it failed, and posts the fixed retry control. These controls require browser confirmation and a same-origin POST. The browser supplies only issue/attempt numbers; paths, branches, sessions, commands, and arbitrary GitHub policy are never accepted from it. See [Recovery](recovery.md).
 
 When the optional supervised orchestrator agent is configured, its dashboard card shows lifecycle and context health and opens the exact server-selected tmux session. Recover keeps an adoptable live conversation, while Clear context and Rebuild context explicitly start a new generation. Attention cards can enqueue one structured, deduplicated investigation notice for their current issue and attempt; the orchestrator remains advisory and cannot directly schedule, mark, publish, or merge GitHub work. Orchestrator actions use the same reconciliation lock and origin checks as other dashboard controls. Its interactive terminal is available only from a loopback browser request, including when unsafe network dashboard access is enabled.
+
+### Send a bounded worker message
+
+Worker messages are asynchronous follow-up turns, not live terminal input. Configure `--dashboard-password` even on loopback; Agent Symphony refuses message confirmation from an unauthenticated dashboard.
+
+Do not put secrets in a worker message. Confirmation records the complete text durably on the GitHub issue, where normal repository access controls apply; dashboard status intentionally omits the text.
+
+1. In the orchestrator console, ask for a message to one exact repository issue and attempt. The orchestrator submits the displayed strict schema to the fixed `agent-host orchestrator-proposal` adapter, which can write only `worker-message-proposal.json` in its managed workspace and enforces an 8192-byte UTF-8 message limit.
+2. Review the dashboard confirmation panel. It shows the exact repository, issue, attempt, and complete message. Choose **Confirm and queue** or **Cancel proposal**.
+3. After confirmation, Agent Symphony freshly verifies the issue, attempt, GitHub controls, and retained runtime. It records the message on the issue before any worker delivery. Duplicate confirmation of the same exact message reuses its stable identity.
+4. If the worker is busy, the message remains queued. After the current turn exits safely, reconciliation uses the existing immutable handoff and worker-owned receipt to start one bounded implementation turn in the same worktree.
+5. Check the attempt card for `queued`, `delivered`, `rejected`, or `failed`. Status shows only the stable message ID and outcome; the message text remains in the authenticated confirmation response and the associated GitHub issue record.
+
+Cancellation, completion, a mismatched attempt, or a merged pull request rejects pending delivery. Fresh merge reconciliation removes the exact session and worktree before message handling, so a message never keeps merged resources alive. A daemon restart reconstructs accepted messages and outcomes from coordinator-authored GitHub markers; the immutable worker receipt prevents a second follow-up turn after an ambiguous restart.
 
 Autonomous merge has additional restrictions: the PR must remain open, non-draft, mergeable, on the expected head, current with its required base, free of unresolved authorized feedback, and compliant with repository-required reviews and checks plus repository merge permissions. Branch protection is optional, and `agent-symphony/policy` does not need to be configured as a required status. GitHub still enforces any rules that do exist when the coordinator submits the expected-head merge.
 
@@ -107,7 +121,7 @@ Commands produce plain human-readable text by default and never depend on color.
 }
 ```
 
-`commands.orchestrator` is optional. Omitting it disables the long-lived advisory agent, so upgrades do not unexpectedly start a model or add cost. When configured, Agent Symphony replaces `{orchestrator_workspace}` in each argument with the absolute managed workspace path, then appends bounded generated context as the command's final argument. The command must accept an initial prompt there. The agent cannot replace coordinator workflow decisions or receive GitHub, SSH-agent, cloud, token, password, private-key, or authorization credentials.
+`commands.orchestrator` is optional. Omitting it disables the long-lived advisory agent, so upgrades do not unexpectedly start a model or add cost. When configured, Agent Symphony replaces `{orchestrator_workspace}` in each argument with the absolute managed workspace path, then appends bounded generated context as the command's final argument. The command must accept an initial prompt there. The agent cannot replace coordinator workflow decisions or receive GitHub, SSH-agent, cloud, token, password, private-key, or authorization credentials. Its only worker-message output is the fixed proposal adapter and strict file; it receives no tmux target, worker command, GitHub mutation, or scheduling interface.
 
 Commands are argument arrays, not shell strings, so runtime code does not use shell interpolation. The default noninteractive Codex implementation command uses `workspace-write` for source edits.
 
@@ -143,4 +157,4 @@ On WSL, diagnostics resolve the Git root, choose the longest containing entry fr
 `scripts/release.sh VERSION [OUTPUT_DIR]` creates reproducible no-CGO archives and `SHA256SUMS` without overwriting existing output. `scripts/validate-release.sh [VERSION]` runs the complete local release gate. These repository scripts are maintainer commands, not installed CLI subcommands.
 ## Host isolation (advanced, optional)
 
-By default no host isolation is installed: `agent-symphony agent-host implementation|review|orchestrator` runs as a plain, same-user subprocess of the coordinator, with no `sudo` and no separate OS identity — see [Setup](setup.md) and [Security](security.md). `agent-symphony install-host --coordinator USER` opts into the stronger advanced boundary; it provisions the documented macOS or Linux/WSL2 host boundary and must run as root from the installed versioned binary. Once installed, `agent-host` becomes the sudo-only bounded JSON adapter and is no longer an interactive operator command in either mode. Unsupported native Windows and WSL repositories under `/mnt/*` fail closed regardless of mode.
+By default no host isolation is installed: `agent-symphony agent-host implementation|review|orchestrator` runs as a plain, same-user subprocess of the coordinator, with no `sudo` and no separate OS identity — see [Setup](setup.md) and [Security](security.md). `agent-symphony install-host --coordinator USER` opts into the stronger advanced boundary; it provisions the documented macOS or Linux/WSL2 host boundary and must run as root from the installed versioned binary. Once installed, the three process modes use only their exact sudo adapters. `orchestrator-proposal` is callable only from the already-running reviewer identity and still validates the fixed workspace/file boundary. None of these modes is an interactive operator command. Unsupported native Windows and WSL repositories under `/mnt/*` fail closed regardless of mode.

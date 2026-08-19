@@ -21,6 +21,7 @@ import (
 	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
@@ -653,7 +654,7 @@ func readReviewResult(input []byte, root string) (string, error) {
 	return string(body), nil
 }
 
-func runHostOrchestrator(ctx context.Context, root, home string) error {
+func runHostOrchestrator(ctx context.Context, root, home string, local bool) error {
 	dir, err := hostGetwd()
 	if err != nil || !belowRoot(dir, root) || !strings.HasPrefix(filepath.Base(dir), "orchestrator-") {
 		return errors.New("orchestrator workspace is outside the reviewer boundary")
@@ -696,7 +697,58 @@ func runHostOrchestrator(ctx context.Context, root, home string) error {
 		return err
 	}
 	env = append(env, "HOME="+home)
+	if local {
+		env = append(env, "AGENT_SYMPHONY_ORCHESTRATOR_ROOT="+root)
+	}
 	return hostOrchestratorRun(ctx, agentruntime.Command{Name: launch.Command[0], Args: append(launch.Command[1:], launch.Context), Dir: dir, Env: env})
+}
+
+func writeHostOrchestratorProposal(root string, input io.Reader) error {
+	dir, err := hostGetwd()
+	if err != nil || !belowRoot(dir, root) || !strings.HasPrefix(filepath.Base(dir), "orchestrator-") {
+		return errors.New("orchestrator workspace is outside the reviewer boundary")
+	}
+	body, err := io.ReadAll(io.LimitReader(input, 16<<10+1))
+	if err != nil || len(body) == 0 || len(body) > 16<<10 {
+		return errors.New("invalid bounded orchestrator proposal")
+	}
+	var proposal struct {
+		Version    int    `json:"version"`
+		Repository string `json:"repository"`
+		Issue      int    `json:"issue"`
+		Attempt    int    `json:"attempt"`
+		Message    string `json:"message"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&proposal) != nil || decoder.Decode(&struct{}{}) != io.EOF || proposal.Version != 1 {
+		return errors.New("invalid orchestrator proposal schema")
+	}
+	if _, err := internalgithub.PrepareOperatorMessage(proposal.Repository, proposal.Issue, proposal.Attempt, proposal.Message); err != nil {
+		return err
+	}
+	canonical, _ := json.Marshal(proposal)
+	path := filepath.Join(dir, orchestratoragent.MessageProposalFileName)
+	listed, err := os.Lstat(path)
+	if err != nil || !listed.Mode().IsRegular() || listed.Mode()&os.ModeSymlink != 0 || listed.Mode().Perm() != 0o660 || fileGID(listed) != hostEGID() {
+		return errors.New("orchestrator proposal contract is unsafe")
+	}
+	file, err := os.OpenFile(path, syscall.O_WRONLY|syscall.O_TRUNC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return errors.New("open fixed orchestrator proposal contract")
+	}
+	opened, statErr := file.Stat()
+	if statErr != nil || !os.SameFile(listed, opened) || opened.Mode().Perm() != 0o660 || fileGID(opened) != hostEGID() {
+		file.Close()
+		return errors.New("orchestrator proposal contract changed while opening")
+	}
+	if _, err = file.Write(append(canonical, '\n')); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 func credentialShapedArgument(value string) bool {
@@ -716,11 +768,15 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		root = "/var/db/agent-symphony/attempts"
 	}
 	orchestratorMode := mode == "orchestrator"
-	if mode == "review" || orchestratorMode {
+	orchestratorProposalMode := mode == "orchestrator-proposal"
+	if orchestratorProposalMode && localRoot == "" {
+		localRoot = strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_ORCHESTRATOR_ROOT"))
+	}
+	if mode == "review" || orchestratorMode || orchestratorProposalMode {
 		wantUser, wantGroup = reviewerUser, snapshotGroup
 		root = strings.Replace(root, "attempts", "snapshots", 1)
 	} else if mode != "implementation" {
-		return errors.New("agent-host mode must be implementation, review, or orchestrator")
+		return errors.New("agent-host mode must be implementation, review, orchestrator, or orchestrator-proposal")
 	}
 	// AGENT_SYMPHONY_LOCAL_ROOT is only ever set by the coordinator's own
 	// implementationBoundary/reviewBoundary when install-host was never run;
@@ -756,7 +812,10 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		homeDir = u.HomeDir
 	}
 	if orchestratorMode {
-		return runHostOrchestrator(ctx, root, homeDir)
+		return runHostOrchestrator(ctx, root, homeDir, localRoot != "")
+	}
+	if orchestratorProposalMode {
+		return writeHostOrchestratorProposal(root, input)
 	}
 	var request struct {
 		Operation string          `json:"operation"`
@@ -1361,7 +1420,7 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 		return "", err
 	}
 	command := agentruntime.PromptCommand(helper, "tmux", buffer, resultPath, request.Command)
-	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony feedback handoff in the current worktree. Current source refs are available under refs/remotes/agent-symphony/. Do not push or use GitHub credentials; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", request.Handoff)
+	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony handoff in the current worktree. It may contain review feedback or one confirmed operator message. Current source refs are available under refs/remotes/agent-symphony/. Do not push or use GitHub credentials; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", request.Handoff)
 	commands := []agentruntime.Command{
 		{Name: "tmux", Args: []string{"load-buffer", "-b", buffer, "-"}, Dir: request.Manifest.Worktree, Stdin: bytes.NewReader(prompt)},
 		{Name: "tmux", Args: append(append([]string{"respawn-pane", "-k", "-t", pane, "--"}, command...), ";", "set-option", "-p", "-t", pane, option, recipient), Dir: request.Manifest.Worktree},

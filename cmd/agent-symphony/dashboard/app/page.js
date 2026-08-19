@@ -37,6 +37,9 @@ export default function Dashboard() {
   const [orchestratorError, setOrchestratorError] = useState("");
   const [orchestratorBusy, setOrchestratorBusy] = useState("");
   const [investigating, setInvestigating] = useState("");
+  const [messageProposal, setMessageProposal] = useState(null);
+  const [messageError, setMessageError] = useState("");
+  const [messageBusy, setMessageBusy] = useState("");
   const closeTerminal = useCallback(() => setTerminal(null), []);
 
   useEffect(() => {
@@ -48,10 +51,18 @@ export default function Dashboard() {
             ? { status: await response.json(), error: "" }
             : { status: null, error: (await response.text()).trim() || `Orchestrator status failed (${response.status})` })
           .catch(() => ({ status: null, error: "Orchestrator status is unavailable" }));
-        const [response, stateResponse, orchestratorResult] = await Promise.all([
+        const proposalRequest = fetch("/orchestrator/proposal.json", { cache: "no-store" })
+          .then(async (response) => response.status === 204
+            ? { proposal: null, error: "" }
+            : response.ok
+              ? { proposal: await response.json(), error: "" }
+              : { proposal: null, error: (await response.text()).trim() || `Message proposal failed (${response.status})` })
+          .catch(() => ({ proposal: null, error: "Message proposal is unavailable" }));
+        const [response, stateResponse, orchestratorResult, proposalResult] = await Promise.all([
           fetch("/status.json", { cache: "no-store" }),
           fetch("/dashboard-state.json", { cache: "no-store" }),
           orchestratorRequest,
+          proposalRequest,
         ]);
         if (!response.ok) throw new Error(response.status === 404 ? "Waiting for the first reconciliation" : `Status request failed (${response.status})`);
         if (!stateResponse.ok) throw new Error(`Dashboard state request failed (${stateResponse.status})`);
@@ -61,6 +72,8 @@ export default function Dashboard() {
           setDashboardState(nextState);
           setOrchestratorStatus(orchestratorResult.status);
           setOrchestratorError(orchestratorResult.error);
+          setMessageProposal(proposalResult.proposal);
+          setMessageError(proposalResult.error);
           setError("");
           setNow(Date.now());
         }
@@ -139,6 +152,29 @@ export default function Dashboard() {
     }
   }, []);
 
+  const performMessageAction = useCallback(async (action) => {
+    if (!messageProposal) return;
+    setMessageBusy(action);
+    setActionNotice("");
+    try {
+      const response = await postWithReconciliationRetry(
+        `/actions/orchestrator/message-${action}`,
+        undefined,
+        { headers: { "Content-Type": "application/json" }, body: JSON.stringify(messageProposal) },
+      );
+      if (!response.ok) throw new Error((await response.text()).trim() || `Message ${action} failed (${response.status})`);
+      setMessageProposal(null);
+      setMessageError("");
+      setActionNotice(action === "confirm"
+        ? `Queued the confirmed message for issue #${messageProposal.issue}, attempt ${messageProposal.attempt}.`
+        : "Cancelled the orchestrator message proposal.");
+    } catch (reason) {
+      setActionNotice(reason instanceof Error ? reason.message : `Message ${action} failed.`);
+    } finally {
+      setMessageBusy("");
+    }
+  }, [messageProposal]);
+
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
@@ -200,6 +236,10 @@ export default function Dashboard() {
         busy={orchestratorBusy}
         onAction={(action) => performOrchestratorAction(action)}
         onOpenTerminal={openOrchestratorTerminal}
+        proposal={messageProposal}
+        messageError={messageError}
+        messageBusy={messageBusy}
+        onMessageAction={performMessageAction}
       />
 
       {actionNotice ? <p className="notice" role="status">{actionNotice}</p> : null}

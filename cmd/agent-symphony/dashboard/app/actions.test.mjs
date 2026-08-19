@@ -28,4 +28,12 @@ test("dashboard actions retry transient reconciliation 503 responses", async (t)
   };
   assert.equal((await postWithReconciliationRetry("/actions/orchestrator/investigate")).status, 500);
   assert.equal(requests, 1);
+
+  let init;
+  globalThis.fetch = async (_url, options) => {
+    init = options;
+    return { status: 204 };
+  };
+  await postWithReconciliationRetry("/actions/orchestrator/message-confirm", undefined, { headers: { "Content-Type": "application/json" }, body: "{}" });
+  assert.deepEqual(init, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 });

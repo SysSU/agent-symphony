@@ -293,6 +293,75 @@ type fakeDashboardOrchestrator struct {
 	actions []string
 }
 
+type fakeDashboardMessageService struct {
+	*fakeDashboardOrchestrator
+	proposal orchestratoragent.MessageProposal
+	confirms int
+	consumes int
+}
+
+func (f *fakeDashboardMessageService) MessageProposal(context.Context) (orchestratoragent.MessageProposal, error) {
+	if f.proposal.Binding == "" {
+		return orchestratoragent.MessageProposal{}, orchestratoragent.ErrNoMessageProposal
+	}
+	return f.proposal, nil
+}
+
+func (f *fakeDashboardMessageService) ConsumeMessageProposal(_ context.Context, binding string) error {
+	if binding != f.proposal.Binding {
+		return errors.New("binding changed")
+	}
+	f.consumes++
+	f.proposal = orchestratoragent.MessageProposal{}
+	return nil
+}
+
+func (f *fakeDashboardMessageService) ConfirmMessage(_ context.Context, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
+	f.confirms++
+	return internalgithub.PrepareOperatorMessage(proposal.Repository, proposal.Issue, proposal.Attempt, proposal.Message)
+}
+
+func TestDashboardWorkerMessageRequiresAuthenticationAndExactConfirmationBinding(t *testing.T) {
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "Run the race test.", Binding: "exact-binding"}
+	service := &fakeDashboardMessageService{fakeDashboardOrchestrator: &fakeDashboardOrchestrator{status: orchestratoragent.Status{Enabled: true, State: "running"}}, proposal: proposal}
+	withoutPassword := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, service, false, "")
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator/proposal.json", nil)
+	response := httptest.NewRecorder()
+	withoutPassword.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("unauthenticated message feature status=%d", response.Code)
+	}
+
+	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, service, false, "password")
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator/proposal.json", nil)
+	request.SetBasicAuth("agent-symphony", "password")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), proposal.Message) || !strings.Contains(response.Body.String(), proposal.Binding) {
+		t.Fatalf("proposal status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	post := func(submitted orchestratoragent.MessageProposal) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(submitted)
+		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/orchestrator/message-confirm", bytes.NewReader(body))
+		request.Header.Set("Origin", "http://127.0.0.1")
+		request.Header.Set("Content-Type", "application/json")
+		request.SetBasicAuth("agent-symphony", "password")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	changed := proposal
+	changed.Message = "Different bytes."
+	if response := post(changed); response.Code != http.StatusConflict || service.confirms != 0 {
+		t.Fatalf("changed proposal status=%d confirms=%d", response.Code, service.confirms)
+	}
+	response = post(proposal)
+	if response.Code != http.StatusOK || service.confirms != 1 || service.consumes != 1 || strings.Contains(response.Body.String(), proposal.Message) {
+		t.Fatalf("confirmed status=%d confirms=%d consumes=%d body=%q", response.Code, service.confirms, service.consumes, response.Body.String())
+	}
+}
+
 func (f *fakeDashboardOrchestrator) Status(context.Context) (orchestratoragent.Status, error) {
 	return f.status, f.err
 }

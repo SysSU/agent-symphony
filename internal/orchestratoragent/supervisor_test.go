@@ -3,6 +3,7 @@ package orchestratoragent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -59,7 +60,7 @@ func (f *fakeRunner) Run(_ context.Context, command agentruntime.Command) (agent
 func newTestSupervisor(t *testing.T, runner *fakeRunner, now *time.Time) *Supervisor {
 	t.Helper()
 	root := t.TempDir()
-	return &Supervisor{Root: root, Workspace: filepath.Join(root, "workspace"), Repository: "SysSU/example", Command: []string{"agent", "--read-only"}, Runner: runner, Now: func() time.Time { return *now }}
+	return &Supervisor{Root: root, Workspace: filepath.Join(root, "workspace"), Repository: "SysSU/example", Command: []string{"agent", "--read-only"}, ProposalCommand: []string{"agent-symphony", "agent-host", "orchestrator-proposal"}, Runner: runner, Now: func() time.Time { return *now }}
 }
 
 func TestDisabledSupervisorNeverLaunches(t *testing.T) {
@@ -70,6 +71,42 @@ func TestDisabledSupervisorNeverLaunches(t *testing.T) {
 	status, err := agent.Observe(context.Background(), nil)
 	if err != nil || status.Enabled || status.State != "disabled" || runner.starts != 0 {
 		t.Fatalf("disabled status = %#v, starts=%d, err=%v", status, runner.starts, err)
+	}
+}
+
+func TestMessageProposalIsExactBoundedAndConsumable(t *testing.T) {
+	now := time.Date(2026, 8, 19, 1, 2, 3, 0, time.UTC)
+	agent := newTestSupervisor(t, &fakeRunner{}, &now)
+	if _, err := agent.Observe(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.MessageProposal(t.Context()); !errors.Is(err, ErrNoMessageProposal) {
+		t.Fatalf("empty proposal err=%v", err)
+	}
+	path := filepath.Join(agent.Workspace, MessageProposalFileName)
+	body, _ := json.Marshal(MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Message: "Run the focused test."})
+	if err := os.WriteFile(path, body, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := agent.MessageProposal(t.Context())
+	if err != nil || proposal.Binding == "" || proposal.Message != "Run the focused test." {
+		t.Fatalf("proposal=%#v err=%v", proposal, err)
+	}
+	if err := agent.ConsumeMessageProposal(t.Context(), "wrong-binding"); err == nil {
+		t.Fatal("mismatched confirmation binding consumed proposal")
+	}
+	if err := agent.ConsumeMessageProposal(t.Context(), proposal.Binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.MessageProposal(t.Context()); !errors.Is(err, ErrNoMessageProposal) {
+		t.Fatalf("consumed proposal err=%v", err)
+	}
+	body, _ = json.Marshal(MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Message: strings.Repeat("x", 8193)})
+	if err := os.WriteFile(path, body, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.MessageProposal(t.Context()); err == nil {
+		t.Fatal("oversized message proposal accepted")
 	}
 }
 

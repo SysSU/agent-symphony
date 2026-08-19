@@ -34,25 +34,33 @@ type AttemptFact struct {
 }
 
 type RecoveryStatus struct {
-	Repository          string   `json:"repository"`
-	Issue               int      `json:"issue"`
-	Title               string   `json:"title,omitempty"`
-	Attempt             int      `json:"attempt"`
-	State               string   `json:"state"`
-	Branch              string   `json:"branch,omitempty"`
-	Worktree            string   `json:"worktree,omitempty"`
-	Session             string   `json:"session,omitempty"`
-	PR                  int      `json:"pr,omitempty"`
-	HeadSHA             string   `json:"head_sha,omitempty"`
-	Priority            int      `json:"priority,omitempty"`
-	Dependencies        []int    `json:"dependencies,omitempty"`
-	ImplementationAgent string   `json:"implementation_agent,omitempty"`
-	ReviewAgent         string   `json:"review_agent,omitempty"`
-	Checks              []string `json:"checks,omitempty"`
-	Blockers            []string `json:"blockers,omitempty"`
-	Diagnostic          string   `json:"diagnostic,omitempty"`
-	Action              string   `json:"next_action,omitempty"`
-	Retryable           bool     `json:"retryable,omitempty"`
+	Repository          string                  `json:"repository"`
+	Issue               int                     `json:"issue"`
+	Title               string                  `json:"title,omitempty"`
+	Attempt             int                     `json:"attempt"`
+	State               string                  `json:"state"`
+	Branch              string                  `json:"branch,omitempty"`
+	Worktree            string                  `json:"worktree,omitempty"`
+	Session             string                  `json:"session,omitempty"`
+	PR                  int                     `json:"pr,omitempty"`
+	HeadSHA             string                  `json:"head_sha,omitempty"`
+	Priority            int                     `json:"priority,omitempty"`
+	Dependencies        []int                   `json:"dependencies,omitempty"`
+	ImplementationAgent string                  `json:"implementation_agent,omitempty"`
+	ReviewAgent         string                  `json:"review_agent,omitempty"`
+	Checks              []string                `json:"checks,omitempty"`
+	Blockers            []string                `json:"blockers,omitempty"`
+	Diagnostic          string                  `json:"diagnostic,omitempty"`
+	Action              string                  `json:"next_action,omitempty"`
+	Retryable           bool                    `json:"retryable,omitempty"`
+	OperatorMessages    []OperatorMessageStatus `json:"operator_messages,omitempty"`
+}
+
+type OperatorMessageStatus struct {
+	ID         string    `json:"id"`
+	State      string    `json:"state"`
+	UpdatedAt  time.Time `json:"updated_at,omitempty"`
+	Diagnostic string    `json:"diagnostic,omitempty"`
 }
 
 type RuntimeCheck func(context.Context, agentruntime.Manifest, AttemptFact) error

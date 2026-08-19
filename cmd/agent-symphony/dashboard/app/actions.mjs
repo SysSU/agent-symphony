@@ -1,7 +1,7 @@
-export async function postWithReconciliationRetry(url, onRetry = () => new Promise((resolve) => setTimeout(resolve, 1000))) {
+export async function postWithReconciliationRetry(url, onRetry = () => new Promise((resolve) => setTimeout(resolve, 1000)), options = {}) {
   let response;
   do {
-    response = await fetch(url, { method: "POST" });
+    response = await fetch(url, { ...options, method: "POST" });
     if (response.status === 503) {
       await response.text();
       await onRetry();
