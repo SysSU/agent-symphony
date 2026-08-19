@@ -240,6 +240,59 @@ func TestOperatorMessageTargetValidationRejectsStaleAndTerminalAttempts(t *testi
 	}
 }
 
+func TestOperatorMessageConfirmationVerifiesThroughImplementationBoundary(t *testing.T) {
+	stateRoot := t.TempDir()
+	snapshotRoot := filepath.Join(t.TempDir(), "snapshots")
+	oldSnapshotRoot := reviewSnapshotRoot
+	reviewSnapshotRoot = snapshotRoot
+	t.Cleanup(func() { reviewSnapshotRoot = oldSnapshotRoot })
+	if err := os.MkdirAll(filepath.Dir(snapshotRoot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 131, Number: 3, BaseSHA: strings.Repeat("a", 40)}
+	runtimeState := newOperatorMessageRuntime(stateRoot)
+	if err := os.MkdirAll(runtimeState.Root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := agentruntime.AttemptIdentity(runtimeState.Root, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.State = "completed"
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "131-3", "agent.log")
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	logPath, script := filepath.Join(t.TempDir(), "boundary.log"), filepath.Join(t.TempDir(), "boundary")
+	scriptBody := fmt.Sprintf(`#!/bin/sh
+payload=$(sed -n '1p')
+printf '%%s\n' "$payload" >> %q
+case "$payload" in
+  *--show-current*) output=%q ;;
+  *'rev-parse","HEAD'*) output=%q ;;
+  *) output='' ;;
+esac
+printf '{"Output":"%%s","Code":0,"Exited":false}' "$output"
+`, logPath, manifest.Branch, attempt.BaseSHA)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", script)
+	runtimeState = newOperatorMessageRuntime(stateRoot)
+	if err := runtimeState.VerifyActive(t.Context(), manifest, attempt.BaseSHA); err != nil {
+		t.Fatalf("confirmation runtime rejected verified target: %v", err)
+	}
+	logBody, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(logBody, []byte(`"operation":"verify"`)) || !bytes.Contains(logBody, []byte(`"operation":"run"`)) {
+		t.Fatalf("confirmation runtime did not use both boundary hooks: %s", logBody)
+	}
+}
+
 func TestClaimedOperatorMessageDoesNotInterruptCompetingHandoff(t *testing.T) {
 	runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
 	store := &operatorMessageStore{}

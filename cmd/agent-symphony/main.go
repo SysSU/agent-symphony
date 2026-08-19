@@ -564,7 +564,7 @@ func confirmOperatorMessage(ctx context.Context, configPath, stateRoot string, p
 	if err != nil {
 		return internalgithub.OperatorMessage{}, err
 	}
-	runtimeState := agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot}
+	runtimeState := newOperatorMessageRuntime(stateRoot)
 	manifests, err := runtimeState.Discover()
 	if err != nil {
 		return internalgithub.OperatorMessage{}, err
@@ -579,6 +579,14 @@ func confirmOperatorMessage(ctx context.Context, configPath, stateRoot string, p
 		return internalgithub.OperatorMessage{}, err
 	}
 	return internalgithub.RecordOperatorMessage(ctx, api, prConfig, message)
+}
+
+func newOperatorMessageRuntime(stateRoot string) agentruntime.Runtime {
+	boundary := implementationBoundary(stateRoot)
+	return agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot, Runner: boundary, VerifyWorker: func(ctx context.Context) error {
+		_, err := boundary.call(ctx, "verify", agentruntime.Command{})
+		return err
+	}}
 }
 
 func validateOperatorMessageTarget(ctx context.Context, proposal orchestratoragent.MessageProposal, issues []internalgithub.RecoveryIssueFact, remote []internalgithub.RecoveryAttemptFact, manifests []agentruntime.Manifest, check orchestrator.RuntimeCheck) error {
