@@ -218,7 +218,7 @@ func TestReviewFindingsRecoversWorkerReceiptAfterCoordinatorRestart(t *testing.T
 		t.Fatal(err)
 	}
 
-	ack, _ := json.Marshal(struct{ Type, Key, OutcomePath, OutcomeToken string }{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(manifest.Worktree, key), head})
+	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(manifest.Worktree, key), head})
 	result, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
 	calls, script := filepath.Join(worktree, "accepts"), filepath.Join(t.TempDir(), "boundary")
 	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\ncase \"$payload\" in *accept-handoff*) printf 'x\\n' >> %q;; esac\nprintf '%%s' '%s'\n", calls, result)
@@ -243,6 +243,22 @@ func TestReviewFindingsRecoversWorkerReceiptAfterCoordinatorRestart(t *testing.T
 	accepts, _ := os.ReadFile(calls)
 	if strings.Count(string(accepts), "x\n") != 1 {
 		t.Fatalf("accept calls=%q", accepts)
+	}
+}
+
+func TestReviewFindingsRejectsMismatchedWorkerReceipt(t *testing.T) {
+	worktree, head := t.TempDir(), "abcdef1"
+	manifest := agentruntime.Manifest{Worktree: worktree, Session: "as-23-1"}
+	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", "independent-review-" + head, handoffReceiptPath(worktree, "independent-review-"+head), "wrong-head"})
+	result, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
+	script := filepath.Join(t.TempDir(), "boundary")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' '"+string(result)+"'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	boundary := workerBoundaryRunner{Command: script}
+	_, err := returnReviewFindings(t.Context(), &agentruntime.Runtime{}, boundary, agentruntime.Attempt{}, manifest, head, []string{"fix"}, []string{"implementation"})
+	if err == nil || !strings.Contains(err.Error(), "acceptance binding mismatch") {
+		t.Fatalf("mismatched receipt err=%v", err)
 	}
 }
 
@@ -283,7 +299,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := "independent-review-" + head
-	ack, _ := json.Marshal(struct{ Type, Key, OutcomePath, OutcomeToken string }{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(manifest.Worktree, key), head})
+	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(manifest.Worktree, key), head})
 	ackResult, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
 	boundaryLog, script := filepath.Join(worktree, "boundary.log"), filepath.Join(t.TempDir(), "boundary")
 	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\nprintf '%%s\\n' \"$payload\" >> %q\ncase \"$payload\" in\n  *operation*export*) printf '%%s' '%s';;\n  *) printf '%%s' '%s';;\nesac\n", boundaryLog, exportResult, ackResult)
