@@ -621,7 +621,7 @@ func validateOperatorMessageTarget(ctx context.Context, proposal orchestratorage
 	statusIndex := slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool {
 		return status.Repository == proposal.Repository && status.Issue == proposal.Issue && status.Attempt == proposal.Attempt
 	})
-	if statusIndex < 0 || !slices.Contains([]string{"resume monitoring the matching attempt", "monitor the matching published pull request"}, statuses[statusIndex].Action) {
+	if statusIndex < 0 || !slices.Contains([]string{"resume monitoring the matching attempt", "resume publication of the matching completed attempt", "monitor the matching published pull request"}, statuses[statusIndex].Action) {
 		return errors.New("operator message target does not have a verified exact runtime owner")
 	}
 	return nil
@@ -2069,13 +2069,22 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 				continue
 			}
 			manifest := manifests[manifestIndex]
+			handoffKey := "operator-message-" + message.ID
+			outcomePath := handoffReceiptPath(manifest.Worktree, handoffKey)
+			outcomeToken := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+handoffKey)))
+			expectedReceipt := handoffReceipt{"agent-symphony-handoff-executed-v1", handoffKey, outcomePath, outcomeToken}
 			switch manifest.State {
 			case "preparing":
 				continue // The accepted message remains durably queued.
 			case "running":
-				if message.State == "queued" {
-					continue // Do not interrupt a live turn before delivery is claimed.
+				if message.State == "queued" || !exactHandoffReceipt(outcomePath, expectedReceipt) {
+					continue // A running pane is busy unless this exact delivery already owns it.
 				}
+				if err := recordOperatorOutcome(ctx, api, cfg, message, "delivered", ""); err != nil {
+					return err
+				}
+				started[key] = true
+				continue
 			case "failed":
 				if err := recordOperatorOutcome(ctx, api, cfg, message, "failed", "attempt runtime failed before delivery"); err != nil {
 					return err
@@ -2127,14 +2136,11 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 			if err != nil {
 				return err
 			}
-			handoffKey := "operator-message-" + message.ID
 			payload, _ := json.Marshal(struct {
 				Type, Key, Kind, Repository, Message string
 				Issue, Attempt                       int
 			}{"agent-symphony-handoff-v1", handoffKey, "operator-message", message.Repository, message.Message, message.Issue, message.Attempt})
 			manifestBody, _ := json.Marshal(resumed)
-			outcomePath := handoffReceiptPath(resumed.Worktree, handoffKey)
-			outcomeToken := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+handoffKey)))
 			request, _ := json.Marshal(struct {
 				Manifest     json.RawMessage `json:"manifest"`
 				Handoff      json.RawMessage `json:"handoff"`
@@ -2160,6 +2166,12 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 		messages[key] = queued
 	}
 	return nil
+}
+
+func exactHandoffReceipt(path string, want handoffReceipt) bool {
+	body, err := os.ReadFile(path)
+	expected, _ := json.Marshal(want)
+	return err == nil && bytes.Equal(body, expected)
 }
 
 func recordOperatorOutcome(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, message *internalgithub.OperatorMessage, state, diagnostic string) error {
