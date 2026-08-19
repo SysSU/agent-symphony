@@ -102,6 +102,13 @@ type boundaryCommand struct {
 	Input []byte   `json:"input,omitempty"`
 }
 
+type handoffReceipt struct {
+	Type         string `json:"type"`
+	Key          string `json:"key"`
+	OutcomePath  string `json:"outcome_path"`
+	OutcomeToken string `json:"outcome_token"`
+}
+
 func (b workerBoundaryRunner) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
 	if strings.TrimSpace(b.Command) == "" {
 		return agentruntime.Result{}, errors.New("AGENT_SYMPHONY_WORKER_BOUNDARY is required")
@@ -1459,7 +1466,7 @@ func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtim
 		if err != nil {
 			return err
 		}
-		var ack struct{ Type, Key, OutcomePath, OutcomeToken string }
+		var ack handoffReceipt
 		decoder := json.NewDecoder(strings.NewReader(accepted.Output))
 		decoder.DisallowUnknownFields()
 		if decoder.Decode(&ack) != nil || decoder.Decode(&struct{}{}) != io.EOF || ack.Type != "agent-symphony-handoff-executed-v1" || ack.Key != key || ack.OutcomePath != outcomePath || ack.OutcomeToken != head {
@@ -1902,12 +1909,7 @@ func resumeHandoffs(ctx context.Context, runtimeState *agentruntime.Runtime, bou
 			Command      []string        `json:"command"`
 		}{manifestBody, payload, outcomePath, outcomeToken, command})
 		accepted, err := boundary.call(ctx, "accept-handoff", agentruntime.Command{Stdin: bytes.NewReader(request)})
-		var ack struct {
-			Type         string `json:"type"`
-			Key          string `json:"key"`
-			OutcomePath  string `json:"outcome_path"`
-			OutcomeToken string `json:"outcome_token"`
-		}
+		var ack handoffReceipt
 		decoder := json.NewDecoder(strings.NewReader(accepted.Output))
 		decoder.DisallowUnknownFields()
 		if err != nil {

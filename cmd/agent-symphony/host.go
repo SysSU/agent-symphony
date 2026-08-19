@@ -1326,12 +1326,7 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 	if err := writeImmutable(filepath.Join(inbox, h.Key+".json"), binding); err != nil {
 		return "", err
 	}
-	ack, _ := json.Marshal(struct {
-		Type         string `json:"type"`
-		Key          string `json:"key"`
-		OutcomePath  string `json:"outcome_path"`
-		OutcomeToken string `json:"outcome_token"`
-	}{"agent-symphony-handoff-executed-v1", h.Key, request.OutcomePath, request.OutcomeToken})
+	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", h.Key, request.OutcomePath, request.OutcomeToken})
 	if body, err := os.ReadFile(request.OutcomePath); err == nil && bytes.Equal(body, ack) {
 		return string(ack), nil
 	} else if err == nil || !errors.Is(err, os.ErrNotExist) {
