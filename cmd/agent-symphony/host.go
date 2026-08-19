@@ -1064,6 +1064,7 @@ func validGitBoundaryArgs(args []string, dir, root string) bool {
 	rest := args[2:]
 	return slices.Equal(rest, []string{"branch", "--show-current"}) ||
 		slices.Equal(rest, []string{"rev-parse", "HEAD"}) ||
+		(len(rest) == 4 && rest[0] == "merge-base" && rest[1] == "--is-ancestor" && preflightObjectID.MatchString(rest[2]) && preflightObjectID.MatchString(rest[3])) ||
 		(len(rest) == 3 && rest[0] == "checkout" && rest[1] == "--detach") ||
 		(len(rest) == 3 && rest[0] == "switch" && rest[1] == "-c") ||
 		slices.Equal(rest, []string{"remote", "remove", "origin"}) ||
