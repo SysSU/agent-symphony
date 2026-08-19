@@ -1014,6 +1014,30 @@ func TestVerifyActiveAcceptsOnlyApprovedUnpublishedAncestryOrPublishedHead(t *te
 	}
 }
 
+func TestResumeHandoffEligibilityOwnsStateTransition(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.sessions[manifest.Session].dead = true
+	if manifest, err = r.Monitor(t.Context(), attempt); err != nil || manifest.State != "completed" {
+		t.Fatalf("completed manifest=%#v err=%v", manifest, err)
+	}
+	eligibilityChecked := false
+	attempt.Eligible = func() bool {
+		eligibilityChecked = true
+		return false
+	}
+	if _, err := r.ResumeHandoff(t.Context(), attempt); err == nil || !strings.Contains(err.Error(), "no longer eligible") {
+		t.Fatalf("ineligible resume=%v", err)
+	}
+	current, err := r.Discover()
+	if !eligibilityChecked || err != nil || len(current) != 1 || current[0].State != "completed" {
+		t.Fatalf("ineligible resume changed state: manifests=%#v err=%v", current, err)
+	}
+}
+
 func TestLaunchConfiguresEmptySessionBeforeAgentAndRetainsFastExit(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	attempt.Command = []string{"fast-exit"}

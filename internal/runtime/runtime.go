@@ -170,6 +170,9 @@ func (r *Runtime) ResumeHandoff(ctx context.Context, attempt Attempt) (Manifest,
 			return Manifest{}, fmt.Errorf("refresh handoff source refs: %w", err)
 		}
 	}
+	if attempt.Eligible != nil && !attempt.Eligible() {
+		return Manifest{}, errors.New("attempt is no longer eligible")
+	}
 	manifest.State, manifest.Diagnostic, manifest.UpdatedAt = "running", "", time.Now().UTC()
 	return manifest, r.writeManifest(attempt, manifest)
 }
@@ -414,9 +417,19 @@ func (r *Runtime) Deliver(ctx context.Context, manifest Manifest, payload []byte
 	return err
 }
 
+// VerifyOwned checks exact branch/session identity through the worker boundary
+// without comparing mutable worktree HEAD.
+func (r *Runtime) VerifyOwned(ctx context.Context, manifest Manifest) error {
+	return r.verifyActive(ctx, manifest, "", false)
+}
+
 // VerifyActive checks exact branch/head/session identity through the worker
 // boundary; it performs no coordinator-side worker command.
 func (r *Runtime) VerifyActive(ctx context.Context, manifest Manifest, head string) error {
+	return r.verifyActive(ctx, manifest, head, true)
+}
+
+func (r *Runtime) verifyActive(ctx context.Context, manifest Manifest, head string, verifyHead bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.VerifyWorker == nil {
@@ -444,17 +457,19 @@ func (r *Runtime) VerifyActive(ctx context.Context, manifest Manifest, head stri
 	if err != nil || strings.TrimSpace(branch.Output) != manifest.Branch {
 		return errors.New("worktree branch does not match manifest")
 	}
-	got, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "rev-parse", "HEAD"}, "", nil, nil)
-	if err != nil {
-		return errors.New("worktree HEAD is unreadable")
-	}
-	current := strings.TrimSpace(got.Output)
-	if !strings.EqualFold(current, head) {
-		if !strings.EqualFold(head, manifest.BaseSHA) {
-			return errors.New("worktree HEAD does not match GitHub")
+	if verifyHead {
+		got, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "rev-parse", "HEAD"}, "", nil, nil)
+		if err != nil {
+			return errors.New("worktree HEAD is unreadable")
 		}
-		if _, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "merge-base", "--is-ancestor", manifest.BaseSHA, current}, "", nil, nil); err != nil {
-			return errors.New("worktree HEAD is not descended from the approved base")
+		current := strings.TrimSpace(got.Output)
+		if !strings.EqualFold(current, head) {
+			if !strings.EqualFold(head, manifest.BaseSHA) {
+				return errors.New("worktree HEAD does not match GitHub")
+			}
+			if _, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "merge-base", "--is-ancestor", manifest.BaseSHA, current}, "", nil, nil); err != nil {
+				return errors.New("worktree HEAD is not descended from the approved base")
+			}
 		}
 	}
 	if _, err := r.run(ctx, r.tmux(), []string{"has-session", "-t", "=" + manifest.Session}, "", nil, nil); err != nil {

@@ -1,3 +1,5 @@
+import { useEffect, useRef } from "react";
+
 import { canInvestigate, orchestratorPresentation } from "../health.mjs";
 
 function githubURL(repository, kind, number) {
@@ -100,10 +102,23 @@ export function StatusCard(props) {
 }
 
 function MessageConfirmation({ proposal, error, busy, onAction }) {
+  const confirmationRef = useRef(null);
+  const proposalKey = proposal ? `${proposal.repository}#${proposal.issue}/${proposal.attempt}:${proposal.message}` : "";
+  useEffect(() => {
+    if (proposalKey) confirmationRef.current?.focus();
+  }, [proposalKey]);
   if (!proposal && !error) return null;
   if (!proposal) return <p className="orchestratorDisabled" role="alert">{error}</p>;
   return (
-    <section className="messageConfirmation" aria-labelledby="messageConfirmationTitle">
+    <section
+      ref={confirmationRef}
+      className="messageConfirmation"
+      role="region"
+      aria-live="assertive"
+      aria-atomic="true"
+      aria-labelledby="messageConfirmationTitle"
+      tabIndex={-1}
+    >
       <p className="eyebrow">Confirmation required</p>
       <h3 id="messageConfirmationTitle">Queue a worker message</h3>
       <p><strong>Exact target:</strong> <code>{proposal.repository}#{proposal.issue}, attempt {proposal.attempt}</code></p>
