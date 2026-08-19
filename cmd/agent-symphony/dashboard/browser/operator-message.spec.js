@@ -6,6 +6,7 @@ const proposal = {
   issue: 131,
   attempt: 3,
   message: "Run the focused race test.",
+  binding: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 };
 
 const attempt = {
@@ -24,6 +25,7 @@ async function mockDashboard(page) {
   let currentProposal = proposal;
   let messageState = "queued";
   const actions = [];
+  const requests = [];
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: true, state: "running", session: "orchestrator" } }));
   await page.route("**/orchestrator/proposal.json", (route) => currentProposal
     ? route.fulfill({ json: currentProposal })
@@ -35,15 +37,27 @@ async function mockDashboard(page) {
   await page.route("**/actions/orchestrator/message-*", async (route) => {
     const action = route.request().url().split("message-").pop();
     actions.push(action);
+    const body = route.request().postDataJSON();
+    requests.push({ action, body });
+    if (JSON.stringify(body) !== JSON.stringify(currentProposal)) {
+      await route.fulfill({ status: 409, body: "orchestrator message proposal changed before confirmation\n" });
+      return;
+    }
     if (action === "confirm") messageState = "delivered";
     currentProposal = null;
     await route.fulfill({ json: {} });
   });
-  return actions;
+  return {
+    actions,
+    requests,
+    replaceProposal(next) {
+      currentProposal = next;
+    },
+  };
 }
 
 test("announces and focuses a proposal, confirms it, and refreshes delivery", async ({ page }) => {
-  const actions = await mockDashboard(page);
+  const dashboard = await mockDashboard(page);
   await page.goto("/");
 
   const confirmation = page.getByRole("region", { name: "Queue a worker message" });
@@ -57,14 +71,15 @@ test("announces and focuses a proposal, confirms it, and refreshes delivery", as
   await expect(page.getByRole("button", { name: "Confirm and queue" })).toBeFocused();
   await page.keyboard.press("Enter");
   await expect(page.getByRole("status").filter({ hasText: "Queued the confirmed message" })).toBeVisible();
-  expect(actions).toEqual(["confirm"]);
+  expect(dashboard.actions).toEqual(["confirm"]);
+  expect(dashboard.requests).toEqual([{ action: "confirm", body: proposal }]);
 
   await expect(page.locator(".messageStatus .state-delivered")).toBeVisible({ timeout: 6500 });
 });
 
 test("cancels a proposal and keeps the confirmation inside a mobile viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  const actions = await mockDashboard(page);
+  const dashboard = await mockDashboard(page);
   await page.goto("/");
 
   const confirmation = page.getByRole("region", { name: "Queue a worker message" });
@@ -76,5 +91,20 @@ test("cancels a proposal and keeps the confirmation inside a mobile viewport", a
   await page.getByRole("button", { name: "Cancel proposal" }).click();
   await expect(page.getByRole("status").filter({ hasText: "Cancelled the orchestrator message proposal" })).toBeVisible();
   await expect(confirmation).toBeHidden();
-  expect(actions).toEqual(["cancel"]);
+  expect(dashboard.actions).toEqual(["cancel"]);
+});
+
+test("keeps the reviewed proposal visible when its binding changes before confirmation", async ({ page }) => {
+  const dashboard = await mockDashboard(page);
+  await page.goto("/");
+
+  const confirmation = page.getByRole("region", { name: "Queue a worker message" });
+  await expect(confirmation).toBeVisible();
+  dashboard.replaceProposal({ ...proposal, binding: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" });
+
+  await page.getByRole("button", { name: "Confirm and queue" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "orchestrator message proposal changed before confirmation" })).toBeVisible();
+  await expect(confirmation).toBeVisible();
+  await expect(page.locator(".messageStatus .state-queued")).toBeVisible();
+  expect(dashboard.requests).toEqual([{ action: "confirm", body: proposal }]);
 });

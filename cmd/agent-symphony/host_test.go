@@ -107,6 +107,41 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 	}
 }
 
+func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
+	fakeHostIdentity(t, 1234, 5678)
+	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner
+	hostGOOS, hostRoot = "linux", t.TempDir()
+	t.Cleanup(func() { hostGOOS, hostRoot, hostExecRunner = oldGOOS, oldRoot, oldExec })
+	root := nativeRoot("/var/lib/agent-symphony/attempts")
+	if err := os.MkdirAll(root, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"set-option", "-w", "-t", "=as-o-r-131-3:0.0", "history-limit", "5000"}
+	var launched agentruntime.Command
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		launched = command
+		return agentruntime.Result{}, nil
+	}
+	payload, _ := json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"run", boundaryCommand{Name: "tmux", Args: want, Dir: root, Env: []string{"PATH=/bin"}}})
+	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if launched.Name != "tmux" || !slices.Equal(launched.Args, want) {
+		t.Fatalf("runtime command changed at boundary: %#v", launched)
+	}
+	want[5] = "5001"
+	payload, _ = json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"run", boundaryCommand{Name: "tmux", Args: want, Dir: root, Env: []string{"PATH=/bin"}}})
+	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{}); err == nil {
+		t.Fatal("unapproved history limit crossed the boundary")
+	}
+}
+
 func TestReviewerBoundaryAllowsOnlyExactOrchestratorTmuxLaunch(t *testing.T) {
 	fakeHostIdentity(t, 1234, 5678)
 	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner
