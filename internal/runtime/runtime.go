@@ -137,6 +137,9 @@ func (r *Runtime) RecordReviewFindings(attempt Attempt, head string, findings []
 	}
 	manifest.ReviewState, manifest.ReviewHead = "findings-queued", head
 	manifest.ReviewFindings, manifest.ReviewHandoffQueued, manifest.ReviewHandoffAck = append([]string(nil), findings...), queued, acknowledged
+	if acknowledged && manifest.State == "completed" {
+		manifest.State, manifest.Diagnostic = "running", ""
+	}
 	manifest.UpdatedAt = time.Now().UTC()
 	return manifest, r.writeManifest(attempt, manifest)
 }

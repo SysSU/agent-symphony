@@ -240,6 +240,9 @@ func TestReviewFindingsRecoversWorkerReceiptAfterCoordinatorRestart(t *testing.T
 	if !stored.ReviewHandoffAck {
 		t.Fatal("worker receipt was not acknowledged")
 	}
+	if stored.State != "running" {
+		t.Fatalf("acknowledged handoff state=%q, want running", stored.State)
+	}
 	accepts, _ := os.ReadFile(calls)
 	if strings.Count(string(accepts), "x\n") != 1 {
 		t.Fatalf("accept calls=%q", accepts)
@@ -326,6 +329,9 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	if !stored.ReviewHandoffAck {
 		t.Fatal("monitor did not recover worker receipt")
 	}
+	if stored.State != "running" {
+		t.Fatalf("acknowledged handoff state=%q, want running", stored.State)
+	}
 	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
 	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, "", state); err != nil {
 		t.Fatalf("retry reached GitHub failure: %v", err)
@@ -335,6 +341,9 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	log, _ := os.ReadFile(boundaryLog)
 	if strings.Count(string(log), "accept-handoff") != 1 {
 		t.Fatalf("handoff redelivered: %s", log)
+	}
+	if strings.Count(string(log), `"operation":"export"`) != 1 {
+		t.Fatalf("live follow-up was exported: %s", log)
 	}
 }
 
