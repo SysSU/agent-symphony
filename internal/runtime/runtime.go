@@ -237,10 +237,10 @@ func PromptCommand(helper, tmux, buffer, resultPath string, command []string) []
 	return append([]string{helper, "worker-capture", tmux, buffer, resultPath, "--"}, command...)
 }
 
-// ReplacementPromptCommand preserves an earlier result until the follow-up
-// worker has finished and can atomically replace it.
-func ReplacementPromptCommand(helper, tmux, buffer, resultPath string, command []string) []string {
-	return append([]string{helper, "worker-capture-replace", tmux, buffer, resultPath, "--"}, command...)
+// HandoffPromptCommand records and signals worker-owned launch before the
+// replacement worker consumes the prompt.
+func HandoffPromptCommand(helper, tmux, buffer, resultPath, launchedPath, recipient, signal string, command []string) []string {
+	return append([]string{helper, "worker-capture-handoff", tmux, buffer, resultPath, launchedPath, recipient, signal, "--"}, command...)
 }
 
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {

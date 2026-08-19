@@ -769,6 +769,9 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if !filepath.IsAbs(localRoot) {
 			return errors.New("local boundary root must be absolute")
 		}
+		if orchestratorMode {
+			return errors.New("orchestrator requires OS-enforced host isolation")
+		}
 		root = localRoot
 		var current *user.User
 		if current, err = hostCurrentUser(); err != nil {
@@ -1396,21 +1399,59 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	command := agentruntime.ReplacementPromptCommand(helper, "tmux", buffer, resultPath, request.Command)
-	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony handoff in the current worktree. It may contain review feedback or one confirmed operator message. Current source refs are available under refs/remotes/agent-symphony/. Do not push or use GitHub credentials; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", request.Handoff)
-	commands := []agentruntime.Command{
-		{Name: "tmux", Args: []string{"load-buffer", "-b", buffer, "-"}, Dir: request.Manifest.Worktree, Stdin: bytes.NewReader(prompt)},
-		{Name: "tmux", Args: append(append([]string{"respawn-pane", "-k", "-t", pane, "--"}, command...), ";", "set-option", "-p", "-t", pane, option, recipient), Dir: request.Manifest.Worktree},
+	launchingPath := filepath.Join(inbox, h.Key+".launching")
+	launchedPath := filepath.Join(inbox, h.Key+".launched")
+	launched, err := immutableMarkerMatches(launchedPath, []byte(recipient))
+	if err != nil {
+		return "", err
 	}
-	for _, command := range commands {
-		if _, err := hostExecRunner(ctx, command); err != nil {
+	if launched {
+		if err := writeImmutable(request.OutcomePath, ack); err != nil {
 			return "", err
 		}
+		return string(ack), nil
+	}
+	launching, err := immutableMarkerMatches(launchingPath, []byte(recipient))
+	if err != nil {
+		return "", err
+	}
+	if launching {
+		state, stateErr := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", pane, "#{pane_dead}"}, Dir: request.Manifest.Worktree})
+		if stateErr == nil && strings.TrimSpace(state.Output) == "0" {
+			return "", errors.New("handoff launch remains in flight")
+		}
+		if stateErr != nil || strings.TrimSpace(state.Output) != "1" {
+			return "", errors.New("cannot reconcile in-flight handoff launch")
+		}
+	}
+	signal := buffer + "-launched"
+	command := agentruntime.HandoffPromptCommand(helper, "tmux", buffer, resultPath, launchedPath, recipient, signal, request.Command)
+	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony handoff in the current worktree. It may contain review feedback or one confirmed operator message. Current source refs are available under refs/remotes/agent-symphony/. Do not push or use GitHub credentials; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", request.Handoff)
+	if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"load-buffer", "-b", buffer, "-"}, Dir: request.Manifest.Worktree, Stdin: bytes.NewReader(prompt)}); err != nil {
+		return "", err
+	}
+	if err := writeImmutable(launchingPath, []byte(recipient)); err != nil {
+		return "", err
+	}
+	tmuxArgs := append(append([]string{"respawn-pane", "-k", "-t", pane, "--"}, command...), ";", "wait-for", signal, ";", "set-option", "-p", "-t", pane, option, recipient)
+	if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: tmuxArgs, Dir: request.Manifest.Worktree}); err != nil {
+		return "", err
 	}
 	if err := writeImmutable(request.OutcomePath, ack); err != nil {
 		return "", err
 	}
 	return string(ack), nil
+}
+
+func immutableMarkerMatches(path string, want []byte) (bool, error) {
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !bytes.Equal(body, want) {
+		return false, errors.New("handoff launch binding mismatch")
+	}
+	return true, nil
 }
 
 func handoffReceiptPath(worktree, key string) string {

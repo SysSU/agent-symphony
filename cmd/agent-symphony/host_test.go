@@ -408,7 +408,7 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if calls != 3 {
 			t.Fatalf("worker made %d tmux calls, want one lookup plus one two-step delivery", calls)
 		}
-		if !slices.Contains(submission.Args, "worker-capture-replace") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
+		if !slices.Contains(submission.Args, "worker-capture-handoff") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
 			t.Fatalf("handoff did not use the stdin capture helper: %#v", submission.Args)
 		}
 		if _, err := os.ReadFile(filepath.Join(worktree, ".agent-symphony", "handoffs", "pane-test.json")); err != nil {
@@ -611,7 +611,7 @@ func TestWorkerResultArtifactFailsClosed(t *testing.T) {
 }
 
 func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
-	for _, failure := range []string{"load-buffer", "submission", "receipt"} {
+	for _, failure := range []string{"load-buffer", "submission", "respawn-side-effect", "receipt"} {
 		t.Run(failure, func(t *testing.T) {
 			oldExec, oldDirSync := hostExecRunner, immutableDirSync
 			t.Cleanup(func() { hostExecRunner, immutableDirSync = oldExec, oldDirSync })
@@ -638,6 +638,9 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 				if slices.Contains(command.Args, "show-options") {
 					return agentruntime.Result{Output: recipient}, nil
 				}
+				if slices.Contains(command.Args, "display-message") {
+					return agentruntime.Result{Output: "1"}, nil
+				}
 				if !injected && failure == "load-buffer" && slices.Contains(command.Args, "load-buffer") {
 					injected = true
 					return agentruntime.Result{}, errors.New("injected load failure")
@@ -646,6 +649,15 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 					if !injected && failure == "submission" {
 						injected = true
 						return agentruntime.Result{}, errors.New("injected submission failure")
+					}
+					if !injected && failure == "respawn-side-effect" {
+						injected = true
+						deliveries++
+						launchedPath := filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.launched")
+						if err := writeImmutable(launchedPath, []byte(command.Args[len(command.Args)-1])); err != nil {
+							t.Fatal(err)
+						}
+						return agentruntime.Result{}, errors.New("injected failure after respawn")
 					}
 					recipient, deliveries = command.Args[len(command.Args)-1], deliveries+1
 				}
@@ -666,6 +678,11 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 			}
 			if _, err := os.Stat(filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.json")); err != nil {
 				t.Fatalf("pending state lost: %v", err)
+			}
+			if failure == "respawn-side-effect" {
+				if _, err := os.Stat(filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.launching")); err != nil {
+					t.Fatalf("durable launch state lost: %v", err)
+				}
 			}
 			if _, err := acceptHandoff(t.Context(), request, root); err != nil {
 				t.Fatalf("restart retry: %v", err)

@@ -262,7 +262,26 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	command := args[0]
-	if command == "worker-capture" || command == "worker-capture-replace" {
+	if command == "worker-capture" || command == "worker-capture-replace" || command == "worker-capture-handoff" {
+		if command == "worker-capture-handoff" {
+			if len(args) < 9 || args[7] != "--" {
+				return misuse(stderr, false, command, "invalid internal worker capture invocation")
+			}
+			if err := writeImmutable(args[4], []byte(args[5])); err != nil {
+				fmt.Fprintln(stderr, "error: "+err.Error())
+				return 1
+			}
+			if err := exec.CommandContext(context.Background(), args[1], "wait-for", "-S", args[6]).Run(); err != nil {
+				fmt.Fprintln(stderr, "launch signal: "+err.Error())
+			}
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			code, err := agentruntime.CaptureWorkerReplacingResult(ctx, args[1], args[2], args[3], args[8:], stdout, stderr)
+			if err != nil {
+				fmt.Fprintln(stderr, "error: "+err.Error())
+			}
+			return code
+		}
 		if len(args) < 6 || args[4] != "--" {
 			return misuse(stderr, false, command, "invalid internal worker capture invocation")
 		}

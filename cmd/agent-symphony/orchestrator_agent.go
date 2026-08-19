@@ -19,6 +19,8 @@ type dashboardOrchestratorService struct {
 	confirm    func(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error)
 }
 
+var orchestratorWorkspacePrepare = prepareOrchestratorWorkspace
+
 func (s dashboardOrchestratorService) MessageProposal(ctx context.Context) (orchestratoragent.MessageProposal, error) {
 	return s.supervisor.MessageProposal(ctx)
 }
@@ -48,25 +50,21 @@ func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratorage
 	if cfg.Commands.Orchestrator == nil {
 		return agent, nil
 	}
+	if !hostIsolationInstalled() {
+		return nil, fmt.Errorf("configured orchestrator requires host isolation; run install-host first")
+	}
 	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
 	if err != nil {
 		return nil, err
 	}
 	agent.Env = env
-	if !hostIsolationInstalled() {
-		agent.Env = append(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+productionSnapshotRoot(stateRoot))
+	group, err := hostLookupGroup(snapshotGroup)
+	if err != nil {
+		return nil, fmt.Errorf("resolve orchestrator boundary group: %w", err)
 	}
-	if hostIsolationInstalled() {
-		group, err := hostLookupGroup(snapshotGroup)
-		if err != nil {
-			return nil, fmt.Errorf("resolve orchestrator boundary group: %w", err)
-		}
-		gid, err := strconv.Atoi(group.Gid)
-		if err != nil || prepareOrchestratorWorkspace(workspace, gid) != nil {
-			return nil, fmt.Errorf("prepare orchestrator reviewer boundary")
-		}
-	} else if err := os.MkdirAll(workspace, 0o750); err != nil {
-		return nil, fmt.Errorf("prepare orchestrator workspace: %w", err)
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil || orchestratorWorkspacePrepare(workspace, gid) != nil {
+		return nil, fmt.Errorf("prepare orchestrator reviewer boundary")
 	}
 	return agent, nil
 }
@@ -93,8 +91,10 @@ func prepareOrchestratorWorkspace(path string, gid int) error {
 	if err != nil || !os.SameFile(listed, opened) {
 		return fmt.Errorf("orchestrator workspace changed while opening")
 	}
-	if err := dir.Chown(-1, gid); err != nil {
-		return err
+	if fileGID(opened) != gid {
+		if err := dir.Chown(-1, gid); err != nil {
+			return err
+		}
 	}
 	if err := dir.Chmod(os.ModeSetgid | 0o750); err != nil {
 		return err
@@ -108,8 +108,5 @@ func prepareOrchestratorWorkspace(path string, gid int) error {
 
 func orchestratorBoundaryCommand() []string {
 	binary, _ := os.Executable()
-	if !hostIsolationInstalled() {
-		return []string{binary, "agent-host", "orchestrator"}
-	}
 	return []string{"sudo", "-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "orchestrator"}
 }

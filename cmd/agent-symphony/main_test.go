@@ -815,10 +815,12 @@ func TestWorkerCaptureInternalCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmux := filepath.Join(dir, "tmux")
-	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; *) exit 2;; esac\n"), 0o700); err != nil {
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; wait-for) printf %s \"$3\" >\"$FAKE_SIGNAL\";; *) exit 2;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("FAKE_PROMPT", prompt)
+	signalPath := filepath.Join(dir, "launch-signal")
+	t.Setenv("FAKE_SIGNAL", signalPath)
 	t.Setenv("TMPDIR", filepath.Join(dir, "inaccessible"))
 	resultPath := filepath.Join(dir, "attempt.result.json")
 	result := `{"type":"agent-symphony-result-v1","validation":"ok","documentation":"none"}`
@@ -837,6 +839,17 @@ func TestWorkerCaptureInternalCLI(t *testing.T) {
 	}
 	if got, err := os.ReadFile(resultPath); err != nil || string(got) != replacement {
 		t.Fatalf("replacement result=%q err=%v", got, err)
+	}
+	launchedPath := filepath.Join(dir, "handoff.launched")
+	code = run([]string{"worker-capture-handoff", tmux, "prompt-buffer", resultPath, launchedPath, "recipient", "signal-name", "--", "sh", "-c", `printf %s "$1"`, "consumer", result}, &stdout, &stderr)
+	if code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("handoff code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if got, err := os.ReadFile(launchedPath); err != nil || string(got) != "recipient" {
+		t.Fatalf("launch marker=%q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(signalPath); err != nil || string(got) != "signal-name" {
+		t.Fatalf("launch signal=%q err=%v", got, err)
 	}
 }
 

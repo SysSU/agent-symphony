@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,6 +21,28 @@ import (
 type orchestratorTestRunner struct {
 	live bool
 	pane string
+}
+
+func fakeAdvancedOrchestratorHost(t *testing.T) int {
+	t.Helper()
+	snapshotRoot := t.TempDir()
+	info, err := os.Stat(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid := fileGID(info)
+	oldUser, oldGroup, oldSnapshotRoot := hostLookupUser, hostLookupGroup, reviewSnapshotRoot
+	hostLookupUser = func(name string) (*user.User, error) {
+		return &user.User{Username: name, Uid: strconv.Itoa(os.Geteuid()), Gid: strconv.Itoa(gid)}, nil
+	}
+	hostLookupGroup = func(name string) (*user.Group, error) {
+		return &user.Group{Name: name, Gid: strconv.Itoa(gid)}, nil
+	}
+	reviewSnapshotRoot = snapshotRoot
+	t.Cleanup(func() {
+		hostLookupUser, hostLookupGroup, reviewSnapshotRoot = oldUser, oldGroup, oldSnapshotRoot
+	})
+	return gid
 }
 
 func (r *orchestratorTestRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
@@ -43,6 +66,10 @@ func (r *orchestratorTestRunner) Run(_ context.Context, command agentruntime.Com
 }
 
 func TestConfiguredReadOnlyOrchestratorProposesThroughCapturedOutput(t *testing.T) {
+	fakeAdvancedOrchestratorHost(t)
+	oldPrepare := orchestratorWorkspacePrepare
+	orchestratorWorkspacePrepare = func(path string, _ int) error { return os.MkdirAll(path, 0o750) }
+	t.Cleanup(func() { orchestratorWorkspacePrepare = oldPrepare })
 	cfg := config.Default("SysSU/example")
 	cfg.Commands.Orchestrator = []string{"codex", "--sandbox", "read-only", "--ask-for-approval", "never", "--no-alt-screen"}
 	stateRoot := t.TempDir()
@@ -103,26 +130,44 @@ func TestConfiguredReadOnlyOrchestratorProposesThroughCapturedOutput(t *testing.
 	}
 }
 
+func TestConfiguredOrchestratorRejectsCoordinatorIdentityAndTmux(t *testing.T) {
+	fakeNoHostIsolation(t)
+	stateRoot := t.TempDir()
+	coordinatorHome := t.TempDir()
+	t.Setenv("HOME", coordinatorHome)
+	t.Setenv("GH_TOKEN", "coordinator-canary")
+	t.Setenv("TMUX", "/private/coordinator-tmux-canary")
+	cfg := config.Default("SysSU/example")
+	cfg.Commands.Orchestrator = []string{"operator-agent"}
+	if _, err := newOrchestratorAgent(cfg, stateRoot); err == nil || !strings.Contains(err.Error(), "requires host isolation") {
+		t.Fatalf("configured same-identity orchestrator was accepted: %v", err)
+	}
+
+	root := filepath.Join(stateRoot, "snapshots")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
+	called := false
+	oldRun := hostOrchestratorRun
+	hostOrchestratorRun = func(context.Context, agentruntime.Command) error { called = true; return nil }
+	t.Cleanup(func() { hostOrchestratorRun = oldRun })
+	if err := agentHost(t.Context(), "orchestrator", strings.NewReader(""), &bytes.Buffer{}); err == nil || called {
+		t.Fatalf("local orchestrator reached coordinator credentials or tmux: called=%v err=%v", called, err)
+	}
+}
+
 func TestAdvancedOrchestratorLaunchContractUsesSnapshotGroup(t *testing.T) {
-	snapshotRoot := t.TempDir()
-	gid := os.Getegid()
-	oldUser, oldGroup, oldSnapshotRoot := hostLookupUser, hostLookupGroup, reviewSnapshotRoot
-	hostLookupUser = func(name string) (*user.User, error) {
-		return &user.User{Username: name, Uid: strconv.Itoa(os.Geteuid()), Gid: strconv.Itoa(gid)}, nil
-	}
-	hostLookupGroup = func(name string) (*user.Group, error) {
-		return &user.Group{Name: name, Gid: strconv.Itoa(gid)}, nil
-	}
-	reviewSnapshotRoot = snapshotRoot
-	t.Cleanup(func() {
-		hostLookupUser, hostLookupGroup, reviewSnapshotRoot = oldUser, oldGroup, oldSnapshotRoot
-	})
+	gid := fakeAdvancedOrchestratorHost(t)
 
 	cfg := config.Default("SysSU/example")
 	cfg.Commands.Orchestrator = []string{"operator-agent", "--read-only"}
 	agent, err := newOrchestratorAgent(cfg, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !slices.Equal(agent.Launcher[:6], []string{"sudo", "-n", "-u", reviewerUser, "-g", snapshotGroup}) {
+		t.Fatalf("orchestrator was not pinned to the reviewer identity: %#v", agent.Launcher)
 	}
 	agent.Runner = &orchestratorTestRunner{}
 	if _, err := agent.Observe(context.Background(), nil); err != nil {
