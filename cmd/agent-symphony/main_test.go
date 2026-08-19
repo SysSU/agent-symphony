@@ -240,6 +240,34 @@ func TestOperatorMessageTargetValidationRejectsStaleAndTerminalAttempts(t *testi
 	}
 }
 
+func TestOperatorMessageAcceptanceBindingRejectsRemoteRaces(t *testing.T) {
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "message"}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 131, Attempt: 3, DispatchAuthorized: true}
+	remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, PR: 7, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", State: "review-ready"}
+	expected, err := operatorMessageBinding(proposal, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{remote})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matchesOperatorMessageBinding(proposal, expected, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{remote}) {
+		t.Fatal("unchanged remote binding was rejected at delivery acceptance")
+	}
+	for name, mutate := range map[string]func(*internalgithub.RecoveryAttemptFact){
+		"force-pushed head": func(fact *internalgithub.RecoveryAttemptFact) { fact.HeadSHA = "ccccccc" },
+		"rebound base":      func(fact *internalgithub.RecoveryAttemptFact) { fact.BaseSHA = "ddddddd" },
+		"closed pull request": func(fact *internalgithub.RecoveryAttemptFact) {
+			fact.State = "blocked"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			current := remote
+			mutate(&current)
+			if matchesOperatorMessageBinding(proposal, expected, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{current}) {
+				t.Fatal("changed remote binding remained eligible at delivery acceptance")
+			}
+		})
+	}
+}
+
 func TestOperatorMessageConfirmationVerifiesThroughImplementationBoundary(t *testing.T) {
 	stateRoot := t.TempDir()
 	snapshotRoot := filepath.Join(t.TempDir(), "snapshots")
@@ -314,7 +342,9 @@ func TestClaimedOperatorMessageDoesNotInterruptCompetingHandoff(t *testing.T) {
 		return issues, remote, current, discoverErr
 	}
 	boundary := &crashingHandoffBoundary{direct: directHandoffBoundary{root: runtimeState.Root}, before: 1}
-	if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal) (bool, error) { return true, nil }); err == nil || !strings.Contains(err.Error(), "after resume") {
+	if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
+		return true, nil
+	}); err == nil || !strings.Contains(err.Error(), "after resume") {
 		t.Fatalf("missing injected restart: %v", err)
 	}
 	recovered, err := internalgithub.FetchOperatorMessages(t.Context(), api, cfg, attempt.Issue)
@@ -353,7 +383,9 @@ func TestClaimedOperatorMessageDoesNotInterruptCompetingHandoff(t *testing.T) {
 	}
 	messages[key] = recovered
 	calls := boundary.calls
-	if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal) (bool, error) { return true, nil }); err != nil {
+	if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
+		return true, nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if boundary.calls != calls || respawns != 1 || messages[key][0].State != "claimed" || runner.dead {
@@ -405,7 +437,9 @@ func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.
 			}
 			t.Cleanup(func() { hostExecRunner = oldExec })
 
-			if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal) (bool, error) { return true, nil }); err == nil {
+			if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
+				return true, nil
+			}); err == nil {
 				t.Fatal("injected crash did not stop delivery")
 			}
 			recovered, err := internalgithub.FetchOperatorMessages(t.Context(), api, cfg, attempt.Issue)
@@ -419,7 +453,9 @@ func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.
 			}
 			if stage == "after resume" {
 				calls := boundary.calls
-				if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal) (bool, error) { return true, nil }); err != nil {
+				if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
+					return true, nil
+				}); err != nil {
 					t.Fatal(err)
 				}
 				if boundary.calls != calls || respawns != 0 || messages[key][0].State != "claimed" {
@@ -434,7 +470,9 @@ func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.
 					t.Fatalf("completed transition=%#v err=%v", current, err)
 				}
 			}
-			if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal) (bool, error) { return true, nil }); err != nil {
+			if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
+				return true, nil
+			}); err != nil {
 				t.Fatal(err)
 			}
 			delivered, err := internalgithub.FetchOperatorMessages(t.Context(), api, cfg, attempt.Issue)
@@ -442,7 +480,9 @@ func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.
 				t.Fatalf("durable delivery=%#v err=%v", delivered, err)
 			}
 			messages[key] = delivered
-			if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal) (bool, error) { return true, nil }); err != nil {
+			if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
+				return true, nil
+			}); err != nil {
 				t.Fatal(err)
 			}
 			if respawns != 1 || store.outcomePosts != 1 {
@@ -614,11 +654,11 @@ func TestOperatorMessageTerminalStateWinsAtAcceptanceBoundary(t *testing.T) {
 		return []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{active}, current, discoverErr
 	}
 	acceptances := 0
-	accept := func(_ context.Context, proposal orchestratoragent.MessageProposal) (bool, error) {
+	accept := func(_ context.Context, proposal orchestratoragent.MessageProposal, expected operatorAttemptBinding) (bool, error) {
 		acceptances++
 		terminal := active
 		terminal.State = "completed"
-		return validateOperatorMessageAuthority(proposal, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{terminal}) == nil, nil
+		return matchesOperatorMessageBinding(proposal, expected, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{terminal}), nil
 	}
 	boundary := &refusingHandoffBoundary{}
 	check := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -106,6 +107,85 @@ func TestMessageProposalIsExactBoundedAndConsumable(t *testing.T) {
 	agent.Runner.(*fakeRunner).pane = MessageProposalPrefix + base64.StdEncoding.EncodeToString(body) + "\n"
 	if _, err := agent.MessageProposal(t.Context()); err == nil {
 		t.Fatal("oversized message proposal accepted")
+	}
+}
+
+func TestMaximumMessageProposalSurvivesNarrowTmuxPane(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	root := t.TempDir()
+	socketRoot := filepath.Join(root, "tmux")
+	if err := os.Mkdir(socketRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"HOME=" + os.Getenv("HOME"), "PATH=/usr/local/bin:/usr/bin:/bin", "SHELL=/bin/sh", "TERM=screen", "TMUX_TMPDIR=" + socketRoot}
+	repository := "SysSU/narrow-frame-" + digestText(root)[:8]
+	message := strings.Repeat(`"`, 8192)
+	body, _ := json.Marshal(MessageProposal{Version: 1, Repository: repository, Issue: 131, Attempt: 3, Message: message})
+	frame := MessageProposalPrefix + base64.StdEncoding.EncodeToString(body)
+	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	trigger, framePath, scriptPath := filepath.Join(workspace, "emit"), filepath.Join(workspace, "frame"), filepath.Join(workspace, "emit-frame")
+	if err := os.WriteFile(framePath, append([]byte(frame), '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nwhile [ ! -f emit ]; do /bin/sleep 0.01; done\n/bin/cat frame\n/bin/sleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 19, 1, 2, 3, 0, time.UTC)
+	agent := &Supervisor{
+		Root:            filepath.Join(root, "state"),
+		Workspace:       workspace,
+		Repository:      repository,
+		ProposalCommand: []string{"agent-symphony", "agent-host", "orchestrator-proposal"},
+		Env:             env,
+		Now:             func() time.Time { return now },
+	}
+	runTmux := func(args ...string) ([]byte, error) {
+		command := exec.Command("tmux", args...)
+		command.Env = env
+		return command.CombinedOutput()
+	}
+	session := Session(agent.Repository)
+	startArgs := []string{"new-session", "-d", "-x", "2", "-y", "24", "-s", session, "-c", workspace}
+	if output, err := runTmux(startArgs...); err != nil {
+		t.Skipf("tmux cannot start in this environment: %v: %s", err, output)
+	}
+	t.Cleanup(func() { _, _ = runTmux("kill-session", "-t", "="+session) })
+	if output, err := runTmux("set-option", "-w", "-t", session+":0", "history-limit", historyLimit); err != nil {
+		if strings.Contains(string(output), "No such file or directory") {
+			t.Skipf("tmux child processes cannot stay live in this environment: %v: %s", err, output)
+		}
+		t.Fatalf("set tmux history: %v: %s", err, output)
+	}
+	if output, err := runTmux("respawn-pane", "-k", "-t", "="+session+":0.0", "--", scriptPath); err != nil {
+		t.Fatalf("start tmux frame emitter: %v: %s", err, output)
+	}
+	if err := os.MkdirAll(agent.Root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.writeState(persisted{Version: stateVersion, Repository: repository, Session: session, State: "running", UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trigger, []byte("emit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		proposal, err := agent.MessageProposal(t.Context())
+		if err == nil {
+			if proposal.Message != message {
+				t.Fatal("maximum proposal changed while wrapped in tmux history")
+			}
+			break
+		}
+		if !errors.Is(err, ErrNoMessageProposal) || time.Now().After(deadline) {
+			t.Fatalf("maximum proposal was lost in narrow tmux history: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

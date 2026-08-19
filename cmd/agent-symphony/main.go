@@ -643,11 +643,52 @@ func validateOperatorMessageAuthority(proposal orchestratoragent.MessageProposal
 		return errors.New("operator message target conflicts with the issue's active attempt binding")
 	}
 	if slices.ContainsFunc(remote, func(fact internalgithub.RecoveryAttemptFact) bool {
-		return fact.Repository == proposal.Repository && fact.Issue == proposal.Issue && fact.Attempt == proposal.Attempt && fact.State == "completed"
+		return fact.Repository == proposal.Repository && fact.Issue == proposal.Issue && fact.Attempt == proposal.Attempt && !slices.Contains([]string{"active", "review-ready"}, fact.State)
 	}) {
-		return errors.New("operator message target attempt is terminal")
+		return errors.New("operator message target attempt is not active")
 	}
 	return nil
+}
+
+type operatorAttemptBinding struct {
+	Repository       string
+	Issue, Attempt   int
+	PR               int
+	BaseSHA, HeadSHA string
+}
+
+func operatorMessageBinding(proposal orchestratoragent.MessageProposal, issues []internalgithub.RecoveryIssueFact, remote []internalgithub.RecoveryAttemptFact) (operatorAttemptBinding, error) {
+	if err := validateOperatorMessageAuthority(proposal, issues, remote); err != nil {
+		return operatorAttemptBinding{}, err
+	}
+	issue := issues[slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
+		return issue.Repository == proposal.Repository && issue.Issue == proposal.Issue
+	})]
+	matches := make([]internalgithub.RecoveryAttemptFact, 0, 1)
+	for _, fact := range remote {
+		if fact.Repository == proposal.Repository && fact.Issue == proposal.Issue && fact.Attempt == proposal.Attempt {
+			matches = append(matches, fact)
+		}
+	}
+	if len(matches) > 1 {
+		return operatorAttemptBinding{}, errors.New("operator message target has ambiguous remote bindings")
+	}
+	if len(matches) == 1 {
+		fact := matches[0]
+		if fact.BaseSHA == "" || fact.PR > 0 && fact.HeadSHA == "" || issue.ActiveAttempt != nil && issue.ActiveAttempt.BaseSHA != fact.BaseSHA {
+			return operatorAttemptBinding{}, errors.New("operator message target has an incomplete or conflicting remote binding")
+		}
+		return operatorAttemptBinding{fact.Repository, fact.Issue, fact.Attempt, fact.PR, fact.BaseSHA, fact.HeadSHA}, nil
+	}
+	if binding := issue.ActiveAttempt; binding != nil && binding.Repository == proposal.Repository && binding.Issue == proposal.Issue && binding.Attempt == proposal.Attempt && binding.BaseSHA != "" && slices.Contains([]string{"active", "review-ready"}, binding.State) {
+		return operatorAttemptBinding{binding.Repository, binding.Issue, binding.Attempt, binding.PR, binding.BaseSHA, binding.HeadSHA}, nil
+	}
+	return operatorAttemptBinding{}, errors.New("operator message target has no exact active binding")
+}
+
+func matchesOperatorMessageBinding(proposal orchestratoragent.MessageProposal, expected operatorAttemptBinding, issues []internalgithub.RecoveryIssueFact, remote []internalgithub.RecoveryAttemptFact) bool {
+	current, err := operatorMessageBinding(proposal, issues, remote)
+	return err == nil && current == expected
 }
 
 func githubPRConfig(c config.Config, actorID int) internalgithub.PRAdapterConfig {
@@ -867,7 +908,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		currentManifests, err := r.Discover()
 		return currentIssues, attempts, currentManifests, err
 	}
-	acceptOperatorTarget := func(ctx context.Context, proposal orchestratoragent.MessageProposal) (bool, error) {
+	acceptOperatorTarget := func(ctx context.Context, proposal orchestratoragent.MessageProposal, expected operatorAttemptBinding) (bool, error) {
 		attempts, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
 		if err != nil {
 			return false, err
@@ -876,7 +917,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		if err != nil {
 			return false, err
 		}
-		return validateOperatorMessageAuthority(proposal, currentIssues, attempts) == nil, nil
+		return matchesOperatorMessageBinding(proposal, expected, currentIssues, attempts), nil
 	}
 	if err := resumeOperatorMessages(ctx, api, prConfig, &r, boundary, freshIssues, freshRemote, refreshedManifests, operatorMessages, c.Commands.Implementation, operatorCheck, refreshOperatorTarget, acceptOperatorTarget); err != nil {
 		attachOperatorMessageStatuses(statuses, operatorMessages)
@@ -2072,7 +2113,7 @@ func attachOperatorMessageStatuses(statuses []orchestrator.RecoveryStatus, messa
 }
 
 type operatorTargetRefresh func(context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error)
-type operatorAcceptanceCheck func(context.Context, orchestratoragent.MessageProposal) (bool, error)
+type operatorAcceptanceCheck func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error)
 
 func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, runtimeState *agentruntime.Runtime, boundary boundaryCaller, issues []internalgithub.RecoveryIssueFact, remote []internalgithub.RecoveryAttemptFact, manifests []agentruntime.Manifest, messages map[string][]internalgithub.OperatorMessage, command []string, check orchestrator.RuntimeCheck, refresh operatorTargetRefresh, accept operatorAcceptanceCheck) error {
 	if len(command) == 0 {
@@ -2185,6 +2226,13 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 				}
 				continue
 			}
+			expectedBinding, err := operatorMessageBinding(proposal, currentIssues, currentRemote)
+			if err != nil {
+				if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "attempt became terminal or lost exact ownership before delivery"); err != nil {
+					return err
+				}
+				continue
+			}
 			manifestIndex = slices.IndexFunc(currentManifests, func(candidate agentruntime.Manifest) bool {
 				return candidate.Repository == message.Repository && candidate.Issue == message.Issue && candidate.Attempt == message.Attempt
 			})
@@ -2197,7 +2245,7 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 			var authorized bool
 			var acceptanceErr error
 			resumed, err := runtimeState.ResumeHandoff(ctx, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Eligible: func() bool {
-				authorized, acceptanceErr = accept(ctx, proposal)
+				authorized, acceptanceErr = accept(ctx, proposal, expectedBinding)
 				return acceptanceErr == nil && authorized
 			}})
 			if acceptanceErr != nil {
