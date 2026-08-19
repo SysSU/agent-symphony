@@ -8,6 +8,7 @@ const proposal = {
   message: "Run the focused race test.",
   binding: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 };
+const confirmationNonce = "browser-bound-confirmation-nonce";
 
 const attempt = {
   repository: proposal.repository,
@@ -28,7 +29,7 @@ async function mockDashboard(page) {
   const requests = [];
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: true, state: "running", session: "orchestrator" } }));
   await page.route("**/orchestrator/proposal.json", (route) => currentProposal
-    ? route.fulfill({ json: currentProposal })
+    ? route.fulfill({ json: currentProposal, headers: { "X-Agent-Symphony-Confirmation-Nonce": confirmationNonce } })
     : route.fulfill({ status: 204 }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
   await page.route("**/status.json", (route) => {
@@ -38,7 +39,7 @@ async function mockDashboard(page) {
     const action = route.request().url().split("message-").pop();
     actions.push(action);
     const body = route.request().postDataJSON();
-    requests.push({ action, body });
+    requests.push({ action, body, nonce: route.request().headers()["x-agent-symphony-confirmation-nonce"] });
     if (JSON.stringify(body) !== JSON.stringify(currentProposal)) {
       await route.fulfill({ status: 409, body: "orchestrator message proposal changed before confirmation\n" });
       return;
@@ -72,7 +73,7 @@ test("announces and focuses a proposal, confirms it, and refreshes delivery", as
   await page.keyboard.press("Enter");
   await expect(page.getByRole("status").filter({ hasText: "Queued the confirmed message" })).toBeVisible();
   expect(dashboard.actions).toEqual(["confirm"]);
-  expect(dashboard.requests).toEqual([{ action: "confirm", body: proposal }]);
+  expect(dashboard.requests).toEqual([{ action: "confirm", body: proposal, nonce: confirmationNonce }]);
 
   await expect(page.locator(".messageStatus .state-delivered")).toBeVisible({ timeout: 6500 });
 });
@@ -92,6 +93,7 @@ test("cancels a proposal and keeps the confirmation inside a mobile viewport", a
   await expect(page.getByRole("status").filter({ hasText: "Cancelled the orchestrator message proposal" })).toBeVisible();
   await expect(confirmation).toBeHidden();
   expect(dashboard.actions).toEqual(["cancel"]);
+  expect(dashboard.requests).toEqual([{ action: "cancel", body: proposal, nonce: confirmationNonce }]);
 });
 
 test("keeps the reviewed proposal visible when its binding changes before confirmation", async ({ page }) => {
@@ -106,5 +108,5 @@ test("keeps the reviewed proposal visible when its binding changes before confir
   await expect(page.getByRole("status").filter({ hasText: "orchestrator message proposal changed before confirmation" })).toBeVisible();
   await expect(confirmation).toBeVisible();
   await expect(page.locator(".messageStatus .state-queued")).toBeVisible();
-  expect(dashboard.requests).toEqual([{ action: "confirm", body: proposal }]);
+  expect(dashboard.requests).toEqual([{ action: "confirm", body: proposal, nonce: confirmationNonce }]);
 });

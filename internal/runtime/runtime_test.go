@@ -434,7 +434,7 @@ printf '%s\n%s\n' "$6" "$6" >&2
 printf %s "$6"`
 	workspaceLink := filepath.Join(workspace, ".agent-symphony-result.json")
 	var diagnostics strings.Builder
-	code, err := captureWorker(t.Context(), tmux, "prompt-buffer", resultPath, []string{"sh", "-c", consumer, "consumer", "line one\nline two", deleted, tempDir, canary, workspaceLink, result}, io.Discard, &diagnostics, tempDir)
+	code, err := captureWorker(t.Context(), tmux, "prompt-buffer", resultPath, []string{"sh", "-c", consumer, "consumer", "line one\nline two", deleted, tempDir, canary, workspaceLink, result}, io.Discard, &diagnostics, tempDir, false)
 	if err != nil || code != 0 {
 		t.Fatalf("fast stdin consumer: code=%d err=%v diagnostics=%s", code, err, diagnostics.String())
 	}
@@ -462,7 +462,7 @@ printf %s "$6"`
 	if err := os.Symlink(canary, attackedResult); err != nil {
 		t.Fatal(err)
 	}
-	if code, err := captureWorker(t.Context(), tmux, "prompt-buffer", attackedResult, []string{"sh", "-c", `printf replaced`}, io.Discard, io.Discard, tempDir); err == nil || code == 0 {
+	if code, err := captureWorker(t.Context(), tmux, "prompt-buffer", attackedResult, []string{"sh", "-c", `printf replaced`}, io.Discard, io.Discard, tempDir, false); err == nil || code == 0 {
 		t.Fatalf("result symlink was accepted: code=%d err=%v", code, err)
 	}
 	if got, err := os.ReadFile(canary); err != nil || string(got) != "unchanged" {
@@ -470,7 +470,7 @@ printf %s "$6"`
 	}
 
 	var reviewerOut strings.Builder
-	code, err = captureWorker(t.Context(), tmux, "prompt-buffer", "", []string{"sh", "-c", `test "$TMPDIR" = /tmp && test "$(cat)" = "$1" && printf reviewer`, "reviewer", "line one\nline two"}, &reviewerOut, io.Discard, tempDir)
+	code, err = captureWorker(t.Context(), tmux, "prompt-buffer", "", []string{"sh", "-c", `test "$TMPDIR" = /tmp && test "$(cat)" = "$1" && printf reviewer`, "reviewer", "line one\nline two"}, &reviewerOut, io.Discard, tempDir, false)
 	if err != nil || code != 0 || reviewerOut.String() != "reviewer" {
 		t.Fatalf("reviewer capture: code=%d output=%q err=%v", code, reviewerOut.String(), err)
 	}
@@ -490,7 +490,7 @@ func TestPromptCommandBoundsStdoutAndPreservesExitStatus(t *testing.T) {
 	t.Setenv("FAKE_PROMPT", prompt)
 	run := func(resultPath string, command []string) (int, error) {
 		t.Helper()
-		return captureWorker(t.Context(), tmux, "prompt-buffer", resultPath, command, io.Discard, io.Discard, dir)
+		return captureWorker(t.Context(), tmux, "prompt-buffer", resultPath, command, io.Discard, io.Discard, dir, false)
 	}
 
 	exitResult := filepath.Join(dir, "exit.result.json")
@@ -554,7 +554,7 @@ func TestCaptureWorkerCancellationKillsAndReapsChildGroup(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			done := make(chan error, 1)
 			go func() {
-				_, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, []string{"sh", "-c", `trap '' INT TERM; sleep 30 & echo $! >"$1"; wait`, "consumer", pidPath}, io.Discard, io.Discard, dir)
+				_, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, []string{"sh", "-c", `trap '' INT TERM; sleep 30 & echo $! >"$1"; wait`, "consumer", pidPath}, io.Discard, io.Discard, dir, false)
 				done <- err
 			}()
 			var pid int
@@ -631,7 +631,7 @@ func TestCaptureWorkerCompletionTerminatesLateDescendants(t *testing.T) {
 			defer devNull.Close()
 			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 			defer cancel()
-			code, captureErr := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir)
+			code, captureErr := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir, false)
 			configuredBody, err := os.ReadFile(identityBase + ".configured")
 			if err != nil {
 				t.Fatal(err)
@@ -779,7 +779,7 @@ func TestCaptureWorkerEscapedStdoutFailsPromptly(t *testing.T) {
 				done := make(chan outcome, 1)
 				started := time.Now()
 				go func() {
-					code, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir)
+					code, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir, false)
 					done <- outcome{code: code, err: err}
 				}()
 				var pid int
@@ -842,7 +842,7 @@ func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
 	}
 	marker := filepath.Join(dir, "consumer-ran")
 	resultPath := filepath.Join(dir, "attempt.result.json")
-	if _, err := captureWorker(t.Context(), tmux, "missing-buffer", resultPath, []string{"sh", "-c", `touch "$1"`, "consumer", marker}, io.Discard, io.Discard, dir); err == nil {
+	if _, err := captureWorker(t.Context(), tmux, "missing-buffer", resultPath, []string{"sh", "-c", `touch "$1"`, "consumer", marker}, io.Discard, io.Discard, dir, false); err == nil {
 		t.Fatal("buffer read failure was masked")
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {

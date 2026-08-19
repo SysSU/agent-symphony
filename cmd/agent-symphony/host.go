@@ -1386,21 +1386,16 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 	if !belowRoot(resultPath, root) {
 		return "", errors.New("handoff result path escapes provisioned root")
 	}
-	if info, err := os.Lstat(resultPath); err == nil {
-		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return "", errors.New("handoff result is not a regular non-symlink file")
-		}
-		if err := os.Remove(resultPath); err != nil {
-			return "", err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	if info, err := os.Lstat(resultPath); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
+		return "", errors.New("handoff result is not a regular non-symlink file")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
 	helper, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	command := agentruntime.PromptCommand(helper, "tmux", buffer, resultPath, request.Command)
+	command := agentruntime.ReplacementPromptCommand(helper, "tmux", buffer, resultPath, request.Command)
 	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony handoff in the current worktree. It may contain review feedback or one confirmed operator message. Current source refs are available under refs/remotes/agent-symphony/. Do not push or use GitHub credentials; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", request.Handoff)
 	commands := []agentruntime.Command{
 		{Name: "tmux", Args: []string{"load-buffer", "-b", buffer, "-"}, Dir: request.Manifest.Worktree, Stdin: bytes.NewReader(prompt)},

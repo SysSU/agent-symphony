@@ -9,3 +9,24 @@ export async function postWithReconciliationRetry(url, onRetry = () => new Promi
   } while (response.status === 503);
   return response;
 }
+
+export async function getOrchestratorStatus() {
+  try {
+    const response = await fetch("/orchestrator.json", { cache: "no-store" });
+    if (response.ok) return { status: await response.json(), error: "" };
+    return { status: null, error: (await response.text()).trim() || `Orchestrator status failed (${response.status})` };
+  } catch {
+    return { status: null, error: "Orchestrator status is unavailable" };
+  }
+}
+
+export async function getMessageProposal() {
+  try {
+    const response = await fetch("/orchestrator/proposal.json", { cache: "no-store" });
+    if (response.status === 204) return { proposal: null, error: "" };
+    if (!response.ok) return { proposal: null, error: (await response.text()).trim() || `Message proposal failed (${response.status})` };
+    return { proposal: { ...await response.json(), confirmationNonce: response.headers.get("X-Agent-Symphony-Confirmation-Nonce") }, error: "" };
+  } catch {
+    return { proposal: null, error: "Message proposal is unavailable" };
+  }
+}

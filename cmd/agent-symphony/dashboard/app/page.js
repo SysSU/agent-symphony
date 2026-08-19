@@ -4,24 +4,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { OrchestratorCard, StatusCard } from "./_components/status-card";
 import ReconcileButton from "./_components/reconcile-button";
-import { postWithReconciliationRetry } from "./actions.mjs";
+import { getMessageProposal, getOrchestratorStatus, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
-import { overallHealth } from "./health.mjs";
-
-const refreshEvery = 5000;
-
-function relativeTime(value, now) {
-  const seconds = Math.max(0, Math.floor((now - new Date(value).getTime()) / 1000));
-  if (seconds < 5) return "just now";
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  return `${Math.floor(minutes / 60)}h ago`;
-}
-
-function attemptKey(status) {
-  return `${status.repository}#${status.issue}/${status.attempt}`;
-}
+import { attemptKey, overallHealth, relativeTime, statusViews } from "./health.mjs";
 
 export default function Dashboard() {
   const [snapshot, setSnapshot] = useState(null);
@@ -46,18 +31,8 @@ export default function Dashboard() {
     let active = true;
     async function refresh() {
       try {
-        const orchestratorRequest = fetch("/orchestrator.json", { cache: "no-store" })
-          .then(async (response) => response.ok
-            ? { status: await response.json(), error: "" }
-            : { status: null, error: (await response.text()).trim() || `Orchestrator status failed (${response.status})` })
-          .catch(() => ({ status: null, error: "Orchestrator status is unavailable" }));
-        const proposalRequest = fetch("/orchestrator/proposal.json", { cache: "no-store" })
-          .then(async (response) => response.status === 204
-            ? { proposal: null, error: "" }
-            : response.ok
-              ? { proposal: await response.json(), error: "" }
-              : { proposal: null, error: (await response.text()).trim() || `Message proposal failed (${response.status})` })
-          .catch(() => ({ proposal: null, error: "Message proposal is unavailable" }));
+        const orchestratorRequest = getOrchestratorStatus();
+        const proposalRequest = getMessageProposal();
         const [response, stateResponse, orchestratorResult, proposalResult] = await Promise.all([
           fetch("/status.json", { cache: "no-store" }),
           fetch("/dashboard-state.json", { cache: "no-store" }),
@@ -82,7 +57,7 @@ export default function Dashboard() {
       }
     }
     refresh();
-    const timer = setInterval(refresh, refreshEvery);
+    const timer = setInterval(refresh, 5000);
     return () => {
       active = false;
       clearInterval(timer);
@@ -154,13 +129,14 @@ export default function Dashboard() {
 
   const performMessageAction = useCallback(async (action) => {
     if (!messageProposal) return;
+    const { confirmationNonce, ...proposal } = messageProposal;
     setMessageBusy(action);
     setActionNotice("");
     try {
       const response = await postWithReconciliationRetry(
         `/actions/orchestrator/message-${action}`,
         undefined,
-        { headers: { "Content-Type": "application/json" }, body: JSON.stringify(messageProposal) },
+        { headers: { "Content-Type": "application/json", "X-Agent-Symphony-Confirmation-Nonce": confirmationNonce }, body: JSON.stringify(proposal) },
       );
       if (!response.ok) throw new Error((await response.text()).trim() || `Message ${action} failed (${response.status})`);
       setMessageProposal(null);
@@ -188,9 +164,7 @@ export default function Dashboard() {
     result[status.state] = (result[status.state] ?? 0) + 1;
     return result;
   }, {})).sort(([a], [b]) => a.localeCompare(b)), [statuses]);
-  const current = statuses.filter((status) => status.state !== "completed");
-  const completed = statuses.filter((status) => status.state === "completed");
-  const visible = tab === "completed" ? completed : current;
+  const { current, completed, visible } = statusViews(statuses, tab);
   const health = overallHealth(snapshot, error, statuses, now);
   const openAttemptTerminal = useCallback((status) => {
     const query = new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) });

@@ -221,6 +221,37 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
+func readDashboardPassword(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !privateDashboardPasswordFile(info) {
+		return "", errors.New("dashboard password file must be a private regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", errors.New("dashboard password file is unavailable")
+	}
+	opened, statErr := file.Stat()
+	body, readErr := io.ReadAll(io.LimitReader(file, 4097))
+	final, finalStatErr := file.Stat()
+	closeErr := file.Close()
+	if statErr != nil || finalStatErr != nil || !privateDashboardPasswordFile(opened) || !privateDashboardPasswordFile(final) || !os.SameFile(info, opened) || !os.SameFile(opened, final) || opened.Size() != final.Size() || !opened.ModTime().Equal(final.ModTime()) || readErr != nil || closeErr != nil || len(body) > 4096 {
+		return "", errors.New("dashboard password file changed while reading")
+	}
+	password := strings.TrimSuffix(strings.TrimSuffix(string(body), "\n"), "\r")
+	if password == "" || strings.ContainsAny(password, "\r\n") {
+		return "", errors.New("dashboard password file must contain one nonempty line")
+	}
+	return password, nil
+}
+
+func privateDashboardPasswordFile(info os.FileInfo) bool {
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return !ok || int(stat.Uid) == os.Geteuid()
+}
+
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == "--version" {
 		fmt.Fprintln(stdout, strings.TrimPrefix(releaseMetadata, "agent-symphony-release-version:"))
@@ -231,13 +262,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	command := args[0]
-	if command == "worker-capture" {
+	if command == "worker-capture" || command == "worker-capture-replace" {
 		if len(args) < 6 || args[4] != "--" {
 			return misuse(stderr, false, command, "invalid internal worker capture invocation")
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		code, err := agentruntime.CaptureWorker(ctx, args[1], args[2], args[3], args[5:], stdout, stderr)
+		capture := agentruntime.CaptureWorker
+		if command == "worker-capture-replace" {
+			capture = agentruntime.CaptureWorkerReplacingResult
+		}
+		code, err := capture(ctx, args[1], args[2], args[3], args[5:], stdout, stderr)
 		if err != nil {
 			fmt.Fprintln(stderr, "error: "+err.Error())
 		}
@@ -268,7 +303,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	interval := fs.Duration("interval", orchestrator.MaxReconcileInterval, "serve reconciliation interval (maximum 60s)")
 	dashboardAddress := fs.String("dashboard-address", "127.0.0.1:8080", "dashboard loopback listen address")
 	allowUnsafeDashboardNetwork := fs.Bool("allow-unsafe-dashboard-network", false, "allow password-protected dashboard access outside loopback")
-	dashboardPassword := fs.String("dashboard-password", "", "dashboard HTTP Basic authentication password")
+	dashboardPasswordFile := fs.String("dashboard-password-file", "", "coordinator-only file containing the dashboard HTTP Basic authentication password")
 	offline := fs.Bool("offline", false, "skip network diagnostics")
 	coordinator := fs.String("coordinator", "", "coordinator OS user")
 	if err := fs.Parse(flagArgs); err != nil {
@@ -299,8 +334,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if *interval <= 0 || *interval > orchestrator.MaxReconcileInterval {
 			return misuse(stderr, wantsJSON, command, "--interval must be greater than zero and no more than 60s")
 		}
-		if *allowUnsafeDashboardNetwork && *dashboardPassword == "" {
-			return misuse(stderr, wantsJSON, command, "--dashboard-password is required with --allow-unsafe-dashboard-network")
+		if *allowUnsafeDashboardNetwork && *dashboardPasswordFile == "" {
+			return misuse(stderr, wantsJSON, command, "--dashboard-password-file is required with --allow-unsafe-dashboard-network")
+		}
+		dashboardPassword := ""
+		if *dashboardPasswordFile != "" {
+			var passwordErr error
+			dashboardPassword, passwordErr = readDashboardPassword(*dashboardPasswordFile)
+			if passwordErr != nil {
+				return fail(stderr, *jsonOutput, command, passwordErr.Error())
+			}
 		}
 		c, err := config.Load(*path)
 		if err != nil {
@@ -356,7 +399,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		dashboardAgent := dashboardOrchestratorService{Service: agent, supervisor: agent, confirm: func(ctx context.Context, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
 			return confirmOperatorMessage(ctx, *path, *runtimeState, proposal)
 		}}
-		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, recoverAttempt, reconcile, dashboardAgent, *allowUnsafeDashboardNetwork, *dashboardPassword, stderr)
+		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, recoverAttempt, reconcile, dashboardAgent, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
@@ -2909,7 +2952,7 @@ options:
 	--interval duration  serve reconciliation interval (maximum 60s)
 	--dashboard-address address  dashboard listen address (serve only; loopback by default)
 	--allow-unsafe-dashboard-network  permit non-loopback dashboard binding (requires password)
-	--dashboard-password password  HTTP Basic password; username is agent-symphony
+	--dashboard-password-file path  coordinator-only HTTP Basic password file; username is agent-symphony
 	--offline     skip the GitHub probe in doctor or diagnostics
 	--coordinator user  coordinator OS user for install-host
 	--json        emit a versioned JSON envelope

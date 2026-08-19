@@ -127,10 +127,10 @@ agent-symphony serve \
   --runtime-state ~/.local/state/agent-symphony \
   --dashboard-address 0.0.0.0:8080 \
   --allow-unsafe-dashboard-network \
-  --dashboard-password "$AGENT_SYMPHONY_DASHBOARD_PASSWORD"
+  --dashboard-password-file ~/.config/agent-symphony/dashboard-password
 ```
 
-The HTTP Basic username is `agent-symphony`. This mode is deliberately named unsafe: HTTP does not encrypt the password or terminal traffic, the expanded password can be visible in process listings, and the dashboard has powerful local controls. Restrict the port with the host firewall and use a long, unique password. Use an encrypted VPN or tunnel instead on an untrusted network.
+Create the password file as the coordinator user with mode `0600`; it must contain one nonempty line. The HTTP Basic username is `agent-symphony`. This mode is deliberately named unsafe: HTTP does not encrypt the password or terminal traffic, and the dashboard has powerful local controls. Restrict the port with the host firewall and use a long, unique password. Use an encrypted VPN or tunnel instead on an untrusted network.
 
 ## Stop the daemon
 

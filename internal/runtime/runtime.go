@@ -237,6 +237,12 @@ func PromptCommand(helper, tmux, buffer, resultPath string, command []string) []
 	return append([]string{helper, "worker-capture", tmux, buffer, resultPath, "--"}, command...)
 }
 
+// ReplacementPromptCommand preserves an earlier result until the follow-up
+// worker has finished and can atomically replace it.
+func ReplacementPromptCommand(helper, tmux, buffer, resultPath string, command []string) []string {
+	return append([]string{helper, "worker-capture-replace", tmux, buffer, resultPath, "--"}, command...)
+}
+
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -151,7 +151,7 @@ func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
 }
 
 func TestDashboardUnsafeNetworkRequiresPassword(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "--dashboard-password is required") {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "dashboard password is required") {
 		t.Fatalf("unsafe dashboard without password error=%v", err)
 	}
 
@@ -333,30 +333,58 @@ func TestDashboardWorkerMessageRequiresAuthenticationAndExactConfirmationBinding
 	}
 
 	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, service, false, "password")
+	navigate := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/", nil)
+	navigate.Header.Set("Sec-Fetch-Mode", "navigate")
+	navigate.Header.Set("Sec-Fetch-Dest", "document")
+	navigate.SetBasicAuth("agent-symphony", "password")
+	navigation := httptest.NewRecorder()
+	handler.ServeHTTP(navigation, navigate)
+	cookies := navigation.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != dashboardSessionCookie || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("browser session cookies=%#v", cookies)
+	}
+	session := cookies[0]
 	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator/proposal.json", nil)
 	request.SetBasicAuth("agent-symphony", "password")
+	request.AddCookie(session)
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), proposal.Message) || !strings.Contains(response.Body.String(), proposal.Binding) {
+	nonce := response.Header().Get(dashboardNonceHeader)
+	if response.Code != http.StatusOK || nonce == "" || !strings.Contains(response.Body.String(), proposal.Message) || !strings.Contains(response.Body.String(), proposal.Binding) {
 		t.Fatalf("proposal status=%d body=%q", response.Code, response.Body.String())
 	}
 
-	post := func(submitted orchestratoragent.MessageProposal) *httptest.ResponseRecorder {
+	post := func(submitted orchestratoragent.MessageProposal, browser bool) *httptest.ResponseRecorder {
 		body, _ := json.Marshal(submitted)
 		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/orchestrator/message-confirm", bytes.NewReader(body))
 		request.Header.Set("Origin", "http://127.0.0.1")
 		request.Header.Set("Content-Type", "application/json")
 		request.SetBasicAuth("agent-symphony", "password")
+		if browser {
+			request.AddCookie(session)
+			request.Header.Set(dashboardNonceHeader, nonce)
+		} else {
+			request.AddCookie(&http.Cookie{Name: dashboardSessionCookie, Value: "forged-session"})
+			request.Header.Set(dashboardNonceHeader, "forged-nonce")
+		}
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
 		return response
 	}
+	if response := post(proposal, false); response.Code != http.StatusForbidden || service.confirms != 0 {
+		t.Fatalf("authenticated non-browser status=%d confirms=%d", response.Code, service.confirms)
+	}
 	changed := proposal
 	changed.Message = "Different bytes."
-	if response := post(changed); response.Code != http.StatusConflict || service.confirms != 0 {
+	if response := post(changed, true); response.Code != http.StatusConflict || service.confirms != 0 {
 		t.Fatalf("changed proposal status=%d confirms=%d", response.Code, service.confirms)
 	}
-	response = post(proposal)
+	service.proposal.Binding = "replacement-binding"
+	if response := post(service.proposal, true); response.Code != http.StatusForbidden || service.confirms != 0 {
+		t.Fatalf("nonce reused for replacement proposal status=%d confirms=%d", response.Code, service.confirms)
+	}
+	service.proposal = proposal
+	response = post(proposal, true)
 	if response.Code != http.StatusOK || service.confirms != 1 || service.consumes != 1 || strings.Contains(response.Body.String(), proposal.Message) {
 		t.Fatalf("confirmed status=%d confirms=%d consumes=%d body=%q", response.Code, service.confirms, service.consumes, response.Body.String())
 	}
@@ -619,11 +647,35 @@ func TestDashboardLoopbackRequestAcceptsTailscaleServeIdentity(t *testing.T) {
 	}
 }
 
-func TestServeUnsafeNetworkFlagRequiresPassword(t *testing.T) {
+func TestServeUnsafeNetworkFlagRequiresPasswordFile(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"serve", "--state", "pr-state.json", "--runtime-state", t.TempDir(), "--allow-unsafe-dashboard-network"}, &stdout, &stderr)
-	if code != 2 || !strings.Contains(stderr.String(), "--dashboard-password is required with --allow-unsafe-dashboard-network") {
+	if code != 2 || !strings.Contains(stderr.String(), "--dashboard-password-file is required with --allow-unsafe-dashboard-network") {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestDashboardPasswordLoadsOnlyFromPrivateCoordinatorFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dashboard-password")
+	if err := os.WriteFile(path, []byte("private-password\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if password, err := readDashboardPassword(path); err != nil || password != "private-password" {
+		t.Fatalf("password=%q err=%v", password, err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDashboardPassword(path); err == nil {
+		t.Fatal("world-readable dashboard password was accepted")
+	}
+	link := filepath.Join(dir, "dashboard-password-link")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDashboardPassword(link); err == nil {
+		t.Fatal("symlinked dashboard password was accepted")
 	}
 }
 

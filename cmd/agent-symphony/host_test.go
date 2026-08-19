@@ -386,7 +386,7 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if calls != 3 {
 			t.Fatalf("worker made %d tmux calls, want one lookup plus one two-step delivery", calls)
 		}
-		if !slices.Contains(submission.Args, "worker-capture") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
+		if !slices.Contains(submission.Args, "worker-capture-replace") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
 			t.Fatalf("handoff did not use the stdin capture helper: %#v", submission.Args)
 		}
 		if _, err := os.ReadFile(filepath.Join(worktree, ".agent-symphony", "handoffs", "pane-test.json")); err != nil {
@@ -598,6 +598,11 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 			if err := os.Mkdir(worktree, 0o700); err != nil {
 				t.Fatal(err)
 			}
+			resultPath := agentruntime.ResultPath(worktree)
+			previousResult := `{"type":"agent-symphony-result-v1","validation":"previous turn passed","documentation":"none"}`
+			if err := os.WriteFile(resultPath, []byte(previousResult), 0o600); err != nil {
+				t.Fatal(err)
+			}
 			handoff := []byte(`{"type":"agent-symphony-handoff-v1","key":"retry-key"}`)
 			request, _ := json.Marshal(struct {
 				Manifest     agentruntime.Manifest `json:"manifest"`
@@ -633,6 +638,9 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 			}
 			if _, err := acceptHandoff(t.Context(), request, root); err == nil {
 				t.Fatal("injected failure succeeded")
+			}
+			if retained, err := os.ReadFile(resultPath); err != nil || string(retained) != previousResult {
+				t.Fatalf("previous result was not retained across %s failure: %q err=%v", failure, retained, err)
 			}
 			if _, err := os.Stat(filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.json")); err != nil {
 				t.Fatalf("pending state lost: %v", err)

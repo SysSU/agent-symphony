@@ -141,7 +141,7 @@ func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
 	}
 	for _, want := range []string{
 		"install-host", "agent-host", "init", "validate", "config view", "serve", "status", "list", "inspect", "reconcile", "doctor", "diagnostics", "pr-governance", "help",
-		"--config", "--state", "--runtime-state", "--attempts", "--issue", "--interval", "--dashboard-address", "--allow-unsafe-dashboard-network", "--dashboard-password", "--offline", "--coordinator", "--json", "--help", "--version",
+		"--config", "--state", "--runtime-state", "--attempts", "--issue", "--interval", "--dashboard-address", "--allow-unsafe-dashboard-network", "--dashboard-password-file", "--offline", "--coordinator", "--json", "--help", "--version",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("help is missing %q", want)
@@ -829,6 +829,14 @@ func TestWorkerCaptureInternalCLI(t *testing.T) {
 	}
 	if got, err := os.ReadFile(resultPath); err != nil || string(got) != result {
 		t.Fatalf("result=%q err=%v", got, err)
+	}
+	replacement := `{"type":"agent-symphony-result-v1","validation":"follow-up passed","documentation":"none"}`
+	code = run([]string{"worker-capture-replace", tmux, "prompt-buffer", resultPath, "--", "sh", "-c", `printf %s "$1"`, "consumer", replacement}, &stdout, &stderr)
+	if code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("replacement code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if got, err := os.ReadFile(resultPath); err != nil || string(got) != replacement {
+		t.Fatalf("replacement result=%q err=%v", got, err)
 	}
 }
 
