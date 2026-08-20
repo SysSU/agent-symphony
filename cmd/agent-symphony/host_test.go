@@ -164,6 +164,33 @@ func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
 	}
 }
 
+func TestWorkerBoundaryAllowsOnlyExactAncestryCheck(t *testing.T) {
+	root := t.TempDir()
+	worktree := filepath.Join(root, "attempt")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base, head := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	command := func(args ...string) boundaryCommand {
+		return boundaryCommand{Name: "git", Args: append([]string{"-C", worktree}, args...)}
+	}
+	if err := validateBoundaryCommand(command("merge-base", "--is-ancestor", base, head), root); err != nil {
+		t.Fatalf("exact ancestry check rejected: %v", err)
+	}
+	for name, args := range map[string][]string{
+		"short object": {"merge-base", "--is-ancestor", "abcdef1", head},
+		"symbolic ref": {"merge-base", "--is-ancestor", base, "HEAD"},
+		"wrong mode":   {"merge-base", "--octopus", base, head},
+		"extra arg":    {"merge-base", "--is-ancestor", base, head, "extra"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateBoundaryCommand(command(args...), root); err == nil {
+				t.Fatal("broader ancestry command accepted")
+			}
+		})
+	}
+}
+
 func TestReviewerBoundaryAllowsOnlyExactOrchestratorTmuxLaunch(t *testing.T) {
 	fakeHostIdentity(t, 1234, 5678)
 	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner

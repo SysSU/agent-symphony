@@ -1118,6 +1118,7 @@ func validGitBoundaryArgs(args []string, dir, root string) bool {
 	return slices.Equal(rest, []string{"branch", "--show-current"}) ||
 		slices.Equal(rest, []string{"rev-parse", "HEAD"}) ||
 		(len(rest) == 4 && rest[0] == "fetch" && rest[1] == "--no-tags" && filepath.IsAbs(rest[2]) && strings.HasSuffix(rest[2], ".source.bundle") && boundedCommandPath(rest[2], dir, root) && rest[3] == "+refs/heads/*:refs/remotes/agent-symphony/*") ||
+		(len(rest) == 4 && rest[0] == "merge-base" && rest[1] == "--is-ancestor" && preflightObjectID.MatchString(rest[2]) && preflightObjectID.MatchString(rest[3])) ||
 		(len(rest) == 3 && rest[0] == "checkout" && rest[1] == "--detach") ||
 		(len(rest) == 3 && rest[0] == "switch" && rest[1] == "-c") ||
 		slices.Equal(rest, []string{"remote", "remove", "origin"}) ||
