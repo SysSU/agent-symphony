@@ -109,7 +109,7 @@ Commands produce plain human-readable text by default and never depend on color.
   "worktree_root": ".worktrees",
   "docs_paths": ["README.md", "docs"],
   "commands": {
-    "implementation": ["codex", "exec", "--sandbox", "workspace-write"],
+    "implementation": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"],
     "reviewer": ["codex", "exec", "--sandbox", "read-only", "-"],
     "orchestrator": ["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"],
     "environment_allowlist": ["LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"]
@@ -127,7 +127,7 @@ In zero-admin mode, the orchestrator runs as the coordinator user. The `danger-f
 
 The agent cannot replace coordinator workflow decisions. Its worker-message output remains the fixed proposal adapter's framed standard-output response; the authenticated dashboard requires explicit confirmation before the coordinator records or delivers it.
 
-Commands are argument arrays, not shell strings, so runtime code does not use shell interpolation. The default noninteractive Codex implementation command uses `workspace-write` for source edits.
+Commands are argument arrays, not shell strings, so runtime code does not use shell interpolation. The default noninteractive Codex implementation command uses `--dangerously-bypass-approvals-and-sandbox` so implementation and validation can use the worker host without Codex sandbox restrictions or approval prompts. Use advanced host isolation to confine that access to the unprivileged worker account.
 
 The boundary helper captures implementation or review stdout in an exclusively created private result file outside the worktree or snapshot; stderr remains in tmux for diagnostics. An implementation must return one `agent-symphony-result-v1` JSON object no larger than 64 KiB. A reviewer must return one bounded `agent-symphony-review-v1` object. The helper owns the process group, stops only that group on completion, overflow, or cancellation, and fails boundedly if an escaped process keeps stdout open. Results remain outside the source tree for safe export and retry.
 

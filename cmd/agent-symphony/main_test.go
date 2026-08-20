@@ -2974,6 +2974,9 @@ func TestInitAndMisuseExitCodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !slices.Equal(initialized.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}) {
+		t.Fatalf("unexpected initialized implementation command: %q", initialized.Commands.Implementation)
+	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
 	if !slices.Equal(initialized.Commands.Orchestrator, wantOrchestrator) {
 		t.Fatalf("initialized orchestrator=%#v", initialized.Commands.Orchestrator)

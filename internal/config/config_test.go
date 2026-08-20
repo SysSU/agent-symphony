@@ -11,7 +11,7 @@ import (
 
 func TestLoadAndValidate(t *testing.T) {
 	c := Default("owner/repo")
-	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "--sandbox", "workspace-write"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "exec", "--sandbox", "read-only", "-"}) {
+	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "exec", "--sandbox", "read-only", "-"}) {
 		t.Fatalf("unexpected default commands: %#v", c.Commands)
 	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
