@@ -139,10 +139,11 @@ func TestMaximumMessageProposalSurvivesNarrowTmuxPane(t *testing.T) {
 		t.Skip("tmux is unavailable")
 	}
 	root := t.TempDir()
-	socketRoot := filepath.Join(root, "tmux")
-	if err := os.Mkdir(socketRoot, 0o700); err != nil {
+	socketRoot, err := os.MkdirTemp("/tmp", "as-tmux-")
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
 	env := []string{"HOME=" + os.Getenv("HOME"), "PATH=/usr/local/bin:/usr/bin:/bin", "SHELL=/bin/sh", "TERM=screen", "TMUX_TMPDIR=" + socketRoot}
 	repository := "SysSU/narrow-frame-" + digestText(root)[:8]
 	message := strings.Repeat(`"`, 8192)
@@ -191,7 +192,7 @@ func TestMaximumMessageProposalSurvivesNarrowTmuxPane(t *testing.T) {
 	if err := os.MkdirAll(agent.Root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := agent.writeState(persisted{Version: stateVersion, Repository: repository, Session: session, State: "running", UpdatedAt: now}); err != nil {
+	if err := agent.writeState(persisted{Version: stateVersion, Repository: repository, Session: session, ContextMode: "rebuild", State: "running", UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(trigger, []byte("emit\n"), 0o600); err != nil {
