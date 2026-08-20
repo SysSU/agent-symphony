@@ -3105,23 +3105,25 @@ func TestPRGovernanceRejectsSymlinkState(t *testing.T) {
 }
 
 func TestStatusHumanNoColorAndVersionedJSON(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "attempts.json")
-	data := `[{"repository":"owner/repo","issue":4,"attempt":1,"base_sha":"abcdef1","state":"completed","pr":10}]`
-	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-		t.Fatal(err)
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "owner/repo", 4, 1)
+	status := orchestrator.RecoveryStatus{Repository: "owner/repo", Issue: 4, Attempt: 1, State: "completed", CurrentPhase: "completed", PR: 10, Session: session, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "completed"}}}
+	previous := reconcileGitHubRun
+	reconcileGitHubRun = func(context.Context, string, string, string, bool) ([]orchestrator.RecoveryStatus, error) {
+		return []orchestrator.RecoveryStatus{status}, nil
 	}
+	t.Cleanup(func() { reconcileGitHubRun = previous })
 	t.Setenv("NO_COLOR", "1")
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"status", "--attempts", path}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "COMPLETED") || strings.Contains(stdout.String(), "\x1b[") {
+	if code := run([]string{"status", "--state", "state", "--runtime-state", "runtime"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "COMPLETED") || !strings.Contains(stdout.String(), "phase: completed") || !strings.Contains(stdout.String(), "session: implementation completed "+session) || strings.Contains(stdout.String(), "\x1b[") {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := run([]string{"inspect", "--issue", "4", "--attempts", path, "--json"}, &stdout, &stderr); code != 0 {
+	if code := run([]string{"inspect", "--issue", "4", "--state", "state", "--runtime-state", "runtime", "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
 	}
 	var got envelope
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil || got.Version != 1 || got.Command != "inspect" || !got.OK {
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil || got.Version != 1 || got.Command != "inspect" || !got.OK || !strings.Contains(stdout.String(), `"current_phase":"completed"`) || !strings.Contains(stdout.String(), `"role":"implementation"`) {
 		t.Fatalf("got %#v err=%v", got, err)
 	}
 }

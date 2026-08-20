@@ -784,14 +784,23 @@ func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "terminal requires the dashboard origin", http.StatusForbidden)
 		return
 	}
-	issue, issueErr := strconv.Atoi(r.URL.Query().Get("issue"))
-	attempt, attemptErr := strconv.Atoi(r.URL.Query().Get("attempt"))
-	status, err := s.projectedStatus(issue, attempt)
-	if issueErr != nil || attemptErr != nil || err != nil {
+	query := r.URL.Query()
+	issue, issueErr := strconv.Atoi(query.Get("issue"))
+	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
+	role := query.Get("role")
+	if role == "" {
+		role = agentruntime.SessionRoleImplementation
+	}
+	session, err := s.projectedSession(issue, attempt, role)
+	wantKeys := 3
+	if query.Get("role") == "" {
+		wantKeys = 2
+	}
+	if issueErr != nil || attemptErr != nil || err != nil || len(query) != wantKeys || len(query["issue"]) != 1 || len(query["attempt"]) != 1 || query.Get("role") != "" && len(query["role"]) != 1 {
 		http.Error(w, "terminal session is not available", http.StatusNotFound)
 		return
 	}
-	s.serveTerminalSession(w, r, status.Session)
+	s.serveTerminalSession(w, r, session.Name, role == agentruntime.SessionRoleReviewer)
 }
 
 func (s *dashboardServer) serveOrchestratorTerminal(w http.ResponseWriter, r *http.Request) {
@@ -816,10 +825,10 @@ func (s *dashboardServer) serveOrchestratorTerminal(w http.ResponseWriter, r *ht
 		http.Error(w, "orchestrator terminal is not available", http.StatusConflict)
 		return
 	}
-	s.serveTerminalSession(w, r, target.Session)
+	s.serveTerminalSession(w, r, target.Session, false)
 }
 
-func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Request, session string) {
+func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Request, session string, readOnly bool) {
 	if exec.CommandContext(r.Context(), s.tmux, "has-session", "-t", "="+session).Run() != nil {
 		http.Error(w, "terminal session is not running", http.StatusConflict)
 		return
@@ -832,7 +841,11 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 	conn.SetReadLimit(maxTerminalInputBytes)
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
-	command := exec.CommandContext(ctx, s.tmux, "attach-session", "-t", "="+session)
+	args := []string{"attach-session"}
+	if readOnly {
+		args = append(args, "-r")
+	}
+	command := exec.CommandContext(ctx, s.tmux, append(args, "-t", "="+session)...)
 	command.Env = append(os.Environ(), "TERM=xterm-256color")
 	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 24, Cols: 80})
 	if err != nil {
@@ -862,6 +875,10 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 			break
 		}
 		if kind == websocket.MessageBinary {
+			if readOnly {
+				_ = conn.Close(websocket.StatusPolicyViolation, "reviewer terminal is read-only")
+				break
+			}
 			if _, err := terminal.Write(message); err != nil {
 				break
 			}
@@ -907,8 +924,21 @@ func (s *dashboardServer) projectedStatus(issue, attempt int) (orchestrator.Reco
 	var found *orchestrator.RecoveryStatus
 	for i := range snapshot.Statuses {
 		status := snapshot.Statuses[i]
-		expected := fmt.Sprintf("as-%s-%d-%d", internalgithub.RepositoryIdentifier(status.Repository), issue, attempt)
-		if status.Issue == issue && status.Attempt == attempt && status.Session == expected {
+		expected, nameErr := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, status.Repository, issue, attempt)
+		validSessions := nameErr == nil && status.Session == expected
+		seen := map[string]bool{}
+		for _, session := range status.Sessions {
+			want, sessionErr := agentruntime.AttemptSessionName(session.Role, status.Repository, issue, attempt)
+			if sessionErr != nil || session.Name != want || session.State == "" || seen[session.Role] {
+				validSessions = false
+				break
+			}
+			seen[session.Role] = true
+		}
+		if len(status.Sessions) > 0 && !seen[agentruntime.SessionRoleImplementation] {
+			validSessions = false
+		}
+		if status.Issue == issue && status.Attempt == attempt && validSessions {
 			if found != nil {
 				return orchestrator.RecoveryStatus{}, errors.New("ambiguous attempt")
 			}
@@ -919,6 +949,25 @@ func (s *dashboardServer) projectedStatus(issue, attempt int) (orchestrator.Reco
 		return *found, nil
 	}
 	return orchestrator.RecoveryStatus{}, errors.New("attempt not found")
+}
+
+func (s *dashboardServer) projectedSession(issue, attempt int, role string) (orchestrator.AttemptSession, error) {
+	status, err := s.projectedStatus(issue, attempt)
+	if err != nil {
+		return orchestrator.AttemptSession{}, err
+	}
+	want, err := agentruntime.AttemptSessionName(role, status.Repository, issue, attempt)
+	if err != nil {
+		return orchestrator.AttemptSession{}, err
+	}
+	if len(status.Sessions) == 0 && role == agentruntime.SessionRoleImplementation {
+		return orchestrator.AttemptSession{Role: role, Name: status.Session, State: status.State}, nil
+	}
+	index := slices.IndexFunc(status.Sessions, func(session orchestrator.AttemptSession) bool { return session.Role == role })
+	if index < 0 || status.Sessions[index].Name != want {
+		return orchestrator.AttemptSession{}, errors.New("attempt session not found")
+	}
+	return status.Sessions[index], nil
 }
 
 func (s *dashboardServer) terminalStatus(issue, attempt int) (orchestrator.RecoveryStatus, error) {

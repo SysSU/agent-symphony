@@ -64,6 +64,7 @@ export function StatusCard(props) {
   const blockers = status.blockers || [];
   const checks = status.checks || [];
   const messages = status.operator_messages || [];
+  const sessions = status.sessions?.length ? status.sessions : status.session ? [{ role: "implementation", name: status.session, state: status.state, current: true }] : [];
 
   return (
     <article className="card">
@@ -79,8 +80,15 @@ export function StatusCard(props) {
       </header>
       <dl>
         <Detail label="Priority">{status.priority ? `P${status.priority}` : "—"}</Detail>
-        <Detail label="tmux session">
-          {status.session ? <button className="terminalLink" type="button" onClick={() => onOpenTerminal(status)}><code>{status.session}</code></button> : null}
+        <Detail label="Current phase">{status.current_phase}</Detail>
+        <Detail label="tmux sessions">
+          {sessions.map((session) => (
+            <span className="line" key={session.role}>
+              <button className="terminalLink" type="button" onClick={() => onOpenTerminal(status, session)} aria-label={`Open ${session.role} terminal`}><code>{session.name}</code></button>
+              {` · ${session.role} · ${session.state}${session.current ? " · current" : ""}`}
+              {session.updated_at ? <> {" · "}<Timestamp value={session.updated_at} /></> : null}
+            </span>
+          ))}
         </Detail>
         <Detail label="Worktree"><code>{worktreeName(status.worktree)}</code></Detail>
         <Detail label="Branch"><code>{status.branch}</code></Detail>
