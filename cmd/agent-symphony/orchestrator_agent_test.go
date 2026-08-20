@@ -15,6 +15,7 @@ import (
 
 	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
@@ -130,7 +131,7 @@ func TestConfiguredReadOnlyOrchestratorProposesThroughCapturedOutput(t *testing.
 	}
 }
 
-func TestConfiguredOrchestratorRejectsCoordinatorIdentityAndTmux(t *testing.T) {
+func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 	fakeNoHostIsolation(t)
 	stateRoot := t.TempDir()
 	coordinatorHome := t.TempDir()
@@ -139,21 +140,48 @@ func TestConfiguredOrchestratorRejectsCoordinatorIdentityAndTmux(t *testing.T) {
 	t.Setenv("TMUX", "/private/coordinator-tmux-canary")
 	cfg := config.Default("SysSU/example")
 	cfg.Commands.Orchestrator = []string{"operator-agent"}
-	if _, err := newOrchestratorAgent(cfg, stateRoot); err == nil || !strings.Contains(err.Error(), "requires host isolation") {
-		t.Fatalf("configured same-identity orchestrator was accepted: %v", err)
-	}
-
-	root := filepath.Join(stateRoot, "snapshots")
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	agent, err := newOrchestratorAgent(cfg, stateRoot)
+	if err != nil {
 		t.Fatal(err)
 	}
+	binary, _ := os.Executable()
+	if !slices.Equal(agent.Launcher, []string{binary, "agent-host", "orchestrator"}) {
+		t.Fatalf("zero-admin launcher=%#v", agent.Launcher)
+	}
+	root := localSnapshotRoot(stateRoot)
+	if !slices.Contains(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+root) || !slices.Equal(agent.ProposalCommand, []string{binary, "agent-host", "orchestrator-proposal"}) {
+		t.Fatalf("zero-admin environment=%#v proposal=%#v", agent.Env, agent.ProposalCommand)
+	}
+	agent.Runner = &orchestratorTestRunner{}
+	if _, err := agent.Observe(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+
 	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
-	called := false
-	oldRun := hostOrchestratorRun
-	hostOrchestratorRun = func(context.Context, agentruntime.Command) error { called = true; return nil }
-	t.Cleanup(func() { hostOrchestratorRun = oldRun })
-	if err := agentHost(t.Context(), "orchestrator", strings.NewReader(""), &bytes.Buffer{}); err == nil || called {
-		t.Fatalf("local orchestrator reached coordinator credentials or tmux: called=%v err=%v", called, err)
+	oldGetwd, oldRun := hostGetwd, hostOrchestratorRun
+	hostGetwd = func() (string, error) { return agent.Workspace, nil }
+	var launched agentruntime.Command
+	hostOrchestratorRun = func(_ context.Context, command agentruntime.Command) error { launched = command; return nil }
+	t.Cleanup(func() { hostGetwd, hostOrchestratorRun = oldGetwd, oldRun })
+	if err := agentHost(t.Context(), "orchestrator", strings.NewReader(""), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := hostCurrentUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if launched.Name != "operator-agent" || launched.Dir != agent.Workspace || !slices.Contains(launched.Env, "HOME="+current.HomeDir) || slices.Contains(launched.Env, "HOME="+coordinatorHome) || !slices.Contains(launched.Env, "AGENT_SYMPHONY_ORCHESTRATOR_ROOT="+root) || slices.ContainsFunc(launched.Env, func(value string) bool {
+		return strings.HasPrefix(value, "GH_TOKEN=") || strings.HasPrefix(value, "TMUX=")
+	}) {
+		t.Fatalf("unsafe zero-admin launch: %#v", launched)
+	}
+
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", "")
+	t.Setenv("AGENT_SYMPHONY_ORCHESTRATOR_ROOT", root)
+	proposal := `{"version":1,"repository":"SysSU/example","issue":159,"attempt":1,"message":"Run the focused test."}`
+	var output bytes.Buffer
+	if err := agentHost(t.Context(), "orchestrator-proposal", strings.NewReader(proposal), &output); err != nil || !strings.HasPrefix(output.String(), orchestratoragent.MessageProposalPrefix) {
+		t.Fatalf("zero-admin proposal=%q err=%v", output.String(), err)
 	}
 }
 

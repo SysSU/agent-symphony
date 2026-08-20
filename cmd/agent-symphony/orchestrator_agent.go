@@ -50,14 +50,18 @@ func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratorage
 	if cfg.Commands.Orchestrator == nil {
 		return agent, nil
 	}
-	if !hostIsolationInstalled() {
-		return nil, fmt.Errorf("configured orchestrator requires host isolation; run install-host first")
-	}
 	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
 	if err != nil {
 		return nil, err
 	}
 	agent.Env = env
+	if !hostIsolationInstalled() {
+		agent.Env = append(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+productionSnapshotRoot(stateRoot))
+		if err := os.MkdirAll(workspace, 0o750); err != nil {
+			return nil, fmt.Errorf("prepare orchestrator workspace: %w", err)
+		}
+		return agent, nil
+	}
 	group, err := hostLookupGroup(snapshotGroup)
 	if err != nil {
 		return nil, fmt.Errorf("resolve orchestrator boundary group: %w", err)
@@ -108,5 +112,8 @@ func prepareOrchestratorWorkspace(path string, gid int) error {
 
 func orchestratorBoundaryCommand() []string {
 	binary, _ := os.Executable()
+	if !hostIsolationInstalled() {
+		return []string{binary, "agent-host", "orchestrator"}
+	}
 	return []string{"sudo", "-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "orchestrator"}
 }

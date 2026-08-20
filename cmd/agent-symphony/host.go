@@ -769,9 +769,6 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if !filepath.IsAbs(localRoot) {
 			return errors.New("local boundary root must be absolute")
 		}
-		if orchestratorMode {
-			return errors.New("orchestrator requires OS-enforced host isolation")
-		}
 		root = localRoot
 		var current *user.User
 		if current, err = hostCurrentUser(); err != nil {
