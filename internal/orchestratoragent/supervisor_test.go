@@ -208,7 +208,13 @@ func TestMaximumMessageProposalSurvivesNarrowTmuxPane(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("maximum proposal was lost in narrow tmux history: %v", err)
+			captured, captureErr := runTmux("capture-pane", "-p", "-J", "-S", "-", "-t", "="+session+":0.0")
+			_, parseErr := parseMessageProposal(string(captured), repository)
+			bounded, boundedErr := agent.run(t.Context(), "tmux", []string{"capture-pane", "-p", "-J", "-S", "-", "-t", "=" + session + ":0.0"}, nil)
+			_, boundedParseErr := parseMessageProposal(bounded.Output, repository)
+			state, stateErr := agent.readOrInitial()
+			pane, paneErr := runTmux("display-message", "-p", "-t", "="+session+":0.0", "#{pane_dead}|#{pane_current_command}|#{history_size}|#{cursor_x}|#{cursor_y}")
+			t.Fatalf("maximum proposal was lost in narrow tmux history: %v; capture_bytes=%d prefix=%t capture_err=%v parse_err=%v bounded_bytes=%d bounded_prefix=%t bounded_err=%v bounded_parse_err=%v consumed=%q state_err=%v pane=%q pane_err=%v", err, len(captured), strings.Contains(string(captured), MessageProposalPrefix), captureErr, parseErr, len(bounded.Output), strings.Contains(bounded.Output, MessageProposalPrefix), boundedErr, boundedParseErr, state.ConsumedProposal, stateErr, strings.TrimSpace(string(pane)), paneErr)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
