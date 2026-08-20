@@ -119,13 +119,22 @@ type persisted struct {
 }
 
 type sanitizedStatus struct {
-	Repository string `json:"repository"`
-	Issue      int    `json:"issue"`
-	Attempt    int    `json:"attempt"`
-	State      string `json:"state"`
-	Blockers   string `json:"blockers,omitempty"`
-	Diagnostic string `json:"diagnostic,omitempty"`
-	NextAction string `json:"next_action,omitempty"`
+	Repository   string             `json:"repository"`
+	Issue        int                `json:"issue"`
+	Attempt      int                `json:"attempt"`
+	State        string             `json:"state"`
+	CurrentPhase string             `json:"current_phase,omitempty"`
+	Sessions     []sanitizedSession `json:"sessions,omitempty"`
+	Blockers     string             `json:"blockers,omitempty"`
+	Diagnostic   string             `json:"diagnostic,omitempty"`
+	NextAction   string             `json:"next_action,omitempty"`
+}
+
+type sanitizedSession struct {
+	Role    string `json:"role"`
+	Name    string `json:"name"`
+	State   string `json:"state"`
+	Current bool   `json:"current,omitempty"`
 }
 
 // Supervisor owns one repository's optional advisory tmux agent.
@@ -687,7 +696,14 @@ func sanitizeProjection(repository string, statuses []orchestrator.RecoveryStatu
 		if status.Repository != repository || status.Issue < 1 || status.Attempt < 0 {
 			continue
 		}
-		result = append(result, sanitizedStatus{Repository: repository, Issue: status.Issue, Attempt: status.Attempt, State: clean(status.State, 64), Blockers: clean(internalgithub.Redact(strings.Join(status.Blockers, "; ")), 512), Diagnostic: clean(internalgithub.Redact(status.Diagnostic), 512), NextAction: clean(status.Action, 512)})
+		sessions := make([]sanitizedSession, 0, len(status.Sessions))
+		for _, session := range status.Sessions {
+			want, err := agentruntime.AttemptSessionName(session.Role, repository, status.Issue, status.Attempt)
+			if err == nil && session.Name == want {
+				sessions = append(sessions, sanitizedSession{Role: session.Role, Name: session.Name, State: clean(session.State, 64), Current: session.Current})
+			}
+		}
+		result = append(result, sanitizedStatus{Repository: repository, Issue: status.Issue, Attempt: status.Attempt, State: clean(status.State, 64), CurrentPhase: clean(status.CurrentPhase, 64), Sessions: sessions, Blockers: clean(internalgithub.Redact(strings.Join(status.Blockers, "; ")), 512), Diagnostic: clean(internalgithub.Redact(status.Diagnostic), 512), NextAction: clean(status.Action, 512)})
 	}
 	slices.SortFunc(result, func(a, b sanitizedStatus) int {
 		if a.Issue != b.Issue {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,7 +178,74 @@ func TestRecoverActiveBindingRetainsCompletedAttemptForPublication(t *testing.T)
 	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "active"}
 	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "completed", Session: "as-o-r-4-2", ReviewState: "running"}
 	got := RecoverChecked(context.Background(), []AttemptFact{fact}, []agentruntime.Manifest{manifest}, func(context.Context, agentruntime.Manifest, AttemptFact) error { return nil })
-	if len(got) != 1 || got[0].State != "active" || got[0].Action != "resume publication of the matching completed attempt" {
+	if len(got) != 1 || got[0].State != "active" || got[0].CurrentPhase != "review" || got[0].Action != "restore or restart the exact reviewer session" {
+		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
+	created := time.Date(2026, 8, 20, 1, 2, 3, 0, time.UTC)
+	updated := created.Add(time.Minute)
+	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 4, 2)
+	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 4, 2)
+	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "active"}
+	base := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: fact.BaseSHA, State: "completed", Session: implementation, CreatedAt: created, UpdatedAt: updated}
+
+	for _, test := range []struct {
+		name           string
+		manifest       agentruntime.Manifest
+		phase          string
+		currentRole    string
+		sessionCount   int
+		actionContains string
+	}{
+		{"implementation", func() agentruntime.Manifest { m := base; m.State = "running"; return m }(), "implementation", "implementation", 1, "implementation session"},
+		{"validation", base, "validation", "", 1, "validate"},
+		{"review running", func() agentruntime.Manifest {
+			m := base
+			m.ReviewState, m.ReviewSession = "running", reviewer
+			return m
+		}(), "review", "reviewer", 2, "reviewer session"},
+		{"review session missing", func() agentruntime.Manifest { m := base; m.ReviewState = "running"; return m }(), "review", "", 1, "restore"},
+		{"findings handoff", func() agentruntime.Manifest {
+			m := base
+			m.ReviewState, m.ReviewHandoffQueued = "findings-queued", true
+			return m
+		}(), "findings-handoff", "implementation", 1, "deliver review findings"},
+		{"follow-up implementation", func() agentruntime.Manifest {
+			m := base
+			m.State, m.ReviewState, m.ReviewHandoffQueued, m.ReviewHandoffAck = "running", "findings-queued", true, true
+			return m
+		}(), "findings-handoff", "implementation", 1, "follow-up implementation"},
+		{"publication after reviewer cleanup", func() agentruntime.Manifest { m := base; m.ReviewState = "clean"; return m }(), "publication", "", 1, "publish"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := RecoverChecked(t.Context(), []AttemptFact{fact}, []agentruntime.Manifest{test.manifest}, func(context.Context, agentruntime.Manifest, AttemptFact) error { return nil })
+			if len(got) != 1 || got[0].CurrentPhase != test.phase || len(got[0].Sessions) != test.sessionCount || !strings.Contains(got[0].Action, test.actionContains) {
+				t.Fatalf("got %#v", got)
+			}
+			current := ""
+			for _, session := range got[0].Sessions {
+				if session.Current {
+					current = session.Role
+				}
+				if session.Name == implementation && (session.CreatedAt != created || session.UpdatedAt != updated) {
+					t.Fatalf("implementation timestamps = %#v", session)
+				}
+			}
+			if current != test.currentRole {
+				t.Fatalf("current role = %q, want %q: %#v", current, test.currentRole, got[0].Sessions)
+			}
+		})
+	}
+}
+
+func TestRecoverOmitsUnknownSessionIdentityAndKeepsTerminalHistory(t *testing.T) {
+	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 4, 2)
+	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "failed"}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: fact.BaseSHA, State: "cancelled", Session: implementation, ReviewState: "running", ReviewSession: "as-r-forged"}
+	got := Recover([]AttemptFact{fact}, []agentruntime.Manifest{manifest})
+	if len(got) != 1 || got[0].CurrentPhase != "failed" || len(got[0].Sessions) != 1 || got[0].Sessions[0].Name != implementation || got[0].Sessions[0].State != "cancelled" {
 		t.Fatalf("got %#v", got)
 	}
 }
@@ -220,7 +288,7 @@ func TestRecoverRunningPublishedAttemptStillRequiresLiveness(t *testing.T) {
 		checked = true
 		return nil
 	})
-	if !checked || len(got) != 1 || got[0].State != "active" || got[0].Action != "resume monitoring the matching attempt" {
+	if !checked || len(got) != 1 || got[0].State != "active" || got[0].Action != "monitor the implementation session" {
 		t.Fatalf("checked=%v got=%#v", checked, got)
 	}
 }

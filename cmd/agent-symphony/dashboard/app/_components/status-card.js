@@ -2,6 +2,8 @@ import { useEffect, useRef } from "react";
 
 import { canInvestigate, orchestratorPresentation } from "../health.mjs";
 
+const attachableSessionRoles = new Set(["implementation", "reviewer"]);
+
 function githubURL(repository, kind, number) {
   const parts = repository.split("/");
   if (parts.length !== 2 || !number) return "";
@@ -61,6 +63,7 @@ export function StatusCard(props) {
   const issueURL = githubURL(status.repository, "issues", status.issue);
   const prURL = githubURL(status.repository, "pull", status.pr);
   const issueLabel = status.title ? `#${status.issue} ${status.title}` : `Issue #${status.issue}`;
+  const sessions = status.sessions?.length ? status.sessions : status.session ? [{ role: "implementation", name: status.session, state: status.state, current: true }] : [];
   const blockers = status.blockers || [];
   const checks = status.checks || [];
   const messages = status.operator_messages || [];
@@ -84,6 +87,14 @@ export function StatusCard(props) {
         </Detail>
         <Detail label="Worktree"><code>{worktreeName(status.worktree)}</code></Detail>
         <Detail label="Branch"><code>{status.branch}</code></Detail>
+        <Detail label="Current phase">{status.current_phase}</Detail>
+        <Detail label="Session lifecycle">{sessions.map((session) => (
+          <span className="line" key={session.role}>
+            {session.role === "implementation" ? null : <><button className="terminalLink" type="button" disabled={!attachableSessionRoles.has(session.role)} onClick={() => onOpenTerminal(status, session)} aria-label={`Open ${session.role} terminal`}><code>{session.name}</code></button>{" · "}</>}
+            {`${session.role} · ${session.state}${session.current ? " · current" : ""}`}
+            {session.updated_at ? <> {" · "}<Timestamp value={session.updated_at} /></> : null}
+          </span>
+        ))}</Detail>
         <Detail label="Blockers">{blockers.map((blocker) => <span className="line" key={blocker}>{blocker}</span>)}</Detail>
         <Detail label="Checks">{checks.map((check) => <span className="line" key={check}>{check}</span>)}</Detail>
         <Detail label="Worker messages">{messages.map((message) => (

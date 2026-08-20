@@ -33,6 +33,11 @@ const (
 	workerResultSuffix = ".result.json"
 )
 
+const (
+	SessionRoleImplementation = "implementation"
+	SessionRoleReviewer       = "reviewer"
+)
+
 var component = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 var commitID = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 
@@ -238,6 +243,28 @@ var (
 )
 
 func PaneTarget(session string) string { return "=" + session + ":0.0" }
+
+// AttemptSessionName returns the deterministic tmux name for a bounded role.
+func AttemptSessionName(role, repository string, issue, attempt int) (string, error) {
+	parts := strings.Split(repository, "/")
+	if len(parts) != 2 || !component.MatchString(parts[0]) || !component.MatchString(parts[1]) || issue < 1 || attempt < 1 {
+		return "", errors.New("invalid attempt session identity")
+	}
+	var name string
+	switch role {
+	case SessionRoleImplementation:
+		name = fmt.Sprintf("as-%s-%d-%d", internalgithub.RepositoryIdentifier(repository), issue, attempt)
+	case SessionRoleReviewer:
+		sum := sha256.Sum256([]byte(repository))
+		name = fmt.Sprintf("as-r-%x-%d-%d", sum[:8], issue, attempt)
+	default:
+		return "", fmt.Errorf("unknown attempt session role %q", role)
+	}
+	if len(name) > maxResourceName {
+		return "", fmt.Errorf("attempt session name exceeds %d bytes", maxResourceName)
+	}
+	return name, nil
+}
 
 func ResultPath(worktree string) string { return worktree + workerResultSuffix }
 
@@ -649,7 +676,10 @@ func AttemptIdentity(root string, a Attempt) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	session := "as-" + name
+	session, err := AttemptSessionName(SessionRoleImplementation, a.Repository, a.Issue, a.Number)
+	if err != nil {
+		return Manifest{}, err
+	}
 	if len(name) > maxResourceName || len(branch) > maxResourceName || len(session) > maxResourceName {
 		return Manifest{}, fmt.Errorf("attempt resource name exceeds %d bytes", maxResourceName)
 	}
@@ -741,6 +771,21 @@ func (r *Runtime) validateManifest(attempt Attempt, manifest Manifest) error {
 	if manifest.Version != want.Version || manifest.Repository != want.Repository || manifest.Issue != want.Issue || manifest.Attempt != want.Attempt ||
 		manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session || manifest.BaseSHA != want.BaseSHA || manifest.LogPath != want.LogPath {
 		return fmt.Errorf("manifest does not match deterministic attempt resources")
+	}
+	switch manifest.ReviewState {
+	case "":
+		if manifest.ReviewSession != "" {
+			return errors.New("review session has no lifecycle state")
+		}
+	case "preparing", "running", "clean", "findings-queued":
+	default:
+		return fmt.Errorf("invalid review state %q", manifest.ReviewState)
+	}
+	if manifest.ReviewSession != "" {
+		wantReview, err := AttemptSessionName(SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
+		if err != nil || manifest.ReviewSession != wantReview {
+			return errors.New("review session does not match deterministic attempt resources")
+		}
 	}
 	switch manifest.State {
 	case "preparing", "running", "completed", "failed", "cancelled":

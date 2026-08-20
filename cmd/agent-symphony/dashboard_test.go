@@ -862,7 +862,7 @@ func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
 	root := t.TempDir()
 	repository, issue, attempt := "o/r", 23, 2
 	session := "as-" + internalgithub.RepositoryIdentifier(repository) + "-23-2"
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{{Repository: repository, Issue: issue, Attempt: attempt, State: "running", Session: session}}); err != nil {
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{{Repository: repository, Issue: issue, Attempt: attempt, State: "running", Session: session, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "running", Current: true}}}}); err != nil {
 		t.Fatal(err)
 	}
 	script := filepath.Join(t.TempDir(), "tmux")
@@ -920,6 +920,69 @@ func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
 	}
 }
 
+func TestDashboardReviewerTerminalIsRoleBoundAndReadOnly(t *testing.T) {
+	root := t.TempDir()
+	repository, issue, attempt := "o/r", 23, 2
+	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, repository, issue, attempt)
+	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, repository, issue, attempt)
+	status := orchestrator.RecoveryStatus{Repository: repository, Issue: issue, Attempt: attempt, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{
+		{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "completed"},
+		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Current: true},
+	}}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(t.TempDir(), "tmux")
+	body := "#!/bin/sh\ncase $1 in\n" +
+		"has-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\";;\n" +
+		"attach-session) test \"$2\" = -r && test \"$3\" = -t && test \"$4\" = \"=$EXPECTED_SESSION\" || exit 2; printf 'review-ready\\r\\n'; sleep 30;;\n" +
+		"*) exit 2;;\nesac\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("EXPECTED_SESSION", reviewer)
+	server := httptest.NewServer(newDashboardHandler(t.Context(), root, script))
+	defer server.Close()
+	dial := func(path, extraQuery string) (*websocket.Conn, *http.Response, error) {
+		endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + path + "?issue=23&attempt=2"
+		if extraQuery != "" {
+			endpoint += "&" + extraQuery
+		}
+		return websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
+	}
+	if connection, response, err := dial("/terminal", "role=future"); err == nil || response == nil || response.StatusCode != http.StatusNotFound {
+		if connection != nil {
+			connection.CloseNow()
+		}
+		t.Fatalf("unknown role response=%v err=%v", response, err)
+	}
+	connection, response, err := dial("/reviewer/terminal", "")
+	if err != nil {
+		t.Fatalf("review terminal dial response=%v err=%v", response, err)
+	}
+	defer connection.CloseNow()
+	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("must not reach reviewer")); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, _, err = connection.Read(t.Context())
+		if err != nil {
+			break
+		}
+	}
+	if websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+		t.Fatalf("reviewer input close=%v err=%v", websocket.CloseStatus(err), err)
+	}
+
+	status.Sessions[1].Name = "as-r-forged"
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&dashboardServer{stateRoot: root}).projectedSession(issue, attempt, agentruntime.SessionRoleReviewer); err == nil {
+		t.Fatal("tampered reviewer identity accepted")
+	}
+}
+
 func TestDashboardTerminalRejectsTamperedIdentityAndInvalidMessages(t *testing.T) {
 	root := t.TempDir()
 	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 8, Attempt: 1, State: "running", Session: "as-arbitrary"}
@@ -969,9 +1032,11 @@ func TestDashboardTerminalRejectsTamperedIdentityAndInvalidMessages(t *testing.T
 	}
 }
 
-func TestDashboardTerminalRequiresLiveSession(t *testing.T) {
+func TestDashboardReviewerTerminalRequiresLiveSession(t *testing.T) {
 	root := t.TempDir()
-	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 8, Attempt: 1, State: "orphaned", Session: "as-" + internalgithub.RepositoryIdentifier("o/r") + "-8-1"}
+	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 8, 1)
+	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 8, 1)
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 8, Attempt: 1, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "completed"}, {Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Current: true}}}
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
 		t.Fatal(err)
 	}
@@ -979,7 +1044,7 @@ func TestDashboardTerminalRequiresLiveSession(t *testing.T) {
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/terminal?issue=8&attempt=1", nil)
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/reviewer/terminal?issue=8&attempt=1", nil)
 	request.Header.Set("Origin", "http://127.0.0.1")
 	response := httptest.NewRecorder()
 	newDashboardHandler(t.Context(), root, script).ServeHTTP(response, request)

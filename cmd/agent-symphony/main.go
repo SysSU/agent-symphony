@@ -492,7 +492,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout)
 			fmt.Fprintf(stdout, "  priority: P%d  dependencies: %v\n", status.Priority, status.Dependencies)
 			fmt.Fprintf(stdout, "  agents: implementation=%s review=%s\n", firstNonempty(status.ImplementationAgent, "-"), firstNonempty(status.ReviewAgent, "-"))
-			fmt.Fprintf(stdout, "  tmux: %s  worktree: %s\n", firstNonempty(status.Session, "-"), firstNonempty(status.Worktree, "-"))
+			fmt.Fprintf(stdout, "  phase: %s  worktree: %s\n", firstNonempty(status.CurrentPhase, "-"), firstNonempty(status.Worktree, "-"))
+			if len(status.Sessions) == 0 {
+				fmt.Fprintln(stdout, "  sessions: -")
+			}
+			for _, session := range status.Sessions {
+				current := ""
+				if session.Current {
+					current = " current"
+				}
+				fmt.Fprintf(stdout, "  session: %s%s %s %s\n", session.Role, current, session.State, session.Name)
+			}
 			fmt.Fprintf(stdout, "  branch: %s  head: %s  checks: %v\n", firstNonempty(status.Branch, "-"), firstNonempty(status.HeadSHA, "-"), status.Checks)
 			if len(status.Blockers) > 0 {
 				fmt.Fprintln(stdout, "  blockers: "+strings.Join(status.Blockers, "; "))
@@ -717,7 +727,7 @@ func validateOperatorMessageTarget(ctx context.Context, proposal orchestratorage
 	statusIndex := slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool {
 		return status.Repository == proposal.Repository && status.Issue == proposal.Issue && status.Attempt == proposal.Attempt
 	})
-	if statusIndex < 0 || !slices.Contains([]string{"resume monitoring the matching attempt", "resume publication of the matching completed attempt", "monitor the matching published pull request"}, statuses[statusIndex].Action) {
+	if statusIndex < 0 || !slices.Contains([]string{"active", "review-ready"}, statuses[statusIndex].State) || !slices.Contains([]string{"implementation", "validation", "review", "findings-handoff", "publication"}, statuses[statusIndex].CurrentPhase) {
 		return errors.New("operator message target does not have a verified exact runtime owner")
 	}
 	return nil
@@ -1133,7 +1143,7 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 			continue
 		}
 		decision := decisions[decisionIndex]
-		statuses = append(statuses, orchestrator.RecoveryStatus{Repository: issue.Repository, Issue: issue.Issue, Title: issue.Title, Attempt: issue.Attempt, State: string(decision.State), Priority: issue.Priority, Dependencies: issue.Dependencies, Blockers: issue.Blockers, Action: decision.Explanation})
+		statuses = append(statuses, orchestrator.RecoveryStatus{Repository: issue.Repository, Issue: issue.Issue, Title: issue.Title, Attempt: issue.Attempt, State: string(decision.State), CurrentPhase: string(decision.State), Priority: issue.Priority, Dependencies: issue.Dependencies, Blockers: issue.Blockers, Action: decision.Explanation})
 	}
 	return statuses, decisions
 }
@@ -1848,8 +1858,8 @@ func cleanupReviewOutcome(ctx context.Context, runtimeState *agentruntime.Runtim
 
 func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, string) {
 	repository := internalgithub.RepositoryIdentifier(attempt.Repository)
-	sum := sha256.Sum256([]byte(attempt.Repository))
-	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", repository, attempt.Issue, attempt.Number)), fmt.Sprintf("as-r-%x-%d-%d", sum[:8], attempt.Issue, attempt.Number)
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
+	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", repository, attempt.Issue, attempt.Number)), session
 }
 
 func reviewResultPath(snapshot, head string) string {
