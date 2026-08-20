@@ -206,26 +206,40 @@ func TestReviewerBoundaryAllowsOnlyExactOrchestratorTmuxLaunch(t *testing.T) {
 		launched = command
 		return agentruntime.Result{}, nil
 	}
-	request := func(target string, env []string) error {
+	request := func(args, env []string) error {
 		payload, _ := json.Marshal(struct {
 			Operation string          `json:"operation"`
 			Command   boundaryCommand `json:"command"`
-		}{"run", boundaryCommand{Name: "tmux", Args: []string{"respawn-pane", "-k", "-t", target, "--", "operator-agent", "sanitized context"}, Dir: dir, Env: env}})
+		}{"run", boundaryCommand{Name: "tmux", Args: args, Dir: dir, Env: env}})
 		return agentHost(t.Context(), "review", bytes.NewReader(payload), &bytes.Buffer{})
 	}
-	if err := request("=as-o-owner-repo:0.0", []string{"MODEL_API_KEY=model-canary", "PATH=/bin"}); err != nil {
+	respawn := func(target string) []string {
+		return []string{"respawn-pane", "-k", "-t", target, "--", "operator-agent", "sanitized context"}
+	}
+	if err := request(respawn("=as-o-owner-repo:0.0"), []string{"MODEL_API_KEY=model-canary", "PATH=/bin"}); err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(launched.Env, "|")
 	if !strings.Contains(joined, "HOME=/var/lib/agent-symphony-reviewer") || strings.Contains(joined, "GITHUB_TOKEN") {
 		t.Fatalf("unsafe orchestrator environment: %s", joined)
 	}
+	for _, args := range [][]string{
+		{"split-window", "-d", "-t", "=as-o-owner-repo:0.0", "-c", dir, "--", "operator-agent", "sanitized context"},
+		{"kill-pane", "-t", "=as-o-owner-repo:0.0"},
+	} {
+		if err := request(args, []string{"PATH=/bin"}); err != nil {
+			t.Fatalf("exact pane replacement rejected: %v", err)
+		}
+	}
 	for _, target := range []string{"as-o-owner-repo:0.0", "=as-o-owner-repo:1.0", "=../../foreign:0.0"} {
-		if err := request(target, []string{"PATH=/bin"}); err == nil {
+		if err := request(respawn(target), []string{"PATH=/bin"}); err == nil {
 			t.Fatalf("unsafe orchestrator target accepted: %q", target)
 		}
 	}
-	if err := request("=as-o-owner-repo:0.0", []string{"GH_TOKEN=secret"}); err == nil {
+	if err := request([]string{"split-window", "-d", "-t", "=as-o-owner-repo:0.0", "-c", filepath.Dir(root), "--", "operator-agent"}, []string{"PATH=/bin"}); err == nil {
+		t.Fatal("orchestrator pane replacement escaped the snapshot root")
+	}
+	if err := request(respawn("=as-o-owner-repo:0.0"), []string{"GH_TOKEN=secret"}); err == nil {
 		t.Fatal("orchestrator launch accepted GitHub credentials")
 	}
 }

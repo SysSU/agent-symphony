@@ -399,7 +399,11 @@ func (s *Supervisor) start(ctx context.Context, state persisted) (persisted, err
 		}
 		command = slices.Clone(s.Launcher)
 	}
-	if _, err := s.run(ctx, "tmux", append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), nil); err != nil {
+	if _, err := s.run(ctx, "tmux", append([]string{"split-window", "-d", "-t", target, "-c", s.Workspace, "--"}, command...), nil); err != nil {
+		_ = s.stop(ctx, state.Session)
+		return s.failed(state, err)
+	}
+	if _, err := s.run(ctx, "tmux", []string{"kill-pane", "-t", target}, nil); err != nil {
 		_ = s.stop(ctx, state.Session)
 		return s.failed(state, err)
 	}

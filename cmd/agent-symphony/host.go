@@ -1150,6 +1150,10 @@ func validTmuxBoundaryArgs(args []string, dir, root string) bool {
 		return len(args) == 6 && slices.Equal(args[1:3], []string{"-w", "-t"}) && validTmuxTarget(args[3], true) && ((args[4] == "remain-on-exit" && args[5] == "on") || (args[4] == "history-limit" && slices.Contains([]string{"5000", "65536"}, args[5])))
 	case "respawn-pane":
 		return len(args) > 5 && slices.Equal(args[1:3], []string{"-k", "-t"}) && validTmuxTarget(args[3], true) && args[4] == "--" && args[5] != ""
+	case "split-window":
+		return len(args) > 7 && slices.Equal(args[1:3], []string{"-d", "-t"}) && validTmuxTarget(args[3], true) && args[4] == "-c" && boundedCommandPath(args[5], dir, root) && args[6] == "--" && args[7] != ""
+	case "kill-pane":
+		return len(args) == 3 && args[1] == "-t" && validTmuxTarget(args[2], true)
 	case "load-buffer":
 		return len(args) == 4 && args[1] == "-b" && args[2] != "" && args[3] == "-"
 	case "paste-buffer":

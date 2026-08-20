@@ -52,7 +52,7 @@ func (f *fakeRunner) Run(_ context.Context, command agentruntime.Command) (agent
 			return agentruntime.Result{Exited: true, Code: 1}, errors.New("launch failed token=secret-value")
 		}
 		f.live = true
-	case "respawn-pane":
+	case "split-window":
 		f.live = true
 	case "kill-session":
 		if !f.live {
@@ -175,7 +175,7 @@ func TestMaximumMessageProposalSurvivesNarrowTmuxPane(t *testing.T) {
 		return command.CombinedOutput()
 	}
 	session := Session(agent.Repository)
-	startArgs := []string{"new-session", "-d", "-x", "2", "-y", "24", "-s", session, "-c", workspace}
+	startArgs := []string{"new-session", "-d", "-x", "80", "-y", "24", "-s", session, "-c", workspace}
 	if output, err := runTmux(startArgs...); err != nil {
 		t.Skipf("tmux cannot start in this environment: %v: %s", err, output)
 	}
@@ -186,8 +186,17 @@ func TestMaximumMessageProposalSurvivesNarrowTmuxPane(t *testing.T) {
 		}
 		t.Fatalf("set tmux history: %v: %s", err, output)
 	}
-	if output, err := runTmux("respawn-pane", "-k", "-t", "="+session+":0.0", "--", scriptPath); err != nil {
+	if output, err := runTmux("split-window", "-d", "-t", "="+session+":0.0", "-c", workspace, "--", scriptPath); err != nil {
 		t.Fatalf("start tmux frame emitter: %v: %s", err, output)
+	}
+	if output, err := runTmux("kill-pane", "-t", "="+session+":0.0"); err != nil {
+		t.Fatalf("remove tmux placeholder pane: %v: %s", err, output)
+	}
+	if output, err := runTmux("display-message", "-p", "-t", "="+session+":0.0", "#{history_limit}"); err != nil || strings.TrimSpace(string(output)) != historyLimit {
+		t.Fatalf("tmux replacement history limit=%q err=%v", output, err)
+	}
+	if output, err := runTmux("resize-window", "-x", "2", "-y", "24", "-t", "="+session+":0"); err != nil {
+		t.Fatalf("narrow tmux window: %v: %s", err, output)
 	}
 	if err := os.MkdirAll(agent.Root, 0o700); err != nil {
 		t.Fatal(err)
@@ -198,7 +207,7 @@ func TestMaximumMessageProposalSurvivesNarrowTmuxPane(t *testing.T) {
 	if err := os.WriteFile(trigger, []byte("emit\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		proposal, err := agent.MessageProposal(t.Context())
 		if err == nil {
@@ -208,13 +217,7 @@ func TestMaximumMessageProposalSurvivesNarrowTmuxPane(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			captured, captureErr := runTmux("capture-pane", "-p", "-J", "-S", "-", "-t", "="+session+":0.0")
-			_, parseErr := parseMessageProposal(string(captured), repository)
-			bounded, boundedErr := agent.run(t.Context(), "tmux", []string{"capture-pane", "-p", "-J", "-S", "-", "-t", "=" + session + ":0.0"}, nil)
-			_, boundedParseErr := parseMessageProposal(bounded.Output, repository)
-			state, stateErr := agent.readOrInitial()
-			pane, paneErr := runTmux("display-message", "-p", "-t", "="+session+":0.0", "#{pane_dead}|#{pane_current_command}|#{history_size}|#{cursor_x}|#{cursor_y}")
-			t.Fatalf("maximum proposal was lost in narrow tmux history: %v; capture_bytes=%d prefix=%t capture_err=%v parse_err=%v bounded_bytes=%d bounded_prefix=%t bounded_err=%v bounded_parse_err=%v consumed=%q state_err=%v pane=%q pane_err=%v", err, len(captured), strings.Contains(string(captured), MessageProposalPrefix), captureErr, parseErr, len(bounded.Output), strings.Contains(bounded.Output, MessageProposalPrefix), boundedErr, boundedParseErr, state.ConsumedProposal, stateErr, strings.TrimSpace(string(pane)), paneErr)
+			t.Fatalf("maximum proposal was lost in narrow tmux history: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -349,7 +352,7 @@ func TestLaunchContractUsesFixedBoundaryCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	index := slices.IndexFunc(runner.commands, func(command agentruntime.Command) bool {
-		return len(command.Args) > 0 && command.Args[0] == "respawn-pane"
+		return len(command.Args) > 0 && command.Args[0] == "split-window"
 	})
 	if index < 0 || !slices.Equal(runner.commands[index].Args[len(runner.commands[index].Args)-3:], agent.Launcher) {
 		t.Fatalf("pane did not use fixed launcher: %#v", runner.commands)
@@ -382,7 +385,7 @@ func TestLaunchExpandsOrchestratorWorkspaceWithoutChangingConfiguredCommand(t *t
 		t.Fatal(err)
 	}
 	index := slices.IndexFunc(runner.commands, func(command agentruntime.Command) bool {
-		return len(command.Args) > 0 && command.Args[0] == "respawn-pane"
+		return len(command.Args) > 0 && command.Args[0] == "split-window"
 	})
 	if index < 0 {
 		t.Fatalf("missing respawn command: %#v", runner.commands)

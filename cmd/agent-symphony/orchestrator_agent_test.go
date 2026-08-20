@@ -52,7 +52,7 @@ func (r *orchestratorTestRunner) Run(_ context.Context, command agentruntime.Com
 			return agentruntime.Result{Exited: true, Code: 1}, errors.New("missing")
 		}
 		return agentruntime.Result{Output: "0\n"}, nil
-	case "new-session", "respawn-pane":
+	case "new-session", "split-window":
 		r.live = true
 	case "capture-pane":
 		return agentruntime.Result{Output: r.pane}, nil
