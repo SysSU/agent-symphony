@@ -9,6 +9,20 @@ const proposal = {
   binding: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 };
 const confirmationNonce = "browser-bound-confirmation-nonce";
+const browserErrors = new WeakMap();
+
+test.beforeEach(async ({ page }) => {
+  const errors = [];
+  browserErrors.set(page, errors);
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(`console: ${message.text()}`);
+  });
+  page.on("pageerror", (error) => errors.push(`page: ${error.message}`));
+});
+
+test.afterEach(async ({ page }) => {
+  expect(browserErrors.get(page)).toEqual([]);
+});
 
 const attempt = {
   repository: proposal.repository,
@@ -25,6 +39,7 @@ const attempt = {
 async function mockDashboard(page) {
   let currentProposal = proposal;
   let messageState = "queued";
+  let messageDiagnostic = "";
   const actions = [];
   const requests = [];
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: true, state: "running", session: "orchestrator" } }));
@@ -33,7 +48,7 @@ async function mockDashboard(page) {
     : route.fulfill({ status: 204 }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
   await page.route("**/status.json", (route) => {
-    route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: [{ ...attempt, operator_messages: [{ ...attempt.operator_messages[0], state: messageState }] }] } });
+    route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: [{ ...attempt, operator_messages: [{ ...attempt.operator_messages[0], state: messageState, diagnostic: messageDiagnostic }] }] } });
   });
   await page.route("**/actions/orchestrator/message-*", async (route) => {
     const action = route.request().url().split("message-").pop();
@@ -53,6 +68,10 @@ async function mockDashboard(page) {
     requests,
     replaceProposal(next) {
       currentProposal = next;
+    },
+    setMessageOutcome(state, diagnostic) {
+      messageState = state;
+      messageDiagnostic = diagnostic;
     },
   };
 }
@@ -109,4 +128,17 @@ test("keeps the reviewed proposal visible when its binding changes before confir
   await expect(confirmation).toBeVisible();
   await expect(page.locator(".messageStatus .state-queued")).toBeVisible();
   expect(dashboard.requests).toEqual([{ action: "confirm", body: proposal, nonce: confirmationNonce }]);
+});
+
+test("renders rejected and failed worker message outcomes", async ({ page }) => {
+  const dashboard = await mockDashboard(page);
+  await page.goto("/");
+
+  dashboard.setMessageOutcome("rejected", "attempt completed before delivery");
+  await expect(page.locator(".messageStatus .state-rejected")).toBeVisible({ timeout: 6500 });
+  await expect(page.locator(".messageStatus")).toContainText("attempt completed before delivery");
+
+  dashboard.setMessageOutcome("failed", "attempt runtime failed before delivery");
+  await expect(page.locator(".messageStatus .state-failed")).toBeVisible({ timeout: 6500 });
+  await expect(page.locator(".messageStatus")).toContainText("attempt runtime failed before delivery");
 });

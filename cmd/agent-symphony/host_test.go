@@ -703,6 +703,75 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 	}
 }
 
+func TestOperatorHandoffCommandDriftPreservesEveryLaunchBoundary(t *testing.T) {
+	for _, stage := range []string{"binding", "launching", "launched", "receipt"} {
+		t.Run(stage, func(t *testing.T) {
+			oldExec := hostExecRunner
+			hostExecRunner = func(context.Context, agentruntime.Command) (agentruntime.Result, error) {
+				return agentruntime.Result{}, errors.New("tmux must not be reached after command drift")
+			}
+			t.Cleanup(func() { hostExecRunner = oldExec })
+
+			root := t.TempDir()
+			worktree := filepath.Join(root, "attempt")
+			if err := os.Mkdir(worktree, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			handoff := json.RawMessage(`{"type":"agent-symphony-handoff-v1","key":"operator-message-stable","kind":"operator-message"}`)
+			requestBody := func(command []string) []byte {
+				body, _ := json.Marshal(handoffRequest{
+					Manifest:     agentruntime.Manifest{Worktree: worktree, Session: "as-command-drift", LogPath: filepath.Join(worktree, "attempt.log")},
+					Handoff:      handoff,
+					OutcomePath:  handoffReceiptPath(worktree, "operator-message-stable"),
+					OutcomeToken: "stable-token",
+					Command:      command,
+				})
+				return body
+			}
+			originalBody := requestBody([]string{"implementation-v1"})
+			original, _, err := decodeHandoffRequest(originalBody, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binding, recipient := handoffBinding(original)
+			inbox := filepath.Join(worktree, ".agent-symphony", "handoffs")
+			if err := os.MkdirAll(inbox, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			files := map[string][]byte{".json": binding}
+			if stage == "launching" || stage == "launched" || stage == "receipt" {
+				files[".launching"] = []byte(recipient)
+			}
+			if stage == "launched" || stage == "receipt" {
+				files[".launched"] = []byte(recipient)
+			}
+			if stage == "receipt" {
+				ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", "operator-message-stable", original.OutcomePath, original.OutcomeToken})
+				files[".receipt"] = ack
+			}
+			for suffix, body := range files {
+				if err := writeImmutable(filepath.Join(inbox, "operator-message-stable"+suffix), body); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			changedBody := requestBody([]string{"implementation-v2"})
+			if _, err := verifyHandoff(t.Context(), changedBody, root); err == nil || !strings.Contains(err.Error(), "binding mismatch") {
+				t.Fatalf("verify command drift = %v", err)
+			}
+			if _, err := acceptOperatorHandoff(t.Context(), changedBody, root); err == nil || !strings.Contains(err.Error(), "binding changed") {
+				t.Fatalf("accept command drift = %v", err)
+			}
+			for suffix, want := range files {
+				got, err := os.ReadFile(filepath.Join(inbox, "operator-message-stable"+suffix))
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("%s evidence changed: %q err=%v", suffix, got, err)
+				}
+			}
+		})
+	}
+}
+
 func tmux(t *testing.T, args ...string) {
 	t.Helper()
 	if out, err := exec.Command("tmux", args...).CombinedOutput(); err != nil {

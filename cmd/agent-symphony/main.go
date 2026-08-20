@@ -1041,13 +1041,22 @@ func cleanupCompletedAttempts(ctx context.Context, boundary boundaryCaller, fact
 			continue
 		}
 		index := slices.IndexFunc(manifests, func(manifest agentruntime.Manifest) bool {
-			return orchestrator.MatchesPublishedAttempt(manifest, fact)
+			if manifest.State != "completed" && manifest.State != "preparing" && manifest.State != "running" {
+				return false
+			}
+			published := manifest
+			published.State = "completed"
+			return orchestrator.MatchesPublishedAttempt(published, fact)
 		})
 		if index < 0 {
 			continue
 		}
+		operation := "cleanup"
+		if manifests[index].State == "preparing" || manifests[index].State == "running" {
+			operation = "abandon"
+		}
 		body, _ := json.Marshal(manifests[index])
-		if _, err := boundary.call(ctx, "cleanup", agentruntime.Command{Stdin: bytes.NewReader(body)}); err != nil {
+		if _, err := boundary.call(ctx, operation, agentruntime.Command{Stdin: bytes.NewReader(body)}); err != nil {
 			return fmt.Errorf("clean up completed %s#%d attempt %d: %w", fact.Repository, fact.Issue, fact.Attempt, err)
 		}
 	}

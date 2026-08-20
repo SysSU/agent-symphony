@@ -30,8 +30,9 @@ import (
 type revokedAttemptRunner struct{ live, interrupted bool }
 
 type cleanupBoundary struct {
-	manifests []agentruntime.Manifest
-	err       error
+	manifests  []agentruntime.Manifest
+	operations []string
+	err        error
 }
 
 type directHandoffBoundary struct{ root string }
@@ -803,7 +804,7 @@ func operatorMessageRuntime(t *testing.T) (*agentruntime.Runtime, agentruntime.A
 }
 
 func (b *cleanupBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
-	if operation != "cleanup" {
+	if operation != "cleanup" && operation != "abandon" {
 		return agentruntime.Result{}, fmt.Errorf("unexpected operation %q", operation)
 	}
 	var manifest agentruntime.Manifest
@@ -811,6 +812,7 @@ func (b *cleanupBoundary) call(_ context.Context, operation string, command agen
 		return agentruntime.Result{}, err
 	}
 	b.manifests = append(b.manifests, manifest)
+	b.operations = append(b.operations, operation)
 	return agentruntime.Result{}, b.err
 }
 
@@ -1586,10 +1588,35 @@ func TestCompletedAttemptCleanupRequiresExactPublishedIdentity(t *testing.T) {
 	if len(boundary.manifests) != 1 || !reflect.DeepEqual(boundary.manifests[0], manifest) {
 		t.Fatalf("cleaned manifests = %#v", boundary.manifests)
 	}
+	if !slices.Equal(boundary.operations, []string{"cleanup"}) {
+		t.Fatalf("cleanup operations = %v", boundary.operations)
+	}
 
 	boundary.err = errors.New("injected cleanup failure")
 	if err := cleanupCompletedAttempts(t.Context(), boundary, []orchestrator.AttemptFact{exact}, []agentruntime.Manifest{manifest}); err == nil || !strings.Contains(err.Error(), "o/r#23 attempt 1") {
 		t.Fatalf("cleanup failure = %v", err)
+	}
+}
+
+func TestMergedAttemptCleansOperatorMessageRaceStates(t *testing.T) {
+	fact := orchestrator.AttemptFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", PR: 7, State: "completed"}
+	for _, test := range []struct {
+		name, state, operation string
+	}{
+		{"message queued", "completed", "cleanup"},
+		{"message claimed after resume", "running", "abandon"},
+		{"follow-up active", "running", "abandon"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", State: test.state, ReviewHead: "bbbbbbb", Session: "operator-follow-up"}
+			boundary := &cleanupBoundary{}
+			if err := cleanupCompletedAttempts(t.Context(), boundary, []orchestrator.AttemptFact{fact}, []agentruntime.Manifest{manifest}); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(boundary.operations, []string{test.operation}) || len(boundary.manifests) != 1 || !reflect.DeepEqual(boundary.manifests[0], manifest) {
+				t.Fatalf("merged %s cleanup operations=%v manifests=%#v", test.name, boundary.operations, boundary.manifests)
+			}
+		})
 	}
 }
 

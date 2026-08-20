@@ -1379,7 +1379,10 @@ func verifyHandoff(ctx context.Context, input []byte, root string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	_, recipient := handoffBinding(request)
+	binding, recipient := handoffBinding(request)
+	if _, err := immutableMarkerMatches(filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs", h.Key+".json"), binding); err != nil {
+		return "", fmt.Errorf("verify handoff binding: %w", err)
+	}
 	option := "@agent-symphony-handoff-" + recipient[:16]
 	observed, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"show-options", "-pqv", "-t", agentruntime.PaneTarget(request.Manifest.Session), option}, Dir: request.Manifest.Worktree})
 	if err != nil {
@@ -1402,14 +1405,13 @@ func acceptOperatorHandoff(ctx context.Context, input []byte, root string) (stri
 		return "", errors.New("invalid operator handoff")
 	}
 	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
-	_, recipient := handoffBinding(request)
-	launched, launchedErr := immutableMarkerMatches(filepath.Join(inbox, h.Key+".launched"), []byte(recipient))
-	launching := false
-	if launchedErr == nil && !launched {
-		launching, _ = immutableMarkerMatches(filepath.Join(inbox, h.Key+".launching"), []byte(recipient))
+	binding, _ := handoffBinding(request)
+	persisted, err := immutableMarkerMatches(filepath.Join(inbox, h.Key+".json"), binding)
+	if err != nil {
+		return "", fmt.Errorf("operator handoff binding changed: %w", err)
 	}
-	if !launched && !launching {
-		for _, suffix := range []string{".json", ".receipt", ".launching", ".launched"} {
+	if !persisted {
+		for _, suffix := range []string{".receipt", ".launching", ".launched"} {
 			if err := os.RemoveAll(filepath.Join(inbox, h.Key+suffix)); err != nil {
 				return "", err
 			}
