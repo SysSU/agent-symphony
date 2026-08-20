@@ -611,8 +611,17 @@ func TestWorkerResultArtifactFailsClosed(t *testing.T) {
 }
 
 func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
-	for _, failure := range []string{"load-buffer", "submission", "respawn-side-effect", "receipt"} {
-		t.Run(failure, func(t *testing.T) {
+	for _, test := range []struct {
+		name, failure, kind string
+		accept              func(context.Context, []byte, string) (string, error)
+	}{
+		{"load-buffer", "load-buffer", "", acceptHandoff},
+		{"submission", "submission", "", acceptHandoff},
+		{"respawn-side-effect", "respawn-side-effect", "", acceptHandoff},
+		{"receipt", "receipt", "", acceptHandoff},
+		{"operator-respawn-side-effect", "respawn-side-effect", "operator-message", acceptOperatorHandoff},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			oldExec, oldDirSync := hostExecRunner, immutableDirSync
 			t.Cleanup(func() { hostExecRunner, immutableDirSync = oldExec, oldDirSync })
 			root := t.TempDir()
@@ -625,7 +634,7 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 			if err := os.WriteFile(resultPath, []byte(previousResult), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			handoff := []byte(`{"type":"agent-symphony-handoff-v1","key":"retry-key"}`)
+			handoff, _ := json.Marshal(struct{ Type, Key, Kind string }{"agent-symphony-handoff-v1", "retry-key", test.kind})
 			request, _ := json.Marshal(struct {
 				Manifest     agentruntime.Manifest `json:"manifest"`
 				Handoff      json.RawMessage       `json:"handoff"`
@@ -641,16 +650,16 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 				if slices.Contains(command.Args, "display-message") {
 					return agentruntime.Result{Output: "1"}, nil
 				}
-				if !injected && failure == "load-buffer" && slices.Contains(command.Args, "load-buffer") {
+				if !injected && test.failure == "load-buffer" && slices.Contains(command.Args, "load-buffer") {
 					injected = true
 					return agentruntime.Result{}, errors.New("injected load failure")
 				}
 				if slices.Contains(command.Args, "set-option") {
-					if !injected && failure == "submission" {
+					if !injected && test.failure == "submission" {
 						injected = true
 						return agentruntime.Result{}, errors.New("injected submission failure")
 					}
-					if !injected && failure == "respawn-side-effect" {
+					if !injected && test.failure == "respawn-side-effect" {
 						injected = true
 						deliveries++
 						launchedPath := filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.launched")
@@ -664,27 +673,27 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 				return agentruntime.Result{}, nil
 			}
 			immutableDirSync = func(dir string) error {
-				if !injected && failure == "receipt" && dir == filepath.Join(worktree, ".agent-symphony", "handoffs") && recipient != "" {
+				if !injected && test.failure == "receipt" && dir == filepath.Join(worktree, ".agent-symphony", "handoffs") && recipient != "" {
 					injected = true
 					return errors.New("injected receipt sync failure")
 				}
 				return oldDirSync(dir)
 			}
-			if _, err := acceptHandoff(t.Context(), request, root); err == nil {
+			if _, err := test.accept(t.Context(), request, root); err == nil {
 				t.Fatal("injected failure succeeded")
 			}
 			if retained, err := os.ReadFile(resultPath); err != nil || string(retained) != previousResult {
-				t.Fatalf("previous result was not retained across %s failure: %q err=%v", failure, retained, err)
+				t.Fatalf("previous result was not retained across %s failure: %q err=%v", test.failure, retained, err)
 			}
 			if _, err := os.Stat(filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.json")); err != nil {
 				t.Fatalf("pending state lost: %v", err)
 			}
-			if failure == "respawn-side-effect" {
+			if test.failure == "respawn-side-effect" {
 				if _, err := os.Stat(filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.launching")); err != nil {
 					t.Fatalf("durable launch state lost: %v", err)
 				}
 			}
-			if _, err := acceptHandoff(t.Context(), request, root); err != nil {
+			if _, err := test.accept(t.Context(), request, root); err != nil {
 				t.Fatalf("restart retry: %v", err)
 			}
 			if deliveries != 1 {

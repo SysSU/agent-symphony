@@ -1402,9 +1402,17 @@ func acceptOperatorHandoff(ctx context.Context, input []byte, root string) (stri
 		return "", errors.New("invalid operator handoff")
 	}
 	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
-	for _, suffix := range []string{".json", ".receipt", ".launching", ".launched"} {
-		if err := os.RemoveAll(filepath.Join(inbox, h.Key+suffix)); err != nil {
-			return "", err
+	_, recipient := handoffBinding(request)
+	launched, launchedErr := immutableMarkerMatches(filepath.Join(inbox, h.Key+".launched"), []byte(recipient))
+	launching := false
+	if launchedErr == nil && !launched {
+		launching, _ = immutableMarkerMatches(filepath.Join(inbox, h.Key+".launching"), []byte(recipient))
+	}
+	if !launched && !launching {
+		for _, suffix := range []string{".json", ".receipt", ".launching", ".launched"} {
+			if err := os.RemoveAll(filepath.Join(inbox, h.Key+suffix)); err != nil {
+				return "", err
+			}
 		}
 	}
 	return acceptHandoff(ctx, input, root)
