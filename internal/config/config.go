@@ -74,7 +74,8 @@ func Default(repository string) Config {
 		DocsPaths:    []string{"README.md", "docs"},
 		Commands: Commands{
 			Implementation: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}, Reviewer: []string{"codex", "exec", "--sandbox", "read-only", "-"},
-			Environment: []string{"LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"},
+			Orchestrator: []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"},
+			Environment:  []string{"LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"},
 		},
 		Status: Status{Format: "human", Color: "auto"},
 	}

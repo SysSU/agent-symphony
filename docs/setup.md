@@ -160,6 +160,16 @@ Each process still manages only its configured repository. The daemons share the
 
 Before upgrading an existing installation to the first release with repository-namespaced reviewer sessions, let active independent reviews finish and reconcile their cleanup. Implementation attempt identities are unchanged.
 
+## Advisory orchestrator
+
+New configuration created by `agent-symphony init` enables the advisory orchestrator. In zero-admin mode, its default Codex command lets the orchestrator use the coordinator user's authenticated `gh` CLI and inspect same-user tmux sessions:
+
+```json
+["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"]
+```
+
+Agent Symphony replaces `{orchestrator_workspace}` with the managed absolute path. Full Codex access is necessary for direct GitHub and tmux inspection, but it also exposes other resources readable by the coordinator user. Use it only with a trusted model. Advanced host isolation runs the orchestrator as the reviewer identity, which cannot inspect the coordinator user's GitHub login or tmux server. After changing the command, use the dashboard Rebuild action, then rerun `validate` and `doctor`.
+
 ## Advanced: host-isolated mode
 
 The default boundary runs implementation and review processes as the coordinator's operating-system user while filtering their environment, remotes, and credential helpers. For OS-enforced separation, install a versioned release as root and provision the fixed worker and reviewer identities:
@@ -174,4 +184,4 @@ sudo /usr/local/libexec/agent-symphony/VERSION/agent-symphony \
 
 Rerun `install-host` after every binary upgrade. `doctor` and `serve` automatically require the stricter boundary once it is installed. The boundary environment variables are test seams, not production setup.
 
-The advisory orchestrator is disabled by default and requires this host-isolated mode. After `install-host` succeeds, enable it by adding a prompt-accepting interactive `commands.orchestrator` array. For Codex, scope directory trust to the workspace Agent Symphony created: `["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "read-only", "--ask-for-approval", "never", "--no-alt-screen"]`. Agent Symphony replaces `{orchestrator_workspace}` with that absolute path at launch. Use the dashboard Rebuild action to replace an already-running session after changing this command, then rerun `validate` and `doctor`. Rerun `install-host` after upgrading so the exact reviewer-identity orchestrator rule remains current.
+When the orchestrator is configured in this mode, Agent Symphony launches it through the reviewer identity and snapshot group. Rerun `install-host` after upgrading so the exact reviewer-identity orchestrator rule remains current.

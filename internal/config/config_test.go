@@ -14,8 +14,9 @@ func TestLoadAndValidate(t *testing.T) {
 	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "exec", "--sandbox", "read-only", "-"}) {
 		t.Fatalf("unexpected default commands: %#v", c.Commands)
 	}
-	if c.Commands.Orchestrator != nil {
-		t.Fatalf("orchestrator must be opt-in, got %#v", c.Commands.Orchestrator)
+	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
+	if !slices.Equal(c.Commands.Orchestrator, wantOrchestrator) {
+		t.Fatalf("unexpected default orchestrator: %#v", c.Commands.Orchestrator)
 	}
 	c.Commands.Implementation = []string{"custom-agent", "--flag"}
 	path := filepath.Join(t.TempDir(), DefaultPath)
