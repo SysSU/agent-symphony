@@ -2970,8 +2970,12 @@ func TestInitAndMisuseExitCodes(t *testing.T) {
 	if code := run([]string{"init"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("init exit %d: %s", code, stderr.String())
 	}
-	if _, err := config.Load(filepath.Join(root, config.DefaultPath)); err != nil {
+	initialized, err := config.Load(filepath.Join(root, config.DefaultPath))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !slices.Equal(initialized.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}) {
+		t.Fatalf("unexpected initialized implementation command: %q", initialized.Commands.Implementation)
 	}
 	stdout.Reset()
 	stderr.Reset()

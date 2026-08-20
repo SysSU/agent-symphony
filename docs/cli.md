@@ -109,7 +109,7 @@ Commands produce plain human-readable text by default and never depend on color.
   "worktree_root": ".worktrees",
   "docs_paths": ["README.md", "docs"],
   "commands": {
-    "implementation": ["codex", "exec", "--sandbox", "workspace-write"],
+    "implementation": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"],
     "reviewer": ["codex", "exec", "--sandbox", "read-only", "-"],
     "orchestrator": ["codex", "--sandbox", "read-only", "--ask-for-approval", "never", "--no-alt-screen"],
     "environment_allowlist": ["LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"]
@@ -123,7 +123,7 @@ Commands produce plain human-readable text by default and never depend on color.
 
 `commands.orchestrator` is optional and requires an advanced host-isolated installation. Omitting it disables the long-lived advisory agent, so upgrades do not unexpectedly start a model or add cost. When configured, Agent Symphony replaces `{orchestrator_workspace}` in each argument with the absolute managed workspace path, then appends bounded generated context as the command's final argument. The command must accept an initial prompt there. The agent cannot replace coordinator workflow decisions or receive GitHub, SSH-agent, cloud, token, password, private-key, or authorization credentials. Its only worker-message output is the fixed proposal adapter's framed standard-output response; it receives no writable proposal path, tmux target, worker command, GitHub mutation, or scheduling interface.
 
-Commands are argument arrays, not shell strings, so runtime code does not use shell interpolation. The default noninteractive Codex implementation command uses `workspace-write` for source edits.
+Commands are argument arrays, not shell strings, so runtime code does not use shell interpolation. The default noninteractive Codex implementation command uses `--dangerously-bypass-approvals-and-sandbox` so implementation and validation can use the worker host without Codex sandbox restrictions or approval prompts. Use advanced host isolation to confine that access to the unprivileged worker account.
 
 The boundary helper captures implementation or review stdout in an exclusively created private result file outside the worktree or snapshot; stderr remains in tmux for diagnostics. An implementation must return one `agent-symphony-result-v1` JSON object no larger than 64 KiB. A reviewer must return one bounded `agent-symphony-review-v1` object. The helper owns the process group, stops only that group on completion, overflow, or cancellation, and fails boundedly if an escaped process keeps stdout open. Results remain outside the source tree for safe export and retry.
 
