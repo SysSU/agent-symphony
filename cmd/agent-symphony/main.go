@@ -356,7 +356,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return success(stdout, *jsonOutput, command, nil, "host isolation installed")
 	case "agent-host":
 		if fs.NArg() != 1 || fs.NFlag() != 0 {
-			return misuse(stderr, wantsJSON, command, "usage: agent-symphony agent-host implementation|review|orchestrator|orchestrator-proposal")
+			return misuse(stderr, wantsJSON, command, "usage: agent-symphony agent-host implementation|review|orchestrator|orchestrator-proposal|orchestrator-proposal-status")
 		}
 		if err := agentHost(context.Background(), fs.Arg(0), os.Stdin, stdout); err != nil {
 			return fail(stderr, false, command, err.Error())
