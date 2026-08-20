@@ -2976,7 +2976,7 @@ func usage(w io.Writer) {
 commands:
 	install-host  provision the native worker/reviewer boundary (run as root)
 	agent-host    execute the implementation, review, or orchestrator boundary
-	init          create .agent-symphony.yaml with safe defaults
+	init          create .agent-symphony.yaml with project defaults
 	validate      validate configuration
 	config view   print validated configuration
 	serve         reconcile at startup and at most every 60 seconds

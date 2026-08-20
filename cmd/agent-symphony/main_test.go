@@ -2970,8 +2970,13 @@ func TestInitAndMisuseExitCodes(t *testing.T) {
 	if code := run([]string{"init"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("init exit %d: %s", code, stderr.String())
 	}
-	if _, err := config.Load(filepath.Join(root, config.DefaultPath)); err != nil {
+	initialized, err := config.Load(filepath.Join(root, config.DefaultPath))
+	if err != nil {
 		t.Fatal(err)
+	}
+	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
+	if !slices.Equal(initialized.Commands.Orchestrator, wantOrchestrator) {
+		t.Fatalf("initialized orchestrator=%#v", initialized.Commands.Orchestrator)
 	}
 	stdout.Reset()
 	stderr.Reset()
