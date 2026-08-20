@@ -66,13 +66,13 @@ func (r *orchestratorTestRunner) Run(_ context.Context, command agentruntime.Com
 	return agentruntime.Result{}, nil
 }
 
-func TestConfiguredReadOnlyOrchestratorProposesThroughCapturedOutput(t *testing.T) {
+func TestConfiguredFullAccessOrchestratorProposesThroughCapturedOutput(t *testing.T) {
 	fakeAdvancedOrchestratorHost(t)
 	oldPrepare := orchestratorWorkspacePrepare
 	orchestratorWorkspacePrepare = func(path string, _ int) error { return os.MkdirAll(path, 0o750) }
 	t.Cleanup(func() { orchestratorWorkspacePrepare = oldPrepare })
 	cfg := config.Default("SysSU/example")
-	cfg.Commands.Orchestrator = []string{"codex", "--sandbox", "read-only", "--ask-for-approval", "never", "--no-alt-screen"}
+	cfg.Commands.Orchestrator = []string{"codex", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
 	stateRoot := t.TempDir()
 	agent, err := newOrchestratorAgent(cfg, stateRoot)
 	if err != nil {
@@ -117,8 +117,8 @@ func TestConfiguredReadOnlyOrchestratorProposesThroughCapturedOutput(t *testing.
 		t.Fatalf("maximum escaped proposal length=%d err=%v", len(got.Message), err)
 	}
 	launch, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratorLaunchFile))
-	if err != nil || !strings.Contains(string(launch), `"--sandbox"`) || !strings.Contains(string(launch), `"read-only"`) {
-		t.Fatalf("read-only launch=%s err=%v", launch, err)
+	if err != nil || !strings.Contains(string(launch), `"--sandbox"`) || !strings.Contains(string(launch), `"danger-full-access"`) {
+		t.Fatalf("full-access launch=%s err=%v", launch, err)
 	}
 	entries, err := os.ReadDir(agent.Workspace)
 	if err != nil {

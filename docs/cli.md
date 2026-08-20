@@ -111,7 +111,7 @@ Commands produce plain human-readable text by default and never depend on color.
   "commands": {
     "implementation": ["codex", "exec", "--sandbox", "workspace-write"],
     "reviewer": ["codex", "exec", "--sandbox", "read-only", "-"],
-    "orchestrator": ["codex", "--sandbox", "read-only", "--ask-for-approval", "never", "--no-alt-screen"],
+    "orchestrator": ["codex", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"],
     "environment_allowlist": ["LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"]
   },
   "status": {
@@ -121,7 +121,11 @@ Commands produce plain human-readable text by default and never depend on color.
 }
 ```
 
-`commands.orchestrator` is optional and requires an advanced host-isolated installation. Omitting it disables the long-lived advisory agent, so upgrades do not unexpectedly start a model or add cost. When configured, Agent Symphony replaces `{orchestrator_workspace}` in each argument with the absolute managed workspace path, then appends bounded generated context as the command's final argument. The command must accept an initial prompt there. The agent cannot replace coordinator workflow decisions or receive GitHub, SSH-agent, cloud, token, password, private-key, or authorization credentials. Its only worker-message output is the fixed proposal adapter's framed standard-output response; it receives no writable proposal path, tmux target, worker command, GitHub mutation, or scheduling interface.
+`commands.orchestrator` is optional in both boundary modes. Omitting it disables the long-lived advisory agent, so upgrades do not unexpectedly start a model or add cost. When configured, Agent Symphony replaces `{orchestrator_workspace}` in each argument with the absolute managed workspace path, then appends bounded generated context as the command's final argument. The command must accept an initial prompt there.
+
+In zero-admin mode, the orchestrator runs as the coordinator user. The `danger-full-access` Codex example lets it use the authenticated `gh` CLI and inspect the same-user tmux server when the bounded projection lacks progress detail. This setting also lets the model access other resources available to that user; Agent Symphony filters the launch environment and instructs the agent to keep GitHub and tmux inspection read-only, but the Codex sandbox no longer enforces that limit. Use this mode only when the orchestrator model is trusted. In advanced host-isolated mode, the orchestrator runs as the reviewer identity and cannot use the coordinator's GitHub login or tmux server even with the same Codex setting.
+
+The agent cannot replace coordinator workflow decisions. Its worker-message output remains the fixed proposal adapter's framed standard-output response; the authenticated dashboard requires explicit confirmation before the coordinator records or delivers it.
 
 Commands are argument arrays, not shell strings, so runtime code does not use shell interpolation. The default noninteractive Codex implementation command uses `workspace-write` for source edits.
 
