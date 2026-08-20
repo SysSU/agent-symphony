@@ -167,8 +167,8 @@ export default function Dashboard() {
   const { current, completed, visible } = statusViews(statuses, tab);
   const health = overallHealth(snapshot, error, statuses, now);
   const openAttemptTerminal = useCallback((status, session) => {
-    const query = new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt), role: session.role });
-    setTerminal({ endpoint: `/terminal?${query}`, title: session.name, eyebrow: `${session.role} tmux session`, readOnly: session.role === "reviewer" });
+    const selected = session ?? { role: "implementation", name: status.session }, route = { implementation: "/terminal", reviewer: "/reviewer/terminal" }[selected.role];
+    if (route && selected.name) setTerminal({ endpoint: `${route}?${new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) })}`, title: selected.name, eyebrow: `${selected.role} tmux session`, readOnly: selected.role === "reviewer" });
   }, []);
   const openOrchestratorTerminal = useCallback(() => {
     if (!orchestratorStatus?.session) return;

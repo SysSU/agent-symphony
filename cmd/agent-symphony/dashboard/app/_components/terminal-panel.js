@@ -35,7 +35,7 @@ export default function TerminalPanel({ config, onClose }) {
       terminal.loadAddon(fit);
       terminal.open(container.current);
       fit.fit();
-      terminal.focus();
+      if (!config.readOnly) terminal.focus();
 
       const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
       socket = new WebSocket(`${scheme}//${window.location.host}${config.endpoint}`);

@@ -155,8 +155,12 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 			s.serveOrchestratorTerminal(w, r)
 			return
 		}
+		if r.URL.Path == "/reviewer/terminal" {
+			s.serveTerminal(w, r, agentruntime.SessionRoleReviewer)
+			return
+		}
 		if r.URL.Path == "/terminal" {
-			s.serveTerminal(w, r)
+			s.serveTerminal(w, r, agentruntime.SessionRoleImplementation)
 			return
 		}
 		static.ServeHTTP(w, r)
@@ -775,7 +779,7 @@ func dashboardRequestLoopback(r *http.Request) bool {
 	return dashboardHostAllowed(r.Host, false) || strings.TrimSpace(r.Header.Get("Tailscale-User-Login")) != ""
 }
 
-func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request) {
+func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request, role string) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "terminal requires GET", http.StatusMethodNotAllowed)
 		return
@@ -787,16 +791,8 @@ func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request) 
 	query := r.URL.Query()
 	issue, issueErr := strconv.Atoi(query.Get("issue"))
 	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
-	role := query.Get("role")
-	if role == "" {
-		role = agentruntime.SessionRoleImplementation
-	}
 	session, err := s.projectedSession(issue, attempt, role)
-	wantKeys := 3
-	if query.Get("role") == "" {
-		wantKeys = 2
-	}
-	if issueErr != nil || attemptErr != nil || err != nil || len(query) != wantKeys || len(query["issue"]) != 1 || len(query["attempt"]) != 1 || query.Get("role") != "" && len(query["role"]) != 1 {
+	if issueErr != nil || attemptErr != nil || err != nil || len(query) != 2 || len(query["issue"]) != 1 || len(query["attempt"]) != 1 {
 		http.Error(w, "terminal session is not available", http.StatusNotFound)
 		return
 	}

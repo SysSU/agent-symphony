@@ -22,7 +22,7 @@ async function mockDashboard(page) {
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: false, state: "disabled" } }));
   await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
-  await page.routeWebSocket("**/terminal?**", (socket) => {
+  await page.routeWebSocket(/\/(?:reviewer\/)?terminal\?/, (socket) => {
     const record = { url: socket.url(), messages: [] };
     sockets.push(record);
     socket.onMessage((message) => record.messages.push(message));
@@ -46,17 +46,18 @@ test("selects each bounded session and keeps reviewer attachment read-only", asy
   await expect(page.getByRole("button", { name: "Close" })).toBeFocused();
   await expect(page.getByRole("status").filter({ hasText: "Connected · read-only" })).toBeVisible();
   await page.screenshot({ path: "test-results/session-selection-desktop.png", fullPage: true });
+  await page.getByLabel(`Read-only terminal for ${attempt.sessions[1].name}`).click();
   await page.keyboard.type("review input");
   await expect.poll(() => sockets.length).toBe(1);
-  expect(sockets[0].url).toContain("issue=163&attempt=1&role=reviewer");
+  expect(sockets[0].url).toContain("/reviewer/terminal?issue=163&attempt=1");
   expect(sockets[0].messages.every((message) => typeof message === "string")).toBe(true);
   await page.getByRole("button", { name: "Close" }).click();
 
-  await page.getByRole("button", { name: "Open implementation terminal" }).click();
+  await page.getByRole("button", { name: attempt.sessions[0].name }).click();
   await expect(page.getByRole("dialog", { name: attempt.sessions[0].name })).toBeVisible();
   await page.keyboard.type("implementation input");
   await expect.poll(() => sockets[1]?.messages.some((message) => typeof message !== "string")).toBe(true);
-  expect(sockets[1].url).toContain("issue=163&attempt=1&role=implementation");
+  expect(sockets[1].url).toContain("/terminal?issue=163&attempt=1");
   expect(errors).toEqual([]);
 });
 
