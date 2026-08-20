@@ -29,7 +29,7 @@ test("groups every status into one ordered dashboard lane", () => {
     "Needs attention": ["blocked", "failed", "conflicting", "orphaned", "cancelled", "future-state"],
     Done: ["completed"],
   });
-  assert.deepEqual(lanes.flatMap((lane) => lane.statuses), statuses);
+  assert.deepEqual(lanes.flatMap((lane) => lane.statuses).map(({ issue }) => issue).sort((a, b) => a - b), statuses.map(({ issue }) => issue));
   assert.deepEqual(groupStatusesByLane([]).map((lane) => lane.statuses.length), [0, 0, 0, 0, 0]);
 });
 

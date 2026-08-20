@@ -69,6 +69,7 @@ h1 { margin: 0; overflow-wrap: anywhere; font-size: clamp(2rem, 5vw, 3.7rem); le
 .health-unavailable .healthDot { background: var(--bad); box-shadow: 0 0 0 4px rgb(165 50 50 / 12%); }
 
 .board { display: grid; grid-template-columns: repeat(5, minmax(230px, 1fr)); gap: 12px; overflow-x: auto; padding-bottom: 8px; }
+.board:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
 .lane { min-width: 0; align-self: start; padding: 12px; border: 1px solid var(--line); border-radius: 16px; background: var(--lane); box-shadow: 0 8px 22px rgb(0 0 0 / 14%); }
 .laneHeader { padding: 2px 2px 12px; }
 .laneHeader h2 { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0; font-size: 0.88rem; letter-spacing: 0.01em; }
