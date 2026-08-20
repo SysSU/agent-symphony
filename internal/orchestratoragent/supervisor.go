@@ -26,15 +26,16 @@ import (
 )
 
 const (
-	stateVersion          = 1
-	maxContextBytes       = 64 << 10
-	maxNoticeBytes        = maxContextBytes
-	maxDiagnosticBytes    = 1024
-	maxProposalBytes      = 64 << 10
-	maxProposalFrameBytes = len(MessageProposalPrefix) + (maxProposalBytes+2)/3*4 + 1
-	maxPaneCaptureBytes   = 2 * maxProposalFrameBytes
-	historyLimit          = "65536"
-	MessageProposalPrefix = "AGENT_SYMPHONY_MESSAGE_PROPOSAL_V1:"
+	stateVersion              = 1
+	maxContextBytes           = 64 << 10
+	maxNoticeBytes            = maxContextBytes
+	maxDiagnosticBytes        = 1024
+	maxProposalBytes          = 64 << 10
+	maxProposalFrameBytes     = len(MessageProposalPrefix) + (maxProposalBytes+2)/3*4 + 1
+	maxPaneCaptureBytes       = 2 * maxProposalFrameBytes
+	historyLimit              = "65536"
+	MessageProposalPrefix     = "AGENT_SYMPHONY_MESSAGE_PROPOSAL_V1:"
+	MessageProposalStatusFile = "orchestrator-proposal-status.json"
 )
 
 var ErrNoMessageProposal = errors.New("orchestrator message proposal is not available")
@@ -73,6 +74,15 @@ type MessageProposal struct {
 	Attempt    int    `json:"attempt"`
 	Message    string `json:"message"`
 	Binding    string `json:"binding,omitempty"`
+}
+
+// MessageProposalStatus is the coordinator's last live observation of the
+// proposal pane. It contains bindings only, never operator message text.
+type MessageProposalStatus struct {
+	Version         int       `json:"version"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	PendingBinding  string    `json:"pending_binding,omitempty"`
+	ConsumedBinding string    `json:"consumed_binding,omitempty"`
 }
 
 // Service is the narrow lifecycle surface consumed by the dashboard.
@@ -129,15 +139,16 @@ type sanitizedSession struct {
 
 // Supervisor owns one repository's optional advisory tmux agent.
 type Supervisor struct {
-	Root            string
-	Workspace       string
-	Repository      string
-	Command         []string
-	Launcher        []string
-	ProposalCommand []string
-	Env             []string
-	Runner          agentruntime.Runner
-	Now             func() time.Time
+	Root                  string
+	Workspace             string
+	Repository            string
+	Command               []string
+	Launcher              []string
+	ProposalCommand       []string
+	ProposalStatusCommand []string
+	Env                   []string
+	Runner                agentruntime.Runner
+	Now                   func() time.Time
 
 	mu              sync.Mutex
 	projection      []sanitizedStatus
@@ -257,6 +268,9 @@ func (s *Supervisor) Investigate(ctx context.Context, issue, attemptNumber int) 
 func (s *Supervisor) MessageProposal(ctx context.Context) (MessageProposal, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.clearMessageProposalStatus(); err != nil {
+		return MessageProposal{}, err
+	}
 	state, err := s.readOrInitial()
 	if err != nil || state.State != "running" {
 		return MessageProposal{}, ErrNoMessageProposal
@@ -266,15 +280,32 @@ func (s *Supervisor) MessageProposal(ctx context.Context) (MessageProposal, erro
 		return MessageProposal{}, err
 	}
 	proposal, err := parseMessageProposal(result.Output, s.Repository)
-	if err == nil && proposal.Binding == state.ConsumedProposal {
+	if err != nil {
+		if errors.Is(err, ErrNoMessageProposal) {
+			if writeErr := s.writeMessageProposalStatus("", state.ConsumedProposal); writeErr != nil {
+				return MessageProposal{}, writeErr
+			}
+		}
+		return MessageProposal{}, err
+	}
+	if proposal.Binding == state.ConsumedProposal {
+		if err := s.writeMessageProposalStatus("", state.ConsumedProposal); err != nil {
+			return MessageProposal{}, err
+		}
 		return MessageProposal{}, ErrNoMessageProposal
 	}
-	return proposal, err
+	if err := s.writeMessageProposalStatus(proposal.Binding, state.ConsumedProposal); err != nil {
+		return MessageProposal{}, err
+	}
+	return proposal, nil
 }
 
 func (s *Supervisor) ConsumeMessageProposal(ctx context.Context, binding string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.clearMessageProposalStatus(); err != nil {
+		return err
+	}
 	state, err := s.readOrInitial()
 	if err != nil {
 		return err
@@ -291,7 +322,10 @@ func (s *Supervisor) ConsumeMessageProposal(ctx context.Context, binding string)
 		return errors.New("orchestrator message proposal binding changed")
 	}
 	state.ConsumedProposal, state.UpdatedAt = binding, s.now()
-	return s.writeState(state)
+	if err := s.writeState(state); err != nil {
+		return err
+	}
+	return s.writeMessageProposalStatus("", binding)
 }
 
 func (s *Supervisor) recover(ctx context.Context) (persisted, error) {
@@ -446,6 +480,9 @@ func (s *Supervisor) live(ctx context.Context, session string) (bool, error) {
 }
 
 func (s *Supervisor) stop(ctx context.Context, session string) error {
+	if err := s.clearMessageProposalStatus(); err != nil {
+		return err
+	}
 	result, err := s.run(ctx, "tmux", []string{"kill-session", "-t", "=" + session}, nil)
 	if err != nil && !(result.Exited && result.Code == 1) {
 		return err
@@ -499,7 +536,10 @@ func (s *Supervisor) context(mode string) ([]byte, error) {
 	body.WriteString("\",\"issue\":123,\"attempt\":1,\"message\":\"1-8192 bytes of UTF-8 text\"}`. Pass the JSON on standard input to ")
 	command, _ := json.Marshal(s.ProposalCommand)
 	body.Write(command)
-	body.WriteString(". This command only validates and emits a framed proposal on standard output; the coordinator reads it from the pane without granting filesystem writes. Do not run worker commands or bypass the read-only tmux and GitHub limits above. The authenticated dashboard will show the exact proposal and require operator confirmation; the coordinator owns all validation, recording, queueing, and delivery.\n")
+	body.WriteString(". A successful command proves only that this frame was emitted. It does not prove that the coordinator captured, persisted, queued, delivered, or displayed it. Pass the same exact JSON to ")
+	statusCommand, _ := json.Marshal(s.ProposalStatusCommand)
+	body.Write(statusCommand)
+	body.WriteString(" to query the coordinator's bounded read-only acknowledgement. Only a `pending` result for the exact binding verifies that this deployed coordinator currently exposes the proposal for dashboard confirmation. `consumed` does not distinguish confirmation from cancellation and proves nothing about queueing or delivery; `replaced` means a different proposal is pending; `unknown` means the required coordinator check is unavailable.\n\nDistinguish implementation capability, command output, and current live state. Source and documentation prove capability, not current state. Classify material operational, UI, GitHub, tmux, handoff, and proposal claims as `VERIFIED`, `INFERRED`, or `UNKNOWN`. Query the authoritative live source before a `VERIFIED` claim, withhold recommendations whose required preconditions are `UNKNOWN`, and state the missing check when verification is unavailable. Never say a conditional dashboard control is available without both its deployed implementation and matching current live state. If the operator reports a contradiction, discard the current narrative and rebuild it from primary evidence. Do not run worker commands or bypass the read-only tmux and GitHub limits above. The coordinator owns all validation, recording, queueing, and delivery.\n")
 	if mode == "rebuild" {
 		encoded, err := json.MarshalIndent(s.projection, "", "  ")
 		if err != nil {
@@ -566,7 +606,7 @@ func (s *Supervisor) contextForStart(mode string) ([]byte, bool, error) {
 }
 
 func (s *Supervisor) validate() error {
-	if s.Repository == "" || s.Root == "" || !filepath.IsAbs(s.Root) || s.Workspace == "" || !filepath.IsAbs(s.Workspace) || len(s.Command) == 0 || strings.TrimSpace(s.Command[0]) == "" || len(s.ProposalCommand) == 0 || strings.TrimSpace(s.ProposalCommand[0]) == "" {
+	if s.Repository == "" || s.Root == "" || !filepath.IsAbs(s.Root) || s.Workspace == "" || !filepath.IsAbs(s.Workspace) || len(s.Command) == 0 || strings.TrimSpace(s.Command[0]) == "" || len(s.ProposalCommand) == 0 || strings.TrimSpace(s.ProposalCommand[0]) == "" || len(s.ProposalStatusCommand) == 0 || strings.TrimSpace(s.ProposalStatusCommand[0]) == "" {
 		return errors.New("invalid orchestrator supervisor configuration")
 	}
 	return nil
@@ -602,6 +642,22 @@ func (s *Supervisor) writeState(state persisted) error {
 		return err
 	}
 	return writeAtomic(filepath.Join(s.Root, "orchestrator-agent.json"), append(body, '\n'), 0o600)
+}
+
+func (s *Supervisor) clearMessageProposalStatus() error {
+	err := os.Remove(filepath.Join(s.Workspace, MessageProposalStatusFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func (s *Supervisor) writeMessageProposalStatus(pending, consumed string) error {
+	body, err := json.Marshal(MessageProposalStatus{Version: stateVersion, UpdatedAt: s.now(), PendingBinding: pending, ConsumedBinding: consumed})
+	if err != nil {
+		return err
+	}
+	return writeAtomic(filepath.Join(s.Workspace, MessageProposalStatusFile), append(body, '\n'), 0o440)
 }
 
 func (s *Supervisor) now() time.Time {

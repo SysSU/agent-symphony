@@ -388,6 +388,14 @@ func TestDashboardWorkerMessageRequiresAuthenticationAndExactConfirmationBinding
 	if response.Code != http.StatusOK || service.confirms != 1 || service.consumes != 1 || strings.Contains(response.Body.String(), proposal.Message) {
 		t.Fatalf("confirmed status=%d confirms=%d consumes=%d body=%q", response.Code, service.confirms, service.consumes, response.Body.String())
 	}
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator/proposal.json", nil)
+	request.SetBasicAuth("agent-symphony", "password")
+	request.AddCookie(session)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("consumed proposal status=%d body=%q", response.Code, response.Body.String())
+	}
 }
 
 func (f *fakeDashboardOrchestrator) Status(context.Context) (orchestratoragent.Status, error) {

@@ -39,13 +39,14 @@ func (s dashboardOrchestratorService) ConfirmMessage(ctx context.Context, propos
 func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratoragent.Supervisor, error) {
 	workspace := filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-"+internalgithub.RepositoryIdentifier(cfg.Repository))
 	agent := &orchestratoragent.Supervisor{
-		Root:            stateRoot,
-		Workspace:       workspace,
-		Repository:      cfg.Repository,
-		Command:         cfg.Commands.Orchestrator,
-		Launcher:        orchestratorBoundaryCommand(),
-		ProposalCommand: orchestratorProposalCommand(),
-		Runner:          agentruntime.ExecRunner{},
+		Root:                  stateRoot,
+		Workspace:             workspace,
+		Repository:            cfg.Repository,
+		Command:               cfg.Commands.Orchestrator,
+		Launcher:              orchestratorBoundaryCommand(),
+		ProposalCommand:       orchestratorProposalCommand(),
+		ProposalStatusCommand: orchestratorProposalStatusCommand(),
+		Runner:                agentruntime.ExecRunner{},
 	}
 	if cfg.Commands.Orchestrator == nil {
 		return agent, nil
@@ -76,6 +77,11 @@ func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratorage
 func orchestratorProposalCommand() []string {
 	binary, _ := os.Executable()
 	return []string{binary, "agent-host", "orchestrator-proposal"}
+}
+
+func orchestratorProposalStatusCommand() []string {
+	binary, _ := os.Executable()
+	return []string{binary, "agent-host", "orchestrator-proposal-status"}
 }
 
 func prepareOrchestratorWorkspace(path string, gid int) error {

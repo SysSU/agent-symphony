@@ -70,6 +70,13 @@ func TestHostOrchestratorProposalEmitsOnlyTheFixedValidatedFrame(t *testing.T) {
 	if output.Len() != 0 {
 		t.Fatalf("invalid proposal emitted output: %q", output.String())
 	}
+	output.Reset()
+	if err := reportHostOrchestratorProposalStatus(root, strings.NewReader(proposal), &output); err != nil || !strings.Contains(output.String(), `"state":"unknown"`) {
+		t.Fatalf("uncaptured proposal status=%q err=%v", output.String(), err)
+	}
+	if entries, err := os.ReadDir(workspace); err != nil || len(entries) != 0 {
+		t.Fatalf("read-only status changed workspace: entries=%#v err=%v", entries, err)
+	}
 }
 
 func fakeHostIdentity(t *testing.T, uid, gid int) {
