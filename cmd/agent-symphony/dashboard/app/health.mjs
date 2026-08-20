@@ -1,5 +1,13 @@
 const staleAfter = 2 * 60 * 1000;
 const attentionStates = new Set(["blocked", "failed", "conflicting", "orphaned"]);
+const laneDefinitions = [
+  { id: "queue", title: "Queue", states: ["runnable", "queued"] },
+  { id: "in-progress", title: "In progress", states: ["active"] },
+  { id: "in-review", title: "In review", states: ["review-ready"] },
+  { id: "needs-attention", title: "Needs attention", states: ["blocked", "failed", "conflicting", "orphaned", "cancelled"] },
+  { id: "done", title: "Done", states: ["completed"] },
+];
+const laneByState = new Map(laneDefinitions.flatMap((lane, index) => lane.states.map((state) => [state, index])));
 
 export function relativeTime(value, now) {
   const seconds = Math.max(0, Math.floor((now - new Date(value).getTime()) / 1000));
@@ -14,10 +22,10 @@ export function attemptKey(status) {
   return `${status.repository}#${status.issue}/${status.attempt}`;
 }
 
-export function statusViews(statuses, tab) {
-  const current = statuses.filter((status) => status.state !== "completed");
-  const completed = statuses.filter((status) => status.state === "completed");
-  return { current, completed, visible: tab === "completed" ? completed : current };
+export function groupStatusesByLane(statuses) {
+  const lanes = laneDefinitions.map(({ id, title }) => ({ id, title, statuses: [] }));
+  for (const status of statuses) lanes[laneByState.get(status.state) ?? 3].statuses.push(status);
+  return lanes;
 }
 
 export function canInvestigate(status) {
@@ -43,7 +51,7 @@ export function overallHealth(snapshot, error, statuses, now) {
   }
 
   const attention = statuses.filter((status) => status.state !== "completed" && (
-    attentionStates.has(status.state) || status.blockers?.length || status.diagnostic
+    (laneByState.get(status.state) ?? 3) === 3 || status.blockers?.length || status.diagnostic
   )).length;
   if (attention) {
     return {
