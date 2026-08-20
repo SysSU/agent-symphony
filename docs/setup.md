@@ -127,10 +127,10 @@ agent-symphony serve \
   --runtime-state ~/.local/state/agent-symphony \
   --dashboard-address 0.0.0.0:8080 \
   --allow-unsafe-dashboard-network \
-  --dashboard-password "$AGENT_SYMPHONY_DASHBOARD_PASSWORD"
+  --dashboard-password-file ~/.config/agent-symphony/dashboard-password
 ```
 
-The HTTP Basic username is `agent-symphony`. This mode is deliberately named unsafe: HTTP does not encrypt the password or terminal traffic, the expanded password can be visible in process listings, and the dashboard has powerful local controls. Restrict the port with the host firewall and use a long, unique password. Use an encrypted VPN or tunnel instead on an untrusted network.
+Create the password file as the coordinator user with mode `0600`; it must contain one nonempty line. The HTTP Basic username is `agent-symphony`. This mode is deliberately named unsafe: HTTP does not encrypt the password or terminal traffic, and the dashboard has powerful local controls. Restrict the port with the host firewall and use a long, unique password. Use an encrypted VPN or tunnel instead on an untrusted network.
 
 ## Stop the daemon
 
@@ -174,4 +174,4 @@ sudo /usr/local/libexec/agent-symphony/VERSION/agent-symphony \
 
 Rerun `install-host` after every binary upgrade. `doctor` and `serve` automatically require the stricter boundary once it is installed. The boundary environment variables are test seams, not production setup.
 
-The advisory orchestrator is disabled by default. Enable it by adding a prompt-accepting interactive `commands.orchestrator` array. For Codex, scope directory trust to the workspace Agent Symphony created: `["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "read-only", "--ask-for-approval", "never", "--no-alt-screen"]`. Agent Symphony replaces `{orchestrator_workspace}` with that absolute path at launch. Use the dashboard Rebuild action to replace an already-running session after changing this command, then rerun `validate` and `doctor`. Advanced installations must rerun `install-host` after upgrading so the exact reviewer-identity orchestrator rule is installed.
+The advisory orchestrator is disabled by default and requires this host-isolated mode. After `install-host` succeeds, enable it by adding a prompt-accepting interactive `commands.orchestrator` array. For Codex, scope directory trust to the workspace Agent Symphony created: `["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "read-only", "--ask-for-approval", "never", "--no-alt-screen"]`. Agent Symphony replaces `{orchestrator_workspace}` with that absolute path at launch. Use the dashboard Rebuild action to replace an already-running session after changing this command, then rerun `validate` and `doctor`. Rerun `install-host` after upgrading so the exact reviewer-identity orchestrator rule remains current.

@@ -3,9 +3,12 @@ package orchestratoragent
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -22,6 +25,7 @@ type fakeRunner struct {
 	starts     int
 	notices    []string
 	commands   []agentruntime.Command
+	pane       string
 }
 
 func (f *fakeRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
@@ -35,6 +39,12 @@ func (f *fakeRunner) Run(_ context.Context, command agentruntime.Command) (agent
 			return agentruntime.Result{Exited: true, Code: 1}, errors.New("missing")
 		}
 		return agentruntime.Result{Output: "0\n"}, nil
+	case "capture-pane":
+		pane := f.pane
+		if command.MaxOutputBytes > 0 && len(pane) > command.MaxOutputBytes {
+			pane = pane[len(pane)-command.MaxOutputBytes:]
+		}
+		return agentruntime.Result{Output: pane}, nil
 	case "new-session":
 		f.starts++
 		if f.failStarts > 0 {
@@ -42,7 +52,7 @@ func (f *fakeRunner) Run(_ context.Context, command agentruntime.Command) (agent
 			return agentruntime.Result{Exited: true, Code: 1}, errors.New("launch failed token=secret-value")
 		}
 		f.live = true
-	case "respawn-pane":
+	case "split-window":
 		f.live = true
 	case "kill-session":
 		if !f.live {
@@ -59,7 +69,7 @@ func (f *fakeRunner) Run(_ context.Context, command agentruntime.Command) (agent
 func newTestSupervisor(t *testing.T, runner *fakeRunner, now *time.Time) *Supervisor {
 	t.Helper()
 	root := t.TempDir()
-	return &Supervisor{Root: root, Workspace: filepath.Join(root, "workspace"), Repository: "SysSU/example", Command: []string{"agent", "--read-only"}, Runner: runner, Now: func() time.Time { return *now }}
+	return &Supervisor{Root: root, Workspace: filepath.Join(root, "workspace"), Repository: "SysSU/example", Command: []string{"agent", "--read-only"}, ProposalCommand: []string{"agent-symphony", "agent-host", "orchestrator-proposal"}, Runner: runner, Now: func() time.Time { return *now }}
 }
 
 func TestDisabledSupervisorNeverLaunches(t *testing.T) {
@@ -70,6 +80,146 @@ func TestDisabledSupervisorNeverLaunches(t *testing.T) {
 	status, err := agent.Observe(context.Background(), nil)
 	if err != nil || status.Enabled || status.State != "disabled" || runner.starts != 0 {
 		t.Fatalf("disabled status = %#v, starts=%d, err=%v", status, runner.starts, err)
+	}
+}
+
+func TestMessageProposalIsExactBoundedAndConsumable(t *testing.T) {
+	now := time.Date(2026, 8, 19, 1, 2, 3, 0, time.UTC)
+	agent := newTestSupervisor(t, &fakeRunner{}, &now)
+	if _, err := agent.Observe(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.MessageProposal(t.Context()); !errors.Is(err, ErrNoMessageProposal) {
+		t.Fatalf("empty proposal err=%v", err)
+	}
+	body, _ := json.Marshal(MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Message: "Run the focused test."})
+	agent.Runner.(*fakeRunner).pane = MessageProposalPrefix + base64.StdEncoding.EncodeToString(body) + "\n"
+	proposal, err := agent.MessageProposal(t.Context())
+	if err != nil || proposal.Binding == "" || proposal.Message != "Run the focused test." {
+		t.Fatalf("proposal=%#v err=%v", proposal, err)
+	}
+	if err := agent.ConsumeMessageProposal(t.Context(), "wrong-binding"); err == nil {
+		t.Fatal("mismatched confirmation binding consumed proposal")
+	}
+	if err := agent.ConsumeMessageProposal(t.Context(), proposal.Binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.MessageProposal(t.Context()); !errors.Is(err, ErrNoMessageProposal) {
+		t.Fatalf("consumed proposal err=%v", err)
+	}
+	body, _ = json.Marshal(MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Message: strings.Repeat("x", 8193)})
+	agent.Runner.(*fakeRunner).pane = MessageProposalPrefix + base64.StdEncoding.EncodeToString(body) + "\n"
+	if _, err := agent.MessageProposal(t.Context()); err == nil {
+		t.Fatal("oversized message proposal accepted")
+	}
+}
+
+func TestMessageProposalBoundsOversizedPaneToMaximumFrameTail(t *testing.T) {
+	now := time.Date(2026, 8, 19, 1, 2, 3, 0, time.UTC)
+	runner := &fakeRunner{}
+	agent := newTestSupervisor(t, runner, &now)
+	if _, err := agent.Observe(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Message: "publish this"})
+	frame := MessageProposalPrefix + base64.StdEncoding.EncodeToString(body) + "\n"
+	runner.pane = strings.Repeat("noise\n", maxPaneCaptureBytes) + frame
+	proposal, err := agent.MessageProposal(t.Context())
+	if err != nil || proposal.Message != "publish this" {
+		t.Fatalf("proposal=%#v err=%v", proposal, err)
+	}
+	command := runner.commands[len(runner.commands)-1]
+	if command.MaxOutputBytes != maxPaneCaptureBytes {
+		t.Fatalf("capture limit=%d want %d", command.MaxOutputBytes, maxPaneCaptureBytes)
+	}
+}
+
+func TestMaximumMessageProposalSurvivesNarrowTmuxPane(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	root := t.TempDir()
+	socketRoot, err := os.MkdirTemp("/tmp", "as-tmux-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	env := []string{"HOME=" + os.Getenv("HOME"), "PATH=/usr/local/bin:/usr/bin:/bin", "SHELL=/bin/sh", "TERM=screen", "TMUX_TMPDIR=" + socketRoot}
+	repository := "SysSU/narrow-frame-" + digestText(root)[:8]
+	message := strings.Repeat(`"`, 8192)
+	body, _ := json.Marshal(MessageProposal{Version: 1, Repository: repository, Issue: 131, Attempt: 3, Message: message})
+	frame := MessageProposalPrefix + base64.StdEncoding.EncodeToString(body)
+	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	trigger, framePath, scriptPath := filepath.Join(workspace, "emit"), filepath.Join(workspace, "frame"), filepath.Join(workspace, "emit-frame")
+	if err := os.WriteFile(framePath, append([]byte(frame), '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nwhile [ ! -f emit ]; do /bin/sleep 0.01; done\n/bin/cat frame\n/bin/sleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 19, 1, 2, 3, 0, time.UTC)
+	agent := &Supervisor{
+		Root:            filepath.Join(root, "state"),
+		Workspace:       workspace,
+		Repository:      repository,
+		ProposalCommand: []string{"agent-symphony", "agent-host", "orchestrator-proposal"},
+		Env:             env,
+		Now:             func() time.Time { return now },
+	}
+	runTmux := func(args ...string) ([]byte, error) {
+		command := exec.Command("tmux", args...)
+		command.Env = env
+		return command.CombinedOutput()
+	}
+	session := Session(agent.Repository)
+	startArgs := []string{"new-session", "-d", "-x", "80", "-y", "24", "-s", session, "-c", workspace}
+	if output, err := runTmux(startArgs...); err != nil {
+		t.Skipf("tmux cannot start in this environment: %v: %s", err, output)
+	}
+	t.Cleanup(func() { _, _ = runTmux("kill-session", "-t", "="+session) })
+	if output, err := runTmux("set-option", "-w", "-t", session+":0", "history-limit", historyLimit); err != nil {
+		if strings.Contains(string(output), "No such file or directory") {
+			t.Skipf("tmux child processes cannot stay live in this environment: %v: %s", err, output)
+		}
+		t.Fatalf("set tmux history: %v: %s", err, output)
+	}
+	if output, err := runTmux("split-window", "-d", "-t", "="+session+":0.0", "-c", workspace, "--", scriptPath); err != nil {
+		t.Fatalf("start tmux frame emitter: %v: %s", err, output)
+	}
+	if output, err := runTmux("kill-pane", "-t", "="+session+":0.0"); err != nil {
+		t.Fatalf("remove tmux placeholder pane: %v: %s", err, output)
+	}
+	if output, err := runTmux("display-message", "-p", "-t", "="+session+":0.0", "#{history_limit}"); err != nil || strings.TrimSpace(string(output)) != historyLimit {
+		t.Fatalf("tmux replacement history limit=%q err=%v", output, err)
+	}
+	if output, err := runTmux("resize-window", "-x", "2", "-y", "24", "-t", "="+session+":0"); err != nil {
+		t.Fatalf("narrow tmux window: %v: %s", err, output)
+	}
+	if err := os.MkdirAll(agent.Root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.writeState(persisted{Version: stateVersion, Repository: repository, Session: session, ContextMode: "rebuild", State: "running", UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trigger, []byte("emit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		proposal, err := agent.MessageProposal(t.Context())
+		if err == nil {
+			if proposal.Message != message {
+				t.Fatal("maximum proposal changed while wrapped in tmux history")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("maximum proposal was lost in narrow tmux history: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -202,7 +352,7 @@ func TestLaunchContractUsesFixedBoundaryCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	index := slices.IndexFunc(runner.commands, func(command agentruntime.Command) bool {
-		return len(command.Args) > 0 && command.Args[0] == "respawn-pane"
+		return len(command.Args) > 0 && command.Args[0] == "split-window"
 	})
 	if index < 0 || !slices.Equal(runner.commands[index].Args[len(runner.commands[index].Args)-3:], agent.Launcher) {
 		t.Fatalf("pane did not use fixed launcher: %#v", runner.commands)
@@ -235,7 +385,7 @@ func TestLaunchExpandsOrchestratorWorkspaceWithoutChangingConfiguredCommand(t *t
 		t.Fatal(err)
 	}
 	index := slices.IndexFunc(runner.commands, func(command agentruntime.Command) bool {
-		return len(command.Args) > 0 && command.Args[0] == "respawn-pane"
+		return len(command.Args) > 0 && command.Args[0] == "split-window"
 	})
 	if index < 0 {
 		t.Fatalf("missing respawn command: %#v", runner.commands)

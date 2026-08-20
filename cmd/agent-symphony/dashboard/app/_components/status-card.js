@@ -1,3 +1,5 @@
+import { useEffect, useRef } from "react";
+
 import { canInvestigate, orchestratorPresentation } from "../health.mjs";
 
 function githubURL(repository, kind, number) {
@@ -61,6 +63,7 @@ export function StatusCard(props) {
   const issueLabel = status.title ? `#${status.issue} ${status.title}` : `Issue #${status.issue}`;
   const blockers = status.blockers || [];
   const checks = status.checks || [];
+  const messages = status.operator_messages || [];
 
   return (
     <article className="card">
@@ -83,11 +86,49 @@ export function StatusCard(props) {
         <Detail label="Branch"><code>{status.branch}</code></Detail>
         <Detail label="Blockers">{blockers.map((blocker) => <span className="line" key={blocker}>{blocker}</span>)}</Detail>
         <Detail label="Checks">{checks.map((check) => <span className="line" key={check}>{check}</span>)}</Detail>
+        <Detail label="Worker messages">{messages.map((message) => (
+          <span className="line messageStatus" key={message.id}>
+            <span className={`state state-${message.state}`}>{message.state}</span>{" "}
+            <code>{message.id.slice(0, 12)}</code>
+            {message.diagnostic ? ` · ${message.diagnostic}` : ""}
+          </span>
+        ))}</Detail>
         <Detail label="Diagnostic">{status.diagnostic}</Detail>
         <Detail label="Next action">{status.next_action}</Detail>
       </dl>
       <StatusActions {...props} />
     </article>
+  );
+}
+
+function MessageConfirmation({ proposal, error, busy, onAction }) {
+  const confirmationRef = useRef(null);
+  const proposalKey = proposal ? `${proposal.repository}#${proposal.issue}/${proposal.attempt}:${proposal.message}` : "";
+  useEffect(() => {
+    if (proposalKey) confirmationRef.current?.focus();
+  }, [proposalKey]);
+  if (!proposal && !error) return null;
+  if (!proposal) return <p className="orchestratorDisabled" role="alert">{error}</p>;
+  return (
+    <section
+      ref={confirmationRef}
+      className="messageConfirmation"
+      role="region"
+      aria-live="assertive"
+      aria-atomic="true"
+      aria-labelledby="messageConfirmationTitle"
+      tabIndex={-1}
+    >
+      <p className="eyebrow">Confirmation required</p>
+      <h3 id="messageConfirmationTitle">Queue a worker message</h3>
+      <p><strong>Exact target:</strong> <code>{proposal.repository}#{proposal.issue}, attempt {proposal.attempt}</code></p>
+      <pre aria-label="Exact proposed worker message">{proposal.message}</pre>
+      <p className="messageSemantics">This is not live chat. Confirmation records the message on GitHub, queues it behind active work, and starts one bounded follow-up turn when safe.</p>
+      <footer className="cardActions orchestratorActions">
+        <button className="primaryAction" type="button" disabled={Boolean(busy)} onClick={() => onAction("confirm")}>{busy === "confirm" ? "Queueing…" : "Confirm and queue"}</button>
+        <button className="secondaryAction" type="button" disabled={Boolean(busy)} onClick={() => onAction("cancel")}>{busy === "cancel" ? "Cancelling…" : "Cancel proposal"}</button>
+      </footer>
+    </section>
   );
 }
 
@@ -109,7 +150,7 @@ function OrchestratorActions({ busy, onAction, onOpenTerminal, state }) {
   );
 }
 
-export function OrchestratorCard({ status, error, busy, onAction, onOpenTerminal }) {
+export function OrchestratorCard({ status, error, busy, onAction, onOpenTerminal, proposal, messageError, messageBusy, onMessageAction }) {
   const current = status || {};
   const presentation = orchestratorPresentation(status, error);
   let controls = <p className="orchestratorDisabled">{error || "Loading orchestrator status…"}</p>;
@@ -140,6 +181,7 @@ export function OrchestratorCard({ status, error, busy, onAction, onOpenTerminal
         <Detail label="Next action">{current.next_action}</Detail>
       </dl>
       {controls}
+      <MessageConfirmation proposal={proposal} error={messageError} busy={messageBusy} onAction={onMessageAction} />
     </section>
   );
 }

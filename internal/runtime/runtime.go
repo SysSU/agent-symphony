@@ -37,11 +37,12 @@ var component = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 var commitID = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 
 type Command struct {
-	Name  string
-	Args  []string
-	Dir   string
-	Env   []string
-	Stdin io.Reader
+	Name           string
+	Args           []string
+	Dir            string
+	Env            []string
+	Stdin          io.Reader
+	MaxOutputBytes int
 }
 
 type Result struct {
@@ -59,7 +60,16 @@ type ExecRunner struct{}
 func (ExecRunner) Run(ctx context.Context, command Command) (Result, error) {
 	cmd := exec.CommandContext(ctx, command.Name, command.Args...)
 	cmd.Dir, cmd.Env, cmd.Stdin = command.Dir, command.Env, command.Stdin
-	out, err := cmd.CombinedOutput()
+	var out []byte
+	var err error
+	if command.MaxOutputBytes > 0 {
+		bounded := tailBuffer{limit: command.MaxOutputBytes}
+		cmd.Stdout, cmd.Stderr = &bounded, &bounded
+		err = cmd.Run()
+		out = bounded.bytes()
+	} else {
+		out, err = cmd.CombinedOutput()
+	}
 	result := Result{Output: string(out)}
 	if err == nil {
 		return result, nil
@@ -69,6 +79,34 @@ func (ExecRunner) Run(ctx context.Context, command Command) (Result, error) {
 		result.Code, result.Exited = exit.ExitCode(), true
 	}
 	return result, err
+}
+
+type tailBuffer struct {
+	mu    sync.Mutex
+	body  []byte
+	limit int
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := len(p)
+	if n >= b.limit {
+		b.body = append(b.body[:0], p[n-b.limit:]...)
+		return n, nil
+	}
+	if overflow := len(b.body) + n - b.limit; overflow > 0 {
+		copy(b.body, b.body[overflow:])
+		b.body = b.body[:len(b.body)-overflow]
+	}
+	b.body = append(b.body, p...)
+	return n, nil
+}
+
+func (b *tailBuffer) bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.body...)
 }
 
 type Attempt struct {
@@ -170,6 +208,9 @@ func (r *Runtime) ResumeHandoff(ctx context.Context, attempt Attempt) (Manifest,
 			return Manifest{}, fmt.Errorf("refresh handoff source refs: %w", err)
 		}
 	}
+	if attempt.Eligible != nil && !attempt.Eligible() {
+		return Manifest{}, errors.New("attempt is no longer eligible")
+	}
 	manifest.State, manifest.Diagnostic, manifest.UpdatedAt = "running", "", time.Now().UTC()
 	return manifest, r.writeManifest(attempt, manifest)
 }
@@ -203,6 +244,12 @@ func ResultPath(worktree string) string { return worktree + workerResultSuffix }
 // PromptCommand runs command through the descriptor-owning capture helper.
 func PromptCommand(helper, tmux, buffer, resultPath string, command []string) []string {
 	return append([]string{helper, "worker-capture", tmux, buffer, resultPath, "--"}, command...)
+}
+
+// HandoffPromptCommand records and signals worker-owned launch after the
+// replacement worker starts.
+func HandoffPromptCommand(helper, tmux, buffer, resultPath, launchedPath, recipient, signal string, command []string) []string {
+	return append([]string{helper, "worker-capture-handoff", tmux, buffer, resultPath, launchedPath, recipient, signal, "--"}, command...)
 }
 
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
@@ -414,9 +461,19 @@ func (r *Runtime) Deliver(ctx context.Context, manifest Manifest, payload []byte
 	return err
 }
 
+// VerifyOwned checks exact branch/session identity through the worker boundary
+// without comparing mutable worktree HEAD.
+func (r *Runtime) VerifyOwned(ctx context.Context, manifest Manifest) error {
+	return r.verifyActive(ctx, manifest, "", false)
+}
+
 // VerifyActive checks exact branch/head/session identity through the worker
 // boundary; it performs no coordinator-side worker command.
 func (r *Runtime) VerifyActive(ctx context.Context, manifest Manifest, head string) error {
+	return r.verifyActive(ctx, manifest, head, true)
+}
+
+func (r *Runtime) verifyActive(ctx context.Context, manifest Manifest, head string, verifyHead bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.VerifyWorker == nil {
@@ -444,17 +501,19 @@ func (r *Runtime) VerifyActive(ctx context.Context, manifest Manifest, head stri
 	if err != nil || strings.TrimSpace(branch.Output) != manifest.Branch {
 		return errors.New("worktree branch does not match manifest")
 	}
-	got, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "rev-parse", "HEAD"}, "", nil, nil)
-	if err != nil {
-		return errors.New("worktree HEAD is unreadable")
-	}
-	current := strings.TrimSpace(got.Output)
-	if !strings.EqualFold(current, head) {
-		if !strings.EqualFold(head, manifest.BaseSHA) {
-			return errors.New("worktree HEAD does not match GitHub")
+	if verifyHead {
+		got, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "rev-parse", "HEAD"}, "", nil, nil)
+		if err != nil {
+			return errors.New("worktree HEAD is unreadable")
 		}
-		if _, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "merge-base", "--is-ancestor", manifest.BaseSHA, current}, "", nil, nil); err != nil {
-			return errors.New("worktree HEAD is not descended from the approved base")
+		current := strings.TrimSpace(got.Output)
+		if !strings.EqualFold(current, head) {
+			if !strings.EqualFold(head, manifest.BaseSHA) {
+				return errors.New("worktree HEAD does not match GitHub")
+			}
+			if _, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "merge-base", "--is-ancestor", manifest.BaseSHA, current}, "", nil, nil); err != nil {
+				return errors.New("worktree HEAD is not descended from the approved base")
+			}
 		}
 	}
 	if _, err := r.run(ctx, r.tmux(), []string{"has-session", "-t", "=" + manifest.Session}, "", nil, nil); err != nil {

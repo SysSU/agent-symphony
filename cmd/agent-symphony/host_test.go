@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,8 +18,59 @@ import (
 	"testing"
 	"time"
 
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
+
+type agentHostRuntimeRunner struct{}
+
+func (agentHostRuntimeRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+	payload, _ := json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"run", boundaryCommand{Name: command.Name, Args: command.Args, Env: command.Env, Dir: command.Dir}})
+	var output bytes.Buffer
+	if err := agentHost(ctx, "implementation", bytes.NewReader(payload), &output); err != nil {
+		return agentruntime.Result{}, err
+	}
+	var result agentruntime.Result
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		return agentruntime.Result{}, err
+	}
+	if result.Code != 0 {
+		return result, fmt.Errorf("agent-host command exited %d", result.Code)
+	}
+	return result, nil
+}
+
+func TestHostOrchestratorProposalEmitsOnlyTheFixedValidatedFrame(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "orchestrator-test")
+	if err := os.Mkdir(workspace, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	oldGetwd := hostGetwd
+	hostGetwd = func() (string, error) { return workspace, nil }
+	t.Cleanup(func() { hostGetwd = oldGetwd })
+	proposal := `{"version":1,"repository":"o/r","issue":131,"attempt":3,"message":"Run the focused test."}`
+	var output bytes.Buffer
+	if err := writeHostOrchestratorProposal(root, strings.NewReader(proposal), &output); err != nil {
+		t.Fatal(err)
+	}
+	frame := strings.TrimSpace(output.String())
+	written, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(frame, orchestratoragent.MessageProposalPrefix))
+	if err != nil || string(written) != proposal || !strings.HasPrefix(frame, orchestratoragent.MessageProposalPrefix) {
+		t.Fatalf("frame=%q decoded=%q err=%v", frame, written, err)
+	}
+	output.Reset()
+	if err := writeHostOrchestratorProposal(root, strings.NewReader(`{"version":1,"repository":"o/r","issue":131,"attempt":3,"message":"changed","command":"tmux"}`), &output); err == nil {
+		t.Fatal("arbitrary proposal field accepted")
+	}
+	if output.Len() != 0 {
+		t.Fatalf("invalid proposal emitted output: %q", output.String())
+	}
+}
 
 func fakeHostIdentity(t *testing.T, uid, gid int) {
 	t.Helper()
@@ -77,6 +129,41 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 	}
 }
 
+func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
+	fakeHostIdentity(t, 1234, 5678)
+	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner
+	hostGOOS, hostRoot = "linux", t.TempDir()
+	t.Cleanup(func() { hostGOOS, hostRoot, hostExecRunner = oldGOOS, oldRoot, oldExec })
+	root := nativeRoot("/var/lib/agent-symphony/attempts")
+	if err := os.MkdirAll(root, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"set-option", "-w", "-t", "=as-o-r-131-3:0.0", "history-limit", "5000"}
+	var launched agentruntime.Command
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		launched = command
+		return agentruntime.Result{}, nil
+	}
+	payload, _ := json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"run", boundaryCommand{Name: "tmux", Args: want, Dir: root, Env: []string{"PATH=/bin"}}})
+	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if launched.Name != "tmux" || !slices.Equal(launched.Args, want) {
+		t.Fatalf("runtime command changed at boundary: %#v", launched)
+	}
+	want[5] = "5001"
+	payload, _ = json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"run", boundaryCommand{Name: "tmux", Args: want, Dir: root, Env: []string{"PATH=/bin"}}})
+	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{}); err == nil {
+		t.Fatal("unapproved history limit crossed the boundary")
+	}
+}
+
 func TestWorkerBoundaryAllowsOnlyExactAncestryCheck(t *testing.T) {
 	root := t.TempDir()
 	worktree := filepath.Join(root, "attempt")
@@ -119,26 +206,40 @@ func TestReviewerBoundaryAllowsOnlyExactOrchestratorTmuxLaunch(t *testing.T) {
 		launched = command
 		return agentruntime.Result{}, nil
 	}
-	request := func(target string, env []string) error {
+	request := func(args, env []string) error {
 		payload, _ := json.Marshal(struct {
 			Operation string          `json:"operation"`
 			Command   boundaryCommand `json:"command"`
-		}{"run", boundaryCommand{Name: "tmux", Args: []string{"respawn-pane", "-k", "-t", target, "--", "operator-agent", "sanitized context"}, Dir: dir, Env: env}})
+		}{"run", boundaryCommand{Name: "tmux", Args: args, Dir: dir, Env: env}})
 		return agentHost(t.Context(), "review", bytes.NewReader(payload), &bytes.Buffer{})
 	}
-	if err := request("=as-o-owner-repo:0.0", []string{"MODEL_API_KEY=model-canary", "PATH=/bin"}); err != nil {
+	respawn := func(target string) []string {
+		return []string{"respawn-pane", "-k", "-t", target, "--", "operator-agent", "sanitized context"}
+	}
+	if err := request(respawn("=as-o-owner-repo:0.0"), []string{"MODEL_API_KEY=model-canary", "PATH=/bin"}); err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(launched.Env, "|")
 	if !strings.Contains(joined, "HOME=/var/lib/agent-symphony-reviewer") || strings.Contains(joined, "GITHUB_TOKEN") {
 		t.Fatalf("unsafe orchestrator environment: %s", joined)
 	}
+	for _, args := range [][]string{
+		{"split-window", "-d", "-t", "=as-o-owner-repo:0.0", "-c", dir, "--", "operator-agent", "sanitized context"},
+		{"kill-pane", "-t", "=as-o-owner-repo:0.0"},
+	} {
+		if err := request(args, []string{"PATH=/bin"}); err != nil {
+			t.Fatalf("exact pane replacement rejected: %v", err)
+		}
+	}
 	for _, target := range []string{"as-o-owner-repo:0.0", "=as-o-owner-repo:1.0", "=../../foreign:0.0"} {
-		if err := request(target, []string{"PATH=/bin"}); err == nil {
+		if err := request(respawn(target), []string{"PATH=/bin"}); err == nil {
 			t.Fatalf("unsafe orchestrator target accepted: %q", target)
 		}
 	}
-	if err := request("=as-o-owner-repo:0.0", []string{"GH_TOKEN=secret"}); err == nil {
+	if err := request([]string{"split-window", "-d", "-t", "=as-o-owner-repo:0.0", "-c", filepath.Dir(root), "--", "operator-agent"}, []string{"PATH=/bin"}); err == nil {
+		t.Fatal("orchestrator pane replacement escaped the snapshot root")
+	}
+	if err := request(respawn("=as-o-owner-repo:0.0"), []string{"GH_TOKEN=secret"}); err == nil {
 		t.Fatal("orchestrator launch accepted GitHub credentials")
 	}
 }
@@ -164,21 +265,21 @@ func TestHostOrchestratorLaunchContractIsReadOnlyAndCredentialFiltered(t *testin
 	t.Setenv("GH_TOKEN", "github-canary")
 	var got agentruntime.Command
 	hostOrchestratorRun = func(_ context.Context, command agentruntime.Command) error { got = command; return nil }
-	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home"); err != nil {
+	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err != nil {
 		t.Fatal(err)
 	}
 	if got.Name != "operator-agent" || !slices.Equal(got.Args, []string{"--read-only", "sanitized context"}) || !slices.Contains(got.Env, "HOME=/reviewer-home") || slices.ContainsFunc(got.Env, func(value string) bool { return strings.HasPrefix(value, "GH_TOKEN=") }) {
 		t.Fatalf("unsafe launch: %#v", got)
 	}
 	hostEGID = func() int { return oldEGID() + 1 }
-	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home"); err == nil {
+	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err == nil {
 		t.Fatal("launch contract outside the reviewer snapshot group was accepted")
 	}
 	hostEGID = oldEGID
 	if err := os.Chmod(path, 0o660); err != nil {
 		t.Fatal(err)
 	}
-	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home"); err == nil {
+	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err == nil {
 		t.Fatal("writable launch contract accepted")
 	}
 }
@@ -348,7 +449,7 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if calls != 3 {
 			t.Fatalf("worker made %d tmux calls, want one lookup plus one two-step delivery", calls)
 		}
-		if !slices.Contains(submission.Args, "worker-capture") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
+		if !slices.Contains(submission.Args, "worker-capture-handoff") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
 			t.Fatalf("handoff did not use the stdin capture helper: %#v", submission.Args)
 		}
 		if _, err := os.ReadFile(filepath.Join(worktree, ".agent-symphony", "handoffs", "pane-test.json")); err != nil {
@@ -551,8 +652,17 @@ func TestWorkerResultArtifactFailsClosed(t *testing.T) {
 }
 
 func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
-	for _, failure := range []string{"load-buffer", "submission", "receipt"} {
-		t.Run(failure, func(t *testing.T) {
+	for _, test := range []struct {
+		name, failure, kind string
+		accept              func(context.Context, []byte, string) (string, error)
+	}{
+		{"load-buffer", "load-buffer", "", acceptHandoff},
+		{"submission", "submission", "", acceptHandoff},
+		{"respawn-side-effect", "respawn-side-effect", "", acceptHandoff},
+		{"receipt", "receipt", "", acceptHandoff},
+		{"operator-respawn-side-effect", "respawn-side-effect", "operator-message", acceptOperatorHandoff},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			oldExec, oldDirSync := hostExecRunner, immutableDirSync
 			t.Cleanup(func() { hostExecRunner, immutableDirSync = oldExec, oldDirSync })
 			root := t.TempDir()
@@ -560,7 +670,12 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 			if err := os.Mkdir(worktree, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			handoff := []byte(`{"type":"agent-symphony-handoff-v1","key":"retry-key"}`)
+			resultPath := agentruntime.ResultPath(worktree)
+			previousResult := `{"type":"agent-symphony-result-v1","validation":"previous turn passed","documentation":"none"}`
+			if err := os.WriteFile(resultPath, []byte(previousResult), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			handoff, _ := json.Marshal(struct{ Type, Key, Kind string }{"agent-symphony-handoff-v1", "retry-key", test.kind})
 			request, _ := json.Marshal(struct {
 				Manifest     agentruntime.Manifest `json:"manifest"`
 				Handoff      json.RawMessage       `json:"handoff"`
@@ -570,42 +685,183 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 			}{agentruntime.Manifest{Worktree: worktree, Session: "as-retry", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, handoffReceiptPath(worktree, "retry-key"), "token", []string{"implementation"}})
 			recipient, deliveries, injected := "", 0, false
 			hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+				if command.Args[0] == "set-option" {
+					recipient = ""
+					return agentruntime.Result{}, nil
+				}
 				if slices.Contains(command.Args, "show-options") {
 					return agentruntime.Result{Output: recipient}, nil
 				}
-				if !injected && failure == "load-buffer" && slices.Contains(command.Args, "load-buffer") {
+				if slices.Contains(command.Args, "display-message") {
+					return agentruntime.Result{Output: "1"}, nil
+				}
+				if !injected && test.failure == "load-buffer" && slices.Contains(command.Args, "load-buffer") {
 					injected = true
 					return agentruntime.Result{}, errors.New("injected load failure")
 				}
 				if slices.Contains(command.Args, "set-option") {
-					if !injected && failure == "submission" {
+					if !injected && test.failure == "submission" {
 						injected = true
 						return agentruntime.Result{}, errors.New("injected submission failure")
+					}
+					if !injected && test.failure == "respawn-side-effect" {
+						injected = true
+						deliveries++
+						launchedPath := filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.launched")
+						if err := writeImmutable(launchedPath, []byte(command.Args[len(command.Args)-1])); err != nil {
+							t.Fatal(err)
+						}
+						return agentruntime.Result{}, errors.New("injected failure after respawn")
 					}
 					recipient, deliveries = command.Args[len(command.Args)-1], deliveries+1
 				}
 				return agentruntime.Result{}, nil
 			}
 			immutableDirSync = func(dir string) error {
-				if !injected && failure == "receipt" && dir == filepath.Join(worktree, ".agent-symphony", "handoffs") && recipient != "" {
+				if !injected && test.failure == "receipt" && dir == filepath.Join(worktree, ".agent-symphony", "handoffs") && recipient != "" {
 					injected = true
 					return errors.New("injected receipt sync failure")
 				}
 				return oldDirSync(dir)
 			}
-			if _, err := acceptHandoff(t.Context(), request, root); err == nil {
+			if _, err := test.accept(t.Context(), request, root); err == nil {
 				t.Fatal("injected failure succeeded")
+			}
+			if retained, err := os.ReadFile(resultPath); err != nil || string(retained) != previousResult {
+				t.Fatalf("previous result was not retained across %s failure: %q err=%v", test.failure, retained, err)
 			}
 			if _, err := os.Stat(filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.json")); err != nil {
 				t.Fatalf("pending state lost: %v", err)
 			}
-			if _, err := acceptHandoff(t.Context(), request, root); err != nil {
+			if test.failure == "respawn-side-effect" {
+				if _, err := os.Stat(filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.launching")); err != nil {
+					t.Fatalf("durable launch state lost: %v", err)
+				}
+			}
+			if _, err := test.accept(t.Context(), request, root); err != nil {
 				t.Fatalf("restart retry: %v", err)
 			}
 			if deliveries != 1 {
 				t.Fatalf("deliveries=%d, want 1", deliveries)
 			}
 		})
+	}
+}
+
+func TestOperatorHandoffCommandDriftPreservesEveryLaunchBoundary(t *testing.T) {
+	for _, stage := range []string{"binding", "launching", "launched", "receipt"} {
+		t.Run(stage, func(t *testing.T) {
+			oldExec := hostExecRunner
+			hostExecRunner = func(context.Context, agentruntime.Command) (agentruntime.Result, error) {
+				return agentruntime.Result{}, errors.New("tmux must not be reached after command drift")
+			}
+			t.Cleanup(func() { hostExecRunner = oldExec })
+
+			root := t.TempDir()
+			worktree := filepath.Join(root, "attempt")
+			if err := os.Mkdir(worktree, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			handoff := json.RawMessage(`{"type":"agent-symphony-handoff-v1","key":"operator-message-stable","kind":"operator-message"}`)
+			requestBody := func(command []string) []byte {
+				body, _ := json.Marshal(handoffRequest{
+					Manifest:     agentruntime.Manifest{Worktree: worktree, Session: "as-command-drift", LogPath: filepath.Join(worktree, "attempt.log")},
+					Handoff:      handoff,
+					OutcomePath:  handoffReceiptPath(worktree, "operator-message-stable"),
+					OutcomeToken: "stable-token",
+					Command:      command,
+				})
+				return body
+			}
+			originalBody := requestBody([]string{"implementation-v1"})
+			original, _, err := decodeHandoffRequest(originalBody, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binding, recipient := handoffBinding(original)
+			inbox := filepath.Join(worktree, ".agent-symphony", "handoffs")
+			if err := os.MkdirAll(inbox, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			files := map[string][]byte{".json": binding}
+			if stage == "launching" || stage == "launched" || stage == "receipt" {
+				files[".launching"] = []byte(recipient)
+			}
+			if stage == "launched" || stage == "receipt" {
+				files[".launched"] = []byte(recipient)
+			}
+			if stage == "receipt" {
+				ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", "operator-message-stable", original.OutcomePath, original.OutcomeToken})
+				files[".receipt"] = ack
+			}
+			for suffix, body := range files {
+				if err := writeImmutable(filepath.Join(inbox, "operator-message-stable"+suffix), body); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			changedBody := requestBody([]string{"implementation-v2"})
+			if _, err := verifyHandoff(t.Context(), changedBody, root); err == nil || !strings.Contains(err.Error(), "binding mismatch") {
+				t.Fatalf("verify command drift = %v", err)
+			}
+			if _, err := acceptOperatorHandoff(t.Context(), changedBody, root); err == nil || !strings.Contains(err.Error(), "binding changed") {
+				t.Fatalf("accept command drift = %v", err)
+			}
+			for suffix, want := range files {
+				got, err := os.ReadFile(filepath.Join(inbox, "operator-message-stable"+suffix))
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("%s evidence changed: %q err=%v", suffix, got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestMissingOperatorHandoffBindingCannotReuseTmuxLaunchOption(t *testing.T) {
+	oldExec := hostExecRunner
+	t.Cleanup(func() { hostExecRunner = oldExec })
+
+	root := t.TempDir()
+	worktree := filepath.Join(root, "attempt")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	handoff := json.RawMessage(`{"type":"agent-symphony-handoff-v1","key":"operator-message-forged","kind":"operator-message"}`)
+	request := handoffRequest{
+		Manifest:     agentruntime.Manifest{Worktree: worktree, Session: "as-forged", LogPath: filepath.Join(worktree, "attempt.log")},
+		Handoff:      handoff,
+		OutcomePath:  handoffReceiptPath(worktree, "operator-message-forged"),
+		OutcomeToken: "token",
+		Command:      []string{"implementation"},
+	}
+	body, _ := json.Marshal(request)
+	_, recipient := handoffBinding(request)
+	option, launches, calls := recipient, 0, 0
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		calls++
+		switch command.Args[0] {
+		case "show-options":
+			return agentruntime.Result{Output: option}, nil
+		case "set-option":
+			option = ""
+		case "respawn-pane":
+			option = recipient
+			launches++
+		}
+		return agentruntime.Result{}, nil
+	}
+
+	if observed, err := verifyHandoff(t.Context(), body, root); err != nil || observed != "" {
+		t.Fatalf("missing binding verification = %q, %v", observed, err)
+	}
+	if calls != 0 {
+		t.Fatalf("missing binding reached tmux verification: %d calls", calls)
+	}
+	if _, err := acceptOperatorHandoff(t.Context(), body, root); err != nil {
+		t.Fatal(err)
+	}
+	if launches != 1 {
+		t.Fatalf("fresh handoff launches=%d, want 1", launches)
 	}
 }
 
@@ -827,6 +1083,71 @@ func TestProductionSeedClonesThroughAgentHostBoundary(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(destination, ".git")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResumeHandoffFetchesThroughAgentHostBoundary(t *testing.T) {
+	oldExec := hostExecRunner
+	hostExecRunner = (agentruntime.ExecRunner{}).Run
+	t.Cleanup(func() { hostExecRunner = oldExec })
+
+	stateRoot := t.TempDir()
+	stateRoot, _ = filepath.EvalSymlinks(stateRoot)
+	root := filepath.Join(stateRoot, "worktrees")
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
+	source := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"commit", "--allow-empty", "-m", "base"}} {
+		if out, err := exec.Command("git", append([]string{"-C", source}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	base := runGit(t, source, "rev-parse", "HEAD")
+	bundle, err := seedAttemptSource(t.Context(), source, "o/r", root, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 4, Number: 2, BaseSHA: base}
+	manifest, err := agentruntime.AttemptIdentity(root, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "clone", "--no-local", "--no-checkout", bundle, manifest.Worktree).CombinedOutput(); err != nil {
+		t.Fatalf("clone attempt: %v: %s", err, out)
+	}
+	runGit(t, manifest.Worktree, "checkout", "--detach", base)
+	runGit(t, manifest.Worktree, "switch", "-c", manifest.Branch)
+	runGit(t, manifest.Worktree, "remote", "remove", "origin")
+
+	runGit(t, source, "commit", "--allow-empty", "-m", "handoff source")
+	want := runGit(t, source, "rev-parse", "HEAD")
+	branch := runGit(t, source, "branch", "--show-current")
+	if _, err := seedAttemptSource(t.Context(), source, "o/r", root, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest.State = "completed"
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "4-2", "agent.log")
+	manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runtimeState := agentruntime.Runtime{Root: root, StateRoot: stateRoot, Source: bundle, Runner: agentHostRuntimeRunner{}}
+	resumed, err := runtimeState.ResumeHandoff(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := runGit(t, manifest.Worktree, "rev-parse", "refs/remotes/agent-symphony/"+branch); resumed.State != "running" || got != want {
+		t.Fatalf("resumed=%#v fetched=%s want=%s", resumed, got, want)
+	}
+	if validGitBoundaryArgs([]string{"-C", manifest.Worktree, "fetch", "--no-tags", filepath.Join(t.TempDir(), "outside.source.bundle"), "+refs/heads/*:refs/remotes/agent-symphony/*"}, root, root) ||
+		validGitBoundaryArgs([]string{"-C", manifest.Worktree, "fetch", "--no-tags", bundle, "+refs/heads/*:refs/remotes/origin/*"}, root, root) {
+		t.Fatal("handoff fetch allowlist accepted a source escape or alternate refspec")
 	}
 }
 

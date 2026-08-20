@@ -4,24 +4,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { OrchestratorCard, StatusCard } from "./_components/status-card";
 import ReconcileButton from "./_components/reconcile-button";
-import { postWithReconciliationRetry } from "./actions.mjs";
+import { getMessageProposal, getOrchestratorStatus, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
-import { overallHealth } from "./health.mjs";
-
-const refreshEvery = 5000;
-
-function relativeTime(value, now) {
-  const seconds = Math.max(0, Math.floor((now - new Date(value).getTime()) / 1000));
-  if (seconds < 5) return "just now";
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  return `${Math.floor(minutes / 60)}h ago`;
-}
-
-function attemptKey(status) {
-  return `${status.repository}#${status.issue}/${status.attempt}`;
-}
+import { attemptKey, overallHealth, relativeTime, statusViews } from "./health.mjs";
 
 export default function Dashboard() {
   const [snapshot, setSnapshot] = useState(null);
@@ -37,21 +22,22 @@ export default function Dashboard() {
   const [orchestratorError, setOrchestratorError] = useState("");
   const [orchestratorBusy, setOrchestratorBusy] = useState("");
   const [investigating, setInvestigating] = useState("");
+  const [messageProposal, setMessageProposal] = useState(null);
+  const [messageError, setMessageError] = useState("");
+  const [messageBusy, setMessageBusy] = useState("");
   const closeTerminal = useCallback(() => setTerminal(null), []);
 
   useEffect(() => {
     let active = true;
     async function refresh() {
       try {
-        const orchestratorRequest = fetch("/orchestrator.json", { cache: "no-store" })
-          .then(async (response) => response.ok
-            ? { status: await response.json(), error: "" }
-            : { status: null, error: (await response.text()).trim() || `Orchestrator status failed (${response.status})` })
-          .catch(() => ({ status: null, error: "Orchestrator status is unavailable" }));
-        const [response, stateResponse, orchestratorResult] = await Promise.all([
+        const orchestratorRequest = getOrchestratorStatus();
+        const proposalRequest = getMessageProposal();
+        const [response, stateResponse, orchestratorResult, proposalResult] = await Promise.all([
           fetch("/status.json", { cache: "no-store" }),
           fetch("/dashboard-state.json", { cache: "no-store" }),
           orchestratorRequest,
+          proposalRequest,
         ]);
         if (!response.ok) throw new Error(response.status === 404 ? "Waiting for the first reconciliation" : `Status request failed (${response.status})`);
         if (!stateResponse.ok) throw new Error(`Dashboard state request failed (${stateResponse.status})`);
@@ -61,6 +47,8 @@ export default function Dashboard() {
           setDashboardState(nextState);
           setOrchestratorStatus(orchestratorResult.status);
           setOrchestratorError(orchestratorResult.error);
+          setMessageProposal(proposalResult.proposal);
+          setMessageError(proposalResult.error);
           setError("");
           setNow(Date.now());
         }
@@ -69,7 +57,7 @@ export default function Dashboard() {
       }
     }
     refresh();
-    const timer = setInterval(refresh, refreshEvery);
+    const timer = setInterval(refresh, 5000);
     return () => {
       active = false;
       clearInterval(timer);
@@ -139,6 +127,30 @@ export default function Dashboard() {
     }
   }, []);
 
+  const performMessageAction = useCallback(async (action) => {
+    if (!messageProposal) return;
+    const { confirmationNonce, ...proposal } = messageProposal;
+    setMessageBusy(action);
+    setActionNotice("");
+    try {
+      const response = await postWithReconciliationRetry(
+        `/actions/orchestrator/message-${action}`,
+        undefined,
+        { headers: { "Content-Type": "application/json", "X-Agent-Symphony-Confirmation-Nonce": confirmationNonce }, body: JSON.stringify(proposal) },
+      );
+      if (!response.ok) throw new Error((await response.text()).trim() || `Message ${action} failed (${response.status})`);
+      setMessageProposal(null);
+      setMessageError("");
+      setActionNotice(action === "confirm"
+        ? `Queued the confirmed message for issue #${messageProposal.issue}, attempt ${messageProposal.attempt}.`
+        : "Cancelled the orchestrator message proposal.");
+    } catch (reason) {
+      setActionNotice(reason instanceof Error ? reason.message : `Message ${action} failed.`);
+    } finally {
+      setMessageBusy("");
+    }
+  }, [messageProposal]);
+
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
@@ -152,9 +164,7 @@ export default function Dashboard() {
     result[status.state] = (result[status.state] ?? 0) + 1;
     return result;
   }, {})).sort(([a], [b]) => a.localeCompare(b)), [statuses]);
-  const current = statuses.filter((status) => status.state !== "completed");
-  const completed = statuses.filter((status) => status.state === "completed");
-  const visible = tab === "completed" ? completed : current;
+  const { current, completed, visible } = statusViews(statuses, tab);
   const health = overallHealth(snapshot, error, statuses, now);
   const openAttemptTerminal = useCallback((status) => {
     const query = new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) });
@@ -200,6 +210,10 @@ export default function Dashboard() {
         busy={orchestratorBusy}
         onAction={(action) => performOrchestratorAction(action)}
         onOpenTerminal={openOrchestratorTerminal}
+        proposal={messageProposal}
+        messageError={messageError}
+        messageBusy={messageBusy}
+        onMessageAction={performMessageAction}
       />
 
       {actionNotice ? <p className="notice" role="status">{actionNotice}</p> : null}

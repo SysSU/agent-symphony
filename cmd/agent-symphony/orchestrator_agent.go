@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,40 +13,65 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
+type dashboardOrchestratorService struct {
+	orchestratoragent.Service
+	supervisor *orchestratoragent.Supervisor
+	confirm    func(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error)
+}
+
+var orchestratorWorkspacePrepare = prepareOrchestratorWorkspace
+
+func (s dashboardOrchestratorService) MessageProposal(ctx context.Context) (orchestratoragent.MessageProposal, error) {
+	return s.supervisor.MessageProposal(ctx)
+}
+
+func (s dashboardOrchestratorService) ConsumeMessageProposal(ctx context.Context, binding string) error {
+	return s.supervisor.ConsumeMessageProposal(ctx, binding)
+}
+
+func (s dashboardOrchestratorService) ConfirmMessage(ctx context.Context, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
+	if s.confirm == nil {
+		return internalgithub.OperatorMessage{}, fmt.Errorf("operator message confirmation is unavailable")
+	}
+	return s.confirm(ctx, proposal)
+}
+
 func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratoragent.Supervisor, error) {
 	workspace := filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-"+internalgithub.RepositoryIdentifier(cfg.Repository))
 	agent := &orchestratoragent.Supervisor{
-		Root:       stateRoot,
-		Workspace:  workspace,
-		Repository: cfg.Repository,
-		Command:    cfg.Commands.Orchestrator,
-		Launcher:   orchestratorBoundaryCommand(),
-		Runner:     agentruntime.ExecRunner{},
+		Root:            stateRoot,
+		Workspace:       workspace,
+		Repository:      cfg.Repository,
+		Command:         cfg.Commands.Orchestrator,
+		Launcher:        orchestratorBoundaryCommand(),
+		ProposalCommand: orchestratorProposalCommand(),
+		Runner:          agentruntime.ExecRunner{},
 	}
 	if cfg.Commands.Orchestrator == nil {
 		return agent, nil
+	}
+	if !hostIsolationInstalled() {
+		return nil, fmt.Errorf("configured orchestrator requires host isolation; run install-host first")
 	}
 	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
 	if err != nil {
 		return nil, err
 	}
 	agent.Env = env
-	if !hostIsolationInstalled() {
-		agent.Env = append(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+productionSnapshotRoot(stateRoot))
+	group, err := hostLookupGroup(snapshotGroup)
+	if err != nil {
+		return nil, fmt.Errorf("resolve orchestrator boundary group: %w", err)
 	}
-	if hostIsolationInstalled() {
-		group, err := hostLookupGroup(snapshotGroup)
-		if err != nil {
-			return nil, fmt.Errorf("resolve orchestrator boundary group: %w", err)
-		}
-		gid, err := strconv.Atoi(group.Gid)
-		if err != nil || prepareOrchestratorWorkspace(workspace, gid) != nil {
-			return nil, fmt.Errorf("prepare orchestrator reviewer boundary")
-		}
-	} else if err := os.MkdirAll(workspace, 0o750); err != nil {
-		return nil, fmt.Errorf("prepare orchestrator workspace: %w", err)
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil || orchestratorWorkspacePrepare(workspace, gid) != nil {
+		return nil, fmt.Errorf("prepare orchestrator reviewer boundary")
 	}
 	return agent, nil
+}
+
+func orchestratorProposalCommand() []string {
+	binary, _ := os.Executable()
+	return []string{binary, "agent-host", "orchestrator-proposal"}
 }
 
 func prepareOrchestratorWorkspace(path string, gid int) error {
@@ -65,8 +91,10 @@ func prepareOrchestratorWorkspace(path string, gid int) error {
 	if err != nil || !os.SameFile(listed, opened) {
 		return fmt.Errorf("orchestrator workspace changed while opening")
 	}
-	if err := dir.Chown(-1, gid); err != nil {
-		return err
+	if fileGID(opened) != gid {
+		if err := dir.Chown(-1, gid); err != nil {
+			return err
+		}
 	}
 	if err := dir.Chmod(os.ModeSetgid | 0o750); err != nil {
 		return err
@@ -80,8 +108,5 @@ func prepareOrchestratorWorkspace(path string, gid int) error {
 
 func orchestratorBoundaryCommand() []string {
 	binary, _ := os.Executable()
-	if !hostIsolationInstalled() {
-		return []string{binary, "agent-host", "orchestrator"}
-	}
 	return []string{"sudo", "-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "orchestrator"}
 }

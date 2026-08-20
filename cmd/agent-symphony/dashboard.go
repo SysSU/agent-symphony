@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +38,8 @@ const (
 	maxDashboardStateBytes  = 1 << 20
 	maxTerminalInputBytes   = 64 << 10
 	dashboardStateVersion   = 1
+	dashboardSessionCookie  = "agent-symphony-confirmation"
+	dashboardNonceHeader    = "X-Agent-Symphony-Confirmation-Nonce"
 )
 
 //go:embed all:dashboard/out
@@ -47,11 +52,21 @@ type dashboardServer struct {
 	allowNet     bool
 	password     string
 	orchestrator orchestratoragent.Service
+	messages     orchestratorMessageService
 	cleanup      func(context.Context, string, agentruntime.Manifest) error
 	recover      func(context.Context, int, int) error
 	reconcile    func(context.Context) error
 	mu           *sync.Mutex
 	localMu      sync.Mutex
+	sessionOnce  sync.Once
+	sessionKey   [32]byte
+	sessionErr   error
+}
+
+type orchestratorMessageService interface {
+	MessageProposal(context.Context) (orchestratoragent.MessageProposal, error)
+	ConsumeMessageProposal(context.Context, string) error
+	ConfirmMessage(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error)
 }
 
 type dashboardHiddenAttempt struct {
@@ -85,6 +100,7 @@ func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string,
 	}
 	static := http.FileServer(http.FS(assets))
 	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, reconcile: reconcile, mu: operationMu}
+	server.messages, _ = service.(orchestratorMessageService)
 	server.cleanup = server.cleanupAttempt
 	return server.handler(static)
 }
@@ -101,6 +117,7 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		if !s.authenticate(w, r) {
 			return
 		}
+		s.issueBrowserSession(w, r)
 		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/recover" {
 			s.serveAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/"))
 			return
@@ -130,6 +147,10 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 			s.serveOrchestratorStatus(w, r)
 			return
 		}
+		if r.URL.Path == "/orchestrator/proposal.json" {
+			s.serveOrchestratorProposal(w, r)
+			return
+		}
 		if r.URL.Path == "/orchestrator/terminal" {
 			s.serveOrchestratorTerminal(w, r)
 			return
@@ -140,6 +161,46 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		}
 		static.ServeHTTP(w, r)
 	})
+}
+
+func (s *dashboardServer) serveOrchestratorProposal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.password == "" {
+		http.Error(w, "worker message confirmation requires dashboard authentication", http.StatusForbidden)
+		return
+	}
+	if s.messages == nil {
+		http.Error(w, "orchestrator message proposals are unavailable", http.StatusConflict)
+		return
+	}
+	session, ok := s.browserSession(r)
+	if !ok {
+		http.Error(w, "worker message confirmation requires a dashboard browser session", http.StatusForbidden)
+		return
+	}
+	proposal, err := s.messages.MessageProposal(r.Context())
+	if errors.Is(err, orchestratoragent.ErrNoMessageProposal) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err != nil {
+		http.Error(w, "orchestrator message proposal is invalid", http.StatusUnprocessableEntity)
+		return
+	}
+	body, _ := json.Marshal(proposal)
+	w.Header().Set(dashboardNonceHeader, s.confirmationNonce(session, proposal.Binding))
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write(body)
+	}
 }
 
 func (s *dashboardServer) serveReconcileAction(w http.ResponseWriter, r *http.Request) {
@@ -214,6 +275,63 @@ func (s *dashboardServer) authenticate(w http.ResponseWriter, r *http.Request) b
 		return false
 	}
 	return true
+}
+
+func (s *dashboardServer) issueBrowserSession(w http.ResponseWriter, r *http.Request) {
+	if s.password == "" || r.Method != http.MethodGet || r.Header.Get("Sec-Fetch-Mode") != "navigate" || r.Header.Get("Sec-Fetch-Dest") != "document" {
+		return
+	}
+	key, ok := s.browserSessionKey()
+	if !ok {
+		return
+	}
+	value := make([]byte, 32)
+	if _, err := rand.Read(value); err != nil {
+		return
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write(value)
+	encoded := base64.RawURLEncoding.EncodeToString(value) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	w.Header().Set("Cache-Control", "no-store")
+	http.SetCookie(w, &http.Cookie{Name: dashboardSessionCookie, Value: encoded, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
+}
+
+func (s *dashboardServer) browserSessionKey() ([]byte, bool) {
+	s.sessionOnce.Do(func() { _, s.sessionErr = rand.Read(s.sessionKey[:]) })
+	return s.sessionKey[:], s.sessionErr == nil
+}
+
+func (s *dashboardServer) browserSession(r *http.Request) (string, bool) {
+	cookie, err := r.Cookie(dashboardSessionCookie)
+	if err != nil {
+		return "", false
+	}
+	value, signature, ok := strings.Cut(cookie.Value, ".")
+	if !ok {
+		return "", false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	provided, signatureErr := base64.RawURLEncoding.DecodeString(signature)
+	key, keyOK := s.browserSessionKey()
+	if err != nil || signatureErr != nil || !keyOK || len(raw) != 32 {
+		return "", false
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write(raw)
+	if !hmac.Equal(provided, mac.Sum(nil)) {
+		return "", false
+	}
+	return value, true
+}
+
+func (s *dashboardServer) confirmationNonce(session, binding string) string {
+	key, ok := s.browserSessionKey()
+	if !ok {
+		return ""
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = io.WriteString(mac, "confirm\x00"+session+"\x00"+binding)
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func serveDashboardJSON(w http.ResponseWriter, r *http.Request, path string, limit int64, missing, unavailable string) {
@@ -465,6 +583,10 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 		http.Error(w, "action requires the dashboard origin", http.StatusForbidden)
 		return
 	}
+	if action == "message-confirm" || action == "message-cancel" {
+		s.serveOrchestratorMessageAction(w, r, action)
+		return
+	}
 	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 || !slices.Contains([]string{"recover", "clear", "rebuild", "investigate"}, action) {
 		http.Error(w, "invalid orchestrator action", http.StatusBadRequest)
 		return
@@ -529,6 +651,81 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 		OK     bool                     `json:"ok"`
 		Status orchestratoragent.Status `json:"status"`
 	}{true, result})
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func (s *dashboardServer) serveOrchestratorMessageAction(w http.ResponseWriter, r *http.Request, action string) {
+	if s.password == "" {
+		http.Error(w, "worker message confirmation requires dashboard authentication", http.StatusForbidden)
+		return
+	}
+	if s.messages == nil || r.Header.Get("Content-Type") != "application/json" || len(r.URL.Query()) != 0 || len(r.TransferEncoding) != 0 || r.ContentLength <= 0 || r.ContentLength > maxTerminalInputBytes {
+		http.Error(w, "invalid orchestrator message action", http.StatusBadRequest)
+		return
+	}
+	var submitted orchestratoragent.MessageProposal
+	decoder := json.NewDecoder(io.LimitReader(r.Body, maxTerminalInputBytes+1))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&submitted) != nil || decoder.Decode(&struct{}{}) != io.EOF || submitted.Binding == "" {
+		http.Error(w, "invalid orchestrator message action", http.StatusBadRequest)
+		return
+	}
+	current, err := s.messages.MessageProposal(r.Context())
+	if err != nil || current != submitted {
+		http.Error(w, "orchestrator message proposal changed before confirmation", http.StatusConflict)
+		return
+	}
+	session, ok := s.browserSession(r)
+	wantNonce := s.confirmationNonce(session, submitted.Binding)
+	gotNonce := r.Header.Get(dashboardNonceHeader)
+	if !ok || wantNonce == "" || subtle.ConstantTimeCompare([]byte(wantNonce), []byte(gotNonce)) != 1 {
+		http.Error(w, "worker message confirmation requires a dashboard browser nonce", http.StatusForbidden)
+		return
+	}
+	operationMu := s.mu
+	if operationMu == nil {
+		operationMu = &s.localMu
+	}
+	if !operationMu.TryLock() {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
+		return
+	}
+	defer operationMu.Unlock()
+	// Re-read under the coordinator operation lock so confirmation binds the
+	// exact bytes the operator reviewed, not a replaced proposal.
+	current, err = s.messages.MessageProposal(r.Context())
+	if err != nil || current != submitted {
+		http.Error(w, "orchestrator message proposal changed before confirmation", http.StatusConflict)
+		return
+	}
+	if action == "message-cancel" {
+		if err := s.messages.ConsumeMessageProposal(r.Context(), submitted.Binding); err != nil {
+			http.Error(w, "orchestrator message cancellation failed", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	message, err := s.messages.ConfirmMessage(r.Context(), submitted)
+	if err != nil {
+		http.Error(w, internalgithub.Redact(err.Error()), http.StatusConflict)
+		return
+	}
+	if err := s.messages.ConsumeMessageProposal(r.Context(), submitted.Binding); err != nil {
+		http.Error(w, "message was recorded, but the proposal could not be cleared", http.StatusInternalServerError)
+		return
+	}
+	body, _ := json.Marshal(struct {
+		ID         string `json:"id"`
+		Repository string `json:"repository"`
+		Issue      int    `json:"issue"`
+		Attempt    int    `json:"attempt"`
+		State      string `json:"state"`
+	}{message.ID, message.Repository, message.Issue, message.Attempt, message.State})
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -742,7 +939,7 @@ func startDashboard(ctx context.Context, address, stateRoot string, operationMu 
 		}
 	}
 	if allowNet && password == "" {
-		return "", errors.New("--dashboard-password is required with --allow-unsafe-dashboard-network")
+		return "", errors.New("dashboard password is required with --allow-unsafe-dashboard-network")
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
@@ -750,7 +947,7 @@ func startDashboard(ctx context.Context, address, stateRoot string, operationMu 
 	}
 	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, recover, reconcile, service, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
-		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password may be visible in process listings, and anyone with it can use terminals and cleanup controls")
+		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password and session data are exposed in transit, and anyone with the password can use terminals and cleanup controls")
 	}
 	go func() {
 		<-ctx.Done()

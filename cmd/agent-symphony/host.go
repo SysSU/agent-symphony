@@ -21,6 +21,7 @@ import (
 	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
@@ -653,7 +654,7 @@ func readReviewResult(input []byte, root string) (string, error) {
 	return string(body), nil
 }
 
-func runHostOrchestrator(ctx context.Context, root, home string) error {
+func runHostOrchestrator(ctx context.Context, root, home string, local bool) error {
 	dir, err := hostGetwd()
 	if err != nil || !belowRoot(dir, root) || !strings.HasPrefix(filepath.Base(dir), "orchestrator-") {
 		return errors.New("orchestrator workspace is outside the reviewer boundary")
@@ -696,7 +697,39 @@ func runHostOrchestrator(ctx context.Context, root, home string) error {
 		return err
 	}
 	env = append(env, "HOME="+home)
+	if local {
+		env = append(env, "AGENT_SYMPHONY_ORCHESTRATOR_ROOT="+root)
+	}
 	return hostOrchestratorRun(ctx, agentruntime.Command{Name: launch.Command[0], Args: append(launch.Command[1:], launch.Context), Dir: dir, Env: env})
+}
+
+func writeHostOrchestratorProposal(root string, input io.Reader, output io.Writer) error {
+	dir, err := hostGetwd()
+	if err != nil || !belowRoot(dir, root) || !strings.HasPrefix(filepath.Base(dir), "orchestrator-") {
+		return errors.New("orchestrator workspace is outside the reviewer boundary")
+	}
+	body, err := io.ReadAll(io.LimitReader(input, 64<<10+1))
+	if err != nil || len(body) == 0 || len(body) > 64<<10 {
+		return errors.New("invalid bounded orchestrator proposal")
+	}
+	var proposal struct {
+		Version    int    `json:"version"`
+		Repository string `json:"repository"`
+		Issue      int    `json:"issue"`
+		Attempt    int    `json:"attempt"`
+		Message    string `json:"message"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&proposal) != nil || decoder.Decode(&struct{}{}) != io.EOF || proposal.Version != 1 {
+		return errors.New("invalid orchestrator proposal schema")
+	}
+	if _, err := internalgithub.PrepareOperatorMessage(proposal.Repository, proposal.Issue, proposal.Attempt, proposal.Message); err != nil {
+		return err
+	}
+	canonical, _ := json.Marshal(proposal)
+	_, err = fmt.Fprintln(output, orchestratoragent.MessageProposalPrefix+base64.StdEncoding.EncodeToString(canonical))
+	return err
 }
 
 func credentialShapedArgument(value string) bool {
@@ -716,11 +749,15 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		root = "/var/db/agent-symphony/attempts"
 	}
 	orchestratorMode := mode == "orchestrator"
-	if mode == "review" || orchestratorMode {
+	orchestratorProposalMode := mode == "orchestrator-proposal"
+	if orchestratorProposalMode && localRoot == "" {
+		localRoot = strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_ORCHESTRATOR_ROOT"))
+	}
+	if mode == "review" || orchestratorMode || orchestratorProposalMode {
 		wantUser, wantGroup = reviewerUser, snapshotGroup
 		root = strings.Replace(root, "attempts", "snapshots", 1)
 	} else if mode != "implementation" {
-		return errors.New("agent-host mode must be implementation, review, or orchestrator")
+		return errors.New("agent-host mode must be implementation, review, orchestrator, or orchestrator-proposal")
 	}
 	// AGENT_SYMPHONY_LOCAL_ROOT is only ever set by the coordinator's own
 	// implementationBoundary/reviewBoundary when install-host was never run;
@@ -731,6 +768,9 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 	if localRoot != "" {
 		if !filepath.IsAbs(localRoot) {
 			return errors.New("local boundary root must be absolute")
+		}
+		if orchestratorMode {
+			return errors.New("orchestrator requires OS-enforced host isolation")
 		}
 		root = localRoot
 		var current *user.User
@@ -756,7 +796,10 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		homeDir = u.HomeDir
 	}
 	if orchestratorMode {
-		return runHostOrchestrator(ctx, root, homeDir)
+		return runHostOrchestrator(ctx, root, homeDir, localRoot != "")
+	}
+	if orchestratorProposalMode {
+		return writeHostOrchestratorProposal(root, input, output)
 	}
 	var request struct {
 		Operation string          `json:"operation"`
@@ -824,6 +867,16 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return errors.New("review boundary cannot accept implementation handoffs")
 		}
 		result.Output, err = acceptHandoff(ctx, request.Command.Input, root)
+	case "accept-operator-handoff":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot accept operator handoffs")
+		}
+		result.Output, err = acceptOperatorHandoff(ctx, request.Command.Input, root)
+	case "verify-handoff":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot verify implementation handoffs")
+		}
+		result.Output, err = verifyHandoff(ctx, request.Command.Input, root)
 	case "review-result":
 		if mode != "review" {
 			return errors.New("implementation boundary cannot read review results")
@@ -1064,6 +1117,7 @@ func validGitBoundaryArgs(args []string, dir, root string) bool {
 	rest := args[2:]
 	return slices.Equal(rest, []string{"branch", "--show-current"}) ||
 		slices.Equal(rest, []string{"rev-parse", "HEAD"}) ||
+		(len(rest) == 4 && rest[0] == "fetch" && rest[1] == "--no-tags" && filepath.IsAbs(rest[2]) && strings.HasSuffix(rest[2], ".source.bundle") && boundedCommandPath(rest[2], dir, root) && rest[3] == "+refs/heads/*:refs/remotes/agent-symphony/*") ||
 		(len(rest) == 4 && rest[0] == "merge-base" && rest[1] == "--is-ancestor" && preflightObjectID.MatchString(rest[2]) && preflightObjectID.MatchString(rest[3])) ||
 		(len(rest) == 3 && rest[0] == "checkout" && rest[1] == "--detach") ||
 		(len(rest) == 3 && rest[0] == "switch" && rest[1] == "-c") ||
@@ -1093,9 +1147,13 @@ func validTmuxBoundaryArgs(args []string, dir, root string) bool {
 	case "capture-pane":
 		return len(args) == 6 && slices.Equal(args[1:5], []string{"-p", "-S", "-", "-t"}) && validTmuxTarget(args[5], true)
 	case "set-option":
-		return len(args) == 6 && slices.Equal(args[1:3], []string{"-w", "-t"}) && validTmuxTarget(args[3], true) && ((args[4] == "remain-on-exit" && args[5] == "on") || (args[4] == "history-limit" && args[5] == "5000"))
+		return len(args) == 6 && slices.Equal(args[1:3], []string{"-w", "-t"}) && validTmuxTarget(args[3], true) && ((args[4] == "remain-on-exit" && args[5] == "on") || (args[4] == "history-limit" && slices.Contains([]string{"5000", "65536"}, args[5])))
 	case "respawn-pane":
 		return len(args) > 5 && slices.Equal(args[1:3], []string{"-k", "-t"}) && validTmuxTarget(args[3], true) && args[4] == "--" && args[5] != ""
+	case "split-window":
+		return len(args) > 7 && slices.Equal(args[1:3], []string{"-d", "-t"}) && validTmuxTarget(args[3], true) && args[4] == "-c" && boundedCommandPath(args[5], dir, root) && args[6] == "--" && args[7] != ""
+	case "kill-pane":
+		return len(args) == 3 && args[1] == "-t" && validTmuxTarget(args[2], true)
 	case "load-buffer":
 		return len(args) == 4 && args[1] == "-b" && args[2] != "" && args[3] == "-"
 	case "paste-buffer":
@@ -1293,30 +1351,24 @@ func readWorkerResult(path string) (workerResult, error) {
 	return result, nil
 }
 
-func acceptHandoff(ctx context.Context, input []byte, root string) (string, error) {
-	var request struct {
-		Manifest     agentruntime.Manifest `json:"manifest"`
-		Handoff      json.RawMessage       `json:"handoff"`
-		OutcomePath  string                `json:"outcome_path"`
-		OutcomeToken string                `json:"outcome_token"`
-		Command      []string              `json:"command"`
-	}
+func decodeHandoffRequest(input []byte, root string) (handoffRequest, struct{ Type, Key string }, error) {
+	var request handoffRequest
 	d := json.NewDecoder(bytes.NewReader(input))
 	d.DisallowUnknownFields()
 	if d.Decode(&request) != nil || d.Decode(&struct{}{}) != io.EOF || !belowRoot(request.Manifest.Worktree, root) || request.OutcomeToken == "" || len(request.Command) == 0 {
-		return "", errors.New("invalid handoff request")
+		return request, struct{ Type, Key string }{}, errors.New("invalid handoff request")
 	}
 	var h struct{ Type, Key string }
 	if json.Unmarshal(request.Handoff, &h) != nil || h.Type != "agent-symphony-handoff-v1" || h.Key == "" || filepath.Base(h.Key) != h.Key || strings.ContainsAny(h.Key, "/\\\x00\r\n") {
-		return "", errors.New("invalid handoff identity")
+		return request, h, errors.New("invalid handoff identity")
 	}
 	if request.OutcomePath != handoffReceiptPath(request.Manifest.Worktree, h.Key) || !belowRoot(request.OutcomePath, request.Manifest.Worktree) {
-		return "", errors.New("invalid handoff receipt path")
+		return request, h, errors.New("invalid handoff receipt path")
 	}
-	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
-	if err := os.MkdirAll(inbox, 0o700); err != nil {
-		return "", err
-	}
+	return request, h, nil
+}
+
+func handoffBinding(request handoffRequest) ([]byte, string) {
 	binding, _ := json.Marshal(struct {
 		State                      string
 		Worktree, Session, LogPath string
@@ -1324,6 +1376,74 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 		OutcomePath, OutcomeToken  string
 		Command                    []string
 	}{"pending", request.Manifest.Worktree, request.Manifest.Session, request.Manifest.LogPath, request.Handoff, request.OutcomePath, request.OutcomeToken, request.Command})
+	return binding, fmt.Sprintf("%x", sha256.Sum256(binding))
+}
+
+func verifyHandoff(ctx context.Context, input []byte, root string) (string, error) {
+	request, h, err := decodeHandoffRequest(input, root)
+	if err != nil {
+		return "", err
+	}
+	binding, recipient := handoffBinding(request)
+	persisted, err := immutableMarkerMatches(filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs", h.Key+".json"), binding)
+	if err != nil {
+		return "", fmt.Errorf("verify handoff binding: %w", err)
+	}
+	if !persisted {
+		return "", nil
+	}
+	option := "@agent-symphony-handoff-" + recipient[:16]
+	observed, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"show-options", "-pqv", "-t", agentruntime.PaneTarget(request.Manifest.Session), option}, Dir: request.Manifest.Worktree})
+	if err != nil {
+		return "", fmt.Errorf("verify handoff launch identity: %w", err)
+	}
+	if strings.TrimSpace(observed.Output) != recipient {
+		return "", nil
+	}
+	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", h.Key, request.OutcomePath, request.OutcomeToken})
+	return string(ack), nil
+}
+
+func acceptOperatorHandoff(ctx context.Context, input []byte, root string) (string, error) {
+	request, h, err := decodeHandoffRequest(input, root)
+	if err != nil {
+		return "", err
+	}
+	var operator struct{ Kind string }
+	if json.Unmarshal(request.Handoff, &operator) != nil || operator.Kind != "operator-message" {
+		return "", errors.New("invalid operator handoff")
+	}
+	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
+	binding, recipient := handoffBinding(request)
+	persisted, err := immutableMarkerMatches(filepath.Join(inbox, h.Key+".json"), binding)
+	if err != nil {
+		return "", fmt.Errorf("operator handoff binding changed: %w", err)
+	}
+	if !persisted {
+		for _, suffix := range []string{".receipt", ".launching", ".launched"} {
+			if err := os.RemoveAll(filepath.Join(inbox, h.Key+suffix)); err != nil {
+				return "", err
+			}
+		}
+		pane := agentruntime.PaneTarget(request.Manifest.Session)
+		option := "@agent-symphony-handoff-" + recipient[:16]
+		if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-pqu", "-t", pane, option}, Dir: request.Manifest.Worktree}); err != nil {
+			return "", fmt.Errorf("clear stale operator handoff launch identity: %w", err)
+		}
+	}
+	return acceptHandoff(ctx, input, root)
+}
+
+func acceptHandoff(ctx context.Context, input []byte, root string) (string, error) {
+	request, h, err := decodeHandoffRequest(input, root)
+	if err != nil {
+		return "", err
+	}
+	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
+	if err := os.MkdirAll(inbox, 0o700); err != nil {
+		return "", err
+	}
+	binding, recipient := handoffBinding(request)
 	if err := writeImmutable(filepath.Join(inbox, h.Key+".json"), binding); err != nil {
 		return "", err
 	}
@@ -1334,7 +1454,7 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 		return "", errors.New("handoff receipt binding mismatch")
 	}
 	buffer := "as-handoff-" + fmt.Sprintf("%x", sha256.Sum256(request.Handoff))[:16]
-	pane, recipient := agentruntime.PaneTarget(request.Manifest.Session), fmt.Sprintf("%x", sha256.Sum256(binding))
+	pane := agentruntime.PaneTarget(request.Manifest.Session)
 	option := "@agent-symphony-handoff-" + recipient[:16]
 	observed, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"show-options", "-pqv", "-t", pane, option}, Dir: request.Manifest.Worktree})
 	if err == nil && strings.TrimSpace(observed.Output) == recipient {
@@ -1347,35 +1467,68 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 	if !belowRoot(resultPath, root) {
 		return "", errors.New("handoff result path escapes provisioned root")
 	}
-	if info, err := os.Lstat(resultPath); err == nil {
-		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return "", errors.New("handoff result is not a regular non-symlink file")
-		}
-		if err := os.Remove(resultPath); err != nil {
-			return "", err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	if info, err := os.Lstat(resultPath); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
+		return "", errors.New("handoff result is not a regular non-symlink file")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
 	helper, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	command := agentruntime.PromptCommand(helper, "tmux", buffer, resultPath, request.Command)
-	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony feedback handoff in the current worktree. Current source refs are available under refs/remotes/agent-symphony/. Do not push or use GitHub credentials; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", request.Handoff)
-	commands := []agentruntime.Command{
-		{Name: "tmux", Args: []string{"load-buffer", "-b", buffer, "-"}, Dir: request.Manifest.Worktree, Stdin: bytes.NewReader(prompt)},
-		{Name: "tmux", Args: append(append([]string{"respawn-pane", "-k", "-t", pane, "--"}, command...), ";", "set-option", "-p", "-t", pane, option, recipient), Dir: request.Manifest.Worktree},
+	launchingPath := filepath.Join(inbox, h.Key+".launching")
+	launchedPath := filepath.Join(inbox, h.Key+".launched")
+	launched, err := immutableMarkerMatches(launchedPath, []byte(recipient))
+	if err != nil {
+		return "", err
 	}
-	for _, command := range commands {
-		if _, err := hostExecRunner(ctx, command); err != nil {
+	if launched {
+		if err := writeImmutable(request.OutcomePath, ack); err != nil {
 			return "", err
 		}
+		return string(ack), nil
+	}
+	launching, err := immutableMarkerMatches(launchingPath, []byte(recipient))
+	if err != nil {
+		return "", err
+	}
+	if launching {
+		state, stateErr := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", pane, "#{pane_dead}"}, Dir: request.Manifest.Worktree})
+		if stateErr == nil && strings.TrimSpace(state.Output) == "0" {
+			return "", errors.New("handoff launch remains in flight")
+		}
+		if stateErr != nil || strings.TrimSpace(state.Output) != "1" {
+			return "", errors.New("cannot reconcile in-flight handoff launch")
+		}
+	}
+	signal := buffer + "-launched"
+	command := agentruntime.HandoffPromptCommand(helper, "tmux", buffer, resultPath, launchedPath, recipient, signal, request.Command)
+	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony handoff in the current worktree. It may contain review feedback or one confirmed operator message. Current source refs are available under refs/remotes/agent-symphony/. Do not push or use GitHub credentials; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", request.Handoff)
+	if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"load-buffer", "-b", buffer, "-"}, Dir: request.Manifest.Worktree, Stdin: bytes.NewReader(prompt)}); err != nil {
+		return "", err
+	}
+	if err := writeImmutable(launchingPath, []byte(recipient)); err != nil {
+		return "", err
+	}
+	tmuxArgs := append(append([]string{"respawn-pane", "-k", "-t", pane, "--"}, command...), ";", "wait-for", signal, ";", "set-option", "-p", "-t", pane, option, recipient)
+	if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: tmuxArgs, Dir: request.Manifest.Worktree}); err != nil {
+		return "", err
 	}
 	if err := writeImmutable(request.OutcomePath, ack); err != nil {
 		return "", err
 	}
 	return string(ack), nil
+}
+
+func immutableMarkerMatches(path string, want []byte) (bool, error) {
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !bytes.Equal(body, want) {
+		return false, errors.New("handoff launch binding mismatch")
+	}
+	return true, nil
 }
 
 func handoffReceiptPath(worktree, key string) string {

@@ -295,7 +295,7 @@ No migration guide is required for the greenfield MVP.
 - Hold GitHub credentials in the orchestrator boundary; do not expose them to sub-agents.
 - Poll current GitHub state at startup and at intervals no greater than 60 seconds.
 - Preserve deterministic issue-to-attempt, worktree, branch, tmux-session, and PR relationships.
-- Limit dashboard GitHub mutation to the permission-gated **Recover attempt** action: revalidate one exact retryable attempt, mark a stuck runtime failed when needed, and post the fixed retry control. Archive, Abandon, and orchestrator actions remain local and cannot alter GitHub policy.
+- Limit dashboard GitHub mutation to permission-gated fixed controls: **Recover attempt** may revalidate one exact retryable attempt, mark a stuck runtime failed, and post the fixed retry control; **Confirm and queue worker message** may record one digest-bound message for a freshly verified exact active attempt. Archive, Abandon, other orchestrator actions, and cancelled message proposals remain local and cannot alter GitHub policy.
 - Treat macOS, Linux, and WSL path and process behavior as explicit compatibility requirements.
 
 ### Implementation Considerations

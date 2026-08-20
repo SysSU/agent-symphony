@@ -1,6 +1,25 @@
 const staleAfter = 2 * 60 * 1000;
 const attentionStates = new Set(["blocked", "failed", "conflicting", "orphaned"]);
 
+export function relativeTime(value, now) {
+  const seconds = Math.max(0, Math.floor((now - new Date(value).getTime()) / 1000));
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  return `${Math.floor(minutes / 60)}h ago`;
+}
+
+export function attemptKey(status) {
+  return `${status.repository}#${status.issue}/${status.attempt}`;
+}
+
+export function statusViews(statuses, tab) {
+  const current = statuses.filter((status) => status.state !== "completed");
+  const completed = statuses.filter((status) => status.state === "completed");
+  return { current, completed, visible: tab === "completed" ? completed : current };
+}
+
 export function canInvestigate(status) {
   return attentionStates.has(status?.state);
 }

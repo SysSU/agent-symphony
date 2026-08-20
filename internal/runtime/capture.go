@@ -33,10 +33,26 @@ IFS= read -r _ <&4`
 
 // CaptureWorker runs command with a tmux prompt and bounded result channel.
 func CaptureWorker(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer) (int, error) {
-	return captureWorker(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp")
+	return captureWorker(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", false)
 }
 
-func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, tempDir string) (int, error) {
+// CaptureWorkerReplacingResult atomically replaces an earlier result only
+// after the follow-up worker has completed and its output is durable.
+func CaptureWorkerReplacingResult(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer) (int, error) {
+	return captureWorkerAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", true, nil)
+}
+
+func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, tempDir string, replace bool) (int, error) {
+	return captureWorkerAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, tempDir, replace, nil)
+}
+
+// CaptureWorkerReplacingResultAfterStart acknowledges a handoff only after its
+// replacement worker has started successfully.
+func CaptureWorkerReplacingResultAfterStart(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, afterStart func() error) (int, error) {
+	return captureWorkerAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", true, afterStart)
+}
+
+func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, tempDir string, replace bool, afterStart func() error) (int, error) {
 	if tmux == "" || buffer == "" || len(command) == 0 || command[0] == "" || (resultPath != "" && !filepath.IsAbs(resultPath)) {
 		return 1, errors.New("invalid worker capture request")
 	}
@@ -86,12 +102,26 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 	child.ExtraFiles = []*os.File{statusWriter, holdReader}
 	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var result *os.File
+	resultName := resultPath
 	if resultPath != "" {
-		result, err = os.OpenFile(resultPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if replace {
+			result, err = os.CreateTemp(filepath.Dir(resultPath), "."+filepath.Base(resultPath)+"-")
+			if err == nil {
+				resultName = result.Name()
+				err = result.Chmod(0o600)
+			}
+		} else {
+			result, err = os.OpenFile(resultPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		}
 		if err != nil {
 			return 1, fmt.Errorf("create worker result: %w", err)
 		}
-		defer result.Close()
+		defer func() {
+			_ = result.Close()
+			if replace {
+				_ = os.Remove(resultName)
+			}
+		}()
 	}
 	workerOutput, err := child.StdoutPipe()
 	if err != nil {
@@ -103,6 +133,13 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 	}
 	if err := child.Start(); err != nil {
 		return 1, err
+	}
+	if afterStart != nil {
+		if err := afterStart(); err != nil {
+			_ = killProcessGroup(child)
+			_ = child.Wait()
+			return 1, err
+		}
 	}
 	pipeFD := int(pipe.Fd())
 	if err := syscall.SetNonblock(pipeFD, true); err != nil {
@@ -187,6 +224,26 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 	}
 	if err := result.Sync(); err != nil {
 		return 1, err
+	}
+	if replace {
+		if err := result.Close(); err != nil {
+			return 1, err
+		}
+		if err := os.Rename(resultName, resultPath); err != nil {
+			return 1, err
+		}
+		dir, err := os.Open(filepath.Dir(resultPath))
+		if err != nil {
+			return 1, err
+		}
+		err = dir.Sync()
+		closeErr := dir.Close()
+		if err != nil {
+			return 1, err
+		}
+		if closeErr != nil {
+			return 1, closeErr
+		}
 	}
 	return finished.code, nil
 }
