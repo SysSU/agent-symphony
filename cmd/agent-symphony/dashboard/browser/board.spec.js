@@ -49,14 +49,17 @@ test.afterEach(async ({ page }) => {
 });
 
 async function mockDashboard(page, attempts, orchestrator = { enabled: true, state: "running", session: "orchestrator" }) {
-  let dashboardState = { hidden: [] };
+  let dashboardState = { version: 1, hidden: [] };
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: orchestrator }));
   await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: dashboardState }));
   await page.route("**/status.json", (route) => route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: attempts } }));
   return {
-    hide(status) {
-      dashboardState = { hidden: [`${status.repository}#${status.issue}/${status.attempt}`] };
+    hide(status, reason) {
+      dashboardState = {
+        version: 1,
+        hidden: [{ repository: status.repository, issue: status.issue, attempt: status.attempt, reason }],
+      };
     },
   };
 }
@@ -247,7 +250,9 @@ for (const scenario of [
         return;
       }
       await actionPending;
-      if (scenario.action === "archive") dashboard.hide(scenario.status);
+      if (scenario.action === "archive" || scenario.action === "abandon") {
+        dashboard.hide(scenario.status, scenario.action === "archive" ? "archived" : "abandoned");
+      }
       await route.fulfill({ json: {} });
     });
     await page.goto("/");
@@ -279,7 +284,7 @@ for (const scenario of [
 
     releaseAction();
     await expect(page.getByRole("status").filter({ hasText: scenario.notice })).toBeVisible();
-    if (scenario.action === "archive") await expect(card).toBeHidden();
+    if (scenario.action === "archive" || scenario.action === "abandon") await expect(card).toBeHidden();
     else await expect(action).toBeEnabled();
     if (scenario.action === "recover") {
       expect(browserErrors.get(page)).toEqual(["console: Failed to load resource: the server responded with a status of 503 (Service Unavailable)"]);
