@@ -195,6 +195,22 @@ func TestPublishedOperatorMessageWithAdvancedHeadStaysQueuedBehindRunningTurn(t 
 	}
 }
 
+func TestPublishedOperatorMessageStaysQueuedWhileCompletedFollowUpReviewRuns(t *testing.T) {
+	message, _ := internalgithub.PrepareOperatorMessage("o/r", 131, 3, "Wait for the follow-up review.")
+	key := "o/r#131/3"
+	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 131, Attempt: 3, DispatchAuthorized: true}
+	remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, PR: 99, BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), State: "review-ready"}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 131, Attempt: 3, BaseSHA: remote.BaseSHA, State: "completed", ReviewState: "running", ReviewHead: strings.Repeat("c", 40), Session: "reviewing"}
+	boundary := &refusingHandoffBoundary{}
+	if err := resumeOperatorMessages(t.Context(), internalgithub.API{}, internalgithub.PRAdapterConfig{}, nil, boundary, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{remote}, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if boundary.calls != 0 || messages[key][0].State != "queued" {
+		t.Fatalf("review-in-progress message was not retained: calls=%d message=%#v", boundary.calls, messages[key][0])
+	}
+}
+
 func TestOperatorMessageTargetValidationRejectsStaleAndTerminalAttempts(t *testing.T) {
 	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "message"}
 	bound := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, BaseSHA: "aaaaaaa", State: "active"}
@@ -849,7 +865,7 @@ func TestWorkerCaptureInternalCLIAndHandoffPreStartRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmux := filepath.Join(dir, "tmux")
-	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; wait-for) printf %s \"$3\" >\"$FAKE_SIGNAL\";; *) exit 2;; esac\n"), 0o700); err != nil {
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; wait-for) test -z \"$FAKE_SIGNAL_FAILURE\" || exit 1; printf %s \"$3\" >\"$FAKE_SIGNAL\";; *) exit 2;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("FAKE_PROMPT", prompt)
@@ -884,6 +900,21 @@ func TestWorkerCaptureInternalCLIAndHandoffPreStartRecovery(t *testing.T) {
 			t.Fatalf("pre-start failure acknowledged launch at %s: %v", path, err)
 		}
 	}
+	stderr.Reset()
+	t.Setenv("FAKE_SIGNAL_FAILURE", "1")
+	code = run([]string{"worker-capture-handoff", tmux, "prompt-buffer", resultPath, launchedPath, "recipient", "signal-name", "--", "sh", "-c", `printf %s "$1"`, "consumer", result}, &stdout, &stderr)
+	if code == 0 || !strings.Contains(stderr.String(), "launch signal") {
+		t.Fatalf("signal failure code=%d stderr=%q", code, stderr.String())
+	}
+	for _, path := range []string{launchedPath, signalPath} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("signal failure retained launch handshake at %s: %v", path, err)
+		}
+	}
+	if got, err := os.ReadFile(resultPath); err != nil || string(got) != replacement {
+		t.Fatalf("signal failure replaced prior result=%q err=%v", got, err)
+	}
+	t.Setenv("FAKE_SIGNAL_FAILURE", "")
 	stderr.Reset()
 	code = run([]string{"worker-capture-handoff", tmux, "prompt-buffer", resultPath, launchedPath, "recipient", "signal-name", "--", "sh", "-c", `printf %s "$1"`, "consumer", result}, &stdout, &stderr)
 	if code != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
@@ -1361,9 +1392,13 @@ func TestReconcilePublishesCompletedUnpublishedAttemptFromIssueBinding(t *testin
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/pulls":
 			var pulls []map[string]any
 			if created {
-				pulls = append(pulls, map[string]any{"number": 7, "body": pullBody, "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": branch}})
+				pulls = append(pulls, map[string]any{"number": 7, "body": pullBody, "state": "open", "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": branch}, "base": map[string]any{"sha": base}})
 			}
 			body, _ = json.Marshal(pulls)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/commits/"+head+"/check-runs":
+			body = []byte(`{"check_runs":[]}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/commits/"+head+"/status":
+			body = []byte(`{"statuses":[]}`)
 		case request.Method == http.MethodPost && request.URL.Path == "/repos/o/r/pulls":
 			var input struct {
 				Body string `json:"body"`

@@ -282,7 +282,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 					return err
 				}
 				if err := exec.CommandContext(context.Background(), args[1], "wait-for", "-S", args[6]).Run(); err != nil {
-					fmt.Fprintln(stderr, "launch signal: "+err.Error())
+					signalErr := fmt.Errorf("launch signal: %w", err)
+					if removeErr := os.Remove(args[4]); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+						return errors.Join(signalErr, fmt.Errorf("roll back launch marker: %w", removeErr))
+					}
+					if syncErr := immutableDirSync(filepath.Dir(args[4])); syncErr != nil {
+						return errors.Join(signalErr, fmt.Errorf("sync launch marker rollback: %w", syncErr))
+					}
+					return signalErr
 				}
 				return nil
 			})
@@ -1006,7 +1013,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if err := monitorQueuedAttempts(ctx, api, &r, c, freshIssues, refreshedManifests, freshRemote, operatorMessages, statePath, stateRoot); err != nil {
 		return statuses, err
 	}
-	validatedManifests, err := r.Discover()
+	freshIssues, freshRemote, validatedManifests, err := refreshOperatorTarget(ctx)
 	if err != nil {
 		return statuses, err
 	}
@@ -2249,6 +2256,12 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 				}
 				continue
 			}
+			manifestIndex := slices.IndexFunc(manifests, func(manifest agentruntime.Manifest) bool {
+				return manifest.Repository == message.Repository && manifest.Issue == message.Issue && manifest.Attempt == message.Attempt
+			})
+			if manifestIndex >= 0 && manifests[manifestIndex].State == "completed" && (manifests[manifestIndex].ReviewState == "preparing" || manifests[manifestIndex].ReviewState == "running") {
+				continue
+			}
 			proposal := orchestratoragent.MessageProposal{Version: 1, Repository: message.Repository, Issue: message.Issue, Attempt: message.Attempt, Message: message.Message}
 			ownershipCheck := func(ctx context.Context, manifest agentruntime.Manifest, _ orchestrator.AttemptFact) error {
 				if runtimeState == nil {
@@ -2262,9 +2275,6 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 				}
 				continue
 			}
-			manifestIndex := slices.IndexFunc(manifests, func(manifest agentruntime.Manifest) bool {
-				return manifest.Repository == message.Repository && manifest.Issue == message.Issue && manifest.Attempt == message.Attempt
-			})
 			if manifestIndex < 0 {
 				if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "exact attempt runtime is missing"); err != nil {
 					return err
