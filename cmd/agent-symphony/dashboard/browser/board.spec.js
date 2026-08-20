@@ -33,12 +33,37 @@ const statuses = [
   },
 ];
 
+const browserErrors = new WeakMap();
+
+test.beforeEach(async ({ page }) => {
+  const errors = [];
+  browserErrors.set(page, errors);
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(`console: ${message.text()}`);
+  });
+  page.on("pageerror", (error) => errors.push(`page: ${error.message}`));
+});
+
+test.afterEach(async ({ page }) => {
+  expect(browserErrors.get(page)).toEqual([]);
+});
+
+async function mockDashboard(page, attempts, orchestrator = { enabled: true, state: "running", session: "orchestrator" }) {
+  let dashboardState = { hidden: [] };
+  await page.route("**/orchestrator.json", (route) => route.fulfill({ json: orchestrator }));
+  await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
+  await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: dashboardState }));
+  await page.route("**/status.json", (route) => route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: attempts } }));
+  return {
+    hide(status) {
+      dashboardState = { hidden: [`${status.repository}#${status.issue}/${status.attempt}`] };
+    },
+  };
+}
+
 test("renders every board lane and keeps overflowing lanes keyboard reachable", async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 900 });
-  await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: true, state: "running", session: "orchestrator" } }));
-  await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
-  await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
-  await page.route("**/status.json", (route) => route.fulfill({ json: { updated_at: new Date().toISOString(), statuses } }));
+  await mockDashboard(page, statuses);
   await page.goto("/");
 
   const board = page.getByRole("region", { name: "Issue status board" });
@@ -74,3 +99,191 @@ test("renders every board lane and keeps overflowing lanes keyboard reachable", 
   await page.keyboard.press("ArrowRight");
   await expect.poll(() => board.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
 });
+
+test("contains long attempt text inside a mobile viewport", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const longText = "unbrokenattemptdetail".repeat(18);
+  await mockDashboard(page, [{
+    repository: `SysSU/${longText}`,
+    issue: 201,
+    attempt: 4,
+    title: longText,
+    state: "active",
+    priority: 2,
+    session: `as-${longText}`,
+    worktree: `/attempts/${longText}`,
+    branch: longText,
+    blockers: [longText],
+    checks: [longText],
+    diagnostic: longText,
+    next_action: longText,
+  }]);
+  await page.goto("/");
+
+  const board = page.getByRole("region", { name: "Issue status board" });
+  const card = board.locator(".card");
+  await expect(card).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  expect(await board.evaluate((element) => element.scrollWidth)).toBeLessThanOrEqual(await board.evaluate((element) => element.clientWidth));
+  const box = await card.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(390);
+});
+
+test("opens attempt and orchestrator terminals, closes them, and restores focus", async ({ page }) => {
+  await page.addInitScript(() => {
+    class MockWebSocket extends EventTarget {
+      static OPEN = 1;
+
+      constructor() {
+        super();
+        this.readyState = MockWebSocket.OPEN;
+        queueMicrotask(() => this.dispatchEvent(new Event("open")));
+      }
+
+      send() {}
+
+      close() {}
+    }
+    window.WebSocket = MockWebSocket;
+  });
+  await mockDashboard(page, [statuses[0]]);
+  await page.goto("/");
+
+  const attemptTerminal = page.getByRole("button", { name: statuses[0].session });
+  await attemptTerminal.click();
+  let dialog = page.getByRole("dialog", { name: statuses[0].session });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Close" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(attemptTerminal).toBeFocused();
+
+  const orchestratorTerminal = page.getByRole("button", { name: "Open terminal" });
+  await orchestratorTerminal.click();
+  dialog = page.getByRole("dialog", { name: "orchestrator" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Close" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(orchestratorTerminal).toBeFocused();
+});
+
+test("disables unavailable terminal and investigation controls", async ({ page }) => {
+  const blocked = { ...statuses[0], issue: 202, state: "blocked" };
+  await mockDashboard(page, [blocked], { enabled: true, state: "starting", session: "orchestrator" });
+  await page.goto("/");
+
+  const orchestrator = page.getByRole("region", { name: "Orchestrator" });
+  await expect(orchestrator.getByRole("button", { name: "orchestrator" })).toBeDisabled();
+  await expect(orchestrator.getByRole("button", { name: "Open terminal" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Ask orchestrator to investigate" })).toHaveCount(0);
+});
+
+test("requests an investigation and disables conflicting controls while it is pending", async ({ page }) => {
+  const blocked = { ...statuses[0], issue: 203, attempt: 2, state: "blocked" };
+  let releaseAction;
+  const actionPending = new Promise((resolve) => { releaseAction = resolve; });
+  const requests = [];
+  await mockDashboard(page, [blocked]);
+  await page.route("**/actions/orchestrator/investigate?*", async (route) => {
+    requests.push(route.request());
+    await actionPending;
+    await route.fulfill({ json: {} });
+  });
+  await page.goto("/");
+
+  const investigate = page.getByRole("button", { name: "Ask orchestrator to investigate" });
+  await investigate.click();
+  await expect(page.getByRole("button", { name: "Requesting…" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Recover/restart" })).toBeDisabled();
+  await expect.poll(() => requests.length).toBe(1);
+  expect(new URL(requests[0].url()).searchParams.get("issue")).toBe(String(blocked.issue));
+  expect(new URL(requests[0].url()).searchParams.get("attempt")).toBe(String(blocked.attempt));
+  expect(requests[0].method()).toBe("POST");
+
+  releaseAction();
+  await expect(page.getByRole("status").filter({ hasText: "Asked the orchestrator to investigate" })).toBeVisible();
+  await expect(investigate).toBeEnabled();
+});
+
+for (const scenario of [
+  {
+    action: "archive",
+    button: "Archive",
+    status: { ...statuses[1], repository: statuses[0].repository },
+    consequence: "hides it from the Done lane",
+    notice: "Archived issue #160, attempt 2.",
+  },
+  {
+    action: "recover",
+    button: "Recover attempt",
+    status: { ...statuses[0], issue: 204, attempt: 3, state: "failed", retryable: true },
+    consequence: "preserves the worktree and diagnostics",
+    notice: "Recovery requested for issue #204, attempt 3.",
+  },
+  {
+    action: "abandon",
+    button: "Abandon attempt",
+    status: { ...statuses[0], issue: 205, attempt: 4, state: "orphaned", retryable: false },
+    consequence: "permanently deletes its local worktree, log, and retained attempt record",
+    notice: "Abandoned issue #205, attempt 4.",
+  },
+]) {
+  test(`${scenario.action} supports confirmation cancellation and acceptance`, async ({ page }) => {
+    let releaseAction;
+    const actionPending = new Promise((resolve) => { releaseAction = resolve; });
+    const requests = [];
+    const dashboard = await mockDashboard(page, [scenario.status]);
+    await page.route(`**/actions/${scenario.action}?*`, async (route) => {
+      const url = new URL(route.request().url());
+      requests.push({
+        method: route.request().method(),
+        issue: url.searchParams.get("issue"),
+        attempt: url.searchParams.get("attempt"),
+      });
+      if (scenario.action === "recover" && requests.length === 1) {
+        await route.fulfill({ status: 503, body: "reconciliation in progress" });
+        return;
+      }
+      await actionPending;
+      if (scenario.action === "archive") dashboard.hide(scenario.status);
+      await route.fulfill({ json: {} });
+    });
+    await page.goto("/");
+
+    const card = page.locator(".card");
+    const action = card.getByRole("button", { name: scenario.button });
+    let confirmation = "";
+    page.once("dialog", async (dialog) => {
+      confirmation = dialog.message();
+      await dialog.dismiss();
+    });
+    await action.click();
+    expect(confirmation).toContain(scenario.consequence);
+    expect(requests).toEqual([]);
+    await expect(action).toBeEnabled();
+
+    page.once("dialog", (dialog) => dialog.accept());
+    await action.click();
+    const actionControl = card.locator(scenario.action === "archive" ? ".secondaryAction" : ".dangerAction");
+    await expect(actionControl).toBeDisabled();
+    await expect(actionControl).toHaveText(scenario.action === "recover" ? "Waiting for reconciliation…" : "Working…");
+    const expectedRequests = scenario.action === "recover" ? 2 : 1;
+    await expect.poll(() => requests.length).toBe(expectedRequests);
+    expect(requests).toEqual(Array.from({ length: expectedRequests }, () => ({
+      method: "POST",
+      issue: String(scenario.status.issue),
+      attempt: String(scenario.status.attempt),
+    })));
+
+    releaseAction();
+    await expect(page.getByRole("status").filter({ hasText: scenario.notice })).toBeVisible();
+    if (scenario.action === "archive") await expect(card).toBeHidden();
+    else await expect(action).toBeEnabled();
+    if (scenario.action === "recover") {
+      expect(browserErrors.get(page)).toEqual(["console: Failed to load resource: the server responded with a status of 503 (Service Unavailable)"]);
+      browserErrors.set(page, []);
+    }
+  });
+}

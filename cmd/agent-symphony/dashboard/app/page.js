@@ -66,7 +66,7 @@ export default function Dashboard() {
   const performAction = useCallback(async (action, status) => {
     const verb = action === "archive" ? "Archive" : action === "recover" ? "Recover" : "Abandon";
     const consequence = action === "archive"
-      ? "This stops its tmux session if needed, deletes its local worktree, and hides it from Completed."
+      ? "This stops its tmux session if needed, deletes its local worktree, and hides it from the Done lane."
       : action === "recover"
         ? "If the attempt is stuck, this stops only its named tmux session. It preserves the worktree and diagnostics, records the failure on GitHub, and requests a new attempt."
       : "This stops its tmux session and permanently deletes its local worktree, log, and retained attempt record.";
