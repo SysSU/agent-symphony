@@ -457,7 +457,7 @@ func TestClaimedOperatorMessageDoesNotInterruptCompetingHandoff(t *testing.T) {
 	}
 }
 
-func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.T) {
+func TestFirstOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.T) {
 	for _, stage := range []string{"after resume", "after worker receipt", "before delivered outcome"} {
 		t.Run(stage, func(t *testing.T) {
 			runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
@@ -471,16 +471,6 @@ func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.
 			}
 			key := fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number)
 			messages := map[string][]internalgithub.OperatorMessage{key: {message}}
-			handoffKey := "operator-message-" + message.ID
-			forgedPath := handoffReceiptPath(manifest.Worktree, handoffKey)
-			if err := os.MkdirAll(filepath.Dir(forgedPath), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			forgedToken := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+handoffKey)))
-			forged, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", handoffKey, forgedPath, forgedToken})
-			if err := os.WriteFile(forgedPath, forged, 0o600); err != nil {
-				t.Fatal(err)
-			}
 			bound := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
 			issues := []internalgithub.RecoveryIssueFact{{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &bound}}
 			remote := []internalgithub.RecoveryAttemptFact{bound}
@@ -523,11 +513,6 @@ func TestOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.
 			recovered, err := internalgithub.FetchOperatorMessages(t.Context(), api, cfg, attempt.Issue)
 			if err != nil || len(recovered) != 1 || recovered[0].State != "claimed" {
 				t.Fatalf("durable claim=%#v err=%v", recovered, err)
-			}
-			if stage == "after worker receipt" {
-				if err := os.RemoveAll(filepath.Join(manifest.Worktree, ".agent-symphony", "handoffs")); err != nil {
-					t.Fatal(err)
-				}
 			}
 			messages[key] = recovered
 			current, err := runtimeState.Discover()

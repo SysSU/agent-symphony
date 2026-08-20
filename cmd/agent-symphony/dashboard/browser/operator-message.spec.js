@@ -128,6 +128,8 @@ test("keeps the reviewed proposal visible when its binding changes before confir
   await expect(confirmation).toBeVisible();
   await expect(page.locator(".messageStatus .state-queued")).toBeVisible();
   expect(dashboard.requests).toEqual([{ action: "confirm", body: proposal, nonce: confirmationNonce }]);
+  expect(browserErrors.get(page)).toEqual(["console: Failed to load resource: the server responded with a status of 409 (Conflict)"]);
+  browserErrors.set(page, []);
 });
 
 test("renders rejected and failed worker message outcomes", async ({ page }) => {

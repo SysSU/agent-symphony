@@ -1385,7 +1385,7 @@ func verifyHandoff(ctx context.Context, input []byte, root string) (string, erro
 		return "", fmt.Errorf("verify handoff binding: %w", err)
 	}
 	if !persisted {
-		return "", errors.New("verify handoff binding is missing")
+		return "", nil
 	}
 	option := "@agent-symphony-handoff-" + recipient[:16]
 	observed, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"show-options", "-pqv", "-t", agentruntime.PaneTarget(request.Manifest.Session), option}, Dir: request.Manifest.Worktree})

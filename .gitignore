@@ -11,3 +11,4 @@ cmd/agent-symphony/dashboard/.next/
 cmd/agent-symphony/dashboard/node_modules/
 cmd/agent-symphony/dashboard/out/*
 !cmd/agent-symphony/dashboard/out/.gitkeep
+cmd/agent-symphony/dashboard/test-results/

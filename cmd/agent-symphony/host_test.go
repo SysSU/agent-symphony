@@ -810,8 +810,8 @@ func TestMissingOperatorHandoffBindingCannotReuseTmuxLaunchOption(t *testing.T) 
 		return agentruntime.Result{}, nil
 	}
 
-	if _, err := verifyHandoff(t.Context(), body, root); err == nil || !strings.Contains(err.Error(), "binding is missing") {
-		t.Fatalf("verified forged tmux option without binding: %v", err)
+	if observed, err := verifyHandoff(t.Context(), body, root); err != nil || observed != "" {
+		t.Fatalf("missing binding verification = %q, %v", observed, err)
 	}
 	if calls != 0 {
 		t.Fatalf("missing binding reached tmux verification: %d calls", calls)

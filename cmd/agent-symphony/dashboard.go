@@ -947,7 +947,7 @@ func startDashboard(ctx context.Context, address, stateRoot string, operationMu 
 	}
 	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, recover, reconcile, service, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
-		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP sends the dashboard password and session data without encryption, and anyone with the password can use terminals and cleanup controls")
+		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password and session data are exposed in transit, and anyone with the password can use terminals and cleanup controls")
 	}
 	go func() {
 		<-ctx.Done()
