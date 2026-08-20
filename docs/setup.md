@@ -162,7 +162,7 @@ Before upgrading an existing installation to the first release with repository-n
 
 ## Advisory orchestrator
 
-The advisory orchestrator is disabled by default. Enable it by adding a prompt-accepting interactive `commands.orchestrator` array. In zero-admin mode, this Codex command lets the orchestrator use the coordinator user's authenticated `gh` CLI and inspect same-user tmux sessions:
+New configuration created by `agent-symphony init` enables the advisory orchestrator. In zero-admin mode, its default Codex command lets the orchestrator use the coordinator user's authenticated `gh` CLI and inspect same-user tmux sessions:
 
 ```json
 ["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"]
