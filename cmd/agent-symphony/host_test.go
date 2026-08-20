@@ -644,6 +644,10 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 			}{agentruntime.Manifest{Worktree: worktree, Session: "as-retry", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, handoffReceiptPath(worktree, "retry-key"), "token", []string{"implementation"}})
 			recipient, deliveries, injected := "", 0, false
 			hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+				if command.Args[0] == "set-option" {
+					recipient = ""
+					return agentruntime.Result{}, nil
+				}
 				if slices.Contains(command.Args, "show-options") {
 					return agentruntime.Result{Output: recipient}, nil
 				}
@@ -769,6 +773,54 @@ func TestOperatorHandoffCommandDriftPreservesEveryLaunchBoundary(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMissingOperatorHandoffBindingCannotReuseTmuxLaunchOption(t *testing.T) {
+	oldExec := hostExecRunner
+	t.Cleanup(func() { hostExecRunner = oldExec })
+
+	root := t.TempDir()
+	worktree := filepath.Join(root, "attempt")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	handoff := json.RawMessage(`{"type":"agent-symphony-handoff-v1","key":"operator-message-forged","kind":"operator-message"}`)
+	request := handoffRequest{
+		Manifest:     agentruntime.Manifest{Worktree: worktree, Session: "as-forged", LogPath: filepath.Join(worktree, "attempt.log")},
+		Handoff:      handoff,
+		OutcomePath:  handoffReceiptPath(worktree, "operator-message-forged"),
+		OutcomeToken: "token",
+		Command:      []string{"implementation"},
+	}
+	body, _ := json.Marshal(request)
+	_, recipient := handoffBinding(request)
+	option, launches, calls := recipient, 0, 0
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		calls++
+		switch command.Args[0] {
+		case "show-options":
+			return agentruntime.Result{Output: option}, nil
+		case "set-option":
+			option = ""
+		case "respawn-pane":
+			option = recipient
+			launches++
+		}
+		return agentruntime.Result{}, nil
+	}
+
+	if _, err := verifyHandoff(t.Context(), body, root); err == nil || !strings.Contains(err.Error(), "binding is missing") {
+		t.Fatalf("verified forged tmux option without binding: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("missing binding reached tmux verification: %d calls", calls)
+	}
+	if _, err := acceptOperatorHandoff(t.Context(), body, root); err != nil {
+		t.Fatal(err)
+	}
+	if launches != 1 {
+		t.Fatalf("fresh handoff launches=%d, want 1", launches)
 	}
 }
 

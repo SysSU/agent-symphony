@@ -1380,8 +1380,12 @@ func verifyHandoff(ctx context.Context, input []byte, root string) (string, erro
 		return "", err
 	}
 	binding, recipient := handoffBinding(request)
-	if _, err := immutableMarkerMatches(filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs", h.Key+".json"), binding); err != nil {
+	persisted, err := immutableMarkerMatches(filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs", h.Key+".json"), binding)
+	if err != nil {
 		return "", fmt.Errorf("verify handoff binding: %w", err)
+	}
+	if !persisted {
+		return "", errors.New("verify handoff binding is missing")
 	}
 	option := "@agent-symphony-handoff-" + recipient[:16]
 	observed, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"show-options", "-pqv", "-t", agentruntime.PaneTarget(request.Manifest.Session), option}, Dir: request.Manifest.Worktree})
@@ -1405,7 +1409,7 @@ func acceptOperatorHandoff(ctx context.Context, input []byte, root string) (stri
 		return "", errors.New("invalid operator handoff")
 	}
 	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
-	binding, _ := handoffBinding(request)
+	binding, recipient := handoffBinding(request)
 	persisted, err := immutableMarkerMatches(filepath.Join(inbox, h.Key+".json"), binding)
 	if err != nil {
 		return "", fmt.Errorf("operator handoff binding changed: %w", err)
@@ -1415,6 +1419,11 @@ func acceptOperatorHandoff(ctx context.Context, input []byte, root string) (stri
 			if err := os.RemoveAll(filepath.Join(inbox, h.Key+suffix)); err != nil {
 				return "", err
 			}
+		}
+		pane := agentruntime.PaneTarget(request.Manifest.Session)
+		option := "@agent-symphony-handoff-" + recipient[:16]
+		if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-pqu", "-t", pane, option}, Dir: request.Manifest.Worktree}); err != nil {
+			return "", fmt.Errorf("clear stale operator handoff launch identity: %w", err)
 		}
 	}
 	return acceptHandoff(ctx, input, root)
