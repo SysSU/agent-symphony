@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -708,9 +709,18 @@ func writeHostOrchestratorProposal(root string, input io.Reader, output io.Write
 	if err != nil || !belowRoot(dir, root) || !strings.HasPrefix(filepath.Base(dir), "orchestrator-") {
 		return errors.New("orchestrator workspace is outside the reviewer boundary")
 	}
+	_, canonical, err := parseHostOrchestratorProposal(input)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(output, orchestratoragent.MessageProposalPrefix+base64.StdEncoding.EncodeToString(canonical))
+	return err
+}
+
+func parseHostOrchestratorProposal(input io.Reader) (orchestratoragent.MessageProposal, []byte, error) {
 	body, err := io.ReadAll(io.LimitReader(input, 64<<10+1))
 	if err != nil || len(body) == 0 || len(body) > 64<<10 {
-		return errors.New("invalid bounded orchestrator proposal")
+		return orchestratoragent.MessageProposal{}, nil, errors.New("invalid bounded orchestrator proposal")
 	}
 	var proposal struct {
 		Version    int    `json:"version"`
@@ -722,14 +732,89 @@ func writeHostOrchestratorProposal(root string, input io.Reader, output io.Write
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&proposal) != nil || decoder.Decode(&struct{}{}) != io.EOF || proposal.Version != 1 {
-		return errors.New("invalid orchestrator proposal schema")
+		return orchestratoragent.MessageProposal{}, nil, errors.New("invalid orchestrator proposal schema")
 	}
 	if _, err := internalgithub.PrepareOperatorMessage(proposal.Repository, proposal.Issue, proposal.Attempt, proposal.Message); err != nil {
-		return err
+		return orchestratoragent.MessageProposal{}, nil, err
 	}
 	canonical, _ := json.Marshal(proposal)
-	_, err = fmt.Fprintln(output, orchestratoragent.MessageProposalPrefix+base64.StdEncoding.EncodeToString(canonical))
-	return err
+	parsed := orchestratoragent.MessageProposal{Version: proposal.Version, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, Message: proposal.Message, Binding: fmt.Sprintf("%x", sha256.Sum256(canonical))}
+	return parsed, canonical, nil
+}
+
+func reportHostOrchestratorProposalStatus(root string, input io.Reader, output io.Writer) error {
+	dir, err := hostGetwd()
+	if err != nil || !belowRoot(dir, root) || !strings.HasPrefix(filepath.Base(dir), "orchestrator-") {
+		return errors.New("orchestrator workspace is outside the reviewer boundary")
+	}
+	proposal, _, err := parseHostOrchestratorProposal(input)
+	if err != nil {
+		return err
+	}
+	status, present, err := readHostOrchestratorProposalStatus(filepath.Join(dir, orchestratoragent.MessageProposalStatusFile))
+	if err != nil {
+		return err
+	}
+	result := struct {
+		Version    int        `json:"version"`
+		Binding    string     `json:"binding"`
+		State      string     `json:"state"`
+		ObservedAt *time.Time `json:"observed_at,omitempty"`
+		Detail     string     `json:"detail"`
+	}{Version: 1, Binding: proposal.Binding, State: "unknown", Detail: "no matching coordinator observation is available"}
+	if present {
+		result.ObservedAt = &status.UpdatedAt
+		switch {
+		case status.PendingBinding == proposal.Binding:
+			result.State, result.Detail = "pending", "the coordinator captured this exact proposal and currently exposes it for confirmation"
+		case status.ConsumedBinding == proposal.Binding:
+			result.State, result.Detail = "consumed", "the coordinator consumed this exact proposal; confirmation, cancellation, queueing, and delivery are not distinguished here"
+		case status.PendingBinding != "":
+			result.State, result.Detail = "replaced", "a different proposal is currently pending"
+		}
+	}
+	return json.NewEncoder(output).Encode(result)
+}
+
+func readHostOrchestratorProposalStatus(path string) (orchestratoragent.MessageProposalStatus, bool, error) {
+	listed, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return orchestratoragent.MessageProposalStatus{}, false, nil
+	}
+	if err != nil || !listed.Mode().IsRegular() || listed.Mode()&os.ModeSymlink != 0 || listed.Mode().Perm() != 0o440 || fileGID(listed) != hostEGID() || listed.Size() <= 0 || listed.Size() > 4<<10 {
+		return orchestratoragent.MessageProposalStatus{}, false, errors.New("orchestrator proposal status is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return orchestratoragent.MessageProposalStatus{}, false, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(listed, opened) {
+		return orchestratoragent.MessageProposalStatus{}, false, errors.New("orchestrator proposal status changed while opening")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, 4<<10+1))
+	if err != nil || int64(len(body)) != opened.Size() || len(body) > 4<<10 {
+		return orchestratoragent.MessageProposalStatus{}, false, errors.New("orchestrator proposal status changed while reading")
+	}
+	var status orchestratoragent.MessageProposalStatus
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&status) != nil || decoder.Decode(&struct{}{}) != io.EOF || status.Version != 1 || status.UpdatedAt.IsZero() || !validProposalBinding(status.PendingBinding) || !validProposalBinding(status.ConsumedBinding) {
+		return orchestratoragent.MessageProposalStatus{}, false, errors.New("orchestrator proposal status is invalid")
+	}
+	return status, true, nil
+}
+
+func validProposalBinding(value string) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func credentialShapedArgument(value string) bool {
@@ -750,14 +835,15 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 	}
 	orchestratorMode := mode == "orchestrator"
 	orchestratorProposalMode := mode == "orchestrator-proposal"
-	if orchestratorProposalMode && localRoot == "" {
+	orchestratorProposalStatusMode := mode == "orchestrator-proposal-status"
+	if (orchestratorProposalMode || orchestratorProposalStatusMode) && localRoot == "" {
 		localRoot = strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_ORCHESTRATOR_ROOT"))
 	}
-	if mode == "review" || orchestratorMode || orchestratorProposalMode {
+	if mode == "review" || orchestratorMode || orchestratorProposalMode || orchestratorProposalStatusMode {
 		wantUser, wantGroup = reviewerUser, snapshotGroup
 		root = strings.Replace(root, "attempts", "snapshots", 1)
 	} else if mode != "implementation" {
-		return errors.New("agent-host mode must be implementation, review, orchestrator, or orchestrator-proposal")
+		return errors.New("agent-host mode must be implementation, review, orchestrator, orchestrator-proposal, or orchestrator-proposal-status")
 	}
 	// AGENT_SYMPHONY_LOCAL_ROOT is only ever set by the coordinator's own
 	// implementationBoundary/reviewBoundary when install-host was never run;
@@ -797,6 +883,9 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 	}
 	if orchestratorProposalMode {
 		return writeHostOrchestratorProposal(root, input, output)
+	}
+	if orchestratorProposalStatusMode {
+		return reportHostOrchestratorProposalStatus(root, input, output)
 	}
 	var request struct {
 		Operation string          `json:"operation"`
