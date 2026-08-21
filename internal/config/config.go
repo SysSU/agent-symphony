@@ -73,7 +73,7 @@ func Default(repository string) Config {
 		WorktreeRoot: ".worktrees",
 		DocsPaths:    []string{"README.md", "docs"},
 		Commands: Commands{
-			Implementation: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}, Reviewer: []string{"codex", "exec", "--sandbox", "read-only", "-"},
+			Implementation: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}, Reviewer: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"},
 			Orchestrator: []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"},
 			Environment:  []string{"LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"},
 		},
