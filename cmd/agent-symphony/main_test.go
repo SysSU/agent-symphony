@@ -1833,7 +1833,7 @@ func TestIndependentReviewIgnoresEchoedAndDuplicatedTerminalResult(t *testing.T)
 	if err != nil || !pending {
 		t.Fatalf("start pending=%v err=%v", pending, err)
 	}
-	if slices.Contains(boundary.respawn, "review") || slices.Contains(boundary.respawn, "--output-last-message") || !slices.Contains(boundary.respawn, reviewResultPath(started.Snapshot, head)) || !slices.Contains(boundary.respawn, "--sandbox") || !slices.Contains(boundary.respawn, "read-only") || !slices.Contains(boundary.respawn, "-") {
+	if slices.Contains(boundary.respawn, "review") || slices.Contains(boundary.respawn, "--output-last-message") || !slices.Contains(boundary.respawn, reviewResultPath(started.Snapshot, head)) || !slices.Contains(boundary.respawn, "--dangerously-bypass-approvals-and-sandbox") || !slices.Contains(boundary.respawn, "-") {
 		t.Fatalf("default reviewer did not receive result artifact: %q", boundary.respawn)
 	}
 	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
@@ -1941,7 +1941,7 @@ func TestDefaultReviewerProductionShapeUsesExactDiffAndRejectsProse(t *testing.T
 	dir := t.TempDir()
 	codex := filepath.Join(dir, "codex")
 	const script = `#!/bin/sh
-test "$#" -eq 4 && test "$1" = exec && test "$2" = --sandbox && test "$3" = read-only && test "$4" = - || exit 20
+test "$#" -eq 3 && test "$1" = exec && test "$2" = --dangerously-bypass-approvals-and-sandbox && test "$3" = - || exit 20
 prompt=$(cat) || exit 21
 printf '%s' "$prompt" | grep -F "$FAKE_REVIEW_BASE..HEAD" >/dev/null || exit 22
 diff=$(git -C "$FAKE_REVIEW_REPO" diff --no-ext-diff "$FAKE_REVIEW_BASE" HEAD) || exit 23
@@ -2976,6 +2976,9 @@ func TestInitAndMisuseExitCodes(t *testing.T) {
 	}
 	if !slices.Equal(initialized.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}) {
 		t.Fatalf("unexpected initialized implementation command: %q", initialized.Commands.Implementation)
+	}
+	if !slices.Equal(initialized.Commands.Reviewer, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
+		t.Fatalf("unexpected initialized reviewer command: %q", initialized.Commands.Reviewer)
 	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
 	if !slices.Equal(initialized.Commands.Orchestrator, wantOrchestrator) {
