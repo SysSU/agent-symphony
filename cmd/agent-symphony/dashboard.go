@@ -196,6 +196,11 @@ func (s *dashboardServer) serveOrchestratorProposal(w http.ResponseWriter, r *ht
 		http.Error(w, "orchestrator message proposal is invalid", http.StatusUnprocessableEntity)
 		return
 	}
+	if proposal.Action != "" && proposal.Action != orchestratoragent.ProposalActionMessage {
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	body, _ := json.Marshal(proposal)
 	w.Header().Set(dashboardNonceHeader, s.confirmationNonce(session, proposal.Binding))
 	w.Header().Set("Cache-Control", "no-store")
@@ -673,7 +678,7 @@ func (s *dashboardServer) serveOrchestratorMessageAction(w http.ResponseWriter, 
 	var submitted orchestratoragent.MessageProposal
 	decoder := json.NewDecoder(io.LimitReader(r.Body, maxTerminalInputBytes+1))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&submitted) != nil || decoder.Decode(&struct{}{}) != io.EOF || submitted.Binding == "" {
+	if decoder.Decode(&submitted) != nil || decoder.Decode(&struct{}{}) != io.EOF || submitted.Binding == "" || submitted.Action != "" && submitted.Action != orchestratoragent.ProposalActionMessage {
 		http.Error(w, "invalid orchestrator message action", http.StatusBadRequest)
 		return
 	}

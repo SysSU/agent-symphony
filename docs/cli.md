@@ -26,7 +26,7 @@ agent-symphony reconcile (--state path --runtime-state path | --attempts path [-
 
 - `help`, `--help`, and `-h` print the command summary. `--version` prints the release version.
 - `install-host` provisions the optional advanced host-isolation boundary. Run it as root from the exact installed binary and repeat it after each binary upgrade.
-- `agent-host` is the internal boundary adapter for implementation, review, and orchestrator processes. `orchestrator-proposal` accepts only the bounded proposal JSON on standard input and emits one strict frame on standard output. `orchestrator-proposal-status` accepts that same exact JSON and reports only whether the coordinator has observed its binding as `pending`, `consumed`, `replaced`, or `unknown`. These are not interactive operator commands.
+- `agent-host` is the internal boundary adapter for implementation, review, and orchestrator processes. `orchestrator-proposal` accepts only the bounded proposal JSON on standard input and emits one strict frame on standard output. `orchestrator-proposal-status` accepts that same exact JSON and reports `pending`, `accepted`, `refused`, `consumed`, `replaced`, or `unknown` for its coordinator-observed binding. These are not interactive operator commands.
 - `init` creates a new config with conservative defaults and refuses to overwrite a file. It requires a GitHub `origin` in the current repository.
 - `validate` requires the config file to be inside the resolved Git root. It rejects malformed input, duplicate JSON keys at any nesting depth, unknown keys, secret-shaped keys or command arguments, invalid policy values, duplicate/empty labels, unsafe command arguments, and paths that are absolute, traverse outside the repository, target Git metadata, or escape through symlinks. Worktree and documentation paths are always anchored at the Git root, not the config file's directory.
 - `config view` prints the validated configuration. Invalid or secret-bearing files are never echoed.
@@ -79,6 +79,12 @@ Do not put secrets in a worker message. Confirmation records the complete text d
 
 Cancellation, completion, a mismatched attempt, or a merged pull request rejects pending delivery. The authoritative check after the durable claim prevents a terminal change during earlier cleanup or discovery from reaching worker acceptance. A daemon restart reconstructs accepted messages, claims, and outcomes from coordinator-authored GitHub markers. For a claimed delivery in the crash window, the worker boundary checks the exact tmux launch identity before reconciliation can start another follow-up turn. Publication requires the coordinator-authored delivered outcome.
 
+### Retry a completed transition
+
+The orchestrator may submit `{"version":1,"repository":"owner/repository","issue":123,"attempt":1,"action":"retry_transition","request_id":"unique-1"}` through `orchestrator-proposal`. The service observes the frame without dashboard polling. Under the reconciliation lock, it refreshes authoritative status and accepts only the exact unblocked active attempt whose implementation session is completed and whose current phase is validation or publication. An accepted request starts the existing bounded reconciliation path without another approval; a stale, blocked, terminal, mismatched, or unrelated phase is refused without mutation.
+
+Pass the same JSON to `orchestrator-proposal-status`. `accepted` proves that bounded reconciliation started, not that publication succeeded. `refused` includes the bounded reason. Verify the resulting issue, pull request head, handoff, and status through their authoritative live sources. Use a new bounded `request_id` for a later retry. This control cannot message or restart a worker, cancel or abandon an attempt, rerun checks, merge a pull request, send tmux input, or execute arbitrary commands.
+
 Autonomous merge has additional restrictions: the PR must remain open, non-draft, mergeable, on the expected head, current with its required base, free of unresolved authorized feedback, and compliant with repository-required reviews and checks plus repository merge permissions. Branch protection is optional, and `agent-symphony/policy` does not need to be configured as a required status. GitHub still enforces any rules that do exist when the coordinator submits the expected-head merge.
 
 For a published attempt, the coordinator repairs missing validation/documentation evidence from the verified worker result. If the unchanged head remains blocked by checks, repository settings, or permissions the coordinator cannot safely change, it posts one deduplicated explanation on the pull request.
@@ -112,7 +118,7 @@ Commands produce plain human-readable text by default and never depend on color.
   "docs_paths": ["README.md", "docs"],
   "commands": {
     "implementation": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"],
-    "reviewer": ["codex", "exec", "--sandbox", "read-only", "-"],
+    "reviewer": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"],
     "orchestrator": ["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"],
     "orchestrator_audit": ["codex", "exec", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "-c", "model_reasoning_effort=\"medium\"", "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "-"],
     "environment_allowlist": ["LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"]
@@ -130,11 +136,11 @@ In zero-admin mode, the orchestrator runs as the coordinator user. The `danger-f
 
 The agent cannot replace coordinator workflow decisions. Its worker-message output remains the fixed proposal adapter's framed standard-output response; the read-only status adapter distinguishes emission from coordinator acknowledgement, and the authenticated dashboard requires explicit confirmation before the coordinator records or delivers it.
 
-Commands are argument arrays, not shell strings, so runtime code does not use shell interpolation. The default noninteractive Codex implementation command uses `--dangerously-bypass-approvals-and-sandbox` so implementation and validation can use the worker host without Codex sandbox restrictions or approval prompts. Use advanced host isolation to confine that access to the unprivileged worker account.
+Commands are argument arrays, not shell strings, so runtime code does not use shell interpolation. The default noninteractive Codex implementation and reviewer commands use `--dangerously-bypass-approvals-and-sandbox` so both roles can use the host without Codex sandbox restrictions or approval prompts. Use advanced host isolation to confine each role to its unprivileged account.
 
 The boundary helper captures implementation or review stdout in an exclusively created private result file outside the worktree or snapshot; stderr remains in tmux for diagnostics. An implementation must return one `agent-symphony-result-v1` JSON object no larger than 64 KiB. A reviewer must return one bounded `agent-symphony-review-v1` object. The helper owns the process group, stops only that group on completion, overflow, or cancellation, and fails boundedly if an escaped process keeps stdout open. Results remain outside the source tree for safe export and retry.
 
-The implementation boundary requires the exact deterministic branch, worktree, and session, a contained Git directory, valid base ancestry, and no remotes or credential helpers. The default reviewer uses `codex exec --sandbox read-only -`; explicit reviewer arrays replace those arguments unchanged. Review covers the complete approved-base-through-attested-`HEAD` range, and terminal transcript text is never parsed as the result.
+The implementation boundary requires the exact deterministic branch, worktree, and session, a contained Git directory, valid base ancestry, and no remotes or credential helpers. The default reviewer uses `codex exec --dangerously-bypass-approvals-and-sandbox -`; explicit reviewer arrays replace those arguments unchanged. Review covers the complete approved-base-through-attested-`HEAD` range, and terminal transcript text is never parsed as the result.
 
 Both boundaries set child `TMPDIR` to `/tmp`. `environment_allowlist` is the complete set of inherited variable names for implementation and review; add model-provider credentials explicitly. GitHub, Git askpass, SSH-agent, and cloud credential variables remain forbidden. Secret-shaped arguments and assignments are rejected so `config view` cannot disclose them. Dependencies are explicit issue references under the optional configured body section. Completion defaults to human review.
 

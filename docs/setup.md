@@ -56,7 +56,7 @@ agent-symphony init
 agent-symphony validate
 ```
 
-The defaults use Codex with full implementation access and no approval prompts. In zero-admin mode that process has the coordinator user's filesystem and process access; install the advanced host boundary before delegating untrusted work. If you use another coding agent, update the `commands` section in `.agent-symphony.yaml` and list any API key variable it needs. See the [CLI reference](cli.md#configuration) for the full schema.
+The defaults use Codex with full implementation and reviewer access and no approval prompts. In zero-admin mode both processes have the coordinator user's filesystem and process access; install the advanced host boundary before delegating untrusted work. If you use another coding agent, update the `commands` section in `.agent-symphony.yaml` and list any API key variable it needs. See the [CLI reference](cli.md#configuration) for the full schema.
 
 ### Create the default labels
 

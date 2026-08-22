@@ -80,6 +80,30 @@ func TestHostOrchestratorProposalEmitsOnlyTheFixedValidatedFrame(t *testing.T) {
 	}
 }
 
+func TestHostTransitionRetryProposalReportsCoordinatorResolution(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "orchestrator-test")
+	if err := os.Mkdir(workspace, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	oldGetwd := hostGetwd
+	hostGetwd = func() (string, error) { return workspace, nil }
+	t.Cleanup(func() { hostGetwd = oldGetwd })
+	submitted := `{"version":1,"repository":"o/r","issue":161,"attempt":1,"action":"retry_transition","request_id":"retry-161-1"}`
+	proposal, _, err := parseHostOrchestratorProposal(strings.NewReader(submitted))
+	if err != nil || proposal.Action != orchestratoragent.ProposalActionRetry {
+		t.Fatalf("proposal=%#v err=%v", proposal, err)
+	}
+	status, _ := json.Marshal(orchestratoragent.MessageProposalStatus{Version: 1, UpdatedAt: time.Now().UTC(), ConsumedBinding: proposal.Binding, ResolvedBinding: proposal.Binding, Resolution: "refused", Detail: "target is stale"})
+	if err := os.WriteFile(filepath.Join(workspace, orchestratoragent.MessageProposalStatusFile), status, 0o440); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := reportHostOrchestratorProposalStatus(root, strings.NewReader(submitted), &output); err != nil || !strings.Contains(output.String(), `"state":"refused"`) || !strings.Contains(output.String(), `"detail":"target is stale"`) {
+		t.Fatalf("resolved proposal status=%q err=%v", output.String(), err)
+	}
+}
+
 func fakeHostIdentity(t *testing.T, uid, gid int) {
 	t.Helper()
 	oldEUID, oldEGID, oldUser, oldGroup, oldOutput := hostEUID, hostEGID, hostLookupUser, hostLookupGroup, hostOutput
