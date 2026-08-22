@@ -1,6 +1,6 @@
 // Package orchestratoragent supervises the optional advisory operator agent.
-// GitHub workflow state remains owned by the coordinator; this package only
-// projects sanitized status into one deterministic tmux conversation.
+// GitHub workflow state remains owned by the coordinator; this package never
+// sends runtime input into the primary tmux conversation.
 package orchestratoragent
 
 import (
@@ -28,14 +28,23 @@ import (
 const (
 	stateVersion              = 1
 	maxContextBytes           = 64 << 10
-	maxNoticeBytes            = maxContextBytes
 	maxDiagnosticBytes        = 1024
 	maxProposalBytes          = 64 << 10
 	maxProposalFrameBytes     = len(MessageProposalPrefix) + (maxProposalBytes+2)/3*4 + 1
 	maxPaneCaptureBytes       = 2 * maxProposalFrameBytes
+	maxAuditReportBytes       = 64 << 10
+	maxAuditReportFileBytes   = 2*maxAuditReportBytes + 4096
+	auditResultFile           = "orchestrator-audit-result.txt"
+	auditResultPlaceholder    = "{orchestrator_result}"
 	historyLimit              = "65536"
+	heartbeatInterval         = 5 * time.Minute
+	auditProcessTimeout       = 4 * time.Minute
+	auditTimeout              = auditProcessTimeout + 10*time.Second
+	failedCycleAuditTimeout   = 10 * time.Second
+	selfAuditMethod           = "examine every nonterminal attempt; treat the timer itself as no evidence of a problem; find the last live-verified completed transition; identify the expected next transition from the deployed implementation and current workflow facts; inspect the current projection and the exact live GitHub, Agent Symphony-owned tmux, manifest, handoff receipt, result, and coordinator log evidence available from trusted runtime paths; mark unavailable evidence unknown; compare with the prior heartbeat; report VERIFIED, INFERRED, and UNKNOWN conclusions separately; decide whether each attempt is healthy, problematic, or unknown; and recommend the shortest supported operator action only after verifying every prerequisite. Use no more than eight live tool calls, give each live command at most 20 seconds, interrupt a command that exceeds that limit and mark its evidence UNKNOWN, and stop checking after three minutes so the bounded report is returned before the process deadline. Never recommend recovery for a published pull request without verifying that it is currently eligible."
 	MessageProposalPrefix     = "AGENT_SYMPHONY_MESSAGE_PROPOSAL_V1:"
 	MessageProposalStatusFile = "orchestrator-proposal-status.json"
+	HeartbeatReportFile       = "orchestrator-heartbeat-report.json"
 	ProposalActionMessage     = "message_attempt"
 	ProposalActionRetry       = "retry_transition"
 )
@@ -118,13 +127,14 @@ type persisted struct {
 	RetryAt       time.Time `json:"retry_at,omitempty"`
 	Failures      int       `json:"failures,omitempty"`
 	// LastAttention remains for backward-compatible decoding of version 1 state.
-	LastAttention      string `json:"last_attention_digest,omitempty"`
-	LastProjection     string `json:"last_projection_digest,omitempty"`
-	LastInvestigation  string `json:"last_investigation_digest,omitempty"`
-	ConsumedProposal   string `json:"consumed_proposal_digest,omitempty"`
-	ProposalResolution string `json:"proposal_resolution,omitempty"`
-	ProposalDetail     string `json:"proposal_detail,omitempty"`
-	PendingAttention   int    `json:"pending_attention,omitempty"`
+	LastAttention      string    `json:"last_attention_digest,omitempty"`
+	LastProjection     string    `json:"last_projection_digest,omitempty"`
+	LastInvestigation  string    `json:"last_investigation_digest,omitempty"`
+	ConsumedProposal   string    `json:"consumed_proposal_digest,omitempty"`
+	ProposalResolution string    `json:"proposal_resolution,omitempty"`
+	ProposalDetail     string    `json:"proposal_detail,omitempty"`
+	LastHeartbeatAt    time.Time `json:"last_heartbeat_at,omitempty"`
+	PendingAttention   int       `json:"pending_attention,omitempty"`
 }
 
 type sanitizedStatus struct {
@@ -133,6 +143,8 @@ type sanitizedStatus struct {
 	Attempt      int                `json:"attempt"`
 	State        string             `json:"state"`
 	CurrentPhase string             `json:"current_phase,omitempty"`
+	PR           int                `json:"pr,omitempty"`
+	HeadSHA      string             `json:"head_sha,omitempty"`
 	Sessions     []sanitizedSession `json:"sessions,omitempty"`
 	Blockers     string             `json:"blockers,omitempty"`
 	Diagnostic   string             `json:"diagnostic,omitempty"`
@@ -146,12 +158,25 @@ type sanitizedSession struct {
 	Current bool   `json:"current,omitempty"`
 }
 
+type heartbeatReport struct {
+	Version                  int       `json:"version"`
+	StartedAt                time.Time `json:"started_at"`
+	CompletedAt              time.Time `json:"completed_at,omitzero"`
+	ProjectionDigest         string    `json:"projection_digest"`
+	State                    string    `json:"state"`
+	Report                   string    `json:"report,omitempty"`
+	ReconciliationDiagnostic string    `json:"reconciliation_diagnostic,omitempty"`
+	Diagnostic               string    `json:"diagnostic,omitempty"`
+}
+
 // Supervisor owns one repository's optional advisory tmux agent.
 type Supervisor struct {
 	Root                  string
 	Workspace             string
+	AuditWorkspace        string
 	Repository            string
 	Command               []string
+	AuditCommand          []string
 	Launcher              []string
 	ProposalCommand       []string
 	ProposalStatusCommand []string
@@ -162,15 +187,34 @@ type Supervisor struct {
 	mu              sync.Mutex
 	projection      []sanitizedStatus
 	projectionKnown bool
+	auditRunning    bool
+	auditChecked    bool
 }
 
-// Observe replaces the in-memory sanitized projection, ensures the session,
-// and delivers a changed attention notice at most once.
+// Observe records a successful reconciliation cycle.
 func (s *Supervisor) Observe(ctx context.Context, statuses []orchestrator.RecoveryStatus) (Status, error) {
+	return s.ObserveCycle(ctx, statuses, nil)
+}
+
+// ObserveCycle records the latest reconciliation outcome and periodically asks
+// the agent to audit nonterminal work. Go supplies evidence but does not decide
+// whether an attempt is stuck.
+func (s *Supervisor) ObserveCycle(ctx context.Context, statuses []orchestrator.RecoveryStatus, cycleErr error) (Status, error) {
+	if cycleErr != nil && ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), failedCycleAuditTimeout)
+		defer cancel()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.projection = sanitizeProjection(s.Repository, statuses)
-	s.projectionKnown = true
+	if !s.auditChecked {
+		s.auditChecked = true
+		_ = s.failStaleAudit()
+	}
+	if cycleErr == nil || len(statuses) > 0 {
+		s.projection = sanitizeProjection(s.Repository, statuses)
+		s.projectionKnown = true
+	}
 	state, err := s.recover(ctx)
 	if err != nil || state.State != "running" {
 		return statusOf(state, len(attention(s.projection))), err
@@ -178,20 +222,48 @@ func (s *Supervisor) Observe(ctx context.Context, statuses []orchestrator.Recove
 	items := s.projection
 	digest := digest(items)
 	state.PendingAttention = len(attention(items))
-	if digest != state.LastProjection && (len(items) > 0 || state.LastProjection != "") {
-		notice, noticeErr := projectionNotice(items)
-		if noticeErr == nil {
-			noticeErr = s.deliver(ctx, state.Session, notice)
-		}
-		if noticeErr != nil {
-			state.Diagnostic = bounded("deliver projection notice: " + noticeErr.Error())
-		} else {
+	diagnostic := ""
+	if cycleErr != nil {
+		diagnostic = bounded(internalgithub.Redact(cycleErr.Error()))
+	}
+	now := s.now()
+	var scheduleErr error
+	write := false
+	launchAudit := false
+	changed := digest != state.LastProjection && (len(items) > 0 || state.LastProjection != "")
+	if changed && len(s.AuditCommand) == 0 {
+		state.LastProjection = digest
+		write = true
+	}
+	if len(s.AuditCommand) > 0 && !s.auditRunning && (changed || hasNonterminalWork(items) && heartbeatDue(state.LastHeartbeatAt, now)) {
+		write = true
+		if changed {
 			state.LastProjection = digest
 		}
-		state.UpdatedAt = s.now()
-		if writeErr := s.writeState(state); writeErr != nil {
-			return statusOf(state, len(items)), errors.Join(noticeErr, writeErr)
+		prompt, auditErr := auditPrompt(items, state.LastHeartbeatAt, diagnostic)
+		if auditErr == nil {
+			auditErr = s.prepareAudit(prompt, now, digest, diagnostic)
 		}
+		state.LastHeartbeatAt = now
+		if auditErr != nil {
+			scheduleErr = auditErr
+			state.Diagnostic = bounded("start heartbeat audit: " + auditErr.Error())
+		} else {
+			s.auditRunning = true
+			launchAudit = true
+		}
+	}
+	if write {
+		state.UpdatedAt = now
+		if writeErr := s.writeState(state); writeErr != nil {
+			if launchAudit {
+				s.auditRunning = false
+			}
+			return statusOf(state, len(items)), errors.Join(scheduleErr, writeErr)
+		}
+	}
+	if launchAudit {
+		go s.runAudit(now, digest, diagnostic)
 	}
 	return statusOf(state, len(items)), nil
 }
@@ -243,6 +315,10 @@ func (s *Supervisor) Rebuild(ctx context.Context) (Status, error) {
 func (s *Supervisor) Investigate(ctx context.Context, issue, attemptNumber int) (Status, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.auditChecked {
+		s.auditChecked = true
+		_ = s.failStaleAudit()
+	}
 	if issue < 1 || attemptNumber < 0 {
 		return Status{}, errors.New("invalid issue or attempt")
 	}
@@ -258,19 +334,30 @@ func (s *Supervisor) Investigate(ctx context.Context, issue, attemptNumber int) 
 	}
 	item := s.projection[index]
 	digest := digest([]sanitizedStatus{item})
-	if digest != state.LastInvestigation {
-		notice, noticeErr := projectionNotice([]sanitizedStatus{item})
-		if noticeErr == nil {
-			noticeErr = s.deliver(ctx, state.Session, notice)
-		}
-		if noticeErr != nil {
-			return statusOf(state, len(attention(s.projection))), noticeErr
-		}
-		state.LastInvestigation, state.UpdatedAt = digest, s.now()
-		if err := s.writeState(state); err != nil {
-			return statusOf(state, len(attention(s.projection))), err
-		}
+	if digest == state.LastInvestigation {
+		return statusOf(state, len(attention(s.projection))), nil
 	}
+	if len(s.AuditCommand) == 0 {
+		return statusOf(state, len(attention(s.projection))), errors.New("orchestrator audit command is not configured")
+	}
+	if s.auditRunning {
+		return statusOf(state, len(attention(s.projection))), errors.New("orchestrator audit is already running")
+	}
+	now := s.now()
+	prompt, err := auditPrompt([]sanitizedStatus{item}, state.LastHeartbeatAt, "")
+	if err == nil {
+		err = s.prepareAudit(prompt, now, digest, "")
+	}
+	if err != nil {
+		return statusOf(state, len(attention(s.projection))), err
+	}
+	s.auditRunning = true
+	state.LastInvestigation, state.LastHeartbeatAt, state.UpdatedAt = digest, now, now
+	if err := s.writeState(state); err != nil {
+		s.auditRunning = false
+		return statusOf(state, len(attention(s.projection))), err
+	}
+	go s.runAudit(now, digest, "")
 	return statusOf(state, len(attention(s.projection))), nil
 }
 
@@ -400,6 +487,7 @@ func (s *Supervisor) restart(ctx context.Context, mode, lastProjection string) (
 	}
 	state.ContextMode, state.LastProjection, state.LastInvestigation = mode, lastProjection, ""
 	state.State, state.Diagnostic, state.Failures, state.RetryAt = "starting", "", 0, time.Time{}
+	state.LastHeartbeatAt = s.now()
 	state, err = s.start(ctx, state)
 	return statusOf(state, len(attention(s.projection))), err
 }
@@ -509,24 +597,124 @@ func (s *Supervisor) stop(ctx context.Context, session string) error {
 	return nil
 }
 
-func (s *Supervisor) deliver(ctx context.Context, session, notice string) error {
-	if len(notice) == 0 || len(notice) > maxNoticeBytes {
-		return errors.New("orchestrator notice is empty or too large")
+func (s *Supervisor) prepareAudit(prompt string, startedAt time.Time, projectionDigest, diagnostic string) error {
+	if s.AuditWorkspace == "" || !filepath.IsAbs(s.AuditWorkspace) || len(s.AuditCommand) == 0 || strings.TrimSpace(s.AuditCommand[0]) == "" || len(s.Launcher) == 0 || strings.TrimSpace(s.Launcher[0]) == "" {
+		return errors.New("invalid orchestrator audit configuration")
 	}
-	buffer := "as-o-notice-" + digestText(notice)[:16]
-	for _, command := range []struct {
-		args  []string
-		input io.Reader
-	}{
-		{[]string{"load-buffer", "-b", buffer, "-"}, strings.NewReader(notice)},
-		{[]string{"paste-buffer", "-d", "-b", buffer, "-t", agentruntime.PaneTarget(session)}, nil},
-		{[]string{"send-keys", "-t", agentruntime.PaneTarget(session), "Enter"}, nil},
-	} {
-		if _, err := s.run(ctx, "tmux", command.args, command.input); err != nil {
-			return err
+	if err := os.MkdirAll(s.AuditWorkspace, 0o750); err != nil {
+		return err
+	}
+	resultPath := filepath.Join(s.AuditWorkspace, auditResultFile)
+	usesResultFile := slices.ContainsFunc(s.AuditCommand, func(arg string) bool { return strings.Contains(arg, auditResultPlaceholder) })
+	if usesResultFile {
+		if err := os.Remove(resultPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale orchestrator audit result: %w", err)
 		}
 	}
-	return nil
+	command := slices.Clone(s.AuditCommand)
+	for index := range command {
+		command[index] = strings.ReplaceAll(command[index], "{orchestrator_workspace}", s.AuditWorkspace)
+		command[index] = strings.ReplaceAll(command[index], auditResultPlaceholder, resultPath)
+	}
+	launch, err := json.MarshalIndent(struct {
+		Version int      `json:"version"`
+		Command []string `json:"command"`
+		Context string   `json:"context"`
+		OneShot bool     `json:"one_shot"`
+		Timeout int      `json:"timeout_seconds"`
+	}{stateVersion, command, prompt, true, int(auditProcessTimeout / time.Second)}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeAtomic(filepath.Join(s.AuditWorkspace, "orchestrator-launch.json"), append(launch, '\n'), 0o440); err != nil {
+		return err
+	}
+	return s.writeHeartbeatReport(heartbeatReport{Version: stateVersion, StartedAt: startedAt, ProjectionDigest: projectionDigest, State: "running", ReconciliationDiagnostic: diagnostic})
+}
+
+func (s *Supervisor) runAudit(startedAt time.Time, projectionDigest, diagnostic string) {
+	ctx, cancel := context.WithTimeout(context.Background(), auditTimeout)
+	defer cancel()
+	runner := s.Runner
+	if runner == nil {
+		runner = agentruntime.ExecRunner{}
+	}
+	result, runErr := runner.Run(ctx, agentruntime.Command{Name: s.Launcher[0], Args: slices.Clone(s.Launcher[1:]), Dir: s.AuditWorkspace, Env: s.Env, MaxOutputBytes: maxAuditReportBytes})
+	resultPath := filepath.Join(s.AuditWorkspace, auditResultFile)
+	if slices.ContainsFunc(s.AuditCommand, func(arg string) bool { return strings.Contains(arg, auditResultPlaceholder) }) {
+		if runErr == nil {
+			result.Output, runErr = readAuditResult(resultPath)
+		}
+		_ = os.Remove(resultPath)
+	}
+	report := heartbeatReport{Version: stateVersion, StartedAt: startedAt, CompletedAt: s.now(), ProjectionDigest: projectionDigest, State: "completed", Report: clean(internalgithub.Redact(result.Output), maxAuditReportBytes), ReconciliationDiagnostic: diagnostic}
+	if runErr != nil {
+		report.State = "failed"
+		report.Diagnostic = bounded(internalgithub.Redact(runErr.Error()))
+	}
+	writeErr := s.writeHeartbeatReport(report)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.auditRunning = false
+	if writeErr == nil {
+		return
+	}
+	state, stateErr := s.readOrInitial()
+	if stateErr == nil {
+		state.Diagnostic = bounded("write heartbeat audit report: " + writeErr.Error())
+		state.UpdatedAt = s.now()
+		_ = s.writeState(state)
+	}
+}
+
+func readAuditResult(path string) (string, error) {
+	listed, err := os.Lstat(path)
+	if err != nil || !listed.Mode().IsRegular() || listed.Mode()&os.ModeSymlink != 0 || listed.Size() < 1 || listed.Size() > maxAuditReportBytes {
+		return "", errors.New("orchestrator audit result is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(listed, opened) {
+		return "", errors.New("orchestrator audit result changed while opening")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, maxAuditReportBytes+1))
+	if err != nil || len(body) < 1 || len(body) > maxAuditReportBytes {
+		return "", errors.New("orchestrator audit result is missing or oversized")
+	}
+	return string(body), nil
+}
+
+func (s *Supervisor) writeHeartbeatReport(report heartbeatReport) error {
+	body, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return err
+	}
+	if len(body) > maxAuditReportFileBytes {
+		return errors.New("orchestrator heartbeat report exceeds its bound")
+	}
+	return writeAtomic(filepath.Join(s.Workspace, HeartbeatReportFile), append(body, '\n'), 0o440)
+}
+
+func (s *Supervisor) failStaleAudit() error {
+	body, err := readRegular(filepath.Join(s.Workspace, HeartbeatReportFile), maxAuditReportFileBytes)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var report heartbeatReport
+	if json.Unmarshal(body, &report) != nil || report.Version != stateVersion || report.State != "running" {
+		return nil
+	}
+	report.State = "failed"
+	report.CompletedAt = s.now()
+	report.Diagnostic = "coordinator restarted before heartbeat audit completed"
+	return s.writeHeartbeatReport(report)
 }
 
 func (s *Supervisor) run(ctx context.Context, name string, args []string, input io.Reader) (agentruntime.Result, error) {
@@ -560,7 +748,9 @@ func (s *Supervisor) context(mode string) ([]byte, error) {
 	body.WriteString("\",\"issue\":123,\"attempt\":1,\"action\":\"retry_transition\",\"request_id\":\"unique-1\"}` to the same command. This is not a general recovery, cancellation, merge, tmux, shell, or GitHub mutation channel. It is accepted automatically only after fresh coordinator validation; worker messages still require dashboard confirmation. A successful command proves only that this frame was emitted. It does not prove that the coordinator captured, persisted, queued, delivered, or displayed it. Pass the same exact JSON to ")
 	statusCommand, _ := json.Marshal(s.ProposalStatusCommand)
 	body.Write(statusCommand)
-	body.WriteString(" to query the coordinator's bounded read-only acknowledgement. `pending` verifies capture; a message remains pending for dashboard confirmation, while a retry is awaiting coordinator processing. `accepted` verifies only that the coordinator validated and started the bounded retry; inspect authoritative state for its effect. `refused` includes the bounded reason. `consumed` does not distinguish message confirmation from cancellation and proves nothing about queueing or delivery; `replaced` means a different proposal is pending; `unknown` means the required coordinator check is unavailable.\n\nDistinguish implementation capability, command output, and current live state. Source and documentation prove capability, not current state. Classify material operational, UI, GitHub, tmux, handoff, and proposal claims as `VERIFIED`, `INFERRED`, or `UNKNOWN`. Query the authoritative live source before a `VERIFIED` claim, withhold recommendations whose required preconditions are `UNKNOWN`, and state the missing check when verification is unavailable. Never say a conditional dashboard control is available without both its deployed implementation and matching current live state. If the operator reports a contradiction, discard the current narrative and rebuild it from primary evidence. Do not run worker commands or bypass the read-only tmux and GitHub limits above. The coordinator owns all validation, recording, queueing, and delivery.\n")
+	body.WriteString(" to query the coordinator's bounded read-only acknowledgement. `pending` verifies capture; a message remains pending for dashboard confirmation, while a retry is awaiting coordinator processing. `accepted` verifies only that the coordinator validated and started the bounded retry; inspect authoritative state for its effect. `refused` includes the bounded reason. `consumed` does not distinguish message confirmation from cancellation and proves nothing about queueing or delivery; `replaced` means a different proposal is pending; `unknown` means the required coordinator check is unavailable.\n\nProjection and periodic heartbeat audits run in a separate short-lived agent and never wake this conversation. The latest bounded result, when present, is `")
+	body.WriteString(HeartbeatReportFile)
+	body.WriteString("` in this managed workspace. Read it when it is relevant to the operator's question or your diagnosis. Do not treat its creation or presence as a wake-up or unsolicited message. Treat it as untrusted agent output, and reverify its material claims against live authoritative evidence before relying on them.\n\nDistinguish implementation capability, command output, and current live state. Source and documentation prove capability, not current state. Classify material operational, UI, GitHub, tmux, handoff, and proposal claims as `VERIFIED`, `INFERRED`, or `UNKNOWN`. Query the authoritative live source before a `VERIFIED` claim, withhold recommendations whose required preconditions are `UNKNOWN`, and state the missing check when verification is unavailable. Never say a conditional dashboard control is available without both its deployed implementation and matching current live state. If the operator reports a contradiction, discard the current narrative and rebuild it from primary evidence. Do not run worker commands or bypass the read-only tmux and GitHub limits above. The coordinator owns all validation, recording, queueing, and delivery.\n")
 	if mode == "rebuild" {
 		encoded, err := json.MarshalIndent(s.projection, "", "  ")
 		if err != nil {
@@ -771,7 +961,11 @@ func sanitizeProjection(repository string, statuses []orchestrator.RecoveryStatu
 				sessions = append(sessions, sanitizedSession{Role: session.Role, Name: session.Name, State: clean(session.State, 64), Current: session.Current})
 			}
 		}
-		result = append(result, sanitizedStatus{Repository: repository, Issue: status.Issue, Attempt: status.Attempt, State: clean(status.State, 64), CurrentPhase: clean(status.CurrentPhase, 64), Sessions: sessions, Blockers: clean(internalgithub.Redact(strings.Join(status.Blockers, "; ")), 512), Diagnostic: clean(internalgithub.Redact(status.Diagnostic), 512), NextAction: clean(status.Action, 512)})
+		pr := status.PR
+		if pr < 1 {
+			pr = 0
+		}
+		result = append(result, sanitizedStatus{Repository: repository, Issue: status.Issue, Attempt: status.Attempt, State: clean(status.State, 64), CurrentPhase: clean(status.CurrentPhase, 64), PR: pr, HeadSHA: clean(status.HeadSHA, 64), Sessions: sessions, Blockers: clean(internalgithub.Redact(strings.Join(status.Blockers, "; ")), 512), Diagnostic: clean(internalgithub.Redact(status.Diagnostic), 512), NextAction: clean(status.Action, 512)})
 	}
 	slices.SortFunc(result, func(a, b sanitizedStatus) int {
 		if a.Issue != b.Issue {
@@ -788,16 +982,30 @@ func attention(statuses []sanitizedStatus) []sanitizedStatus {
 	})
 }
 
-func projectionNotice(items []sanitizedStatus) (string, error) {
-	body, err := json.Marshal(items)
+func auditPrompt(items []sanitizedStatus, previous time.Time, diagnostic string) (string, error) {
+	body, err := json.Marshal(struct {
+		PreviousHeartbeatAt      time.Time         `json:"previous_heartbeat_at,omitzero"`
+		Projection               []sanitizedStatus `json:"projection"`
+		ReconciliationDiagnostic string            `json:"reconciliation_diagnostic,omitempty"`
+	}{previous, items, diagnostic})
 	if err != nil {
 		return "", err
 	}
-	notice := "Agent Symphony current projection changed. Use this sanitized data first. For progress details not present here, inspect GitHub and tmux read-only as allowed by your instructions:\n" + string(body)
-	if len(notice) > maxNoticeBytes {
-		return "", errors.New("orchestrator projection notice exceeds 64 KiB")
+	notice := "You are a separate one-shot Agent Symphony heartbeat auditor. Do not contact or write into the primary orchestrator conversation. Produce one bounded plain-text report and exit. Do not mutate GitHub, tmux, the filesystem, workers, or coordinator state. Use read-only live checks only. " + selfAuditMethod + "\nBounded evidence:\n" + string(body)
+	if len(notice) > maxContextBytes {
+		return "", errors.New("orchestrator heartbeat audit exceeds 64 KiB")
 	}
 	return notice, nil
+}
+
+func hasNonterminalWork(items []sanitizedStatus) bool {
+	return slices.ContainsFunc(items, func(item sanitizedStatus) bool {
+		return item.State != "completed" && item.State != "cancelled"
+	})
+}
+
+func heartbeatDue(last, now time.Time) bool {
+	return last.IsZero() || !now.Before(last.Add(heartbeatInterval))
 }
 
 func digest(items []sanitizedStatus) string {

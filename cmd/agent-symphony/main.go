@@ -420,12 +420,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if err != nil {
 				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
 			}
-			var agentErr error
-			if err == nil {
-				_, agentErr = agent.Observe(ctx, statuses)
-			} else {
-				_, agentErr = agent.Recover(ctx)
-			}
+			_, agentErr := agent.ObserveCycle(ctx, statuses, err)
 			if agentErr != nil {
 				fmt.Fprintln(stderr, "orchestrator agent: "+internalgithub.Redact(agentErr.Error()))
 			}
