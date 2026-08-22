@@ -344,6 +344,16 @@ func TestDashboardWorkerMessageRequiresAuthenticationAndExactConfirmationBinding
 		t.Fatalf("browser session cookies=%#v", cookies)
 	}
 	session := cookies[0]
+	service.proposal = orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Action: orchestratoragent.ProposalActionRetry, RequestID: "retry-1", Binding: "retry-binding"}
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator/proposal.json", nil)
+	request.SetBasicAuth("agent-symphony", "password")
+	request.AddCookie(session)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("automatic retry was exposed as a message confirmation: status=%d body=%q", response.Code, response.Body.String())
+	}
+	service.proposal = proposal
 	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator/proposal.json", nil)
 	request.SetBasicAuth("agent-symphony", "password")
 	request.AddCookie(session)

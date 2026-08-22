@@ -129,6 +129,36 @@ func TestMessageProposalIsExactBoundedAndConsumable(t *testing.T) {
 	}
 }
 
+func TestTransitionRetryProposalRecordsDurableResolution(t *testing.T) {
+	now := time.Date(2026, 8, 22, 1, 2, 3, 0, time.UTC)
+	agent := newTestSupervisor(t, &fakeRunner{}, &now)
+	if _, err := agent.Observe(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(MessageProposal{Version: 1, Repository: agent.Repository, Issue: 161, Attempt: 1, Action: ProposalActionRetry, RequestID: "retry-161-1"})
+	agent.Runner.(*fakeRunner).pane = MessageProposalPrefix + base64.StdEncoding.EncodeToString(body) + "\n"
+	proposal, err := agent.MessageProposal(t.Context())
+	if err != nil || proposal.Action != ProposalActionRetry || proposal.RequestID != "retry-161-1" {
+		t.Fatalf("proposal=%#v err=%v", proposal, err)
+	}
+	if err := agent.ResolveMessageProposal(t.Context(), proposal.Binding, "accepted", "bounded retry started"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.MessageProposal(t.Context()); !errors.Is(err, ErrNoMessageProposal) {
+		t.Fatalf("resolved proposal remained pending: %v", err)
+	}
+	statusBody, err := os.ReadFile(filepath.Join(agent.Workspace, MessageProposalStatusFile))
+	var status MessageProposalStatus
+	if err != nil || json.Unmarshal(statusBody, &status) != nil || status.ResolvedBinding != proposal.Binding || status.Resolution != "accepted" || status.Detail != "bounded retry started" {
+		t.Fatalf("resolved proposal status=%s err=%v", statusBody, err)
+	}
+	invalid, _ := json.Marshal(MessageProposal{Version: 1, Repository: agent.Repository, Issue: 161, Attempt: 1, Action: ProposalActionRetry})
+	agent.Runner.(*fakeRunner).pane = MessageProposalPrefix + base64.StdEncoding.EncodeToString(invalid) + "\n"
+	if _, err := agent.MessageProposal(t.Context()); err == nil {
+		t.Fatal("transition retry without a request ID was accepted")
+	}
+}
+
 func TestMessageProposalBoundsOversizedPaneToMaximumFrameTail(t *testing.T) {
 	now := time.Date(2026, 8, 19, 1, 2, 3, 0, time.UTC)
 	runner := &fakeRunner{}

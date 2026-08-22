@@ -727,18 +727,24 @@ func parseHostOrchestratorProposal(input io.Reader) (orchestratoragent.MessagePr
 		Repository string `json:"repository"`
 		Issue      int    `json:"issue"`
 		Attempt    int    `json:"attempt"`
-		Message    string `json:"message"`
+		Action     string `json:"action,omitempty"`
+		Message    string `json:"message,omitempty"`
+		RequestID  string `json:"request_id,omitempty"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&proposal) != nil || decoder.Decode(&struct{}{}) != io.EOF || proposal.Version != 1 {
 		return orchestratoragent.MessageProposal{}, nil, errors.New("invalid orchestrator proposal schema")
 	}
-	if _, err := internalgithub.PrepareOperatorMessage(proposal.Repository, proposal.Issue, proposal.Attempt, proposal.Message); err != nil {
+	parsed := orchestratoragent.MessageProposal{Version: proposal.Version, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, Action: proposal.Action, Message: proposal.Message, RequestID: proposal.RequestID}
+	if err := orchestratoragent.ValidateMessageProposal(parsed); err != nil {
 		return orchestratoragent.MessageProposal{}, nil, err
 	}
 	canonical, _ := json.Marshal(proposal)
-	parsed := orchestratoragent.MessageProposal{Version: proposal.Version, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, Message: proposal.Message, Binding: fmt.Sprintf("%x", sha256.Sum256(canonical))}
+	if parsed.Action == "" {
+		parsed.Action = orchestratoragent.ProposalActionMessage
+	}
+	parsed.Binding = fmt.Sprintf("%x", sha256.Sum256(canonical))
 	return parsed, canonical, nil
 }
 
@@ -765,8 +771,10 @@ func reportHostOrchestratorProposalStatus(root string, input io.Reader, output i
 	if present {
 		result.ObservedAt = &status.UpdatedAt
 		switch {
+		case status.ResolvedBinding == proposal.Binding && status.Resolution != "":
+			result.State, result.Detail = status.Resolution, status.Detail
 		case status.PendingBinding == proposal.Binding:
-			result.State, result.Detail = "pending", "the coordinator captured this exact proposal and currently exposes it for confirmation"
+			result.State, result.Detail = "pending", "the coordinator captured this exact proposal and has not resolved it"
 		case status.ConsumedBinding == proposal.Binding:
 			result.State, result.Detail = "consumed", "the coordinator consumed this exact proposal; confirmation, cancellation, queueing, and delivery are not distinguished here"
 		case status.PendingBinding != "":
