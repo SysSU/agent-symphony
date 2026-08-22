@@ -120,7 +120,7 @@ Commands produce plain human-readable text by default and never depend on color.
     "implementation": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"],
     "reviewer": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"],
     "orchestrator": ["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"],
-    "orchestrator_audit": ["codex", "exec", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "-c", "model_reasoning_effort=\"medium\"", "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "-"],
+    "orchestrator_audit": ["codex", "exec", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "-c", "model_reasoning_effort=\"medium\"", "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"],
     "environment_allowlist": ["LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"]
   },
   "status": {
@@ -130,7 +130,7 @@ Commands produce plain human-readable text by default and never depend on color.
 }
 ```
 
-New configuration created by `agent-symphony init` enables both orchestrator commands above. Remove `commands.orchestrator` to disable the advisory console and all heartbeat audits. Remove only `commands.orchestrator_audit` to keep the console without periodic model usage. Agent Symphony replaces `{orchestrator_workspace}` in each command argument with that process's absolute managed workspace. It appends bounded generated context to the primary command and sends the one-shot audit prompt on standard input. The default audit uses medium reasoning effort so it does not inherit a slower interactive setting. The audit command must return one plain-text result and exit; Agent Symphony bounds its output and stops it after four minutes.
+New configuration created by `agent-symphony init` enables both orchestrator commands above. Remove `commands.orchestrator` to disable the advisory console and all heartbeat audits. Remove only `commands.orchestrator_audit` to keep the console without periodic model usage. Agent Symphony replaces `{orchestrator_workspace}` with the process's absolute managed workspace and `{orchestrator_result}` with a transient result path. It appends bounded generated context to the primary command and sends the one-shot audit prompt on standard input. The default audit uses medium reasoning effort and Codex's final-message output so progress logs cannot displace the diagnosis. A custom audit may omit `{orchestrator_result}` and return one plain-text result on standard output instead. Agent Symphony bounds the result and stops the process after four minutes.
 
 In zero-admin mode, the orchestrator runs as the coordinator user. The `danger-full-access` Codex example lets it use the authenticated `gh` CLI and inspect the same-user tmux server when the bounded projection lacks progress detail. This setting also lets the model access other resources available to that user; Agent Symphony filters the launch environment and instructs the agent to keep GitHub and tmux inspection read-only, but the Codex sandbox no longer enforces that limit. Use this mode only when the orchestrator model is trusted. In advanced host-isolated mode, the orchestrator runs as the reviewer identity and cannot use the coordinator's GitHub login or tmux server even with the same Codex setting.
 

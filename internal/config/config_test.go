@@ -18,7 +18,7 @@ func TestLoadAndValidate(t *testing.T) {
 	if !slices.Equal(c.Commands.Orchestrator, wantOrchestrator) {
 		t.Fatalf("unexpected default orchestrator: %#v", c.Commands.Orchestrator)
 	}
-	wantAudit := []string{"codex", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "-"}
+	wantAudit := []string{"codex", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"}
 	if !slices.Equal(c.Commands.OrchestratorAudit, wantAudit) {
 		t.Fatalf("unexpected default orchestrator audit: %#v", c.Commands.OrchestratorAudit)
 	}

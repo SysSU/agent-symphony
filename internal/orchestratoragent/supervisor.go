@@ -34,6 +34,8 @@ const (
 	maxPaneCaptureBytes       = 2 * maxProposalFrameBytes
 	maxAuditReportBytes       = 64 << 10
 	maxAuditReportFileBytes   = 2*maxAuditReportBytes + 4096
+	auditResultFile           = "orchestrator-audit-result.txt"
+	auditResultPlaceholder    = "{orchestrator_result}"
 	historyLimit              = "65536"
 	heartbeatInterval         = 5 * time.Minute
 	auditProcessTimeout       = 4 * time.Minute
@@ -602,9 +604,17 @@ func (s *Supervisor) prepareAudit(prompt string, startedAt time.Time, projection
 	if err := os.MkdirAll(s.AuditWorkspace, 0o750); err != nil {
 		return err
 	}
+	resultPath := filepath.Join(s.AuditWorkspace, auditResultFile)
+	usesResultFile := slices.ContainsFunc(s.AuditCommand, func(arg string) bool { return strings.Contains(arg, auditResultPlaceholder) })
+	if usesResultFile {
+		if err := os.Remove(resultPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale orchestrator audit result: %w", err)
+		}
+	}
 	command := slices.Clone(s.AuditCommand)
 	for index := range command {
 		command[index] = strings.ReplaceAll(command[index], "{orchestrator_workspace}", s.AuditWorkspace)
+		command[index] = strings.ReplaceAll(command[index], auditResultPlaceholder, resultPath)
 	}
 	launch, err := json.MarshalIndent(struct {
 		Version int      `json:"version"`
@@ -630,6 +640,13 @@ func (s *Supervisor) runAudit(startedAt time.Time, projectionDigest, diagnostic 
 		runner = agentruntime.ExecRunner{}
 	}
 	result, runErr := runner.Run(ctx, agentruntime.Command{Name: s.Launcher[0], Args: slices.Clone(s.Launcher[1:]), Dir: s.AuditWorkspace, Env: s.Env, MaxOutputBytes: maxAuditReportBytes})
+	resultPath := filepath.Join(s.AuditWorkspace, auditResultFile)
+	if slices.ContainsFunc(s.AuditCommand, func(arg string) bool { return strings.Contains(arg, auditResultPlaceholder) }) {
+		if runErr == nil {
+			result.Output, runErr = readAuditResult(resultPath)
+		}
+		_ = os.Remove(resultPath)
+	}
 	report := heartbeatReport{Version: stateVersion, StartedAt: startedAt, CompletedAt: s.now(), ProjectionDigest: projectionDigest, State: "completed", Report: clean(internalgithub.Redact(result.Output), maxAuditReportBytes), ReconciliationDiagnostic: diagnostic}
 	if runErr != nil {
 		report.State = "failed"
@@ -648,6 +665,27 @@ func (s *Supervisor) runAudit(startedAt time.Time, projectionDigest, diagnostic 
 		state.UpdatedAt = s.now()
 		_ = s.writeState(state)
 	}
+}
+
+func readAuditResult(path string) (string, error) {
+	listed, err := os.Lstat(path)
+	if err != nil || !listed.Mode().IsRegular() || listed.Mode()&os.ModeSymlink != 0 || listed.Size() < 1 || listed.Size() > maxAuditReportBytes {
+		return "", errors.New("orchestrator audit result is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(listed, opened) {
+		return "", errors.New("orchestrator audit result changed while opening")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, maxAuditReportBytes+1))
+	if err != nil || len(body) < 1 || len(body) > maxAuditReportBytes {
+		return "", errors.New("orchestrator audit result is missing or oversized")
+	}
+	return string(body), nil
 }
 
 func (s *Supervisor) writeHeartbeatReport(report heartbeatReport) error {

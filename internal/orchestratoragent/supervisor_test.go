@@ -20,15 +20,17 @@ import (
 )
 
 type fakeRunner struct {
-	live        bool
-	honorCtx    bool
-	failStarts  int
-	starts      int
-	commands    []agentruntime.Command
-	pane        string
-	auditOutput string
-	auditStarts atomic.Int32
-	auditGate   chan struct{}
+	live         bool
+	honorCtx     bool
+	failStarts   int
+	starts       int
+	commands     []agentruntime.Command
+	pane         string
+	auditOutput  string
+	auditResult  bool
+	runnerOutput string
+	auditStarts  atomic.Int32
+	auditGate    chan struct{}
 }
 
 func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
@@ -43,6 +45,12 @@ func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (age
 			case <-ctx.Done():
 				return agentruntime.Result{}, ctx.Err()
 			}
+		}
+		if f.auditResult {
+			if err := os.WriteFile(filepath.Join(command.Dir, auditResultFile), []byte(f.auditOutput), 0o600); err != nil {
+				return agentruntime.Result{}, err
+			}
+			return agentruntime.Result{Output: f.runnerOutput}, nil
 		}
 		return agentruntime.Result{Output: f.auditOutput}, nil
 	}
@@ -414,9 +422,9 @@ func TestFailureBackoffAndRedaction(t *testing.T) {
 
 func TestHeartbeatUsesSeparateOneShotAgentAndReplacesLatestReport(t *testing.T) {
 	now := time.Date(2026, 8, 20, 1, 2, 3, 0, time.UTC)
-	runner := &fakeRunner{auditOutput: "VERIFIED: the fake audit completed."}
+	runner := &fakeRunner{auditOutput: "VERIFIED: the fake audit completed.", auditResult: true, runnerOutput: strings.Repeat("noisy runner transcript\n", maxAuditReportBytes)}
 	agent := newTestSupervisor(t, runner, &now)
-	agent.AuditCommand = []string{"audit-agent", "-"}
+	agent.AuditCommand = []string{"audit-agent", "--output", auditResultPlaceholder, "-"}
 	agent.Launcher = []string{"agent-symphony", "agent-host", "orchestrator"}
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, agent.Repository, 161, 1)
 	head := strings.Repeat("a", 40)
@@ -444,11 +452,11 @@ func TestHeartbeatUsesSeparateOneShotAgentAndReplacesLatestReport(t *testing.T) 
 		t.Fatal(err)
 	}
 	contract, err := os.ReadFile(filepath.Join(agent.AuditWorkspace, "orchestrator-launch.json"))
-	if err != nil || !strings.Contains(string(contract), `"one_shot": true`) || !strings.Contains(string(contract), `"timeout_seconds": 240`) || !strings.Contains(string(contract), "separate one-shot") || !strings.Contains(string(contract), "last live-verified completed transition") || !strings.Contains(string(contract), "no more than eight live tool calls") || !strings.Contains(string(contract), "each live command at most 20 seconds") || !strings.Contains(string(contract), "stop checking after three minutes") || !strings.Contains(string(contract), `\"issue\":161`) || !strings.Contains(string(contract), `\"current_phase\":\"findings-handoff\"`) || !strings.Contains(string(contract), `\"pr\":165`) || !strings.Contains(string(contract), head) || !strings.Contains(string(contract), `\"state\":\"completed\"`) || !strings.Contains(string(contract), "deliver retained feedback result") || !strings.Contains(string(contract), firstHeartbeat.Format(time.RFC3339)) || !strings.Contains(string(contract), "reconciliation deadline exceeded") || strings.Contains(string(contract), "abc123") || len(contract) > 128<<10 {
+	if err != nil || !strings.Contains(string(contract), `"one_shot": true`) || !strings.Contains(string(contract), `"timeout_seconds": 240`) || !strings.Contains(string(contract), filepath.Join(agent.AuditWorkspace, auditResultFile)) || strings.Contains(string(contract), auditResultPlaceholder) || !strings.Contains(string(contract), "separate one-shot") || !strings.Contains(string(contract), "last live-verified completed transition") || !strings.Contains(string(contract), "no more than eight live tool calls") || !strings.Contains(string(contract), "each live command at most 20 seconds") || !strings.Contains(string(contract), "stop checking after three minutes") || !strings.Contains(string(contract), `\"issue\":161`) || !strings.Contains(string(contract), `\"current_phase\":\"findings-handoff\"`) || !strings.Contains(string(contract), `\"pr\":165`) || !strings.Contains(string(contract), head) || !strings.Contains(string(contract), `\"state\":\"completed\"`) || !strings.Contains(string(contract), "deliver retained feedback result") || !strings.Contains(string(contract), firstHeartbeat.Format(time.RFC3339)) || !strings.Contains(string(contract), "reconciliation deadline exceeded") || strings.Contains(string(contract), "abc123") || len(contract) > 128<<10 {
 		t.Fatalf("unsafe or incomplete audit contract=%q err=%v", contract, err)
 	}
 	report := waitHeartbeatReport(t, agent.Workspace, "completed")
-	if report.Report != runner.auditOutput || report.ReconciliationDiagnostic == "" || strings.Contains(report.ReconciliationDiagnostic, "abc123") || runner.auditStarts.Load() != 2 {
+	if _, err := os.Stat(filepath.Join(agent.AuditWorkspace, auditResultFile)); !errors.Is(err, os.ErrNotExist) || report.Report != runner.auditOutput || strings.Contains(report.Report, "noisy runner transcript") || report.ReconciliationDiagnostic == "" || strings.Contains(report.ReconciliationDiagnostic, "abc123") || runner.auditStarts.Load() != 2 {
 		t.Fatalf("audit report=%#v starts=%d", report, runner.auditStarts.Load())
 	}
 	state, err := agent.readOrInitial()
@@ -499,6 +507,22 @@ func TestHeartbeatUsesSeparateOneShotAgentAndReplacesLatestReport(t *testing.T) 
 		t.Fatalf("terminal work received periodic audit: audits=%d err=%v", runner.auditStarts.Load(), err)
 	}
 	assertNoTmuxInput(t, runner)
+}
+
+func TestHeartbeatFinalResultArtifactFailsClosed(t *testing.T) {
+	now := time.Date(2026, 8, 20, 1, 2, 3, 0, time.UTC)
+	runner := &fakeRunner{auditOutput: "noisy runner transcript"}
+	agent := newTestSupervisor(t, runner, &now)
+	agent.AuditCommand = []string{"audit-agent", "--output", auditResultPlaceholder, "-"}
+	agent.Launcher = []string{"agent-symphony", "agent-host", "orchestrator"}
+
+	if _, err := agent.Observe(t.Context(), []orchestrator.RecoveryStatus{{Repository: agent.Repository, Issue: 161, Attempt: 1, State: "active"}}); err != nil {
+		t.Fatal(err)
+	}
+	report := waitHeartbeatReport(t, agent.Workspace, "failed")
+	if report.Report != "" || report.Diagnostic != "orchestrator audit result is unsafe" {
+		t.Fatalf("missing final result did not fail closed: %#v", report)
+	}
 }
 
 func waitHeartbeatReport(t *testing.T, workspace, state string) heartbeatReport {
