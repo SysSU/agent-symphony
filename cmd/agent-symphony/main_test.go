@@ -212,6 +212,39 @@ func TestPublishedOperatorMessageStaysQueuedWhileCompletedFollowUpReviewRuns(t *
 	}
 }
 
+func TestTransitionRetryOnlyAcceptsExactUnblockedCompletedPublication(t *testing.T) {
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Action: orchestratoragent.ProposalActionRetry, RequestID: "retry-1"}
+	valid := orchestrator.RecoveryStatus{
+		Repository:         proposal.Repository,
+		Issue:              proposal.Issue,
+		Attempt:            proposal.Attempt,
+		State:              "active",
+		CurrentPhase:       "publication",
+		DispatchAuthorized: true,
+		Sessions:           []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, State: "completed"}},
+	}
+	if err := validateTransitionRetry(proposal, []orchestrator.RecoveryStatus{valid}); err != nil {
+		t.Fatalf("valid transition retry rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*orchestrator.RecoveryStatus){
+		"stale attempt":         func(status *orchestrator.RecoveryStatus) { status.Attempt++ },
+		"authorization revoked": func(status *orchestrator.RecoveryStatus) { status.DispatchAuthorized = false },
+		"blocked":               func(status *orchestrator.RecoveryStatus) { status.Blockers = []string{"authorization revoked"} },
+		"running worker":        func(status *orchestrator.RecoveryStatus) { status.Sessions[0].State = "running" },
+		"unrelated transition":  func(status *orchestrator.RecoveryStatus) { status.CurrentPhase = "review" },
+		"terminal":              func(status *orchestrator.RecoveryStatus) { status.State = "completed" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			status := valid
+			status.Sessions = slices.Clone(valid.Sessions)
+			mutate(&status)
+			if err := validateTransitionRetry(proposal, []orchestrator.RecoveryStatus{status}); err == nil {
+				t.Fatal("unsafe transition retry accepted")
+			}
+		})
+	}
+}
+
 func TestOperatorMessageTargetValidationRejectsStaleAndTerminalAttempts(t *testing.T) {
 	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "message"}
 	bound := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, BaseSHA: "aaaaaaa", State: "active"}
@@ -1305,7 +1338,7 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	}
 }
 
-func TestReconcilePublishesCompletedUnpublishedAttemptFromIssueBinding(t *testing.T) {
+func TestReconcilePublishesCompletedAttemptBeforePRGovernanceFailure(t *testing.T) {
 	coordinator, worker, remote := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
 	for _, repo := range []string{coordinator, worker} {
 		runGit(t, repo, "init")
@@ -1349,7 +1382,7 @@ func TestReconcilePublishesCompletedUnpublishedAttemptFromIssueBinding(t *testin
 		t.Fatal(err)
 	}
 	var pullBody string
-	created := false
+	created, governanceFailed := false, false
 	comments := []map[string]any{{"id": 1, "body": activeMarker, "created_at": issueCreated, "updated_at": issueCreated, "user": map[string]any{"id": 42}}}
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		status := http.StatusOK
@@ -1382,6 +1415,9 @@ func TestReconcilePublishesCompletedUnpublishedAttemptFromIssueBinding(t *testin
 				pulls = append(pulls, map[string]any{"number": 7, "body": pullBody, "state": "open", "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": branch}, "base": map[string]any{"sha": base}})
 			}
 			body, _ = json.Marshal(pulls)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/pulls/7":
+			governanceFailed = true
+			status, body = http.StatusInternalServerError, []byte(`{"message":"forced governance failure"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/commits/"+head+"/check-runs":
 			body = []byte(`{"check_runs":[]}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/commits/"+head+"/status":
@@ -1468,8 +1504,8 @@ func TestReconcilePublishesCompletedUnpublishedAttemptFromIssueBinding(t *testin
 		t.Fatal(err)
 	}
 	statuses, err := reconcileGitHub(t.Context(), configPath, statePath, stateRoot, true)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !governanceFailed {
+		t.Fatalf("pull-request governance did not fail after publication: err=%v failed=%v", err, governanceFailed)
 	}
 	if !created {
 		t.Fatalf("completed unpublished attempt was not published: statuses=%#v comments=%#v", statuses, comments)
