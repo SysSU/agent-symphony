@@ -195,7 +195,7 @@ func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 		t.Fatalf("zero-admin launcher=%#v", agent.Launcher)
 	}
 	root := localSnapshotRoot(stateRoot)
-	if !slices.Contains(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+root) || !slices.Equal(agent.ProposalCommand, []string{binary, "agent-host", "orchestrator-proposal"}) || !slices.Equal(agent.ProposalStatusCommand, []string{binary, "agent-host", "orchestrator-proposal-status"}) {
+	if !slices.Contains(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+root) || !slices.Equal(agent.ProposalCommand, []string{binary, "agent-host", "orchestrator-proposal"}) || !slices.Equal(agent.ProposalStatusCommand, []string{binary, "agent-host", "orchestrator-proposal-status"}) || agent.AuditWorkspace != filepath.Join(root, "orchestrator-audit-"+internalgithub.RepositoryIdentifier(cfg.Repository)) || len(agent.AuditCommand) == 0 {
 		t.Fatalf("zero-admin environment=%#v proposal=%#v status=%#v", agent.Env, agent.ProposalCommand, agent.ProposalStatusCommand)
 	}
 	agent.Runner = &orchestratorTestRunner{}
@@ -253,6 +253,13 @@ func TestAdvancedOrchestratorLaunchContractUsesSnapshotGroup(t *testing.T) {
 	}
 	if workspace.Mode()&(os.ModePerm|os.ModeSetgid) != os.ModeSetgid|0o750 || fileGID(workspace) != gid {
 		t.Fatalf("workspace mode=%v gid=%d", workspace.Mode(), fileGID(workspace))
+	}
+	auditWorkspace, err := os.Stat(agent.AuditWorkspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auditWorkspace.Mode()&(os.ModePerm|os.ModeSetgid) != os.ModeSetgid|0o750 || fileGID(auditWorkspace) != gid {
+		t.Fatalf("audit workspace mode=%v gid=%d", auditWorkspace.Mode(), fileGID(auditWorkspace))
 	}
 	contract, err := os.Stat(filepath.Join(agent.Workspace, orchestratorLaunchFile))
 	if err != nil {

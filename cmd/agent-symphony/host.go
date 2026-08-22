@@ -45,7 +45,11 @@ var (
 	hostGetwd           = os.Getwd
 	hostOrchestratorRun = func(ctx context.Context, command agentruntime.Command) error {
 		cmd := exec.CommandContext(ctx, command.Name, command.Args...)
-		cmd.Dir, cmd.Env, cmd.Stdin, cmd.Stdout, cmd.Stderr = command.Dir, command.Env, os.Stdin, os.Stdout, os.Stderr
+		stdin := command.Stdin
+		if stdin == nil {
+			stdin = os.Stdin
+		}
+		cmd.Dir, cmd.Env, cmd.Stdin, cmd.Stdout, cmd.Stderr = command.Dir, command.Env, stdin, os.Stdout, os.Stderr
 		return cmd.Run()
 	}
 	hostRun = func(name string, args ...string) error {
@@ -682,6 +686,8 @@ func runHostOrchestrator(ctx context.Context, root, home string, local bool) err
 		Version int      `json:"version"`
 		Command []string `json:"command"`
 		Context string   `json:"context"`
+		OneShot bool     `json:"one_shot,omitempty"`
+		Timeout int      `json:"timeout_seconds,omitempty"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
@@ -701,7 +707,21 @@ func runHostOrchestrator(ctx context.Context, root, home string, local bool) err
 	if local {
 		env = append(env, "AGENT_SYMPHONY_ORCHESTRATOR_ROOT="+root)
 	}
-	return hostOrchestratorRun(ctx, agentruntime.Command{Name: launch.Command[0], Args: append(launch.Command[1:], launch.Context), Dir: dir, Env: env})
+	command := agentruntime.Command{Name: launch.Command[0], Args: slices.Clone(launch.Command[1:]), Dir: dir, Env: env}
+	if launch.OneShot {
+		if launch.Timeout < 1 || launch.Timeout > 300 {
+			return errors.New("invalid one-shot orchestrator timeout")
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(launch.Timeout)*time.Second)
+		defer cancel()
+		command.Stdin = strings.NewReader(launch.Context)
+	} else if launch.Timeout == 0 {
+		command.Args = append(command.Args, launch.Context)
+	} else {
+		return errors.New("interactive orchestrator cannot set a timeout")
+	}
+	return hostOrchestratorRun(ctx, command)
 }
 
 func writeHostOrchestratorProposal(root string, input io.Reader, output io.Writer) error {
