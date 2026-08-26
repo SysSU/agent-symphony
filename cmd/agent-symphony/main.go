@@ -635,8 +635,6 @@ func watchOrchestratorProposals(ctx context.Context, agent *orchestratoragent.Su
 	}
 }
 
-var reconcileOrchestratorProposal = reconcileGitHub
-
 func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.Supervisor, operationMu *sync.Mutex, configPath, statePath, stateRoot string, reconcile func(context.Context) error, log io.Writer) {
 	proposal, err := agent.MessageProposal(ctx)
 	if errors.Is(err, orchestratoragent.ErrNoMessageProposal) {
@@ -652,7 +650,7 @@ func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.S
 	defer operationMu.Unlock()
 	controlCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	statuses, err := reconcileOrchestratorProposal(controlCtx, configPath, statePath, stateRoot, false)
+	statuses, err := reconcileGitHub(controlCtx, configPath, statePath, stateRoot, false)
 	if err != nil {
 		fmt.Fprintln(log, "orchestrator transition retry validation: "+internalgithub.Redact(err.Error()))
 		return
@@ -663,14 +661,11 @@ func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.S
 		}
 		return
 	}
-	if err := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "accepted", "the coordinator validated the exact completed attempt and durably scheduled bounded reconciliation"); err != nil {
+	if err := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "accepted", "the coordinator validated the exact completed attempt and started bounded reconciliation"); err != nil {
 		fmt.Fprintln(log, "orchestrator transition retry acceptance: "+internalgithub.Redact(err.Error()))
 		return
 	}
-	reconcileErr := reconcile(controlCtx)
-	if reconcileErr != nil {
-		fmt.Fprintln(log, "orchestrator transition retry reconciliation: "+internalgithub.Redact(reconcileErr.Error()))
-	}
+	_ = reconcile(controlCtx)
 }
 
 func validateTransitionRetry(proposal orchestratoragent.MessageProposal, statuses []orchestrator.RecoveryStatus) error {

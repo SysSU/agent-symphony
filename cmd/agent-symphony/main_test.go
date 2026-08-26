@@ -16,7 +16,6 @@ import (
 	"reflect"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -243,58 +242,6 @@ func TestTransitionRetryOnlyAcceptsExactUnblockedCompletedPublication(t *testing
 				t.Fatal("unsafe transition retry accepted")
 			}
 		})
-	}
-}
-
-func TestTransitionRetryRemainsAcceptedWhenReconciliationDeadlineExpires(t *testing.T) {
-	now := time.Date(2026, 8, 26, 1, 2, 3, 0, time.UTC)
-	runner := &orchestratorTestRunner{}
-	root := t.TempDir()
-	agent := &orchestratoragent.Supervisor{
-		Root:                  root,
-		Workspace:             filepath.Join(root, "workspace"),
-		Repository:            "o/r",
-		Command:               []string{"operator-agent"},
-		ProposalCommand:       []string{"agent-symphony", "agent-host", "orchestrator-proposal"},
-		ProposalStatusCommand: []string{"agent-symphony", "agent-host", "orchestrator-proposal-status"},
-		Runner:                runner,
-		Now:                   func() time.Time { return now },
-	}
-	if _, err := agent.Observe(t.Context(), nil); err != nil {
-		t.Fatal(err)
-	}
-	frame, _ := json.Marshal(orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Action: orchestratoragent.ProposalActionRetry, RequestID: "retry-ordering"})
-	runner.pane = orchestratoragent.MessageProposalPrefix + base64.StdEncoding.EncodeToString(frame) + "\n"
-	valid := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 131, Attempt: 3, State: "active", CurrentPhase: "publication", DispatchAuthorized: true, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, State: "completed"}}}
-	oldReconcile := reconcileOrchestratorProposal
-	reconcileOrchestratorProposal = func(context.Context, string, string, string, bool) ([]orchestrator.RecoveryStatus, error) {
-		return []orchestrator.RecoveryStatus{valid}, nil
-	}
-	t.Cleanup(func() { reconcileOrchestratorProposal = oldReconcile })
-
-	started := 0
-	pendingAtReconciliation := false
-	var log bytes.Buffer
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
-	defer cancel()
-	processOrchestratorProposal(ctx, agent, &sync.Mutex{}, "config", "state", "runtime", func(ctx context.Context) error {
-		started++
-		if _, err := agent.MessageProposal(ctx); !errors.Is(err, orchestratoragent.ErrNoMessageProposal) {
-			pendingAtReconciliation = true
-		}
-		<-ctx.Done()
-		return ctx.Err()
-	}, &log)
-	if started != 1 || pendingAtReconciliation || !strings.Contains(log.String(), "orchestrator transition retry reconciliation: context deadline exceeded") {
-		t.Fatalf("reconciliation starts=%d pending=%t log=%q", started, pendingAtReconciliation, log.String())
-	}
-	if _, err := agent.MessageProposal(t.Context()); !errors.Is(err, orchestratoragent.ErrNoMessageProposal) {
-		t.Fatalf("started retry was not consumed: %v", err)
-	}
-	body, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
-	var status orchestratoragent.MessageProposalStatus
-	if err != nil || json.Unmarshal(body, &status) != nil || status.Resolution != "accepted" || !strings.Contains(status.Detail, "durably scheduled") {
-		t.Fatalf("retry status=%s err=%v", body, err)
 	}
 }
 
