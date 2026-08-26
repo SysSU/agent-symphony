@@ -2657,7 +2657,7 @@ func recoverDashboardAttempt(ctx context.Context, configPath, statePath, stateRo
 
 func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, issues []internalgithub.RecoveryIssueFact) error {
 	for _, status := range statuses {
-		if status.State != "active" && status.State != "review-ready" {
+		if status.State != "active" && status.State != "review-ready" && !(status.State == "blocked" && slices.Equal(status.Blockers, []string{"runtime liveness mismatch"})) {
 			continue
 		}
 		manifestIndex := slices.IndexFunc(manifests, func(manifest agentruntime.Manifest) bool {

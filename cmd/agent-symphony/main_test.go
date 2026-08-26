@@ -2074,6 +2074,40 @@ func TestRevokedBoundAttemptCancelsWorkerAndSuppressesPublication(t *testing.T) 
 	}
 }
 
+func TestMonitorConsumesDeadAttemptFromLivenessMismatchProjection(t *testing.T) {
+	state, root := t.TempDir(), t.TempDir()
+	state, _ = filepath.EvalSymlinks(state)
+	root, _ = filepath.EvalSymlinks(root)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 4, BaseSHA: "abcdef0"}
+	manifest, err := agentruntime.AttemptIdentity(root, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.State = "running"
+	manifest.LogPath = filepath.Join(state, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-4", "agent.log")
+	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &operatorMessageRunner{dead: true}
+	runtimeState := &agentruntime.Runtime{Root: root, StateRoot: state, Tmux: "tmux", Runner: runner}
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 23, Attempt: 4, State: "blocked", Blockers: []string{"runtime liveness mismatch"}, Diagnostic: "worktree HEAD does not match GitHub"}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 4, DispatchAuthorized: true}
+	if err := monitorAttempts(t.Context(), runtimeState, []orchestrator.RecoveryStatus{status}, []agentruntime.Manifest{manifest}, []internalgithub.RecoveryIssueFact{issue}); err != nil {
+		t.Fatal(err)
+	}
+	storedBody, _ := os.ReadFile(manifestPath)
+	var stored agentruntime.Manifest
+	log, _ := os.ReadFile(manifest.LogPath)
+	if json.Unmarshal(storedBody, &stored) != nil || stored.State != "completed" || string(log) != "completed" {
+		t.Fatalf("dead liveness-mismatch attempt was not captured: manifest=%#v log=%q", stored, log)
+	}
+}
+
 func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) {
 	source := t.TempDir()
 	for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}} {
