@@ -1237,7 +1237,13 @@ func TestProductionSeedClonesThroughAgentHostBoundary(t *testing.T) {
 
 func TestResumeHandoffFetchesThroughAgentHostBoundary(t *testing.T) {
 	oldExec := hostExecRunner
-	hostExecRunner = (agentruntime.ExecRunner{}).Run
+	execRunner := agentruntime.ExecRunner{}
+	hostExecRunner = func(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		if command.Name == "tmux" && slices.Contains(command.Args, "has-session") {
+			return agentruntime.Result{}, nil
+		}
+		return execRunner.Run(ctx, command)
+	}
 	t.Cleanup(func() { hostExecRunner = oldExec })
 
 	stateRoot := t.TempDir()
