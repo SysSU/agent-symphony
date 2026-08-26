@@ -47,10 +47,11 @@ type CompletionPolicies struct {
 }
 
 type Commands struct {
-	Implementation []string `json:"implementation"`
-	Reviewer       []string `json:"reviewer"`
-	Orchestrator   []string `json:"orchestrator,omitempty"`
-	Environment    []string `json:"environment_allowlist"`
+	Implementation    []string `json:"implementation"`
+	Reviewer          []string `json:"reviewer"`
+	Orchestrator      []string `json:"orchestrator,omitempty"`
+	OrchestratorAudit []string `json:"orchestrator_audit,omitempty"`
+	Environment       []string `json:"environment_allowlist"`
 }
 
 type Status struct {
@@ -74,8 +75,9 @@ func Default(repository string) Config {
 		DocsPaths:    []string{"README.md", "docs"},
 		Commands: Commands{
 			Implementation: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}, Reviewer: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"},
-			Orchestrator: []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"},
-			Environment:  []string{"LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"},
+			Orchestrator:      []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"},
+			OrchestratorAudit: []string{"codex", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"},
+			Environment:       []string{"LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"},
 		},
 		Status: Status{Format: "human", Color: "auto"},
 	}
@@ -242,16 +244,22 @@ func (c Config) Validate() error {
 			}
 		}
 	}
-	if c.Commands.Orchestrator != nil {
-		if len(c.Commands.Orchestrator) == 0 || strings.TrimSpace(c.Commands.Orchestrator[0]) == "" {
-			problems = append(problems, "commands.orchestrator must contain an executable when configured")
+	for _, optional := range []struct {
+		name    string
+		command []string
+	}{{"orchestrator", c.Commands.Orchestrator}, {"orchestrator_audit", c.Commands.OrchestratorAudit}} {
+		if optional.command == nil {
+			continue
 		}
-		for _, arg := range c.Commands.Orchestrator {
+		if len(optional.command) == 0 || strings.TrimSpace(optional.command[0]) == "" {
+			problems = append(problems, "commands."+optional.name+" must contain an executable when configured")
+		}
+		for _, arg := range optional.command {
 			if strings.ContainsRune(arg, 0) || strings.ContainsAny(arg, "\r\n") {
-				problems = append(problems, "commands.orchestrator contains an unsafe argument")
+				problems = append(problems, "commands."+optional.name+" contains an unsafe argument")
 			}
 			if secretName(arg) != "" {
-				problems = append(problems, "commands.orchestrator contains a credential-shaped argument")
+				problems = append(problems, "commands."+optional.name+" contains a credential-shaped argument")
 			}
 		}
 	}
