@@ -74,6 +74,7 @@ export default function TerminalPanel({ config, onClose }) {
     const keyboard = (event) => {
       if (event.key === "Escape") {
         event.preventDefault();
+        event.stopPropagation();
         onClose();
         return;
       }
@@ -94,11 +95,11 @@ export default function TerminalPanel({ config, onClose }) {
         first.focus();
       }
     };
-    window.addEventListener("keydown", keyboard);
+    window.addEventListener("keydown", keyboard, true);
     document.body.classList.add("terminalOpen");
     return () => {
       disposed = true;
-      window.removeEventListener("keydown", keyboard);
+      window.removeEventListener("keydown", keyboard, true);
       document.body.classList.remove("terminalOpen");
       resizeObserver?.disconnect();
       input?.dispose();

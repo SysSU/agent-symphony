@@ -135,22 +135,7 @@ test("contains long attempt text inside a mobile viewport", async ({ page }) => 
 });
 
 test("opens attempt and orchestrator terminals, closes them, and restores focus", async ({ page }) => {
-  await page.addInitScript(() => {
-    class MockWebSocket extends EventTarget {
-      static OPEN = 1;
-
-      constructor() {
-        super();
-        this.readyState = MockWebSocket.OPEN;
-        queueMicrotask(() => this.dispatchEvent(new Event("open")));
-      }
-
-      send() {}
-
-      close() {}
-    }
-    window.WebSocket = MockWebSocket;
-  });
+  await page.routeWebSocket((url) => url.pathname.endsWith("/terminal"), () => {});
   await mockDashboard(page, [statuses[0]]);
   await page.goto("/");
 
@@ -158,7 +143,8 @@ test("opens attempt and orchestrator terminals, closes them, and restores focus"
   await attemptTerminal.click();
   let dialog = page.getByRole("dialog", { name: statuses[0].session });
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole("button", { name: "Close" })).toBeFocused();
+  await expect(dialog.getByRole("status")).toHaveText("Connected");
+  await expect(dialog.locator(".terminal textarea")).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
   await expect(attemptTerminal).toBeFocused();
