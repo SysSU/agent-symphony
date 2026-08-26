@@ -1644,6 +1644,74 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	}
 }
 
+func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testing.T) {
+	coordinator, worker, remote := gitRepository(t), t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
+	runGit(t, worker, "init")
+	runGit(t, worker, "config", "user.email", "test@example.invalid")
+	runGit(t, worker, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "add", "file")
+	runGit(t, worker, "commit", "-m", "base")
+	base := runGit(t, worker, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("head"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "commit", "-am", "head")
+	head := runGit(t, worker, "rev-parse", "HEAD")
+	branch, _ := internalgithub.AttemptBranch("o/r", 23, 1)
+	runGit(t, coordinator, "init", "--bare", remote)
+	runGit(t, coordinator, "remote", "set-url", "origin", remote)
+	runGit(t, worker, "push", remote, base+":refs/heads/"+branch)
+
+	bundlePath := filepath.Join(t.TempDir(), "attempt.bundle")
+	runGit(t, worker, "bundle", "create", bundlePath, "--all")
+	bundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: branch, BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "old validation", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
+	exportedJSON, _ := json.Marshal(exported)
+	exportResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
+
+	stateRoot, worktree := t.TempDir(), t.TempDir()
+	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worktree, Session: "as-23-1", BaseSHA: base, LogPath: filepath.Join(worktree, "attempt.log"), State: "completed", ReviewState: "clean", ReviewHead: head, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	manifestPath := filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier("o/r"), "23-1", "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifestBody, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, manifestBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := "independent-review-" + head
+	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(worktree, key), head})
+	ackResult, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
+	script := filepath.Join(t.TempDir(), "boundary")
+	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\ncase \"$payload\" in\n  *'\"operation\":\"export\"'*) printf '%%s' '%s';;\n  *) printf '%%s' '%s';;\nesac\n", exportResult, ackResult)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", script)
+
+	currentBase := strings.Repeat("b", 40)
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseBranch: "main", BaseSHA: currentBase, DispatchAuthorized: true}
+	pending, err := publishWorkerResult(t.Context(), internalgithub.API{}, &agentruntime.Runtime{StateRoot: stateRoot}, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, issue, manifest, stateRoot, nil)
+	if err != nil || pending {
+		t.Fatalf("base refresh handoff pending=%v err=%v", pending, err)
+	}
+	storedBody, _ := os.ReadFile(manifestPath)
+	var stored agentruntime.Manifest
+	_ = json.Unmarshal(storedBody, &stored)
+	if stored.State != "running" || !stored.ReviewHandoffAck || len(stored.ReviewFindings) != 1 || !strings.Contains(stored.ReviewFindings[0], currentBase) {
+		t.Fatalf("base drift was not durably handed back: %#v", stored)
+	}
+	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != base {
+		t.Fatalf("stale head was published: got %s want %s", got, base)
+	}
+}
+
 func TestReconcileMonitorsAndPublishesCompletedAttemptBeforePRGovernanceFailure(t *testing.T) {
 	coordinator, worker, remote := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
 	for _, repo := range []string{coordinator, worker} {

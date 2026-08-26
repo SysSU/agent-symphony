@@ -2189,6 +2189,14 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 	if manifest.ReviewState == "findings-queued" && manifest.ReviewHead == head {
 		return returnReviewFindings(ctx, runtimeState, boundary, attempt, manifest, head, manifest.ReviewFindings, cfg.Commands.Implementation)
 	}
+	if preflightObjectID.MatchString(issue.BaseSHA) && issue.BaseSHA != manifest.BaseSHA && scanGit(ctx, root, nil, []string{"merge-base", "--is-ancestor", issue.BaseSHA, head}, nil) != nil {
+		findings := []string{fmt.Sprintf("Integrate current `%s` at exact commit `%s`, resolve conflicts, and rerun the relevant validation.", issue.BaseBranch, issue.BaseSHA)}
+		queued, err := runtimeState.RecordReviewFindings(attempt, head, findings, false, false)
+		if err != nil {
+			return false, err
+		}
+		return returnReviewFindings(ctx, runtimeState, boundary, attempt, queued, head, findings, cfg.Commands.Implementation)
+	}
 	if manifest.ReviewState != "clean" || manifest.ReviewHead != head {
 		review, pending, err = runIndependentReview(ctx, runtimeState, attempt, reviewBoundary(stateRoot), reviewEnv, cfg.Commands.Reviewer, issue, manifest, root, head, snapshotRoot)
 	}
