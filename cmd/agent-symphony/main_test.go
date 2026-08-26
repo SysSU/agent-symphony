@@ -1625,7 +1625,7 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(old) })
-	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worker, BaseSHA: base, State: "completed", ReviewState: "clean", ReviewHead: head, UpdatedAt: time.Now().UTC()}
+	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worker, BaseSHA: base, State: "completed", ReviewState: "clean", ReviewBase: base, ReviewHead: head, UpdatedAt: time.Now().UTC()}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 2, Title: "Operator follow-up", BaseBranch: "main", DispatchAuthorized: true}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "review-ready"}}
 	message.State = "delivered"
@@ -1676,7 +1676,7 @@ func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testin
 	exportResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
 
 	stateRoot, worktree := t.TempDir(), t.TempDir()
-	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worktree, Session: "as-23-1", BaseSHA: base, LogPath: filepath.Join(worktree, "attempt.log"), State: "completed", ReviewState: "clean", ReviewHead: head, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worktree, Session: "as-23-1", BaseSHA: base, LogPath: filepath.Join(worktree, "attempt.log"), State: "completed", ReviewState: "clean", ReviewBase: base, ReviewHead: head, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	manifestPath := filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier("o/r"), "23-1", "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
 		t.Fatal(err)
@@ -1875,7 +1875,7 @@ esac
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest.State, manifest.ReviewState, manifest.ReviewHead = "running", "clean", head
+	manifest.State, manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead = "running", "clean", base, head
 	manifest.CreatedAt, manifest.UpdatedAt = issueCreated, issueCreated
 	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
@@ -2125,6 +2125,16 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 		t.Fatal(string(out))
 	}
 	base := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", source, "rev-parse", "HEAD"))))
+	if err := os.WriteFile(filepath.Join(source, "upstream"), []byte("current base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", source, "add", "upstream").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, err := exec.Command("git", "-C", source, "commit", "-m", "current base").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	reviewBase := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", source, "rev-parse", "HEAD"))))
 	if err := os.WriteFile(filepath.Join(source, "file"), []byte("changed"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -2152,7 +2162,7 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	old := reviewSnapshotRoot
 	reviewSnapshotRoot = t.TempDir()
 	t.Cleanup(func() { reviewSnapshotRoot = old })
-	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: reviewBase}
 	t.Setenv("OPENAI_API_KEY", "model-canary")
 	t.Setenv("GITHUB_TOKEN", "github-canary")
 	t.Setenv("SSH_AUTH_SOCK", "ssh-canary")
@@ -2204,6 +2214,22 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	}
 	if !strings.Contains(string(log), `"reviewer","--custom"`) || strings.Contains(string(log), "--output-last-message") {
 		t.Fatalf("custom reviewer command or result environment changed: %s", log)
+	}
+	var prompt string
+	decoder := json.NewDecoder(bytes.NewReader(log))
+	for {
+		var request struct {
+			Command boundaryCommand `json:"command"`
+		}
+		if decoder.Decode(&request) != nil {
+			break
+		}
+		if slices.Contains(request.Command.Args, "load-buffer") {
+			prompt = string(request.Command.Input)
+		}
+	}
+	if !strings.Contains(prompt, reviewBase+"..HEAD") || strings.Contains(prompt, base+"..HEAD") {
+		t.Fatalf("review prompt base is not current: %q", prompt)
 	}
 }
 
@@ -2261,12 +2287,23 @@ func TestRunningReviewAcceptsBlankLivePaneStatus(t *testing.T) {
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
 	head, root := strings.Repeat("b", 40), t.TempDir()
 	snapshot, session := reviewIdentity(attempt, root)
-	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
 	boundary := &artifactReviewBoundary{paneOutput: "0 \n"}
 
 	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, []string{"reviewer"}, internalgithub.RecoveryIssueFact{}, manifest, "", head, root)
 	if err != nil || !pending || result.Snapshot != snapshot || result.Session != session || boundary.respawns != 0 {
 		t.Fatalf("result=%#v pending=%v respawns=%d err=%v", result, pending, boundary.respawns, err)
+	}
+}
+
+func TestRunningReviewWithDifferentBaseIsNotReused(t *testing.T) {
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
+	head, root := strings.Repeat("b", 40), t.TempDir()
+	snapshot, session := reviewIdentity(attempt, root)
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
+	issue := internalgithub.RecoveryIssueFact{BaseSHA: strings.Repeat("c", 40)}
+	if _, pending, err := runIndependentReview(t.Context(), nil, attempt, &artifactReviewBoundary{paneOutput: "0"}, nil, []string{"reviewer"}, issue, manifest, "", head, root); err == nil || pending {
+		t.Fatalf("mismatched-base review was reused: pending=%v err=%v", pending, err)
 	}
 }
 
@@ -2295,7 +2332,7 @@ func TestIndependentReviewIgnoresEchoedAndDuplicatedTerminalResult(t *testing.T)
 	if slices.Contains(boundary.respawn, "review") || slices.Contains(boundary.respawn, "--output-last-message") || !slices.Contains(boundary.respawn, reviewResultPath(started.Snapshot, head)) || !slices.Contains(boundary.respawn, "--dangerously-bypass-approvals-and-sandbox") || !slices.Contains(boundary.respawn, "-") {
 		t.Fatalf("default reviewer did not receive result artifact: %q", boundary.respawn)
 	}
-	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
 	if _, _, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, defaultReviewer, issue, manifest, source, head, root); err == nil {
 		t.Fatal("malformed artifact was accepted")
 	}
@@ -2335,7 +2372,7 @@ func TestReviewResultReadFailureRetriesWithoutRespawningReviewer(t *testing.T) {
 	defer func() {
 		_ = cleanupReviewResources(t.Context(), boundary, nil, attempt, head, started.Snapshot, started.Session, root)
 	}()
-	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
 	if _, pending, err = runIndependentReview(t.Context(), nil, attempt, boundary, nil, command, issue, manifest, source, head, root); err != nil || !pending {
 		t.Fatalf("transient read pending=%v err=%v", pending, err)
 	}
@@ -2365,7 +2402,7 @@ func TestInvalidReviewArtifactFailsWithoutRespawningReviewer(t *testing.T) {
 	defer func() {
 		_ = cleanupReviewResources(t.Context(), boundary, nil, attempt, head, started.Snapshot, started.Session, root)
 	}()
-	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
 	if _, pending, err = runIndependentReview(t.Context(), nil, attempt, boundary, nil, command, issue, manifest, source, head, root); err == nil || pending || boundary.respawns != 1 {
 		t.Fatalf("invalid artifact pending=%v respawns=%d err=%v", pending, boundary.respawns, err)
 	}
@@ -2944,7 +2981,7 @@ func TestPreparingReviewCleanupRetainsStateAndRetries(t *testing.T) {
 				t.Fatal(err)
 			}
 			var stored agentruntime.Manifest
-			if json.Unmarshal(storedBody, &stored) != nil || stored.ReviewState != "preparing" || stored.ReviewSnapshot != snapshot || stored.ReviewSession != session {
+			if json.Unmarshal(storedBody, &stored) != nil || stored.ReviewState != "preparing" || stored.ReviewBase != baseSHA || stored.ReviewSnapshot != snapshot || stored.ReviewSession != session {
 				t.Fatalf("preparing state not retained: %#v", stored)
 			}
 			if _, err := os.Stat(marker); err != nil {
@@ -2985,7 +3022,7 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	if err := os.WriteFile(resultPath, []byte(`{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`), 0o660); err != nil {
 		t.Fatal(err)
 	}
-	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "running", ReviewHead: "head", ReviewSnapshot: snapshot, ReviewSession: session}
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: "head", ReviewSnapshot: snapshot, ReviewSession: session}
 	sum := sha256.Sum256([]byte(attempt.Repository))
 	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
@@ -3017,7 +3054,7 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	if err := json.Unmarshal(storedBody, &stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.ReviewState != "clean" || stored.ReviewSession == "" || stored.ReviewSnapshot == "" {
+	if stored.ReviewState != "clean" || stored.ReviewBase != attempt.BaseSHA || stored.ReviewSession == "" || stored.ReviewSnapshot == "" {
 		t.Fatalf("cleanup discarded retry state: %#v", stored)
 	}
 	if _, err := os.Stat(snapshot); err != nil {
@@ -3112,7 +3149,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	if err := os.Mkdir(snapshot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Branch: "issue-23", BaseSHA: base, State: "completed", ReviewState: "clean", ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session, UpdatedAt: time.Now().UTC()}
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Branch: "issue-23", BaseSHA: base, State: "completed", ReviewState: "clean", ReviewBase: base, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session, UpdatedAt: time.Now().UTC()}
 	sum := sha256.Sum256([]byte(attempt.Repository))
 	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {

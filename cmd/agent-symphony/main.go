@@ -2189,15 +2189,19 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 	if manifest.ReviewState == "findings-queued" && manifest.ReviewHead == head {
 		return returnReviewFindings(ctx, runtimeState, boundary, attempt, manifest, head, manifest.ReviewFindings, cfg.Commands.Implementation)
 	}
-	if preflightObjectID.MatchString(issue.BaseSHA) && issue.BaseSHA != manifest.BaseSHA && scanGit(ctx, root, nil, []string{"merge-base", "--is-ancestor", issue.BaseSHA, head}, nil) != nil {
-		findings := []string{fmt.Sprintf("Integrate current `%s` at exact commit `%s`, resolve conflicts, and rerun the relevant validation.", issue.BaseBranch, issue.BaseSHA)}
-		queued, err := runtimeState.RecordReviewFindings(attempt, head, findings, false, false)
-		if err != nil {
-			return false, err
+	reviewBase := manifest.BaseSHA
+	if preflightObjectID.MatchString(issue.BaseSHA) {
+		if issue.BaseSHA != manifest.BaseSHA && scanGit(ctx, root, nil, []string{"merge-base", "--is-ancestor", issue.BaseSHA, head}, nil) != nil {
+			findings := []string{fmt.Sprintf("Integrate current `%s` at exact commit `%s`, resolve conflicts, and rerun the relevant validation.", issue.BaseBranch, issue.BaseSHA)}
+			queued, err := runtimeState.RecordReviewFindings(attempt, head, findings, false, false)
+			if err != nil {
+				return false, err
+			}
+			return returnReviewFindings(ctx, runtimeState, boundary, attempt, queued, head, findings, cfg.Commands.Implementation)
 		}
-		return returnReviewFindings(ctx, runtimeState, boundary, attempt, queued, head, findings, cfg.Commands.Implementation)
+		reviewBase = issue.BaseSHA
 	}
-	if manifest.ReviewState != "clean" || manifest.ReviewHead != head {
+	if manifest.ReviewState != "clean" || manifest.ReviewBase != reviewBase || manifest.ReviewHead != head {
 		review, pending, err = runIndependentReview(ctx, runtimeState, attempt, reviewBoundary(stateRoot), reviewEnv, cfg.Commands.Reviewer, issue, manifest, root, head, snapshotRoot)
 	}
 	if err != nil {
@@ -2214,7 +2218,7 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		return returnReviewFindings(ctx, runtimeState, boundary, attempt, queued, head, review.Findings, cfg.Commands.Implementation)
 	}
 	if manifest.ReviewState != "clean" {
-		if _, err := runtimeState.RecordReview(attempt, "clean", head, "", ""); err != nil {
+		if _, err := runtimeState.RecordReview(attempt, "clean", reviewBase, head, "", ""); err != nil {
 			return false, err
 		}
 	}
@@ -2338,7 +2342,7 @@ func cleanupReviewOutcome(ctx context.Context, runtimeState *agentruntime.Runtim
 	if err := cleanupReviewResources(ctx, boundary, env, attempt, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession, snapshotRoot); err != nil {
 		return manifest, err
 	}
-	return runtimeState.RecordReview(attempt, manifest.ReviewState, manifest.ReviewHead, "", "")
+	return runtimeState.RecordReview(attempt, manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead, "", "")
 }
 
 func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, string) {
@@ -2413,11 +2417,15 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
 	}
-	if !preflightObjectID.MatchString(attempt.BaseSHA) {
+	reviewBase := attempt.BaseSHA
+	if preflightObjectID.MatchString(issue.BaseSHA) {
+		reviewBase = issue.BaseSHA
+	}
+	if !preflightObjectID.MatchString(reviewBase) {
 		return independentReviewResult{}, false, errors.New("review base is missing or invalid")
 	}
 	snapshot, session := reviewIdentity(attempt, snapshotRoot)
-	if manifest.ReviewState == "running" && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
+	if manifest.ReviewState == "running" && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
 		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_dead} #{pane_dead_status}"}, Dir: snapshot, Env: env})
 		if err == nil {
 			dead, status, statusErr := agentruntime.ParsePaneStatus(result.Output)
@@ -2446,7 +2454,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 					if parsed.Status == "findings" {
 						persisted, err = runtimeState.RecordReviewFindings(attempt, head, parsed.Findings, false, false)
 					} else {
-						persisted, err = runtimeState.RecordReview(attempt, "clean", head, snapshot, session)
+						persisted, err = runtimeState.RecordReview(attempt, "clean", reviewBase, head, snapshot, session)
 					}
 					if err != nil {
 						return independentReviewResult{}, false, err
@@ -2464,7 +2472,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 		}
 	}
 	if runtimeState != nil {
-		if _, err := runtimeState.RecordReview(attempt, "preparing", head, snapshot, session); err != nil {
+		if _, err := runtimeState.RecordReview(attempt, "preparing", reviewBase, head, snapshot, session); err != nil {
 			return independentReviewResult{}, false, err
 		}
 	}
@@ -2483,7 +2491,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if got, err := gitSingleLine(ctx, snapshot, "rev-parse", "HEAD"); err != nil || got != head {
 		return independentReviewResult{}, false, errors.New("review snapshot HEAD differs from attested worker head")
 	}
-	if err := scanGit(ctx, snapshot, nil, []string{"merge-base", "--is-ancestor", attempt.BaseSHA, "HEAD"}, nil); err != nil || strings.EqualFold(attempt.BaseSHA, head) {
+	if err := scanGit(ctx, snapshot, nil, []string{"merge-base", "--is-ancestor", reviewBase, "HEAD"}, nil); err != nil || strings.EqualFold(reviewBase, head) {
 		return independentReviewResult{}, false, errors.New("review base is unavailable or not an ancestor of attested HEAD")
 	}
 	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "remote", "remove", "origin").Run()
@@ -2529,7 +2537,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-w", "-t", agentruntime.PaneTarget(session), "remain-on-exit", "on"}, Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
-	prompt := reviewPrompt(issue, attempt.BaseSHA)
+	prompt := reviewPrompt(issue, reviewBase)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"load-buffer", "-b", session, "-"}, Dir: snapshot, Env: env, Stdin: strings.NewReader(prompt)}); err != nil {
 		return independentReviewResult{}, false, err
 	}
@@ -2542,7 +2550,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 		return independentReviewResult{}, false, err
 	}
 	if runtimeState != nil {
-		if _, err := runtimeState.RecordReview(attempt, "running", head, snapshot, session); err != nil {
+		if _, err := runtimeState.RecordReview(attempt, "running", reviewBase, head, snapshot, session); err != nil {
 			return independentReviewResult{}, false, err
 		}
 	}

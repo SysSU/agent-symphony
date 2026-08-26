@@ -140,6 +140,7 @@ type Manifest struct {
 	ImplementationAgent string    `json:"implementation_agent,omitempty"`
 	ReviewAgent         string    `json:"review_agent,omitempty"`
 	ReviewState         string    `json:"review_state,omitempty"`
+	ReviewBase          string    `json:"review_base,omitempty"`
 	ReviewHead          string    `json:"review_head,omitempty"`
 	ReviewSnapshot      string    `json:"review_snapshot,omitempty"`
 	ReviewSession       string    `json:"review_session,omitempty"`
@@ -150,14 +151,14 @@ type Manifest struct {
 	UpdatedAt           time.Time `json:"updated_at"`
 }
 
-func (r *Runtime) RecordReview(attempt Attempt, state, head, snapshot, session string) (Manifest, error) {
+func (r *Runtime) RecordReview(attempt Attempt, state, base, head, snapshot, session string) (Manifest, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	manifest, err := r.readManifest(attempt)
 	if err != nil {
 		return Manifest{}, err
 	}
-	manifest.ReviewState, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = state, head, snapshot, session
+	manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = state, base, head, snapshot, session
 	if state != "findings-queued" {
 		manifest.ReviewFindings, manifest.ReviewHandoffQueued, manifest.ReviewHandoffAck = nil, false, false
 	}
@@ -939,6 +940,9 @@ func (r *Runtime) validateManifest(attempt Attempt, manifest Manifest) error {
 	case "preparing", "running", "clean", "findings-queued":
 	default:
 		return fmt.Errorf("invalid review state %q", manifest.ReviewState)
+	}
+	if manifest.ReviewBase != "" && !commitID.MatchString(manifest.ReviewBase) {
+		return errors.New("review base is invalid")
 	}
 	if manifest.ReviewSession != "" {
 		wantReview, err := AttemptSessionName(SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
