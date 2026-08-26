@@ -246,7 +246,7 @@ func TestTransitionRetryOnlyAcceptsExactUnblockedCompletedPublication(t *testing
 	}
 }
 
-func TestTransitionRetryStartsReconciliationBeforeDurableAcceptance(t *testing.T) {
+func TestTransitionRetryRemainsAcceptedWhenReconciliationDeadlineExpires(t *testing.T) {
 	now := time.Date(2026, 8, 26, 1, 2, 3, 0, time.UTC)
 	runner := &orchestratorTestRunner{}
 	root := t.TempDir()
@@ -273,23 +273,27 @@ func TestTransitionRetryStartsReconciliationBeforeDurableAcceptance(t *testing.T
 	t.Cleanup(func() { reconcileOrchestratorProposal = oldReconcile })
 
 	started := 0
+	pendingAtReconciliation := false
 	var log bytes.Buffer
-	processOrchestratorProposal(t.Context(), agent, &sync.Mutex{}, "config", "state", "runtime", func(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	processOrchestratorProposal(ctx, agent, &sync.Mutex{}, "config", "state", "runtime", func(ctx context.Context) error {
 		started++
-		if proposal, err := agent.MessageProposal(ctx); err != nil || proposal.RequestID != "retry-ordering" {
-			t.Fatalf("proposal was consumed before reconciliation: proposal=%#v err=%v", proposal, err)
+		if _, err := agent.MessageProposal(ctx); !errors.Is(err, orchestratoragent.ErrNoMessageProposal) {
+			pendingAtReconciliation = true
 		}
-		return errors.New("injected reconciliation failure")
+		<-ctx.Done()
+		return ctx.Err()
 	}, &log)
-	if started != 1 || !strings.Contains(log.String(), "orchestrator transition retry reconciliation: injected reconciliation failure") {
-		t.Fatalf("reconciliation starts=%d log=%q", started, log.String())
+	if started != 1 || pendingAtReconciliation || !strings.Contains(log.String(), "orchestrator transition retry reconciliation: context deadline exceeded") {
+		t.Fatalf("reconciliation starts=%d pending=%t log=%q", started, pendingAtReconciliation, log.String())
 	}
 	if _, err := agent.MessageProposal(t.Context()); !errors.Is(err, orchestratoragent.ErrNoMessageProposal) {
 		t.Fatalf("started retry was not consumed: %v", err)
 	}
 	body, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
 	var status orchestratoragent.MessageProposalStatus
-	if err != nil || json.Unmarshal(body, &status) != nil || status.Resolution != "accepted" {
+	if err != nil || json.Unmarshal(body, &status) != nil || status.Resolution != "accepted" || !strings.Contains(status.Detail, "durably scheduled") {
 		t.Fatalf("retry status=%s err=%v", body, err)
 	}
 }

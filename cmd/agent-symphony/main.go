@@ -663,11 +663,11 @@ func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.S
 		}
 		return
 	}
-	reconcileErr := reconcile(controlCtx)
-	if err := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "accepted", "the coordinator validated the exact completed attempt and started bounded reconciliation"); err != nil {
+	if err := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "accepted", "the coordinator validated the exact completed attempt and durably scheduled bounded reconciliation"); err != nil {
 		fmt.Fprintln(log, "orchestrator transition retry acceptance: "+internalgithub.Redact(err.Error()))
 		return
 	}
+	reconcileErr := reconcile(controlCtx)
 	if reconcileErr != nil {
 		fmt.Fprintln(log, "orchestrator transition retry reconciliation: "+internalgithub.Redact(reconcileErr.Error()))
 	}
