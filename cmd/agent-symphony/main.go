@@ -2080,7 +2080,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			return f.Repository == manifest.Repository && f.Issue == manifest.Issue && f.Attempt == manifest.Attempt
 		})
 		issueIndex := slices.IndexFunc(issues, func(i internalgithub.RecoveryIssueFact) bool {
-			return i.Repository == manifest.Repository && i.Issue == manifest.Issue && i.Attempt == manifest.Attempt
+			return i.Repository == manifest.Repository && i.Issue == manifest.Issue
 		})
 		if issueIndex < 0 {
 			continue
@@ -2095,6 +2095,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 		if !preparedOK && (bound.Repository != manifest.Repository || bound.Issue != manifest.Issue || bound.Attempt != manifest.Attempt || bound.BaseSHA != manifest.BaseSHA) {
 			continue
 		}
+		issue.Attempt = manifest.Attempt
 		operatorDelivered := slices.ContainsFunc(operatorMessages[fmt.Sprintf("%s#%d/%d", manifest.Repository, manifest.Issue, manifest.Attempt)], func(message internalgithub.OperatorMessage) bool {
 			return message.State == "delivered"
 		})

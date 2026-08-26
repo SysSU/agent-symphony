@@ -1626,7 +1626,7 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	}
 	t.Cleanup(func() { _ = os.Chdir(old) })
 	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worker, BaseSHA: base, State: "completed", ReviewState: "clean", ReviewHead: head, UpdatedAt: time.Now().UTC()}
-	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Title: "Operator follow-up", BaseBranch: "main", DispatchAuthorized: true}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 2, Title: "Operator follow-up", BaseBranch: "main", DispatchAuthorized: true}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "review-ready"}}
 	message.State = "delivered"
 	operatorMessages := map[string][]internalgithub.OperatorMessage{"o/r#23/1": {message}}
@@ -1636,7 +1636,7 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != head {
 		t.Fatalf("published head=%s want %s; body=%q comments=%#v", got, head, pullBody, comments)
 	}
-	if !strings.Contains(pullBody, head) || len(comments) != 3 {
+	if !strings.Contains(pullBody, head) || !strings.Contains(pullBody, "Attempt: 1") || strings.Contains(pullBody, "Attempt: 2") || len(comments) != 3 {
 		t.Fatalf("pull request was not fully updated: body=%q comments=%#v", pullBody, comments)
 	}
 }
