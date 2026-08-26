@@ -66,13 +66,13 @@ func (r *orchestratorTestRunner) Run(_ context.Context, command agentruntime.Com
 	return agentruntime.Result{}, nil
 }
 
-func TestConfiguredReadOnlyOrchestratorProposesThroughCapturedOutput(t *testing.T) {
+func TestConfiguredFullAccessOrchestratorProposesThroughCapturedOutput(t *testing.T) {
 	fakeAdvancedOrchestratorHost(t)
 	oldPrepare := orchestratorWorkspacePrepare
 	orchestratorWorkspacePrepare = func(path string, _ int) error { return os.MkdirAll(path, 0o750) }
 	t.Cleanup(func() { orchestratorWorkspacePrepare = oldPrepare })
 	cfg := config.Default("SysSU/example")
-	cfg.Commands.Orchestrator = []string{"codex", "--sandbox", "read-only", "--ask-for-approval", "never", "--no-alt-screen"}
+	cfg.Commands.Orchestrator = []string{"codex", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
 	stateRoot := t.TempDir()
 	agent, err := newOrchestratorAgent(cfg, stateRoot)
 	if err != nil {
@@ -98,10 +98,32 @@ func TestConfiguredReadOnlyOrchestratorProposesThroughCapturedOutput(t *testing.
 	if _, err := agent.Observe(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("AGENT_SYMPHONY_ORCHESTRATOR_ROOT", productionSnapshotRoot(stateRoot))
+	queryStatus := func(input []byte) string {
+		t.Helper()
+		var output bytes.Buffer
+		if err := agentHost(t.Context(), "orchestrator-proposal-status", bytes.NewReader(input), &output); err != nil {
+			t.Fatal(err)
+		}
+		var status struct {
+			State string `json:"state"`
+		}
+		if err := json.Unmarshal(output.Bytes(), &status); err != nil {
+			t.Fatal(err)
+		}
+		return status.State
+	}
+	if state := queryStatus(body); state != "unknown" {
+		t.Fatalf("emitted-only proposal state=%q", state)
+	}
 	got, err := agent.MessageProposal(t.Context())
 	if err != nil || got.Binding == "" || got.Message != proposal.Message {
 		t.Fatalf("proposal=%#v err=%v", got, err)
 	}
+	if state := queryStatus(body); state != "pending" {
+		t.Fatalf("captured proposal state=%q", state)
+	}
+	previous := slices.Clone(body)
 	proposal.Message = strings.Repeat("<", internalgithub.OperatorMessageMaxBytes)
 	body, _ = json.Marshal(proposal)
 	if len(body) <= 16<<10 {
@@ -116,15 +138,39 @@ func TestConfiguredReadOnlyOrchestratorProposesThroughCapturedOutput(t *testing.
 	if err != nil || got.Message != proposal.Message {
 		t.Fatalf("maximum escaped proposal length=%d err=%v", len(got.Message), err)
 	}
+	if state := queryStatus(previous); state != "replaced" {
+		t.Fatalf("replaced proposal state=%q", state)
+	}
+	if state := queryStatus(body); state != "pending" {
+		t.Fatalf("replacement proposal state=%q", state)
+	}
+	if err := agent.ConsumeMessageProposal(t.Context(), got.Binding); err != nil {
+		t.Fatal(err)
+	}
+	if state := queryStatus(body); state != "consumed" {
+		t.Fatalf("consumed proposal state=%q", state)
+	}
 	launch, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratorLaunchFile))
-	if err != nil || !strings.Contains(string(launch), `"--sandbox"`) || !strings.Contains(string(launch), `"read-only"`) {
-		t.Fatalf("read-only launch=%s err=%v", launch, err)
+	if err != nil || !strings.Contains(string(launch), `"--sandbox"`) || !strings.Contains(string(launch), `"danger-full-access"`) || !strings.Contains(string(launch), "orchestrator-proposal-status") || !strings.Contains(string(launch), "successful command proves only") {
+		t.Fatalf("full-access launch=%s err=%v", launch, err)
 	}
 	entries, err := os.ReadDir(agent.Workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
+		if entry.Name() == orchestratoragent.MessageProposalStatusFile {
+			path := filepath.Join(agent.Workspace, entry.Name())
+			status, readErr := os.ReadFile(path)
+			info, statErr := os.Stat(path)
+			if readErr != nil || statErr != nil {
+				t.Fatalf("read proposal status: read=%v stat=%v", readErr, statErr)
+			}
+			if info.Mode().Perm() != 0o440 || strings.Contains(string(status), proposal.Message) {
+				t.Fatalf("unsafe proposal status=%q mode=%v", status, info.Mode())
+			}
+			continue
+		}
 		if strings.Contains(entry.Name(), "proposal") {
 			t.Fatalf("read-only proposal required a writable file: %s", entry.Name())
 		}
@@ -149,8 +195,8 @@ func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 		t.Fatalf("zero-admin launcher=%#v", agent.Launcher)
 	}
 	root := localSnapshotRoot(stateRoot)
-	if !slices.Contains(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+root) || !slices.Equal(agent.ProposalCommand, []string{binary, "agent-host", "orchestrator-proposal"}) {
-		t.Fatalf("zero-admin environment=%#v proposal=%#v", agent.Env, agent.ProposalCommand)
+	if !slices.Contains(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+root) || !slices.Equal(agent.ProposalCommand, []string{binary, "agent-host", "orchestrator-proposal"}) || !slices.Equal(agent.ProposalStatusCommand, []string{binary, "agent-host", "orchestrator-proposal-status"}) || agent.AuditWorkspace != filepath.Join(root, "orchestrator-audit-"+internalgithub.RepositoryIdentifier(cfg.Repository)) || len(agent.AuditCommand) == 0 {
+		t.Fatalf("zero-admin environment=%#v proposal=%#v status=%#v", agent.Env, agent.ProposalCommand, agent.ProposalStatusCommand)
 	}
 	agent.Runner = &orchestratorTestRunner{}
 	if _, err := agent.Observe(t.Context(), nil); err != nil {
@@ -207,6 +253,13 @@ func TestAdvancedOrchestratorLaunchContractUsesSnapshotGroup(t *testing.T) {
 	}
 	if workspace.Mode()&(os.ModePerm|os.ModeSetgid) != os.ModeSetgid|0o750 || fileGID(workspace) != gid {
 		t.Fatalf("workspace mode=%v gid=%d", workspace.Mode(), fileGID(workspace))
+	}
+	auditWorkspace, err := os.Stat(agent.AuditWorkspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auditWorkspace.Mode()&(os.ModePerm|os.ModeSetgid) != os.ModeSetgid|0o750 || fileGID(auditWorkspace) != gid {
+		t.Fatalf("audit workspace mode=%v gid=%d", auditWorkspace.Mode(), fileGID(auditWorkspace))
 	}
 	contract, err := os.Stat(filepath.Join(agent.Workspace, orchestratorLaunchFile))
 	if err != nil {

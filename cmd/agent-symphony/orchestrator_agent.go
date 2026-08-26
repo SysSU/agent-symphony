@@ -38,17 +38,25 @@ func (s dashboardOrchestratorService) ConfirmMessage(ctx context.Context, propos
 
 func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratoragent.Supervisor, error) {
 	workspace := filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-"+internalgithub.RepositoryIdentifier(cfg.Repository))
+	auditWorkspace := filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-audit-"+internalgithub.RepositoryIdentifier(cfg.Repository))
 	agent := &orchestratoragent.Supervisor{
-		Root:            stateRoot,
-		Workspace:       workspace,
-		Repository:      cfg.Repository,
-		Command:         cfg.Commands.Orchestrator,
-		Launcher:        orchestratorBoundaryCommand(),
-		ProposalCommand: orchestratorProposalCommand(),
-		Runner:          agentruntime.ExecRunner{},
+		Root:                  stateRoot,
+		Workspace:             workspace,
+		AuditWorkspace:        auditWorkspace,
+		Repository:            cfg.Repository,
+		Command:               cfg.Commands.Orchestrator,
+		AuditCommand:          cfg.Commands.OrchestratorAudit,
+		Launcher:              orchestratorBoundaryCommand(),
+		ProposalCommand:       orchestratorProposalCommand(),
+		ProposalStatusCommand: orchestratorProposalStatusCommand(),
+		Runner:                agentruntime.ExecRunner{},
 	}
 	if cfg.Commands.Orchestrator == nil {
 		return agent, nil
+	}
+	workspaces := []string{workspace}
+	if cfg.Commands.OrchestratorAudit != nil {
+		workspaces = append(workspaces, auditWorkspace)
 	}
 	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
 	if err != nil {
@@ -57,8 +65,10 @@ func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratorage
 	agent.Env = env
 	if !hostIsolationInstalled() {
 		agent.Env = append(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+productionSnapshotRoot(stateRoot))
-		if err := os.MkdirAll(workspace, 0o750); err != nil {
-			return nil, fmt.Errorf("prepare orchestrator workspace: %w", err)
+		for _, path := range workspaces {
+			if err := os.MkdirAll(path, 0o750); err != nil {
+				return nil, fmt.Errorf("prepare orchestrator workspace: %w", err)
+			}
 		}
 		return agent, nil
 	}
@@ -67,8 +77,13 @@ func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratorage
 		return nil, fmt.Errorf("resolve orchestrator boundary group: %w", err)
 	}
 	gid, err := strconv.Atoi(group.Gid)
-	if err != nil || orchestratorWorkspacePrepare(workspace, gid) != nil {
+	if err != nil {
 		return nil, fmt.Errorf("prepare orchestrator reviewer boundary")
+	}
+	for _, path := range workspaces {
+		if orchestratorWorkspacePrepare(path, gid) != nil {
+			return nil, fmt.Errorf("prepare orchestrator reviewer boundary")
+		}
 	}
 	return agent, nil
 }
@@ -76,6 +91,11 @@ func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratorage
 func orchestratorProposalCommand() []string {
 	binary, _ := os.Executable()
 	return []string{binary, "agent-host", "orchestrator-proposal"}
+}
+
+func orchestratorProposalStatusCommand() []string {
+	binary, _ := os.Executable()
+	return []string{binary, "agent-host", "orchestrator-proposal-status"}
 }
 
 func prepareOrchestratorWorkspace(path string, gid int) error {

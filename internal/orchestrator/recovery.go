@@ -42,6 +42,8 @@ type RecoveryStatus struct {
 	Branch              string                  `json:"branch,omitempty"`
 	Worktree            string                  `json:"worktree,omitempty"`
 	Session             string                  `json:"session,omitempty"`
+	Sessions            []AttemptSession        `json:"sessions,omitempty"`
+	CurrentPhase        string                  `json:"current_phase,omitempty"`
 	PR                  int                     `json:"pr,omitempty"`
 	HeadSHA             string                  `json:"head_sha,omitempty"`
 	Priority            int                     `json:"priority,omitempty"`
@@ -53,7 +55,17 @@ type RecoveryStatus struct {
 	Diagnostic          string                  `json:"diagnostic,omitempty"`
 	Action              string                  `json:"next_action,omitempty"`
 	Retryable           bool                    `json:"retryable,omitempty"`
+	DispatchAuthorized  bool                    `json:"dispatch_authorized,omitempty"`
 	OperatorMessages    []OperatorMessageStatus `json:"operator_messages,omitempty"`
+}
+
+type AttemptSession struct {
+	Role      string    `json:"role"`
+	Name      string    `json:"name"`
+	State     string    `json:"state"`
+	Current   bool      `json:"current,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitzero"`
+	UpdatedAt time.Time `json:"updated_at,omitzero"`
 }
 
 type OperatorMessageStatus struct {
@@ -209,10 +221,14 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 				}
 				status.State, status.Blockers, status.Diagnostic, status.Action, status.Retryable = "blocked", []string{"runtime liveness mismatch"}, diagnostic, "recover this attempt or restore its exact runtime resources", true
 			}
+			projectAttemptLifecycle(&status, manifest)
 			break
 		}
 		if (fact.State == "active" || fact.State == "review-ready") && status.Session == "" {
-			status.State, status.Blockers, status.Diagnostic, status.Action = "blocked", []string{"runtime resources missing"}, "GitHub says active but local attempt resources are missing", "reconstruct the resources or create a new traceable attempt"
+			status.State, status.CurrentPhase, status.Blockers, status.Diagnostic, status.Action = "blocked", "blocked", []string{"runtime resources missing"}, "GitHub says active but local attempt resources are missing", "reconstruct the resources or create a new traceable attempt"
+		}
+		if status.CurrentPhase == "" {
+			status.CurrentPhase = status.State
 		}
 		result = append(result, status)
 	}
@@ -220,7 +236,9 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 		if used[i] {
 			continue
 		}
-		result = append(result, RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "orphaned", Branch: manifest.Branch, Worktree: manifest.Worktree, Session: manifest.Session, Diagnostic: "local attempt has no authoritative GitHub marker", Action: "preserve diagnostics; do not attach or dispatch"})
+		status := RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "orphaned", Branch: manifest.Branch, Worktree: manifest.Worktree, Session: manifest.Session, Diagnostic: "local attempt has no authoritative GitHub marker", Action: "preserve diagnostics; do not attach or dispatch"}
+		projectAttemptLifecycle(&status, manifest)
+		result = append(result, status)
 	}
 	slices.SortFunc(result, func(a, b RecoveryStatus) int {
 		if a.Repository != b.Repository {
@@ -232,6 +250,83 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 		return a.Attempt - b.Attempt
 	})
 	return result
+}
+
+func projectAttemptLifecycle(status *RecoveryStatus, manifest agentruntime.Manifest) {
+	add := func(role, name, state string, created time.Time) {
+		want, err := agentruntime.AttemptSessionName(role, manifest.Repository, manifest.Issue, manifest.Attempt)
+		if err == nil && name == want && state != "" {
+			status.Sessions = append(status.Sessions, AttemptSession{Role: role, Name: name, State: state, CreatedAt: created, UpdatedAt: manifest.UpdatedAt})
+		}
+	}
+	add(agentruntime.SessionRoleImplementation, manifest.Session, manifest.State, manifest.CreatedAt)
+	if manifest.ReviewSession != "" {
+		add(agentruntime.SessionRoleReviewer, manifest.ReviewSession, manifest.ReviewState, time.Time{})
+	}
+
+	switch status.State {
+	case "completed", "failed", "cancelled", "orphaned", "conflicting":
+		status.CurrentPhase = status.State
+		return
+	case "blocked":
+		status.CurrentPhase = "blocked"
+		return
+	}
+	switch {
+	case manifest.State == "failed" || manifest.State == "cancelled":
+		status.CurrentPhase = manifest.State
+	case manifest.State == "preparing" || manifest.State == "running":
+		if manifest.ReviewState == "findings-queued" {
+			status.CurrentPhase = "findings-handoff"
+		} else {
+			status.CurrentPhase = "implementation"
+		}
+	case manifest.ReviewState == "preparing" || manifest.ReviewState == "running":
+		status.CurrentPhase = "review"
+	case manifest.ReviewState == "findings-queued":
+		status.CurrentPhase = "findings-handoff"
+	case manifest.ReviewState == "clean":
+		status.CurrentPhase = "publication"
+	case manifest.State == "completed":
+		status.CurrentPhase = "validation"
+	default:
+		status.CurrentPhase = status.State
+	}
+
+	currentRole := ""
+	switch status.CurrentPhase {
+	case "implementation", "findings-handoff":
+		currentRole = agentruntime.SessionRoleImplementation
+	case "review":
+		currentRole = agentruntime.SessionRoleReviewer
+	}
+	for i := range status.Sessions {
+		status.Sessions[i].Current = status.Sessions[i].Role == currentRole
+	}
+	if len(status.Blockers) != 0 || (status.State != "active" && status.State != "review-ready") {
+		return
+	}
+	switch status.CurrentPhase {
+	case "implementation":
+		status.Action = "monitor the implementation session"
+	case "validation":
+		status.Action = "validate the completed implementation result"
+	case "review":
+		status.Action = "monitor the independent reviewer session"
+		if !slices.ContainsFunc(status.Sessions, func(session AttemptSession) bool { return session.Role == agentruntime.SessionRoleReviewer }) {
+			status.Action = "restore or restart the exact reviewer session"
+		}
+	case "findings-handoff":
+		status.Action = "deliver review findings to the implementation session"
+		if manifest.ReviewHandoffAck {
+			status.Action = "monitor follow-up implementation after review findings"
+		}
+	case "publication":
+		status.Action = "publish the independently reviewed implementation"
+		if status.PR > 0 {
+			status.Action = "monitor the matching published pull request"
+		}
+	}
 }
 
 func runtimeWorktreeBlocker(err error) string {

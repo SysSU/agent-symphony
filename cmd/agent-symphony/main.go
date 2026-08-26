@@ -356,7 +356,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return success(stdout, *jsonOutput, command, nil, "host isolation installed")
 	case "agent-host":
 		if fs.NArg() != 1 || fs.NFlag() != 0 {
-			return misuse(stderr, wantsJSON, command, "usage: agent-symphony agent-host implementation|review|orchestrator|orchestrator-proposal")
+			return misuse(stderr, wantsJSON, command, "usage: agent-symphony agent-host implementation|review|orchestrator|orchestrator-proposal|orchestrator-proposal-status")
 		}
 		if err := agentHost(context.Background(), fs.Arg(0), os.Stdin, stdout); err != nil {
 			return fail(stderr, false, command, err.Error())
@@ -420,12 +420,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if err != nil {
 				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
 			}
-			var agentErr error
-			if err == nil {
-				_, agentErr = agent.Observe(ctx, statuses)
-			} else {
-				_, agentErr = agent.Recover(ctx)
-			}
+			_, agentErr := agent.ObserveCycle(ctx, statuses, err)
 			if agentErr != nil {
 				fmt.Fprintln(stderr, "orchestrator agent: "+internalgithub.Redact(agentErr.Error()))
 			}
@@ -444,6 +439,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			defer operationMu.Unlock()
 			return reconcile(ctx)
 		}
+		go watchOrchestratorProposals(ctx, agent, operationMu, *path, *statePath, *runtimeState, reconcile, stderr)
 		if err := orchestrator.ReconcileLoop(ctx, *interval, lockedReconcile); err != nil && !errors.Is(err, context.Canceled) {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
@@ -492,7 +488,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout)
 			fmt.Fprintf(stdout, "  priority: P%d  dependencies: %v\n", status.Priority, status.Dependencies)
 			fmt.Fprintf(stdout, "  agents: implementation=%s review=%s\n", firstNonempty(status.ImplementationAgent, "-"), firstNonempty(status.ReviewAgent, "-"))
-			fmt.Fprintf(stdout, "  tmux: %s  worktree: %s\n", firstNonempty(status.Session, "-"), firstNonempty(status.Worktree, "-"))
+			fmt.Fprintf(stdout, "  phase: %s  worktree: %s\n", firstNonempty(status.CurrentPhase, "-"), firstNonempty(status.Worktree, "-"))
+			if len(status.Sessions) == 0 {
+				fmt.Fprintln(stdout, "  sessions: -")
+			}
+			for _, session := range status.Sessions {
+				current := ""
+				if session.Current {
+					current = " current"
+				}
+				fmt.Fprintf(stdout, "  session: %s%s %s %s\n", session.Role, current, session.State, session.Name)
+			}
 			fmt.Fprintf(stdout, "  branch: %s  head: %s  checks: %v\n", firstNonempty(status.Branch, "-"), firstNonempty(status.HeadSHA, "-"), status.Checks)
 			if len(status.Blockers) > 0 {
 				fmt.Fprintln(stdout, "  blockers: "+strings.Join(status.Blockers, "; "))
@@ -616,13 +622,79 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
+func watchOrchestratorProposals(ctx context.Context, agent *orchestratoragent.Supervisor, operationMu *sync.Mutex, configPath, statePath, stateRoot string, reconcile func(context.Context) error, log io.Writer) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		processOrchestratorProposal(ctx, agent, operationMu, configPath, statePath, stateRoot, reconcile, log)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.Supervisor, operationMu *sync.Mutex, configPath, statePath, stateRoot string, reconcile func(context.Context) error, log io.Writer) {
+	proposal, err := agent.MessageProposal(ctx)
+	if errors.Is(err, orchestratoragent.ErrNoMessageProposal) {
+		return
+	}
+	if err != nil {
+		fmt.Fprintln(log, "orchestrator proposal: "+internalgithub.Redact(err.Error()))
+		return
+	}
+	if proposal.Action != orchestratoragent.ProposalActionRetry || !operationMu.TryLock() {
+		return
+	}
+	defer operationMu.Unlock()
+	controlCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	statuses, err := reconcileGitHub(controlCtx, configPath, statePath, stateRoot, false)
+	if err != nil {
+		fmt.Fprintln(log, "orchestrator transition retry validation: "+internalgithub.Redact(err.Error()))
+		return
+	}
+	if err := validateTransitionRetry(proposal, statuses); err != nil {
+		if resolveErr := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "refused", err.Error()); resolveErr != nil {
+			fmt.Fprintln(log, "orchestrator transition retry refusal: "+internalgithub.Redact(resolveErr.Error()))
+		}
+		return
+	}
+	if err := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "accepted", "the coordinator validated the exact completed attempt and started bounded reconciliation"); err != nil {
+		fmt.Fprintln(log, "orchestrator transition retry acceptance: "+internalgithub.Redact(err.Error()))
+		return
+	}
+	_ = reconcile(controlCtx)
+}
+
+func validateTransitionRetry(proposal orchestratoragent.MessageProposal, statuses []orchestrator.RecoveryStatus) error {
+	matches := make([]orchestrator.RecoveryStatus, 0, 1)
+	for _, status := range statuses {
+		if status.Repository == proposal.Repository && status.Issue == proposal.Issue && status.Attempt == proposal.Attempt {
+			matches = append(matches, status)
+		}
+	}
+	if len(matches) != 1 {
+		return errors.New("retry target is not the exact current issue attempt")
+	}
+	target := matches[0]
+	completedImplementation := slices.ContainsFunc(target.Sessions, func(session orchestrator.AttemptSession) bool {
+		return session.Role == agentruntime.SessionRoleImplementation && session.State == "completed"
+	})
+	if !target.DispatchAuthorized || !slices.Contains([]string{"active", "review-ready"}, target.State) || !slices.Contains([]string{"validation", "publication"}, target.CurrentPhase) || len(target.Blockers) != 0 || !completedImplementation {
+		return errors.New("retry target is not an authorized completed result awaiting validation or publication")
+	}
+	return nil
+}
+
 func confirmOperatorMessage(ctx context.Context, configPath, stateRoot string, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return internalgithub.OperatorMessage{}, err
 	}
 	message, err := internalgithub.PrepareOperatorMessage(proposal.Repository, proposal.Issue, proposal.Attempt, proposal.Message)
-	if err != nil || proposal.Version != 1 || proposal.Repository != cfg.Repository {
+	if err != nil || proposal.Version != 1 || proposal.Repository != cfg.Repository || proposal.Action != "" && proposal.Action != orchestratoragent.ProposalActionMessage {
 		return internalgithub.OperatorMessage{}, errors.New("operator message target or body is invalid")
 	}
 	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
@@ -717,7 +789,7 @@ func validateOperatorMessageTarget(ctx context.Context, proposal orchestratorage
 	statusIndex := slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool {
 		return status.Repository == proposal.Repository && status.Issue == proposal.Issue && status.Attempt == proposal.Attempt
 	})
-	if statusIndex < 0 || !slices.Contains([]string{"resume monitoring the matching attempt", "resume publication of the matching completed attempt", "monitor the matching published pull request"}, statuses[statusIndex].Action) {
+	if statusIndex < 0 || !slices.Contains([]string{"active", "review-ready"}, statuses[statusIndex].State) || !slices.Contains([]string{"implementation", "validation", "review", "findings-handoff", "publication"}, statuses[statusIndex].CurrentPhase) {
 		return errors.New("operator message target does not have a verified exact runtime owner")
 	}
 	return nil
@@ -947,16 +1019,23 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 	if err := resumeHandoffs(ctx, &r, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
 		return statuses, err
 	}
-	if err := cleanupCompletedAttempts(ctx, boundary, facts, manifests); err != nil {
+	queuedManifests, err := r.Discover()
+	if err != nil {
 		return statuses, err
 	}
-	if err := ensurePublishedEvidence(ctx, api, facts, manifests, user.ID); err != nil {
+	if err := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, operatorMessages, statePath, stateRoot); err != nil {
+		return statuses, err
+	}
+	if err := cleanupCompletedAttempts(ctx, boundary, facts, queuedManifests); err != nil {
+		return statuses, err
+	}
+	if err := ensurePublishedEvidence(ctx, api, facts, queuedManifests, user.ID); err != nil {
 		return statuses, err
 	}
 	if err := internalgithub.RunPRReconciliation(ctx, api, prConfig, statePath); err != nil {
 		return statuses, err
 	}
-	if err := monitorAttempts(ctx, &r, statuses, manifests, issues); err != nil {
+	if err := monitorAttempts(ctx, &r, statuses, queuedManifests, issues); err != nil {
 		return statuses, err
 	}
 	// Re-read GitHub after governance and monitoring. A merge or cancellation
@@ -974,10 +1053,6 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		freshFacts[i] = orchestrator.AttemptFact{Repository: fact.Repository, Issue: fact.Issue, Attempt: fact.Attempt, BaseSHA: fact.BaseSHA, HeadSHA: fact.HeadSHA, PR: fact.PR, State: fact.State, Checks: fact.Checks, Diagnostic: fact.Diagnostic}
 	}
 	if err := cleanupCompletedAttempts(ctx, boundary, freshFacts, manifests); err != nil {
-		return statuses, err
-	}
-	refreshedManifests, err := r.Discover()
-	if err != nil {
 		return statuses, err
 	}
 	operatorCheck := func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
@@ -1010,10 +1085,7 @@ func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot strin
 		}
 		return matchesOperatorMessageBinding(proposal, expected, currentIssues, attempts), nil
 	}
-	if err := monitorQueuedAttempts(ctx, api, &r, c, freshIssues, refreshedManifests, freshRemote, operatorMessages, statePath, stateRoot); err != nil {
-		return statuses, err
-	}
-	freshIssues, freshRemote, validatedManifests, err := refreshOperatorTarget(ctx)
+	validatedManifests, err := r.Discover()
 	if err != nil {
 		return statuses, err
 	}
@@ -1116,6 +1188,7 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 		for j := range statuses {
 			if statuses[j].Repository == issue.Repository && statuses[j].Issue == issue.Issue {
 				statuses[j].Title, statuses[j].Priority, statuses[j].Dependencies = issue.Title, issue.Priority, issue.Dependencies
+				statuses[j].DispatchAuthorized = issue.DispatchAuthorized
 				statuses[j].Blockers = append(statuses[j].Blockers, issue.Blockers...)
 				if statuses[j].State == "failed" {
 					statuses[j].Retryable = statuses[j].Retryable && issue.RecoveryAuthorized && issue.RecoveryAttempt == statuses[j].Attempt
@@ -1133,7 +1206,7 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 			continue
 		}
 		decision := decisions[decisionIndex]
-		statuses = append(statuses, orchestrator.RecoveryStatus{Repository: issue.Repository, Issue: issue.Issue, Title: issue.Title, Attempt: issue.Attempt, State: string(decision.State), Priority: issue.Priority, Dependencies: issue.Dependencies, Blockers: issue.Blockers, Action: decision.Explanation})
+		statuses = append(statuses, orchestrator.RecoveryStatus{Repository: issue.Repository, Issue: issue.Issue, Title: issue.Title, Attempt: issue.Attempt, State: string(decision.State), CurrentPhase: string(decision.State), Priority: issue.Priority, Dependencies: issue.Dependencies, Blockers: issue.Blockers, Action: decision.Explanation})
 	}
 	return statuses, decisions
 }
@@ -1848,8 +1921,8 @@ func cleanupReviewOutcome(ctx context.Context, runtimeState *agentruntime.Runtim
 
 func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, string) {
 	repository := internalgithub.RepositoryIdentifier(attempt.Repository)
-	sum := sha256.Sum256([]byte(attempt.Repository))
-	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", repository, attempt.Issue, attempt.Number)), fmt.Sprintf("as-r-%x-%d-%d", sum[:8], attempt.Issue, attempt.Number)
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
+	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", repository, attempt.Issue, attempt.Number)), session
 }
 
 func reviewResultPath(snapshot, head string) string {
@@ -2976,7 +3049,7 @@ func usage(w io.Writer) {
 commands:
 	install-host  provision the native worker/reviewer boundary (run as root)
 	agent-host    execute the implementation, review, or orchestrator boundary
-	init          create .agent-symphony.yaml with safe defaults
+	init          create .agent-symphony.yaml with project defaults
 	validate      validate configuration
 	config view   print validated configuration
 	serve         reconcile at startup and at most every 60 seconds

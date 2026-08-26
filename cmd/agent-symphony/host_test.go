@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -69,6 +70,37 @@ func TestHostOrchestratorProposalEmitsOnlyTheFixedValidatedFrame(t *testing.T) {
 	}
 	if output.Len() != 0 {
 		t.Fatalf("invalid proposal emitted output: %q", output.String())
+	}
+	output.Reset()
+	if err := reportHostOrchestratorProposalStatus(root, strings.NewReader(proposal), &output); err != nil || !strings.Contains(output.String(), `"state":"unknown"`) {
+		t.Fatalf("uncaptured proposal status=%q err=%v", output.String(), err)
+	}
+	if entries, err := os.ReadDir(workspace); err != nil || len(entries) != 0 {
+		t.Fatalf("read-only status changed workspace: entries=%#v err=%v", entries, err)
+	}
+}
+
+func TestHostTransitionRetryProposalReportsCoordinatorResolution(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "orchestrator-test")
+	if err := os.Mkdir(workspace, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	oldGetwd := hostGetwd
+	hostGetwd = func() (string, error) { return workspace, nil }
+	t.Cleanup(func() { hostGetwd = oldGetwd })
+	submitted := `{"version":1,"repository":"o/r","issue":161,"attempt":1,"action":"retry_transition","request_id":"retry-161-1"}`
+	proposal, _, err := parseHostOrchestratorProposal(strings.NewReader(submitted))
+	if err != nil || proposal.Action != orchestratoragent.ProposalActionRetry {
+		t.Fatalf("proposal=%#v err=%v", proposal, err)
+	}
+	status, _ := json.Marshal(orchestratoragent.MessageProposalStatus{Version: 1, UpdatedAt: time.Now().UTC(), ConsumedBinding: proposal.Binding, ResolvedBinding: proposal.Binding, Resolution: "refused", Detail: "target is stale"})
+	if err := os.WriteFile(filepath.Join(workspace, orchestratoragent.MessageProposalStatusFile), status, 0o440); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := reportHostOrchestratorProposalStatus(root, strings.NewReader(submitted), &output); err != nil || !strings.Contains(output.String(), `"state":"refused"`) || !strings.Contains(output.String(), `"detail":"target is stale"`) {
+		t.Fatalf("resolved proposal status=%q err=%v", output.String(), err)
 	}
 }
 
@@ -270,6 +302,32 @@ func TestHostOrchestratorLaunchContractIsReadOnlyAndCredentialFiltered(t *testin
 	}
 	if got.Name != "operator-agent" || !slices.Equal(got.Args, []string{"--read-only", "sanitized context"}) || !slices.Contains(got.Env, "HOME=/reviewer-home") || slices.ContainsFunc(got.Env, func(value string) bool { return strings.HasPrefix(value, "GH_TOKEN=") }) {
 		t.Fatalf("unsafe launch: %#v", got)
+	}
+	oneShot, _ := json.Marshal(struct {
+		Version int      `json:"version"`
+		Command []string `json:"command"`
+		Context string   `json:"context"`
+		OneShot bool     `json:"one_shot"`
+		Timeout int      `json:"timeout_seconds"`
+	}{1, []string{"operator-agent", "--read-only", "-"}, "audit prompt", true, 120})
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, oneShot, 0o440); err != nil {
+		t.Fatal(err)
+	}
+	var stdin string
+	hostOrchestratorRun = func(_ context.Context, command agentruntime.Command) error {
+		got = command
+		body, _ := io.ReadAll(command.Stdin)
+		stdin = string(body)
+		return nil
+	}
+	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got.Args, []string{"--read-only", "-"}) || stdin != "audit prompt" {
+		t.Fatalf("one-shot launch args=%q stdin=%q", got.Args, stdin)
 	}
 	hostEGID = func() int { return oldEGID() + 1 }
 	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err == nil {
