@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -12,26 +13,28 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
 type orchestratorTestRunner struct {
-	live bool
-	pane string
+	live  bool
+	pane  string
+	audit func(context.Context, agentruntime.Command) (agentruntime.Result, error)
 }
 
 func fakeAdvancedOrchestratorHost(t *testing.T) int {
 	t.Helper()
 	snapshotRoot := t.TempDir()
-	info, err := os.Stat(snapshotRoot)
-	if err != nil {
+	gid := os.Getegid()
+	if err := os.Chown(snapshotRoot, -1, gid); err != nil {
 		t.Fatal(err)
 	}
-	gid := fileGID(info)
 	oldUser, oldGroup, oldSnapshotRoot := hostLookupUser, hostLookupGroup, reviewSnapshotRoot
 	hostLookupUser = func(name string) (*user.User, error) {
 		return &user.User{Username: name, Uid: strconv.Itoa(os.Geteuid()), Gid: strconv.Itoa(gid)}, nil
@@ -46,7 +49,13 @@ func fakeAdvancedOrchestratorHost(t *testing.T) int {
 	return gid
 }
 
-func (r *orchestratorTestRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+func (r *orchestratorTestRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+	if command.Name != "tmux" {
+		if r.audit != nil {
+			return r.audit(ctx, command)
+		}
+		return agentruntime.Result{}, nil
+	}
 	switch command.Args[0] {
 	case "display-message":
 		if !r.live {
@@ -64,6 +73,70 @@ func (r *orchestratorTestRunner) Run(_ context.Context, command agentruntime.Com
 		r.live = false
 	}
 	return agentruntime.Result{}, nil
+}
+
+func TestAdvancedOrchestratorHeartbeatWritesReviewerWritableResult(t *testing.T) {
+	gid := fakeAdvancedOrchestratorHost(t)
+	stateRoot := t.TempDir()
+	cfg := config.Default("SysSU/example")
+	cfg.Commands.Orchestrator = []string{"operator-agent"}
+	cfg.Commands.OrchestratorAudit = []string{"audit-agent", "--output", "{orchestrator_result}", "-"}
+	agent, err := newOrchestratorAgent(cfg, stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resultPath := filepath.Join(agent.AuditWorkspace, "orchestrator-audit-result.txt")
+	oldGetwd, oldRun, oldEGID := hostGetwd, hostOrchestratorRun, hostEGID
+	hostGetwd = func() (string, error) { return agent.AuditWorkspace, nil }
+	hostEGID = func() int { return gid }
+	hostOrchestratorRun = func(_ context.Context, command agentruntime.Command) error {
+		info, statErr := os.Stat(resultPath)
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode().Perm() != 0o660 || fileGID(info) != gid {
+			return fmt.Errorf("reviewer result mode=%v gid=%d", info.Mode(), fileGID(info))
+		}
+		if command.Name != "audit-agent" || !slices.Equal(command.Args, []string{"--output", resultPath, "-"}) {
+			return fmt.Errorf("audit command=%#v", command)
+		}
+		return os.WriteFile(resultPath, []byte("VERIFIED: reviewer audit completed."), 0o660)
+	}
+	t.Cleanup(func() { hostGetwd, hostOrchestratorRun, hostEGID = oldGetwd, oldRun, oldEGID })
+
+	runner := &orchestratorTestRunner{}
+	runner.audit = func(ctx context.Context, _ agentruntime.Command) (agentruntime.Result, error) {
+		return agentruntime.Result{}, runHostOrchestrator(ctx, productionSnapshotRoot(stateRoot), "/reviewer-home", false)
+	}
+	agent.Runner = runner
+	if _, err := agent.Observe(t.Context(), []orchestrator.RecoveryStatus{{Repository: cfg.Repository, Issue: 161, Attempt: 1, State: "active"}}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		body, readErr := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.HeartbeatReportFile))
+		var report struct {
+			State  string `json:"state"`
+			Report string `json:"report"`
+		}
+		if readErr == nil && json.Unmarshal(body, &report) == nil && report.State == "completed" {
+			if report.Report != "VERIFIED: reviewer audit completed." {
+				t.Fatalf("heartbeat report=%q", report.Report)
+			}
+			break
+		}
+		if report.State == "failed" {
+			t.Fatalf("heartbeat audit failed: body=%q", body)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("heartbeat audit did not complete: body=%q err=%v", body, readErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(resultPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reviewer result was not removed: %v", err)
+	}
 }
 
 func TestConfiguredFullAccessOrchestratorProposesThroughCapturedOutput(t *testing.T) {

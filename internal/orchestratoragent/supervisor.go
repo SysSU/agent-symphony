@@ -607,8 +607,8 @@ func (s *Supervisor) prepareAudit(prompt string, startedAt time.Time, projection
 	resultPath := filepath.Join(s.AuditWorkspace, auditResultFile)
 	usesResultFile := slices.ContainsFunc(s.AuditCommand, func(arg string) bool { return strings.Contains(arg, auditResultPlaceholder) })
 	if usesResultFile {
-		if err := os.Remove(resultPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove stale orchestrator audit result: %w", err)
+		if err := writeAtomic(resultPath, nil, 0o660); err != nil {
+			return fmt.Errorf("prepare orchestrator audit result: %w", err)
 		}
 	}
 	command := slices.Clone(s.AuditCommand)

@@ -218,7 +218,11 @@ export default function Dashboard() {
       {actionNotice ? <p className="notice" role="status">{actionNotice}</p> : null}
       {!error && snapshot && statuses.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
 
-      <section className="board" aria-label="Issue status board" tabIndex={0}>
+      <section className="board" aria-label="Issue status board" tabIndex={0} onKeyDown={(event) => {
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        event.preventDefault();
+        event.currentTarget.scrollLeft += event.key === "ArrowLeft" ? -event.currentTarget.clientWidth : event.currentTarget.clientWidth;
+      }}>
         {lanes.map((lane) => (
           <section className="lane" aria-labelledby={`lane-${lane.id}`} key={lane.id}>
             <header className="laneHeader">

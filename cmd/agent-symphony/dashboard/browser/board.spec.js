@@ -101,6 +101,8 @@ test("renders every board lane and keeps overflowing lanes keyboard reachable", 
   await expect(board).toHaveCSS("outline-style", "solid");
   await page.keyboard.press("ArrowRight");
   await expect.poll(() => board.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
+  await page.keyboard.press("ArrowLeft");
+  await expect.poll(() => board.evaluate((element) => element.scrollLeft)).toBe(0);
 });
 
 test("contains long attempt text inside a mobile viewport", async ({ page }) => {
