@@ -2210,6 +2210,7 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 			return false, err
 		}
 	}
+	result.Validation = fmt.Sprintf("Independent review passed for exact head `%s`.", head)
 	run := func(dir string, args ...string) (string, error) {
 		out, err := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "-C", dir}, args...)...).CombinedOutput()
 		return strings.TrimSpace(string(out)), err

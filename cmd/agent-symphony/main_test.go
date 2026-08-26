@@ -1554,7 +1554,7 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: branch, BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "focused tests passed", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
+	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: branch, BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "stale diagnostic probe", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
 	exportedJSON, _ := json.Marshal(exported)
 	boundaryResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
 	implementation := filepath.Join(t.TempDir(), "implementation-boundary")
@@ -1638,6 +1638,9 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	}
 	if !strings.Contains(pullBody, head) || !strings.Contains(pullBody, "Attempt: 1") || strings.Contains(pullBody, "Attempt: 2") || len(comments) != 3 {
 		t.Fatalf("pull request was not fully updated: body=%q comments=%#v", pullBody, comments)
+	}
+	if !strings.Contains(pullBody, "Independent review passed for exact head `"+head+"`.") || strings.Contains(pullBody, "stale diagnostic probe") {
+		t.Fatalf("pull request did not publish exact-head review evidence: body=%q", pullBody)
 	}
 }
 
