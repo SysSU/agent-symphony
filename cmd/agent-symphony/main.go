@@ -2142,6 +2142,15 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 					completed = internalgithub.PreparedPublication{Handoff: handoff, Outcome: outcome, HeadSHA: head}
 					return recovery.PrepareHandoffPublication(ctx, handoff, head, outcome)
 				}
+			} else if bound.PR > 0 {
+				prepare = func(head string) error {
+					if head == bound.HeadSHA {
+						return nil
+					}
+					var err error
+					completed, err = recovery.PrepareAttemptPublication(ctx, manifest.Repository, bound.PR, manifest.Issue, manifest.Attempt, bound.HeadSHA, head)
+					return err
+				}
 			}
 			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot, prepare)
 			if err != nil {
@@ -2150,7 +2159,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			if pending {
 				continue
 			}
-			if handoff.PR == 0 {
+			if completed.HeadSHA == "" {
 				continue
 			}
 			if err := recovery.CompleteHandoffPublication(ctx, completed); err != nil {

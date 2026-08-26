@@ -1642,6 +1642,10 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	if !strings.Contains(pullBody, "Independent review passed for exact head `"+head+"`.") || strings.Contains(pullBody, "stale diagnostic probe") {
 		t.Fatalf("pull request did not publish exact-head review evidence: body=%q", pullBody)
 	}
+	recovered, err := (&internalgithub.FileRecovery{Path: recoveryPath}).PullRequestState(t.Context(), "o/r", 7, 23, 1, head)
+	if err != nil || recovered.HeadSHA != head {
+		t.Fatalf("published follow-up did not advance recovery: state=%#v err=%v", recovered, err)
+	}
 }
 
 func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testing.T) {
