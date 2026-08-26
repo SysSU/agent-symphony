@@ -58,6 +58,7 @@ type dashboardServer struct {
 	reconcile    func(context.Context) error
 	mu           *sync.Mutex
 	localMu      sync.Mutex
+	messageMu    sync.Mutex
 	sessionOnce  sync.Once
 	sessionKey   [32]byte
 	sessionErr   error
@@ -698,17 +699,9 @@ func (s *dashboardServer) serveOrchestratorMessageAction(w http.ResponseWriter, 
 		http.Error(w, "worker message confirmation requires a dashboard browser nonce", http.StatusForbidden)
 		return
 	}
-	operationMu := s.mu
-	if operationMu == nil {
-		operationMu = &s.localMu
-	}
-	if !operationMu.TryLock() {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
-		return
-	}
-	defer operationMu.Unlock()
-	// Re-read under the coordinator operation lock so confirmation binds the
+	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
+	// Re-read under the message lock so confirmation binds the
 	// exact bytes the operator reviewed, not a replaced proposal.
 	current, err = s.messages.MessageProposal(r.Context())
 	if err != nil || current != submitted {
@@ -779,18 +772,11 @@ func (s *dashboardServer) serveAttemptMessageAction(w http.ResponseWriter, r *ht
 		http.Error(w, "invalid worker follow-up", http.StatusBadRequest)
 		return
 	}
-	operationMu := s.mu
-	if operationMu == nil {
-		operationMu = &s.localMu
-	}
-	if !operationMu.TryLock() {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
-		return
-	}
-	defer operationMu.Unlock()
+	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
 	status, err := s.projectedStatus(issue, attempt)
-	if err != nil || !slices.Contains([]string{"active", "review-ready"}, status.State) {
+	messageEligible := err == nil && (slices.Contains([]string{"active", "review-ready"}, status.State) || status.Retryable && slices.Contains([]string{"blocked", "orphaned"}, status.State))
+	if !messageEligible {
 		http.Error(w, "attempt is not eligible for a worker follow-up", http.StatusConflict)
 		return
 	}
@@ -898,7 +884,9 @@ func (s *dashboardServer) serveOrchestratorTerminal(w http.ResponseWriter, r *ht
 }
 
 func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Request, session string, readOnly bool) {
-	if exec.CommandContext(r.Context(), s.tmux, "has-session", "-t", "="+session).Run() != nil {
+	probe := exec.CommandContext(r.Context(), s.tmux, "has-session", "-t", "="+session)
+	probe.Dir = "/tmp"
+	if probe.Run() != nil {
 		http.Error(w, "terminal session is not running", http.StatusConflict)
 		return
 	}
@@ -915,6 +903,7 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 		args = append(args, "-r")
 	}
 	command := exec.CommandContext(ctx, s.tmux, append(args, "-t", "="+session)...)
+	command.Dir = "/tmp"
 	command.Env = append(os.Environ(), "TERM=xterm-256color")
 	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 24, Cols: 80})
 	if err != nil {

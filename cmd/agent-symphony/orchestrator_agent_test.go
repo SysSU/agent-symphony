@@ -24,6 +24,28 @@ type orchestratorTestRunner struct {
 	pane string
 }
 
+func TestDashboardMessageConfirmationSchedulesOnlyDurablyAcceptedMessages(t *testing.T) {
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 4, Attempt: 2, Message: "Continue."}
+	var scheduled internalgithub.OperatorMessage
+	service := dashboardOrchestratorService{
+		confirm: func(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
+			return internalgithub.PrepareOperatorMessage("o/r", 4, 2, "Continue.")
+		},
+		accepted: func(message internalgithub.OperatorMessage) { scheduled = message },
+	}
+	message, err := service.ConfirmMessage(t.Context(), proposal)
+	if err != nil || scheduled.ID == "" || scheduled.ID != message.ID {
+		t.Fatalf("message=%#v scheduled=%#v err=%v", message, scheduled, err)
+	}
+	service.confirm = func(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
+		return internalgithub.OperatorMessage{}, errors.New("not recorded")
+	}
+	scheduled = internalgithub.OperatorMessage{}
+	if _, err := service.ConfirmMessage(t.Context(), proposal); err == nil || scheduled.ID != "" {
+		t.Fatalf("failed confirmation scheduled=%#v err=%v", scheduled, err)
+	}
+}
+
 func fakeAdvancedOrchestratorHost(t *testing.T) int {
 	t.Helper()
 	snapshotRoot := t.TempDir()

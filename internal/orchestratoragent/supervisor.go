@@ -748,7 +748,11 @@ func (s *Supervisor) run(ctx context.Context, name string, args []string, input 
 	if runner == nil {
 		runner = agentruntime.ExecRunner{}
 	}
-	command := agentruntime.Command{Name: name, Args: args, Dir: s.Workspace, Env: s.Env, Stdin: input}
+	dir := s.Workspace
+	if name == "tmux" {
+		dir = "/tmp"
+	}
+	command := agentruntime.Command{Name: name, Args: args, Dir: dir, Env: s.Env, Stdin: input}
 	result, err := runner.Run(ctx, command)
 	if err != nil {
 		return result, fmt.Errorf("%s %q: %w", name, args, err)

@@ -217,6 +217,34 @@ func TestAPIReadPersistsETagAndBody(t *testing.T) {
 	}
 }
 
+func TestAPIReadSnapshotDeduplicatesUntilMutation(t *testing.T) {
+	var reads atomic.Int32
+	api := API{BaseURL: "https://api.example.test", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			reads.Add(1)
+			return httpResponse(http.StatusOK, `{"ok":true}`, nil), nil
+		}
+		return httpResponse(http.StatusCreated, `{}`, nil), nil
+	})}}.WithReadSnapshot()
+	var result struct {
+		OK bool `json:"ok"`
+	}
+	if _, _, err := api.Read(t.Context(), "/read", "", &result); err != nil {
+		t.Fatal(err)
+	}
+	result.OK = false
+	if _, _, err := api.Read(t.Context(), "/read", "", &result); err != nil || !result.OK || reads.Load() != 1 {
+		t.Fatalf("snapshot read: result=%#v reads=%d err=%v", result, reads.Load(), err)
+	}
+	body, _ := AttributedBody(5, 1, "done")
+	if err := api.Mutate(t.Context(), http.MethodPost, "/write", map[string]string{"body": body}, Mutation{Issue: 5, Attempt: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := api.Read(t.Context(), "/read", "", &result); err != nil || reads.Load() != 2 {
+		t.Fatalf("post-mutation read: reads=%d err=%v", reads.Load(), err)
+	}
+}
+
 func TestReadCacheRejectsUnsafeState(t *testing.T) {
 	dir := t.TempDir()
 	malformed := filepath.Join(dir, "malformed.json")
@@ -354,9 +382,10 @@ func TestAgentEnvironmentRejectsReservedExplicitNames(t *testing.T) {
 	}
 }
 
-func TestAgentEnvironmentNeverCarriesCoordinatorHome(t *testing.T) {
-	env, err := AgentEnvironmentWith([]string{"HOME=/coordinator", "PATH=/bin"})
-	if err != nil || strings.Contains(strings.Join(env, "\n"), "HOME=") {
+func TestAgentEnvironmentCarriesIsolatedCodexHomeButNotCoordinatorHome(t *testing.T) {
+	env, err := AgentEnvironmentWith([]string{"HOME=/coordinator", "CODEX_HOME=/runtime/codex", "PATH=/bin"})
+	joined := strings.Join(env, "\n")
+	if err != nil || strings.Contains(joined, "HOME=/coordinator") || !strings.Contains(joined, "CODEX_HOME=/runtime/codex") {
 		t.Fatalf("environment=%v err=%v", env, err)
 	}
 }

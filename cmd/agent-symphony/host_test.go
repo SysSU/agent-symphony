@@ -188,8 +188,19 @@ func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
 	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	if launched.Name != "tmux" || !slices.Equal(launched.Args, want) {
+	if launched.Name != "tmux" || !slices.Equal(launched.Args, want) || launched.Dir != "/tmp" {
 		t.Fatalf("runtime command changed at boundary: %#v", launched)
+	}
+	newSession := []string{"new-session", "-d", "-s", "as-o-r-131-3", "-c", root}
+	payload, _ = json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"run", boundaryCommand{Name: "tmux", Args: newSession, Dir: root, Env: []string{"PATH=/bin"}}})
+	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(launched.Args, "HOME=/var/lib/agent-symphony-worker") || launched.Dir != "/tmp" {
+		t.Fatalf("new tmux session did not receive worker HOME from the host boundary: %#v", launched)
 	}
 	want[5] = "5001"
 	payload, _ = json.Marshal(struct {
@@ -483,8 +494,13 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 			if slices.Contains(command.Args, "show-options") {
 				return agentruntime.Result{Output: recipient}, nil
 			}
-			if slices.Contains(command.Args, "set-option") {
+			if command.Args[0] == "respawn-pane" {
 				submission = command
+				var err error
+				recipient, err = acknowledgeHandoffLaunch(command)
+				return agentruntime.Result{}, err
+			}
+			if command.Args[0] == "set-option" {
 				recipient = command.Args[len(command.Args)-1]
 			}
 			return agentruntime.Result{}, nil
@@ -509,10 +525,10 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if _, err := acceptHandoff(t.Context(), request, root); err != nil {
 			t.Fatal(err)
 		}
-		if calls != 3 {
-			t.Fatalf("worker made %d tmux calls, want one lookup plus one two-step delivery", calls)
+		if calls != 4 {
+			t.Fatalf("worker made %d tmux calls, want lookup, buffer load, launch, and ready binding", calls)
 		}
-		if !slices.Contains(submission.Args, "worker-capture-handoff") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
+		if !slices.Contains(submission.Args, "worker-capture-handoff-ready") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
 			t.Fatalf("handoff did not use the stdin capture helper: %#v", submission.Args)
 		}
 		if _, err := os.ReadFile(filepath.Join(worktree, ".agent-symphony", "handoffs", "pane-test.json")); err != nil {
@@ -749,7 +765,11 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 			recipient, deliveries, injected := "", 0, false
 			hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 				if command.Args[0] == "set-option" {
-					recipient = ""
+					if len(command.Args) == 5 {
+						recipient = ""
+					} else {
+						recipient = command.Args[len(command.Args)-1]
+					}
 					return agentruntime.Result{}, nil
 				}
 				if slices.Contains(command.Args, "show-options") {
@@ -762,21 +782,22 @@ func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 					injected = true
 					return agentruntime.Result{}, errors.New("injected load failure")
 				}
-				if slices.Contains(command.Args, "set-option") {
+				if command.Args[0] == "respawn-pane" {
 					if !injected && test.failure == "submission" {
 						injected = true
 						return agentruntime.Result{}, errors.New("injected submission failure")
 					}
+					launchedRecipient, launchErr := acknowledgeHandoffLaunch(command)
+					if launchErr != nil {
+						return agentruntime.Result{}, launchErr
+					}
 					if !injected && test.failure == "respawn-side-effect" {
 						injected = true
 						deliveries++
-						launchedPath := filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.launched")
-						if err := writeImmutable(launchedPath, []byte(command.Args[len(command.Args)-1])); err != nil {
-							t.Fatal(err)
-						}
+						recipient = launchedRecipient
 						return agentruntime.Result{}, errors.New("injected failure after respawn")
 					}
-					recipient, deliveries = command.Args[len(command.Args)-1], deliveries+1
+					recipient, deliveries = launchedRecipient, deliveries+1
 				}
 				return agentruntime.Result{}, nil
 			}
@@ -907,8 +928,13 @@ func TestMissingOperatorHandoffBindingCannotReuseTmuxLaunchOption(t *testing.T) 
 			return agentruntime.Result{Output: option}, nil
 		case "set-option":
 			option = ""
+			if len(command.Args) == 6 {
+				option = command.Args[5]
+			}
 		case "respawn-pane":
-			option = recipient
+			if _, err := acknowledgeHandoffLaunch(command); err != nil {
+				return agentruntime.Result{}, err
+			}
 			launches++
 			if index := slices.Index(command.Args, "-c"); index >= 0 && index+1 < len(command.Args) {
 				launchDir = command.Args[index+1]
@@ -928,6 +954,63 @@ func TestMissingOperatorHandoffBindingCannotReuseTmuxLaunchOption(t *testing.T) 
 	}
 	if launches != 1 || launchDir != worktree {
 		t.Fatalf("fresh handoff launches=%d dir=%q", launches, launchDir)
+	}
+}
+
+func TestOperatorHandoffRetriesAfterUnacknowledgedWorkerStartup(t *testing.T) {
+	oldExec := hostExecRunner
+	t.Cleanup(func() { hostExecRunner = oldExec })
+	root := t.TempDir()
+	worktree := filepath.Join(root, "attempt")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	handoff := json.RawMessage(`{"type":"agent-symphony-handoff-v1","key":"operator-message-retry","kind":"operator-message"}`)
+	request := handoffRequest{
+		Manifest:     agentruntime.Manifest{Worktree: worktree, Session: "as-retry", LogPath: filepath.Join(worktree, "attempt.log")},
+		Handoff:      handoff,
+		OutcomePath:  handoffReceiptPath(worktree, "operator-message-retry"),
+		OutcomeToken: "token",
+		Command:      []string{"implementation"},
+	}
+	binding, recipient := handoffBinding(request)
+	inbox := filepath.Join(worktree, ".agent-symphony", "handoffs")
+	if err := os.MkdirAll(inbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeImmutable(filepath.Join(inbox, "operator-message-retry.json"), binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeImmutable(filepath.Join(inbox, "operator-message-retry.launching"), []byte(recipient)); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(request)
+	respawns := 0
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		switch command.Args[0] {
+		case "show-options":
+			return agentruntime.Result{}, nil
+		case "display-message":
+			if slices.Contains(command.Args, "#{pane_start_command}") {
+				return agentruntime.Result{Output: "/bin/zsh"}, nil
+			}
+			return agentruntime.Result{Output: "0"}, nil
+		case "respawn-pane":
+			respawns++
+			if _, err := acknowledgeHandoffLaunch(command); err != nil {
+				return agentruntime.Result{}, err
+			}
+		}
+		return agentruntime.Result{}, nil
+	}
+	if _, err := acceptOperatorHandoff(t.Context(), body, root); err != nil {
+		t.Fatal(err)
+	}
+	if respawns != 1 {
+		t.Fatalf("replacement worker respawns=%d", respawns)
+	}
+	if body, err := os.ReadFile(filepath.Join(inbox, "operator-message-retry.launched")); err != nil || string(body) != recipient {
+		t.Fatalf("replacement launch was not acknowledged: %q %v", body, err)
 	}
 }
 
@@ -1568,12 +1651,18 @@ func TestBoundarySelectionUsesLocalModeWhenHostIsolationIsNotInstalled(t *testin
 	if want := "AGENT_SYMPHONY_LOCAL_ROOT=" + localAttemptRoot(stateRoot); !slices.Contains(implementation.Env, want) {
 		t.Fatalf("expected local root env %q, got %#v", want, implementation.Env)
 	}
+	if want := "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot); !slices.Contains(implementation.Env, want) {
+		t.Fatalf("expected project tmux env %q, got %#v", want, implementation.Env)
+	}
 	review := reviewBoundary(stateRoot)
 	if review.Command == "sudo" {
 		t.Fatalf("expected local review boundary, got sudo: %#v", review)
 	}
 	if want := "AGENT_SYMPHONY_LOCAL_ROOT=" + localSnapshotRoot(stateRoot); !slices.Contains(review.Env, want) {
 		t.Fatalf("expected local snapshot root env %q, got %#v", want, review.Env)
+	}
+	if want := "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot); !slices.Contains(review.Env, want) {
+		t.Fatalf("expected project tmux env %q, got %#v", want, review.Env)
 	}
 }
 

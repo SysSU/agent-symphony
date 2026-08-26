@@ -343,7 +343,8 @@ func TestDashboardQueuesAuthenticatedWorkerFollowUpForExactProjectedAttempt(t *t
 		t.Fatalf("unauthenticated status=%d confirms=%d", response.Code, service.confirms)
 	}
 
-	server := &dashboardServer{stateRoot: root, password: "password", messages: service, mu: &sync.Mutex{}}
+	operationMu := &sync.Mutex{}
+	server := &dashboardServer{stateRoot: root, password: "password", messages: service, mu: operationMu}
 	handler := server.handler(http.NotFoundHandler())
 	navigate := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/", nil)
 	navigate.Header.Set("Sec-Fetch-Mode", "navigate")
@@ -359,10 +360,25 @@ func TestDashboardQueuesAuthenticatedWorkerFollowUpForExactProjectedAttempt(t *t
 	request.SetBasicAuth("agent-symphony", "password")
 	request.AddCookie(sessionCookie)
 	response = httptest.NewRecorder()
+	operationMu.Lock()
 	handler.ServeHTTP(response, request)
+	operationMu.Unlock()
 	want := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "Continue the focused fix."}
 	if response.Code != http.StatusOK || service.confirms != 1 || service.confirmed != want || !strings.Contains(response.Body.String(), `"state":"queued"`) {
 		t.Fatalf("status=%d confirms=%d proposal=%#v body=%q", response.Code, service.confirms, service.confirmed, response.Body.String())
+	}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 131, Attempt: 3, State: "blocked", Retryable: true, Session: session}}); err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/attempt/message?issue=131&attempt=3", strings.NewReader(`{"message":"Recover and continue."}`))
+	request.Header.Set("Origin", "http://127.0.0.1")
+	request.Header.Set("Content-Type", "application/json")
+	request.SetBasicAuth("agent-symphony", "password")
+	request.AddCookie(sessionCookie)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || service.confirms != 2 {
+		t.Fatalf("retryable status=%d confirms=%d body=%q", response.Code, service.confirms, response.Body.String())
 	}
 }
 
@@ -377,7 +393,8 @@ func TestDashboardWorkerMessageRequiresAuthenticationAndExactConfirmationBinding
 		t.Fatalf("unauthenticated message feature status=%d", response.Code)
 	}
 
-	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, service, false, "password")
+	operationMu := &sync.Mutex{}
+	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", operationMu, nil, nil, service, false, "password")
 	navigate := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/", nil)
 	navigate.Header.Set("Sec-Fetch-Mode", "navigate")
 	navigate.Header.Set("Sec-Fetch-Dest", "document")
@@ -439,7 +456,9 @@ func TestDashboardWorkerMessageRequiresAuthenticationAndExactConfirmationBinding
 		t.Fatalf("nonce reused for replacement proposal status=%d confirms=%d", response.Code, service.confirms)
 	}
 	service.proposal = proposal
+	operationMu.Lock()
 	response = post(proposal, true)
+	operationMu.Unlock()
 	if response.Code != http.StatusOK || service.confirms != 1 || service.consumes != 1 || strings.Contains(response.Body.String(), proposal.Message) {
 		t.Fatalf("confirmed status=%d confirms=%d consumes=%d body=%q", response.Code, service.confirms, service.consumes, response.Body.String())
 	}

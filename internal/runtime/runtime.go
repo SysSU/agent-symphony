@@ -216,8 +216,94 @@ func (r *Runtime) ResumeHandoff(ctx context.Context, attempt Attempt) (Manifest,
 	if attempt.Eligible != nil && !attempt.Eligible() {
 		return Manifest{}, errors.New("attempt is no longer eligible")
 	}
+	live, err := r.session(ctx, manifest.Session)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if !live {
+		env, err := internalgithub.AgentEnvironmentWith(os.Environ(), r.AllowEnv...)
+		if err != nil {
+			return Manifest{}, err
+		}
+		if err := r.startSession(ctx, manifest, env); err != nil {
+			return Manifest{}, err
+		}
+	}
 	manifest.State, manifest.Diagnostic, manifest.UpdatedAt = "running", "", time.Now().UTC()
 	return manifest, r.writeManifest(attempt, manifest)
+}
+
+// RecoverInterruptedHandoff restores the retained completed turn when a
+// claimed replacement died before its launch acknowledgment became durable.
+func (r *Runtime) RecoverInterruptedHandoff(ctx context.Context, manifest Manifest, handoffKey string) (Manifest, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.VerifyWorker == nil {
+		return manifest, false, errors.New("worker identity verification hook is required")
+	}
+	if err := r.VerifyWorker(ctx); err != nil {
+		return manifest, false, fmt.Errorf("verify worker identity: %w", err)
+	}
+	attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		return manifest, false, err
+	}
+	if manifest.State != "running" || handoffKey == "" || filepath.Base(handoffKey) != handoffKey || strings.ContainsAny(handoffKey, "/\\\x00\r\n") {
+		return manifest, false, nil
+	}
+	inbox := filepath.Join(manifest.Worktree, ".agent-symphony", "handoffs")
+	launchingPath := filepath.Join(inbox, handoffKey+".launching")
+	launchedPath := filepath.Join(inbox, handoffKey+".launched")
+	launching := false
+	if info, err := os.Lstat(launchingPath); err == nil {
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() == 0 {
+			return manifest, false, nil
+		}
+		launching = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return manifest, false, err
+	}
+	if _, err := os.Lstat(launchedPath); err == nil {
+		return manifest, false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return manifest, false, err
+	}
+	if info, err := os.Lstat(ResultPath(manifest.Worktree)); err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return manifest, false, nil
+	}
+	live, err := r.session(ctx, manifest.Session)
+	if err != nil {
+		return manifest, false, err
+	}
+	if live {
+		if !launching {
+			return manifest, false, nil
+		}
+		target := PaneTarget(manifest.Session)
+		state, err := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", target, "#{pane_dead}"}, "", []string{}, nil)
+		if err != nil || strings.TrimSpace(state.Output) != "1" {
+			return manifest, false, err
+		}
+		started, err := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", target, "#{pane_start_command}"}, "", []string{}, nil)
+		if err != nil || !strings.Contains(started.Output, " worker-capture-handoff-ready ") {
+			return manifest, false, err
+		}
+		if _, err := r.run(ctx, r.tmux(), []string{"kill-session", "-t", "=" + manifest.Session}, "", []string{}, nil); err != nil {
+			return manifest, false, err
+		}
+	}
+	env, err := internalgithub.AgentEnvironmentWith(os.Environ(), r.AllowEnv...)
+	if err != nil {
+		return manifest, false, err
+	}
+	if err := r.startSession(ctx, manifest, env); err != nil {
+		return manifest, false, err
+	}
+	manifest.State, manifest.Diagnostic, manifest.UpdatedAt = "completed", "", time.Now().UTC()
+	if err := r.writeManifest(attempt, manifest); err != nil {
+		return manifest, false, err
+	}
+	return manifest, true, nil
 }
 
 type Runtime struct {
@@ -274,9 +360,9 @@ func PromptCommand(helper, tmux, buffer, resultPath string, command []string) []
 }
 
 // HandoffPromptCommand records and signals worker-owned launch after the
-// replacement worker starts.
+// replacement worker produces its first observable output.
 func HandoffPromptCommand(helper, tmux, buffer, resultPath, launchedPath, recipient, signal string, command []string) []string {
-	return append([]string{helper, "worker-capture-handoff", tmux, buffer, resultPath, launchedPath, recipient, signal, "--"}, command...)
+	return append([]string{helper, "worker-capture-handoff-ready", tmux, buffer, resultPath, launchedPath, recipient, signal, "--"}, command...)
 }
 
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
@@ -371,20 +457,10 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 		_ = r.writeManifest(attempt, manifest)
 		return manifest, fmt.Errorf("attempt became ineligible before launch")
 	}
-	args := []string{"new-session", "-d", "-s", manifest.Session, "-c", manifest.Worktree, "-e", "GIT_CONFIG_NOSYSTEM=1", "-e", "GIT_TERMINAL_PROMPT=0"}
-	for _, value := range env {
-		args = append(args, "-e", value)
-	}
-	if _, err := r.run(ctx, r.tmux(), args, "", []string{}, nil); err != nil {
+	if err := r.startSession(ctx, manifest, env); err != nil {
 		return failStop("launch tmux", err)
 	}
 	target := PaneTarget(manifest.Session)
-	if _, err := r.run(ctx, r.tmux(), []string{"set-option", "-w", "-t", target, "remain-on-exit", "on"}, "", []string{}, nil); err != nil {
-		return failStop("configure tmux", err)
-	}
-	if _, err := r.run(ctx, r.tmux(), []string{"set-option", "-w", "-t", target, "history-limit", historyLimit}, "", []string{}, nil); err != nil {
-		return failStop("configure tmux history", err)
-	}
 	if attempt.Context != "" {
 		if _, err := r.run(ctx, r.tmux(), []string{"load-buffer", "-b", manifest.Session, "-"}, "", []string{}, strings.NewReader(attempt.Context)); err != nil {
 			return failStop("load agent context", err)
@@ -446,6 +522,76 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 	return manifest, r.writeManifest(attempt, manifest)
 }
 
+// InterruptLegacyOperatorHandoff replaces only an old handoff protocol running
+// the former default Codex command after one full reconciliation deadline.
+func (r *Runtime) InterruptLegacyOperatorHandoff(ctx context.Context, manifest Manifest, minimumAge time.Duration) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
+	if manifest.State != "running" || time.Since(manifest.UpdatedAt) < minimumAge {
+		return false, nil
+	}
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		return false, err
+	}
+	target := PaneTarget(manifest.Session)
+	started, err := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", target, "#{pane_start_command}"}, "", []string{}, nil)
+	if err != nil {
+		return false, err
+	}
+	command := strings.TrimSpace(started.Output)
+	legacyProtocol := strings.Contains(command, " worker-capture-handoff ") && !strings.Contains(command, " worker-capture-handoff-ready ")
+	defaultCodex := strings.HasSuffix(command, " -- codex exec --dangerously-bypass-approvals-and-sandbox -") || strings.HasSuffix(command, " -- codex exec resume --last --dangerously-bypass-approvals-and-sandbox -")
+	if !legacyProtocol || !defaultCodex {
+		return false, nil
+	}
+	if _, err := r.run(ctx, r.tmux(), []string{"send-keys", "-t", target, "C-c"}, "", []string{}, nil); err != nil {
+		return false, err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		state, err := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", target, "#{pane_dead}"}, "", []string{}, nil)
+		if err != nil {
+			return false, err
+		}
+		if strings.TrimSpace(state.Output) == "1" {
+			if _, err := r.run(ctx, r.tmux(), []string{"kill-session", "-t", "=" + manifest.Session}, "", []string{}, nil); err != nil {
+				return false, err
+			}
+			env, err := internalgithub.AgentEnvironmentWith(os.Environ(), r.AllowEnv...)
+			if err != nil {
+				return false, err
+			}
+			if err := r.startSession(ctx, manifest, env); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	return false, errors.New("legacy operator handoff did not stop after interrupt")
+}
+
+func (r *Runtime) startSession(ctx context.Context, manifest Manifest, env []string) error {
+	args := []string{"new-session", "-d", "-s", manifest.Session, "-c", manifest.Worktree, "-e", "GIT_CONFIG_NOSYSTEM=1", "-e", "GIT_TERMINAL_PROMPT=0"}
+	for _, value := range env {
+		args = append(args, "-e", value)
+	}
+	if _, err := r.run(ctx, r.tmux(), args, "", []string{}, nil); err != nil {
+		return err
+	}
+	target := PaneTarget(manifest.Session)
+	if _, err := r.run(ctx, r.tmux(), []string{"set-option", "-w", "-t", target, "remain-on-exit", "on"}, "", []string{}, nil); err != nil {
+		return err
+	}
+	_, err := r.run(ctx, r.tmux(), []string{"set-option", "-w", "-t", target, "history-limit", historyLimit}, "", []string{}, nil)
+	return err
+}
+
 // ParsePaneStatus parses tmux's pane_dead and pane_dead_status format.
 func ParsePaneStatus(output string) (bool, int, error) {
 	fields := strings.Fields(output)
@@ -491,16 +637,22 @@ func (r *Runtime) Deliver(ctx context.Context, manifest Manifest, payload []byte
 // VerifyOwned checks exact branch/session identity through the worker boundary
 // without comparing mutable worktree HEAD.
 func (r *Runtime) VerifyOwned(ctx context.Context, manifest Manifest) error {
-	return r.verifyActive(ctx, manifest, "", false)
+	return r.verifyActive(ctx, manifest, "", false, true)
 }
 
 // VerifyActive checks exact branch/head/session identity through the worker
 // boundary; it performs no coordinator-side worker command.
 func (r *Runtime) VerifyActive(ctx context.Context, manifest Manifest, head string) error {
-	return r.verifyActive(ctx, manifest, head, true)
+	return r.verifyActive(ctx, manifest, head, true, true)
 }
 
-func (r *Runtime) verifyActive(ctx context.Context, manifest Manifest, head string, verifyHead bool) error {
+// VerifyRetained checks a completed worktree and result without requiring its
+// previous tmux session; a follow-up handoff creates a fresh session.
+func (r *Runtime) VerifyRetained(ctx context.Context, manifest Manifest, head string) error {
+	return r.verifyActive(ctx, manifest, head, head != "", false)
+}
+
+func (r *Runtime) verifyActive(ctx context.Context, manifest Manifest, head string, verifyHead, verifySession bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.VerifyWorker == nil {
@@ -542,6 +694,13 @@ func (r *Runtime) verifyActive(ctx context.Context, manifest Manifest, head stri
 				return errors.New("worktree HEAD is not descended from the approved base")
 			}
 		}
+	}
+	if !verifySession {
+		result, err := os.Lstat(ResultPath(manifest.Worktree))
+		if err != nil || !result.Mode().IsRegular() || result.Mode()&os.ModeSymlink != 0 {
+			return errors.New("retained worker result is missing or unsafe")
+		}
+		return nil
 	}
 	if _, err := r.run(ctx, r.tmux(), []string{"has-session", "-t", "=" + manifest.Session}, "", nil, nil); err != nil {
 		return errors.New("exact tmux session is not live")

@@ -60,9 +60,10 @@ function StatusActions({ status, onAction, onInvestigate, investigationEnabled, 
 }
 
 function OperatorFollowUp({ status, enabled, onNotice }) {
-  const [message, setMessage] = useState("");
-  const [busy, setBusy] = useState(false);
-  if (!enabled || !["active", "review-ready"].includes(status.state)) return null;
+	const [message, setMessage] = useState("");
+	const [busy, setBusy] = useState(false);
+	const retryable = status.retryable && ["blocked", "orphaned"].includes(status.state);
+	if (!enabled || (!retryable && !["active", "review-ready"].includes(status.state))) return null;
   const id = `follow-up-${status.issue}-${status.attempt}`;
   async function submit(event) {
     event.preventDefault();
@@ -86,8 +87,8 @@ function OperatorFollowUp({ status, enabled, onNotice }) {
     <form className="followUp" onSubmit={submit}>
       <label htmlFor={id}>Tell this agent what to do next</label>
       <textarea id={id} value={message} maxLength={8192} required rows={4} disabled={busy} onChange={(event) => setMessage(event.target.value)} aria-describedby={`${id}-help`} />
-      <p id={`${id}-help`}>Queues one verified follow-up in this exact worktree. The default Codex command resumes its last recorded session. Open tmux above to watch after it starts.</p>
-      <button className="primaryAction" type="submit" disabled={busy || !message.trim()}>{busy ? "Queueing…" : "Queue follow-up and resume"}</button>
+      <p id={`${id}-help`}>Queues one verified fresh turn in this exact worktree. Open tmux above to watch after it starts.</p>
+      <button className="primaryAction" type="submit" disabled={busy || !message.trim()}>{busy ? "Queueing…" : "Queue follow-up"}</button>
     </form>
   );
 }

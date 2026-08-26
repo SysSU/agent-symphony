@@ -73,6 +73,10 @@ var (
 	hostRoot             = ""
 )
 
+func runHostTmux(ctx context.Context, args []string, stdin io.Reader) (agentruntime.Result, error) {
+	return hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: args, Dir: "/tmp", Stdin: stdin})
+}
+
 func nativeRoot(path string) string { return filepath.Join(hostRoot, path) }
 
 // hostIsolationInstalled reports whether install-host has ever provisioned the
@@ -1000,7 +1004,18 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return filterErr
 		}
 		env = append(env, "HOME="+homeDir)
-		result, err = hostExecRunner(ctx, agentruntime.Command{Name: request.Command.Name, Args: request.Command.Args, Dir: request.Command.Dir, Env: env, Stdin: bytes.NewReader(request.Command.Input)})
+		dir := request.Command.Dir
+		args := request.Command.Args
+		if request.Command.Name == "tmux" {
+			dir = "/tmp"
+			if tmuxRoot := os.Getenv("TMUX_TMPDIR"); tmuxRoot != "" {
+				env = append(env, "TMUX_TMPDIR="+tmuxRoot)
+			}
+			if len(args) > 0 && args[0] == "new-session" {
+				args = append(slices.Clone(args), "-e", "HOME="+homeDir)
+			}
+		}
+		result, err = hostExecRunner(ctx, agentruntime.Command{Name: request.Command.Name, Args: args, Dir: dir, Env: env, Stdin: bytes.NewReader(request.Command.Input)})
 	case "export":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot export implementation attempts")
@@ -1125,7 +1140,7 @@ func removeAttemptResources(ctx context.Context, input []byte, root string, comp
 
 func stopAttemptSession(ctx context.Context, session string) error {
 	probe := func() (bool, error) {
-		result, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + session}})
+		result, err := runHostTmux(ctx, []string{"has-session", "-t", "=" + session}, nil)
 		if err == nil {
 			return true, nil
 		}
@@ -1138,7 +1153,7 @@ func stopAttemptSession(ctx context.Context, session string) error {
 	if err != nil || !live {
 		return err
 	}
-	if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", "=" + session}}); err != nil {
+	if _, err := runHostTmux(ctx, []string{"kill-session", "-t", "=" + session}, nil); err != nil {
 		if live, probeErr := probe(); probeErr != nil || live {
 			return errors.Join(err, probeErr)
 		}
@@ -1297,7 +1312,7 @@ func validTmuxBoundaryArgs(args []string, dir, root string) bool {
 	case "has-session", "kill-session":
 		return len(args) == 3 && args[1] == "-t" && validTmuxTarget(args[2], false)
 	case "display-message":
-		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && (args[4] == "#{pane_dead}" || args[4] == "#{pane_dead} #{pane_dead_status}")
+		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", "#{pane_dead} #{pane_dead_status}", "#{pane_start_command}"}, args[4])
 	case "capture-pane":
 		return len(args) == 6 && slices.Equal(args[1:5], []string{"-p", "-S", "-", "-t"}) && validTmuxTarget(args[5], true)
 	case "set-option":
@@ -1328,7 +1343,7 @@ func validTmuxTarget(target string, pane bool) bool {
 
 func reservedHostEnvironment(name string) bool {
 	upper := strings.ToUpper(name)
-	if upper == "HOME" {
+	if upper == "HOME" || upper == "TMUX_TMPDIR" {
 		return true
 	}
 	for _, part := range []string{"TOKEN", "SECRET", "PASSWORD", "PASSWD", "PRIVATE_KEY", "PRIVATE-KEY", "CREDENTIAL", "AUTHORIZATION", "GITHUB_PAT"} {
@@ -1547,7 +1562,7 @@ func verifyHandoff(ctx context.Context, input []byte, root string) (string, erro
 		return "", nil
 	}
 	option := "@agent-symphony-handoff-" + recipient[:16]
-	observed, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"show-options", "-pqv", "-t", agentruntime.PaneTarget(request.Manifest.Session), option}, Dir: request.Manifest.Worktree})
+	observed, err := runHostTmux(ctx, []string{"show-options", "-pqv", "-t", agentruntime.PaneTarget(request.Manifest.Session), option}, nil)
 	if err != nil {
 		return "", fmt.Errorf("verify handoff launch identity: %w", err)
 	}
@@ -1581,7 +1596,7 @@ func acceptOperatorHandoff(ctx context.Context, input []byte, root string) (stri
 		}
 		pane := agentruntime.PaneTarget(request.Manifest.Session)
 		option := "@agent-symphony-handoff-" + recipient[:16]
-		if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-pqu", "-t", pane, option}, Dir: request.Manifest.Worktree}); err != nil {
+		if _, err := runHostTmux(ctx, []string{"set-option", "-pqu", "-t", pane, option}, nil); err != nil {
 			return "", fmt.Errorf("clear stale operator handoff launch identity: %w", err)
 		}
 	}
@@ -1610,7 +1625,7 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 	buffer := "as-handoff-" + fmt.Sprintf("%x", sha256.Sum256(request.Handoff))[:16]
 	pane := agentruntime.PaneTarget(request.Manifest.Session)
 	option := "@agent-symphony-handoff-" + recipient[:16]
-	observed, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"show-options", "-pqv", "-t", pane, option}, Dir: request.Manifest.Worktree})
+	observed, err := runHostTmux(ctx, []string{"show-options", "-pqv", "-t", pane, option}, nil)
 	if err == nil && strings.TrimSpace(observed.Output) == recipient {
 		if err := writeImmutable(request.OutcomePath, ack); err != nil {
 			return "", err
@@ -1647,25 +1662,46 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 		return "", err
 	}
 	if launching {
-		state, stateErr := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", pane, "#{pane_dead}"}, Dir: request.Manifest.Worktree})
+		state, stateErr := runHostTmux(ctx, []string{"display-message", "-p", "-t", pane, "#{pane_dead}"}, nil)
 		if stateErr == nil && strings.TrimSpace(state.Output) == "0" {
-			return "", errors.New("handoff launch remains in flight")
+			started, startErr := runHostTmux(ctx, []string{"display-message", "-p", "-t", pane, "#{pane_start_command}"}, nil)
+			if startErr != nil {
+				return "", errors.New("cannot reconcile in-flight handoff launch")
+			}
+			if strings.Contains(started.Output, " worker-capture-handoff-ready ") && strings.Contains(started.Output, launchedPath) && strings.Contains(started.Output, recipient) {
+				return "", errors.New("handoff launch remains in flight")
+			}
 		}
 		if stateErr != nil || strings.TrimSpace(state.Output) != "1" {
-			return "", errors.New("cannot reconcile in-flight handoff launch")
+			if stateErr != nil || strings.TrimSpace(state.Output) != "0" {
+				return "", errors.New("cannot reconcile in-flight handoff launch")
+			}
+		}
+		if err := os.Remove(launchingPath); err != nil {
+			return "", err
+		}
+		if err := immutableDirSync(inbox); err != nil {
+			return "", err
 		}
 	}
 	signal := buffer + "-launched"
 	command := agentruntime.HandoffPromptCommand(helper, "tmux", buffer, resultPath, launchedPath, recipient, signal, request.Command)
 	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony handoff in the current worktree. It may contain review feedback or one confirmed operator message. Current source refs are available under refs/remotes/agent-symphony/. Do not push or use GitHub credentials; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", request.Handoff)
-	if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: []string{"load-buffer", "-b", buffer, "-"}, Dir: request.Manifest.Worktree, Stdin: bytes.NewReader(prompt)}); err != nil {
+	if _, err := runHostTmux(ctx, []string{"load-buffer", "-b", buffer, "-"}, bytes.NewReader(prompt)); err != nil {
 		return "", err
 	}
 	if err := writeImmutable(launchingPath, []byte(recipient)); err != nil {
 		return "", err
 	}
-	tmuxArgs := append(append([]string{"respawn-pane", "-k", "-t", pane, "-c", request.Manifest.Worktree, "--"}, command...), ";", "wait-for", signal, ";", "set-option", "-p", "-t", pane, option, recipient)
-	if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: tmuxArgs, Dir: request.Manifest.Worktree}); err != nil {
+	tmuxArgs := append(append([]string{"respawn-pane", "-k", "-t", pane, "-c", request.Manifest.Worktree, "--"}, command...), ";", "wait-for", signal)
+	if _, err := runHostTmux(ctx, tmuxArgs, nil); err != nil {
+		return "", err
+	}
+	launched, err = immutableMarkerMatches(launchedPath, []byte(recipient))
+	if err != nil || !launched {
+		return "", errors.New("replacement worker did not produce startup output")
+	}
+	if _, err := runHostTmux(ctx, []string{"set-option", "-p", "-t", pane, option, recipient}, nil); err != nil {
 		return "", err
 	}
 	if err := writeImmutable(request.OutcomePath, ack); err != nil {

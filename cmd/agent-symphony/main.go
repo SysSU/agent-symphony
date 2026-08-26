@@ -84,6 +84,33 @@ type workerBoundaryRunner struct {
 type boundaryCaller interface {
 	call(context.Context, string, agentruntime.Command) (agentruntime.Result, error)
 }
+
+type operationCancellation struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+}
+
+func (o *operationCancellation) begin(ctx context.Context) (context.Context, func()) {
+	operationCtx, cancel := context.WithCancel(ctx)
+	o.mu.Lock()
+	o.cancel = cancel
+	o.mu.Unlock()
+	return operationCtx, func() {
+		cancel()
+		o.mu.Lock()
+		o.cancel = nil
+		o.mu.Unlock()
+	}
+}
+
+func (o *operationCancellation) interrupt() {
+	o.mu.Lock()
+	if o.cancel != nil {
+		o.cancel()
+	}
+	o.mu.Unlock()
+}
+
 type limitedBuffer struct {
 	bytes.Buffer
 	Limit int
@@ -161,7 +188,7 @@ func (b workerBoundaryRunner) call(ctx context.Context, operation string, comman
 
 func minimalBoundaryEnvironment() []string {
 	var env []string
-	for _, name := range []string{"PATH", "TMPDIR", "SYSTEMROOT"} {
+	for _, name := range []string{"PATH", "TMPDIR", "SYSTEMROOT", "CODEX_HOME"} {
 		if value := os.Getenv(name); value != "" {
 			env = append(env, name+"="+value)
 		}
@@ -178,7 +205,7 @@ func implementationBoundary(stateRoot string) workerBoundaryRunner {
 	}
 	binary, _ := os.Executable()
 	if !hostIsolationInstalled() {
-		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "implementation"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localAttemptRoot(stateRoot)}}
+		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "implementation"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localAttemptRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot)}}
 	}
 	return workerBoundaryRunner{Command: "sudo", Args: []string{"-n", "-u", workerUser, "-g", attemptGroup, binary, "agent-host", "implementation"}}
 }
@@ -189,7 +216,7 @@ func reviewBoundary(stateRoot string) workerBoundaryRunner {
 	}
 	binary, _ := os.Executable()
 	if !hostIsolationInstalled() {
-		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "review"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localSnapshotRoot(stateRoot)}}
+		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "review"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localSnapshotRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot)}}
 	}
 	return workerBoundaryRunner{Command: "sudo", Args: []string{"-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "review"}}
 }
@@ -224,6 +251,66 @@ func productionSnapshotRoot(stateRoot string) string {
 		root = "/var/db/agent-symphony/snapshots"
 	}
 	return root
+}
+
+func projectTmuxRoot(stateRoot string) string { return filepath.Join(stateRoot, "tmux") }
+
+var agentCodexAssets = []string{"auth.json", "config.toml", "AGENTS.md", "rules", "skills", "plugins", "cache", "installation_id"}
+
+func configureAgentCodexHome(stateRoot string) error {
+	source := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if source == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("resolve user home for Codex: %w", err)
+		}
+		source = filepath.Join(home, ".codex")
+	}
+	source, err := filepath.Abs(source)
+	if err != nil {
+		return fmt.Errorf("resolve Codex home: %w", err)
+	}
+	target, err := filepath.Abs(filepath.Join(stateRoot, "codex-home"))
+	if err != nil {
+		return fmt.Errorf("resolve agent Codex home: %w", err)
+	}
+	if filepath.Clean(source) == filepath.Clean(target) {
+		return os.Setenv("CODEX_HOME", target)
+	}
+	if err := ensureLocalRoot(target); err != nil {
+		return fmt.Errorf("prepare agent Codex home: %w", err)
+	}
+	for _, name := range agentCodexAssets {
+		from, to := filepath.Join(source, name), filepath.Join(target, name)
+		if _, err := os.Lstat(from); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return fmt.Errorf("inspect Codex capability %s: %w", name, err)
+		}
+		if destination, err := os.Readlink(to); err == nil && destination == from {
+			continue
+		} else if err == nil || !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("agent Codex capability %s conflicts with managed link", name)
+		}
+		if err := os.Symlink(from, to); err != nil {
+			return fmt.Errorf("link Codex capability %s: %w", name, err)
+		}
+	}
+	if err := os.Setenv("CODEX_HOME", target); err != nil {
+		return fmt.Errorf("configure agent Codex home: %w", err)
+	}
+	return nil
+}
+
+func configureProjectTmux(stateRoot string) error {
+	root, err := filepath.Abs(projectTmuxRoot(stateRoot))
+	if err != nil {
+		return err
+	}
+	if err := ensureLocalRoot(root); err != nil {
+		return fmt.Errorf("prepare project tmux root: %w", err)
+	}
+	return os.Setenv("TMUX_TMPDIR", root)
 }
 
 func main() {
@@ -271,18 +358,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	command := args[0]
-	if command == "worker-capture" || command == "worker-capture-replace" || command == "worker-capture-handoff" {
-		if command == "worker-capture-handoff" {
+	if command == "worker-capture" || command == "worker-capture-replace" || command == "worker-capture-handoff" || command == "worker-capture-handoff-ready" {
+		if command == "worker-capture-handoff" || command == "worker-capture-handoff-ready" {
 			if len(args) < 9 || args[7] != "--" {
 				return misuse(stderr, false, command, "invalid internal worker capture invocation")
 			}
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 			defer stop()
+			signalLaunch := func() error {
+				command := exec.CommandContext(context.Background(), args[1], "wait-for", "-S", args[6])
+				command.Dir = "/tmp"
+				return command.Run()
+			}
 			code, err := agentruntime.CaptureWorkerReplacingResultAfterStart(ctx, args[1], args[2], args[3], args[8:], stdout, stderr, func() error {
 				if err := writeImmutable(args[4], []byte(args[5])); err != nil {
 					return err
 				}
-				if err := exec.CommandContext(context.Background(), args[1], "wait-for", "-S", args[6]).Run(); err != nil {
+				if err := signalLaunch(); err != nil {
 					signalErr := fmt.Errorf("launch signal: %w", err)
 					if removeErr := os.Remove(args[4]); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 						return errors.Join(signalErr, fmt.Errorf("roll back launch marker: %w", removeErr))
@@ -295,6 +387,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return nil
 			})
 			if err != nil {
+				if command == "worker-capture-handoff-ready" {
+					_ = signalLaunch()
+				}
 				fmt.Fprintln(stderr, "error: "+err.Error())
 			}
 			return code
@@ -394,6 +489,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return fail(stderr, *jsonOutput, command, rootErr.Error())
 			}
 		}
+		if err := configureProjectTmux(*runtimeState); err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		if !hostIsolationInstalled() {
+			if err := configureAgentCodexHome(*runtimeState); err != nil {
+				return fail(stderr, *jsonOutput, command, err.Error())
+			}
+		}
 		api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
 		if _, err := api.AuthenticatedUser(context.Background()); err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
@@ -413,13 +516,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		operationMu := &sync.Mutex{}
+		deliveryMu := &sync.Mutex{}
 		recoverAttempt := func(ctx context.Context, issue, attempt int) error {
 			return recoverDashboardAttempt(ctx, *path, *statePath, *runtimeState, issue, attempt)
 		}
+		operations := &operationCancellation{}
 		reconcile := func(ctx context.Context) error {
-			statuses, err := reconcileGitHub(ctx, *path, *statePath, *runtimeState, true)
-			if err != nil {
+			cycleCtx, finish := operations.begin(ctx)
+			defer finish()
+			statuses, err := reconcileGitHub(cycleCtx, *path, *statePath, *runtimeState, true)
+			if err != nil && !errors.Is(err, context.Canceled) {
 				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
+			}
+			if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				return err
 			}
 			_, agentErr := agent.ObserveCycle(ctx, statuses, err)
 			if agentErr != nil {
@@ -429,18 +539,48 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		dashboardAgent := dashboardOrchestratorService{Service: agent, supervisor: agent, confirm: func(ctx context.Context, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
 			return confirmOperatorMessage(ctx, *path, *runtimeState, proposal)
+		}, accepted: func(message internalgithub.OperatorMessage) {
+			operations.interrupt()
+			go func() {
+				deliveryMu.Lock()
+				defer deliveryMu.Unlock()
+				operationMu.Lock()
+				defer operationMu.Unlock()
+				if ctx.Err() != nil {
+					return
+				}
+				if err := writeOperatorMessageStatus(*runtimeState, message); err != nil {
+					fmt.Fprintln(stderr, "operator message projection: "+internalgithub.Redact(err.Error()))
+				}
+				deliveryCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+				defer cancel()
+				delivered, err := deliverOperatorMessageWithRetry(deliveryCtx, *path, *runtimeState, message)
+				if err != nil {
+					fmt.Fprintln(stderr, "operator message delivery: "+internalgithub.Redact(err.Error()))
+				}
+				if projectionErr := writeOperatorMessageStatus(*runtimeState, delivered); projectionErr != nil {
+					fmt.Fprintln(stderr, "operator message projection: "+internalgithub.Redact(projectionErr.Error()))
+				}
+			}()
 		}}
 		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, recoverAttempt, reconcile, dashboardAgent, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
+		deliveryMu.Lock()
+		retryCtx, retryCancel := context.WithTimeout(ctx, 90*time.Second)
+		if err := retryProjectedOperatorMessages(retryCtx, *path, *runtimeState); err != nil && !errors.Is(err, context.Canceled) {
+			fmt.Fprintln(stderr, "operator message startup recovery: "+internalgithub.Redact(err.Error()))
+		}
+		retryCancel()
+		deliveryMu.Unlock()
 		lockedReconcile := func(ctx context.Context) error {
 			operationMu.Lock()
 			defer operationMu.Unlock()
 			return reconcile(ctx)
 		}
-		go watchOrchestratorProposals(ctx, agent, operationMu, *path, *statePath, *runtimeState, stderr)
+		go watchOrchestratorProposals(ctx, agent, operationMu, operations, *path, *statePath, *runtimeState, stderr)
 		if err := orchestrator.ReconcileLoop(ctx, *interval, lockedReconcile); err != nil && !errors.Is(err, context.Canceled) {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
@@ -454,6 +594,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if *attemptsPath == "" {
 			if *statePath == "" || *runtimeState == "" {
 				return misuse(stderr, wantsJSON, command, command+" requires --state and --runtime-state unless --attempts is supplied")
+			}
+			if err := configureProjectTmux(*runtimeState); err != nil {
+				return fail(stderr, *jsonOutput, command, err.Error())
+			}
+			if !hostIsolationInstalled() {
+				if err := configureAgentCodexHome(*runtimeState); err != nil {
+					return fail(stderr, *jsonOutput, command, err.Error())
+				}
 			}
 			if command == "reconcile" {
 				lock, lockErr := acquireDaemonLock(filepath.Join(*runtimeState, "daemon.lock"))
@@ -623,11 +771,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-func watchOrchestratorProposals(ctx context.Context, agent *orchestratoragent.Supervisor, operationMu *sync.Mutex, configPath, statePath, stateRoot string, log io.Writer) {
+func watchOrchestratorProposals(ctx context.Context, agent *orchestratoragent.Supervisor, operationMu *sync.Mutex, operations *operationCancellation, configPath, statePath, stateRoot string, log io.Writer) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		processOrchestratorProposal(ctx, agent, operationMu, configPath, statePath, stateRoot, log)
+		processOrchestratorProposal(ctx, agent, operationMu, operations, configPath, statePath, stateRoot, log)
 		select {
 		case <-ctx.Done():
 			return
@@ -636,7 +784,7 @@ func watchOrchestratorProposals(ctx context.Context, agent *orchestratoragent.Su
 	}
 }
 
-func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.Supervisor, operationMu *sync.Mutex, configPath, statePath, stateRoot string, log io.Writer) {
+func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.Supervisor, operationMu *sync.Mutex, operations *operationCancellation, configPath, statePath, stateRoot string, log io.Writer) {
 	proposal, err := agent.MessageProposal(ctx)
 	if errors.Is(err, orchestratoragent.ErrNoMessageProposal) {
 		return
@@ -649,7 +797,9 @@ func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.S
 		return
 	}
 	defer operationMu.Unlock()
-	controlCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	operationCtx, finish := operations.begin(ctx)
+	defer finish()
+	controlCtx, cancel := context.WithTimeout(operationCtx, 10*time.Minute)
 	defer cancel()
 	running := false
 	_, err = reconcileRetryRun(controlCtx, configPath, statePath, stateRoot, reconcileOptions{
@@ -729,37 +879,208 @@ func confirmOperatorMessage(ctx context.Context, configPath, stateRoot string, p
 	if err := api.VerifyRepository(ctx, cfg.Repository); err != nil {
 		return internalgithub.OperatorMessage{}, err
 	}
-	remote, err := internalgithub.FetchAttemptFacts(ctx, api, cfg.Repository, user.ID)
-	if err != nil {
-		return internalgithub.OperatorMessage{}, err
-	}
-	prConfig := githubPRConfig(cfg, user.ID)
-	issues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, remote, false)
-	if err != nil {
-		return internalgithub.OperatorMessage{}, err
-	}
 	runtimeState := newOperatorMessageRuntime(stateRoot)
 	manifests, err := runtimeState.Discover()
 	if err != nil {
 		return internalgithub.OperatorMessage{}, err
 	}
-	if err := validateOperatorMessageTarget(ctx, proposal, issues, remote, manifests, func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
-		return verifyOperatorMessageRuntime(ctx, &runtimeState, manifest, fact)
-	}); err != nil {
+	if err := validateOperatorMessageAdmission(ctx, proposal, &runtimeState, manifests); err != nil {
 		return internalgithub.OperatorMessage{}, err
 	}
-	return internalgithub.RecordOperatorMessage(ctx, api, prConfig, message)
+	return internalgithub.RecordOperatorMessage(ctx, api, githubPRConfig(cfg, user.ID), message)
+}
+
+func validateOperatorMessageAdmission(ctx context.Context, proposal orchestratoragent.MessageProposal, runtimeState *agentruntime.Runtime, manifests []agentruntime.Manifest) error {
+	matching := make([]agentruntime.Manifest, 0, 1)
+	for _, manifest := range manifests {
+		if manifest.Repository == proposal.Repository && manifest.Issue == proposal.Issue && manifest.Attempt == proposal.Attempt {
+			matching = append(matching, manifest)
+		}
+	}
+	if len(matching) != 1 {
+		return errors.New("operator message target does not have a verified exact runtime owner")
+	}
+	manifest := matching[0]
+	var err error
+	if manifest.State == "completed" {
+		err = runtimeState.VerifyRetained(ctx, manifest, "")
+	} else if manifest.State == "running" {
+		err = runtimeState.VerifyOwned(ctx, manifest)
+		if err != nil {
+			err = runtimeState.VerifyRetained(ctx, manifest, "")
+		}
+	} else {
+		err = errors.New("runtime is not eligible")
+	}
+	if err != nil {
+		return errors.New("operator message target does not have a verified exact runtime owner")
+	}
+	return nil
+}
+
+func fetchOperatorMessageTarget(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, proposal orchestratoragent.MessageProposal) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, error) {
+	api = api.WithReadSnapshot()
+	remote, err := internalgithub.FetchOperatorAttemptFacts(ctx, api, cfg.Repository, cfg.ActorID, proposal.Issue, proposal.Attempt)
+	if err != nil {
+		return nil, nil, err
+	}
+	issues, err := internalgithub.FetchOperatorIssueFacts(ctx, api, cfg, remote, proposal.Issue)
+	return issues, remote, err
+}
+
+func deliverOperatorMessage(ctx context.Context, configPath, stateRoot string, accepted internalgithub.OperatorMessage) (internalgithub.OperatorMessage, error) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return accepted, err
+	}
+	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
+	user, err := api.AuthenticatedUser(ctx)
+	if err != nil {
+		return accepted, err
+	}
+	if err := api.VerifyRepository(ctx, cfg.Repository); err != nil {
+		return accepted, err
+	}
+	prConfig := githubPRConfig(cfg, user.ID)
+	messages, err := internalgithub.FetchOperatorMessages(ctx, api, prConfig, accepted.Issue)
+	if err != nil {
+		return accepted, err
+	}
+	index := slices.IndexFunc(messages, func(message internalgithub.OperatorMessage) bool { return message.ID == accepted.ID })
+	if index < 0 {
+		return accepted, errors.New("operator message is not durably accepted")
+	}
+	accepted = messages[index]
+	if accepted.State != "queued" && accepted.State != "claimed" {
+		return accepted, nil
+	}
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: accepted.Repository, Issue: accepted.Issue, Attempt: accepted.Attempt, Message: accepted.Message}
+	issues, remote, err := fetchOperatorMessageTarget(ctx, api, prConfig, proposal)
+	if err != nil {
+		return accepted, err
+	}
+	runtimeState := newOperatorMessageRuntime(stateRoot)
+	runtimeState.Source = filepath.Join(productionAttemptRoot(stateRoot), internalgithub.RepositoryIdentifier(cfg.Repository)+".source.bundle")
+	runtimeState.AllowEnv = cfg.Commands.Environment
+	manifests, err := runtimeState.Discover()
+	if err != nil {
+		return accepted, err
+	}
+	check := func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
+		return verifyOperatorMessageRuntime(ctx, &runtimeState, manifest, fact)
+	}
+	refresh := func(ctx context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
+		currentManifests, err := runtimeState.Discover()
+		return issues, remote, currentManifests, err
+	}
+	accept := func(ctx context.Context, proposal orchestratoragent.MessageProposal, expected operatorAttemptBinding) (bool, error) {
+		currentIssues, currentRemote, err := fetchOperatorMessageTarget(ctx, api, prConfig, proposal)
+		if err != nil {
+			return false, err
+		}
+		return matchesOperatorMessageBinding(proposal, expected, currentIssues, currentRemote), nil
+	}
+	key := fmt.Sprintf("%s#%d/%d", accepted.Repository, accepted.Issue, accepted.Attempt)
+	byAttempt := map[string][]internalgithub.OperatorMessage{key: {accepted}}
+	if err := resumeOperatorMessages(ctx, api, prConfig, &runtimeState, implementationBoundary(stateRoot), issues, remote, manifests, byAttempt, cfg.Commands.Implementation, check, refresh, accept); err != nil {
+		return byAttempt[key][0], err
+	}
+	return byAttempt[key][0], nil
+}
+
+func deliverOperatorMessageWithRetry(ctx context.Context, configPath, stateRoot string, message internalgithub.OperatorMessage) (internalgithub.OperatorMessage, error) {
+	var err error
+	for range 2 {
+		message, err = deliverOperatorMessage(ctx, configPath, stateRoot, message)
+		if err == nil || ctx.Err() != nil {
+			return message, err
+		}
+	}
+	return message, err
+}
+
+func retryProjectedOperatorMessages(ctx context.Context, configPath, stateRoot string) error {
+	body, err := readDashboardStatus(filepath.Join(stateRoot, "status.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var snapshot struct {
+		UpdatedAt time.Time                     `json:"updated_at"`
+		Statuses  []orchestrator.RecoveryStatus `json:"statuses"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&snapshot) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("invalid status snapshot")
+	}
+	pending := make(map[int]map[string]bool)
+	pendingCount := 0
+	for _, status := range snapshot.Statuses {
+		for _, message := range status.OperatorMessages {
+			if message.State != "queued" {
+				continue
+			}
+			pendingCount++
+			if pendingCount > 64 {
+				return errors.New("operator message startup recovery exceeds limit")
+			}
+			if pending[status.Issue] == nil {
+				pending[status.Issue] = make(map[string]bool)
+			}
+			pending[status.Issue][message.ID] = true
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
+	user, err := api.AuthenticatedUser(ctx)
+	if err != nil {
+		return err
+	}
+	if err := api.VerifyRepository(ctx, cfg.Repository); err != nil {
+		return err
+	}
+	prConfig := githubPRConfig(cfg, user.ID)
+	for issue, ids := range pending {
+		messages, err := internalgithub.FetchOperatorMessages(ctx, api, prConfig, issue)
+		if err != nil {
+			return err
+		}
+		for _, message := range messages {
+			if !ids[message.ID] || message.State != "queued" && message.State != "claimed" {
+				continue
+			}
+			delivered, err := deliverOperatorMessageWithRetry(ctx, configPath, stateRoot, message)
+			if projectionErr := writeOperatorMessageStatus(stateRoot, delivered); projectionErr != nil {
+				return projectionErr
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func verifyOperatorMessageRuntime(ctx context.Context, runtimeState *agentruntime.Runtime, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
 	if manifest.State == "running" {
-		return runtimeState.VerifyOwned(ctx, manifest)
+		if err := runtimeState.VerifyOwned(ctx, manifest); err == nil {
+			return nil
+		}
 	}
 	head := fact.HeadSHA
 	if head == "" {
 		head = fact.BaseSHA
 	}
-	return runtimeState.VerifyActive(ctx, manifest, head)
+	return runtimeState.VerifyRetained(ctx, manifest, head)
 }
 
 func newOperatorMessageRuntime(stateRoot string) agentruntime.Runtime {
@@ -1076,6 +1397,13 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if err != nil {
 		return statuses, fmt.Errorf("rediscover queued attempts: %w", err)
 	}
+	if err := monitorAttempts(ctx, &r, statuses, queuedManifests, issues); err != nil {
+		return statuses, fmt.Errorf("monitor live attempts: %w", err)
+	}
+	queuedManifests, err = r.Discover()
+	if err != nil {
+		return statuses, fmt.Errorf("rediscover monitored attempts: %w", err)
+	}
 	if err := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, operatorMessages, statePath, stateRoot); err != nil {
 		return statuses, fmt.Errorf("process completed worker results: %w", err)
 	}
@@ -1087,9 +1415,6 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	}
 	if err := internalgithub.RunPRReconciliation(ctx, api, prConfig, statePath); err != nil {
 		return statuses, fmt.Errorf("reconcile pull request governance: %w", err)
-	}
-	if err := monitorAttempts(ctx, &r, statuses, queuedManifests, issues); err != nil {
-		return statuses, fmt.Errorf("monitor live attempts: %w", err)
 	}
 	// Re-read GitHub after governance and monitoring. A merge or cancellation
 	// observed here wins over every queued operator message.
@@ -1303,6 +1628,40 @@ func writeStatusSnapshot(stateRoot string, statuses []orchestrator.RecoveryStatu
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+func writeOperatorMessageStatus(stateRoot string, message internalgithub.OperatorMessage) error {
+	body, err := readDashboardStatus(filepath.Join(stateRoot, "status.json"))
+	if err != nil {
+		return err
+	}
+	var snapshot struct {
+		UpdatedAt time.Time                     `json:"updated_at"`
+		Statuses  []orchestrator.RecoveryStatus `json:"statuses"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&snapshot) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("invalid status snapshot")
+	}
+	index := slices.IndexFunc(snapshot.Statuses, func(status orchestrator.RecoveryStatus) bool {
+		return status.Repository == message.Repository && status.Issue == message.Issue && status.Attempt == message.Attempt
+	})
+	if index < 0 {
+		return errors.New("operator message target is missing from the status snapshot")
+	}
+	state := message.State
+	if state == "claimed" {
+		state = "queued"
+	}
+	status := orchestrator.OperatorMessageStatus{ID: message.ID, State: state, UpdatedAt: message.UpdatedAt, Diagnostic: message.Diagnostic}
+	messages := &snapshot.Statuses[index].OperatorMessages
+	if messageIndex := slices.IndexFunc(*messages, func(current orchestrator.OperatorMessageStatus) bool { return current.ID == message.ID }); messageIndex >= 0 {
+		(*messages)[messageIndex] = status
+	} else {
+		*messages = append(*messages, status)
+	}
+	return writeStatusSnapshot(stateRoot, snapshot.Statuses)
 }
 
 func seedAttemptSource(ctx context.Context, checkout, repositoryName, attemptRoot, baseBranch, baseSHA string) (string, error) {
@@ -2288,20 +2647,20 @@ func recoverDashboardAttempt(ctx context.Context, configPath, statePath, stateRo
 
 func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, issues []internalgithub.RecoveryIssueFact) error {
 	for _, status := range statuses {
-		if status.Action != "resume monitoring the matching attempt" && status.Action != "monitor the matching published pull request" {
+		if status.State != "active" && status.State != "review-ready" {
 			continue
 		}
-		var base string
-		for _, manifest := range manifests {
-			if manifest.Repository == status.Repository && manifest.Issue == status.Issue && manifest.Attempt == status.Attempt {
-				base = manifest.BaseSHA
-				break
-			}
+		manifestIndex := slices.IndexFunc(manifests, func(manifest agentruntime.Manifest) bool {
+			return manifest.Repository == status.Repository && manifest.Issue == status.Issue && manifest.Attempt == status.Attempt && manifest.State == "running"
+		})
+		if manifestIndex < 0 {
+			continue
 		}
+		manifest := manifests[manifestIndex]
 		authorized := slices.ContainsFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
 			return issue.Repository == status.Repository && issue.Issue == status.Issue && issue.DispatchAuthorized
 		})
-		_, err := runtime.Monitor(ctx, agentruntime.Attempt{Repository: status.Repository, Issue: status.Issue, Number: status.Attempt, BaseSHA: base, Eligible: func() bool { return authorized }})
+		_, err := runtime.Monitor(ctx, agentruntime.Attempt{Repository: status.Repository, Issue: status.Issue, Number: status.Attempt, BaseSHA: manifest.BaseSHA, Eligible: func() bool { return authorized }})
 		if err != nil {
 			return fmt.Errorf("monitor %s#%d attempt %d: %w", status.Repository, status.Issue, status.Attempt, err)
 		}
@@ -2366,7 +2725,6 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 	if len(command) == 0 {
 		return errors.New("implementation command is missing")
 	}
-	followUpCommand := operatorFollowUpCommand(command)
 	started := map[string]bool{}
 	for key, queued := range messages {
 		for index := range queued {
@@ -2395,15 +2753,35 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 			manifestIndex := slices.IndexFunc(manifests, func(manifest agentruntime.Manifest) bool {
 				return manifest.Repository == message.Repository && manifest.Issue == message.Issue && manifest.Attempt == message.Attempt
 			})
+			handoffKey := "operator-message-" + message.ID
+			if manifestIndex >= 0 && runtimeState != nil {
+				recovered, changed, err := runtimeState.RecoverInterruptedHandoff(ctx, manifests[manifestIndex], handoffKey)
+				if err != nil {
+					return err
+				}
+				if changed {
+					manifests[manifestIndex] = recovered
+				}
+			}
 			if manifestIndex >= 0 && manifests[manifestIndex].State == "completed" && (manifests[manifestIndex].ReviewState == "preparing" || manifests[manifestIndex].ReviewState == "running") {
 				continue
 			}
 			proposal := orchestratoragent.MessageProposal{Version: 1, Repository: message.Repository, Issue: message.Issue, Attempt: message.Attempt, Message: message.Message}
-			ownershipCheck := func(ctx context.Context, manifest agentruntime.Manifest, _ orchestrator.AttemptFact) error {
-				if runtimeState == nil {
-					return nil
+			ownershipCheck := check
+			if runtimeState != nil {
+				ownershipCheck = func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
+					if manifest.State == "running" {
+						if err := runtimeState.VerifyOwned(ctx, manifest); err == nil {
+							return nil
+						}
+					}
+					if check != nil {
+						return check(ctx, manifest, fact)
+					}
+					return verifyOperatorMessageRuntime(ctx, runtimeState, manifest, fact)
 				}
-				return runtimeState.VerifyOwned(ctx, manifest)
+			} else if ownershipCheck == nil {
+				ownershipCheck = func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
 			}
 			if err := validateOperatorMessageTarget(ctx, proposal, issues, remote, manifests, ownershipCheck); err != nil {
 				if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "exact verified attempt ownership is missing"); err != nil {
@@ -2418,7 +2796,6 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 				continue
 			}
 			manifest := manifests[manifestIndex]
-			handoffKey := "operator-message-" + message.ID
 			outcomePath := handoffReceiptPath(manifest.Worktree, handoffKey)
 			outcomeToken := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+handoffKey)))
 			expectedReceipt := handoffReceipt{"agent-symphony-handoff-executed-v1", handoffKey, outcomePath, outcomeToken}
@@ -2427,7 +2804,7 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 				Issue, Attempt                       int
 			}{"agent-symphony-handoff-v1", handoffKey, "operator-message", message.Repository, message.Message, message.Issue, message.Attempt})
 			requestBody := func(manifest agentruntime.Manifest) []byte {
-				request, _ := json.Marshal(handoffRequest{manifest, payload, outcomePath, outcomeToken, followUpCommand})
+				request, _ := json.Marshal(handoffRequest{manifest, payload, outcomePath, outcomeToken, command})
 				return request
 			}
 			verifyDelivery := func(manifest agentruntime.Manifest) (bool, error) {
@@ -2454,7 +2831,39 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 				continue // The accepted message remains durably queued.
 			case "running":
 				if message.State == "queued" {
-					continue // A running pane is busy unless this exact delivery already owns it.
+					if runtimeState == nil {
+						continue
+					}
+					superseded, err := runtimeState.InterruptLegacyOperatorHandoff(ctx, manifest, 2*time.Minute)
+					if err != nil {
+						return err
+					}
+					if superseded {
+						break
+					}
+					monitored, err := runtimeState.Monitor(ctx, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA})
+					if err != nil {
+						return err
+					}
+					manifests[manifestIndex], manifest = monitored, monitored
+					switch monitored.State {
+					case "running":
+						continue
+					case "failed":
+						if err := recordOperatorOutcome(ctx, api, cfg, message, "failed", "attempt runtime failed before delivery"); err != nil {
+							return err
+						}
+						continue
+					case "cancelled":
+						if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "attempt was cancelled before delivery"); err != nil {
+							return err
+						}
+						continue
+					case "completed":
+					default:
+						return errors.New("monitored operator message runtime state is invalid")
+					}
+					break
 				}
 				verified, verifyErr := verifyDelivery(manifest)
 				if verifyErr != nil {
@@ -2576,13 +2985,6 @@ func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg int
 	return nil
 }
 
-func operatorFollowUpCommand(command []string) []string {
-	if (len(command) != 3 && len(command) != 4) || filepath.Base(command[0]) != "codex" || command[1] != "exec" || command[2] != "--dangerously-bypass-approvals-and-sandbox" || len(command) == 4 && command[3] != "-" {
-		return command
-	}
-	return []string{command[0], "exec", "resume", "--last", command[2], "-"}
-}
-
 func recordOperatorOutcome(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, message *internalgithub.OperatorMessage, state, diagnostic string) error {
 	if err := internalgithub.RecordOperatorMessageOutcome(ctx, api, cfg, *message, state, diagnostic); err != nil {
 		return err
@@ -2601,9 +3003,9 @@ func resumeHandoffs(ctx context.Context, runtimeState *agentruntime.Runtime, bou
 	}
 	live := map[string]agentruntime.Manifest{}
 	for _, status := range statuses {
-		if (status.State == "active" || status.State == "review-ready") && (status.Action == "resume monitoring the matching attempt" || status.Action == "monitor the matching published pull request") {
+		if (status.State == "active" || status.State == "review-ready") && status.DispatchAuthorized && len(status.Blockers) == 0 {
 			for _, manifest := range manifests {
-				if manifest.Repository == status.Repository && manifest.Issue == status.Issue && manifest.Attempt == status.Attempt {
+				if manifest.Repository == status.Repository && manifest.Issue == status.Issue && manifest.Attempt == status.Attempt && (manifest.State == "running" || manifest.State == "completed") {
 					live[fmt.Sprintf("%s#%d/%d", status.Repository, status.Issue, status.Attempt)] = manifest
 				}
 			}

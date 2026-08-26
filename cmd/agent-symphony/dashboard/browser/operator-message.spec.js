@@ -36,7 +36,7 @@ const attempt = {
   operator_messages: [{ id: "message-1234567890", state: "queued" }],
 };
 
-async function mockDashboard(page) {
+async function mockDashboard(page, projectedAttempt = attempt) {
   let currentProposal = proposal;
   let messageState = "queued";
   let messageDiagnostic = "";
@@ -49,7 +49,7 @@ async function mockDashboard(page) {
     : route.fulfill({ status: 204 }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
   await page.route("**/status.json", (route) => {
-    route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: [{ ...attempt, operator_messages: [{ ...attempt.operator_messages[0], state: messageState, diagnostic: messageDiagnostic }] }] } });
+    route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: [{ ...projectedAttempt, operator_messages: [{ ...projectedAttempt.operator_messages[0], state: messageState, diagnostic: messageDiagnostic }] }] } });
   });
   await page.route("**/actions/orchestrator/message-*", async (route) => {
     const action = route.request().url().split("message-").pop();
@@ -82,12 +82,12 @@ async function mockDashboard(page) {
   };
 }
 
-test("queues a direct follow-up for the exact attempt", async ({ page }) => {
-  const dashboard = await mockDashboard(page);
+test("queues a direct follow-up for the exact retryable attempt", async ({ page }) => {
+	const dashboard = await mockDashboard(page, { ...attempt, state: "blocked", retryable: true });
   await page.goto("/");
 
   await page.getByLabel("Tell this agent what to do next").fill("Inspect the failing test and continue the fix.");
-  await page.getByRole("button", { name: "Queue follow-up and resume" }).click();
+  await page.getByRole("button", { name: "Queue follow-up" }).click();
 
   await expect(page.getByRole("status").filter({ hasText: "Queued a follow-up for issue #131, attempt 3" })).toBeVisible();
   expect(dashboard.directRequests).toHaveLength(1);

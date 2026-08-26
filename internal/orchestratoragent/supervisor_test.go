@@ -531,6 +531,9 @@ func TestLaunchContractUsesFixedBoundaryCommand(t *testing.T) {
 	}
 	remainOptions := 0
 	for _, command := range runner.commands {
+		if command.Dir != "/tmp" {
+			t.Fatalf("tmux control command inherited workspace cwd: %#v", command)
+		}
 		if slices.Contains(command.Args, "remain-on-exit") {
 			remainOptions++
 		}
