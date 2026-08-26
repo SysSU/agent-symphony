@@ -709,12 +709,48 @@ func writeHostOrchestratorProposal(root string, input io.Reader, output io.Write
 	if err != nil || !belowRoot(dir, root) || !strings.HasPrefix(filepath.Base(dir), "orchestrator-") {
 		return errors.New("orchestrator workspace is outside the reviewer boundary")
 	}
-	_, canonical, err := parseHostOrchestratorProposal(input)
+	proposal, canonical, err := parseHostOrchestratorProposal(input)
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(output, orchestratoragent.MessageProposalPrefix+base64.StdEncoding.EncodeToString(canonical))
-	return err
+	path := filepath.Join(dir, orchestratoragent.MessageProposalFile)
+	listed, err := os.Lstat(path)
+	if err != nil || !listed.Mode().IsRegular() || listed.Mode()&os.ModeSymlink != 0 || listed.Mode().Perm() != 0o620 || fileGID(listed) != hostEGID() || listed.Size() > 64<<10 {
+		return errors.New("orchestrator proposal file is unsafe")
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		file.Close()
+		return err
+	}
+	opened, statErr := file.Stat()
+	if statErr != nil || !os.SameFile(listed, opened) {
+		file.Close()
+		return errors.New("orchestrator proposal file changed while opening")
+	}
+	if err := file.Truncate(0); err != nil {
+		file.Close()
+		return err
+	}
+	if _, err := file.Write(append(canonical, '\n')); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return json.NewEncoder(output).Encode(struct {
+		Version int    `json:"version"`
+		Binding string `json:"binding"`
+		State   string `json:"state"`
+	}{1, proposal.Binding, "submitted"})
 }
 
 func parseHostOrchestratorProposal(input io.Reader) (orchestratoragent.MessageProposal, []byte, error) {
@@ -808,7 +844,7 @@ func readHostOrchestratorProposalStatus(path string) (orchestratoragent.MessageP
 	var status orchestratoragent.MessageProposalStatus
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&status) != nil || decoder.Decode(&struct{}{}) != io.EOF || status.Version != 1 || status.UpdatedAt.IsZero() || !validProposalBinding(status.PendingBinding) || !validProposalBinding(status.ConsumedBinding) {
+	if decoder.Decode(&status) != nil || decoder.Decode(&struct{}{}) != io.EOF || status.Version != 1 || status.UpdatedAt.IsZero() || !validProposalBinding(status.PendingBinding) || !validProposalBinding(status.ConsumedBinding) || !validProposalBinding(status.ResolvedBinding) || !validProposalResolution(status.Resolution) || (status.Resolution == "") != (status.ResolvedBinding == "") {
 		return orchestratoragent.MessageProposalStatus{}, false, errors.New("orchestrator proposal status is invalid")
 	}
 	return status, true, nil
@@ -823,6 +859,10 @@ func validProposalBinding(value string) bool {
 	}
 	_, err := hex.DecodeString(value)
 	return err == nil
+}
+
+func validProposalResolution(value string) bool {
+	return value == "" || slices.Contains([]string{"running", "succeeded", "failed", "refused", "accepted"}, value)
 }
 
 func credentialShapedArgument(value string) bool {
@@ -1604,7 +1644,7 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 	if err := writeImmutable(launchingPath, []byte(recipient)); err != nil {
 		return "", err
 	}
-	tmuxArgs := append(append([]string{"respawn-pane", "-k", "-t", pane, "--"}, command...), ";", "wait-for", signal, ";", "set-option", "-p", "-t", pane, option, recipient)
+	tmuxArgs := append(append([]string{"respawn-pane", "-k", "-t", pane, "-c", request.Manifest.Worktree, "--"}, command...), ";", "wait-for", signal, ";", "set-option", "-p", "-t", pane, option, recipient)
 	if _, err := hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: tmuxArgs, Dir: request.Manifest.Worktree}); err != nil {
 		return "", err
 	}

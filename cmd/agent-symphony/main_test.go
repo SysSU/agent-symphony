@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -242,6 +243,90 @@ func TestTransitionRetryOnlyAcceptsExactUnblockedCompletedPublication(t *testing
 				t.Fatal("unsafe transition retry accepted")
 			}
 		})
+	}
+}
+
+func TestTransitionRetryRunsOnceAndRecordsTerminalOutcome(t *testing.T) {
+	root := t.TempDir()
+	agent := &orchestratoragent.Supervisor{
+		Root:                  root,
+		Workspace:             filepath.Join(root, "orchestrator-o-r"),
+		Repository:            "o/r",
+		Command:               []string{"agent"},
+		ProposalCommand:       []string{"proposal"},
+		ProposalStatusCommand: []string{"proposal-status"},
+		Runner:                &orchestratorTestRunner{},
+	}
+	if _, err := agent.Observe(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Action: orchestratoragent.ProposalActionRetry, RequestID: "retry-once"}
+	body, _ := json.Marshal(proposal)
+	if err := os.WriteFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalFile), body, 0o620); err != nil {
+		t.Fatal(err)
+	}
+	valid := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 131, Attempt: 3, State: "active", CurrentPhase: "publication", DispatchAuthorized: true, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, State: "completed"}}}
+	previous := reconcileRetryRun
+	calls := 0
+	reconcileRetryRun = func(ctx context.Context, _, _, _ string, options reconcileOptions) ([]orchestrator.RecoveryStatus, error) {
+		calls++
+		if !options.transition || options.intake || options.timeout != 10*time.Minute {
+			t.Fatalf("retry options=%+v", options)
+		}
+		if err := options.authorize([]orchestrator.RecoveryStatus{valid}); err != nil {
+			return nil, err
+		}
+		return []orchestrator.RecoveryStatus{valid}, nil
+	}
+	t.Cleanup(func() { reconcileRetryRun = previous })
+	operationMu := &sync.Mutex{}
+	operationMu.Lock()
+	processOrchestratorProposal(t.Context(), agent, operationMu, "config", "state", "runtime", io.Discard)
+	operationMu.Unlock()
+	pendingBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
+	var pending orchestratoragent.MessageProposalStatus
+	if err != nil || json.Unmarshal(pendingBody, &pending) != nil || calls != 0 || pending.PendingBinding == "" {
+		t.Fatalf("busy calls=%d status=%s err=%v", calls, pendingBody, err)
+	}
+	processOrchestratorProposal(t.Context(), agent, operationMu, "config", "state", "runtime", io.Discard)
+	statusBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
+	var status orchestratoragent.MessageProposalStatus
+	if err != nil || json.Unmarshal(statusBody, &status) != nil || calls != 1 || status.Resolution != "succeeded" || status.PendingBinding != "" {
+		t.Fatalf("calls=%d status=%s err=%v", calls, statusBody, err)
+	}
+
+	proposal.RequestID = "retry-fails"
+	body, _ = json.Marshal(proposal)
+	if err := os.WriteFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalFile), body, 0o620); err != nil {
+		t.Fatal(err)
+	}
+	reconcileRetryRun = func(_ context.Context, _, _, _ string, options reconcileOptions) ([]orchestrator.RecoveryStatus, error) {
+		calls++
+		if err := options.authorize([]orchestrator.RecoveryStatus{valid}); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("publish stage failed")
+	}
+	processOrchestratorProposal(t.Context(), agent, &sync.Mutex{}, "config", "state", "runtime", io.Discard)
+	statusBody, err = os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
+	if err != nil || json.Unmarshal(statusBody, &status) != nil || calls != 2 || status.Resolution != "failed" || !strings.Contains(status.Detail, "publish stage failed") {
+		t.Fatalf("calls=%d status=%s err=%v", calls, statusBody, err)
+	}
+}
+
+func TestOperatorFollowUpResumesTheDefaultCodexSession(t *testing.T) {
+	defaultCommand := []string{"/usr/local/bin/codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}
+	want := []string{"/usr/local/bin/codex", "exec", "resume", "--last", "--dangerously-bypass-approvals-and-sandbox", "-"}
+	if got := operatorFollowUpCommand(defaultCommand); !slices.Equal(got, want) {
+		t.Fatalf("resumed command=%q", got)
+	}
+	custom := []string{"codex", "exec", "--json"}
+	if got := operatorFollowUpCommand(custom); !slices.Equal(got, custom) {
+		t.Fatalf("custom command changed=%q", got)
+	}
+	ephemeral := []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--ephemeral"}
+	if got := operatorFollowUpCommand(ephemeral); !slices.Equal(got, ephemeral) {
+		t.Fatalf("ephemeral command changed=%q", got)
 	}
 }
 

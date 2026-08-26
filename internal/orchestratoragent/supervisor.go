@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
@@ -31,10 +31,8 @@ const (
 	maxNoticeBytes            = maxContextBytes
 	maxDiagnosticBytes        = 1024
 	maxProposalBytes          = 64 << 10
-	maxProposalFrameBytes     = len(MessageProposalPrefix) + (maxProposalBytes+2)/3*4 + 1
-	maxPaneCaptureBytes       = 2 * maxProposalFrameBytes
 	historyLimit              = "65536"
-	MessageProposalPrefix     = "AGENT_SYMPHONY_MESSAGE_PROPOSAL_V1:"
+	MessageProposalFile       = "orchestrator-proposal.json"
 	MessageProposalStatusFile = "orchestrator-proposal-status.json"
 	ProposalActionMessage     = "message_attempt"
 	ProposalActionRetry       = "retry_transition"
@@ -122,6 +120,7 @@ type persisted struct {
 	LastProjection     string `json:"last_projection_digest,omitempty"`
 	LastInvestigation  string `json:"last_investigation_digest,omitempty"`
 	ConsumedProposal   string `json:"consumed_proposal_digest,omitempty"`
+	ProposalBinding    string `json:"proposal_binding,omitempty"`
 	ProposalResolution string `json:"proposal_resolution,omitempty"`
 	ProposalDetail     string `json:"proposal_detail,omitempty"`
 	PendingAttention   int    `json:"pending_attention,omitempty"`
@@ -281,11 +280,7 @@ func (s *Supervisor) MessageProposal(ctx context.Context) (MessageProposal, erro
 	if err != nil || state.State != "running" {
 		return MessageProposal{}, ErrNoMessageProposal
 	}
-	result, err := s.run(ctx, "tmux", []string{"capture-pane", "-p", "-J", "-S", "-", "-t", agentruntime.PaneTarget(state.Session)}, nil)
-	if err != nil {
-		return MessageProposal{}, err
-	}
-	proposal, err := parseMessageProposal(result.Output, s.Repository)
+	proposal, err := s.readMessageProposal()
 	if err != nil {
 		if errors.Is(err, ErrNoMessageProposal) {
 			if writeErr := s.writeMessageProposalStatus("", state); writeErr != nil {
@@ -312,15 +307,16 @@ func (s *Supervisor) ConsumeMessageProposal(ctx context.Context, binding string)
 	return s.consumeMessageProposal(ctx, binding, "", "")
 }
 
-// ResolveMessageProposal records the coordinator-owned outcome of one exact
-// automatic proposal without implying that the requested transition completed.
+// ResolveMessageProposal records the coordinator-owned lifecycle of one exact
+// automatic proposal. Succeeded means the guarded pass returned, not that an
+// external state change occurred.
 func (s *Supervisor) ResolveMessageProposal(ctx context.Context, binding, resolution, detail string) error {
-	if resolution != "accepted" && resolution != "refused" {
+	if !slices.Contains([]string{"running", "succeeded", "failed", "refused"}, resolution) {
 		return errors.New("invalid orchestrator proposal resolution")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.consumeMessageProposal(ctx, binding, resolution, bounded(internalgithub.Redact(detail)))
+	return s.resolveMessageProposal(binding, resolution, bounded(internalgithub.Redact(detail)), resolution != "running")
 }
 
 func (s *Supervisor) consumeMessageProposal(ctx context.Context, binding, resolution, detail string) error {
@@ -328,11 +324,7 @@ func (s *Supervisor) consumeMessageProposal(ctx context.Context, binding, resolu
 	if err != nil {
 		return err
 	}
-	result, err := s.run(ctx, "tmux", []string{"capture-pane", "-p", "-J", "-S", "-", "-t", agentruntime.PaneTarget(state.Session)}, nil)
-	if err != nil {
-		return err
-	}
-	proposal, err := parseMessageProposal(result.Output, s.Repository)
+	proposal, err := s.readMessageProposal()
 	if err != nil {
 		return err
 	}
@@ -340,11 +332,39 @@ func (s *Supervisor) consumeMessageProposal(ctx context.Context, binding, resolu
 		return errors.New("orchestrator message proposal binding changed")
 	}
 	state.ConsumedProposal, state.UpdatedAt = binding, s.now()
-	state.ProposalResolution, state.ProposalDetail = resolution, detail
+	state.ProposalBinding, state.ProposalResolution, state.ProposalDetail = "", resolution, detail
 	if err := s.writeState(state); err != nil {
 		return err
 	}
 	return s.writeMessageProposalStatus("", state)
+}
+
+func (s *Supervisor) resolveMessageProposal(binding, resolution, detail string, final bool) error {
+	state, err := s.readOrInitial()
+	if err != nil {
+		return err
+	}
+	proposal, proposalErr := s.readMessageProposal()
+	continuing := final && state.ProposalBinding == binding && state.ProposalResolution == "running"
+	if binding == "" || !continuing && (proposalErr != nil || proposal.Binding != binding) {
+		return errors.New("orchestrator message proposal binding changed")
+	}
+	state.ProposalBinding, state.ProposalResolution, state.ProposalDetail = binding, resolution, detail
+	if final {
+		state.ConsumedProposal = binding
+	}
+	state.UpdatedAt = s.now()
+	if err := s.writeState(state); err != nil {
+		return err
+	}
+	pending := binding
+	if final {
+		pending = ""
+		if proposalErr == nil && proposal.Binding != binding {
+			pending = proposal.Binding
+		}
+	}
+	return s.writeMessageProposalStatus(pending, state)
 }
 
 func (s *Supervisor) recover(ctx context.Context) (persisted, error) {
@@ -412,6 +432,9 @@ func (s *Supervisor) start(ctx context.Context, state persisted) (persisted, err
 		return s.failed(state, err)
 	}
 	if err := os.MkdirAll(s.Workspace, 0o750); err != nil {
+		return s.failed(state, err)
+	}
+	if err := s.ensureMessageProposalFile(); err != nil {
 		return s.failed(state, err)
 	}
 	contextBody, durable, err := s.contextForStart(state.ContextMode)
@@ -502,6 +525,9 @@ func (s *Supervisor) stop(ctx context.Context, session string) error {
 	if err := s.clearMessageProposalStatus(); err != nil {
 		return err
 	}
+	if err := s.clearMessageProposal(); err != nil {
+		return err
+	}
 	result, err := s.run(ctx, "tmux", []string{"kill-session", "-t", "=" + session}, nil)
 	if err != nil && !(result.Exited && result.Code == 1) {
 		return err
@@ -535,9 +561,6 @@ func (s *Supervisor) run(ctx context.Context, name string, args []string, input 
 		runner = agentruntime.ExecRunner{}
 	}
 	command := agentruntime.Command{Name: name, Args: args, Dir: s.Workspace, Env: s.Env, Stdin: input}
-	if name == "tmux" && len(args) > 0 && args[0] == "capture-pane" {
-		command.MaxOutputBytes = maxPaneCaptureBytes
-	}
 	result, err := runner.Run(ctx, command)
 	if err != nil {
 		return result, fmt.Errorf("%s %q: %w", name, args, err)
@@ -557,10 +580,10 @@ func (s *Supervisor) context(mode string) ([]byte, error) {
 	body.Write(command)
 	body.WriteString(". To retry coordinator processing of one exact authorized attempt whose implementation result is complete and awaiting validation or publication, submit `{\"version\":1,\"repository\":\"")
 	body.WriteString(s.Repository)
-	body.WriteString("\",\"issue\":123,\"attempt\":1,\"action\":\"retry_transition\",\"request_id\":\"unique-1\"}` to the same command. This is not a general recovery, cancellation, merge, tmux, shell, or GitHub mutation channel. It is accepted automatically only after fresh coordinator validation; worker messages still require dashboard confirmation. A successful command proves only that this frame was emitted. It does not prove that the coordinator captured, persisted, queued, delivered, or displayed it. Pass the same exact JSON to ")
+	body.WriteString("\",\"issue\":123,\"attempt\":1,\"action\":\"retry_transition\",\"request_id\":\"unique-1\"}` to the same command. This is not a general recovery, cancellation, merge, tmux, shell, or GitHub mutation channel. It is processed automatically only after fresh coordinator validation; worker messages still require dashboard confirmation. A successful command durably submits the exact bounded proposal, but does not prove that the coordinator accepted or completed it. Pass the same exact JSON to ")
 	statusCommand, _ := json.Marshal(s.ProposalStatusCommand)
 	body.Write(statusCommand)
-	body.WriteString(" to query the coordinator's bounded read-only acknowledgement. `pending` verifies capture; a message remains pending for dashboard confirmation, while a retry is awaiting coordinator processing. `accepted` verifies only that the coordinator validated and started the bounded retry; inspect authoritative state for its effect. `refused` includes the bounded reason. `consumed` does not distinguish message confirmation from cancellation and proves nothing about queueing or delivery; `replaced` means a different proposal is pending; `unknown` means the required coordinator check is unavailable.\n\nDistinguish implementation capability, command output, and current live state. Source and documentation prove capability, not current state. Classify material operational, UI, GitHub, tmux, handoff, and proposal claims as `VERIFIED`, `INFERRED`, or `UNKNOWN`. Query the authoritative live source before a `VERIFIED` claim, withhold recommendations whose required preconditions are `UNKNOWN`, and state the missing check when verification is unavailable. Never say a conditional dashboard control is available without both its deployed implementation and matching current live state. If the operator reports a contradiction, discard the current narrative and rebuild it from primary evidence. Do not run worker commands or bypass the read-only tmux and GitHub limits above. The coordinator owns all validation, recording, queueing, and delivery.\n")
+	body.WriteString(" to query the coordinator's bounded read-only acknowledgement. `pending` verifies capture. `running` means the exact retry is executing. `succeeded` means its coordinator pass returned successfully; re-check authoritative issue, PR, and status state for the effect. `refused` or `failed` includes the bounded reason. `consumed` does not distinguish message confirmation from cancellation and proves nothing about queueing or delivery; `replaced` means a different proposal is pending; `unknown` means the required coordinator check is unavailable.\n\nWhen the operator asks you to look at, investigate, deep dive, fix, or explain a stuck or non-progressing attempt, begin the full diagnostic and recovery loop immediately; do not wait for a second prompt. Verify the exact projected issue/attempt, current GitHub issue and PR, exact tmux pane, manifest and durable result, and proposal status. If the freshly projected attempt is an authorized completed implementation result in validation or publication, submit one `retry_transition` with a new request ID. Poll its status to `succeeded`, `failed`, or `refused`, then re-check authoritative GitHub and coordinator state. Never stop merely because a separate eligibility pre-check is unknown: the retry performs that guarded validation. Never repeat a request ID or claim recovery from submission or `running` alone.\n\nDistinguish implementation capability, command output, and current live state. Source and documentation prove capability, not current state. Classify material operational, UI, GitHub, tmux, handoff, and proposal claims as `VERIFIED`, `INFERRED`, or `UNKNOWN`. Query the authoritative live source before a `VERIFIED` claim, withhold recommendations whose required preconditions are `UNKNOWN`, and state the missing check when verification is unavailable. Never say a conditional dashboard control is available without both its deployed implementation and matching current live state. If the operator reports a contradiction, discard the current narrative and rebuild it from primary evidence. Do not run worker commands or bypass the read-only tmux and GitHub limits above. The coordinator owns all validation, recording, queueing, and delivery.\n")
 	if mode == "rebuild" {
 		encoded, err := json.MarshalIndent(s.projection, "", "  ")
 		if err != nil {
@@ -576,22 +599,12 @@ func (s *Supervisor) context(mode string) ([]byte, error) {
 	return []byte(body.String()), nil
 }
 
-func parseMessageProposal(output, repository string) (MessageProposal, error) {
-	var body []byte
-	for _, line := range slices.Backward(strings.Split(output, "\n")) {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, MessageProposalPrefix) {
-			continue
-		}
-		var err error
-		body, err = base64.StdEncoding.Strict().DecodeString(strings.TrimPrefix(line, MessageProposalPrefix))
-		if err != nil || len(body) == 0 || len(body) > maxProposalBytes {
-			return MessageProposal{}, errors.New("orchestrator message proposal frame is invalid")
-		}
-		break
-	}
+func decodeMessageProposal(body []byte, repository string) (MessageProposal, error) {
 	if len(body) == 0 {
 		return MessageProposal{}, ErrNoMessageProposal
+	}
+	if len(body) > maxProposalBytes {
+		return MessageProposal{}, errors.New("orchestrator message proposal is oversized")
 	}
 	var submitted struct {
 		Version    int    `json:"version"`
@@ -617,6 +630,84 @@ func parseMessageProposal(output, repository string) (MessageProposal, error) {
 	canonical, _ := json.Marshal(submitted)
 	proposal.Binding = digestText(string(canonical))
 	return proposal, nil
+}
+
+func (s *Supervisor) ensureMessageProposalFile() error {
+	path := filepath.Join(s.Workspace, MessageProposalFile)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o620)
+	if errors.Is(err, os.ErrExist) {
+		info, statErr := os.Lstat(path)
+		if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o620 || info.Size() > maxProposalBytes {
+			return errors.New("orchestrator proposal file is unsafe")
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := file.Chmod(0o620); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func (s *Supervisor) clearMessageProposal() error {
+	path := filepath.Join(s.Workspace, MessageProposalFile)
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o620 {
+		return errors.New("orchestrator proposal file is unsafe")
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		file.Close()
+		return err
+	}
+	opened, statErr := file.Stat()
+	if statErr != nil || !os.SameFile(info, opened) {
+		file.Close()
+		return errors.New("orchestrator proposal file changed while opening")
+	}
+	if err := file.Truncate(0); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func (s *Supervisor) readMessageProposal() (MessageProposal, error) {
+	path := filepath.Join(s.Workspace, MessageProposalFile)
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o620 || info.Size() > maxProposalBytes {
+		return MessageProposal{}, errors.New("orchestrator proposal file is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return MessageProposal{}, err
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH); err != nil {
+		return MessageProposal{}, err
+	}
+	opened, statErr := file.Stat()
+	if statErr != nil || !os.SameFile(info, opened) || opened.Size() > maxProposalBytes {
+		return MessageProposal{}, errors.New("orchestrator proposal file changed while opening")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, maxProposalBytes+1))
+	if err != nil || int64(len(body)) != opened.Size() || int64(len(body)) > maxProposalBytes {
+		return MessageProposal{}, errors.New("orchestrator proposal file changed while reading")
+	}
+	return decodeMessageProposal(bytes.TrimSpace(body), s.Repository)
 }
 
 func (s *Supervisor) contextForStart(mode string) ([]byte, bool, error) {
@@ -681,7 +772,11 @@ func (s *Supervisor) clearMessageProposalStatus() error {
 func (s *Supervisor) writeMessageProposalStatus(pending string, state persisted) error {
 	status := MessageProposalStatus{Version: stateVersion, UpdatedAt: s.now(), PendingBinding: pending, ConsumedBinding: state.ConsumedProposal}
 	if state.ProposalResolution != "" {
-		status.ResolvedBinding, status.Resolution, status.Detail = state.ConsumedProposal, state.ProposalResolution, state.ProposalDetail
+		status.ResolvedBinding = state.ProposalBinding
+		if status.ResolvedBinding == "" { // Compatibility with state written before proposal_binding existed.
+			status.ResolvedBinding = state.ConsumedProposal
+		}
+		status.Resolution, status.Detail = state.ProposalResolution, state.ProposalDetail
 	}
 	body, err := json.Marshal(status)
 	if err != nil {

@@ -126,6 +126,10 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 			s.serveReconcileAction(w, r)
 			return
 		}
+		if r.URL.Path == "/actions/attempt/message" {
+			s.serveAttemptMessageAction(w, r)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/actions/orchestrator/") {
 			s.serveOrchestratorAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/orchestrator/"))
 			return
@@ -735,6 +739,70 @@ func (s *dashboardServer) serveOrchestratorMessageAction(w http.ResponseWriter, 
 		Attempt    int    `json:"attempt"`
 		State      string `json:"state"`
 	}{message.ID, message.Repository, message.Issue, message.Attempt, message.State})
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func (s *dashboardServer) serveAttemptMessageAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "action requires POST", http.StatusMethodNotAllowed)
+		return
+	}
+	if !sameDashboardOrigin(r) {
+		http.Error(w, "action requires the dashboard origin", http.StatusForbidden)
+		return
+	}
+	if s.password == "" || s.messages == nil {
+		http.Error(w, "worker follow-up requires an authenticated dashboard", http.StatusForbidden)
+		return
+	}
+	if _, ok := s.browserSession(r); !ok {
+		http.Error(w, "worker follow-up requires a dashboard browser session", http.StatusForbidden)
+		return
+	}
+	query := r.URL.Query()
+	issue, issueErr := strconv.Atoi(query.Get("issue"))
+	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
+	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || len(query) != 2 || len(query["issue"]) != 1 || len(query["attempt"]) != 1 || r.Header.Get("Content-Type") != "application/json" || len(r.TransferEncoding) != 0 || r.ContentLength <= 0 || r.ContentLength > maxTerminalInputBytes {
+		http.Error(w, "invalid worker follow-up", http.StatusBadRequest)
+		return
+	}
+	var submitted struct {
+		Message string `json:"message"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(r.Body, maxTerminalInputBytes+1))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&submitted) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		http.Error(w, "invalid worker follow-up", http.StatusBadRequest)
+		return
+	}
+	operationMu := s.mu
+	if operationMu == nil {
+		operationMu = &s.localMu
+	}
+	if !operationMu.TryLock() {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
+		return
+	}
+	defer operationMu.Unlock()
+	status, err := s.projectedStatus(issue, attempt)
+	if err != nil || !slices.Contains([]string{"active", "review-ready"}, status.State) {
+		http.Error(w, "attempt is not eligible for a worker follow-up", http.StatusConflict)
+		return
+	}
+	message, err := s.messages.ConfirmMessage(r.Context(), orchestratoragent.MessageProposal{Version: 1, Repository: status.Repository, Issue: issue, Attempt: attempt, Message: submitted.Message})
+	if err != nil {
+		http.Error(w, internalgithub.Redact(err.Error()), http.StatusConflict)
+		return
+	}
+	body, _ := json.Marshal(struct {
+		ID    string `json:"id"`
+		State string `json:"state"`
+	}{message.ID, message.State})
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

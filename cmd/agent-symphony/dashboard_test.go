@@ -295,9 +295,10 @@ type fakeDashboardOrchestrator struct {
 
 type fakeDashboardMessageService struct {
 	*fakeDashboardOrchestrator
-	proposal orchestratoragent.MessageProposal
-	confirms int
-	consumes int
+	proposal  orchestratoragent.MessageProposal
+	confirmed orchestratoragent.MessageProposal
+	confirms  int
+	consumes  int
 }
 
 func (f *fakeDashboardMessageService) MessageProposal(context.Context) (orchestratoragent.MessageProposal, error) {
@@ -317,8 +318,52 @@ func (f *fakeDashboardMessageService) ConsumeMessageProposal(_ context.Context, 
 }
 
 func (f *fakeDashboardMessageService) ConfirmMessage(_ context.Context, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
+	f.confirmed = proposal
 	f.confirms++
 	return internalgithub.PrepareOperatorMessage(proposal.Repository, proposal.Issue, proposal.Attempt, proposal.Message)
+}
+
+func TestDashboardQueuesAuthenticatedWorkerFollowUpForExactProjectedAttempt(t *testing.T) {
+	root := t.TempDir()
+	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 131, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 131, Attempt: 3, State: "active", Session: session}}); err != nil {
+		t.Fatal(err)
+	}
+	service := &fakeDashboardMessageService{fakeDashboardOrchestrator: &fakeDashboardOrchestrator{}}
+	withoutPassword := (&dashboardServer{stateRoot: root, messages: service, mu: &sync.Mutex{}}).handler(http.NotFoundHandler())
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/attempt/message?issue=131&attempt=3", strings.NewReader(`{"message":"Continue the focused fix."}`))
+	request.Header.Set("Origin", "http://127.0.0.1")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	withoutPassword.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || service.confirms != 0 {
+		t.Fatalf("unauthenticated status=%d confirms=%d", response.Code, service.confirms)
+	}
+
+	server := &dashboardServer{stateRoot: root, password: "password", messages: service, mu: &sync.Mutex{}}
+	handler := server.handler(http.NotFoundHandler())
+	navigate := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/", nil)
+	navigate.Header.Set("Sec-Fetch-Mode", "navigate")
+	navigate.Header.Set("Sec-Fetch-Dest", "document")
+	navigate.SetBasicAuth("agent-symphony", "password")
+	navigation := httptest.NewRecorder()
+	handler.ServeHTTP(navigation, navigate)
+	sessionCookie := navigation.Result().Cookies()[0]
+
+	request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/attempt/message?issue=131&attempt=3", strings.NewReader(`{"message":"Continue the focused fix."}`))
+	request.Header.Set("Origin", "http://127.0.0.1")
+	request.Header.Set("Content-Type", "application/json")
+	request.SetBasicAuth("agent-symphony", "password")
+	request.AddCookie(sessionCookie)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	want := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "Continue the focused fix."}
+	if response.Code != http.StatusOK || service.confirms != 1 || service.confirmed != want || !strings.Contains(response.Body.String(), `"state":"queued"`) {
+		t.Fatalf("status=%d confirms=%d proposal=%#v body=%q", response.Code, service.confirms, service.confirmed, response.Body.String())
+	}
 }
 
 func TestDashboardWorkerMessageRequiresAuthenticationAndExactConfirmationBinding(t *testing.T) {

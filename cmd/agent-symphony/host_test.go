@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,10 +43,17 @@ func (agentHostRuntimeRunner) Run(ctx context.Context, command agentruntime.Comm
 	return result, nil
 }
 
-func TestHostOrchestratorProposalEmitsOnlyTheFixedValidatedFrame(t *testing.T) {
+func TestHostOrchestratorProposalWritesOnlyTheFixedValidatedArtifact(t *testing.T) {
 	root := t.TempDir()
 	workspace := filepath.Join(root, "orchestrator-test")
 	if err := os.Mkdir(workspace, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	proposalPath := filepath.Join(workspace, orchestratoragent.MessageProposalFile)
+	if err := os.WriteFile(proposalPath, nil, 0o620); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(proposalPath, 0o620); err != nil {
 		t.Fatal(err)
 	}
 	oldGetwd := hostGetwd
@@ -58,10 +64,9 @@ func TestHostOrchestratorProposalEmitsOnlyTheFixedValidatedFrame(t *testing.T) {
 	if err := writeHostOrchestratorProposal(root, strings.NewReader(proposal), &output); err != nil {
 		t.Fatal(err)
 	}
-	frame := strings.TrimSpace(output.String())
-	written, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(frame, orchestratoragent.MessageProposalPrefix))
-	if err != nil || string(written) != proposal || !strings.HasPrefix(frame, orchestratoragent.MessageProposalPrefix) {
-		t.Fatalf("frame=%q decoded=%q err=%v", frame, written, err)
+	written, err := os.ReadFile(proposalPath)
+	if err != nil || strings.TrimSpace(string(written)) != proposal || !strings.Contains(output.String(), `"state":"submitted"`) {
+		t.Fatalf("output=%q artifact=%q err=%v", output.String(), written, err)
 	}
 	output.Reset()
 	if err := writeHostOrchestratorProposal(root, strings.NewReader(`{"version":1,"repository":"o/r","issue":131,"attempt":3,"message":"changed","command":"tmux"}`), &output); err == nil {
@@ -74,7 +79,7 @@ func TestHostOrchestratorProposalEmitsOnlyTheFixedValidatedFrame(t *testing.T) {
 	if err := reportHostOrchestratorProposalStatus(root, strings.NewReader(proposal), &output); err != nil || !strings.Contains(output.String(), `"state":"unknown"`) {
 		t.Fatalf("uncaptured proposal status=%q err=%v", output.String(), err)
 	}
-	if entries, err := os.ReadDir(workspace); err != nil || len(entries) != 0 {
+	if entries, err := os.ReadDir(workspace); err != nil || len(entries) != 1 || entries[0].Name() != orchestratoragent.MessageProposalFile {
 		t.Fatalf("read-only status changed workspace: entries=%#v err=%v", entries, err)
 	}
 }
@@ -867,7 +872,7 @@ func TestMissingOperatorHandoffBindingCannotReuseTmuxLaunchOption(t *testing.T) 
 	}
 	body, _ := json.Marshal(request)
 	_, recipient := handoffBinding(request)
-	option, launches, calls := recipient, 0, 0
+	option, launches, calls, launchDir := recipient, 0, 0, ""
 	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 		calls++
 		switch command.Args[0] {
@@ -878,6 +883,9 @@ func TestMissingOperatorHandoffBindingCannotReuseTmuxLaunchOption(t *testing.T) 
 		case "respawn-pane":
 			option = recipient
 			launches++
+			if index := slices.Index(command.Args, "-c"); index >= 0 && index+1 < len(command.Args) {
+				launchDir = command.Args[index+1]
+			}
 		}
 		return agentruntime.Result{}, nil
 	}
@@ -891,8 +899,8 @@ func TestMissingOperatorHandoffBindingCannotReuseTmuxLaunchOption(t *testing.T) 
 	if _, err := acceptOperatorHandoff(t.Context(), body, root); err != nil {
 		t.Fatal(err)
 	}
-	if launches != 1 {
-		t.Fatalf("fresh handoff launches=%d, want 1", launches)
+	if launches != 1 || launchDir != worktree {
+		t.Fatalf("fresh handoff launches=%d dir=%q", launches, launchDir)
 	}
 }
 

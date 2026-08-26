@@ -118,6 +118,13 @@ code { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo
 .messageStatus .state { display: inline-block; }
 .state-delivered { background: #edf8f0; color: var(--good); }
 .state-rejected, .state-failed { background: #fae7e4; color: var(--bad); }
+.followUp { display: grid; gap: 9px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.followUp label { font-weight: 750; }
+.followUp textarea { width: 100%; resize: vertical; padding: 10px; border: 1px solid #aebbb8; border-radius: 9px; color: var(--ink); background: var(--paper); font: inherit; }
+.followUp textarea:focus-visible { outline: 3px solid #75b8ad; outline-offset: 2px; }
+.followUp p { margin: 0; color: var(--muted); font-size: 0.82rem; }
+.followUp button { justify-self: end; padding: 9px 12px; border: 1px solid; border-radius: 9px; cursor: pointer; font: inherit; font-weight: 750; }
+.followUp button:disabled { cursor: wait; opacity: 0.6; }
 
 .terminalBackdrop { position: fixed; z-index: 10; inset: 0; display: grid; place-items: center; padding: 24px; background: rgb(8 14 15 / 72%); }
 .terminalPanel { display: flex; width: min(1100px, 100%); height: min(760px, 90vh); flex-direction: column; overflow: hidden; border: 1px solid #354345; border-radius: 16px; background: #101719; box-shadow: 0 24px 80px rgb(0 0 0 / 45%); color: #e8efed; }
