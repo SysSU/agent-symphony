@@ -48,10 +48,10 @@ h1 { margin: 0; overflow-wrap: anywhere; font-size: clamp(2rem, 5vw, 3.7rem); le
 .freshness { margin: 10px 0 0; color: var(--muted); }
 
 .counts { display: flex; flex-wrap: wrap; justify-content: end; gap: 8px; }
-.count { min-width: 84px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); box-shadow: 0 5px 16px rgb(0 0 0 / 12%); }
+.count { min-width: 84px; max-width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); box-shadow: 0 5px 16px rgb(0 0 0 / 12%); }
 .count strong, .count span { display: block; }
 .count strong { font-size: 1.35rem; }
-.count span { margin-top: 2px; color: var(--muted); font-size: 0.72rem; text-transform: uppercase; }
+.count span { margin-top: 2px; overflow-wrap: anywhere; color: var(--muted); font-size: 0.72rem; text-transform: uppercase; }
 
 .health { display: flex; align-items: start; gap: 12px; margin-bottom: 20px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); }
 .health > div { flex: 1 1 240px; }
@@ -85,8 +85,8 @@ h1 { margin: 0; overflow-wrap: anywhere; font-size: clamp(2rem, 5vw, 3.7rem); le
 .issue:hover { text-decoration: underline; }
 .identity { margin: 5px 0 0; color: var(--muted); font-size: 0.78rem; }
 
-.cardChips { display: flex; flex: none; flex-direction: column; align-items: end; gap: 5px; }
-.state, .priority { flex: none; padding: 4px 7px; border: 1px solid transparent; border-radius: 999px; font-size: 0.64rem; font-weight: 800; line-height: 1; text-transform: uppercase; }
+.cardChips { display: flex; max-width: 100%; flex: none; flex-direction: column; align-items: end; gap: 5px; }
+.state, .priority { max-width: 100%; flex: 0 1 auto; overflow-wrap: anywhere; padding: 4px 7px; border: 1px solid transparent; border-radius: 999px; font-size: 0.64rem; font-weight: 800; line-height: 1; text-transform: uppercase; }
 .state { background: #3a2022; color: var(--bad); }
 .state-runnable, .state-queued, .state-eligible, .state-recovering, .state-stopped, .state-loading { background: #352b18; color: var(--warn); }
 .state-active, .state-running { background: #182d43; color: #7bbbf3; }

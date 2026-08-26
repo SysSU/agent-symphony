@@ -133,12 +133,13 @@ test("renders every board lane and keeps overflowing lanes keyboard reachable", 
 test("contains long attempt text inside a mobile viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const longText = "unbrokenattemptdetail".repeat(18);
+  const longState = `unknown-${longText}`;
   await mockDashboard(page, [{
     repository: `SysSU/${longText}`,
     issue: 201,
     attempt: 4,
     title: longText,
-    state: "active",
+    state: longState,
     priority: 2,
     session: `as-${longText}`,
     worktree: `/attempts/${longText}`,
@@ -153,16 +154,22 @@ test("contains long attempt text inside a mobile viewport", async ({ page }) => 
   const board = page.getByRole("region", { name: "Issue status board" });
   const card = board.locator(".card");
   await expect(card).toBeVisible();
+  await expect(page.locator(".count span")).toHaveText(longState);
+  await expect(card.locator(".state")).toHaveText(longState);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   expect(await board.evaluate((element) => element.scrollWidth)).toBeLessThanOrEqual(await board.evaluate((element) => element.clientWidth));
   const box = await card.boundingBox();
   expect(box).not.toBeNull();
   expect(box.x).toBeGreaterThanOrEqual(0);
   expect(box.x + box.width).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: "test-results/board-mobile-long-state.png", fullPage: true });
 });
 
 test("opens attempt and orchestrator terminals, closes them, and restores focus", async ({ page }) => {
-  await page.routeWebSocket((url) => url.pathname.endsWith("/terminal"), () => {});
+  const terminalMessages = [];
+  await page.routeWebSocket((url) => url.pathname.endsWith("/terminal"), (socket) => {
+    socket.onMessage((message) => terminalMessages.push(message));
+  });
   await mockDashboard(page, [statuses[0]]);
   await page.goto("/");
 
@@ -172,6 +179,10 @@ test("opens attempt and orchestrator terminals, closes them, and restores focus"
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole("status")).toHaveText("Connected");
   await expect(dialog.locator(".terminal textarea")).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect.poll(() => terminalMessages.some((message) => Buffer.isBuffer(message) && message.equals(Buffer.from([0x1b])))).toBe(true);
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Close" }).focus();
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
   await expect(attemptTerminal).toBeFocused();

@@ -76,6 +76,7 @@ export default function TerminalPanel({ config, onClose }) {
     closeButton.current?.focus();
     const keyboard = (event) => {
       if (event.key === "Escape") {
+        if (container.current?.contains(event.target)) return;
         event.preventDefault();
         event.stopPropagation();
         onClose();
