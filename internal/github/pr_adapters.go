@@ -364,7 +364,12 @@ func completePreparedPublication(state *PRState, prepared PreparedPublication) e
 			return err
 		}
 	}
-	state.HeadSHA = prepared.HeadSHA
+	advancePublicationHead(state, prepared.HeadSHA)
+	return nil
+}
+
+func advancePublicationHead(state *PRState, head string) {
+	state.HeadSHA = head
 	state.CheckHead, state.PolicyStatus = "", ""
 	state.ValidationQueuedSHA, state.ValidationInFlightSHA, state.ValidationResult, state.ValidationEvidence = "", "", "", ""
 	state.MergeAttemptSHA, state.MergePhase = "", ""
@@ -372,7 +377,15 @@ func completePreparedPublication(state *PRState, prepared PreparedPublication) e
 	state.Facts.BranchModifiedOutsideAttempt = false
 	state.PendingDispositions, state.ConfirmedDispositions = nil, nil
 	state.PreparedPublication = nil
-	return nil
+}
+
+func recoveryWorkInFlight(state PRState) bool {
+	if state.PreparedPublication != nil || state.ValidationQueuedSHA != "" || state.ValidationInFlightSHA != "" || state.MergeAttemptSHA != "" || state.MergePhase != "" {
+		return true
+	}
+	return slices.ContainsFunc(state.Facts.Feedback, func(feedback Feedback) bool {
+		return feedback.Execution == FeedbackClaimed || feedback.Execution == FeedbackInFlight
+	})
 }
 
 // CompleteHandoffPublication atomically records feedback outcomes and advances
@@ -424,11 +437,14 @@ func (r *FileRecovery) hydrateAttempts(repository string, facts []RecoveryAttemp
 					return nil, errors.New("authoritative pull request attempt conflicts with recovery state")
 				}
 				if state.HeadSHA != fact.HeadSHA {
-					if state.PreparedPublication == nil || state.PreparedPublication.HeadSHA != fact.HeadSHA {
+					if state.PreparedPublication != nil && state.PreparedPublication.HeadSHA == fact.HeadSHA {
+						if err := completePreparedPublication(state, *state.PreparedPublication); err != nil {
+							return nil, err
+						}
+					} else if fact.PublicationConfirmed && !recoveryWorkInFlight(*state) {
+						advancePublicationHead(state, fact.HeadSHA)
+					} else {
 						return nil, errors.New("authoritative pull request attempt conflicts with recovery state")
-					}
-					if err := completePreparedPublication(state, *state.PreparedPublication); err != nil {
-						return nil, err
 					}
 				}
 				found = true

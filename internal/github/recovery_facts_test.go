@@ -478,7 +478,7 @@ func TestFetchAttemptFactsPaginatesMarkersAndChecks(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(b)))}, nil
 	})}}
 	facts, err := FetchAttemptFacts(context.Background(), api, "o/r", 42)
-	if err != nil || len(facts) != 1 || facts[0].BaseSHA != "aaaaaaa" || facts[0].State != "review-ready" || len(facts[0].Checks) != 101 {
+	if err != nil || len(facts) != 1 || facts[0].BaseSHA != "aaaaaaa" || facts[0].State != "review-ready" || !facts[0].PublicationConfirmed || len(facts[0].Checks) != 101 {
 		t.Fatalf("facts=%#v err=%v", facts, err)
 	}
 }

@@ -134,6 +134,7 @@ type RecoveryAttemptFact struct {
 	Repository              string
 	Issue, Attempt, PR      int
 	BaseSHA, HeadSHA, State string
+	PublicationConfirmed    bool
 	Diagnostic              string
 	Checks                  []string
 }
@@ -699,7 +700,7 @@ func fetchAttemptFacts(ctx context.Context, api API, repository string, actorID,
 					state = "review-ready"
 				}
 			}
-			facts = append(facts, RecoveryAttemptFact{Repository: repository, Issue: issue, Attempt: attempt, BaseSHA: boundBase, HeadSHA: pull.Head.SHA, PR: pull.Number, State: state, Checks: checks})
+			facts = append(facts, RecoveryAttemptFact{Repository: repository, Issue: issue, Attempt: attempt, BaseSHA: boundBase, HeadSHA: pull.Head.SHA, PR: pull.Number, State: state, PublicationConfirmed: true, Checks: checks})
 		}
 		if targetIssue > 0 || len(pulls) < recoveryPullsPerPage {
 			return facts, nil
