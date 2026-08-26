@@ -64,6 +64,31 @@ async function mockDashboard(page, attempts, orchestrator = { enabled: true, sta
   };
 }
 
+test("shows loading then unavailable when the initial status request fails", async ({ page }) => {
+  let releaseStatus;
+  const statusPending = new Promise((resolve) => { releaseStatus = resolve; });
+  await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: true, state: "running", session: "orchestrator" } }));
+  await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
+  await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { version: 1, hidden: [] } }));
+  await page.route("**/status.json", async (route) => {
+    await statusPending;
+    await route.fulfill({ status: 500, body: "status unavailable" });
+  });
+  await page.goto("/");
+
+  const board = page.getByRole("region", { name: "Issue status board" });
+  await expect(board).toContainText("Loading issue status board…");
+  await expect(board.getByText("No attempts")).toHaveCount(0);
+
+  releaseStatus();
+  await expect(board).toContainText("Issue status board unavailable.");
+  await expect(board.locator(".lane")).toHaveCount(0);
+  const errors = browserErrors.get(page);
+  expect(errors.length).toBeGreaterThan(0);
+  expect(new Set(errors)).toEqual(new Set(["console: Failed to load resource: the server responded with a status of 500 (Internal Server Error)"]));
+  browserErrors.set(page, []);
+});
+
 test("renders every board lane and keeps overflowing lanes keyboard reachable", async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 900 });
   await mockDashboard(page, statuses);

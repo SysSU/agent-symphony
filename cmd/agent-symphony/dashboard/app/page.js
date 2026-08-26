@@ -223,7 +223,7 @@ export default function Dashboard() {
         event.preventDefault();
         event.currentTarget.scrollLeft += event.key === "ArrowLeft" ? -event.currentTarget.clientWidth : event.currentTarget.clientWidth;
       }}>
-        {lanes.map((lane) => (
+        {snapshot ? lanes.map((lane) => (
           <section className="lane" aria-labelledby={`lane-${lane.id}`} key={lane.id}>
             <header className="laneHeader">
               <h2 id={`lane-${lane.id}`}>
@@ -251,7 +251,7 @@ export default function Dashboard() {
               </ol>
             ) : <p className="emptyLane">No attempts</p>}
           </section>
-        ))}
+        )) : <p className="boardState" role="status">{error ? "Issue status board unavailable." : "Loading issue status board…"}</p>}
       </section>
       {terminal ? <TerminalPanel config={terminal} onClose={closeTerminal} /> : null}
     </main>
