@@ -286,6 +286,10 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	if err != nil || len(bound) != 1 || bound[0].Eligible || !bound[0].Active || !bound[0].DispatchAuthorized || bound[0].Attempt != 2 || bound[0].ActiveAttempt == nil || bound[0].ActiveAttempt.BaseSHA != "abcdef0" {
 		t.Fatalf("bound facts=%#v err=%v", bound, err)
 	}
+	targeted, err := FetchOperatorIssueFacts(context.Background(), api, cfg, nil, 10)
+	if err != nil || len(targeted) != 1 || !targeted[0].Active || !targeted[0].DispatchAuthorized || targeted[0].Attempt != 2 {
+		t.Fatalf("targeted facts=%#v err=%v", targeted, err)
+	}
 	terminal, _ := TerminalFailureMarker(10, 2, now.Add(20*time.Minute))
 	snapshotBodies = append(snapshotBodies, "Attempt failed closed: worker produced no repository changes\n\n"+terminal)
 	failed, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
@@ -474,7 +478,32 @@ func TestFetchAttemptFactsPaginatesMarkersAndChecks(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(b)))}, nil
 	})}}
 	facts, err := FetchAttemptFacts(context.Background(), api, "o/r", 42)
-	if err != nil || len(facts) != 1 || facts[0].BaseSHA != "aaaaaaa" || facts[0].State != "review-ready" || len(facts[0].Checks) != 101 {
+	if err != nil || len(facts) != 1 || facts[0].BaseSHA != "aaaaaaa" || facts[0].State != "review-ready" || !facts[0].PublicationConfirmed || len(facts[0].Checks) != 101 {
+		t.Fatalf("facts=%#v err=%v", facts, err)
+	}
+}
+
+func TestFetchOperatorAttemptFactsReadsOnlyTheDeterministicPullRequest(t *testing.T) {
+	branch, _ := AttemptBranch("o/r", 4, 2)
+	marker, _ := AttemptMarker(4, 2, branch, "ccccccc", 9, "review")
+	binding, _ := ActiveAttemptMarker("o/r", 4, 2, "aaaaaaa")
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var body any
+		switch {
+		case r.URL.Path == "/repos/o/r/pulls" && r.URL.Query().Get("head") == "o:"+branch:
+			body = []any{map[string]any{"number": 9, "body": marker, "state": "open", "head": map[string]any{"sha": "ccccccc", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}}}
+		case r.URL.RequestURI() == "/repos/o/r/issues/4":
+			body = map[string]any{"state": "open"}
+		case r.URL.RequestURI() == "/repos/o/r/issues/4/comments?per_page=100&page=1":
+			body = []any{map[string]any{"body": binding, "user": map[string]any{"id": 42}}, map[string]any{"body": marker, "user": map[string]any{"id": 42}}}
+		default:
+			t.Fatalf("unexpected operator-target request %s", r.URL.String())
+		}
+		encoded, _ := json.Marshal(body)
+		return httpResponse(http.StatusOK, string(encoded), nil), nil
+	})}}
+	facts, err := FetchOperatorAttemptFacts(context.Background(), api, "o/r", 42, 4, 2)
+	if err != nil || len(facts) != 1 || facts[0].BaseSHA != "aaaaaaa" || facts[0].State != "active" || len(facts[0].Checks) != 0 {
 		t.Fatalf("facts=%#v err=%v", facts, err)
 	}
 }

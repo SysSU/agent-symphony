@@ -23,7 +23,7 @@ func AgentEnvironment(environment []string) []string {
 }
 
 func AgentEnvironmentWith(environment []string, allowed ...string) ([]string, error) {
-	safe := map[string]bool{"PATH": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "TERM": true, "COLORTERM": true, "NO_COLOR": true}
+	safe := map[string]bool{"PATH": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "TERM": true, "COLORTERM": true, "NO_COLOR": true, "CODEX_HOME": true}
 	for _, name := range allowed {
 		if reservedAgentVariable(name) && !modelCredentialVariable(name) {
 			return nil, errors.New("reserved credential or coordinator variable " + name + " cannot be allowed")

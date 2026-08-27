@@ -17,6 +17,7 @@ type dashboardOrchestratorService struct {
 	orchestratoragent.Service
 	supervisor *orchestratoragent.Supervisor
 	confirm    func(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error)
+	accepted   func(internalgithub.OperatorMessage)
 }
 
 var orchestratorWorkspacePrepare = prepareOrchestratorWorkspace
@@ -33,7 +34,11 @@ func (s dashboardOrchestratorService) ConfirmMessage(ctx context.Context, propos
 	if s.confirm == nil {
 		return internalgithub.OperatorMessage{}, fmt.Errorf("operator message confirmation is unavailable")
 	}
-	return s.confirm(ctx, proposal)
+	message, err := s.confirm(ctx, proposal)
+	if err == nil && s.accepted != nil {
+		s.accepted(message)
+	}
+	return message, err
 }
 
 func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratoragent.Supervisor, error) {
@@ -62,7 +67,7 @@ func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratorage
 	if err != nil {
 		return nil, err
 	}
-	agent.Env = env
+	agent.Env = append(env, "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
 	if !hostIsolationInstalled() {
 		agent.Env = append(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+productionSnapshotRoot(stateRoot))
 		for _, path := range workspaces {

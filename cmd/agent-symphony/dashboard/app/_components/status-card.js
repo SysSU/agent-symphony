@@ -1,5 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
+import { postWithReconciliationRetry } from "../actions.mjs";
 import { canInvestigate, orchestratorPresentation } from "../health.mjs";
 
 const attachableSessionRoles = new Set(["implementation", "reviewer"]);
@@ -58,6 +59,40 @@ function StatusActions({ status, onAction, onInvestigate, investigationEnabled, 
   );
 }
 
+function OperatorFollowUp({ status, enabled, onNotice }) {
+	const [message, setMessage] = useState("");
+	const [busy, setBusy] = useState(false);
+	const retryable = status.retryable && ["blocked", "orphaned"].includes(status.state);
+	if (!enabled || (!retryable && !["active", "review-ready"].includes(status.state))) return null;
+  const id = `follow-up-${status.issue}-${status.attempt}`;
+  async function submit(event) {
+    event.preventDefault();
+    const body = message.trim();
+    if (!body) return;
+    setBusy(true);
+    onNotice("");
+    try {
+      const query = new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) });
+      const response = await postWithReconciliationRetry(`/actions/attempt/message?${query}`, undefined, { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: body }) });
+      if (!response.ok) throw new Error((await response.text()).trim() || `Worker follow-up failed (${response.status})`);
+      setMessage("");
+      onNotice(`Queued a follow-up for issue #${status.issue}, attempt ${status.attempt}. The coordinator will start its verified follow-up when safe.`);
+    } catch (reason) {
+      onNotice(reason instanceof Error ? reason.message : "Worker follow-up failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <form className="followUp" onSubmit={submit}>
+      <label htmlFor={id}>Tell this agent what to do next</label>
+      <textarea id={id} value={message} maxLength={8192} required rows={4} disabled={busy} onChange={(event) => setMessage(event.target.value)} aria-describedby={`${id}-help`} />
+      <p id={`${id}-help`}>Queues one verified fresh turn in this exact worktree. Open tmux above to watch after it starts.</p>
+      <button className="primaryAction" type="submit" disabled={busy || !message.trim()}>{busy ? "Queueing…" : "Queue follow-up"}</button>
+    </form>
+  );
+}
+
 export function StatusCard(props) {
   const { status, onOpenTerminal } = props;
   const issueURL = githubURL(status.repository, "issues", status.issue);
@@ -107,6 +142,7 @@ export function StatusCard(props) {
         <Detail label="Diagnostic">{status.diagnostic}</Detail>
         <Detail label="Next action">{status.next_action}</Detail>
       </dl>
+      <OperatorFollowUp status={status} enabled={props.followUpEnabled} onNotice={props.onNotice} />
       <StatusActions {...props} />
     </article>
   );

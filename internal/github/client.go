@@ -17,11 +17,19 @@ import (
 )
 
 type API struct {
-	BaseURL string
-	HTTP    *http.Client
-	Cache   *ReadCache
-	Sleep   func(context.Context, time.Duration) error
-	Retries int
+	BaseURL  string
+	HTTP     *http.Client
+	Cache    *ReadCache
+	snapshot map[string]json.RawMessage
+	Sleep    func(context.Context, time.Duration) error
+	Retries  int
+}
+
+// WithReadSnapshot deduplicates identical reads during one authoritative
+// projection. Mutations still invalidate the snapshot before they run.
+func (a API) WithReadSnapshot() API {
+	a.snapshot = map[string]json.RawMessage{}
+	return a
 }
 
 const maxJSONBody = 1 << 20
@@ -129,6 +137,9 @@ func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool
 	if !strings.HasPrefix(path, "/") {
 		return "", false, errors.New("GitHub API path must start with /")
 	}
+	if body, ok := a.snapshot[path]; ok {
+		return "", false, decodeJSON(bytes.NewReader(body), dst)
+	}
 	var cached readCacheEntry
 	if etag == "" && a.Cache != nil {
 		cached, _ = a.Cache.get(path)
@@ -145,6 +156,9 @@ func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool
 			if len(cached.Body) > 0 {
 				if err := decodeJSON(bytes.NewReader(cached.Body), dst); err != nil {
 					return "", false, fmt.Errorf("decode cached GitHub read: %w", err)
+				}
+				if a.snapshot != nil {
+					a.snapshot[path] = append(json.RawMessage(nil), cached.Body...)
 				}
 			}
 			responseETag := resp.Header.Get("ETag")
@@ -164,6 +178,9 @@ func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool
 				if err := a.Cache.put(path, responseETag, body.Bytes()); err != nil {
 					return "", false, fmt.Errorf("cache GitHub read: %w", err)
 				}
+			}
+			if a.snapshot != nil {
+				a.snapshot[path] = append(json.RawMessage(nil), body.Bytes()...)
 			}
 			return responseETag, true, nil
 		}
@@ -218,6 +235,7 @@ func (a API) Mutate(ctx context.Context, method, path string, body any, attribut
 	if json.Unmarshal(b, &object) != nil || json.Unmarshal(object["body"], &persistedBody) != nil || !strings.Contains(persistedBody, marker) {
 		return errors.New("GitHub mutation body must persist issue and attempt attribution")
 	}
+	clear(a.snapshot)
 	resp, err := a.do(ctx, method, path, "", b, attribution)
 	if err != nil {
 		return &ambiguousMutationError{fmt.Errorf("GitHub mutation outcome is ambiguous; reconcile issue #%d attempt %d: %w", attribution.Issue, attribution.Attempt, err)}

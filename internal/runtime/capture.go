@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -22,7 +23,23 @@ var (
 	ErrWorkerOutputOpen = errors.New("worker stdout remained open after process-group termination")
 )
 
-const workerCaptureDrainTimeout = 500 * time.Millisecond
+const (
+	workerCaptureDrainTimeout = 500 * time.Millisecond
+	workerReadyTimeout        = 15 * time.Second
+)
+
+type readyWriter struct {
+	io.Writer
+	ready func()
+}
+
+func (w readyWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if n > 0 {
+		w.ready()
+	}
+	return n, err
+}
 
 // The wrapper pins the process-group identity until its parent signals the group.
 const workerWrapper = `set +m
@@ -67,11 +84,13 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 	}
 	defer prompt.Close()
 	save := exec.CommandContext(ctx, tmux, "save-buffer", "-b", buffer, "-")
+	save.Dir = tempDir
 	save.Stdout, save.Stderr = prompt, stderr
 	if err := save.Run(); err != nil {
 		return 1, fmt.Errorf("save prompt buffer: %w", err)
 	}
 	deleteBuffer := exec.CommandContext(ctx, tmux, "delete-buffer", "-b", buffer)
+	deleteBuffer.Dir = tempDir
 	deleteBuffer.Stderr = stderr
 	if err := deleteBuffer.Run(); err != nil {
 		return 1, fmt.Errorf("delete prompt buffer: %w", err)
@@ -79,7 +98,6 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 	if _, err := prompt.Seek(0, io.SeekStart); err != nil {
 		return 1, err
 	}
-
 	if _, err := exec.LookPath(command[0]); err != nil {
 		return 1, err
 	}
@@ -98,7 +116,10 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 
 	args := append([]string{"-c", workerWrapper, "agent-symphony-worker"}, command...)
 	child := exec.Command("/bin/sh", args...)
-	child.Stdin, child.Stderr, child.Env = prompt, stderr, captureEnvironment(os.Environ())
+	ready := make(chan struct{})
+	var readyOnce sync.Once
+	markReady := func() { readyOnce.Do(func() { close(ready) }) }
+	child.Stdin, child.Stderr, child.Env = prompt, readyWriter{Writer: stderr, ready: markReady}, captureEnvironment(os.Environ())
 	child.ExtraFiles = []*os.File{statusWriter, holdReader}
 	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var result *os.File
@@ -134,13 +155,6 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 	if err := child.Start(); err != nil {
 		return 1, err
 	}
-	if afterStart != nil {
-		if err := afterStart(); err != nil {
-			_ = killProcessGroup(child)
-			_ = child.Wait()
-			return 1, err
-		}
-	}
 	pipeFD := int(pipe.Fd())
 	if err := syscall.SetNonblock(pipeFD, true); err != nil {
 		_ = killProcessGroup(child)
@@ -164,7 +178,38 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 	if resultPath != "" {
 		destination, bounded = result, true
 	}
+	destination = readyWriter{Writer: destination, ready: markReady}
 	go func() { captured <- captureWorkerOutput(destination, pipeFD, stopped, bounded) }()
+	if afterStart != nil {
+		timer := time.NewTimer(workerReadyTimeout)
+		select {
+		case <-ready:
+			timer.Stop()
+			if err := afterStart(); err != nil {
+				_ = killProcessGroup(child)
+				close(stopped)
+				<-captured
+				_ = pipe.Close()
+				_ = child.Wait()
+				return 1, err
+			}
+		case <-timer.C:
+			_ = killProcessGroup(child)
+			close(stopped)
+			<-captured
+			_ = pipe.Close()
+			_ = child.Wait()
+			return 1, errors.New("worker produced no startup output within 15 seconds")
+		case <-ctx.Done():
+			timer.Stop()
+			_ = killProcessGroup(child)
+			close(stopped)
+			<-captured
+			_ = pipe.Close()
+			_ = child.Wait()
+			return 1, ctx.Err()
+		}
+	}
 	if !bounded {
 		var finished completion
 		select {
