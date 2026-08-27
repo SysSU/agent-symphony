@@ -11,7 +11,7 @@ import (
 
 func TestLoadAndValidate(t *testing.T) {
 	c := Default("owner/repo")
-	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
+	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
 		t.Fatalf("unexpected default commands: %#v", c.Commands)
 	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
@@ -33,6 +33,22 @@ func TestLoadAndValidate(t *testing.T) {
 	}
 	if c.Repository != "owner/repo" || c.Concurrency != 1 || c.CompletionPolicies.Default != "human-review" || !slices.Equal(c.Commands.Implementation, []string{"custom-agent", "--flag"}) {
 		t.Fatalf("unexpected defaults: %#v", c)
+	}
+}
+
+func TestLoadNormalizesTheLegacyDefaultCodexStdinCommand(t *testing.T) {
+	c := Default("owner/repo")
+	c.Commands.Implementation = c.Commands.Implementation[:3]
+	path := filepath.Join(t.TempDir(), DefaultPath)
+	if err := Write(path, c); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := load(path, filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(loaded.Commands.Implementation, Default("owner/repo").Commands.Implementation) {
+		t.Fatalf("legacy implementation command was not normalized: %q", loaded.Commands.Implementation)
 	}
 }
 

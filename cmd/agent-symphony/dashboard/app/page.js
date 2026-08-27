@@ -22,7 +22,7 @@ export default function Dashboard() {
   const [orchestratorBusy, setOrchestratorBusy] = useState("");
   const [investigating, setInvestigating] = useState("");
   const [messageProposal, setMessageProposal] = useState(null);
-  const [messageError, setMessageError] = useState("");
+  const [messageError, setMessageError] = useState("Loading worker-message controls…");
   const [messageBusy, setMessageBusy] = useState("");
   const closeTerminal = useCallback(() => setTerminal(null), []);
 
@@ -245,6 +245,8 @@ export default function Dashboard() {
                       busy={busy === attemptKey(status)}
                       investigating={investigating === attemptKey(status)}
                       waiting={waiting && busy === attemptKey(status)}
+                      followUpEnabled={!messageError}
+                      onNotice={setActionNotice}
                     />
                   </li>
                 ))}

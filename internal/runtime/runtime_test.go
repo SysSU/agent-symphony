@@ -137,6 +137,9 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 		if s == nil {
 			return Result{}, errors.New("missing session")
 		}
+		if slices.Contains(command.Args, "#{pane_start_command}") {
+			return Result{Output: strings.Join(s.agent, " ")}, nil
+		}
 		if slices.Contains(command.Args, "#{pane_dead} #{pane_dead_status}") {
 			if s.dead {
 				return Result{Output: "1 " + strconv.Itoa(s.status)}, nil
@@ -182,6 +185,91 @@ func TestParsePaneStatus(t *testing.T) {
 			dead, status, err := ParsePaneStatus(test.output)
 			if dead != test.dead || status != test.status || test.wantErr == "" && err != nil || test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
 				t.Fatalf("ParsePaneStatus(%q) = %v, %d, %v", test.output, dead, status, err)
+			}
+		})
+	}
+}
+
+func TestInterruptLegacyOperatorHandoffStopsOnlyTheRetiredResumeCommand(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		command []string
+		want    bool
+	}{
+		{"old resume", []string{"agent-symphony", "worker-capture-handoff", "--", "codex", "exec", "resume", "--last", "--dangerously-bypass-approvals-and-sandbox", "-"}, true},
+		{"old fresh", []string{"agent-symphony", "worker-capture-handoff", "--", "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}, true},
+		{"ready protocol", []string{"agent-symphony", "worker-capture-handoff-ready", "--", "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r, fake, attempt, _ := testRuntime(t)
+			manifest, err := r.PrepareAndStart(t.Context(), attempt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest.UpdatedAt = time.Now().Add(-3 * time.Minute)
+			oldSession := fake.sessions[manifest.Session]
+			oldSession.agent = test.command
+			got, err := r.InterruptLegacyOperatorHandoff(t.Context(), manifest, 2*time.Minute)
+			if err != nil || got != test.want || oldSession.stopped != test.want {
+				t.Fatalf("interrupted=%v stopped=%v err=%v", got, oldSession.stopped, err)
+			}
+			if test.want && (fake.sessions[manifest.Session] == oldSession || fake.sessions[manifest.Session].dead) {
+				t.Fatal("retired pane was not replaced with a fresh live session")
+			}
+		})
+	}
+}
+
+func TestRecoverInterruptedHandoffRecreatesOnlyUnacknowledgedStartup(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		missing  bool
+		dead     bool
+		noMarker bool
+		want     bool
+	}{
+		{name: "missing session", missing: true, want: true},
+		{name: "missing before launch marker", missing: true, noMarker: true, want: true},
+		{name: "dead ready worker", dead: true, want: true},
+		{name: "live ready worker"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r, fake, attempt, _ := testRuntime(t)
+			manifest, err := r.PrepareAndStart(t.Context(), attempt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := "operator-message-" + strings.Repeat("a", 64)
+			inbox := filepath.Join(manifest.Worktree, ".agent-symphony", "handoffs")
+			if err := os.MkdirAll(inbox, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if !test.noMarker {
+				if err := os.WriteFile(filepath.Join(inbox, key+".launching"), []byte("recipient"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(ResultPath(manifest.Worktree), []byte(`{"type":"agent-symphony-result-v1","validation":"retained","documentation":"none"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			old := fake.sessions[manifest.Session]
+			old.agent = []string{"agent-symphony", "worker-capture-handoff-ready", "tmux", "buffer", "result", "launched", "recipient", "signal", "--", "codex", "exec", "-"}
+			old.dead = test.dead
+			if test.missing {
+				delete(fake.sessions, manifest.Session)
+			}
+			got, recovered, err := r.RecoverInterruptedHandoff(t.Context(), manifest, key)
+			if err != nil || recovered != test.want {
+				t.Fatalf("recovered=%v manifest=%#v err=%v", recovered, got, err)
+			}
+			if test.want {
+				if got.State != "completed" || fake.sessions[manifest.Session] == nil || fake.sessions[manifest.Session] == old {
+					t.Fatalf("interrupted startup was not reset: %#v session=%#v", got, fake.sessions[manifest.Session])
+				}
+				stored, err := readManifest(r.manifestPath(attempt))
+				if err != nil || stored.State != "completed" {
+					t.Fatalf("recovery was not durable: %#v err=%v", stored, err)
+				}
 			}
 		})
 	}
@@ -275,6 +363,23 @@ func TestResumeHandoffRefreshesTrustedSourceRefs(t *testing.T) {
 	}
 	if got := gitOutput(t, resumed.Worktree, "remote"); got != "" {
 		t.Fatalf("worker remote=%q", got)
+	}
+}
+
+func TestResumeHandoffRecreatesMissingSessionBeforeStateTransition(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.sessions[manifest.Session].dead = true
+	if manifest, err = r.Monitor(t.Context(), attempt); err != nil || manifest.State != "completed" {
+		t.Fatalf("completed manifest=%#v err=%v", manifest, err)
+	}
+	delete(fake.sessions, manifest.Session)
+	resumed, err := r.ResumeHandoff(t.Context(), attempt)
+	if err != nil || resumed.State != "running" || fake.sessions[manifest.Session] == nil {
+		t.Fatalf("resumed=%#v session=%#v err=%v", resumed, fake.sessions[manifest.Session], err)
 	}
 }
 
@@ -603,6 +708,29 @@ func TestCaptureWorkerCancellationKillsAndReapsChildGroup(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestHandoffLaunchWaitsForWorkerOutput(t *testing.T) {
+	dir := t.TempDir()
+	prompt := filepath.Join(dir, "prompt")
+	if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tmux := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; *) exit 2;; esac\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_PROMPT", prompt)
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	acknowledged := false
+	code, err := CaptureWorkerReplacingResultAfterStart(ctx, tmux, "prompt-buffer", filepath.Join(dir, "result"), []string{"sh", "-c", "cat >/dev/null; sleep 5"}, io.Discard, io.Discard, func() error {
+		acknowledged = true
+		return nil
+	})
+	if code == 0 || !errors.Is(err, context.DeadlineExceeded) || acknowledged {
+		t.Fatalf("code=%d err=%v acknowledged=%v", code, err, acknowledged)
 	}
 }
 

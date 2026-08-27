@@ -24,6 +24,28 @@ type orchestratorTestRunner struct {
 	pane string
 }
 
+func TestDashboardMessageConfirmationSchedulesOnlyDurablyAcceptedMessages(t *testing.T) {
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 4, Attempt: 2, Message: "Continue."}
+	var scheduled internalgithub.OperatorMessage
+	service := dashboardOrchestratorService{
+		confirm: func(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
+			return internalgithub.PrepareOperatorMessage("o/r", 4, 2, "Continue.")
+		},
+		accepted: func(message internalgithub.OperatorMessage) { scheduled = message },
+	}
+	message, err := service.ConfirmMessage(t.Context(), proposal)
+	if err != nil || scheduled.ID == "" || scheduled.ID != message.ID {
+		t.Fatalf("message=%#v scheduled=%#v err=%v", message, scheduled, err)
+	}
+	service.confirm = func(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
+		return internalgithub.OperatorMessage{}, errors.New("not recorded")
+	}
+	scheduled = internalgithub.OperatorMessage{}
+	if _, err := service.ConfirmMessage(t.Context(), proposal); err == nil || scheduled.ID != "" {
+		t.Fatalf("failed confirmation scheduled=%#v err=%v", scheduled, err)
+	}
+}
+
 func fakeAdvancedOrchestratorHost(t *testing.T) int {
 	t.Helper()
 	snapshotRoot := t.TempDir()
@@ -66,7 +88,7 @@ func (r *orchestratorTestRunner) Run(_ context.Context, command agentruntime.Com
 	return agentruntime.Result{}, nil
 }
 
-func TestConfiguredFullAccessOrchestratorProposesThroughCapturedOutput(t *testing.T) {
+func TestConfiguredFullAccessOrchestratorProposesThroughDurableArtifact(t *testing.T) {
 	fakeAdvancedOrchestratorHost(t)
 	oldPrepare := orchestratorWorkspacePrepare
 	orchestratorWorkspacePrepare = func(path string, _ int) error { return os.MkdirAll(path, 0o750) }
@@ -76,6 +98,11 @@ func TestConfiguredFullAccessOrchestratorProposesThroughCapturedOutput(t *testin
 	stateRoot := t.TempDir()
 	agent, err := newOrchestratorAgent(cfg, stateRoot)
 	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &orchestratorTestRunner{}
+	agent.Runner = runner
+	if _, err := agent.Observe(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
 	proposal := struct {
@@ -91,11 +118,6 @@ func TestConfiguredFullAccessOrchestratorProposesThroughCapturedOutput(t *testin
 	t.Cleanup(func() { hostGetwd = oldGetwd })
 	var pane bytes.Buffer
 	if err := writeHostOrchestratorProposal(productionSnapshotRoot(stateRoot), bytes.NewReader(body), &pane); err != nil {
-		t.Fatal(err)
-	}
-	runner := &orchestratorTestRunner{pane: pane.String()}
-	agent.Runner = runner
-	if _, err := agent.Observe(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENT_SYMPHONY_ORCHESTRATOR_ROOT", productionSnapshotRoot(stateRoot))
@@ -133,7 +155,6 @@ func TestConfiguredFullAccessOrchestratorProposesThroughCapturedOutput(t *testin
 	if err := writeHostOrchestratorProposal(productionSnapshotRoot(stateRoot), bytes.NewReader(body), &pane); err != nil {
 		t.Fatal(err)
 	}
-	runner.pane = pane.String()
 	got, err = agent.MessageProposal(t.Context())
 	if err != nil || got.Message != proposal.Message {
 		t.Fatalf("maximum escaped proposal length=%d err=%v", len(got.Message), err)
@@ -151,7 +172,7 @@ func TestConfiguredFullAccessOrchestratorProposesThroughCapturedOutput(t *testin
 		t.Fatalf("consumed proposal state=%q", state)
 	}
 	launch, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratorLaunchFile))
-	if err != nil || !strings.Contains(string(launch), `"--sandbox"`) || !strings.Contains(string(launch), `"danger-full-access"`) || !strings.Contains(string(launch), "orchestrator-proposal-status") || !strings.Contains(string(launch), "successful command proves only") {
+	if err != nil || !strings.Contains(string(launch), `"--sandbox"`) || !strings.Contains(string(launch), `"danger-full-access"`) || !strings.Contains(string(launch), "orchestrator-proposal-status") || !strings.Contains(string(launch), "successful command durably submits") {
 		t.Fatalf("full-access launch=%s err=%v", launch, err)
 	}
 	entries, err := os.ReadDir(agent.Workspace)
@@ -159,6 +180,16 @@ func TestConfiguredFullAccessOrchestratorProposesThroughCapturedOutput(t *testin
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
+		if entry.Name() == orchestratoragent.MessageProposalFile {
+			info, statErr := entry.Info()
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			if info.Mode().Perm() != 0o620 {
+				t.Fatalf("unsafe proposal artifact mode=%v", info.Mode())
+			}
+			continue
+		}
 		if entry.Name() == orchestratoragent.MessageProposalStatusFile {
 			path := filepath.Join(agent.Workspace, entry.Name())
 			status, readErr := os.ReadFile(path)
@@ -172,7 +203,7 @@ func TestConfiguredFullAccessOrchestratorProposesThroughCapturedOutput(t *testin
 			continue
 		}
 		if strings.Contains(entry.Name(), "proposal") {
-			t.Fatalf("read-only proposal required a writable file: %s", entry.Name())
+			t.Fatalf("unexpected proposal artifact: %s", entry.Name())
 		}
 	}
 }
@@ -226,7 +257,7 @@ func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 	t.Setenv("AGENT_SYMPHONY_ORCHESTRATOR_ROOT", root)
 	proposal := `{"version":1,"repository":"SysSU/example","issue":159,"attempt":1,"message":"Run the focused test."}`
 	var output bytes.Buffer
-	if err := agentHost(t.Context(), "orchestrator-proposal", strings.NewReader(proposal), &output); err != nil || !strings.HasPrefix(output.String(), orchestratoragent.MessageProposalPrefix) {
+	if err := agentHost(t.Context(), "orchestrator-proposal", strings.NewReader(proposal), &output); err != nil || !strings.Contains(output.String(), `"state":"submitted"`) {
 		t.Fatalf("zero-admin proposal=%q err=%v", output.String(), err)
 	}
 }
@@ -267,5 +298,12 @@ func TestAdvancedOrchestratorLaunchContractUsesSnapshotGroup(t *testing.T) {
 	}
 	if contract.Mode().Perm() != 0o440 || fileGID(contract) != gid {
 		t.Fatalf("launch contract mode=%v gid=%d", contract.Mode(), fileGID(contract))
+	}
+	proposal, err := os.Stat(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proposal.Mode().Perm() != 0o620 || fileGID(proposal) != gid {
+		t.Fatalf("proposal artifact mode=%v gid=%d err=%v", proposal.Mode(), fileGID(proposal), err)
 	}
 }

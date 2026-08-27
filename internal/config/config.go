@@ -74,7 +74,7 @@ func Default(repository string) Config {
 		WorktreeRoot: ".worktrees",
 		DocsPaths:    []string{"README.md", "docs"},
 		Commands: Commands{
-			Implementation: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}, Reviewer: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"},
+			Implementation: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}, Reviewer: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"},
 			Orchestrator:      []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"},
 			OrchestratorAudit: []string{"codex", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"},
 			Environment:       []string{"LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"},
@@ -119,6 +119,7 @@ func load(path, root string) (Config, error) {
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return Config{}, fmt.Errorf("parse %s: multiple JSON values", path)
 	}
+	normalizeLegacyCodexCommand(&c)
 	if err := c.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -128,6 +129,13 @@ func load(path, root string) (Config, error) {
 		}
 	}
 	return c, nil
+}
+
+func normalizeLegacyCodexCommand(c *Config) {
+	command := c.Commands.Implementation
+	if len(command) == 3 && filepath.Base(command[0]) == "codex" && command[1] == "exec" && command[2] == "--dangerously-bypass-approvals-and-sandbox" {
+		c.Commands.Implementation = append(command, "-")
+	}
 }
 
 func GitRoot() (string, error) {

@@ -58,6 +58,7 @@ type dashboardServer struct {
 	reconcile    func(context.Context) error
 	mu           *sync.Mutex
 	localMu      sync.Mutex
+	messageMu    sync.Mutex
 	sessionOnce  sync.Once
 	sessionKey   [32]byte
 	sessionErr   error
@@ -124,6 +125,10 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		}
 		if r.URL.Path == "/actions/reconcile" {
 			s.serveReconcileAction(w, r)
+			return
+		}
+		if r.URL.Path == "/actions/attempt/message" {
+			s.serveAttemptMessageAction(w, r)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/actions/orchestrator/") {
@@ -694,17 +699,9 @@ func (s *dashboardServer) serveOrchestratorMessageAction(w http.ResponseWriter, 
 		http.Error(w, "worker message confirmation requires a dashboard browser nonce", http.StatusForbidden)
 		return
 	}
-	operationMu := s.mu
-	if operationMu == nil {
-		operationMu = &s.localMu
-	}
-	if !operationMu.TryLock() {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
-		return
-	}
-	defer operationMu.Unlock()
-	// Re-read under the coordinator operation lock so confirmation binds the
+	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
+	// Re-read under the message lock so confirmation binds the
 	// exact bytes the operator reviewed, not a replaced proposal.
 	current, err = s.messages.MessageProposal(r.Context())
 	if err != nil || current != submitted {
@@ -735,6 +732,63 @@ func (s *dashboardServer) serveOrchestratorMessageAction(w http.ResponseWriter, 
 		Attempt    int    `json:"attempt"`
 		State      string `json:"state"`
 	}{message.ID, message.Repository, message.Issue, message.Attempt, message.State})
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func (s *dashboardServer) serveAttemptMessageAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "action requires POST", http.StatusMethodNotAllowed)
+		return
+	}
+	if !sameDashboardOrigin(r) {
+		http.Error(w, "action requires the dashboard origin", http.StatusForbidden)
+		return
+	}
+	if s.password == "" || s.messages == nil {
+		http.Error(w, "worker follow-up requires an authenticated dashboard", http.StatusForbidden)
+		return
+	}
+	if _, ok := s.browserSession(r); !ok {
+		http.Error(w, "worker follow-up requires a dashboard browser session", http.StatusForbidden)
+		return
+	}
+	query := r.URL.Query()
+	issue, issueErr := strconv.Atoi(query.Get("issue"))
+	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
+	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || len(query) != 2 || len(query["issue"]) != 1 || len(query["attempt"]) != 1 || r.Header.Get("Content-Type") != "application/json" || len(r.TransferEncoding) != 0 || r.ContentLength <= 0 || r.ContentLength > maxTerminalInputBytes {
+		http.Error(w, "invalid worker follow-up", http.StatusBadRequest)
+		return
+	}
+	var submitted struct {
+		Message string `json:"message"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(r.Body, maxTerminalInputBytes+1))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&submitted) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		http.Error(w, "invalid worker follow-up", http.StatusBadRequest)
+		return
+	}
+	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
+	status, err := s.projectedStatus(issue, attempt)
+	messageEligible := err == nil && (slices.Contains([]string{"active", "review-ready"}, status.State) || status.Retryable && slices.Contains([]string{"blocked", "orphaned"}, status.State))
+	if !messageEligible {
+		http.Error(w, "attempt is not eligible for a worker follow-up", http.StatusConflict)
+		return
+	}
+	message, err := s.messages.ConfirmMessage(r.Context(), orchestratoragent.MessageProposal{Version: 1, Repository: status.Repository, Issue: issue, Attempt: attempt, Message: submitted.Message})
+	if err != nil {
+		http.Error(w, internalgithub.Redact(err.Error()), http.StatusConflict)
+		return
+	}
+	body, _ := json.Marshal(struct {
+		ID    string `json:"id"`
+		State string `json:"state"`
+	}{message.ID, message.State})
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -830,7 +884,9 @@ func (s *dashboardServer) serveOrchestratorTerminal(w http.ResponseWriter, r *ht
 }
 
 func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Request, session string, readOnly bool) {
-	if exec.CommandContext(r.Context(), s.tmux, "has-session", "-t", "="+session).Run() != nil {
+	probe := exec.CommandContext(r.Context(), s.tmux, "has-session", "-t", "="+session)
+	probe.Dir = "/tmp"
+	if probe.Run() != nil {
 		http.Error(w, "terminal session is not running", http.StatusConflict)
 		return
 	}
@@ -847,6 +903,7 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 		args = append(args, "-r")
 	}
 	command := exec.CommandContext(ctx, s.tmux, append(args, "-t", "="+session)...)
+	command.Dir = "/tmp"
 	command.Env = append(os.Environ(), "TERM=xterm-256color")
 	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 24, Cols: 80})
 	if err != nil {

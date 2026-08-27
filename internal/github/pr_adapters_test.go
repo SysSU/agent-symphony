@@ -968,6 +968,26 @@ func TestPreparedHandoffPublicationAdvancesHeadAndRecoversAfterRestart(t *testin
 		}
 	})
 
+	t.Run("attempt follow-up restart", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		body, _ := json.Marshal([]PRState{{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: "abcdef0"}})
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		recovery := &FileRecovery{Path: path}
+		if _, err := recovery.PrepareAttemptPublication(context.Background(), "o/r", 3, 10, 2, "abcdef0", "1234567"); err != nil {
+			t.Fatal(err)
+		}
+		fact := RecoveryAttemptFact{Repository: "o/r", PR: 3, Issue: 10, Attempt: 2, HeadSHA: "1234567", State: "review-ready"}
+		if err := recovery.hydrateAttempts("o/r", []RecoveryAttemptFact{fact}); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := recovery.PullRequestState(context.Background(), "o/r", 3, 10, 2, "1234567")
+		if got.HeadSHA != "1234567" || got.PreparedPublication != nil || got.Facts.BranchModifiedOutsideAttempt {
+			t.Fatalf("recovered follow-up=%#v", got)
+		}
+	})
+
 	t.Run("mismatched and unprepared heads", func(t *testing.T) {
 		recovery, handoff, _ := prepare(t)
 		wrong := RecoveryAttemptFact{Repository: "o/r", PR: 3, Issue: 10, Attempt: 2, HeadSHA: "7654321", State: "active"}
@@ -986,6 +1006,42 @@ func TestPreparedHandoffPublicationAdvancesHeadAndRecoversAfterRestart(t *testin
 		}
 		if got, ok, err := recovery.ReceivedHandoff(context.Background(), "o/r", 3, 10, 2, handoff.HeadSHA); err != nil || !ok || got.Key != handoff.Key {
 			t.Fatalf("failed transitions changed handoff: got=%#v ok=%v err=%v", got, ok, err)
+		}
+	})
+
+	t.Run("confirmed legacy follow-up", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		body, _ := json.Marshal([]PRState{{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: "abcdef0"}})
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		recovery := &FileRecovery{Path: path}
+		fact := RecoveryAttemptFact{Repository: "o/r", PR: 3, Issue: 10, Attempt: 2, HeadSHA: "1234567", State: "review-ready", PublicationConfirmed: true}
+		unconfirmed := fact
+		unconfirmed.PublicationConfirmed = false
+		if err := recovery.hydrateAttempts("o/r", []RecoveryAttemptFact{unconfirmed}); err == nil {
+			t.Fatal("unconfirmed head advanced idle recovery")
+		}
+		if err := recovery.hydrateAttempts("o/r", []RecoveryAttemptFact{fact}); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := recovery.PullRequestState(context.Background(), "o/r", 3, 10, 2, "1234567")
+		if got.HeadSHA != "1234567" || got.Facts.BranchModifiedOutsideAttempt {
+			t.Fatalf("confirmed follow-up=%#v", got)
+		}
+	})
+
+	t.Run("confirmed busy follow-up", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: "abcdef0", Facts: PRFacts{Feedback: []Feedback{{ID: 55, Source: feedbackInline, Execution: FeedbackInFlight}}}}
+		body, _ := json.Marshal([]PRState{state})
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		recovery := &FileRecovery{Path: path}
+		fact := RecoveryAttemptFact{Repository: "o/r", PR: 3, Issue: 10, Attempt: 2, HeadSHA: "1234567", State: "review-ready", PublicationConfirmed: true}
+		if err := recovery.hydrateAttempts("o/r", []RecoveryAttemptFact{fact}); err == nil {
+			t.Fatal("confirmed head discarded in-flight recovery work")
 		}
 	})
 }

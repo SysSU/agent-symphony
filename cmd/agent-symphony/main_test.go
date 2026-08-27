@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,15 +46,24 @@ type crashingHandoffBoundary struct {
 }
 
 type operatorMessageRunner struct {
-	dead         bool
-	missing      bool
-	branch, head string
+	dead, interrupted     bool
+	missing               bool
+	branch, head, started string
 }
 
 type operatorMessageStore struct {
 	comments        []map[string]any
 	outcomeFailures int
 	outcomePosts    int
+}
+
+func acknowledgeHandoffLaunch(command agentruntime.Command) (string, error) {
+	index := slices.Index(command.Args, "worker-capture-handoff-ready")
+	if index < 0 || index+5 >= len(command.Args) {
+		return "", nil
+	}
+	recipient := command.Args[index+5]
+	return recipient, writeImmutable(command.Args[index+4], []byte(recipient))
 }
 
 func (b *refusingHandoffBoundary) call(_ context.Context, operation string, _ agentruntime.Command) (agentruntime.Result, error) {
@@ -101,10 +111,19 @@ func (r *operatorMessageRunner) Run(_ context.Context, command agentruntime.Comm
 		}
 		return agentruntime.Result{}, nil
 	case "display-message":
-		if r.dead {
+		if slices.Contains(command.Args, "#{pane_start_command}") {
+			return agentruntime.Result{Output: r.started}, nil
+		}
+		if r.dead || r.interrupted {
+			if slices.Contains(command.Args, "#{pane_dead}") && !slices.Contains(command.Args, "#{pane_dead} #{pane_dead_status}") {
+				return agentruntime.Result{Output: "1"}, nil
+			}
 			return agentruntime.Result{Output: "1 0"}, nil
 		}
 		return agentruntime.Result{Output: "0"}, nil
+	case "send-keys":
+		r.interrupted = true
+		return agentruntime.Result{}, nil
 	case "capture-pane":
 		return agentruntime.Result{Output: "completed"}, nil
 	default:
@@ -176,8 +195,11 @@ func TestOperatorMessageQueuesBehindRunningTurnWithoutInterruptingIt(t *testing.
 }
 
 func TestPublishedOperatorMessageWithAdvancedHeadStaysQueuedBehindRunningTurn(t *testing.T) {
-	runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
-	manifest.State = "running"
+	runtimeState, attempt, _, runner := operatorMessageRuntime(t)
+	manifest, err := runtimeState.ResumeHandoff(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
 	manifest.ReviewHead = strings.Repeat("b", 40)
 	runner.head = strings.Repeat("c", 40)
 	message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Wait for the active follow-up.")
@@ -193,6 +215,63 @@ func TestPublishedOperatorMessageWithAdvancedHeadStaysQueuedBehindRunningTurn(t 
 	}
 	if boundary.calls != 0 || messages[key][0].State != "queued" {
 		t.Fatalf("busy published follow-up was not retained: calls=%d message=%#v", boundary.calls, messages[key][0])
+	}
+}
+
+func TestQueuedOperatorMessageRetiresLegacyResumeBeforeFreshDelivery(t *testing.T) {
+	runtimeState, attempt, _, runner := operatorMessageRuntime(t)
+	manifest, err := runtimeState.ResumeHandoff(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.UpdatedAt = time.Now().Add(-3 * time.Minute)
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner.started = "agent-symphony worker-capture-handoff tmux buffer result launch token launched -- codex exec resume --last --dangerously-bypass-approvals-and-sandbox -"
+	store := &operatorMessageStore{}
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: store.roundTrip(t)}}
+	cfg := internalgithub.PRAdapterConfig{Repository: attempt.Repository, ActorID: 42}
+	message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Resume after the prior pane exited.")
+	message, err = internalgithub.RecordOperatorMessage(t.Context(), api, cfg, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number)
+	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
+	bound := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
+	issues := []internalgithub.RecoveryIssueFact{{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &bound}}
+	remote := []internalgithub.RecoveryAttemptFact{bound}
+	refresh := func(context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
+		current, discoverErr := runtimeState.Discover()
+		return issues, remote, current, discoverErr
+	}
+	oldExec := hostExecRunner
+	recipient, launched := "", ""
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		if len(command.Args) > 0 && command.Args[0] == "show-options" {
+			return agentruntime.Result{Output: recipient}, nil
+		}
+		if len(command.Args) > 0 && command.Args[0] == "respawn-pane" {
+			var err error
+			recipient, err = acknowledgeHandoffLaunch(command)
+			if err != nil {
+				return agentruntime.Result{}, err
+			}
+			launched = strings.Join(command.Args, " ")
+		}
+		return agentruntime.Result{}, nil
+	}
+	t.Cleanup(func() { hostExecRunner = oldExec })
+	defaultCommand := []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}
+	if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, &directHandoffBoundary{root: runtimeState.Root}, issues, remote, []agentruntime.Manifest{manifest}, messages, defaultCommand, func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if messages[key][0].State != "delivered" || !runner.interrupted || recipient == "" || !strings.Contains(launched, strings.Join(defaultCommand, " ")) || strings.Contains(launched, " resume ") {
+		t.Fatalf("message=%#v interrupted=%v recipient=%q launch=%q", messages[key][0], runner.interrupted, recipient, launched)
 	}
 }
 
@@ -242,6 +321,129 @@ func TestTransitionRetryOnlyAcceptsExactUnblockedCompletedPublication(t *testing
 				t.Fatal("unsafe transition retry accepted")
 			}
 		})
+	}
+}
+
+func TestTransitionRetryRunsOnceAndRecordsTerminalOutcome(t *testing.T) {
+	root := t.TempDir()
+	agent := &orchestratoragent.Supervisor{
+		Root:                  root,
+		Workspace:             filepath.Join(root, "orchestrator-o-r"),
+		Repository:            "o/r",
+		Command:               []string{"agent"},
+		ProposalCommand:       []string{"proposal"},
+		ProposalStatusCommand: []string{"proposal-status"},
+		Runner:                &orchestratorTestRunner{},
+	}
+	if _, err := agent.Observe(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Action: orchestratoragent.ProposalActionRetry, RequestID: "retry-once"}
+	body, _ := json.Marshal(proposal)
+	if err := os.WriteFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalFile), body, 0o620); err != nil {
+		t.Fatal(err)
+	}
+	valid := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 131, Attempt: 3, State: "active", CurrentPhase: "publication", DispatchAuthorized: true, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, State: "completed"}}}
+	previous := reconcileRetryRun
+	calls := 0
+	reconcileRetryRun = func(ctx context.Context, _, _, _ string, options reconcileOptions) ([]orchestrator.RecoveryStatus, error) {
+		calls++
+		if !options.transition || options.intake || options.timeout != 10*time.Minute {
+			t.Fatalf("retry options=%+v", options)
+		}
+		if err := options.authorize([]orchestrator.RecoveryStatus{valid}); err != nil {
+			return nil, err
+		}
+		return []orchestrator.RecoveryStatus{valid}, nil
+	}
+	t.Cleanup(func() { reconcileRetryRun = previous })
+	operationMu := &sync.Mutex{}
+	operationMu.Lock()
+	processOrchestratorProposal(t.Context(), agent, operationMu, &operationCancellation{}, "config", "state", "runtime", io.Discard)
+	operationMu.Unlock()
+	pendingBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
+	var pending orchestratoragent.MessageProposalStatus
+	if err != nil || json.Unmarshal(pendingBody, &pending) != nil || calls != 0 || pending.PendingBinding == "" {
+		t.Fatalf("busy calls=%d status=%s err=%v", calls, pendingBody, err)
+	}
+	processOrchestratorProposal(t.Context(), agent, operationMu, &operationCancellation{}, "config", "state", "runtime", io.Discard)
+	statusBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
+	var status orchestratoragent.MessageProposalStatus
+	if err != nil || json.Unmarshal(statusBody, &status) != nil || calls != 1 || status.Resolution != "succeeded" || status.PendingBinding != "" {
+		t.Fatalf("calls=%d status=%s err=%v", calls, statusBody, err)
+	}
+
+	proposal.RequestID = "retry-fails"
+	body, _ = json.Marshal(proposal)
+	if err := os.WriteFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalFile), body, 0o620); err != nil {
+		t.Fatal(err)
+	}
+	reconcileRetryRun = func(_ context.Context, _, _, _ string, options reconcileOptions) ([]orchestrator.RecoveryStatus, error) {
+		calls++
+		if err := options.authorize([]orchestrator.RecoveryStatus{valid}); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("publish stage failed")
+	}
+	processOrchestratorProposal(t.Context(), agent, &sync.Mutex{}, &operationCancellation{}, "config", "state", "runtime", io.Discard)
+	statusBody, err = os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
+	if err != nil || json.Unmarshal(statusBody, &status) != nil || calls != 2 || status.Resolution != "failed" || !strings.Contains(status.Detail, "publish stage failed") {
+		t.Fatalf("calls=%d status=%s err=%v", calls, statusBody, err)
+	}
+}
+
+func TestOperationCancellationInterruptsTheCurrentCoordinatorPass(t *testing.T) {
+	operations := &operationCancellation{}
+	ctx, finish := operations.begin(t.Context())
+	operations.interrupt()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("coordinator pass was not interrupted")
+	}
+	finish()
+}
+
+func TestWriteOperatorMessageStatusProjectsQueuedAndTerminalStateImmediately(t *testing.T) {
+	root := t.TempDir()
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 4, Attempt: 2, State: "active"}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	message, err := internalgithub.PrepareOperatorMessage("o/r", 4, 2, "Continue the exact attempt.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	message.State = "claimed"
+	message.UpdatedAt = time.Unix(10, 0).UTC()
+	if err := writeOperatorMessageStatus(root, message); err != nil {
+		t.Fatal(err)
+	}
+	message.State, message.Diagnostic = "delivered", ""
+	message.UpdatedAt = time.Unix(20, 0).UTC()
+	if err := writeOperatorMessageStatus(root, message); err != nil {
+		t.Fatal(err)
+	}
+	body, err := readDashboardStatus(filepath.Join(root, "status.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot struct {
+		Statuses []orchestrator.RecoveryStatus `json:"statuses"`
+	}
+	if json.Unmarshal(body, &snapshot) != nil || len(snapshot.Statuses) != 1 || len(snapshot.Statuses[0].OperatorMessages) != 1 || snapshot.Statuses[0].OperatorMessages[0].State != "delivered" || !snapshot.Statuses[0].OperatorMessages[0].UpdatedAt.Equal(message.UpdatedAt) {
+		t.Fatalf("snapshot=%s", body)
+	}
+}
+
+func TestStartupMessageRecoveryAcceptsCurrentStatusSchemaWithoutPendingWork(t *testing.T) {
+	root := t.TempDir()
+	statuses := []orchestrator.RecoveryStatus{{Issue: 161, OperatorMessages: []orchestrator.OperatorMessageStatus{{ID: strings.Repeat("a", 64), State: "delivered"}}}}
+	if err := writeStatusSnapshot(root, statuses); err != nil {
+		t.Fatal(err)
+	}
+	if err := retryProjectedOperatorMessages(t.Context(), filepath.Join(root, "missing-config"), root); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -306,7 +508,9 @@ func TestOperatorMessageTargetValidationVerifiesCompletedRuntimeResources(t *tes
 	}{
 		{"missing worktree", func(manifest agentruntime.Manifest, _ *operatorMessageRunner) { _ = os.RemoveAll(manifest.Worktree) }},
 		{"mismatched branch", func(_ agentruntime.Manifest, runner *operatorMessageRunner) { runner.branch = "wrong-branch" }},
-		{"missing session", func(_ agentruntime.Manifest, runner *operatorMessageRunner) { runner.missing = true }},
+		{"missing result", func(manifest agentruntime.Manifest, _ *operatorMessageRunner) {
+			_ = os.Remove(agentruntime.ResultPath(manifest.Worktree))
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
@@ -413,6 +617,32 @@ printf '{"Output":"%%s","Code":0,"Exited":false}' "$output"
 	}
 }
 
+func TestOperatorMessageAdmissionRequiresOnlyTheExactLocalRuntimeOwner(t *testing.T) {
+	runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Message: "Queue before remote delivery validation."}
+	if err := validateOperatorMessageAdmission(t.Context(), proposal, runtimeState, []agentruntime.Manifest{manifest}); err != nil {
+		t.Fatalf("exact local owner was rejected: %v", err)
+	}
+	runner.missing = true
+	if err := validateOperatorMessageAdmission(t.Context(), proposal, runtimeState, []agentruntime.Manifest{manifest}); err != nil {
+		t.Fatalf("completed retained owner required its old session: %v", err)
+	}
+	manifest.State = "running"
+	if err := validateOperatorMessageAdmission(t.Context(), proposal, runtimeState, []agentruntime.Manifest{manifest}); err != nil {
+		t.Fatalf("interrupted pre-launch owner was rejected: %v", err)
+	}
+	manifest.State = "completed"
+	if err := os.Remove(agentruntime.ResultPath(manifest.Worktree)); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOperatorMessageAdmission(t.Context(), proposal, runtimeState, []agentruntime.Manifest{manifest}); err == nil {
+		t.Fatal("completed owner without a retained result was admitted")
+	}
+	if err := validateOperatorMessageAdmission(t.Context(), proposal, runtimeState, []agentruntime.Manifest{manifest, manifest}); err == nil {
+		t.Fatal("ambiguous local owner was admitted")
+	}
+}
+
 func TestClaimedOperatorMessageDoesNotInterruptCompetingHandoff(t *testing.T) {
 	runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
 	store := &operatorMessageStore{}
@@ -456,6 +686,9 @@ func TestClaimedOperatorMessageDoesNotInterruptCompetingHandoff(t *testing.T) {
 		}
 		if len(command.Args) > 0 && command.Args[0] == "respawn-pane" {
 			respawns++
+			if _, err := acknowledgeHandoffLaunch(command); err != nil {
+				return agentruntime.Result{}, err
+			}
 		}
 		return agentruntime.Result{}, nil
 	}
@@ -532,7 +765,11 @@ func TestFirstOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *tes
 				}
 				if len(command.Args) > 0 && command.Args[0] == "respawn-pane" {
 					respawns++
-					recipient = command.Args[len(command.Args)-1]
+					var err error
+					recipient, err = acknowledgeHandoffLaunch(command)
+					if err != nil {
+						return agentruntime.Result{}, err
+					}
 				}
 				return agentruntime.Result{}, nil
 			}
@@ -809,6 +1046,9 @@ func operatorMessageRuntime(t *testing.T) (*agentruntime.Runtime, agentruntime.A
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(agentruntime.ResultPath(manifest.Worktree), []byte(`{"type":"agent-symphony-result-v1","validation":"retained","documentation":"none"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -885,7 +1125,7 @@ func TestWorkerCaptureInternalCLIAndHandoffPreStartRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmux := filepath.Join(dir, "tmux")
-	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; wait-for) test -z \"$FAKE_SIGNAL_FAILURE\" || exit 1; printf %s \"$3\" >\"$FAKE_SIGNAL\";; *) exit 2;; esac\n"), 0o700); err != nil {
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ntest \"$PWD\" = /tmp || exit 3\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; wait-for) test -z \"$FAKE_SIGNAL_FAILURE\" || exit 1; printf %s \"$3\" >\"$FAKE_SIGNAL\";; *) exit 2;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("FAKE_PROMPT", prompt)
@@ -920,6 +1160,19 @@ func TestWorkerCaptureInternalCLIAndHandoffPreStartRecovery(t *testing.T) {
 			t.Fatalf("pre-start failure acknowledged launch at %s: %v", path, err)
 		}
 	}
+	code = run([]string{"worker-capture-handoff-ready", tmux, "prompt-buffer", resultPath, launchedPath, "recipient", "signal-name", "--", "agent-symphony-missing-worker-command"}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("ready-protocol pre-start failure succeeded")
+	}
+	if _, err := os.Stat(launchedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ready-protocol failure acknowledged launch: %v", err)
+	}
+	if got, err := os.ReadFile(signalPath); err != nil || string(got) != "signal-name" {
+		t.Fatalf("ready-protocol failure did not wake coordinator: %q %v", got, err)
+	}
+	if err := os.Remove(signalPath); err != nil {
+		t.Fatal(err)
+	}
 	stderr.Reset()
 	t.Setenv("FAKE_SIGNAL_FAILURE", "1")
 	code = run([]string{"worker-capture-handoff", tmux, "prompt-buffer", resultPath, launchedPath, "recipient", "signal-name", "--", "sh", "-c", `printf %s "$1"`, "consumer", result}, &stdout, &stderr)
@@ -945,6 +1198,53 @@ func TestWorkerCaptureInternalCLIAndHandoffPreStartRecovery(t *testing.T) {
 	}
 	if got, err := os.ReadFile(signalPath); err != nil || string(got) != "signal-name" {
 		t.Fatalf("launch signal=%q err=%v", got, err)
+	}
+}
+
+func TestConfigureProjectTmuxUsesPrivateProjectNamespace(t *testing.T) {
+	stateRoot := t.TempDir()
+	t.Setenv("TMUX_TMPDIR", "previous")
+	if err := configureProjectTmux(stateRoot); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(stateRoot, "tmux")
+	if got := os.Getenv("TMUX_TMPDIR"); got != want {
+		t.Fatalf("TMUX_TMPDIR=%q, want %q", got, want)
+	}
+	if info, err := os.Lstat(want); err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("project tmux root=%v err=%v", info, err)
+	}
+}
+
+func TestConfigureAgentCodexHomeLinksCapabilitiesAndIsolatesRuntimeState(t *testing.T) {
+	source, stateRoot := t.TempDir(), t.TempDir()
+	for _, name := range agentCodexAssets {
+		path := filepath.Join(source, name)
+		if name == "skills" || name == "plugins" || name == "cache" || name == "rules" {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.WriteFile(path, []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("CODEX_HOME", source)
+	if err := configureAgentCodexHome(stateRoot); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(stateRoot, "codex-home")
+	if got := os.Getenv("CODEX_HOME"); got != target {
+		t.Fatalf("CODEX_HOME=%q, want %q", got, target)
+	}
+	for _, name := range agentCodexAssets {
+		if got, err := os.Readlink(filepath.Join(target, name)); err != nil || got != filepath.Join(source, name) {
+			t.Fatalf("capability %s link=%q err=%v", name, got, err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(target, "thread-writer-locks")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mutable Codex runtime state was shared: %v", err)
 	}
 }
 
@@ -1163,6 +1463,9 @@ func TestCompletedTurnContractFailureIsPreservedBeforeFollowUp(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			runtimeState, attempt, manifest, _ := operatorMessageRuntime(t)
 			resultPath := agentruntime.ResultPath(manifest.Worktree)
+			if err := os.Remove(resultPath); err != nil {
+				t.Fatal(err)
+			}
 			if test.result != "" {
 				if err := os.WriteFile(resultPath, []byte(test.result), 0o600); err != nil {
 					t.Fatal(err)
@@ -1251,7 +1554,7 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: branch, BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "focused tests passed", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
+	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: branch, BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "stale diagnostic probe", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
 	exportedJSON, _ := json.Marshal(exported)
 	boundaryResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
 	implementation := filepath.Join(t.TempDir(), "implementation-boundary")
@@ -1322,8 +1625,8 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(old) })
-	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worker, BaseSHA: base, State: "completed", ReviewState: "clean", ReviewHead: head, UpdatedAt: time.Now().UTC()}
-	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Title: "Operator follow-up", BaseBranch: "main", DispatchAuthorized: true}
+	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worker, BaseSHA: base, State: "completed", ReviewState: "clean", ReviewBase: base, ReviewHead: head, UpdatedAt: time.Now().UTC()}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 2, Title: "Operator follow-up", BaseBranch: "main", DispatchAuthorized: true}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "review-ready"}}
 	message.State = "delivered"
 	operatorMessages := map[string][]internalgithub.OperatorMessage{"o/r#23/1": {message}}
@@ -1333,12 +1636,87 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != head {
 		t.Fatalf("published head=%s want %s; body=%q comments=%#v", got, head, pullBody, comments)
 	}
-	if !strings.Contains(pullBody, head) || len(comments) != 3 {
+	if !strings.Contains(pullBody, head) || !strings.Contains(pullBody, "Attempt: 1") || strings.Contains(pullBody, "Attempt: 2") || len(comments) != 3 {
 		t.Fatalf("pull request was not fully updated: body=%q comments=%#v", pullBody, comments)
+	}
+	if !strings.Contains(pullBody, "Independent review passed for exact head `"+head+"`.") || strings.Contains(pullBody, "stale diagnostic probe") {
+		t.Fatalf("pull request did not publish exact-head review evidence: body=%q", pullBody)
+	}
+	recovered, err := (&internalgithub.FileRecovery{Path: recoveryPath}).PullRequestState(t.Context(), "o/r", 7, 23, 1, head)
+	if err != nil || recovered.HeadSHA != head {
+		t.Fatalf("published follow-up did not advance recovery: state=%#v err=%v", recovered, err)
 	}
 }
 
-func TestReconcilePublishesCompletedAttemptBeforePRGovernanceFailure(t *testing.T) {
+func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testing.T) {
+	coordinator, worker, remote := gitRepository(t), t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
+	runGit(t, worker, "init")
+	runGit(t, worker, "config", "user.email", "test@example.invalid")
+	runGit(t, worker, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "add", "file")
+	runGit(t, worker, "commit", "-m", "base")
+	base := runGit(t, worker, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("head"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worker, "commit", "-am", "head")
+	head := runGit(t, worker, "rev-parse", "HEAD")
+	branch, _ := internalgithub.AttemptBranch("o/r", 23, 1)
+	runGit(t, coordinator, "init", "--bare", remote)
+	runGit(t, coordinator, "remote", "set-url", "origin", remote)
+	runGit(t, worker, "push", remote, base+":refs/heads/"+branch)
+
+	bundlePath := filepath.Join(t.TempDir(), "attempt.bundle")
+	runGit(t, worker, "bundle", "create", bundlePath, "--all")
+	bundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: branch, BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "old validation", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
+	exportedJSON, _ := json.Marshal(exported)
+	exportResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
+
+	stateRoot, worktree := t.TempDir(), t.TempDir()
+	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worktree, Session: "as-23-1", BaseSHA: base, LogPath: filepath.Join(worktree, "attempt.log"), State: "completed", ReviewState: "clean", ReviewBase: base, ReviewHead: head, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	manifestPath := filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier("o/r"), "23-1", "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifestBody, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, manifestBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := "independent-review-" + head
+	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(worktree, key), head})
+	ackResult, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
+	script := filepath.Join(t.TempDir(), "boundary")
+	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\ncase \"$payload\" in\n  *'\"operation\":\"export\"'*) printf '%%s' '%s';;\n  *) printf '%%s' '%s';;\nesac\n", exportResult, ackResult)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", script)
+
+	currentBase := strings.Repeat("b", 40)
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseBranch: "main", BaseSHA: currentBase, DispatchAuthorized: true}
+	pending, err := publishWorkerResult(t.Context(), internalgithub.API{}, &agentruntime.Runtime{StateRoot: stateRoot}, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, issue, manifest, stateRoot, nil)
+	if err != nil || pending {
+		t.Fatalf("base refresh handoff pending=%v err=%v", pending, err)
+	}
+	storedBody, _ := os.ReadFile(manifestPath)
+	var stored agentruntime.Manifest
+	_ = json.Unmarshal(storedBody, &stored)
+	if stored.State != "running" || !stored.ReviewHandoffAck || len(stored.ReviewFindings) != 1 || !strings.Contains(stored.ReviewFindings[0], currentBase) {
+		t.Fatalf("base drift was not durably handed back: %#v", stored)
+	}
+	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != base {
+		t.Fatalf("stale head was published: got %s want %s", got, base)
+	}
+}
+
+func TestReconcileMonitorsAndPublishesCompletedAttemptBeforePRGovernanceFailure(t *testing.T) {
 	coordinator, worker, remote := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
 	for _, repo := range []string{coordinator, worker} {
 		runGit(t, repo, "init")
@@ -1371,7 +1749,19 @@ func TestReconcilePublishesCompletedAttemptBeforePRGovernanceFailure(t *testing.
 	exportedJSON, _ := json.Marshal(exported)
 	boundaryResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
 	implementation := filepath.Join(t.TempDir(), "implementation-boundary")
-	if err := os.WriteFile(implementation, []byte("#!/bin/sh\nprintf '%s' '"+string(boundaryResult)+"'\n"), 0o700); err != nil {
+	boundaryScript := fmt.Sprintf(`#!/bin/sh
+payload=$(sed -n '1p')
+case "$payload" in
+  *'"operation":"verify"'*) printf '{"Code":0}';;
+  *'"branch","--show-current"'*) printf '{"Output":"%s"}';;
+  *'"rev-parse","HEAD"'*) printf '{"Output":"%s"}';;
+  *'"display-message"'*) printf '{"Output":"1 0"}';;
+  *'"capture-pane"'*) printf '{"Output":"completed"}';;
+  *'"operation":"export"'*) printf '%%s' '%s';;
+  *) printf '{"Code":0}';;
+esac
+`, branch, head, string(boundaryResult))
+	if err := os.WriteFile(implementation, []byte(boundaryScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", implementation)
@@ -1486,7 +1876,10 @@ func TestReconcilePublishesCompletedAttemptBeforePRGovernanceFailure(t *testing.
 		t.Fatal(err)
 	}
 	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier("o/r"), "23-1", "agent.log")
-	manifest.State, manifest.ReviewState, manifest.ReviewHead = "completed", "clean", head
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest.State, manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead = "running", "clean", base, head
 	manifest.CreatedAt, manifest.UpdatedAt = issueCreated, issueCreated
 	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
@@ -1663,7 +2056,7 @@ func TestRevokedBoundAttemptCancelsWorkerAndSuppressesPublication(t *testing.T) 
 	}
 	runner := &revokedAttemptRunner{live: true}
 	runtimeState := &agentruntime.Runtime{Root: root, StateRoot: state, Tmux: "tmux", Runner: runner, StopWait: time.Millisecond}
-	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 23, Attempt: 4, Action: "resume monitoring the matching attempt"}
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 23, Attempt: 4, State: "active", Action: "monitor the implementation session"}
 	authorized := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 4, DispatchAuthorized: true}
 	if err := monitorAttempts(t.Context(), runtimeState, []orchestrator.RecoveryStatus{status}, []agentruntime.Manifest{manifest}, []internalgithub.RecoveryIssueFact{authorized}); err != nil || !runner.live {
 		t.Fatalf("authorized worker did not continue: live=%v err=%v", runner.live, err)
@@ -1685,6 +2078,40 @@ func TestRevokedBoundAttemptCancelsWorkerAndSuppressesPublication(t *testing.T) 
 	}
 }
 
+func TestMonitorConsumesDeadAttemptFromLivenessMismatchProjection(t *testing.T) {
+	state, root := t.TempDir(), t.TempDir()
+	state, _ = filepath.EvalSymlinks(state)
+	root, _ = filepath.EvalSymlinks(root)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 4, BaseSHA: "abcdef0"}
+	manifest, err := agentruntime.AttemptIdentity(root, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.State = "running"
+	manifest.LogPath = filepath.Join(state, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-4", "agent.log")
+	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &operatorMessageRunner{dead: true}
+	runtimeState := &agentruntime.Runtime{Root: root, StateRoot: state, Tmux: "tmux", Runner: runner}
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 23, Attempt: 4, State: "blocked", Blockers: []string{"runtime liveness mismatch"}, Diagnostic: "worktree HEAD does not match GitHub"}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 4, DispatchAuthorized: true}
+	if err := monitorAttempts(t.Context(), runtimeState, []orchestrator.RecoveryStatus{status}, []agentruntime.Manifest{manifest}, []internalgithub.RecoveryIssueFact{issue}); err != nil {
+		t.Fatal(err)
+	}
+	storedBody, _ := os.ReadFile(manifestPath)
+	var stored agentruntime.Manifest
+	log, _ := os.ReadFile(manifest.LogPath)
+	if json.Unmarshal(storedBody, &stored) != nil || stored.State != "completed" || string(log) != "completed" {
+		t.Fatalf("dead liveness-mismatch attempt was not captured: manifest=%#v log=%q", stored, log)
+	}
+}
+
 func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) {
 	source := t.TempDir()
 	for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}} {
@@ -1702,6 +2129,16 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 		t.Fatal(string(out))
 	}
 	base := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", source, "rev-parse", "HEAD"))))
+	if err := os.WriteFile(filepath.Join(source, "upstream"), []byte("current base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", source, "add", "upstream").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, err := exec.Command("git", "-C", source, "commit", "-m", "current base").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	reviewBase := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", source, "rev-parse", "HEAD"))))
 	if err := os.WriteFile(filepath.Join(source, "file"), []byte("changed"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1729,7 +2166,7 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	old := reviewSnapshotRoot
 	reviewSnapshotRoot = t.TempDir()
 	t.Cleanup(func() { reviewSnapshotRoot = old })
-	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: reviewBase}
 	t.Setenv("OPENAI_API_KEY", "model-canary")
 	t.Setenv("GITHUB_TOKEN", "github-canary")
 	t.Setenv("SSH_AUTH_SOCK", "ssh-canary")
@@ -1781,6 +2218,22 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	}
 	if !strings.Contains(string(log), `"reviewer","--custom"`) || strings.Contains(string(log), "--output-last-message") {
 		t.Fatalf("custom reviewer command or result environment changed: %s", log)
+	}
+	var prompt string
+	decoder := json.NewDecoder(bytes.NewReader(log))
+	for {
+		var request struct {
+			Command boundaryCommand `json:"command"`
+		}
+		if decoder.Decode(&request) != nil {
+			break
+		}
+		if slices.Contains(request.Command.Args, "load-buffer") {
+			prompt = string(request.Command.Input)
+		}
+	}
+	if !strings.Contains(prompt, reviewBase+"..HEAD") || strings.Contains(prompt, base+"..HEAD") {
+		t.Fatalf("review prompt base is not current: %q", prompt)
 	}
 }
 
@@ -1838,12 +2291,23 @@ func TestRunningReviewAcceptsBlankLivePaneStatus(t *testing.T) {
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
 	head, root := strings.Repeat("b", 40), t.TempDir()
 	snapshot, session := reviewIdentity(attempt, root)
-	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
 	boundary := &artifactReviewBoundary{paneOutput: "0 \n"}
 
 	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, []string{"reviewer"}, internalgithub.RecoveryIssueFact{}, manifest, "", head, root)
 	if err != nil || !pending || result.Snapshot != snapshot || result.Session != session || boundary.respawns != 0 {
 		t.Fatalf("result=%#v pending=%v respawns=%d err=%v", result, pending, boundary.respawns, err)
+	}
+}
+
+func TestRunningReviewWithDifferentBaseIsNotReused(t *testing.T) {
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
+	head, root := strings.Repeat("b", 40), t.TempDir()
+	snapshot, session := reviewIdentity(attempt, root)
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
+	issue := internalgithub.RecoveryIssueFact{BaseSHA: strings.Repeat("c", 40)}
+	if _, pending, err := runIndependentReview(t.Context(), nil, attempt, &artifactReviewBoundary{paneOutput: "0"}, nil, []string{"reviewer"}, issue, manifest, "", head, root); err == nil || pending {
+		t.Fatalf("mismatched-base review was reused: pending=%v err=%v", pending, err)
 	}
 }
 
@@ -1872,7 +2336,7 @@ func TestIndependentReviewIgnoresEchoedAndDuplicatedTerminalResult(t *testing.T)
 	if slices.Contains(boundary.respawn, "review") || slices.Contains(boundary.respawn, "--output-last-message") || !slices.Contains(boundary.respawn, reviewResultPath(started.Snapshot, head)) || !slices.Contains(boundary.respawn, "--dangerously-bypass-approvals-and-sandbox") || !slices.Contains(boundary.respawn, "-") {
 		t.Fatalf("default reviewer did not receive result artifact: %q", boundary.respawn)
 	}
-	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
 	if _, _, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, defaultReviewer, issue, manifest, source, head, root); err == nil {
 		t.Fatal("malformed artifact was accepted")
 	}
@@ -1912,7 +2376,7 @@ func TestReviewResultReadFailureRetriesWithoutRespawningReviewer(t *testing.T) {
 	defer func() {
 		_ = cleanupReviewResources(t.Context(), boundary, nil, attempt, head, started.Snapshot, started.Session, root)
 	}()
-	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
 	if _, pending, err = runIndependentReview(t.Context(), nil, attempt, boundary, nil, command, issue, manifest, source, head, root); err != nil || !pending {
 		t.Fatalf("transient read pending=%v err=%v", pending, err)
 	}
@@ -1942,7 +2406,7 @@ func TestInvalidReviewArtifactFailsWithoutRespawningReviewer(t *testing.T) {
 	defer func() {
 		_ = cleanupReviewResources(t.Context(), boundary, nil, attempt, head, started.Snapshot, started.Session, root)
 	}()
-	manifest := agentruntime.Manifest{ReviewState: "running", ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
 	if _, pending, err = runIndependentReview(t.Context(), nil, attempt, boundary, nil, command, issue, manifest, source, head, root); err == nil || pending || boundary.respawns != 1 {
 		t.Fatalf("invalid artifact pending=%v respawns=%d err=%v", pending, boundary.respawns, err)
 	}
@@ -2521,7 +2985,7 @@ func TestPreparingReviewCleanupRetainsStateAndRetries(t *testing.T) {
 				t.Fatal(err)
 			}
 			var stored agentruntime.Manifest
-			if json.Unmarshal(storedBody, &stored) != nil || stored.ReviewState != "preparing" || stored.ReviewSnapshot != snapshot || stored.ReviewSession != session {
+			if json.Unmarshal(storedBody, &stored) != nil || stored.ReviewState != "preparing" || stored.ReviewBase != baseSHA || stored.ReviewSnapshot != snapshot || stored.ReviewSession != session {
 				t.Fatalf("preparing state not retained: %#v", stored)
 			}
 			if _, err := os.Stat(marker); err != nil {
@@ -2562,7 +3026,7 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	if err := os.WriteFile(resultPath, []byte(`{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`), 0o660); err != nil {
 		t.Fatal(err)
 	}
-	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "running", ReviewHead: "head", ReviewSnapshot: snapshot, ReviewSession: session}
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: "head", ReviewSnapshot: snapshot, ReviewSession: session}
 	sum := sha256.Sum256([]byte(attempt.Repository))
 	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
@@ -2594,7 +3058,7 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	if err := json.Unmarshal(storedBody, &stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.ReviewState != "clean" || stored.ReviewSession == "" || stored.ReviewSnapshot == "" {
+	if stored.ReviewState != "clean" || stored.ReviewBase != attempt.BaseSHA || stored.ReviewSession == "" || stored.ReviewSnapshot == "" {
 		t.Fatalf("cleanup discarded retry state: %#v", stored)
 	}
 	if _, err := os.Stat(snapshot); err != nil {
@@ -2689,7 +3153,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	if err := os.Mkdir(snapshot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Branch: "issue-23", BaseSHA: base, State: "completed", ReviewState: "clean", ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session, UpdatedAt: time.Now().UTC()}
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Branch: "issue-23", BaseSHA: base, State: "completed", ReviewState: "clean", ReviewBase: base, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session, UpdatedAt: time.Now().UTC()}
 	sum := sha256.Sum256([]byte(attempt.Repository))
 	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
@@ -2944,8 +3408,8 @@ func TestResumeHandoffsDeliversConfiguredImplementationCommand(t *testing.T) {
 	if err := os.WriteFile(statePath, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, Worktree: worktree, Session: "as-4-2", LogPath: filepath.Join(worktree, "attempt.log")}
-	statuses := []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 4, Attempt: 2, State: "review-ready", Action: "monitor the matching published pull request"}}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, State: "completed", Worktree: worktree, Session: "as-4-2", LogPath: filepath.Join(worktree, "attempt.log")}
+	statuses := []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 4, Attempt: 2, State: "review-ready", DispatchAuthorized: true, Action: "publish the independently reviewed implementation"}}
 
 	oldExec := hostExecRunner
 	var respawn []string
@@ -2956,6 +3420,9 @@ func TestResumeHandoffsDeliversConfiguredImplementationCommand(t *testing.T) {
 		}
 		if slices.Contains(command.Args, "respawn-pane") {
 			respawn = slices.Clone(command.Args)
+			if _, err := acknowledgeHandoffLaunch(command); err != nil {
+				return agentruntime.Result{}, err
+			}
 		}
 		if slices.Contains(command.Args, "load-buffer") {
 			body, _ := io.ReadAll(command.Stdin)
@@ -2985,6 +3452,30 @@ func TestResumeHandoffsDeliversConfiguredImplementationCommand(t *testing.T) {
 	}
 }
 
+func TestResumeHandoffsLeavesUnauthorizedWorkQueued(t *testing.T) {
+	for _, status := range []orchestrator.RecoveryStatus{
+		{Repository: "o/r", Issue: 4, Attempt: 2, State: "review-ready", Action: "monitor the matching published pull request"},
+		{Repository: "o/r", Issue: 4, Attempt: 2, State: "review-ready", DispatchAuthorized: true, Blockers: []string{"review required"}, Action: "monitor the matching published pull request"},
+	} {
+		stateRoot := t.TempDir()
+		statePath := filepath.Join(stateRoot, "state.json")
+		state := []internalgithub.PRState{{Repository: "o/r", Number: 3, Issue: 4, Attempt: 2, HeadSHA: "abcdef0", Facts: internalgithub.PRFacts{Feedback: []internalgithub.Feedback{{ID: 55, Source: "conversation", Execution: internalgithub.FeedbackClaimed}}}}}
+		body, _ := json.Marshal(state)
+		if err := os.WriteFile(statePath, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, State: "completed"}
+		boundary := &refusingHandoffBoundary{}
+		if err := resumeHandoffs(t.Context(), nil, boundary, statePath, stateRoot, []orchestrator.RecoveryStatus{status}, []agentruntime.Manifest{manifest}, []string{"implementation"}); err != nil {
+			t.Fatal(err)
+		}
+		handoffs, err := (&internalgithub.FileRecovery{Path: statePath}).ClaimHandoffsFor(t.Context(), map[string]bool{"o/r#4/2": true})
+		if err != nil || len(handoffs) != 1 || boundary.calls != 0 {
+			t.Fatalf("unauthorized handoff was consumed: handoffs=%#v calls=%d err=%v", handoffs, boundary.calls, err)
+		}
+	}
+}
+
 func TestConfigViewAcceptsConventionalSubcommandFlags(t *testing.T) {
 	root := gitRepository(t)
 	path := filepath.Join(root, config.DefaultPath)
@@ -3010,7 +3501,7 @@ func TestInitAndMisuseExitCodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(initialized.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}) {
+	if !slices.Equal(initialized.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
 		t.Fatalf("unexpected initialized implementation command: %q", initialized.Commands.Implementation)
 	}
 	if !slices.Equal(initialized.Commands.Reviewer, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
@@ -3145,6 +3636,7 @@ func TestPRGovernanceRejectsSymlinkState(t *testing.T) {
 
 func TestStatusHumanNoColorAndVersionedJSON(t *testing.T) {
 	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "owner/repo", 4, 1)
+	runtimeState := t.TempDir()
 	status := orchestrator.RecoveryStatus{Repository: "owner/repo", Issue: 4, Attempt: 1, State: "completed", CurrentPhase: "completed", PR: 10, Session: session, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "completed"}}}
 	previous := reconcileGitHubRun
 	reconcileGitHubRun = func(context.Context, string, string, string, bool) ([]orchestrator.RecoveryStatus, error) {
@@ -3153,12 +3645,12 @@ func TestStatusHumanNoColorAndVersionedJSON(t *testing.T) {
 	t.Cleanup(func() { reconcileGitHubRun = previous })
 	t.Setenv("NO_COLOR", "1")
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"status", "--state", "state", "--runtime-state", "runtime"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "COMPLETED") || !strings.Contains(stdout.String(), "phase: completed") || !strings.Contains(stdout.String(), "session: implementation completed "+session) || strings.Contains(stdout.String(), "\x1b[") {
+	if code := run([]string{"status", "--state", "state", "--runtime-state", runtimeState}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "COMPLETED") || !strings.Contains(stdout.String(), "phase: completed") || !strings.Contains(stdout.String(), "session: implementation completed "+session) || strings.Contains(stdout.String(), "\x1b[") {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := run([]string{"inspect", "--issue", "4", "--state", "state", "--runtime-state", "runtime", "--json"}, &stdout, &stderr); code != 0 {
+	if code := run([]string{"inspect", "--issue", "4", "--state", "state", "--runtime-state", runtimeState, "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
 	}
 	var got envelope
