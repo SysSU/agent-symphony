@@ -102,6 +102,8 @@ export function StatusCard(props) {
   const blockers = status.blockers || [];
   const checks = status.checks || [];
   const messages = status.operator_messages || [];
+  const state = status.state || "unknown";
+  const priority = status.priority ? `P${status.priority}` : "P—";
 
   return (
     <article className="card">
@@ -113,10 +115,12 @@ export function StatusCard(props) {
             {status.pr ? <>{" · "}<a href={prURL} target="_blank" rel="noreferrer">PR #{status.pr}</a></> : null}
           </p>
         </div>
-        <span className={`state state-${status.state}`}>{status.state}</span>
+        <div className="cardChips">
+          <span className={`priority priority-${status.priority || "unset"}`} aria-label={`Priority ${status.priority || "not set"}`}>{priority}</span>
+          <span className={`state state-${state}`}>{state}</span>
+        </div>
       </header>
       <dl>
-        <Detail label="Priority">{status.priority ? `P${status.priority}` : "—"}</Detail>
         <Detail label="tmux session">
           {status.session ? <button className="terminalLink" type="button" onClick={() => onOpenTerminal(status)}><code>{status.session}</code></button> : null}
         </Detail>

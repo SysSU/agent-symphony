@@ -6,6 +6,7 @@
 /agent-symphony
 _bmad-output/
 .cursor
+.pinchtab/
 .worktrees/
 cmd/agent-symphony/dashboard/.next/
 cmd/agent-symphony/dashboard/node_modules/

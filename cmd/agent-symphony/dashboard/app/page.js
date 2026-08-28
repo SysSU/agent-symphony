@@ -6,7 +6,7 @@ import { OrchestratorCard, StatusCard } from "./_components/status-card";
 import ReconcileButton from "./_components/reconcile-button";
 import { getMessageProposal, getOrchestratorStatus, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
-import { attemptKey, overallHealth, relativeTime, statusViews } from "./health.mjs";
+import { attemptKey, groupStatusesByLane, overallHealth, relativeTime } from "./health.mjs";
 
 export default function Dashboard() {
   const [snapshot, setSnapshot] = useState(null);
@@ -16,7 +16,6 @@ export default function Dashboard() {
   const [busy, setBusy] = useState("");
   const [waiting, setWaiting] = useState(false);
   const [now, setNow] = useState(() => Date.now());
-  const [tab, setTab] = useState("current");
   const [terminal, setTerminal] = useState(null);
   const [orchestratorStatus, setOrchestratorStatus] = useState(null);
   const [orchestratorError, setOrchestratorError] = useState("");
@@ -67,7 +66,7 @@ export default function Dashboard() {
   const performAction = useCallback(async (action, status) => {
     const verb = action === "archive" ? "Archive" : action === "recover" ? "Recover" : "Abandon";
     const consequence = action === "archive"
-      ? "This stops its tmux session if needed, deletes its local worktree, and hides it from Completed."
+      ? "This stops its tmux session if needed, deletes its local worktree, and hides it from the Done lane."
       : action === "recover"
         ? "If the attempt is stuck, this stops only its named tmux session. It preserves the worktree and diagnostics, records the failure on GitHub, and requests a new attempt."
       : "This stops its tmux session and permanently deletes its local worktree, log, and retained attempt record.";
@@ -164,7 +163,7 @@ export default function Dashboard() {
     result[status.state] = (result[status.state] ?? 0) + 1;
     return result;
   }, {})).sort(([a], [b]) => a.localeCompare(b)), [statuses]);
-  const { current, completed, visible } = statusViews(statuses, tab);
+  const lanes = groupStatusesByLane(statuses);
   const health = overallHealth(snapshot, error, statuses, now);
   const openAttemptTerminal = useCallback((status, session) => {
     const selected = session ?? { role: "implementation", name: status.session }, route = { implementation: "/terminal", reviewer: "/reviewer/terminal" }[selected.role];
@@ -219,46 +218,42 @@ export default function Dashboard() {
       {actionNotice ? <p className="notice" role="status">{actionNotice}</p> : null}
       {!error && snapshot && statuses.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
 
-      {statuses.length > 0 ? (
-        <div className="tabs" role="tablist" aria-label="Attempt status views">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "current"}
-            onClick={() => setTab("current")}
-          >
-            Current <span>{current.length}</span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "completed"}
-            onClick={() => setTab("completed")}
-          >
-            Completed <span>{completed.length}</span>
-          </button>
-        </div>
-      ) : null}
-
-      {!error && snapshot && statuses.length > 0 && visible.length === 0 ? (
-        <p className="notice">No {tab} attempts.</p>
-      ) : null}
-
-      <section className="grid" aria-label="Issue status">
-        {visible.map((status) => (
-          <StatusCard
-            key={`${status.repository}-${status.issue}-${status.attempt}`}
-            status={status}
-            onOpenTerminal={openAttemptTerminal}
-            onAction={performAction}
-            onInvestigate={(status) => performOrchestratorAction("investigate", status)}
-            investigationEnabled={Boolean(orchestratorStatus?.enabled && orchestratorStatus.state === "running")}
-            investigationBusy={Boolean(orchestratorBusy)}
-            busy={busy === attemptKey(status)} investigating={investigating === attemptKey(status)}
-            waiting={waiting && busy === attemptKey(status)}
-            followUpEnabled={!messageError} onNotice={setActionNotice}
-          />
-        ))}
+      <section className="board" aria-label="Issue status board" tabIndex={0} onKeyDown={(event) => {
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        event.preventDefault();
+        event.currentTarget.scrollLeft += event.key === "ArrowLeft" ? -event.currentTarget.clientWidth : event.currentTarget.clientWidth;
+      }}>
+        {snapshot ? lanes.map((lane) => (
+          <section className="lane" aria-labelledby={`lane-${lane.id}`} key={lane.id}>
+            <header className="laneHeader">
+              <h2 id={`lane-${lane.id}`}>
+                {lane.title}
+                <span className="laneCount" aria-label={`${lane.statuses.length} attempt${lane.statuses.length === 1 ? "" : "s"}`}>{lane.statuses.length}</span>
+              </h2>
+            </header>
+            {lane.statuses.length ? (
+              <ol className="laneCards">
+                {lane.statuses.map((status) => (
+                  <li key={`${status.repository}-${status.issue}-${status.attempt}`}>
+                    <StatusCard
+                      status={status}
+                      onOpenTerminal={openAttemptTerminal}
+                      onAction={performAction}
+                      onInvestigate={(status) => performOrchestratorAction("investigate", status)}
+                      investigationEnabled={Boolean(orchestratorStatus?.enabled && orchestratorStatus.state === "running")}
+                      investigationBusy={Boolean(orchestratorBusy)}
+                      busy={busy === attemptKey(status)}
+                      investigating={investigating === attemptKey(status)}
+                      waiting={waiting && busy === attemptKey(status)}
+                      followUpEnabled={!messageError}
+                      onNotice={setActionNotice}
+                    />
+                  </li>
+                ))}
+              </ol>
+            ) : <p className="emptyLane">No attempts</p>}
+          </section>
+        )) : <p className="boardState" role="status">{error ? "Issue status board unavailable." : "Loading issue status board…"}</p>}
       </section>
       {terminal ? <TerminalPanel config={terminal} onClose={closeTerminal} /> : null}
     </main>
