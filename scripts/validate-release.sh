@@ -9,7 +9,7 @@ export GOMODCACHE="$tmp/go-mod-cache"
 
 scripts/build-dashboard.sh
 rm -rf cmd/agent-symphony/dashboard/node_modules
-go test -race ./...
+go test -race -p 1 ./...
 scripts/lint.sh
 rm -rf cmd/agent-symphony/dashboard/node_modules
 sh -n scripts/*.sh
