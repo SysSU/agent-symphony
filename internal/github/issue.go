@@ -24,6 +24,7 @@ type IssueInput struct {
 
 type ContractConfig struct {
 	Ready, P1, P2, P3 string
+	IssueFilter       string
 	DependencySection string
 	DefaultCompletion string
 	HumanReview       string
@@ -32,6 +33,7 @@ type ContractConfig struct {
 
 type Controls struct {
 	Ready        bool   `json:"ready"`
+	IssueFilter  bool   `json:"issue_filter,omitempty"`
 	Priority     int    `json:"priority"`
 	Dependencies []int  `json:"dependencies"`
 	Completion   string `json:"completion"`
@@ -63,6 +65,12 @@ func NormalizeIssue(issue IssueInput, cfg ContractConfig, completed map[int]bool
 	result.Controls.Ready = slices.Contains(issue.Labels, cfg.Ready)
 	if !result.Controls.Ready {
 		result.Blockers = append(result.Blockers, "readiness label is missing")
+	}
+	if cfg.IssueFilter != "" {
+		result.Controls.IssueFilter = slices.Contains(issue.Labels, cfg.IssueFilter)
+		if !result.Controls.IssueFilter {
+			result.Blockers = append(result.Blockers, "issue filter label is missing")
+		}
 	}
 	for priority, label := range map[int]string{1: cfg.P1, 2: cfg.P2, 3: cfg.P3} {
 		if slices.Contains(issue.Labels, label) {
@@ -209,12 +217,15 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 		"cancelled":  strconv.FormatBool(controls.Cancelled),
 		"retry":      strconv.FormatBool(controls.Retry),
 	}
+	if controls.IssueFilter || slices.ContainsFunc(provenance, func(p Provenance) bool { return p.Name == "issue_filter" }) {
+		required["issue_filter"] = strconv.FormatBool(controls.IssueFilter)
+	}
 	seen := make(map[string]bool, len(required))
 	var ready, autonomous Provenance
 	for _, p := range provenance {
-		creationDefault := p.Value == map[string]string{"ready": "false", "priority": "0", "completion": "human-review", "closed": "false", "cancelled": "false", "retry": "false"}[p.Name]
+		creationDefault := p.Value == map[string]string{"ready": "false", "issue_filter": "false", "priority": "0", "completion": "human-review", "closed": "false", "cancelled": "false", "retry": "false"}[p.Name]
 		creation := p.Source == "creation" && creationDefault && p.EventID == 0 && p.ActorID == anchor.AuthorID && p.CreatedAt.Equal(anchor.CreatedAt)
-		mutationSource := p.Source == "timeline" && slices.Contains([]string{"ready", "priority", "completion", "closed"}, p.Name) || p.Source == "comment" && slices.Contains([]string{"cancelled", "retry"}, p.Name)
+		mutationSource := p.Source == "timeline" && slices.Contains([]string{"ready", "issue_filter", "priority", "completion", "closed"}, p.Name) || p.Source == "comment" && slices.Contains([]string{"cancelled", "retry"}, p.Name)
 		mutation := mutationSource && p.ActorID != 0 && !p.CreatedAt.IsZero() && (labelOnly || approval.CreatedAt.After(p.CreatedAt)) && authorized(p.ActorID) && timeline(p)
 		if !creation && !mutation {
 			return Snapshot{}, errors.New("control provenance is missing or unauthorized")

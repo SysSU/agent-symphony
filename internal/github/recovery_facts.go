@@ -308,7 +308,8 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			if terminal.Attempt > 0 && !retryAuthorizesFailure(controls, retry, terminal) {
 				recoveryBlockers-- // Recover exists to resolve this one expected blocker.
 			}
-			authorized := controls.Ready && !controls.Closed && !controls.Cancelled && len(blockers) == 0
+			filterMatches := cfg.IssueFilterLabel == "" || controls.IssueFilter
+			authorized := controls.Ready && filterMatches && !controls.Closed && !controls.Cancelled && len(blockers) == 0
 			bound := binding.Attempt > 0
 			attempt := max(1, next[issue.Number])
 			var activeAttempt *RecoveryAttemptFact
@@ -318,7 +319,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			}
 			isActive := active[issue.Number] || bound || bindingConflicts.Any
 			eligible := authorized && !isActive && !completed[issue.Number]
-			recoveryAuthorized := controls.Ready && !controls.Closed && !controls.Cancelled && recoveryBlockers == 0 && !completed[issue.Number]
+			recoveryAuthorized := controls.Ready && filterMatches && !controls.Closed && !controls.Cancelled && recoveryBlockers == 0 && !completed[issue.Number]
 			recoveryAttempt := 0
 			if recoveryAuthorized && !isActive && slices.ContainsFunc(terminalAttempts, func(fact RecoveryAttemptFact) bool { return fact.Attempt == terminal.Attempt }) {
 				recoveryAttempt = terminal.Attempt

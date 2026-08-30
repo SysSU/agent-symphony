@@ -742,6 +742,73 @@ func productionPRConfig() PRAdapterConfig {
 	return PRAdapterConfig{Repository: "o/r", ReadyLabel: "ready", HumanReviewLabel: "review", AutonomousMergeLabel: "auto", MergeMethod: "squash", PriorityP1Label: "P1", PriorityP2Label: "P2", PriorityP3Label: "P3", DependencySection: "Dependencies", DefaultCompletion: "human-review", ApprovalCommand: "/approve", CancelCommand: "/cancel", RetryCommand: "/retry", ActorID: 42}
 }
 
+func TestAuthorizedControlsTrackOptionalIssueFilter(t *testing.T) {
+	now := time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
+	filterPresent := true
+	var snapshots []string
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}}
+		events := []any{
+			map[string]any{"id": 20, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": 5}},
+			map[string]any{"id": 21, "event": "labeled", "label": map[string]any{"name": "P1"}, "created_at": now.Add(2 * time.Second), "actor": map[string]any{"id": 5}},
+			map[string]any{"id": 22, "event": "labeled", "label": map[string]any{"name": "agent-work"}, "created_at": now.Add(3 * time.Second), "actor": map[string]any{"id": 5}},
+		}
+		if filterPresent {
+			labels = append(labels, map[string]any{"name": "agent-work"})
+		} else {
+			events = append(events, map[string]any{"id": 23, "event": "unlabeled", "label": map[string]any{"name": "agent-work"}, "created_at": now.Add(4 * time.Second), "actor": map[string]any{"id": 5}})
+		}
+		comments := make([]any, len(snapshots))
+		for i, snapshot := range snapshots {
+			comments[i] = map[string]any{"id": 60 + i, "body": snapshot, "user": map[string]any{"id": 42}}
+		}
+		var response any
+		switch r.Method + " " + r.URL.RequestURI() {
+		case "GET /repos/o/r/issues/10":
+			response = map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": "work", "created_at": now, "user": map[string]any{"id": 5}, "labels": labels}
+		case "GET /repos/o/r/issues/10/timeline?per_page=100&page=1":
+			response = events
+		case "GET /repos/o/r/issues/10/comments?per_page=100&page=1":
+			response = comments
+		case "POST /graphql":
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+		case "GET /user/5":
+			response = map[string]any{"login": "owner"}
+		case "GET /repos/o/r/collaborators/owner/permission":
+			response = map[string]any{"permission": "maintain"}
+		case "POST /repos/o/r/issues/10/comments":
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil {
+				t.Fatal("invalid snapshot request")
+			}
+			snapshots = append(snapshots, payload.Body)
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return httpResponse(http.StatusOK, string(body), nil), nil
+	})}}
+	cfg := productionPRConfig()
+	cfg.IssueFilterLabel = "agent-work"
+	source := GitHubPRSource{API: api, Config: cfg}
+	controls, _, _, err := source.authorizedControlsWithIntake(context.Background(), 10, true)
+	if err != nil || !controls.IssueFilter || len(snapshots) != 1 {
+		t.Fatalf("configured present controls=%#v snapshots=%d err=%v", controls, len(snapshots), err)
+	}
+
+	filterPresent = false
+	if _, _, _, err := source.authorizedControlsWithIntake(context.Background(), 10, true); err == nil || len(snapshots) != 1 {
+		t.Fatalf("configured missing snapshots=%d err=%v", len(snapshots), err)
+	}
+
+	source.Config.IssueFilterLabel = ""
+	controls, _, _, err = source.authorizedControlsWithIntake(context.Background(), 10, true)
+	if err != nil || controls.IssueFilter || len(snapshots) != 2 {
+		t.Fatalf("unconfigured controls=%#v snapshots=%d err=%v", controls, len(snapshots), err)
+	}
+}
+
 func TestProductionAuthorizedControlsVerifyGitHubSnapshot(t *testing.T) {
 	cfg := productionPRConfig()
 	now := time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC)
