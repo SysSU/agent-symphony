@@ -37,10 +37,10 @@ type requiredCheck struct {
 
 // PRAdapterConfig contains repository policy names already owned by repository config.
 type PRAdapterConfig struct {
-	Repository, ReadyLabel, HumanReviewLabel, AutonomousMergeLabel, MergeMethod string
-	PriorityP1Label, PriorityP2Label, PriorityP3Label, DependencySection        string
-	DefaultCompletion, ApprovalCommand, CancelCommand, RetryCommand             string
-	ActorID                                                                     int
+	Repository, ReadyLabel, IssueFilterLabel, HumanReviewLabel, AutonomousMergeLabel, MergeMethod string
+	PriorityP1Label, PriorityP2Label, PriorityP3Label, DependencySection                          string
+	DefaultCompletion, ApprovalCommand, CancelCommand, RetryCommand                               string
+	ActorID                                                                                       int
 }
 
 // FileRecovery is the durable handoff from reconciliation to issue recovery.
@@ -957,7 +957,7 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 	for i := range issue.Labels {
 		labels[i] = issue.Labels[i].Name
 	}
-	contract := ContractConfig{Ready: s.Config.ReadyLabel, P1: s.Config.PriorityP1Label, P2: s.Config.PriorityP2Label, P3: s.Config.PriorityP3Label, DependencySection: s.Config.DependencySection, DefaultCompletion: s.Config.DefaultCompletion, HumanReview: s.Config.HumanReviewLabel, AutonomousMerge: s.Config.AutonomousMergeLabel}
+	contract := ContractConfig{Ready: s.Config.ReadyLabel, P1: s.Config.PriorityP1Label, P2: s.Config.PriorityP2Label, P3: s.Config.PriorityP3Label, IssueFilter: s.Config.IssueFilterLabel, DependencySection: s.Config.DependencySection, DefaultCompletion: s.Config.DefaultCompletion, HumanReview: s.Config.HumanReviewLabel, AutonomousMerge: s.Config.AutonomousMergeLabel}
 	input := IssueInput{Number: number, NodeID: issue.NodeID, State: issue.State, Body: issue.Body, CreatedAt: issue.CreatedAt, AuthorID: issue.User.ID, Labels: labels}
 	events, err := s.issueTimeline(ctx, number)
 	if err != nil {
@@ -1145,6 +1145,9 @@ func latestControlCommand(comments []issueCommentRecord, cancel, retry string) (
 
 func (s *GitHubPRSource) controlProvenance(issue issueControlRecord, controls Controls, events []issueTimelineEvent) ([]Provenance, error) {
 	wants := map[string]string{"ready": strconv.FormatBool(controls.Ready), "priority": strconv.Itoa(controls.Priority), "completion": controls.Completion, "closed": strconv.FormatBool(controls.Closed), "cancelled": strconv.FormatBool(controls.Cancelled), "retry": strconv.FormatBool(controls.Retry)}
+	if s.Config.IssueFilterLabel != "" {
+		wants["issue_filter"] = strconv.FormatBool(controls.IssueFilter)
+	}
 	labels := map[string]bool{}
 	var latest = map[string]*issueTimelineEvent{}
 	for i := range events {
@@ -1158,6 +1161,9 @@ func (s *GitHubPRSource) controlProvenance(issue issueControlRecord, controls Co
 			if e.Label.Name == s.Config.ReadyLabel {
 				name = "ready"
 			}
+			if s.Config.IssueFilterLabel != "" && e.Label.Name == s.Config.IssueFilterLabel {
+				name = "issue_filter"
+			}
 			if slices.Contains([]string{s.Config.PriorityP1Label, s.Config.PriorityP2Label, s.Config.PriorityP3Label}, e.Label.Name) {
 				name = "priority"
 			}
@@ -1170,6 +1176,9 @@ func (s *GitHubPRSource) controlProvenance(issue issueControlRecord, controls Co
 		}
 	}
 	current := map[string]string{"ready": strconv.FormatBool(labels[s.Config.ReadyLabel]), "closed": strconv.FormatBool(issue.State == "closed"), "completion": s.Config.DefaultCompletion, "priority": "0", "cancelled": "false", "retry": "false"}
+	if s.Config.IssueFilterLabel != "" {
+		current["issue_filter"] = strconv.FormatBool(labels[s.Config.IssueFilterLabel])
+	}
 	for label, value := range map[string]string{s.Config.PriorityP1Label: "1", s.Config.PriorityP2Label: "2", s.Config.PriorityP3Label: "3"} {
 		if labels[label] {
 			if current["priority"] != "0" {
@@ -1183,8 +1192,12 @@ func (s *GitHubPRSource) controlProvenance(issue issueControlRecord, controls Co
 			current["completion"] = value
 		}
 	}
+	names := []string{"ready", "priority", "completion", "closed", "cancelled", "retry"}
+	if s.Config.IssueFilterLabel != "" {
+		names = append(names, "issue_filter")
+	}
 	var result []Provenance
-	for _, name := range []string{"ready", "priority", "completion", "closed", "cancelled", "retry"} {
+	for _, name := range names {
 		if current[name] != wants[name] {
 			return nil, fmt.Errorf("current %s cannot be reconstructed from timeline", name)
 		}

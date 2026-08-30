@@ -36,6 +36,49 @@ func TestLoadAndValidate(t *testing.T) {
 	}
 }
 
+func TestOptionalIssueFilterLabel(t *testing.T) {
+	c := Default("owner/repo")
+	if c.Labels.IssueFilter != "" {
+		t.Fatalf("default issue filter = %q", c.Labels.IssueFilter)
+	}
+	path := filepath.Join(t.TempDir(), DefaultPath)
+	if err := Write(path, c); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"issue_filter"`) {
+		t.Fatalf("default configuration contains an issue filter: %s", b)
+	}
+
+	empty := strings.Replace(string(b), `"ready": "agent-ready"`, `"issue_filter": "",`+"\n"+`    "ready": "agent-ready"`, 1)
+	if err := os.WriteFile(path, []byte(empty), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if loaded, err := load(path, filepath.Dir(path)); err != nil || loaded.Labels.IssueFilter != "" {
+		t.Fatalf("empty issue filter = %q, err=%v", loaded.Labels.IssueFilter, err)
+	}
+
+	c.Labels.IssueFilter = "agent-work"
+	if err := Write(path, c); err != nil {
+		t.Fatal(err)
+	}
+	if loaded, err := load(path, filepath.Dir(path)); err != nil || loaded.Labels.IssueFilter != "agent-work" {
+		t.Fatalf("configured issue filter = %q, err=%v", loaded.Labels.IssueFilter, err)
+	}
+
+	c.Labels.IssueFilter = c.Labels.Ready
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "used more than once") {
+		t.Fatalf("duplicate issue filter error = %v", err)
+	}
+	c.Labels.IssueFilter = " "
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "labels must not be empty") {
+		t.Fatalf("blank issue filter error = %v", err)
+	}
+}
+
 func TestLoadNormalizesTheLegacyDefaultCodexStdinCommand(t *testing.T) {
 	c := Default("owner/repo")
 	c.Commands.Implementation = c.Commands.Implementation[:3]

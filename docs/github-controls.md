@@ -24,10 +24,11 @@ After posting a control comment, wait for the next `serve` cycle or run `agent-s
 | `priority:P1` | `labels.priority_p1` | Selects the highest scheduling priority. Exactly one configured priority label is required. |
 | `priority:P2` | `labels.priority_p2` | Selects the middle scheduling priority. Exactly one configured priority label is required. |
 | `priority:P3` | `labels.priority_p3` | Selects the lowest scheduling priority. Exactly one configured priority label is required. |
+| None | `labels.issue_filter` | Optional repository-specific queue filter. When configured, an issue must currently have this label as well as `agent-ready`; removing it makes the issue ineligible. |
 | `needs-human-review` | `completion_policies.human_review_label` | Explicitly requests the human-review PR label and pending policy status. Human review is already the default when no completion label is present. |
 | `autonomous-merge` | `completion_policies.autonomous_merge_label` | Opts into coordinator-managed merge after all review, validation, repository-rule, and permission checks pass. Apply it after the latest issue-body edit. |
 
-`needs-human-review` and `autonomous-merge` conflict; do not apply both. All configured control-label names must be nonempty and unique.
+`needs-human-review` and `autonomous-merge` conflict; do not apply both. Required control-label names must be nonempty. `labels.issue_filter` may be omitted or empty; when nonempty, it must be unique like every other configured label name.
 
 Edit the issue body before applying `agent-ready`. If an already-ready issue body changes, reapply `agent-ready`; reapply `autonomous-merge` too when autonomous completion is still intended.
 

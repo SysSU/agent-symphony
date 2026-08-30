@@ -369,6 +369,23 @@ func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 	}
 }
 
+func TestNormalizeIssueOptionalFilter(t *testing.T) {
+	cfg := ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", IssueFilter: "agent-work"}
+	issue := IssueInput{Number: 5, State: "open", Labels: []string{"ready", "P1"}}
+	if got := NormalizeIssue(issue, cfg, nil); got.Ready || got.Controls.IssueFilter || !slices.Contains(got.Blockers, "issue filter label is missing") {
+		t.Fatalf("missing filter = %#v", got)
+	}
+	issue.Labels = append(issue.Labels, "agent-work")
+	if got := NormalizeIssue(issue, cfg, nil); !got.Ready || !got.Controls.IssueFilter {
+		t.Fatalf("present filter = %#v", got)
+	}
+	cfg.IssueFilter = ""
+	issue.Labels = issue.Labels[:2]
+	if got := NormalizeIssue(issue, cfg, nil); !got.Ready || got.Controls.IssueFilter {
+		t.Fatalf("unconfigured filter = %#v", got)
+	}
+}
+
 func TestAgentEnvironmentRejectsReservedExplicitNames(t *testing.T) {
 	for _, name := range []string{"GITHUB_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID", "AZURE_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDFLARE_API_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "FTP_PROXY", "APP_PEM", "MY_APP_KEY", "RANDOM_PASSWORD"} {
 		t.Run(name, func(t *testing.T) {

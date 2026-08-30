@@ -30,10 +30,11 @@ type Config struct {
 }
 
 type Labels struct {
-	Ready      string `json:"ready"`
-	PriorityP1 string `json:"priority_p1"`
-	PriorityP2 string `json:"priority_p2"`
-	PriorityP3 string `json:"priority_p3"`
+	Ready       string `json:"ready"`
+	PriorityP1  string `json:"priority_p1"`
+	PriorityP2  string `json:"priority_p2"`
+	PriorityP3  string `json:"priority_p3"`
+	IssueFilter string `json:"issue_filter,omitempty"`
 }
 
 type Dependencies struct {
@@ -208,6 +209,9 @@ func (c Config) Validate() error {
 		problems = append(problems, "repository must be owner/name")
 	}
 	labels := []string{c.Labels.Ready, c.Labels.PriorityP1, c.Labels.PriorityP2, c.Labels.PriorityP3, c.CompletionPolicies.HumanReview, c.CompletionPolicies.AutonomousMerge}
+	if c.Labels.IssueFilter != "" {
+		labels = append(labels, c.Labels.IssueFilter)
+	}
 	seen := map[string]bool{}
 	for _, label := range labels {
 		if strings.TrimSpace(label) == "" {

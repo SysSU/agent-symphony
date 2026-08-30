@@ -1200,7 +1200,7 @@ func matchesOperatorMessageBinding(proposal orchestratoragent.MessageProposal, e
 }
 
 func githubPRConfig(c config.Config, actorID int) internalgithub.PRAdapterConfig {
-	return internalgithub.PRAdapterConfig{Repository: c.Repository, ReadyLabel: c.Labels.Ready, HumanReviewLabel: c.CompletionPolicies.HumanReview, AutonomousMergeLabel: c.CompletionPolicies.AutonomousMerge, MergeMethod: "squash", PriorityP1Label: c.Labels.PriorityP1, PriorityP2Label: c.Labels.PriorityP2, PriorityP3Label: c.Labels.PriorityP3, DependencySection: c.Dependencies.Section, DefaultCompletion: c.CompletionPolicies.Default, ApprovalCommand: "/agent-symphony approve", CancelCommand: "/agent-symphony cancel", RetryCommand: "/agent-symphony retry", ActorID: actorID}
+	return internalgithub.PRAdapterConfig{Repository: c.Repository, ReadyLabel: c.Labels.Ready, IssueFilterLabel: c.Labels.IssueFilter, HumanReviewLabel: c.CompletionPolicies.HumanReview, AutonomousMergeLabel: c.CompletionPolicies.AutonomousMerge, MergeMethod: "squash", PriorityP1Label: c.Labels.PriorityP1, PriorityP2Label: c.Labels.PriorityP2, PriorityP3Label: c.Labels.PriorityP3, DependencySection: c.Dependencies.Section, DefaultCompletion: c.CompletionPolicies.Default, ApprovalCommand: "/agent-symphony approve", CancelCommand: "/agent-symphony cancel", RetryCommand: "/agent-symphony retry", ActorID: actorID}
 }
 
 func onlyFlags(fs *flag.FlagSet, allowed ...string) bool {
