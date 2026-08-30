@@ -1463,6 +1463,9 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		return statuses, fmt.Errorf("resume operator messages: %w", operatorErr)
 	}
 	dispatchErr := dispatchIssues(ctx, api, &r, c, prConfig, freshIssues, decisions)
+	if _, _, err = refreshProjection(freshFacts, freshIssues); err != nil {
+		return statuses, errors.Join(fmt.Errorf("write local dispatched status projection: %w", err), dispatchErr)
+	}
 	freshRemote, err = internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
 	if err != nil {
 		return statuses, errors.Join(fmt.Errorf("refresh dispatched pull request attempts: %w", err), dispatchErr)

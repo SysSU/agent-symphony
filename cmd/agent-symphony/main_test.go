@@ -1919,6 +1919,129 @@ esac
 	}
 }
 
+func TestReconcileProjectsDispatchedSessionBeforeFailedRemoteRefresh(t *testing.T) {
+	root := gitRepository(t)
+	for _, args := range [][]string{{"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"switch", "-c", "main"}} {
+		runGit(t, root, args...)
+	}
+	if err := os.WriteFile(filepath.Join(root, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", "file")
+	runGit(t, root, "commit", "-m", "base")
+	base := runGit(t, root, "rev-parse", "HEAD")
+	runGit(t, root, "update-ref", "refs/remotes/origin/main", base)
+
+	configPath := filepath.Join(root, config.DefaultPath)
+	if err := config.Write(configPath, config.Default("owner/repo")); err != nil {
+		t.Fatal(err)
+	}
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshotRoot := reviewSnapshotRoot
+	reviewSnapshotRoot = filepath.Join(t.TempDir(), "snapshots")
+	t.Cleanup(func() { reviewSnapshotRoot = oldSnapshotRoot })
+	attemptRoot := productionAttemptRoot(stateRoot)
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	attempt := agentruntime.Attempt{Repository: "owner/repo", Issue: 184, Number: 1, BaseSHA: base}
+	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(attemptRoot, internalgithub.RepositoryIdentifier(attempt.Repository)+".source.bundle")
+	boundary := filepath.Join(t.TempDir(), "implementation-boundary")
+	boundaryScript := fmt.Sprintf(`#!/bin/sh
+payload=$(sed -n '1p')
+case "$payload" in
+  *'"clone","--no-local","--no-checkout"'*) git clone --no-local --no-checkout %q %q >/dev/null 2>&1;;
+  *'"checkout","--detach"'*) git -C %q checkout --detach %q >/dev/null 2>&1;;
+  *'"switch","-c"'*) git -C %q switch -c %q >/dev/null 2>&1;;
+  *'"remote","remove","origin"'*) git -C %q remote remove origin;;
+  *'"config","--local","credential.helper",""'*) git -C %q config --local credential.helper '';;
+  *'"has-session"'*) printf '{"Code":1,"Exited":true}'; exit 0;;
+  *) printf '{"Code":0}'; exit 0;;
+esac
+if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true}'; fi
+`, source, manifest.Worktree, manifest.Worktree, base, manifest.Worktree, manifest.Branch, manifest.Worktree, manifest.Worktree)
+	if err := os.WriteFile(boundary, []byte(boundaryScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", boundary)
+
+	createdAt := time.Date(2026, 8, 30, 1, 0, 0, 0, time.UTC)
+	var comments []map[string]any
+	dispatched := false
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		var response any
+		switch request.Method + " " + request.URL.Path {
+		case "GET /user":
+			response = map[string]any{"id": 42, "login": "coordinator"}
+		case "GET /user/42":
+			response = map[string]any{"login": "coordinator"}
+		case "GET /repos/owner/repo":
+			response = map[string]any{"full_name": "owner/repo", "default_branch": "main", "permissions": map[string]any{"pull": true}}
+		case "GET /repos/owner/repo/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": base}}
+		case "GET /repos/owner/repo/issues":
+			response = []map[string]any{{"number": 184, "title": "Project dispatched session", "body": "Keep the local projection current.", "created_at": createdAt}}
+		case "GET /repos/owner/repo/issues/184":
+			response = map[string]any{"number": 184, "node_id": "issue-node", "state": "open", "title": "Project dispatched session", "body": "Keep the local projection current.", "created_at": createdAt, "user": map[string]any{"id": 42}, "labels": []map[string]any{{"name": "agent-ready"}, {"name": "priority:P1"}}}
+		case "GET /repos/owner/repo/issues/184/timeline":
+			response = []map[string]any{
+				{"id": 11, "event": "labeled", "created_at": createdAt.Add(time.Minute), "actor": map[string]any{"id": 42}, "label": map[string]any{"name": "agent-ready"}},
+				{"id": 12, "event": "labeled", "created_at": createdAt.Add(2 * time.Minute), "actor": map[string]any{"id": 42}, "label": map[string]any{"name": "priority:P1"}},
+			}
+		case "GET /repos/owner/repo/issues/184/comments":
+			response = comments
+		case "GET /repos/owner/repo/collaborators/coordinator/permission":
+			response = map[string]any{"permission": "admin"}
+		case "GET /repos/owner/repo/pulls":
+			if dispatched {
+				status, response = http.StatusBadRequest, map[string]any{"message": "forced post-dispatch read failure"}
+			} else {
+				response = []any{}
+			}
+		case "POST /graphql":
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+		case "POST /repos/owner/repo/issues/184/comments":
+			var input struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			comments = append(comments, map[string]any{"id": len(comments) + 1, "body": input.Body, "created_at": createdAt.Add(time.Duration(len(comments)+1) * time.Minute), "updated_at": createdAt.Add(time.Duration(len(comments)+1) * time.Minute), "user": map[string]any{"id": 42}})
+			dispatched = dispatched || strings.Contains(input.Body, "agent-symphony:active-attempt:v1")
+			status, response = http.StatusCreated, map[string]any{}
+		default:
+			t.Fatalf("unexpected GitHub request %s", request.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d", status), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI, githubClient = "https://example.test", client
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+
+	statePath := filepath.Join(stateRoot, "pr.json")
+	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = reconcileGitHub(t.Context(), configPath, statePath, stateRoot, true)
+	if err == nil || !strings.Contains(err.Error(), "refresh dispatched pull request attempts") || !dispatched {
+		t.Fatalf("post-dispatch failure err=%v dispatched=%v", err, dispatched)
+	}
+	projected, err := (&dashboardServer{stateRoot: stateRoot}).projectedStatus(184, 1)
+	if err != nil || projected.Session != manifest.Session || len(projected.Sessions) != 1 || projected.Sessions[0].Name != manifest.Session {
+		t.Fatalf("local dispatched projection=%#v err=%v", projected, err)
+	}
+}
+
 func TestProjectRecoveryStatusesUsesCurrentManifestAndFreshRemoteFacts(t *testing.T) {
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 23, 1)
 	head := strings.Repeat("b", 40)
