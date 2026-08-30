@@ -1137,3 +1137,29 @@ func TestDashboardMissingReviewerSessionClosesWithExplicitReason(t *testing.T) {
 		t.Fatalf("missing session reached attachment: %v", err)
 	}
 }
+
+func TestDashboardTerminalAttachRaceClosesWithExplicitReason(t *testing.T) {
+	root := t.TempDir()
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 8, 1)
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 8, Attempt: 1, State: "running", Session: session, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "running", Current: true}}}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(t.TempDir(), "tmux")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nif test \"$1\" = has-session; then exit 0; fi\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(newDashboardHandler(t.Context(), root, script))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/terminal?issue=8&attempt=1"
+	connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
+	if err != nil {
+		t.Fatalf("terminal dial response=%v err=%v", response, err)
+	}
+	defer connection.CloseNow()
+	_, _, err = connection.Read(t.Context())
+	var closeErr websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.StatusNormalClosure || closeErr.Reason != "Session ended." {
+		t.Fatalf("attach race close=%#v err=%v", closeErr, err)
+	}
+}

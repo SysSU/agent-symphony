@@ -923,6 +923,7 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 				return
 			}
 			if readErr != nil {
+				_ = conn.Close(websocket.StatusNormalClosure, "Session ended.")
 				return
 			}
 		}

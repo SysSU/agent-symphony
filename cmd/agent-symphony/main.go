@@ -1462,8 +1462,21 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if operatorErr != nil {
 		return statuses, fmt.Errorf("resume operator messages: %w", operatorErr)
 	}
-	if err := dispatchIssues(ctx, api, &r, c, prConfig, freshIssues, decisions); err != nil {
-		return statuses, fmt.Errorf("dispatch eligible issues: %w", err)
+	dispatchErr := dispatchIssues(ctx, api, &r, c, prConfig, freshIssues, decisions)
+	freshRemote, err = internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
+	if err != nil {
+		return statuses, errors.Join(fmt.Errorf("refresh dispatched pull request attempts: %w", err), dispatchErr)
+	}
+	freshIssues, err = internalgithub.FetchIssueFacts(ctx, api, prConfig, freshRemote, false)
+	if err != nil {
+		return statuses, errors.Join(fmt.Errorf("refresh dispatched issue controls: %w", err), dispatchErr)
+	}
+	_, freshFacts = recoveryAttemptFacts(freshRemote, freshIssues)
+	if _, _, err = refreshProjection(freshFacts, freshIssues); err != nil {
+		return statuses, errors.Join(fmt.Errorf("write dispatched status projection: %w", err), dispatchErr)
+	}
+	if dispatchErr != nil {
+		return statuses, fmt.Errorf("dispatch eligible issues: %w", dispatchErr)
 	}
 	if err := ctx.Err(); err != nil {
 		return statuses, fmt.Errorf("reconciliation exceeded the %s recovery target: %w", options.timeout, err)
