@@ -1290,31 +1290,12 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if err != nil {
 		return nil, fmt.Errorf("fetch pull request attempts: %w", err)
 	}
-	facts := make([]orchestrator.AttemptFact, len(remote))
-	for i, f := range remote {
-		facts[i] = orchestrator.AttemptFact{Repository: f.Repository, Issue: f.Issue, Attempt: f.Attempt, BaseSHA: f.BaseSHA, HeadSHA: f.HeadSHA, PR: f.PR, State: f.State, Checks: f.Checks, Diagnostic: f.Diagnostic}
-	}
 	prConfig := githubPRConfig(c, user.ID)
 	issues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, remote, options.intake)
 	if err != nil {
 		return nil, fmt.Errorf("fetch issue controls: %w", err)
 	}
-	for i := range issues {
-		if binding := issues[i].ActiveAttempt; binding != nil && !slices.ContainsFunc(remote, func(f internalgithub.RecoveryAttemptFact) bool {
-			return f.Repository == binding.Repository && f.Issue == binding.Issue && f.Attempt == binding.Attempt
-		}) {
-			remote = append(remote, *binding)
-			facts = append(facts, orchestrator.AttemptFact{Repository: binding.Repository, Issue: binding.Issue, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: binding.State, Diagnostic: binding.Diagnostic})
-		}
-		for _, binding := range issues[i].TerminalAttempts {
-			if slices.ContainsFunc(facts, func(f orchestrator.AttemptFact) bool {
-				return f.Repository == binding.Repository && f.Issue == binding.Issue && f.Attempt == binding.Attempt && f.BaseSHA == binding.BaseSHA && f.State == binding.State
-			}) {
-				continue
-			}
-			facts = append(facts, orchestrator.AttemptFact{Repository: binding.Repository, Issue: binding.Issue, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: binding.State, Diagnostic: binding.Diagnostic})
-		}
-	}
+	remote, facts := recoveryAttemptFacts(remote, issues)
 	boundary := implementationBoundary(stateRoot)
 	binary, err := os.Executable()
 	if err != nil {
@@ -1344,20 +1325,14 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 			return nil, fmt.Errorf("resume bound attempts: %w", err)
 		}
 	}
-	for i := range issues {
-		issues[i].Active = issues[i].Active || slices.ContainsFunc(manifests, func(m agentruntime.Manifest) bool {
-			return m.Repository == issues[i].Repository && m.Issue == issues[i].Issue && (m.State == "preparing" || m.State == "running")
-		})
-	}
-	addTerminalAttemptBlockers(issues, manifests, facts)
-	statuses := orchestrator.RecoverChecked(ctx, facts, manifests, func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
+	checkRuntime := func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
 		head := fact.HeadSHA
 		if head == "" {
 			head = fact.BaseSHA
 		}
 		return r.VerifyActive(ctx, manifest, head)
-	})
-	statuses, decisions := joinIssueProjection(statuses, issues, c.Concurrency)
+	}
+	statuses, decisions := projectRecoveryStatuses(ctx, facts, issues, manifests, c.Concurrency, checkRuntime)
 	operatorMessages, err := fetchOperatorMessages(ctx, api, prConfig, issues, remote, manifests)
 	if err != nil {
 		return statuses, fmt.Errorf("fetch operator messages: %w", err)
@@ -1373,6 +1348,15 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	}
 	if !options.transition {
 		return statuses, nil
+	}
+	refreshProjection := func(currentFacts []orchestrator.AttemptFact, currentIssues []internalgithub.RecoveryIssueFact) ([]agentruntime.Manifest, []orchestrator.Decision, error) {
+		currentManifests, discoverErr := r.Discover()
+		if discoverErr != nil {
+			return nil, nil, discoverErr
+		}
+		statuses, decisions = projectRecoveryStatuses(ctx, currentFacts, currentIssues, currentManifests, c.Concurrency, checkRuntime)
+		attachOperatorMessageStatuses(statuses, operatorMessages)
+		return currentManifests, decisions, writeStatusSnapshot(stateRoot, statuses)
 	}
 	// Governance may mutate GitHub only after authenticated repository access,
 	// exact proposal authorization, and the duplicate suppression below.
@@ -1397,15 +1381,21 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if err != nil {
 		return statuses, fmt.Errorf("rediscover queued attempts: %w", err)
 	}
-	if err := monitorAttempts(ctx, &r, statuses, queuedManifests, issues); err != nil {
-		return statuses, fmt.Errorf("monitor live attempts: %w", err)
-	}
-	queuedManifests, err = r.Discover()
+	monitorErr := monitorAttempts(ctx, &r, statuses, queuedManifests, issues)
+	queuedManifests, decisions, err = refreshProjection(facts, issues)
 	if err != nil {
-		return statuses, fmt.Errorf("rediscover monitored attempts: %w", err)
+		return statuses, errors.Join(fmt.Errorf("refresh monitored attempt projection: %w", err), monitorErr)
 	}
-	if err := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, operatorMessages, statePath, stateRoot); err != nil {
-		return statuses, fmt.Errorf("process completed worker results: %w", err)
+	if monitorErr != nil {
+		return statuses, fmt.Errorf("monitor live attempts: %w", monitorErr)
+	}
+	transitionErr := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, operatorMessages, statePath, stateRoot)
+	queuedManifests, decisions, err = refreshProjection(facts, issues)
+	if err != nil {
+		return statuses, errors.Join(fmt.Errorf("refresh completed attempt projection: %w", err), transitionErr)
+	}
+	if transitionErr != nil {
+		return statuses, fmt.Errorf("process completed worker results: %w", transitionErr)
 	}
 	if err := cleanupCompletedAttempts(ctx, boundary, facts, queuedManifests); err != nil {
 		return statuses, fmt.Errorf("clean completed attempts: %w", err)
@@ -1426,11 +1416,8 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if err != nil {
 		return statuses, fmt.Errorf("refresh issue controls: %w", err)
 	}
-	freshFacts := make([]orchestrator.AttemptFact, len(freshRemote))
-	for i, fact := range freshRemote {
-		freshFacts[i] = orchestrator.AttemptFact{Repository: fact.Repository, Issue: fact.Issue, Attempt: fact.Attempt, BaseSHA: fact.BaseSHA, HeadSHA: fact.HeadSHA, PR: fact.PR, State: fact.State, Checks: fact.Checks, Diagnostic: fact.Diagnostic}
-	}
-	if err := cleanupCompletedAttempts(ctx, boundary, freshFacts, manifests); err != nil {
+	freshRemote, freshFacts := recoveryAttemptFacts(freshRemote, freshIssues)
+	if err := cleanupCompletedAttempts(ctx, boundary, freshFacts, queuedManifests); err != nil {
 		return statuses, fmt.Errorf("clean newly completed attempts: %w", err)
 	}
 	operatorCheck := func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
@@ -1463,26 +1450,61 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		}
 		return matchesOperatorMessageBinding(proposal, expected, currentIssues, attempts), nil
 	}
-	validatedManifests, err := r.Discover()
+	validatedManifests, decisions, err := refreshProjection(freshFacts, freshIssues)
 	if err != nil {
-		return statuses, fmt.Errorf("validate operator-message manifests: %w", err)
+		return statuses, fmt.Errorf("write fresh status projection: %w", err)
 	}
-	if err := resumeOperatorMessages(ctx, api, prConfig, &r, boundary, freshIssues, freshRemote, validatedManifests, operatorMessages, c.Commands.Implementation, operatorCheck, refreshOperatorTarget, acceptOperatorTarget); err != nil {
-		attachOperatorMessageStatuses(statuses, operatorMessages)
-		_ = writeStatusSnapshot(stateRoot, statuses)
-		return statuses, fmt.Errorf("resume operator messages: %w", err)
+	operatorErr := resumeOperatorMessages(ctx, api, prConfig, &r, boundary, freshIssues, freshRemote, validatedManifests, operatorMessages, c.Commands.Implementation, operatorCheck, refreshOperatorTarget, acceptOperatorTarget)
+	_, decisions, err = refreshProjection(freshFacts, freshIssues)
+	if err != nil {
+		return statuses, errors.Join(fmt.Errorf("write final status projection: %w", err), operatorErr)
 	}
-	attachOperatorMessageStatuses(statuses, operatorMessages)
-	if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
-		return statuses, fmt.Errorf("write final status projection: %w", err)
+	if operatorErr != nil {
+		return statuses, fmt.Errorf("resume operator messages: %w", operatorErr)
 	}
-	if err := dispatchIssues(ctx, api, &r, c, prConfig, issues, decisions); err != nil {
+	if err := dispatchIssues(ctx, api, &r, c, prConfig, freshIssues, decisions); err != nil {
 		return statuses, fmt.Errorf("dispatch eligible issues: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return statuses, fmt.Errorf("reconciliation exceeded the %s recovery target: %w", options.timeout, err)
 	}
 	return statuses, nil
+}
+
+func recoveryAttemptFacts(remote []internalgithub.RecoveryAttemptFact, issues []internalgithub.RecoveryIssueFact) ([]internalgithub.RecoveryAttemptFact, []orchestrator.AttemptFact) {
+	remote = slices.Clone(remote)
+	facts := make([]orchestrator.AttemptFact, len(remote))
+	for i, fact := range remote {
+		facts[i] = orchestrator.AttemptFact{Repository: fact.Repository, Issue: fact.Issue, Attempt: fact.Attempt, BaseSHA: fact.BaseSHA, HeadSHA: fact.HeadSHA, PR: fact.PR, State: fact.State, Checks: fact.Checks, Diagnostic: fact.Diagnostic}
+	}
+	for i := range issues {
+		if binding := issues[i].ActiveAttempt; binding != nil && !slices.ContainsFunc(remote, func(fact internalgithub.RecoveryAttemptFact) bool {
+			return fact.Repository == binding.Repository && fact.Issue == binding.Issue && fact.Attempt == binding.Attempt
+		}) {
+			remote = append(remote, *binding)
+			facts = append(facts, orchestrator.AttemptFact{Repository: binding.Repository, Issue: binding.Issue, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: binding.State, Diagnostic: binding.Diagnostic})
+		}
+		for _, binding := range issues[i].TerminalAttempts {
+			if !slices.ContainsFunc(facts, func(fact orchestrator.AttemptFact) bool {
+				return fact.Repository == binding.Repository && fact.Issue == binding.Issue && fact.Attempt == binding.Attempt && fact.BaseSHA == binding.BaseSHA && fact.State == binding.State
+			}) {
+				facts = append(facts, orchestrator.AttemptFact{Repository: binding.Repository, Issue: binding.Issue, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: binding.State, Diagnostic: binding.Diagnostic})
+			}
+		}
+	}
+	return remote, facts
+}
+
+func projectRecoveryStatuses(ctx context.Context, facts []orchestrator.AttemptFact, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, capacity int, check orchestrator.RuntimeCheck) ([]orchestrator.RecoveryStatus, []orchestrator.Decision) {
+	issues = slices.Clone(issues)
+	for i := range issues {
+		issues[i].Blockers = slices.Clone(issues[i].Blockers)
+		issues[i].Active = issues[i].Active || slices.ContainsFunc(manifests, func(manifest agentruntime.Manifest) bool {
+			return manifest.Repository == issues[i].Repository && manifest.Issue == issues[i].Issue && (manifest.State == "preparing" || manifest.State == "running")
+		})
+	}
+	addTerminalAttemptBlockers(issues, manifests, facts)
+	return joinIssueProjection(orchestrator.RecoverChecked(ctx, facts, manifests, check), issues, capacity)
 }
 
 func cleanupCompletedAttempts(ctx context.Context, boundary boundaryCaller, facts []orchestrator.AttemptFact, manifests []agentruntime.Manifest) error {

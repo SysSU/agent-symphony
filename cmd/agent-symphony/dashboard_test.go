@@ -1106,7 +1106,7 @@ func TestDashboardTerminalRejectsTamperedIdentityAndInvalidMessages(t *testing.T
 	}
 }
 
-func TestDashboardReviewerTerminalRequiresLiveSession(t *testing.T) {
+func TestDashboardMissingReviewerSessionClosesWithExplicitReason(t *testing.T) {
 	root := t.TempDir()
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 8, 1)
 	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 8, 1)
@@ -1115,14 +1115,25 @@ func TestDashboardReviewerTerminalRequiresLiveSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := filepath.Join(t.TempDir(), "tmux")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+	attached := filepath.Join(t.TempDir(), "attached")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nif test \"$1\" = has-session; then exit 1; fi\ntouch \"$ATTACHED\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/reviewer/terminal?issue=8&attempt=1", nil)
-	request.Header.Set("Origin", "http://127.0.0.1")
-	response := httptest.NewRecorder()
-	newDashboardHandler(t.Context(), root, script).ServeHTTP(response, request)
-	if response.Code != http.StatusConflict {
-		t.Fatalf("missing session status=%d body=%q", response.Code, response.Body.String())
+	t.Setenv("ATTACHED", attached)
+	server := httptest.NewServer(newDashboardHandler(t.Context(), root, script))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/reviewer/terminal?issue=8&attempt=1"
+	connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
+	if err != nil {
+		t.Fatalf("missing session dial response=%v err=%v", response, err)
+	}
+	defer connection.CloseNow()
+	_, _, err = connection.Read(t.Context())
+	var closeErr websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.StatusNormalClosure || closeErr.Reason != "Session ended." {
+		t.Fatalf("missing session close=%#v err=%v", closeErr, err)
+	}
+	if _, err := os.Stat(attached); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing session reached attachment: %v", err)
 	}
 }

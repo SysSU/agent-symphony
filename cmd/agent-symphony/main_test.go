@@ -1880,6 +1880,7 @@ esac
 		t.Fatal(err)
 	}
 	manifest.State, manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead = "running", "clean", base, head
+	manifest.ReviewSession, _ = agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
 	manifest.CreatedAt, manifest.UpdatedAt = issueCreated, issueCreated
 	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
@@ -1892,6 +1893,7 @@ esac
 	oldAPI, oldClient := githubAPI, githubClient
 	githubAPI, githubClient = "https://example.test", client
 	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", implementation)
 	statePath := filepath.Join(stateRoot, "pr.json")
 	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1908,6 +1910,23 @@ esac
 	}
 	if !created || !strings.Contains(pullBody, head) || len(comments) != 5 {
 		t.Fatalf("publication incomplete: created=%v body=%q comments=%#v", created, pullBody, comments)
+	}
+	projected, err := (&dashboardServer{stateRoot: stateRoot}).projectedStatus(23, 1)
+	if err != nil || projected.CurrentPhase != "publication" || slices.ContainsFunc(projected.Sessions, func(session orchestrator.AttemptSession) bool {
+		return session.Role == agentruntime.SessionRoleReviewer
+	}) {
+		t.Fatalf("post-review projection=%#v err=%v", projected, err)
+	}
+}
+
+func TestProjectRecoveryStatusesUsesCurrentManifestAndFreshRemoteFacts(t *testing.T) {
+	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 23, 1)
+	head := strings.Repeat("b", 40)
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: strings.Repeat("a", 40), ReviewHead: head, State: "completed", ReviewState: "clean", Session: implementation}
+	fact := orchestrator.AttemptFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: manifest.BaseSHA, HeadSHA: head, PR: 7, State: "active", Checks: []string{"ci:success"}}
+	statuses, _ := projectRecoveryStatuses(t.Context(), []orchestrator.AttemptFact{fact}, []internalgithub.RecoveryIssueFact{{Repository: "o/r", Issue: 23, Active: true}}, []agentruntime.Manifest{manifest}, 1, nil)
+	if len(statuses) != 1 || statuses[0].CurrentPhase != "publication" || statuses[0].PR != 7 || !slices.Equal(statuses[0].Checks, []string{"ci:success"}) || len(statuses[0].Sessions) != 1 {
+		t.Fatalf("fresh projection=%#v", statuses)
 	}
 }
 
