@@ -34,7 +34,10 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
-const outputVersion = 1
+const (
+	outputVersion              = 1
+	humanInstructionPrecedence = "Confirmed human instructions amend the issue contract. Apply them in listed chronological order; a later human instruction supersedes conflicting earlier issue text or human instructions. Automated review feedback never supersedes a conflicting human instruction."
+)
 
 var releaseMetadata = "agent-symphony-release-version:devel"
 
@@ -1254,7 +1257,7 @@ type reconcileOptions struct {
 }
 
 func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
-	return reconcileGitHubWith(ctx, configPath, statePath, stateRoot, reconcileOptions{transition: transition, intake: transition, timeout: 2 * time.Minute})
+	return reconcileGitHubWith(ctx, configPath, statePath, stateRoot, reconcileOptions{transition: transition, intake: transition, timeout: 5 * time.Minute})
 }
 
 func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot string, options reconcileOptions) (result []orchestrator.RecoveryStatus, resultErr error) {
@@ -2119,6 +2122,43 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string
 	return nil
 }
 
+func amendIssueWithHumanInstructions(issue internalgithub.RecoveryIssueFact, messages []internalgithub.OperatorMessage, feedback []internalgithub.Feedback) (internalgithub.RecoveryIssueFact, []string, bool) {
+	type instruction struct {
+		created time.Time
+		key     string
+		body    string
+	}
+	var instructions []instruction
+	operatorDelivered := false
+	for _, message := range messages {
+		want, err := internalgithub.PrepareOperatorMessage(message.Repository, message.Issue, message.Attempt, message.Message)
+		if err == nil && want.ID == message.ID && message.State == "delivered" && message.Repository == issue.Repository && message.Issue == issue.Issue && message.Attempt == issue.Attempt {
+			instructions = append(instructions, instruction{message.UpdatedAt, "operator:" + message.ID, message.Message})
+			operatorDelivered = true
+		}
+	}
+	for _, item := range feedback {
+		if item.ID > 0 && item.Authorized && strings.TrimSpace(item.Body) != "" && slices.Contains([]string{"issue", "conversation", "inline", "review"}, item.Source) {
+			instructions = append(instructions, instruction{item.CreatedAt, fmt.Sprintf("%s:%d", item.Source, item.ID), strings.TrimSpace(item.Body)})
+		}
+	}
+	slices.SortFunc(instructions, func(a, b instruction) int {
+		if compared := a.created.Compare(b.created); compared != 0 {
+			return compared
+		}
+		return strings.Compare(a.key, b.key)
+	})
+	bodies := make([]string, len(instructions))
+	for i, item := range instructions {
+		bodies[i] = item.key + "\n" + item.body
+	}
+	if len(instructions) > 0 {
+		encoded, _ := json.Marshal(bodies)
+		issue.Body += "\n\n" + humanInstructionPrecedence + "\n" + string(encoded)
+	}
+	return issue, bodies, operatorDelivered
+}
+
 func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, operatorMessages map[string][]internalgithub.OperatorMessage, statePath, stateRoot string, refreshProjection func() error) error {
 	recovery := &internalgithub.FileRecovery{Path: statePath}
 	for _, manifest := range manifests {
@@ -2151,9 +2191,8 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			continue
 		}
 		issue.Attempt = manifest.Attempt
-		operatorDelivered := slices.ContainsFunc(operatorMessages[fmt.Sprintf("%s#%d/%d", manifest.Repository, manifest.Issue, manifest.Attempt)], func(message internalgithub.OperatorMessage) bool {
-			return message.State == "delivered"
-		})
+		attemptMessages := operatorMessages[fmt.Sprintf("%s#%d/%d", manifest.Repository, manifest.Issue, manifest.Attempt)]
+		_, _, operatorDelivered := amendIssueWithHumanInstructions(issue, attemptMessages, nil)
 		var (
 			handoff internalgithub.RecoveryHandoff
 			err     error
@@ -2177,6 +2216,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 		if !issue.DispatchAuthorized {
 			continue
 		}
+		issue, humanInstructions, _ := amendIssueWithHumanInstructions(issue, attemptMessages, handoff.Feedback)
 		current := manifest
 		if manifest.State == "preparing" || manifest.State == "running" {
 			continue // monitorAttempts owns live bound attempts from the same snapshot.
@@ -2207,7 +2247,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 					return err
 				}
 			}
-			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot, prepare, refreshProjection)
+			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, humanInstructions, stateRoot, prepare, refreshProjection)
 			if err != nil {
 				return errors.Join(err, durableAttemptFailure(ctx, api, issue, current, err))
 			}
@@ -2229,7 +2269,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 	return nil
 }
 
-func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeState *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, stateRoot string, preparePublication func(string) error, refreshProjection func() error) (bool, error) {
+func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeState *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, humanInstructions []string, stateRoot string, preparePublication func(string) error, refreshProjection func() error) (bool, error) {
 	boundary := implementationBoundary(stateRoot)
 	snapshotRoot := productionSnapshotRoot(stateRoot)
 	reviewEnv, err := configuredAgentEnvironment(cfg.Commands.Environment)
@@ -2256,7 +2296,7 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		}
 	}
 	if manifest.ReviewState == "findings-queued" && manifest.ReviewHead == head {
-		return returnReviewFindings(ctx, runtimeState, boundary, attempt, manifest, head, manifest.ReviewFindings, cfg.Commands.Implementation)
+		return returnReviewFindings(ctx, runtimeState, boundary, attempt, manifest, head, manifest.ReviewFindings, humanInstructions, cfg.Commands.Implementation)
 	}
 	reviewBase := manifest.BaseSHA
 	if preflightObjectID.MatchString(issue.BaseSHA) {
@@ -2266,7 +2306,7 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 			if err != nil {
 				return false, err
 			}
-			return returnReviewFindings(ctx, runtimeState, boundary, attempt, queued, head, findings, cfg.Commands.Implementation)
+			return returnReviewFindings(ctx, runtimeState, boundary, attempt, queued, head, findings, humanInstructions, cfg.Commands.Implementation)
 		}
 		reviewBase = issue.BaseSHA
 	}
@@ -2284,7 +2324,7 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		if err != nil {
 			return false, err
 		}
-		return returnReviewFindings(ctx, runtimeState, boundary, attempt, queued, head, review.Findings, cfg.Commands.Implementation)
+		return returnReviewFindings(ctx, runtimeState, boundary, attempt, queued, head, review.Findings, humanInstructions, cfg.Commands.Implementation)
 	}
 	if manifest.ReviewState != "clean" {
 		if _, err := runtimeState.RecordReview(attempt, "clean", reviewBase, head, "", ""); err != nil {
@@ -2364,10 +2404,13 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 	return false, api.CreateIssueComment(ctx, issue.Repository, issue.Issue, comment+"\n\n"+marker, mutation)
 }
 
-func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtime, boundary workerBoundaryRunner, attempt agentruntime.Attempt, manifest agentruntime.Manifest, head string, findings, command []string) (bool, error) {
+func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtime, boundary workerBoundaryRunner, attempt agentruntime.Attempt, manifest agentruntime.Manifest, head string, findings, humanInstructions, command []string) (bool, error) {
 	key := "independent-review-" + head
 	outcomePath := handoffReceiptPath(manifest.Worktree, key)
-	handoff, _ := json.Marshal(struct{ Type, Key, Findings string }{"agent-symphony-handoff-v1", key, strings.Join(findings, "\n")})
+	handoff, _ := json.Marshal(struct {
+		Type, Key, Findings string
+		HumanInstructions   []string `json:"human_instructions,omitempty"`
+	}{"agent-symphony-handoff-v1", key, strings.Join(findings, "\n"), humanInstructions})
 	accept := func() error {
 		request, _ := json.Marshal(struct {
 			Manifest     agentruntime.Manifest `json:"manifest"`

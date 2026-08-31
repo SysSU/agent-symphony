@@ -81,6 +81,35 @@ type operatorMessageStore struct {
 	outcomePosts    int
 }
 
+func TestAuthorizedHumanInstructionsAmendIndependentReviewContractInOrder(t *testing.T) {
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 186, Attempt: 1, Body: "Commit the repository YAML."}
+	now := time.Date(2026, 8, 31, 6, 0, 0, 0, time.UTC)
+	first, _ := internalgithub.PrepareOperatorMessage("o/r", 186, 1, "Keep the YAML ignored.")
+	first.State, first.UpdatedAt = "delivered", now
+	later, _ := internalgithub.PrepareOperatorMessage("o/r", 186, 1, "Keep the machine-local config out of the PR.")
+	later.State, later.UpdatedAt = "delivered", now.Add(3*time.Minute)
+	queued, _ := internalgithub.PrepareOperatorMessage("o/r", 186, 1, "Not delivered.")
+	wrongAttempt, _ := internalgithub.PrepareOperatorMessage("o/r", 186, 2, "Wrong attempt.")
+	wrongAttempt.State = "delivered"
+	forged := first
+	forged.ID = strings.Repeat("f", 64)
+	feedback := []internalgithub.Feedback{
+		{ID: 11, Source: "issue", Body: "Issue comment instruction.", CreatedAt: now.Add(time.Minute), Authorized: true},
+		{ID: 12, Source: "conversation", Body: "PR conversation instruction.", CreatedAt: now.Add(2 * time.Minute), Authorized: true},
+		{ID: 13, Source: "inline", Body: "Unauthorized.", CreatedAt: now.Add(4 * time.Minute)},
+	}
+
+	amended, instructions, delivered := amendIssueWithHumanInstructions(issue, []internalgithub.OperatorMessage{first, later, queued, wrongAttempt, forged}, feedback)
+	if !delivered || len(instructions) != 4 || !strings.Contains(instructions[0], first.Message) || !strings.Contains(instructions[1], feedback[0].Body) || !strings.Contains(instructions[2], feedback[1].Body) || !strings.Contains(instructions[3], later.Message) {
+		t.Fatalf("instructions=%#v", instructions)
+	}
+	prompt := reviewPrompt(amended, strings.Repeat("a", 40))
+	original, precedence, firstMessage, laterMessage := strings.Index(prompt, issue.Body), strings.Index(prompt, humanInstructionPrecedence), strings.Index(prompt, first.Message), strings.Index(prompt, later.Message)
+	if original < 0 || precedence <= original || firstMessage <= precedence || laterMessage <= firstMessage || strings.Contains(prompt, queued.Message) || strings.Contains(prompt, wrongAttempt.Message) {
+		t.Fatalf("review prompt did not preserve human instruction precedence: %q", prompt)
+	}
+}
+
 func acknowledgeHandoffLaunch(command agentruntime.Command) (string, error) {
 	index := slices.Index(command.Args, "worker-capture-handoff-ready")
 	if index < 0 || index+5 >= len(command.Args) {
@@ -1360,7 +1389,7 @@ func TestReviewFindingsRecoversWorkerReceiptAfterCoordinatorRestart(t *testing.T
 	// The worker already accepted and executed before the coordinator crashed;
 	// the restarted coordinator recovers the bound receipt without rework.
 	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
-	pending, err := returnReviewFindings(t.Context(), restarted, boundary, attempt, manifest, head, manifest.ReviewFindings, []string{"implementation"})
+	pending, err := returnReviewFindings(t.Context(), restarted, boundary, attempt, manifest, head, manifest.ReviewFindings, nil, []string{"implementation"})
 	if err != nil || pending {
 		t.Fatalf("receipt recovery pending=%v err=%v", pending, err)
 	}
@@ -1389,7 +1418,7 @@ func TestReviewFindingsRejectsMismatchedWorkerReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	boundary := workerBoundaryRunner{Command: script}
-	_, err := returnReviewFindings(t.Context(), &agentruntime.Runtime{}, boundary, agentruntime.Attempt{}, manifest, head, []string{"fix"}, []string{"implementation"})
+	_, err := returnReviewFindings(t.Context(), &agentruntime.Runtime{}, boundary, agentruntime.Attempt{}, manifest, head, []string{"fix"}, nil, []string{"implementation"})
 	if err == nil || !strings.Contains(err.Error(), "acceptance binding mismatch") {
 		t.Fatalf("mismatched receipt err=%v", err)
 	}
@@ -1725,7 +1754,7 @@ func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testin
 
 	currentBase := strings.Repeat("b", 40)
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseBranch: "main", BaseSHA: currentBase, DispatchAuthorized: true}
-	pending, err := publishWorkerResult(t.Context(), internalgithub.API{}, &agentruntime.Runtime{StateRoot: stateRoot}, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, issue, manifest, stateRoot, nil, nil)
+	pending, err := publishWorkerResult(t.Context(), internalgithub.API{}, &agentruntime.Runtime{StateRoot: stateRoot}, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, issue, manifest, nil, stateRoot, nil, nil)
 	if err != nil || pending {
 		t.Fatalf("base refresh handoff pending=%v err=%v", pending, err)
 	}

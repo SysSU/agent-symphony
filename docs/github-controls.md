@@ -16,6 +16,8 @@ Post each command as the entire comment body and do not edit it. Of `cancel` and
 
 After posting a control comment, wait for the next `serve` cycle or run `agent-symphony reconcile`.
 
+After an attempt has a pull request, other nonempty issue comments posted after its first coordinator-authored publication marker are implementation feedback. Pre-PR issue history is not replayed. Pull-request conversation comments, inline review comments, and review bodies use the same path. The coordinator freshly requires `write`, `maintain`, or `admin` permission before each handoff, and excludes control commands and its own workflow comments. These comments and confirmed dashboard messages amend the issue contract in chronological order: a later human instruction wins over conflicting earlier text, and automated review findings never override a human instruction.
+
 ## Issue labels
 
 | Default label | Configuration key | Effect |

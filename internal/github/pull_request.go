@@ -233,7 +233,7 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 			return err
 		}
 	}
-	if !result.Merge && result.CheckStatus == "completed" && c.ActorID > 0 {
+	if !result.Merge && result.CheckStatus == "completed" && len(result.MergeBlockers) > 0 && c.ActorID > 0 {
 		body, err := PolicyFailureBody(state.Issue, state.Attempt, state.HeadSHA, state.ValidationResult, result.MergeBlockers)
 		if err != nil {
 			return err
