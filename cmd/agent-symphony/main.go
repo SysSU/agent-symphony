@@ -1389,7 +1389,10 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if monitorErr != nil {
 		return statuses, fmt.Errorf("monitor live attempts: %w", monitorErr)
 	}
-	transitionErr := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, operatorMessages, statePath, stateRoot)
+	transitionErr := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, operatorMessages, statePath, stateRoot, func() error {
+		_, _, err := refreshProjection(facts, issues)
+		return err
+	})
 	queuedManifests, decisions, err = refreshProjection(facts, issues)
 	if err != nil {
 		return statuses, errors.Join(fmt.Errorf("refresh completed attempt projection: %w", err), transitionErr)
@@ -2105,7 +2108,7 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string
 	return nil
 }
 
-func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, operatorMessages map[string][]internalgithub.OperatorMessage, statePath, stateRoot string) error {
+func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, operatorMessages map[string][]internalgithub.OperatorMessage, statePath, stateRoot string, refreshProjection func() error) error {
 	recovery := &internalgithub.FileRecovery{Path: statePath}
 	for _, manifest := range manifests {
 		var prepared internalgithub.PreparedPublication
@@ -2193,7 +2196,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 					return err
 				}
 			}
-			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot, prepare)
+			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, stateRoot, prepare, refreshProjection)
 			if err != nil {
 				return errors.Join(err, durableAttemptFailure(ctx, api, issue, current, err))
 			}
@@ -2215,7 +2218,7 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 	return nil
 }
 
-func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeState *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, stateRoot string, preparePublication func(string) error) (bool, error) {
+func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeState *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, stateRoot string, preparePublication func(string) error, refreshProjection func() error) (bool, error) {
 	boundary := implementationBoundary(stateRoot)
 	snapshotRoot := productionSnapshotRoot(stateRoot)
 	reviewEnv, err := configuredAgentEnvironment(cfg.Commands.Environment)
@@ -2234,6 +2237,11 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		manifest, cleanupErr = cleanupReviewOutcome(ctx, runtimeState, attempt, reviewBoundary(stateRoot), reviewEnv, manifest, snapshotRoot)
 		if cleanupErr != nil {
 			return true, nil
+		}
+		if refreshProjection != nil {
+			if err := refreshProjection(); err != nil {
+				return false, err
+			}
 		}
 	}
 	if manifest.ReviewState == "findings-queued" && manifest.ReviewHead == head {
@@ -2270,6 +2278,11 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 	if manifest.ReviewState != "clean" {
 		if _, err := runtimeState.RecordReview(attempt, "clean", reviewBase, head, "", ""); err != nil {
 			return false, err
+		}
+		if refreshProjection != nil {
+			if err := refreshProjection(); err != nil {
+				return false, err
+			}
 		}
 	}
 	result.Validation = fmt.Sprintf("Independent review passed for exact head `%s`.", head)

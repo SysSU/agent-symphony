@@ -1425,7 +1425,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	runtimeState := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: base, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", state); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", state, nil); err != nil {
 		log, _ := os.ReadFile(boundaryLog)
 		t.Fatalf("transient rework reached GitHub failure: %v\n%s", err, log)
 	}
@@ -1439,7 +1439,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 		t.Fatalf("acknowledged handoff state=%q, want running", stored.State)
 	}
 	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, "", state); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, "", state, nil); err != nil {
 		t.Fatalf("retry reached GitHub failure: %v", err)
 	}
 	storedBody, _ = os.ReadFile(manifestPath)
@@ -1493,7 +1493,7 @@ func TestCompletedTurnContractFailureIsPreservedBeforeFollowUp(t *testing.T) {
 			boundFact := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
 			bound := []internalgithub.RecoveryAttemptFact{boundFact}
 			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &boundFact}
-			err := monitorQueuedAttempts(t.Context(), api, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", runtimeState.StateRoot)
+			err := monitorQueuedAttempts(t.Context(), api, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", runtimeState.StateRoot, nil)
 			message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Do not mask the preceding result.")
 			message.State = "claimed"
 			messages := map[string][]internalgithub.OperatorMessage{fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number): {message}}
@@ -1630,7 +1630,7 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "review-ready"}}
 	message.State = "delivered"
 	operatorMessages := map[string][]internalgithub.OperatorMessage{"o/r#23/1": {message}}
-	if err := monitorQueuedAttempts(t.Context(), api, &agentruntime.Runtime{}, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, operatorMessages, recoveryPath, t.TempDir()); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), api, &agentruntime.Runtime{}, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, operatorMessages, recoveryPath, t.TempDir(), nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != head {
@@ -1701,7 +1701,7 @@ func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testin
 
 	currentBase := strings.Repeat("b", 40)
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseBranch: "main", BaseSHA: currentBase, DispatchAuthorized: true}
-	pending, err := publishWorkerResult(t.Context(), internalgithub.API{}, &agentruntime.Runtime{StateRoot: stateRoot}, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, issue, manifest, stateRoot, nil)
+	pending, err := publishWorkerResult(t.Context(), internalgithub.API{}, &agentruntime.Runtime{StateRoot: stateRoot}, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, issue, manifest, stateRoot, nil, nil)
 	if err != nil || pending {
 		t.Fatalf("base refresh handoff pending=%v err=%v", pending, err)
 	}
@@ -2093,7 +2093,7 @@ func TestBoundAttemptSuppressesRestartDispatchAcrossWorkerAndReviewStates(t *tes
 		t.Fatalf("contradictory remote attempt was resumed: manifests=%#v err=%v", manifests, err)
 	}
 	orphan := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 3, BaseSHA: "aaaaaaa", State: "completed"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{orphan}, nil, nil, "", ""); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{orphan}, nil, nil, "", "", nil); err != nil {
 		t.Fatalf("genuine orphan was not preserved: %v", err)
 	}
 }
@@ -2219,7 +2219,7 @@ func TestRevokedBoundAttemptCancelsWorkerAndSuppressesPublication(t *testing.T) 
 	completed := manifest
 	completed.State = "completed"
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 4, BaseSHA: attempt.BaseSHA, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{revoked}, []agentruntime.Manifest{completed}, bound, nil, "", ""); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{revoked}, []agentruntime.Manifest{completed}, bound, nil, "", "", nil); err != nil {
 		t.Fatalf("revoked completed attempt reached publication: %v", err)
 	}
 }
@@ -3312,7 +3312,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	runtimeState := &agentruntime.Runtime{StateRoot: state}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true, BaseBranch: "main"}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, recoveryPath, state); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, recoveryPath, state, nil); err != nil {
 		t.Fatal(err)
 	}
 	storedBody, _ := os.ReadFile(manifestPath)
@@ -3324,11 +3324,58 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	if refs, _ := exec.Command("git", "-C", remote, "show-ref").Output(); len(bytes.TrimSpace(refs)) != 0 {
 		t.Fatalf("publication ran before authoritative cleanup: %s", refs)
 	}
+	_, facts := recoveryAttemptFacts(bound, []internalgithub.RecoveryIssueFact{issue})
+	statuses, _ := projectRecoveryStatuses(t.Context(), facts, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, 1, nil)
+	if len(statuses) != 1 || !slices.ContainsFunc(statuses[0].Sessions, func(session orchestrator.AttemptSession) bool {
+		return session.Role == agentruntime.SessionRoleReviewer
+	}) {
+		t.Fatalf("fixture did not project the retained reviewer: %#v", statuses)
+	}
+	if err := writeStatusSnapshot(state, statuses); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := os.WriteFile(review, []byte("#!/bin/sh\nprintf '{\"Code\":0}'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, recoveryPath, state)
+	stopAfterProjection := errors.New("stop after projection")
+	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, recoveryPath, state, func() error {
+		body, err := os.ReadFile(manifestPath)
+		if err != nil {
+			return err
+		}
+		var current agentruntime.Manifest
+		if err := json.Unmarshal(body, &current); err != nil {
+			return err
+		}
+		statuses, _ := projectRecoveryStatuses(t.Context(), facts, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{current}, 1, nil)
+		if err := writeStatusSnapshot(state, statuses); err != nil {
+			return err
+		}
+		body, err = readDashboardStatus(filepath.Join(state, "status.json"))
+		if err != nil {
+			return err
+		}
+		var snapshot struct {
+			Statuses []orchestrator.RecoveryStatus `json:"statuses"`
+		}
+		if json.Unmarshal(body, &snapshot) != nil || len(snapshot.Statuses) != 1 || slices.ContainsFunc(snapshot.Statuses[0].Sessions, func(session orchestrator.AttemptSession) bool {
+			return session.Role == agentruntime.SessionRoleReviewer
+		}) {
+			return errors.New("status projection retained the cleaned reviewer")
+		}
+		return stopAfterProjection
+	})
+	if !errors.Is(err, stopAfterProjection) {
+		t.Fatalf("first post-cleanup projection err=%v", err)
+	}
+	if refs, _ := exec.Command("git", "-C", remote, "show-ref").Output(); len(bytes.TrimSpace(refs)) != 0 {
+		t.Fatalf("publication ran before the post-cleanup projection: %s", refs)
+	}
+	storedBody, _ = os.ReadFile(manifestPath)
+	stored = agentruntime.Manifest{}
+	_ = json.Unmarshal(storedBody, &stored)
+	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, recoveryPath, state, nil)
 	if err == nil || !strings.Contains(err.Error(), "authenticate GitHub CLI") {
 		t.Fatalf("publication did not continue after cleanup: %v", err)
 	}
