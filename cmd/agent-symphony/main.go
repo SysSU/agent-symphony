@@ -434,7 +434,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	attemptsPath := fs.String("attempts", "", "authoritative attempt facts file")
 	runtimeState := fs.String("runtime-state", "", "local runtime state root")
 	issueNumber := fs.Int("issue", 0, "issue number to inspect")
-	interval := fs.Duration("interval", orchestrator.MaxReconcileInterval, "serve reconciliation interval (maximum 60s)")
+	interval := fs.Duration("interval", orchestrator.MaxReconcileInterval, "override configured serve reconciliation interval (maximum 60s)")
 	dashboardAddress := fs.String("dashboard-address", "127.0.0.1:8080", "dashboard loopback listen address")
 	allowUnsafeDashboardNetwork := fs.Bool("allow-unsafe-dashboard-network", false, "allow password-protected dashboard access outside loopback")
 	dashboardPasswordFile := fs.String("dashboard-password-file", "", "coordinator-only file containing the dashboard HTTP Basic authentication password")
@@ -483,6 +483,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
+		*interval = effectiveServeInterval(fs, c.ReconciliationIntervalSeconds, *interval)
 		if runningOnWSL() {
 			root, rootErr := config.GitRoot()
 			if rootErr == nil {
@@ -1214,6 +1215,16 @@ func onlyFlags(fs *flag.FlagSet, allowed ...string) bool {
 	ok := true
 	fs.Visit(func(f *flag.Flag) { ok = ok && want[f.Name] })
 	return ok
+}
+
+func effectiveServeInterval(fs *flag.FlagSet, configuredSeconds int, override time.Duration) time.Duration {
+	interval := time.Duration(configuredSeconds) * time.Second
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "interval" {
+			interval = override
+		}
+	})
+	return interval
 }
 
 func acquireDaemonLock(path string) (*os.File, error) {
@@ -3655,7 +3666,7 @@ options:
 	--runtime-state path  bounded runtime manifest root
 	--attempts path  offline authoritative attempt facts
 	--issue number  issue to inspect
-	--interval duration  serve reconciliation interval (maximum 60s)
+	--interval duration  override configured serve reconciliation interval (maximum 60s)
 	--dashboard-address address  dashboard listen address (serve only; loopback by default)
 	--allow-unsafe-dashboard-network  permit non-loopback dashboard binding (requires password)
 	--dashboard-password-file path  coordinator-only HTTP Basic password file; username is agent-symphony

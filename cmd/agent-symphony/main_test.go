@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,29 @@ import (
 	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
+
+func TestEffectiveServeInterval(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want time.Duration
+	}{
+		{"configured", nil, 20 * time.Second},
+		{"override", []string{"--interval=7s"}, 7 * time.Second},
+		{"explicit default override", []string{"--interval=60s"}, 60 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+			override := fs.Duration("interval", 60*time.Second, "")
+			if err := fs.Parse(test.args); err != nil {
+				t.Fatal(err)
+			}
+			if got := effectiveServeInterval(fs, 20, *override); got != test.want {
+				t.Fatalf("interval = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
 
 type revokedAttemptRunner struct{ live, interrupted bool }
 

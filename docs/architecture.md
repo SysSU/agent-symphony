@@ -50,7 +50,7 @@ Repository configuration names exactly one primary implementation agent command 
 
 ### Repository contract
 
-Version-controlled `.agent-symphony.yaml` contains its schema version, repository identity, labels, explicit dependency syntax, completion policy, concurrency, local/offline worktree path, documentation paths, implementation and review commands, optional primary and one-shot orchestrator commands, environment allowlist, and status preferences. Secrets and mutable status are forbidden. Schema version `1` rejects unknown keys and unsafe paths.
+Git-ignored, machine-local `.agent-symphony.yaml` contains its schema version, repository identity, labels, explicit dependency syntax, completion policy, concurrency, reconciliation interval, local/offline worktree path, documentation paths, implementation and review commands, optional primary and one-shot orchestrator commands, environment allowlist, and status preferences. Secrets and mutable status are forbidden. Schema version `1` rejects unknown keys and unsafe paths.
 
 An eligible issue is open, has the configured ready label, has exactly one P1-P3 label, has the optional issue-filter label when configured, has no conflicting completion label, has no unresolved explicit dependency, and is not represented by an active or completed attempt. The body is unrestricted. If the configured Dependencies section is present, its issue references are enforced; otherwise the issue has no declared dependencies. Controls require current `maintain` or `admin` permission, including when the actor is the authenticated coordinator user.
 
