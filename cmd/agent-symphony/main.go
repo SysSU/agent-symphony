@@ -1246,7 +1246,7 @@ type reconcileOptions struct {
 }
 
 func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
-	return reconcileGitHubWith(ctx, configPath, statePath, stateRoot, reconcileOptions{transition: transition, intake: transition, timeout: 2 * time.Minute})
+	return reconcileGitHubWith(ctx, configPath, statePath, stateRoot, reconcileOptions{transition: transition, intake: transition, timeout: 5 * time.Minute})
 }
 
 func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot string, options reconcileOptions) (result []orchestrator.RecoveryStatus, resultErr error) {
