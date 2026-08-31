@@ -13,6 +13,7 @@ go test -race -p 1 ./...
 scripts/lint.sh
 rm -rf cmd/agent-symphony/dashboard/node_modules
 sh -n scripts/*.sh
+ruby -rjson -e 'abort "managed config interval must be 20 seconds" unless JSON.parse(File.read(".agent-symphony.yaml")).fetch("reconciliation_interval_seconds") == 20'
 test -s cmd/agent-symphony/dashboard/out/index.html
 test "$(git ls-files cmd/agent-symphony/dashboard/out | grep -vc '/.gitkeep$' || true)" -eq 0
 git check-ignore -q cmd/agent-symphony/dashboard/out/index.html
