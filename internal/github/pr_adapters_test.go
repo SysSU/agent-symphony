@@ -289,13 +289,17 @@ func TestIssueEvidenceRequiresCoordinatorAttributionAndAllPages(t *testing.T) {
 
 func TestSameUserFeedbackAllowedAndCoordinatorArtifactsFiltered(t *testing.T) {
 	artifact, _ := AttributedBody(9, 1, "Attempt published for review.")
-	active, _ := ActiveAttemptMarker("o/r", 9, 1, strings.Repeat("a", 40))
+	branch, _ := AttemptBranch("o/r", 9, 1)
+	published, _ := AttemptMarker(9, 1, branch, strings.Repeat("a", 40), 3, "review")
+	republished, _ := AttemptMarker(9, 1, branch, strings.Repeat("b", 40), 3, "review")
 	source := GitHubPRSource{API: fixtureAPI(t, map[string]any{
 		"/repos/o/r/issues/9/comments?per_page=100&page=1": []any{
-			map[string]any{"id": 3, "body": active, "user": map[string]any{"id": 42}},
+			map[string]any{"id": 2, "body": "pre-publication guidance", "user": map[string]any{"id": 42}},
+			map[string]any{"id": 3, "body": published, "user": map[string]any{"id": 42}},
 			map[string]any{"id": 4, "body": "issue guidance", "user": map[string]any{"id": 42}},
 			map[string]any{"id": 5, "body": "/cancel", "user": map[string]any{"id": 42}},
 			map[string]any{"id": 6, "body": artifact, "user": map[string]any{"id": 42}},
+			map[string]any{"id": 7, "body": republished, "user": map[string]any{"id": 42}},
 		},
 		"/repos/o/r/issues/3/comments?per_page=100&page=1": []any{
 			map[string]any{"id": 1, "body": "please fix this", "user": map[string]any{"id": 42}},
@@ -1416,14 +1420,15 @@ func TestFileRecoveryConcurrentGoroutinesExecuteOnce(t *testing.T) {
 }
 
 func TestFeedbackSourcesPaginateDoNotCollideAndRefetchExactly(t *testing.T) {
-	active, _ := ActiveAttemptMarker("o/r", 10, 2, strings.Repeat("a", 40))
+	branch, _ := AttemptBranch("o/r", 10, 2)
+	published, _ := AttemptMarker(10, 2, branch, strings.Repeat("a", 40), 3, "review")
 	hundred := make([]map[string]any, 100)
 	for i := range hundred {
 		hundred[i] = map[string]any{"id": i + 10, "body": "conversation", "user": map[string]any{"id": 5}}
 	}
 	responses := map[string]any{
 		"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{
-			map[string]any{"id": 6, "body": active, "user": map[string]any{"id": 42}},
+			map[string]any{"id": 6, "body": published, "user": map[string]any{"id": 42}},
 			map[string]any{"id": 7, "body": "same", "user": map[string]any{"id": 5}},
 		},
 		"/repos/o/r/issues/3/comments?per_page=100&page=1": hundred,

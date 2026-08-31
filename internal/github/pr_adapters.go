@@ -1373,8 +1373,8 @@ func (s *GitHubPRSource) readFeedback(ctx context.Context, number, issue, attemp
 	var boundary *issueCommentRecord
 	for i := range issueComments {
 		comment := &issueComments[i]
-		marker, markerErr := parseActiveAttemptMarker(comment.Body)
-		if comment.User.ID == s.Config.ActorID && markerErr == nil && marker.Issue == issue && marker.Attempt == attempt && (boundary == nil || comment.CreatedAt.After(boundary.CreatedAt) || comment.CreatedAt.Equal(boundary.CreatedAt) && comment.ID > boundary.ID) {
+		marker, markerErr := parseAttemptMarker(comment.Body)
+		if comment.User.ID == s.Config.ActorID && markerErr == nil && marker.Issue == issue && marker.Attempt == attempt && marker.PR == number && marker.Outcome == "review" && (boundary == nil || comment.CreatedAt.Before(boundary.CreatedAt) || comment.CreatedAt.Equal(boundary.CreatedAt) && comment.ID < boundary.ID) {
 			boundary = comment
 		}
 	}
@@ -1719,6 +1719,9 @@ func exactAttemptMarker(body string) bool {
 
 func coordinatorArtifact(body string) bool {
 	if _, err := ParseSnapshotComment(body, 1, 1); err == nil {
+		return true
+	}
+	if _, err := parseAttemptMarker(body); err == nil {
 		return true
 	}
 	return exactAttemptMarker(body)
