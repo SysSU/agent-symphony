@@ -151,7 +151,7 @@ func TestGitHubPRSourcePaginatesAndFailsClosed(t *testing.T) {
 	checks := make([]map[string]any, 100)
 	statuses := make([]map[string]any, 100)
 	for i := range 100 {
-		comments[i] = map[string]any{"body": "noise", "user": map[string]any{"id": 9}}
+		comments[i] = map[string]any{"id": i + 1000, "body": "noise", "user": map[string]any{"id": 9}}
 		reviews[i] = map[string]any{"id": i + 1, "state": "COMMENTED", "user": map[string]any{"id": i + 10}}
 		checks[i] = map[string]any{"name": fmt.Sprintf("optional-%d", i), "status": "completed", "conclusion": "success", "app": map[string]any{"id": 1}}
 		statuses[i] = map[string]any{"context": fmt.Sprintf("optional-%d", i), "state": "success"}
@@ -289,30 +289,47 @@ func TestIssueEvidenceRequiresCoordinatorAttributionAndAllPages(t *testing.T) {
 
 func TestSameUserFeedbackAllowedAndCoordinatorArtifactsFiltered(t *testing.T) {
 	artifact, _ := AttributedBody(9, 1, "Attempt published for review.")
+	active, _ := ActiveAttemptMarker("o/r", 9, 1, strings.Repeat("a", 40))
 	source := GitHubPRSource{API: fixtureAPI(t, map[string]any{
+		"/repos/o/r/issues/9/comments?per_page=100&page=1": []any{
+			map[string]any{"id": 3, "body": active, "user": map[string]any{"id": 42}},
+			map[string]any{"id": 4, "body": "issue guidance", "user": map[string]any{"id": 42}},
+			map[string]any{"id": 5, "body": "/cancel", "user": map[string]any{"id": 42}},
+			map[string]any{"id": 6, "body": artifact, "user": map[string]any{"id": 42}},
+		},
 		"/repos/o/r/issues/3/comments?per_page=100&page=1": []any{
 			map[string]any{"id": 1, "body": "please fix this", "user": map[string]any{"id": 42}},
 			map[string]any{"id": 2, "body": artifact, "user": map[string]any{"id": 42}},
 		},
 		"/repos/o/r/pulls/3/comments?per_page=100&page=1": []any{},
 		"/repos/o/r/pulls/3/reviews?per_page=100&page=1":  []any{},
-		"/graphql":                     map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviewDecision": nil}}}},
-		"/repos/o/r/issues/comments/1": map[string]any{"id": 1, "body": "please fix this", "user": map[string]any{"id": 42}},
-		"/repos/o/r/issues/comments/2": map[string]any{"id": 2, "body": artifact, "user": map[string]any{"id": 42}},
-		"/user/42":                     map[string]any{"login": "coordinator"},
+		"/graphql":                                        map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviewDecision": nil}}}},
+		"/repos/o/r/issues/comments/1":                    map[string]any{"id": 1, "body": "please fix this", "user": map[string]any{"id": 42}},
+		"/repos/o/r/issues/comments/2":                    map[string]any{"id": 2, "body": artifact, "user": map[string]any{"id": 42}},
+		"/repos/o/r/issues/comments/4":                    map[string]any{"id": 4, "body": "issue guidance", "user": map[string]any{"id": 42}},
+		"/repos/o/r/issues/comments/5":                    map[string]any{"id": 5, "body": "/cancel", "user": map[string]any{"id": 42}},
+		"/user/42":                                        map[string]any{"login": "coordinator"},
 		"/repos/o/r/collaborators/coordinator/permission": map[string]any{"permission": "admin"},
-	}), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
-	comments, err := source.readFeedback(context.Background(), 3)
-	if err != nil || len(comments) != 1 || comments[0].ID != 1 {
+	}), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42, CancelCommand: "/cancel"}}
+	comments, err := source.readFeedback(context.Background(), 3, 9, 1)
+	if err != nil || len(comments) != 2 || comments[0].ID != 4 || comments[0].Source != feedbackIssue || comments[1].ID != 1 || comments[1].Source != feedbackConversation {
 		t.Fatalf("comments=%#v err=%v", comments, err)
 	}
-	fresh, err := source.FreshFeedback(context.Background(), PRState{Repository: "o/r", Number: 3}, Feedback{ID: 1, Source: feedbackConversation})
+	fresh, err := source.FreshFeedback(context.Background(), PRState{Repository: "o/r", Number: 3}, Feedback{ID: 4, Source: feedbackIssue})
+	if err != nil || !fresh.Authorized {
+		t.Fatalf("issue feedback=%#v err=%v", fresh, err)
+	}
+	fresh, err = source.FreshFeedback(context.Background(), PRState{Repository: "o/r", Number: 3}, Feedback{ID: 1, Source: feedbackConversation})
 	if err != nil || !fresh.Authorized {
 		t.Fatalf("fresh=%#v err=%v", fresh, err)
 	}
 	fresh, err = source.FreshFeedback(context.Background(), PRState{Repository: "o/r", Number: 3}, Feedback{ID: 2, Source: feedbackConversation})
 	if err != nil || fresh.Authorized {
 		t.Fatalf("artifact=%#v err=%v", fresh, err)
+	}
+	fresh, err = source.FreshFeedback(context.Background(), PRState{Repository: "o/r", Number: 3}, Feedback{ID: 5, Source: feedbackIssue})
+	if err != nil || fresh.Authorized {
+		t.Fatalf("control comment=%#v err=%v", fresh, err)
 	}
 }
 
@@ -1399,11 +1416,16 @@ func TestFileRecoveryConcurrentGoroutinesExecuteOnce(t *testing.T) {
 }
 
 func TestFeedbackSourcesPaginateDoNotCollideAndRefetchExactly(t *testing.T) {
+	active, _ := ActiveAttemptMarker("o/r", 10, 2, strings.Repeat("a", 40))
 	hundred := make([]map[string]any, 100)
 	for i := range hundred {
 		hundred[i] = map[string]any{"id": i + 10, "body": "conversation", "user": map[string]any{"id": 5}}
 	}
 	responses := map[string]any{
+		"/repos/o/r/issues/10/comments?per_page=100&page=1": []any{
+			map[string]any{"id": 6, "body": active, "user": map[string]any{"id": 42}},
+			map[string]any{"id": 7, "body": "same", "user": map[string]any{"id": 5}},
+		},
 		"/repos/o/r/issues/3/comments?per_page=100&page=1": hundred,
 		"/repos/o/r/issues/3/comments?per_page=100&page=2": []any{map[string]any{"id": 7, "body": "same", "user": map[string]any{"id": 5}}},
 		"/repos/o/r/pulls/3/comments?per_page=100&page=1":  []any{map[string]any{"id": 7, "body": "same", "user": map[string]any{"id": 5}}},
@@ -1414,8 +1436,8 @@ func TestFeedbackSourcesPaginateDoNotCollideAndRefetchExactly(t *testing.T) {
 		"/user/5":                                          map[string]any{"login": "owner"},
 		"/repos/o/r/collaborators/owner/permission":        map[string]any{"permission": "write"},
 	}
-	source := GitHubPRSource{API: fixtureAPI(t, responses), Config: PRAdapterConfig{Repository: "o/r"}}
-	records, err := source.readFeedback(context.Background(), 3)
+	source := GitHubPRSource{API: fixtureAPI(t, responses), Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
+	records, err := source.readFeedback(context.Background(), 3, 10, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1425,7 +1447,7 @@ func TestFeedbackSourcesPaginateDoNotCollideAndRefetchExactly(t *testing.T) {
 			same = append(same, Feedback{ID: record.ID, Source: record.Source, ActorID: 5, Body: record.Body, Authorized: true})
 		}
 	}
-	if got := ActionableFeedback(same, func(int) bool { return true }); len(got) != 3 {
+	if got := ActionableFeedback(same, func(int) bool { return true }); len(got) != 4 {
 		t.Fatalf("colliding feedback: %#v", got)
 	}
 	for _, feedback := range same {

@@ -22,9 +22,10 @@ import (
 
 var attemptMarker = regexp.MustCompile(`agent-symphony:issue:(\d+):attempt:(\d+)`)
 var mergeMarker = regexp.MustCompile(`(?m)^Merge attempt for head \x60([0-9a-fA-F]{7,64})\x60: \*\*(prepared|dispatched|resolved)\*\*\.$`)
-var feedbackDispositionMarker = regexp.MustCompile(`^Feedback (conversation|inline|review):([1-9][0-9]*): \*\*(addressed|blocked)\*\*\n\n([^\x00]*)\n\n<!-- agent-symphony:issue:([1-9][0-9]*):attempt:([1-9][0-9]*) -->$`)
+var feedbackDispositionMarker = regexp.MustCompile(`^Feedback (issue|conversation|inline|review):([1-9][0-9]*): \*\*(addressed|blocked)\*\*\n\n([^\x00]*)\n\n<!-- agent-symphony:issue:([1-9][0-9]*):attempt:([1-9][0-9]*) -->$`)
 
 const (
+	feedbackIssue        = "issue"
 	feedbackConversation = "conversation"
 	feedbackInline       = "inline"
 	feedbackReview       = "review"
@@ -847,7 +848,7 @@ func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRSt
 		return PRState{}, err
 	}
 	state.Facts.MergePermission = repository.Permissions.Push
-	comments, err := s.readFeedback(ctx, number)
+	comments, err := s.readFeedback(ctx, number, issue, attempt)
 	if err != nil {
 		return PRState{}, err
 	}
@@ -1363,8 +1364,27 @@ type feedbackRecord struct {
 	User      struct{ ID int }
 }
 
-func (s *GitHubPRSource) readFeedback(ctx context.Context, number int) ([]feedbackRecord, error) {
+func (s *GitHubPRSource) readFeedback(ctx context.Context, number, issue, attempt int) ([]feedbackRecord, error) {
 	var all []feedbackRecord
+	issueComments, err := s.issueComments(ctx, issue)
+	if err != nil {
+		return nil, err
+	}
+	var boundary *issueCommentRecord
+	for i := range issueComments {
+		comment := &issueComments[i]
+		marker, markerErr := parseActiveAttemptMarker(comment.Body)
+		if comment.User.ID == s.Config.ActorID && markerErr == nil && marker.Issue == issue && marker.Attempt == attempt && (boundary == nil || comment.CreatedAt.After(boundary.CreatedAt) || comment.CreatedAt.Equal(boundary.CreatedAt) && comment.ID > boundary.ID) {
+			boundary = comment
+		}
+	}
+	if boundary != nil {
+		for _, comment := range issueComments {
+			if (comment.CreatedAt.After(boundary.CreatedAt) || comment.CreatedAt.Equal(boundary.CreatedAt) && comment.ID > boundary.ID) && !s.excludedFeedback(feedbackIssue, comment.Body, comment.User.ID) {
+				all = append(all, feedbackRecord{ID: comment.ID, Source: feedbackIssue, Body: comment.Body, CreatedAt: comment.CreatedAt, User: comment.User})
+			}
+		}
+	}
 	paths := []struct{ path, source string }{
 		{fmt.Sprintf("/repos/%s/issues/%d/comments", s.Config.Repository, number), feedbackConversation},
 		{fmt.Sprintf("/repos/%s/pulls/%d/comments", s.Config.Repository, number), feedbackInline},
@@ -1384,7 +1404,7 @@ func (s *GitHubPRSource) readFeedback(ctx context.Context, number int) ([]feedba
 				}
 			}
 			batch = slices.DeleteFunc(batch, func(f feedbackRecord) bool {
-				return f.User.ID == s.Config.ActorID && coordinatorArtifact(f.Body)
+				return s.excludedFeedback(f.Source, f.Body, f.User.ID)
 			})
 			all = append(all, batch...)
 			if !fullPage {
@@ -1393,6 +1413,13 @@ func (s *GitHubPRSource) readFeedback(ctx context.Context, number int) ([]feedba
 		}
 	}
 	return all, nil
+}
+
+func (s *GitHubPRSource) excludedFeedback(source, body string, actor int) bool {
+	if actor == s.Config.ActorID && coordinatorArtifact(body) {
+		return true
+	}
+	return source == feedbackIssue && slices.Contains([]string{s.Config.ApprovalCommand, s.Config.CancelCommand, s.Config.RetryCommand}, strings.TrimSpace(body))
 }
 
 func (s *GitHubPRSource) readRules(ctx context.Context, branch string, required *[]requiredCheck, count *int, dismissStale *bool, facts *PRFacts) error {
@@ -1664,6 +1691,8 @@ func (s *GitHubPRSource) FreshFeedback(ctx context.Context, state PRState, feedb
 	}
 	var path string
 	switch feedback.Source {
+	case feedbackIssue:
+		path = fmt.Sprintf("/repos/%s/issues/comments/%d", state.Repository, feedback.ID)
 	case feedbackConversation:
 		path = fmt.Sprintf("/repos/%s/issues/comments/%d", state.Repository, feedback.ID)
 	case feedbackInline:
@@ -1676,7 +1705,7 @@ func (s *GitHubPRSource) FreshFeedback(ctx context.Context, state PRState, feedb
 	if _, _, err := s.API.Read(ctx, path, "", &comment); err != nil {
 		return Feedback{}, err
 	}
-	if comment.User.ID == s.Config.ActorID && coordinatorArtifact(comment.Body) {
+	if s.excludedFeedback(feedback.Source, comment.Body, comment.User.ID) {
 		return Feedback{ID: comment.ID, Source: feedback.Source, ActorID: comment.User.ID, Body: comment.Body, CreatedAt: comment.CreatedAt}, nil
 	}
 	authorized, err := s.actorAuthorized(ctx, comment.User.ID)

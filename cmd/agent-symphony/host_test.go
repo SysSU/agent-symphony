@@ -488,9 +488,14 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		oldExec := hostExecRunner
 		calls := 0
 		recipient := ""
+		prompt := ""
 		var submission agentruntime.Command
 		hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 			calls++
+			if command.Args[0] == "load-buffer" {
+				body, _ := io.ReadAll(command.Stdin)
+				prompt = string(body)
+			}
 			if slices.Contains(command.Args, "show-options") {
 				return agentruntime.Result{Output: recipient}, nil
 			}
@@ -511,7 +516,7 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if err := os.Mkdir(worktree, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		handoff := []byte(`{"type":"agent-symphony-handoff-v1","key":"pane-test"}`)
+		handoff := []byte(`{"type":"agent-symphony-handoff-v1","key":"pane-test","human_instructions":["keep the YAML ignored"]}`)
 		request, _ := json.Marshal(struct {
 			Manifest     agentruntime.Manifest `json:"manifest"`
 			Handoff      json.RawMessage       `json:"handoff"`
@@ -530,6 +535,9 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		}
 		if !slices.Contains(submission.Args, "worker-capture-handoff-ready") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
 			t.Fatalf("handoff did not use the stdin capture helper: %#v", submission.Args)
+		}
+		if !strings.Contains(prompt, humanInstructionPrecedence) || !strings.Contains(prompt, "keep the YAML ignored") {
+			t.Fatalf("handoff omitted human instruction precedence: %q", prompt)
 		}
 		if _, err := os.ReadFile(filepath.Join(worktree, ".agent-symphony", "handoffs", "pane-test.json")); err != nil {
 			t.Fatalf("durable handoff: %v", err)
