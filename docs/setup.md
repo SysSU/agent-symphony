@@ -106,7 +106,7 @@ agent-symphony status \
 
 Success means the issue appears in the status output and its `action` explains the next step. If it does not start, use its `blockers`, `diagnostic`, and `action` fields with the [status interpretation guide](cli.md#status-and-next-actions).
 
-For continuous operation, use `serve`; it reconciles immediately and then polls GitHub every `reconciliation_interval_seconds` (60 seconds by default). Set the repository's `.agent-symphony.yaml` to 20 seconds for faster intake:
+For continuous operation, use `serve`; it reconciles immediately and then polls GitHub every `reconciliation_interval_seconds` (60 seconds by default). Set the machine-local `.agent-symphony.yaml` to 20 seconds for faster intake; keep this git-ignored file out of pull requests:
 
 ```json
 "reconciliation_interval_seconds": 20
