@@ -63,6 +63,13 @@ func TestReconciliationIntervalConfiguration(t *testing.T) {
 	if err != nil || loaded.ReconciliationIntervalSeconds != 60 {
 		t.Fatalf("legacy reconciliation interval = %d, err=%v", loaded.ReconciliationIntervalSeconds, err)
 	}
+	null := strings.Replace(string(b), `"reconciliation_interval_seconds": 20`, `"reconciliation_interval_seconds": null`, 1)
+	if err := os.WriteFile(path, []byte(null), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := load(path, filepath.Dir(path)); err == nil || !strings.Contains(err.Error(), "reconciliation_interval_seconds must be between 1 and 60") {
+		t.Fatalf("null reconciliation interval error = %v", err)
+	}
 
 	for _, value := range []int{0, 61} {
 		c.ReconciliationIntervalSeconds = value

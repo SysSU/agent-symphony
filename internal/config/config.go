@@ -118,7 +118,14 @@ func load(path, root string) (Config, error) {
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
-	c := Config{ReconciliationIntervalSeconds: DefaultReconciliationIntervalSeconds}
+	var c Config
+	if fields, ok := raw.(map[string]any); ok {
+		if interval, present := fields["reconciliation_interval_seconds"]; !present {
+			c.ReconciliationIntervalSeconds = DefaultReconciliationIntervalSeconds
+		} else if interval == nil {
+			return Config{}, fmt.Errorf("parse %s: reconciliation_interval_seconds must be between 1 and 60", path)
+		}
+	}
 	if err := dec.Decode(&c); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
