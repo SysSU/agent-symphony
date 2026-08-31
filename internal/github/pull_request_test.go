@@ -384,7 +384,7 @@ func TestProductionReconcilerRunsRecoveredIssuesThenPullRequests(t *testing.T) {
 		return httpResponse(http.StatusCreated, `{}`, nil), nil
 	})}}
 	issuesRead := false
-	coordinator := &PRCoordinator{API: api, Source: source, Signals: signals}
+	coordinator := &PRCoordinator{API: api, Source: source, Signals: signals, ActorID: 42}
 	if err := (Reconciler{FullRead: func() error { issuesRead = true; return nil }, PullRequests: coordinator}).RunOnce(); err != nil {
 		t.Fatal(err)
 	}
