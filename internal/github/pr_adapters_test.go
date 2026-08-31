@@ -353,10 +353,11 @@ func TestUnavailableBranchProtectionContinuesFailClosedAndIdempotent(t *testing.
 		{"unavailable after classic unavailable", fixtureHTTP{http.StatusForbidden, `{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"403"}`}, unavailable, false, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			commentReads := 0
 			responses := map[string]any{
 				"/repos/o/r/pulls/3":                                               map[string]any{"number": 3, "state": "open", "merged": false, "body": "<!-- agent-symphony:issue:10:attempt:2 -->", "mergeable": true, "head": map[string]any{"sha": "abc"}, "base": map[string]any{"ref": "main"}},
 				"/repos/o/r/issues/10":                                             map[string]any{"state": "open", "labels": []any{}},
-				"/repos/o/r/issues/10/comments?per_page=100&page=1":                []any{},
+				"/repos/o/r/issues/10/comments?per_page=100&page=1":                countedFixture{[]any{}, &commentReads},
 				"/repos/o/r/branches/main/protection":                              test.protection,
 				"/repos/o/r/rules/branches/main?per_page=100&page=1":               test.rules,
 				"/repos/o/r/commits/abc/check-runs?filter=all&per_page=100&page=1": map[string]any{"check_runs": []any{}},
@@ -375,6 +376,9 @@ func TestUnavailableBranchProtectionContinuesFailClosedAndIdempotent(t *testing.
 			}
 			if first.Facts.PolicyCheckRequired != test.policy {
 				t.Fatalf("available rules were not evaluated: %#v", first.Facts)
+			}
+			if commentReads != 2 {
+				t.Fatalf("issue comment reads = %d, want one per fresh projection", commentReads)
 			}
 		})
 	}
@@ -1468,12 +1472,21 @@ type fixtureHTTP struct {
 	body   string
 }
 
+type countedFixture struct {
+	value any
+	calls *int
+}
+
 func fixtureAPI(t *testing.T, responses map[string]any) API {
 	t.Helper()
 	return API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		value, ok := responses[req.URL.RequestURI()]
 		if !ok {
 			return nil, fmt.Errorf("unexpected fixture request %s", req.URL.RequestURI())
+		}
+		if counted, ok := value.(countedFixture); ok {
+			*counted.calls++
+			value = counted.value
 		}
 		if response, ok := value.(fixtureHTTP); ok {
 			return httpResponse(response.status, response.body, nil), nil

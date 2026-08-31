@@ -742,6 +742,12 @@ func (s *GitHubPRSource) OpenPullRequests(ctx context.Context) ([]int, error) {
 }
 
 func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRState, error) {
+	snapshot := *s
+	snapshot.API = s.API.WithReadSnapshot()
+	return snapshot.freshPullRequest(ctx, number)
+}
+
+func (s *GitHubPRSource) freshPullRequest(ctx context.Context, number int) (PRState, error) {
 	var pull struct {
 		Number           int `json:"number"`
 		Body, State      string
