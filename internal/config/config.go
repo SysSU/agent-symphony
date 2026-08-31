@@ -14,19 +14,23 @@ import (
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 )
 
-const DefaultPath = ".agent-symphony.yaml"
+const (
+	DefaultPath                          = ".agent-symphony.yaml"
+	DefaultReconciliationIntervalSeconds = 60
+)
 
 type Config struct {
-	Version            int                `json:"version"`
-	Repository         string             `json:"repository"`
-	Labels             Labels             `json:"labels"`
-	Dependencies       Dependencies       `json:"dependencies"`
-	CompletionPolicies CompletionPolicies `json:"completion_policies"`
-	Concurrency        int                `json:"concurrency"`
-	WorktreeRoot       string             `json:"worktree_root"`
-	DocsPaths          []string           `json:"docs_paths"`
-	Commands           Commands           `json:"commands"`
-	Status             Status             `json:"status"`
+	Version                       int                `json:"version"`
+	Repository                    string             `json:"repository"`
+	Labels                        Labels             `json:"labels"`
+	Dependencies                  Dependencies       `json:"dependencies"`
+	CompletionPolicies            CompletionPolicies `json:"completion_policies"`
+	Concurrency                   int                `json:"concurrency"`
+	ReconciliationIntervalSeconds int                `json:"reconciliation_interval_seconds"`
+	WorktreeRoot                  string             `json:"worktree_root"`
+	DocsPaths                     []string           `json:"docs_paths"`
+	Commands                      Commands           `json:"commands"`
+	Status                        Status             `json:"status"`
 }
 
 type Labels struct {
@@ -71,9 +75,10 @@ func Default(repository string) Config {
 		CompletionPolicies: CompletionPolicies{
 			Default: "human-review", HumanReview: "needs-human-review", AutonomousMerge: "autonomous-merge",
 		},
-		Concurrency:  1,
-		WorktreeRoot: ".worktrees",
-		DocsPaths:    []string{"README.md", "docs"},
+		Concurrency:                   1,
+		ReconciliationIntervalSeconds: DefaultReconciliationIntervalSeconds,
+		WorktreeRoot:                  ".worktrees",
+		DocsPaths:                     []string{"README.md", "docs"},
 		Commands: Commands{
 			Implementation: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}, Reviewer: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"},
 			Orchestrator:      []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"},
@@ -114,6 +119,13 @@ func load(path, root string) (Config, error) {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	var c Config
+	if fields, ok := raw.(map[string]any); ok {
+		if interval, present := fields["reconciliation_interval_seconds"]; !present {
+			c.ReconciliationIntervalSeconds = DefaultReconciliationIntervalSeconds
+		} else if interval == nil {
+			return Config{}, fmt.Errorf("parse %s: reconciliation_interval_seconds must be between 1 and 60", path)
+		}
+	}
 	if err := dec.Decode(&c); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
@@ -231,6 +243,9 @@ func (c Config) Validate() error {
 	}
 	if c.Concurrency < 1 {
 		problems = append(problems, "concurrency must be at least 1")
+	}
+	if c.ReconciliationIntervalSeconds < 1 || c.ReconciliationIntervalSeconds > 60 {
+		problems = append(problems, "reconciliation_interval_seconds must be between 1 and 60")
 	}
 	if err := safePath(c.WorktreeRoot); err != nil {
 		problems = append(problems, "worktree_root: "+err.Error())

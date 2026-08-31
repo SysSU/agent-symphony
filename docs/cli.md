@@ -32,7 +32,7 @@ agent-symphony reconcile (--state path --runtime-state path | --attempts path [-
 - `config view` prints the validated configuration. Invalid or secret-bearing files are never echoed.
 - `doctor` and its `diagnostics` alias check the supported platform, WSL filesystem placement, Git, tmux, configured agent commands, Git repository/remote identity, GitHub CLI authentication, and effective repository access. `--runtime-state` selects the state root to check. `--offline` skips only the GitHub probe and emits an explicit warning.
 - `pr-governance` is a one-shot pull-request governance command. It creates an empty private recovery-state JSON file when the named file is absent, then durably writes feedback and validation handoffs. Recovery claims those handoffs before they cross into the isolated runtime. All GitHub reads and writes use the authenticated `gh` session.
-- `serve --state path --runtime-state path` verifies the authenticated GitHub CLI account and repository, acquires a non-following single-instance lock for that runtime state, reconciles immediately, and polls at most every 60 seconds across bounded GitHub failures. It also serves that repository's dashboard at `--dashboard-address` (default `127.0.0.1:8080`). Localhost or a loopback IP is required unless `--allow-unsafe-dashboard-network` is set; that opt-in requires `--dashboard-password-file`. The file must be a coordinator-owned regular file with no group or other permissions and one nonempty password line. The coordinator reads it without placing the password in process arguments. HTTP Basic authentication protects every dashboard route using username `agent-symphony`; a password file may also protect loopback without the unsafe flag. Every cycle has a whole-cycle two-minute deadline. `reconcile` performs one production cycle; `status`, `list`, and `inspect` refresh and expose the same queued, active, blocked, review-ready, and completed projection. Supplying `--attempts path` selects the nonmutating offline diagnostic. No GitHub credential or identity environment variables are required or read. Independent repository daemons on one host must use distinct `--state`, `--runtime-state`, and dashboard addresses.
+- `serve --state path --runtime-state path` verifies the authenticated GitHub CLI account and repository, acquires a non-following single-instance lock for that runtime state, reconciles immediately, and polls at the configured interval across bounded GitHub failures. `--interval` overrides the repository setting for that run. It also serves that repository's dashboard at `--dashboard-address` (default `127.0.0.1:8080`). Localhost or a loopback IP is required unless `--allow-unsafe-dashboard-network` is set; that opt-in requires `--dashboard-password-file`. The file must be a coordinator-owned regular file with no group or other permissions and one nonempty password line. The coordinator reads it without placing the password in process arguments. HTTP Basic authentication protects every dashboard route using username `agent-symphony`; a password file may also protect loopback without the unsafe flag. Every cycle has a whole-cycle two-minute deadline. `reconcile` performs one production cycle; `status`, `list`, and `inspect` refresh and expose the same queued, active, blocked, review-ready, and completed projection. Supplying `--attempts path` selects the nonmutating offline diagnostic. No GitHub credential or identity environment variables are required or read. Independent repository daemons on one host must use distinct `--state`, `--runtime-state`, and dashboard addresses.
 
 Unsafe network mode serves plain HTTP: the password and terminal traffic are not encrypted, and anyone with the password can use the dashboard's terminal, recovery, and cleanup controls. Use it only on a trusted network with host-level firewall rules, or carry it over an encrypted VPN or tunnel.
 
@@ -114,6 +114,7 @@ Commands produce plain human-readable text by default and never depend on color.
     "autonomous_merge_label": "autonomous-merge"
   },
   "concurrency": 1,
+  "reconciliation_interval_seconds": 60,
   "worktree_root": ".worktrees",
   "docs_paths": ["README.md", "docs"],
   "commands": {
@@ -129,6 +130,8 @@ Commands produce plain human-readable text by default and never depend on color.
   }
 }
 ```
+
+`reconciliation_interval_seconds` controls continuous `serve` reconciliation in whole seconds. It must be between 1 and 60 and defaults to 60 when omitted from an older configuration. An explicit `serve --interval duration` overrides it for that run.
 
 The generated default omits `labels.issue_filter`, so no extra queue label is required. To limit intake to a repository-specific queue, add one label name under `labels`:
 
