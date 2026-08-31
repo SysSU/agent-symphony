@@ -1463,6 +1463,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		return statuses, fmt.Errorf("resume operator messages: %w", operatorErr)
 	}
 	dispatchErr := dispatchIssues(ctx, api, &r, c, prConfig, freshIssues, decisions)
+	_, freshFacts = recoveryAttemptFacts(freshRemote, freshIssues)
 	if _, _, err = refreshProjection(freshFacts, freshIssues); err != nil {
 		return statuses, errors.Join(fmt.Errorf("write local dispatched status projection: %w", err), dispatchErr)
 	}
@@ -1791,6 +1792,8 @@ func dispatchIssues(ctx context.Context, api internalgithub.API, runtime *agentr
 		if err := internalgithub.EnsureActiveAttempt(ctx, api, prConfig, issue.Issue, issue.Attempt, issue.BaseSHA); err != nil {
 			return fmt.Errorf("bind dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
 		}
+		binding := internalgithub.RecoveryAttemptFact{Repository: issue.Repository, Issue: issue.Issue, Attempt: issue.Attempt, BaseSHA: issue.BaseSHA, State: "active"}
+		issues[index].Active, issues[index].Eligible, issues[index].ActiveAttempt = true, false, &binding
 		issue.DispatchAuthorized = issue.Eligible
 		if _, err := startIssueAttempt(ctx, runtime, cfg, issue); err != nil {
 			return fmt.Errorf("dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)

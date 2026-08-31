@@ -1954,6 +1954,7 @@ func TestReconcileProjectsDispatchedSessionBeforeFailedRemoteRefresh(t *testing.
 	}
 	source := filepath.Join(attemptRoot, internalgithub.RepositoryIdentifier(attempt.Repository)+".source.bundle")
 	boundary := filepath.Join(t.TempDir(), "implementation-boundary")
+	sessionState := filepath.Join(t.TempDir(), "session")
 	boundaryScript := fmt.Sprintf(`#!/bin/sh
 payload=$(sed -n '1p')
 case "$payload" in
@@ -1962,11 +1963,14 @@ case "$payload" in
   *'"switch","-c"'*) git -C %q switch -c %q >/dev/null 2>&1;;
   *'"remote","remove","origin"'*) git -C %q remote remove origin;;
   *'"config","--local","credential.helper",""'*) git -C %q config --local credential.helper '';;
-  *'"has-session"'*) printf '{"Code":1,"Exited":true}'; exit 0;;
+  *'"branch","--show-current"'*) printf '{"Output":"%s"}'; exit 0;;
+  *'"rev-parse","HEAD"'*) printf '{"Output":"%s"}'; exit 0;;
+  *'"has-session"'*) if test -f %q; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true}'; fi; exit 0;;
+  *'"new-session"'*) touch %q;;
   *) printf '{"Code":0}'; exit 0;;
 esac
 if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true}'; fi
-`, source, manifest.Worktree, manifest.Worktree, base, manifest.Worktree, manifest.Branch, manifest.Worktree, manifest.Worktree)
+`, source, manifest.Worktree, manifest.Worktree, base, manifest.Worktree, manifest.Branch, manifest.Worktree, manifest.Worktree, manifest.Branch, base, sessionState, sessionState)
 	if err := os.WriteFile(boundary, []byte(boundaryScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -2037,7 +2041,7 @@ if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true
 		t.Fatalf("post-dispatch failure err=%v dispatched=%v", err, dispatched)
 	}
 	projected, err := (&dashboardServer{stateRoot: stateRoot}).projectedStatus(184, 1)
-	if err != nil || projected.Session != manifest.Session || len(projected.Sessions) != 1 || projected.Sessions[0].Name != manifest.Session {
+	if err != nil || projected.State != "active" || projected.CurrentPhase != "implementation" || projected.Session != manifest.Session || len(projected.Sessions) != 1 || projected.Sessions[0].Name != manifest.Session {
 		t.Fatalf("local dispatched projection=%#v err=%v", projected, err)
 	}
 }
