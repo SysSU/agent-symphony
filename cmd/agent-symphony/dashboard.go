@@ -884,17 +884,17 @@ func (s *dashboardServer) serveOrchestratorTerminal(w http.ResponseWriter, r *ht
 }
 
 func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Request, session string, readOnly bool) {
-	probe := exec.CommandContext(r.Context(), s.tmux, "has-session", "-t", "="+session)
-	probe.Dir = "/tmp"
-	if probe.Run() != nil {
-		http.Error(w, "terminal session is not running", http.StatusConflict)
-		return
-	}
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer conn.CloseNow()
+	probe := exec.CommandContext(r.Context(), s.tmux, "has-session", "-t", "="+session)
+	probe.Dir = "/tmp"
+	if probe.Run() != nil {
+		_ = conn.Close(websocket.StatusNormalClosure, "Session ended.")
+		return
+	}
 	conn.SetReadLimit(maxTerminalInputBytes)
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
@@ -923,6 +923,7 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 				return
 			}
 			if readErr != nil {
+				_ = conn.Close(websocket.StatusNormalClosure, "Session ended.")
 				return
 			}
 		}

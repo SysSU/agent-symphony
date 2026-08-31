@@ -16,7 +16,7 @@ const attempt = {
   branch: "issue-163-attempt-sessions",
 };
 
-async function mockDashboard(page) {
+async function mockDashboard(page, closeReason = "") {
   const sockets = [];
   await page.route("**/status.json", (route) => route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: [attempt] } }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
@@ -26,6 +26,7 @@ async function mockDashboard(page) {
     const record = { url: socket.url(), messages: [] };
     sockets.push(record);
     socket.onMessage((message) => record.messages.push(message));
+    if (closeReason) setTimeout(() => void socket.close({ code: 1000, reason: closeReason }), 0);
   });
   return sockets;
 }
@@ -73,4 +74,12 @@ test("keeps session selection and the terminal dialog inside a mobile viewport",
   expect(box.x).toBeGreaterThanOrEqual(0);
   expect(box.x + box.width).toBeLessThanOrEqual(390);
   await page.screenshot({ path: "test-results/session-selection-mobile.png", fullPage: true });
+});
+
+test("shows the server close reason directly", async ({ page }) => {
+  await mockDashboard(page, "Session ended.");
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Open reviewer terminal" }).click();
+  await expect(page.locator("#terminalConnection")).toHaveText("Session ended.");
 });

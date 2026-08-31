@@ -1425,7 +1425,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	runtimeState := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: base, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", state); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", state, nil); err != nil {
 		log, _ := os.ReadFile(boundaryLog)
 		t.Fatalf("transient rework reached GitHub failure: %v\n%s", err, log)
 	}
@@ -1439,7 +1439,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 		t.Fatalf("acknowledged handoff state=%q, want running", stored.State)
 	}
 	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, "", state); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, "", state, nil); err != nil {
 		t.Fatalf("retry reached GitHub failure: %v", err)
 	}
 	storedBody, _ = os.ReadFile(manifestPath)
@@ -1493,7 +1493,7 @@ func TestCompletedTurnContractFailureIsPreservedBeforeFollowUp(t *testing.T) {
 			boundFact := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
 			bound := []internalgithub.RecoveryAttemptFact{boundFact}
 			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &boundFact}
-			err := monitorQueuedAttempts(t.Context(), api, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", runtimeState.StateRoot)
+			err := monitorQueuedAttempts(t.Context(), api, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", runtimeState.StateRoot, nil)
 			message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Do not mask the preceding result.")
 			message.State = "claimed"
 			messages := map[string][]internalgithub.OperatorMessage{fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number): {message}}
@@ -1630,7 +1630,7 @@ func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testi
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "review-ready"}}
 	message.State = "delivered"
 	operatorMessages := map[string][]internalgithub.OperatorMessage{"o/r#23/1": {message}}
-	if err := monitorQueuedAttempts(t.Context(), api, &agentruntime.Runtime{}, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, operatorMessages, recoveryPath, t.TempDir()); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), api, &agentruntime.Runtime{}, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, operatorMessages, recoveryPath, t.TempDir(), nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != head {
@@ -1701,7 +1701,7 @@ func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testin
 
 	currentBase := strings.Repeat("b", 40)
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseBranch: "main", BaseSHA: currentBase, DispatchAuthorized: true}
-	pending, err := publishWorkerResult(t.Context(), internalgithub.API{}, &agentruntime.Runtime{StateRoot: stateRoot}, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, issue, manifest, stateRoot, nil)
+	pending, err := publishWorkerResult(t.Context(), internalgithub.API{}, &agentruntime.Runtime{StateRoot: stateRoot}, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, issue, manifest, stateRoot, nil, nil)
 	if err != nil || pending {
 		t.Fatalf("base refresh handoff pending=%v err=%v", pending, err)
 	}
@@ -1880,6 +1880,7 @@ esac
 		t.Fatal(err)
 	}
 	manifest.State, manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead = "running", "clean", base, head
+	manifest.ReviewSession, _ = agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
 	manifest.CreatedAt, manifest.UpdatedAt = issueCreated, issueCreated
 	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
@@ -1892,6 +1893,7 @@ esac
 	oldAPI, oldClient := githubAPI, githubClient
 	githubAPI, githubClient = "https://example.test", client
 	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", implementation)
 	statePath := filepath.Join(stateRoot, "pr.json")
 	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1908,6 +1910,150 @@ esac
 	}
 	if !created || !strings.Contains(pullBody, head) || len(comments) != 5 {
 		t.Fatalf("publication incomplete: created=%v body=%q comments=%#v", created, pullBody, comments)
+	}
+	projected, err := (&dashboardServer{stateRoot: stateRoot}).projectedStatus(23, 1)
+	if err != nil || projected.CurrentPhase != "publication" || slices.ContainsFunc(projected.Sessions, func(session orchestrator.AttemptSession) bool {
+		return session.Role == agentruntime.SessionRoleReviewer
+	}) {
+		t.Fatalf("post-review projection=%#v err=%v", projected, err)
+	}
+}
+
+func TestReconcileProjectsDispatchedSessionBeforeFailedRemoteRefresh(t *testing.T) {
+	root := gitRepository(t)
+	for _, args := range [][]string{{"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"switch", "-c", "main"}} {
+		runGit(t, root, args...)
+	}
+	if err := os.WriteFile(filepath.Join(root, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", "file")
+	runGit(t, root, "commit", "-m", "base")
+	base := runGit(t, root, "rev-parse", "HEAD")
+	runGit(t, root, "update-ref", "refs/remotes/origin/main", base)
+
+	configPath := filepath.Join(root, config.DefaultPath)
+	if err := config.Write(configPath, config.Default("owner/repo")); err != nil {
+		t.Fatal(err)
+	}
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshotRoot := reviewSnapshotRoot
+	reviewSnapshotRoot = filepath.Join(t.TempDir(), "snapshots")
+	t.Cleanup(func() { reviewSnapshotRoot = oldSnapshotRoot })
+	attemptRoot := productionAttemptRoot(stateRoot)
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	attempt := agentruntime.Attempt{Repository: "owner/repo", Issue: 184, Number: 1, BaseSHA: base}
+	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(attemptRoot, internalgithub.RepositoryIdentifier(attempt.Repository)+".source.bundle")
+	boundary := filepath.Join(t.TempDir(), "implementation-boundary")
+	sessionState := filepath.Join(t.TempDir(), "session")
+	boundaryScript := fmt.Sprintf(`#!/bin/sh
+payload=$(sed -n '1p')
+case "$payload" in
+  *'"clone","--no-local","--no-checkout"'*) git clone --no-local --no-checkout %q %q >/dev/null 2>&1;;
+  *'"checkout","--detach"'*) git -C %q checkout --detach %q >/dev/null 2>&1;;
+  *'"switch","-c"'*) git -C %q switch -c %q >/dev/null 2>&1;;
+  *'"remote","remove","origin"'*) git -C %q remote remove origin;;
+  *'"config","--local","credential.helper",""'*) git -C %q config --local credential.helper '';;
+  *'"branch","--show-current"'*) printf '{"Output":"%s"}'; exit 0;;
+  *'"rev-parse","HEAD"'*) printf '{"Output":"%s"}'; exit 0;;
+  *'"has-session"'*) if test -f %q; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true}'; fi; exit 0;;
+  *'"new-session"'*) touch %q;;
+  *) printf '{"Code":0}'; exit 0;;
+esac
+if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true}'; fi
+`, source, manifest.Worktree, manifest.Worktree, base, manifest.Worktree, manifest.Branch, manifest.Worktree, manifest.Worktree, manifest.Branch, base, sessionState, sessionState)
+	if err := os.WriteFile(boundary, []byte(boundaryScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", boundary)
+
+	createdAt := time.Date(2026, 8, 30, 1, 0, 0, 0, time.UTC)
+	var comments []map[string]any
+	dispatched := false
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		var response any
+		switch request.Method + " " + request.URL.Path {
+		case "GET /user":
+			response = map[string]any{"id": 42, "login": "coordinator"}
+		case "GET /user/42":
+			response = map[string]any{"login": "coordinator"}
+		case "GET /repos/owner/repo":
+			response = map[string]any{"full_name": "owner/repo", "default_branch": "main", "permissions": map[string]any{"pull": true}}
+		case "GET /repos/owner/repo/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": base}}
+		case "GET /repos/owner/repo/issues":
+			response = []map[string]any{{"number": 184, "title": "Project dispatched session", "body": "Keep the local projection current.", "created_at": createdAt}}
+		case "GET /repos/owner/repo/issues/184":
+			response = map[string]any{"number": 184, "node_id": "issue-node", "state": "open", "title": "Project dispatched session", "body": "Keep the local projection current.", "created_at": createdAt, "user": map[string]any{"id": 42}, "labels": []map[string]any{{"name": "agent-ready"}, {"name": "priority:P1"}}}
+		case "GET /repos/owner/repo/issues/184/timeline":
+			response = []map[string]any{
+				{"id": 11, "event": "labeled", "created_at": createdAt.Add(time.Minute), "actor": map[string]any{"id": 42}, "label": map[string]any{"name": "agent-ready"}},
+				{"id": 12, "event": "labeled", "created_at": createdAt.Add(2 * time.Minute), "actor": map[string]any{"id": 42}, "label": map[string]any{"name": "priority:P1"}},
+			}
+		case "GET /repos/owner/repo/issues/184/comments":
+			response = comments
+		case "GET /repos/owner/repo/collaborators/coordinator/permission":
+			response = map[string]any{"permission": "admin"}
+		case "GET /repos/owner/repo/pulls":
+			if dispatched {
+				status, response = http.StatusBadRequest, map[string]any{"message": "forced post-dispatch read failure"}
+			} else {
+				response = []any{}
+			}
+		case "POST /graphql":
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+		case "POST /repos/owner/repo/issues/184/comments":
+			var input struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			comments = append(comments, map[string]any{"id": len(comments) + 1, "body": input.Body, "created_at": createdAt.Add(time.Duration(len(comments)+1) * time.Minute), "updated_at": createdAt.Add(time.Duration(len(comments)+1) * time.Minute), "user": map[string]any{"id": 42}})
+			dispatched = dispatched || strings.Contains(input.Body, "agent-symphony:active-attempt:v1")
+			status, response = http.StatusCreated, map[string]any{}
+		default:
+			t.Fatalf("unexpected GitHub request %s", request.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d", status), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI, githubClient = "https://example.test", client
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+
+	statePath := filepath.Join(stateRoot, "pr.json")
+	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = reconcileGitHub(t.Context(), configPath, statePath, stateRoot, true)
+	if err == nil || !strings.Contains(err.Error(), "refresh dispatched pull request attempts") || !dispatched {
+		t.Fatalf("post-dispatch failure err=%v dispatched=%v", err, dispatched)
+	}
+	projected, err := (&dashboardServer{stateRoot: stateRoot}).projectedStatus(184, 1)
+	if err != nil || projected.State != "active" || projected.CurrentPhase != "implementation" || projected.Session != manifest.Session || len(projected.Sessions) != 1 || projected.Sessions[0].Name != manifest.Session {
+		t.Fatalf("local dispatched projection=%#v err=%v", projected, err)
+	}
+}
+
+func TestProjectRecoveryStatusesUsesCurrentManifestAndFreshRemoteFacts(t *testing.T) {
+	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 23, 1)
+	head := strings.Repeat("b", 40)
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: strings.Repeat("a", 40), ReviewHead: head, State: "completed", ReviewState: "clean", Session: implementation}
+	fact := orchestrator.AttemptFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: manifest.BaseSHA, HeadSHA: head, PR: 7, State: "active", Checks: []string{"ci:success"}}
+	statuses, _ := projectRecoveryStatuses(t.Context(), []orchestrator.AttemptFact{fact}, []internalgithub.RecoveryIssueFact{{Repository: "o/r", Issue: 23, Active: true}}, []agentruntime.Manifest{manifest}, 1, nil)
+	if len(statuses) != 1 || statuses[0].CurrentPhase != "publication" || statuses[0].PR != 7 || !slices.Equal(statuses[0].Checks, []string{"ci:success"}) || len(statuses[0].Sessions) != 1 {
+		t.Fatalf("fresh projection=%#v", statuses)
 	}
 }
 
@@ -1947,7 +2093,7 @@ func TestBoundAttemptSuppressesRestartDispatchAcrossWorkerAndReviewStates(t *tes
 		t.Fatalf("contradictory remote attempt was resumed: manifests=%#v err=%v", manifests, err)
 	}
 	orphan := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 3, BaseSHA: "aaaaaaa", State: "completed"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{orphan}, nil, nil, "", ""); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{orphan}, nil, nil, "", "", nil); err != nil {
 		t.Fatalf("genuine orphan was not preserved: %v", err)
 	}
 }
@@ -2073,7 +2219,7 @@ func TestRevokedBoundAttemptCancelsWorkerAndSuppressesPublication(t *testing.T) 
 	completed := manifest
 	completed.State = "completed"
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 4, BaseSHA: attempt.BaseSHA, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{revoked}, []agentruntime.Manifest{completed}, bound, nil, "", ""); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{revoked}, []agentruntime.Manifest{completed}, bound, nil, "", "", nil); err != nil {
 		t.Fatalf("revoked completed attempt reached publication: %v", err)
 	}
 }
@@ -3166,7 +3312,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	runtimeState := &agentruntime.Runtime{StateRoot: state}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true, BaseBranch: "main"}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, recoveryPath, state); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, recoveryPath, state, nil); err != nil {
 		t.Fatal(err)
 	}
 	storedBody, _ := os.ReadFile(manifestPath)
@@ -3178,11 +3324,58 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	if refs, _ := exec.Command("git", "-C", remote, "show-ref").Output(); len(bytes.TrimSpace(refs)) != 0 {
 		t.Fatalf("publication ran before authoritative cleanup: %s", refs)
 	}
+	_, facts := recoveryAttemptFacts(bound, []internalgithub.RecoveryIssueFact{issue})
+	statuses, _ := projectRecoveryStatuses(t.Context(), facts, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, 1, nil)
+	if len(statuses) != 1 || !slices.ContainsFunc(statuses[0].Sessions, func(session orchestrator.AttemptSession) bool {
+		return session.Role == agentruntime.SessionRoleReviewer
+	}) {
+		t.Fatalf("fixture did not project the retained reviewer: %#v", statuses)
+	}
+	if err := writeStatusSnapshot(state, statuses); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := os.WriteFile(review, []byte("#!/bin/sh\nprintf '{\"Code\":0}'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, recoveryPath, state)
+	stopAfterProjection := errors.New("stop after projection")
+	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, recoveryPath, state, func() error {
+		body, err := os.ReadFile(manifestPath)
+		if err != nil {
+			return err
+		}
+		var current agentruntime.Manifest
+		if err := json.Unmarshal(body, &current); err != nil {
+			return err
+		}
+		statuses, _ := projectRecoveryStatuses(t.Context(), facts, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{current}, 1, nil)
+		if err := writeStatusSnapshot(state, statuses); err != nil {
+			return err
+		}
+		body, err = readDashboardStatus(filepath.Join(state, "status.json"))
+		if err != nil {
+			return err
+		}
+		var snapshot struct {
+			Statuses []orchestrator.RecoveryStatus `json:"statuses"`
+		}
+		if json.Unmarshal(body, &snapshot) != nil || len(snapshot.Statuses) != 1 || slices.ContainsFunc(snapshot.Statuses[0].Sessions, func(session orchestrator.AttemptSession) bool {
+			return session.Role == agentruntime.SessionRoleReviewer
+		}) {
+			return errors.New("status projection retained the cleaned reviewer")
+		}
+		return stopAfterProjection
+	})
+	if !errors.Is(err, stopAfterProjection) {
+		t.Fatalf("first post-cleanup projection err=%v", err)
+	}
+	if refs, _ := exec.Command("git", "-C", remote, "show-ref").Output(); len(bytes.TrimSpace(refs)) != 0 {
+		t.Fatalf("publication ran before the post-cleanup projection: %s", refs)
+	}
+	storedBody, _ = os.ReadFile(manifestPath)
+	stored = agentruntime.Manifest{}
+	_ = json.Unmarshal(storedBody, &stored)
+	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, recoveryPath, state, nil)
 	if err == nil || !strings.Contains(err.Error(), "authenticate GitHub CLI") {
 		t.Fatalf("publication did not continue after cleanup: %v", err)
 	}

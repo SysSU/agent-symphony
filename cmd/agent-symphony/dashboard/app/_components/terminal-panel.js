@@ -52,7 +52,7 @@ export default function TerminalPanel({ config, onClose }) {
       socket.addEventListener("message", (event) => terminal.write(new Uint8Array(event.data)));
       socket.addEventListener("close", (event) => {
         if (disposed) return;
-        const message = `Terminal disconnected${event.reason ? `: ${event.reason}` : "."}`;
+        const message = event.reason || "Terminal disconnected.";
         setConnection(message);
         terminal.writeln(`\r\n\x1b[33m${message}\x1b[0m`);
       });
