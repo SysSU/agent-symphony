@@ -11,6 +11,9 @@ import (
 
 func TestLoadAndValidate(t *testing.T) {
 	c := Default("owner/repo")
+	if c.ReconciliationIntervalSeconds != 60 {
+		t.Fatalf("default reconciliation interval = %d", c.ReconciliationIntervalSeconds)
+	}
 	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
 		t.Fatalf("unexpected default commands: %#v", c.Commands)
 	}
@@ -31,8 +34,41 @@ func TestLoadAndValidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Repository != "owner/repo" || c.Concurrency != 1 || c.CompletionPolicies.Default != "human-review" || !slices.Equal(c.Commands.Implementation, []string{"custom-agent", "--flag"}) {
+	if c.Repository != "owner/repo" || c.Concurrency != 1 || c.ReconciliationIntervalSeconds != 60 || c.CompletionPolicies.Default != "human-review" || !slices.Equal(c.Commands.Implementation, []string{"custom-agent", "--flag"}) {
 		t.Fatalf("unexpected defaults: %#v", c)
+	}
+}
+
+func TestReconciliationIntervalConfiguration(t *testing.T) {
+	c := Default("owner/repo")
+	c.ReconciliationIntervalSeconds = 20
+	path := filepath.Join(t.TempDir(), DefaultPath)
+	if err := Write(path, c); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := load(path, filepath.Dir(path))
+	if err != nil || loaded.ReconciliationIntervalSeconds != 20 {
+		t.Fatalf("configured reconciliation interval = %d, err=%v", loaded.ReconciliationIntervalSeconds, err)
+	}
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.Replace(string(b), "  \"reconciliation_interval_seconds\": 20,\n", "", 1)
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = load(path, filepath.Dir(path))
+	if err != nil || loaded.ReconciliationIntervalSeconds != 60 {
+		t.Fatalf("legacy reconciliation interval = %d, err=%v", loaded.ReconciliationIntervalSeconds, err)
+	}
+
+	for _, value := range []int{0, 61} {
+		c.ReconciliationIntervalSeconds = value
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "reconciliation_interval_seconds must be between 1 and 60") {
+			t.Fatalf("interval %d error = %v", value, err)
+		}
 	}
 }
 
