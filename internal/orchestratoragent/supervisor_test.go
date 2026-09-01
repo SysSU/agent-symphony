@@ -24,6 +24,7 @@ type fakeRunner struct {
 	failStarts     int
 	starts         int
 	commands       []agentruntime.Command
+	commandTimes   []time.Time
 	auditOutput    string
 	auditResult    bool
 	runnerOutput   string
@@ -54,6 +55,7 @@ func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (age
 		return agentruntime.Result{Output: f.auditOutput}, nil
 	}
 	f.commands = append(f.commands, command)
+	f.commandTimes = append(f.commandTimes, time.Now())
 	if len(command.Args) > 0 && command.Args[0] == "load-buffer" {
 		body, _ := io.ReadAll(command.Stdin)
 		f.attentionInput = string(body)
@@ -470,6 +472,7 @@ func TestAttentionAuditWakesPrimaryOnceAndRequiresFreshExactProposal(t *testing.
 		t.Fatalf("handoff=%#v body=%s input=%q err=%v", handoff, body, runner.attentionInput, err)
 	}
 	inputCommands := countAttentionInput(runner)
+	assertAttentionPasteSettled(t, runner)
 	if _, err := agent.Observe(t.Context(), failed); err != nil || countAttentionInput(runner) != inputCommands {
 		t.Fatalf("unchanged attention repeated wake: commands=%d want=%d err=%v", countAttentionInput(runner), inputCommands, err)
 	}
@@ -508,6 +511,19 @@ func TestAttentionAuditWakesPrimaryOnceAndRequiresFreshExactProposal(t *testing.
 		t.Fatalf("verified handoff=%#v body=%s err=%v", handoff, body, err)
 	}
 	assertOnlyBoundedAttentionInput(t, runner)
+}
+
+func assertAttentionPasteSettled(t *testing.T, runner *fakeRunner) {
+	t.Helper()
+	for index, command := range runner.commands {
+		if len(command.Args) > 0 && command.Args[0] == "send-keys" {
+			if index == 0 || runner.commands[index-1].Args[0] != "paste-buffer" || runner.commandTimes[index].Sub(runner.commandTimes[index-1]) < attentionPasteSettle {
+				t.Fatalf("primary submit did not wait for pasted input to settle: %#v", runner.commands)
+			}
+			return
+		}
+	}
+	t.Fatal("primary submit command is missing")
 }
 
 func TestRestartDoesNotRepeatRunningAttentionAction(t *testing.T) {
