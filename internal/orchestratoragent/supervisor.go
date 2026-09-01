@@ -40,6 +40,7 @@ const (
 	auditProcessTimeout       = 4 * time.Minute
 	auditTimeout              = auditProcessTimeout + 10*time.Second
 	attentionTimeout          = 12 * time.Minute
+	attentionPasteSettle      = 250 * time.Millisecond
 	failedCycleAuditTimeout   = 10 * time.Second
 	selfAuditMethod           = "examine every nonterminal attempt; treat the timer itself as no evidence of a problem; find the last live-verified completed transition; identify the expected next transition from the deployed implementation and current workflow facts; inspect the current projection and the exact live GitHub, Agent Symphony-owned tmux, manifest, handoff receipt, result, and coordinator log evidence available from trusted runtime paths; mark unavailable evidence unknown; compare with the prior heartbeat; report VERIFIED, INFERRED, and UNKNOWN conclusions separately; decide whether each attempt is healthy, problematic, or unknown; and recommend the shortest supported operator action only after verifying every prerequisite. Use no more than eight live tool calls, give each live command at most 20 seconds, interrupt a command that exceeds that limit and mark its evidence UNKNOWN, and stop checking after three minutes so the bounded report is returned before the process deadline. Never recommend recovery for a published pull request without verifying that it is currently eligible."
 	MessageProposalFile       = "orchestrator-proposal.json"
@@ -1349,6 +1350,11 @@ func (s *Supervisor) wakeAttention(ctx context.Context, handoff attentionHandoff
 	target := agentruntime.PaneTarget(Session(s.Repository))
 	if _, err := s.run(ctx, "tmux", []string{"paste-buffer", "-b", buffer, "-d", "-t", target}, nil); err != nil {
 		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(attentionPasteSettle):
 	}
 	_, err := s.run(ctx, "tmux", []string{"send-keys", "-t", target, "Enter"}, nil)
 	return err
