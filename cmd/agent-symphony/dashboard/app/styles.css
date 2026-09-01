@@ -78,6 +78,10 @@ h1 { margin: 0; overflow-wrap: anywhere; font-size: clamp(2rem, 5vw, 3.7rem); le
 .laneCards { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
 .laneCards > li { min-width: 0; }
 .emptyLane { margin: 0; padding: 22px 8px; border: 1px dashed #323b47; border-radius: 12px; color: var(--muted); font-size: 0.82rem; text-align: center; }
+.attemptHistory { margin-top: 20px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: var(--lane); }
+.attemptHistory summary { cursor: pointer; font-size: 0.88rem; font-weight: 750; }
+.attemptHistory summary .laneCount { margin-left: 8px; vertical-align: middle; }
+.historyCards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 10px; margin: 14px 0 0; padding: 0; list-style: none; }
 .card { min-width: 0; padding: 14px; border: 1px solid #303946; border-radius: 13px; background: var(--paper); box-shadow: 0 4px 14px rgb(0 0 0 / 14%); }
 .cardHeader { display: flex; align-items: start; justify-content: space-between; gap: 10px; }
 .cardHeader > div:first-child { min-width: 0; }
