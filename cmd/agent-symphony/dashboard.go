@@ -144,6 +144,10 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 			serveDashboardJSON(w, r, filepath.Join(s.stateRoot, "status.json"), maxDashboardStatusBytes, "status is not available yet", "status snapshot is unavailable")
 			return
 		}
+		if r.URL.Path == "/release.json" {
+			serveDashboardRelease(w, r)
+			return
+		}
 		if r.URL.Path == "/dashboard-state.json" {
 			s.serveState(w, r)
 			return
@@ -170,6 +174,19 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		}
 		static.ServeHTTP(w, r)
 	})
+}
+
+func serveDashboardRelease(w http.ResponseWriter, r *http.Request) {
+	body, _ := json.Marshal(struct {
+		Release string `json:"release"`
+	}{releaseVersion()})
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write(body)
+	}
 }
 
 func (s *dashboardServer) serveOrchestratorProposal(w http.ResponseWriter, r *http.Request) {

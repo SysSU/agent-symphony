@@ -5,13 +5,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { OrchestratorCard, StatusCard } from "./_components/status-card";
 import AttemptHistory from "./_components/attempt-history";
 import ReconcileButton from "./_components/reconcile-button";
-import { getMessageProposal, getOrchestratorStatus, postWithReconciliationRetry } from "./actions.mjs";
+import { getMessageProposal, getOrchestratorStatus, getRelease, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
 import { attemptKey, groupStatusesByLane, overallHealth, partitionAttemptHistory, relativeTime } from "./health.mjs";
 
 export default function Dashboard() {
   const [snapshot, setSnapshot] = useState(null);
   const [dashboardState, setDashboardState] = useState({ hidden: [] });
+  const [release, setRelease] = useState("");
   const [error, setError] = useState("");
   const [actionNotice, setActionNotice] = useState("");
   const [busy, setBusy] = useState("");
@@ -30,6 +31,7 @@ export default function Dashboard() {
   useEffect(() => {
     let active = true;
     async function refresh() {
+      getRelease().then((value) => { if (active) setRelease(value); });
       try {
         const orchestratorRequest = getOrchestratorStatus();
         const proposalRequest = getMessageProposal();
@@ -182,9 +184,8 @@ export default function Dashboard() {
         <div>
           <p className="eyebrow">Agent Symphony</p>
           <h1>{projected.length ? projected[0].repository : "Repository dashboard"}</h1>
-          <p className="freshness" aria-live="polite">
-            {snapshot ? `Updated ${relativeTime(snapshot.updated_at, now)}` : "Loading status…"}
-          </p>
+          <p className="freshness" aria-live="polite">{snapshot ? `Updated ${relativeTime(snapshot.updated_at, now)}` : "Loading status…"}</p>
+          <p className="release" aria-live="polite">{release ? <>Release <code>{release}</code></> : "Loading release…"}</p>
         </div>
         <div className="counts" aria-label="Issue counts by state">
           {counts.map(([state, count]) => (
@@ -228,8 +229,7 @@ export default function Dashboard() {
         {snapshot ? lanes.map((lane) => (
           <section className="lane" aria-labelledby={`lane-${lane.id}`} key={lane.id}>
             <header className="laneHeader">
-              <h2 id={`lane-${lane.id}`}>
-                {lane.title}
+              <h2 id={`lane-${lane.id}`}>{lane.title}
                 <span className="laneCount" aria-label={`${lane.statuses.length} attempt${lane.statuses.length === 1 ? "" : "s"}`}>{lane.statuses.length}</span>
               </h2>
             </header>

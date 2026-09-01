@@ -41,6 +41,10 @@ const (
 
 var releaseMetadata = "agent-symphony-release-version:devel"
 
+func releaseVersion() string {
+	return strings.TrimPrefix(releaseMetadata, "agent-symphony-release-version:")
+}
+
 var (
 	githubAPI          = "https://api.github.com"
 	githubClient       = &http.Client{Transport: internalgithub.CLITransport{}}
@@ -353,7 +357,7 @@ func privateDashboardPasswordFile(info os.FileInfo) bool {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == "--version" {
-		fmt.Fprintln(stdout, strings.TrimPrefix(releaseMetadata, "agent-symphony-release-version:"))
+		fmt.Fprintln(stdout, releaseVersion())
 		return 0
 	}
 	if len(args) == 0 {

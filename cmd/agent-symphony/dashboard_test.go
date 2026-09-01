@@ -57,6 +57,24 @@ func TestDashboardServesEmbeddedNextPageAndStatus(t *testing.T) {
 	}
 }
 
+func TestDashboardReleaseMatchesCLI(t *testing.T) {
+	previous := releaseMetadata
+	releaseMetadata = "agent-symphony-release-version:0.5.0"
+	t.Cleanup(func() { releaseMetadata = previous })
+
+	var stdout bytes.Buffer
+	if code := run([]string{"--version"}, &stdout, io.Discard); code != 0 || strings.TrimSpace(stdout.String()) != "0.5.0" {
+		t.Fatalf("--version code=%d output=%q", code, stdout.String())
+	}
+	request := httptest.NewRequest(http.MethodGet, "/release.json", nil)
+	request.Host = "127.0.0.1"
+	response := httptest.NewRecorder()
+	dashboardHandler(t.TempDir()).ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Body.String() != `{"release":"0.5.0"}` {
+		t.Fatalf("release status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
 func TestDashboardEmbedsNextAssets(t *testing.T) {
 	requireDashboardBuild(t)
 	paths, err := fs.Glob(dashboardFiles, "dashboard/out/_next/static/chunks/*.js")

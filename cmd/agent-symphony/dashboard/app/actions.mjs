@@ -20,6 +20,17 @@ export async function getOrchestratorStatus() {
   }
 }
 
+export async function getRelease() {
+  try {
+    const response = await fetch("/release.json", { cache: "no-store" });
+    if (!response.ok) return "unavailable";
+    const metadata = await response.json();
+    return typeof metadata.release === "string" && metadata.release ? metadata.release : "unavailable";
+  } catch {
+    return "unavailable";
+  }
+}
+
 export async function getMessageProposal() {
   try {
     const response = await fetch("/orchestrator/proposal.json", { cache: "no-store" });

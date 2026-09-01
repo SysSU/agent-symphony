@@ -43,6 +43,7 @@ async function mockDashboard(page, projectedAttempt = attempt) {
   const actions = [];
   const requests = [];
   const directRequests = [];
+  await page.route("**/release.json", (route) => route.fulfill({ json: { release: "0.5.0" } }));
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: true, state: "running", session: "orchestrator" } }));
   await page.route("**/orchestrator/proposal.json", (route) => currentProposal
     ? route.fulfill({ json: currentProposal, headers: { "X-Agent-Symphony-Confirmation-Nonce": confirmationNonce } })

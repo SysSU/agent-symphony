@@ -42,6 +42,7 @@ test.beforeEach(async ({ page }) => {
     if (message.type() === "error") errors.push(`console: ${message.text()}`);
   });
   page.on("pageerror", (error) => errors.push(`page: ${error.message}`));
+  await page.route("**/release.json", (route) => route.fulfill({ json: { release: "0.5.0" } }));
 });
 
 test.afterEach(async ({ page }) => {
@@ -128,6 +129,37 @@ test("renders every board lane and keeps overflowing lanes keyboard reachable", 
   await expect.poll(() => board.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
   await page.keyboard.press("ArrowLeft");
   await expect.poll(() => board.evaluate((element) => element.scrollLeft)).toBe(0);
+});
+
+test("shows the running release on desktop and mobile", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await mockDashboard(page, statuses);
+  await page.goto("/");
+
+  const release = page.locator(".release");
+  await expect(release).toBeVisible();
+  await expect(release).toHaveText("Release 0.5.0");
+  await expect(release).toHaveAttribute("aria-live", "polite");
+  await page.screenshot({ path: "test-results/dashboard-release-desktop.png", fullPage: true });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(release).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: "test-results/dashboard-release-mobile.png", fullPage: true });
+});
+
+test("refreshes the running release without reloading", async ({ page }) => {
+  let release = "0.5.0";
+  await page.clock.install();
+  await page.route("**/release.json", (route) => route.fulfill({ json: { release } }));
+  await mockDashboard(page, statuses);
+  await page.goto("/");
+
+  const metadata = page.locator(".release");
+  await expect(metadata).toHaveText("Release 0.5.0");
+  release = "0.6.0";
+  await page.clock.fastForward(5000);
+  await expect(metadata).toHaveText("Release 0.6.0");
 });
 
 test("moves superseded terminal attempts into read-only history", async ({ page }) => {

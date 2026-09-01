@@ -46,6 +46,7 @@ main { width: min(1680px, calc(100% - 32px)); margin: 0 auto; padding: 40px 0 72
 
 h1 { margin: 0; overflow-wrap: anywhere; font-size: clamp(2rem, 5vw, 3.7rem); letter-spacing: -0.055em; }
 .freshness { margin: 10px 0 0; color: var(--muted); }
+.release { margin: 5px 0 0; color: var(--muted); font-size: 0.78rem; }
 
 .counts { display: flex; flex-wrap: wrap; justify-content: end; gap: 8px; }
 .count { min-width: 84px; max-width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); box-shadow: 0 5px 16px rgb(0 0 0 / 12%); }
