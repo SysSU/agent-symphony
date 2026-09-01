@@ -790,13 +790,15 @@ func parseHostOrchestratorProposal(input io.Reader) (orchestratoragent.MessagePr
 		Action     string `json:"action,omitempty"`
 		Message    string `json:"message,omitempty"`
 		RequestID  string `json:"request_id,omitempty"`
+		HandoffID  string `json:"handoff_id,omitempty"`
+		Detail     string `json:"detail,omitempty"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&proposal) != nil || decoder.Decode(&struct{}{}) != io.EOF || proposal.Version != 1 {
 		return orchestratoragent.MessageProposal{}, nil, errors.New("invalid orchestrator proposal schema")
 	}
-	parsed := orchestratoragent.MessageProposal{Version: proposal.Version, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, Action: proposal.Action, Message: proposal.Message, RequestID: proposal.RequestID}
+	parsed := orchestratoragent.MessageProposal{Version: proposal.Version, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, Action: proposal.Action, Message: proposal.Message, RequestID: proposal.RequestID, HandoffID: proposal.HandoffID, Detail: proposal.Detail}
 	if err := orchestratoragent.ValidateMessageProposal(parsed); err != nil {
 		return orchestratoragent.MessageProposal{}, nil, err
 	}

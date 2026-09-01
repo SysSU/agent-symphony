@@ -109,6 +109,28 @@ func TestHostTransitionRetryProposalReportsCoordinatorResolution(t *testing.T) {
 	}
 }
 
+func TestHostAttentionActionsRequireExactBoundedHandoff(t *testing.T) {
+	handoff := strings.Repeat("a", 64)
+	for _, submitted := range []string{
+		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"recover_attempt","request_id":"recover-187-1","handoff_id":"` + handoff + `"}`,
+		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"human_attention","request_id":"attention-187-1","handoff_id":"` + handoff + `","detail":"operator repair is required"}`,
+	} {
+		proposal, _, err := parseHostOrchestratorProposal(strings.NewReader(submitted))
+		if err != nil || proposal.HandoffID != handoff {
+			t.Fatalf("proposal=%#v err=%v", proposal, err)
+		}
+	}
+	for _, submitted := range []string{
+		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"recover_attempt","request_id":"recover-187-1"}`,
+		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"human_attention","request_id":"attention-187-1","handoff_id":"` + handoff + `"}`,
+		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"shell","request_id":"unsafe","handoff_id":"` + handoff + `"}`,
+	} {
+		if _, _, err := parseHostOrchestratorProposal(strings.NewReader(submitted)); err == nil {
+			t.Fatalf("unsafe proposal accepted: %s", submitted)
+		}
+	}
+}
+
 func fakeHostIdentity(t *testing.T, uid, gid int) {
 	t.Helper()
 	oldEUID, oldEGID, oldUser, oldGroup, oldOutput := hostEUID, hostEGID, hostLookupUser, hostLookupGroup, hostOutput
