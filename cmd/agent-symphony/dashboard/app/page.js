@@ -4,13 +4,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { OrchestratorCard, StatusCard } from "./_components/status-card";
 import ReconcileButton from "./_components/reconcile-button";
-import { getMessageProposal, getOrchestratorStatus, postWithReconciliationRetry } from "./actions.mjs";
+import { getMessageProposal, getOrchestratorStatus, getRelease, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
 import { attemptKey, groupStatusesByLane, overallHealth, relativeTime } from "./health.mjs";
 
 export default function Dashboard() {
   const [snapshot, setSnapshot] = useState(null);
   const [dashboardState, setDashboardState] = useState({ hidden: [] });
+  const [release, setRelease] = useState("");
   const [error, setError] = useState("");
   const [actionNotice, setActionNotice] = useState("");
   const [busy, setBusy] = useState("");
@@ -55,6 +56,7 @@ export default function Dashboard() {
         if (active) setError(reason instanceof Error ? reason.message : "Status request failed");
       }
     }
+    getRelease().then((value) => { if (active) setRelease(value); });
     refresh();
     const timer = setInterval(refresh, 5000);
     return () => {
@@ -183,6 +185,7 @@ export default function Dashboard() {
           <p className="freshness" aria-live="polite">
             {snapshot ? `Updated ${relativeTime(snapshot.updated_at, now)}` : "Loading status…"}
           </p>
+          <p className="release" aria-live="polite">{release ? <>Release <code>{release}</code></> : "Loading release…"}</p>
         </div>
         <div className="counts" aria-label="Issue counts by state">
           {counts.map(([state, count]) => (
