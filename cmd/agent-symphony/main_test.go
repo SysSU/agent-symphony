@@ -445,6 +445,54 @@ func TestTransitionRetryRunsOnceAndRecordsTerminalOutcome(t *testing.T) {
 	}
 }
 
+func TestAttentionProposalRecordsDurableHumanOutcomeWithoutMutation(t *testing.T) {
+	root := t.TempDir()
+	agent := &orchestratoragent.Supervisor{
+		Root:                  root,
+		Workspace:             filepath.Join(root, "orchestrator-o-r"),
+		Repository:            "o/r",
+		Command:               []string{"agent"},
+		ProposalCommand:       []string{"proposal"},
+		ProposalStatusCommand: []string{"proposal-status"},
+		Runner:                &orchestratorTestRunner{},
+	}
+	blocked := []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 193, Attempt: 1, State: "blocked", CurrentPhase: "blocked", Blockers: []string{"unsafe worktree"}}}
+	if _, err := agent.Observe(t.Context(), blocked); err != nil {
+		t.Fatal(err)
+	}
+	var handoff struct {
+		ID string `json:"id"`
+	}
+	handoffBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.AttentionHandoffFile))
+	if err != nil || json.Unmarshal(handoffBody, &handoff) != nil || handoff.ID == "" {
+		t.Fatalf("handoff=%s err=%v", handoffBody, err)
+	}
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 193, Attempt: 1, Action: orchestratoragent.ProposalActionAttention, RequestID: "attention-193-1", HandoffID: handoff.ID, Detail: "unsafe worktree requires operator repair"}
+	body, _ := json.Marshal(proposal)
+	if err := os.WriteFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalFile), body, 0o620); err != nil {
+		t.Fatal(err)
+	}
+	previous := reconcileGitHubRun
+	reconcileGitHubRun = func(context.Context, string, string, string, bool) ([]orchestrator.RecoveryStatus, error) {
+		return blocked, nil
+	}
+	t.Cleanup(func() { reconcileGitHubRun = previous })
+	processOrchestratorProposal(t.Context(), agent, &sync.Mutex{}, &operationCancellation{}, "config", "state", "runtime", io.Discard)
+	statusBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
+	var status orchestratoragent.MessageProposalStatus
+	if err != nil || json.Unmarshal(statusBody, &status) != nil || status.Resolution != "succeeded" || status.Detail != proposal.Detail {
+		t.Fatalf("proposal status=%s err=%v", statusBody, err)
+	}
+	var outcome struct {
+		State  string `json:"state"`
+		Detail string `json:"detail"`
+	}
+	handoffBody, err = os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.AttentionHandoffFile))
+	if err != nil || json.Unmarshal(handoffBody, &outcome) != nil || outcome.State != "human-attention" || outcome.Detail != proposal.Detail {
+		t.Fatalf("attention outcome=%s err=%v", handoffBody, err)
+	}
+}
+
 func TestOperationCancellationInterruptsTheCurrentCoordinatorPass(t *testing.T) {
 	operations := &operationCancellation{}
 	ctx, finish := operations.begin(t.Context())
@@ -4009,7 +4057,7 @@ func TestConcurrentOneShotReconcileRunsOneMutation(t *testing.T) {
 	}
 }
 
-func TestRecoverDashboardFailedAttemptRequestsRetryOnceAndPreservesResources(t *testing.T) {
+func TestRecoverProposalAndDashboardShareOneIdempotentGuardedPath(t *testing.T) {
 	root := gitRepository(t)
 	configPath := filepath.Join(root, config.DefaultPath)
 	if err := config.Write(configPath, config.Default("o/r")); err != nil {
@@ -4086,10 +4134,31 @@ func TestRecoverDashboardFailedAttemptRequestsRetryOnceAndPreservesResources(t *
 	oldAPI, oldClient := githubAPI, githubClient
 	githubAPI, githubClient = "https://example.invalid", client
 	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
-	for range 2 {
-		if err := recoverDashboardAttempt(t.Context(), configPath, filepath.Join(stateRoot, "pr.json"), stateRoot, 24, 2); err != nil {
-			t.Fatal(err)
-		}
+	agentRoot := filepath.Join(root, "orchestrator-state")
+	agent := &orchestratoragent.Supervisor{Root: agentRoot, Workspace: filepath.Join(agentRoot, "orchestrator-o-r"), Repository: "o/r", Command: []string{"agent"}, ProposalCommand: []string{"proposal"}, ProposalStatusCommand: []string{"proposal-status"}, Runner: &orchestratorTestRunner{}}
+	if _, err := agent.Observe(t.Context(), []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	var handoff struct {
+		ID string `json:"id"`
+	}
+	handoffBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.AttentionHandoffFile))
+	if err != nil || json.Unmarshal(handoffBody, &handoff) != nil || handoff.ID == "" {
+		t.Fatalf("handoff=%s err=%v", handoffBody, err)
+	}
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 24, Attempt: 2, Action: orchestratoragent.ProposalActionRecover, RequestID: "recover-24-2", HandoffID: handoff.ID}
+	proposalBody, _ := json.Marshal(proposal)
+	if err := os.WriteFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalFile), proposalBody, 0o620); err != nil {
+		t.Fatal(err)
+	}
+	processOrchestratorProposal(t.Context(), agent, &sync.Mutex{}, &operationCancellation{}, configPath, filepath.Join(stateRoot, "pr.json"), stateRoot, io.Discard)
+	var proposalStatus orchestratoragent.MessageProposalStatus
+	proposalStatusBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
+	if err != nil || json.Unmarshal(proposalStatusBody, &proposalStatus) != nil || proposalStatus.Resolution != "succeeded" {
+		t.Fatalf("proposal status=%s err=%v", proposalStatusBody, err)
+	}
+	if err := recoverDashboardAttempt(t.Context(), configPath, filepath.Join(stateRoot, "pr.json"), stateRoot, 24, 2); err != nil {
+		t.Fatal(err)
 	}
 	if posts != 1 {
 		t.Fatalf("retry posts=%d", posts)

@@ -797,7 +797,7 @@ func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.S
 		fmt.Fprintln(log, "orchestrator proposal: "+internalgithub.Redact(err.Error()))
 		return
 	}
-	if proposal.Action != orchestratoragent.ProposalActionRetry || !operationMu.TryLock() {
+	if !slices.Contains([]string{orchestratoragent.ProposalActionRetry, orchestratoragent.ProposalActionRecover, orchestratoragent.ProposalActionAttention}, proposal.Action) || !operationMu.TryLock() {
 		return
 	}
 	defer operationMu.Unlock()
@@ -806,20 +806,45 @@ func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.S
 	controlCtx, cancel := context.WithTimeout(operationCtx, 10*time.Minute)
 	defer cancel()
 	running := false
-	_, err = reconcileRetryRun(controlCtx, configPath, statePath, stateRoot, reconcileOptions{
-		transition: true,
-		timeout:    10 * time.Minute,
-		authorize: func(statuses []orchestrator.RecoveryStatus) error {
-			if err := validateTransitionRetry(proposal, statuses); err != nil {
-				return transitionRetryRefusal{err}
+	switch proposal.Action {
+	case orchestratoragent.ProposalActionRetry:
+		_, err = reconcileRetryRun(controlCtx, configPath, statePath, stateRoot, reconcileOptions{
+			transition: true,
+			timeout:    10 * time.Minute,
+			authorize: func(statuses []orchestrator.RecoveryStatus) error {
+				if validateErr := validateTransitionRetry(proposal, statuses); validateErr != nil {
+					return transitionRetryRefusal{validateErr}
+				}
+				if validateErr := agent.ValidateAttentionProposal(proposal, statuses); validateErr != nil {
+					return transitionRetryRefusal{validateErr}
+				}
+				if resolveErr := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "running", "the coordinator validated the exact completed attempt and is running bounded reconciliation"); resolveErr != nil {
+					return fmt.Errorf("record running retry: %w", resolveErr)
+				}
+				running = true
+				return nil
+			},
+		})
+	case orchestratoragent.ProposalActionRecover, orchestratoragent.ProposalActionAttention:
+		var statuses []orchestrator.RecoveryStatus
+		statuses, err = reconcileGitHubRun(controlCtx, configPath, statePath, stateRoot, false)
+		if err == nil {
+			if validateErr := agent.ValidateAttentionProposal(proposal, statuses); validateErr != nil {
+				err = transitionRetryRefusal{validateErr}
 			}
-			if err := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "running", "the coordinator validated the exact completed attempt and is running bounded reconciliation"); err != nil {
-				return fmt.Errorf("record running retry: %w", err)
+		}
+		if err == nil {
+			detail := "the coordinator re-verified the exact attention target"
+			if proposal.Action == orchestratoragent.ProposalActionRecover {
+				detail += " and is running guarded attempt recovery"
 			}
-			running = true
-			return nil
-		},
-	})
+			err = agent.ResolveMessageProposal(controlCtx, proposal.Binding, "running", detail)
+			running = err == nil
+		}
+		if err == nil && proposal.Action == orchestratoragent.ProposalActionRecover {
+			err = recoverDashboardAttempt(controlCtx, configPath, statePath, stateRoot, proposal.Issue, proposal.Attempt)
+		}
+	}
 	if err != nil {
 		resolution := "failed"
 		var refusal transitionRetryRefusal
@@ -830,17 +855,21 @@ func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.S
 		resolveErr := agent.ResolveMessageProposal(resolveCtx, proposal.Binding, resolution, err.Error())
 		resolveCancel()
 		if resolveErr != nil {
-			fmt.Fprintln(log, "orchestrator transition retry outcome: "+internalgithub.Redact(resolveErr.Error()))
+			fmt.Fprintln(log, "orchestrator proposal outcome: "+internalgithub.Redact(resolveErr.Error()))
 		}
-		fmt.Fprintln(log, "orchestrator transition retry "+resolution+": "+internalgithub.Redact(err.Error()))
+		fmt.Fprintln(log, "orchestrator proposal "+resolution+": "+internalgithub.Redact(err.Error()))
 		return
 	}
 	if !running {
-		fmt.Fprintln(log, "orchestrator transition retry failed: coordinator reconciliation skipped authorization")
+		fmt.Fprintln(log, "orchestrator proposal failed: coordinator processing skipped authorization")
 		return
 	}
-	if err := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "succeeded", "the validated bounded coordinator reconciliation completed successfully"); err != nil {
-		fmt.Fprintln(log, "orchestrator transition retry outcome: "+internalgithub.Redact(err.Error()))
+	detail := "the validated bounded coordinator action completed; waiting for a fresh projection"
+	if proposal.Action == orchestratoragent.ProposalActionAttention {
+		detail = proposal.Detail
+	}
+	if err := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "succeeded", detail); err != nil {
+		fmt.Fprintln(log, "orchestrator proposal outcome: "+internalgithub.Redact(err.Error()))
 	}
 }
 
