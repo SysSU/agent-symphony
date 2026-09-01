@@ -18,6 +18,7 @@ const attempt = {
 
 async function mockDashboard(page, closeReason = "") {
   const sockets = [];
+  await page.route("**/release.json", (route) => route.fulfill({ json: { release: "0.5.0" } }));
   await page.route("**/status.json", (route) => route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: [attempt] } }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: false, state: "disabled" } }));
