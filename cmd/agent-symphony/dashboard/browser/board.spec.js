@@ -148,6 +148,20 @@ test("shows the running release on desktop and mobile", async ({ page }) => {
   await page.screenshot({ path: "test-results/dashboard-release-mobile.png", fullPage: true });
 });
 
+test("refreshes the running release without reloading", async ({ page }) => {
+  let release = "0.5.0";
+  await page.clock.install();
+  await page.route("**/release.json", (route) => route.fulfill({ json: { release } }));
+  await mockDashboard(page, statuses);
+  await page.goto("/");
+
+  const metadata = page.locator(".release");
+  await expect(metadata).toHaveText("Release 0.5.0");
+  release = "0.6.0";
+  await page.clock.fastForward(5000);
+  await expect(metadata).toHaveText("Release 0.6.0");
+});
+
 test("moves superseded terminal attempts into read-only history", async ({ page }) => {
   const failed = {
     repository: "SysSU/agent-symphony",

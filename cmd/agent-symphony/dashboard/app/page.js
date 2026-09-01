@@ -31,6 +31,7 @@ export default function Dashboard() {
   useEffect(() => {
     let active = true;
     async function refresh() {
+      getRelease().then((value) => { if (active) setRelease(value); });
       try {
         const orchestratorRequest = getOrchestratorStatus();
         const proposalRequest = getMessageProposal();
@@ -57,7 +58,6 @@ export default function Dashboard() {
         if (active) setError(reason instanceof Error ? reason.message : "Status request failed");
       }
     }
-    getRelease().then((value) => { if (active) setRelease(value); });
     refresh();
     const timer = setInterval(refresh, 5000);
     return () => {
