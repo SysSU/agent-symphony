@@ -1,5 +1,6 @@
 const staleAfter = 2 * 60 * 1000;
 const attentionStates = new Set(["blocked", "failed", "conflicting", "orphaned"]);
+const historicalStates = new Set(["failed", "orphaned", "cancelled"]);
 const laneDefinitions = [
   { id: "queue", title: "Queue", states: ["runnable", "queued"] },
   { id: "in-progress", title: "In progress", states: ["active"] },
@@ -20,6 +21,21 @@ export function relativeTime(value, now) {
 
 export function attemptKey(status) {
   return `${status.repository}#${status.issue}/${status.attempt}`;
+}
+
+export function partitionAttemptHistory(statuses) {
+  const latest = new Map();
+  for (const status of statuses) {
+    if (!status.repository || !Number.isInteger(status.issue) || !Number.isInteger(status.attempt)) continue;
+    const key = `${status.repository}#${status.issue}`;
+    latest.set(key, Math.max(latest.get(key) ?? 0, status.attempt));
+  }
+  return statuses.reduce((result, status) => {
+    const key = `${status.repository}#${status.issue}`;
+    const historical = historicalStates.has(status.state) && Number.isInteger(status.attempt) && status.attempt < (latest.get(key) ?? status.attempt);
+    result[historical ? "historical" : "current"].push(status);
+    return result;
+  }, { current: [], historical: [] });
 }
 
 export function groupStatusesByLane(statuses) {

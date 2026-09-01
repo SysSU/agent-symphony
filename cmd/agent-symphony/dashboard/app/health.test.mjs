@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { canInvestigate, groupStatusesByLane, orchestratorPresentation, overallHealth } from "./health.mjs";
+import { canInvestigate, groupStatusesByLane, orchestratorPresentation, overallHealth, partitionAttemptHistory } from "./health.mjs";
 
 const now = new Date("2026-08-13T12:00:00Z").getTime();
 const fresh = { updated_at: "2026-08-13T11:59:30Z" };
@@ -31,6 +31,23 @@ test("groups every status into one ordered dashboard lane", () => {
   });
   assert.deepEqual(lanes.flatMap((lane) => lane.statuses).map(({ issue }) => issue).sort((a, b) => a - b), statuses.map(({ issue }) => issue));
   assert.deepEqual(groupStatusesByLane([]).map((lane) => lane.statuses.length), [0, 0, 0, 0, 0]);
+});
+
+test("partitions superseded terminal attempts by repository and issue", () => {
+  const statuses = [
+    { repository: "o/r", issue: 187, attempt: 1, state: "failed" },
+    { repository: "o/r", issue: 187, attempt: 2, state: "review-ready" },
+    { repository: "o/r", issue: 188, attempt: 1, state: "orphaned" },
+    { repository: "o/r", issue: 188, attempt: 2, state: "active" },
+    { repository: "x/r", issue: 187, attempt: 1, state: "cancelled" },
+    { repository: "o/r", issue: 189, attempt: 1, state: "failed" },
+    { repository: "o/r", issue: 190, attempt: 1, state: "cancelled" },
+    { repository: "o/r", issue: 190, attempt: 2, state: "queued" },
+  ];
+
+  const partitioned = partitionAttemptHistory(statuses);
+  assert.deepEqual(partitioned.historical, [statuses[0], statuses[2], statuses[6]]);
+  assert.deepEqual(partitioned.current, [statuses[1], statuses[3], statuses[4], statuses[5], statuses[7]]);
 });
 
 test("orchestrator presentation and investigation eligibility", () => {
