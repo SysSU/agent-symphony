@@ -130,6 +130,41 @@ test("renders every board lane and keeps overflowing lanes keyboard reachable", 
   await expect.poll(() => board.evaluate((element) => element.scrollLeft)).toBe(0);
 });
 
+test("moves superseded terminal attempts into read-only history", async ({ page }) => {
+  const failed = {
+    repository: "SysSU/agent-symphony",
+    issue: 187,
+    attempt: 1,
+    title: "Show the release version",
+    state: "failed",
+    session: "as-agent-symphony-187-1",
+    diagnostic: "checkout base failed",
+  };
+  const current = { ...failed, attempt: 2, state: "review-ready", session: "", diagnostic: "", pr: 196 };
+  await mockDashboard(page, [failed, current]);
+  await page.goto("/");
+
+  const board = page.getByRole("region", { name: "Issue status board" });
+  await expect(page.getByRole("heading", { name: "Everything is okay" })).toBeVisible();
+  await expect(page.locator("#lane-needs-attention .laneCount")).toHaveText("0");
+  await expect(page.locator("#lane-in-review .laneCount")).toHaveText("1");
+  await expect(page.locator(".count span")).toHaveText("review-ready");
+  await expect(board).not.toContainText("checkout base failed");
+
+  const history = page.locator("details.attemptHistory");
+  await expect(history.getByText("Previous attempts")).toBeVisible();
+  expect(await history.evaluate((element) => element.open)).toBe(false);
+  await history.locator("summary").click();
+  await expect(history).toContainText("Attempt 1");
+  await expect(history).toContainText("checkout base failed");
+  await expect(history.getByRole("button")).toBeDisabled();
+  await expect(history.getByRole("button", { name: /investigate|recover|abandon/i })).toHaveCount(0);
+  await page.screenshot({ path: "test-results/board-attempt-history-desktop.png", fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: "test-results/board-attempt-history-mobile.png", fullPage: true });
+});
+
 test("contains long attempt text inside a mobile viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const longText = "unbrokenattemptdetail".repeat(18);

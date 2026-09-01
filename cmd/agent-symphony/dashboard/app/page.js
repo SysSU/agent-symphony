@@ -3,10 +3,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { OrchestratorCard, StatusCard } from "./_components/status-card";
+import AttemptHistory from "./_components/attempt-history";
 import ReconcileButton from "./_components/reconcile-button";
 import { getMessageProposal, getOrchestratorStatus, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
-import { attemptKey, groupStatusesByLane, overallHealth, relativeTime } from "./health.mjs";
+import { attemptKey, groupStatusesByLane, overallHealth, partitionAttemptHistory, relativeTime } from "./health.mjs";
 
 export default function Dashboard() {
   const [snapshot, setSnapshot] = useState(null);
@@ -155,10 +156,11 @@ export default function Dashboard() {
     return () => clearInterval(timer);
   }, []);
 
-  const projected = snapshot ? snapshot.statuses : [];
+  const projected = useMemo(() => snapshot ? snapshot.statuses : [], [snapshot]);
   const hidden = useMemo(() => new Set((dashboardState.hidden ?? []).map(attemptKey)), [dashboardState]);
-  const statuses = projected.filter((status) => !hidden.has(attemptKey(status)));
-  const repository = projected.length ? projected[0].repository : "Repository dashboard";
+  const partitioned = useMemo(() => partitionAttemptHistory(projected), [projected]);
+  const statuses = partitioned.current.filter((status) => !hidden.has(attemptKey(status)));
+  const historical = partitioned.historical.filter((status) => !hidden.has(attemptKey(status)));
   const counts = useMemo(() => Object.entries(statuses.reduce((result, status) => {
     result[status.state] = (result[status.state] ?? 0) + 1;
     return result;
@@ -179,7 +181,7 @@ export default function Dashboard() {
       <header className="hero">
         <div>
           <p className="eyebrow">Agent Symphony</p>
-          <h1>{repository}</h1>
+          <h1>{projected.length ? projected[0].repository : "Repository dashboard"}</h1>
           <p className="freshness" aria-live="polite">
             {snapshot ? `Updated ${relativeTime(snapshot.updated_at, now)}` : "Loading status…"}
           </p>
@@ -255,6 +257,7 @@ export default function Dashboard() {
           </section>
         )) : <p className="boardState" role="status">{error ? "Issue status board unavailable." : "Loading issue status board…"}</p>}
       </section>
+      <AttemptHistory statuses={historical} />
       {terminal ? <TerminalPanel config={terminal} onClose={closeTerminal} /> : null}
     </main>
   );

@@ -5,6 +5,10 @@ import { canInvestigate, orchestratorPresentation } from "../health.mjs";
 
 const attachableSessionRoles = new Set(["implementation", "reviewer"]);
 
+function sessionDisabled(readOnly, role) {
+  return readOnly || !attachableSessionRoles.has(role);
+}
+
 function githubURL(repository, kind, number) {
   const parts = repository.split("/");
   if (parts.length !== 2 || !number) return "";
@@ -37,10 +41,10 @@ function actionLabel(status, busy, waiting) {
   return status.state === "completed" ? "Archive" : "Abandon attempt";
 }
 
-function StatusActions({ status, onAction, onInvestigate, investigationEnabled, investigationBusy, busy, investigating, waiting }) {
+function StatusActions({ status, onAction, onInvestigate, investigationEnabled, investigationBusy, busy, investigating, waiting, readOnly }) {
   const investigationAvailable = investigationEnabled && canInvestigate(status);
   const actionAvailable = status.state === "completed" || status.state === "orphaned" || status.retryable;
-  if (!investigationAvailable && !actionAvailable) return null;
+  if (readOnly || (!investigationAvailable && !actionAvailable)) return null;
   const action = actionFor(status);
   const label = actionLabel(status, busy, waiting);
   return (
@@ -59,11 +63,11 @@ function StatusActions({ status, onAction, onInvestigate, investigationEnabled, 
   );
 }
 
-function OperatorFollowUp({ status, enabled, onNotice }) {
+function OperatorFollowUp({ status, enabled, onNotice, readOnly }) {
 	const [message, setMessage] = useState("");
 	const [busy, setBusy] = useState(false);
 	const retryable = status.retryable && ["blocked", "orphaned"].includes(status.state);
-	if (!enabled || (!retryable && !["active", "review-ready"].includes(status.state))) return null;
+	if (readOnly || !enabled || (!retryable && !["active", "review-ready"].includes(status.state))) return null;
   const id = `follow-up-${status.issue}-${status.attempt}`;
   async function submit(event) {
     event.preventDefault();
@@ -94,7 +98,7 @@ function OperatorFollowUp({ status, enabled, onNotice }) {
 }
 
 export function StatusCard(props) {
-  const { status, onOpenTerminal } = props;
+  const { status, onOpenTerminal, readOnly } = props;
   const issueURL = githubURL(status.repository, "issues", status.issue);
   const prURL = githubURL(status.repository, "pull", status.pr);
   const issueLabel = status.title ? `#${status.issue} ${status.title}` : `Issue #${status.issue}`;
@@ -122,14 +126,14 @@ export function StatusCard(props) {
       </header>
       <dl>
         <Detail label="tmux session">
-          {status.session ? <button className="terminalLink" type="button" onClick={() => onOpenTerminal(status)}><code>{status.session}</code></button> : null}
+          {status.session ? <button className="terminalLink" type="button" disabled={readOnly} onClick={() => onOpenTerminal(status)}><code>{status.session}</code></button> : null}
         </Detail>
         <Detail label="Worktree"><code>{worktreeName(status.worktree)}</code></Detail>
         <Detail label="Branch"><code>{status.branch}</code></Detail>
         <Detail label="Current phase">{status.current_phase}</Detail>
         <Detail label="Session lifecycle">{sessions.map((session) => (
           <span className="line" key={session.role}>
-            {session.role === "implementation" ? null : <><button className="terminalLink" type="button" disabled={!attachableSessionRoles.has(session.role)} onClick={() => onOpenTerminal(status, session)} aria-label={`Open ${session.role} terminal`}><code>{session.name}</code></button>{" · "}</>}
+            {session.role === "implementation" ? null : <><button className="terminalLink" type="button" disabled={sessionDisabled(readOnly, session.role)} onClick={() => onOpenTerminal(status, session)} aria-label={`Open ${session.role} terminal`}><code>{session.name}</code></button>{" · "}</>}
             {`${session.role} · ${session.state}${session.current ? " · current" : ""}`}
             {session.updated_at ? <> {" · "}<Timestamp value={session.updated_at} /></> : null}
           </span>
@@ -146,8 +150,8 @@ export function StatusCard(props) {
         <Detail label="Diagnostic">{status.diagnostic}</Detail>
         <Detail label="Next action">{status.next_action}</Detail>
       </dl>
-      <OperatorFollowUp status={status} enabled={props.followUpEnabled} onNotice={props.onNotice} />
-      <StatusActions {...props} />
+      <OperatorFollowUp status={status} enabled={props.followUpEnabled} onNotice={props.onNotice} readOnly={readOnly} />
+      <StatusActions {...props} readOnly={readOnly} />
     </article>
   );
 }
