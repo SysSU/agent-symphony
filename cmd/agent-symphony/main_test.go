@@ -4057,7 +4057,7 @@ func TestConcurrentOneShotReconcileRunsOneMutation(t *testing.T) {
 	}
 }
 
-func TestRecoverDashboardFailedAttemptRequestsRetryOnceAndPreservesResources(t *testing.T) {
+func TestRecoverProposalAndDashboardShareOneIdempotentGuardedPath(t *testing.T) {
 	root := gitRepository(t)
 	configPath := filepath.Join(root, config.DefaultPath)
 	if err := config.Write(configPath, config.Default("o/r")); err != nil {
@@ -4134,10 +4134,31 @@ func TestRecoverDashboardFailedAttemptRequestsRetryOnceAndPreservesResources(t *
 	oldAPI, oldClient := githubAPI, githubClient
 	githubAPI, githubClient = "https://example.invalid", client
 	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
-	for range 2 {
-		if err := recoverDashboardAttempt(t.Context(), configPath, filepath.Join(stateRoot, "pr.json"), stateRoot, 24, 2); err != nil {
-			t.Fatal(err)
-		}
+	agentRoot := filepath.Join(root, "orchestrator-state")
+	agent := &orchestratoragent.Supervisor{Root: agentRoot, Workspace: filepath.Join(agentRoot, "orchestrator-o-r"), Repository: "o/r", Command: []string{"agent"}, ProposalCommand: []string{"proposal"}, ProposalStatusCommand: []string{"proposal-status"}, Runner: &orchestratorTestRunner{}}
+	if _, err := agent.Observe(t.Context(), []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	var handoff struct {
+		ID string `json:"id"`
+	}
+	handoffBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.AttentionHandoffFile))
+	if err != nil || json.Unmarshal(handoffBody, &handoff) != nil || handoff.ID == "" {
+		t.Fatalf("handoff=%s err=%v", handoffBody, err)
+	}
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 24, Attempt: 2, Action: orchestratoragent.ProposalActionRecover, RequestID: "recover-24-2", HandoffID: handoff.ID}
+	proposalBody, _ := json.Marshal(proposal)
+	if err := os.WriteFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalFile), proposalBody, 0o620); err != nil {
+		t.Fatal(err)
+	}
+	processOrchestratorProposal(t.Context(), agent, &sync.Mutex{}, &operationCancellation{}, configPath, filepath.Join(stateRoot, "pr.json"), stateRoot, io.Discard)
+	var proposalStatus orchestratoragent.MessageProposalStatus
+	proposalStatusBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
+	if err != nil || json.Unmarshal(proposalStatusBody, &proposalStatus) != nil || proposalStatus.Resolution != "succeeded" {
+		t.Fatalf("proposal status=%s err=%v", proposalStatusBody, err)
+	}
+	if err := recoverDashboardAttempt(t.Context(), configPath, filepath.Join(stateRoot, "pr.json"), stateRoot, 24, 2); err != nil {
+		t.Fatal(err)
 	}
 	if posts != 1 {
 		t.Fatalf("retry posts=%d", posts)
