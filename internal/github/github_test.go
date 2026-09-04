@@ -389,13 +389,13 @@ func TestNormalizeIssueOptionalFilter(t *testing.T) {
 
 func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 	cfg := ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", DependencySection: "Dependencies"}
-	complete := "## Context\nreason and evidence\n## Acceptance criteria\n- observable result\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
+	complete := "## Context\n### Evidence\nreason and evidence\n## Acceptance criteria\n- observable result\n## Checklist\n### Backend\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
 	tests := []struct {
 		name, body, blocker string
 	}{
 		{"complete", complete, ""},
 		{"missing section", strings.Replace(complete, "## Validation", "## Verification", 1), "required ## Validation section is missing"},
-		{"empty section", strings.Replace(complete, "reason and evidence", "", 1), "required ## Context section is empty"},
+		{"empty section", strings.Replace(complete, "### Evidence\nreason and evidence", "", 1), "required ## Context section is empty"},
 		{"malformed checklist", strings.Replace(complete, "- [ ] implement", "implement", 1), "## Checklist must contain a Markdown task"},
 		{"malformed dependencies", strings.Replace(complete, "None.", "to be decided", 1), "## Dependencies must contain issue references or None"},
 	}
@@ -412,6 +412,18 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 				t.Fatalf("contract = %#v, want blocker %q", got, test.blocker)
 			}
 		})
+	}
+}
+
+func TestMarkdownSectionStopsAtSameOrHigherHeading(t *testing.T) {
+	body := "## Context\n### Evidence\nproof\n#### Detail\nmore proof\n##not a heading\nstill context\n## Validation\ncommands\n# Appendix\nnot validation\n"
+	context, ok := markdownSection(body, "Context")
+	if !ok || context != "### Evidence\nproof\n#### Detail\nmore proof\n##not a heading\nstill context" {
+		t.Fatalf("context section = %q, found=%v", context, ok)
+	}
+	validation, ok := markdownSection(body, "Validation")
+	if !ok || validation != "commands" {
+		t.Fatalf("validation section = %q, found=%v", validation, ok)
 	}
 }
 

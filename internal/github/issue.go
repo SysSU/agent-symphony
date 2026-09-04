@@ -178,11 +178,12 @@ func markdownSection(body, name string) (string, bool) {
 	lines := strings.Split(body, "\n")
 	start := -1
 	for i, line := range lines {
-		if strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(line, "##")), name) && strings.HasPrefix(strings.TrimSpace(line), "##") {
+		level, title := markdownHeading(line)
+		if start < 0 && level == 2 && strings.EqualFold(title, name) {
 			start = i + 1
 			continue
 		}
-		if start >= 0 && strings.HasPrefix(strings.TrimSpace(line), "##") {
+		if start >= 0 && level > 0 && level <= 2 {
 			return strings.Join(lines[start:i], "\n"), true
 		}
 	}
@@ -190,6 +191,15 @@ func markdownSection(body, name string) (string, bool) {
 		return strings.Join(lines[start:], "\n"), true
 	}
 	return "", false
+}
+
+func markdownHeading(line string) (int, string) {
+	line = strings.TrimLeft(line, " \t")
+	level := len(line) - len(strings.TrimLeft(line, "#"))
+	if level < 1 || level > 6 || len(line) > level && line[level] != ' ' && line[level] != '\t' {
+		return 0, ""
+	}
+	return level, strings.TrimSpace(line[level:])
 }
 
 func IssuePaths(body string) []string {
