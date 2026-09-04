@@ -130,14 +130,19 @@ func TestDashboardRejectsNonLoopbackRequestHost(t *testing.T) {
 	}
 }
 
-func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
+func TestWebDashboardStartsWithoutDesktopRuntimeAndStopsWithContext(t *testing.T) {
 	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, false, "", io.Discard); err == nil {
 		t.Fatal("non-loopback dashboard address accepted")
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	var log bytes.Buffer
+	root := t.TempDir()
+	wantStatus := `{"updated_at":"2026-09-04T00:00:00Z","statuses":[]}`
+	if err := os.WriteFile(filepath.Join(root, "status.json"), []byte(wantStatus), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running", Session: "as-o-test"}}
-	url, err := startDashboard(ctx, "127.0.0.1:0", t.TempDir(), nil, nil, nil, service, false, "", &log)
+	url, err := startDashboard(ctx, "127.0.0.1:0", root, nil, nil, nil, service, false, "", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +159,15 @@ func TestDashboardUsesLoopbackAndStopsWithContext(t *testing.T) {
 	response.Body.Close()
 	if readErr != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(body), `"session":"as-o-test"`) {
 		t.Fatalf("orchestrator response=%q status=%d err=%v", body, response.StatusCode, readErr)
+	}
+	response, err = http.Get(url + "/status.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr = io.ReadAll(response.Body)
+	response.Body.Close()
+	if readErr != nil || response.StatusCode != http.StatusOK || string(body) != wantStatus {
+		t.Fatalf("status response=%q status=%d err=%v", body, response.StatusCode, readErr)
 	}
 	cancel()
 	deadline := time.Now().Add(time.Second)
