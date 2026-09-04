@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	extensionast "github.com/yuin/goldmark/extension/ast"
+	goldmarktext "github.com/yuin/goldmark/text"
 )
 
 type IssueInput struct {
@@ -43,16 +50,21 @@ type Controls struct {
 }
 
 type NormalizedIssue struct {
-	Number   int
-	Controls Controls
-	Ready    bool
-	Blockers []string
+	Number           int
+	Controls         Controls
+	Ready            bool
+	Blockers         []string
+	contractBlockers []string
 }
 
 var issueReference = regexp.MustCompile(`(?m)(?:^|\s)#([1-9][0-9]*)(?:\s|$|[,.;])`)
+var issueMarkdown = goldmark.New(goldmark.WithExtensions(extension.TaskList))
 
 func NormalizeIssue(issue IssueInput, cfg ContractConfig, completed map[int]bool) NormalizedIssue {
 	result := NormalizedIssue{Number: issue.Number}
+	markdown := parseMarkdownDocument(issue.Body, false)
+	result.contractBlockers = issueContractBlockers(markdown, cfg.DependencySection)
+	result.Blockers = append(result.Blockers, result.contractBlockers...)
 	result.Controls.Closed = issue.State != "open"
 	result.Controls.Cancelled = issue.Cancelled
 	result.Controls.Retry = issue.Retry
@@ -83,8 +95,8 @@ func NormalizeIssue(issue IssueInput, cfg ContractConfig, completed map[int]bool
 	if result.Controls.Priority == 0 {
 		result.Blockers = append(result.Blockers, "exactly one priority label is required")
 	}
-	if section, ok := markdownSection(issue.Body, cfg.DependencySection); ok {
-		for _, match := range issueReference.FindAllStringSubmatch(section, -1) {
+	if section, ok := markdown.section(cfg.DependencySection); ok {
+		for _, match := range issueReference.FindAllStringSubmatch(section.text, -1) {
 			n, _ := strconv.Atoi(match[1])
 			if n == issue.Number {
 				result.Blockers = append(result.Blockers, "issue depends on itself")
@@ -115,6 +127,46 @@ func NormalizeIssue(issue IssueInput, cfg ContractConfig, completed map[int]bool
 	return result
 }
 
+func issueContractBlockers(markdown markdownDocumentFacts, dependencySection string) []string {
+	if dependencySection == "" {
+		dependencySection = "Dependencies"
+	}
+	sections := []string{"Context", "Acceptance criteria", "Checklist", "Validation", dependencySection}
+	var blockers []string
+	for _, name := range sections {
+		facts, ok := markdown.section(name)
+		if !ok {
+			blockers = append(blockers, fmt.Sprintf("required ## %s section is missing", name))
+			continue
+		}
+		if strings.TrimSpace(facts.text) == "" {
+			blockers = append(blockers, fmt.Sprintf("required ## %s section is empty", name))
+			continue
+		}
+		if name == "Checklist" && !facts.hasTask {
+			blockers = append(blockers, "## Checklist must contain a Markdown task")
+		}
+		if name == dependencySection && !dependenciesDeclared(facts.text) {
+			blockers = append(blockers, fmt.Sprintf("## %s must contain issue references or None", name))
+		}
+	}
+	return blockers
+}
+
+func dependenciesDeclared(section string) bool {
+	if issueReference.MatchString(section) {
+		return true
+	}
+	for _, line := range strings.Split(section, "\n") {
+		value := strings.TrimSpace(line)
+		value = strings.TrimSpace(strings.TrimLeft(value, "-*+"))
+		if strings.EqualFold(strings.TrimSuffix(value, "."), "none") {
+			return true
+		}
+	}
+	return false
+}
+
 type PermissionAuthorizer interface {
 	Permission(actorID int) (string, error)
 }
@@ -131,30 +183,225 @@ func AuthorizedControlActor(actorID int, authorizer PermissionAuthorizer) (bool,
 }
 
 func markdownSection(body, name string) (string, bool) {
-	lines := strings.Split(body, "\n")
-	start := -1
-	for i, line := range lines {
-		if strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(line, "##")), name) && strings.HasPrefix(strings.TrimSpace(line), "##") {
-			start = i + 1
+	facts, ok := parseMarkdownDocument(body, false).section(name)
+	return facts.text, ok
+}
+
+type markdownDocumentFacts struct {
+	sections []markdownSectionFacts
+}
+
+type markdownSectionFacts struct {
+	name, text string
+	hasTask    bool
+}
+
+type markdownSemanticState struct {
+	htmlCodeDepth int
+}
+
+func (document markdownDocumentFacts) section(name string) (markdownSectionFacts, bool) {
+	for _, section := range document.sections {
+		if strings.EqualFold(section.name, name) {
+			return section, true
+		}
+	}
+	return markdownSectionFacts{}, false
+}
+
+func parseMarkdownDocument(body string, preserveSingleLineCode bool) markdownDocumentFacts {
+	source := []byte(body)
+	root := issueMarkdown.Parser().Parse(goldmarktext.NewReader(source))
+	document := markdownDocumentFacts{}
+	state := markdownSemanticState{}
+	var current *markdownSectionFacts
+	var section bytes.Buffer
+	finish := func() {
+		if current != nil {
+			current.text = strings.TrimSuffix(section.String(), "\n")
+			document.sections = append(document.sections, *current)
+			current = nil
+			section.Reset()
+		}
+	}
+	for node := root.FirstChild(); node != nil; node = node.NextSibling() {
+		heading, isHeading := node.(*ast.Heading)
+		if state.htmlCodeDepth == 0 && isHeading && heading.Level <= 2 {
+			finish()
+			if name, ok := markdownHeadingName(heading, source); ok {
+				current = &markdownSectionFacts{name: name}
+			}
 			continue
 		}
-		if start >= 0 && strings.HasPrefix(strings.TrimSpace(line), "##") {
-			return strings.Join(lines[start:i], "\n"), true
+		if current == nil {
+			markdownObserveHTMLCode(&state, node, source)
+		} else {
+			markdownAppendVisible(&section, node, source, preserveSingleLineCode, &state, &current.hasTask)
 		}
 	}
-	if start >= 0 {
-		return strings.Join(lines[start:], "\n"), true
+	finish()
+	return document
+}
+
+func markdownHeadingName(heading *ast.Heading, source []byte) (string, bool) {
+	if heading.Level != 2 || heading.Lines().Len() == 0 {
+		return "", false
 	}
-	return "", false
+	segment := heading.Lines().At(0)
+	lineStart := markdownLineStart(source, segment.Start)
+	prefix := bytes.TrimSpace(source[lineStart:segment.Start])
+	return string(segment.Value(source)), bytes.Equal(prefix, []byte("##"))
+}
+
+func markdownObserveHTMLCode(state *markdownSemanticState, node ast.Node, source []byte) {
+	_ = ast.Walk(node, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if entering && (node.Kind() == ast.KindRawHTML || node.Kind() == ast.KindHTMLBlock) {
+			markdownUpdateHTMLCodeDepth(&state.htmlCodeDepth, markdownHTMLCodeTag(node, source))
+		}
+		return ast.WalkContinue, nil
+	})
+}
+
+func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte, preserveSingleLineCode bool, state *markdownSemanticState, hasTask *bool) {
+	switch node.Kind() {
+	case ast.KindCodeBlock, ast.KindFencedCodeBlock:
+		return
+	case ast.KindHTMLBlock:
+		markdownUpdateHTMLCodeDepth(&state.htmlCodeDepth, markdownHTMLCodeTag(node, source))
+		return
+	case ast.KindHeading, ast.KindParagraph, ast.KindTextBlock:
+		if node.Lines().Len() == 0 {
+			return
+		}
+		first := node.Lines().At(0)
+		last := node.Lines().At(node.Lines().Len() - 1)
+		start := markdownLineStart(source, first.Start)
+		visible := append([]byte(nil), source[start:markdownLineEnd(source, last.Stop)]...)
+		startingHTMLCodeDepth := state.htmlCodeDepth
+		_ = ast.Walk(node, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			switch node.Kind() {
+			case ast.KindCodeSpan:
+				span := node.(*ast.CodeSpan)
+				if span.FirstChild() != nil && (!preserveSingleLineCode || markdownLineStart(source, span.FirstChild().(*ast.Text).Segment.Start) != markdownLineStart(source, span.LastChild().(*ast.Text).Segment.Stop)) {
+					for child := span.FirstChild(); child != nil; child = child.NextSibling() {
+						markdownMask(visible, start, child.(*ast.Text).Segment)
+					}
+				}
+			case ast.KindRawHTML:
+				raw := node.(*ast.RawHTML)
+				markdownUpdateHTMLCodeDepth(&state.htmlCodeDepth, markdownHTMLCodeTag(node, source))
+				for i := 0; i < raw.Segments.Len(); i++ {
+					markdownMask(visible, start, raw.Segments.At(i))
+				}
+			case ast.KindText:
+				if state.htmlCodeDepth > 0 {
+					markdownMask(visible, start, node.(*ast.Text).Segment)
+				}
+			case extensionast.KindTaskCheckBox:
+				if state.htmlCodeDepth == 0 && markdownTaskHasSpace(node, source) {
+					*hasTask = true
+				}
+			}
+			return ast.WalkContinue, nil
+		})
+		if startingHTMLCodeDepth > 0 && state.htmlCodeDepth > 0 {
+			markdownMask(visible, start, goldmarktext.NewSegment(start, start+len(visible)))
+		}
+		section.Write(visible)
+		return
+	}
+	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+		markdownAppendVisible(section, child, source, preserveSingleLineCode, state, hasTask)
+	}
+}
+
+func markdownTaskHasSpace(node ast.Node, source []byte) bool {
+	parent := node.Parent()
+	if parent == nil || parent.Lines().Len() == 0 {
+		return false
+	}
+	segment := parent.Lines().At(0)
+	line := segment.Value(source)
+	return len(line) > 3 && (line[3] == ' ' || line[3] == '\t')
+}
+
+func markdownHTMLCodeTag(node ast.Node, source []byte) int {
+	var value bytes.Buffer
+	var segments *goldmarktext.Segments
+	switch node := node.(type) {
+	case *ast.RawHTML:
+		segments = node.Segments
+	case *ast.HTMLBlock:
+		segments = node.Lines()
+	default:
+		return 0
+	}
+	for i := 0; i < segments.Len(); i++ {
+		segment := segments.At(i)
+		value.Write(segment.Value(source))
+	}
+	tag := bytes.TrimSpace(value.Bytes())
+	if len(tag) < 3 || tag[0] != '<' {
+		return 0
+	}
+	closing := len(tag) > 2 && tag[1] == '/'
+	nameStart := 1
+	if closing {
+		nameStart++
+	}
+	nameEnd := nameStart
+	for nameEnd < len(tag) && (tag[nameEnd] >= 'A' && tag[nameEnd] <= 'Z' || tag[nameEnd] >= 'a' && tag[nameEnd] <= 'z' || tag[nameEnd] >= '0' && tag[nameEnd] <= '9' || tag[nameEnd] == '-') {
+		nameEnd++
+	}
+	if !bytes.EqualFold(tag[nameStart:nameEnd], []byte("code")) {
+		return 0
+	}
+	if closing {
+		return -1
+	}
+	if len(tag) > 1 && tag[len(tag)-2] == '/' {
+		return 0
+	}
+	return 1
+}
+
+func markdownUpdateHTMLCodeDepth(depth *int, tag int) {
+	if tag > 0 {
+		*depth++
+	} else if tag < 0 && *depth > 0 {
+		*depth--
+	}
+}
+
+func markdownLineStart(source []byte, offset int) int {
+	return bytes.LastIndexByte(source[:offset], '\n') + 1
+}
+
+func markdownLineEnd(source []byte, offset int) int {
+	if newline := bytes.IndexByte(source[offset:], '\n'); newline >= 0 {
+		return offset + newline + 1
+	}
+	return len(source)
+}
+
+func markdownMask(section []byte, offset int, segment goldmarktext.Segment) {
+	for i := max(segment.Start, offset); i < min(segment.Stop, offset+len(section)); i++ {
+		if section[i-offset] != '\n' && section[i-offset] != '\r' {
+			section[i-offset] = ' '
+		}
+	}
 }
 
 func IssuePaths(body string) []string {
-	section, ok := markdownSection(body, "Paths")
+	facts, ok := parseMarkdownDocument(body, true).section("Paths")
 	if !ok {
 		return nil
 	}
 	var paths []string
-	for _, line := range strings.Split(section, "\n") {
+	for _, line := range strings.Split(facts.text, "\n") {
 		path := strings.TrimSpace(line)
 		path = strings.TrimSpace(strings.TrimPrefix(path, "-"))
 		path = strings.Trim(path, "`")

@@ -316,7 +316,7 @@ No migration guide is required for the greenfield MVP.
 - **FR4:** A stakeholder can declare dependencies between issues.
 - **FR5:** A stakeholder can require human review for an issue.
 - **FR6:** A stakeholder can allow policy-controlled merge for an issue.
-- **FR7:** The system accepts arbitrary issue-body text while validating label, authorization, dependency, and lifecycle eligibility separately.
+- **FR7:** The system requires the implementation issue contract's body sections and separately validates label, authorization, dependency, and lifecycle eligibility.
 - **FR8:** The system can record execution status, blockers, scope changes, decisions, validation evidence, and completion in GitHub.
 - **FR9:** The system can restrict control actions to authorized GitHub actors.
 

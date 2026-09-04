@@ -268,15 +268,15 @@ func TestReadCacheRejectsUnsafeState(t *testing.T) {
 
 func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 	cfg := ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", DependencySection: "Dependencies", HumanReview: "human", AutonomousMerge: "auto"}
-	body := "## Context\nfix intake\n## Acceptance Criteria\n- [ ] safe\n## Tasks\n- [ ] implement\n## Validation\ngo test\n## Dependencies\n- #3\n"
+	body := "## Context\nfix intake\n## Acceptance Criteria\n- [ ] safe\n## Checklist\n- [ ] implement\n## Validation\ngo test\n## Dependencies\n- #3\n"
 	issue := IssueInput{Number: 5, State: "open", Body: body, Labels: []string{"ready", "P1", "auto"}}
 	normalized := NormalizeIssue(issue, cfg, map[int]bool{3: true})
 	if !normalized.Ready || normalized.Controls.Priority != 1 || normalized.Controls.Completion != "autonomous-merge" {
 		t.Fatalf("normalized %#v", normalized)
 	}
 	arbitrary := NormalizeIssue(IssueInput{Number: 6, State: "open", Body: "any unstructured text", Labels: []string{"ready", "P1", "auto"}}, cfg, nil)
-	if !arbitrary.Ready || len(arbitrary.Blockers) != 0 || len(arbitrary.Controls.Dependencies) != 0 {
-		t.Fatalf("arbitrary body was restricted: %#v", arbitrary)
+	if arbitrary.Ready || len(arbitrary.contractBlockers) != 5 || len(arbitrary.Controls.Dependencies) != 0 {
+		t.Fatalf("incomplete contract was accepted: %#v", arbitrary)
 	}
 	paths := IssuePaths("arbitrary text\n\n## Paths\n- `docs/coordination-a.md`\n- README.md\n- README.md\n")
 	if !slices.Equal(paths, []string{"README.md", "docs/coordination-a.md"}) || IssuePaths("arbitrary text") != nil {
@@ -370,8 +370,9 @@ func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 }
 
 func TestNormalizeIssueOptionalFilter(t *testing.T) {
-	cfg := ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", IssueFilter: "agent-work"}
-	issue := IssueInput{Number: 5, State: "open", Labels: []string{"ready", "P1"}}
+	cfg := ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", IssueFilter: "agent-work", DependencySection: "Dependencies"}
+	body := "## Context\nreason\n## Acceptance criteria\n- works\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
+	issue := IssueInput{Number: 5, State: "open", Body: body, Labels: []string{"ready", "P1"}}
 	if got := NormalizeIssue(issue, cfg, nil); got.Ready || got.Controls.IssueFilter || !slices.Contains(got.Blockers, "issue filter label is missing") {
 		t.Fatalf("missing filter = %#v", got)
 	}
@@ -383,6 +384,158 @@ func TestNormalizeIssueOptionalFilter(t *testing.T) {
 	issue.Labels = issue.Labels[:2]
 	if got := NormalizeIssue(issue, cfg, nil); !got.Ready || got.Controls.IssueFilter {
 		t.Fatalf("unconfigured filter = %#v", got)
+	}
+}
+
+func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
+	cfg := ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", DependencySection: "Dependencies"}
+	complete := "## Context\n### Evidence\nreason and evidence\n## Acceptance criteria\n- observable result\n## Checklist\n### Backend\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
+	tests := []struct {
+		name, body, blocker string
+	}{
+		{"complete", complete, ""},
+		{"empty heading before contract", "##\n" + complete, ""},
+		{"empty closing-hash heading after contract", complete + "## ###\n", ""},
+		{"ordered task", strings.Replace(complete, "- [ ] implement", "1. [ ] implement", 1), ""},
+		{"closing heading hashes", strings.Replace(complete, "## Context", "## Context ##", 1), ""},
+		{"task with inline comment", strings.Replace(complete, "- [ ] implement", "- [ ] implement <!-- rationale -->", 1), ""},
+		{"none with inline comment", strings.Replace(complete, "None.", "None. <!-- no dependencies -->", 1), ""},
+		{"missing section", strings.Replace(complete, "## Validation", "## Verification", 1), "required ## Validation section is missing"},
+		{"empty section", strings.Replace(complete, "### Evidence\nreason and evidence", "", 1), "required ## Context section is empty"},
+		{"malformed checklist", strings.Replace(complete, "- [ ] implement", "implement", 1), "## Checklist must contain a Markdown task"},
+		{"malformed dependencies", strings.Replace(complete, "None.", "to be decided", 1), "## Dependencies must contain issue references or None"},
+		{"indented-code checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "    - [ ] implement", 1), "required ## Checklist section is empty"},
+		{"indented-code dependencies", strings.Replace(complete, "None.", "    #123", 1), "required ## Dependencies section is empty"},
+		{"fenced-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "Example:\n~~~md\n- [ ] implement\n~~~", 1), "## Checklist must contain a Markdown task"},
+		{"nested fenced-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "- Example:\n\n    ~~~md\n    - [ ] implement\n    ~~~", 1), "## Checklist must contain a Markdown task"},
+		{"fenced-only dependencies", strings.Replace(complete, "None.", "Example:\n```md\n#123\n```", 1), "## Dependencies must contain issue references or None"},
+		{"nested fenced-only dependencies", strings.Replace(complete, "None.", "- Example:\n\n    ```md\n    #123\n    ```", 1), "## Dependencies must contain issue references or None"},
+		{"comment-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<!--\n- [ ] implement\n-->", 1), "required ## Checklist section is empty"},
+		{"comment-only dependencies", strings.Replace(complete, "None.", "<!--\n#123\n-->", 1), "required ## Dependencies section is empty"},
+		{"pre-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<pre>\n- [ ] implement\n</pre>", 1), "required ## Checklist section is empty"},
+		{"pre-only dependencies", strings.Replace(complete, "None.", "<pre>\n#123\n</pre>", 1), "required ## Dependencies section is empty"},
+		{"empty backtick fence", strings.Replace(complete, "### Evidence\nreason and evidence", "```\n```", 1), "required ## Context section is empty"},
+		{"empty tilde fence", strings.Replace(complete, "### Evidence\nreason and evidence", "~~~\n~~~", 1), "required ## Context section is empty"},
+		{"dependency fence info", strings.Replace(complete, "None.", "```md #123\n```", 1), "required ## Dependencies section is empty"},
+		{"multiline code-span checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "`start\n    - [ ] code only\nend`", 1), "## Checklist must contain a Markdown task"},
+		{"inline HTML code checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<code>- [ ] code only</code>", 1), "required ## Checklist section is empty"},
+		{"multiline code-span dependencies", strings.Replace(complete, "None.", "`start\n    #123\nend`", 1), "## Dependencies must contain issue references or None"},
+		{"inline HTML code dependencies", strings.Replace(complete, "None.", "<code>#123</code>", 1), "required ## Dependencies section is empty"},
+		{"single-line code-span dependencies", strings.Replace(complete, "None.", "- ` #123 `", 1), "## Dependencies must contain issue references or None"},
+		{"inline HTML before non-task", strings.Replace(complete, "### Backend\n- [ ] implement", "<code>prefix</code> - [ ] not a task", 1), "## Checklist must contain a Markdown task"},
+		{"plain prefix before non-task", strings.Replace(complete, "### Backend\n- [ ] implement", "- prefix [ ] not a task", 1), "## Checklist must contain a Markdown task"},
+		{"inline markup before non-task", strings.Replace(complete, "### Backend\n- [ ] implement", "- **prefix** [ ] not a task", 1), "## Checklist must contain a Markdown task"},
+		{"block-spanning HTML code checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<code>\n\n- [ ] code only\n\n</code>\n", 1), "required ## Checklist section is empty"},
+		{"block-spanning HTML code dependencies", strings.Replace(complete, "None.", "<code>\n\n#123\n\n</code>", 1), "required ## Dependencies section is empty"},
+		{"unchecked task without space", strings.Replace(complete, "- [ ] implement", "- [ ]implement", 1), "## Checklist must contain a Markdown task"},
+		{"checked task without space", strings.Replace(complete, "- [ ] implement", "- [x]implement", 1), "## Checklist must contain a Markdown task"},
+		{"pre-section HTML code checklist", strings.Replace(complete, "## Checklist\n### Backend\n- [ ] implement", "<code>\n\n## Checklist\n- [ ] code only\n\n</code>\n", 1), "required ## Checklist section is missing"},
+		{"pre-section HTML code dependencies", strings.Replace(complete, "## Dependencies\nNone.", "<code>\n\n## Dependencies\n#123\n\n</code>", 1), "required ## Dependencies section is missing"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: test.body, Labels: []string{"ready", "P1"}}, cfg, nil)
+			if len(got.Controls.Dependencies) != 0 {
+				t.Fatalf("contract parsed dependencies from fenced or invalid content: %#v", got)
+			}
+			if test.blocker == "" {
+				if !got.Ready || len(got.contractBlockers) != 0 {
+					t.Fatalf("complete contract = %#v", got)
+				}
+				return
+			}
+			if got.Ready || !slices.Contains(got.contractBlockers, test.blocker) {
+				t.Fatalf("contract = %#v, want blocker %q", got, test.blocker)
+			}
+		})
+	}
+	allFenced := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: "```md\n" + complete + "```\n", Labels: []string{"ready", "P1"}}, cfg, nil)
+	if allFenced.Ready || len(allFenced.contractBlockers) != 5 || len(allFenced.Controls.Dependencies) != 0 {
+		t.Fatalf("all-fenced fake contract = %#v", allFenced)
+	}
+	wrappedContractBody := "<code>\n\n" + strings.Replace(complete, "None.", "#123", 1) + "## Paths\n- internal/fake.go\n\n</code>\n"
+	wrappedContract := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: wrappedContractBody, Labels: []string{"ready", "P1"}}, cfg, map[int]bool{123: true})
+	if wrappedContract.Ready || len(wrappedContract.contractBlockers) != 5 || len(wrappedContract.Controls.Dependencies) != 0 || len(IssuePaths(wrappedContractBody)) != 0 {
+		t.Fatalf("HTML-code-wrapped contract = %#v, paths=%#v", wrappedContract, IssuePaths(wrappedContractBody))
+	}
+	for _, marker := range []string{"```", "~~~"} {
+		t.Run("nested "+marker, func(t *testing.T) {
+			fake := "- Example:\n\n    " + marker + "md\n    " + strings.ReplaceAll(complete+"## Paths\n- internal/fake.go\n", "\n", "\n    ") + marker + "\n"
+			got := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: fake, Labels: []string{"ready", "P1"}}, cfg, nil)
+			if got.Ready || len(got.contractBlockers) != 5 || len(got.Controls.Dependencies) != 0 || len(IssuePaths(fake)) != 0 {
+				t.Fatalf("nested fenced fake contract = %#v, paths=%#v", got, IssuePaths(fake))
+			}
+		})
+	}
+	fakeContract := strings.Replace(complete, "None.", "#123", 1) + "## Paths\n- internal/fake.go\n"
+	for _, marker := range []string{"```", "~~~"} {
+		t.Run("same-line list fence "+marker, func(t *testing.T) {
+			fake := "- " + marker + "md\n  " + strings.ReplaceAll(fakeContract, "\n", "\n  ") + marker + "\n"
+			got := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: fake, Labels: []string{"ready", "P1"}}, cfg, map[int]bool{123: true})
+			if got.Ready || len(got.contractBlockers) != 5 || len(got.Controls.Dependencies) != 0 || len(IssuePaths(fake)) != 0 {
+				t.Fatalf("same-line list fenced fake contract = %#v, paths=%#v", got, IssuePaths(fake))
+			}
+		})
+	}
+	for _, marker := range []string{"```", "~~~"} {
+		t.Run("indented pseudo-closer "+marker, func(t *testing.T) {
+			fake := marker + "md\n    " + marker + "\n" + fakeContract + marker + "\n"
+			got := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: fake, Labels: []string{"ready", "P1"}}, cfg, map[int]bool{123: true})
+			if got.Ready || len(got.contractBlockers) != 5 || len(got.Controls.Dependencies) != 0 || len(IssuePaths(fake)) != 0 {
+				t.Fatalf("pseudo-closed fake contract = %#v, paths=%#v", got, IssuePaths(fake))
+			}
+		})
+	}
+	indented := "    " + strings.ReplaceAll(fakeContract, "\n", "\n    ")
+	got := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: indented, Labels: []string{"ready", "P1"}}, cfg, map[int]bool{123: true})
+	if got.Ready || len(got.contractBlockers) != 5 || len(got.Controls.Dependencies) != 0 || len(IssuePaths(indented)) != 0 {
+		t.Fatalf("indented-code fake contract = %#v, paths=%#v", got, IssuePaths(indented))
+	}
+	if paths := IssuePaths("## Paths\n    - internal/fake.go\n"); len(paths) != 0 {
+		t.Fatalf("indented-code paths = %#v", paths)
+	}
+	commented := "<!--\n" + fakeContract + "-->\n"
+	got = NormalizeIssue(IssueInput{Number: 5, State: "open", Body: commented, Labels: []string{"ready", "P1"}}, cfg, map[int]bool{123: true})
+	if got.Ready || len(got.contractBlockers) != 5 || len(got.Controls.Dependencies) != 0 || len(IssuePaths(commented)) != 0 {
+		t.Fatalf("comment-only fake contract = %#v, paths=%#v", got, IssuePaths(commented))
+	}
+	if paths := IssuePaths("## Paths\n<!--\n- internal/fake.go\n-->\n"); len(paths) != 0 {
+		t.Fatalf("comment-only paths = %#v", paths)
+	}
+	preformatted := "<pre>\n" + fakeContract + "</pre>\n"
+	got = NormalizeIssue(IssueInput{Number: 5, State: "open", Body: preformatted, Labels: []string{"ready", "P1"}}, cfg, map[int]bool{123: true})
+	if got.Ready || len(got.contractBlockers) != 5 || len(got.Controls.Dependencies) != 0 || len(IssuePaths(preformatted)) != 0 {
+		t.Fatalf("preformatted fake contract = %#v, paths=%#v", got, IssuePaths(preformatted))
+	}
+	if paths := IssuePaths("## Paths\n<pre>\n- internal/fake.go\n</pre>\n"); len(paths) != 0 {
+		t.Fatalf("preformatted paths = %#v", paths)
+	}
+	if paths := IssuePaths("## Paths\n```internal/fake.go\n```\n"); len(paths) != 0 {
+		t.Fatalf("fence-info paths = %#v", paths)
+	}
+	if paths := IssuePaths("## Paths\n`start\n    internal/fake.go\nend`\n"); len(paths) != 0 {
+		t.Fatalf("multiline code-span paths = %#v", paths)
+	}
+	if paths := IssuePaths("## Paths\n<code>internal/fake.go</code>\n"); len(paths) != 0 {
+		t.Fatalf("inline HTML code paths = %#v", paths)
+	}
+	if paths := IssuePaths("## Paths\n<code>\n\n- internal/fake.go\n\n</code>\n"); len(paths) != 0 {
+		t.Fatalf("block-spanning HTML code paths = %#v", paths)
+	}
+	if paths := IssuePaths("<code>\n\n## Paths\n- internal/fake.go\n\n</code>\n"); len(paths) != 0 {
+		t.Fatalf("pre-section HTML code paths = %#v", paths)
+	}
+}
+
+func TestMarkdownSectionStopsAtSameOrHigherHeading(t *testing.T) {
+	body := "## Context\n### Evidence\nproof\n#### Detail\nmore proof\n##not a heading\nstill context\n## Validation\ncommands\n# Appendix\nnot validation\n"
+	context, ok := markdownSection(body, "Context")
+	if !ok || context != "### Evidence\nproof\n#### Detail\nmore proof\n##not a heading\nstill context" {
+		t.Fatalf("context section = %q, found=%v", context, ok)
+	}
+	validation, ok := markdownSection(body, "Validation")
+	if !ok || validation != "commands" {
+		t.Fatalf("validation section = %q, found=%v", validation, ok)
 	}
 }
 

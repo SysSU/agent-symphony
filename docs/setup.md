@@ -83,7 +83,7 @@ The GitHub CLI, connectivity, and permissions diagnostics should pass and identi
 
 ## 5. Label a test issue and reconcile
 
-Open an issue with any body text and add `agent-ready` plus exactly one configured priority label. If `labels.issue_filter` is configured, add that label too. Apply `agent-ready` after the final body edit; that label authorizes dispatch and pull-request creation. Then choose one completion path:
+Open an issue that satisfies the [implementation issue contract](github-controls.md#implementation-issue-contract), then add `agent-ready` plus exactly one configured priority label. If `labels.issue_filter` is configured, add that label too. Apply `agent-ready` after the final body edit; that label authorizes dispatch and pull-request creation. Then choose one completion path:
 
 - For unattended completion, also add `autonomous-merge`.
 - For normal GitHub review and manual merge, omit `autonomous-merge`; Agent Symphony leaves the pull request open.

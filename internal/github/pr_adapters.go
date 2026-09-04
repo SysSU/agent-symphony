@@ -990,6 +990,9 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 		}
 	}
 	normalized := NormalizeIssue(input, contract, completed)
+	if len(normalized.contractBlockers) > 0 {
+		return Controls{}, false, nil, fmt.Errorf("issue contract is incomplete: %s", strings.Join(normalized.contractBlockers, "; "))
+	}
 	anchor := Anchor{IssueNodeID: issue.NodeID, CreatedAt: issue.CreatedAt, ChangedAt: issue.CreatedAt, AuthorID: issue.User.ID}
 	anchorActor := 0
 	edit, err := s.latestBodyEdit(ctx, number)
