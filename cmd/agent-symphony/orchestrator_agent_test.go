@@ -69,7 +69,11 @@ func fakeAdvancedOrchestratorHost(t *testing.T) int {
 }
 
 func (r *orchestratorTestRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
-	switch command.Args[0] {
+	args := command.Args
+	if offset := slices.Index(args, ";"); offset >= 0 && offset+1 < len(args) {
+		args = args[offset+1:]
+	}
+	switch args[0] {
 	case "display-message":
 		if !r.live {
 			return agentruntime.Result{Exited: true, Code: 1}, errors.New("missing")
@@ -271,7 +275,7 @@ func TestAdvancedOrchestratorLaunchContractUsesSnapshotGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(agent.Launcher[:7], []string{"sudo", githubCLIPreserveEnv, "-n", "-u", reviewerUser, "-g", snapshotGroup}) {
+	if !slices.Equal(agent.Launcher[:6], []string{"sudo", "-n", "-u", reviewerUser, "-g", snapshotGroup}) {
 		t.Fatalf("orchestrator was not pinned to the reviewer identity: %#v", agent.Launcher)
 	}
 	agent.Runner = &orchestratorTestRunner{}

@@ -68,10 +68,11 @@ grep -qF "throw 'WSL release validation failed'" .github/workflows/release-valid
 ! grep -F '$PATH' .github/workflows/release-validation.yml | grep -qF 'scripts/validate-release.sh 0.0.0-wsl'
 git diff --check
 CGO_ENABLED=0 go build -o "$tmp/agent-symphony" ./cmd/agent-symphony
-go test ./cmd/agent-symphony -run 'Test(PRGovernanceCommandWiresFakeGitHubAndRecoveryState|ProductionHandoffOutcomeIsCompletedWithoutRedelivery|DaemonLockIsSingleInstanceAndNoFollow)' -count=1
+go test ./cmd/agent-symphony -run 'Test(PRGovernanceCommandWiresFakeGitHubAndRecoveryState|ProductionHandoffOutcomeIsCompletedWithoutRedelivery|DaemonLockIsSingleInstanceAndNoFollow|DaemonGitHubAuthenticationBoundary|ReviewAuthenticationCrossesIndependentReviewBoundary|SudoPolicyPreservesOnlyBoundedGitHubEnvironment|AdvancedAgentHostRejectsLocalRootSeamBeforeExecution)' -count=1
 go test ./internal/orchestrator -run 'Test(ReconcileLoopRunsAtStartupAndRecoversAfterTransientOutage|RecoverRestartDuplicateStaleAndOrphans)' -count=1
-go test ./internal/github -run 'Test(CLITransportUsesGitHubCLIAuthenticatedSession|AuthorizedRoleGitHubCLIAuthentication|IssueControlsApprovalAndCredentialExclusion|SameUserFeedbackAllowedAndCoordinatorArtifactsFiltered|FetchIssueFactsAutonomousLabelsAuthorizeWithoutApproval|ProductionReconcilerRunsRecoveredIssuesThenPullRequests|EvaluatePRGovernance)' -count=1
-go test ./internal/runtime -run 'Test(LifecycleCreatesCredentialedSessionWithoutCredentialedRepository|CredentialedSessionLaunchFailureIsRedacted|AgentFailureCancelAndIneligibility)' -count=1
+go test ./internal/orchestratoragent -run 'Test(OrchestratorAuthenticationCrossesItsSessionBoundary|HeartbeatAuthenticationCrossesItsOneShotBoundary)' -count=1
+go test ./internal/github -run 'Test(CLITransportUsesGitHubCLIAuthenticatedSession|RedactEnvironmentRemovesRawCredentialValues|IssueControlsApprovalAndCredentialExclusion|SameUserFeedbackAllowedAndCoordinatorArtifactsFiltered|FetchIssueFactsAutonomousLabelsAuthorizeWithoutApproval|ProductionReconcilerRunsRecoveredIssuesThenPullRequests|EvaluatePRGovernance)' -count=1
+go test ./internal/runtime -run 'Test(LifecycleCreatesCredentialedSessionWithoutCredentialedRepository|CredentialedSessionLaunchFailureIsRedacted|CredentialedPaneOutputIsRedactedBeforeLogPersistence|ImplementationAuthenticationCrossesRuntimeBoundary|TmuxSessionImportsAuthenticationWithoutPuttingValuesInArgv|AgentFailureCancelAndIneligibility)' -count=1
 
 SOURCE_DATE_EPOCH=0 scripts/release.sh "$version" "$tmp/one"
 SOURCE_DATE_EPOCH=0 scripts/release.sh "$version" "$tmp/two"

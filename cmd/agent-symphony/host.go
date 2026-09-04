@@ -278,14 +278,14 @@ func restoreSudoers(path string, body []byte) error {
 func installableSudoAuthority(body []byte, binary string) bool {
 	for _, line := range strings.Split(string(body), "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "(") {
-			return exactSudoAuthority(body, binary) || exactSudoAuthorityFor(body, binary, true, false) || exactSudoAuthorityFor(body, binary, false, false)
+			return exactSudoAuthority(body, binary) || exactSudoAuthorityFor(body, binary, true, true) || exactSudoAuthorityFor(body, binary, false, false)
 		}
 	}
 	return true
 }
 
 func exactSudoAuthority(body []byte, binary string) bool {
-	return exactSudoAuthorityFor(body, binary, true, true)
+	return exactSudoAuthorityFor(body, binary, true, false)
 }
 
 func exactSudoAuthorityFor(body []byte, binary string, orchestrator, setenv bool) bool {
@@ -588,7 +588,7 @@ func parseDSCLRecord(body []byte) map[string]string {
 }
 
 func writeSudoers(coordinator, binary string) (bool, error) {
-	body := fmt.Sprintf("# managed by agent-symphony; rerun install-host after upgrades\n%s ALL=(%s:%s) NOPASSWD:SETENV: %s agent-host implementation\n%s ALL=(%s:%s) NOPASSWD:SETENV: %s agent-host review\n%s ALL=(%s:%s) NOPASSWD:SETENV: %s agent-host orchestrator\n", coordinator, workerUser, attemptGroup, binary, coordinator, reviewerUser, snapshotGroup, binary, coordinator, reviewerUser, snapshotGroup, binary)
+	body := sudoersPolicy(coordinator, binary)
 	dir, path := nativeRoot("/etc/sudoers.d"), nativeRoot("/etc/sudoers.d/agent-symphony")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return false, err
@@ -619,6 +619,10 @@ func writeSudoers(coordinator, binary string) (bool, error) {
 	}
 	_, statErr := os.Lstat(path)
 	return errors.Is(statErr, os.ErrNotExist), os.Rename(name, path)
+}
+
+func sudoersPolicy(coordinator, binary string) string {
+	return fmt.Sprintf("# managed by agent-symphony; rerun install-host after upgrades\nDefaults!%s env_keep += \"%s\"\n%s ALL=(%s:%s) NOPASSWD: %s agent-host implementation\n%s ALL=(%s:%s) NOPASSWD: %s agent-host review\n%s ALL=(%s:%s) NOPASSWD: %s agent-host orchestrator\n", binary, strings.Join(internalgithub.GitHubCLIEnvironmentNames(), " "), coordinator, workerUser, attemptGroup, binary, coordinator, reviewerUser, snapshotGroup, binary, coordinator, reviewerUser, snapshotGroup, binary)
 }
 
 type reviewResultRequest struct {
@@ -910,6 +914,9 @@ func credentialShapedArgument(value string) bool {
 
 func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writer) error {
 	localRoot := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_LOCAL_ROOT"))
+	if localRoot != "" && hostIsolationInstalled() {
+		return errors.New("local boundary root is disabled when host isolation is installed")
+	}
 	wantUser, wantGroup, root := workerUser, attemptGroup, "/var/lib/agent-symphony/attempts"
 	if hostGOOS == "darwin" {
 		root = "/var/db/agent-symphony/attempts"
@@ -982,6 +989,7 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		return errors.New("invalid bounded JSON request")
 	}
 	var result agentruntime.Result
+	redactionEnv := append(os.Environ(), request.Command.Env...)
 	switch request.Operation {
 	case "verify":
 		if localRoot != "" {
@@ -1017,10 +1025,10 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		args := request.Command.Args
 		if request.Command.Name == "tmux" {
 			dir = "/tmp"
-			if tmuxRoot := os.Getenv("TMUX_TMPDIR"); tmuxRoot != "" {
+			if tmuxRoot := os.Getenv("TMUX_TMPDIR"); localRoot != "" && tmuxRoot != "" {
 				env = append(env, "TMUX_TMPDIR="+tmuxRoot)
 			}
-			if len(args) > 0 && args[0] == "new-session" {
+			if tmuxNewSessionOffset(args) >= 0 {
 				args = append(slices.Clone(args), "-e", "HOME="+homeDir)
 			}
 		}
@@ -1066,8 +1074,9 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 	default:
 		return errors.New("unsupported boundary operation")
 	}
+	result.Output = internalgithub.RedactEnvironment(result.Output, redactionEnv)
 	if err != nil && !result.Exited {
-		return err
+		return errors.New(internalgithub.RedactEnvironment(err.Error(), redactionEnv))
 	}
 	return json.NewEncoder(output).Encode(result)
 }
@@ -1263,7 +1272,7 @@ func validateBoundaryCommand(c boundaryCommand, root string) error {
 			return errors.New("boundary command directory escapes provisioned root")
 		}
 	}
-	if (c.Name == "git" && !validGitBoundaryArgs(c.Args, c.Dir, root)) || (c.Name == "tmux" && !validTmuxBoundaryArgs(c.Args, c.Dir, root)) {
+	if (c.Name == "git" && !validGitBoundaryArgs(c.Args, c.Dir, root)) || (c.Name == "tmux" && !validTmuxBoundaryArgs(c.Args, c.Env, c.Dir, root)) {
 		return errors.New("boundary command arguments are not allowed")
 	}
 	for _, value := range c.Env {
@@ -1303,21 +1312,19 @@ func validGitBoundaryArgs(args []string, dir, root string) bool {
 		slices.Equal(rest, []string{"config", "--local", "credential.helper", ""})
 }
 
-func validTmuxBoundaryArgs(args []string, dir, root string) bool {
+func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		return false
 	}
-	switch args[0] {
-	case "new-session":
-		if len(args) < 6 || args[1] != "-d" || args[2] != "-s" || args[4] != "-c" || !boundedCommandPath(args[5], dir, root) {
+	if offset := tmuxNewSessionOffset(args); offset >= 0 {
+		if offset == 0 || !slices.Equal(strings.Fields(args[3]), environmentNames(environment)) {
 			return false
 		}
-		for i := 6; i < len(args); i += 2 {
-			if i+1 >= len(args) || args[i] != "-e" || !strings.Contains(args[i+1], "=") {
-				return false
-			}
-		}
-		return true
+		args = args[offset:]
+	}
+	switch args[0] {
+	case "new-session":
+		return len(args) == 6 && args[1] == "-d" && args[2] == "-s" && args[4] == "-c" && boundedCommandPath(args[5], dir, root)
 	case "has-session", "kill-session":
 		return len(args) == 3 && args[1] == "-t" && validTmuxTarget(args[2], false)
 	case "display-message":
@@ -1341,6 +1348,27 @@ func validTmuxBoundaryArgs(args []string, dir, root string) bool {
 	default:
 		return false
 	}
+}
+
+func tmuxNewSessionOffset(args []string) int {
+	if len(args) > 5 && slices.Equal(args[:3], []string{"set-option", "-g", "update-environment"}) && args[4] == ";" && args[5] == "new-session" {
+		return 5
+	}
+	if len(args) > 0 && args[0] == "new-session" {
+		return 0
+	}
+	return -1
+}
+
+func environmentNames(environment []string) []string {
+	var names []string
+	for _, entry := range environment {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok && name != "" && !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func validTmuxTarget(target string, pane bool) bool {

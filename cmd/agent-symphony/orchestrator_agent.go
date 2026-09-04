@@ -140,5 +140,5 @@ func orchestratorBoundaryCommand() []string {
 	if !hostIsolationInstalled() {
 		return []string{binary, "agent-host", "orchestrator"}
 	}
-	return []string{"sudo", githubCLIPreserveEnv, "-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "orchestrator"}
+	return []string{"sudo", "-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "orchestrator"}
 }

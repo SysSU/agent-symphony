@@ -503,10 +503,16 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 		return manifest, fmt.Errorf("observe tmux session: %w", err)
 	}
 	if dead {
+		env, envErr := r.agentEnvironment(manifest.Repository, attempt.Env...)
 		capture, captureErr := r.run(ctx, r.tmux(), []string{"capture-pane", "-p", "-S", "-", "-t", PaneTarget(manifest.Session)}, "", []string{}, nil)
+		if envErr != nil {
+			captureErr = errors.Join(captureErr, envErr)
+		} else if captureErr != nil {
+			captureErr = errors.New(internalgithub.RedactEnvironment(captureErr.Error(), env))
+		}
 		var logErr error
 		if captureErr == nil {
-			logErr = os.WriteFile(manifest.LogPath, []byte(capture.Output), 0o600)
+			logErr = os.WriteFile(manifest.LogPath, []byte(internalgithub.RedactEnvironment(capture.Output, env)), 0o600)
 		}
 		if captureErr != nil || logErr != nil {
 			cause := errors.Join(captureErr, logErr)
@@ -582,11 +588,8 @@ func (r *Runtime) agentEnvironment(repository string, extra ...string) ([]string
 }
 
 func (r *Runtime) startSession(ctx context.Context, manifest Manifest, env []string) error {
-	args := []string{"new-session", "-d", "-s", manifest.Session, "-c", manifest.Worktree, "-e", "GIT_CONFIG_NOSYSTEM=1", "-e", "GIT_TERMINAL_PROMPT=0"}
-	for _, value := range env {
-		args = append(args, "-e", value)
-	}
-	if _, err := r.run(ctx, r.tmux(), args, "", []string{}, nil); err != nil {
+	env = append(slices.Clone(env), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
+	if _, err := r.run(ctx, r.tmux(), TmuxNewSessionArgs(manifest.Session, manifest.Worktree, env), "", env, nil); err != nil {
 		return err
 	}
 	target := PaneTarget(manifest.Session)
@@ -595,6 +598,21 @@ func (r *Runtime) startSession(ctx context.Context, manifest Manifest, env []str
 	}
 	_, err := r.run(ctx, r.tmux(), []string{"set-option", "-w", "-t", target, "history-limit", historyLimit}, "", []string{}, nil)
 	return err
+}
+
+// TmuxNewSessionArgs imports only the supplied environment names from the
+// client. Values remain in the process environment instead of tmux argv.
+func TmuxNewSessionArgs(session, dir string, environment []string) []string {
+	names := make([]string, 0, len(environment))
+	seen := map[string]bool{}
+	for _, entry := range environment {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok && name != "" && !seen[name] {
+			names = append(names, name)
+			seen[name] = true
+		}
+	}
+	return []string{"set-option", "-g", "update-environment", strings.Join(names, " "), ";", "new-session", "-d", "-s", session, "-c", dir}
 }
 
 // ParsePaneStatus parses tmux's pane_dead and pane_dead_status format.
@@ -1173,7 +1191,8 @@ func (r *Runtime) run(ctx context.Context, name string, args []string, dir strin
 	}
 	result, err := runner.Run(ctx, Command{Name: name, Args: args, Dir: dir, Env: env, Stdin: stdin})
 	if err != nil {
-		return result, fmt.Errorf("%s %s failed: %s: %w", filepath.Base(name), internalgithub.Redact(fmt.Sprint(args)), internalgithub.Redact(strings.TrimSpace(result.Output)), err)
+		redact := func(value string) string { return internalgithub.RedactEnvironment(value, env) }
+		return result, fmt.Errorf("%s %s failed: %s: %s", filepath.Base(name), redact(fmt.Sprint(args)), redact(strings.TrimSpace(result.Output)), redact(err.Error()))
 	}
 	return result, nil
 }
@@ -1194,5 +1213,5 @@ func diagnostic(err error) string {
 	if err == nil {
 		return ""
 	}
-	return err.Error()
+	return internalgithub.RedactEnvironment(err.Error(), os.Environ())
 }
