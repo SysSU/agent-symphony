@@ -423,6 +423,10 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 		{"inline HTML code dependencies", strings.Replace(complete, "None.", "<code>#123</code>", 1), "required ## Dependencies section is empty"},
 		{"single-line code-span dependencies", strings.Replace(complete, "None.", "- ` #123 `", 1), "## Dependencies must contain issue references or None"},
 		{"inline HTML before non-task", strings.Replace(complete, "### Backend\n- [ ] implement", "<code>prefix</code> - [ ] not a task", 1), "## Checklist must contain a Markdown task"},
+		{"plain prefix before non-task", strings.Replace(complete, "### Backend\n- [ ] implement", "- prefix [ ] not a task", 1), "## Checklist must contain a Markdown task"},
+		{"inline markup before non-task", strings.Replace(complete, "### Backend\n- [ ] implement", "- **prefix** [ ] not a task", 1), "## Checklist must contain a Markdown task"},
+		{"block-spanning HTML code checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<code>\n\n- [ ] code only\n\n</code>\n", 1), "required ## Checklist section is empty"},
+		{"block-spanning HTML code dependencies", strings.Replace(complete, "None.", "<code>\n\n#123\n\n</code>", 1), "required ## Dependencies section is empty"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -505,6 +509,9 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 	}
 	if paths := IssuePaths("## Paths\n<code>internal/fake.go</code>\n"); len(paths) != 0 {
 		t.Fatalf("inline HTML code paths = %#v", paths)
+	}
+	if paths := IssuePaths("## Paths\n<code>\n\n- internal/fake.go\n\n</code>\n"); len(paths) != 0 {
+		t.Fatalf("block-spanning HTML code paths = %#v", paths)
 	}
 }
 

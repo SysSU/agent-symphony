@@ -189,6 +189,7 @@ func markdownVisibleSection(body, name string, preserveSingleLineCode bool) (str
 	source := []byte(body)
 	document := issueMarkdown.Parser().Parse(goldmarktext.NewReader(source))
 	found := false
+	htmlCodeDepth := 0
 	var section bytes.Buffer
 	for node := document.FirstChild(); node != nil; node = node.NextSibling() {
 		heading, isHeading := node.(*ast.Heading)
@@ -196,7 +197,7 @@ func markdownVisibleSection(body, name string, preserveSingleLineCode bool) (str
 			break
 		}
 		if found {
-			markdownAppendVisible(&section, node, source, preserveSingleLineCode)
+			markdownAppendVisible(&section, node, source, preserveSingleLineCode, &htmlCodeDepth)
 			continue
 		}
 		if !isHeading || !markdownHeadingNamed(heading, source, name) {
@@ -217,13 +218,14 @@ func markdownHeadingNamed(heading *ast.Heading, source []byte, name string) bool
 	segment := heading.Lines().At(0)
 	lineStart := markdownLineStart(source, segment.Start)
 	prefix := bytes.TrimSpace(source[lineStart:segment.Start])
-	return bytes.Equal(prefix, []byte("##")) && strings.EqualFold(string(heading.Text(source)), name)
+	return bytes.Equal(prefix, []byte("##")) && strings.EqualFold(string(segment.Value(source)), name)
 }
 
 func markdownSectionHasTask(body, name string) bool {
 	source := []byte(body)
 	document := issueMarkdown.Parser().Parse(goldmarktext.NewReader(source))
 	found := false
+	htmlCodeDepth := 0
 	for node := document.FirstChild(); node != nil; node = node.NextSibling() {
 		heading, isHeading := node.(*ast.Heading)
 		if found && isHeading && heading.Level <= 2 {
@@ -235,7 +237,13 @@ func markdownSectionHasTask(body, name string) bool {
 		}
 		hasTask := false
 		_ = ast.Walk(node, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
-			if entering && node.Kind() == extensionast.KindTaskCheckBox {
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			if node.Kind() == ast.KindRawHTML || node.Kind() == ast.KindHTMLBlock {
+				markdownUpdateHTMLCodeDepth(&htmlCodeDepth, markdownHTMLCodeTag(node, source))
+			}
+			if node.Kind() == extensionast.KindTaskCheckBox && htmlCodeDepth == 0 {
 				hasTask = true
 			}
 			return ast.WalkContinue, nil
@@ -247,9 +255,12 @@ func markdownSectionHasTask(body, name string) bool {
 	return false
 }
 
-func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte, preserveSingleLineCode bool) {
+func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte, preserveSingleLineCode bool, htmlCodeDepth *int) {
 	switch node.Kind() {
-	case ast.KindCodeBlock, ast.KindFencedCodeBlock, ast.KindHTMLBlock:
+	case ast.KindCodeBlock, ast.KindFencedCodeBlock:
+		return
+	case ast.KindHTMLBlock:
+		markdownUpdateHTMLCodeDepth(htmlCodeDepth, markdownHTMLCodeTag(node, source))
 		return
 	case ast.KindHeading, ast.KindParagraph, ast.KindTextBlock:
 		if node.Lines().Len() == 0 {
@@ -259,7 +270,7 @@ func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte, 
 		last := node.Lines().At(node.Lines().Len() - 1)
 		start := markdownLineStart(source, first.Start)
 		visible := append([]byte(nil), source[start:markdownLineEnd(source, last.Stop)]...)
-		htmlCodeDepth := 0
+		startingHTMLCodeDepth := *htmlCodeDepth
 		_ = ast.Walk(node, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
 			if !entering {
 				return ast.WalkContinue, nil
@@ -274,35 +285,41 @@ func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte, 
 				}
 			case ast.KindRawHTML:
 				raw := node.(*ast.RawHTML)
-				tag := markdownHTMLCodeTag(raw, source)
-				if tag < 0 && htmlCodeDepth > 0 {
-					htmlCodeDepth--
-				}
+				markdownUpdateHTMLCodeDepth(htmlCodeDepth, markdownHTMLCodeTag(node, source))
 				for i := 0; i < raw.Segments.Len(); i++ {
 					markdownMask(visible, start, raw.Segments.At(i))
 				}
-				if tag > 0 {
-					htmlCodeDepth++
-				}
 			case ast.KindText:
-				if htmlCodeDepth > 0 {
+				if *htmlCodeDepth > 0 {
 					markdownMask(visible, start, node.(*ast.Text).Segment)
 				}
 			}
 			return ast.WalkContinue, nil
 		})
+		if startingHTMLCodeDepth > 0 && *htmlCodeDepth > 0 {
+			markdownMask(visible, start, goldmarktext.NewSegment(start, start+len(visible)))
+		}
 		section.Write(visible)
 		return
 	}
 	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
-		markdownAppendVisible(section, child, source, preserveSingleLineCode)
+		markdownAppendVisible(section, child, source, preserveSingleLineCode, htmlCodeDepth)
 	}
 }
 
-func markdownHTMLCodeTag(raw *ast.RawHTML, source []byte) int {
+func markdownHTMLCodeTag(node ast.Node, source []byte) int {
 	var value bytes.Buffer
-	for i := 0; i < raw.Segments.Len(); i++ {
-		segment := raw.Segments.At(i)
+	var segments *goldmarktext.Segments
+	switch node := node.(type) {
+	case *ast.RawHTML:
+		segments = node.Segments
+	case *ast.HTMLBlock:
+		segments = node.Lines()
+	default:
+		return 0
+	}
+	for i := 0; i < segments.Len(); i++ {
+		segment := segments.At(i)
 		value.Write(segment.Value(source))
 	}
 	tag := bytes.TrimSpace(value.Bytes())
@@ -328,6 +345,14 @@ func markdownHTMLCodeTag(raw *ast.RawHTML, source []byte) int {
 		return 0
 	}
 	return 1
+}
+
+func markdownUpdateHTMLCodeDepth(depth *int, tag int) {
+	if tag > 0 {
+		*depth++
+	} else if tag < 0 && *depth > 0 {
+		*depth--
+	}
 }
 
 func markdownLineStart(source []byte, offset int) int {
