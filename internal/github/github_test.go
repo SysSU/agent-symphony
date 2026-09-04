@@ -427,6 +427,10 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 		{"inline markup before non-task", strings.Replace(complete, "### Backend\n- [ ] implement", "- **prefix** [ ] not a task", 1), "## Checklist must contain a Markdown task"},
 		{"block-spanning HTML code checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<code>\n\n- [ ] code only\n\n</code>\n", 1), "required ## Checklist section is empty"},
 		{"block-spanning HTML code dependencies", strings.Replace(complete, "None.", "<code>\n\n#123\n\n</code>", 1), "required ## Dependencies section is empty"},
+		{"unchecked task without space", strings.Replace(complete, "- [ ] implement", "- [ ]implement", 1), "## Checklist must contain a Markdown task"},
+		{"checked task without space", strings.Replace(complete, "- [ ] implement", "- [x]implement", 1), "## Checklist must contain a Markdown task"},
+		{"pre-section HTML code checklist", strings.Replace(complete, "## Checklist\n### Backend\n- [ ] implement", "<code>\n\n## Checklist\n- [ ] code only\n\n</code>\n", 1), "required ## Checklist section is missing"},
+		{"pre-section HTML code dependencies", strings.Replace(complete, "## Dependencies\nNone.", "<code>\n\n## Dependencies\n#123\n\n</code>", 1), "required ## Dependencies section is missing"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -448,6 +452,11 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 	allFenced := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: "```md\n" + complete + "```\n", Labels: []string{"ready", "P1"}}, cfg, nil)
 	if allFenced.Ready || len(allFenced.contractBlockers) != 5 || len(allFenced.Controls.Dependencies) != 0 {
 		t.Fatalf("all-fenced fake contract = %#v", allFenced)
+	}
+	wrappedContractBody := "<code>\n\n" + strings.Replace(complete, "None.", "#123", 1) + "## Paths\n- internal/fake.go\n\n</code>\n"
+	wrappedContract := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: wrappedContractBody, Labels: []string{"ready", "P1"}}, cfg, map[int]bool{123: true})
+	if wrappedContract.Ready || len(wrappedContract.contractBlockers) != 5 || len(wrappedContract.Controls.Dependencies) != 0 || len(IssuePaths(wrappedContractBody)) != 0 {
+		t.Fatalf("HTML-code-wrapped contract = %#v, paths=%#v", wrappedContract, IssuePaths(wrappedContractBody))
 	}
 	for _, marker := range []string{"```", "~~~"} {
 		t.Run("nested "+marker, func(t *testing.T) {
@@ -512,6 +521,9 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 	}
 	if paths := IssuePaths("## Paths\n<code>\n\n- internal/fake.go\n\n</code>\n"); len(paths) != 0 {
 		t.Fatalf("block-spanning HTML code paths = %#v", paths)
+	}
+	if paths := IssuePaths("<code>\n\n## Paths\n- internal/fake.go\n\n</code>\n"); len(paths) != 0 {
+		t.Fatalf("pre-section HTML code paths = %#v", paths)
 	}
 }
 
