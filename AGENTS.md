@@ -37,8 +37,26 @@ All issue implementation must occur in a dedicated Git worktree. Keep the primar
 - Preserve unrelated user changes and untracked files. Never use destructive Git commands or broad cleanup operations to resolve conflicts.
 - Before committing code changes, run `scripts/lint.sh` and resolve every failure.
 - Run the smallest relevant build, lint, and test checks before finishing, and report the actual results.
-- Tests should verify behavior, branching, validation, side effects, or failure handling—not constants, type-only exports, or trivial re-exports.
 - Write documentation in plain English. Be direct and concise, cut filler, prefer common words to jargon, and briefly define any technical term readers need.
+
+## Test Practices
+
+Tests must protect behavior that users and operators depend on. Do not add a test only to satisfy a checklist, increase a count, or execute code without a meaningful assertion.
+
+- Start with the regression or risk. The issue or pull request must say what behavior the test protects and what failure it would catch. For a bug fix, add a test that fails before the fix and passes after it.
+- Prioritize core user journeys and externally observable results. Assert the outcome a user, operator, API client, or dependent component sees—not private call order, internal fields, or incidental markup.
+- Use the narrowest test level that provides real confidence:
+  - Unit tests cover branching, validation, state transitions, transformations, and failure handling within one component.
+  - Integration tests cover boundaries between components or processes, including GitHub, tmux, the filesystem, runtime services, and dashboard state.
+  - End-to-end tests cover critical operator workflows in the running system. Add them when the behavior crosses the full stack and the environment can support a reliable test. If an end-to-end test is not practical, record the constraint and the closest integration coverage.
+- Cover the successful path plus important failures and edge cases. Use table-driven Go tests when several meaningful cases share the same setup. Use Go fuzzing for parsers and untrusted input boundaries when the risk justifies it, and the race detector when concurrency behavior changes.
+- Keep tests isolated and deterministic. Control test data, time, filesystem state, and network boundaries. Mock an external dependency only at its boundary; do not write a test whose only evidence is that its mock was called.
+- For dashboard flows, use the existing Playwright setup. Interact through visible text, roles, labels, and other accessible contracts; use web-first assertions instead of fixed sleeps or CSS selectors tied to implementation details.
+- Reject low-value tests that check constants, type-only exports, trivial re-exports, copied production logic, implementation snapshots, or unconditional success. A useful test fails for a plausible product regression and tells the reader which behavior broke.
+- Run the smallest relevant checks while developing, then the required broader checks before review. Typical commands are `go test ./...`, `npm --prefix cmd/agent-symphony/dashboard test`, and `npm --prefix cmd/agent-symphony/dashboard run test:browser`. Record the exact commands and results in the issue or pull request.
+- Do not invent runtime tests for documentation-only or other non-runtime changes. Record why unit, integration, or end-to-end coverage does not apply and run the appropriate structural or content validation instead.
+
+Research references: [Go table-driven tests](https://go.dev/wiki/TableDrivenTests), [Go fuzzing](https://go.dev/doc/security/fuzz/), [Playwright best practices](https://playwright.dev/docs/best-practices), [Testing Library guiding principles](https://testing-library.com/docs/), and [Google guidance on change-detector tests](https://testing.googleblog.com/2015/01/testing-on-toilet-change-detector-tests.html).
 
 ## BMAD Artifacts
 
