@@ -208,12 +208,10 @@ func markdownSection(body, name string) (string, bool) {
 }
 
 func markdownFence(line string) (byte, int, string) {
-	line = strings.TrimSuffix(line, "\r")
-	indent := len(line) - len(strings.TrimLeft(line, " "))
-	if indent > 3 || indent == len(line) {
+	line = strings.TrimLeft(strings.TrimSuffix(line, "\r"), " \t")
+	if line == "" {
 		return 0, 0, ""
 	}
-	line = line[indent:]
 	marker := line[0]
 	if marker != '`' && marker != '~' {
 		return 0, 0, ""

@@ -399,7 +399,9 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 		{"malformed checklist", strings.Replace(complete, "- [ ] implement", "implement", 1), "## Checklist must contain a Markdown task"},
 		{"malformed dependencies", strings.Replace(complete, "None.", "to be decided", 1), "## Dependencies must contain issue references or None"},
 		{"fenced-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "Example:\n~~~md\n- [ ] implement\n~~~", 1), "## Checklist must contain a Markdown task"},
+		{"nested fenced-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "- Example:\n\n    ~~~md\n    - [ ] implement\n    ~~~", 1), "## Checklist must contain a Markdown task"},
 		{"fenced-only dependencies", strings.Replace(complete, "None.", "Example:\n```md\n#123\n```", 1), "## Dependencies must contain issue references or None"},
+		{"nested fenced-only dependencies", strings.Replace(complete, "None.", "- Example:\n\n    ```md\n    #123\n    ```", 1), "## Dependencies must contain issue references or None"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -421,6 +423,15 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 	allFenced := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: "```md\n" + complete + "```\n", Labels: []string{"ready", "P1"}}, cfg, nil)
 	if allFenced.Ready || len(allFenced.contractBlockers) != 5 || len(allFenced.Controls.Dependencies) != 0 {
 		t.Fatalf("all-fenced fake contract = %#v", allFenced)
+	}
+	for _, marker := range []string{"```", "~~~"} {
+		t.Run("nested "+marker, func(t *testing.T) {
+			fake := "- Example:\n\n    " + marker + "md\n" + strings.ReplaceAll(complete+"## Paths\n- internal/fake.go\n", "\n", "\n    ") + marker + "\n"
+			got := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: fake, Labels: []string{"ready", "P1"}}, cfg, nil)
+			if got.Ready || len(got.contractBlockers) != 5 || len(got.Controls.Dependencies) != 0 || len(IssuePaths(fake)) != 0 {
+				t.Fatalf("nested fenced fake contract = %#v, paths=%#v", got, IssuePaths(fake))
+			}
+		})
 	}
 }
 
