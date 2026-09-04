@@ -131,21 +131,24 @@ test("renders every board lane and keeps overflowing lanes keyboard reachable", 
   await expect.poll(() => board.evaluate((element) => element.scrollLeft)).toBe(0);
 });
 
-test("shows the running release on desktop and mobile", async ({ page }) => {
+test("provides the accessible web dashboard on desktop and mobile", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 });
   await mockDashboard(page, statuses);
   await page.goto("/");
 
+  await expect(page.getByRole("main")).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: statuses[0].repository })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Issue status board" })).toBeVisible();
   const release = page.locator(".release");
   await expect(release).toBeVisible();
   await expect(release).toHaveText("Release 0.5.0");
   await expect(release).toHaveAttribute("aria-live", "polite");
-  await page.screenshot({ path: "test-results/dashboard-release-desktop.png", fullPage: true });
+  await page.screenshot({ path: "test-results/web-dashboard-desktop.png", fullPage: true });
 
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(release).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
-  await page.screenshot({ path: "test-results/dashboard-release-mobile.png", fullPage: true });
+  await page.screenshot({ path: "test-results/web-dashboard-mobile.png", fullPage: true });
 });
 
 test("refreshes the running release without reloading", async ({ page }) => {

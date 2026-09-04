@@ -2,6 +2,8 @@
 
 Agent Symphony is a GitHub-native, multi-agent software delivery orchestrator inspired by [OpenAI Symphony](https://github.com/openai/symphony). It coordinates coding agents from a ready GitHub Issue through implementation, validation, review, and policy-controlled merge.
 
+The browser dashboard is the only graphical interface. Agent Symphony does not ship or require a desktop client.
+
 ## Features
 
 - Uses GitHub Issues as the work queue and implementation record

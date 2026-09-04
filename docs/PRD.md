@@ -106,6 +106,8 @@ Users manage intent, priority, and governance rather than agent sessions. Execut
 
 **Resource requirements:** One experienced systems developer familiar with GitHub CLI, Git, process supervision, and CLI tooling; one pilot repository; stakeholder access for workflow validation and review-policy testing.
 
+The browser dashboard is the only graphical application in scope. A packaged desktop client and desktop-specific configuration are explicitly out of scope.
+
 ### MVP - Minimum Viable Product
 
 - One configured GitHub repository accessible through an authenticated GitHub CLI session.

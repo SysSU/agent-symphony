@@ -160,7 +160,7 @@ func TestLoadRejectsUnknownKeysAndSecrets(t *testing.T) {
 	tests := []struct {
 		name, content, want string
 	}{
-		{"unknown", strings.Replace(valid, `"version": 1`, `"mystery": true, "version": 1`, 1), "unknown field"},
+		{"desktop client", strings.Replace(valid, `"version": 1`, `"desktop_client": true, "version": 1`, 1), "unknown field"},
 		{"secret", strings.Replace(valid, `"version": 1`, `"github_token": "canary", "version": 1`, 1), "secret-shaped"},
 	}
 	for _, test := range tests {
