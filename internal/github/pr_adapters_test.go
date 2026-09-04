@@ -545,7 +545,7 @@ func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t 
 			}
 			cfg := productionPRConfig()
 			now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
-			body := "## Context\nx\n## Acceptance Criteria\nx\n## Tasks\nx\n## Validation\nx\n## Dependencies\nnone\n"
+			body := "## Context\nx\n## Acceptance Criteria\nx\n## Checklist\n- [ ] x\n## Validation\nx\n## Dependencies\nnone\n"
 			controls := NormalizeIssue(IssueInput{Number: 10, State: "open", Body: body, Labels: []string{"ready", "P3"}}, ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", DependencySection: "Dependencies", DefaultCompletion: "human-review", HumanReview: "review", AutonomousMerge: "auto"}, nil).Controls
 			provenance := []Provenance{
 				{Name: "ready", Value: "true", Source: "timeline", EventID: 20, ActorID: 5, CreatedAt: now},
@@ -769,6 +769,7 @@ func productionPRConfig() PRAdapterConfig {
 
 func TestAuthorizedControlsTrackOptionalIssueFilter(t *testing.T) {
 	now := time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
+	body := "## Context\nx\n## Acceptance criteria\nx\n## Checklist\n- [ ] x\n## Validation\nx\n## Dependencies\nNone.\n"
 	filterPresent := true
 	var snapshots []string
 	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -790,7 +791,7 @@ func TestAuthorizedControlsTrackOptionalIssueFilter(t *testing.T) {
 		var response any
 		switch r.Method + " " + r.URL.RequestURI() {
 		case "GET /repos/o/r/issues/10":
-			response = map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": "work", "created_at": now, "user": map[string]any{"id": 5}, "labels": labels}
+			response = map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 5}, "labels": labels}
 		case "GET /repos/o/r/issues/10/timeline?per_page=100&page=1":
 			response = events
 		case "GET /repos/o/r/issues/10/comments?per_page=100&page=1":
@@ -837,7 +838,7 @@ func TestAuthorizedControlsTrackOptionalIssueFilter(t *testing.T) {
 func TestProductionAuthorizedControlsVerifyGitHubSnapshot(t *testing.T) {
 	cfg := productionPRConfig()
 	now := time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC)
-	body := "## Context\nx\n## Acceptance Criteria\nx\n## Tasks\nx\n## Validation\nx\n## Dependencies\nnone\n"
+	body := "## Context\nx\n## Acceptance Criteria\nx\n## Checklist\n- [ ] x\n## Validation\nx\n## Dependencies\nnone\n"
 	controls := NormalizeIssue(IssueInput{Number: 10, State: "open", Body: body, Labels: []string{"ready", "P1", "auto"}}, ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", DependencySection: "Dependencies", DefaultCompletion: "human-review", HumanReview: "review", AutonomousMerge: "auto"}, nil).Controls
 	provenance := provenanceFor(controls, 5)
 	for i := range provenance {

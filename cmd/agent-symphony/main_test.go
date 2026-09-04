@@ -29,6 +29,8 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
+const completeImplementationIssueBody = "## Context\nreason and evidence\n## Acceptance criteria\n- result\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
+
 func TestEffectiveServeInterval(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -1219,6 +1221,27 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 	}
 }
 
+func TestIssueContractControlsDispatch(t *testing.T) {
+	now := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
+	cfg := internalgithub.ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", DependencySection: "Dependencies"}
+	for _, test := range []struct {
+		name, body string
+		state      orchestrator.State
+	}{
+		{"incomplete issue is deferred", "implement from chat", orchestrator.Blocked},
+		{"complete issue is eligible", completeImplementationIssueBody, orchestrator.Runnable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			normalized := internalgithub.NormalizeIssue(internalgithub.IssueInput{Number: 211, State: "open", Body: test.body, Labels: []string{"ready", "P1"}}, cfg, nil)
+			issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 211, Priority: normalized.Controls.Priority, CreatedAt: now, Blockers: normalized.Blockers, Eligible: normalized.Ready}
+			_, decisions := joinIssueProjection(nil, []internalgithub.RecoveryIssueFact{issue}, 1)
+			if len(decisions) != 1 || decisions[0].State != test.state {
+				t.Fatalf("decisions = %#v, want %s", decisions, test.state)
+			}
+		})
+	}
+}
+
 func TestWorkerCaptureInternalCLIAndHandoffPreStartRecovery(t *testing.T) {
 	dir := t.TempDir()
 	prompt := filepath.Join(dir, "prompt")
@@ -1888,9 +1911,9 @@ esac
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/branches/main":
 			body, _ = json.Marshal(map[string]any{"commit": map[string]any{"sha": base}})
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues":
-			body, _ = json.Marshal([]map[string]any{{"number": 23, "title": "Completed attempt", "body": "Publish the completed work.", "created_at": issueCreated}})
+			body, _ = json.Marshal([]map[string]any{{"number": 23, "title": "Completed attempt", "body": completeImplementationIssueBody, "created_at": issueCreated}})
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues/23":
-			body, _ = json.Marshal(map[string]any{"number": 23, "node_id": "issue-node", "state": "open", "body": "Publish the completed work.", "created_at": issueCreated, "user": map[string]any{"id": 42}, "labels": []map[string]any{{"name": "agent-ready"}, {"name": "priority:P1"}}})
+			body, _ = json.Marshal(map[string]any{"number": 23, "node_id": "issue-node", "state": "open", "body": completeImplementationIssueBody, "created_at": issueCreated, "user": map[string]any{"id": 42}, "labels": []map[string]any{{"name": "agent-ready"}, {"name": "priority:P1"}}})
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues/23/timeline":
 			body, _ = json.Marshal([]map[string]any{
 				{"id": 11, "event": "labeled", "created_at": issueCreated.Add(time.Minute), "actor": map[string]any{"id": 42}, "label": map[string]any{"name": "agent-ready"}},
@@ -2093,9 +2116,9 @@ if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true
 		case "GET /repos/owner/repo/branches/main":
 			response = map[string]any{"commit": map[string]any{"sha": base}}
 		case "GET /repos/owner/repo/issues":
-			response = []map[string]any{{"number": 184, "title": "Project dispatched session", "body": "Keep the local projection current.", "created_at": createdAt}}
+			response = []map[string]any{{"number": 184, "title": "Project dispatched session", "body": completeImplementationIssueBody, "created_at": createdAt}}
 		case "GET /repos/owner/repo/issues/184":
-			response = map[string]any{"number": 184, "node_id": "issue-node", "state": "open", "title": "Project dispatched session", "body": "Keep the local projection current.", "created_at": createdAt, "user": map[string]any{"id": 42}, "labels": []map[string]any{{"name": "agent-ready"}, {"name": "priority:P1"}}}
+			response = map[string]any{"number": 184, "node_id": "issue-node", "state": "open", "title": "Project dispatched session", "body": completeImplementationIssueBody, "created_at": createdAt, "user": map[string]any{"id": 42}, "labels": []map[string]any{{"name": "agent-ready"}, {"name": "priority:P1"}}}
 		case "GET /repos/owner/repo/issues/184/timeline":
 			response = []map[string]any{
 				{"id": 11, "event": "labeled", "created_at": createdAt.Add(time.Minute), "actor": map[string]any{"id": 42}, "label": map[string]any{"name": "agent-ready"}},

@@ -4,6 +4,14 @@ Agent Symphony reads issue labels and exact issue comments as workflow controls.
 
 Label names are configurable. Run `agent-symphony config view` to see the names for the current repository; the tables below show the defaults.
 
+## Implementation issue contract
+
+GitHub Issues are the sole source of truth for implementation work. Chat messages and local story files do not authorize implementation.
+
+Before applying `agent-ready`, the issue body must contain nonempty `## Context`, `## Acceptance criteria`, `## Checklist`, `## Validation`, and dependency sections. The dependency heading is configured by `dependencies.section` and defaults to `## Dependencies`. Put the reason and relevant evidence in Context, at least one Markdown task in Checklist, expected checks in Validation, and either issue references or `None` in Dependencies. Missing, empty, or malformed required sections block dispatch.
+
+When implementation starts, record its branch, worktree, and current status on the issue. Keep status changes, checklist progress, blockers, scope changes, and validation evidence current. Link the pull request and make it close the issue.
+
 ## Issue comments
 
 Post each command as the entire comment body and do not edit it. Of `cancel` and `retry`, the latest valid comment wins.

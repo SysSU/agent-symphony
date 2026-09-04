@@ -8,7 +8,9 @@ GitHub Issues are the sole source of truth for implementation state.
 
 - Do not implement bugs, features, spikes, or tasks directly from chat. Every unit of implementation work must start from, or be attached to, a GitHub issue.
 - Before implementation, record the request, relevant evidence and context, acceptance criteria, task checklist, and validation expectations in the issue.
+- Before applying the ready label, give the issue nonempty `## Context`, `## Acceptance criteria`, `## Checklist`, `## Validation`, and `## Dependencies` sections. The checklist must contain a Markdown task. Dependencies must list issue references or say `None`.
 - Keep the issue current while working: note when work starts, check off completed tasks, record blockers and scope changes, and link the pull request.
+- When work starts, record the branch, worktree, and status on the issue. Before review, record the exact validation results and link a pull request that closes the issue.
 - Before requesting review, add the actual validation evidence to the issue or pull request.
 - Do not create local BMAD story files such as `docs/stories/*.story.md`; use the GitHub issue instead.
 - Use chat and messaging tools for discussion and notifications only. Record decisions in the GitHub issue before continuing implementation.

@@ -268,15 +268,15 @@ func TestReadCacheRejectsUnsafeState(t *testing.T) {
 
 func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 	cfg := ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", DependencySection: "Dependencies", HumanReview: "human", AutonomousMerge: "auto"}
-	body := "## Context\nfix intake\n## Acceptance Criteria\n- [ ] safe\n## Tasks\n- [ ] implement\n## Validation\ngo test\n## Dependencies\n- #3\n"
+	body := "## Context\nfix intake\n## Acceptance Criteria\n- [ ] safe\n## Checklist\n- [ ] implement\n## Validation\ngo test\n## Dependencies\n- #3\n"
 	issue := IssueInput{Number: 5, State: "open", Body: body, Labels: []string{"ready", "P1", "auto"}}
 	normalized := NormalizeIssue(issue, cfg, map[int]bool{3: true})
 	if !normalized.Ready || normalized.Controls.Priority != 1 || normalized.Controls.Completion != "autonomous-merge" {
 		t.Fatalf("normalized %#v", normalized)
 	}
 	arbitrary := NormalizeIssue(IssueInput{Number: 6, State: "open", Body: "any unstructured text", Labels: []string{"ready", "P1", "auto"}}, cfg, nil)
-	if !arbitrary.Ready || len(arbitrary.Blockers) != 0 || len(arbitrary.Controls.Dependencies) != 0 {
-		t.Fatalf("arbitrary body was restricted: %#v", arbitrary)
+	if arbitrary.Ready || len(arbitrary.contractBlockers) != 5 || len(arbitrary.Controls.Dependencies) != 0 {
+		t.Fatalf("incomplete contract was accepted: %#v", arbitrary)
 	}
 	paths := IssuePaths("arbitrary text\n\n## Paths\n- `docs/coordination-a.md`\n- README.md\n- README.md\n")
 	if !slices.Equal(paths, []string{"README.md", "docs/coordination-a.md"}) || IssuePaths("arbitrary text") != nil {
@@ -370,8 +370,9 @@ func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 }
 
 func TestNormalizeIssueOptionalFilter(t *testing.T) {
-	cfg := ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", IssueFilter: "agent-work"}
-	issue := IssueInput{Number: 5, State: "open", Labels: []string{"ready", "P1"}}
+	cfg := ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", IssueFilter: "agent-work", DependencySection: "Dependencies"}
+	body := "## Context\nreason\n## Acceptance criteria\n- works\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
+	issue := IssueInput{Number: 5, State: "open", Body: body, Labels: []string{"ready", "P1"}}
 	if got := NormalizeIssue(issue, cfg, nil); got.Ready || got.Controls.IssueFilter || !slices.Contains(got.Blockers, "issue filter label is missing") {
 		t.Fatalf("missing filter = %#v", got)
 	}
@@ -383,6 +384,34 @@ func TestNormalizeIssueOptionalFilter(t *testing.T) {
 	issue.Labels = issue.Labels[:2]
 	if got := NormalizeIssue(issue, cfg, nil); !got.Ready || got.Controls.IssueFilter {
 		t.Fatalf("unconfigured filter = %#v", got)
+	}
+}
+
+func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
+	cfg := ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", DependencySection: "Dependencies"}
+	complete := "## Context\nreason and evidence\n## Acceptance criteria\n- observable result\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
+	tests := []struct {
+		name, body, blocker string
+	}{
+		{"complete", complete, ""},
+		{"missing section", strings.Replace(complete, "## Validation", "## Verification", 1), "required ## Validation section is missing"},
+		{"empty section", strings.Replace(complete, "reason and evidence", "", 1), "required ## Context section is empty"},
+		{"malformed checklist", strings.Replace(complete, "- [ ] implement", "implement", 1), "## Checklist must contain a Markdown task"},
+		{"malformed dependencies", strings.Replace(complete, "None.", "to be decided", 1), "## Dependencies must contain issue references or None"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: test.body, Labels: []string{"ready", "P1"}}, cfg, nil)
+			if test.blocker == "" {
+				if !got.Ready || len(got.contractBlockers) != 0 {
+					t.Fatalf("complete contract = %#v", got)
+				}
+				return
+			}
+			if got.Ready || !slices.Contains(got.contractBlockers, test.blocker) {
+				t.Fatalf("contract = %#v, want blocker %q", got, test.blocker)
+			}
+		})
 	}
 }
 

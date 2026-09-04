@@ -43,16 +43,20 @@ type Controls struct {
 }
 
 type NormalizedIssue struct {
-	Number   int
-	Controls Controls
-	Ready    bool
-	Blockers []string
+	Number           int
+	Controls         Controls
+	Ready            bool
+	Blockers         []string
+	contractBlockers []string
 }
 
 var issueReference = regexp.MustCompile(`(?m)(?:^|\s)#([1-9][0-9]*)(?:\s|$|[,.;])`)
+var checklistItem = regexp.MustCompile(`(?m)^[ \t]*[-*+][ \t]+\[[ xX]\][ \t]+\S`)
 
 func NormalizeIssue(issue IssueInput, cfg ContractConfig, completed map[int]bool) NormalizedIssue {
 	result := NormalizedIssue{Number: issue.Number}
+	result.contractBlockers = issueContractBlockers(issue.Body, cfg.DependencySection)
+	result.Blockers = append(result.Blockers, result.contractBlockers...)
 	result.Controls.Closed = issue.State != "open"
 	result.Controls.Cancelled = issue.Cancelled
 	result.Controls.Retry = issue.Retry
@@ -113,6 +117,46 @@ func NormalizeIssue(issue IssueInput, cfg ContractConfig, completed map[int]bool
 	}
 	result.Ready = len(result.Blockers) == 0
 	return result
+}
+
+func issueContractBlockers(body, dependencySection string) []string {
+	if dependencySection == "" {
+		dependencySection = "Dependencies"
+	}
+	sections := []string{"Context", "Acceptance criteria", "Checklist", "Validation", dependencySection}
+	var blockers []string
+	for _, name := range sections {
+		section, ok := markdownSection(body, name)
+		if !ok {
+			blockers = append(blockers, fmt.Sprintf("required ## %s section is missing", name))
+			continue
+		}
+		if strings.TrimSpace(section) == "" {
+			blockers = append(blockers, fmt.Sprintf("required ## %s section is empty", name))
+			continue
+		}
+		if name == "Checklist" && !checklistItem.MatchString(section) {
+			blockers = append(blockers, "## Checklist must contain a Markdown task")
+		}
+		if name == dependencySection && !dependenciesDeclared(section) {
+			blockers = append(blockers, fmt.Sprintf("## %s must contain issue references or None", name))
+		}
+	}
+	return blockers
+}
+
+func dependenciesDeclared(section string) bool {
+	if issueReference.MatchString(section) {
+		return true
+	}
+	for _, line := range strings.Split(section, "\n") {
+		value := strings.TrimSpace(line)
+		value = strings.TrimSpace(strings.TrimLeft(value, "-*+"))
+		if strings.EqualFold(strings.TrimSuffix(value, "."), "none") {
+			return true
+		}
+	}
+	return false
 }
 
 type PermissionAuthorizer interface {

@@ -180,7 +180,7 @@ func TestRetryMustFollowEveryTerminalFailure(t *testing.T) {
 
 func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
-	body := "arbitrary issue body without structured sections"
+	body := "## Context\nreason and evidence\n## Acceptance criteria\n- result\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
 	var snapshotBodies []string
 	changed := false
 	posts := 0
@@ -303,6 +303,18 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	if err != nil || len(history) != 1 || len(history[0].TerminalAttempts) != 2 || history[0].TerminalAttempts[0].Attempt != 2 || history[0].TerminalAttempts[1].Attempt != 3 || history[0].RecoveryAttempt != 3 || !history[0].RecoveryAuthorized {
 		t.Fatalf("terminal history=%#v err=%v", history, err)
 	}
+
+	legacy, err := ParseSnapshotComment(snapshotBodies[1], 42, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = "unstructured pre-upgrade issue body"
+	legacy.BodyHash = bodyHash(body, legacy.Anchor)
+	snapshotBodies = []string{SnapshotComment(legacy)}
+	incomplete, err := FetchIssueFacts(context.Background(), api, cfg, nil, false)
+	if err != nil || len(incomplete) != 1 || incomplete[0].Eligible || incomplete[0].DispatchAuthorized || len(incomplete[0].Blockers) != 1 || !strings.Contains(incomplete[0].Blockers[0], "issue contract is incomplete") {
+		t.Fatalf("pre-upgrade incomplete snapshot facts=%#v err=%v", incomplete, err)
+	}
 }
 
 func TestContradictoryTerminalMarkersDoNotProjectFailedAttempt(t *testing.T) {
@@ -320,7 +332,7 @@ func TestContradictoryTerminalMarkersDoNotProjectFailedAttempt(t *testing.T) {
 
 func TestFetchIssueFactsAutonomousLabelsAuthorizeWithoutApproval(t *testing.T) {
 	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
-	body := "## Context\nx\n## Acceptance Criteria\nx\n## Tasks\nx\n## Validation\nx\n## Dependencies\nnone\n"
+	body := "## Context\nx\n## Acceptance Criteria\nx\n## Checklist\n- [ ] x\n## Validation\nx\n## Dependencies\nnone\n"
 	var snapshots []string
 	autonomous, edited, priorityChanged, approved := true, false, false, false
 	actor, posts := 5, 0
@@ -440,6 +452,7 @@ func TestFetchIssueFactsAutonomousLabelsAuthorizeWithoutApproval(t *testing.T) {
 
 func TestFetchIssueFactsRequiresConfiguredIssueFilter(t *testing.T) {
 	now := time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
+	body := "## Context\nx\n## Acceptance criteria\nx\n## Checklist\n- [ ] x\n## Validation\nx\n## Dependencies\nNone.\n"
 	filterPresent := false
 	var snapshots []string
 	posts := 0
@@ -464,9 +477,9 @@ func TestFetchIssueFactsRequiresConfiguredIssueFilter(t *testing.T) {
 		case "GET /repos/o/r/branches/main":
 			response = map[string]any{"commit": map[string]any{"sha": "abcdef0"}}
 		case "GET /repos/o/r/issues?state=open&per_page=100&page=1":
-			response = []any{map[string]any{"number": 10, "title": "filtered", "body": "work", "created_at": now}}
+			response = []any{map[string]any{"number": 10, "title": "filtered", "body": body, "created_at": now}}
 		case "GET /repos/o/r/issues/10":
-			response = map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": "work", "created_at": now, "user": map[string]any{"id": 5}, "labels": labels}
+			response = map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 5}, "labels": labels}
 		case "GET /repos/o/r/issues/10/timeline?per_page=100&page=1":
 			response = events
 		case "GET /repos/o/r/issues/10/comments?per_page=100&page=1":
