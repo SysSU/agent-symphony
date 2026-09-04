@@ -16,6 +16,8 @@ import (
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	extensionast "github.com/yuin/goldmark/extension/ast"
 	goldmarktext "github.com/yuin/goldmark/text"
 )
 
@@ -56,7 +58,7 @@ type NormalizedIssue struct {
 }
 
 var issueReference = regexp.MustCompile(`(?m)(?:^|\s)#([1-9][0-9]*)(?:\s|$|[,.;])`)
-var checklistItem = regexp.MustCompile(`(?m)^[ \t]*(?:[-*+]|[0-9]{1,9}[.)])[ \t]+\[[ xX]\][ \t]+\S`)
+var issueMarkdown = goldmark.New(goldmark.WithExtensions(extension.TaskList))
 
 func NormalizeIssue(issue IssueInput, cfg ContractConfig, completed map[int]bool) NormalizedIssue {
 	result := NormalizedIssue{Number: issue.Number}
@@ -140,7 +142,7 @@ func issueContractBlockers(body, dependencySection string) []string {
 			blockers = append(blockers, fmt.Sprintf("required ## %s section is empty", name))
 			continue
 		}
-		if name == "Checklist" && !checklistItem.MatchString(section) {
+		if name == "Checklist" && !markdownSectionHasTask(body, name) {
 			blockers = append(blockers, "## Checklist must contain a Markdown task")
 		}
 		if name == dependencySection && !dependenciesDeclared(section) {
@@ -180,8 +182,12 @@ func AuthorizedControlActor(actorID int, authorizer PermissionAuthorizer) (bool,
 }
 
 func markdownSection(body, name string) (string, bool) {
+	return markdownVisibleSection(body, name, false)
+}
+
+func markdownVisibleSection(body, name string, preserveSingleLineCode bool) (string, bool) {
 	source := []byte(body)
-	document := goldmark.DefaultParser().Parse(goldmarktext.NewReader(source))
+	document := issueMarkdown.Parser().Parse(goldmarktext.NewReader(source))
 	found := false
 	var section bytes.Buffer
 	for node := document.FirstChild(); node != nil; node = node.NextSibling() {
@@ -190,18 +196,13 @@ func markdownSection(body, name string) (string, bool) {
 			break
 		}
 		if found {
-			markdownAppendVisible(&section, node, source)
+			markdownAppendVisible(&section, node, source, preserveSingleLineCode)
 			continue
 		}
-		if !isHeading || heading.Level != 2 || heading.Lines().Len() == 0 {
+		if !isHeading || !markdownHeadingNamed(heading, source, name) {
 			continue
 		}
-		segment := heading.Lines().At(0)
-		lineStart := markdownLineStart(source, segment.Start)
-		prefix := bytes.TrimSpace(source[lineStart:segment.Start])
-		if bytes.Equal(prefix, []byte("##")) && strings.EqualFold(string(heading.Text(source)), name) {
-			found = true
-		}
+		found = true
 	}
 	if !found {
 		return "", false
@@ -209,7 +210,44 @@ func markdownSection(body, name string) (string, bool) {
 	return strings.TrimSuffix(section.String(), "\n"), true
 }
 
-func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte) {
+func markdownHeadingNamed(heading *ast.Heading, source []byte, name string) bool {
+	if heading.Level != 2 || heading.Lines().Len() == 0 {
+		return false
+	}
+	segment := heading.Lines().At(0)
+	lineStart := markdownLineStart(source, segment.Start)
+	prefix := bytes.TrimSpace(source[lineStart:segment.Start])
+	return bytes.Equal(prefix, []byte("##")) && strings.EqualFold(string(heading.Text(source)), name)
+}
+
+func markdownSectionHasTask(body, name string) bool {
+	source := []byte(body)
+	document := issueMarkdown.Parser().Parse(goldmarktext.NewReader(source))
+	found := false
+	for node := document.FirstChild(); node != nil; node = node.NextSibling() {
+		heading, isHeading := node.(*ast.Heading)
+		if found && isHeading && heading.Level <= 2 {
+			break
+		}
+		if !found {
+			found = isHeading && markdownHeadingNamed(heading, source, name)
+			continue
+		}
+		hasTask := false
+		_ = ast.Walk(node, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+			if entering && node.Kind() == extensionast.KindTaskCheckBox {
+				hasTask = true
+			}
+			return ast.WalkContinue, nil
+		})
+		if hasTask {
+			return true
+		}
+	}
+	return false
+}
+
+func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte, preserveSingleLineCode bool) {
 	switch node.Kind() {
 	case ast.KindCodeBlock, ast.KindFencedCodeBlock, ast.KindHTMLBlock:
 		return
@@ -229,7 +267,7 @@ func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte) 
 			switch node.Kind() {
 			case ast.KindCodeSpan:
 				span := node.(*ast.CodeSpan)
-				if span.FirstChild() != nil && markdownLineStart(source, span.FirstChild().(*ast.Text).Segment.Start) != markdownLineStart(source, span.LastChild().(*ast.Text).Segment.Stop) {
+				if span.FirstChild() != nil && (!preserveSingleLineCode || markdownLineStart(source, span.FirstChild().(*ast.Text).Segment.Start) != markdownLineStart(source, span.LastChild().(*ast.Text).Segment.Stop)) {
 					for child := span.FirstChild(); child != nil; child = child.NextSibling() {
 						markdownMask(visible, start, child.(*ast.Text).Segment)
 					}
@@ -257,7 +295,7 @@ func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte) 
 		return
 	}
 	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
-		markdownAppendVisible(section, child, source)
+		markdownAppendVisible(section, child, source, preserveSingleLineCode)
 	}
 }
 
@@ -312,7 +350,7 @@ func markdownMask(section []byte, offset int, segment goldmarktext.Segment) {
 }
 
 func IssuePaths(body string) []string {
-	section, ok := markdownSection(body, "Paths")
+	section, ok := markdownVisibleSection(body, "Paths", true)
 	if !ok {
 		return nil
 	}

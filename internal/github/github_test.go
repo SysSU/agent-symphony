@@ -421,6 +421,8 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 		{"inline HTML code checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<code>- [ ] code only</code>", 1), "required ## Checklist section is empty"},
 		{"multiline code-span dependencies", strings.Replace(complete, "None.", "`start\n    #123\nend`", 1), "## Dependencies must contain issue references or None"},
 		{"inline HTML code dependencies", strings.Replace(complete, "None.", "<code>#123</code>", 1), "required ## Dependencies section is empty"},
+		{"single-line code-span dependencies", strings.Replace(complete, "None.", "- ` #123 `", 1), "## Dependencies must contain issue references or None"},
+		{"inline HTML before non-task", strings.Replace(complete, "### Backend\n- [ ] implement", "<code>prefix</code> - [ ] not a task", 1), "## Checklist must contain a Markdown task"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
