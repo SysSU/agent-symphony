@@ -181,6 +181,7 @@ func markdownSection(body, name string) (string, bool) {
 	var containers []int
 	var fence byte
 	var fenceWidth, fenceContainer int
+	var htmlComment bool
 	for i, line := range lines {
 		indent, _ := markdownIndent(line, 0)
 		if fence != 0 {
@@ -193,6 +194,11 @@ func markdownSection(body, name string) (string, bool) {
 				continue
 			}
 			fence = 0
+		}
+		if htmlComment {
+			lines[i] = ""
+			htmlComment = !strings.Contains(line, "-->")
+			continue
 		}
 		if strings.TrimSpace(line) != "" {
 			for len(containers) > 0 && indent < containers[len(containers)-1] {
@@ -207,13 +213,20 @@ func markdownSection(body, name string) (string, bool) {
 			lines[i] = ""
 			continue
 		}
-		if next, ok := markdownListIndent(line, container); ok {
+		blockLine, blockMargin := line, container
+		if next, content, ok := markdownListIndent(line, container); ok {
 			containers = append(containers, next)
 			container = next
+			blockLine, blockMargin = content, 0
 		}
-		marker, width, rest := markdownFence(line, container)
+		marker, width, rest := markdownFence(blockLine, blockMargin)
 		if marker != 0 && (marker == '~' || !strings.Contains(rest, "`")) {
 			fence, fenceWidth, fenceContainer, lines[i] = marker, width, container, ""
+			continue
+		}
+		if comment := strings.Index(blockLine, "<!--"); comment >= 0 {
+			lines[i] = ""
+			htmlComment = !strings.Contains(blockLine[comment+4:], "-->")
 			continue
 		}
 		level, title := markdownHeading(line)
@@ -231,21 +244,23 @@ func markdownSection(body, name string) (string, bool) {
 	return "", false
 }
 
-func markdownListIndent(line string, container int) (int, bool) {
+func markdownListIndent(line string, container int) (int, string, bool) {
 	indent, start := markdownIndent(line, 0)
 	if indent < container || indent-container > 3 || start == len(line) {
-		return 0, false
+		return 0, "", false
 	}
 	prefix := markdownListItem.FindString(line[start:])
 	if prefix == "" {
-		return 0, false
+		return 0, "", false
 	}
 	marker := strings.IndexAny(prefix, " \t")
 	padding, _ := markdownIndent(prefix[marker:], indent+marker)
+	consumed := len(prefix) - marker
 	if padding > 4 {
 		padding = 1
+		consumed = 1
 	}
-	return indent + marker + padding, true
+	return indent + marker + padding, line[start+marker+consumed:], true
 }
 
 func markdownIndent(line string, column int) (int, int) {

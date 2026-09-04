@@ -404,6 +404,8 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 		{"nested fenced-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "- Example:\n\n    ~~~md\n    - [ ] implement\n    ~~~", 1), "## Checklist must contain a Markdown task"},
 		{"fenced-only dependencies", strings.Replace(complete, "None.", "Example:\n```md\n#123\n```", 1), "## Dependencies must contain issue references or None"},
 		{"nested fenced-only dependencies", strings.Replace(complete, "None.", "- Example:\n\n    ```md\n    #123\n    ```", 1), "## Dependencies must contain issue references or None"},
+		{"comment-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<!--\n- [ ] implement\n-->", 1), "required ## Checklist section is empty"},
+		{"comment-only dependencies", strings.Replace(complete, "None.", "<!--\n#123\n-->", 1), "required ## Dependencies section is empty"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -437,6 +439,15 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 	}
 	fakeContract := strings.Replace(complete, "None.", "#123", 1) + "## Paths\n- internal/fake.go\n"
 	for _, marker := range []string{"```", "~~~"} {
+		t.Run("same-line list fence "+marker, func(t *testing.T) {
+			fake := "- " + marker + "md\n  " + strings.ReplaceAll(fakeContract, "\n", "\n  ") + marker + "\n"
+			got := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: fake, Labels: []string{"ready", "P1"}}, cfg, map[int]bool{123: true})
+			if got.Ready || len(got.contractBlockers) != 5 || len(got.Controls.Dependencies) != 0 || len(IssuePaths(fake)) != 0 {
+				t.Fatalf("same-line list fenced fake contract = %#v, paths=%#v", got, IssuePaths(fake))
+			}
+		})
+	}
+	for _, marker := range []string{"```", "~~~"} {
 		t.Run("indented pseudo-closer "+marker, func(t *testing.T) {
 			fake := marker + "md\n    " + marker + "\n" + fakeContract + marker + "\n"
 			got := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: fake, Labels: []string{"ready", "P1"}}, cfg, map[int]bool{123: true})
@@ -452,6 +463,14 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 	}
 	if paths := IssuePaths("## Paths\n    - internal/fake.go\n"); len(paths) != 0 {
 		t.Fatalf("indented-code paths = %#v", paths)
+	}
+	commented := "<!--\n" + fakeContract + "-->\n"
+	got = NormalizeIssue(IssueInput{Number: 5, State: "open", Body: commented, Labels: []string{"ready", "P1"}}, cfg, map[int]bool{123: true})
+	if got.Ready || len(got.contractBlockers) != 5 || len(got.Controls.Dependencies) != 0 || len(IssuePaths(commented)) != 0 {
+		t.Fatalf("comment-only fake contract = %#v, paths=%#v", got, IssuePaths(commented))
+	}
+	if paths := IssuePaths("## Paths\n<!--\n- internal/fake.go\n-->\n"); len(paths) != 0 {
+		t.Fatalf("comment-only paths = %#v", paths)
 	}
 }
 
