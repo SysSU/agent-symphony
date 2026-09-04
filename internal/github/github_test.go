@@ -394,6 +394,8 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 		name, body, blocker string
 	}{
 		{"complete", complete, ""},
+		{"empty heading before contract", "##\n" + complete, ""},
+		{"empty closing-hash heading after contract", complete + "## ###\n", ""},
 		{"ordered task", strings.Replace(complete, "- [ ] implement", "1. [ ] implement", 1), ""},
 		{"closing heading hashes", strings.Replace(complete, "## Context", "## Context ##", 1), ""},
 		{"task with inline comment", strings.Replace(complete, "- [ ] implement", "- [ ] implement <!-- rationale -->", 1), ""},
@@ -412,6 +414,9 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 		{"comment-only dependencies", strings.Replace(complete, "None.", "<!--\n#123\n-->", 1), "required ## Dependencies section is empty"},
 		{"pre-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<pre>\n- [ ] implement\n</pre>", 1), "required ## Checklist section is empty"},
 		{"pre-only dependencies", strings.Replace(complete, "None.", "<pre>\n#123\n</pre>", 1), "required ## Dependencies section is empty"},
+		{"empty backtick fence", strings.Replace(complete, "### Evidence\nreason and evidence", "```\n```", 1), "required ## Context section is empty"},
+		{"empty tilde fence", strings.Replace(complete, "### Evidence\nreason and evidence", "~~~\n~~~", 1), "required ## Context section is empty"},
+		{"dependency fence info", strings.Replace(complete, "None.", "```md #123\n```", 1), "required ## Dependencies section is empty"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -485,6 +490,9 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 	}
 	if paths := IssuePaths("## Paths\n<pre>\n- internal/fake.go\n</pre>\n"); len(paths) != 0 {
 		t.Fatalf("preformatted paths = %#v", paths)
+	}
+	if paths := IssuePaths("## Paths\n```internal/fake.go\n```\n"); len(paths) != 0 {
+		t.Fatalf("fence-info paths = %#v", paths)
 	}
 }
 

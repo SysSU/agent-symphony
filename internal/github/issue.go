@@ -182,57 +182,60 @@ func AuthorizedControlActor(actorID int, authorizer PermissionAuthorizer) (bool,
 func markdownSection(body, name string) (string, bool) {
 	source := []byte(body)
 	document := goldmark.DefaultParser().Parse(goldmarktext.NewReader(source))
-	start, end := -1, len(source)
+	found := false
+	var section bytes.Buffer
 	for node := document.FirstChild(); node != nil; node = node.NextSibling() {
-		heading, ok := node.(*ast.Heading)
-		if !ok {
+		heading, isHeading := node.(*ast.Heading)
+		if found && isHeading && heading.Level <= 2 {
+			break
+		}
+		if found {
+			markdownAppendVisible(&section, node, source)
+			continue
+		}
+		if !isHeading || heading.Level != 2 || heading.Lines().Len() == 0 {
 			continue
 		}
 		segment := heading.Lines().At(0)
 		lineStart := markdownLineStart(source, segment.Start)
-		if start < 0 {
-			prefix := bytes.TrimSpace(source[lineStart:segment.Start])
-			if heading.Level == 2 && bytes.Equal(prefix, []byte("##")) && strings.EqualFold(string(heading.Text(source)), name) {
-				start = markdownLineEnd(source, segment.Stop)
-			}
-			continue
-		}
-		if heading.Level <= 2 {
-			end = lineStart
-			if end > start {
-				end--
-			}
-			break
+		prefix := bytes.TrimSpace(source[lineStart:segment.Start])
+		if bytes.Equal(prefix, []byte("##")) && strings.EqualFold(string(heading.Text(source)), name) {
+			found = true
 		}
 	}
-	if start < 0 {
+	if !found {
 		return "", false
 	}
-	section := append([]byte(nil), source[start:end]...)
-	_ = ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
-		if !entering {
+	return strings.TrimSuffix(section.String(), "\n"), true
+}
+
+func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte) {
+	switch node.Kind() {
+	case ast.KindCodeBlock, ast.KindFencedCodeBlock, ast.KindHTMLBlock:
+		return
+	case ast.KindHeading, ast.KindParagraph, ast.KindTextBlock:
+		if node.Lines().Len() == 0 {
+			return
+		}
+		first := node.Lines().At(0)
+		last := node.Lines().At(node.Lines().Len() - 1)
+		start := markdownLineStart(source, first.Start)
+		visible := append([]byte(nil), source[start:markdownLineEnd(source, last.Stop)]...)
+		_ = ast.Walk(node, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+			if entering && node.Kind() == ast.KindRawHTML {
+				raw := node.(*ast.RawHTML)
+				for i := 0; i < raw.Segments.Len(); i++ {
+					markdownMask(visible, start, raw.Segments.At(i))
+				}
+			}
 			return ast.WalkContinue, nil
-		}
-		switch node.Kind() {
-		case ast.KindCodeBlock, ast.KindFencedCodeBlock:
-			markdownMaskLines(section, start, node.Lines())
-			return ast.WalkSkipChildren, nil
-		case ast.KindHTMLBlock:
-			block := node.(*ast.HTMLBlock)
-			markdownMaskLines(section, start, block.Lines())
-			if block.HasClosure() {
-				markdownMask(section, start, block.ClosureLine)
-			}
-			return ast.WalkSkipChildren, nil
-		case ast.KindRawHTML:
-			raw := node.(*ast.RawHTML)
-			for i := 0; i < raw.Segments.Len(); i++ {
-				markdownMask(section, start, raw.Segments.At(i))
-			}
-		}
-		return ast.WalkContinue, nil
-	})
-	return string(section), true
+		})
+		section.Write(visible)
+		return
+	}
+	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+		markdownAppendVisible(section, child, source)
+	}
 }
 
 func markdownLineStart(source []byte, offset int) int {
@@ -244,12 +247,6 @@ func markdownLineEnd(source []byte, offset int) int {
 		return offset + newline + 1
 	}
 	return len(source)
-}
-
-func markdownMaskLines(section []byte, offset int, lines *goldmarktext.Segments) {
-	for i := 0; i < lines.Len(); i++ {
-		markdownMask(section, offset, lines.At(i))
-	}
 }
 
 func markdownMask(section []byte, offset int, segment goldmarktext.Segment) {

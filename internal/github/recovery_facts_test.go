@@ -180,7 +180,7 @@ func TestRetryMustFollowEveryTerminalFailure(t *testing.T) {
 
 func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
-	body := "## Context\nreason and evidence\n## Acceptance criteria\n- result\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
+	body := "##\n## Context\nreason and evidence\n## Acceptance criteria\n- result\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n## ###\n"
 	var snapshotBodies []string
 	changed := false
 	posts := 0
