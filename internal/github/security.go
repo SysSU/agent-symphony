@@ -24,6 +24,9 @@ func AgentEnvironment(environment []string) []string {
 
 func AgentEnvironmentWith(environment []string, allowed ...string) ([]string, error) {
 	safe := map[string]bool{"PATH": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "TERM": true, "COLORTERM": true, "NO_COLOR": true, "CODEX_HOME": true}
+	for _, name := range []string{"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_REPO", "GH_CONFIG_DIR"} {
+		safe[name] = true
+	}
 	for _, name := range allowed {
 		if reservedAgentVariable(name) && !modelCredentialVariable(name) {
 			return nil, errors.New("reserved credential or coordinator variable " + name + " cannot be allowed")
@@ -49,6 +52,9 @@ func modelCredentialVariable(name string) bool {
 }
 
 func reservedAgentVariable(name string) bool {
+	if GitHubCLIEnvironmentVariable(name) {
+		return false
+	}
 	upper := strings.ToUpper(name)
 	if upper == "HOME" {
 		return true
@@ -65,6 +71,17 @@ func reservedAgentVariable(name string) bool {
 		if strings.Contains(upper, part) {
 			return true
 		}
+	}
+	return false
+}
+
+// GitHubCLIEnvironmentVariable reports variables used by gh to find its
+// authenticated session and target repository without copying credentials to
+// repository files.
+func GitHubCLIEnvironmentVariable(name string) bool {
+	switch name {
+	case "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_REPO", "GH_CONFIG_DIR":
+		return true
 	}
 	return false
 }

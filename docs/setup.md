@@ -44,7 +44,7 @@ gh auth status
 gh repo view OWNER/REPOSITORY
 ```
 
-Agent Symphony uses that account to work with issues and pull requests. For unattended setups, `gh` can read `GH_TOKEN` or `GITHUB_TOKEN` instead; Agent Symphony does not store it. See [GitHub CLI integration](github-cli.md).
+Agent Symphony uses that account to work with issues and pull requests. In zero-admin mode, daemon and agent roles share this stored login. For unattended or advanced host-isolated setups, `gh` can read `GH_TOKEN` or `GITHUB_TOKEN`; Agent Symphony forwards it only through the authorized role environments and does not write it to repository files. See [GitHub CLI integration](github-cli.md).
 
 ## 3. Initialize the repository
 
@@ -174,7 +174,7 @@ New configuration created by `agent-symphony init` enables the advisory orchestr
 ["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"]
 ```
 
-Agent Symphony replaces `{orchestrator_workspace}` with the managed absolute path. Full Codex access is necessary for direct GitHub and tmux inspection, but it also exposes other resources readable by the coordinator user. Use it only with a trusted model. Advanced host isolation runs the orchestrator as the reviewer identity, which cannot inspect the coordinator user's GitHub login or tmux server. After changing the command, use the dashboard Rebuild action, then rerun `validate` and `doctor`.
+Agent Symphony replaces `{orchestrator_workspace}` with the managed absolute path. Full Codex access is necessary for direct GitHub and tmux inspection, but it also exposes other resources readable by the coordinator user. Use it only with a trusted model. Advanced host isolation runs the orchestrator and heartbeat as the reviewer identity. They cannot inspect the coordinator user's stored login or tmux server, so provide a supported GitHub CLI token variable to the service or authenticate that fixed account separately. After changing the command, use the dashboard Rebuild action, then rerun `validate` and `doctor`.
 
 ## Advanced: host-isolated mode
 
@@ -190,4 +190,4 @@ sudo /usr/local/libexec/agent-symphony/VERSION/agent-symphony \
 
 Rerun `install-host` after every binary upgrade. `doctor` and `serve` automatically require the stricter boundary once it is installed. The boundary environment variables are test seams, not production setup.
 
-When the orchestrator is configured in this mode, Agent Symphony launches it through the reviewer identity and snapshot group. Rerun `install-host` after upgrading so the exact reviewer-identity orchestrator rule remains current.
+When the orchestrator is configured in this mode, Agent Symphony launches it through the reviewer identity and snapshot group. Start the service with `GH_TOKEN` or `GITHUB_TOKEN` (or the enterprise equivalent) so implementation, review, orchestrator, and heartbeat sessions use the same authenticated CLI path. Rerun `install-host` after upgrading so the exact reviewer-identity orchestrator rule and its bounded GitHub environment pass-through remain current.

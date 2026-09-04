@@ -278,17 +278,17 @@ func restoreSudoers(path string, body []byte) error {
 func installableSudoAuthority(body []byte, binary string) bool {
 	for _, line := range strings.Split(string(body), "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "(") {
-			return exactSudoAuthority(body, binary) || exactSudoAuthorityFor(body, binary, false)
+			return exactSudoAuthority(body, binary) || exactSudoAuthorityFor(body, binary, true, false) || exactSudoAuthorityFor(body, binary, false, false)
 		}
 	}
 	return true
 }
 
 func exactSudoAuthority(body []byte, binary string) bool {
-	return exactSudoAuthorityFor(body, binary, true)
+	return exactSudoAuthorityFor(body, binary, true, true)
 }
 
-func exactSudoAuthorityFor(body []byte, binary string, orchestrator bool) bool {
+func exactSudoAuthorityFor(body []byte, binary string, orchestrator, setenv bool) bool {
 	want := map[string]bool{
 		workerUser + ":" + attemptGroup + "\x00" + binary + " agent-host implementation": false,
 		reviewerUser + ":" + snapshotGroup + "\x00" + binary + " agent-host review":      false,
@@ -303,6 +303,13 @@ func exactSudoAuthorityFor(body []byte, binary string, orchestrator bool) bool {
 		}
 		runas, command, ok := strings.Cut(line, ") NOPASSWD:")
 		if !ok {
+			return false
+		}
+		hasSetenv := strings.HasPrefix(command, "SETENV:")
+		if hasSetenv {
+			command = strings.TrimPrefix(command, "SETENV:")
+		}
+		if hasSetenv != setenv {
 			return false
 		}
 		parts := strings.Split(strings.TrimPrefix(runas, "("), ":")
@@ -581,7 +588,7 @@ func parseDSCLRecord(body []byte) map[string]string {
 }
 
 func writeSudoers(coordinator, binary string) (bool, error) {
-	body := fmt.Sprintf("# managed by agent-symphony; rerun install-host after upgrades\n%s ALL=(%s:%s) NOPASSWD: %s agent-host implementation\n%s ALL=(%s:%s) NOPASSWD: %s agent-host review\n%s ALL=(%s:%s) NOPASSWD: %s agent-host orchestrator\n", coordinator, workerUser, attemptGroup, binary, coordinator, reviewerUser, snapshotGroup, binary, coordinator, reviewerUser, snapshotGroup, binary)
+	body := fmt.Sprintf("# managed by agent-symphony; rerun install-host after upgrades\n%s ALL=(%s:%s) NOPASSWD:SETENV: %s agent-host implementation\n%s ALL=(%s:%s) NOPASSWD:SETENV: %s agent-host review\n%s ALL=(%s:%s) NOPASSWD:SETENV: %s agent-host orchestrator\n", coordinator, workerUser, attemptGroup, binary, coordinator, reviewerUser, snapshotGroup, binary, coordinator, reviewerUser, snapshotGroup, binary)
 	dir, path := nativeRoot("/etc/sudoers.d"), nativeRoot("/etc/sudoers.d/agent-symphony")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return false, err
@@ -1344,6 +1351,9 @@ func validTmuxTarget(target string, pane bool) bool {
 }
 
 func reservedHostEnvironment(name string) bool {
+	if internalgithub.GitHubCLIEnvironmentVariable(name) {
+		return false
+	}
 	upper := strings.ToUpper(name)
 	if upper == "HOME" || upper == "TMUX_TMPDIR" {
 		return true
@@ -1688,7 +1698,7 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 	}
 	signal := buffer + "-launched"
 	command := agentruntime.HandoffPromptCommand(helper, "tmux", buffer, resultPath, launchedPath, recipient, signal, request.Command)
-	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony handoff in the current worktree. It may contain review feedback or confirmed human instructions. %s Current source refs are available under refs/remotes/agent-symphony/. Do not push or use GitHub credentials; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", humanInstructionPrecedence, request.Handoff)
+	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony handoff in the current worktree. It may contain review feedback or confirmed human instructions. %s Current source refs are available under refs/remotes/agent-symphony/. Do not push; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", humanInstructionPrecedence, request.Handoff)
 	if _, err := runHostTmux(ctx, []string{"load-buffer", "-b", buffer, "-"}, bytes.NewReader(prompt)); err != nil {
 		return "", err
 	}

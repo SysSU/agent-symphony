@@ -284,7 +284,7 @@ func valueAfter(args []string, flag string) string {
 	return ""
 }
 
-func TestLifecycleCreatesUncredentialedRepositoryAndPreservesPrimary(t *testing.T) {
+func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *testing.T) {
 	r, fake, attempt, primary := testRuntime(t)
 	before := gitOutput(t, primary, "status", "--porcelain=v1", "--branch")
 	t.Setenv("GITHUB_TOKEN", "credential-canary")
@@ -308,14 +308,17 @@ func TestLifecycleCreatesUncredentialedRepositoryAndPreservesPrimary(t *testing.
 	if got := gitOutput(t, primary, "status", "--porcelain=v1", "--branch"); got != before {
 		t.Fatalf("primary checkout changed: before %q after %q", before, got)
 	}
+	credentialAvailable, repositoryBound := false, false
 	for _, command := range fake.seen {
 		if command.Name != "tmux" {
 			continue
 		}
 		joined := strings.Join(append(command.Args, command.Env...), " ")
-		if strings.Contains(joined, "credential-canary") || strings.Contains(joined, "GITHUB_TOKEN") {
-			t.Fatalf("credential reached agent command: %#v", command)
-		}
+		credentialAvailable = credentialAvailable || strings.Contains(joined, "GITHUB_TOKEN=credential-canary")
+		repositoryBound = repositoryBound || strings.Contains(joined, "GH_REPO=owner/repo")
+	}
+	if !credentialAvailable || !repositoryBound {
+		t.Fatal("GitHub CLI authentication or repository binding was unavailable in the implementation session")
 	}
 	info, err := os.Stat(r.manifestPath(attempt))
 	if err != nil || info.Mode().Perm() != 0o600 {
@@ -1079,6 +1082,15 @@ func TestForgetRemovesOnlyCleanedAttemptRecord(t *testing.T) {
 	}
 }
 
+func TestCredentialedSessionLaunchFailureIsRedacted(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	t.Setenv("GITHUB_TOKEN", "credential-canary")
+	fake.fail = "new-session"
+	if _, err := r.PrepareAndStart(t.Context(), attempt); err == nil || strings.Contains(err.Error(), "credential-canary") {
+		t.Fatalf("credentialed launch failure was not safely redacted: %v", err)
+	}
+}
+
 func TestWorkerIdentityFailsClosedBeforeMutation(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	r.VerifyWorker = nil
@@ -1101,7 +1113,7 @@ func TestWorkerIdentityFailsClosedBeforeMutation(t *testing.T) {
 	if _, err := r.PrepareAndStart(context.Background(), missingCommand); err == nil || !strings.Contains(err.Error(), "command") {
 		t.Fatalf("missing command = %v", err)
 	}
-	r.AllowEnv = []string{"GITHUB_TOKEN"}
+	r.AllowEnv = []string{"SSH_AUTH_SOCK"}
 	if _, err := r.PrepareAndStart(context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "environment") {
 		t.Fatalf("environment filtering error = %v", err)
 	}

@@ -1372,7 +1372,7 @@ func TestConfigureAgentCodexHomeLinksCapabilitiesAndIsolatesRuntimeState(t *test
 	}
 }
 
-func TestWorkerBoundaryStripsCredentialCanaries(t *testing.T) {
+func TestWorkerBoundarySharesOnlyGitHubCLICredentials(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "boundary")
 	body := "#!/bin/sh\nprintf '{\"Output\":\"%s|%s|%s\",\"Code\":0,\"Exited\":false}' \"$GITHUB_TOKEN\" \"$GH_TOKEN\" \"$MODEL_TOKEN\"\n"
@@ -1383,7 +1383,7 @@ func TestWorkerBoundaryStripsCredentialCanaries(t *testing.T) {
 	t.Setenv("GH_TOKEN", "gh-canary")
 	t.Setenv("MODEL_TOKEN", "model-canary")
 	result, err := (workerBoundaryRunner{Command: script}).call(context.Background(), "verify", agentruntime.Command{})
-	if err != nil || result.Output != "||" {
+	if err != nil || result.Output != "github-canary|gh-canary|" {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
 }
@@ -2483,7 +2483,7 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	if err != nil || load < 0 || start < load || !strings.Contains(string(log), "worker-capture") {
 		t.Fatalf("review stdin was not loaded before reviewer start: %s err=%v", log, err)
 	}
-	if !strings.Contains(string(log), `OPENAI_API_KEY=model-canary`) || slices.ContainsFunc([]string{"github-canary", "ssh-canary", "cloud-canary", "proxy-canary", "app-canary", "/coordinator-home"}, func(secret string) bool { return strings.Contains(string(log), secret) }) {
+	if !strings.Contains(string(log), `OPENAI_API_KEY=model-canary`) || !strings.Contains(string(log), `GITHUB_TOKEN=github-canary`) || !strings.Contains(string(log), `GH_REPO=o/r`) || slices.ContainsFunc([]string{"ssh-canary", "cloud-canary", "proxy-canary", "app-canary", "/coordinator-home"}, func(secret string) bool { return strings.Contains(string(log), secret) }) {
 		t.Fatalf("review boundary environment was not safely filtered: %s", log)
 	}
 	if !strings.Contains(string(log), `"reviewer","--custom"`) || strings.Contains(string(log), "--output-last-message") {

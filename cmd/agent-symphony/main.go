@@ -37,6 +37,7 @@ import (
 const (
 	outputVersion              = 1
 	humanInstructionPrecedence = "Confirmed human instructions amend the issue contract. Apply them in listed chronological order; a later human instruction supersedes conflicting earlier issue text or human instructions. Automated review feedback never supersedes a conflicting human instruction."
+	githubCLIPreserveEnv       = "--preserve-env=GH_TOKEN,GITHUB_TOKEN,GH_ENTERPRISE_TOKEN,GITHUB_ENTERPRISE_TOKEN,GH_HOST,GH_REPO,GH_CONFIG_DIR"
 )
 
 var releaseMetadata = "agent-symphony-release-version:devel"
@@ -195,7 +196,7 @@ func (b workerBoundaryRunner) call(ctx context.Context, operation string, comman
 
 func minimalBoundaryEnvironment() []string {
 	var env []string
-	for _, name := range []string{"PATH", "TMPDIR", "SYSTEMROOT", "CODEX_HOME"} {
+	for _, name := range []string{"PATH", "TMPDIR", "SYSTEMROOT", "CODEX_HOME", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_REPO", "GH_CONFIG_DIR"} {
 		if value := os.Getenv(name); value != "" {
 			env = append(env, name+"="+value)
 		}
@@ -214,7 +215,7 @@ func implementationBoundary(stateRoot string) workerBoundaryRunner {
 	if !hostIsolationInstalled() {
 		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "implementation"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localAttemptRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot)}}
 	}
-	return workerBoundaryRunner{Command: "sudo", Args: []string{"-n", "-u", workerUser, "-g", attemptGroup, binary, "agent-host", "implementation"}}
+	return workerBoundaryRunner{Command: "sudo", Args: []string{githubCLIPreserveEnv, "-n", "-u", workerUser, "-g", attemptGroup, binary, "agent-host", "implementation"}}
 }
 
 func reviewBoundary(stateRoot string) workerBoundaryRunner {
@@ -225,7 +226,7 @@ func reviewBoundary(stateRoot string) workerBoundaryRunner {
 	if !hostIsolationInstalled() {
 		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "review"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localSnapshotRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot)}}
 	}
-	return workerBoundaryRunner{Command: "sudo", Args: []string{"-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "review"}}
+	return workerBoundaryRunner{Command: "sudo", Args: []string{githubCLIPreserveEnv, "-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "review"}}
 }
 
 // productionAttemptRoot and productionSnapshotRoot are the single source of
@@ -2567,6 +2568,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
 	}
+	env = append(slices.Clone(env), "GH_REPO="+issue.Repository)
 	reviewBase := attempt.BaseSHA
 	if preflightObjectID.MatchString(issue.BaseSHA) {
 		reviewBase = issue.BaseSHA

@@ -59,6 +59,45 @@ func TestCLITransportUsesGitHubCLIAuthenticatedSession(t *testing.T) {
 	}
 }
 
+func TestAuthorizedRoleGitHubCLIAuthentication(t *testing.T) {
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+case "$GH_TOKEN" in
+valid) printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"id":42,"login":"authorized-role"}' ;;
+'') echo 'GitHub CLI authentication is missing' >&2; exit 4 ;;
+*) echo "GitHub CLI authentication token=$GH_TOKEN is invalid" >&2; exit 1 ;;
+esac
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{"daemon", "orchestrator", "heartbeat", "implementation", "review"} {
+		for _, auth := range []struct {
+			name, token string
+			ok          bool
+		}{{"authenticated", "valid", true}, {"missing", "", false}, {"invalid", "invalid-canary", false}} {
+			t.Run(role+"/"+auth.name, func(t *testing.T) {
+				env, err := AgentEnvironmentWith([]string{"PATH=" + dir, "GH_TOKEN=" + auth.token})
+				if err != nil {
+					t.Fatal(err)
+				}
+				api := API{BaseURL: "https://api.github.com", HTTP: &http.Client{Transport: CLITransport{Path: ghPath, Env: env}}, Retries: 1, Sleep: func(context.Context, time.Duration) error { return nil }}
+				user, err := api.AuthenticatedUser(t.Context())
+				if auth.ok {
+					if err != nil || user.Login != "authorized-role" {
+						t.Fatalf("authenticated role failed: user=%#v err=%v", user, err)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), "authenticate GitHub CLI") || strings.Contains(err.Error(), "invalid-canary") {
+					t.Fatalf("authentication failure was unclear or exposed a credential: %v", err)
+				}
+			})
+		}
+	}
+}
+
 func httpResponse(status int, body string, headers http.Header) *http.Response {
 	normalized := make(http.Header)
 	for name, values := range headers {
@@ -361,7 +400,7 @@ func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(env, "\n")
-	if strings.Contains(joined, "GITHUB_TOKEN") || strings.Contains(joined, "SSH_AUTH") || strings.Contains(joined, "SURPRISE_CREDENTIAL") || !strings.Contains(joined, "MODEL_API_KEY=allowed") {
+	if !strings.Contains(joined, "GITHUB_TOKEN=canary") || strings.Contains(joined, "SSH_AUTH") || strings.Contains(joined, "SURPRISE_CREDENTIAL") || !strings.Contains(joined, "MODEL_API_KEY=allowed") {
 		t.Fatalf("environment %s", joined)
 	}
 	if got := Redact("authorization: Bearer-canary password=hunter2", "Bearer-canary"); strings.Contains(got, "hunter2") || strings.Contains(got, "Bearer-canary") {
@@ -540,7 +579,7 @@ func TestMarkdownSectionStopsAtSameOrHigherHeading(t *testing.T) {
 }
 
 func TestAgentEnvironmentRejectsReservedExplicitNames(t *testing.T) {
-	for _, name := range []string{"GITHUB_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID", "AZURE_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDFLARE_API_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "FTP_PROXY", "APP_PEM", "MY_APP_KEY", "RANDOM_PASSWORD"} {
+	for _, name := range []string{"SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID", "AZURE_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDFLARE_API_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "FTP_PROXY", "APP_PEM", "MY_APP_KEY", "RANDOM_PASSWORD"} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := AgentEnvironmentWith([]string{name + "=value"}, name); err == nil {
 				t.Fatalf("reserved name %s accepted", name)
@@ -549,6 +588,12 @@ func TestAgentEnvironmentRejectsReservedExplicitNames(t *testing.T) {
 	}
 	if env, err := AgentEnvironmentWith([]string{"OPENAI_API_KEY=model", "PATH=/bin"}, "OPENAI_API_KEY"); err != nil || !strings.Contains(strings.Join(env, "\n"), "OPENAI_API_KEY=model") {
 		t.Fatalf("safe model credential rejected: %v %v", env, err)
+	}
+	for _, name := range []string{"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_REPO", "GH_CONFIG_DIR"} {
+		env, err := AgentEnvironmentWith([]string{name + "=value"}, name)
+		if err != nil || !strings.Contains(strings.Join(env, "\n"), name+"=value") {
+			t.Fatalf("GitHub CLI variable %s rejected", name)
+		}
 	}
 }
 

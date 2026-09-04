@@ -222,7 +222,7 @@ func (r *Runtime) ResumeHandoff(ctx context.Context, attempt Attempt) (Manifest,
 		return Manifest{}, err
 	}
 	if !live {
-		env, err := internalgithub.AgentEnvironmentWith(os.Environ(), r.AllowEnv...)
+		env, err := r.agentEnvironment(manifest.Repository)
 		if err != nil {
 			return Manifest{}, err
 		}
@@ -293,7 +293,7 @@ func (r *Runtime) RecoverInterruptedHandoff(ctx context.Context, manifest Manife
 			return manifest, false, err
 		}
 	}
-	env, err := internalgithub.AgentEnvironmentWith(os.Environ(), r.AllowEnv...)
+	env, err := r.agentEnvironment(manifest.Repository)
 	if err != nil {
 		return manifest, false, err
 	}
@@ -384,7 +384,7 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	if attempt.Context != "" && strings.TrimSpace(r.Helper) == "" {
 		return Manifest{}, errors.New("attempt capture helper is required")
 	}
-	env, err := internalgithub.AgentEnvironmentWith(append(os.Environ(), attempt.Env...), r.AllowEnv...)
+	env, err := r.agentEnvironment(attempt.Repository, attempt.Env...)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("build worker environment: %w", err)
 	}
@@ -559,7 +559,7 @@ func (r *Runtime) InterruptLegacyOperatorHandoff(ctx context.Context, manifest M
 			if _, err := r.run(ctx, r.tmux(), []string{"kill-session", "-t", "=" + manifest.Session}, "", []string{}, nil); err != nil {
 				return false, err
 			}
-			env, err := internalgithub.AgentEnvironmentWith(os.Environ(), r.AllowEnv...)
+			env, err := r.agentEnvironment(manifest.Repository)
 			if err != nil {
 				return false, err
 			}
@@ -575,6 +575,10 @@ func (r *Runtime) InterruptLegacyOperatorHandoff(ctx context.Context, manifest M
 		}
 	}
 	return false, errors.New("legacy operator handoff did not stop after interrupt")
+}
+
+func (r *Runtime) agentEnvironment(repository string, extra ...string) ([]string, error) {
+	return internalgithub.AgentEnvironmentWith(append(append(os.Environ(), extra...), "GH_REPO="+repository), r.AllowEnv...)
 }
 
 func (r *Runtime) startSession(ctx context.Context, manifest Manifest, env []string) error {
@@ -1169,7 +1173,7 @@ func (r *Runtime) run(ctx context.Context, name string, args []string, dir strin
 	}
 	result, err := runner.Run(ctx, Command{Name: name, Args: args, Dir: dir, Env: env, Stdin: stdin})
 	if err != nil {
-		return result, fmt.Errorf("%s %q failed: %s: %w", filepath.Base(name), args, strings.TrimSpace(result.Output), err)
+		return result, fmt.Errorf("%s %s failed: %s: %w", filepath.Base(name), internalgithub.Redact(fmt.Sprint(args)), internalgithub.Redact(strings.TrimSpace(result.Output)), err)
 	}
 	return result, nil
 }

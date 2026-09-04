@@ -226,7 +226,7 @@ func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 		t.Fatalf("zero-admin launcher=%#v", agent.Launcher)
 	}
 	root := localSnapshotRoot(stateRoot)
-	if !slices.Contains(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+root) || !slices.Equal(agent.ProposalCommand, []string{binary, "agent-host", "orchestrator-proposal"}) || !slices.Equal(agent.ProposalStatusCommand, []string{binary, "agent-host", "orchestrator-proposal-status"}) || agent.AuditWorkspace != filepath.Join(root, "orchestrator-audit-"+internalgithub.RepositoryIdentifier(cfg.Repository)) || len(agent.AuditCommand) == 0 {
+	if !slices.Contains(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+root) || !slices.Contains(agent.Env, "GH_REPO="+cfg.Repository) || !slices.Equal(agent.ProposalCommand, []string{binary, "agent-host", "orchestrator-proposal"}) || !slices.Equal(agent.ProposalStatusCommand, []string{binary, "agent-host", "orchestrator-proposal-status"}) || agent.AuditWorkspace != filepath.Join(root, "orchestrator-audit-"+internalgithub.RepositoryIdentifier(cfg.Repository)) || len(agent.AuditCommand) == 0 {
 		t.Fatalf("zero-admin environment=%#v proposal=%#v status=%#v", agent.Env, agent.ProposalCommand, agent.ProposalStatusCommand)
 	}
 	agent.Runner = &orchestratorTestRunner{}
@@ -247,8 +247,8 @@ func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if launched.Name != "operator-agent" || launched.Dir != agent.Workspace || !slices.Contains(launched.Env, "HOME="+current.HomeDir) || slices.Contains(launched.Env, "HOME="+coordinatorHome) || !slices.Contains(launched.Env, "AGENT_SYMPHONY_ORCHESTRATOR_ROOT="+root) || slices.ContainsFunc(launched.Env, func(value string) bool {
-		return strings.HasPrefix(value, "GH_TOKEN=") || strings.HasPrefix(value, "TMUX=")
+	if launched.Name != "operator-agent" || launched.Dir != agent.Workspace || !slices.Contains(launched.Env, "HOME="+current.HomeDir) || slices.Contains(launched.Env, "HOME="+coordinatorHome) || !slices.Contains(launched.Env, "AGENT_SYMPHONY_ORCHESTRATOR_ROOT="+root) || !slices.Contains(launched.Env, "GH_TOKEN=coordinator-canary") || slices.ContainsFunc(launched.Env, func(value string) bool {
+		return strings.HasPrefix(value, "TMUX=")
 	}) {
 		t.Fatalf("unsafe zero-admin launch: %#v", launched)
 	}
@@ -271,7 +271,7 @@ func TestAdvancedOrchestratorLaunchContractUsesSnapshotGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(agent.Launcher[:6], []string{"sudo", "-n", "-u", reviewerUser, "-g", snapshotGroup}) {
+	if !slices.Equal(agent.Launcher[:7], []string{"sudo", githubCLIPreserveEnv, "-n", "-u", reviewerUser, "-g", snapshotGroup}) {
 		t.Fatalf("orchestrator was not pinned to the reviewer identity: %#v", agent.Launcher)
 	}
 	agent.Runner = &orchestratorTestRunner{}
