@@ -221,11 +221,34 @@ func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte) 
 		last := node.Lines().At(node.Lines().Len() - 1)
 		start := markdownLineStart(source, first.Start)
 		visible := append([]byte(nil), source[start:markdownLineEnd(source, last.Stop)]...)
+		htmlCodeDepth := 0
 		_ = ast.Walk(node, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
-			if entering && node.Kind() == ast.KindRawHTML {
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			switch node.Kind() {
+			case ast.KindCodeSpan:
+				span := node.(*ast.CodeSpan)
+				if span.FirstChild() != nil && markdownLineStart(source, span.FirstChild().(*ast.Text).Segment.Start) != markdownLineStart(source, span.LastChild().(*ast.Text).Segment.Stop) {
+					for child := span.FirstChild(); child != nil; child = child.NextSibling() {
+						markdownMask(visible, start, child.(*ast.Text).Segment)
+					}
+				}
+			case ast.KindRawHTML:
 				raw := node.(*ast.RawHTML)
+				tag := markdownHTMLCodeTag(raw, source)
+				if tag < 0 && htmlCodeDepth > 0 {
+					htmlCodeDepth--
+				}
 				for i := 0; i < raw.Segments.Len(); i++ {
 					markdownMask(visible, start, raw.Segments.At(i))
+				}
+				if tag > 0 {
+					htmlCodeDepth++
+				}
+			case ast.KindText:
+				if htmlCodeDepth > 0 {
+					markdownMask(visible, start, node.(*ast.Text).Segment)
 				}
 			}
 			return ast.WalkContinue, nil
@@ -236,6 +259,37 @@ func markdownAppendVisible(section *bytes.Buffer, node ast.Node, source []byte) 
 	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
 		markdownAppendVisible(section, child, source)
 	}
+}
+
+func markdownHTMLCodeTag(raw *ast.RawHTML, source []byte) int {
+	var value bytes.Buffer
+	for i := 0; i < raw.Segments.Len(); i++ {
+		segment := raw.Segments.At(i)
+		value.Write(segment.Value(source))
+	}
+	tag := bytes.TrimSpace(value.Bytes())
+	if len(tag) < 3 || tag[0] != '<' {
+		return 0
+	}
+	closing := len(tag) > 2 && tag[1] == '/'
+	nameStart := 1
+	if closing {
+		nameStart++
+	}
+	nameEnd := nameStart
+	for nameEnd < len(tag) && (tag[nameEnd] >= 'A' && tag[nameEnd] <= 'Z' || tag[nameEnd] >= 'a' && tag[nameEnd] <= 'z' || tag[nameEnd] >= '0' && tag[nameEnd] <= '9' || tag[nameEnd] == '-') {
+		nameEnd++
+	}
+	if !bytes.EqualFold(tag[nameStart:nameEnd], []byte("code")) {
+		return 0
+	}
+	if closing {
+		return -1
+	}
+	if len(tag) > 1 && tag[len(tag)-2] == '/' {
+		return 0
+	}
+	return 1
 }
 
 func markdownLineStart(source []byte, offset int) int {

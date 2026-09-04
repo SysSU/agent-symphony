@@ -417,6 +417,10 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 		{"empty backtick fence", strings.Replace(complete, "### Evidence\nreason and evidence", "```\n```", 1), "required ## Context section is empty"},
 		{"empty tilde fence", strings.Replace(complete, "### Evidence\nreason and evidence", "~~~\n~~~", 1), "required ## Context section is empty"},
 		{"dependency fence info", strings.Replace(complete, "None.", "```md #123\n```", 1), "required ## Dependencies section is empty"},
+		{"multiline code-span checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "`start\n    - [ ] code only\nend`", 1), "## Checklist must contain a Markdown task"},
+		{"inline HTML code checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<code>- [ ] code only</code>", 1), "required ## Checklist section is empty"},
+		{"multiline code-span dependencies", strings.Replace(complete, "None.", "`start\n    #123\nend`", 1), "## Dependencies must contain issue references or None"},
+		{"inline HTML code dependencies", strings.Replace(complete, "None.", "<code>#123</code>", 1), "required ## Dependencies section is empty"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -493,6 +497,12 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 	}
 	if paths := IssuePaths("## Paths\n```internal/fake.go\n```\n"); len(paths) != 0 {
 		t.Fatalf("fence-info paths = %#v", paths)
+	}
+	if paths := IssuePaths("## Paths\n`start\n    internal/fake.go\nend`\n"); len(paths) != 0 {
+		t.Fatalf("multiline code-span paths = %#v", paths)
+	}
+	if paths := IssuePaths("## Paths\n<code>internal/fake.go</code>\n"); len(paths) != 0 {
+		t.Fatalf("inline HTML code paths = %#v", paths)
 	}
 }
 
