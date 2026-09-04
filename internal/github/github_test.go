@@ -398,10 +398,15 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 		{"empty section", strings.Replace(complete, "### Evidence\nreason and evidence", "", 1), "required ## Context section is empty"},
 		{"malformed checklist", strings.Replace(complete, "- [ ] implement", "implement", 1), "## Checklist must contain a Markdown task"},
 		{"malformed dependencies", strings.Replace(complete, "None.", "to be decided", 1), "## Dependencies must contain issue references or None"},
+		{"fenced-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "Example:\n~~~md\n- [ ] implement\n~~~", 1), "## Checklist must contain a Markdown task"},
+		{"fenced-only dependencies", strings.Replace(complete, "None.", "Example:\n```md\n#123\n```", 1), "## Dependencies must contain issue references or None"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: test.body, Labels: []string{"ready", "P1"}}, cfg, nil)
+			if len(got.Controls.Dependencies) != 0 {
+				t.Fatalf("contract parsed dependencies from fenced or invalid content: %#v", got)
+			}
 			if test.blocker == "" {
 				if !got.Ready || len(got.contractBlockers) != 0 {
 					t.Fatalf("complete contract = %#v", got)
@@ -412,6 +417,10 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 				t.Fatalf("contract = %#v, want blocker %q", got, test.blocker)
 			}
 		})
+	}
+	allFenced := NormalizeIssue(IssueInput{Number: 5, State: "open", Body: "```md\n" + complete + "```\n", Labels: []string{"ready", "P1"}}, cfg, nil)
+	if allFenced.Ready || len(allFenced.contractBlockers) != 5 || len(allFenced.Controls.Dependencies) != 0 {
+		t.Fatalf("all-fenced fake contract = %#v", allFenced)
 	}
 }
 

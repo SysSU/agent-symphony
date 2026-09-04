@@ -177,7 +177,21 @@ func AuthorizedControlActor(actorID int, authorizer PermissionAuthorizer) (bool,
 func markdownSection(body, name string) (string, bool) {
 	lines := strings.Split(body, "\n")
 	start := -1
+	var fence byte
+	var fenceWidth int
 	for i, line := range lines {
+		marker, width, rest := markdownFence(line)
+		if fence != 0 {
+			lines[i] = ""
+			if marker == fence && width >= fenceWidth && strings.TrimSpace(rest) == "" {
+				fence = 0
+			}
+			continue
+		}
+		if marker != 0 && (marker == '~' || !strings.Contains(rest, "`")) {
+			fence, fenceWidth, lines[i] = marker, width, ""
+			continue
+		}
 		level, title := markdownHeading(line)
 		if start < 0 && level == 2 && strings.EqualFold(title, name) {
 			start = i + 1
@@ -191,6 +205,24 @@ func markdownSection(body, name string) (string, bool) {
 		return strings.Join(lines[start:], "\n"), true
 	}
 	return "", false
+}
+
+func markdownFence(line string) (byte, int, string) {
+	line = strings.TrimSuffix(line, "\r")
+	indent := len(line) - len(strings.TrimLeft(line, " "))
+	if indent > 3 || indent == len(line) {
+		return 0, 0, ""
+	}
+	line = line[indent:]
+	marker := line[0]
+	if marker != '`' && marker != '~' {
+		return 0, 0, ""
+	}
+	width := len(line) - len(strings.TrimLeft(line, string(marker)))
+	if width < 3 {
+		return 0, 0, ""
+	}
+	return marker, width, line[width:]
 }
 
 func markdownHeading(line string) (int, string) {
