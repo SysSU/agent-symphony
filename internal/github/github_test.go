@@ -394,6 +394,10 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 		name, body, blocker string
 	}{
 		{"complete", complete, ""},
+		{"ordered task", strings.Replace(complete, "- [ ] implement", "1. [ ] implement", 1), ""},
+		{"closing heading hashes", strings.Replace(complete, "## Context", "## Context ##", 1), ""},
+		{"task with inline comment", strings.Replace(complete, "- [ ] implement", "- [ ] implement <!-- rationale -->", 1), ""},
+		{"none with inline comment", strings.Replace(complete, "None.", "None. <!-- no dependencies -->", 1), ""},
 		{"missing section", strings.Replace(complete, "## Validation", "## Verification", 1), "required ## Validation section is missing"},
 		{"empty section", strings.Replace(complete, "### Evidence\nreason and evidence", "", 1), "required ## Context section is empty"},
 		{"malformed checklist", strings.Replace(complete, "- [ ] implement", "implement", 1), "## Checklist must contain a Markdown task"},
@@ -406,6 +410,8 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 		{"nested fenced-only dependencies", strings.Replace(complete, "None.", "- Example:\n\n    ```md\n    #123\n    ```", 1), "## Dependencies must contain issue references or None"},
 		{"comment-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<!--\n- [ ] implement\n-->", 1), "required ## Checklist section is empty"},
 		{"comment-only dependencies", strings.Replace(complete, "None.", "<!--\n#123\n-->", 1), "required ## Dependencies section is empty"},
+		{"pre-only checklist", strings.Replace(complete, "### Backend\n- [ ] implement", "<pre>\n- [ ] implement\n</pre>", 1), "required ## Checklist section is empty"},
+		{"pre-only dependencies", strings.Replace(complete, "None.", "<pre>\n#123\n</pre>", 1), "required ## Dependencies section is empty"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -471,6 +477,14 @@ func TestNormalizeIssueRequiresCompleteContract(t *testing.T) {
 	}
 	if paths := IssuePaths("## Paths\n<!--\n- internal/fake.go\n-->\n"); len(paths) != 0 {
 		t.Fatalf("comment-only paths = %#v", paths)
+	}
+	preformatted := "<pre>\n" + fakeContract + "</pre>\n"
+	got = NormalizeIssue(IssueInput{Number: 5, State: "open", Body: preformatted, Labels: []string{"ready", "P1"}}, cfg, map[int]bool{123: true})
+	if got.Ready || len(got.contractBlockers) != 5 || len(got.Controls.Dependencies) != 0 || len(IssuePaths(preformatted)) != 0 {
+		t.Fatalf("preformatted fake contract = %#v, paths=%#v", got, IssuePaths(preformatted))
+	}
+	if paths := IssuePaths("## Paths\n<pre>\n- internal/fake.go\n</pre>\n"); len(paths) != 0 {
+		t.Fatalf("preformatted paths = %#v", paths)
 	}
 }
 

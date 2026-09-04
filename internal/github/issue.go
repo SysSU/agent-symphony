@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	goldmarktext "github.com/yuin/goldmark/text"
 )
 
 type IssueInput struct {
@@ -51,8 +56,7 @@ type NormalizedIssue struct {
 }
 
 var issueReference = regexp.MustCompile(`(?m)(?:^|\s)#([1-9][0-9]*)(?:\s|$|[,.;])`)
-var checklistItem = regexp.MustCompile(`(?m)^[ \t]*[-*+][ \t]+\[[ xX]\][ \t]+\S`)
-var markdownListItem = regexp.MustCompile(`^(?:[-*+]|[0-9]{1,9}[.)])[ \t]+`)
+var checklistItem = regexp.MustCompile(`(?m)^[ \t]*(?:[-*+]|[0-9]{1,9}[.)])[ \t]+\[[ xX]\][ \t]+\S`)
 
 func NormalizeIssue(issue IssueInput, cfg ContractConfig, completed map[int]bool) NormalizedIssue {
 	result := NormalizedIssue{Number: issue.Number}
@@ -176,137 +180,84 @@ func AuthorizedControlActor(actorID int, authorizer PermissionAuthorizer) (bool,
 }
 
 func markdownSection(body, name string) (string, bool) {
-	lines := strings.Split(body, "\n")
-	start := -1
-	var containers []int
-	var fence byte
-	var fenceWidth, fenceContainer int
-	var htmlComment bool
-	for i, line := range lines {
-		indent, _ := markdownIndent(line, 0)
-		if fence != 0 {
-			if fenceContainer == 0 || strings.TrimSpace(line) == "" || indent >= fenceContainer {
-				marker, width, rest := markdownFence(line, fenceContainer)
-				lines[i] = ""
-				if marker == fence && width >= fenceWidth && strings.TrimSpace(rest) == "" {
-					fence = 0
-				}
-				continue
+	source := []byte(body)
+	document := goldmark.DefaultParser().Parse(goldmarktext.NewReader(source))
+	start, end := -1, len(source)
+	for node := document.FirstChild(); node != nil; node = node.NextSibling() {
+		heading, ok := node.(*ast.Heading)
+		if !ok {
+			continue
+		}
+		segment := heading.Lines().At(0)
+		lineStart := markdownLineStart(source, segment.Start)
+		if start < 0 {
+			prefix := bytes.TrimSpace(source[lineStart:segment.Start])
+			if heading.Level == 2 && bytes.Equal(prefix, []byte("##")) && strings.EqualFold(string(heading.Text(source)), name) {
+				start = markdownLineEnd(source, segment.Stop)
 			}
-			fence = 0
-		}
-		if htmlComment {
-			lines[i] = ""
-			htmlComment = !strings.Contains(line, "-->")
 			continue
 		}
-		if strings.TrimSpace(line) != "" {
-			for len(containers) > 0 && indent < containers[len(containers)-1] {
-				containers = containers[:len(containers)-1]
+		if heading.Level <= 2 {
+			end = lineStart
+			if end > start {
+				end--
+			}
+			break
+		}
+	}
+	if start < 0 {
+		return "", false
+	}
+	section := append([]byte(nil), source[start:end]...)
+	_ = ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch node.Kind() {
+		case ast.KindCodeBlock, ast.KindFencedCodeBlock:
+			markdownMaskLines(section, start, node.Lines())
+			return ast.WalkSkipChildren, nil
+		case ast.KindHTMLBlock:
+			block := node.(*ast.HTMLBlock)
+			markdownMaskLines(section, start, block.Lines())
+			if block.HasClosure() {
+				markdownMask(section, start, block.ClosureLine)
+			}
+			return ast.WalkSkipChildren, nil
+		case ast.KindRawHTML:
+			raw := node.(*ast.RawHTML)
+			for i := 0; i < raw.Segments.Len(); i++ {
+				markdownMask(section, start, raw.Segments.At(i))
 			}
 		}
-		container := 0
-		if len(containers) > 0 {
-			container = containers[len(containers)-1]
-		}
-		if indent-container >= 4 {
-			lines[i] = ""
-			continue
-		}
-		blockLine, blockMargin := line, container
-		if next, content, ok := markdownListIndent(line, container); ok {
-			containers = append(containers, next)
-			container = next
-			blockLine, blockMargin = content, 0
-		}
-		marker, width, rest := markdownFence(blockLine, blockMargin)
-		if marker != 0 && (marker == '~' || !strings.Contains(rest, "`")) {
-			fence, fenceWidth, fenceContainer, lines[i] = marker, width, container, ""
-			continue
-		}
-		if comment := strings.Index(blockLine, "<!--"); comment >= 0 {
-			lines[i] = ""
-			htmlComment = !strings.Contains(blockLine[comment+4:], "-->")
-			continue
-		}
-		level, title := markdownHeading(line)
-		if start < 0 && level == 2 && strings.EqualFold(title, name) {
-			start = i + 1
-			continue
-		}
-		if start >= 0 && level > 0 && level <= 2 {
-			return strings.Join(lines[start:i], "\n"), true
-		}
-	}
-	if start >= 0 {
-		return strings.Join(lines[start:], "\n"), true
-	}
-	return "", false
+		return ast.WalkContinue, nil
+	})
+	return string(section), true
 }
 
-func markdownListIndent(line string, container int) (int, string, bool) {
-	indent, start := markdownIndent(line, 0)
-	if indent < container || indent-container > 3 || start == len(line) {
-		return 0, "", false
-	}
-	prefix := markdownListItem.FindString(line[start:])
-	if prefix == "" {
-		return 0, "", false
-	}
-	marker := strings.IndexAny(prefix, " \t")
-	padding, _ := markdownIndent(prefix[marker:], indent+marker)
-	consumed := len(prefix) - marker
-	if padding > 4 {
-		padding = 1
-		consumed = 1
-	}
-	return indent + marker + padding, line[start+marker+consumed:], true
+func markdownLineStart(source []byte, offset int) int {
+	return bytes.LastIndexByte(source[:offset], '\n') + 1
 }
 
-func markdownIndent(line string, column int) (int, int) {
-	start := column
-	for i := 0; i < len(line); i++ {
-		switch line[i] {
-		case ' ':
-			column++
-		case '\t':
-			column += 4 - column%4
-		default:
-			return column - start, i
+func markdownLineEnd(source []byte, offset int) int {
+	if newline := bytes.IndexByte(source[offset:], '\n'); newline >= 0 {
+		return offset + newline + 1
+	}
+	return len(source)
+}
+
+func markdownMaskLines(section []byte, offset int, lines *goldmarktext.Segments) {
+	for i := 0; i < lines.Len(); i++ {
+		markdownMask(section, offset, lines.At(i))
+	}
+}
+
+func markdownMask(section []byte, offset int, segment goldmarktext.Segment) {
+	for i := max(segment.Start, offset); i < min(segment.Stop, offset+len(section)); i++ {
+		if section[i-offset] != '\n' && section[i-offset] != '\r' {
+			section[i-offset] = ' '
 		}
 	}
-	return column - start, len(line)
-}
-
-func markdownFence(line string, container int) (byte, int, string) {
-	line = strings.TrimSuffix(line, "\r")
-	indent, start := markdownIndent(line, 0)
-	if indent < container || indent-container > 3 || start == len(line) {
-		return 0, 0, ""
-	}
-	line = line[start:]
-	marker := line[0]
-	if marker != '`' && marker != '~' {
-		return 0, 0, ""
-	}
-	width := len(line) - len(strings.TrimLeft(line, string(marker)))
-	if width < 3 {
-		return 0, 0, ""
-	}
-	return marker, width, line[width:]
-}
-
-func markdownHeading(line string) (int, string) {
-	indent, start := markdownIndent(line, 0)
-	if indent > 3 {
-		return 0, ""
-	}
-	line = line[start:]
-	level := len(line) - len(strings.TrimLeft(line, "#"))
-	if level < 1 || level > 6 || len(line) > level && line[level] != ' ' && line[level] != '\t' {
-		return 0, ""
-	}
-	return level, strings.TrimSpace(line[level:])
 }
 
 func IssuePaths(body string) []string {
