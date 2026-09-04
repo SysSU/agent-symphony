@@ -52,6 +52,7 @@ type NormalizedIssue struct {
 
 var issueReference = regexp.MustCompile(`(?m)(?:^|\s)#([1-9][0-9]*)(?:\s|$|[,.;])`)
 var checklistItem = regexp.MustCompile(`(?m)^[ \t]*[-*+][ \t]+\[[ xX]\][ \t]+\S`)
+var markdownListItem = regexp.MustCompile(`^(?:[-*+]|[0-9]{1,9}[.)])[ \t]+`)
 
 func NormalizeIssue(issue IssueInput, cfg ContractConfig, completed map[int]bool) NormalizedIssue {
 	result := NormalizedIssue{Number: issue.Number}
@@ -177,19 +178,42 @@ func AuthorizedControlActor(actorID int, authorizer PermissionAuthorizer) (bool,
 func markdownSection(body, name string) (string, bool) {
 	lines := strings.Split(body, "\n")
 	start := -1
+	var containers []int
 	var fence byte
-	var fenceWidth int
+	var fenceWidth, fenceContainer int
 	for i, line := range lines {
-		marker, width, rest := markdownFence(line)
+		indent, _ := markdownIndent(line, 0)
 		if fence != 0 {
-			lines[i] = ""
-			if marker == fence && width >= fenceWidth && strings.TrimSpace(rest) == "" {
-				fence = 0
+			if fenceContainer == 0 || strings.TrimSpace(line) == "" || indent >= fenceContainer {
+				marker, width, rest := markdownFence(line, fenceContainer)
+				lines[i] = ""
+				if marker == fence && width >= fenceWidth && strings.TrimSpace(rest) == "" {
+					fence = 0
+				}
+				continue
 			}
+			fence = 0
+		}
+		if strings.TrimSpace(line) != "" {
+			for len(containers) > 0 && indent < containers[len(containers)-1] {
+				containers = containers[:len(containers)-1]
+			}
+		}
+		container := 0
+		if len(containers) > 0 {
+			container = containers[len(containers)-1]
+		}
+		if indent-container >= 4 {
+			lines[i] = ""
 			continue
 		}
+		if next, ok := markdownListIndent(line, container); ok {
+			containers = append(containers, next)
+			container = next
+		}
+		marker, width, rest := markdownFence(line, container)
 		if marker != 0 && (marker == '~' || !strings.Contains(rest, "`")) {
-			fence, fenceWidth, lines[i] = marker, width, ""
+			fence, fenceWidth, fenceContainer, lines[i] = marker, width, container, ""
 			continue
 		}
 		level, title := markdownHeading(line)
@@ -207,11 +231,45 @@ func markdownSection(body, name string) (string, bool) {
 	return "", false
 }
 
-func markdownFence(line string) (byte, int, string) {
-	line = strings.TrimLeft(strings.TrimSuffix(line, "\r"), " \t")
-	if line == "" {
+func markdownListIndent(line string, container int) (int, bool) {
+	indent, start := markdownIndent(line, 0)
+	if indent < container || indent-container > 3 || start == len(line) {
+		return 0, false
+	}
+	prefix := markdownListItem.FindString(line[start:])
+	if prefix == "" {
+		return 0, false
+	}
+	marker := strings.IndexAny(prefix, " \t")
+	padding, _ := markdownIndent(prefix[marker:], indent+marker)
+	if padding > 4 {
+		padding = 1
+	}
+	return indent + marker + padding, true
+}
+
+func markdownIndent(line string, column int) (int, int) {
+	start := column
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case ' ':
+			column++
+		case '\t':
+			column += 4 - column%4
+		default:
+			return column - start, i
+		}
+	}
+	return column - start, len(line)
+}
+
+func markdownFence(line string, container int) (byte, int, string) {
+	line = strings.TrimSuffix(line, "\r")
+	indent, start := markdownIndent(line, 0)
+	if indent < container || indent-container > 3 || start == len(line) {
 		return 0, 0, ""
 	}
+	line = line[start:]
 	marker := line[0]
 	if marker != '`' && marker != '~' {
 		return 0, 0, ""
@@ -224,7 +282,11 @@ func markdownFence(line string) (byte, int, string) {
 }
 
 func markdownHeading(line string) (int, string) {
-	line = strings.TrimLeft(line, " \t")
+	indent, start := markdownIndent(line, 0)
+	if indent > 3 {
+		return 0, ""
+	}
+	line = line[start:]
 	level := len(line) - len(strings.TrimLeft(line, "#"))
 	if level < 1 || level > 6 || len(line) > level && line[level] != ' ' && line[level] != '\t' {
 		return 0, ""
