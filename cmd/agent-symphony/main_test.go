@@ -1204,9 +1204,10 @@ func (r *revokedAttemptRunner) Run(_ context.Context, command agentruntime.Comma
 }
 
 func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T) {
-	issue := internalgithub.RecoveryIssueFact{Repository: "owner/repo", Issue: 56, Attempt: 3, Body: "## Context\nunique issue contract\n\n## Validation\ngo test ./..."}
-	prompt := implementationPrompt(issue)
-	for _, want := range []string{"Repository: owner/repo", "Issue: #56", "Attempt: 3", issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "stdout", "stderr", "outside the worktree"} {
+	issue := internalgithub.RecoveryIssueFact{Repository: "owner/repo", Issue: 56, Attempt: 3, BaseBranch: "main", Body: "## Context\nunique issue contract\n\n## Validation\ngo test ./..."}
+	identity := agentruntime.Manifest{Branch: "agent-symphony/owner-repo/56-3", Worktree: "/attempts/owner-repo-56-3", Session: "as-owner-repo-56-3"}
+	prompt := implementationPrompt(issue, identity)
+	for _, want := range []string{"Project: owner/repo", "Issue: #56", "Attempt: 3", "Base branch: main", "Branch: " + identity.Branch, "Worktree: " + identity.Worktree, "Session: " + identity.Session, issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "stdout", "stderr", "outside the worktree"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt omitted %q: %s", want, prompt)
 		}
@@ -1218,6 +1219,18 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 	result, err := parseWorkerResult([]byte(line))
 	if err != nil || result.Validation == "" || result.Documentation == "" {
 		t.Fatalf("documented result was rejected: %#v, %v", result, err)
+	}
+}
+
+func TestDispatchRejectsAnythingButEligibleAuthorizedIssueBeforeBinding(t *testing.T) {
+	decision := []orchestrator.Decision{{Repository: "o/r", Number: 4, State: orchestrator.Runnable}}
+	for _, issue := range []internalgithub.RecoveryIssueFact{
+		{Repository: "o/r", Issue: 4, Attempt: 1, BaseSHA: "abcdef0", DispatchAuthorized: true},
+		{Repository: "o/r", Issue: 4, Attempt: 1, BaseSHA: "abcdef0", Eligible: true},
+	} {
+		if err := dispatchIssues(t.Context(), internalgithub.API{}, &agentruntime.Runtime{}, config.Config{}, internalgithub.PRAdapterConfig{}, []internalgithub.RecoveryIssueFact{issue}, decision); err == nil || !strings.Contains(err.Error(), "issue is not eligible") {
+			t.Fatalf("dispatch error = %v for %#v", err, issue)
+		}
 	}
 }
 
@@ -2043,7 +2056,7 @@ esac
 	}
 }
 
-func TestReconcileProjectsDispatchedSessionBeforeFailedRemoteRefresh(t *testing.T) {
+func TestReconcileFetchesEligibleIssueAndLaunchesDirectSessionWithoutOrchestrator(t *testing.T) {
 	root := gitRepository(t)
 	for _, args := range [][]string{{"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"switch", "-c", "main"}} {
 		runGit(t, root, args...)
@@ -2057,7 +2070,9 @@ func TestReconcileProjectsDispatchedSessionBeforeFailedRemoteRefresh(t *testing.
 	runGit(t, root, "update-ref", "refs/remotes/origin/main", base)
 
 	configPath := filepath.Join(root, config.DefaultPath)
-	if err := config.Write(configPath, config.Default("owner/repo")); err != nil {
+	cfg := config.Default("owner/repo")
+	cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
+	if err := config.Write(configPath, cfg); err != nil {
 		t.Fatal(err)
 	}
 	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
@@ -2079,6 +2094,7 @@ func TestReconcileProjectsDispatchedSessionBeforeFailedRemoteRefresh(t *testing.
 	source := filepath.Join(attemptRoot, internalgithub.RepositoryIdentifier(attempt.Repository)+".source.bundle")
 	boundary := filepath.Join(t.TempDir(), "implementation-boundary")
 	sessionState := filepath.Join(t.TempDir(), "session")
+	launchPayload := filepath.Join(t.TempDir(), "launch-payload.json")
 	boundaryScript := fmt.Sprintf(`#!/bin/sh
 payload=$(sed -n '1p')
 case "$payload" in
@@ -2091,10 +2107,12 @@ case "$payload" in
   *'"rev-parse","HEAD"'*) printf '{"Output":"%s"}'; exit 0;;
   *'"has-session"'*) if test -f %q; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true}'; fi; exit 0;;
   *'"new-session"'*) touch %q;;
+  *'"load-buffer"'*) printf '%%s' "$payload" >%q;;
+  *'"display-message"'*) printf '{"Output":"0"}'; exit 0;;
   *) printf '{"Code":0}'; exit 0;;
 esac
 if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true}'; fi
-`, source, manifest.Worktree, manifest.Worktree, base, manifest.Worktree, manifest.Branch, manifest.Worktree, manifest.Worktree, manifest.Branch, base, sessionState, sessionState)
+`, source, manifest.Worktree, manifest.Worktree, base, manifest.Worktree, manifest.Branch, manifest.Worktree, manifest.Worktree, manifest.Branch, base, sessionState, sessionState, launchPayload)
 	if err := os.WriteFile(boundary, []byte(boundaryScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -2102,7 +2120,7 @@ if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true
 
 	createdAt := time.Date(2026, 8, 30, 1, 0, 0, 0, time.UTC)
 	var comments []map[string]any
-	dispatched := false
+	dispatched, pullReads := false, 0
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		status := http.StatusOK
 		var response any
@@ -2129,8 +2147,9 @@ if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true
 		case "GET /repos/owner/repo/collaborators/coordinator/permission":
 			response = map[string]any{"permission": "admin"}
 		case "GET /repos/owner/repo/pulls":
-			if dispatched {
-				status, response = http.StatusBadRequest, map[string]any{"message": "forced post-dispatch read failure"}
+			pullReads++
+			if pullReads > 1 {
+				status, response = http.StatusBadRequest, map[string]any{"message": "forced coordinator read failure"}
 			} else {
 				response = []any{}
 			}
@@ -2161,8 +2180,28 @@ if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true
 		t.Fatal(err)
 	}
 	_, err = reconcileGitHub(t.Context(), configPath, statePath, stateRoot, true)
-	if err == nil || !strings.Contains(err.Error(), "refresh dispatched pull request attempts") || !dispatched {
-		t.Fatalf("post-dispatch failure err=%v dispatched=%v", err, dispatched)
+	if err == nil || !strings.Contains(err.Error(), "reconcile pull request governance") || !dispatched || pullReads != 2 {
+		t.Fatalf("post-dispatch coordinator failure err=%v dispatched=%v pull_reads=%d", err, dispatched, pullReads)
+	}
+	var launched struct {
+		Command struct {
+			Input []byte `json:"input"`
+		} `json:"command"`
+	}
+	payload, readErr := os.ReadFile(launchPayload)
+	if readErr != nil || json.Unmarshal(payload, &launched) != nil {
+		t.Fatalf("launch payload=%q err=%v", payload, readErr)
+	}
+	for _, want := range []string{"Project: owner/repo", "Issue: #184", "Base branch: main", "Branch: " + manifest.Branch, "Worktree: " + manifest.Worktree, "Session: " + manifest.Session, completeImplementationIssueBody} {
+		if !strings.Contains(string(launched.Command.Input), want) {
+			t.Fatalf("direct launch omitted %q: %s", want, launched.Command.Input)
+		}
+	}
+	if len(comments) == 0 || !slices.ContainsFunc(comments, func(comment map[string]any) bool {
+		body, _ := comment["body"].(string)
+		return strings.Contains(body, manifest.Branch) && strings.Contains(body, manifest.Worktree) && strings.Contains(body, manifest.Session)
+	}) {
+		t.Fatalf("issue did not record direct session identity: %#v", comments)
 	}
 	projected, err := (&dashboardServer{stateRoot: stateRoot}).projectedStatus(184, 1)
 	if err != nil || projected.State != "active" || projected.CurrentPhase != "implementation" || projected.Session != manifest.Session || len(projected.Sessions) != 1 || projected.Sessions[0].Name != manifest.Session {

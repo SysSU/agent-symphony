@@ -10,7 +10,7 @@ GitHub Issues are the sole source of truth for implementation work. Chat message
 
 Before applying `agent-ready`, the issue body must contain nonempty `## Context`, `## Acceptance criteria`, `## Checklist`, `## Validation`, and dependency sections. The dependency heading is configured by `dependencies.section` and defaults to `## Dependencies`. Put the reason and relevant evidence in Context, at least one Markdown task in Checklist, expected checks in Validation, and either issue references or `None` in Dependencies. Missing, empty, or malformed required sections block dispatch.
 
-When implementation starts, record its branch, worktree, and current status on the issue. Keep status changes, checklist progress, blockers, scope changes, and validation evidence current. Link the pull request and make it close the issue.
+Dispatch records the deterministic implementation branch, worktree, and tmux session in the active-attempt comment before launch. The implementation session receives that same project and issue identity in its launch context. Keep later status changes, checklist progress, blockers, scope changes, and validation evidence current. Link the pull request and make it close the issue.
 
 ## Issue comments
 

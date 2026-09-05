@@ -45,8 +45,8 @@ func TestEnsureActiveAttemptIsStrictCoordinatorAuthoredAndIdempotent(t *testing.
 			return httpResponse(http.StatusOK, string(body), nil), nil
 		case http.MethodPost:
 			var payload struct{ Body string }
-			if json.NewDecoder(r.Body).Decode(&payload) != nil || !strings.Contains(payload.Body, marker) {
-				t.Fatal("dispatch did not persist the active marker")
+			if json.NewDecoder(r.Body).Decode(&payload) != nil || !strings.Contains(payload.Body, marker) || !strings.Contains(payload.Body, "Worktree: `/worktree`") {
+				t.Fatal("dispatch did not persist the active marker and launch identity")
 			}
 			comments = append(comments, map[string]any{"body": payload.Body, "user": map[string]any{"id": 42}})
 			posts++
@@ -61,7 +61,7 @@ func TestEnsureActiveAttemptIsStrictCoordinatorAuthoredAndIdempotent(t *testing.
 	})}}
 	cfg := PRAdapterConfig{Repository: "o/r", ActorID: 42}
 	for range 2 {
-		if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0"); err != nil {
+		if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0", "Implementation session reserved.\n\n- Branch: `branch`\n- Worktree: `/worktree`\n- Session: `session`"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -69,8 +69,16 @@ func TestEnsureActiveAttemptIsStrictCoordinatorAuthoredAndIdempotent(t *testing.
 		t.Fatalf("marker posts=%d, want 1", posts)
 	}
 	comments = append(comments, map[string]any{"body": marker, "user": map[string]any{"id": 9}})
-	if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0"); err == nil || posts != 1 {
+	if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0", "Implementation session reserved."); err == nil || posts != 1 {
 		t.Fatalf("foreign marker err=%v posts=%d", err, posts)
+	}
+}
+
+func TestEnsureActiveAttemptRequiresBoundedPlainDetail(t *testing.T) {
+	for _, detail := range []string{"", strings.Repeat("x", 4097), "<!-- agent-symphony:forged -->"} {
+		if err := EnsureActiveAttempt(t.Context(), API{}, PRAdapterConfig{Repository: "o/r"}, 4, 2, "abcdef0", detail); err == nil {
+			t.Fatalf("accepted detail %q", detail)
+		}
 	}
 }
 

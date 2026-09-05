@@ -374,10 +374,13 @@ func fetchActiveAttempts(ctx context.Context, api API, cfg PRAdapterConfig, issu
 	return nil, markerConflicts{}, errors.New("issue comments exceed bounded recovery limit")
 }
 
-func EnsureActiveAttempt(ctx context.Context, api API, cfg PRAdapterConfig, issue, attempt int, baseSHA string) error {
+func EnsureActiveAttempt(ctx context.Context, api API, cfg PRAdapterConfig, issue, attempt int, baseSHA, detail string) error {
 	marker, err := ActiveAttemptMarker(cfg.Repository, issue, attempt, baseSHA)
 	if err != nil {
 		return err
+	}
+	if strings.TrimSpace(detail) == "" || len(detail) > 4096 || strings.Contains(detail, "<!-- agent-symphony:") {
+		return errors.New("active attempt detail is invalid")
 	}
 	check := func() (bool, error) {
 		found, conflicts, err := fetchActiveAttempts(ctx, api, cfg, issue)
@@ -399,7 +402,7 @@ func EnsureActiveAttempt(ctx context.Context, api API, cfg PRAdapterConfig, issu
 	if present, err := check(); err != nil || present {
 		return err
 	}
-	message, _ := AttributedBody(issue, attempt, "Attempt bound for execution.")
+	message, _ := AttributedBody(issue, attempt, detail)
 	createErr := api.CreateIssueComment(ctx, cfg.Repository, issue, message+"\n\n"+marker, Mutation{Issue: issue, Attempt: attempt})
 	present, confirmErr := check()
 	if confirmErr != nil {
