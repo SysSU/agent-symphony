@@ -11,6 +11,7 @@ test("overall dashboard health", () => {
   for (const status of [{ state: "blocked" }, { state: "cancelled" }, { state: "future-state" }, { state: "active", blockers: ["waiting"] }, { state: "active", diagnostic: "worker stopped" }]) {
     assert.equal(overallHealth(fresh, "", [status], now).state, "attention");
   }
+  assert.equal(overallHealth(fresh, "", [{ state: "active", needs_attention: true }, { state: "completed", needs_attention: true }], now).state, "attention");
   assert.equal(overallHealth(fresh, "", [{ state: "completed", diagnostic: "old" }], now).state, "good");
   assert.equal(overallHealth({ updated_at: "2026-08-13T11:57:59Z" }, "", [], now).state, "stale");
   assert.equal(overallHealth(fresh, "Status request failed", [], now).state, "unavailable");
@@ -31,6 +32,7 @@ test("groups every status into one ordered dashboard lane", () => {
   });
   assert.deepEqual(lanes.flatMap((lane) => lane.statuses).map(({ issue }) => issue).sort((a, b) => a - b), statuses.map(({ issue }) => issue));
   assert.deepEqual(groupStatusesByLane([]).map((lane) => lane.statuses.length), [0, 0, 0, 0, 0]);
+  assert.deepEqual(groupStatusesByLane([{ issue: 218, state: "active", needs_attention: true }]).map((lane) => lane.statuses.length), [0, 0, 0, 1, 0]);
 });
 
 test("partitions superseded terminal attempts by repository and issue", () => {

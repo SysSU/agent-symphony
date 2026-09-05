@@ -11,6 +11,95 @@ import (
 	"time"
 )
 
+func TestDirectStatusRequiresTheSmallVocabularyAndReason(t *testing.T) {
+	for _, test := range []struct {
+		body            string
+		wantOK, wantSet bool
+		wantReason      string
+	}{
+		{"/agent-symphony status needs-attention: failing browser validation", true, true, "failing browser validation"},
+		{"/agent-symphony status clear: browser validation now passes", true, false, "browser validation now passes"},
+		{"/agent-symphony status needs-attention:", false, false, ""},
+		{"/agent-symphony status clear", false, false, ""},
+		{"/agent-symphony status blocked: reason", false, false, ""},
+		{"/agent-symphony status needs-attention: \t" + strings.Repeat("x", 1024) + " \n", true, true, strings.Repeat("x", 1024)},
+		{"/agent-symphony status needs-attention: " + strings.Repeat("x", 1025), false, false, ""},
+	} {
+		got, ok := parseDirectStatus(test.body)
+		if ok != test.wantOK || got.NeedsAttention != test.wantSet || got.Reason != test.wantReason {
+			t.Fatalf("parseDirectStatus(%q) = %#v, %v", test.body, got, ok)
+		}
+	}
+}
+
+func TestDirectStatusUsesNewestAuthenticatedIssueOrPullRequestComment(t *testing.T) {
+	now := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
+	labelPresent := true
+	issueComments := []map[string]any{{"id": 1, "body": "/agent-symphony status needs-attention: implementation needs an operator decision", "created_at": now, "updated_at": now, "user": map[string]any{"id": 42}}}
+	pullComments := []map[string]any{
+		{"id": 2, "body": "/agent-symphony status clear: foreign clear", "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 9}},
+		{"id": 3, "body": "/agent-symphony status clear: edited clear", "created_at": now.Add(2 * time.Minute), "updated_at": now.Add(3 * time.Minute), "user": map[string]any{"id": 42}},
+	}
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var response any
+		switch r.URL.RequestURI() {
+		case "/repos/o/r/issues/10":
+			labels := []any{}
+			if labelPresent {
+				labels = append(labels, map[string]any{"name": strings.ToUpper(NeedsAttentionLabel)})
+			}
+			response = map[string]any{"labels": labels}
+		case "/repos/o/r/issues/10/comments?per_page=100&page=1":
+			response = issueComments
+		case "/repos/o/r/issues/11/comments?per_page=100&page=1":
+			response = pullComments
+		default:
+			t.Fatalf("unexpected request %s", r.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return httpResponse(http.StatusOK, string(body), nil), nil
+	})}}
+	source := GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
+	status, err := source.directStatus(t.Context(), 10, 11)
+	if err != nil || !status.NeedsAttention || status.Reason != "implementation needs an operator decision" {
+		t.Fatalf("set status = %#v, %v", status, err)
+	}
+	labelPresent = false
+	status, err = source.directStatus(t.Context(), 10, 11)
+	if err != nil || !status.NeedsAttention || status.Reason != "direct needs-attention status is incomplete: needs-attention label is missing" {
+		t.Fatalf("incomplete set status = %#v, %v", status, err)
+	}
+	labelPresent = true
+	pullComments = append(pullComments, map[string]any{"id": 4, "body": "/agent-symphony status clear: review verified the correction", "created_at": now.Add(4 * time.Minute), "updated_at": now.Add(4 * time.Minute), "user": map[string]any{"id": 42}})
+	status, err = source.directStatus(t.Context(), 10, 11)
+	if err != nil || !status.NeedsAttention || status.Reason != "direct status clear is incomplete: needs-attention label remains" {
+		t.Fatalf("incomplete clear status = %#v, %v", status, err)
+	}
+	labelPresent = false
+	status, err = source.directStatus(t.Context(), 10, 11)
+	if err != nil || status.NeedsAttention || status.Reason != "review verified the correction" {
+		t.Fatalf("clear status = %#v, %v", status, err)
+	}
+	for i, body := range []string{"/agent-symphony status needs-attention:", "/agent-symphony status blocked: unsupported vocabulary"} {
+		createdAt := now.Add(time.Duration(5+i) * time.Minute)
+		pullComments = append(pullComments, map[string]any{"id": 5 + i, "body": body, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
+		status, err = source.directStatus(t.Context(), 10, 11)
+		if err != nil || !status.NeedsAttention || status.Reason != "direct status intent is incomplete: use needs-attention or clear with a nonempty reason" {
+			t.Fatalf("malformed status = %#v, %v", status, err)
+		}
+	}
+}
+
+func TestDirectStatusAuthenticationFailureIsNotSuccess(t *testing.T) {
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return httpResponse(http.StatusUnauthorized, `{"message":"Requires authentication"}`, nil), nil
+	})}}
+	status, err := (&GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}).directStatus(t.Context(), 10, 0)
+	if err == nil || status.commentID != 0 || !strings.Contains(err.Error(), "GitHub read") {
+		t.Fatalf("status=%#v err=%v", status, err)
+	}
+}
+
 func TestTerminalFailureRequiresStrictCoordinatorAuthorship(t *testing.T) {
 	marker, _ := TerminalFailureMarker(4, 2, time.Unix(10, 0))
 	api := fixtureAPI(t, map[string]any{"/repos/o/r/issues/4/comments?per_page=100&page=1": []any{
@@ -190,7 +279,8 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
 	body := "##\n## Context\nreason and evidence\n## Acceptance criteria\n- result\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n## ###\n"
 	var snapshotBodies []string
-	changed := false
+	changed, needsAttentionLabel, mentionedPR := false, false, false
+	var pullComments []any
 	posts := 0
 	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		comments := []any{map[string]any{"id": 50, "body": "/approve", "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 5}}}
@@ -211,7 +301,11 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 			if changed {
 				priority = "P2"
 			}
-			response = map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 9}, "labels": []any{map[string]any{"name": "ready"}, map[string]any{"name": priority}}}
+			labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": priority}}
+			if needsAttentionLabel {
+				labels = append(labels, map[string]any{"name": strings.ToUpper(NeedsAttentionLabel)})
+			}
+			response = map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 9}, "labels": labels}
 		case "GET /repos/o/r/issues/10/timeline?per_page=100&page=1":
 			events := []any{
 				map[string]any{"id": 20, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": 5}},
@@ -223,9 +317,14 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 					map[string]any{"id": 23, "event": "labeled", "label": map[string]any{"name": "P2"}, "created_at": now.Add(3 * time.Minute), "actor": map[string]any{"id": 5}},
 				)
 			}
+			if mentionedPR {
+				events = append(events, map[string]any{"event": "cross-referenced", "source": map[string]any{"issue": map[string]any{"number": 11, "state": "open", "repository_url": "https://api.example.test/repos/o/r", "pull_request": map[string]any{"url": "https://api.example.test/repos/o/r/pulls/11"}}}})
+			}
 			response = events
 		case "GET /repos/o/r/issues/10/comments?per_page=100&page=1":
 			response = comments
+		case "GET /repos/o/r/issues/11/comments?per_page=100&page=1":
+			response = pullComments
 		case "POST /graphql":
 			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
 		case "GET /repos/o/r/issues/comments/50":
@@ -298,17 +397,50 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	if err != nil || len(targeted) != 1 || !targeted[0].Active || !targeted[0].DispatchAuthorized || targeted[0].Attempt != 2 {
 		t.Fatalf("targeted facts=%#v err=%v", targeted, err)
 	}
+	snapshotBodies = append(snapshotBodies, "/agent-symphony status needs-attention: implementation needs an operator decision")
+	needsAttentionLabel = true
+	attention, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || len(attention) != 1 || !attention[0].NeedsAttention || attention[0].Eligible || !attention[0].DispatchAuthorized || attention[0].RecoveryAuthorized || !slices.Contains(attention[0].Blockers, "needs attention: implementation needs an operator decision") {
+		t.Fatalf("attention facts=%#v err=%v", attention, err)
+	}
+	snapshotBodies = append(snapshotBodies, "/agent-symphony status clear: operator decision recorded")
+	needsAttentionLabel = false
+	cleared, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || len(cleared) != 1 || cleared[0].NeedsAttention || !cleared[0].DispatchAuthorized || len(cleared[0].Blockers) != 0 {
+		t.Fatalf("cleared facts=%#v err=%v", cleared, err)
+	}
+	mentionedPR = true
+	reviewSetAt := now.Add(time.Hour)
+	pullComments = append(pullComments, map[string]any{"id": 500, "body": "/agent-symphony status needs-attention: review found a blocking regression", "created_at": reviewSetAt, "updated_at": reviewSetAt, "user": map[string]any{"id": 42}})
+	foreignAttempt := []RecoveryAttemptFact{{Repository: "o/r", Issue: 9, Attempt: 1, PR: 11, State: "active"}}
+	unrelated, err := FetchIssueFacts(context.Background(), api, cfg, foreignAttempt, true)
+	if err != nil || len(unrelated) != 1 || unrelated[0].NeedsAttention || !unrelated[0].DispatchAuthorized || len(unrelated[0].Blockers) != 0 {
+		t.Fatalf("merely mentioned issue facts=%#v err=%v", unrelated, err)
+	}
+	needsAttentionLabel = true
+	authoritativeAttempt := []RecoveryAttemptFact{{Repository: "o/r", Issue: 10, Attempt: 2, PR: 11, State: "active"}}
+	reviewAttention, err := FetchIssueFacts(context.Background(), api, cfg, authoritativeAttempt, true)
+	if err != nil || len(reviewAttention) != 1 || reviewAttention[0].Attempt != 2 || reviewAttention[0].CurrentAttempt != 2 || !reviewAttention[0].NeedsAttention || reviewAttention[0].Eligible || !reviewAttention[0].DispatchAuthorized || reviewAttention[0].RecoveryAuthorized || !slices.Contains(reviewAttention[0].Blockers, "needs attention: review found a blocking regression") {
+		t.Fatalf("review attention facts=%#v err=%v", reviewAttention, err)
+	}
+	needsAttentionLabel = false
+	reviewClearAt := reviewSetAt.Add(time.Minute)
+	pullComments = append(pullComments, map[string]any{"id": 501, "body": "/agent-symphony status clear: review verified the correction", "created_at": reviewClearAt, "updated_at": reviewClearAt, "user": map[string]any{"id": 42}})
+	reviewCleared, err := FetchIssueFacts(context.Background(), api, cfg, authoritativeAttempt, true)
+	if err != nil || len(reviewCleared) != 1 || reviewCleared[0].Attempt != 2 || reviewCleared[0].CurrentAttempt != 2 || reviewCleared[0].NeedsAttention || len(reviewCleared[0].Blockers) != 0 {
+		t.Fatalf("review clear facts=%#v err=%v", reviewCleared, err)
+	}
 	terminal, _ := TerminalFailureMarker(10, 2, now.Add(20*time.Minute))
 	snapshotBodies = append(snapshotBodies, "Attempt failed closed: worker produced no repository changes\n\n"+terminal)
 	failed, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || len(failed) != 1 || failed[0].Active || failed[0].ActiveAttempt != nil || len(failed[0].TerminalAttempts) != 1 || failed[0].TerminalAttempts[0].Attempt != 2 || failed[0].TerminalAttempts[0].BaseSHA != "abcdef0" || failed[0].TerminalAttempts[0].Diagnostic != "worker produced no repository changes" || failed[0].RecoveryAttempt != 2 || !failed[0].RecoveryAuthorized || failed[0].Attempt != 3 || len(failed[0].Blockers) == 0 {
+	if err != nil || len(failed) != 1 || failed[0].Active || failed[0].ActiveAttempt != nil || len(failed[0].TerminalAttempts) != 1 || failed[0].TerminalAttempts[0].Attempt != 2 || failed[0].TerminalAttempts[0].BaseSHA != "abcdef0" || failed[0].TerminalAttempts[0].Diagnostic != "worker produced no repository changes" || failed[0].RecoveryAttempt != 2 || !failed[0].RecoveryAuthorized || failed[0].Attempt != 3 || failed[0].CurrentAttempt != 2 || len(failed[0].Blockers) == 0 {
 		t.Fatalf("terminal transition facts=%#v err=%v", failed, err)
 	}
 	third, _ := ActiveAttemptMarker("o/r", 10, 3, "abcdef0")
 	thirdTerminal, _ := TerminalFailureMarker(10, 3, now.Add(30*time.Minute))
 	snapshotBodies = append(snapshotBodies, third, "Attempt failed closed: newer failure\n\n"+thirdTerminal)
 	history, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || len(history) != 1 || len(history[0].TerminalAttempts) != 2 || history[0].TerminalAttempts[0].Attempt != 2 || history[0].TerminalAttempts[1].Attempt != 3 || history[0].RecoveryAttempt != 3 || !history[0].RecoveryAuthorized {
+	if err != nil || len(history) != 1 || len(history[0].TerminalAttempts) != 2 || history[0].TerminalAttempts[0].Attempt != 2 || history[0].TerminalAttempts[1].Attempt != 3 || history[0].RecoveryAttempt != 3 || !history[0].RecoveryAuthorized || history[0].Attempt != 4 || history[0].CurrentAttempt != 3 {
 		t.Fatalf("terminal history=%#v err=%v", history, err)
 	}
 

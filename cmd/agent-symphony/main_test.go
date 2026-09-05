@@ -54,7 +54,10 @@ func TestEffectiveServeInterval(t *testing.T) {
 	}
 }
 
-type revokedAttemptRunner struct{ live, interrupted bool }
+type revokedAttemptRunner struct {
+	live, interrupted bool
+	starts            int
+}
 
 type cleanupBoundary struct {
 	manifests  []agentruntime.Manifest
@@ -1177,9 +1180,12 @@ func (b *cleanupBoundary) call(_ context.Context, operation string, command agen
 	return agentruntime.Result{}, b.err
 }
 
-func (r *revokedAttemptRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+func (r *revokedAttemptRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if len(command.Args) == 0 {
 		return agentruntime.Result{}, errors.New("missing tmux operation")
+	}
+	if command.Name == "git" {
+		return agentruntime.ExecRunner{}.Run(ctx, command)
 	}
 	switch command.Args[0] {
 	case "has-session":
@@ -1198,6 +1204,16 @@ func (r *revokedAttemptRunner) Run(_ context.Context, command agentruntime.Comma
 	case "kill-session":
 		r.live = false
 		return agentruntime.Result{}, nil
+	case "set-option":
+		if slices.Contains(command.Args, "new-session") {
+			r.live = true
+		}
+		return agentruntime.Result{}, nil
+	case "load-buffer":
+		return agentruntime.Result{}, nil
+	case "respawn-pane":
+		r.starts++
+		return agentruntime.Result{}, nil
 	default:
 		return agentruntime.Result{}, fmt.Errorf("unexpected tmux operation %q", command.Args[0])
 	}
@@ -1207,7 +1223,7 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 	issue := internalgithub.RecoveryIssueFact{Repository: "owner/repo", Issue: 56, Attempt: 3, BaseBranch: "main", Body: "## Context\nunique issue contract\n\n## Validation\ngo test ./..."}
 	identity := agentruntime.Manifest{Branch: "agent-symphony/owner-repo/56-3", Worktree: "/attempts/owner-repo-56-3", Session: "as-owner-repo-56-3"}
 	prompt := implementationPrompt(issue, identity)
-	for _, want := range []string{"Project: owner/repo", "Issue: #56", "Attempt: 3", "Base branch: main", "Branch: " + identity.Branch, "Worktree: " + identity.Worktree, "Session: " + identity.Session, issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "stdout", "stderr", "outside the worktree"} {
+	for _, want := range []string{"Project: owner/repo", "Issue: #56", "Attempt: 3", "Base branch: main", "Branch: " + identity.Branch, "Worktree: " + identity.Worktree, "Session: " + identity.Session, issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "stdout", "stderr", "outside the worktree", "/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "Re-read both the comment and label", "partial-update errors are failures, never success"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt omitted %q: %s", want, prompt)
 		}
@@ -1222,6 +1238,15 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 	}
 }
 
+func TestReviewPromptExposesTheSameDirectStatusContract(t *testing.T) {
+	prompt := reviewPrompt(internalgithub.RecoveryIssueFact{Issue: 56, Attempt: 3, Body: "review contract"}, strings.Repeat("a", 40))
+	for _, want := range []string{"/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "nonempty reason", "fresh re-read", "partial-update errors are failures, never success"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("review prompt omitted %q: %s", want, prompt)
+		}
+	}
+}
+
 func TestDispatchRejectsAnythingButEligibleAuthorizedIssueBeforeBinding(t *testing.T) {
 	decision := []orchestrator.Decision{{Repository: "o/r", Number: 4, State: orchestrator.Runnable}}
 	for _, issue := range []internalgithub.RecoveryIssueFact{
@@ -1230,6 +1255,233 @@ func TestDispatchRejectsAnythingButEligibleAuthorizedIssueBeforeBinding(t *testi
 	} {
 		if err := dispatchIssues(t.Context(), internalgithub.API{}, &agentruntime.Runtime{}, config.Config{}, internalgithub.PRAdapterConfig{}, []internalgithub.RecoveryIssueFact{issue}, decision); err == nil || !strings.Contains(err.Error(), "issue is not eligible") {
 			t.Fatalf("dispatch error = %v for %#v", err, issue)
+		}
+	}
+}
+
+func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t *testing.T) {
+	source := gitRepository(t)
+	for _, args := range [][]string{{"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"switch", "-c", "main"}} {
+		runGit(t, source, args...)
+	}
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "file")
+	runGit(t, source, "commit", "-m", "base")
+	base := runGit(t, source, "rev-parse", "HEAD")
+
+	now := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
+	activeMarker, _ := internalgithub.ActiveAttemptMarker("o/r", 218, 2, base)
+	terminalMarker, _ := internalgithub.TerminalFailureMarker(218, 2, now.Add(4*time.Minute))
+	var snapshots []string
+	statusMode := ""
+	terminal := false
+	issueState := "open"
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		comments := make([]any, len(snapshots))
+		for i, snapshot := range snapshots {
+			comments[i] = map[string]any{"id": 60 + i, "body": snapshot, "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 42}}
+		}
+		comments = append(comments, map[string]any{"id": 65, "body": activeMarker, "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 42}})
+		if terminal {
+			comments = append(comments, map[string]any{"id": 66, "body": "Attempt failed closed: attempt 2 failed current\n\n" + terminalMarker, "created_at": now.Add(4 * time.Minute), "updated_at": now.Add(4 * time.Minute), "user": map[string]any{"id": 42}})
+		}
+		var pullComments []any
+		switch statusMode {
+		case "set":
+			pullComments = append(pullComments, map[string]any{"id": 70, "body": "/agent-symphony status needs-attention: operator decision required", "created_at": now.Add(2 * time.Minute), "updated_at": now.Add(2 * time.Minute), "user": map[string]any{"id": 42}})
+		case "clear":
+			pullComments = append(pullComments, map[string]any{"id": 71, "body": "/agent-symphony status clear: operator decision recorded", "created_at": now.Add(3 * time.Minute), "updated_at": now.Add(3 * time.Minute), "user": map[string]any{"id": 42}})
+		case "malformed":
+			pullComments = append(pullComments, map[string]any{"id": 72, "body": "/agent-symphony status needs-attention:", "created_at": now.Add(5 * time.Minute), "updated_at": now.Add(5 * time.Minute), "user": map[string]any{"id": 42}})
+		}
+		labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}}
+		if statusMode == "set" {
+			labels = append(labels, map[string]any{"name": "NEEDS-ATTENTION"})
+		}
+		var response any
+		switch request.Method + " " + request.URL.RequestURI() {
+		case "GET /repos/o/r":
+			response = map[string]any{"default_branch": "main"}
+		case "GET /repos/o/r/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": base}}
+		case "GET /repos/o/r/issues?state=open&per_page=100&page=1":
+			response = []any{}
+			if issueState == "open" {
+				response = []any{map[string]any{"number": 218, "title": "Direct status", "body": completeImplementationIssueBody, "created_at": now}}
+			}
+		case "GET /repos/o/r/issues/218":
+			response = map[string]any{"number": 218, "node_id": "I_218", "state": issueState, "title": "Direct status", "body": completeImplementationIssueBody, "created_at": now, "user": map[string]any{"id": 5}, "labels": labels}
+		case "GET /repos/o/r/issues/218/timeline?per_page=100&page=1":
+			response = []any{
+				map[string]any{"id": 20, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": 5}},
+				map[string]any{"id": 21, "event": "labeled", "label": map[string]any{"name": "P1"}, "created_at": now.Add(2 * time.Second), "actor": map[string]any{"id": 5}},
+			}
+		case "GET /repos/o/r/issues/218/comments?per_page=100&page=1":
+			response = comments
+		case "GET /repos/o/r/issues/220/comments?per_page=100&page=1":
+			response = pullComments
+		case "POST /graphql":
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+		case "GET /user/5":
+			response = map[string]any{"login": "maintainer"}
+		case "GET /repos/o/r/collaborators/maintainer/permission":
+			response = map[string]any{"permission": "maintain"}
+		case "POST /repos/o/r/issues/218/comments":
+			var input struct{ Body string }
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			snapshots = append(snapshots, input.Body)
+			return &http.Response{StatusCode: http.StatusCreated, Status: "201 Created", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+		default:
+			t.Fatalf("unexpected GitHub request %s", request.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}}
+	cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ReadyLabel: "ready", HumanReviewLabel: "review", AutonomousMergeLabel: "auto", PriorityP1Label: "P1", PriorityP2Label: "P2", PriorityP3Label: "P3", DependencySection: "Dependencies", DefaultCompletion: "human-review", ApprovalCommand: "/approve", CancelCommand: "/cancel", RetryCommand: "/retry", ActorID: 42}
+	published := []internalgithub.RecoveryAttemptFact{
+		{Repository: "o/r", Issue: 218, Attempt: 1, State: "failed", Diagnostic: "attempt 1 failed before retry"},
+		{Repository: "o/r", Issue: 218, Attempt: 2, BaseSHA: base, PR: 220, State: "active"},
+	}
+	facts, err := internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, true)
+	if err != nil || len(facts) != 1 || facts[0].Attempt != 2 || facts[0].CurrentAttempt != 2 || facts[0].Eligible || !facts[0].Active || !facts[0].DispatchAuthorized {
+		t.Fatalf("initial facts=%#v err=%v", facts, err)
+	}
+
+	stateRoot, _ := filepath.EvalSymlinks(t.TempDir())
+	attemptRoot, _ := filepath.EvalSymlinks(t.TempDir())
+	runner := &revokedAttemptRunner{}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Tmux: "tmux", Runner: runner, VerifyWorker: func(context.Context) error { return nil }}
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 218, Number: 2, BaseSHA: base, Command: []string{"agent"}}
+	manifest, err := runtimeState.PrepareAndStart(t.Context(), attempt)
+	if err != nil || manifest.State != "running" || !runner.live || runner.starts != 1 {
+		t.Fatalf("start manifest=%#v live=%v starts=%d err=%v", manifest, runner.live, runner.starts, err)
+	}
+
+	statusMode = "set"
+	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
+	if err != nil || len(facts) != 1 || facts[0].Attempt != 2 || facts[0].CurrentAttempt != 2 || !facts[0].NeedsAttention || facts[0].Eligible || !facts[0].DispatchAuthorized {
+		t.Fatalf("set facts=%#v err=%v", facts, err)
+	}
+	queued := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 219, Attempt: 1, Priority: 1, CreatedAt: now.Add(time.Minute), Eligible: false, DispatchAuthorized: true, NeedsAttention: true, Blockers: []string{"needs attention: queued operator decision required"}}
+	issues := append(facts, queued)
+	manifests, _ := runtimeState.Discover()
+	_, attemptFacts := recoveryAttemptFacts(published, facts)
+	live := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
+	statuses, decisions := projectRecoveryStatuses(t.Context(), attemptFacts, issues, manifests, 2, live)
+	if err := monitorAttempts(t.Context(), runtimeState, statuses, manifests, issues); err != nil {
+		t.Fatal(err)
+	}
+	active := slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 2 })
+	historical := slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 1 })
+	queuedDecision := slices.IndexFunc(decisions, func(decision orchestrator.Decision) bool { return decision.Number == 219 })
+	stored, _ := runtimeState.Discover()
+	if active < 0 || statuses[active].State != "active" || !statuses[active].NeedsAttention || historical < 0 || statuses[historical].State != "failed" || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" || queuedDecision < 0 || decisions[queuedDecision].State != orchestrator.Blocked || len(stored) != 1 || stored[0].State != "running" || stored[0].Session != manifest.Session || !runner.live || runner.starts != 1 {
+		t.Fatalf("set reconcile statuses=%#v decisions=%#v manifests=%#v live=%v starts=%d", statuses, decisions, stored, runner.live, runner.starts)
+	}
+
+	statusMode = "clear"
+	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
+	if err != nil || len(facts) != 1 || facts[0].Attempt != 2 || facts[0].CurrentAttempt != 2 || facts[0].NeedsAttention || !facts[0].DispatchAuthorized {
+		t.Fatalf("clear facts=%#v err=%v", facts, err)
+	}
+	issues = append(facts, queued)
+	manifests, _ = runtimeState.Discover()
+	_, attemptFacts = recoveryAttemptFacts(published, facts)
+	statuses, decisions = projectRecoveryStatuses(t.Context(), attemptFacts, issues, manifests, 2, live)
+	if err := monitorAttempts(t.Context(), runtimeState, statuses, manifests, issues); err != nil {
+		t.Fatal(err)
+	}
+	active = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 2 })
+	historical = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 1 })
+	queuedDecision = slices.IndexFunc(decisions, func(decision orchestrator.Decision) bool { return decision.Number == 219 })
+	stored, _ = runtimeState.Discover()
+	if active < 0 || statuses[active].State != "active" || statuses[active].NeedsAttention || historical < 0 || statuses[historical].State != "failed" || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" || queuedDecision < 0 || decisions[queuedDecision].State != orchestrator.Blocked || len(stored) != 1 || stored[0].State != "running" || stored[0].Session != manifest.Session || !runner.live || runner.starts != 1 {
+		t.Fatalf("clear reconcile statuses=%#v decisions=%#v manifests=%#v live=%v starts=%d", statuses, decisions, stored, runner.live, runner.starts)
+	}
+
+	terminal = true
+	published[1].State = "failed"
+	published[1].Diagnostic = "attempt 2 failed current"
+	statusMode = "set"
+	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
+	if err != nil || len(facts) != 1 || facts[0].Attempt != 3 || facts[0].CurrentAttempt != 2 || !facts[0].NeedsAttention || facts[0].Active {
+		t.Fatalf("terminal set facts=%#v err=%v", facts, err)
+	}
+	_, attemptFacts = recoveryAttemptFacts(published, facts)
+	statuses, _ = projectRecoveryStatuses(t.Context(), attemptFacts, facts, nil, 2, nil)
+	active = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 2 })
+	historical = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 1 })
+	if active < 0 || statuses[active].State != "failed" || !statuses[active].NeedsAttention || statuses[active].Diagnostic != "attempt 2 failed current" || !slices.Contains(statuses[active].Blockers, "needs attention: operator decision required") || historical < 0 || statuses[historical].State != "failed" || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" {
+		t.Fatalf("terminal set projection=%#v", statuses)
+	}
+
+	statusMode = "clear"
+	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
+	if err != nil || len(facts) != 1 || facts[0].Attempt != 3 || facts[0].CurrentAttempt != 2 || facts[0].NeedsAttention {
+		t.Fatalf("terminal clear facts=%#v err=%v", facts, err)
+	}
+	_, attemptFacts = recoveryAttemptFacts(published, facts)
+	statuses, _ = projectRecoveryStatuses(t.Context(), attemptFacts, facts, nil, 2, nil)
+	active = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 2 })
+	historical = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 1 })
+	if active < 0 || statuses[active].State != "failed" || statuses[active].NeedsAttention || statuses[active].Diagnostic != "attempt 2 failed current" || historical < 0 || statuses[historical].State != "failed" || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" {
+		t.Fatalf("terminal clear projection=%#v", statuses)
+	}
+
+	statusMode = "malformed"
+	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
+	if err != nil || len(facts) != 1 || facts[0].CurrentAttempt != 2 || !facts[0].NeedsAttention || !slices.Contains(facts[0].Blockers, "needs attention: direct status intent is incomplete: use needs-attention or clear with a nonempty reason") {
+		t.Fatalf("malformed facts=%#v err=%v", facts, err)
+	}
+	_, attemptFacts = recoveryAttemptFacts(published, facts)
+	statuses, _ = projectRecoveryStatuses(t.Context(), attemptFacts, facts, nil, 2, nil)
+	active = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 2 })
+	historical = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 1 })
+	if active < 0 || !statuses[active].NeedsAttention || !slices.Contains(statuses[active].Blockers, "needs attention: direct status intent is incomplete: use needs-attention or clear with a nonempty reason") || historical < 0 || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" {
+		t.Fatalf("malformed projection=%#v", statuses)
+	}
+
+	terminal = false
+	for _, lifecycle := range []struct {
+		state, issueState string
+		completed         bool
+	}{
+		{"blocked", "open", false},
+		{"completed", "closed", true},
+	} {
+		published[1].State = lifecycle.state
+		published[1].Diagnostic = lifecycle.state + " attempt 2 remains current"
+		issueState = lifecycle.issueState
+		for _, status := range []struct {
+			mode      string
+			attention bool
+		}{
+			{"set", true},
+			{"clear", false},
+		} {
+			statusMode = status.mode
+			facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
+			if err != nil || len(facts) != 1 || facts[0].Attempt != 3 || facts[0].CurrentAttempt != 2 || facts[0].Completed != lifecycle.completed || facts[0].NeedsAttention != status.attention {
+				t.Fatalf("%s %s facts=%#v err=%v", lifecycle.state, status.mode, facts, err)
+			}
+			_, attemptFacts = recoveryAttemptFacts(published, facts)
+			statuses, _ = projectRecoveryStatuses(t.Context(), attemptFacts, facts, nil, 2, nil)
+			active = slices.IndexFunc(statuses, func(projected orchestrator.RecoveryStatus) bool {
+				return projected.Issue == 218 && projected.Attempt == 2
+			})
+			historical = slices.IndexFunc(statuses, func(projected orchestrator.RecoveryStatus) bool {
+				return projected.Issue == 218 && projected.Attempt == 1
+			})
+			if active < 0 || statuses[active].State != lifecycle.state || statuses[active].NeedsAttention != status.attention || statuses[active].Diagnostic != lifecycle.state+" attempt 2 remains current" || historical < 0 || statuses[historical].State != "failed" || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" {
+				t.Fatalf("%s %s projection=%#v", lifecycle.state, status.mode, statuses)
+			}
+			if status.attention && !slices.Contains(statuses[active].Blockers, "needs attention: operator decision required") {
+				t.Fatalf("%s set projection omitted attention reason: %#v", lifecycle.state, statuses[active])
+			}
 		}
 	}
 }
@@ -3779,6 +4031,25 @@ func TestQueuedIssueProjectionIsReadOnlyAndAuthoritative(t *testing.T) {
 	statuses, decisions := joinIssueProjection(nil, issues, 1)
 	if len(statuses) != 1 || statuses[0].State != string(orchestrator.Blocked) || statuses[0].Priority != 1 || len(statuses[0].Dependencies) != 1 || len(statuses[0].Blockers) != 1 || statuses[0].Action == "" || len(decisions) != 1 {
 		t.Fatalf("statuses=%#v decisions=%#v", statuses, decisions)
+	}
+}
+
+func TestAttentionProjectionAppliesOnlyToTheCurrentAttempt(t *testing.T) {
+	statuses := []orchestrator.RecoveryStatus{
+		{Repository: "o/r", Issue: 218, Attempt: 1, State: "failed", Blockers: []string{"attempt 1 failed before retry"}},
+		{Repository: "o/r", Issue: 218, Attempt: 2, State: "review-ready"},
+	}
+	issue := internalgithub.RecoveryIssueFact{
+		Repository: "o/r", Issue: 218, Attempt: 2, DispatchAuthorized: true, NeedsAttention: true,
+		Blockers: []string{"needs attention: review found a blocking regression"},
+	}
+
+	got, _ := joinIssueProjection(statuses, []internalgithub.RecoveryIssueFact{issue}, 1)
+	if got[0].NeedsAttention || len(got[0].Blockers) != 1 || got[0].Blockers[0] != "attempt 1 failed before retry" || got[0].State != "failed" {
+		t.Fatalf("historical attempt=%#v", got[0])
+	}
+	if !got[1].NeedsAttention || len(got[1].Blockers) != 1 || got[1].Blockers[0] != "needs attention: review found a blocking regression" || got[1].State != "review-ready" {
+		t.Fatalf("current attempt=%#v", got[1])
 	}
 }
 

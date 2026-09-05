@@ -122,6 +122,34 @@ func TestOptionalIssueFilterLabel(t *testing.T) {
 	}
 }
 
+func TestNeedsAttentionLabelIsReservedFromEveryWorkflowLabel(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		collide func(*Config)
+	}{
+		{"ready", func(c *Config) { c.Labels.Ready = "NEEDS-ATTENTION" }},
+		{"issue filter", func(c *Config) { c.Labels.IssueFilter = "NEEDS-ATTENTION" }},
+		{"priority P1", func(c *Config) { c.Labels.PriorityP1 = "NEEDS-ATTENTION" }},
+		{"priority P2", func(c *Config) { c.Labels.PriorityP2 = "NEEDS-ATTENTION" }},
+		{"priority P3", func(c *Config) { c.Labels.PriorityP3 = "NEEDS-ATTENTION" }},
+		{"human review", func(c *Config) { c.CompletionPolicies.HumanReview = "NEEDS-ATTENTION" }},
+		{"autonomous merge", func(c *Config) { c.CompletionPolicies.AutonomousMerge = "NEEDS-ATTENTION" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := Default("owner/repo")
+			test.collide(&c)
+			if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "used more than once") {
+				t.Fatalf("collision error = %v", err)
+			}
+		})
+	}
+	c := Default("owner/repo")
+	c.Labels.PriorityP1 = strings.ToUpper(c.Labels.Ready)
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "used more than once") {
+		t.Fatalf("case-folded workflow collision error = %v", err)
+	}
+}
+
 func TestLoadNormalizesTheLegacyDefaultCodexStdinCommand(t *testing.T) {
 	c := Default("owner/repo")
 	c.Commands.Implementation = c.Commands.Implementation[:3]

@@ -29,6 +29,10 @@ function Detail({ label, children }) {
   );
 }
 
+function AttentionChip({ needed }) {
+  return needed ? <span className="state state-blocked">needs attention</span> : null;
+}
+
 function actionFor(status) {
   if (status.retryable) return "recover";
   return status.state === "completed" ? "archive" : "abandon";
@@ -120,6 +124,7 @@ export function StatusCard(props) {
           </p>
         </div>
         <div className="cardChips">
+          <AttentionChip needed={status.needs_attention} />
           <span className={`priority priority-${status.priority || "unset"}`} aria-label={`Priority ${status.priority || "not set"}`}>{priority}</span>
           <span className={`state state-${state}`}>{state}</span>
         </div>

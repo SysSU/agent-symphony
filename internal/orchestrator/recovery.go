@@ -56,6 +56,7 @@ type RecoveryStatus struct {
 	Action              string                  `json:"next_action,omitempty"`
 	Retryable           bool                    `json:"retryable,omitempty"`
 	DispatchAuthorized  bool                    `json:"dispatch_authorized,omitempty"`
+	NeedsAttention      bool                    `json:"needs_attention,omitempty"`
 	OperatorMessages    []OperatorMessageStatus `json:"operator_messages,omitempty"`
 }
 

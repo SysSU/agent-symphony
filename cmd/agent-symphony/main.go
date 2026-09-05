@@ -1651,12 +1651,19 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 	}
 	decisions := orchestrator.Schedule(scheduled, orchestrator.Capacity{Global: capacity, Repositories: map[string]int{}})
 	for _, issue := range issues {
+		currentAttempt := issue.Attempt
+		if issue.CurrentAttempt > 0 {
+			currentAttempt = issue.CurrentAttempt
+		}
 		found := false
 		for j := range statuses {
 			if statuses[j].Repository == issue.Repository && statuses[j].Issue == issue.Issue {
 				statuses[j].Title, statuses[j].Priority, statuses[j].Dependencies = issue.Title, issue.Priority, issue.Dependencies
 				statuses[j].DispatchAuthorized = issue.DispatchAuthorized
-				statuses[j].Blockers = append(statuses[j].Blockers, issue.Blockers...)
+				statuses[j].NeedsAttention = statuses[j].Attempt == currentAttempt && issue.NeedsAttention
+				if statuses[j].Attempt == currentAttempt {
+					statuses[j].Blockers = append(statuses[j].Blockers, issue.Blockers...)
+				}
 				if statuses[j].State == "failed" {
 					statuses[j].Retryable = statuses[j].Retryable && issue.RecoveryAuthorized && issue.RecoveryAttempt == statuses[j].Attempt
 				} else {
@@ -1673,7 +1680,7 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 			continue
 		}
 		decision := decisions[decisionIndex]
-		statuses = append(statuses, orchestrator.RecoveryStatus{Repository: issue.Repository, Issue: issue.Issue, Title: issue.Title, Attempt: issue.Attempt, State: string(decision.State), CurrentPhase: string(decision.State), Priority: issue.Priority, Dependencies: issue.Dependencies, Blockers: issue.Blockers, Action: decision.Explanation})
+		statuses = append(statuses, orchestrator.RecoveryStatus{Repository: issue.Repository, Issue: issue.Issue, Title: issue.Title, Attempt: issue.Attempt, State: string(decision.State), CurrentPhase: string(decision.State), Priority: issue.Priority, Dependencies: issue.Dependencies, Blockers: issue.Blockers, Action: decision.Explanation, NeedsAttention: issue.NeedsAttention})
 	}
 	return statuses, decisions
 }
@@ -1866,7 +1873,7 @@ func dispatchIssues(ctx context.Context, api internalgithub.API, runtime *agentr
 }
 
 func implementationPrompt(issue internalgithub.RecoveryIssueFact, identity agentruntime.Manifest) string {
-	return fmt.Sprintf("Project: %s\nIssue: #%d\nAttempt: %d\nBase branch: %s\nBranch: %s\nWorktree: %s\nSession: %s\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Agent Symphony captures stdout outside the worktree. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.BaseBranch, identity.Branch, identity.Worktree, identity.Session, issue.Body)
+	return fmt.Sprintf("Project: %s\nIssue: #%d\nAttempt: %d\nBase branch: %s\nBranch: %s\nWorktree: %s\nSession: %s\n\n%s\n\nDirect status: use the installed gh CLI to post one unedited comment on issue #%d or its pull request: `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON`. A nonempty reason is required. Pair the comment with the `needs-attention` label on the bound issue: add it when setting status and remove it when clearing. Re-read both the comment and label before reporting the status changed; authentication, authorization, or partial-update errors are failures, never success. Other issue-authorized comments, labels, and Markdown links may also be updated directly with gh.\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Agent Symphony captures stdout outside the worktree. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.BaseBranch, identity.Branch, identity.Worktree, identity.Session, issue.Body, issue.Issue)
 }
 
 type workerResult struct {
@@ -2573,7 +2580,7 @@ type independentReviewResult struct {
 }
 
 func reviewPrompt(issue internalgithub.RecoveryIssueFact, base string) string {
-	return fmt.Sprintf("Review only the exact attested change at %s..HEAD for issue #%d attempt %d. Inspect that entire diff and its affected code for correctness, regressions, security, and missing behavioral tests. Make the entire final response exactly one bounded JSON object on stdout: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings. Do not wrap it in Markdown, emit prose, or emit another object.\n\n%s", base, issue.Issue, issue.Attempt, issue.Body)
+	return fmt.Sprintf("Review only the exact attested change at %s..HEAD for issue #%d attempt %d. Inspect that entire diff and its affected code for correctness, regressions, security, and missing behavioral tests. Use the installed gh CLI to post direct status on the issue or pull request as one unedited `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON` comment; pair it with adding or removing the bound issue's `needs-attention` label. A nonempty reason and a fresh re-read of both comment and label are required before reporting the status changed. Authentication, authorization, or partial-update errors are failures, never success. Make the entire final response exactly one bounded JSON object on stdout: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings. Do not wrap it in Markdown, emit prose, or emit another object.\n\n%s", base, issue.Issue, issue.Attempt, issue.Body)
 }
 
 func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot string) (independentReviewResult, bool, error) {
