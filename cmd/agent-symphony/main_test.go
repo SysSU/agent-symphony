@@ -18,7 +18,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -84,6 +83,113 @@ func TestRuntimeStateRefusesForeignExistingProjectBeforeBinding(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "deployment.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("foreign state was bound: %v", err)
+	}
+}
+
+func TestDeploymentBindingRecoversFromInterruptedImmutableWriteAndInstall(t *testing.T) {
+	origCreate, origWrite, origFileSync, origInstall, origDirSync := immutableCreate, immutableWrite, immutableFileSync, immutableInstall, immutableDirSync
+	t.Cleanup(func() {
+		immutableCreate, immutableWrite, immutableFileSync, immutableInstall, immutableDirSync = origCreate, origWrite, origFileSync, origInstall, origDirSync
+	})
+	for _, stage := range []string{"write", "install"} {
+		t.Run(stage, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "state")
+			immutableCreate, immutableWrite, immutableFileSync, immutableInstall, immutableDirSync = origCreate, origWrite, origFileSync, origInstall, origDirSync
+			if stage == "write" {
+				immutableWrite = func(f *os.File, body []byte) error {
+					_, _ = f.Write(body[:len(body)/2])
+					return errors.New("injected interrupted write")
+				}
+			} else {
+				immutableInstall = func(string, string) error { return errors.New("injected interrupted install") }
+			}
+			if err := bindDeployment(root, "owner/repo"); err == nil {
+				t.Fatal("interrupted deployment binding succeeded")
+			}
+			if _, err := os.Lstat(filepath.Join(root, "deployment.json")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("partial deployment identity exposed: %v", err)
+			}
+			immutableCreate, immutableWrite, immutableFileSync, immutableInstall, immutableDirSync = origCreate, origWrite, origFileSync, origInstall, origDirSync
+			if err := bindDeployment(root, "owner/repo"); err != nil {
+				t.Fatalf("restart recovery: %v", err)
+			}
+		})
+	}
+}
+
+func TestServeRepositoryVerificationFailureDoesNotBindDeployment(t *testing.T) {
+	root := gitRepository(t)
+	configPath := filepath.Join(root, config.DefaultPath)
+	if err := config.Write(configPath, config.Default("owner/missing")); err != nil {
+		t.Fatal(err)
+	}
+	oldAPI, oldClient := githubAPI, githubClient
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	githubAPI = "https://example.invalid"
+	githubClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		status, response := http.StatusOK, any(map[string]any{"id": 42, "login": "coordinator"})
+		if r.URL.Path == "/repos/owner/missing" {
+			status, response = http.StatusNotFound, map[string]any{"message": "not found"}
+		} else if r.URL.Path != "/user" {
+			t.Fatalf("unexpected request %s", r.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{StatusCode: status, Status: http.StatusText(status), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	stateRoot := filepath.Join(root, "runtime-state")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"serve", "--config", configPath, "--state", filepath.Join(root, "state.json"), "--runtime-state", stateRoot}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "verify GitHub repository") {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Lstat(stateRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed repository verification mutated runtime state: %v", err)
+	}
+}
+
+func TestForeignBoundDeploymentRemainsUnchanged(t *testing.T) {
+	root := gitRepository(t)
+	configPath := filepath.Join(root, config.DefaultPath)
+	if err := config.Write(configPath, config.Default("owner/second")); err != nil {
+		t.Fatal(err)
+	}
+	stateRoot := filepath.Join(root, "runtime-state")
+	if err := bindDeployment(stateRoot, "owner/first"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(stateRoot, "deployment.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAPI, oldClient := githubAPI, githubClient
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	githubAPI = "https://example.invalid"
+	githubClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var response any
+		switch r.URL.Path {
+		case "/user":
+			response = map[string]any{"id": 42, "login": "coordinator"}
+		case "/repos/owner/second":
+			response = map[string]any{"full_name": "owner/second", "permissions": map[string]any{"pull": true}}
+		default:
+			t.Fatalf("unexpected request %s", r.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"status", "--config", configPath, "--state", filepath.Join(root, "state.json"), "--runtime-state", stateRoot}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "bound to project owner/first") {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	after, err := os.ReadFile(filepath.Join(stateRoot, "deployment.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) || len(entries) != 1 || entries[0].Name() != "deployment.json" {
+		t.Fatalf("foreign deployment changed: entries=%v identity=%q", entries, after)
 	}
 }
 
@@ -4574,47 +4680,45 @@ func TestDaemonLockIsSingleInstanceAndNoFollow(t *testing.T) {
 	}
 }
 
-func TestConcurrentOneShotReconcileRunsOneMutation(t *testing.T) {
-	runtimeState := t.TempDir()
-	original := reconcileGitHubRun
-	t.Cleanup(func() { reconcileGitHubRun = original })
-	started, release := make(chan struct{}, 2), make(chan struct{})
-	var snapshots, dispatches atomic.Int32
-	reconcileGitHubRun = func(context.Context, string, string, string, bool) ([]orchestrator.RecoveryStatus, error) {
-		snapshots.Add(1)
-		dispatches.Add(1)
-		started <- struct{}{}
-		<-release
-		return nil, nil
+func TestOneShotReconcileAcquiresDaemonLockAfterProjectPreparation(t *testing.T) {
+	root := gitRepository(t)
+	configPath := filepath.Join(root, config.DefaultPath)
+	if err := config.Write(configPath, config.Default("owner/repo")); err != nil {
+		t.Fatal(err)
 	}
-	runOnce := func() int {
-		return run([]string{"reconcile", "--state", filepath.Join(runtimeState, "pr.json"), "--runtime-state", runtimeState}, io.Discard, io.Discard)
+	stateRoot := filepath.Join(root, "runtime-state")
+	if err := bindDeployment(stateRoot, "owner/repo"); err != nil {
+		t.Fatal(err)
 	}
-	first := make(chan int, 1)
-	go func() { first <- runOnce() }()
-	<-started
-	second := make(chan int, 1)
-	go func() { second <- runOnce() }()
-	select {
-	case <-started:
-		close(release)
-		<-first
-		<-second
-		t.Fatal("concurrent reconcile entered the snapshot and dispatch transition")
-	case code := <-second:
-		if code != 1 {
-			close(release)
-			<-first
-			t.Fatalf("concurrent reconcile exit=%d, want 1", code)
+	lock, err := acquireDaemonLock(filepath.Join(stateRoot, "daemon.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseDaemonLock(lock)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	oldAPI, oldClient := githubAPI, githubClient
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	requests := 0
+	githubAPI = "https://example.invalid"
+	githubClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		var response any
+		switch r.URL.Path {
+		case "/user":
+			response = map[string]any{"id": 42, "login": "coordinator"}
+		case "/repos/owner/repo":
+			response = map[string]any{"full_name": "owner/repo", "permissions": map[string]any{"pull": true}}
+		default:
+			t.Fatalf("unexpected request before lock %s", r.URL.String())
 		}
-	case <-time.After(time.Second):
-		close(release)
-		<-first
-		t.Fatal("concurrent reconcile did not fail fast on daemon lock")
+		body, _ := json.Marshal(response)
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	if _, err := reconcileGitHub(t.Context(), configPath, filepath.Join(root, "state.json"), stateRoot, true); err == nil || !strings.Contains(err.Error(), "another agent-symphony instance") {
+		t.Fatalf("concurrent reconcile error=%v", err)
 	}
-	close(release)
-	if code := <-first; code != 0 || snapshots.Load() != 1 || dispatches.Load() != 1 {
-		t.Fatalf("first exit=%d snapshots=%d dispatches=%d", code, snapshots.Load(), dispatches.Load())
+	if requests != 2 {
+		t.Fatalf("requests before lock=%d, want authentication and repository verification", requests)
 	}
 }
 

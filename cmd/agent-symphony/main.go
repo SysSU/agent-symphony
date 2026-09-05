@@ -312,24 +312,33 @@ func bindDeployment(stateRoot, repository string) error {
 		return errors.New("runtime state contains an attempt from another project")
 	}
 	body, _ := json.Marshal(want)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		return bindDeployment(stateRoot, repository)
-	}
-	if err != nil {
-		return fmt.Errorf("create deployment identity: %w", err)
-	}
-	if _, err = file.Write(append(body, '\n')); err == nil {
-		err = file.Sync()
-	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		_ = os.Remove(path)
+	if err := writeImmutable(path, append(body, '\n')); err != nil {
 		return fmt.Errorf("write deployment identity: %w", err)
 	}
 	return nil
+}
+
+func prepareProjectDeployment(ctx context.Context, stateRoot, repository string) (internalgithub.API, internalgithub.AuthenticatedUser, error) {
+	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
+	user, err := api.AuthenticatedUser(ctx)
+	if err != nil {
+		return api, user, fmt.Errorf("authenticate GitHub: %w", err)
+	}
+	if err := api.VerifyRepository(ctx, repository); err != nil {
+		return api, user, fmt.Errorf("verify GitHub repository: %w", err)
+	}
+	if err := bindDeployment(stateRoot, repository); err != nil {
+		return api, user, err
+	}
+	if err := configureProjectTmux(stateRoot); err != nil {
+		return api, user, err
+	}
+	if !hostIsolationInstalled() {
+		if err := configureAgentCodexHome(stateRoot); err != nil {
+			return api, user, err
+		}
+	}
+	return api, user, nil
 }
 
 var agentCodexAssets = []string{"auth.json", "config.toml", "AGENTS.md", "rules", "skills", "plugins", "cache", "installation_id"}
@@ -576,22 +585,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return fail(stderr, *jsonOutput, command, rootErr.Error())
 			}
 		}
-		if err := bindDeployment(*runtimeState, c.Repository); err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
-		if err := configureProjectTmux(*runtimeState); err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
-		if !hostIsolationInstalled() {
-			if err := configureAgentCodexHome(*runtimeState); err != nil {
-				return fail(stderr, *jsonOutput, command, err.Error())
-			}
-		}
-		api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
-		if _, err := api.AuthenticatedUser(context.Background()); err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
-		if err := api.VerifyRepository(context.Background(), c.Repository); err != nil {
+		if _, _, err := prepareProjectDeployment(context.Background(), *runtimeState, c.Repository); err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		lock, err := acquireDaemonLock(filepath.Join(*runtimeState, "daemon.lock"))
@@ -614,7 +608,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		reconcile := func(ctx context.Context) error {
 			cycleCtx, finish := operations.begin(ctx)
 			defer finish()
-			statuses, err := reconcileGitHub(cycleCtx, *path, *statePath, *runtimeState, true)
+			statuses, err := reconcileGitHubServing(cycleCtx, *path, *statePath, *runtimeState, true)
 			if err != nil && !errors.Is(err, context.Canceled) {
 				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
 			}
@@ -684,21 +678,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if *attemptsPath == "" {
 			if *statePath == "" || *runtimeState == "" {
 				return misuse(stderr, wantsJSON, command, command+" requires --state and --runtime-state unless --attempts is supplied")
-			}
-			if err := configureProjectTmux(*runtimeState); err != nil {
-				return fail(stderr, *jsonOutput, command, err.Error())
-			}
-			if !hostIsolationInstalled() {
-				if err := configureAgentCodexHome(*runtimeState); err != nil {
-					return fail(stderr, *jsonOutput, command, err.Error())
-				}
-			}
-			if command == "reconcile" {
-				lock, lockErr := acquireDaemonLock(filepath.Join(*runtimeState, "daemon.lock"))
-				if lockErr != nil {
-					return fail(stderr, *jsonOutput, command, lockErr.Error())
-				}
-				defer releaseDaemonLock(lock)
 			}
 			statuses, err = reconcileGitHubRun(context.Background(), *path, *statePath, *runtimeState, command == "reconcile")
 		} else {
@@ -1376,10 +1355,15 @@ type reconcileOptions struct {
 	transition bool
 	intake     bool
 	timeout    time.Duration
+	lock       bool
 	authorize  func([]orchestrator.RecoveryStatus) error
 }
 
 func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
+	return reconcileGitHubWith(ctx, configPath, statePath, stateRoot, reconcileOptions{transition: transition, intake: transition, timeout: 5 * time.Minute, lock: transition})
+}
+
+func reconcileGitHubServing(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
 	return reconcileGitHubWith(ctx, configPath, statePath, stateRoot, reconcileOptions{transition: transition, intake: transition, timeout: 5 * time.Minute})
 }
 
@@ -1403,8 +1387,16 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 			return nil, fmt.Errorf("validate WSL filesystem: %w", err)
 		}
 	}
-	if err := bindDeployment(stateRoot, c.Repository); err != nil {
+	api, user, err := prepareProjectDeployment(ctx, stateRoot, c.Repository)
+	if err != nil {
 		return nil, err
+	}
+	if options.lock {
+		lock, lockErr := acquireDaemonLock(filepath.Join(stateRoot, "daemon.lock"))
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		defer releaseDaemonLock(lock)
 	}
 	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
 	if err != nil {
@@ -1418,14 +1410,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 			resultErr = fmt.Errorf("save GitHub cache: %w", err)
 		}
 	}()
-	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient, Cache: cache}
-	user, err := api.AuthenticatedUser(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("authenticate GitHub: %w", err)
-	}
-	if err := api.VerifyRepository(ctx, c.Repository); err != nil {
-		return nil, fmt.Errorf("verify GitHub repository: %w", err)
-	}
+	api.Cache = cache
 	remote, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch pull request attempts: %w", err)
@@ -3387,14 +3372,14 @@ func writeImmutable(path string, body []byte) error {
 	}
 	existing, readErr := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if readErr != nil {
-		return errors.New("immutable handoff inbox key collision")
+		return errors.New("immutable file collision")
 	}
 	old, readErr := io.ReadAll(io.LimitReader(existing, int64(len(body))+1))
 	if closeErr := existing.Close(); readErr == nil {
 		readErr = closeErr
 	}
 	if readErr != nil || !bytes.Equal(old, body) {
-		return errors.New("immutable handoff inbox key collision")
+		return errors.New("immutable file collision")
 	}
 	return immutableDirSync(dir)
 }
