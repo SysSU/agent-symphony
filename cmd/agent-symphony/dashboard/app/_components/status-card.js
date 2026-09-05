@@ -80,7 +80,7 @@ function OperatorFollowUp({ status, enabled, onNotice, readOnly }) {
     setBusy(true);
     onNotice("");
     try {
-      const query = new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) });
+      const query = new URLSearchParams({ repository: status.repository, issue: String(status.issue), attempt: String(status.attempt) });
       const response = await postWithReconciliationRetry(`/actions/attempt/message?${query}`, undefined, { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: body }) });
       if (!response.ok) throw new Error((await response.text()).trim() || `Worker follow-up failed (${response.status})`);
       setMessage("");

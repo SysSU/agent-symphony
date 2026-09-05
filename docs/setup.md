@@ -152,7 +152,8 @@ cd /path/to/first-repository
 agent-symphony serve \
   --state ~/.local/state/agent-symphony/first/pr.json \
   --runtime-state ~/.local/state/agent-symphony/first \
-  --dashboard-address 127.0.0.1:8081
+  --dashboard-address 127.0.0.1:8081 \
+  --dashboard-project http://127.0.0.1:8082
 ```
 
 ```sh
@@ -160,10 +161,11 @@ cd /path/to/second-repository
 agent-symphony serve \
   --state ~/.local/state/agent-symphony/second/pr.json \
   --runtime-state ~/.local/state/agent-symphony/second \
-  --dashboard-address 127.0.0.1:8082
+  --dashboard-address 127.0.0.1:8082 \
+  --dashboard-project http://127.0.0.1:8081
 ```
 
-Each process still manages only its configured repository. The daemons share the authenticated GitHub CLI account and, in advanced mode, the provisioned worker/reviewer identities; source bundle, worktree, review snapshot, and tmux session names include the repository identity. Concurrency remains per daemon, so size the sum of their configured capacities for the host.
+Each process still manages only its configured repository. On first use, its runtime-state root gets a private `deployment.json` identity; Agent Symphony rejects that root with any other project configuration. The project selector reads configured peers without combining state or forwarding controls. Peer aggregation is unauthenticated, so a dashboard protected by `--dashboard-password-file` appears unavailable to another deployment; open it directly and authenticate instead. The daemons share the authenticated GitHub CLI account and, in advanced mode, the provisioned worker/reviewer identities; source bundle, worktree, review snapshot, and tmux session names include the repository identity. Concurrency remains per daemon, so size the sum of their configured capacities for the host.
 
 Before upgrading an existing installation to the first release with repository-namespaced reviewer sessions, let active independent reviews finish and reconcile their cleanup. Implementation attempt identities are unchanged.
 
