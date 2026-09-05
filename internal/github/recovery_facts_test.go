@@ -3,7 +3,6 @@ package github
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -23,6 +22,7 @@ func TestDirectStatusRequiresTheSmallVocabularyAndReason(t *testing.T) {
 		{"/agent-symphony status needs-attention:", false, false, ""},
 		{"/agent-symphony status clear", false, false, ""},
 		{"/agent-symphony status blocked: reason", false, false, ""},
+		{"/agent-symphony status needs-attention: \t" + strings.Repeat("x", 1024) + " \n", true, true, strings.Repeat("x", 1024)},
 		{"/agent-symphony status needs-attention: " + strings.Repeat("x", 1025), false, false, ""},
 	} {
 		got, ok := parseDirectStatus(test.body)
@@ -89,16 +89,6 @@ func TestDirectStatusAuthenticationFailureIsNotSuccess(t *testing.T) {
 	status, err := (&GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}).directStatus(t.Context(), 10, 0)
 	if err == nil || status.commentID != 0 || !strings.Contains(err.Error(), "GitHub read") {
 		t.Fatalf("status=%#v err=%v", status, err)
-	}
-}
-
-func TestDirectStatusRejectsAmbiguousLinkedPullRequests(t *testing.T) {
-	event := func(number int) map[string]any {
-		return map[string]any{"event": "cross-referenced", "source": map[string]any{"issue": map[string]any{"number": number, "state": "open", "repository_url": "https://api.example.test/repos/o/r", "pull_request": map[string]any{"url": fmt.Sprintf("https://api.example.test/repos/o/r/pulls/%d", number)}}}}
-	}
-	api := fixtureAPI(t, map[string]any{"/repos/o/r/issues/10/timeline?per_page=100&page=1": []any{event(11), event(12)}})
-	if pull, err := (&GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r"}}).linkedPullRequest(t.Context(), 10); err == nil || pull != 0 || !strings.Contains(err.Error(), "multiple open linked pull requests") {
-		t.Fatalf("linked pull=%d err=%v", pull, err)
 	}
 }
 
@@ -273,7 +263,7 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
 	body := "##\n## Context\nreason and evidence\n## Acceptance criteria\n- result\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n## ###\n"
 	var snapshotBodies []string
-	changed, needsAttentionLabel, linkedPR := false, false, false
+	changed, needsAttentionLabel, mentionedPR := false, false, false
 	var pullComments []any
 	posts := 0
 	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -311,7 +301,7 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 					map[string]any{"id": 23, "event": "labeled", "label": map[string]any{"name": "P2"}, "created_at": now.Add(3 * time.Minute), "actor": map[string]any{"id": 5}},
 				)
 			}
-			if linkedPR {
+			if mentionedPR {
 				events = append(events, map[string]any{"event": "cross-referenced", "source": map[string]any{"issue": map[string]any{"number": 11, "state": "open", "repository_url": "https://api.example.test/repos/o/r", "pull_request": map[string]any{"url": "https://api.example.test/repos/o/r/pulls/11"}}}})
 			}
 			response = events
@@ -403,17 +393,24 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	if err != nil || len(cleared) != 1 || cleared[0].NeedsAttention || !cleared[0].DispatchAuthorized || len(cleared[0].Blockers) != 0 {
 		t.Fatalf("cleared facts=%#v err=%v", cleared, err)
 	}
-	linkedPR, needsAttentionLabel = true, true
+	mentionedPR = true
 	reviewSetAt := now.Add(time.Hour)
 	pullComments = append(pullComments, map[string]any{"id": 500, "body": "/agent-symphony status needs-attention: review found a blocking regression", "created_at": reviewSetAt, "updated_at": reviewSetAt, "user": map[string]any{"id": 42}})
-	reviewAttention, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	foreignAttempt := []RecoveryAttemptFact{{Repository: "o/r", Issue: 9, Attempt: 1, PR: 11, State: "active"}}
+	unrelated, err := FetchIssueFacts(context.Background(), api, cfg, foreignAttempt, true)
+	if err != nil || len(unrelated) != 1 || unrelated[0].NeedsAttention || !unrelated[0].DispatchAuthorized || len(unrelated[0].Blockers) != 0 {
+		t.Fatalf("merely mentioned issue facts=%#v err=%v", unrelated, err)
+	}
+	needsAttentionLabel = true
+	authoritativeAttempt := []RecoveryAttemptFact{{Repository: "o/r", Issue: 10, Attempt: 2, PR: 11, State: "active"}}
+	reviewAttention, err := FetchIssueFacts(context.Background(), api, cfg, authoritativeAttempt, true)
 	if err != nil || len(reviewAttention) != 1 || !reviewAttention[0].NeedsAttention || reviewAttention[0].Eligible || !reviewAttention[0].DispatchAuthorized || reviewAttention[0].RecoveryAuthorized || !slices.Contains(reviewAttention[0].Blockers, "needs attention: review found a blocking regression") {
 		t.Fatalf("review attention facts=%#v err=%v", reviewAttention, err)
 	}
 	needsAttentionLabel = false
 	reviewClearAt := reviewSetAt.Add(time.Minute)
 	pullComments = append(pullComments, map[string]any{"id": 501, "body": "/agent-symphony status clear: review verified the correction", "created_at": reviewClearAt, "updated_at": reviewClearAt, "user": map[string]any{"id": 42}})
-	reviewCleared, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	reviewCleared, err := FetchIssueFacts(context.Background(), api, cfg, authoritativeAttempt, true)
 	if err != nil || len(reviewCleared) != 1 || reviewCleared[0].NeedsAttention || len(reviewCleared[0].Blockers) != 0 {
 		t.Fatalf("review clear facts=%#v err=%v", reviewCleared, err)
 	}

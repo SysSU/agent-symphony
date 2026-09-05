@@ -1656,8 +1656,10 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 			if statuses[j].Repository == issue.Repository && statuses[j].Issue == issue.Issue {
 				statuses[j].Title, statuses[j].Priority, statuses[j].Dependencies = issue.Title, issue.Priority, issue.Dependencies
 				statuses[j].DispatchAuthorized = issue.DispatchAuthorized
-				statuses[j].NeedsAttention = issue.NeedsAttention
-				statuses[j].Blockers = append(statuses[j].Blockers, issue.Blockers...)
+				statuses[j].NeedsAttention = statuses[j].Attempt == issue.Attempt && issue.NeedsAttention
+				if statuses[j].Attempt == issue.Attempt {
+					statuses[j].Blockers = append(statuses[j].Blockers, issue.Blockers...)
+				}
 				if statuses[j].State == "failed" {
 					statuses[j].Retryable = statuses[j].Retryable && issue.RecoveryAuthorized && issue.RecoveryAttempt == statuses[j].Attempt
 				} else {

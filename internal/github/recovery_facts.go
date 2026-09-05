@@ -169,13 +169,11 @@ type directStatus struct {
 
 func parseDirectStatus(body string) (directStatus, bool) {
 	command, reason, found := strings.Cut(strings.TrimSpace(body), ":")
-	if !found || len(reason) > 1024 || strings.ContainsRune(reason, 0) {
+	reason = strings.TrimSpace(reason)
+	if !found || reason == "" || len(reason) > 1024 || strings.ContainsRune(reason, 0) {
 		return directStatus{}, false
 	}
-	status := directStatus{Reason: strings.TrimSpace(reason)}
-	if status.Reason == "" {
-		return directStatus{}, false
-	}
+	status := directStatus{Reason: reason}
 	switch command {
 	case directStatusPrefix + "needs-attention":
 		status.NeedsAttention = true
@@ -227,39 +225,6 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 		latest.NeedsAttention = true
 	}
 	return latest, nil
-}
-
-func (s *GitHubPRSource) linkedPullRequest(ctx context.Context, issue int) (int, error) {
-	found := 0
-	for page := 1; ; page++ {
-		var events []struct {
-			Event  string
-			Source struct {
-				Issue struct {
-					Number        int
-					State         string
-					RepositoryURL string                `json:"repository_url"`
-					PullRequest   *struct{ URL string } `json:"pull_request"`
-				}
-			}
-		}
-		if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d/timeline?per_page=100&page=%d", s.Config.Repository, issue, page), "", &events); err != nil {
-			return 0, err
-		}
-		for _, event := range events {
-			candidate := event.Source.Issue
-			if event.Event != "cross-referenced" || candidate.State != "open" || candidate.Number < 1 || candidate.PullRequest == nil || !strings.HasSuffix(candidate.RepositoryURL, "/repos/"+s.Config.Repository) || !strings.HasSuffix(candidate.PullRequest.URL, fmt.Sprintf("/pulls/%d", candidate.Number)) {
-				continue
-			}
-			if found != 0 && found != candidate.Number {
-				return 0, errors.New("issue has multiple open linked pull requests for direct status")
-			}
-			found = candidate.Number
-		}
-		if len(events) < 100 {
-			return found, nil
-		}
-	}
 }
 
 type markerConflicts struct {
@@ -383,12 +348,6 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			for _, attempt := range attempts {
 				if attempt.Issue == issue.Number && attempt.Attempt >= next[issue.Number]-1 {
 					pullRequest = attempt.PR
-				}
-			}
-			if pullRequest == 0 {
-				pullRequest, err = source.linkedPullRequest(ctx, issue.Number)
-				if err != nil {
-					return nil, fmt.Errorf("read linked pull request for issue #%d: %w", issue.Number, err)
 				}
 			}
 			status, err := source.directStatus(ctx, issue.Number, pullRequest)

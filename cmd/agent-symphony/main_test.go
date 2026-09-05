@@ -3893,6 +3893,25 @@ func TestQueuedIssueProjectionIsReadOnlyAndAuthoritative(t *testing.T) {
 	}
 }
 
+func TestAttentionProjectionAppliesOnlyToTheCurrentAttempt(t *testing.T) {
+	statuses := []orchestrator.RecoveryStatus{
+		{Repository: "o/r", Issue: 218, Attempt: 1, State: "failed", Blockers: []string{"attempt 1 failed before retry"}},
+		{Repository: "o/r", Issue: 218, Attempt: 2, State: "review-ready"},
+	}
+	issue := internalgithub.RecoveryIssueFact{
+		Repository: "o/r", Issue: 218, Attempt: 2, DispatchAuthorized: true, NeedsAttention: true,
+		Blockers: []string{"needs attention: review found a blocking regression"},
+	}
+
+	got, _ := joinIssueProjection(statuses, []internalgithub.RecoveryIssueFact{issue}, 1)
+	if got[0].NeedsAttention || len(got[0].Blockers) != 1 || got[0].Blockers[0] != "attempt 1 failed before retry" || got[0].State != "failed" {
+		t.Fatalf("historical attempt=%#v", got[0])
+	}
+	if !got[1].NeedsAttention || len(got[1].Blockers) != 1 || got[1].Blockers[0] != "needs attention: review found a blocking regression" || got[1].State != "review-ready" {
+		t.Fatalf("current attempt=%#v", got[1])
+	}
+}
+
 func TestIssueProjectionAllowsOnlyLatestUnblockedTerminalRecovery(t *testing.T) {
 	statuses := []orchestrator.RecoveryStatus{
 		{Repository: "o/r", Issue: 4, Attempt: 1, State: "failed", Retryable: true},

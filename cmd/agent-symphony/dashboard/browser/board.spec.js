@@ -155,20 +155,33 @@ test("shows implementation needs-attention and the later review clear", async ({
   const status = {
     repository: "SysSU/agent-symphony",
     issue: 218,
-    attempt: 1,
+    attempt: 2,
     title: "Direct agent status",
     state: "active",
     needs_attention: true,
     blockers: ["needs attention: implementation needs an operator decision"],
   };
+  const historical = {
+    ...status,
+    attempt: 1,
+    state: "failed",
+    needs_attention: false,
+    blockers: ["attempt 1 failed before retry"],
+  };
   await page.setViewportSize({ width: 1280, height: 900 });
-  await mockDashboard(page, [status]);
+  await mockDashboard(page, [historical, status]);
   await page.goto("/");
 
   const attention = page.locator(".lane").filter({ has: page.locator("#lane-needs-attention") });
   await expect(attention.getByRole("link", { name: "#218 Direct agent status" })).toBeVisible();
   await expect(attention.getByText("needs attention", { exact: true })).toBeVisible();
   await expect(attention.getByText("needs attention: implementation needs an operator decision", { exact: true })).toBeVisible();
+  const history = page.locator("details.attemptHistory");
+  await history.locator("summary").click();
+  await expect(history).toContainText("Attempt 1");
+  await expect(history).toContainText("attempt 1 failed before retry");
+  await expect(history.getByText("needs attention", { exact: true })).toHaveCount(0);
+  await expect(history.getByText("needs attention: implementation needs an operator decision", { exact: true })).toHaveCount(0);
   await page.screenshot({ path: "test-results/direct-status-attention-desktop.png", fullPage: true });
 
   Object.assign(status, { state: "review-ready", needs_attention: false, blockers: [] });
@@ -176,6 +189,7 @@ test("shows implementation needs-attention and the later review clear", async ({
   await expect(page.locator("#lane-needs-attention .laneCount")).toHaveText("0");
   await expect(page.locator("#lane-in-review .laneCount")).toHaveText("1");
   await expect(page.getByText("needs attention", { exact: true })).toHaveCount(0);
+  await expect(page.locator("details.attemptHistory")).toContainText("attempt 1 failed before retry");
 
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
