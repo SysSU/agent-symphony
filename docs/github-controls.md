@@ -39,7 +39,7 @@ After an attempt has a pull request, other nonempty issue comments posted after 
 | `autonomous-merge` | `completion_policies.autonomous_merge_label` | Opts into coordinator-managed merge after all review, validation, repository-rule, and permission checks pass. Apply it after the latest issue-body edit. |
 | `needs-attention` | Fixed | Create this reserved label during setup. It pairs with a reasoned direct-status comment to hold dispatch and move the current dashboard card to **Needs attention**. |
 
-`needs-human-review` and `autonomous-merge` conflict; do not apply both. Required control-label names must be nonempty. `labels.issue_filter` may be omitted or empty; when nonempty, it must be unique like every other configured label name.
+`needs-human-review` and `autonomous-merge` conflict; do not apply both. Required control-label names must be nonempty. `labels.issue_filter` may be omitted or empty; when nonempty, it must be unique like every other configured label name. Label names are compared case-insensitively, matching GitHub label identity.
 
 Edit the issue body before applying `agent-ready`. If an already-ready issue body changes, reapply `agent-ready`; reapply `autonomous-merge` too when autonomous completion is still intended.
 

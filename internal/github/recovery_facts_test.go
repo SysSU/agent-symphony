@@ -46,7 +46,7 @@ func TestDirectStatusUsesNewestAuthenticatedIssueOrPullRequestComment(t *testing
 		case "/repos/o/r/issues/10":
 			labels := []any{}
 			if labelPresent {
-				labels = append(labels, map[string]any{"name": NeedsAttentionLabel})
+				labels = append(labels, map[string]any{"name": strings.ToUpper(NeedsAttentionLabel)})
 			}
 			response = map[string]any{"labels": labels}
 		case "/repos/o/r/issues/10/comments?per_page=100&page=1":
@@ -303,7 +303,7 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 			}
 			labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": priority}}
 			if needsAttentionLabel {
-				labels = append(labels, map[string]any{"name": NeedsAttentionLabel})
+				labels = append(labels, map[string]any{"name": strings.ToUpper(NeedsAttentionLabel)})
 			}
 			response = map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 9}, "labels": labels}
 		case "GET /repos/o/r/issues/10/timeline?per_page=100&page=1":

@@ -217,7 +217,7 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", s.Config.Repository, issue), "", &current); err != nil {
 		return directStatus{}, err
 	}
-	labelPresent := slices.ContainsFunc(current.Labels, func(label struct{ Name string }) bool { return label.Name == NeedsAttentionLabel })
+	labelPresent := slices.ContainsFunc(current.Labels, func(label struct{ Name string }) bool { return strings.EqualFold(label.Name, NeedsAttentionLabel) })
 	if latest.commentID == 0 {
 		if labelPresent {
 			return directStatus{NeedsAttention: true, Reason: "needs-attention label requires an explanatory status comment"}, nil
@@ -274,7 +274,8 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 	if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/branches/%s", cfg.Repository, repository.DefaultBranch), "", &branch); err != nil {
 		return nil, err
 	}
-	active, completed, next, published := map[int]bool{}, map[int]bool{}, map[int]int{}, map[int]int{}
+	active, completed, next, published, currentPR := map[int]bool{}, map[int]bool{}, map[int]int{}, map[int]int{}, map[int]int{}
+	var completedIssues []int
 	for _, attempt := range attempts {
 		if attempt.Repository != cfg.Repository {
 			continue
@@ -286,35 +287,59 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			active[attempt.Issue] = true
 			published[attempt.Issue] = max(published[attempt.Issue], attempt.Attempt)
 		}
-		completed[attempt.Issue] = completed[attempt.Issue] || attempt.State == "completed"
+		if attempt.PR > 0 {
+			currentPR[attempt.Issue] = max(currentPR[attempt.Issue], attempt.Attempt)
+		}
+		if attempt.State == "completed" {
+			completed[attempt.Issue] = true
+			if !slices.Contains(completedIssues, attempt.Issue) {
+				completedIssues = append(completedIssues, attempt.Issue)
+			}
+		}
 	}
 	source := GitHubPRSource{API: api, Config: cfg}
 	var result []RecoveryIssueFact
+	type issueRecord struct {
+		Number             int
+		Title, Body, State string
+		CreatedAt          time.Time `json:"created_at"`
+		PullRequest        any       `json:"pull_request"`
+	}
+	seenIssues := map[int]bool{}
 	for page := 1; page <= recoveryPageLimit; page++ {
-		var issues []struct {
-			Number             int
-			Title, Body, State string
-			CreatedAt          time.Time `json:"created_at"`
-			PullRequest        any       `json:"pull_request"`
-		}
+		var issues []issueRecord
+		lastPage := targetIssue > 0
 		if targetIssue > 0 {
-			var issue struct {
-				Number             int
-				Title, Body, State string
-				CreatedAt          time.Time `json:"created_at"`
-				PullRequest        any       `json:"pull_request"`
-			}
+			var issue issueRecord
 			if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", cfg.Repository, targetIssue), "", &issue); err != nil {
 				return nil, err
 			}
-			if issue.State != "open" || issue.PullRequest != nil {
+			if issue.PullRequest != nil || issue.State != "open" && !completed[issue.Number] {
 				return result, nil
 			}
 			issues = append(issues, issue)
-		} else if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues?state=open&per_page=100&page=%d", cfg.Repository, page), "", &issues); err != nil {
-			return nil, err
+		} else {
+			if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues?state=open&per_page=100&page=%d", cfg.Repository, page), "", &issues); err != nil {
+				return nil, err
+			}
+			lastPage = len(issues) < 100
+			if lastPage {
+				for _, issueNumber := range completedIssues {
+					if seenIssues[issueNumber] || slices.ContainsFunc(issues, func(issue issueRecord) bool { return issue.Number == issueNumber }) {
+						continue
+					}
+					var issue issueRecord
+					if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", cfg.Repository, issueNumber), "", &issue); err != nil {
+						return nil, err
+					}
+					if issue.State == "closed" && issue.PullRequest == nil {
+						issues = append(issues, issue)
+					}
+				}
+			}
 		}
 		for _, issue := range issues {
+			seenIssues[issue.Number] = true
 			if issue.PullRequest != nil {
 				continue
 			}
@@ -361,7 +386,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 					next[issue.Number] = marker.Attempt + 1
 				}
 			}
-			currentAttempt := max(published[issue.Number], terminal.Attempt, binding.Attempt)
+			currentAttempt := max(currentPR[issue.Number], terminal.Attempt, binding.Attempt)
 			pullRequest := 0
 			for _, attempt := range attempts {
 				if attempt.Repository == cfg.Repository && attempt.Issue == issue.Number && attempt.Attempt == currentAttempt {
@@ -372,7 +397,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			if err != nil {
 				return nil, fmt.Errorf("read direct status for issue #%d: %w", issue.Number, err)
 			}
-			controls, _, retry, err := source.authorizedControlsWithIntake(ctx, issue.Number, intake)
+			controls, _, retry, err := source.authorizedControlsWithIntake(ctx, issue.Number, intake && issue.State != "closed")
 			if err != nil {
 				attempt := max(1, next[issue.Number])
 				if published[issue.Number] > 0 {
@@ -440,7 +465,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			}
 			result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts})
 		}
-		if targetIssue > 0 || len(issues) < 100 {
+		if lastPage {
 			return result, nil
 		}
 	}

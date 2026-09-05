@@ -1277,6 +1277,7 @@ func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t
 	var snapshots []string
 	statusMode := ""
 	terminal := false
+	issueState := "open"
 	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		comments := make([]any, len(snapshots))
 		for i, snapshot := range snapshots {
@@ -1297,7 +1298,7 @@ func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t
 		}
 		labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}}
 		if statusMode == "set" {
-			labels = append(labels, map[string]any{"name": "needs-attention"})
+			labels = append(labels, map[string]any{"name": "NEEDS-ATTENTION"})
 		}
 		var response any
 		switch request.Method + " " + request.URL.RequestURI() {
@@ -1306,9 +1307,12 @@ func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t
 		case "GET /repos/o/r/branches/main":
 			response = map[string]any{"commit": map[string]any{"sha": base}}
 		case "GET /repos/o/r/issues?state=open&per_page=100&page=1":
-			response = []any{map[string]any{"number": 218, "title": "Direct status", "body": completeImplementationIssueBody, "created_at": now}}
+			response = []any{}
+			if issueState == "open" {
+				response = []any{map[string]any{"number": 218, "title": "Direct status", "body": completeImplementationIssueBody, "created_at": now}}
+			}
 		case "GET /repos/o/r/issues/218":
-			response = map[string]any{"number": 218, "node_id": "I_218", "state": "open", "title": "Direct status", "body": completeImplementationIssueBody, "created_at": now, "user": map[string]any{"id": 5}, "labels": labels}
+			response = map[string]any{"number": 218, "node_id": "I_218", "state": issueState, "title": "Direct status", "body": completeImplementationIssueBody, "created_at": now, "user": map[string]any{"id": 5}, "labels": labels}
 		case "GET /repos/o/r/issues/218/timeline?per_page=100&page=1":
 			response = []any{
 				map[string]any{"id": 20, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": 5}},
@@ -1439,6 +1443,46 @@ func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t
 	historical = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 1 })
 	if active < 0 || !statuses[active].NeedsAttention || !slices.Contains(statuses[active].Blockers, "needs attention: direct status intent is incomplete: use needs-attention or clear with a nonempty reason") || historical < 0 || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" {
 		t.Fatalf("malformed projection=%#v", statuses)
+	}
+
+	terminal = false
+	for _, lifecycle := range []struct {
+		state, issueState string
+		completed         bool
+	}{
+		{"blocked", "open", false},
+		{"completed", "closed", true},
+	} {
+		published[1].State = lifecycle.state
+		published[1].Diagnostic = lifecycle.state + " attempt 2 remains current"
+		issueState = lifecycle.issueState
+		for _, status := range []struct {
+			mode      string
+			attention bool
+		}{
+			{"set", true},
+			{"clear", false},
+		} {
+			statusMode = status.mode
+			facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
+			if err != nil || len(facts) != 1 || facts[0].Attempt != 3 || facts[0].CurrentAttempt != 2 || facts[0].Completed != lifecycle.completed || facts[0].NeedsAttention != status.attention {
+				t.Fatalf("%s %s facts=%#v err=%v", lifecycle.state, status.mode, facts, err)
+			}
+			_, attemptFacts = recoveryAttemptFacts(published, facts)
+			statuses, _ = projectRecoveryStatuses(t.Context(), attemptFacts, facts, nil, 2, nil)
+			active = slices.IndexFunc(statuses, func(projected orchestrator.RecoveryStatus) bool {
+				return projected.Issue == 218 && projected.Attempt == 2
+			})
+			historical = slices.IndexFunc(statuses, func(projected orchestrator.RecoveryStatus) bool {
+				return projected.Issue == 218 && projected.Attempt == 1
+			})
+			if active < 0 || statuses[active].State != lifecycle.state || statuses[active].NeedsAttention != status.attention || statuses[active].Diagnostic != lifecycle.state+" attempt 2 remains current" || historical < 0 || statuses[historical].State != "failed" || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" {
+				t.Fatalf("%s %s projection=%#v", lifecycle.state, status.mode, statuses)
+			}
+			if status.attention && !slices.Contains(statuses[active].Blockers, "needs attention: operator decision required") {
+				t.Fatalf("%s set projection omitted attention reason: %#v", lifecycle.state, statuses[active])
+			}
+		}
 	}
 }
 

@@ -230,10 +230,11 @@ func (c Config) Validate() error {
 			problems = append(problems, "labels must not be empty")
 			break
 		}
-		if seen[label] {
+		identity := strings.ToLower(label)
+		if seen[identity] {
 			problems = append(problems, fmt.Sprintf("label %q is used more than once", label))
 		}
-		seen[label] = true
+		seen[identity] = true
 	}
 	if c.Dependencies.Section == "" {
 		problems = append(problems, "dependencies.section must not be empty")
