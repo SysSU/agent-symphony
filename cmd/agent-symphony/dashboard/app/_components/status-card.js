@@ -139,7 +139,8 @@ export function StatusCard(props) {
         <Detail label="Session lifecycle">{sessions.map((session) => (
           <span className="line" key={session.role}>
             {session.role === "implementation" ? null : <><button className="terminalLink" type="button" disabled={sessionDisabled(readOnly, session.role)} onClick={() => onOpenTerminal(status, session)} aria-label={`Open ${session.role} terminal`}><code>{session.name}</code></button>{" · "}</>}
-            {`${session.role} · ${session.state}${session.current ? " · current" : ""}`}
+            {`${session.role}${session.mode ? ` · ${session.mode}` : ""} · ${session.state}${session.current ? " · current" : ""}`}
+            {session.target ? <> {" · target "}<code>{session.target}</code></> : null}
             {session.updated_at ? <> {" · "}<Timestamp value={session.updated_at} /></> : null}
           </span>
         ))}</Detail>

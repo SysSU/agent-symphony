@@ -204,6 +204,7 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 		{"review running", func() agentruntime.Manifest {
 			m := base
 			m.ReviewState, m.ReviewSession = "running", reviewer
+			m.ReviewMode, m.ReviewTarget = agentruntime.ReviewModeImplementation, "aaaaaaa..bbbbbbb"
 			return m
 		}(), "review", "reviewer", 2, "reviewer session"},
 		{"review session missing", func() agentruntime.Manifest { m := base; m.ReviewState = "running"; return m }(), "review", "", 1, "restore"},
@@ -231,6 +232,9 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 				}
 				if session.Name == implementation && (session.CreatedAt != created || session.UpdatedAt != updated) {
 					t.Fatalf("implementation timestamps = %#v", session)
+				}
+				if session.Name == reviewer && test.name == "review running" && (session.Mode != agentruntime.ReviewModeImplementation || session.Target != "aaaaaaa..bbbbbbb") {
+					t.Fatalf("review metadata = %#v", session)
 				}
 			}
 			if current != test.currentRole {

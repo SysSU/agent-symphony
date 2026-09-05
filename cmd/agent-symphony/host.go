@@ -629,6 +629,8 @@ type reviewResultRequest struct {
 	Repository string `json:"repository"`
 	Issue      int    `json:"issue"`
 	Attempt    int    `json:"attempt"`
+	Mode       string `json:"mode"`
+	Target     string `json:"target"`
 	Head       string `json:"head"`
 }
 
@@ -648,8 +650,11 @@ func readReviewResult(input []byte, root string) (string, error) {
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || len(request.Repository) > 256 || strings.ContainsAny(request.Repository, "\\\x00\r\n") {
 		return "", errors.New("invalid review result request")
 	}
+	if !agentruntime.ValidReviewMetadata(request.Mode, request.Target) || !validReviewTarget(request.Mode, request.Target, request.Repository, request.Issue, request.Head) {
+		return "", errors.New("invalid review result request")
+	}
 	snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
-	path := reviewResultPath(snapshot, request.Head)
+	path := reviewResultPath(snapshot, request.Target)
 	if !belowRoot(path, root) {
 		return "", errors.New("review result path escapes snapshot root")
 	}

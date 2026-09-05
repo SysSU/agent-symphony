@@ -1026,14 +1026,14 @@ func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
 	}
 }
 
-func TestDashboardReviewerTerminalIsRoleBoundAndReadOnly(t *testing.T) {
+func TestDashboardReviewerTerminalIsRoleBoundAndInteractive(t *testing.T) {
 	root := t.TempDir()
 	repository, issue, attempt := "o/r", 23, 2
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, repository, issue, attempt)
 	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, repository, issue, attempt)
 	status := orchestrator.RecoveryStatus{Repository: repository, Issue: issue, Attempt: attempt, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{
 		{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "completed"},
-		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Current: true},
+		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModePlan, Target: "o/r#23 plan sha256:" + strings.Repeat("a", 64), Current: true},
 	}}
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
 		t.Fatal(err)
@@ -1041,7 +1041,7 @@ func TestDashboardReviewerTerminalIsRoleBoundAndReadOnly(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "tmux")
 	body := "#!/bin/sh\ncase $1 in\n" +
 		"has-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\";;\n" +
-		"attach-session) test \"$2\" = -r && test \"$3\" = -t && test \"$4\" = \"=$EXPECTED_SESSION\" || exit 2; printf 'review-ready\\r\\n'; sleep 30;;\n" +
+		"attach-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\" || exit 2; read line; printf 'got:%s\\r\\n' \"$line\";;\n" +
 		"*) exit 2;;\nesac\n"
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
@@ -1067,17 +1067,21 @@ func TestDashboardReviewerTerminalIsRoleBoundAndReadOnly(t *testing.T) {
 		t.Fatalf("review terminal dial response=%v err=%v", response, err)
 	}
 	defer connection.CloseNow()
-	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("must not reach reviewer")); err != nil {
+	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("review the dependency edge\n")); err != nil {
 		t.Fatal(err)
 	}
+	var output strings.Builder
 	for {
-		_, _, err = connection.Read(t.Context())
-		if err != nil {
+		kind, message, readErr := connection.Read(t.Context())
+		if readErr != nil {
+			t.Fatalf("reviewer terminal output=%q err=%v", output.String(), readErr)
+		}
+		if kind == websocket.MessageBinary {
+			output.Write(message)
+		}
+		if strings.Contains(output.String(), "got:review the dependency edge") {
 			break
 		}
-	}
-	if websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
-		t.Fatalf("reviewer input close=%v err=%v", websocket.CloseStatus(err), err)
 	}
 
 	status.Sessions[1].Name = "as-r-forged"
@@ -1086,6 +1090,14 @@ func TestDashboardReviewerTerminalIsRoleBoundAndReadOnly(t *testing.T) {
 	}
 	if _, err := (&dashboardServer{stateRoot: root}).projectedSession(issue, attempt, agentruntime.SessionRoleReviewer); err == nil {
 		t.Fatal("tampered reviewer identity accepted")
+	}
+	status.Sessions[1].Name = reviewer
+	status.Sessions[1].Mode = "ui-review"
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&dashboardServer{stateRoot: root}).projectedSession(issue, attempt, agentruntime.SessionRoleReviewer); err == nil {
+		t.Fatal("invalid reviewer mode accepted")
 	}
 }
 

@@ -64,6 +64,8 @@ type AttemptSession struct {
 	Role      string    `json:"role"`
 	Name      string    `json:"name"`
 	State     string    `json:"state"`
+	Mode      string    `json:"mode,omitempty"`
+	Target    string    `json:"target,omitempty"`
 	Current   bool      `json:"current,omitempty"`
 	CreatedAt time.Time `json:"created_at,omitzero"`
 	UpdatedAt time.Time `json:"updated_at,omitzero"`
@@ -254,15 +256,15 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 }
 
 func projectAttemptLifecycle(status *RecoveryStatus, manifest agentruntime.Manifest) {
-	add := func(role, name, state string, created time.Time) {
+	add := func(role, name, state, mode, target string, created time.Time) {
 		want, err := agentruntime.AttemptSessionName(role, manifest.Repository, manifest.Issue, manifest.Attempt)
 		if err == nil && name == want && state != "" {
-			status.Sessions = append(status.Sessions, AttemptSession{Role: role, Name: name, State: state, CreatedAt: created, UpdatedAt: manifest.UpdatedAt})
+			status.Sessions = append(status.Sessions, AttemptSession{Role: role, Name: name, State: state, Mode: mode, Target: target, CreatedAt: created, UpdatedAt: manifest.UpdatedAt})
 		}
 	}
-	add(agentruntime.SessionRoleImplementation, manifest.Session, manifest.State, manifest.CreatedAt)
+	add(agentruntime.SessionRoleImplementation, manifest.Session, manifest.State, "", "", manifest.CreatedAt)
 	if manifest.ReviewSession != "" {
-		add(agentruntime.SessionRoleReviewer, manifest.ReviewSession, manifest.ReviewState, time.Time{})
+		add(agentruntime.SessionRoleReviewer, manifest.ReviewSession, manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget, time.Time{})
 	}
 
 	switch status.State {

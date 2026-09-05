@@ -872,7 +872,7 @@ func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "terminal session is not available", http.StatusNotFound)
 		return
 	}
-	s.serveTerminalSession(w, r, session.Name, role == agentruntime.SessionRoleReviewer)
+	s.serveTerminalSession(w, r, session.Name)
 }
 
 func (s *dashboardServer) serveOrchestratorTerminal(w http.ResponseWriter, r *http.Request) {
@@ -897,10 +897,10 @@ func (s *dashboardServer) serveOrchestratorTerminal(w http.ResponseWriter, r *ht
 		http.Error(w, "orchestrator terminal is not available", http.StatusConflict)
 		return
 	}
-	s.serveTerminalSession(w, r, target.Session, false)
+	s.serveTerminalSession(w, r, target.Session)
 }
 
-func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Request, session string, readOnly bool) {
+func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Request, session string) {
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
@@ -915,11 +915,7 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 	conn.SetReadLimit(maxTerminalInputBytes)
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
-	args := []string{"attach-session"}
-	if readOnly {
-		args = append(args, "-r")
-	}
-	command := exec.CommandContext(ctx, s.tmux, append(args, "-t", "="+session)...)
+	command := exec.CommandContext(ctx, s.tmux, "attach-session", "-t", "="+session)
 	command.Dir = "/tmp"
 	command.Env = append(os.Environ(), "TERM=xterm-256color")
 	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 24, Cols: 80})
@@ -951,10 +947,6 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 			break
 		}
 		if kind == websocket.MessageBinary {
-			if readOnly {
-				_ = conn.Close(websocket.StatusPolicyViolation, "reviewer terminal is read-only")
-				break
-			}
 			if _, err := terminal.Write(message); err != nil {
 				break
 			}
@@ -1005,7 +997,8 @@ func (s *dashboardServer) projectedStatus(issue, attempt int) (orchestrator.Reco
 		seen := map[string]bool{}
 		for _, session := range status.Sessions {
 			want, sessionErr := agentruntime.AttemptSessionName(session.Role, status.Repository, issue, attempt)
-			if sessionErr != nil || session.Name != want || session.State == "" || seen[session.Role] {
+			metadataValid := session.Role != agentruntime.SessionRoleReviewer && session.Mode == "" && session.Target == "" || session.Role == agentruntime.SessionRoleReviewer && agentruntime.ValidReviewMetadata(session.Mode, session.Target)
+			if sessionErr != nil || session.Name != want || session.State == "" || !metadataValid || seen[session.Role] {
 				validSessions = false
 				break
 			}

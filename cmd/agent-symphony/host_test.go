@@ -425,7 +425,7 @@ func TestHostOrchestratorLaunchContractIsReadOnlyAndCredentialFiltered(t *testin
 
 func TestReviewResultArtifactFailsClosed(t *testing.T) {
 	const valid = `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`
-	request := reviewResultRequest{Repository: "o/r", Issue: 23, Attempt: 1, Head: strings.Repeat("a", 40)}
+	request := reviewResultRequest{Repository: "o/r", Issue: 23, Attempt: 1, Mode: agentruntime.ReviewModeImplementation, Target: strings.Repeat("b", 40) + ".." + strings.Repeat("a", 40), Head: strings.Repeat("a", 40)}
 	requestBody, _ := json.Marshal(request)
 
 	for _, test := range []struct {
@@ -458,7 +458,7 @@ func TestReviewResultArtifactFailsClosed(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
-			path := reviewResultPath(snapshot, request.Head)
+			path := reviewResultPath(snapshot, request.Target)
 			test.setup(t, path, root)
 			output, err := readReviewResult(requestBody, root)
 			if err == nil {
@@ -473,10 +473,31 @@ func TestReviewResultArtifactFailsClosed(t *testing.T) {
 		})
 	}
 
+	for _, test := range []struct {
+		name   string
+		mutate func(*reviewResultRequest)
+	}{
+		{"unknown mode", func(request *reviewResultRequest) { request.Mode = "ui-review" }},
+		{"head outside target", func(request *reviewResultRequest) { request.Head = strings.Repeat("c", 40) }},
+		{"plan target for wrong issue", func(request *reviewResultRequest) {
+			request.Mode = agentruntime.ReviewModePlan
+			request.Target = "o/r#24 plan sha256:" + strings.Repeat("a", 64)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := request
+			test.mutate(&invalid)
+			body, _ := json.Marshal(invalid)
+			if _, err := readReviewResult(body, t.TempDir()); err == nil {
+				t.Fatal("invalid mode or exact target reached the review artifact")
+			}
+		})
+	}
+
 	t.Run("substitution", func(t *testing.T) {
 		root := t.TempDir()
 		snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
-		path := reviewResultPath(snapshot, request.Head)
+		path := reviewResultPath(snapshot, request.Target)
 		mustWriteFile(t, path, valid)
 		oldOpen := hostReviewResultOpen
 		hostReviewResultOpen = func(candidate string, flags int, mode uint32) (int, error) {
@@ -494,7 +515,7 @@ func TestReviewResultArtifactFailsClosed(t *testing.T) {
 
 	root := t.TempDir()
 	snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
-	mustWriteFile(t, reviewResultPath(snapshot, request.Head), valid)
+	mustWriteFile(t, reviewResultPath(snapshot, request.Target), valid)
 	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
 	operation, _ := json.Marshal(struct {
 		Operation string          `json:"operation"`

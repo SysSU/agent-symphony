@@ -1148,6 +1148,35 @@ func TestQueuedReviewHandoffTransitionsAreDurableAndImmutable(t *testing.T) {
 	}
 }
 
+func TestReviewModeAndTargetAreDurableAndValidated(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := attempt.BaseSHA + ".." + strings.Repeat("b", 40)
+	reviewer, _ := AttemptSessionName(SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
+	stored, err := r.RecordReview(attempt, "running", ReviewModeImplementation, target, attempt.BaseSHA, strings.Repeat("b", 40), "/review/snapshot", reviewer)
+	if err != nil || stored.ReviewMode != ReviewModeImplementation || stored.ReviewTarget != target {
+		t.Fatalf("review metadata was not persisted: %#v err=%v", stored, err)
+	}
+	for _, test := range []struct{ mode, target string }{
+		{"ui-review", target},
+		{ReviewModePlan, ""},
+		{ReviewModeImplementation, "unsafe\ntarget"},
+	} {
+		invalid := stored
+		invalid.ReviewMode, invalid.ReviewTarget = test.mode, test.target
+		if err := r.validateManifest(attempt, invalid); err == nil {
+			t.Fatalf("invalid review metadata was accepted: %#v", test)
+		}
+	}
+	manifest.ReviewState = ""
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		t.Fatalf("legacy manifest without review metadata was rejected: %v", err)
+	}
+}
+
 func TestStopInterruptsPaneZeroWhenAnotherPaneIsActive(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	manifest, err := r.PrepareAndStart(t.Context(), attempt)
