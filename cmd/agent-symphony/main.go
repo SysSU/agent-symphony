@@ -3102,8 +3102,12 @@ func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuse
 	return nil
 }
 
-func reconcilePlanReviews(ctx context.Context, runtimeState *agentruntime.Runtime, reviewBoundary boundaryCaller, implementationBoundary workerBoundaryRunner, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, source, snapshotRoot string) error {
+func reconcilePlanReviews(ctx context.Context, runtimeState *agentruntime.Runtime, reviewBoundary boundaryCaller, implementationBoundary workerBoundaryRunner, cfg config.Config, issues []internalgithub.RecoveryIssueFact, _ []agentruntime.Manifest, source, snapshotRoot string) error {
 	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
+	if err != nil {
+		return err
+	}
+	manifests, err := runtimeState.Discover()
 	if err != nil {
 		return err
 	}
@@ -3118,9 +3122,13 @@ func reconcilePlanReviews(ctx context.Context, runtimeState *agentruntime.Runtim
 			return fmt.Errorf("plan review %s#%d has no authoritative issue", manifest.Repository, manifest.Issue)
 		}
 		issue := issues[index]
+		active := func() bool {
+			binding := issue.ActiveAttempt
+			return manifest.State == "running" && issue.DispatchAuthorized && binding != nil && binding.Repository == manifest.Repository && binding.Issue == manifest.Issue && binding.Attempt == manifest.Attempt && binding.BaseSHA == manifest.BaseSHA && slices.Contains([]string{"active", "review-ready"}, binding.State)
+		}
 		issue.Attempt = manifest.Attempt
 		attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: cfg.Commands.Implementation}
-		if manifest.ReviewState == "preparing" || manifest.ReviewState == "running" {
+		if active() && (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") {
 			_, pending, err := runIndependentReview(ctx, runtimeState, attempt, reviewBoundary, env, cfg.Commands.Reviewer, issue, manifest, source, manifest.ReviewHead, snapshotRoot, agentruntime.ReviewModePlan)
 			if err != nil {
 				return fmt.Errorf("%s#%d attempt %d: %w", manifest.Repository, manifest.Issue, manifest.Attempt, err)
@@ -3128,25 +3136,25 @@ func reconcilePlanReviews(ctx context.Context, runtimeState *agentruntime.Runtim
 			if pending {
 				continue
 			}
+			current, err := runtimeState.Discover()
+			if err != nil {
+				return err
+			}
+			stored := slices.IndexFunc(current, func(candidate agentruntime.Manifest) bool {
+				return candidate.Repository == manifest.Repository && candidate.Issue == manifest.Issue && candidate.Attempt == manifest.Attempt
+			})
+			if stored < 0 {
+				return errors.New("completed plan review lost its attempt manifest")
+			}
+			manifest = current[stored]
 		}
-		current, err := runtimeState.Discover()
-		if err != nil {
-			return err
-		}
-		stored := slices.IndexFunc(current, func(candidate agentruntime.Manifest) bool {
-			return candidate.Repository == manifest.Repository && candidate.Issue == manifest.Issue && candidate.Attempt == manifest.Attempt
-		})
-		if stored < 0 {
-			return errors.New("completed plan review lost its attempt manifest")
-		}
-		manifest = current[stored]
 		if manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" {
 			manifest, err = cleanupReviewOutcome(ctx, runtimeState, attempt, reviewBoundary, env, manifest, snapshotRoot)
 			if err != nil {
 				return fmt.Errorf("clean up plan review %s#%d attempt %d: %w", manifest.Repository, manifest.Issue, manifest.Attempt, err)
 			}
 		}
-		if manifest.ReviewState == "findings-queued" && !manifest.ReviewHandoffAck {
+		if active() && manifest.ReviewState == "findings-queued" && !manifest.ReviewHandoffAck {
 			if _, err := returnReviewFindings(ctx, runtimeState, implementationBoundary, attempt, manifest, manifest.ReviewHead, manifest.ReviewFindings, nil, cfg.Commands.Implementation); err != nil {
 				return err
 			}

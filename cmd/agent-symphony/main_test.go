@@ -3168,7 +3168,8 @@ func TestReconcilePlanReviewCompletesWhileImplementationRemainsActive(t *testing
 		t.Fatal(err)
 	}
 	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot}
-	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "a changed plan body", DispatchAuthorized: true}
+	binding := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "a changed plan body", DispatchAuthorized: true, ActiveAttempt: &binding}
 	boundary := &artifactReviewBoundary{root: snapshotRoot, paneOutput: "1 0"}
 	cfg := config.Config{Commands: config.Commands{Reviewer: []string{"reviewer"}, Implementation: []string{"implementation"}}}
 	if err := reconcilePlanReviews(t.Context(), runtimeState, boundary, workerBoundaryRunner{}, cfg, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, "", snapshotRoot); err != nil {
@@ -3201,7 +3202,8 @@ func TestReconcilePlanReviewRetriesRetainedCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "reviewed plan"}
+	binding := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "reviewed plan", DispatchAuthorized: true, ActiveAttempt: &binding}
 	manifest.State = "running"
 	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-2", "agent.log")
 	manifest.ReviewMode = agentruntime.ReviewModePlan
@@ -3263,7 +3265,8 @@ func TestReconcilePlanReviewRetriesUnacknowledgedFindings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "reviewed plan"}
+	binding := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "reviewed plan", DispatchAuthorized: true, ActiveAttempt: &binding}
 	manifest.State = "running"
 	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-2", "agent.log")
 	manifest.ReviewMode = agentruntime.ReviewModePlan
@@ -3313,6 +3316,88 @@ func TestReconcilePlanReviewRetriesUnacknowledgedFindings(t *testing.T) {
 	count, countErr := os.ReadFile(calls)
 	if err != nil || countErr != nil || string(count) != "2" || len(stored) != 1 || stored[0].State != "running" || !stored[0].ReviewHandoffQueued || !stored[0].ReviewHandoffAck {
 		t.Fatalf("retried findings state=%#v calls=%q err=%v countErr=%v", stored, count, err, countErr)
+	}
+}
+
+func TestReconcilePlanReviewOnlyCleansAfterCancellation(t *testing.T) {
+	for _, reviewState := range []string{"running", "findings-queued"} {
+		t.Run(reviewState, func(t *testing.T) {
+			stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			attemptRoot, snapshotRoot, source := filepath.Join(stateRoot, "worktrees"), filepath.Join(stateRoot, "snapshots"), t.TempDir()
+			if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, source, "init")
+			runGit(t, source, "config", "user.email", "test@example.invalid")
+			runGit(t, source, "config", "user.name", "test")
+			runGit(t, source, "commit", "--allow-empty", "-m", "base")
+			base := runGit(t, source, "rev-parse", "HEAD")
+			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 2, BaseSHA: base}
+			manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "reviewed plan"}
+			manifest.State = "running"
+			manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-2", "agent.log")
+			manifest.ReviewMode = agentruntime.ReviewModePlan
+			manifest.ReviewTarget, _ = reviewTarget(manifest.ReviewMode, issue, base, base)
+			manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewState = base, base, reviewState
+			manifest.ReviewSnapshot, manifest.ReviewSession = reviewIdentity(attempt, snapshotRoot)
+			if reviewState == "findings-queued" {
+				manifest.ReviewFindings = []string{"do not deliver after cancellation"}
+			}
+			manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+			if err := os.MkdirAll(manifest.ReviewSnapshot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(manifest.ReviewSnapshot, "retained")
+			mustWriteFile(t, marker, "cleanup allowed")
+			if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			body, _ := json.Marshal(manifest)
+			if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Runner: &revokedAttemptRunner{}}
+			stale, err := runtimeState.Discover()
+			if err != nil || len(stale) != 1 {
+				t.Fatalf("discover stale manifest=%#v err=%v", stale, err)
+			}
+			if _, err := runtimeState.Cancel(t.Context(), attempt, "cancelled between discovery and plan reconciliation"); err != nil {
+				t.Fatal(err)
+			}
+			key := "independent-review-" + base
+			ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(manifest.Worktree, key), base})
+			result, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
+			delivered, script := filepath.Join(t.TempDir(), "delivered"), filepath.Join(t.TempDir(), "boundary")
+			scriptBody := fmt.Sprintf("#!/bin/sh\nprintf delivered > %q\nprintf '%%s' '%s'\n", delivered, result)
+			if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			oldRoot := reviewSnapshotRoot
+			reviewSnapshotRoot = snapshotRoot
+			t.Cleanup(func() { reviewSnapshotRoot = oldRoot })
+			reviewBoundary := &recoveringReviewBoundary{displayErr: errors.New("reviewer became unobservable")}
+			cfg := config.Config{Commands: config.Commands{Reviewer: []string{"reviewer"}, Implementation: []string{"implementation"}}}
+			if err := reconcilePlanReviews(t.Context(), runtimeState, reviewBoundary, workerBoundaryRunner{Command: script}, cfg, []internalgithub.RecoveryIssueFact{issue}, stale, source, snapshotRoot); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := runtimeState.Discover()
+			if err != nil || len(stored) != 1 || stored[0].State != "cancelled" || stored[0].ReviewState != reviewState || stored[0].ReviewSnapshot != "" || stored[0].ReviewSession != "" || reviewBoundary.started != 0 {
+				t.Fatalf("cancelled review state=%#v starts=%d err=%v", stored, reviewBoundary.started, err)
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("cancelled review resource remains: %v", err)
+			}
+			if _, err := os.Stat(delivered); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("cancelled review delivered findings: %v", err)
+			}
+		})
 	}
 }
 
