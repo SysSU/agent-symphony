@@ -2843,6 +2843,8 @@ type artifactReviewBoundary struct {
 	root          string
 	terminal      string
 	paneOutput    string
+	prompt        string
+	env           []string
 	captureCalls  int
 	respawn       []string
 	respawns      int
@@ -2898,6 +2900,13 @@ func (b *artifactReviewBoundary) call(_ context.Context, operation string, comma
 			return agentruntime.Result{Output: b.paneOutput}, nil
 		}
 		return agentruntime.Result{Output: "1 0"}, nil
+	}
+	if slices.Contains(command.Args, "new-session") {
+		b.env = slices.Clone(command.Env)
+	}
+	if slices.Contains(command.Args, "load-buffer") {
+		body, _ := io.ReadAll(command.Stdin)
+		b.prompt = string(body)
 	}
 	if slices.Contains(command.Args, "capture-pane") {
 		b.captureCalls++
@@ -3028,6 +3037,52 @@ func TestRunningReviewWithDifferentBaseIsNotReused(t *testing.T) {
 	issue := internalgithub.RecoveryIssueFact{BaseSHA: strings.Repeat("c", 40)}
 	if _, pending, err := runIndependentReview(t.Context(), nil, attempt, &artifactReviewBoundary{paneOutput: "0"}, nil, []string{"reviewer"}, issue, manifest, "", head, root); err == nil || pending {
 		t.Fatalf("mismatched-base review was reused: pending=%v err=%v", pending, err)
+	}
+}
+
+func TestLegacyDeadSuccessfulReviewResumesFromHeadArtifact(t *testing.T) {
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptRoot := filepath.Join(stateRoot, "worktrees")
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base, head := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: base}
+	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-1", "agent.log")
+	manifest.State, manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead = "completed", "running", base, head
+	manifest.ReviewSnapshot, manifest.ReviewSession = reviewIdentity(attempt, filepath.Join(stateRoot, "snapshots"))
+	manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+	if err := os.MkdirAll(manifest.ReviewSnapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const clean = `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`
+	legacyResult := reviewResultPath(manifest.ReviewSnapshot, head)
+	mustWriteFile(t, legacyResult, clean)
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot}
+	boundary := &artifactReviewBoundary{root: filepath.Join(stateRoot, "snapshots"), paneOutput: "1 0"}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base}
+	result, pending, err := runIndependentReview(t.Context(), runtimeState, attempt, boundary, nil, []string{"reviewer"}, issue, manifest, "", head, filepath.Join(stateRoot, "snapshots"), agentruntime.ReviewModeImplementation)
+	target, _ := reviewTarget(agentruntime.ReviewModeImplementation, issue, base, head)
+	stored, discoverErr := runtimeState.Discover()
+	if err != nil || pending || result.Status != "clean" || discoverErr != nil || len(stored) != 1 || stored[0].ReviewState != "clean" || stored[0].ReviewMode != agentruntime.ReviewModeImplementation || stored[0].ReviewTarget != target || stored[0].ReviewSnapshot != "" || stored[0].ReviewSession != "" || boundary.respawns != 0 {
+		t.Fatalf("result=%#v pending=%v manifest=%#v respawns=%d err=%v discover=%v", result, pending, stored, boundary.respawns, err, discoverErr)
+	}
+	if _, err := os.Stat(legacyResult); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy result was not cleaned: %v", err)
 	}
 }
 

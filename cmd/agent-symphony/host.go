@@ -626,12 +626,13 @@ func sudoersPolicy(coordinator, binary string) string {
 }
 
 type reviewResultRequest struct {
-	Repository string `json:"repository"`
-	Issue      int    `json:"issue"`
-	Attempt    int    `json:"attempt"`
-	Mode       string `json:"mode"`
-	Target     string `json:"target"`
-	Head       string `json:"head"`
+	Repository         string `json:"repository"`
+	Issue              int    `json:"issue"`
+	Attempt            int    `json:"attempt"`
+	Mode               string `json:"mode"`
+	Target             string `json:"target"`
+	Head               string `json:"head"`
+	LegacyHeadArtifact bool   `json:"legacy_head_artifact,omitempty"`
 }
 
 const (
@@ -650,7 +651,7 @@ func readReviewResult(input []byte, root string) (string, error) {
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || len(request.Repository) > 256 || strings.ContainsAny(request.Repository, "\\\x00\r\n") {
 		return "", errors.New("invalid review result request")
 	}
-	if !agentruntime.ValidReviewMetadata(request.Mode, request.Target) || !validReviewTarget(request.Mode, request.Target, request.Repository, request.Issue, request.Head) {
+	if !agentruntime.ValidReviewMetadata(request.Mode, request.Target) || !validReviewTarget(request.Mode, request.Target, request.Repository, request.Issue, request.Head) || request.LegacyHeadArtifact && request.Mode != agentruntime.ReviewModeImplementation {
 		return "", errors.New("invalid review result request")
 	}
 	snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
@@ -659,6 +660,10 @@ func readReviewResult(input []byte, root string) (string, error) {
 		return "", errors.New("review result path escapes snapshot root")
 	}
 	listed, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) && request.LegacyHeadArtifact {
+		path = reviewResultPath(snapshot, request.Head)
+		listed, err = os.Lstat(path)
+	}
 	if err != nil || !listed.Mode().IsRegular() || listed.Size() <= 0 || listed.Size() > maxReviewResultSize {
 		return "", errors.New("review result artifact is missing, unsafe, or oversized")
 	}

@@ -27,21 +27,36 @@ const implementationReview = {
   worktree: "/attempts/agent-symphony-164-1",
   branch: "issue-164-interactive-review",
 };
+const planCandidate = {
+  ...attempt,
+  issue: 165,
+  title: "Review this issue plan",
+  current_phase: "implementation",
+  session: "as-syssu-agent-symphony-4bb6b1ed4949-165-1",
+  sessions: [
+    { role: "implementation", name: "as-syssu-agent-symphony-4bb6b1ed4949-165-1", state: "running", current: true },
+  ],
+};
 
 async function mockDashboard(page, closeReason = "") {
   const sockets = [];
+  const reviewPlanRequests = [];
   await page.route("**/release.json", (route) => route.fulfill({ json: { release: "0.5.0" } }));
-  await page.route("**/status.json", (route) => route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: [attempt, implementationReview] } }));
+  await page.route("**/status.json", (route) => route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: [attempt, implementationReview, planCandidate] } }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: false, state: "disabled" } }));
   await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
+  await page.route("**/actions/review-plan?*", (route) => {
+    reviewPlanRequests.push(route.request().url());
+    return route.fulfill({ status: 200, json: { ok: true } });
+  });
   await page.routeWebSocket(/\/(?:reviewer\/)?terminal\?/, (socket) => {
     const record = { url: socket.url(), messages: [] };
     sockets.push(record);
     socket.onMessage((message) => record.messages.push(message));
     if (closeReason) setTimeout(() => void socket.close({ code: 1000, reason: closeReason }), 0);
   });
-  return sockets;
+  return { sockets, reviewPlanRequests };
 }
 
 test("opens and chats with both exact review modes", async ({ page }) => {
@@ -50,7 +65,7 @@ test("opens and chats with both exact review modes", async ({ page }) => {
     if (message.type() === "error") errors.push(message.text());
   });
   page.on("pageerror", (error) => errors.push(error.message));
-  const sockets = await mockDashboard(page);
+  const { sockets } = await mockDashboard(page);
   await page.goto("/");
 
   await expect(page.getByText("review", { exact: true })).toHaveCount(2);
@@ -79,6 +94,17 @@ test("opens and chats with both exact review modes", async ({ page }) => {
   await expect.poll(() => sockets[2]?.messages.some((message) => typeof message !== "string")).toBe(true);
   expect(sockets[2].url).toContain("/terminal?issue=163&attempt=1");
   expect(errors).toEqual([]);
+});
+
+test("starts an issue-bound plan review from the attempt card", async ({ page }) => {
+  const { reviewPlanRequests } = await mockDashboard(page);
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Start plan review" }).click();
+  await expect.poll(() => reviewPlanRequests).toEqual([
+    `${new URL(page.url()).origin}/actions/review-plan?issue=165&attempt=1`,
+  ]);
+  await expect(page.getByRole("status").filter({ hasText: "Started plan review for issue #165, attempt 1." })).toBeVisible();
 });
 
 test("keeps session selection and the terminal dialog inside a mobile viewport", async ({ page }) => {

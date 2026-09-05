@@ -473,6 +473,31 @@ func TestReviewResultArtifactFailsClosed(t *testing.T) {
 		})
 	}
 
+	t.Run("legacy head artifact", func(t *testing.T) {
+		root := t.TempDir()
+		snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+		mustWriteFile(t, reviewResultPath(snapshot, request.Head), valid)
+		legacy := request
+		legacy.LegacyHeadArtifact = true
+		body, _ := json.Marshal(legacy)
+		if output, err := readReviewResult(body, root); err != nil || output != valid {
+			t.Fatalf("legacy result=%q err=%v", output, err)
+		}
+		mustWriteFile(t, reviewResultPath(snapshot, request.Target), strings.Repeat("x", maxReviewResultSize+1))
+		if _, err := readReviewResult(body, root); err == nil {
+			t.Fatal("legacy fallback bypassed the target-keyed artifact")
+		}
+		if _, err := readReviewResult(requestBody, root); err == nil {
+			t.Fatal("modern request read the legacy head-keyed artifact")
+		}
+		legacy.Mode = agentruntime.ReviewModePlan
+		legacy.Target = "o/r#23 plan sha256:" + strings.Repeat("a", 64)
+		body, _ = json.Marshal(legacy)
+		if _, err := readReviewResult(body, root); err == nil {
+			t.Fatal("plan review requested the legacy implementation artifact")
+		}
+	})
+
 	for _, test := range []struct {
 		name   string
 		mutate func(*reviewResultRequest)

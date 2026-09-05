@@ -55,6 +55,7 @@ type dashboardServer struct {
 	messages     orchestratorMessageService
 	cleanup      func(context.Context, string, agentruntime.Manifest) error
 	recover      func(context.Context, int, int) error
+	planReview   func(context.Context, int, int) error
 	reconcile    func(context.Context) error
 	mu           *sync.Mutex
 	localMu      sync.Mutex
@@ -91,16 +92,16 @@ func newDashboardHandler(ctx context.Context, stateRoot, tmux string) http.Handl
 }
 
 func newDashboardHandlerWithMutex(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex) http.Handler {
-	return newDashboardHandlerWithOptions(ctx, stateRoot, tmux, operationMu, nil, nil, nil, false, "")
+	return newDashboardHandlerWithOptions(ctx, stateRoot, tmux, operationMu, nil, nil, nil, nil, false, "")
 }
 
-func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
+func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
 	assets, err := fs.Sub(dashboardFiles, "dashboard/out")
 	if err != nil {
 		panic(err)
 	}
 	static := http.FileServer(http.FS(assets))
-	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, reconcile: reconcile, mu: operationMu}
+	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, planReview: planReview, reconcile: reconcile, mu: operationMu}
 	server.messages, _ = service.(orchestratorMessageService)
 	server.cleanup = server.cleanupAttempt
 	return server.handler(static)
@@ -119,7 +120,7 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 			return
 		}
 		s.issueBrowserSession(w, r)
-		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/recover" {
+		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/recover" || r.URL.Path == "/actions/review-plan" {
 			s.serveAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/"))
 			return
 		}
@@ -499,10 +500,15 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 		http.Error(w, "action requires the dashboard origin", http.StatusForbidden)
 		return
 	}
-	issue, issueErr := strconv.Atoi(r.URL.Query().Get("issue"))
-	attempt, attemptErr := strconv.Atoi(r.URL.Query().Get("attempt"))
-	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || (action != "archive" && action != "abandon" && action != "recover") {
+	query := r.URL.Query()
+	issue, issueErr := strconv.Atoi(query.Get("issue"))
+	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
+	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || (action != "archive" && action != "abandon" && action != "recover" && action != "review-plan") {
 		http.Error(w, "invalid action", http.StatusBadRequest)
+		return
+	}
+	if action == "review-plan" && (r.ContentLength != 0 || len(r.TransferEncoding) != 0 || len(query) != 2 || len(query["issue"]) != 1 || len(query["attempt"]) != 1) {
+		http.Error(w, "invalid plan review action", http.StatusBadRequest)
 		return
 	}
 	operationMu := s.mu
@@ -516,6 +522,21 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 	}
 	defer operationMu.Unlock()
 	status, err := s.projectedStatus(issue, attempt)
+	if action == "review-plan" {
+		if err != nil || status.State != "active" || s.planReview == nil {
+			http.Error(w, "attempt is not eligible for plan review", http.StatusConflict)
+			return
+		}
+		if err := s.planReview(r.Context(), issue, attempt); err != nil {
+			http.Error(w, internalgithub.Redact(err.Error()), http.StatusConflict)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+		return
+	}
 	if action == "recover" {
 		if err != nil || !status.Retryable || status.PR > 0 || s.recover == nil {
 			http.Error(w, "attempt is not eligible for recovery", http.StatusConflict)
@@ -1043,7 +1064,7 @@ func (s *dashboardServer) terminalStatus(issue, attempt int) (orchestrator.Recov
 	return s.projectedStatus(issue, attempt)
 }
 
-func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, recover func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
+func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", fmt.Errorf("dashboard address: %w", err)
@@ -1063,7 +1084,7 @@ func startDashboard(ctx context.Context, address, stateRoot string, operationMu 
 	if err != nil {
 		return "", fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
-	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, recover, reconcile, service, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, recover, planReview, reconcile, service, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
 		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password and session data are exposed in transit, and anyone with the password can use terminals and cleanup controls")
 	}

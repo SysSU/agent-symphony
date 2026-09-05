@@ -14,12 +14,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
@@ -131,7 +133,7 @@ func TestDashboardRejectsNonLoopbackRequestHost(t *testing.T) {
 }
 
 func TestWebDashboardStartsWithoutDesktopRuntimeAndStopsWithContext(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, false, "", io.Discard); err == nil {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, nil, false, "", io.Discard); err == nil {
 		t.Fatal("non-loopback dashboard address accepted")
 	}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -142,7 +144,7 @@ func TestWebDashboardStartsWithoutDesktopRuntimeAndStopsWithContext(t *testing.T
 		t.Fatal(err)
 	}
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running", Session: "as-o-test"}}
-	url, err := startDashboard(ctx, "127.0.0.1:0", root, nil, nil, nil, service, false, "", &log)
+	url, err := startDashboard(ctx, "127.0.0.1:0", root, nil, nil, nil, nil, service, false, "", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,12 +185,12 @@ func TestWebDashboardStartsWithoutDesktopRuntimeAndStopsWithContext(t *testing.T
 }
 
 func TestDashboardUnsafeNetworkRequiresPassword(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "dashboard password is required") {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "dashboard password is required") {
 		t.Fatalf("unsafe dashboard without password error=%v", err)
 	}
 
 	password := "test-dashboard-password"
-	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, nil, true, password)
+	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, nil, nil, true, password)
 	for _, test := range []struct {
 		name, method, path, username, password string
 		status                                 int
@@ -239,7 +241,7 @@ func TestDashboardUnsafeNetworkBindingWarnsAndAcceptsAuthentication(t *testing.T
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var log bytes.Buffer
-	boundURL, err := startDashboard(ctx, "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, true, "test-dashboard-password", &log)
+	boundURL, err := startDashboard(ctx, "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, nil, true, "test-dashboard-password", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +419,7 @@ func TestDashboardQueuesAuthenticatedWorkerFollowUpForExactProjectedAttempt(t *t
 func TestDashboardWorkerMessageRequiresAuthenticationAndExactConfirmationBinding(t *testing.T) {
 	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "Run the race test.", Binding: "exact-binding"}
 	service := &fakeDashboardMessageService{fakeDashboardOrchestrator: &fakeDashboardOrchestrator{status: orchestratoragent.Status{Enabled: true, State: "running"}}, proposal: proposal}
-	withoutPassword := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, service, false, "")
+	withoutPassword := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, nil, service, false, "")
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator/proposal.json", nil)
 	response := httptest.NewRecorder()
 	withoutPassword.ServeHTTP(response, request)
@@ -426,7 +428,7 @@ func TestDashboardWorkerMessageRequiresAuthenticationAndExactConfirmationBinding
 	}
 
 	operationMu := &sync.Mutex{}
-	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", operationMu, nil, nil, service, false, "password")
+	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", operationMu, nil, nil, nil, service, false, "password")
 	navigate := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/", nil)
 	navigate.Header.Set("Sec-Fetch-Mode", "navigate")
 	navigate.Header.Set("Sec-Fetch-Dest", "document")
@@ -547,7 +549,7 @@ func TestDashboardOrchestratorStatusAndActions(t *testing.T) {
 	now := time.Now().UTC()
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, UpdatedAt: now, Enabled: true, State: "running", Session: "as-o-test", Generation: 2, ContextMode: "rebuild", RebuiltAt: now, Diagnostic: "password=hunter2", NextAction: "none"}}
 	operationMu := &sync.Mutex{}
-	handler := newDashboardHandlerWithOptions(t.Context(), root, "tmux", operationMu, nil, nil, service, false, "")
+	handler := newDashboardHandlerWithOptions(t.Context(), root, "tmux", operationMu, nil, nil, nil, service, false, "")
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator.json", nil)
 	response := httptest.NewRecorder()
@@ -616,7 +618,7 @@ func TestDashboardRemoteProxyInvestigationRequiresExactForwardedOrigin(t *testin
 		t.Fatal(err)
 	}
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running"}}
-	handler := newDashboardHandlerWithOptions(t.Context(), root, "tmux", &sync.Mutex{}, nil, nil, service, false, "password")
+	handler := newDashboardHandlerWithOptions(t.Context(), root, "tmux", &sync.Mutex{}, nil, nil, nil, service, false, "password")
 	request := func(origin, forwardedHost, forwardedProto, login, remoteAddr string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/orchestrator/investigate?issue=31&attempt=2", nil)
 		r.Header.Set("Origin", origin)
@@ -657,7 +659,7 @@ func TestDashboardRemoteProxyInvestigationRequiresExactForwardedOrigin(t *testin
 
 func TestDashboardOrchestratorClearAndRebuildAreBodylessPOSTsWithContextTransitions(t *testing.T) {
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running", Generation: 4, ContextMode: "rebuild"}}
-	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, service, false, "")
+	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, nil, service, false, "")
 
 	for _, action := range []string{"clear", "rebuild"} {
 		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/actions/orchestrator/"+action, nil)
@@ -703,7 +705,7 @@ func TestDashboardOrchestratorTerminalIsExactAndLoopbackOnly(t *testing.T) {
 	}
 	t.Setenv("EXPECTED_SESSION", session)
 
-	unsafe := newDashboardHandlerWithOptions(t.Context(), root, script, &sync.Mutex{}, nil, nil, service, true, "password")
+	unsafe := newDashboardHandlerWithOptions(t.Context(), root, script, &sync.Mutex{}, nil, nil, nil, service, true, "password")
 	request := httptest.NewRequest(http.MethodGet, "http://192.0.2.10/orchestrator/terminal", nil)
 	request.Header.Set("Origin", "http://192.0.2.10")
 	request.SetBasicAuth("agent-symphony", "password")
@@ -713,7 +715,7 @@ func TestDashboardOrchestratorTerminalIsExactAndLoopbackOnly(t *testing.T) {
 		t.Fatalf("non-loopback orchestrator terminal status=%d", response.Code)
 	}
 
-	server := httptest.NewServer(newDashboardHandlerWithOptions(t.Context(), root, script, &sync.Mutex{}, nil, nil, service, false, ""))
+	server := httptest.NewServer(newDashboardHandlerWithOptions(t.Context(), root, script, &sync.Mutex{}, nil, nil, nil, service, false, ""))
 	defer server.Close()
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/orchestrator/terminal"
 	connection, responseHTTP, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
@@ -930,6 +932,85 @@ func TestDashboardRecoverRequiresSameOriginFreshRetryableProjection(t *testing.T
 	if response := request("http://127.0.0.1"); response.Code != http.StatusConflict || calls != 1 {
 		t.Fatalf("stale status=%d calls=%d", response.Code, calls)
 	}
+}
+
+func TestDashboardPlanReviewActionStartsExactIssueBoundReviewer(t *testing.T) {
+	source := gitRepository(t)
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "config", "user.name", "test")
+	runGit(t, source, "commit", "--allow-empty", "-m", "base")
+	base := runGit(t, source, "rev-parse", "HEAD")
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptRoot := filepath.Join(stateRoot, "worktrees")
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 215, Number: 3, BaseSHA: base}
+	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "215-3", "agent.log")
+	manifest.State, manifest.CreatedAt, manifest.UpdatedAt = "running", time.Now().UTC(), time.Now().UTC()
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Runner: &operatorMessageRunner{branch: manifest.Branch, head: base}, VerifyWorker: func(context.Context) error { return nil }}
+	binding := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, Body: "## Plan\nReview this operator-selected plan.", DispatchAuthorized: true, ActiveAttempt: &binding}
+	snapshotRoot := filepath.Join(t.TempDir(), "snapshots")
+	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	boundary := &artifactReviewBoundary{root: snapshotRoot}
+	status := orchestrator.RecoveryStatus{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "active", Branch: manifest.Branch, Worktree: manifest.Worktree, Session: manifest.Session}
+	if err := writeStatusSnapshot(stateRoot, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	operationMu := &sync.Mutex{}
+	calls := 0
+	server := &dashboardServer{ctx: t.Context(), stateRoot: stateRoot, tmux: "tmux", mu: operationMu, planReview: func(ctx context.Context, issueNumber, attemptNumber int) error {
+		calls++
+		return startIssuePlanReview(ctx, runtimeState, boundary, config.Default(attempt.Repository), []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, source, snapshotRoot, issueNumber, attemptNumber)
+	}}
+	invalid := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?issue=215&attempt=3", strings.NewReader("unexpected"))
+	invalid.Header.Set("Origin", "http://127.0.0.1")
+	invalidResponse := httptest.NewRecorder()
+	server.handler(http.NotFoundHandler()).ServeHTTP(invalidResponse, invalid)
+	if invalidResponse.Code != http.StatusBadRequest || calls != 0 {
+		t.Fatalf("invalid status=%d calls=%d", invalidResponse.Code, calls)
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?issue=215&attempt=3", nil)
+	request.Header.Set("Origin", "http://127.0.0.1")
+	response := httptest.NewRecorder()
+	server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
+	target, _ := reviewTarget(agentruntime.ReviewModePlan, issue, base, base)
+	stored, discoverErr := runtimeState.Discover()
+	if response.Code != http.StatusOK || calls != 1 || discoverErr != nil || len(stored) != 1 || stored[0].ReviewState != "running" || stored[0].ReviewMode != agentruntime.ReviewModePlan || stored[0].ReviewTarget != target {
+		t.Fatalf("status=%d body=%q calls=%d manifest=%#v err=%v", response.Code, response.Body.String(), calls, stored, discoverErr)
+	}
+	wantSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
+	if stored[0].ReviewSession != wantSession || boundary.respawns != 1 || !slices.Contains(boundary.respawn, reviewResultPath(stored[0].ReviewSnapshot, target)) || !slices.Contains(boundary.env, "GH_REPO=o/r") || !strings.Contains(boundary.prompt, "Review mode: plan-review") || !strings.Contains(boundary.prompt, target) || !strings.Contains(boundary.prompt, "/agent-symphony status needs-attention") {
+		t.Fatalf("stored=%#v respawn=%q env=%q prompt=%q", stored[0], boundary.respawn, boundary.env, boundary.prompt)
+	}
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(stored[0].ReviewSnapshot, func(path string, entry os.DirEntry, err error) error {
+			if err == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
 }
 
 func writeDashboardManifest(t *testing.T, stateRoot string, issue, attemptNumber int, state string) agentruntime.Manifest {
