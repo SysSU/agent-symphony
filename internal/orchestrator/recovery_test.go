@@ -205,6 +205,7 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 			m := base
 			m.ReviewState, m.ReviewSession = "running", reviewer
 			m.ReviewMode, m.ReviewTarget = agentruntime.ReviewModeImplementation, "aaaaaaa..bbbbbbb"
+			m.ReviewBase, m.ReviewHead = "aaaaaaa", "bbbbbbb"
 			return m
 		}(), "review", "reviewer", 2, "reviewer session"},
 		{"review session missing", func() agentruntime.Manifest { m := base; m.ReviewState = "running"; return m }(), "review", "", 1, "restore"},
@@ -251,6 +252,17 @@ func TestRecoverOmitsUnknownSessionIdentityAndKeepsTerminalHistory(t *testing.T)
 	got := Recover([]AttemptFact{fact}, []agentruntime.Manifest{manifest})
 	if len(got) != 1 || got[0].CurrentPhase != "failed" || len(got[0].Sessions) != 1 || got[0].Sessions[0].Name != implementation || got[0].Sessions[0].State != "cancelled" {
 		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestRecoverOmitsMalformedReviewTarget(t *testing.T) {
+	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 4, 2)
+	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 4, 2)
+	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "active"}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: fact.BaseSHA, State: "running", Session: implementation, ReviewState: "running", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: "garbage", ReviewSession: reviewer}
+	got := Recover([]AttemptFact{fact}, []agentruntime.Manifest{manifest})
+	if len(got) != 1 || slices.ContainsFunc(got[0].Sessions, func(session AttemptSession) bool { return session.Role == agentruntime.SessionRoleReviewer }) {
+		t.Fatalf("malformed reviewer was projected: %#v", got)
 	}
 }
 

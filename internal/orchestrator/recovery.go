@@ -263,7 +263,7 @@ func projectAttemptLifecycle(status *RecoveryStatus, manifest agentruntime.Manif
 		}
 	}
 	add(agentruntime.SessionRoleImplementation, manifest.Session, manifest.State, "", "", manifest.CreatedAt)
-	if manifest.ReviewSession != "" {
+	if manifest.ReviewSession != "" && agentruntime.ValidReviewBinding(manifest.ReviewMode, manifest.ReviewTarget, manifest.Repository, manifest.Issue, manifest.ReviewBase, manifest.ReviewHead, manifest.BaseSHA) {
 		add(agentruntime.SessionRoleReviewer, manifest.ReviewSession, manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget, time.Time{})
 	}
 

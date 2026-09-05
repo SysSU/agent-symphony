@@ -122,7 +122,7 @@ Commands produce plain human-readable text by default and never depend on color.
   "docs_paths": ["README.md", "docs"],
   "commands": {
     "implementation": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"],
-    "reviewer": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"],
+    "reviewer": ["codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"],
     "orchestrator": ["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"],
     "orchestrator_audit": ["codex", "exec", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "-c", "model_reasoning_effort=\"medium\"", "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"],
     "environment_allowlist": ["LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"]
@@ -133,6 +133,8 @@ Commands produce plain human-readable text by default and never depend on color.
   }
 }
 ```
+
+The reviewer command is launched in its shared interactive tmux session with the bound review prompt as its final argument. It must keep standard input attached for operator chat and atomically write its final structured result to `AGENT_SYMPHONY_REVIEW_RESULT`; the previous generated `codex exec ... -` reviewer value is upgraded to the interactive default at launch.
 
 `reconciliation_interval_seconds` controls continuous `serve` reconciliation in whole seconds. It must be between 1 and 60 and defaults to 60 when omitted from an older configuration. An explicit `serve --interval duration` overrides it for that run.
 

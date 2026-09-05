@@ -2444,6 +2444,7 @@ esac
 		t.Fatal(err)
 	}
 	manifest.State, manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead = "running", "clean", base, head
+	manifest.ReviewMode, manifest.ReviewTarget = agentruntime.ReviewModeImplementation, base+".."+head
 	manifest.ReviewSession, _ = agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
 	manifest.CreatedAt, manifest.UpdatedAt = issueCreated, issueCreated
 	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
@@ -2949,9 +2950,9 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 		t.Fatalf("review result existed before capture: %v", err)
 	}
 	log, err := os.ReadFile(boundaryLog)
-	load, start := strings.Index(string(log), `"args":["load-buffer"`), strings.Index(string(log), `"args":["respawn-pane"`)
-	if err != nil || load < 0 || start < load || !strings.Contains(string(log), "worker-capture") {
-		t.Fatalf("review stdin was not loaded before reviewer start: %s err=%v", log, err)
+	start := strings.Index(string(log), `"args":["respawn-pane"`)
+	if err != nil || start < 0 || strings.Contains(string(log), "worker-capture") {
+		t.Fatalf("interactive reviewer was not launched directly: %s err=%v", log, err)
 	}
 	if !strings.Contains(string(log), `OPENAI_API_KEY=model-canary`) || !strings.Contains(string(log), `GITHUB_TOKEN=github-canary`) || !strings.Contains(string(log), `GH_REPO=o/r`) || slices.ContainsFunc([]string{"ssh-canary", "cloud-canary", "proxy-canary", "app-canary", "/coordinator-home"}, func(secret string) bool { return strings.Contains(string(log), secret) }) {
 		t.Fatalf("review boundary environment was not safely filtered: %s", log)
@@ -2968,8 +2969,8 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 		if decoder.Decode(&request) != nil {
 			break
 		}
-		if slices.Contains(request.Command.Args, "load-buffer") {
-			prompt = string(request.Command.Input)
+		if slices.Contains(request.Command.Args, "respawn-pane") {
+			prompt = request.Command.Args[len(request.Command.Args)-1]
 		}
 	}
 	if !strings.Contains(prompt, "Review mode: implementation-review") || !strings.Contains(prompt, target) || strings.Contains(prompt, base+".."+head) {
@@ -3084,8 +3085,9 @@ func (b *artifactReviewBoundary) call(_ context.Context, operation string, comma
 	if slices.Contains(command.Args, "respawn-pane") {
 		b.respawn = slices.Clone(command.Args)
 		b.respawns++
-		for _, path := range command.Args {
-			if strings.HasPrefix(path, b.root+string(filepath.Separator)) && strings.Contains(filepath.Base(filepath.Dir(path)), ".result-") {
+		b.prompt = command.Args[len(command.Args)-1]
+		for _, entry := range command.Env {
+			if path := strings.TrimPrefix(entry, "AGENT_SYMPHONY_REVIEW_RESULT="); path != entry && strings.HasPrefix(path, b.root+string(filepath.Separator)) {
 				if err := os.WriteFile(path, []byte(b.resultContent), 0o660); err != nil {
 					return agentruntime.Result{}, err
 				}
@@ -3110,7 +3112,7 @@ func TestPlanReviewUsesExistingReviewerSessionAndExactArtifact(t *testing.T) {
 	}
 	boundary := &artifactReviewBoundary{root: root}
 	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, []string{"reviewer"}, issue, agentruntime.Manifest{}, source, head, root, agentruntime.ReviewModePlan)
-	if err != nil || !pending || boundary.respawns != 1 || !slices.Contains(boundary.respawn, reviewResultPath(result.Snapshot, target)) {
+	if err != nil || !pending || boundary.respawns != 1 || !slices.Contains(boundary.env, "AGENT_SYMPHONY_REVIEW_RESULT="+reviewResultPath(result.Snapshot, target)) {
 		t.Fatalf("plan review result=%#v target=%q respawn=%q pending=%v err=%v", result, target, boundary.respawn, pending, err)
 	}
 	wantSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
@@ -3125,6 +3127,63 @@ func TestPlanReviewUsesExistingReviewerSessionAndExactArtifact(t *testing.T) {
 			return nil
 		})
 	})
+}
+
+func TestReconcilePlanReviewCompletesWhileImplementationRemainsActive(t *testing.T) {
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptRoot, snapshotRoot := filepath.Join(stateRoot, "worktrees"), filepath.Join(stateRoot, "snapshots")
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := strings.Repeat("a", 40)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 2, BaseSHA: base}
+	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.State = "running"
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-2", "agent.log")
+	manifest.ReviewMode = agentruntime.ReviewModePlan
+	manifest.ReviewTarget = "o/r#23 plan sha256:" + strings.Repeat("b", 64)
+	manifest.ReviewBase, manifest.ReviewHead = base, base
+	manifest.ReviewState = "running"
+	manifest.ReviewSnapshot, manifest.ReviewSession = reviewIdentity(attempt, snapshotRoot)
+	manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(manifest.ReviewSnapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resultPath := reviewResultPath(manifest.ReviewSnapshot, manifest.ReviewTarget)
+	if err := os.MkdirAll(filepath.Dir(resultPath), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, resultPath, `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`)
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "a changed plan body", DispatchAuthorized: true}
+	boundary := &artifactReviewBoundary{root: snapshotRoot, paneOutput: "1 0"}
+	cfg := config.Config{Commands: config.Commands{Reviewer: []string{"reviewer"}, Implementation: []string{"implementation"}}}
+	if err := reconcilePlanReviews(t.Context(), runtimeState, boundary, workerBoundaryRunner{}, cfg, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, "", snapshotRoot); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := runtimeState.Discover()
+	if err != nil || len(stored) != 1 || stored[0].State != "running" || stored[0].ReviewState != "clean" || stored[0].ReviewTarget != manifest.ReviewTarget || stored[0].ReviewSession != "" || stored[0].ReviewSnapshot != "" {
+		t.Fatalf("stored=%#v err=%v", stored, err)
+	}
+	statuses, _ := projectRecoveryStatuses(t.Context(), []orchestrator.AttemptFact{{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}}, []internalgithub.RecoveryIssueFact{issue}, stored, 1, func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil })
+	if len(statuses) != 1 || statuses[0].CurrentPhase != "implementation" || slices.ContainsFunc(statuses[0].Sessions, func(session orchestrator.AttemptSession) bool {
+		return session.Role == agentruntime.SessionRoleReviewer
+	}) {
+		t.Fatalf("stale plan reviewer remained projected: %#v", statuses)
+	}
 }
 
 func TestReviewAuthenticationCrossesIndependentReviewBoundary(t *testing.T) {
@@ -3273,13 +3332,13 @@ func TestIndependentReviewIgnoresEchoedAndDuplicatedTerminalResult(t *testing.T)
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: base}
 	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "review this"}
 	target, _ := reviewTarget(agentruntime.ReviewModeImplementation, issue, base, head)
-	defaultReviewer := config.Default(attempt.Repository).Commands.Reviewer
+	defaultReviewer := []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"} // Existing generated configurations are upgraded at launch.
 	started, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, defaultReviewer, issue, agentruntime.Manifest{}, source, head, root)
 	if err != nil || !pending {
 		t.Fatalf("start pending=%v err=%v", pending, err)
 	}
-	if slices.Contains(boundary.respawn, "review") || slices.Contains(boundary.respawn, "--output-last-message") || !slices.Contains(boundary.respawn, reviewResultPath(started.Snapshot, target)) || !slices.Contains(boundary.respawn, "--dangerously-bypass-approvals-and-sandbox") || !slices.Contains(boundary.respawn, "-") {
-		t.Fatalf("default reviewer did not receive result artifact: %q", boundary.respawn)
+	if slices.Contains(boundary.respawn, "exec") || slices.Contains(boundary.respawn, "--output-last-message") || !slices.Contains(boundary.respawn, "--dangerously-bypass-approvals-and-sandbox") || !slices.Contains(boundary.respawn, "--no-alt-screen") || !slices.Contains(boundary.env, "AGENT_SYMPHONY_REVIEW_RESULT="+reviewResultPath(started.Snapshot, target)) {
+		t.Fatalf("default reviewer was not launched interactively with its result binding: %q env=%q", boundary.respawn, boundary.env)
 	}
 	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
 	if _, _, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, defaultReviewer, issue, manifest, source, head, root); err == nil {
@@ -3416,41 +3475,24 @@ func TestReviewCaptureRedactsResultBeforeFindingsHandoff(t *testing.T) {
 }
 
 func TestDefaultReviewerProductionShapeUsesExactDiffAndRejectsProse(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux is unavailable")
-	}
 	dir := t.TempDir()
 	codex := filepath.Join(dir, "codex")
 	const script = `#!/bin/sh
-test "$#" -eq 3 && test "$1" = exec && test "$2" = --dangerously-bypass-approvals-and-sandbox && test "$3" = - || exit 20
-prompt=$(cat) || exit 21
+test "$#" -eq 3 && test "$1" = --dangerously-bypass-approvals-and-sandbox && test "$2" = --no-alt-screen || exit 20
+prompt=$3
 printf '%s' "$prompt" | grep -F "$FAKE_REVIEW_BASE..$FAKE_REVIEW_HEAD" >/dev/null || exit 22
 diff=$(git -C "$FAKE_REVIEW_REPO" diff --no-ext-diff "$FAKE_REVIEW_BASE" HEAD) || exit 23
 printf '%s' "$diff" | grep -F '+first implementation commit' >/dev/null || exit 24
 printf '%s' "$diff" | grep -F '+second implementation commit' >/dev/null || exit 25
+read operator && test "$operator" = 'inspect the edge' || exit 26
 printf x >>"$FAKE_REVIEW_COUNT"
-printf '%s' "$FAKE_REVIEW_OUTPUT"
-printf 'review diagnostic\n' >&2`
+printf '%s' "$FAKE_REVIEW_OUTPUT" >"$AGENT_SYMPHONY_REVIEW_RESULT.tmp"
+mv "$AGENT_SYMPHONY_REVIEW_RESULT.tmp" "$AGENT_SYMPHONY_REVIEW_RESULT"
+printf 'received:%s\n' "$operator"`
 	if err := os.WriteFile(codex, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	tmuxRoot, err := os.MkdirTemp("/tmp", "agent-symphony-review-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(tmuxRoot) })
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
-	t.Setenv("TMUX", "")
-	t.Setenv("TMUX_PANE", "")
-	t.Setenv("TMUX_TMPDIR", tmuxRoot)
-	bootstrap := exec.Command("tmux", "-f", "/dev/null", "new-session", "-d", "-s", "agent-symphony-test-bootstrap")
-	if output, err := bootstrap.CombinedOutput(); err != nil {
-		t.Fatalf("start isolated tmux server: %v: %s", err, output)
-	}
-	t.Cleanup(func() {
-		command := exec.Command("tmux", "kill-session", "-t", "=agent-symphony-test-bootstrap")
-		_ = command.Run()
-	})
 	source := t.TempDir()
 	runGit(t, source, "init")
 	runGit(t, source, "config", "user.email", "test@example.invalid")
@@ -3488,26 +3530,21 @@ printf 'review diagnostic\n' >&2`
 			count := filepath.Join(dir, fmt.Sprintf("count-%d", i))
 			t.Setenv("FAKE_REVIEW_COUNT", count)
 			t.Setenv("FAKE_REVIEW_OUTPUT", test.output)
-			buffer := fmt.Sprintf("review-%d", i)
-			load := exec.Command("tmux", "load-buffer", "-b", buffer, "-")
 			prompt, err := reviewPrompt(agentruntime.ReviewModeImplementation, base+".."+head, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23 + i, Attempt: 1, Body: "Review the change."})
 			if err != nil {
 				t.Fatal(err)
-			}
-			load.Stdin = strings.NewReader(prompt)
-			if output, err := load.CombinedOutput(); err != nil {
-				t.Fatalf("load real tmux prompt: %v: %s", err, output)
 			}
 			resultRoot := filepath.Join(dir, fmt.Sprintf("result-%d", i))
 			if err := os.Mkdir(resultRoot, 0o700); err != nil {
 				t.Fatal(err)
 			}
 			resultPath := filepath.Join(resultRoot, "result.json")
-			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-			defer cancel()
-			code, err := agentruntime.CaptureWorker(ctx, "tmux", buffer, resultPath, defaultReviewer, io.Discard, io.Discard)
-			if err != nil || code != 0 {
-				t.Fatalf("default reviewer capture code=%d err=%v", code, err)
+			command := exec.Command(defaultReviewer[0], append(defaultReviewer[1:], prompt)...)
+			command.Dir, command.Stdin = source, strings.NewReader("inspect the edge\n")
+			command.Env = append(os.Environ(), "AGENT_SYMPHONY_REVIEW_RESULT="+resultPath)
+			output, err := command.CombinedOutput()
+			if err != nil || !strings.Contains(string(output), "received:inspect the edge") {
+				t.Fatalf("interactive reviewer output=%q err=%v", output, err)
 			}
 			body, err := os.ReadFile(resultPath)
 			_, parseErr := parseIndependentReview(string(body))
@@ -4143,7 +4180,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	if err := os.Mkdir(snapshot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Branch: "issue-23", BaseSHA: base, State: "completed", ReviewState: "clean", ReviewBase: base, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session, UpdatedAt: time.Now().UTC()}
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Branch: "issue-23", BaseSHA: base, State: "completed", ReviewState: "clean", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: base + ".." + head, ReviewBase: base, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session, UpdatedAt: time.Now().UTC()}
 	sum := sha256.Sum256([]byte(attempt.Repository))
 	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
@@ -4560,7 +4597,7 @@ func TestInitAndMisuseExitCodes(t *testing.T) {
 	if !slices.Equal(initialized.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
 		t.Fatalf("unexpected initialized implementation command: %q", initialized.Commands.Implementation)
 	}
-	if !slices.Equal(initialized.Commands.Reviewer, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
+	if !slices.Equal(initialized.Commands.Reviewer, []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
 		t.Fatalf("unexpected initialized reviewer command: %q", initialized.Commands.Reviewer)
 	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}

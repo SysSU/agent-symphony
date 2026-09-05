@@ -681,7 +681,7 @@ func readReviewResult(input []byte, root string) (string, error) {
 	if err != nil || len(body) == 0 || len(body) > maxReviewResultSize {
 		return "", errors.New("review result artifact is missing or oversized")
 	}
-	return string(body), nil
+	return internalgithub.RedactEnvironment(string(body), os.Environ()), nil
 }
 
 func runHostOrchestrator(ctx context.Context, root, home string, local bool) error {

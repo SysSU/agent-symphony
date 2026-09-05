@@ -1547,12 +1547,13 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		return statuses, fmt.Errorf("rediscover queued attempts: %w", err)
 	}
 	monitorErr := monitorAttempts(ctx, &r, statuses, queuedManifests, issues)
+	planReviewErr := reconcilePlanReviews(ctx, &r, reviewBoundary(stateRoot), boundary, c, issues, queuedManifests, source, productionSnapshotRoot(stateRoot))
 	queuedManifests, decisions, err = refreshProjection(facts, issues)
 	if err != nil {
-		return statuses, errors.Join(fmt.Errorf("refresh monitored attempt projection: %w", err), monitorErr)
+		return statuses, errors.Join(fmt.Errorf("refresh monitored attempt projection: %w", err), monitorErr, planReviewErr)
 	}
-	if monitorErr != nil {
-		return statuses, fmt.Errorf("monitor live attempts: %w", monitorErr)
+	if monitorErr != nil || planReviewErr != nil {
+		return statuses, fmt.Errorf("monitor live attempts and plan reviews: %w", errors.Join(monitorErr, planReviewErr))
 	}
 	transitionErr := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, operatorMessages, statePath, stateRoot, func() error {
 		_, _, err := refreshProjection(facts, issues)
@@ -2764,17 +2765,11 @@ func reviewTarget(mode string, issue internalgithub.RecoveryIssueFact, base, hea
 }
 
 func validReviewTarget(mode, target, repository string, issue int, head string) bool {
-	switch mode {
-	case agentruntime.ReviewModePlan:
-		prefix := fmt.Sprintf("%s#%d plan sha256:", repository, issue)
-		digest := strings.TrimPrefix(target, prefix)
-		return strings.HasPrefix(target, prefix) && len(digest) == 64 && preflightObjectID.MatchString(digest)
-	case agentruntime.ReviewModeImplementation:
-		base, selectedHead, ok := strings.Cut(target, "..")
-		return ok && preflightObjectID.MatchString(base) && preflightObjectID.MatchString(selectedHead) && strings.EqualFold(selectedHead, head) && !strings.EqualFold(base, selectedHead)
-	default:
+	if !agentruntime.ValidReviewTarget(mode, target, repository, issue) {
 		return false
 	}
+	_, selectedHead, implementation := strings.Cut(target, "..")
+	return !implementation || strings.EqualFold(selectedHead, head)
 }
 
 func manifestReviewTarget(head, target string) string {
@@ -2830,6 +2825,9 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	target, err := reviewTarget(mode, issue, reviewBase, head)
 	if err != nil {
 		return independentReviewResult{}, false, err
+	}
+	if mode == agentruntime.ReviewModePlan && (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") && manifest.ReviewMode == mode && agentruntime.ValidReviewTarget(mode, manifest.ReviewTarget, attempt.Repository, attempt.Issue) {
+		target, reviewBase, head = manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead
 	}
 	snapshot, session := reviewIdentity(attempt, snapshotRoot)
 	legacyHeadArtifact := manifest.ReviewState == "running" && manifest.ReviewMode == "" && manifest.ReviewTarget == ""
@@ -2938,6 +2936,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 		return independentReviewResult{}, false, err
 	}
 	resultPath := reviewResultPath(snapshot, target)
+	env = append(env, "AGENT_SYMPHONY_REVIEW_RESULT="+resultPath)
 	resultRoot := filepath.Dir(resultPath)
 	if err := os.Mkdir(resultRoot, 0o770); err != nil || reviewGID >= 0 && os.Chown(resultRoot, -1, reviewGID) != nil || os.Chmod(resultRoot, 0o770) != nil {
 		_ = os.RemoveAll(resultRoot)
@@ -2954,14 +2953,11 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if err != nil {
 		return independentReviewResult{}, false, err
 	}
-	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"load-buffer", "-b", session, "-"}, Dir: snapshot, Env: env, Stdin: strings.NewReader(prompt)}); err != nil {
-		return independentReviewResult{}, false, err
+	prompt += "\n\nBefore exiting, atomically write the final JSON object to the path in AGENT_SYMPHONY_REVIEW_RESULT. The result file is the lifecycle authority; terminal text is only operator-visible conversation."
+	if slices.Equal(command, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
+		command = config.Default(attempt.Repository).Commands.Reviewer
 	}
-	binary, err := os.Executable()
-	if err != nil {
-		return independentReviewResult{}, false, err
-	}
-	command = agentruntime.PromptCommand(binary, "tmux", session, resultPath, command)
+	command = append(slices.Clone(command), prompt)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
@@ -3097,6 +3093,48 @@ func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuse
 		_, err := runtime.Monitor(ctx, agentruntime.Attempt{Repository: status.Repository, Issue: status.Issue, Number: status.Attempt, BaseSHA: manifest.BaseSHA, Eligible: func() bool { return authorized }})
 		if err != nil {
 			return fmt.Errorf("monitor %s#%d attempt %d: %w", status.Repository, status.Issue, status.Attempt, err)
+		}
+	}
+	return nil
+}
+
+func reconcilePlanReviews(ctx context.Context, runtimeState *agentruntime.Runtime, reviewBoundary boundaryCaller, implementationBoundary workerBoundaryRunner, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, source, snapshotRoot string) error {
+	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
+	if err != nil {
+		return err
+	}
+	for _, manifest := range manifests {
+		if manifest.ReviewMode != agentruntime.ReviewModePlan || manifest.ReviewState != "preparing" && manifest.ReviewState != "running" {
+			continue
+		}
+		index := slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
+			return issue.Repository == manifest.Repository && issue.Issue == manifest.Issue
+		})
+		if index < 0 {
+			return fmt.Errorf("plan review %s#%d has no authoritative issue", manifest.Repository, manifest.Issue)
+		}
+		issue := issues[index]
+		issue.Attempt = manifest.Attempt
+		attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: cfg.Commands.Implementation}
+		result, pending, err := runIndependentReview(ctx, runtimeState, attempt, reviewBoundary, env, cfg.Commands.Reviewer, issue, manifest, source, manifest.ReviewHead, snapshotRoot, agentruntime.ReviewModePlan)
+		if err != nil {
+			return fmt.Errorf("%s#%d attempt %d: %w", manifest.Repository, manifest.Issue, manifest.Attempt, err)
+		}
+		if pending || len(result.Findings) == 0 {
+			continue
+		}
+		current, err := runtimeState.Discover()
+		if err != nil {
+			return err
+		}
+		stored := slices.IndexFunc(current, func(candidate agentruntime.Manifest) bool {
+			return candidate.Repository == manifest.Repository && candidate.Issue == manifest.Issue && candidate.Attempt == manifest.Attempt
+		})
+		if stored < 0 {
+			return errors.New("completed plan review lost its attempt manifest")
+		}
+		if _, err := returnReviewFindings(ctx, runtimeState, implementationBoundary, attempt, current[stored], manifest.ReviewHead, result.Findings, nil, cfg.Commands.Implementation); err != nil {
+			return err
 		}
 	}
 	return nil

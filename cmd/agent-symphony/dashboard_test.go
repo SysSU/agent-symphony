@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -1101,7 +1102,7 @@ func TestDashboardPlanReviewActionStartsExactIssueBoundReviewer(t *testing.T) {
 		t.Fatalf("status=%d body=%q calls=%d manifest=%#v err=%v", response.Code, response.Body.String(), calls, stored, discoverErr)
 	}
 	wantSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
-	if stored[0].ReviewSession != wantSession || boundary.respawns != 1 || !slices.Contains(boundary.respawn, reviewResultPath(stored[0].ReviewSnapshot, target)) || !slices.Contains(boundary.env, "GH_REPO=o/r") || !strings.Contains(boundary.prompt, "Review mode: plan-review") || !strings.Contains(boundary.prompt, target) || !strings.Contains(boundary.prompt, "/agent-symphony status needs-attention") {
+	if stored[0].ReviewSession != wantSession || boundary.respawns != 1 || !slices.Contains(boundary.env, "AGENT_SYMPHONY_REVIEW_RESULT="+reviewResultPath(stored[0].ReviewSnapshot, target)) || !slices.Contains(boundary.env, "GH_REPO=o/r") || !strings.Contains(boundary.prompt, "Review mode: plan-review") || !strings.Contains(boundary.prompt, target) || !strings.Contains(boundary.prompt, "/agent-symphony status needs-attention") {
 		t.Fatalf("stored=%#v respawn=%q env=%q prompt=%q", stored[0], boundary.respawn, boundary.env, boundary.prompt)
 	}
 	t.Cleanup(func() {
@@ -1281,6 +1282,121 @@ func TestDashboardReviewerTerminalIsRoleBoundAndInteractive(t *testing.T) {
 	if _, err := (&dashboardServer{stateRoot: root}).projectedSession(issue, attempt, agentruntime.SessionRoleReviewer); err == nil {
 		t.Fatal("invalid reviewer mode accepted")
 	}
+	status.Sessions[1].Mode, status.Sessions[1].Target = agentruntime.ReviewModeImplementation, "garbage"
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&dashboardServer{stateRoot: root}).projectedSession(issue, attempt, agentruntime.SessionRoleReviewer); err == nil {
+		t.Fatal("malformed newline-free reviewer target accepted")
+	}
+}
+
+type liveReviewBoundary struct{ root string }
+
+func (b liveReviewBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if operation == "review-result" {
+		input, _ := io.ReadAll(command.Stdin)
+		output, err := readReviewResult(input, b.root)
+		return agentruntime.Result{Output: output}, err
+	}
+	return (agentruntime.ExecRunner{}).Run(ctx, command)
+}
+
+func TestDashboardInputReachesLaunchedReviewerAndReturnsVisibleResponse(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	tmuxRoot, err := os.MkdirTemp("/tmp", "agent-symphony-live-review-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmuxRoot) })
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_PANE", "")
+	t.Setenv("TMUX_TMPDIR", tmuxRoot)
+
+	source := t.TempDir()
+	runGit(t, source, "init", "-q")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "config", "user.name", "test")
+	runGit(t, source, "commit", "--allow-empty", "-qm", "base")
+	base := runGit(t, source, "rev-parse", "HEAD")
+	runGit(t, source, "commit", "--allow-empty", "-qm", "head")
+	head := runGit(t, source, "rev-parse", "HEAD")
+	snapshotRoot := t.TempDir()
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 2, BaseSHA: base}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, Body: "Review the operator flow."}
+	target, _ := reviewTarget(agentruntime.ReviewModeImplementation, issue, base, head)
+	reviewer := filepath.Join(t.TempDir(), "reviewer")
+	script := `#!/bin/sh
+case "$1" in *"Review mode: implementation-review"*"$FAKE_TARGET"*) ;; *) exit 20;; esac
+printf 'reviewer-ready\n'
+IFS= read -r message || exit 21
+printf 'reviewer-received:%s\n' "$message"
+printf '%s' '{"type":"agent-symphony-review-v1","status":"clean","findings":[]}' >"$AGENT_SYMPHONY_REVIEW_RESULT.tmp" || exit 22
+mv "$AGENT_SYMPHONY_REVIEW_RESULT.tmp" "$AGENT_SYMPHONY_REVIEW_RESULT"`
+	if err := os.WriteFile(reviewer, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	boundary := liveReviewBoundary{root: snapshotRoot}
+	reviewEnv := []string{"PATH=" + os.Getenv("PATH"), "TERM=xterm-256color", "TMUX_TMPDIR=" + tmuxRoot, "FAKE_TARGET=" + target}
+	started, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, reviewEnv, []string{reviewer}, issue, agentruntime.Manifest{}, source, head, snapshotRoot)
+	if err != nil || !pending {
+		t.Fatalf("launch pending=%v err=%v", pending, err)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "kill-session", "-t", "="+started.Session).Run()
+		_ = filepath.WalkDir(started.Snapshot, func(path string, entry os.DirEntry, err error) error {
+			if err == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+
+	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, attempt.Repository, attempt.Issue, attempt.Number)
+	statusRoot := t.TempDir()
+	status := orchestrator.RecoveryStatus{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "running"}, {Role: agentruntime.SessionRoleReviewer, Name: started.Session, State: "running", Mode: agentruntime.ReviewModeImplementation, Target: target, Current: true}}}
+	if err := writeStatusSnapshot(statusRoot, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), statusRoot, attempt.Repository, nil, "tmux", &sync.Mutex{}, nil, nil, nil, nil, false, ""))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/reviewer/terminal?repository=o%2Fr&issue=23&attempt=2"
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	connection, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
+	if err != nil {
+		t.Fatalf("dial response=%v err=%v", response, err)
+	}
+	if err := connection.Write(ctx, websocket.MessageBinary, []byte("inspect the dependency edge\n")); err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	for !strings.Contains(output.String(), "reviewer-received:inspect the dependency edge") {
+		kind, message, err := connection.Read(ctx)
+		if err != nil {
+			t.Fatalf("visible output=%q err=%v", output.String(), err)
+		}
+		if kind == websocket.MessageBinary {
+			output.Write(message)
+		}
+	}
+	connection.CloseNow()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pane, _ := exec.Command("tmux", "display-message", "-p", "-t", agentruntime.PaneTarget(started.Session), "#{pane_dead}").Output()
+		if strings.TrimSpace(string(pane)) == "1" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: target, ReviewBase: base, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, reviewEnv, []string{reviewer}, issue, manifest, source, head, snapshotRoot)
+	if err != nil || pending || result.Status != "clean" {
+		t.Fatalf("result=%#v pending=%v err=%v output=%q", result, pending, err, output.String())
+	}
 }
 
 func TestDashboardTerminalRejectsTamperedIdentityAndInvalidMessages(t *testing.T) {
@@ -1336,7 +1452,7 @@ func TestDashboardMissingReviewerSessionClosesWithExplicitReason(t *testing.T) {
 	root := t.TempDir()
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 8, 1)
 	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 8, 1)
-	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 8, Attempt: 1, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "completed"}, {Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Current: true}}}
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 8, Attempt: 1, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "completed"}, {Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModePlan, Target: "o/r#8 plan sha256:" + strings.Repeat("a", 64), Current: true}}}
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
 		t.Fatal(err)
 	}

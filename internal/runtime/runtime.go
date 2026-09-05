@@ -343,6 +343,33 @@ func ValidReviewMetadata(mode, target string) bool {
 	return slices.Contains([]string{ReviewModePlan, ReviewModeImplementation}, mode) && strings.TrimSpace(target) != "" && len(target) <= 512 && !strings.ContainsAny(target, "\x00\r\n")
 }
 
+// ValidReviewTarget validates the mode-specific target grammar and public identity.
+func ValidReviewTarget(mode, target, repository string, issue int) bool {
+	switch mode {
+	case ReviewModePlan:
+		prefix := fmt.Sprintf("%s#%d plan sha256:", repository, issue)
+		digest := strings.TrimPrefix(target, prefix)
+		return strings.HasPrefix(target, prefix) && len(digest) == 64 && commitID.MatchString(digest)
+	case ReviewModeImplementation:
+		base, head, ok := strings.Cut(target, "..")
+		return ok && commitID.MatchString(base) && commitID.MatchString(head) && !strings.EqualFold(base, head)
+	default:
+		return false
+	}
+}
+
+// ValidReviewBinding validates a persisted target against its attested commits.
+func ValidReviewBinding(mode, target, repository string, issue int, base, head, attemptBase string) bool {
+	if !ValidReviewTarget(mode, target, repository, issue) || !commitID.MatchString(base) || !commitID.MatchString(head) {
+		return false
+	}
+	if mode == ReviewModePlan {
+		return strings.EqualFold(base, head) && strings.EqualFold(base, attemptBase)
+	}
+	targetBase, targetHead, _ := strings.Cut(target, "..")
+	return strings.EqualFold(targetBase, base) && strings.EqualFold(targetHead, head)
+}
+
 // AttemptSessionName returns the deterministic tmux name for a bounded role.
 func AttemptSessionName(role, repository string, issue, attempt int) (string, error) {
 	parts := strings.Split(repository, "/")
@@ -972,14 +999,21 @@ func (r *Runtime) validateManifest(attempt Attempt, manifest Manifest) error {
 			return errors.New("review metadata has no lifecycle state")
 		}
 	case "preparing", "running", "clean", "findings-queued":
-		if !ValidReviewMetadata(manifest.ReviewMode, manifest.ReviewTarget) {
+		legacy := manifest.ReviewMode == "" && manifest.ReviewTarget == ""
+		if !legacy && (!ValidReviewMetadata(manifest.ReviewMode, manifest.ReviewTarget) || !ValidReviewTarget(manifest.ReviewMode, manifest.ReviewTarget, manifest.Repository, manifest.Issue)) {
 			return errors.New("review mode or target is invalid")
+		}
+		if !legacy && !ValidReviewBinding(manifest.ReviewMode, manifest.ReviewTarget, manifest.Repository, manifest.Issue, manifest.ReviewBase, manifest.ReviewHead, manifest.BaseSHA) {
+			return errors.New("review target does not match persisted identity")
 		}
 	default:
 		return fmt.Errorf("invalid review state %q", manifest.ReviewState)
 	}
 	if manifest.ReviewBase != "" && !commitID.MatchString(manifest.ReviewBase) {
 		return errors.New("review base is invalid")
+	}
+	if manifest.ReviewHead != "" && !commitID.MatchString(manifest.ReviewHead) {
+		return errors.New("review head is invalid")
 	}
 	if manifest.ReviewSession != "" {
 		wantReview, err := AttemptSessionName(SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)

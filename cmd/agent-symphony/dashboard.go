@@ -1218,7 +1218,7 @@ func (s *dashboardServer) projectedStatus(issue, attempt int) (orchestrator.Reco
 		seen := map[string]bool{}
 		for _, session := range status.Sessions {
 			want, sessionErr := agentruntime.AttemptSessionName(session.Role, status.Repository, issue, attempt)
-			metadataValid := session.Role != agentruntime.SessionRoleReviewer && session.Mode == "" && session.Target == "" || session.Role == agentruntime.SessionRoleReviewer && agentruntime.ValidReviewMetadata(session.Mode, session.Target)
+			metadataValid := session.Role != agentruntime.SessionRoleReviewer && session.Mode == "" && session.Target == "" || session.Role == agentruntime.SessionRoleReviewer && agentruntime.ValidReviewTarget(session.Mode, session.Target, status.Repository, status.Issue)
 			if sessionErr != nil || session.Name != want || session.State == "" || !metadataValid || seen[session.Role] {
 				validSessions = false
 				break

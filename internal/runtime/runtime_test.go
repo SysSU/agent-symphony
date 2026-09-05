@@ -1163,6 +1163,8 @@ func TestReviewModeAndTargetAreDurableAndValidated(t *testing.T) {
 	for _, test := range []struct{ mode, target string }{
 		{"ui-review", target},
 		{ReviewModePlan, ""},
+		{ReviewModePlan, "owner/repo#1 plan sha256:not-a-digest"},
+		{ReviewModeImplementation, "garbage"},
 		{ReviewModeImplementation, "unsafe\ntarget"},
 	} {
 		invalid := stored
@@ -1170,6 +1172,18 @@ func TestReviewModeAndTargetAreDurableAndValidated(t *testing.T) {
 		if err := r.validateManifest(attempt, invalid); err == nil {
 			t.Fatalf("invalid review metadata was accepted: %#v", test)
 		}
+	}
+	invalid := stored
+	invalid.ReviewTarget = strings.Repeat("c", 40) + ".." + strings.Repeat("b", 40)
+	if err := r.validateManifest(attempt, invalid); err == nil {
+		t.Fatal("review target detached from persisted base was accepted")
+	}
+	invalid = stored
+	invalid.ReviewMode = ReviewModePlan
+	invalid.ReviewTarget = fmt.Sprintf("%s#%d plan sha256:%s", attempt.Repository, attempt.Issue, strings.Repeat("c", 64))
+	invalid.ReviewHead = strings.Repeat("b", 40)
+	if err := r.validateManifest(attempt, invalid); err == nil {
+		t.Fatal("plan target detached from persisted attempt base was accepted")
 	}
 	manifest.ReviewState = ""
 	if err := r.validateManifest(attempt, manifest); err != nil {
