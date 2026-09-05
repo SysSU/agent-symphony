@@ -422,185 +422,6 @@ type fakeDashboardOrchestrator struct {
 	actions []string
 }
 
-type fakeDashboardMessageService struct {
-	*fakeDashboardOrchestrator
-	proposal  orchestratoragent.MessageProposal
-	confirmed orchestratoragent.MessageProposal
-	confirms  int
-	consumes  int
-}
-
-func (f *fakeDashboardMessageService) MessageProposal(context.Context) (orchestratoragent.MessageProposal, error) {
-	if f.proposal.Binding == "" {
-		return orchestratoragent.MessageProposal{}, orchestratoragent.ErrNoMessageProposal
-	}
-	return f.proposal, nil
-}
-
-func (f *fakeDashboardMessageService) ConsumeMessageProposal(_ context.Context, binding string) error {
-	if binding != f.proposal.Binding {
-		return errors.New("binding changed")
-	}
-	f.consumes++
-	f.proposal = orchestratoragent.MessageProposal{}
-	return nil
-}
-
-func (f *fakeDashboardMessageService) ConfirmMessage(_ context.Context, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
-	f.confirmed = proposal
-	f.confirms++
-	return internalgithub.PrepareOperatorMessage(proposal.Repository, proposal.Issue, proposal.Attempt, proposal.Message)
-}
-
-func TestDashboardQueuesAuthenticatedWorkerFollowUpForExactProjectedAttempt(t *testing.T) {
-	root := t.TempDir()
-	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 131, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 131, Attempt: 3, State: "active", Session: session}}); err != nil {
-		t.Fatal(err)
-	}
-	service := &fakeDashboardMessageService{fakeDashboardOrchestrator: &fakeDashboardOrchestrator{}}
-	withoutPassword := (&dashboardServer{stateRoot: root, messages: service, mu: &sync.Mutex{}}).handler(http.NotFoundHandler())
-	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/attempt/message?issue=131&attempt=3", strings.NewReader(`{"message":"Continue the focused fix."}`))
-	request.Header.Set("Origin", "http://127.0.0.1")
-	request.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	withoutPassword.ServeHTTP(response, request)
-	if response.Code != http.StatusForbidden || service.confirms != 0 {
-		t.Fatalf("unauthenticated status=%d confirms=%d", response.Code, service.confirms)
-	}
-
-	operationMu := &sync.Mutex{}
-	server := &dashboardServer{stateRoot: root, password: "password", messages: service, mu: operationMu}
-	handler := server.handler(http.NotFoundHandler())
-	navigate := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/", nil)
-	navigate.Header.Set("Sec-Fetch-Mode", "navigate")
-	navigate.Header.Set("Sec-Fetch-Dest", "document")
-	navigate.SetBasicAuth("agent-symphony", "password")
-	navigation := httptest.NewRecorder()
-	handler.ServeHTTP(navigation, navigate)
-	sessionCookie := navigation.Result().Cookies()[0]
-
-	request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/attempt/message?issue=131&attempt=3", strings.NewReader(`{"message":"Continue the focused fix."}`))
-	request.Header.Set("Origin", "http://127.0.0.1")
-	request.Header.Set("Content-Type", "application/json")
-	request.SetBasicAuth("agent-symphony", "password")
-	request.AddCookie(sessionCookie)
-	response = httptest.NewRecorder()
-	operationMu.Lock()
-	handler.ServeHTTP(response, request)
-	operationMu.Unlock()
-	want := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "Continue the focused fix."}
-	if response.Code != http.StatusOK || service.confirms != 1 || service.confirmed != want || !strings.Contains(response.Body.String(), `"state":"queued"`) {
-		t.Fatalf("status=%d confirms=%d proposal=%#v body=%q", response.Code, service.confirms, service.confirmed, response.Body.String())
-	}
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 131, Attempt: 3, State: "blocked", Retryable: true, Session: session}}); err != nil {
-		t.Fatal(err)
-	}
-	request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/attempt/message?issue=131&attempt=3", strings.NewReader(`{"message":"Recover and continue."}`))
-	request.Header.Set("Origin", "http://127.0.0.1")
-	request.Header.Set("Content-Type", "application/json")
-	request.SetBasicAuth("agent-symphony", "password")
-	request.AddCookie(sessionCookie)
-	response = httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || service.confirms != 2 {
-		t.Fatalf("retryable status=%d confirms=%d body=%q", response.Code, service.confirms, response.Body.String())
-	}
-}
-
-func TestDashboardWorkerMessageRequiresAuthenticationAndExactConfirmationBinding(t *testing.T) {
-	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "Run the race test.", Binding: "exact-binding"}
-	service := &fakeDashboardMessageService{fakeDashboardOrchestrator: &fakeDashboardOrchestrator{status: orchestratoragent.Status{Enabled: true, State: "running"}}, proposal: proposal}
-	withoutPassword := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, nil, service, false, "")
-	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator/proposal.json", nil)
-	response := httptest.NewRecorder()
-	withoutPassword.ServeHTTP(response, request)
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("unauthenticated message feature status=%d", response.Code)
-	}
-
-	operationMu := &sync.Mutex{}
-	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", operationMu, nil, nil, nil, service, false, "password")
-	navigate := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/", nil)
-	navigate.Header.Set("Sec-Fetch-Mode", "navigate")
-	navigate.Header.Set("Sec-Fetch-Dest", "document")
-	navigate.SetBasicAuth("agent-symphony", "password")
-	navigation := httptest.NewRecorder()
-	handler.ServeHTTP(navigation, navigate)
-	cookies := navigation.Result().Cookies()
-	if len(cookies) != 1 || cookies[0].Name != dashboardSessionCookie || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
-		t.Fatalf("browser session cookies=%#v", cookies)
-	}
-	session := cookies[0]
-	service.proposal = orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Action: orchestratoragent.ProposalActionRetry, RequestID: "retry-1", Binding: "retry-binding"}
-	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator/proposal.json", nil)
-	request.SetBasicAuth("agent-symphony", "password")
-	request.AddCookie(session)
-	response = httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusNoContent {
-		t.Fatalf("automatic retry was exposed as a message confirmation: status=%d body=%q", response.Code, response.Body.String())
-	}
-	service.proposal = proposal
-	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator/proposal.json", nil)
-	request.SetBasicAuth("agent-symphony", "password")
-	request.AddCookie(session)
-	response = httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	nonce := response.Header().Get(dashboardNonceHeader)
-	if response.Code != http.StatusOK || nonce == "" || !strings.Contains(response.Body.String(), proposal.Message) || !strings.Contains(response.Body.String(), proposal.Binding) {
-		t.Fatalf("proposal status=%d body=%q", response.Code, response.Body.String())
-	}
-
-	post := func(submitted orchestratoragent.MessageProposal, browser bool) *httptest.ResponseRecorder {
-		body, _ := json.Marshal(submitted)
-		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/orchestrator/message-confirm", bytes.NewReader(body))
-		request.Header.Set("Origin", "http://127.0.0.1")
-		request.Header.Set("Content-Type", "application/json")
-		request.SetBasicAuth("agent-symphony", "password")
-		if browser {
-			request.AddCookie(session)
-			request.Header.Set(dashboardNonceHeader, nonce)
-		} else {
-			request.AddCookie(&http.Cookie{Name: dashboardSessionCookie, Value: "forged-session"})
-			request.Header.Set(dashboardNonceHeader, "forged-nonce")
-		}
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, request)
-		return response
-	}
-	if response := post(proposal, false); response.Code != http.StatusForbidden || service.confirms != 0 {
-		t.Fatalf("authenticated non-browser status=%d confirms=%d", response.Code, service.confirms)
-	}
-	changed := proposal
-	changed.Message = "Different bytes."
-	if response := post(changed, true); response.Code != http.StatusConflict || service.confirms != 0 {
-		t.Fatalf("changed proposal status=%d confirms=%d", response.Code, service.confirms)
-	}
-	service.proposal.Binding = "replacement-binding"
-	if response := post(service.proposal, true); response.Code != http.StatusForbidden || service.confirms != 0 {
-		t.Fatalf("nonce reused for replacement proposal status=%d confirms=%d", response.Code, service.confirms)
-	}
-	service.proposal = proposal
-	operationMu.Lock()
-	response = post(proposal, true)
-	operationMu.Unlock()
-	if response.Code != http.StatusOK || service.confirms != 1 || service.consumes != 1 || strings.Contains(response.Body.String(), proposal.Message) {
-		t.Fatalf("confirmed status=%d confirms=%d consumes=%d body=%q", response.Code, service.confirms, service.consumes, response.Body.String())
-	}
-	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator/proposal.json", nil)
-	request.SetBasicAuth("agent-symphony", "password")
-	request.AddCookie(session)
-	response = httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusNoContent {
-		t.Fatalf("consumed proposal status=%d body=%q", response.Code, response.Body.String())
-	}
-}
-
 func (f *fakeDashboardOrchestrator) Status(context.Context) (orchestratoragent.Status, error) {
 	return f.status, f.err
 }
@@ -1065,7 +886,7 @@ func TestDashboardPlanReviewActionRestartsCleanIssueBoundReviewer(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Runner: &operatorMessageRunner{branch: manifest.Branch, head: base}, VerifyWorker: func(context.Context) error { return nil }}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Runner: &attemptRunner{branch: manifest.Branch, head: base}, VerifyWorker: func(context.Context) error { return nil }}
 	snapshotRoot := filepath.Join(t.TempDir(), "snapshots")
 	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -1224,7 +1045,7 @@ func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
 	}
 }
 
-func TestDashboardInputReachesLaunchedImplementationAgent(t *testing.T) {
+func TestDashboardRoutesOperatorInputDirectlyToLaunchedImplementationWithoutOrchestrator(t *testing.T) {
 	tmuxBinary, err := exec.LookPath("tmux")
 	if err != nil {
 		t.Skip("tmux is unavailable")
@@ -1427,7 +1248,49 @@ func TestDashboardImplementationTerminalRequiresRunningCurrentProjection(t *test
 	}
 }
 
-func TestDashboardReviewerTerminalIsRoleBoundAndInteractive(t *testing.T) {
+func TestAttemptSessionRoutingNeedsNoOrchestrator(t *testing.T) {
+	root := t.TempDir()
+	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 226, 1)
+	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 226, 1)
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 226, Attempt: 1, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{
+		{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "running", Current: true},
+		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModeImplementation, Target: strings.Repeat("a", 40) + ".." + strings.Repeat("b", 40), Current: true},
+	}}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	server := &dashboardServer{stateRoot: root}
+	for _, test := range []struct {
+		role, want string
+	}{
+		{agentruntime.SessionRoleImplementation, implementation},
+		{agentruntime.SessionRoleReviewer, reviewer},
+	} {
+		t.Run(test.role, func(t *testing.T) {
+			session, err := server.projectedSession(226, 1, test.role)
+			if err != nil || session.Name != test.want {
+				t.Fatalf("session=%#v err=%v", session, err)
+			}
+		})
+	}
+	for _, test := range []struct {
+		method, path string
+		status       int
+	}{
+		{http.MethodPost, "/actions/attempt/message", http.StatusMethodNotAllowed},
+		{http.MethodGet, "/orchestrator/proposal.json", http.StatusNotFound},
+	} {
+		request := httptest.NewRequest(test.method, "http://127.0.0.1"+test.path, nil)
+		request.Header.Set("Origin", "http://127.0.0.1")
+		response := httptest.NewRecorder()
+		server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
+		if response.Code != test.status {
+			t.Fatalf("retired coordinator route %s status=%d", test.path, response.Code)
+		}
+	}
+}
+
+func TestDashboardRoutesOperatorInputDirectlyToReviewerWithoutOrchestrator(t *testing.T) {
 	root := t.TempDir()
 	repository, issue, attempt := "o/r", 23, 2
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, repository, issue, attempt)
@@ -1603,15 +1466,15 @@ mv "$AGENT_SYMPHONY_REVIEW_RESULT.tmp" "$AGENT_SYMPHONY_REVIEW_RESULT"`
 	connection.CloseNow()
 
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		pane, _ := exec.Command("tmux", "display-message", "-p", "-t", agentruntime.PaneTarget(started.Session), "#{pane_dead}").Output()
-		if strings.TrimSpace(string(pane)) == "1" {
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: target, ReviewBase: base, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	var result independentReviewResult
+	for {
+		result, pending, err = runIndependentReview(t.Context(), nil, attempt, boundary, reviewEnv, []string{reviewer}, issue, manifest, source, head, snapshotRoot)
+		if err != nil || !pending || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	manifest := agentruntime.Manifest{ReviewState: "running", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: target, ReviewBase: base, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
-	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, reviewEnv, []string{reviewer}, issue, manifest, source, head, snapshotRoot)
 	if err != nil || pending || result.Status != "clean" {
 		t.Fatalf("result=%#v pending=%v err=%v output=%q", result, pending, err, output.String())
 	}

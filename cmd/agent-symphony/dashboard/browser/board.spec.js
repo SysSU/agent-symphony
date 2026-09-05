@@ -53,7 +53,6 @@ async function mockDashboard(page, attempts, orchestrator = { enabled: true, sta
   let dashboardState = { version: 1, hidden: [] };
   const snapshot = () => ({ updated_at: new Date().toISOString(), statuses: attempts });
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: orchestrator }));
-  await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: dashboardState }));
   await page.route("**/status.json", (route) => route.fulfill({ json: snapshot() }));
   await page.route("**/projects.json", (route) => route.fulfill({ json: { version: 1, projects: [{ version: 1, repository: attempts[0]?.repository || "SysSU/agent-symphony", local: true, snapshot: snapshot(), state: dashboardState }] } }));
@@ -71,7 +70,6 @@ test("shows loading then unavailable when the initial status request fails", asy
   let releaseStatus;
   const statusPending = new Promise((resolve) => { releaseStatus = resolve; });
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: true, state: "running", session: "orchestrator" } }));
-  await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { version: 1, hidden: [] } }));
   await page.route("**/projects.json", (route) => route.fulfill({ json: { version: 1, projects: [{ version: 1, repository: "SysSU/agent-symphony", local: true }] } }));
   await page.route("**/status.json", async (route) => {
@@ -176,7 +174,7 @@ test("switches between two isolated project deployments without exposing peer co
   await expect(page.getByText(peer.session, { exact: true })).toBeVisible();
   await expect(page.getByText("agent-symphony-161-1", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("link", { name: "Open project dashboard" })).toHaveAttribute("href", "http://127.0.0.1:8082");
-  await expect(page.getByRole("button", { name: /archive|recover|abandon|open terminal|queue follow-up/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /archive|recover|abandon|open terminal/i })).toHaveCount(0);
   await expect(page.getByText("Peer status is read-only here.")).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });

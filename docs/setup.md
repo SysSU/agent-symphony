@@ -122,7 +122,7 @@ agent-symphony serve \
   --dashboard-address 127.0.0.1:8080
 ```
 
-Open the dashboard URL printed by `serve` in a browser. This web dashboard is the supported graphical interface; there is no desktop client to install or configure. The running application release appears below the repository name in the dashboard header and matches `agent-symphony --version`. The dashboard stays on loopback by default because it provides terminal access plus confirmed recovery and cleanup controls for exact attempts shown in current status. To use **Tell this agent what to do next**, configure `--dashboard-password-file` even on loopback; the follow-up is recorded on GitHub and resumes the default Codex implementation session in the exact worktree when reconciliation accepts it.
+Open the dashboard URL printed by `serve` in a browser. This web dashboard is the supported graphical interface; there is no desktop client to install or configure. The running application release appears below the repository name in the dashboard header and matches `agent-symphony --version`. The dashboard stays on loopback by default because it provides direct implementation and reviewer terminal access plus confirmed recovery and cleanup controls for exact attempts shown in current status.
 
 See [Recovery](recovery.md) before using Recover, Archive, or Abandon.
 

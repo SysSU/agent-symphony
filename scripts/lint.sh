@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
-unformatted=$(git ls-files -z -- '*.go' | xargs -0 gofmt -l)
+unformatted=$(git ls-files -z --cached --others --exclude-standard -- '*.go' | xargs -0 sh -c 'for path do test ! -f "$path" || gofmt -l "$path"; done' sh)
 if test -n "$unformatted"; then
   echo "gofmt required:" >&2
   echo "$unformatted" >&2

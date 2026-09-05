@@ -171,9 +171,9 @@ func TestMessageProposalIsExactBoundedAndConsumable(t *testing.T) {
 	if err != nil || json.Unmarshal(statusBody, &status) != nil || status.PendingBinding != "" || status.ConsumedBinding != "" {
 		t.Fatalf("empty proposal status=%s err=%v", statusBody, err)
 	}
-	writeTestProposal(t, agent, MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Message: "Run the focused test."})
+	writeTestProposal(t, agent, MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Action: ProposalActionRetry, RequestID: "retry-131-3"})
 	proposal, err := agent.MessageProposal(t.Context())
-	if err != nil || proposal.Binding == "" || proposal.Message != "Run the focused test." {
+	if err != nil || proposal.Binding == "" || proposal.Action != ProposalActionRetry || proposal.RequestID != "retry-131-3" {
 		t.Fatalf("proposal=%#v err=%v", proposal, err)
 	}
 	statusBody, err = os.ReadFile(filepath.Join(agent.Workspace, MessageProposalStatusFile))
@@ -195,9 +195,9 @@ func TestMessageProposalIsExactBoundedAndConsumable(t *testing.T) {
 	if _, err := agent.MessageProposal(t.Context()); !errors.Is(err, ErrNoMessageProposal) {
 		t.Fatalf("consumed proposal err=%v", err)
 	}
-	writeTestProposal(t, agent, MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Message: strings.Repeat("x", 8193)})
+	writeTestProposal(t, agent, MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Action: ProposalActionRetry, RequestID: strings.Repeat("x", 257)})
 	if _, err := agent.MessageProposal(t.Context()); err == nil {
-		t.Fatal("oversized message proposal accepted")
+		t.Fatal("oversized request ID accepted")
 	}
 }
 
@@ -220,7 +220,7 @@ func TestTransitionRetryProposalRecordsDurableResolution(t *testing.T) {
 	if err != nil || json.Unmarshal(statusBody, &status) != nil || status.ResolvedBinding != proposal.Binding || status.Resolution != "running" || status.PendingBinding != proposal.Binding {
 		t.Fatalf("running proposal status=%s err=%v", statusBody, err)
 	}
-	writeTestProposal(t, agent, MessageProposal{Version: 1, Repository: agent.Repository, Issue: 162, Attempt: 1, Message: "Inspect the next attempt."})
+	writeTestProposal(t, agent, MessageProposal{Version: 1, Repository: agent.Repository, Issue: 162, Attempt: 1, Action: ProposalActionRetry, RequestID: "retry-162-1"})
 	replacement, err := agent.readMessageProposal()
 	if err != nil {
 		t.Fatal(err)
@@ -249,9 +249,9 @@ func TestMessageProposalDoesNotReadDecoratedTerminalOutput(t *testing.T) {
 	if _, err := agent.Observe(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
-	writeTestProposal(t, agent, MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Message: "publish this"})
+	writeTestProposal(t, agent, MessageProposal{Version: 1, Repository: agent.Repository, Issue: 131, Attempt: 3, Action: ProposalActionRetry, RequestID: "retry-131-3"})
 	proposal, err := agent.MessageProposal(t.Context())
-	if err != nil || proposal.Message != "publish this" {
+	if err != nil || proposal.RequestID != "retry-131-3" {
 		t.Fatalf("proposal=%#v err=%v", proposal, err)
 	}
 	for _, command := range runner.commands {
@@ -602,7 +602,7 @@ func TestMonitoringAttentionCheckInIsExactAndDeduplicated(t *testing.T) {
 		t.Fatal("monitoring check-in without exact handoff was accepted")
 	}
 	proposal.HandoffID = strings.Repeat("a", 64)
-	proposal.Message = "arbitrary instruction"
+	proposal.Detail = "arbitrary instruction"
 	if err := ValidateMessageProposal(proposal); err == nil {
 		t.Fatal("monitoring check-in with arbitrary text was accepted")
 	}
