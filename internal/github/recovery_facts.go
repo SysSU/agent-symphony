@@ -250,10 +250,10 @@ func FetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 	return fetchIssueFacts(ctx, api, cfg, attempts, intake, 0)
 }
 
-// FetchOperatorIssueFacts reads only the issue that owns one operator message.
-func FetchOperatorIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts []RecoveryAttemptFact, issue int) ([]RecoveryIssueFact, error) {
+// FetchIssueFactsForIssue reads only the issue named by a bounded control action.
+func FetchIssueFactsForIssue(ctx context.Context, api API, cfg PRAdapterConfig, attempts []RecoveryAttemptFact, issue int) ([]RecoveryIssueFact, error) {
 	if issue < 1 {
-		return nil, errors.New("operator issue lookup requires a positive issue")
+		return nil, errors.New("targeted issue lookup requires a positive issue")
 	}
 	return fetchIssueFacts(ctx, api, cfg, attempts, false, issue)
 }
@@ -689,15 +689,6 @@ func fetchTerminalFailures(ctx context.Context, api API, cfg PRAdapterConfig, is
 
 func FetchAttemptFacts(ctx context.Context, api API, repository string, actorID int) ([]RecoveryAttemptFact, error) {
 	return fetchAttemptFacts(ctx, api, repository, actorID, 0, 0, true)
-}
-
-// FetchOperatorAttemptFacts reads only the deterministic pull request for one
-// operator-message target and skips check data that cannot affect delivery.
-func FetchOperatorAttemptFacts(ctx context.Context, api API, repository string, actorID, issue, attempt int) ([]RecoveryAttemptFact, error) {
-	if issue < 1 || attempt < 1 {
-		return nil, errors.New("operator attempt lookup requires a positive issue and attempt")
-	}
-	return fetchAttemptFacts(ctx, api, repository, actorID, issue, attempt, false)
 }
 
 func fetchAttemptFacts(ctx context.Context, api API, repository string, actorID, targetIssue, targetAttempt int, includeChecks bool) ([]RecoveryAttemptFact, error) {

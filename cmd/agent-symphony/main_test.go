@@ -205,55 +205,34 @@ type cleanupBoundary struct {
 }
 
 type directHandoffBoundary struct{ root string }
-
 type refusingHandoffBoundary struct{ calls int }
 
-type crashingHandoffBoundary struct {
-	direct               directHandoffBoundary
-	before, after, calls int
-}
-
-type operatorMessageRunner struct {
+type attemptRunner struct {
 	dead, interrupted     bool
 	missing               bool
 	branch, head, started string
 	buffer                string
 }
 
-type operatorMessageStore struct {
-	comments        []map[string]any
-	outcomeFailures int
-	outcomePosts    int
-}
-
 func TestAuthorizedHumanInstructionsAmendIndependentReviewContractInOrder(t *testing.T) {
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 186, Attempt: 1, Body: "Commit the repository YAML."}
 	now := time.Date(2026, 8, 31, 6, 0, 0, 0, time.UTC)
-	first, _ := internalgithub.PrepareOperatorMessage("o/r", 186, 1, "Keep the YAML ignored.")
-	first.State, first.UpdatedAt = "delivered", now
-	later, _ := internalgithub.PrepareOperatorMessage("o/r", 186, 1, "Keep the machine-local config out of the PR.")
-	later.State, later.UpdatedAt = "delivered", now.Add(3*time.Minute)
-	queued, _ := internalgithub.PrepareOperatorMessage("o/r", 186, 1, "Not delivered.")
-	wrongAttempt, _ := internalgithub.PrepareOperatorMessage("o/r", 186, 2, "Wrong attempt.")
-	wrongAttempt.State = "delivered"
-	forged := first
-	forged.ID = strings.Repeat("f", 64)
 	feedback := []internalgithub.Feedback{
-		{ID: 11, Source: "issue", Body: "Issue comment instruction.", CreatedAt: now.Add(time.Minute), Authorized: true},
-		{ID: 12, Source: "conversation", Body: "PR conversation instruction.", CreatedAt: now.Add(2 * time.Minute), Authorized: true},
+		{ID: 11, Source: "issue", Body: "Issue comment instruction.", CreatedAt: now, Authorized: true},
+		{ID: 12, Source: "conversation", Body: "PR conversation instruction.", CreatedAt: now.Add(time.Minute), Authorized: true},
 		{ID: 13, Source: "inline", Body: "Unauthorized.", CreatedAt: now.Add(4 * time.Minute)},
 	}
 
-	amended, instructions, delivered := amendIssueWithHumanInstructions(issue, []internalgithub.OperatorMessage{first, later, queued, wrongAttempt, forged}, feedback)
-	if !delivered || len(instructions) != 4 || !strings.Contains(instructions[0], first.Message) || !strings.Contains(instructions[1], feedback[0].Body) || !strings.Contains(instructions[2], feedback[1].Body) || !strings.Contains(instructions[3], later.Message) {
+	amended, instructions := amendIssueWithHumanInstructions(issue, feedback)
+	if len(instructions) != 2 || !strings.Contains(instructions[0], feedback[0].Body) || !strings.Contains(instructions[1], feedback[1].Body) {
 		t.Fatalf("instructions=%#v", instructions)
 	}
 	prompt, err := reviewPrompt(agentruntime.ReviewModeImplementation, strings.Repeat("a", 40)+".."+strings.Repeat("b", 40), amended)
 	if err != nil {
 		t.Fatal(err)
 	}
-	original, precedence, firstMessage, laterMessage := strings.Index(prompt, issue.Body), strings.Index(prompt, humanInstructionPrecedence), strings.Index(prompt, first.Message), strings.Index(prompt, later.Message)
-	if original < 0 || precedence <= original || firstMessage <= precedence || laterMessage <= firstMessage || strings.Contains(prompt, queued.Message) || strings.Contains(prompt, wrongAttempt.Message) {
+	original, precedence, firstFeedback, laterFeedback := strings.Index(prompt, issue.Body), strings.Index(prompt, humanInstructionPrecedence), strings.Index(prompt, feedback[0].Body), strings.Index(prompt, feedback[1].Body)
+	if original < 0 || precedence <= original || firstFeedback <= precedence || laterFeedback <= firstFeedback || strings.Contains(prompt, feedback[2].Body) {
 		t.Fatalf("review prompt did not preserve human instruction precedence: %q", prompt)
 	}
 }
@@ -275,21 +254,7 @@ func (b *refusingHandoffBoundary) call(_ context.Context, operation string, _ ag
 	return agentruntime.Result{}, errors.New("handoff must remain queued")
 }
 
-func (b *crashingHandoffBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
-	b.calls++
-	if b.before > 0 {
-		b.before--
-		return agentruntime.Result{}, errors.New("injected crash after resume")
-	}
-	result, err := b.direct.call(ctx, operation, command)
-	if err == nil && b.after > 0 && operation == "accept-operator-handoff" {
-		b.after--
-		return agentruntime.Result{}, errors.New("injected crash after worker receipt")
-	}
-	return result, err
-}
-
-func (r *operatorMessageRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+func (r *attemptRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if len(command.Args) == 0 {
 		return agentruntime.Result{}, nil
 	}
@@ -334,32 +299,6 @@ func (r *operatorMessageRunner) Run(_ context.Context, command agentruntime.Comm
 	default:
 		return agentruntime.Result{}, nil
 	}
-}
-
-func (s *operatorMessageStore) roundTrip(t *testing.T) http.RoundTripper {
-	t.Helper()
-	return roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.Method == http.MethodGet {
-			body, _ := json.Marshal(s.comments)
-			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
-		}
-		var input struct {
-			Body string `json:"body"`
-		}
-		body, _ := io.ReadAll(request.Body)
-		if json.Unmarshal(body, &input) != nil {
-			t.Fatal("invalid comment mutation")
-		}
-		if strings.Contains(input.Body, "agent-symphony:operator-message-outcome:v1") {
-			if s.outcomeFailures > 0 {
-				s.outcomeFailures--
-				return nil, errors.New("injected crash before delivered outcome")
-			}
-			s.outcomePosts++
-		}
-		s.comments = append(s.comments, map[string]any{"body": input.Body, "created_at": time.Now().UTC(), "user": map[string]any{"id": 42}})
-		return &http.Response{StatusCode: http.StatusCreated, Status: "201 Created", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
-	})
 }
 
 func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
@@ -477,125 +416,6 @@ func TestChatIssueRejectsStatusFromForeignRepositoryBeforeTmux(t *testing.T) {
 	}
 	if _, err := os.Stat(called); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("foreign repository reached tmux: %v", err)
-	}
-}
-
-func TestOperatorMessageQueuesBehindRunningTurnWithoutInterruptingIt(t *testing.T) {
-	message, _ := internalgithub.PrepareOperatorMessage("o/r", 131, 3, "Run the focused test.")
-	key := "o/r#131/3"
-	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
-	bound := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, State: "active"}
-	issues := []internalgithub.RecoveryIssueFact{{Repository: "o/r", Issue: 131, Attempt: 3, DispatchAuthorized: true, ActiveAttempt: &bound}}
-	manifests := []agentruntime.Manifest{{Repository: "o/r", Issue: 131, Attempt: 3, State: "running", Session: "live"}}
-	boundary := &refusingHandoffBoundary{}
-	if err := resumeOperatorMessages(t.Context(), internalgithub.API{}, internalgithub.PRAdapterConfig{}, nil, boundary, issues, nil, manifests, messages, []string{"implementation"}, func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if boundary.calls != 0 || messages[key][0].State != "queued" {
-		t.Fatalf("running turn was interrupted: calls=%d message=%#v", boundary.calls, messages[key][0])
-	}
-	statuses := []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 131, Attempt: 3}}
-	attachOperatorMessageStatuses(statuses, messages)
-	body, _ := json.Marshal(statuses)
-	if bytes.Contains(body, []byte(message.Message)) || !bytes.Contains(body, []byte(message.ID)) || !bytes.Contains(body, []byte(`"state":"queued"`)) {
-		t.Fatalf("dashboard status exposed content or omitted outcome: %s", body)
-	}
-}
-
-func TestPublishedOperatorMessageWithAdvancedHeadStaysQueuedBehindRunningTurn(t *testing.T) {
-	runtimeState, attempt, _, runner := operatorMessageRuntime(t)
-	manifest, err := runtimeState.ResumeHandoff(t.Context(), attempt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest.ReviewHead = strings.Repeat("b", 40)
-	runner.head = strings.Repeat("c", 40)
-	message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Wait for the active follow-up.")
-	key := fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number)
-	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
-	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true}
-	published := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, PR: 99, BaseSHA: attempt.BaseSHA, HeadSHA: manifest.ReviewHead, State: "review-ready"}
-	boundary := &refusingHandoffBoundary{}
-	if err := resumeOperatorMessages(t.Context(), internalgithub.API{}, internalgithub.PRAdapterConfig{}, runtimeState, boundary, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{published}, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error {
-		return errors.New("worktree HEAD does not match GitHub")
-	}, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if boundary.calls != 0 || messages[key][0].State != "queued" {
-		t.Fatalf("busy published follow-up was not retained: calls=%d message=%#v", boundary.calls, messages[key][0])
-	}
-}
-
-func TestQueuedOperatorMessageRetiresLegacyResumeBeforeFreshDelivery(t *testing.T) {
-	runtimeState, attempt, _, runner := operatorMessageRuntime(t)
-	manifest, err := runtimeState.ResumeHandoff(t.Context(), attempt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest.UpdatedAt = time.Now().Add(-3 * time.Minute)
-	body, _ := json.Marshal(manifest)
-	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	runner.started = "agent-symphony worker-capture-handoff tmux buffer result launch token launched -- codex exec resume --last --dangerously-bypass-approvals-and-sandbox -"
-	store := &operatorMessageStore{}
-	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: store.roundTrip(t)}}
-	cfg := internalgithub.PRAdapterConfig{Repository: attempt.Repository, ActorID: 42}
-	message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Resume after the prior pane exited.")
-	message, err = internalgithub.RecordOperatorMessage(t.Context(), api, cfg, message)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number)
-	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
-	bound := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
-	issues := []internalgithub.RecoveryIssueFact{{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &bound}}
-	remote := []internalgithub.RecoveryAttemptFact{bound}
-	refresh := func(context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
-		current, discoverErr := runtimeState.Discover()
-		return issues, remote, current, discoverErr
-	}
-	oldExec := hostExecRunner
-	recipient, launched := "", ""
-	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
-		if len(command.Args) > 0 && command.Args[0] == "show-options" {
-			return agentruntime.Result{Output: recipient}, nil
-		}
-		if len(command.Args) > 0 && command.Args[0] == "respawn-pane" {
-			var err error
-			recipient, err = acknowledgeHandoffLaunch(command)
-			if err != nil {
-				return agentruntime.Result{}, err
-			}
-			launched = strings.Join(command.Args, " ")
-		}
-		return agentruntime.Result{}, nil
-	}
-	t.Cleanup(func() { hostExecRunner = oldExec })
-	defaultCommand := []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}
-	if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, &directHandoffBoundary{root: runtimeState.Root}, issues, remote, []agentruntime.Manifest{manifest}, messages, defaultCommand, func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
-		return true, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if messages[key][0].State != "delivered" || !runner.interrupted || recipient == "" || !strings.Contains(launched, strings.Join(defaultCommand, " ")) || strings.Contains(launched, " resume ") {
-		t.Fatalf("message=%#v interrupted=%v recipient=%q launch=%q", messages[key][0], runner.interrupted, recipient, launched)
-	}
-}
-
-func TestPublishedOperatorMessageStaysQueuedWhileCompletedFollowUpReviewRuns(t *testing.T) {
-	message, _ := internalgithub.PrepareOperatorMessage("o/r", 131, 3, "Wait for the follow-up review.")
-	key := "o/r#131/3"
-	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
-	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 131, Attempt: 3, DispatchAuthorized: true}
-	remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, PR: 99, BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), State: "review-ready"}
-	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 131, Attempt: 3, BaseSHA: remote.BaseSHA, State: "completed", ReviewState: "running", ReviewHead: strings.Repeat("c", 40), Session: "reviewing"}
-	boundary := &refusingHandoffBoundary{}
-	if err := resumeOperatorMessages(t.Context(), internalgithub.API{}, internalgithub.PRAdapterConfig{}, nil, boundary, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{remote}, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if boundary.calls != 0 || messages[key][0].State != "queued" {
-		t.Fatalf("review-in-progress message was not retained: calls=%d message=%#v", boundary.calls, messages[key][0])
 	}
 }
 
@@ -783,7 +603,7 @@ func TestMonitoringCheckInReachesTheExactOwnerAndRemainsDeduplicated(t *testing.
 	}
 	monitorCheckInRun = func(_ context.Context, stateRoot string, got orchestratoragent.MessageProposal) error {
 		checkIns++
-		if stateRoot != "runtime" || got.Repository != proposal.Repository || got.Issue != proposal.Issue || got.Attempt != proposal.Attempt || got.Message != "" {
+		if stateRoot != "runtime" || got.Repository != proposal.Repository || got.Issue != proposal.Issue || got.Attempt != proposal.Attempt {
 			t.Fatalf("check-in target=%#v state=%q", got, stateRoot)
 		}
 		return nil
@@ -802,7 +622,7 @@ func TestMonitoringCheckInReachesTheExactOwnerAndRemainsDeduplicated(t *testing.
 }
 
 func TestMonitoringCheckInUsesFixedExactTmuxDelivery(t *testing.T) {
-	runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
+	runtimeState, attempt, manifest, runner := attemptRuntime(t)
 	manifest.State = "running"
 	body, _ := json.Marshal(manifest)
 	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
@@ -838,644 +658,6 @@ func TestOperationCancellationInterruptsTheCurrentCoordinatorPass(t *testing.T) 
 	finish()
 }
 
-func TestWriteOperatorMessageStatusProjectsQueuedAndTerminalStateImmediately(t *testing.T) {
-	root := t.TempDir()
-	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 4, Attempt: 2, State: "active"}
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
-		t.Fatal(err)
-	}
-	message, err := internalgithub.PrepareOperatorMessage("o/r", 4, 2, "Continue the exact attempt.")
-	if err != nil {
-		t.Fatal(err)
-	}
-	message.State = "claimed"
-	message.UpdatedAt = time.Unix(10, 0).UTC()
-	if err := writeOperatorMessageStatus(root, message); err != nil {
-		t.Fatal(err)
-	}
-	message.State, message.Diagnostic = "delivered", ""
-	message.UpdatedAt = time.Unix(20, 0).UTC()
-	if err := writeOperatorMessageStatus(root, message); err != nil {
-		t.Fatal(err)
-	}
-	body, err := readDashboardStatus(filepath.Join(root, "status.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var snapshot struct {
-		Statuses []orchestrator.RecoveryStatus `json:"statuses"`
-	}
-	if json.Unmarshal(body, &snapshot) != nil || len(snapshot.Statuses) != 1 || len(snapshot.Statuses[0].OperatorMessages) != 1 || snapshot.Statuses[0].OperatorMessages[0].State != "delivered" || !snapshot.Statuses[0].OperatorMessages[0].UpdatedAt.Equal(message.UpdatedAt) {
-		t.Fatalf("snapshot=%s", body)
-	}
-}
-
-func TestWriteOperatorMessageStatusRejectsMixedProjectSnapshotWithoutReplacingIt(t *testing.T) {
-	root := t.TempDir()
-	statuses := []orchestrator.RecoveryStatus{
-		{Repository: "o/r", Issue: 4, Attempt: 2, State: "active"},
-		{Repository: "other/project", Issue: 5, Attempt: 1, State: "active"},
-	}
-	if err := writeStatusSnapshot(root, statuses); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(root, "status.json")
-	before, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	message, err := internalgithub.PrepareOperatorMessage("o/r", 4, 2, "Do not rewrite mixed project state.")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := writeOperatorMessageStatus(root, message); err == nil || !strings.Contains(err.Error(), "cross-project") {
-		t.Fatalf("mixed project status error = %v", err)
-	}
-	after, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(after, before) {
-		t.Fatal("mixed project status snapshot was replaced")
-	}
-}
-
-func TestStartupMessageRecoveryAcceptsCurrentStatusSchemaWithoutPendingWork(t *testing.T) {
-	root := t.TempDir()
-	statuses := []orchestrator.RecoveryStatus{{Issue: 161, OperatorMessages: []orchestrator.OperatorMessageStatus{{ID: strings.Repeat("a", 64), State: "delivered"}}}}
-	if err := writeStatusSnapshot(root, statuses); err != nil {
-		t.Fatal(err)
-	}
-	if err := retryProjectedOperatorMessages(t.Context(), filepath.Join(root, "missing-config"), root); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestOperatorMessageTargetValidationRejectsStaleAndTerminalAttempts(t *testing.T) {
-	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "message"}
-	bound := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, BaseSHA: "aaaaaaa", State: "active"}
-	activeIssue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 131, Attempt: 3, DispatchAuthorized: true, ActiveAttempt: &bound}
-	running := agentruntime.Manifest{Repository: "o/r", Issue: 131, Attempt: 3, BaseSHA: "aaaaaaa", State: "running", Session: "live"}
-	check := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
-	if err := validateOperatorMessageTarget(t.Context(), proposal, []internalgithub.RecoveryIssueFact{activeIssue}, nil, []agentruntime.Manifest{running}, check); err != nil {
-		t.Fatalf("active target rejected: %v", err)
-	}
-	unpublished := running
-	unpublished.State = "completed"
-	if err := validateOperatorMessageTarget(t.Context(), proposal, []internalgithub.RecoveryIssueFact{activeIssue}, nil, []agentruntime.Manifest{unpublished}, check); err != nil {
-		t.Fatalf("completed unpublished target rejected: %v", err)
-	}
-	publishedIssue := activeIssue
-	publishedIssue.ActiveAttempt = nil
-	published := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, PR: 7, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", State: "review-ready"}
-	completed := agentruntime.Manifest{Repository: "o/r", Issue: 131, Attempt: 3, BaseSHA: "aaaaaaa", State: "completed", ReviewHead: "bbbbbbb", Session: "retained"}
-	if err := validateOperatorMessageTarget(t.Context(), proposal, []internalgithub.RecoveryIssueFact{publishedIssue}, []internalgithub.RecoveryAttemptFact{published}, []agentruntime.Manifest{completed}, check); err != nil {
-		t.Fatalf("published target rejected: %v", err)
-	}
-	cancelled := activeIssue
-	cancelled.Cancelled, cancelled.DispatchAuthorized = true, false
-	wrong := bound
-	wrong.Attempt = 2
-	mismatched := activeIssue
-	mismatched.ActiveAttempt = &wrong
-	wrongBase := bound
-	wrongBase.BaseSHA = "ccccccc"
-	baseMismatch := activeIssue
-	baseMismatch.ActiveAttempt = &wrongBase
-	headMismatch := published
-	headMismatch.HeadSHA = "ccccccc"
-	for name, input := range map[string]struct {
-		issues    []internalgithub.RecoveryIssueFact
-		remote    []internalgithub.RecoveryAttemptFact
-		manifests []agentruntime.Manifest
-	}{
-		"missing":                   {nil, nil, nil},
-		"competing active binding":  {[]internalgithub.RecoveryIssueFact{mismatched}, []internalgithub.RecoveryAttemptFact{published}, []agentruntime.Manifest{completed}},
-		"mismatched base":           {[]internalgithub.RecoveryIssueFact{baseMismatch}, nil, []agentruntime.Manifest{running}},
-		"mismatched published head": {[]internalgithub.RecoveryIssueFact{publishedIssue}, []internalgithub.RecoveryAttemptFact{headMismatch}, []agentruntime.Manifest{completed}},
-		"cancelled":                 {[]internalgithub.RecoveryIssueFact{cancelled}, nil, []agentruntime.Manifest{running}},
-		"merged":                    {[]internalgithub.RecoveryIssueFact{activeIssue}, []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 131, Attempt: 3, BaseSHA: "aaaaaaa", State: "completed"}}, []agentruntime.Manifest{running}},
-		"terminal":                  {[]internalgithub.RecoveryIssueFact{activeIssue}, nil, []agentruntime.Manifest{{Repository: "o/r", Issue: 131, Attempt: 3, BaseSHA: "aaaaaaa", State: "failed"}}},
-	} {
-		t.Run(name, func(t *testing.T) {
-			if err := validateOperatorMessageTarget(t.Context(), proposal, input.issues, input.remote, input.manifests, check); err == nil {
-				t.Fatal("unsafe target accepted")
-			}
-		})
-	}
-}
-
-func TestOperatorMessageTargetValidationVerifiesCompletedRuntimeResources(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		mutate func(agentruntime.Manifest, *operatorMessageRunner)
-	}{
-		{"missing worktree", func(manifest agentruntime.Manifest, _ *operatorMessageRunner) { _ = os.RemoveAll(manifest.Worktree) }},
-		{"mismatched branch", func(_ agentruntime.Manifest, runner *operatorMessageRunner) { runner.branch = "wrong-branch" }},
-		{"missing result", func(manifest agentruntime.Manifest, _ *operatorMessageRunner) {
-			_ = os.Remove(agentruntime.ResultPath(manifest.Worktree))
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
-			test.mutate(manifest, runner)
-			bound := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
-			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &bound}
-			proposal := orchestratoragent.MessageProposal{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Message: "message"}
-			err := validateOperatorMessageTarget(t.Context(), proposal, []internalgithub.RecoveryIssueFact{issue}, nil, []agentruntime.Manifest{manifest}, func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
-				return verifyOperatorMessageRuntime(ctx, runtimeState, manifest, fact)
-			})
-			if err == nil || !strings.Contains(err.Error(), "verified exact runtime owner") {
-				t.Fatalf("completed target with invalid runtime accepted: %v", err)
-			}
-		})
-	}
-}
-
-func TestOperatorMessageAcceptanceBindingRejectsRemoteRaces(t *testing.T) {
-	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 131, Attempt: 3, Message: "message"}
-	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 131, Attempt: 3, DispatchAuthorized: true}
-	remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, PR: 7, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", State: "review-ready"}
-	expected, err := operatorMessageBinding(proposal, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{remote})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !matchesOperatorMessageBinding(proposal, expected, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{remote}) {
-		t.Fatal("unchanged remote binding was rejected at delivery acceptance")
-	}
-	for name, mutate := range map[string]func(*internalgithub.RecoveryAttemptFact){
-		"force-pushed head": func(fact *internalgithub.RecoveryAttemptFact) { fact.HeadSHA = "ccccccc" },
-		"rebound base":      func(fact *internalgithub.RecoveryAttemptFact) { fact.BaseSHA = "ddddddd" },
-		"closed pull request": func(fact *internalgithub.RecoveryAttemptFact) {
-			fact.State = "blocked"
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			current := remote
-			mutate(&current)
-			if matchesOperatorMessageBinding(proposal, expected, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{current}) {
-				t.Fatal("changed remote binding remained eligible at delivery acceptance")
-			}
-		})
-	}
-}
-
-func TestOperatorMessageConfirmationAcceptsOwnedRunningAdvancedHead(t *testing.T) {
-	stateRoot := t.TempDir()
-	snapshotRoot := filepath.Join(t.TempDir(), "snapshots")
-	oldSnapshotRoot := reviewSnapshotRoot
-	reviewSnapshotRoot = snapshotRoot
-	t.Cleanup(func() { reviewSnapshotRoot = oldSnapshotRoot })
-	if err := os.MkdirAll(filepath.Dir(snapshotRoot), 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 131, Number: 3, BaseSHA: strings.Repeat("a", 40)}
-	runtimeState := newOperatorMessageRuntime(stateRoot)
-	if err := os.MkdirAll(runtimeState.Root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	manifest, err := agentruntime.AttemptIdentity(runtimeState.Root, attempt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest.State = "running"
-	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "131-3", "agent.log")
-	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	logPath, script := filepath.Join(t.TempDir(), "boundary.log"), filepath.Join(t.TempDir(), "boundary")
-	scriptBody := fmt.Sprintf(`#!/bin/sh
-payload=$(sed -n '1p')
-printf '%%s\n' "$payload" >> %q
-case "$payload" in
-  *--show-current*) output=%q ;;
-  *'rev-parse","HEAD'*) output=%q ;;
-  *) output='' ;;
-esac
-printf '{"Output":"%%s","Code":0,"Exited":false}' "$output"
-`, logPath, manifest.Branch, strings.Repeat("c", 40))
-	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", script)
-	runtimeState = newOperatorMessageRuntime(stateRoot)
-	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Message: "Queue behind the running turn."}
-	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true}
-	remote := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, PR: 7, BaseSHA: attempt.BaseSHA, HeadSHA: strings.Repeat("b", 40), State: "review-ready"}
-	if err := validateOperatorMessageTarget(t.Context(), proposal, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{remote}, []agentruntime.Manifest{manifest}, func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
-		return verifyOperatorMessageRuntime(ctx, &runtimeState, manifest, fact)
-	}); err != nil {
-		t.Fatalf("confirmation rejected the owned advanced-head running target: %v", err)
-	}
-	logBody, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(logBody, []byte(`"operation":"verify"`)) || !bytes.Contains(logBody, []byte(`"operation":"run"`)) {
-		t.Fatalf("confirmation runtime did not use both boundary hooks: %s", logBody)
-	}
-	if bytes.Contains(logBody, []byte(`rev-parse`)) {
-		t.Fatalf("busy confirmation compared mutable HEAD: %s", logBody)
-	}
-}
-
-func TestOperatorMessageAdmissionRequiresOnlyTheExactLocalRuntimeOwner(t *testing.T) {
-	runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
-	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Message: "Queue before remote delivery validation."}
-	if err := validateOperatorMessageAdmission(t.Context(), proposal, runtimeState, []agentruntime.Manifest{manifest}); err != nil {
-		t.Fatalf("exact local owner was rejected: %v", err)
-	}
-	runner.missing = true
-	if err := validateOperatorMessageAdmission(t.Context(), proposal, runtimeState, []agentruntime.Manifest{manifest}); err != nil {
-		t.Fatalf("completed retained owner required its old session: %v", err)
-	}
-	manifest.State = "running"
-	if err := validateOperatorMessageAdmission(t.Context(), proposal, runtimeState, []agentruntime.Manifest{manifest}); err != nil {
-		t.Fatalf("interrupted pre-launch owner was rejected: %v", err)
-	}
-	manifest.State = "completed"
-	if err := os.Remove(agentruntime.ResultPath(manifest.Worktree)); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateOperatorMessageAdmission(t.Context(), proposal, runtimeState, []agentruntime.Manifest{manifest}); err == nil {
-		t.Fatal("completed owner without a retained result was admitted")
-	}
-	if err := validateOperatorMessageAdmission(t.Context(), proposal, runtimeState, []agentruntime.Manifest{manifest, manifest}); err == nil {
-		t.Fatal("ambiguous local owner was admitted")
-	}
-}
-
-func TestClaimedOperatorMessageDoesNotInterruptCompetingHandoff(t *testing.T) {
-	runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
-	store := &operatorMessageStore{}
-	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: store.roundTrip(t)}}
-	cfg := internalgithub.PRAdapterConfig{Repository: attempt.Repository, ActorID: 42}
-	message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Wait for the current handoff.")
-	message, err := internalgithub.RecordOperatorMessage(t.Context(), api, cfg, message)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number)
-	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
-	bound := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
-	issues := []internalgithub.RecoveryIssueFact{{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &bound}}
-	remote := []internalgithub.RecoveryAttemptFact{bound}
-	check := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
-	refresh := func(context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
-		current, discoverErr := runtimeState.Discover()
-		return issues, remote, current, discoverErr
-	}
-	boundary := &crashingHandoffBoundary{direct: directHandoffBoundary{root: runtimeState.Root}, before: 1}
-	if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
-		return true, nil
-	}); err == nil || !strings.Contains(err.Error(), "after resume") {
-		t.Fatalf("missing injected restart: %v", err)
-	}
-	recovered, err := internalgithub.FetchOperatorMessages(t.Context(), api, cfg, attempt.Issue)
-	if err != nil || len(recovered) != 1 || recovered[0].State != "claimed" {
-		t.Fatalf("durable claim=%#v err=%v", recovered, err)
-	}
-	current, err := runtimeState.Discover()
-	if err != nil || len(current) != 1 || current[0].State != "running" {
-		t.Fatalf("resumed manifest=%#v err=%v", current, err)
-	}
-
-	oldExec := hostExecRunner
-	respawns := 0
-	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
-		if len(command.Args) > 0 && command.Args[0] == "show-options" {
-			return agentruntime.Result{Output: "different handoff"}, nil
-		}
-		if len(command.Args) > 0 && command.Args[0] == "respawn-pane" {
-			respawns++
-			if _, err := acknowledgeHandoffLaunch(command); err != nil {
-				return agentruntime.Result{}, err
-			}
-		}
-		return agentruntime.Result{}, nil
-	}
-	t.Cleanup(func() { hostExecRunner = oldExec })
-	competingKey := "independent-review-competing"
-	competingPayload := json.RawMessage(`{"type":"agent-symphony-handoff-v1","key":"independent-review-competing"}`)
-	competingPath := handoffReceiptPath(manifest.Worktree, competingKey)
-	request, _ := json.Marshal(struct {
-		Manifest     agentruntime.Manifest `json:"manifest"`
-		Handoff      json.RawMessage       `json:"handoff"`
-		OutcomePath  string                `json:"outcome_path"`
-		OutcomeToken string                `json:"outcome_token"`
-		Command      []string              `json:"command"`
-	}{current[0], competingPayload, competingPath, "competing-token", []string{"implementation"}})
-	if _, err := boundary.direct.call(t.Context(), "accept-handoff", agentruntime.Command{Stdin: bytes.NewReader(request)}); err != nil {
-		t.Fatal(err)
-	}
-	messages[key] = recovered
-	calls := boundary.calls
-	if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
-		return true, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if boundary.calls != calls+1 || respawns != 1 || messages[key][0].State != "claimed" || runner.dead {
-		t.Fatalf("competing live turn was interrupted: calls=%d respawns=%d message=%#v", boundary.calls, respawns, messages[key][0])
-	}
-	statuses := []orchestrator.RecoveryStatus{{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number}}
-	attachOperatorMessageStatuses(statuses, messages)
-	if len(statuses[0].OperatorMessages) != 1 || statuses[0].OperatorMessages[0].State != "queued" {
-		t.Fatalf("restart claim leaked internal dashboard state: %#v", statuses[0].OperatorMessages)
-	}
-}
-
-func TestFirstOperatorMessageDeliveryRecoversExactlyOnceAtCrashBoundaries(t *testing.T) {
-	for _, stage := range []string{"after resume", "after worker receipt", "before delivered outcome"} {
-		t.Run(stage, func(t *testing.T) {
-			runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
-			store := &operatorMessageStore{}
-			api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: store.roundTrip(t)}}
-			cfg := internalgithub.PRAdapterConfig{Repository: attempt.Repository, ActorID: 42}
-			message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Recover this delivery exactly once.")
-			message, err := internalgithub.RecordOperatorMessage(t.Context(), api, cfg, message)
-			if err != nil {
-				t.Fatal(err)
-			}
-			key := fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number)
-			messages := map[string][]internalgithub.OperatorMessage{key: {message}}
-			bound := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
-			issues := []internalgithub.RecoveryIssueFact{{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &bound}}
-			remote := []internalgithub.RecoveryAttemptFact{bound}
-			check := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
-			refresh := func(context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
-				current, discoverErr := runtimeState.Discover()
-				return issues, remote, current, discoverErr
-			}
-			boundary := &crashingHandoffBoundary{direct: directHandoffBoundary{root: runtimeState.Root}}
-			switch stage {
-			case "after resume":
-				boundary.before = 1
-			case "after worker receipt":
-				boundary.after = 1
-			case "before delivered outcome":
-				store.outcomeFailures = 1
-			}
-			oldExec := hostExecRunner
-			respawns, recipient := 0, ""
-			hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
-				if len(command.Args) > 0 && command.Args[0] == "show-options" {
-					if recipient == "" {
-						return agentruntime.Result{}, nil
-					}
-					return agentruntime.Result{Output: recipient}, nil
-				}
-				if len(command.Args) > 0 && command.Args[0] == "respawn-pane" {
-					respawns++
-					var err error
-					recipient, err = acknowledgeHandoffLaunch(command)
-					if err != nil {
-						return agentruntime.Result{}, err
-					}
-				}
-				return agentruntime.Result{}, nil
-			}
-			t.Cleanup(func() { hostExecRunner = oldExec })
-
-			if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
-				return true, nil
-			}); err == nil {
-				t.Fatal("injected crash did not stop delivery")
-			}
-			recovered, err := internalgithub.FetchOperatorMessages(t.Context(), api, cfg, attempt.Issue)
-			if err != nil || len(recovered) != 1 || recovered[0].State != "claimed" {
-				t.Fatalf("durable claim=%#v err=%v", recovered, err)
-			}
-			messages[key] = recovered
-			current, err := runtimeState.Discover()
-			if err != nil || len(current) != 1 || current[0].State != "running" {
-				t.Fatalf("resumed manifest=%#v err=%v", current, err)
-			}
-			if stage == "after resume" {
-				calls := boundary.calls
-				if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
-					return true, nil
-				}); err != nil {
-					t.Fatal(err)
-				}
-				if boundary.calls != calls+1 || respawns != 0 || messages[key][0].State != "claimed" {
-					t.Fatalf("unowned running pane was reused: calls=%d respawns=%d message=%#v", boundary.calls, respawns, messages[key][0])
-				}
-				runner.dead = true
-				if _, err := runtimeState.Monitor(t.Context(), attempt); err != nil {
-					t.Fatal(err)
-				}
-				current, err = runtimeState.Discover()
-				if err != nil || len(current) != 1 || current[0].State != "completed" {
-					t.Fatalf("completed transition=%#v err=%v", current, err)
-				}
-			}
-			if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
-				return true, nil
-			}); err != nil {
-				t.Fatal(err)
-			}
-			delivered, err := internalgithub.FetchOperatorMessages(t.Context(), api, cfg, attempt.Issue)
-			if err != nil || len(delivered) != 1 || delivered[0].State != "delivered" {
-				t.Fatalf("durable delivery=%#v err=%v", delivered, err)
-			}
-			messages[key] = delivered
-			if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, issues, remote, current, messages, []string{"implementation"}, check, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
-				return true, nil
-			}); err != nil {
-				t.Fatal(err)
-			}
-			if respawns != 1 || store.outcomePosts != 1 {
-				t.Fatalf("delivery repeated: respawns=%d delivered outcomes=%d", respawns, store.outcomePosts)
-			}
-		})
-	}
-}
-
-func TestMergedAttemptRejectsPendingOperatorMessageBeforeDelivery(t *testing.T) {
-	comments := []map[string]any{}
-	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.Method == http.MethodGet {
-			body, _ := json.Marshal(comments)
-			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
-		}
-		var input struct {
-			Body string `json:"body"`
-		}
-		body, _ := io.ReadAll(request.Body)
-		if json.Unmarshal(body, &input) != nil {
-			t.Fatal("invalid comment mutation")
-		}
-		comments = append(comments, map[string]any{"body": input.Body, "created_at": time.Now().UTC(), "user": map[string]any{"id": 42}})
-		return &http.Response{StatusCode: http.StatusCreated, Status: "201 Created", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
-	})
-	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: transport}}
-	cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}
-	message, _ := internalgithub.PrepareOperatorMessage("o/r", 131, 3, "Do not outlive the merge.")
-	message, err := internalgithub.RecordOperatorMessage(t.Context(), api, cfg, message)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := "o/r#131/3"
-	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
-	remote := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 131, Attempt: 3, State: "completed", PR: 99}}
-	boundary := &refusingHandoffBoundary{}
-	if err := resumeOperatorMessages(t.Context(), api, cfg, nil, boundary, nil, remote, nil, messages, []string{"implementation"}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if boundary.calls != 0 || messages[key][0].State != "rejected" {
-		t.Fatalf("merged message delivered: calls=%d message=%#v", boundary.calls, messages[key][0])
-	}
-	recovered, err := internalgithub.FetchOperatorMessages(t.Context(), api, cfg, 131)
-	if err != nil || len(recovered) != 1 || recovered[0].State != "rejected" {
-		t.Fatalf("durable rejection=%#v err=%v", recovered, err)
-	}
-}
-
-func TestOperatorMessageOutcomeFailureAfterCleanupIsRecoveredOnRestart(t *testing.T) {
-	store := &operatorMessageStore{}
-	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: store.roundTrip(t)}}
-	cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}
-	message, _ := internalgithub.PrepareOperatorMessage("o/r", 131, 3, "Reject this after the merged runtime is cleaned up.")
-	if _, err := internalgithub.RecordOperatorMessage(t.Context(), api, cfg, message); err != nil {
-		t.Fatal(err)
-	}
-	terminal := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 131, Attempt: 3, State: "completed", PR: 99}}
-	messages, err := fetchOperatorMessages(t.Context(), api, cfg, nil, terminal, nil)
-	if err != nil || len(messages["o/r#131/3"]) != 1 {
-		t.Fatalf("message was not rediscovered after cleanup: messages=%#v err=%v", messages, err)
-	}
-	store.outcomeFailures = 1
-	if err := resumeOperatorMessages(t.Context(), api, cfg, nil, &refusingHandoffBoundary{}, nil, terminal, nil, messages, []string{"implementation"}, nil, nil, nil); err == nil {
-		t.Fatal("injected outcome failure did not stop reconciliation")
-	}
-	messages, err = fetchOperatorMessages(t.Context(), api, cfg, nil, terminal, nil)
-	if err != nil || len(messages["o/r#131/3"]) != 1 || messages["o/r#131/3"][0].State != "queued" {
-		t.Fatalf("restart did not recover unresolved message: messages=%#v err=%v", messages, err)
-	}
-	if err := resumeOperatorMessages(t.Context(), api, cfg, nil, &refusingHandoffBoundary{}, nil, terminal, nil, messages, []string{"implementation"}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if messages["o/r#131/3"][0].State != "rejected" || store.outcomePosts != 1 {
-		t.Fatalf("recovered outcome=%#v posts=%d", messages["o/r#131/3"][0], store.outcomePosts)
-	}
-}
-
-func TestOperatorMessageTerminalStateWinsAfterDurableClaimBeforeAcceptance(t *testing.T) {
-	comments := []map[string]any{}
-	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.Method == http.MethodGet {
-			body, _ := json.Marshal(comments)
-			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
-		}
-		var input struct {
-			Body string `json:"body"`
-		}
-		body, _ := io.ReadAll(request.Body)
-		if json.Unmarshal(body, &input) != nil {
-			t.Fatal("invalid comment mutation")
-		}
-		comments = append(comments, map[string]any{"body": input.Body, "created_at": time.Now().UTC(), "user": map[string]any{"id": 42}})
-		return &http.Response{StatusCode: http.StatusCreated, Status: "201 Created", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
-	})
-	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: transport}}
-	cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}
-	message, _ := internalgithub.PrepareOperatorMessage("o/r", 131, 3, "Stop if the attempt merges during delivery.")
-	message, err := internalgithub.RecordOperatorMessage(t.Context(), api, cfg, message)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := "o/r#131/3"
-	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
-	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 131, Attempt: 3, DispatchAuthorized: true}
-	active := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 131, Attempt: 3, PR: 99, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", State: "review-ready"}
-	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 131, Attempt: 3, BaseSHA: "aaaaaaa", State: "completed", ReviewHead: "bbbbbbb", Session: "retained"}
-	boundary := &refusingHandoffBoundary{}
-	crashAfterClaim := func(ctx context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
-		recovered, err := internalgithub.FetchOperatorMessages(ctx, api, cfg, 131)
-		if err != nil || len(recovered) != 1 || recovered[0].State != "claimed" {
-			t.Fatalf("delivery was not durably claimed before refresh: %#v err=%v", recovered, err)
-		}
-		return nil, nil, nil, errors.New("injected restart after claim")
-	}
-	if err := resumeOperatorMessages(t.Context(), api, cfg, nil, boundary, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{active}, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, nil, crashAfterClaim, nil); err == nil || !strings.Contains(err.Error(), "injected restart") {
-		t.Fatalf("claim did not survive injected restart: %v", err)
-	}
-	recovered, err := internalgithub.FetchOperatorMessages(t.Context(), api, cfg, 131)
-	if err != nil || len(recovered) != 1 || recovered[0].State != "claimed" {
-		t.Fatalf("restart did not recover claim=%#v err=%v", recovered, err)
-	}
-	messages[key] = recovered
-	manifest.State = "running" // ResumeHandoff may have committed before a crash.
-	refreshTerminal := func(context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
-		terminal := active
-		terminal.State = "completed"
-		return []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{terminal}, []agentruntime.Manifest{manifest}, nil
-	}
-	check := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
-	if err := resumeOperatorMessages(t.Context(), api, cfg, nil, boundary, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{active}, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, check, refreshTerminal, nil); err != nil {
-		t.Fatal(err)
-	}
-	if boundary.calls != 0 || messages[key][0].State != "claimed" {
-		t.Fatalf("unverified running pane was reused: calls=%d message=%#v", boundary.calls, messages[key][0])
-	}
-	terminal := active
-	terminal.State = "completed"
-	if err := resumeOperatorMessages(t.Context(), api, cfg, nil, boundary, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{terminal}, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, check, refreshTerminal, nil); err != nil {
-		t.Fatal(err)
-	}
-	if boundary.calls != 0 || messages[key][0].State != "rejected" {
-		t.Fatalf("terminal race reached acceptance: calls=%d message=%#v", boundary.calls, messages[key][0])
-	}
-	recovered, err = internalgithub.FetchOperatorMessages(t.Context(), api, cfg, 131)
-	if err != nil || len(recovered) != 1 || recovered[0].State != "rejected" {
-		t.Fatalf("restart-safe terminal outcome=%#v err=%v", recovered, err)
-	}
-}
-
-func TestOperatorMessageTerminalStateWinsAtAcceptanceBoundary(t *testing.T) {
-	runtimeState, attempt, manifest, _ := operatorMessageRuntime(t)
-	store := &operatorMessageStore{}
-	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: store.roundTrip(t)}}
-	cfg := internalgithub.PRAdapterConfig{Repository: attempt.Repository, ActorID: 42}
-	message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Do not start after merge.")
-	message, err := internalgithub.RecordOperatorMessage(t.Context(), api, cfg, message)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number)
-	messages := map[string][]internalgithub.OperatorMessage{key: {message}}
-	active := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
-	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &active}
-	refreshes := 0
-	refresh := func(context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
-		refreshes++
-		current, discoverErr := runtimeState.Discover()
-		return []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{active}, current, discoverErr
-	}
-	acceptances := 0
-	accept := func(_ context.Context, proposal orchestratoragent.MessageProposal, expected operatorAttemptBinding) (bool, error) {
-		acceptances++
-		terminal := active
-		terminal.State = "completed"
-		return matchesOperatorMessageBinding(proposal, expected, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{terminal}), nil
-	}
-	boundary := &refusingHandoffBoundary{}
-	check := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
-	if err := resumeOperatorMessages(t.Context(), api, cfg, runtimeState, boundary, []internalgithub.RecoveryIssueFact{issue}, []internalgithub.RecoveryAttemptFact{active}, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, check, refresh, accept); err != nil {
-		t.Fatal(err)
-	}
-	if refreshes != 1 || acceptances != 1 || boundary.calls != 0 || messages[key][0].State != "rejected" {
-		t.Fatalf("terminal acceptance race was not excluded: refreshes=%d acceptances=%d calls=%d message=%#v", refreshes, acceptances, boundary.calls, messages[key][0])
-	}
-	current, err := runtimeState.Discover()
-	if err != nil || len(current) != 1 || current[0].State != "completed" {
-		t.Fatalf("terminal race changed the retained runtime: manifests=%#v err=%v", current, err)
-	}
-}
-
 func (b *directHandoffBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
 	body, err := io.ReadAll(command.Stdin)
 	if err != nil {
@@ -1485,8 +667,6 @@ func (b *directHandoffBoundary) call(ctx context.Context, operation string, comm
 	switch operation {
 	case "accept-handoff":
 		out, err = acceptHandoff(ctx, body, b.root)
-	case "accept-operator-handoff":
-		out, err = acceptOperatorHandoff(ctx, body, b.root)
 	case "verify-handoff":
 		out, err = verifyHandoff(ctx, body, b.root)
 	default:
@@ -1495,7 +675,7 @@ func (b *directHandoffBoundary) call(ctx context.Context, operation string, comm
 	return agentruntime.Result{Output: out}, err
 }
 
-func operatorMessageRuntime(t *testing.T) (*agentruntime.Runtime, agentruntime.Attempt, agentruntime.Manifest, *operatorMessageRunner) {
+func attemptRuntime(t *testing.T) (*agentruntime.Runtime, agentruntime.Attempt, agentruntime.Manifest, *attemptRunner) {
 	t.Helper()
 	root, stateRoot := t.TempDir(), t.TempDir()
 	stateRoot, _ = filepath.EvalSymlinks(stateRoot)
@@ -1520,7 +700,7 @@ func operatorMessageRuntime(t *testing.T) (*agentruntime.Runtime, agentruntime.A
 	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner := &operatorMessageRunner{branch: manifest.Branch, head: attempt.BaseSHA}
+	runner := &attemptRunner{branch: manifest.Branch, head: attempt.BaseSHA}
 	runtimeState := &agentruntime.Runtime{Root: root, StateRoot: stateRoot, Source: "source.bundle", Runner: runner, VerifyWorker: func(context.Context) error { return nil }}
 	return runtimeState, attempt, manifest, runner
 }
@@ -1582,7 +762,7 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 	identity := agentruntime.Manifest{Branch: "agent-symphony/owner-repo/56-3", Worktree: "/attempts/owner-repo-56-3", Session: "as-owner-repo-56-3"}
 	for _, interactive := range []bool{false, true} {
 		prompt := implementationPrompt(issue, identity, interactive)
-		for _, want := range []string{"Project: owner/repo", "Issue: #56", "Attempt: 3", "Base branch: main", "Branch: " + identity.Branch, "Worktree: " + identity.Worktree, "Session: " + identity.Session, issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "Re-read both the comment and label", "partial-update errors are failures, never success"} {
+		for _, want := range []string{"Project: owner/repo", "Issue: #56", "Attempt: 3", "Base branch: main", "Branch: " + identity.Branch, "Worktree: " + identity.Worktree, "Session: " + identity.Session, issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "installed gh CLI", "/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "Re-read both the comment and label", "updated directly with gh", "partial-update errors are failures, never success"} {
 			if !strings.Contains(prompt, want) {
 				t.Fatalf("interactive=%v prompt omitted %q: %s", interactive, want, prompt)
 			}
@@ -1628,7 +808,7 @@ func TestDispatchRejectsAnythingButEligibleAuthorizedIssueBeforeBinding(t *testi
 	}
 }
 
-func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t *testing.T) {
+func TestImplementationGitHubStatusUpdatesNeedNoOrchestratorRelay(t *testing.T) {
 	source := gitRepository(t)
 	for _, args := range [][]string{{"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"switch", "-c", "main"}} {
 		runGit(t, source, args...)
@@ -2067,7 +1247,7 @@ func TestWriteImmutableRecoversAtEveryDurabilityBoundary(t *testing.T) {
 	}
 }
 
-func TestReviewFindingsRecoversWorkerReceiptAfterCoordinatorRestart(t *testing.T) {
+func TestReviewFindingsHandoffReachesImplementationWithoutOrchestrator(t *testing.T) {
 	state, worktree := t.TempDir(), t.TempDir()
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
 	head, key := "abcdef1", "independent-review-abcdef1"
@@ -2183,7 +1363,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	runtimeState := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: base, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", state, nil); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, "", state, nil); err != nil {
 		log, _ := os.ReadFile(boundaryLog)
 		t.Fatalf("transient rework reached GitHub failure: %v\n%s", err, log)
 	}
@@ -2197,7 +1377,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 		t.Fatalf("acknowledged handoff state=%q, want running", stored.State)
 	}
 	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, "", state, nil); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, restarted, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, "", state, nil); err != nil {
 		t.Fatalf("retry reached GitHub failure: %v", err)
 	}
 	storedBody, _ = os.ReadFile(manifestPath)
@@ -2211,7 +1391,7 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	}
 }
 
-func TestCompletedTurnContractFailureIsPreservedBeforeFollowUp(t *testing.T) {
+func TestCompletedTurnContractFailureIsPreserved(t *testing.T) {
 	for _, test := range []struct {
 		name, result, export string
 	}{
@@ -2219,7 +1399,7 @@ func TestCompletedTurnContractFailureIsPreservedBeforeFollowUp(t *testing.T) {
 		{name: "malformed", result: "not-json", export: "{"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			runtimeState, attempt, manifest, _ := operatorMessageRuntime(t)
+			runtimeState, attempt, manifest, _ := attemptRuntime(t)
 			resultPath := agentruntime.ResultPath(manifest.Worktree)
 			if err := os.Remove(resultPath); err != nil {
 				t.Fatal(err)
@@ -2251,25 +1431,9 @@ func TestCompletedTurnContractFailureIsPreservedBeforeFollowUp(t *testing.T) {
 			boundFact := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "active"}
 			bound := []internalgithub.RecoveryAttemptFact{boundFact}
 			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, DispatchAuthorized: true, ActiveAttempt: &boundFact}
-			err := monitorQueuedAttempts(t.Context(), api, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, "", runtimeState.StateRoot, nil)
-			message, _ := internalgithub.PrepareOperatorMessage(attempt.Repository, attempt.Issue, attempt.Number, "Do not mask the preceding result.")
-			message.State = "claimed"
-			messages := map[string][]internalgithub.OperatorMessage{fmt.Sprintf("%s#%d/%d", attempt.Repository, attempt.Issue, attempt.Number): {message}}
-			followUp := &refusingHandoffBoundary{}
-			if err == nil {
-				refresh := func(context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
-					current, discoverErr := runtimeState.Discover()
-					return []internalgithub.RecoveryIssueFact{issue}, bound, current, discoverErr
-				}
-				err = resumeOperatorMessages(t.Context(), api, internalgithub.PRAdapterConfig{}, runtimeState, followUp, []internalgithub.RecoveryIssueFact{issue}, bound, []agentruntime.Manifest{manifest}, messages, []string{"implementation"}, func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }, refresh, func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error) {
-					return true, nil
-				})
-			}
+			err := monitorQueuedAttempts(t.Context(), api, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, "", runtimeState.StateRoot, nil)
 			if err == nil || !strings.Contains(err.Error(), "invalid attested metadata") {
 				t.Fatalf("invalid completed result did not stop reconciliation: %v", err)
-			}
-			if followUp.calls != 0 {
-				t.Fatal("queued operator message replaced the invalid completed result")
 			}
 			body, readErr := os.ReadFile(resultPath)
 			if test.result == "" {
@@ -2280,129 +1444,6 @@ func TestCompletedTurnContractFailureIsPreservedBeforeFollowUp(t *testing.T) {
 				t.Fatalf("malformed result was not preserved: %q %v", body, readErr)
 			}
 		})
-	}
-}
-
-func TestPublishedPROperatorMessageFollowUpIsPublishedWithoutPRFeedback(t *testing.T) {
-	coordinator, worker, remote := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
-	for _, repo := range []string{coordinator, worker} {
-		runGit(t, repo, "init")
-		runGit(t, repo, "config", "user.email", "test@example.invalid")
-		runGit(t, repo, "config", "user.name", "test")
-	}
-	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("base"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, worker, "add", "file")
-	runGit(t, worker, "commit", "-m", "base")
-	base := runGit(t, worker, "rev-parse", "HEAD")
-	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("operator follow-up"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, worker, "commit", "-am", "operator follow-up")
-	head := runGit(t, worker, "rev-parse", "HEAD")
-	branch, _ := internalgithub.AttemptBranch("o/r", 23, 1)
-	runGit(t, coordinator, "init", "--bare", remote)
-	runGit(t, worker, "push", remote, base+":refs/heads/"+branch)
-	runGit(t, coordinator, "remote", "add", "origin", remote)
-
-	bundlePath := filepath.Join(t.TempDir(), "attempt.bundle")
-	runGit(t, worker, "bundle", "create", bundlePath, "--all")
-	bundle, err := os.ReadFile(bundlePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	exported := workerExport{Type: "agent-symphony-export-v1", Repository: "o/r", Branch: branch, BaseSHA: base, HeadSHA: head, BundleSHA256: fmt.Sprintf("%x", sha256.Sum256(bundle)), Clean: true, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "stale diagnostic probe", Documentation: "none"}, Bundle: base64.StdEncoding.EncodeToString(bundle)}
-	exportedJSON, _ := json.Marshal(exported)
-	boundaryResult, _ := json.Marshal(agentruntime.Result{Output: string(exportedJSON)})
-	implementation := filepath.Join(t.TempDir(), "implementation-boundary")
-	if err := os.WriteFile(implementation, []byte("#!/bin/sh\nprintf '%s' '"+string(boundaryResult)+"'\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", implementation)
-
-	message, _ := internalgithub.PrepareOperatorMessage("o/r", 23, 1, "Apply the follow-up.")
-	key := "operator-message-" + message.ID
-	receiptPath := handoffReceiptPath(worker, key)
-	if err := os.MkdirAll(filepath.Dir(receiptPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(receiptPath, []byte("malformed worker receipt"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(filepath.Dir(receiptPath), "operator-message-forged.receipt"), []byte(`{"type":"agent-symphony-handoff-executed-v1"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	recoveryPath := filepath.Join(t.TempDir(), "pr.json")
-	recoveryBody, _ := json.Marshal([]internalgithub.PRState{{Repository: "o/r", Number: 7, Issue: 23, Attempt: 1, HeadSHA: base}})
-	if err := os.WriteFile(recoveryPath, recoveryBody, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var pullBody string
-	var comments []map[string]any
-	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		status := http.StatusOK
-		var body []byte
-		switch {
-		case request.Method == http.MethodGet && request.URL.Path == "/user":
-			body = []byte(`{"id":42,"login":"coordinator"}`)
-		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/pulls":
-			body, _ = json.Marshal([]map[string]any{{"number": 7, "body": pullBody, "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": branch}}})
-		case request.Method == http.MethodPatch && request.URL.Path == "/repos/o/r/pulls/7":
-			var input struct {
-				Body string `json:"body"`
-			}
-			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
-				t.Fatal(err)
-			}
-			pullBody = input.Body
-			body = []byte(`{}`)
-		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues/23/comments":
-			body, _ = json.Marshal(comments)
-		case request.Method == http.MethodPost && request.URL.Path == "/repos/o/r/issues/23/comments":
-			var input struct {
-				Body string `json:"body"`
-			}
-			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
-				t.Fatal(err)
-			}
-			comments = append(comments, map[string]any{"body": input.Body, "user": map[string]any{"id": 42}})
-			status, body = http.StatusCreated, []byte(`{}`)
-		default:
-			t.Fatalf("unexpected GitHub request %s %s", request.Method, request.URL.String())
-		}
-		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d", status), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
-	})}}
-
-	old, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chdir(coordinator); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(old) })
-	manifest := agentruntime.Manifest{Version: 1, Repository: "o/r", Issue: 23, Attempt: 1, Branch: branch, Worktree: worker, BaseSHA: base, State: "completed", ReviewState: "clean", ReviewBase: base, ReviewHead: head, UpdatedAt: time.Now().UTC()}
-	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 2, Title: "Operator follow-up", BaseBranch: "main", DispatchAuthorized: true}
-	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "review-ready"}}
-	message.State = "delivered"
-	operatorMessages := map[string][]internalgithub.OperatorMessage{"o/r#23/1": {message}}
-	if err := monitorQueuedAttempts(t.Context(), api, &agentruntime.Runtime{}, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, operatorMessages, recoveryPath, t.TempDir(), nil); err != nil {
-		t.Fatal(err)
-	}
-	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != head {
-		t.Fatalf("published head=%s want %s; body=%q comments=%#v", got, head, pullBody, comments)
-	}
-	if !strings.Contains(pullBody, head) || !strings.Contains(pullBody, "Attempt: 1") || strings.Contains(pullBody, "Attempt: 2") || len(comments) != 3 {
-		t.Fatalf("pull request was not fully updated: body=%q comments=%#v", pullBody, comments)
-	}
-	if !strings.Contains(pullBody, "Independent review passed for exact head `"+head+"`.") || strings.Contains(pullBody, "stale diagnostic probe") {
-		t.Fatalf("pull request did not publish exact-head review evidence: body=%q", pullBody)
-	}
-	recovered, err := (&internalgithub.FileRecovery{Path: recoveryPath}).PullRequestState(t.Context(), "o/r", 7, 23, 1, head)
-	if err != nil || recovered.HeadSHA != head {
-		t.Fatalf("published follow-up did not advance recovery: state=%#v err=%v", recovered, err)
 	}
 }
 
@@ -2474,7 +1515,7 @@ func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testin
 	}
 }
 
-func TestReconcileMonitorsAndPublishesCompletedAttemptBeforePRGovernanceFailure(t *testing.T) {
+func TestReconcilePublishesReviewedAttemptWithoutOrchestratorBeforeGovernanceFailure(t *testing.T) {
 	coordinator, worker, remote := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
 	for _, repo := range []string{coordinator, worker} {
 		runGit(t, repo, "init")
@@ -2614,7 +1655,9 @@ esac
 	}
 	t.Cleanup(func() { _ = os.Chdir(old) })
 	configPath := filepath.Join(coordinator, config.DefaultPath)
-	if err := config.Write(configPath, config.Default("o/r")); err != nil {
+	cfg := config.Default("o/r")
+	cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
+	if err := config.Write(configPath, cfg); err != nil {
 		t.Fatal(err)
 	}
 	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
@@ -2882,7 +1925,7 @@ func TestBoundAttemptSuppressesRestartDispatchAcrossWorkerAndReviewStates(t *tes
 		t.Fatalf("contradictory remote attempt was resumed: manifests=%#v err=%v", manifests, err)
 	}
 	orphan := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 3, BaseSHA: "aaaaaaa", State: "completed"}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{orphan}, nil, nil, "", "", nil); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{orphan}, nil, "", "", nil); err != nil {
 		t.Fatalf("genuine orphan was not preserved: %v", err)
 	}
 }
@@ -2947,28 +1990,6 @@ func TestCompletedAttemptCleanupRequiresExactPublishedIdentity(t *testing.T) {
 	}
 }
 
-func TestMergedAttemptCleansOperatorMessageRaceStates(t *testing.T) {
-	fact := orchestrator.AttemptFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", HeadSHA: "bbbbbbb", PR: 7, State: "completed"}
-	for _, test := range []struct {
-		name, state, operation string
-	}{
-		{"message queued", "completed", "cleanup"},
-		{"message claimed after resume", "running", "abandon"},
-		{"follow-up active", "running", "abandon"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			manifest := agentruntime.Manifest{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: "aaaaaaa", State: test.state, ReviewHead: "bbbbbbb", Session: "operator-follow-up"}
-			boundary := &cleanupBoundary{}
-			if err := cleanupCompletedAttempts(t.Context(), boundary, []orchestrator.AttemptFact{fact}, []agentruntime.Manifest{manifest}); err != nil {
-				t.Fatal(err)
-			}
-			if !slices.Equal(boundary.operations, []string{test.operation}) || len(boundary.manifests) != 1 || !reflect.DeepEqual(boundary.manifests[0], manifest) {
-				t.Fatalf("merged %s cleanup operations=%v manifests=%#v", test.name, boundary.operations, boundary.manifests)
-			}
-		})
-	}
-}
-
 func TestRevokedBoundAttemptCancelsWorkerAndSuppressesPublication(t *testing.T) {
 	state, root := t.TempDir(), t.TempDir()
 	state, _ = filepath.EvalSymlinks(state)
@@ -3008,7 +2029,7 @@ func TestRevokedBoundAttemptCancelsWorkerAndSuppressesPublication(t *testing.T) 
 	completed := manifest
 	completed.State = "completed"
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 4, BaseSHA: attempt.BaseSHA, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{revoked}, []agentruntime.Manifest{completed}, bound, nil, "", "", nil); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, nil, config.Config{}, []internalgithub.RecoveryIssueFact{revoked}, []agentruntime.Manifest{completed}, bound, "", "", nil); err != nil {
 		t.Fatalf("revoked completed attempt reached publication: %v", err)
 	}
 }
@@ -3032,7 +2053,7 @@ func TestMonitorConsumesDeadAttemptFromLivenessMismatchProjection(t *testing.T) 
 	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner := &operatorMessageRunner{dead: true}
+	runner := &attemptRunner{dead: true}
 	runtimeState := &agentruntime.Runtime{Root: root, StateRoot: state, Tmux: "tmux", Runner: runner}
 	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 23, Attempt: 4, State: "blocked", Blockers: []string{"runtime liveness mismatch"}, Diagnostic: "worktree HEAD does not match GitHub"}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 4, DispatchAuthorized: true}
@@ -3047,7 +2068,7 @@ func TestMonitorConsumesDeadAttemptFromLivenessMismatchProjection(t *testing.T) 
 	}
 }
 
-func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) {
+func TestIndependentReviewStartsWithoutOrchestratorAndUsesReadOnlySnapshot(t *testing.T) {
 	source := t.TempDir()
 	for _, args := range [][]string{{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}} {
 		if out, err := exec.Command("git", append([]string{"-C", source}, args...)...).CombinedOutput(); err != nil {
@@ -4629,7 +3650,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	runtimeState := &agentruntime.Runtime{StateRoot: state}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true, BaseBranch: "main"}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, PR: 7, BaseSHA: base, HeadSHA: base, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, nil, recoveryPath, state, nil); err != nil {
+	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, recoveryPath, state, nil); err != nil {
 		t.Fatal(err)
 	}
 	storedBody, _ := os.ReadFile(manifestPath)
@@ -4656,7 +3677,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	stopAfterProjection := errors.New("stop after projection")
-	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, recoveryPath, state, func() error {
+	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, recoveryPath, state, func() error {
 		body, err := os.ReadFile(manifestPath)
 		if err != nil {
 			return err
@@ -4692,7 +3713,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	storedBody, _ = os.ReadFile(manifestPath)
 	stored = agentruntime.Manifest{}
 	_ = json.Unmarshal(storedBody, &stored)
-	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, nil, recoveryPath, state, nil)
+	err = monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{stored}, bound, recoveryPath, state, nil)
 	if err == nil || !strings.Contains(err.Error(), "authenticate GitHub CLI") {
 		t.Fatalf("publication did not continue after cleanup: %v", err)
 	}

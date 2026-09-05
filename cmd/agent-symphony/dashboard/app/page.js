@@ -5,7 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import { StatusCard } from "./_components/status-card";
 import AttemptHistory from "./_components/attempt-history";
 import ProjectNavigation, { ProjectAgentConsole, ProjectHeader, ProjectHealthControl, projectBoard, projectView } from "./_components/project-navigation";
-import { getMessageProposal, getOrchestratorStatus, getRelease, postWithReconciliationRetry } from "./actions.mjs";
+import { getOrchestratorStatus, getRelease, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
 import { attemptKey } from "./health.mjs";
 
@@ -23,9 +23,6 @@ export default function Dashboard() {
   const [orchestratorError, setOrchestratorError] = useState("");
   const [orchestratorBusy, setOrchestratorBusy] = useState("");
   const [investigating, setInvestigating] = useState("");
-  const [messageProposal, setMessageProposal] = useState(null);
-  const [messageError, setMessageError] = useState("Loading worker-message controls…");
-  const [messageBusy, setMessageBusy] = useState("");
   const [projects, setProjects] = useState([]);
   const [selectedRepository, setSelectedRepository] = useState("");
   const closeTerminal = useCallback(() => setTerminal(null), []);
@@ -36,13 +33,11 @@ export default function Dashboard() {
       getRelease().then((value) => { if (active) setRelease(value); });
       try {
         const orchestratorRequest = getOrchestratorStatus();
-        const proposalRequest = getMessageProposal();
-        const [response, stateResponse, projectsResponse, orchestratorResult, proposalResult] = await Promise.all([
+        const [response, stateResponse, projectsResponse, orchestratorResult] = await Promise.all([
           fetch("/status.json", { cache: "no-store" }),
           fetch("/dashboard-state.json", { cache: "no-store" }),
           fetch("/projects.json", { cache: "no-store" }),
           orchestratorRequest,
-          proposalRequest,
         ]);
         if (!response.ok) throw new Error(response.status === 404 ? "Waiting for the first reconciliation" : `Status request failed (${response.status})`);
         if (!stateResponse.ok) throw new Error(`Dashboard state request failed (${stateResponse.status})`);
@@ -54,8 +49,6 @@ export default function Dashboard() {
           setProjects(nextProjects.projects ?? []);
           setOrchestratorStatus(orchestratorResult.status);
           setOrchestratorError(orchestratorResult.error);
-          setMessageProposal(proposalResult.proposal);
-          setMessageError(proposalResult.error);
           setError("");
           setNow(Date.now());
         }
@@ -134,30 +127,6 @@ export default function Dashboard() {
     }
   }, []);
 
-  const performMessageAction = useCallback(async (action) => {
-    if (!messageProposal) return;
-    const { confirmationNonce, ...proposal } = messageProposal;
-    setMessageBusy(action);
-    setActionNotice("");
-    try {
-      const response = await postWithReconciliationRetry(
-        `/actions/orchestrator/message-${action}`,
-        undefined,
-        { headers: { "Content-Type": "application/json", "X-Agent-Symphony-Confirmation-Nonce": confirmationNonce }, body: JSON.stringify(proposal) },
-      );
-      if (!response.ok) throw new Error((await response.text()).trim() || `Message ${action} failed (${response.status})`);
-      setMessageProposal(null);
-      setMessageError("");
-      setActionNotice(action === "confirm"
-        ? `Queued the confirmed message for issue #${messageProposal.issue}, attempt ${messageProposal.attempt}.`
-        : "Cancelled the orchestrator message proposal.");
-    } catch (reason) {
-      setActionNotice(reason instanceof Error ? reason.message : `Message ${action} failed.`);
-    } finally {
-      setMessageBusy("");
-    }
-  }, [messageProposal]);
-
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
@@ -198,10 +167,6 @@ export default function Dashboard() {
         busy={orchestratorBusy}
         onAction={(action) => performOrchestratorAction(action)}
         onOpenTerminal={openOrchestratorTerminal}
-        proposal={messageProposal}
-        messageError={messageError}
-        messageBusy={messageBusy}
-        onMessageAction={performMessageAction}
       />
 
       {actionNotice ? <p className="notice" role="status">{actionNotice}</p> : null}
@@ -233,7 +198,6 @@ export default function Dashboard() {
                       busy={busy === attemptKey(status)}
                       investigating={investigating === attemptKey(status)}
                       waiting={waiting && busy === attemptKey(status)}
-                      followUpEnabled={!messageError}
                       onNotice={setActionNotice}
                       readOnly={Boolean(remoteProject)}
                     />

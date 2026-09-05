@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { getMessageProposal, postWithReconciliationRetry } from "./actions.mjs";
+import { postWithReconciliationRetry } from "./actions.mjs";
 
 test("dashboard actions retry transient reconciliation 503 responses", async (t) => {
   const originalFetch = globalThis.fetch;
@@ -34,19 +34,6 @@ test("dashboard actions retry transient reconciliation 503 responses", async (t)
     init = options;
     return { status: 204 };
   };
-  await postWithReconciliationRetry("/actions/orchestrator/message-confirm", undefined, { headers: { "Content-Type": "application/json" }, body: "{}" });
+  await postWithReconciliationRetry("/actions/reconcile", undefined, { headers: { "Content-Type": "application/json" }, body: "{}" });
   assert.deepEqual(init, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-});
-
-test("message proposals retain the browser confirmation nonce outside the submitted body", async (t) => {
-  const originalFetch = globalThis.fetch;
-  t.after(() => { globalThis.fetch = originalFetch; });
-  const proposal = { version: 1, repository: "o/r", issue: 131, attempt: 3, message: "message", binding: "binding" };
-  globalThis.fetch = async () => ({
-    ok: true,
-    status: 200,
-    json: async () => proposal,
-    headers: { get: () => "browser-nonce" },
-  });
-  assert.deepEqual(await getMessageProposal(), { proposal: { ...proposal, confirmationNonce: "browser-nonce" }, error: "" });
 });

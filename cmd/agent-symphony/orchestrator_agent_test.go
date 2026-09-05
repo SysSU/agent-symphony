@@ -24,28 +24,6 @@ type orchestratorTestRunner struct {
 	pane string
 }
 
-func TestDashboardMessageConfirmationSchedulesOnlyDurablyAcceptedMessages(t *testing.T) {
-	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 4, Attempt: 2, Message: "Continue."}
-	var scheduled internalgithub.OperatorMessage
-	service := dashboardOrchestratorService{
-		confirm: func(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
-			return internalgithub.PrepareOperatorMessage("o/r", 4, 2, "Continue.")
-		},
-		accepted: func(message internalgithub.OperatorMessage) { scheduled = message },
-	}
-	message, err := service.ConfirmMessage(t.Context(), proposal)
-	if err != nil || scheduled.ID == "" || scheduled.ID != message.ID {
-		t.Fatalf("message=%#v scheduled=%#v err=%v", message, scheduled, err)
-	}
-	service.confirm = func(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
-		return internalgithub.OperatorMessage{}, errors.New("not recorded")
-	}
-	scheduled = internalgithub.OperatorMessage{}
-	if _, err := service.ConfirmMessage(t.Context(), proposal); err == nil || scheduled.ID != "" {
-		t.Fatalf("failed confirmation scheduled=%#v err=%v", scheduled, err)
-	}
-}
-
 func fakeAdvancedOrchestratorHost(t *testing.T) int {
 	t.Helper()
 	snapshotRoot := t.TempDir()
@@ -109,13 +87,7 @@ func TestConfiguredFullAccessOrchestratorProposesThroughDurableArtifact(t *testi
 	if _, err := agent.Observe(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
-	proposal := struct {
-		Version    int    `json:"version"`
-		Repository string `json:"repository"`
-		Issue      int    `json:"issue"`
-		Attempt    int    `json:"attempt"`
-		Message    string `json:"message"`
-	}{1, cfg.Repository, 131, 3, "Run the focused test."}
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: cfg.Repository, Issue: 131, Attempt: 3, Action: orchestratoragent.ProposalActionRetry, RequestID: "retry-131-3"}
 	body, _ := json.Marshal(proposal)
 	oldGetwd := hostGetwd
 	hostGetwd = func() (string, error) { return agent.Workspace, nil }
@@ -143,25 +115,22 @@ func TestConfiguredFullAccessOrchestratorProposesThroughDurableArtifact(t *testi
 		t.Fatalf("emitted-only proposal state=%q", state)
 	}
 	got, err := agent.MessageProposal(t.Context())
-	if err != nil || got.Binding == "" || got.Message != proposal.Message {
+	if err != nil || got.Binding == "" || got.Action != proposal.Action || got.RequestID != proposal.RequestID {
 		t.Fatalf("proposal=%#v err=%v", got, err)
 	}
 	if state := queryStatus(body); state != "pending" {
 		t.Fatalf("captured proposal state=%q", state)
 	}
 	previous := slices.Clone(body)
-	proposal.Message = strings.Repeat("<", internalgithub.OperatorMessageMaxBytes)
+	proposal.RequestID = "retry-131-4"
 	body, _ = json.Marshal(proposal)
-	if len(body) <= 16<<10 {
-		t.Fatalf("maximum escaped proposal did not exercise the transport bound: %d bytes", len(body))
-	}
 	pane.Reset()
 	if err := writeHostOrchestratorProposal(productionSnapshotRoot(stateRoot), bytes.NewReader(body), &pane); err != nil {
 		t.Fatal(err)
 	}
 	got, err = agent.MessageProposal(t.Context())
-	if err != nil || got.Message != proposal.Message {
-		t.Fatalf("maximum escaped proposal length=%d err=%v", len(got.Message), err)
+	if err != nil || got.RequestID != proposal.RequestID {
+		t.Fatalf("replacement proposal=%#v err=%v", got, err)
 	}
 	if state := queryStatus(previous); state != "replaced" {
 		t.Fatalf("replaced proposal state=%q", state)
@@ -201,7 +170,7 @@ func TestConfiguredFullAccessOrchestratorProposesThroughDurableArtifact(t *testi
 			if readErr != nil || statErr != nil {
 				t.Fatalf("read proposal status: read=%v stat=%v", readErr, statErr)
 			}
-			if info.Mode().Perm() != 0o440 || strings.Contains(string(status), proposal.Message) {
+			if info.Mode().Perm() != 0o440 || strings.Contains(string(status), proposal.RequestID) {
 				t.Fatalf("unsafe proposal status=%q mode=%v", status, info.Mode())
 			}
 			continue
@@ -259,7 +228,7 @@ func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 
 	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", "")
 	t.Setenv("AGENT_SYMPHONY_ORCHESTRATOR_ROOT", root)
-	proposal := `{"version":1,"repository":"SysSU/example","issue":159,"attempt":1,"message":"Run the focused test."}`
+	proposal := `{"version":1,"repository":"SysSU/example","issue":159,"attempt":1,"action":"retry_transition","request_id":"retry-159-1"}`
 	var output bytes.Buffer
 	if err := agentHost(t.Context(), "orchestrator-proposal", strings.NewReader(proposal), &output); err != nil || !strings.Contains(output.String(), `"state":"submitted"`) {
 		t.Fatalf("zero-admin proposal=%q err=%v", output.String(), err)

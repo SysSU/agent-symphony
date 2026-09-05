@@ -1,6 +1,3 @@
-import { useEffect, useRef, useState } from "react";
-
-import { postWithReconciliationRetry } from "../actions.mjs";
 import { canInvestigate, orchestratorPresentation } from "../health.mjs";
 import PlanReviewButton from "./plan-review-button";
 
@@ -74,40 +71,6 @@ function StatusActions({ status, onAction, onInvestigate, onNotice, investigatio
   );
 }
 
-function OperatorFollowUp({ status, enabled, onNotice, readOnly }) {
-  const [message, setMessage] = useState("");
-  const [busy, setBusy] = useState(false);
-  const retryable = status.retryable && ["blocked", "orphaned"].includes(status.state);
-  if (readOnly || !enabled || (!retryable && !["active", "review-ready"].includes(status.state))) return null;
-  const id = `follow-up-${status.issue}-${status.attempt}`;
-  async function submit(event) {
-    event.preventDefault();
-    const body = message.trim();
-    if (!body) return;
-    setBusy(true);
-    onNotice("");
-    try {
-      const query = new URLSearchParams({ repository: status.repository, issue: String(status.issue), attempt: String(status.attempt) });
-      const response = await postWithReconciliationRetry(`/actions/attempt/message?${query}`, undefined, { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: body }) });
-      if (!response.ok) throw new Error((await response.text()).trim() || `Worker follow-up failed (${response.status})`);
-      setMessage("");
-      onNotice(`Queued a follow-up for issue #${status.issue}, attempt ${status.attempt}. The coordinator will start its verified follow-up when safe.`);
-    } catch (reason) {
-      onNotice(reason instanceof Error ? reason.message : "Worker follow-up failed.");
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <form className="followUp" onSubmit={submit}>
-      <label htmlFor={id}>Tell this agent what to do next</label>
-      <textarea id={id} value={message} maxLength={8192} required rows={4} disabled={busy} onChange={(event) => setMessage(event.target.value)} aria-describedby={`${id}-help`} />
-      <p id={`${id}-help`}>Queues one verified fresh turn in this exact worktree. Open tmux above to watch after it starts.</p>
-      <button className="primaryAction" type="submit" disabled={busy || !message.trim()}>{busy ? "Queueing…" : "Queue follow-up"}</button>
-    </form>
-  );
-}
-
 export function StatusCard(props) {
   const { status, onOpenTerminal, readOnly } = props;
   const issueURL = githubURL(status.repository, "issues", status.issue);
@@ -116,7 +79,6 @@ export function StatusCard(props) {
   const sessions = status.sessions?.length ? status.sessions : status.session ? [{ role: "implementation", name: status.session, state: status.state, current: true }] : [];
   const blockers = status.blockers || [];
   const checks = status.checks || [];
-  const messages = status.operator_messages || [];
   const state = status.state || "unknown";
   const priority = status.priority ? `P${status.priority}` : "P—";
 
@@ -153,50 +115,11 @@ export function StatusCard(props) {
         ))}</Detail>
         <Detail label="Blockers">{blockers.map((blocker) => <span className="line" key={blocker}>{blocker}</span>)}</Detail>
         <Detail label="Checks">{checks.map((check) => <span className="line" key={check}>{check}</span>)}</Detail>
-        <Detail label="Worker messages">{messages.map((message) => (
-          <span className="line messageStatus" key={message.id}>
-            <span className={`state state-${message.state}`}>{message.state}</span>{" "}
-            <code>{message.id.slice(0, 12)}</code>
-            {message.diagnostic ? ` · ${message.diagnostic}` : ""}
-          </span>
-        ))}</Detail>
         <Detail label="Diagnostic">{status.diagnostic}</Detail>
         <Detail label="Next action">{status.next_action}</Detail>
       </dl>
-      <OperatorFollowUp status={status} enabled={props.followUpEnabled} onNotice={props.onNotice} readOnly={readOnly} />
       <StatusActions {...props} readOnly={readOnly} />
     </article>
-  );
-}
-
-function MessageConfirmation({ proposal, error, busy, onAction }) {
-  const confirmationRef = useRef(null);
-  const proposalKey = proposal ? `${proposal.repository}#${proposal.issue}/${proposal.attempt}:${proposal.message}` : "";
-  useEffect(() => {
-    if (proposalKey) confirmationRef.current?.focus();
-  }, [proposalKey]);
-  if (!proposal && !error) return null;
-  if (!proposal) return <p className="orchestratorDisabled" role="alert">{error}</p>;
-  return (
-    <section
-      ref={confirmationRef}
-      className="messageConfirmation"
-      role="region"
-      aria-live="assertive"
-      aria-atomic="true"
-      aria-labelledby="messageConfirmationTitle"
-      tabIndex={-1}
-    >
-      <p className="eyebrow">Confirmation required</p>
-      <h3 id="messageConfirmationTitle">Queue a worker message</h3>
-      <p><strong>Exact target:</strong> <code>{proposal.repository}#{proposal.issue}, attempt {proposal.attempt}</code></p>
-      <pre aria-label="Exact proposed worker message">{proposal.message}</pre>
-      <p className="messageSemantics">This is not live chat. Confirmation records the message on GitHub, queues it behind active work, and starts one bounded follow-up turn when safe.</p>
-      <footer className="cardActions orchestratorActions">
-        <button className="primaryAction" type="button" disabled={Boolean(busy)} onClick={() => onAction("confirm")}>{busy === "confirm" ? "Queueing…" : "Confirm and queue"}</button>
-        <button className="secondaryAction" type="button" disabled={Boolean(busy)} onClick={() => onAction("cancel")}>{busy === "cancel" ? "Cancelling…" : "Cancel proposal"}</button>
-      </footer>
-    </section>
   );
 }
 
@@ -218,7 +141,7 @@ function OrchestratorActions({ busy, onAction, onOpenTerminal, state }) {
   );
 }
 
-export function OrchestratorCard({ status, error, busy, onAction, onOpenTerminal, proposal, messageError, messageBusy, onMessageAction }) {
+export function OrchestratorCard({ status, error, busy, onAction, onOpenTerminal }) {
   const current = status || {};
   const presentation = orchestratorPresentation(status, error);
   let controls = <p className="orchestratorDisabled">{error || "Loading orchestrator status…"}</p>;
@@ -249,7 +172,6 @@ export function OrchestratorCard({ status, error, busy, onAction, onOpenTerminal
         <Detail label="Next action">{current.next_action}</Detail>
       </dl>
       {controls}
-      <MessageConfirmation proposal={proposal} error={messageError} busy={messageBusy} onAction={onMessageAction} />
     </section>
   );
 }

@@ -46,7 +46,6 @@ async function mockDashboard(page, closeReason = "", reviewPlanResponse = { stat
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
   await page.route("**/projects.json", (route) => route.fulfill({ json: { version: 1, projects: [{ version: 1, repository: attempt.repository, local: true, snapshot: { updated_at: new Date().toISOString(), statuses: [attempt] }, state: { version: 1, hidden: [] } }] } }));
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: false, state: "disabled" } }));
-  await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
   await page.route("**/actions/review-plan?*", (route) => {
     reviewPlanRequests.push(route.request().url());
     return route.fulfill(reviewPlanResponse);

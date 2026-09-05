@@ -189,6 +189,15 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 	return Result{}, nil
 }
 
+func valueAfter(args []string, flag string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
 func environmentValue(environment []string, name string) string {
 	for _, entry := range environment {
 		if key, value, ok := strings.Cut(entry, "="); ok && key == name {
@@ -222,100 +231,6 @@ func TestParsePaneStatus(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestInterruptLegacyOperatorHandoffStopsOnlyTheRetiredResumeCommand(t *testing.T) {
-	for _, test := range []struct {
-		name    string
-		command []string
-		want    bool
-	}{
-		{"old resume", []string{"agent-symphony", "worker-capture-handoff", "--", "codex", "exec", "resume", "--last", "--dangerously-bypass-approvals-and-sandbox", "-"}, true},
-		{"old fresh", []string{"agent-symphony", "worker-capture-handoff", "--", "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}, true},
-		{"ready protocol", []string{"agent-symphony", "worker-capture-handoff-ready", "--", "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			r, fake, attempt, _ := testRuntime(t)
-			manifest, err := r.PrepareAndStart(t.Context(), attempt)
-			if err != nil {
-				t.Fatal(err)
-			}
-			manifest.UpdatedAt = time.Now().Add(-3 * time.Minute)
-			oldSession := fake.sessions[manifest.Session]
-			oldSession.agent = test.command
-			got, err := r.InterruptLegacyOperatorHandoff(t.Context(), manifest, 2*time.Minute)
-			if err != nil || got != test.want || oldSession.stopped != test.want {
-				t.Fatalf("interrupted=%v stopped=%v err=%v", got, oldSession.stopped, err)
-			}
-			if test.want && (fake.sessions[manifest.Session] == oldSession || fake.sessions[manifest.Session].dead) {
-				t.Fatal("retired pane was not replaced with a fresh live session")
-			}
-		})
-	}
-}
-
-func TestRecoverInterruptedHandoffRecreatesOnlyUnacknowledgedStartup(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		missing  bool
-		dead     bool
-		noMarker bool
-		want     bool
-	}{
-		{name: "missing session", missing: true, want: true},
-		{name: "missing before launch marker", missing: true, noMarker: true, want: true},
-		{name: "dead ready worker", dead: true, want: true},
-		{name: "live ready worker"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			r, fake, attempt, _ := testRuntime(t)
-			manifest, err := r.PrepareAndStart(t.Context(), attempt)
-			if err != nil {
-				t.Fatal(err)
-			}
-			key := "operator-message-" + strings.Repeat("a", 64)
-			inbox := filepath.Join(manifest.Worktree, ".agent-symphony", "handoffs")
-			if err := os.MkdirAll(inbox, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if !test.noMarker {
-				if err := os.WriteFile(filepath.Join(inbox, key+".launching"), []byte("recipient"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if err := os.WriteFile(ResultPath(manifest.Worktree), []byte(`{"type":"agent-symphony-result-v1","validation":"retained","documentation":"none"}`), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			old := fake.sessions[manifest.Session]
-			old.agent = []string{"agent-symphony", "worker-capture-handoff-ready", "tmux", "buffer", "result", "launched", "recipient", "signal", "--", "codex", "exec", "-"}
-			old.dead = test.dead
-			if test.missing {
-				delete(fake.sessions, manifest.Session)
-			}
-			got, recovered, err := r.RecoverInterruptedHandoff(t.Context(), manifest, key)
-			if err != nil || recovered != test.want {
-				t.Fatalf("recovered=%v manifest=%#v err=%v", recovered, got, err)
-			}
-			if test.want {
-				if got.State != "completed" || fake.sessions[manifest.Session] == nil || fake.sessions[manifest.Session] == old {
-					t.Fatalf("interrupted startup was not reset: %#v session=%#v", got, fake.sessions[manifest.Session])
-				}
-				stored, err := readManifest(r.manifestPath(attempt))
-				if err != nil || stored.State != "completed" {
-					t.Fatalf("recovery was not durable: %#v err=%v", stored, err)
-				}
-			}
-		})
-	}
-}
-
-func valueAfter(args []string, flag string) string {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == flag {
-			return args[i+1]
-		}
-	}
-	return ""
 }
 
 func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *testing.T) {

@@ -809,7 +809,6 @@ func parseHostOrchestratorProposal(input io.Reader) (orchestratoragent.MessagePr
 		Issue      int    `json:"issue"`
 		Attempt    int    `json:"attempt"`
 		Action     string `json:"action,omitempty"`
-		Message    string `json:"message,omitempty"`
 		RequestID  string `json:"request_id,omitempty"`
 		HandoffID  string `json:"handoff_id,omitempty"`
 		Detail     string `json:"detail,omitempty"`
@@ -819,14 +818,11 @@ func parseHostOrchestratorProposal(input io.Reader) (orchestratoragent.MessagePr
 	if decoder.Decode(&proposal) != nil || decoder.Decode(&struct{}{}) != io.EOF || proposal.Version != 1 {
 		return orchestratoragent.MessageProposal{}, nil, errors.New("invalid orchestrator proposal schema")
 	}
-	parsed := orchestratoragent.MessageProposal{Version: proposal.Version, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, Action: proposal.Action, Message: proposal.Message, RequestID: proposal.RequestID, HandoffID: proposal.HandoffID, Detail: proposal.Detail}
+	parsed := orchestratoragent.MessageProposal{Version: proposal.Version, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, Action: proposal.Action, RequestID: proposal.RequestID, HandoffID: proposal.HandoffID, Detail: proposal.Detail}
 	if err := orchestratoragent.ValidateMessageProposal(parsed); err != nil {
 		return orchestratoragent.MessageProposal{}, nil, err
 	}
 	canonical, _ := json.Marshal(proposal)
-	if parsed.Action == "" {
-		parsed.Action = orchestratoragent.ProposalActionMessage
-	}
 	parsed.Binding = fmt.Sprintf("%x", sha256.Sum256(canonical))
 	return parsed, canonical, nil
 }
@@ -1063,11 +1059,6 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return errors.New("review boundary cannot accept implementation handoffs")
 		}
 		result.Output, err = acceptHandoff(ctx, request.Command.Input, root)
-	case "accept-operator-handoff":
-		if mode != "implementation" {
-			return errors.New("review boundary cannot accept operator handoffs")
-		}
-		result.Output, err = acceptOperatorHandoff(ctx, request.Command.Input, root)
 	case "verify-handoff":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot verify implementation handoffs")
@@ -1621,36 +1612,6 @@ func verifyHandoff(ctx context.Context, input []byte, root string) (string, erro
 	}
 	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", h.Key, request.OutcomePath, request.OutcomeToken})
 	return string(ack), nil
-}
-
-func acceptOperatorHandoff(ctx context.Context, input []byte, root string) (string, error) {
-	request, h, err := decodeHandoffRequest(input, root)
-	if err != nil {
-		return "", err
-	}
-	var operator struct{ Kind string }
-	if json.Unmarshal(request.Handoff, &operator) != nil || operator.Kind != "operator-message" {
-		return "", errors.New("invalid operator handoff")
-	}
-	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
-	binding, recipient := handoffBinding(request)
-	persisted, err := immutableMarkerMatches(filepath.Join(inbox, h.Key+".json"), binding)
-	if err != nil {
-		return "", fmt.Errorf("operator handoff binding changed: %w", err)
-	}
-	if !persisted {
-		for _, suffix := range []string{".receipt", ".launching", ".launched"} {
-			if err := os.RemoveAll(filepath.Join(inbox, h.Key+suffix)); err != nil {
-				return "", err
-			}
-		}
-		pane := agentruntime.PaneTarget(request.Manifest.Session)
-		option := "@agent-symphony-handoff-" + recipient[:16]
-		if _, err := runHostTmux(ctx, []string{"set-option", "-pqu", "-t", pane, option}, nil); err != nil {
-			return "", fmt.Errorf("clear stale operator handoff launch identity: %w", err)
-		}
-	}
-	return acceptHandoff(ctx, input, root)
 }
 
 func acceptHandoff(ctx context.Context, input []byte, root string) (string, error) {

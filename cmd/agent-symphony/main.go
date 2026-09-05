@@ -708,7 +708,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		operationMu := &sync.Mutex{}
-		deliveryMu := &sync.Mutex{}
 		recoverAttempt := func(ctx context.Context, issue, attempt int) error {
 			return recoverDashboardAttempt(ctx, *path, *statePath, *runtimeState, issue, attempt)
 		}
@@ -733,44 +732,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 			}
 			return err
 		}
-		dashboardAgent := dashboardOrchestratorService{Service: agent, supervisor: agent, confirm: func(ctx context.Context, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
-			return confirmOperatorMessage(ctx, *path, *runtimeState, proposal)
-		}, accepted: func(message internalgithub.OperatorMessage) {
-			operations.interrupt()
-			go func() {
-				deliveryMu.Lock()
-				defer deliveryMu.Unlock()
-				operationMu.Lock()
-				defer operationMu.Unlock()
-				if ctx.Err() != nil {
-					return
-				}
-				if err := writeOperatorMessageStatus(*runtimeState, message); err != nil {
-					fmt.Fprintln(stderr, "operator message projection: "+internalgithub.Redact(err.Error()))
-				}
-				deliveryCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-				defer cancel()
-				delivered, err := deliverOperatorMessageWithRetry(deliveryCtx, *path, *runtimeState, message)
-				if err != nil {
-					fmt.Fprintln(stderr, "operator message delivery: "+internalgithub.Redact(err.Error()))
-				}
-				if projectionErr := writeOperatorMessageStatus(*runtimeState, delivered); projectionErr != nil {
-					fmt.Fprintln(stderr, "operator message projection: "+internalgithub.Redact(projectionErr.Error()))
-				}
-			}()
-		}}
-		dashboardURL, err := startProjectDashboard(ctx, *dashboardAddress, *runtimeState, c.Repository, peerProjects, operationMu, recoverAttempt, startPlanReview, reconcile, dashboardAgent, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
+		dashboardURL, err := startProjectDashboard(ctx, *dashboardAddress, *runtimeState, c.Repository, peerProjects, operationMu, recoverAttempt, startPlanReview, reconcile, agent, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
-		deliveryMu.Lock()
-		retryCtx, retryCancel := context.WithTimeout(ctx, 90*time.Second)
-		if err := retryProjectedOperatorMessages(retryCtx, *path, *runtimeState); err != nil && !errors.Is(err, context.Canceled) {
-			fmt.Fprintln(stderr, "operator message startup recovery: "+internalgithub.Redact(err.Error()))
-		}
-		retryCancel()
-		deliveryMu.Unlock()
 		lockedReconcile := func(ctx context.Context) error {
 			operationMu.Lock()
 			defer operationMu.Unlock()
@@ -1096,7 +1062,11 @@ func validateMonitoringCheckIn(proposal orchestratoragent.MessageProposal, statu
 }
 
 func deliverMonitoringCheckIn(ctx context.Context, stateRoot string, proposal orchestratoragent.MessageProposal) error {
-	runtimeState := newOperatorMessageRuntime(stateRoot)
+	boundary := implementationBoundary(stateRoot)
+	runtimeState := agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot, Runner: boundary, VerifyWorker: func(ctx context.Context) error {
+		_, err := boundary.call(ctx, "verify", agentruntime.Command{})
+		return err
+	}}
 	return sendMonitoringCheckIn(ctx, &runtimeState, proposal)
 }
 
@@ -1119,343 +1089,6 @@ func sendMonitoringCheckIn(ctx context.Context, runtimeState *agentruntime.Runti
 		Request    string `json:"request"`
 	}{"agent-symphony-monitoring-check-in-v1", proposal.Repository, proposal.Issue, proposal.Attempt, "Report current progress and the next step in this session. Continue only the implementation you already own. If blocked, set needs-attention with a specific reason through the direct GitHub status contract; clear a prior monitoring status only after fresh evidence shows recovery."})
 	return runtimeState.Deliver(ctx, matches[0], payload)
-}
-
-func confirmOperatorMessage(ctx context.Context, configPath, stateRoot string, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		return internalgithub.OperatorMessage{}, err
-	}
-	message, err := internalgithub.PrepareOperatorMessage(proposal.Repository, proposal.Issue, proposal.Attempt, proposal.Message)
-	if err != nil || proposal.Version != 1 || proposal.Repository != cfg.Repository || proposal.Action != "" && proposal.Action != orchestratoragent.ProposalActionMessage {
-		return internalgithub.OperatorMessage{}, errors.New("operator message target or body is invalid")
-	}
-	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
-	user, err := api.AuthenticatedUser(ctx)
-	if err != nil {
-		return internalgithub.OperatorMessage{}, err
-	}
-	if err := api.VerifyRepository(ctx, cfg.Repository); err != nil {
-		return internalgithub.OperatorMessage{}, err
-	}
-	runtimeState := newOperatorMessageRuntime(stateRoot)
-	manifests, err := runtimeState.Discover()
-	if err != nil {
-		return internalgithub.OperatorMessage{}, err
-	}
-	if err := validateOperatorMessageAdmission(ctx, proposal, &runtimeState, manifests); err != nil {
-		return internalgithub.OperatorMessage{}, err
-	}
-	return internalgithub.RecordOperatorMessage(ctx, api, githubPRConfig(cfg, user.ID), message)
-}
-
-func validateOperatorMessageAdmission(ctx context.Context, proposal orchestratoragent.MessageProposal, runtimeState *agentruntime.Runtime, manifests []agentruntime.Manifest) error {
-	matching := make([]agentruntime.Manifest, 0, 1)
-	for _, manifest := range manifests {
-		if manifest.Repository == proposal.Repository && manifest.Issue == proposal.Issue && manifest.Attempt == proposal.Attempt {
-			matching = append(matching, manifest)
-		}
-	}
-	if len(matching) != 1 {
-		return errors.New("operator message target does not have a verified exact runtime owner")
-	}
-	manifest := matching[0]
-	var err error
-	if manifest.State == "completed" {
-		err = runtimeState.VerifyRetained(ctx, manifest, "")
-	} else if manifest.State == "running" {
-		err = runtimeState.VerifyOwned(ctx, manifest)
-		if err != nil {
-			err = runtimeState.VerifyRetained(ctx, manifest, "")
-		}
-	} else {
-		err = errors.New("runtime is not eligible")
-	}
-	if err != nil {
-		return errors.New("operator message target does not have a verified exact runtime owner")
-	}
-	return nil
-}
-
-func fetchOperatorMessageTarget(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, proposal orchestratoragent.MessageProposal) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, error) {
-	api = api.WithReadSnapshot()
-	remote, err := internalgithub.FetchOperatorAttemptFacts(ctx, api, cfg.Repository, cfg.ActorID, proposal.Issue, proposal.Attempt)
-	if err != nil {
-		return nil, nil, err
-	}
-	issues, err := internalgithub.FetchOperatorIssueFacts(ctx, api, cfg, remote, proposal.Issue)
-	return issues, remote, err
-}
-
-func deliverOperatorMessage(ctx context.Context, configPath, stateRoot string, accepted internalgithub.OperatorMessage) (internalgithub.OperatorMessage, error) {
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		return accepted, err
-	}
-	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
-	user, err := api.AuthenticatedUser(ctx)
-	if err != nil {
-		return accepted, err
-	}
-	if err := api.VerifyRepository(ctx, cfg.Repository); err != nil {
-		return accepted, err
-	}
-	prConfig := githubPRConfig(cfg, user.ID)
-	messages, err := internalgithub.FetchOperatorMessages(ctx, api, prConfig, accepted.Issue)
-	if err != nil {
-		return accepted, err
-	}
-	index := slices.IndexFunc(messages, func(message internalgithub.OperatorMessage) bool { return message.ID == accepted.ID })
-	if index < 0 {
-		return accepted, errors.New("operator message is not durably accepted")
-	}
-	accepted = messages[index]
-	if accepted.State != "queued" && accepted.State != "claimed" {
-		return accepted, nil
-	}
-	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: accepted.Repository, Issue: accepted.Issue, Attempt: accepted.Attempt, Message: accepted.Message}
-	issues, remote, err := fetchOperatorMessageTarget(ctx, api, prConfig, proposal)
-	if err != nil {
-		return accepted, err
-	}
-	runtimeState := newOperatorMessageRuntime(stateRoot)
-	runtimeState.Source = filepath.Join(productionAttemptRoot(stateRoot), internalgithub.RepositoryIdentifier(cfg.Repository)+".source.bundle")
-	runtimeState.AllowEnv = cfg.Commands.Environment
-	manifests, err := runtimeState.Discover()
-	if err != nil {
-		return accepted, err
-	}
-	check := func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
-		return verifyOperatorMessageRuntime(ctx, &runtimeState, manifest, fact)
-	}
-	refresh := func(ctx context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
-		currentManifests, err := runtimeState.Discover()
-		return issues, remote, currentManifests, err
-	}
-	accept := func(ctx context.Context, proposal orchestratoragent.MessageProposal, expected operatorAttemptBinding) (bool, error) {
-		currentIssues, currentRemote, err := fetchOperatorMessageTarget(ctx, api, prConfig, proposal)
-		if err != nil {
-			return false, err
-		}
-		return matchesOperatorMessageBinding(proposal, expected, currentIssues, currentRemote), nil
-	}
-	key := fmt.Sprintf("%s#%d/%d", accepted.Repository, accepted.Issue, accepted.Attempt)
-	byAttempt := map[string][]internalgithub.OperatorMessage{key: {accepted}}
-	if err := resumeOperatorMessages(ctx, api, prConfig, &runtimeState, implementationBoundary(stateRoot), issues, remote, manifests, byAttempt, cfg.Commands.Implementation, check, refresh, accept); err != nil {
-		return byAttempt[key][0], err
-	}
-	return byAttempt[key][0], nil
-}
-
-func deliverOperatorMessageWithRetry(ctx context.Context, configPath, stateRoot string, message internalgithub.OperatorMessage) (internalgithub.OperatorMessage, error) {
-	var err error
-	for range 2 {
-		message, err = deliverOperatorMessage(ctx, configPath, stateRoot, message)
-		if err == nil || ctx.Err() != nil {
-			return message, err
-		}
-	}
-	return message, err
-}
-
-func retryProjectedOperatorMessages(ctx context.Context, configPath, stateRoot string) error {
-	body, err := readDashboardStatus(filepath.Join(stateRoot, "status.json"))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	var snapshot struct {
-		UpdatedAt time.Time                     `json:"updated_at"`
-		Statuses  []orchestrator.RecoveryStatus `json:"statuses"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&snapshot) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return errors.New("invalid status snapshot")
-	}
-	pending := make(map[int]map[string]bool)
-	pendingCount := 0
-	for _, status := range snapshot.Statuses {
-		for _, message := range status.OperatorMessages {
-			if message.State != "queued" {
-				continue
-			}
-			pendingCount++
-			if pendingCount > 64 {
-				return errors.New("operator message startup recovery exceeds limit")
-			}
-			if pending[status.Issue] == nil {
-				pending[status.Issue] = make(map[string]bool)
-			}
-			pending[status.Issue][message.ID] = true
-		}
-	}
-	if len(pending) == 0 {
-		return nil
-	}
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		return err
-	}
-	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
-	user, err := api.AuthenticatedUser(ctx)
-	if err != nil {
-		return err
-	}
-	if err := api.VerifyRepository(ctx, cfg.Repository); err != nil {
-		return err
-	}
-	prConfig := githubPRConfig(cfg, user.ID)
-	for issue, ids := range pending {
-		messages, err := internalgithub.FetchOperatorMessages(ctx, api, prConfig, issue)
-		if err != nil {
-			return err
-		}
-		for _, message := range messages {
-			if !ids[message.ID] || message.State != "queued" && message.State != "claimed" {
-				continue
-			}
-			delivered, err := deliverOperatorMessageWithRetry(ctx, configPath, stateRoot, message)
-			if projectionErr := writeOperatorMessageStatus(stateRoot, delivered); projectionErr != nil {
-				return projectionErr
-			}
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func verifyOperatorMessageRuntime(ctx context.Context, runtimeState *agentruntime.Runtime, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
-	if manifest.State == "running" {
-		if err := runtimeState.VerifyOwned(ctx, manifest); err == nil {
-			return nil
-		}
-	}
-	head := fact.HeadSHA
-	if head == "" {
-		head = fact.BaseSHA
-	}
-	return runtimeState.VerifyRetained(ctx, manifest, head)
-}
-
-func newOperatorMessageRuntime(stateRoot string) agentruntime.Runtime {
-	boundary := implementationBoundary(stateRoot)
-	return agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot, Runner: boundary, VerifyWorker: func(ctx context.Context) error {
-		_, err := boundary.call(ctx, "verify", agentruntime.Command{})
-		return err
-	}}
-}
-
-func validateOperatorMessageTarget(ctx context.Context, proposal orchestratoragent.MessageProposal, issues []internalgithub.RecoveryIssueFact, remote []internalgithub.RecoveryAttemptFact, manifests []agentruntime.Manifest, check orchestrator.RuntimeCheck) error {
-	if err := validateOperatorMessageAuthority(proposal, issues, remote); err != nil {
-		return err
-	}
-	issueIndex := slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
-		return issue.Repository == proposal.Repository && issue.Issue == proposal.Issue
-	})
-	issue := issues[issueIndex]
-	matching := make([]agentruntime.Manifest, 0, 1)
-	for _, manifest := range manifests {
-		if manifest.Repository == proposal.Repository && manifest.Issue == proposal.Issue && manifest.Attempt == proposal.Attempt {
-			matching = append(matching, manifest)
-		}
-	}
-	if len(matching) != 1 {
-		return errors.New("operator message target runtime is missing or ambiguous")
-	}
-	manifest := matching[0]
-	if binding := issue.ActiveAttempt; binding != nil && (binding.BaseSHA != manifest.BaseSHA || !slices.Contains([]string{"active", "review-ready"}, binding.State)) {
-		return errors.New("operator message target does not match the issue's exact base binding")
-	}
-	facts := make([]orchestrator.AttemptFact, 0, len(remote)+1)
-	for _, fact := range remote {
-		if fact.Repository == proposal.Repository && fact.Issue == proposal.Issue && fact.Attempt == proposal.Attempt && issue.ActiveAttempt != nil && fact.BaseSHA != issue.ActiveAttempt.BaseSHA {
-			return errors.New("operator message target has conflicting active base bindings")
-		}
-		facts = append(facts, orchestrator.AttemptFact{Repository: fact.Repository, Issue: fact.Issue, Attempt: fact.Attempt, BaseSHA: fact.BaseSHA, HeadSHA: fact.HeadSHA, PR: fact.PR, State: fact.State, Checks: fact.Checks, Diagnostic: fact.Diagnostic})
-	}
-	if binding := issue.ActiveAttempt; binding != nil && !slices.ContainsFunc(remote, func(fact internalgithub.RecoveryAttemptFact) bool {
-		return fact.Repository == binding.Repository && fact.Issue == binding.Issue && fact.Attempt == binding.Attempt
-	}) {
-		facts = append(facts, orchestrator.AttemptFact{Repository: binding.Repository, Issue: binding.Issue, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, HeadSHA: binding.HeadSHA, PR: binding.PR, State: binding.State, Checks: binding.Checks, Diagnostic: binding.Diagnostic})
-	}
-	factIndex := slices.IndexFunc(facts, func(fact orchestrator.AttemptFact) bool {
-		return fact.Repository == proposal.Repository && fact.Issue == proposal.Issue && fact.Attempt == proposal.Attempt
-	})
-	if factIndex < 0 || check == nil || check(ctx, manifest, facts[factIndex]) != nil {
-		return errors.New("operator message target does not have a verified exact runtime owner")
-	}
-	statuses := orchestrator.RecoverChecked(ctx, facts, []agentruntime.Manifest{manifest}, func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil })
-	statusIndex := slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool {
-		return status.Repository == proposal.Repository && status.Issue == proposal.Issue && status.Attempt == proposal.Attempt
-	})
-	if statusIndex < 0 || !slices.Contains([]string{"active", "review-ready"}, statuses[statusIndex].State) || !slices.Contains([]string{"implementation", "validation", "review", "findings-handoff", "publication"}, statuses[statusIndex].CurrentPhase) {
-		return errors.New("operator message target does not have a verified exact runtime owner")
-	}
-	return nil
-}
-
-func validateOperatorMessageAuthority(proposal orchestratoragent.MessageProposal, issues []internalgithub.RecoveryIssueFact, remote []internalgithub.RecoveryAttemptFact) error {
-	issueIndex := slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
-		return issue.Repository == proposal.Repository && issue.Issue == proposal.Issue
-	})
-	if issueIndex < 0 || issues[issueIndex].Cancelled || issues[issueIndex].Completed || !issues[issueIndex].DispatchAuthorized {
-		return errors.New("operator message target is not an active authorized issue attempt")
-	}
-	if binding := issues[issueIndex].ActiveAttempt; binding != nil && (binding.Repository != proposal.Repository || binding.Issue != proposal.Issue || binding.Attempt != proposal.Attempt) {
-		return errors.New("operator message target conflicts with the issue's active attempt binding")
-	}
-	if slices.ContainsFunc(remote, func(fact internalgithub.RecoveryAttemptFact) bool {
-		return fact.Repository == proposal.Repository && fact.Issue == proposal.Issue && fact.Attempt == proposal.Attempt && !slices.Contains([]string{"active", "review-ready"}, fact.State)
-	}) {
-		return errors.New("operator message target attempt is not active")
-	}
-	return nil
-}
-
-type operatorAttemptBinding struct {
-	Repository       string
-	Issue, Attempt   int
-	PR               int
-	BaseSHA, HeadSHA string
-}
-
-func operatorMessageBinding(proposal orchestratoragent.MessageProposal, issues []internalgithub.RecoveryIssueFact, remote []internalgithub.RecoveryAttemptFact) (operatorAttemptBinding, error) {
-	if err := validateOperatorMessageAuthority(proposal, issues, remote); err != nil {
-		return operatorAttemptBinding{}, err
-	}
-	issue := issues[slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
-		return issue.Repository == proposal.Repository && issue.Issue == proposal.Issue
-	})]
-	matches := make([]internalgithub.RecoveryAttemptFact, 0, 1)
-	for _, fact := range remote {
-		if fact.Repository == proposal.Repository && fact.Issue == proposal.Issue && fact.Attempt == proposal.Attempt {
-			matches = append(matches, fact)
-		}
-	}
-	if len(matches) > 1 {
-		return operatorAttemptBinding{}, errors.New("operator message target has ambiguous remote bindings")
-	}
-	if len(matches) == 1 {
-		fact := matches[0]
-		if fact.BaseSHA == "" || fact.PR > 0 && fact.HeadSHA == "" || issue.ActiveAttempt != nil && issue.ActiveAttempt.BaseSHA != fact.BaseSHA {
-			return operatorAttemptBinding{}, errors.New("operator message target has an incomplete or conflicting remote binding")
-		}
-		return operatorAttemptBinding{fact.Repository, fact.Issue, fact.Attempt, fact.PR, fact.BaseSHA, fact.HeadSHA}, nil
-	}
-	if binding := issue.ActiveAttempt; binding != nil && binding.Repository == proposal.Repository && binding.Issue == proposal.Issue && binding.Attempt == proposal.Attempt && binding.BaseSHA != "" && slices.Contains([]string{"active", "review-ready"}, binding.State) {
-		return operatorAttemptBinding{binding.Repository, binding.Issue, binding.Attempt, binding.PR, binding.BaseSHA, binding.HeadSHA}, nil
-	}
-	return operatorAttemptBinding{}, errors.New("operator message target has no exact active binding")
-}
-
-func matchesOperatorMessageBinding(proposal orchestratoragent.MessageProposal, expected operatorAttemptBinding, issues []internalgithub.RecoveryIssueFact, remote []internalgithub.RecoveryAttemptFact) bool {
-	current, err := operatorMessageBinding(proposal, issues, remote)
-	return err == nil && current == expected
 }
 
 func githubPRConfig(c config.Config, actorID int) internalgithub.PRAdapterConfig {
@@ -1581,7 +1214,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	prConfig := githubPRConfig(c, user.ID)
 	var issues []internalgithub.RecoveryIssueFact
 	if options.planReviewIssue > 0 {
-		issues, err = internalgithub.FetchOperatorIssueFacts(ctx, api, prConfig, remote, options.planReviewIssue)
+		issues, err = internalgithub.FetchIssueFactsForIssue(ctx, api, prConfig, remote, options.planReviewIssue)
 	} else {
 		issues, err = internalgithub.FetchIssueFacts(ctx, api, prConfig, remote, options.intake)
 	}
@@ -1644,24 +1277,14 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		}
 	}
 	if !options.transition {
-		operatorMessages, err := fetchOperatorMessages(ctx, api, prConfig, issues, remote, manifests)
-		if err != nil {
-			return statuses, fmt.Errorf("fetch operator messages: %w", err)
-		}
-		attachOperatorMessageStatuses(statuses, operatorMessages)
-		if err := writeProjectStatusSnapshot(stateRoot, c.Repository, statuses); err != nil {
-			return statuses, fmt.Errorf("write status projection: %w", err)
-		}
 		return statuses, nil
 	}
-	operatorMessages := map[string][]internalgithub.OperatorMessage{}
 	refreshProjection := func(currentFacts []orchestrator.AttemptFact, currentIssues []internalgithub.RecoveryIssueFact) ([]agentruntime.Manifest, []orchestrator.Decision, error) {
 		currentManifests, discoverErr := r.Discover()
 		if discoverErr != nil {
 			return nil, nil, discoverErr
 		}
 		statuses, decisions = projectRecoveryStatuses(ctx, currentFacts, currentIssues, currentManifests, c.Concurrency, checkRuntime)
-		attachOperatorMessageStatuses(statuses, operatorMessages)
 		return currentManifests, decisions, writeProjectStatusSnapshot(stateRoot, c.Repository, statuses)
 	}
 	// Governance may mutate GitHub only after authenticated repository access,
@@ -1688,14 +1311,6 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if dispatchErr != nil {
 		return statuses, fmt.Errorf("dispatch eligible issues: %w", dispatchErr)
 	}
-	operatorMessages, err = fetchOperatorMessages(ctx, api, prConfig, issues, remote, manifests)
-	if err != nil {
-		return statuses, fmt.Errorf("fetch operator messages: %w", err)
-	}
-	attachOperatorMessageStatuses(statuses, operatorMessages)
-	if err := writeProjectStatusSnapshot(stateRoot, c.Repository, statuses); err != nil {
-		return statuses, fmt.Errorf("write operator message status projection: %w", err)
-	}
 	if err := resumeHandoffs(ctx, &r, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
 		return statuses, fmt.Errorf("resume durable handoffs: %w", err)
 	}
@@ -1712,7 +1327,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if monitorErr != nil || planReviewErr != nil {
 		return statuses, fmt.Errorf("monitor live attempts and plan reviews: %w", errors.Join(monitorErr, planReviewErr))
 	}
-	transitionErr := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, operatorMessages, statePath, stateRoot, func() error {
+	transitionErr := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, statePath, stateRoot, func() error {
 		_, _, err := refreshProjection(facts, issues)
 		return err
 	})
@@ -1732,8 +1347,8 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if err := internalgithub.RunPRReconciliation(ctx, api, prConfig, statePath); err != nil {
 		return statuses, fmt.Errorf("reconcile pull request governance: %w", err)
 	}
-	// Re-read GitHub after governance and monitoring. A merge or cancellation
-	// observed here wins over every queued operator message.
+	// Re-read GitHub after governance and monitoring so remote terminal state
+	// wins before local cleanup.
 	freshRemote, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
 	if err != nil {
 		return statuses, fmt.Errorf("refresh pull request attempts: %w", err)
@@ -1742,51 +1357,13 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if err != nil {
 		return statuses, fmt.Errorf("refresh issue controls: %w", err)
 	}
-	freshRemote, freshFacts := recoveryAttemptFacts(freshRemote, freshIssues)
+	_, freshFacts := recoveryAttemptFacts(freshRemote, freshIssues)
 	if err := cleanupCompletedAttempts(ctx, boundary, freshFacts, queuedManifests); err != nil {
 		return statuses, fmt.Errorf("clean newly completed attempts: %w", err)
 	}
-	operatorCheck := func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
-		head := fact.HeadSHA
-		if head == "" {
-			head = fact.BaseSHA
-		}
-		return r.VerifyActive(ctx, manifest, head)
-	}
-	refreshOperatorTarget := func(ctx context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error) {
-		attempts, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		currentIssues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, attempts, false)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		currentManifests, err := r.Discover()
-		return currentIssues, attempts, currentManifests, err
-	}
-	acceptOperatorTarget := func(ctx context.Context, proposal orchestratoragent.MessageProposal, expected operatorAttemptBinding) (bool, error) {
-		attempts, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
-		if err != nil {
-			return false, err
-		}
-		currentIssues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, attempts, false)
-		if err != nil {
-			return false, err
-		}
-		return matchesOperatorMessageBinding(proposal, expected, currentIssues, attempts), nil
-	}
-	validatedManifests, decisions, err := refreshProjection(freshFacts, freshIssues)
-	if err != nil {
-		return statuses, fmt.Errorf("write fresh status projection: %w", err)
-	}
-	operatorErr := resumeOperatorMessages(ctx, api, prConfig, &r, boundary, freshIssues, freshRemote, validatedManifests, operatorMessages, c.Commands.Implementation, operatorCheck, refreshOperatorTarget, acceptOperatorTarget)
 	_, decisions, err = refreshProjection(freshFacts, freshIssues)
 	if err != nil {
-		return statuses, errors.Join(fmt.Errorf("write final status projection: %w", err), operatorErr)
-	}
-	if operatorErr != nil {
-		return statuses, fmt.Errorf("resume operator messages: %w", operatorErr)
+		return statuses, fmt.Errorf("write fresh status projection: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return statuses, fmt.Errorf("reconciliation exceeded the %s recovery target: %w", options.timeout, err)
@@ -1987,40 +1564,6 @@ func writeProjectStatusSnapshot(stateRoot, repository string, statuses []orchest
 		return errors.New("refusing to write a cross-project status projection")
 	}
 	return writeStatusSnapshot(stateRoot, statuses)
-}
-
-func writeOperatorMessageStatus(stateRoot string, message internalgithub.OperatorMessage) error {
-	body, err := readDashboardStatus(filepath.Join(stateRoot, "status.json"))
-	if err != nil {
-		return err
-	}
-	var snapshot struct {
-		UpdatedAt time.Time                     `json:"updated_at"`
-		Statuses  []orchestrator.RecoveryStatus `json:"statuses"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&snapshot) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return errors.New("invalid status snapshot")
-	}
-	index := slices.IndexFunc(snapshot.Statuses, func(status orchestrator.RecoveryStatus) bool {
-		return status.Repository == message.Repository && status.Issue == message.Issue && status.Attempt == message.Attempt
-	})
-	if index < 0 {
-		return errors.New("operator message target is missing from the status snapshot")
-	}
-	state := message.State
-	if state == "claimed" {
-		state = "queued"
-	}
-	status := orchestrator.OperatorMessageStatus{ID: message.ID, State: state, UpdatedAt: message.UpdatedAt, Diagnostic: message.Diagnostic}
-	messages := &snapshot.Statuses[index].OperatorMessages
-	if messageIndex := slices.IndexFunc(*messages, func(current orchestrator.OperatorMessageStatus) bool { return current.ID == message.ID }); messageIndex >= 0 {
-		(*messages)[messageIndex] = status
-	} else {
-		*messages = append(*messages, status)
-	}
-	return writeProjectStatusSnapshot(stateRoot, message.Repository, snapshot.Statuses)
 }
 
 func seedAttemptSource(ctx context.Context, checkout, repositoryName, attemptRoot, baseBranch, baseSHA string) (string, error) {
@@ -2450,21 +1993,13 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string
 	return nil
 }
 
-func amendIssueWithHumanInstructions(issue internalgithub.RecoveryIssueFact, messages []internalgithub.OperatorMessage, feedback []internalgithub.Feedback) (internalgithub.RecoveryIssueFact, []string, bool) {
+func amendIssueWithHumanInstructions(issue internalgithub.RecoveryIssueFact, feedback []internalgithub.Feedback) (internalgithub.RecoveryIssueFact, []string) {
 	type instruction struct {
 		created time.Time
 		key     string
 		body    string
 	}
 	var instructions []instruction
-	operatorDelivered := false
-	for _, message := range messages {
-		want, err := internalgithub.PrepareOperatorMessage(message.Repository, message.Issue, message.Attempt, message.Message)
-		if err == nil && want.ID == message.ID && message.State == "delivered" && message.Repository == issue.Repository && message.Issue == issue.Issue && message.Attempt == issue.Attempt {
-			instructions = append(instructions, instruction{message.UpdatedAt, "operator:" + message.ID, message.Message})
-			operatorDelivered = true
-		}
-	}
 	for _, item := range feedback {
 		if item.ID > 0 && item.Authorized && strings.TrimSpace(item.Body) != "" && slices.Contains([]string{"issue", "conversation", "inline", "review"}, item.Source) {
 			instructions = append(instructions, instruction{item.CreatedAt, fmt.Sprintf("%s:%d", item.Source, item.ID), strings.TrimSpace(item.Body)})
@@ -2484,10 +2019,10 @@ func amendIssueWithHumanInstructions(issue internalgithub.RecoveryIssueFact, mes
 		encoded, _ := json.Marshal(bodies)
 		issue.Body += "\n\n" + humanInstructionPrecedence + "\n" + string(encoded)
 	}
-	return issue, bodies, operatorDelivered
+	return issue, bodies
 }
 
-func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, operatorMessages map[string][]internalgithub.OperatorMessage, statePath, stateRoot string, refreshProjection func() error) error {
+func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, statePath, stateRoot string, refreshProjection func() error) error {
 	recovery := &internalgithub.FileRecovery{Path: statePath}
 	for _, manifest := range manifests {
 		var prepared internalgithub.PreparedPublication
@@ -2519,8 +2054,6 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 			continue
 		}
 		issue.Attempt = manifest.Attempt
-		attemptMessages := operatorMessages[fmt.Sprintf("%s#%d/%d", manifest.Repository, manifest.Issue, manifest.Attempt)]
-		_, _, operatorDelivered := amendIssueWithHumanInstructions(issue, attemptMessages, nil)
 		var (
 			handoff internalgithub.RecoveryHandoff
 			err     error
@@ -2535,16 +2068,13 @@ func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime 
 				return err
 			}
 			if !received {
-				if !operatorDelivered {
-					continue
-				}
-				handoff = internalgithub.RecoveryHandoff{}
+				continue
 			}
 		}
 		if !issue.DispatchAuthorized {
 			continue
 		}
-		issue, humanInstructions, _ := amendIssueWithHumanInstructions(issue, attemptMessages, handoff.Feedback)
+		issue, humanInstructions := amendIssueWithHumanInstructions(issue, handoff.Feedback)
 		current := manifest
 		if manifest.State == "preparing" || manifest.State == "running" {
 			continue // monitorAttempts owns live bound attempts from the same snapshot.
@@ -3330,331 +2860,6 @@ func reconcilePlanReviews(ctx context.Context, runtimeState *agentruntime.Runtim
 			}
 		}
 	}
-	return nil
-}
-
-func fetchOperatorMessages(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, issues []internalgithub.RecoveryIssueFact, attempts []internalgithub.RecoveryAttemptFact, manifests []agentruntime.Manifest) (map[string][]internalgithub.OperatorMessage, error) {
-	result := map[string][]internalgithub.OperatorMessage{}
-	seen := map[int]bool{}
-	fetch := func(repository string, issue int) error {
-		if repository != cfg.Repository || seen[issue] {
-			return nil
-		}
-		seen[issue] = true
-		messages, err := internalgithub.FetchOperatorMessages(ctx, api, cfg, issue)
-		if err != nil {
-			return err
-		}
-		for _, message := range messages {
-			key := fmt.Sprintf("%s#%d/%d", message.Repository, message.Issue, message.Attempt)
-			result[key] = append(result[key], message)
-		}
-		return nil
-	}
-	for _, issue := range issues {
-		if err := fetch(issue.Repository, issue.Issue); err != nil {
-			return nil, err
-		}
-	}
-	for _, attempt := range attempts {
-		if err := fetch(attempt.Repository, attempt.Issue); err != nil {
-			return nil, err
-		}
-	}
-	for _, manifest := range manifests {
-		if err := fetch(manifest.Repository, manifest.Issue); err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
-func attachOperatorMessageStatuses(statuses []orchestrator.RecoveryStatus, messages map[string][]internalgithub.OperatorMessage) {
-	for i := range statuses {
-		statuses[i].OperatorMessages = nil
-		key := fmt.Sprintf("%s#%d/%d", statuses[i].Repository, statuses[i].Issue, statuses[i].Attempt)
-		for _, message := range messages[key] {
-			state := message.State
-			if state == "claimed" {
-				state = "queued"
-			}
-			statuses[i].OperatorMessages = append(statuses[i].OperatorMessages, orchestrator.OperatorMessageStatus{ID: message.ID, State: state, UpdatedAt: message.UpdatedAt, Diagnostic: message.Diagnostic})
-		}
-	}
-}
-
-type operatorTargetRefresh func(context.Context) ([]internalgithub.RecoveryIssueFact, []internalgithub.RecoveryAttemptFact, []agentruntime.Manifest, error)
-type operatorAcceptanceCheck func(context.Context, orchestratoragent.MessageProposal, operatorAttemptBinding) (bool, error)
-
-func resumeOperatorMessages(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, runtimeState *agentruntime.Runtime, boundary boundaryCaller, issues []internalgithub.RecoveryIssueFact, remote []internalgithub.RecoveryAttemptFact, manifests []agentruntime.Manifest, messages map[string][]internalgithub.OperatorMessage, command []string, check orchestrator.RuntimeCheck, refresh operatorTargetRefresh, accept operatorAcceptanceCheck) error {
-	if len(command) == 0 {
-		return errors.New("implementation command is missing")
-	}
-	started := map[string]bool{}
-	for key, queued := range messages {
-		for index := range queued {
-			message := &queued[index]
-			if message.State != "queued" && message.State != "claimed" {
-				continue
-			}
-			remoteIndex := slices.IndexFunc(remote, func(fact internalgithub.RecoveryAttemptFact) bool {
-				return fact.Repository == message.Repository && fact.Issue == message.Issue && fact.Attempt == message.Attempt
-			})
-			if remoteIndex >= 0 && remote[remoteIndex].State == "completed" {
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "attempt completed or merged before delivery"); err != nil {
-					return err
-				}
-				continue
-			}
-			issueIndex := slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
-				return issue.Repository == message.Repository && issue.Issue == message.Issue
-			})
-			if issueIndex < 0 || issues[issueIndex].Cancelled || issues[issueIndex].Completed || !issues[issueIndex].DispatchAuthorized {
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "attempt is no longer active and authorized"); err != nil {
-					return err
-				}
-				continue
-			}
-			manifestIndex := slices.IndexFunc(manifests, func(manifest agentruntime.Manifest) bool {
-				return manifest.Repository == message.Repository && manifest.Issue == message.Issue && manifest.Attempt == message.Attempt
-			})
-			handoffKey := "operator-message-" + message.ID
-			if manifestIndex >= 0 && runtimeState != nil {
-				recovered, changed, err := runtimeState.RecoverInterruptedHandoff(ctx, manifests[manifestIndex], handoffKey)
-				if err != nil {
-					return err
-				}
-				if changed {
-					manifests[manifestIndex] = recovered
-				}
-			}
-			if manifestIndex >= 0 && manifests[manifestIndex].State == "completed" && (manifests[manifestIndex].ReviewState == "preparing" || manifests[manifestIndex].ReviewState == "running") {
-				continue
-			}
-			proposal := orchestratoragent.MessageProposal{Version: 1, Repository: message.Repository, Issue: message.Issue, Attempt: message.Attempt, Message: message.Message}
-			ownershipCheck := check
-			if runtimeState != nil {
-				ownershipCheck = func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
-					if manifest.State == "running" {
-						if err := runtimeState.VerifyOwned(ctx, manifest); err == nil {
-							return nil
-						}
-					}
-					if check != nil {
-						return check(ctx, manifest, fact)
-					}
-					return verifyOperatorMessageRuntime(ctx, runtimeState, manifest, fact)
-				}
-			} else if ownershipCheck == nil {
-				ownershipCheck = func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
-			}
-			if err := validateOperatorMessageTarget(ctx, proposal, issues, remote, manifests, ownershipCheck); err != nil {
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "exact verified attempt ownership is missing"); err != nil {
-					return err
-				}
-				continue
-			}
-			if manifestIndex < 0 {
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "exact attempt runtime is missing"); err != nil {
-					return err
-				}
-				continue
-			}
-			manifest := manifests[manifestIndex]
-			outcomePath := handoffReceiptPath(manifest.Worktree, handoffKey)
-			outcomeToken := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+handoffKey)))
-			expectedReceipt := handoffReceipt{"agent-symphony-handoff-executed-v1", handoffKey, outcomePath, outcomeToken}
-			payload, _ := json.Marshal(struct {
-				Type, Key, Kind, Repository, Message string
-				Issue, Attempt                       int
-			}{"agent-symphony-handoff-v1", handoffKey, "operator-message", message.Repository, message.Message, message.Issue, message.Attempt})
-			requestBody := func(manifest agentruntime.Manifest) []byte {
-				request, _ := json.Marshal(handoffRequest{manifest, payload, outcomePath, outcomeToken, command})
-				return request
-			}
-			verifyDelivery := func(manifest agentruntime.Manifest) (bool, error) {
-				if message.State != "claimed" {
-					return false, nil
-				}
-				observed, verifyErr := boundary.call(ctx, "verify-handoff", agentruntime.Command{Stdin: bytes.NewReader(requestBody(manifest))})
-				if verifyErr != nil {
-					return false, fmt.Errorf("verify claimed operator message delivery: %w", verifyErr)
-				}
-				if observed.Output != "" {
-					var receipt handoffReceipt
-					decoder := json.NewDecoder(strings.NewReader(observed.Output))
-					decoder.DisallowUnknownFields()
-					if decoder.Decode(&receipt) != nil || decoder.Decode(&struct{}{}) != io.EOF || receipt != expectedReceipt {
-						return false, errors.New("verified operator message receipt binding mismatch")
-					}
-					return true, nil
-				}
-				return false, nil
-			}
-			switch manifest.State {
-			case "preparing":
-				continue // The accepted message remains durably queued.
-			case "running":
-				if message.State == "queued" {
-					if runtimeState == nil {
-						continue
-					}
-					superseded, err := runtimeState.InterruptLegacyOperatorHandoff(ctx, manifest, 2*time.Minute)
-					if err != nil {
-						return err
-					}
-					if superseded {
-						break
-					}
-					monitored, err := runtimeState.Monitor(ctx, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA})
-					if err != nil {
-						return err
-					}
-					manifests[manifestIndex], manifest = monitored, monitored
-					switch monitored.State {
-					case "running":
-						continue
-					case "failed":
-						if err := recordOperatorOutcome(ctx, api, cfg, message, "failed", "attempt runtime failed before delivery"); err != nil {
-							return err
-						}
-						continue
-					case "cancelled":
-						if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "attempt was cancelled before delivery"); err != nil {
-							return err
-						}
-						continue
-					case "completed":
-					default:
-						return errors.New("monitored operator message runtime state is invalid")
-					}
-					break
-				}
-				verified, verifyErr := verifyDelivery(manifest)
-				if verifyErr != nil {
-					return verifyErr
-				}
-				if !verified {
-					continue
-				}
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "delivered", ""); err != nil {
-					return err
-				}
-				started[key] = true
-				continue
-			case "failed":
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "failed", "attempt runtime failed before delivery"); err != nil {
-					return err
-				}
-				continue
-			case "cancelled":
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "attempt was cancelled before delivery"); err != nil {
-					return err
-				}
-				continue
-			case "completed":
-				if manifest.ReviewState == "preparing" || manifest.ReviewState == "running" {
-					continue
-				}
-			default:
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "failed", "attempt runtime state is invalid"); err != nil {
-					return err
-				}
-				continue
-			}
-			if started[key] {
-				continue
-			}
-			if message.State == "queued" {
-				claimed, err := internalgithub.RecordOperatorMessageClaim(ctx, api, cfg, *message)
-				if err != nil {
-					return err
-				}
-				*message = claimed
-			}
-			if refresh == nil {
-				return errors.New("authoritative operator message target refresh is unavailable")
-			}
-			currentIssues, currentRemote, currentManifests, err := refresh(ctx)
-			if err != nil {
-				return err
-			}
-			if err := validateOperatorMessageTarget(ctx, proposal, currentIssues, currentRemote, currentManifests, check); err != nil {
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "attempt became terminal or lost exact ownership before delivery"); err != nil {
-					return err
-				}
-				continue
-			}
-			expectedBinding, err := operatorMessageBinding(proposal, currentIssues, currentRemote)
-			if err != nil {
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "attempt became terminal or lost exact ownership before delivery"); err != nil {
-					return err
-				}
-				continue
-			}
-			manifestIndex = slices.IndexFunc(currentManifests, func(candidate agentruntime.Manifest) bool {
-				return candidate.Repository == message.Repository && candidate.Issue == message.Issue && candidate.Attempt == message.Attempt
-			})
-			manifest = currentManifests[manifestIndex]
-			// ResumeHandoff owns the final authoritative proof so terminal cleanup
-			// wins without first changing the retained manifest back to running.
-			if accept == nil {
-				return errors.New("authoritative operator message acceptance check is unavailable")
-			}
-			var authorized bool
-			var acceptanceErr error
-			resumed, err := runtimeState.ResumeHandoff(ctx, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Eligible: func() bool {
-				authorized, acceptanceErr = accept(ctx, proposal, expectedBinding)
-				return acceptanceErr == nil && authorized
-			}})
-			if acceptanceErr != nil {
-				return acceptanceErr
-			}
-			if !authorized {
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "rejected", "attempt became terminal or lost exact ownership at delivery acceptance"); err != nil {
-					return err
-				}
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			verified, verifyErr := verifyDelivery(resumed)
-			if verifyErr != nil {
-				return verifyErr
-			}
-			if verified {
-				if err := recordOperatorOutcome(ctx, api, cfg, message, "delivered", ""); err != nil {
-					return err
-				}
-				started[key] = true
-				continue
-			}
-			accepted, err := boundary.call(ctx, "accept-operator-handoff", agentruntime.Command{Stdin: bytes.NewReader(requestBody(resumed))})
-			if err != nil {
-				return fmt.Errorf("worker-owned operator message acceptance: %w", err)
-			}
-			var ack handoffReceipt
-			decoder := json.NewDecoder(strings.NewReader(accepted.Output))
-			decoder.DisallowUnknownFields()
-			if decoder.Decode(&ack) != nil || decoder.Decode(&struct{}{}) != io.EOF || ack.Type != "agent-symphony-handoff-executed-v1" || ack.Key != handoffKey || ack.OutcomePath != outcomePath || ack.OutcomeToken != outcomeToken {
-				return errors.New("worker-owned operator message acceptance binding mismatch")
-			}
-			if err := recordOperatorOutcome(ctx, api, cfg, message, "delivered", ""); err != nil {
-				return err
-			}
-			started[key] = true
-		}
-		messages[key] = queued
-	}
-	return nil
-}
-
-func recordOperatorOutcome(ctx context.Context, api internalgithub.API, cfg internalgithub.PRAdapterConfig, message *internalgithub.OperatorMessage, state, diagnostic string) error {
-	if err := internalgithub.RecordOperatorMessageOutcome(ctx, api, cfg, *message, state, diagnostic); err != nil {
-		return err
-	}
-	message.State, message.Diagnostic = state, diagnostic
 	return nil
 }
 

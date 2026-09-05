@@ -30,14 +30,3 @@ export async function getRelease() {
     return "unavailable";
   }
 }
-
-export async function getMessageProposal() {
-  try {
-    const response = await fetch("/orchestrator/proposal.json", { cache: "no-store" });
-    if (response.status === 204) return { proposal: null, error: "" };
-    if (!response.ok) return { proposal: null, error: (await response.text()).trim() || `Message proposal failed (${response.status})` };
-    return { proposal: { ...await response.json(), confirmationNonce: response.headers.get("X-Agent-Symphony-Confirmation-Nonce") }, error: "" };
-  } catch {
-    return { proposal: null, error: "Message proposal is unavailable" };
-  }
-}

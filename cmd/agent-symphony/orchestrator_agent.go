@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,33 +12,7 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
-type dashboardOrchestratorService struct {
-	orchestratoragent.Service
-	supervisor *orchestratoragent.Supervisor
-	confirm    func(context.Context, orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error)
-	accepted   func(internalgithub.OperatorMessage)
-}
-
 var orchestratorWorkspacePrepare = prepareOrchestratorWorkspace
-
-func (s dashboardOrchestratorService) MessageProposal(ctx context.Context) (orchestratoragent.MessageProposal, error) {
-	return s.supervisor.MessageProposal(ctx)
-}
-
-func (s dashboardOrchestratorService) ConsumeMessageProposal(ctx context.Context, binding string) error {
-	return s.supervisor.ConsumeMessageProposal(ctx, binding)
-}
-
-func (s dashboardOrchestratorService) ConfirmMessage(ctx context.Context, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {
-	if s.confirm == nil {
-		return internalgithub.OperatorMessage{}, fmt.Errorf("operator message confirmation is unavailable")
-	}
-	message, err := s.confirm(ctx, proposal)
-	if err == nil && s.accepted != nil {
-		s.accepted(message)
-	}
-	return message, err
-}
 
 func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratoragent.Supervisor, error) {
 	workspace := filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-"+internalgithub.RepositoryIdentifier(cfg.Repository))
