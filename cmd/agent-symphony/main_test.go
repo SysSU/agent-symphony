@@ -1273,23 +1273,30 @@ func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t
 
 	now := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
 	activeMarker, _ := internalgithub.ActiveAttemptMarker("o/r", 218, 2, base)
+	terminalMarker, _ := internalgithub.TerminalFailureMarker(218, 2, now.Add(4*time.Minute))
 	var snapshots []string
-	set, clear := false, false
+	statusMode := ""
+	terminal := false
 	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		comments := make([]any, len(snapshots))
 		for i, snapshot := range snapshots {
 			comments[i] = map[string]any{"id": 60 + i, "body": snapshot, "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 42}}
 		}
 		comments = append(comments, map[string]any{"id": 65, "body": activeMarker, "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 42}})
-		var pullComments []any
-		if set {
-			pullComments = append(pullComments, map[string]any{"id": 70, "body": "/agent-symphony status needs-attention: operator decision required", "created_at": now.Add(2 * time.Minute), "updated_at": now.Add(2 * time.Minute), "user": map[string]any{"id": 42}})
+		if terminal {
+			comments = append(comments, map[string]any{"id": 66, "body": "Attempt failed closed: attempt 2 failed current\n\n" + terminalMarker, "created_at": now.Add(4 * time.Minute), "updated_at": now.Add(4 * time.Minute), "user": map[string]any{"id": 42}})
 		}
-		if clear {
+		var pullComments []any
+		switch statusMode {
+		case "set":
+			pullComments = append(pullComments, map[string]any{"id": 70, "body": "/agent-symphony status needs-attention: operator decision required", "created_at": now.Add(2 * time.Minute), "updated_at": now.Add(2 * time.Minute), "user": map[string]any{"id": 42}})
+		case "clear":
 			pullComments = append(pullComments, map[string]any{"id": 71, "body": "/agent-symphony status clear: operator decision recorded", "created_at": now.Add(3 * time.Minute), "updated_at": now.Add(3 * time.Minute), "user": map[string]any{"id": 42}})
+		case "malformed":
+			pullComments = append(pullComments, map[string]any{"id": 72, "body": "/agent-symphony status needs-attention:", "created_at": now.Add(5 * time.Minute), "updated_at": now.Add(5 * time.Minute), "user": map[string]any{"id": 42}})
 		}
 		labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}}
-		if set && !clear {
+		if statusMode == "set" {
 			labels = append(labels, map[string]any{"name": "needs-attention"})
 		}
 		var response any
@@ -1336,7 +1343,7 @@ func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t
 		{Repository: "o/r", Issue: 218, Attempt: 2, BaseSHA: base, PR: 220, State: "active"},
 	}
 	facts, err := internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, true)
-	if err != nil || len(facts) != 1 || facts[0].Attempt != 2 || facts[0].Eligible || !facts[0].Active || !facts[0].DispatchAuthorized {
+	if err != nil || len(facts) != 1 || facts[0].Attempt != 2 || facts[0].CurrentAttempt != 2 || facts[0].Eligible || !facts[0].Active || !facts[0].DispatchAuthorized {
 		t.Fatalf("initial facts=%#v err=%v", facts, err)
 	}
 
@@ -1350,9 +1357,9 @@ func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t
 		t.Fatalf("start manifest=%#v live=%v starts=%d err=%v", manifest, runner.live, runner.starts, err)
 	}
 
-	set = true
+	statusMode = "set"
 	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
-	if err != nil || len(facts) != 1 || facts[0].Attempt != 2 || !facts[0].NeedsAttention || facts[0].Eligible || !facts[0].DispatchAuthorized {
+	if err != nil || len(facts) != 1 || facts[0].Attempt != 2 || facts[0].CurrentAttempt != 2 || !facts[0].NeedsAttention || facts[0].Eligible || !facts[0].DispatchAuthorized {
 		t.Fatalf("set facts=%#v err=%v", facts, err)
 	}
 	queued := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 219, Attempt: 1, Priority: 1, CreatedAt: now.Add(time.Minute), Eligible: false, DispatchAuthorized: true, NeedsAttention: true, Blockers: []string{"needs attention: queued operator decision required"}}
@@ -1372,9 +1379,9 @@ func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t
 		t.Fatalf("set reconcile statuses=%#v decisions=%#v manifests=%#v live=%v starts=%d", statuses, decisions, stored, runner.live, runner.starts)
 	}
 
-	clear = true
+	statusMode = "clear"
 	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
-	if err != nil || len(facts) != 1 || facts[0].Attempt != 2 || facts[0].NeedsAttention || !facts[0].DispatchAuthorized {
+	if err != nil || len(facts) != 1 || facts[0].Attempt != 2 || facts[0].CurrentAttempt != 2 || facts[0].NeedsAttention || !facts[0].DispatchAuthorized {
 		t.Fatalf("clear facts=%#v err=%v", facts, err)
 	}
 	issues = append(facts, queued)
@@ -1390,6 +1397,48 @@ func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t
 	stored, _ = runtimeState.Discover()
 	if active < 0 || statuses[active].State != "active" || statuses[active].NeedsAttention || historical < 0 || statuses[historical].State != "failed" || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" || queuedDecision < 0 || decisions[queuedDecision].State != orchestrator.Blocked || len(stored) != 1 || stored[0].State != "running" || stored[0].Session != manifest.Session || !runner.live || runner.starts != 1 {
 		t.Fatalf("clear reconcile statuses=%#v decisions=%#v manifests=%#v live=%v starts=%d", statuses, decisions, stored, runner.live, runner.starts)
+	}
+
+	terminal = true
+	published[1].State = "failed"
+	published[1].Diagnostic = "attempt 2 failed current"
+	statusMode = "set"
+	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
+	if err != nil || len(facts) != 1 || facts[0].Attempt != 3 || facts[0].CurrentAttempt != 2 || !facts[0].NeedsAttention || facts[0].Active {
+		t.Fatalf("terminal set facts=%#v err=%v", facts, err)
+	}
+	_, attemptFacts = recoveryAttemptFacts(published, facts)
+	statuses, _ = projectRecoveryStatuses(t.Context(), attemptFacts, facts, nil, 2, nil)
+	active = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 2 })
+	historical = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 1 })
+	if active < 0 || statuses[active].State != "failed" || !statuses[active].NeedsAttention || statuses[active].Diagnostic != "attempt 2 failed current" || !slices.Contains(statuses[active].Blockers, "needs attention: operator decision required") || historical < 0 || statuses[historical].State != "failed" || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" {
+		t.Fatalf("terminal set projection=%#v", statuses)
+	}
+
+	statusMode = "clear"
+	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
+	if err != nil || len(facts) != 1 || facts[0].Attempt != 3 || facts[0].CurrentAttempt != 2 || facts[0].NeedsAttention {
+		t.Fatalf("terminal clear facts=%#v err=%v", facts, err)
+	}
+	_, attemptFacts = recoveryAttemptFacts(published, facts)
+	statuses, _ = projectRecoveryStatuses(t.Context(), attemptFacts, facts, nil, 2, nil)
+	active = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 2 })
+	historical = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 1 })
+	if active < 0 || statuses[active].State != "failed" || statuses[active].NeedsAttention || statuses[active].Diagnostic != "attempt 2 failed current" || historical < 0 || statuses[historical].State != "failed" || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" {
+		t.Fatalf("terminal clear projection=%#v", statuses)
+	}
+
+	statusMode = "malformed"
+	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, published, false)
+	if err != nil || len(facts) != 1 || facts[0].CurrentAttempt != 2 || !facts[0].NeedsAttention || !slices.Contains(facts[0].Blockers, "needs attention: direct status intent is incomplete: use needs-attention or clear with a nonempty reason") {
+		t.Fatalf("malformed facts=%#v err=%v", facts, err)
+	}
+	_, attemptFacts = recoveryAttemptFacts(published, facts)
+	statuses, _ = projectRecoveryStatuses(t.Context(), attemptFacts, facts, nil, 2, nil)
+	active = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 2 })
+	historical = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 && status.Attempt == 1 })
+	if active < 0 || !statuses[active].NeedsAttention || !slices.Contains(statuses[active].Blockers, "needs attention: direct status intent is incomplete: use needs-attention or clear with a nonempty reason") || historical < 0 || statuses[historical].NeedsAttention || statuses[historical].Diagnostic != "attempt 1 failed before retry" {
+		t.Fatalf("malformed projection=%#v", statuses)
 	}
 }
 

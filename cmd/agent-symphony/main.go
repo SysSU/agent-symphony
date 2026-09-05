@@ -1651,13 +1651,17 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 	}
 	decisions := orchestrator.Schedule(scheduled, orchestrator.Capacity{Global: capacity, Repositories: map[string]int{}})
 	for _, issue := range issues {
+		currentAttempt := issue.Attempt
+		if issue.CurrentAttempt > 0 {
+			currentAttempt = issue.CurrentAttempt
+		}
 		found := false
 		for j := range statuses {
 			if statuses[j].Repository == issue.Repository && statuses[j].Issue == issue.Issue {
 				statuses[j].Title, statuses[j].Priority, statuses[j].Dependencies = issue.Title, issue.Priority, issue.Dependencies
 				statuses[j].DispatchAuthorized = issue.DispatchAuthorized
-				statuses[j].NeedsAttention = statuses[j].Attempt == issue.Attempt && issue.NeedsAttention
-				if statuses[j].Attempt == issue.Attempt {
+				statuses[j].NeedsAttention = statuses[j].Attempt == currentAttempt && issue.NeedsAttention
+				if statuses[j].Attempt == currentAttempt {
 					statuses[j].Blockers = append(statuses[j].Blockers, issue.Blockers...)
 				}
 				if statuses[j].State == "failed" {

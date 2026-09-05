@@ -37,7 +37,7 @@ After an attempt has a pull request, other nonempty issue comments posted after 
 | None | `labels.issue_filter` | Optional repository-specific queue filter. When configured, an issue must currently have this label as well as `agent-ready`; removing it makes the issue ineligible. |
 | `needs-human-review` | `completion_policies.human_review_label` | Explicitly requests the human-review PR label and pending policy status. Human review is already the default when no completion label is present. |
 | `autonomous-merge` | `completion_policies.autonomous_merge_label` | Opts into coordinator-managed merge after all review, validation, repository-rule, and permission checks pass. Apply it after the latest issue-body edit. |
-| `needs-attention` | Fixed | Pairs with a reasoned direct-status comment to hold dispatch and move the current dashboard card to **Needs attention**. |
+| `needs-attention` | Fixed | Create this reserved label during setup. It pairs with a reasoned direct-status comment to hold dispatch and move the current dashboard card to **Needs attention**. |
 
 `needs-human-review` and `autonomous-merge` conflict; do not apply both. Required control-label names must be nonempty. `labels.issue_filter` may be omitted or empty; when nonempty, it must be unique like every other configured label name.
 
@@ -52,7 +52,7 @@ Authorized daemon, implementation, review, orchestrator, heartbeat, and other ag
 /agent-symphony status clear: REASON
 ```
 
-`REASON` must be nonempty and at most 1,024 bytes. Pair the comment with the fixed `needs-attention` label on the bound issue: add it when setting status and remove it when clearing. The newest valid comment from the currently authenticated Agent Symphony GitHub account wins across the issue and its current pull request when it agrees with that label. Edited, malformed, foreign, or reasonless comments do not change status. A missing reason or a comment/label mismatch remains visible as incomplete needs-attention instead of reporting success. Needs-attention prevents a queued issue from dispatching and moves the current dashboard card to **Needs attention** without replacing its underlying attempt lifecycle; clearing it restores the authoritative issue/PR lifecycle projection.
+`REASON` must be nonempty and at most 1,024 bytes. Pair the comment with the fixed `needs-attention` label on the bound issue: add it when setting status and remove it when clearing. The newest valid comment from the currently authenticated Agent Symphony GitHub account wins across the issue and its current pull request when it agrees with that label. Foreign or edited comments do not change status. An authenticated unedited malformed or reasonless status comment, or any comment/label mismatch, remains visible as incomplete needs-attention instead of reporting success. Needs-attention prevents a queued issue from dispatching and moves the current dashboard card to **Needs attention** without replacing its underlying attempt lifecycle; clearing it restores the authoritative issue/PR lifecycle projection.
 
 Use native `gh issue comment`, `gh pr comment`, `gh issue edit`, and `gh pr edit` commands for authorized comments, labels, and Markdown links. A zero exit status proves only that the CLI request completed: re-read the exact issue or pull request before reporting the mutation as successful. Missing authentication, insufficient permission, a failed post, or a failed re-read is an explicit failure and must never be reported as success.
 

@@ -220,7 +220,7 @@ func (c Config) Validate() error {
 	if len(parts) != 2 || !repositoryPart(parts[0]) || !repositoryPart(parts[1]) {
 		problems = append(problems, "repository must be owner/name")
 	}
-	labels := []string{c.Labels.Ready, c.Labels.PriorityP1, c.Labels.PriorityP2, c.Labels.PriorityP3, c.CompletionPolicies.HumanReview, c.CompletionPolicies.AutonomousMerge}
+	labels := []string{c.Labels.Ready, c.Labels.PriorityP1, c.Labels.PriorityP2, c.Labels.PriorityP3, c.CompletionPolicies.HumanReview, c.CompletionPolicies.AutonomousMerge, internalgithub.NeedsAttentionLabel}
 	if c.Labels.IssueFilter != "" {
 		labels = append(labels, c.Labels.IssueFilter)
 	}

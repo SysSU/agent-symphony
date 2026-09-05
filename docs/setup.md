@@ -69,9 +69,10 @@ gh label create "priority:P2" --color D97706 --description "Middle Agent Symphon
 gh label create "priority:P3" --color FBCA04 --description "Lowest Agent Symphony priority"
 gh label create needs-human-review --color D93F0B --description "Require explicit human review"
 gh label create autonomous-merge --color 5319E7 --description "Allow policy-controlled autonomous merge"
+gh label create needs-attention --color D93F0B --description "Agent Symphony requires operator attention"
 ```
 
-If you change the names in `.agent-symphony.yaml`, create those names instead. See [GitHub controls](github-controls.md) for their meaning.
+If you change the names in `.agent-symphony.yaml`, create those names instead. `needs-attention` is fixed and cannot be reused as a configured workflow label. See [GitHub controls](github-controls.md) for their meaning.
 
 ## 4. Run diagnostics
 

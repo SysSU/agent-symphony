@@ -46,7 +46,7 @@ func TestDirectStatusUsesNewestAuthenticatedIssueOrPullRequestComment(t *testing
 		case "/repos/o/r/issues/10":
 			labels := []any{}
 			if labelPresent {
-				labels = append(labels, map[string]any{"name": directStatusLabel})
+				labels = append(labels, map[string]any{"name": NeedsAttentionLabel})
 			}
 			response = map[string]any{"labels": labels}
 		case "/repos/o/r/issues/10/comments?per_page=100&page=1":
@@ -79,6 +79,14 @@ func TestDirectStatusUsesNewestAuthenticatedIssueOrPullRequestComment(t *testing
 	status, err = source.directStatus(t.Context(), 10, 11)
 	if err != nil || status.NeedsAttention || status.Reason != "review verified the correction" {
 		t.Fatalf("clear status = %#v, %v", status, err)
+	}
+	for i, body := range []string{"/agent-symphony status needs-attention:", "/agent-symphony status blocked: unsupported vocabulary"} {
+		createdAt := now.Add(time.Duration(5+i) * time.Minute)
+		pullComments = append(pullComments, map[string]any{"id": 5 + i, "body": body, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
+		status, err = source.directStatus(t.Context(), 10, 11)
+		if err != nil || !status.NeedsAttention || status.Reason != "direct status intent is incomplete: use needs-attention or clear with a nonempty reason" {
+			t.Fatalf("malformed status = %#v, %v", status, err)
+		}
 	}
 }
 
@@ -295,7 +303,7 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 			}
 			labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": priority}}
 			if needsAttentionLabel {
-				labels = append(labels, map[string]any{"name": directStatusLabel})
+				labels = append(labels, map[string]any{"name": NeedsAttentionLabel})
 			}
 			response = map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 9}, "labels": labels}
 		case "GET /repos/o/r/issues/10/timeline?per_page=100&page=1":
@@ -412,27 +420,27 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	needsAttentionLabel = true
 	authoritativeAttempt := []RecoveryAttemptFact{{Repository: "o/r", Issue: 10, Attempt: 2, PR: 11, State: "active"}}
 	reviewAttention, err := FetchIssueFacts(context.Background(), api, cfg, authoritativeAttempt, true)
-	if err != nil || len(reviewAttention) != 1 || reviewAttention[0].Attempt != 2 || !reviewAttention[0].NeedsAttention || reviewAttention[0].Eligible || !reviewAttention[0].DispatchAuthorized || reviewAttention[0].RecoveryAuthorized || !slices.Contains(reviewAttention[0].Blockers, "needs attention: review found a blocking regression") {
+	if err != nil || len(reviewAttention) != 1 || reviewAttention[0].Attempt != 2 || reviewAttention[0].CurrentAttempt != 2 || !reviewAttention[0].NeedsAttention || reviewAttention[0].Eligible || !reviewAttention[0].DispatchAuthorized || reviewAttention[0].RecoveryAuthorized || !slices.Contains(reviewAttention[0].Blockers, "needs attention: review found a blocking regression") {
 		t.Fatalf("review attention facts=%#v err=%v", reviewAttention, err)
 	}
 	needsAttentionLabel = false
 	reviewClearAt := reviewSetAt.Add(time.Minute)
 	pullComments = append(pullComments, map[string]any{"id": 501, "body": "/agent-symphony status clear: review verified the correction", "created_at": reviewClearAt, "updated_at": reviewClearAt, "user": map[string]any{"id": 42}})
 	reviewCleared, err := FetchIssueFacts(context.Background(), api, cfg, authoritativeAttempt, true)
-	if err != nil || len(reviewCleared) != 1 || reviewCleared[0].Attempt != 2 || reviewCleared[0].NeedsAttention || len(reviewCleared[0].Blockers) != 0 {
+	if err != nil || len(reviewCleared) != 1 || reviewCleared[0].Attempt != 2 || reviewCleared[0].CurrentAttempt != 2 || reviewCleared[0].NeedsAttention || len(reviewCleared[0].Blockers) != 0 {
 		t.Fatalf("review clear facts=%#v err=%v", reviewCleared, err)
 	}
 	terminal, _ := TerminalFailureMarker(10, 2, now.Add(20*time.Minute))
 	snapshotBodies = append(snapshotBodies, "Attempt failed closed: worker produced no repository changes\n\n"+terminal)
 	failed, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || len(failed) != 1 || failed[0].Active || failed[0].ActiveAttempt != nil || len(failed[0].TerminalAttempts) != 1 || failed[0].TerminalAttempts[0].Attempt != 2 || failed[0].TerminalAttempts[0].BaseSHA != "abcdef0" || failed[0].TerminalAttempts[0].Diagnostic != "worker produced no repository changes" || failed[0].RecoveryAttempt != 2 || !failed[0].RecoveryAuthorized || failed[0].Attempt != 3 || len(failed[0].Blockers) == 0 {
+	if err != nil || len(failed) != 1 || failed[0].Active || failed[0].ActiveAttempt != nil || len(failed[0].TerminalAttempts) != 1 || failed[0].TerminalAttempts[0].Attempt != 2 || failed[0].TerminalAttempts[0].BaseSHA != "abcdef0" || failed[0].TerminalAttempts[0].Diagnostic != "worker produced no repository changes" || failed[0].RecoveryAttempt != 2 || !failed[0].RecoveryAuthorized || failed[0].Attempt != 3 || failed[0].CurrentAttempt != 2 || len(failed[0].Blockers) == 0 {
 		t.Fatalf("terminal transition facts=%#v err=%v", failed, err)
 	}
 	third, _ := ActiveAttemptMarker("o/r", 10, 3, "abcdef0")
 	thirdTerminal, _ := TerminalFailureMarker(10, 3, now.Add(30*time.Minute))
 	snapshotBodies = append(snapshotBodies, third, "Attempt failed closed: newer failure\n\n"+thirdTerminal)
 	history, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || len(history) != 1 || len(history[0].TerminalAttempts) != 2 || history[0].TerminalAttempts[0].Attempt != 2 || history[0].TerminalAttempts[1].Attempt != 3 || history[0].RecoveryAttempt != 3 || !history[0].RecoveryAuthorized {
+	if err != nil || len(history) != 1 || len(history[0].TerminalAttempts) != 2 || history[0].TerminalAttempts[0].Attempt != 2 || history[0].TerminalAttempts[1].Attempt != 3 || history[0].RecoveryAttempt != 3 || !history[0].RecoveryAuthorized || history[0].Attempt != 4 || history[0].CurrentAttempt != 3 {
 		t.Fatalf("terminal history=%#v err=%v", history, err)
 	}
 
