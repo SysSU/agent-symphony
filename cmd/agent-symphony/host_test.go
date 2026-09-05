@@ -868,6 +868,19 @@ func TestWorkerResultArtifactFailsClosed(t *testing.T) {
 	})
 }
 
+func TestWorkerResultArtifactRedactsInteractiveCredentials(t *testing.T) {
+	t.Setenv("MODEL_API_KEY", "issue-214-secret-value")
+	path := filepath.Join(t.TempDir(), "attempt.result.json")
+	body := `{"type":"agent-symphony-result-v1","validation":"issue-214-secret-value","documentation":"none"}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := readWorkerResult(path)
+	if err != nil || strings.Contains(result.Validation, "issue-214-secret-value") || !strings.Contains(result.Validation, "REDACTED") {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}
+
 func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
 	for _, test := range []struct {
 		name, failure, kind string

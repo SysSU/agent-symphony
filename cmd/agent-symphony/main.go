@@ -270,6 +270,20 @@ type deploymentIdentity struct {
 	Repository string `json:"repository"`
 }
 
+func readDeploymentIdentity(stateRoot string) (deploymentIdentity, error) {
+	body, err := readDashboardFile(filepath.Join(stateRoot, "deployment.json"), maxDashboardStateBytes)
+	if err != nil {
+		return deploymentIdentity{}, err
+	}
+	var identity deploymentIdentity
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&identity) != nil || decoder.Decode(&struct{}{}) != io.EOF || identity.Version != deploymentIdentityVersion || identity.Repository == "" {
+		return deploymentIdentity{}, errors.New("runtime state has an invalid deployment identity")
+	}
+	return identity, nil
+}
+
 func bindDeployment(stateRoot, repository string) error {
 	if info, err := os.Lstat(stateRoot); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
@@ -284,13 +298,7 @@ func bindDeployment(stateRoot, repository string) error {
 	}
 	path := filepath.Join(stateRoot, "deployment.json")
 	want := deploymentIdentity{deploymentIdentityVersion, repository}
-	if body, err := readDashboardFile(path, maxDashboardStateBytes); err == nil {
-		var current deploymentIdentity
-		decoder := json.NewDecoder(bytes.NewReader(body))
-		decoder.DisallowUnknownFields()
-		if decoder.Decode(&current) != nil || decoder.Decode(&struct{}{}) != io.EOF || current.Version != deploymentIdentityVersion || current.Repository == "" {
-			return errors.New("runtime state has an invalid deployment identity")
-		}
+	if current, err := readDeploymentIdentity(stateRoot); err == nil {
 		if current.Repository != repository {
 			return fmt.Errorf("runtime state is bound to project %s, not %s", current.Repository, repository)
 		}
@@ -435,6 +443,97 @@ func privateDashboardPasswordFile(info os.FileInfo) bool {
 	return !ok || int(stat.Uid) == os.Geteuid()
 }
 
+func implementationChatTarget(statuses []orchestrator.RecoveryStatus, issue int) (orchestrator.RecoveryStatus, orchestrator.AttemptSession, error) {
+	var latest *orchestrator.RecoveryStatus
+	var target *orchestrator.RecoveryStatus
+	for i := range statuses {
+		status := &statuses[i]
+		if status.Issue != issue {
+			continue
+		}
+		if latest == nil || status.Attempt > latest.Attempt {
+			latest = status
+		}
+		if status.CurrentPhase != "implementation" && status.CurrentPhase != "findings-handoff" && status.State != "running" {
+			continue
+		}
+		if target != nil {
+			return orchestrator.RecoveryStatus{}, orchestrator.AttemptSession{}, fmt.Errorf("issue #%d has multiple current implementation attempts; reconcile the project before retrying", issue)
+		}
+		target = status
+	}
+	if latest == nil {
+		return orchestrator.RecoveryStatus{}, orchestrator.AttemptSession{}, fmt.Errorf("issue #%d has no projected attempt; reconcile the project after the issue becomes eligible", issue)
+	}
+	if target == nil {
+		var session orchestrator.AttemptSession
+		if index := slices.IndexFunc(latest.Sessions, func(session orchestrator.AttemptSession) bool {
+			return session.Role == agentruntime.SessionRoleImplementation
+		}); index >= 0 {
+			session = latest.Sessions[index]
+		} else if latest.Session != "" {
+			session = orchestrator.AttemptSession{Name: latest.Session, State: latest.State}
+		}
+		return orchestrator.RecoveryStatus{}, orchestrator.AttemptSession{}, inactiveImplementationChatError(*latest, session)
+	}
+
+	var session orchestrator.AttemptSession
+	if len(target.Sessions) == 0 && target.Session != "" {
+		session = orchestrator.AttemptSession{Role: agentruntime.SessionRoleImplementation, Name: target.Session, State: target.State, Current: true}
+	} else {
+		index := slices.IndexFunc(target.Sessions, func(session orchestrator.AttemptSession) bool {
+			return session.Role == agentruntime.SessionRoleImplementation && session.Current
+		})
+		if index >= 0 {
+			session = target.Sessions[index]
+		}
+	}
+	want, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, target.Repository, target.Issue, target.Attempt)
+	if err != nil || session.Name != want {
+		return orchestrator.RecoveryStatus{}, orchestrator.AttemptSession{}, fmt.Errorf("issue #%d attempt %d has no valid current implementation session; next action: %s", issue, target.Attempt, firstNonempty(target.Action, "reconcile and inspect the attempt"))
+	}
+	if session.State != "running" {
+		return orchestrator.RecoveryStatus{}, orchestrator.AttemptSession{}, inactiveImplementationChatError(*target, session)
+	}
+	return *target, session, nil
+}
+
+func inactiveImplementationChatError(status orchestrator.RecoveryStatus, session orchestrator.AttemptSession) error {
+	identity := "has no active implementation session"
+	if session.Name != "" {
+		identity = fmt.Sprintf("implementation session %s is inactive (%s)", session.Name, firstNonempty(session.State, "unknown"))
+	}
+	return fmt.Errorf("issue #%d attempt %d %s; next action: %s", status.Issue, status.Attempt, identity, firstNonempty(status.Action, "reconcile and inspect the attempt"))
+}
+
+func chatIssue(stateRoot string, issue int, stdin io.Reader, stdout, stderr io.Writer) error {
+	deployment, err := readDeploymentIdentity(stateRoot)
+	if err != nil {
+		return fmt.Errorf("read deployment identity: %w", err)
+	}
+	snapshot, err := (&dashboardServer{stateRoot: stateRoot, repository: deployment.Repository}).readStatus()
+	if err != nil {
+		return fmt.Errorf("read projected issue sessions: %w", err)
+	}
+	status, session, err := implementationChatTarget(snapshot.Statuses, issue)
+	if err != nil {
+		return err
+	}
+	if err := configureProjectTmux(stateRoot); err != nil {
+		return fmt.Errorf("configure project tmux: %w", err)
+	}
+	if !tmuxPaneLive(context.Background(), "tmux", session.Name) {
+		return fmt.Errorf("issue #%d attempt %d implementation session %s is missing or inactive; reconcile project runtime state, then retry chat or inspect the issue", issue, status.Attempt, session.Name)
+	}
+	fmt.Fprintf(stderr, "Attaching to %s for issue #%d. Detach with Ctrl-b d.\n", session.Name, issue)
+	command := exec.Command("tmux", "attach-session", "-t", "="+session.Name)
+	command.Dir, command.Stdin, command.Stdout, command.Stderr = "/tmp", stdin, stdout, stderr
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("implementation session %s ended before attachment completed; reconcile and inspect issue #%d", session.Name, issue)
+	}
+	return nil
+}
+
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == "--version" {
 		fmt.Fprintln(stdout, releaseVersion())
@@ -548,6 +647,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		if err := agentHost(context.Background(), fs.Arg(0), os.Stdin, stdout); err != nil {
 			return fail(stderr, false, command, internalgithub.RedactEnvironment(err.Error(), os.Environ()))
+		}
+		return 0
+	case "chat":
+		if fs.NArg() != 0 || *issueNumber <= 0 || *runtimeState == "" || !onlyFlags(fs, "issue", "runtime-state") {
+			return misuse(stderr, wantsJSON, command, "usage: agent-symphony chat --issue number --runtime-state path")
+		}
+		if err := chatIssue(*runtimeState, *issueNumber, os.Stdin, stdout, stderr); err != nil {
+			return fail(stderr, false, command, err.Error())
 		}
 		return 0
 	case "serve":
@@ -1965,13 +2072,21 @@ func seedAttemptSource(ctx context.Context, checkout, repositoryName, attemptRoo
 }
 
 func startIssueAttempt(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact) (agentruntime.Manifest, error) {
-	attempt := agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Command: cfg.Commands.Implementation, Eligible: func() bool { return issue.DispatchAuthorized }}
+	command, interactive := interactiveImplementationCommand(cfg.Commands.Implementation)
+	attempt := agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Command: command, Interactive: interactive, Eligible: func() bool { return issue.DispatchAuthorized }}
 	identity, err := agentruntime.AttemptIdentity(runtime.Root, attempt)
 	if err != nil {
 		return agentruntime.Manifest{}, err
 	}
-	attempt.Context = implementationPrompt(issue, identity)
+	attempt.Context = implementationPrompt(issue, identity, interactive)
 	return runtime.PrepareAndStart(ctx, attempt)
+}
+
+func interactiveImplementationCommand(command []string) ([]string, bool) {
+	if slices.Equal(command, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
+		return []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}, true
+	}
+	return command, false
 }
 
 func resumeBoundAttempts(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact) ([]agentruntime.Manifest, error) {
@@ -2028,8 +2143,12 @@ func dispatchIssues(ctx context.Context, api internalgithub.API, runtime *agentr
 	return nil
 }
 
-func implementationPrompt(issue internalgithub.RecoveryIssueFact, identity agentruntime.Manifest) string {
-	return fmt.Sprintf("Project: %s\nIssue: #%d\nAttempt: %d\nBase branch: %s\nBranch: %s\nWorktree: %s\nSession: %s\n\n%s\n\nDirect status: use the installed gh CLI to post one unedited comment on issue #%d or its pull request: `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON`. A nonempty reason is required. Pair the comment with the `needs-attention` label on the bound issue: add it when setting status and remove it when clearing. Re-read both the comment and label before reporting the status changed; authentication, authorization, or partial-update errors are failures, never success. Other issue-authorized comments, labels, and Markdown links may also be updated directly with gh.\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Agent Symphony captures stdout outside the worktree. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.BaseBranch, identity.Branch, identity.Worktree, identity.Session, issue.Body, issue.Issue)
+func implementationPrompt(issue internalgithub.RecoveryIssueFact, identity agentruntime.Manifest, interactive bool) string {
+	completion := "Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Agent Symphony captures stdout outside the worktree. Do not wrap it in Markdown fences or emit another stdout object."
+	if interactive {
+		completion = "Before exiting, write exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence to the existing private file named by " + agentruntime.WorkerResultEnvironment + ". Write the file in place without replacing it. Terminal output is operator-visible conversation, not the result artifact."
+	}
+	return fmt.Sprintf("Project: %s\nIssue: #%d\nAttempt: %d\nBase branch: %s\nBranch: %s\nWorktree: %s\nSession: %s\n\n%s\n\nDirect status: use the installed gh CLI to post one unedited comment on issue #%d or its pull request: `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON`. A nonempty reason is required. Pair the comment with the `needs-attention` label on the bound issue: add it when setting status and remove it when clearing. Re-read both the comment and label before reporting the status changed; authentication, authorization, or partial-update errors are failures, never success. Other issue-authorized comments, labels, and Markdown links may also be updated directly with gh.\n\nCompletion contract: %s\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.BaseBranch, identity.Branch, identity.Worktree, identity.Session, issue.Body, issue.Issue, completion)
 }
 
 type workerResult struct {
@@ -2491,7 +2610,8 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 	}
 	review := independentReviewResult{Type: "agent-symphony-review-v1", Status: "clean"}
 	pending := false
-	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: cfg.Commands.Implementation}
+	command, interactive := interactiveImplementationCommand(cfg.Commands.Implementation)
+	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: command, Interactive: interactive}
 	if (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued") && manifest.ReviewHead == head && (manifest.ReviewSnapshot != "" || manifest.ReviewSession != "") {
 		var cleanupErr error
 		manifest, cleanupErr = cleanupReviewOutcome(ctx, runtimeState, attempt, reviewBoundary(stateRoot), reviewEnv, manifest, snapshotRoot)
@@ -4057,6 +4177,7 @@ func usage(w io.Writer) {
 commands:
 	install-host  provision the native worker/reviewer boundary (run as root)
 	agent-host    execute the implementation, review, or orchestrator boundary
+	chat          attach to the active implementation session for an issue
 	init          create .agent-symphony.yaml with project defaults
 	validate      validate configuration
 	config view   print validated configuration

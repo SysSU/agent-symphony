@@ -52,9 +52,15 @@ async function mockDashboard(page, closeReason = "", reviewPlanResponse = { stat
     return route.fulfill(reviewPlanResponse);
   });
   await page.routeWebSocket(/\/(?:reviewer\/)?terminal\?/, (socket) => {
-    const record = { url: socket.url(), messages: [] };
+    const record = { url: socket.url(), messages: [], replied: false };
     sockets.push(record);
-    socket.onMessage((message) => record.messages.push(message));
+    socket.onMessage((message) => {
+      record.messages.push(message);
+      if (typeof message !== "string" && !record.replied) {
+        record.replied = true;
+        socket.send(Buffer.from("agent: acknowledged\r\n"));
+      }
+    });
     if (closeReason) setTimeout(() => void socket.close({ code: 1000, reason: closeReason }), 0);
   });
   return { sockets, reviewPlanRequests };
@@ -96,8 +102,10 @@ test("opens and chats with both exact review modes", async ({ page }) => {
   await page.keyboard.type("implementation input");
   await expect.poll(() => sockets[2]?.messages.some((message) => typeof message !== "string")).toBe(true);
   const target = new URL(sockets[2].url);
+  await expect(page.getByText("agent: acknowledged", { exact: false })).toBeVisible();
   expect(target.pathname).toBe("/terminal");
   expect(Object.fromEntries(target.searchParams)).toEqual({ repository: attempt.repository, issue: "163", attempt: "1" });
+  expect(Buffer.concat(sockets[2].messages.filter((message) => typeof message !== "string").map((message) => Buffer.from(message))).toString()).toContain("implementation input");
   expect(errors).toEqual([]);
 });
 

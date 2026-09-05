@@ -1563,7 +1563,7 @@ func readWorkerResult(path string) (workerResult, error) {
 	if statErr != nil || finalStatErr != nil || !opened.Mode().IsRegular() || !final.Mode().IsRegular() || !os.SameFile(info, opened) || !os.SameFile(opened, final) || opened.Size() != final.Size() || !opened.ModTime().Equal(final.ModTime()) || readErr != nil || closeErr != nil || len(body) > agentruntime.WorkerResultMaxBytes {
 		return workerResult{}, errors.New("worker result is invalid")
 	}
-	result, err := parseWorkerResult(body)
+	result, err := parseWorkerResult([]byte(internalgithub.RedactEnvironment(string(body), os.Environ())))
 	if err != nil {
 		return workerResult{}, err
 	}
