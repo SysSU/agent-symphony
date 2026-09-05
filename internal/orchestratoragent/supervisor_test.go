@@ -495,7 +495,7 @@ func TestHeartbeatUsesSeparateOneShotAgentAndReplacesLatestReport(t *testing.T) 
 		t.Fatal(err)
 	}
 	contract, err := os.ReadFile(filepath.Join(agent.AuditWorkspace, "orchestrator-launch.json"))
-	if err != nil || !strings.Contains(string(contract), `"one_shot": true`) || !strings.Contains(string(contract), `"timeout_seconds": 240`) || !strings.Contains(string(contract), filepath.Join(agent.AuditWorkspace, auditResultFile)) || strings.Contains(string(contract), auditResultPlaceholder) || !strings.Contains(string(contract), "separate one-shot") || !strings.Contains(string(contract), "last live-verified completed transition") || !strings.Contains(string(contract), "no more than eight live tool calls") || !strings.Contains(string(contract), "each live command at most 20 seconds") || !strings.Contains(string(contract), "stop checking after three minutes") || !strings.Contains(string(contract), `\"issue\":161`) || !strings.Contains(string(contract), `\"current_phase\":\"findings-handoff\"`) || !strings.Contains(string(contract), `\"pr\":165`) || !strings.Contains(string(contract), head) || !strings.Contains(string(contract), `\"state\":\"completed\"`) || !strings.Contains(string(contract), "deliver retained feedback result") || !strings.Contains(string(contract), firstHeartbeat.Format(time.RFC3339)) || !strings.Contains(string(contract), "reconciliation deadline exceeded") || strings.Contains(string(contract), "abc123") || len(contract) > 128<<10 {
+	if err != nil || !strings.Contains(string(contract), `"one_shot": true`) || !strings.Contains(string(contract), `"timeout_seconds": 240`) || !strings.Contains(string(contract), filepath.Join(agent.AuditWorkspace, auditResultFile)) || strings.Contains(string(contract), auditResultPlaceholder) || !strings.Contains(string(contract), "separate one-shot") || !strings.Contains(string(contract), "last live-verified completed transition") || !strings.Contains(string(contract), "Observable progress") || !strings.Contains(string(contract), "two consecutive observations") || !strings.Contains(string(contract), "previous_heartbeat_report") || !strings.Contains(string(contract), runner.auditOutput) || !strings.Contains(string(contract), "do not repeat an identical current update") || !strings.Contains(string(contract), "do not claim, schedule, or implement") || !strings.Contains(string(contract), "no more than eight live tool calls") || !strings.Contains(string(contract), "each live command at most 20 seconds") || !strings.Contains(string(contract), "stop checking after three minutes") || !strings.Contains(string(contract), `\"issue\":161`) || !strings.Contains(string(contract), `\"current_phase\":\"findings-handoff\"`) || !strings.Contains(string(contract), `\"pr\":165`) || !strings.Contains(string(contract), head) || !strings.Contains(string(contract), `\"state\":\"completed\"`) || !strings.Contains(string(contract), "deliver retained feedback result") || !strings.Contains(string(contract), firstHeartbeat.Format(time.RFC3339)) || !strings.Contains(string(contract), "reconciliation deadline exceeded") || strings.Contains(string(contract), "abc123") || len(contract) > 128<<10 {
 		t.Fatalf("unsafe or incomplete audit contract=%q err=%v", contract, err)
 	}
 	report := waitHeartbeatReport(t, agent.Workspace, "completed")
@@ -552,6 +552,60 @@ func TestHeartbeatUsesSeparateOneShotAgentAndReplacesLatestReport(t *testing.T) 
 		t.Fatalf("terminal work received periodic audit: audits=%d err=%v", runner.auditStarts.Load(), err)
 	}
 	assertOnlyBoundedAttentionInput(t, runner)
+}
+
+func TestMonitoringAttentionCheckInIsExactAndDeduplicated(t *testing.T) {
+	now := time.Date(2026, 9, 4, 1, 2, 3, 0, time.UTC)
+	runner := &fakeRunner{}
+	agent := newTestSupervisor(t, runner, &now)
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, agent.Repository, 219, 1)
+	active := []orchestrator.RecoveryStatus{{Repository: agent.Repository, Issue: 219, Attempt: 1, State: "active", CurrentPhase: "implementation", DispatchAuthorized: true, NeedsAttention: true, Blockers: []string{"needs attention: no verified progress across two heartbeats"}, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "running", Current: true}}}}
+
+	status, err := agent.Observe(t.Context(), active)
+	if err != nil || status.PendingAttention != 1 {
+		t.Fatalf("active attention status=%#v err=%v", status, err)
+	}
+	var handoff attentionHandoff
+	body, err := os.ReadFile(filepath.Join(agent.Workspace, AttentionHandoffFile))
+	if err != nil || json.Unmarshal(body, &handoff) != nil || handoff.State != "waiting" || handoff.AttentionState != "active" {
+		t.Fatalf("active attention handoff=%s err=%v", body, err)
+	}
+	inputCommands := countAttentionInput(runner)
+	proposal := MessageProposal{Version: 1, Repository: agent.Repository, Issue: 219, Attempt: 1, Action: ProposalActionCheckIn, RequestID: "check-in-219-1", HandoffID: handoff.ID}
+	writeTestProposal(t, agent, proposal)
+	proposal, err = agent.MessageProposal(t.Context())
+	if err != nil || agent.ValidateAttentionProposal(proposal, active) != nil {
+		t.Fatalf("monitoring check-in=%#v err=%v", proposal, err)
+	}
+	if err := agent.ResolveMessageProposal(t.Context(), proposal.Binding, "running", "delivering fixed check-in"); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.ResolveMessageProposal(t.Context(), proposal.Binding, "succeeded", "fixed check-in delivered"); err != nil {
+		t.Fatal(err)
+	}
+	body, err = os.ReadFile(filepath.Join(agent.Workspace, AttentionHandoffFile))
+	if err != nil || json.Unmarshal(body, &handoff) != nil || handoff.State != "waiting" || handoff.Action != ProposalActionCheckIn {
+		t.Fatalf("waiting check-in handoff=%s err=%v", body, err)
+	}
+	if _, err := agent.Observe(t.Context(), active); err != nil || countAttentionInput(runner) != inputCommands {
+		t.Fatalf("unchanged attention repeated check-in wake: commands=%d want=%d err=%v", countAttentionInput(runner), inputCommands, err)
+	}
+	active[0].NeedsAttention, active[0].Blockers = false, nil
+	status, err = agent.Observe(t.Context(), active)
+	body, readErr := os.ReadFile(filepath.Join(agent.Workspace, AttentionHandoffFile))
+	if err != nil || readErr != nil || json.Unmarshal(body, &handoff) != nil || status.PendingAttention != 0 || handoff.State != "recovered" {
+		t.Fatalf("recovered status=%#v handoff=%s observe=%v read=%v", status, body, err, readErr)
+	}
+
+	proposal.HandoffID = ""
+	if err := ValidateMessageProposal(proposal); err == nil {
+		t.Fatal("monitoring check-in without exact handoff was accepted")
+	}
+	proposal.HandoffID = strings.Repeat("a", 64)
+	proposal.Message = "arbitrary instruction"
+	if err := ValidateMessageProposal(proposal); err == nil {
+		t.Fatal("monitoring check-in with arbitrary text was accepted")
+	}
 }
 
 func TestHeartbeatFinalResultArtifactFailsClosed(t *testing.T) {

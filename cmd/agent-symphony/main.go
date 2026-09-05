@@ -50,6 +50,7 @@ var (
 	githubClient       = &http.Client{Transport: internalgithub.CLITransport{}}
 	reconcileGitHubRun = reconcileGitHub
 	reconcileRetryRun  = reconcileGitHubWith
+	monitorCheckInRun  = deliverMonitoringCheckIn
 	reviewSnapshotRoot = ""
 	runningOnWSL       = func() bool { return runtime.GOOS == "linux" && isWSL() }
 	immutableCreate    = os.CreateTemp
@@ -963,7 +964,7 @@ func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.S
 		fmt.Fprintln(log, "orchestrator proposal: "+internalgithub.Redact(err.Error()))
 		return
 	}
-	if !slices.Contains([]string{orchestratoragent.ProposalActionRetry, orchestratoragent.ProposalActionRecover, orchestratoragent.ProposalActionAttention}, proposal.Action) || !operationMu.TryLock() {
+	if !slices.Contains([]string{orchestratoragent.ProposalActionCheckIn, orchestratoragent.ProposalActionRetry, orchestratoragent.ProposalActionRecover, orchestratoragent.ProposalActionAttention}, proposal.Action) || !operationMu.TryLock() {
 		return
 	}
 	defer operationMu.Unlock()
@@ -991,7 +992,7 @@ func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.S
 				return nil
 			},
 		})
-	case orchestratoragent.ProposalActionRecover, orchestratoragent.ProposalActionAttention:
+	case orchestratoragent.ProposalActionCheckIn, orchestratoragent.ProposalActionRecover, orchestratoragent.ProposalActionAttention:
 		var statuses []orchestrator.RecoveryStatus
 		statuses, err = reconcileGitHubRun(controlCtx, configPath, statePath, stateRoot, false)
 		if err == nil {
@@ -999,16 +1000,25 @@ func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.S
 				err = transitionRetryRefusal{validateErr}
 			}
 		}
+		if err == nil && proposal.Action == orchestratoragent.ProposalActionCheckIn {
+			if validateErr := validateMonitoringCheckIn(proposal, statuses); validateErr != nil {
+				err = transitionRetryRefusal{validateErr}
+			}
+		}
 		if err == nil {
 			detail := "the coordinator re-verified the exact attention target"
 			if proposal.Action == orchestratoragent.ProposalActionRecover {
 				detail += " and is running guarded attempt recovery"
+			} else if proposal.Action == orchestratoragent.ProposalActionCheckIn {
+				detail += " and is delivering the fixed monitoring check-in"
 			}
 			err = agent.ResolveMessageProposal(controlCtx, proposal.Binding, "running", detail)
 			running = err == nil
 		}
 		if err == nil && proposal.Action == orchestratoragent.ProposalActionRecover {
 			err = recoverDashboardAttempt(controlCtx, configPath, statePath, stateRoot, proposal.Issue, proposal.Attempt)
+		} else if err == nil && proposal.Action == orchestratoragent.ProposalActionCheckIn {
+			err = monitorCheckInRun(controlCtx, stateRoot, proposal)
 		}
 	}
 	if err != nil {
@@ -1033,6 +1043,8 @@ func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.S
 	detail := "the validated bounded coordinator action completed; waiting for a fresh projection"
 	if proposal.Action == orchestratoragent.ProposalActionAttention {
 		detail = proposal.Detail
+	} else if proposal.Action == orchestratoragent.ProposalActionCheckIn {
+		detail = "the fixed monitoring check-in reached the exact implementation owner; waiting for fresh status evidence"
 	}
 	if err := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "succeeded", detail); err != nil {
 		fmt.Fprintln(log, "orchestrator proposal outcome: "+internalgithub.Redact(err.Error()))
@@ -1059,6 +1071,44 @@ func validateTransitionRetry(proposal orchestratoragent.MessageProposal, statuse
 		return errors.New("retry target is not an authorized completed result awaiting validation or publication")
 	}
 	return nil
+}
+
+func validateMonitoringCheckIn(proposal orchestratoragent.MessageProposal, statuses []orchestrator.RecoveryStatus) error {
+	matches := slices.DeleteFunc(slices.Clone(statuses), func(status orchestrator.RecoveryStatus) bool {
+		return status.Repository != proposal.Repository || status.Issue != proposal.Issue || status.Attempt != proposal.Attempt
+	})
+	if len(matches) != 1 || !matches[0].NeedsAttention || !matches[0].DispatchAuthorized || !slices.Contains([]string{"active", "review-ready"}, matches[0].State) || !slices.ContainsFunc(matches[0].Sessions, func(session orchestrator.AttemptSession) bool {
+		return session.Role == agentruntime.SessionRoleImplementation && session.State == "running" && session.Current
+	}) {
+		return errors.New("monitoring check-in target is not the exact active implementation owner")
+	}
+	return nil
+}
+
+func deliverMonitoringCheckIn(ctx context.Context, stateRoot string, proposal orchestratoragent.MessageProposal) error {
+	runtimeState := newOperatorMessageRuntime(stateRoot)
+	return sendMonitoringCheckIn(ctx, &runtimeState, proposal)
+}
+
+func sendMonitoringCheckIn(ctx context.Context, runtimeState *agentruntime.Runtime, proposal orchestratoragent.MessageProposal) error {
+	manifests, err := runtimeState.Discover()
+	if err != nil {
+		return err
+	}
+	matches := slices.DeleteFunc(manifests, func(manifest agentruntime.Manifest) bool {
+		return manifest.Repository != proposal.Repository || manifest.Issue != proposal.Issue || manifest.Attempt != proposal.Attempt || manifest.State != "running"
+	})
+	if len(matches) != 1 || runtimeState.VerifyOwned(ctx, matches[0]) != nil {
+		return errors.New("monitoring check-in target does not have one verified live implementation owner")
+	}
+	payload, _ := json.Marshal(struct {
+		Type       string `json:"type"`
+		Repository string `json:"repository"`
+		Issue      int    `json:"issue"`
+		Attempt    int    `json:"attempt"`
+		Request    string `json:"request"`
+	}{"agent-symphony-monitoring-check-in-v1", proposal.Repository, proposal.Issue, proposal.Attempt, "Report current progress and the next step in this session. Continue only the implementation you already own. If blocked, set needs-attention with a specific reason through the direct GitHub status contract; clear a prior monitoring status only after fresh evidence shows recovery."})
+	return runtimeState.Deliver(ctx, matches[0], payload)
 }
 
 func confirmOperatorMessage(ctx context.Context, configPath, stateRoot string, proposal orchestratoragent.MessageProposal) (internalgithub.OperatorMessage, error) {

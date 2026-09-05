@@ -112,6 +112,7 @@ func TestHostTransitionRetryProposalReportsCoordinatorResolution(t *testing.T) {
 func TestHostAttentionActionsRequireExactBoundedHandoff(t *testing.T) {
 	handoff := strings.Repeat("a", 64)
 	for _, submitted := range []string{
+		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"check_in_attempt","request_id":"check-in-187-1","handoff_id":"` + handoff + `"}`,
 		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"recover_attempt","request_id":"recover-187-1","handoff_id":"` + handoff + `"}`,
 		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"human_attention","request_id":"attention-187-1","handoff_id":"` + handoff + `","detail":"operator repair is required"}`,
 	} {
@@ -121,6 +122,8 @@ func TestHostAttentionActionsRequireExactBoundedHandoff(t *testing.T) {
 		}
 	}
 	for _, submitted := range []string{
+		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"check_in_attempt","request_id":"check-in-187-1"}`,
+		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"check_in_attempt","request_id":"check-in-187-1","handoff_id":"` + handoff + `","message":"do more work"}`,
 		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"recover_attempt","request_id":"recover-187-1"}`,
 		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"human_attention","request_id":"attention-187-1","handoff_id":"` + handoff + `"}`,
 		`{"version":1,"repository":"o/r","issue":187,"attempt":1,"action":"shell","request_id":"unsafe","handoff_id":"` + handoff + `"}`,
