@@ -792,7 +792,7 @@ func TestDashboardOrchestratorTerminalIsExactAndLoopbackOnly(t *testing.T) {
 	service := &fakeDashboardOrchestrator{target: orchestratoragent.AttachTarget{Session: session}}
 	script := filepath.Join(t.TempDir(), "tmux")
 	body := "#!/bin/sh\ncase $1 in\n" +
-		"has-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\";;\n" +
+		"display-message) test \"$2\" = -p && test \"$3\" = -t && test \"$4\" = \"=$EXPECTED_SESSION:0.0\" && printf '0\\n';;\n" +
 		"attach-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\" || exit 2; printf 'orchestrator-ready\\r\\n'; sleep 30;;\n" +
 		"*) exit 2;;\nesac\n"
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
@@ -1171,7 +1171,7 @@ func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
 	}
 	script := filepath.Join(t.TempDir(), "tmux")
 	body := "#!/bin/sh\ncase $1 in\n" +
-		"has-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\";;\n" +
+		"display-message) test \"$2\" = -p && test \"$3\" = -t && test \"$4\" = \"=$EXPECTED_SESSION:0.0\" && printf '0\\n';;\n" +
 		"attach-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\" || exit 2; printf 'ready\\r\\n'; IFS= read -r input; stty size; printf 'got:%s\\r\\n' \"$input\"; sleep 30;;\n" +
 		"*) exit 2;;\nesac\n"
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
@@ -1322,6 +1322,111 @@ sleep 1
 	}
 }
 
+func TestDashboardAndCLIRejectRetainedDeadImplementationPane(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	root, err := os.MkdirTemp("/tmp", "agent-symphony-214-dead-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_PANE", "")
+	t.Setenv("TMUX_TMPDIR", "")
+	if err := configureProjectTmux(root); err != nil {
+		t.Fatal(err)
+	}
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 214, 1)
+	pane := agentruntime.PaneTarget(session)
+	for _, args := range [][]string{
+		{"-f", "/dev/null", "new-session", "-d", "-s", session, "sleep 30"},
+		{"set-option", "-w", "-t", pane, "remain-on-exit", "on"},
+		{"respawn-pane", "-k", "-t", pane, "--", "sh", "-c", "exit 0"},
+	} {
+		if output, err := exec.Command("tmux", args...).CombinedOutput(); err != nil {
+			t.Fatalf("tmux %v: %s: %v", args, output, err)
+		}
+	}
+	t.Cleanup(func() { _ = exec.Command("tmux", "kill-server").Run() })
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		output, _ := exec.Command("tmux", "display-message", "-p", "-t", pane, "#{pane_dead}").Output()
+		if strings.TrimSpace(string(output)) == "1" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tmux pane did not become retained-dead")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := exec.Command("tmux", "has-session", "-t", "="+session).Run(); err != nil {
+		t.Fatalf("dead pane was not retained: %v", err)
+	}
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 214, Attempt: 1, State: "active", CurrentPhase: "implementation", Session: session, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "running", Current: true}}}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := chatIssue(root, 214, strings.NewReader("must not be sent\n"), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "missing or inactive") {
+		t.Fatalf("retained-dead CLI error=%v", err)
+	}
+	server := httptest.NewServer(newDashboardHandler(t.Context(), root, "tmux"))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/terminal?issue=214&attempt=1"
+	connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
+	if err != nil {
+		t.Fatalf("retained-dead terminal dial response=%v err=%v", response, err)
+	}
+	defer connection.CloseNow()
+	_, _, err = connection.Read(t.Context())
+	var closeErr websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.StatusNormalClosure || closeErr.Reason != "Session ended." {
+		t.Fatalf("retained-dead terminal close=%#v err=%v", closeErr, err)
+	}
+}
+
+func TestDashboardImplementationTerminalRequiresRunningCurrentProjection(t *testing.T) {
+	root := t.TempDir()
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 214, 1)
+	called := filepath.Join(t.TempDir(), "tmux-called")
+	tmux := filepath.Join(t.TempDir(), "tmux")
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ntouch \"$TMUX_CALLED\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMUX_CALLED", called)
+	server := httptest.NewServer(newDashboardHandler(t.Context(), root, tmux))
+	defer server.Close()
+
+	for name, projected := range map[string]orchestrator.AttemptSession{
+		"not current": {Role: agentruntime.SessionRoleImplementation, Name: session, State: "running"},
+		"not running": {Role: agentruntime.SessionRoleImplementation, Name: session, State: "completed", Current: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 214, Attempt: 1, State: "active", Session: session, Sessions: []orchestrator.AttemptSession{projected}}
+			if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+				t.Fatal(err)
+			}
+			request, _ := http.NewRequest(http.MethodGet, server.URL+"/terminal?issue=214&attempt=1", nil)
+			request.Header.Set("Origin", server.URL)
+			response, err := server.Client().Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response.Body.Close()
+			if response.StatusCode != http.StatusNotFound {
+				t.Fatalf("terminal status=%d, want %d", response.StatusCode, http.StatusNotFound)
+			}
+		})
+	}
+	if _, err := os.Stat(called); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inactive projection reached tmux: %v", err)
+	}
+}
+
 func TestDashboardReviewerTerminalIsRoleBoundAndInteractive(t *testing.T) {
 	root := t.TempDir()
 	repository, issue, attempt := "o/r", 23, 2
@@ -1336,7 +1441,7 @@ func TestDashboardReviewerTerminalIsRoleBoundAndInteractive(t *testing.T) {
 	}
 	script := filepath.Join(t.TempDir(), "tmux")
 	body := "#!/bin/sh\ncase $1 in\n" +
-		"has-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\";;\n" +
+		"display-message) test \"$2\" = -p && test \"$3\" = -t && test \"$4\" = \"=$EXPECTED_SESSION:0.0\" && printf '0\\n';;\n" +
 		"attach-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\" || exit 2; read line; printf 'got:%s\\r\\n' \"$line\";;\n" +
 		"*) exit 2;;\nesac\n"
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
@@ -1523,11 +1628,12 @@ func TestDashboardTerminalRejectsTamperedIdentityAndInvalidMessages(t *testing.T
 	}
 
 	status.Session = "as-" + internalgithub.RepositoryIdentifier(status.Repository) + "-8-1"
+	status.Sessions = []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: status.Session, State: "running", Current: true}}
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
 		t.Fatal(err)
 	}
 	script := filepath.Join(t.TempDir(), "tmux")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ncase $1 in has-session) exit 0;; attach-session) sleep 30;; esac\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncase $1 in display-message) printf '0\\n';; attach-session) sleep 30;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(newDashboardHandler(t.Context(), root, script))
@@ -1571,7 +1677,7 @@ func TestDashboardMissingReviewerSessionClosesWithExplicitReason(t *testing.T) {
 	}
 	script := filepath.Join(t.TempDir(), "tmux")
 	attached := filepath.Join(t.TempDir(), "attached")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nif test \"$1\" = has-session; then exit 1; fi\ntouch \"$ATTACHED\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nif test \"$1\" = display-message; then exit 1; fi\ntouch \"$ATTACHED\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("ATTACHED", attached)
@@ -1601,7 +1707,7 @@ func TestDashboardTerminalAttachRaceClosesWithExplicitReason(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := filepath.Join(t.TempDir(), "tmux")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nif test \"$1\" = has-session; then exit 0; fi\nexit 1\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nif test \"$1\" = display-message; then printf '0\\n'; exit 0; fi\nexit 1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(newDashboardHandler(t.Context(), root, script))

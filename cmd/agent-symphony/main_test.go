@@ -409,6 +409,9 @@ func TestImplementationChatTargetRequiresOneRunningCurrentSession(t *testing.T) 
 
 func TestChatIssueExchangesInputWithExactTmuxSessionAndReportsMissingRuntime(t *testing.T) {
 	root := t.TempDir()
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
 	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 214, 2)
 	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 214, Attempt: 2, State: "active", CurrentPhase: "implementation", Action: "monitor the implementation session", Session: session, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "running", Current: true}}}
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
@@ -417,7 +420,7 @@ func TestChatIssueExchangesInputWithExactTmuxSessionAndReportsMissingRuntime(t *
 	bin := t.TempDir()
 	tmux := filepath.Join(bin, "tmux")
 	script := "#!/bin/sh\ncase $1 in\n" +
-		"has-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\";;\n" +
+		"display-message) test \"$2\" = -p && test \"$3\" = -t && test \"$4\" = \"=$EXPECTED_SESSION:0.0\" && test \"$5\" = '#{pane_dead}' && printf '0\\n';;\n" +
 		"attach-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\" || exit 2; IFS= read -r input; printf 'agent:%s\\n' \"$input\";;\n" +
 		"*) exit 2;;\nesac\n"
 	if err := os.WriteFile(tmux, []byte(script), 0o700); err != nil {
@@ -437,7 +440,7 @@ func TestChatIssueExchangesInputWithExactTmuxSessionAndReportsMissingRuntime(t *
 		t.Fatalf("TMUX_TMPDIR=%q, want %q", got, projectTmuxRoot(root))
 	}
 
-	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nif test \"$1\" = has-session; then exit 1; fi\nprintf attached >\"$ATTACHED\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nif test \"$1\" = display-message; then exit 1; fi\nprintf attached >\"$ATTACHED\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	attached := filepath.Join(t.TempDir(), "attached")
@@ -447,6 +450,33 @@ func TestChatIssueExchangesInputWithExactTmuxSessionAndReportsMissingRuntime(t *
 	}
 	if _, err := os.Stat(attached); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("missing session reached attach: %v", err)
+	}
+}
+
+func TestChatIssueRejectsStatusFromForeignRepositoryBeforeTmux(t *testing.T) {
+	root := t.TempDir()
+	if err := bindDeployment(root, "owner/local"); err != nil {
+		t.Fatal(err)
+	}
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "owner/foreign", 214, 1)
+	status := orchestrator.RecoveryStatus{Repository: "owner/foreign", Issue: 214, Attempt: 1, State: "active", CurrentPhase: "implementation", Session: session, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "running", Current: true}}}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	called := filepath.Join(t.TempDir(), "tmux-called")
+	if err := os.WriteFile(filepath.Join(bin, "tmux"), []byte("#!/bin/sh\ntouch \"$TMUX_CALLED\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TMUX_CALLED", called)
+
+	err := chatIssue(root, 214, strings.NewReader("must not be sent\n"), io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "status snapshot contains another project") {
+		t.Fatalf("foreign repository error=%v", err)
+	}
+	if _, err := os.Stat(called); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("foreign repository reached tmux: %v", err)
 	}
 }
 

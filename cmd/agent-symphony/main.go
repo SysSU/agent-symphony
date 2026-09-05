@@ -270,6 +270,20 @@ type deploymentIdentity struct {
 	Repository string `json:"repository"`
 }
 
+func readDeploymentIdentity(stateRoot string) (deploymentIdentity, error) {
+	body, err := readDashboardFile(filepath.Join(stateRoot, "deployment.json"), maxDashboardStateBytes)
+	if err != nil {
+		return deploymentIdentity{}, err
+	}
+	var identity deploymentIdentity
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&identity) != nil || decoder.Decode(&struct{}{}) != io.EOF || identity.Version != deploymentIdentityVersion || identity.Repository == "" {
+		return deploymentIdentity{}, errors.New("runtime state has an invalid deployment identity")
+	}
+	return identity, nil
+}
+
 func bindDeployment(stateRoot, repository string) error {
 	if info, err := os.Lstat(stateRoot); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
@@ -284,13 +298,7 @@ func bindDeployment(stateRoot, repository string) error {
 	}
 	path := filepath.Join(stateRoot, "deployment.json")
 	want := deploymentIdentity{deploymentIdentityVersion, repository}
-	if body, err := readDashboardFile(path, maxDashboardStateBytes); err == nil {
-		var current deploymentIdentity
-		decoder := json.NewDecoder(bytes.NewReader(body))
-		decoder.DisallowUnknownFields()
-		if decoder.Decode(&current) != nil || decoder.Decode(&struct{}{}) != io.EOF || current.Version != deploymentIdentityVersion || current.Repository == "" {
-			return errors.New("runtime state has an invalid deployment identity")
-		}
+	if current, err := readDeploymentIdentity(stateRoot); err == nil {
 		if current.Repository != repository {
 			return fmt.Errorf("runtime state is bound to project %s, not %s", current.Repository, repository)
 		}
@@ -499,7 +507,11 @@ func inactiveImplementationChatError(status orchestrator.RecoveryStatus, session
 }
 
 func chatIssue(stateRoot string, issue int, stdin io.Reader, stdout, stderr io.Writer) error {
-	snapshot, err := (&dashboardServer{stateRoot: stateRoot}).readStatus()
+	deployment, err := readDeploymentIdentity(stateRoot)
+	if err != nil {
+		return fmt.Errorf("read deployment identity: %w", err)
+	}
+	snapshot, err := (&dashboardServer{stateRoot: stateRoot, repository: deployment.Repository}).readStatus()
 	if err != nil {
 		return fmt.Errorf("read projected issue sessions: %w", err)
 	}
@@ -510,10 +522,8 @@ func chatIssue(stateRoot string, issue int, stdin io.Reader, stdout, stderr io.W
 	if err := configureProjectTmux(stateRoot); err != nil {
 		return fmt.Errorf("configure project tmux: %w", err)
 	}
-	probe := exec.Command("tmux", "has-session", "-t", "="+session.Name)
-	probe.Dir = "/tmp"
-	if probe.Run() != nil {
-		return fmt.Errorf("issue #%d attempt %d implementation session %s is missing; reconcile project runtime state, then retry chat or inspect the issue", issue, status.Attempt, session.Name)
+	if !tmuxPaneLive(context.Background(), "tmux", session.Name) {
+		return fmt.Errorf("issue #%d attempt %d implementation session %s is missing or inactive; reconcile project runtime state, then retry chat or inspect the issue", issue, status.Attempt, session.Name)
 	}
 	fmt.Fprintf(stderr, "Attaching to %s for issue #%d. Detach with Ctrl-b d.\n", session.Name, issue)
 	command := exec.Command("tmux", "attach-session", "-t", "="+session.Name)

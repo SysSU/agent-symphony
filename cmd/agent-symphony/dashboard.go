@@ -1136,9 +1136,7 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer conn.CloseNow()
-	probe := exec.CommandContext(r.Context(), s.tmux, "has-session", "-t", "="+session)
-	probe.Dir = "/tmp"
-	if probe.Run() != nil {
+	if !tmuxPaneLive(r.Context(), s.tmux, session) {
 		_ = conn.Close(websocket.StatusNormalClosure, "Session ended.")
 		return
 	}
@@ -1202,6 +1200,13 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 	_ = command.Wait()
 }
 
+func tmuxPaneLive(ctx context.Context, tmux, session string) bool {
+	command := exec.CommandContext(ctx, tmux, "display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_dead}")
+	command.Dir = "/tmp"
+	output, err := command.Output()
+	return err == nil && strings.TrimSpace(string(output)) == "0"
+}
+
 func (s *dashboardServer) projectedStatus(issue, attempt int) (orchestrator.RecoveryStatus, error) {
 	if issue < 1 || attempt < 1 {
 		return orchestrator.RecoveryStatus{}, errors.New("invalid attempt")
@@ -1251,10 +1256,10 @@ func (s *dashboardServer) projectedSession(issue, attempt int, role string) (orc
 		return orchestrator.AttemptSession{}, err
 	}
 	if len(status.Sessions) == 0 && role == agentruntime.SessionRoleImplementation {
-		return orchestrator.AttemptSession{Role: role, Name: status.Session, State: status.State}, nil
+		return orchestrator.AttemptSession{}, errors.New("attempt session is not projected as current")
 	}
 	index := slices.IndexFunc(status.Sessions, func(session orchestrator.AttemptSession) bool { return session.Role == role })
-	if index < 0 || status.Sessions[index].Name != want {
+	if index < 0 || status.Sessions[index].Name != want || status.Sessions[index].State != "running" || !status.Sessions[index].Current {
 		return orchestrator.AttemptSession{}, errors.New("attempt session not found")
 	}
 	return status.Sessions[index], nil
