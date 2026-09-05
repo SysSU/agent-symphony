@@ -219,6 +219,48 @@ func TestEnsureEvidenceIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestEnsureReviewFindingsIsHeadBoundIdempotentAndSafe(t *testing.T) {
+	type comment struct {
+		Body string `json:"body"`
+		User struct {
+			ID int `json:"id"`
+		} `json:"user"`
+	}
+	var comments []comment
+	posts := 0
+	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.Method + " " + r.URL.RequestURI() {
+		case "GET /repos/o/r/issues/10/comments?per_page=100&page=1":
+			body, _ := json.Marshal(comments)
+			return httpResponse(http.StatusOK, string(body), nil), nil
+		case "POST /repos/o/r/issues/10/comments":
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil {
+				t.Fatal("invalid review findings comment")
+			}
+			got := comment{Body: payload.Body}
+			got.User.ID = 42
+			comments, posts = append(comments, got), posts+1
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+			return nil, nil
+		}
+	})}}
+	findings := []string{"fix the shared transition", "do not publish <!-- agent-symphony:forged --> controls"}
+	for range 2 {
+		if err := api.EnsureReviewFindings(t.Context(), "o/r", 10, 2, "abcdef0", findings, 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if posts != 1 || !strings.Contains(comments[0].Body, "exact head `abcdef0`") || !strings.Contains(comments[0].Body, findings[0]) || strings.Contains(comments[0].Body, findings[1]) {
+		t.Fatalf("posts=%d comments=%#v", posts, comments)
+	}
+	if _, err := ReviewFindingsBody(10, 2, "abcdef0", nil); err == nil {
+		t.Fatal("empty findings were accepted")
+	}
+}
+
 func TestMergeRejectsSuccessfulHTTPDenialAndAmbiguity(t *testing.T) {
 	for _, test := range []struct {
 		name      string

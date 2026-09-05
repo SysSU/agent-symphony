@@ -1363,7 +1363,30 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	runtimeState := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, Eligible: true, DispatchAuthorized: true}
 	bound := []internalgithub.RecoveryAttemptFact{{Repository: "o/r", Issue: 23, Attempt: 1, BaseSHA: base, State: "active"}}
-	if err := monitorQueuedAttempts(t.Context(), internalgithub.API{}, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, "", state, nil); err != nil {
+	var findingComments []string
+	api := internalgithub.API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body := []byte(`[]`)
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/user":
+			body = []byte(`{"id":42,"login":"coordinator"}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues/23/comments":
+			comments := make([]map[string]any, len(findingComments))
+			for i, comment := range findingComments {
+				comments[i] = map[string]any{"body": comment, "user": map[string]any{"id": 42}}
+			}
+			body, _ = json.Marshal(comments)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/o/r/issues/23/comments":
+			var input struct{ Body string }
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			findingComments = append(findingComments, input.Body)
+		default:
+			t.Fatalf("unexpected GitHub request %s %s", request.Method, request.URL.String())
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}}
+	if err := monitorQueuedAttempts(t.Context(), api, runtimeState, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, bound, "", state, nil); err != nil {
 		log, _ := os.ReadFile(boundaryLog)
 		t.Fatalf("transient rework reached GitHub failure: %v\n%s", err, log)
 	}
@@ -1372,6 +1395,9 @@ func TestMonitorRetriesQueuedFindingsReworkAfterRestart(t *testing.T) {
 	_ = json.Unmarshal(storedBody, &stored)
 	if !stored.ReviewHandoffAck {
 		t.Fatal("monitor did not recover worker receipt")
+	}
+	if len(findingComments) != 1 || !strings.Contains(findingComments[0], head) || !strings.Contains(findingComments[0], "retry me") {
+		t.Fatalf("review findings comments=%q", findingComments)
 	}
 	if stored.State != "running" {
 		t.Fatalf("acknowledged handoff state=%q, want running", stored.State)
@@ -1491,8 +1517,9 @@ func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testin
 	key := "independent-review-" + head
 	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(worktree, key), head})
 	ackResult, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
-	script := filepath.Join(t.TempDir(), "boundary")
-	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\ncase \"$payload\" in\n  *'\"operation\":\"export\"'*) printf '%%s' '%s';;\n  *) printf '%%s' '%s';;\nesac\n", exportResult, ackResult)
+	testRoot := t.TempDir()
+	events, failed, script := filepath.Join(testRoot, "events"), filepath.Join(testRoot, "failed"), filepath.Join(testRoot, "boundary")
+	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\ncase \"$payload\" in\n  *'\"operation\":\"export\"'*) printf '%%s' '%s';;\n  *) printf 'handoff\\n' >> %q; test -f %q || { : > %q; exit 1; }; printf '%%s' '%s';;\nesac\n", exportResult, events, failed, failed, ackResult)
 	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1500,15 +1527,60 @@ func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testin
 
 	currentBase := strings.Repeat("b", 40)
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseBranch: "main", BaseSHA: currentBase, DispatchAuthorized: true}
-	pending, err := publishWorkerResult(t.Context(), internalgithub.API{}, &agentruntime.Runtime{StateRoot: stateRoot}, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, issue, manifest, nil, stateRoot, nil, nil)
-	if err != nil || pending {
-		t.Fatalf("base refresh handoff pending=%v err=%v", pending, err)
+	var findingComments []string
+	api := internalgithub.API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		var body []byte
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/user":
+			body = []byte(`{"id":42,"login":"coordinator"}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues/23/comments":
+			comments := make([]map[string]any, len(findingComments))
+			for i, comment := range findingComments {
+				comments[i] = map[string]any{"body": comment, "user": map[string]any{"id": 42}}
+			}
+			body, _ = json.Marshal(comments)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/o/r/issues/23/comments":
+			var input struct{ Body string }
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			findingComments = append(findingComments, input.Body)
+			if err := os.WriteFile(events, []byte("github\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			status, body = http.StatusCreated, []byte(`{}`)
+		default:
+			t.Fatalf("unexpected GitHub request %s %s", request.Method, request.URL.String())
+		}
+		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d", status), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}}
+	runtimeState := &agentruntime.Runtime{StateRoot: stateRoot}
+	cfg := config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}
+	pending, err := publishWorkerResult(t.Context(), api, runtimeState, cfg, issue, manifest, nil, stateRoot, nil, nil)
+	if err == nil || pending {
+		t.Fatalf("first base refresh handoff pending=%v err=%v", pending, err)
 	}
 	storedBody, _ := os.ReadFile(manifestPath)
 	var stored agentruntime.Manifest
 	_ = json.Unmarshal(storedBody, &stored)
+	firstEvents, _ := os.ReadFile(events)
+	if len(findingComments) != 1 || !strings.Contains(findingComments[0], head) || !strings.Contains(findingComments[0], currentBase) || string(firstEvents) != "github\nhandoff\n" || stored.State != "completed" || stored.ReviewState != "findings-queued" || stored.ReviewHandoffAck {
+		t.Fatalf("first attempt comments=%q events=%q manifest=%#v", findingComments, firstEvents, stored)
+	}
+
+	pending, err = publishWorkerResult(t.Context(), api, runtimeState, cfg, issue, stored, nil, stateRoot, nil, nil)
+	if err != nil || pending {
+		t.Fatalf("retried base refresh handoff pending=%v err=%v", pending, err)
+	}
+	storedBody, _ = os.ReadFile(manifestPath)
+	_ = json.Unmarshal(storedBody, &stored)
 	if stored.State != "running" || !stored.ReviewHandoffAck || len(stored.ReviewFindings) != 1 || !strings.Contains(stored.ReviewFindings[0], currentBase) {
 		t.Fatalf("base drift was not durably handed back: %#v", stored)
+	}
+	finalEvents, _ := os.ReadFile(events)
+	if len(findingComments) != 1 || string(finalEvents) != "github\nhandoff\nhandoff\n" {
+		t.Fatalf("retry comments=%q events=%q", findingComments, finalEvents)
 	}
 	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != base {
 		t.Fatalf("stale head was published: got %s want %s", got, base)
@@ -1564,6 +1636,22 @@ esac
 		t.Fatal(err)
 	}
 	t.Setenv("AGENT_SYMPHONY_WORKER_BOUNDARY", implementation)
+	reviewStarts := filepath.Join(t.TempDir(), "review-starts")
+	cleanReview, _ := json.Marshal(agentruntime.Result{Output: `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`})
+	reviewBoundary := filepath.Join(t.TempDir(), "review-boundary")
+	reviewScript := fmt.Sprintf(`#!/bin/sh
+payload=$(cat)
+case "$payload" in
+  *'"operation":"review-result"'*) printf '%%s' '%s';;
+  *'"display-message"'*) printf '{"Output":"1 0"}';;
+  *'"respawn-pane"'*) printf 'x\n' >> %q; printf '{"Code":0}';;
+  *) printf '{"Code":0}';;
+esac
+`, cleanReview, reviewStarts)
+	if err := os.WriteFile(reviewBoundary, []byte(reviewScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", reviewBoundary)
 
 	issueCreated := time.Date(2026, 8, 19, 1, 0, 0, 0, time.UTC)
 	activeMarker, err := internalgithub.ActiveAttemptMarker("o/r", 23, 1, base)
@@ -1667,6 +1755,9 @@ esac
 	oldSnapshotRoot := reviewSnapshotRoot
 	reviewSnapshotRoot = filepath.Join(t.TempDir(), "snapshots")
 	t.Cleanup(func() { reviewSnapshotRoot = oldSnapshotRoot })
+	if err := os.MkdirAll(reviewSnapshotRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: base}
 	attemptRoot := productionAttemptRoot(stateRoot)
 	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
@@ -1680,9 +1771,7 @@ esac
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest.State, manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead = "running", "clean", base, head
-	manifest.ReviewMode, manifest.ReviewTarget = agentruntime.ReviewModeImplementation, base+".."+head
-	manifest.ReviewSession, _ = agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
+	manifest.State = "running"
 	manifest.CreatedAt, manifest.UpdatedAt = issueCreated, issueCreated
 	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
@@ -1695,12 +1784,38 @@ esac
 	oldAPI, oldClient := githubAPI, githubClient
 	githubAPI, githubClient = "https://example.test", client
 	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
-	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", implementation)
 	statePath := filepath.Join(stateRoot, "pr.json")
 	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	statuses, err := reconcileGitHub(t.Context(), configPath, statePath, stateRoot, true)
+	if err != nil || created || governanceFailed {
+		t.Fatalf("review start err=%v created=%v governanceFailed=%v statuses=%#v", err, created, governanceFailed, statuses)
+	}
+	storedBody, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored agentruntime.Manifest
+	if err := json.Unmarshal(storedBody, &stored); err != nil {
+		t.Fatal(err)
+	}
+	wantTarget := base + ".." + head
+	starts, _ := os.ReadFile(reviewStarts)
+	if stored.State != "completed" || stored.ReviewState != "running" || stored.ReviewMode != agentruntime.ReviewModeImplementation || stored.ReviewTarget != wantTarget || stored.ReviewHead != head || strings.Count(string(starts), "x\n") != 1 {
+		t.Fatalf("fast-follow review manifest=%#v starts=%q", stored, starts)
+	}
+	projected, err := (&dashboardServer{stateRoot: stateRoot}).projectedStatus(23, 1)
+	if err != nil || projected.CurrentPhase != "review" || !slices.ContainsFunc(projected.Sessions, func(session orchestrator.AttemptSession) bool {
+		return session.Role == agentruntime.SessionRoleReviewer && session.Current && session.Target == wantTarget
+	}) {
+		t.Fatalf("review projection=%#v err=%v", projected, err)
+	}
+	if _, err := exec.Command("git", "-C", remote, "rev-parse", "refs/heads/"+branch).CombinedOutput(); err == nil {
+		t.Fatal("implementation was published before review completed")
+	}
+
+	statuses, err = reconcileGitHub(t.Context(), configPath, statePath, stateRoot, true)
 	if err == nil || !governanceFailed {
 		t.Fatalf("pull-request governance did not fail after publication: err=%v failed=%v", err, governanceFailed)
 	}
@@ -1713,7 +1828,11 @@ esac
 	if !created || !strings.Contains(pullBody, head) || len(comments) != 5 {
 		t.Fatalf("publication incomplete: created=%v body=%q comments=%#v", created, pullBody, comments)
 	}
-	projected, err := (&dashboardServer{stateRoot: stateRoot}).projectedStatus(23, 1)
+	starts, _ = os.ReadFile(reviewStarts)
+	if strings.Count(string(starts), "x\n") != 1 {
+		t.Fatalf("review started more than once: %q", starts)
+	}
+	projected, err = (&dashboardServer{stateRoot: stateRoot}).projectedStatus(23, 1)
 	if err != nil || projected.CurrentPhase != "publication" || slices.ContainsFunc(projected.Sessions, func(session orchestrator.AttemptSession) bool {
 		return session.Role == agentruntime.SessionRoleReviewer
 	}) {
@@ -2692,6 +2811,20 @@ func TestRunningReviewAcceptsBlankLivePaneStatus(t *testing.T) {
 	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, []string{"reviewer"}, internalgithub.RecoveryIssueFact{}, manifest, "", head, root)
 	if err != nil || !pending || result.Snapshot != snapshot || result.Session != session || boundary.respawns != 0 {
 		t.Fatalf("result=%#v pending=%v respawns=%d err=%v", result, pending, boundary.respawns, err)
+	}
+}
+
+func TestFailedReviewReturnsActionableSessionStatus(t *testing.T) {
+	base, head := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: base}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number}
+	target, _ := reviewTarget(agentruntime.ReviewModeImplementation, issue, base, head)
+	snapshot, session := reviewIdentity(attempt, t.TempDir())
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: target, ReviewBase: base, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
+
+	_, pending, err := runIndependentReview(t.Context(), nil, attempt, &artifactReviewBoundary{paneOutput: "1 9"}, nil, []string{"reviewer"}, issue, manifest, "", head, filepath.Dir(snapshot))
+	if err == nil || pending || !strings.Contains(err.Error(), session) || !strings.Contains(err.Error(), "retry the attempt") {
+		t.Fatalf("pending=%v err=%v", pending, err)
 	}
 }
 
