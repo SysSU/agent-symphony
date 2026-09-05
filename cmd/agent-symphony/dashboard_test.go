@@ -59,6 +59,100 @@ func TestDashboardServesEmbeddedNextPageAndStatus(t *testing.T) {
 	}
 }
 
+func TestDashboardProjectURLs(t *testing.T) {
+	got, err := validateDashboardProjectURLs([]string{"http://127.0.0.1:8082/", "https://projects.example.test"})
+	if err != nil || !slices.Equal(got, []string{"http://127.0.0.1:8082", "https://projects.example.test"}) {
+		t.Fatalf("validated URLs=%v err=%v", got, err)
+	}
+	for _, value := range []string{"127.0.0.1:8082", "file:///tmp/status", "http://user:secret@localhost:8082", "http://localhost:8082/path", "http://localhost:8082?project=other"} {
+		if _, err := validateDashboardProjectURLs([]string{value}); err == nil {
+			t.Fatalf("accepted dashboard project %q", value)
+		}
+	}
+	if _, err := validateDashboardProjectURLs([]string{"http://localhost:8082", "http://localhost:8082/"}); err == nil {
+		t.Fatal("accepted duplicate dashboard projects")
+	}
+}
+
+func TestDashboardRejectsContaminatedPeerProjection(t *testing.T) {
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(dashboardProject{
+			Version:    1,
+			Repository: "owner/first",
+			Snapshot:   &dashboardStatusSnapshot{Statuses: []orchestrator.RecoveryStatus{{Repository: "owner/second", Issue: 7, Attempt: 1}}},
+			State:      &dashboardState{Version: 1, Hidden: []dashboardHiddenAttempt{}},
+		})
+	}))
+	defer peer.Close()
+	project := fetchDashboardProject(t.Context(), peer.URL)
+	if project.Repository != "" || project.Snapshot != nil || project.Error != "project status is invalid" {
+		t.Fatalf("contaminated peer project = %#v", project)
+	}
+}
+
+func TestDashboardAggregatesTwoProjectsReadOnlyAndRejectsCrossProjectRoutes(t *testing.T) {
+	firstRoot, secondRoot := t.TempDir(), t.TempDir()
+	firstRepository, secondRepository := "owner/first", "owner/second"
+	firstSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, firstRepository, 7, 1)
+	secondSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, secondRepository, 7, 1)
+	first := orchestrator.RecoveryStatus{Repository: firstRepository, Issue: 7, Attempt: 1, State: "active", Session: firstSession}
+	second := orchestrator.RecoveryStatus{Repository: secondRepository, Issue: 7, Attempt: 1, State: "blocked", Session: secondSession}
+	if err := bindDeployment(firstRoot, firstRepository); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindDeployment(secondRoot, secondRepository); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeProjectStatusSnapshot(firstRoot, firstRepository, []orchestrator.RecoveryStatus{first}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeProjectStatusSnapshot(secondRoot, secondRepository, []orchestrator.RecoveryStatus{second}); err != nil {
+		t.Fatal(err)
+	}
+	peer := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), secondRoot, secondRepository, nil, "tmux", &sync.Mutex{}, nil, nil, nil, nil, false, ""))
+	defer peer.Close()
+	aggregator := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), firstRoot, firstRepository, []string{peer.URL}, "tmux", &sync.Mutex{}, nil, nil, nil, nil, false, ""))
+	defer aggregator.Close()
+
+	response, err := http.Get(aggregator.URL + "/projects.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var projects struct {
+		Projects []dashboardProject `json:"projects"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&projects); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || len(projects.Projects) != 2 || projects.Projects[0].Repository != firstRepository || projects.Projects[1].Repository != secondRepository || projects.Projects[1].Local || projects.Projects[1].URL != peer.URL || projects.Projects[0].Snapshot.Statuses[0].Session != firstSession || projects.Projects[1].Snapshot.Statuses[0].Session != secondSession {
+		t.Fatalf("aggregated projects = %#v", projects.Projects)
+	}
+
+	request, _ := http.NewRequest(http.MethodPost, aggregator.URL+"/actions/archive?repository="+url.QueryEscape(secondRepository)+"&issue=7&attempt=1", nil)
+	request.Header.Set("Origin", aggregator.URL)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("cross-project action status = %d", response.StatusCode)
+	}
+
+	if err := writeStatusSnapshot(firstRoot, []orchestrator.RecoveryStatus{second}); err != nil {
+		t.Fatal(err)
+	}
+	response, err = http.Get(aggregator.URL + "/status.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("contaminated status response = %d", response.StatusCode)
+	}
+}
+
 func TestDashboardReleaseMatchesCLI(t *testing.T) {
 	previous := releaseMetadata
 	releaseMetadata = "agent-symphony-release-version:0.5.0"
@@ -979,18 +1073,25 @@ func TestDashboardPlanReviewActionStartsExactIssueBoundReviewer(t *testing.T) {
 	}
 	operationMu := &sync.Mutex{}
 	calls := 0
-	server := &dashboardServer{ctx: t.Context(), stateRoot: stateRoot, tmux: "tmux", mu: operationMu, planReview: func(ctx context.Context, issueNumber, attemptNumber int) error {
+	server := &dashboardServer{ctx: t.Context(), stateRoot: stateRoot, repository: attempt.Repository, tmux: "tmux", mu: operationMu, planReview: func(ctx context.Context, issueNumber, attemptNumber int) error {
 		calls++
 		return startIssuePlanReview(ctx, runtimeState, boundary, config.Default(attempt.Repository), []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, source, snapshotRoot, issueNumber, attemptNumber)
 	}}
-	invalid := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?issue=215&attempt=3", strings.NewReader("unexpected"))
+	wrongProject := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?repository=x/y&issue=215&attempt=3", nil)
+	wrongProject.Header.Set("Origin", "http://127.0.0.1")
+	wrongProjectResponse := httptest.NewRecorder()
+	server.handler(http.NotFoundHandler()).ServeHTTP(wrongProjectResponse, wrongProject)
+	if wrongProjectResponse.Code != http.StatusBadRequest || calls != 0 {
+		t.Fatalf("wrong project status=%d calls=%d", wrongProjectResponse.Code, calls)
+	}
+	invalid := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?repository=o/r&issue=215&attempt=3", strings.NewReader("unexpected"))
 	invalid.Header.Set("Origin", "http://127.0.0.1")
 	invalidResponse := httptest.NewRecorder()
 	server.handler(http.NotFoundHandler()).ServeHTTP(invalidResponse, invalid)
 	if invalidResponse.Code != http.StatusBadRequest || calls != 0 {
 		t.Fatalf("invalid status=%d calls=%d", invalidResponse.Code, calls)
 	}
-	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?issue=215&attempt=3", nil)
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?repository=o/r&issue=215&attempt=3", nil)
 	request.Header.Set("Origin", "http://127.0.0.1")
 	response := httptest.NewRecorder()
 	server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
@@ -1061,11 +1162,11 @@ func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("EXPECTED_SESSION", session)
-	server := httptest.NewServer(newDashboardHandler(t.Context(), root, script))
+	server := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), root, repository, nil, script, &sync.Mutex{}, nil, nil, nil, nil, false, ""))
 	defer server.Close()
 
 	dial := func(origin string, selectedIssue int) (*websocket.Conn, *http.Response, error) {
-		endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/terminal?issue=" + strconv.Itoa(selectedIssue) + "&attempt=2"
+		endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/terminal?repository=" + url.QueryEscape(repository) + "&issue=" + strconv.Itoa(selectedIssue) + "&attempt=2"
 		return websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{origin}}})
 	}
 	if connection, response, err := dial("https://evil.example", issue); err == nil || response == nil || response.StatusCode != http.StatusForbidden {
@@ -1128,10 +1229,10 @@ func TestDashboardReviewerTerminalIsRoleBoundAndInteractive(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("EXPECTED_SESSION", reviewer)
-	server := httptest.NewServer(newDashboardHandler(t.Context(), root, script))
+	server := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), root, repository, nil, script, &sync.Mutex{}, nil, nil, nil, nil, false, ""))
 	defer server.Close()
 	dial := func(path, extraQuery string) (*websocket.Conn, *http.Response, error) {
-		endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + path + "?issue=23&attempt=2"
+		endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + path + "?repository=" + url.QueryEscape(repository) + "&issue=23&attempt=2"
 		if extraQuery != "" {
 			endpoint += "&" + extraQuery
 		}

@@ -49,6 +49,7 @@ async function mockDashboard(page, projectedAttempt = attempt) {
     ? route.fulfill({ json: currentProposal, headers: { "X-Agent-Symphony-Confirmation-Nonce": confirmationNonce } })
     : route.fulfill({ status: 204 }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
+  await page.route("**/projects.json", (route) => route.fulfill({ json: { version: 1, projects: [{ version: 1, repository: projectedAttempt.repository, local: true, snapshot: { updated_at: new Date().toISOString(), statuses: [projectedAttempt] }, state: { version: 1, hidden: [] } }] } }));
   await page.route("**/status.json", (route) => {
     route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: [{ ...projectedAttempt, operator_messages: [{ ...projectedAttempt.operator_messages[0], state: messageState, diagnostic: messageDiagnostic }] }] } });
   });
@@ -92,7 +93,9 @@ test("queues a direct follow-up for the exact retryable attempt", async ({ page 
 
   await expect(page.getByRole("status").filter({ hasText: "Queued a follow-up for issue #131, attempt 3" })).toBeVisible();
   expect(dashboard.directRequests).toHaveLength(1);
-  expect(dashboard.directRequests[0].url).toContain("/actions/attempt/message?issue=131&attempt=3");
+  const target = new URL(dashboard.directRequests[0].url);
+  expect(target.pathname).toBe("/actions/attempt/message");
+  expect(Object.fromEntries(target.searchParams)).toEqual({ repository: attempt.repository, issue: "131", attempt: "3" });
   expect(dashboard.directRequests[0].body).toEqual({ message: "Inspect the failing test and continue the fix." });
   await expect(page.getByLabel("Tell this agent what to do next")).toHaveValue("");
 });

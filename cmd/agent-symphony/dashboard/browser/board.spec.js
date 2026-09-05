@@ -51,10 +51,12 @@ test.afterEach(async ({ page }) => {
 
 async function mockDashboard(page, attempts, orchestrator = { enabled: true, state: "running", session: "orchestrator" }) {
   let dashboardState = { version: 1, hidden: [] };
+  const snapshot = () => ({ updated_at: new Date().toISOString(), statuses: attempts });
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: orchestrator }));
   await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: dashboardState }));
-  await page.route("**/status.json", (route) => route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: attempts } }));
+  await page.route("**/status.json", (route) => route.fulfill({ json: snapshot() }));
+  await page.route("**/projects.json", (route) => route.fulfill({ json: { version: 1, projects: [{ version: 1, repository: attempts[0]?.repository || "SysSU/agent-symphony", local: true, snapshot: snapshot(), state: dashboardState }] } }));
   return {
     hide(status, reason) {
       dashboardState = {
@@ -71,6 +73,7 @@ test("shows loading then unavailable when the initial status request fails", asy
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: true, state: "running", session: "orchestrator" } }));
   await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { version: 1, hidden: [] } }));
+  await page.route("**/projects.json", (route) => route.fulfill({ json: { version: 1, projects: [{ version: 1, repository: "SysSU/agent-symphony", local: true }] } }));
   await page.route("**/status.json", async (route) => {
     await statusPending;
     await route.fulfill({ status: 500, body: "status unavailable" });
@@ -149,6 +152,35 @@ test("provides the accessible web dashboard on desktop and mobile", async ({ pag
   await expect(release).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   await page.screenshot({ path: "test-results/web-dashboard-mobile.png", fullPage: true });
+});
+
+test("switches between two isolated project deployments without exposing peer controls", async ({ page }) => {
+  const local = statuses[0];
+  const peer = { ...statuses[0], repository: "SysSU/second-project", issue: 7, title: "Peer work", session: "as-second-project-7-1", worktree: "/second/worktrees/7-1" };
+  const snapshot = (status) => ({ updated_at: new Date().toISOString(), statuses: [status] });
+  await mockDashboard(page, [local]);
+  await page.route("**/projects.json", (route) => route.fulfill({ json: {
+    version: 1,
+    projects: [
+      { version: 1, repository: local.repository, local: true, snapshot: snapshot(local), state: { version: 1, hidden: [] } },
+      { version: 1, repository: peer.repository, url: "http://127.0.0.1:8082", snapshot: snapshot(peer), state: { version: 1, hidden: [] } },
+    ],
+  } }));
+  await page.goto("/");
+
+  const projects = page.getByRole("navigation", { name: "Project deployments" });
+  await expect(projects.getByRole("button", { name: local.repository })).toHaveAttribute("aria-pressed", "true");
+  await projects.getByRole("button", { name: peer.repository }).click();
+  await expect(page.getByRole("heading", { level: 1, name: peer.repository })).toBeVisible();
+  await expect(page.getByRole("link", { name: "#7 Peer work" })).toBeVisible();
+  await expect(page.getByText(peer.session, { exact: true })).toBeVisible();
+  await expect(page.getByText("agent-symphony-161-1", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Open project dashboard" })).toHaveAttribute("href", "http://127.0.0.1:8082");
+  await expect(page.getByRole("button", { name: /archive|recover|abandon|open terminal|queue follow-up/i })).toHaveCount(0);
+  await expect(page.getByText("Peer status is read-only here.")).toBeVisible();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
 });
 
 test("shows implementation needs-attention and the later review clear", async ({ page }) => {

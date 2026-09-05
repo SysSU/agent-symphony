@@ -44,6 +44,7 @@ async function mockDashboard(page, closeReason = "") {
   await page.route("**/release.json", (route) => route.fulfill({ json: { release: "0.5.0" } }));
   await page.route("**/status.json", (route) => route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: [attempt, implementationReview, planCandidate] } }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
+  await page.route("**/projects.json", (route) => route.fulfill({ json: { version: 1, projects: [{ version: 1, repository: attempt.repository, local: true, snapshot: { updated_at: new Date().toISOString(), statuses: [attempt] }, state: { version: 1, hidden: [] } }] } }));
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: false, state: "disabled" } }));
   await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
   await page.route("**/actions/review-plan?*", (route) => {
@@ -83,7 +84,9 @@ test("opens and chats with both exact review modes", async ({ page }) => {
     await expect.poll(() => terminal.evaluate((element) => element.contains(document.activeElement))).toBe(true);
     await page.keyboard.type(`${review.sessions[1].mode} question`);
     await expect.poll(() => sockets[index]?.messages.some((message) => typeof message !== "string")).toBe(true);
-    expect(sockets[index].url).toContain(`/reviewer/terminal?issue=${review.issue}&attempt=1`);
+    const target = new URL(sockets[index].url);
+    expect(target.pathname).toBe("/reviewer/terminal");
+    expect(Object.fromEntries(target.searchParams)).toEqual({ repository: review.repository, issue: String(review.issue), attempt: "1" });
     await page.getByRole("button", { name: "Close" }).click();
   }
   await page.screenshot({ path: "test-results/session-selection-desktop.png", fullPage: true });
@@ -92,7 +95,9 @@ test("opens and chats with both exact review modes", async ({ page }) => {
   await expect(page.getByRole("dialog", { name: attempt.sessions[0].name })).toBeVisible();
   await page.keyboard.type("implementation input");
   await expect.poll(() => sockets[2]?.messages.some((message) => typeof message !== "string")).toBe(true);
-  expect(sockets[2].url).toContain("/terminal?issue=163&attempt=1");
+  const target = new URL(sockets[2].url);
+  expect(target.pathname).toBe("/terminal");
+  expect(Object.fromEntries(target.searchParams)).toEqual({ repository: attempt.repository, issue: "163", attempt: "1" });
   expect(errors).toEqual([]);
 });
 
@@ -102,7 +107,7 @@ test("starts an issue-bound plan review from the attempt card", async ({ page })
 
   await page.getByRole("button", { name: "Start plan review" }).click();
   await expect.poll(() => reviewPlanRequests).toEqual([
-    `${new URL(page.url()).origin}/actions/review-plan?issue=165&attempt=1`,
+    `${new URL(page.url()).origin}/actions/review-plan?repository=SysSU%2Fagent-symphony&issue=165&attempt=1`,
   ]);
   await expect(page.getByRole("status").filter({ hasText: "Started plan review for issue #165, attempt 1." })).toBeVisible();
 });

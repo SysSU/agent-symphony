@@ -48,6 +48,8 @@ var dashboardFiles embed.FS
 type dashboardServer struct {
 	ctx          context.Context
 	stateRoot    string
+	repository   string
+	peerProjects []string
 	tmux         string
 	allowNet     bool
 	password     string
@@ -83,6 +85,21 @@ type dashboardState struct {
 	Hidden  []dashboardHiddenAttempt `json:"hidden"`
 }
 
+type dashboardStatusSnapshot struct {
+	UpdatedAt time.Time                     `json:"updated_at"`
+	Statuses  []orchestrator.RecoveryStatus `json:"statuses"`
+}
+
+type dashboardProject struct {
+	Version    int                      `json:"version"`
+	Repository string                   `json:"repository,omitempty"`
+	URL        string                   `json:"url,omitempty"`
+	Local      bool                     `json:"local,omitempty"`
+	Snapshot   *dashboardStatusSnapshot `json:"snapshot,omitempty"`
+	State      *dashboardState          `json:"state,omitempty"`
+	Error      string                   `json:"error,omitempty"`
+}
+
 func dashboardHandler(stateRoot string) http.Handler {
 	return newDashboardHandler(context.Background(), stateRoot, "tmux")
 }
@@ -96,12 +113,16 @@ func newDashboardHandlerWithMutex(ctx context.Context, stateRoot, tmux string, o
 }
 
 func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
+	return newProjectDashboardHandlerWithOptions(ctx, stateRoot, "", nil, tmux, operationMu, recover, planReview, reconcile, service, allowNet, password)
+}
+
+func newProjectDashboardHandlerWithOptions(ctx context.Context, stateRoot, repository string, peerProjects []string, tmux string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
 	assets, err := fs.Sub(dashboardFiles, "dashboard/out")
 	if err != nil {
 		panic(err)
 	}
 	static := http.FileServer(http.FS(assets))
-	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, planReview: planReview, reconcile: reconcile, mu: operationMu}
+	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, repository: repository, peerProjects: peerProjects, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, planReview: planReview, reconcile: reconcile, mu: operationMu}
 	server.messages, _ = service.(orchestratorMessageService)
 	server.cleanup = server.cleanupAttempt
 	return server.handler(static)
@@ -142,7 +163,15 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 			return
 		}
 		if r.URL.Path == "/status.json" {
-			serveDashboardJSON(w, r, filepath.Join(s.stateRoot, "status.json"), maxDashboardStatusBytes, "status is not available yet", "status snapshot is unavailable")
+			s.serveStatus(w, r)
+			return
+		}
+		if r.URL.Path == "/project.json" {
+			s.serveProject(w, r)
+			return
+		}
+		if r.URL.Path == "/projects.json" {
+			s.serveProjects(w, r)
 			return
 		}
 		if r.URL.Path == "/release.json" {
@@ -385,6 +414,173 @@ func serveDashboardJSON(w http.ResponseWriter, r *http.Request, path string, lim
 	}
 }
 
+func validateDashboardProjectURLs(values []string) ([]string, error) {
+	if len(values) > 16 {
+		return nil, errors.New("--dashboard-project may be repeated at most 16 times")
+	}
+	result := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		project, err := url.Parse(value)
+		if err != nil || (project.Scheme != "http" && project.Scheme != "https") || project.Host == "" || project.User != nil || project.RawQuery != "" || project.Fragment != "" || project.Path != "" && project.Path != "/" {
+			return nil, fmt.Errorf("invalid --dashboard-project %q: use an HTTP(S) origin without credentials, path, query, or fragment", value)
+		}
+		project.Path = ""
+		normalized := project.String()
+		if seen[normalized] {
+			return nil, fmt.Errorf("duplicate --dashboard-project %q", normalized)
+		}
+		seen[normalized] = true
+		result = append(result, normalized)
+	}
+	return result, nil
+}
+
+func (s *dashboardServer) readStatus() (dashboardStatusSnapshot, error) {
+	body, err := readDashboardStatus(filepath.Join(s.stateRoot, "status.json"))
+	if err != nil {
+		return dashboardStatusSnapshot{}, err
+	}
+	var snapshot dashboardStatusSnapshot
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&snapshot) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return dashboardStatusSnapshot{}, errors.New("invalid status snapshot")
+	}
+	if s.repository != "" && slices.ContainsFunc(snapshot.Statuses, func(status orchestrator.RecoveryStatus) bool { return status.Repository != s.repository }) {
+		return dashboardStatusSnapshot{}, errors.New("status snapshot contains another project")
+	}
+	return snapshot, nil
+}
+
+func (s *dashboardServer) project() (dashboardProject, error) {
+	snapshot, err := s.readStatus()
+	if err != nil {
+		return dashboardProject{}, err
+	}
+	state, err := s.readState()
+	if err != nil {
+		return dashboardProject{}, err
+	}
+	repository := s.repository
+	if repository == "" && len(snapshot.Statuses) > 0 {
+		repository = snapshot.Statuses[0].Repository
+	}
+	if repository == "" {
+		return dashboardProject{}, errors.New("project identity is unavailable")
+	}
+	return dashboardProject{Version: 1, Repository: repository, Snapshot: &snapshot, State: &state}, nil
+}
+
+func (s *dashboardServer) serveStatus(w http.ResponseWriter, r *http.Request) {
+	if s.repository == "" {
+		serveDashboardJSON(w, r, filepath.Join(s.stateRoot, "status.json"), maxDashboardStatusBytes, "status is not available yet", "status snapshot is unavailable")
+		return
+	}
+	snapshot, err := s.readStatus()
+	if errors.Is(err, os.ErrNotExist) {
+		http.Error(w, "status is not available yet", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "status snapshot is unavailable", http.StatusInternalServerError)
+		return
+	}
+	body, _ := json.Marshal(snapshot)
+	serveDashboardBody(w, r, body)
+}
+
+func (s *dashboardServer) serveProject(w http.ResponseWriter, r *http.Request) {
+	project, err := s.project()
+	if errors.Is(err, os.ErrNotExist) {
+		http.Error(w, "status is not available yet", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "project status is unavailable", http.StatusInternalServerError)
+		return
+	}
+	body, _ := json.Marshal(project)
+	serveDashboardBody(w, r, body)
+}
+
+func serveDashboardBody(w http.ResponseWriter, r *http.Request, body []byte) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write(body)
+	}
+}
+
+func (s *dashboardServer) serveProjects(w http.ResponseWriter, r *http.Request) {
+	local, err := s.project()
+	if err != nil {
+		local = dashboardProject{Version: 1, Repository: s.repository, Local: true, Error: "status is not available yet"}
+	}
+	local.Local = true
+	projects := make([]dashboardProject, len(s.peerProjects)+1)
+	projects[0] = local
+	var wait sync.WaitGroup
+	for i, projectURL := range s.peerProjects {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			projects[i+1] = fetchDashboardProject(r.Context(), projectURL)
+		}()
+	}
+	wait.Wait()
+	seen := map[string]bool{}
+	for i := range projects {
+		if projects[i].Repository == "" || !seen[projects[i].Repository] {
+			seen[projects[i].Repository] = projects[i].Repository != ""
+			continue
+		}
+		projects[i].Repository, projects[i].Snapshot, projects[i].State, projects[i].Error = "", nil, nil, "duplicate project deployment"
+	}
+	body, _ := json.Marshal(struct {
+		Version  int                `json:"version"`
+		Projects []dashboardProject `json:"projects"`
+	}{1, projects})
+	serveDashboardBody(w, r, body)
+}
+
+func fetchDashboardProject(ctx context.Context, projectURL string) dashboardProject {
+	project := dashboardProject{Version: 1, URL: projectURL}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, projectURL+"/project.json", nil)
+	if err != nil {
+		project.Error = "project status is unavailable"
+		return project
+	}
+	client := http.Client{Timeout: 2 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		project.Error = "project status is unavailable"
+		return project
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		project.Error = "project status is unavailable"
+		return project
+	}
+	decoder := json.NewDecoder(io.LimitReader(response.Body, maxDashboardStatusBytes+maxDashboardStateBytes+1))
+	decoder.DisallowUnknownFields()
+	var remote dashboardProject
+	if decoder.Decode(&remote) != nil || decoder.Decode(&struct{}{}) != io.EOF || remote.Version != 1 || remote.Repository == "" || remote.Snapshot == nil || !validDashboardState(remote.State, remote.Repository) || remote.URL != "" || remote.Local || remote.Error != "" || slices.ContainsFunc(remote.Snapshot.Statuses, func(status orchestrator.RecoveryStatus) bool { return status.Repository != remote.Repository }) {
+		project.Error = "project status is invalid"
+		return project
+	}
+	remote.URL = projectURL
+	return remote
+}
+
+func validDashboardState(state *dashboardState, repository string) bool {
+	return state != nil && state.Version == dashboardStateVersion && len(state.Hidden) <= 10_000 && !slices.ContainsFunc(state.Hidden, func(hidden dashboardHiddenAttempt) bool {
+		return hidden.Repository != repository || hidden.Issue < 1 || hidden.Attempt < 1 || hidden.Reason != "archived" && hidden.Reason != "abandoned"
+	})
+}
+
 func readDashboardStatus(path string) ([]byte, error) {
 	return readDashboardFile(path, maxDashboardStatusBytes)
 }
@@ -444,7 +640,7 @@ func (s *dashboardServer) readState() (dashboardState, error) {
 		return dashboardState{}, errors.New("invalid dashboard state")
 	}
 	for _, hidden := range state.Hidden {
-		if hidden.Repository == "" || hidden.Issue < 1 || hidden.Attempt < 1 || (hidden.Reason != "archived" && hidden.Reason != "abandoned") {
+		if hidden.Repository == "" || s.repository != "" && hidden.Repository != s.repository || hidden.Issue < 1 || hidden.Attempt < 1 || (hidden.Reason != "archived" && hidden.Reason != "abandoned") {
 			return dashboardState{}, errors.New("invalid dashboard state entry")
 		}
 	}
@@ -503,11 +699,11 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 	query := r.URL.Query()
 	issue, issueErr := strconv.Atoi(query.Get("issue"))
 	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
-	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || (action != "archive" && action != "abandon" && action != "recover" && action != "review-plan") {
+	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || !s.validProjectQuery(query, "issue", "attempt") || (action != "archive" && action != "abandon" && action != "recover" && action != "review-plan") {
 		http.Error(w, "invalid action", http.StatusBadRequest)
 		return
 	}
-	if action == "review-plan" && (r.ContentLength != 0 || len(r.TransferEncoding) != 0 || len(query) != 2 || len(query["issue"]) != 1 || len(query["attempt"]) != 1) {
+	if action == "review-plan" && (r.ContentLength != 0 || len(r.TransferEncoding) != 0) {
 		http.Error(w, "invalid plan review action", http.StatusBadRequest)
 		return
 	}
@@ -653,7 +849,7 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 		issue, issueErr = strconv.Atoi(r.URL.Query().Get("issue"))
 		attempt, attemptErr = strconv.Atoi(r.URL.Query().Get("attempt"))
 		query := r.URL.Query()
-		if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || len(query) != 2 || len(query["issue"]) != 1 || len(query["attempt"]) != 1 {
+		if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || !s.validProjectQuery(query, "issue", "attempt") {
 			http.Error(w, "invalid orchestrator action", http.StatusBadRequest)
 			return
 		}
@@ -797,7 +993,7 @@ func (s *dashboardServer) serveAttemptMessageAction(w http.ResponseWriter, r *ht
 	query := r.URL.Query()
 	issue, issueErr := strconv.Atoi(query.Get("issue"))
 	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
-	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || len(query) != 2 || len(query["issue"]) != 1 || len(query["attempt"]) != 1 || r.Header.Get("Content-Type") != "application/json" || len(r.TransferEncoding) != 0 || r.ContentLength <= 0 || r.ContentLength > maxTerminalInputBytes {
+	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || !s.validProjectQuery(query, "issue", "attempt") || r.Header.Get("Content-Type") != "application/json" || len(r.TransferEncoding) != 0 || r.ContentLength <= 0 || r.ContentLength > maxTerminalInputBytes {
 		http.Error(w, "invalid worker follow-up", http.StatusBadRequest)
 		return
 	}
@@ -835,6 +1031,19 @@ func (s *dashboardServer) serveAttemptMessageAction(w http.ResponseWriter, r *ht
 
 func orchestratorAttentionState(state string) bool {
 	return slices.Contains([]string{"blocked", "failed", "conflicting", "orphaned"}, state)
+}
+
+func (s *dashboardServer) validProjectQuery(query url.Values, keys ...string) bool {
+	want := len(keys)
+	for _, key := range keys {
+		if len(query[key]) != 1 {
+			return false
+		}
+	}
+	if s.repository == "" {
+		return len(query) == want
+	}
+	return len(query) == want+1 && len(query["repository"]) == 1 && query.Get("repository") == s.repository
 }
 
 func sameDashboardOrigin(r *http.Request) bool {
@@ -889,7 +1098,7 @@ func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request, 
 	issue, issueErr := strconv.Atoi(query.Get("issue"))
 	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
 	session, err := s.projectedSession(issue, attempt, role)
-	if issueErr != nil || attemptErr != nil || err != nil || len(query) != 2 || len(query["issue"]) != 1 || len(query["attempt"]) != 1 {
+	if issueErr != nil || attemptErr != nil || err != nil || !s.validProjectQuery(query, "issue", "attempt") {
 		http.Error(w, "terminal session is not available", http.StatusNotFound)
 		return
 	}
@@ -997,18 +1206,9 @@ func (s *dashboardServer) projectedStatus(issue, attempt int) (orchestrator.Reco
 	if issue < 1 || attempt < 1 {
 		return orchestrator.RecoveryStatus{}, errors.New("invalid attempt")
 	}
-	body, err := readDashboardStatus(filepath.Join(s.stateRoot, "status.json"))
+	snapshot, err := s.readStatus()
 	if err != nil {
 		return orchestrator.RecoveryStatus{}, err
-	}
-	var snapshot struct {
-		UpdatedAt time.Time                     `json:"updated_at"`
-		Statuses  []orchestrator.RecoveryStatus `json:"statuses"`
-	}
-	decoder := json.NewDecoder(strings.NewReader(string(body)))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&snapshot) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return orchestrator.RecoveryStatus{}, errors.New("invalid status snapshot")
 	}
 	var found *orchestrator.RecoveryStatus
 	for i := range snapshot.Statuses {
@@ -1065,6 +1265,10 @@ func (s *dashboardServer) terminalStatus(issue, attempt int) (orchestrator.Recov
 }
 
 func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
+	return startProjectDashboard(ctx, address, stateRoot, "", nil, operationMu, recover, planReview, reconcile, service, allowNet, password, log)
+}
+
+func startProjectDashboard(ctx context.Context, address, stateRoot, repository string, peerProjects []string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", fmt.Errorf("dashboard address: %w", err)
@@ -1084,7 +1288,7 @@ func startDashboard(ctx context.Context, address, stateRoot string, operationMu 
 	if err != nil {
 		return "", fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
-	server := &http.Server{Handler: newDashboardHandlerWithOptions(ctx, stateRoot, "tmux", operationMu, recover, planReview, reconcile, service, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: newProjectDashboardHandlerWithOptions(ctx, stateRoot, repository, peerProjects, "tmux", operationMu, recover, planReview, reconcile, service, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
 		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password and session data are exposed in transit, and anyone with the password can use terminals and cleanup controls")
 	}

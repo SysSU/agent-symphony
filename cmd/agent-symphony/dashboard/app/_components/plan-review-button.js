@@ -8,7 +8,7 @@ export default function PlanReviewButton({ status, onNotice }) {
     setBusy(true);
     onNotice("");
     try {
-      const query = new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) });
+      const query = new URLSearchParams({ repository: status.repository, issue: String(status.issue), attempt: String(status.attempt) });
       const response = await postWithReconciliationRetry(`/actions/review-plan?${query}`);
       if (!response.ok) throw new Error((await response.text()).trim() || `Plan review failed (${response.status})`);
       onNotice(`Started plan review for issue #${status.issue}, attempt ${status.attempt}.`);
