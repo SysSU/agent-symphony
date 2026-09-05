@@ -491,6 +491,35 @@ func EvidenceBody(issue, attempt int, kind, head string) (string, error) {
 	return AttributedBody(issue, attempt, fmt.Sprintf("Agent Symphony %s evidence for head `%s`.", kind, head))
 }
 
+func ReviewFindingsBody(issue, attempt int, head string, findings []string) (string, error) {
+	if !regexpSHA.MatchString(head) || len(findings) == 0 || len(findings) > 100 {
+		return "", errors.New("review findings require a head SHA and one to 100 findings")
+	}
+	findings = slices.Clone(findings)
+	for i, finding := range findings {
+		if strings.TrimSpace(finding) == "" || len(finding) > 4096 {
+			return "", errors.New("review finding is invalid or oversized")
+		}
+		findings[i] = strings.ReplaceAll(finding, "<!--", "&lt;!--")
+	}
+	return AttributedBody(issue, attempt, fmt.Sprintf("Independent review findings for exact head `%s`:\n\n- %s", head, strings.Join(findings, "\n- ")))
+}
+
+func (a API) EnsureReviewFindings(ctx context.Context, repository string, issue, attempt int, head string, findings []string, actorID int) error {
+	body, err := ReviewFindingsBody(issue, attempt, head, findings)
+	if err != nil || actorID <= 0 {
+		if err == nil {
+			err = errors.New("review findings publication requires the coordinator actor")
+		}
+		return err
+	}
+	present, err := HasAttemptComment(ctx, a, repository, issue, body, actorID)
+	if err != nil || present {
+		return err
+	}
+	return a.CreateIssueComment(ctx, repository, issue, body, Mutation{Issue: issue, Attempt: attempt})
+}
+
 func PolicyFailureBody(issue, attempt int, head, validation string, blockers []string) (string, error) {
 	if !regexpSHA.MatchString(head) || len(blockers) == 0 || validation != "" && !slices.Contains([]string{"passed", "failed", "blocked"}, validation) {
 		return "", errors.New("policy failure comment requires a head SHA and blockers")

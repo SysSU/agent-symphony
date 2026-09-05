@@ -2142,6 +2142,13 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 	pending := false
 	command, interactive := interactiveImplementationCommand(cfg.Commands.Implementation)
 	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: command, Interactive: interactive}
+	ensureFindings := func(findings []string) error {
+		user, err := api.AuthenticatedUser(ctx)
+		if err != nil {
+			return err
+		}
+		return api.EnsureReviewFindings(ctx, issue.Repository, issue.Issue, issue.Attempt, head, findings, user.ID)
+	}
 	if (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued") && manifest.ReviewHead == head && (manifest.ReviewSnapshot != "" || manifest.ReviewSession != "") {
 		var cleanupErr error
 		manifest, cleanupErr = cleanupReviewOutcome(ctx, runtimeState, attempt, reviewBoundary(stateRoot), reviewEnv, manifest, snapshotRoot)
@@ -2155,6 +2162,9 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		}
 	}
 	if manifest.ReviewState == "findings-queued" && manifest.ReviewHead == head {
+		if err := ensureFindings(manifest.ReviewFindings); err != nil {
+			return false, err
+		}
 		return returnReviewFindings(ctx, runtimeState, boundary, attempt, manifest, head, manifest.ReviewFindings, humanInstructions, cfg.Commands.Implementation)
 	}
 	reviewBase := manifest.BaseSHA
@@ -2187,6 +2197,9 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		return true, nil
 	}
 	if len(review.Findings) > 0 {
+		if err := ensureFindings(review.Findings); err != nil {
+			return false, err
+		}
 		queued, err := runtimeState.RecordReviewFindings(attempt, head, review.Findings, false, false)
 		if err != nil {
 			return false, err
@@ -2546,7 +2559,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 			if statusErr != nil {
 				// The reviewer is temporarily unobservable; rebuild below.
 			} else if status != 0 {
-				return independentReviewResult{}, false, fmt.Errorf("reviewer exited %d", status)
+				return independentReviewResult{}, false, fmt.Errorf("reviewer exited %d; inspect reviewer session %s and retry the attempt after correcting the failure", status, session)
 			} else {
 				request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, Head: head, LegacyHeadArtifact: legacyHeadArtifact})
 				artifact, err := boundary.call(ctx, "review-result", agentruntime.Command{Stdin: bytes.NewReader(request)})
