@@ -26,11 +26,12 @@ import (
 const WorkerResultMaxBytes = 64 << 10
 
 const (
-	manifestVersion    = 1
-	maxResourceName    = 64
-	maxPathLength      = 4096
-	historyLimit       = "5000"
-	workerResultSuffix = ".result.json"
+	manifestVersion         = 1
+	maxResourceName         = 64
+	maxPathLength           = 4096
+	historyLimit            = "5000"
+	workerResultSuffix      = ".result.json"
+	WorkerResultEnvironment = "AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
 )
 
 const (
@@ -115,14 +116,15 @@ func (b *tailBuffer) bytes() []byte {
 }
 
 type Attempt struct {
-	Repository string
-	Issue      int
-	Number     int
-	BaseSHA    string
-	Context    string
-	Command    []string
-	Env        []string
-	Eligible   func() bool
+	Repository  string
+	Issue       int
+	Number      int
+	BaseSHA     string
+	Context     string
+	Command     []string
+	Env         []string
+	Interactive bool
+	Eligible    func() bool
 }
 
 type Manifest struct {
@@ -137,6 +139,7 @@ type Manifest struct {
 	LogPath             string    `json:"log_path"`
 	State               string    `json:"state"`
 	Diagnostic          string    `json:"diagnostic,omitempty"`
+	Interactive         bool      `json:"interactive,omitempty"`
 	ImplementationAgent string    `json:"implementation_agent,omitempty"`
 	ReviewAgent         string    `json:"review_agent,omitempty"`
 	ReviewState         string    `json:"review_state,omitempty"`
@@ -381,7 +384,10 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	if len(attempt.Command) == 0 || strings.TrimSpace(attempt.Command[0]) == "" {
 		return Manifest{}, errors.New("attempt command is required")
 	}
-	if attempt.Context != "" && strings.TrimSpace(r.Helper) == "" {
+	if attempt.Interactive && strings.TrimSpace(attempt.Context) == "" {
+		return Manifest{}, errors.New("interactive attempt context is required")
+	}
+	if attempt.Context != "" && !attempt.Interactive && strings.TrimSpace(r.Helper) == "" {
 		return Manifest{}, errors.New("attempt capture helper is required")
 	}
 	env, err := r.agentEnvironment(attempt.Repository, attempt.Env...)
@@ -458,17 +464,29 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 		_ = r.writeManifest(attempt, manifest)
 		return manifest, fmt.Errorf("attempt became ineligible before launch")
 	}
+	if attempt.Interactive {
+		result, err := os.OpenFile(ResultPath(manifest.Worktree), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return fail("prepare worker result", err)
+		}
+		if err := result.Close(); err != nil {
+			return fail("prepare worker result", err)
+		}
+		env = append(env, WorkerResultEnvironment+"="+ResultPath(manifest.Worktree))
+	}
 	if err := r.startSession(ctx, manifest, env); err != nil {
 		return failStop("launch tmux", err)
 	}
 	target := PaneTarget(manifest.Session)
-	if attempt.Context != "" {
+	if attempt.Context != "" && !attempt.Interactive {
 		if _, err := r.run(ctx, r.tmux(), []string{"load-buffer", "-b", manifest.Session, "-"}, "", []string{}, strings.NewReader(attempt.Context)); err != nil {
 			return failStop("load agent context", err)
 		}
 	}
-	command := attempt.Command
-	if attempt.Context != "" {
+	command := slices.Clone(attempt.Command)
+	if attempt.Interactive {
+		command = append(command, attempt.Context)
+	} else if attempt.Context != "" {
 		command = PromptCommand(r.Helper, r.tmux(), manifest.Session, ResultPath(manifest.Worktree), command)
 	}
 	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
@@ -520,7 +538,16 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 			manifest.UpdatedAt = time.Now().UTC()
 			return manifest, errors.Join(cause, r.writeManifest(attempt, manifest))
 		} else if status == 0 {
-			manifest.State = "completed"
+			if manifest.Interactive {
+				info, err := os.Lstat(ResultPath(manifest.Worktree))
+				if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() == 0 || info.Size() > WorkerResultMaxBytes {
+					manifest.State, manifest.Diagnostic = "failed", "agent exited without a valid private result artifact"
+				} else {
+					manifest.State = "completed"
+				}
+			} else {
+				manifest.State = "completed"
+			}
 		} else {
 			manifest.State, manifest.Diagnostic = "failed", fmt.Sprintf("agent exited with status %d; output preserved in %s", status, manifest.LogPath)
 		}
@@ -873,7 +900,7 @@ func AttemptIdentity(root string, a Attempt) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("attempt path must be absolute and at most %d bytes", maxPathLength)
 	}
 	return Manifest{Version: manifestVersion, Repository: a.Repository, Issue: a.Issue, Attempt: a.Number,
-		Branch: branch, Worktree: worktree, Session: session, BaseSHA: a.BaseSHA}, nil
+		Branch: branch, Worktree: worktree, Session: session, BaseSHA: a.BaseSHA, Interactive: a.Interactive}, nil
 }
 
 func (r *Runtime) rejectCaseCollision(repository string) error {

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -1118,6 +1119,104 @@ func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "40 120") {
 		t.Fatalf("terminal did not resize: %q", output.String())
+	}
+}
+
+func TestDashboardInputReachesLaunchedImplementationAgent(t *testing.T) {
+	tmuxBinary, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	source := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "Test"}} {
+		if out, err := exec.Command("git", append([]string{"-C", source}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s: %v", args, out, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(source, "README"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "README"}, {"commit", "-qm", "base"}} {
+		if out, err := exec.Command("git", append([]string{"-C", source}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s: %v", args, out, err)
+		}
+	}
+	baseSHA := runGit(t, source, "rev-parse", "HEAD")
+	stateRoot, attemptRoot := t.TempDir(), filepath.Join(t.TempDir(), "attempts")
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := agentruntime.AttemptIdentity(attemptRoot, agentruntime.Attempt{Repository: "o/r", Issue: 214, Number: 1, BaseSHA: baseSHA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := fmt.Sprintf("as214-%d", time.Now().UnixNano())
+	tmux := filepath.Join(t.TempDir(), "tmux")
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nexec "+strconv.Quote(tmuxBinary)+" -L "+strconv.Quote(socket)+" -f /dev/null \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	agent := filepath.Join(t.TempDir(), "interactive-agent")
+	script := `#!/bin/sh
+test "$#" = 1 && case $1 in *"Issue: #214"*"Session: "*) ;; *) exit 9;; esac
+test -f "$AGENT_SYMPHONY_IMPLEMENTATION_RESULT" || exit 8
+printf 'implementation-ready\r\n'
+IFS= read -r input
+printf 'implementation-received:%s\r\n' "$input"
+printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"direct input received","documentation":"none"}' >"$AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
+sleep 1
+`
+	if err := os.WriteFile(agent, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Git: "git", Tmux: tmux, Runner: agentruntime.ExecRunner{}, AllowEnv: []string{"PATH", "TERM"}, VerifyWorker: func(context.Context) error { return nil }}
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 214, Number: 1, BaseSHA: baseSHA, Context: "Issue: #214\nSession: " + identity.Session, Command: []string{agent}, Interactive: true}
+	manifest, err := runtimeState.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-session", "-t", "="+manifest.Session).Run() })
+	status := orchestrator.RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "active", CurrentPhase: "implementation", Session: manifest.Session, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: manifest.Session, State: "running", Current: true}}}
+	if err := writeStatusSnapshot(stateRoot, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(newDashboardHandler(t.Context(), stateRoot, tmux))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/terminal?issue=214&attempt=1"
+	connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
+	if err != nil {
+		t.Fatalf("terminal dial response=%v err=%v", response, err)
+	}
+	defer connection.CloseNow()
+	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("hello implementation\n")); err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	deadline, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	for !strings.Contains(output.String(), "implementation-received:hello implementation") {
+		kind, message, err := connection.Read(deadline)
+		if err != nil || kind != websocket.MessageBinary {
+			t.Fatalf("terminal output=%q kind=%v err=%v", output.String(), kind, err)
+		}
+		output.Write(message)
+	}
+	connection.CloseNow()
+	var monitored agentruntime.Manifest
+	monitorDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(monitorDeadline) {
+		monitored, err = runtimeState.Monitor(t.Context(), agentruntime.Attempt{Repository: attempt.Repository, Issue: attempt.Issue, Number: attempt.Number, BaseSHA: attempt.BaseSHA})
+		if err != nil || monitored.State != "running" {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if err != nil || monitored.State != "completed" {
+		t.Fatalf("monitored manifest=%#v err=%v", monitored, err)
+	}
+	result, err := readWorkerResult(agentruntime.ResultPath(manifest.Worktree))
+	if err != nil || result.Validation != "direct input received" {
+		t.Fatalf("worker result=%#v err=%v", result, err)
 	}
 }
 

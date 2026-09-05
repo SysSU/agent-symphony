@@ -377,6 +377,51 @@ func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *tes
 	}
 }
 
+func TestInteractiveLifecycleKeepsAgentOnTmuxAndRequiresResult(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		result     string
+		wantState  string
+		wantReason string
+	}{
+		{name: "completed result", result: `{"type":"agent-symphony-result-v1","validation":"go test ./... passed","documentation":"none"}`, wantState: "completed"},
+		{name: "missing result", wantState: "failed", wantReason: "valid private result artifact"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r, fake, attempt, _ := testRuntime(t)
+			attempt.Command, attempt.Interactive = []string{"interactive-agent", "--tty"}, true
+			manifest, err := r.PrepareAndStart(t.Context(), attempt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !manifest.Interactive || fake.buffers[manifest.Session] != "" || !slices.Equal(fake.sessions[manifest.Session].agent, []string{"interactive-agent", "--tty", attempt.Context}) {
+				t.Fatalf("interactive launch manifest=%#v session=%#v buffers=%#v", manifest, fake.sessions[manifest.Session], fake.buffers)
+			}
+			info, err := os.Lstat(ResultPath(manifest.Worktree))
+			if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+				t.Fatalf("result artifact info=%v err=%v", info, err)
+			}
+			foundEnvironment := false
+			for _, command := range fake.seen {
+				foundEnvironment = foundEnvironment || environmentValue(command.Env, WorkerResultEnvironment) == ResultPath(manifest.Worktree)
+			}
+			if !foundEnvironment {
+				t.Fatalf("%s was not imported into tmux", WorkerResultEnvironment)
+			}
+			if test.result != "" {
+				if err := os.WriteFile(ResultPath(manifest.Worktree), []byte(test.result), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fake.sessions[manifest.Session].dead = true
+			got, err := r.Monitor(t.Context(), Attempt{Repository: attempt.Repository, Issue: attempt.Issue, Number: attempt.Number, BaseSHA: attempt.BaseSHA})
+			if err != nil || got.State != test.wantState || !strings.Contains(got.Diagnostic, test.wantReason) {
+				t.Fatalf("monitored manifest=%#v err=%v", got, err)
+			}
+		})
+	}
+}
+
 func TestResumeHandoffRefreshesTrustedSourceRefs(t *testing.T) {
 	r, fake, attempt, primary := testRuntime(t)
 	manifest, err := r.PrepareAndStart(t.Context(), attempt)

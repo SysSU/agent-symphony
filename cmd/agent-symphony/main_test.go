@@ -360,12 +360,85 @@ func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
 		t.Fatalf("help code=%d stderr=%q", code, stderr.String())
 	}
 	for _, want := range []string{
-		"install-host", "agent-host", "init", "validate", "config view", "serve", "status", "list", "inspect", "reconcile", "doctor", "diagnostics", "pr-governance", "help",
+		"install-host", "agent-host", "chat", "init", "validate", "config view", "serve", "status", "list", "inspect", "reconcile", "doctor", "diagnostics", "pr-governance", "help",
 		"--config", "--state", "--runtime-state", "--attempts", "--issue", "--interval", "--dashboard-address", "--allow-unsafe-dashboard-network", "--dashboard-password-file", "--offline", "--coordinator", "--json", "--help", "--version",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("help is missing %q", want)
 		}
+	}
+}
+
+func TestImplementationChatTargetRequiresOneRunningCurrentSession(t *testing.T) {
+	running, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 214, 2)
+	completed, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 214, 1)
+	history := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 214, Attempt: 1, State: "active", CurrentPhase: "validation", Action: "validate the completed implementation result", Session: completed, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: completed, State: "completed"}}}
+	active := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 214, Attempt: 2, State: "active", CurrentPhase: "implementation", Action: "monitor the implementation session", Session: running, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: running, State: "running", Current: true}}}
+
+	status, session, err := implementationChatTarget([]orchestrator.RecoveryStatus{history, active}, 214)
+	if err != nil || status.Attempt != 2 || session.Name != running {
+		t.Fatalf("status=%#v session=%#v err=%v", status, session, err)
+	}
+	for name, statuses := range map[string][]orchestrator.RecoveryStatus{
+		"missing":  nil,
+		"inactive": {history},
+		"ambiguous": {active, func() orchestrator.RecoveryStatus {
+			other := active
+			other.Attempt = 3
+			other.Session, _ = agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 214, 3)
+			other.Sessions[0].Name = other.Session
+			return other
+		}()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := implementationChatTarget(statuses, 214)
+			if err == nil || name == "inactive" && (!strings.Contains(err.Error(), completed) || !strings.Contains(err.Error(), "completed") || !strings.Contains(err.Error(), history.Action)) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestChatIssueExchangesInputWithExactTmuxSessionAndReportsMissingRuntime(t *testing.T) {
+	root := t.TempDir()
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 214, 2)
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 214, Attempt: 2, State: "active", CurrentPhase: "implementation", Action: "monitor the implementation session", Session: session, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "running", Current: true}}}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	tmux := filepath.Join(bin, "tmux")
+	script := "#!/bin/sh\ncase $1 in\n" +
+		"has-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\";;\n" +
+		"attach-session) test \"$2\" = -t && test \"$3\" = \"=$EXPECTED_SESSION\" || exit 2; IFS= read -r input; printf 'agent:%s\\n' \"$input\";;\n" +
+		"*) exit 2;;\nesac\n"
+	if err := os.WriteFile(tmux, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("EXPECTED_SESSION", session)
+	t.Setenv("TMUX_TMPDIR", "")
+	var stdout, stderr bytes.Buffer
+	if err := chatIssue(root, 214, strings.NewReader("hello agent\n"), &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "agent:hello agent\n" || !strings.Contains(stderr.String(), session) || !strings.Contains(stderr.String(), "Ctrl-b d") {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if got := os.Getenv("TMUX_TMPDIR"); got != projectTmuxRoot(root) {
+		t.Fatalf("TMUX_TMPDIR=%q, want %q", got, projectTmuxRoot(root))
+	}
+
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nif test \"$1\" = has-session; then exit 1; fi\nprintf attached >\"$ATTACHED\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	attached := filepath.Join(t.TempDir(), "attached")
+	t.Setenv("ATTACHED", attached)
+	if err := chatIssue(root, 214, strings.NewReader("must not be sent\n"), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), session) || !strings.Contains(err.Error(), "reconcile project runtime state") {
+		t.Fatalf("missing runtime error=%v", err)
+	}
+	if _, err := os.Stat(attached); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing session reached attach: %v", err)
 	}
 }
 
@@ -1391,19 +1464,27 @@ func (r *revokedAttemptRunner) Run(ctx context.Context, command agentruntime.Com
 func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T) {
 	issue := internalgithub.RecoveryIssueFact{Repository: "owner/repo", Issue: 56, Attempt: 3, BaseBranch: "main", Body: "## Context\nunique issue contract\n\n## Validation\ngo test ./..."}
 	identity := agentruntime.Manifest{Branch: "agent-symphony/owner-repo/56-3", Worktree: "/attempts/owner-repo-56-3", Session: "as-owner-repo-56-3"}
-	prompt := implementationPrompt(issue, identity)
-	for _, want := range []string{"Project: owner/repo", "Issue: #56", "Attempt: 3", "Base branch: main", "Branch: " + identity.Branch, "Worktree: " + identity.Worktree, "Session: " + identity.Session, issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "stdout", "stderr", "outside the worktree", "/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "Re-read both the comment and label", "partial-update errors are failures, never success"} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("prompt omitted %q: %s", want, prompt)
+	for _, interactive := range []bool{false, true} {
+		prompt := implementationPrompt(issue, identity, interactive)
+		for _, want := range []string{"Project: owner/repo", "Issue: #56", "Attempt: 3", "Base branch: main", "Branch: " + identity.Branch, "Worktree: " + identity.Worktree, "Session: " + identity.Session, issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "Re-read both the comment and label", "partial-update errors are failures, never success"} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("interactive=%v prompt omitted %q: %s", interactive, want, prompt)
+			}
 		}
-	}
-	if strings.Count(prompt, issue.Body) != 1 || strings.Contains(prompt, "GITHUB_TOKEN") || strings.Contains(prompt, "PRIVATE_KEY") {
-		t.Fatalf("prompt changed issue content or named a credential: %s", prompt)
-	}
-	line := prompt[strings.LastIndex(prompt, "\n")+1:]
-	result, err := parseWorkerResult([]byte(line))
-	if err != nil || result.Validation == "" || result.Documentation == "" {
-		t.Fatalf("documented result was rejected: %#v, %v", result, err)
+		if interactive && (!strings.Contains(prompt, agentruntime.WorkerResultEnvironment) || !strings.Contains(prompt, "operator-visible conversation") || strings.Contains(prompt, "Make stdout")) {
+			t.Fatalf("interactive completion contract is not direct-chat safe: %s", prompt)
+		}
+		if !interactive && (!strings.Contains(prompt, "Make stdout") || !strings.Contains(prompt, "outside the worktree")) {
+			t.Fatalf("captured completion contract changed: %s", prompt)
+		}
+		if strings.Count(prompt, issue.Body) != 1 || strings.Contains(prompt, "GITHUB_TOKEN") || strings.Contains(prompt, "PRIVATE_KEY") {
+			t.Fatalf("prompt changed issue content or named a credential: %s", prompt)
+		}
+		line := prompt[strings.LastIndex(prompt, "\n")+1:]
+		result, err := parseWorkerResult([]byte(line))
+		if err != nil || result.Validation == "" || result.Documentation == "" {
+			t.Fatalf("documented result was rejected: %#v, %v", result, err)
+		}
 	}
 }
 
@@ -2528,7 +2609,7 @@ case "$payload" in
   *'"rev-parse","HEAD"'*) printf '{"Output":"%s"}'; exit 0;;
   *'"has-session"'*) if test -f %q; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true}'; fi; exit 0;;
   *'"new-session"'*) touch %q;;
-  *'"load-buffer"'*) printf '%%s' "$payload" >%q;;
+  *'"respawn-pane"'*) printf '%%s' "$payload" >%q;;
   *'"display-message"'*) printf '{"Output":"0"}'; exit 0;;
   *) printf '{"Code":0}'; exit 0;;
 esac
@@ -2606,16 +2687,20 @@ if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true
 	}
 	var launched struct {
 		Command struct {
-			Input []byte `json:"input"`
+			Args []string `json:"args"`
 		} `json:"command"`
 	}
 	payload, readErr := os.ReadFile(launchPayload)
 	if readErr != nil || json.Unmarshal(payload, &launched) != nil {
 		t.Fatalf("launch payload=%q err=%v", payload, readErr)
 	}
+	if len(launched.Command.Args) < 4 || !slices.Equal(launched.Command.Args[len(launched.Command.Args)-4:len(launched.Command.Args)-1], []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
+		t.Fatalf("direct launch command=%q", launched.Command.Args)
+	}
+	prompt := launched.Command.Args[len(launched.Command.Args)-1]
 	for _, want := range []string{"Project: owner/repo", "Issue: #184", "Base branch: main", "Branch: " + manifest.Branch, "Worktree: " + manifest.Worktree, "Session: " + manifest.Session, completeImplementationIssueBody} {
-		if !strings.Contains(string(launched.Command.Input), want) {
-			t.Fatalf("direct launch omitted %q: %s", want, launched.Command.Input)
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("direct launch omitted %q: %s", want, prompt)
 		}
 	}
 	if len(comments) == 0 || !slices.ContainsFunc(comments, func(comment map[string]any) bool {

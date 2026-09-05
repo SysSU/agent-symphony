@@ -25,9 +25,15 @@ async function mockDashboard(page, closeReason = "") {
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: false, state: "disabled" } }));
   await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
   await page.routeWebSocket(/\/(?:reviewer\/)?terminal\?/, (socket) => {
-    const record = { url: socket.url(), messages: [] };
+    const record = { url: socket.url(), messages: [], replied: false };
     sockets.push(record);
-    socket.onMessage((message) => record.messages.push(message));
+    socket.onMessage((message) => {
+      record.messages.push(message);
+      if (typeof message !== "string" && !record.replied) {
+        record.replied = true;
+        socket.send(Buffer.from("agent: acknowledged\r\n"));
+      }
+    });
     if (closeReason) setTimeout(() => void socket.close({ code: 1000, reason: closeReason }), 0);
   });
   return sockets;
@@ -62,9 +68,11 @@ test("selects each bounded session and keeps reviewer attachment read-only", asy
   await expect(page.getByRole("dialog", { name: attempt.sessions[0].name })).toBeVisible();
   await page.keyboard.type("implementation input");
   await expect.poll(() => sockets[1]?.messages.some((message) => typeof message !== "string")).toBe(true);
+  await expect(page.getByText("agent: acknowledged", { exact: false })).toBeVisible();
   target = new URL(sockets[1].url);
   expect(target.pathname).toBe("/terminal");
   expect(Object.fromEntries(target.searchParams)).toEqual({ repository: attempt.repository, issue: "163", attempt: "1" });
+  expect(Buffer.concat(sockets[1].messages.filter((message) => typeof message !== "string").map((message) => Buffer.from(message))).toString()).toContain("implementation input");
   expect(errors).toEqual([]);
 });
 
