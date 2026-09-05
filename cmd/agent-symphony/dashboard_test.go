@@ -1466,15 +1466,15 @@ mv "$AGENT_SYMPHONY_REVIEW_RESULT.tmp" "$AGENT_SYMPHONY_REVIEW_RESULT"`
 	connection.CloseNow()
 
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		pane, _ := exec.Command("tmux", "display-message", "-p", "-t", agentruntime.PaneTarget(started.Session), "#{pane_dead}").Output()
-		if strings.TrimSpace(string(pane)) == "1" {
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: target, ReviewBase: base, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
+	var result independentReviewResult
+	for {
+		result, pending, err = runIndependentReview(t.Context(), nil, attempt, boundary, reviewEnv, []string{reviewer}, issue, manifest, source, head, snapshotRoot)
+		if err != nil || !pending || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	manifest := agentruntime.Manifest{ReviewState: "running", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: target, ReviewBase: base, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
-	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, reviewEnv, []string{reviewer}, issue, manifest, source, head, snapshotRoot)
 	if err != nil || pending || result.Status != "clean" {
 		t.Fatalf("result=%#v pending=%v err=%v output=%q", result, pending, err, output.String())
 	}
