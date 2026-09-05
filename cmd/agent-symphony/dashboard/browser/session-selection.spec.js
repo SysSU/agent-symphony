@@ -21,6 +21,7 @@ async function mockDashboard(page, closeReason = "") {
   await page.route("**/release.json", (route) => route.fulfill({ json: { release: "0.5.0" } }));
   await page.route("**/status.json", (route) => route.fulfill({ json: { updated_at: new Date().toISOString(), statuses: [attempt] } }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { hidden: [] } }));
+  await page.route("**/projects.json", (route) => route.fulfill({ json: { version: 1, projects: [{ version: 1, repository: attempt.repository, local: true, snapshot: { updated_at: new Date().toISOString(), statuses: [attempt] }, state: { version: 1, hidden: [] } }] } }));
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: false, state: "disabled" } }));
   await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
   await page.routeWebSocket(/\/(?:reviewer\/)?terminal\?/, (socket) => {
@@ -51,7 +52,9 @@ test("selects each bounded session and keeps reviewer attachment read-only", asy
   await page.getByLabel(`Read-only terminal for ${attempt.sessions[1].name}`).click();
   await page.keyboard.type("review input");
   await expect.poll(() => sockets.length).toBe(1);
-  expect(sockets[0].url).toContain("/reviewer/terminal?issue=163&attempt=1");
+  let target = new URL(sockets[0].url);
+  expect(target.pathname).toBe("/reviewer/terminal");
+  expect(Object.fromEntries(target.searchParams)).toEqual({ repository: attempt.repository, issue: "163", attempt: "1" });
   expect(sockets[0].messages.every((message) => typeof message === "string")).toBe(true);
   await page.getByRole("button", { name: "Close" }).click();
 
@@ -59,7 +62,9 @@ test("selects each bounded session and keeps reviewer attachment read-only", asy
   await expect(page.getByRole("dialog", { name: attempt.sessions[0].name })).toBeVisible();
   await page.keyboard.type("implementation input");
   await expect.poll(() => sockets[1]?.messages.some((message) => typeof message !== "string")).toBe(true);
-  expect(sockets[1].url).toContain("/terminal?issue=163&attempt=1");
+  target = new URL(sockets[1].url);
+  expect(target.pathname).toBe("/terminal");
+  expect(Object.fromEntries(target.searchParams)).toEqual({ repository: attempt.repository, issue: "163", attempt: "1" });
   expect(errors).toEqual([]);
 });
 

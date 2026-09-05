@@ -54,6 +54,39 @@ func TestEffectiveServeInterval(t *testing.T) {
 	}
 }
 
+func TestRuntimeStateBindsExactlyOneProject(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	if err := bindDeployment(root, "owner/first"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindDeployment(root, "owner/first"); err != nil {
+		t.Fatalf("same project binding failed: %v", err)
+	}
+	if err := bindDeployment(root, "owner/second"); err == nil || !strings.Contains(err.Error(), "bound to project owner/first") {
+		t.Fatalf("cross-project binding error = %v", err)
+	}
+	info, err := os.Stat(filepath.Join(root, "deployment.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("deployment identity mode=%v", info.Mode().Perm())
+	}
+}
+
+func TestRuntimeStateRefusesForeignExistingProjectBeforeBinding(t *testing.T) {
+	root := t.TempDir()
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{{Repository: "owner/first", Issue: 1, Attempt: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindDeployment(root, "owner/second"); err == nil || !strings.Contains(err.Error(), "another project") {
+		t.Fatalf("foreign existing status binding error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "deployment.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("foreign state was bound: %v", err)
+	}
+}
+
 type revokedAttemptRunner struct {
 	live, interrupted bool
 	starts            int

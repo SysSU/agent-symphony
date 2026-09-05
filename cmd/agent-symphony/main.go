@@ -262,6 +262,76 @@ func productionSnapshotRoot(stateRoot string) string {
 
 func projectTmuxRoot(stateRoot string) string { return filepath.Join(stateRoot, "tmux") }
 
+const deploymentIdentityVersion = 1
+
+type deploymentIdentity struct {
+	Version    int    `json:"version"`
+	Repository string `json:"repository"`
+}
+
+func bindDeployment(stateRoot, repository string) error {
+	if info, err := os.Lstat(stateRoot); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return errors.New("runtime state root must be a non-symlink directory")
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+			return fmt.Errorf("prepare runtime state root: %w", err)
+		}
+	} else {
+		return fmt.Errorf("inspect runtime state root: %w", err)
+	}
+	path := filepath.Join(stateRoot, "deployment.json")
+	want := deploymentIdentity{deploymentIdentityVersion, repository}
+	if body, err := readDashboardFile(path, maxDashboardStateBytes); err == nil {
+		var current deploymentIdentity
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&current) != nil || decoder.Decode(&struct{}{}) != io.EOF || current.Version != deploymentIdentityVersion || current.Repository == "" {
+			return errors.New("runtime state has an invalid deployment identity")
+		}
+		if current.Repository != repository {
+			return fmt.Errorf("runtime state is bound to project %s, not %s", current.Repository, repository)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read deployment identity: %w", err)
+	}
+	server := dashboardServer{stateRoot: stateRoot, repository: repository}
+	if _, err := server.readStatus(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("bind existing status: %w", err)
+	}
+	if _, err := server.readState(); err != nil {
+		return fmt.Errorf("bind existing dashboard state: %w", err)
+	}
+	manifests, err := (&agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot}).Discover()
+	if err != nil {
+		return fmt.Errorf("bind existing attempts: %w", err)
+	}
+	if slices.ContainsFunc(manifests, func(manifest agentruntime.Manifest) bool { return manifest.Repository != repository }) {
+		return errors.New("runtime state contains an attempt from another project")
+	}
+	body, _ := json.Marshal(want)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return bindDeployment(stateRoot, repository)
+	}
+	if err != nil {
+		return fmt.Errorf("create deployment identity: %w", err)
+	}
+	if _, err = file.Write(append(body, '\n')); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("write deployment identity: %w", err)
+	}
+	return nil
+}
+
 var agentCodexAssets = []string{"auth.json", "config.toml", "AGENTS.md", "rules", "skills", "plugins", "cache", "installation_id"}
 
 func configureAgentCodexHome(stateRoot string) error {
@@ -440,12 +510,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	issueNumber := fs.Int("issue", 0, "issue number to inspect")
 	interval := fs.Duration("interval", orchestrator.MaxReconcileInterval, "override configured serve reconciliation interval (maximum 60s)")
 	dashboardAddress := fs.String("dashboard-address", "127.0.0.1:8080", "dashboard loopback listen address")
+	var dashboardProjects stringList
+	fs.Var(&dashboardProjects, "dashboard-project", "additional dashboard URL to present read-only (repeatable; serve only)")
 	allowUnsafeDashboardNetwork := fs.Bool("allow-unsafe-dashboard-network", false, "allow password-protected dashboard access outside loopback")
 	dashboardPasswordFile := fs.String("dashboard-password-file", "", "coordinator-only file containing the dashboard HTTP Basic authentication password")
 	offline := fs.Bool("offline", false, "skip network diagnostics")
 	coordinator := fs.String("coordinator", "", "coordinator OS user")
 	if err := fs.Parse(flagArgs); err != nil {
 		return misuse(stderr, wantsJSON, command, err.Error())
+	}
+	if command != "serve" && len(dashboardProjects) > 0 {
+		return misuse(stderr, wantsJSON, command, "--dashboard-project is available only with serve")
 	}
 
 	switch command {
@@ -487,6 +562,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
+		peerProjects, err := validateDashboardProjectURLs(dashboardProjects)
+		if err != nil {
+			return misuse(stderr, wantsJSON, command, err.Error())
+		}
 		*interval = effectiveServeInterval(fs, c.ReconciliationIntervalSeconds, *interval)
 		if runningOnWSL() {
 			root, rootErr := config.GitRoot()
@@ -496,6 +575,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if rootErr != nil {
 				return fail(stderr, *jsonOutput, command, rootErr.Error())
 			}
+		}
+		if err := bindDeployment(*runtimeState, c.Repository); err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		if err := configureProjectTmux(*runtimeState); err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
@@ -571,7 +653,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 				}
 			}()
 		}}
-		dashboardURL, err := startDashboard(ctx, *dashboardAddress, *runtimeState, operationMu, recoverAttempt, reconcile, dashboardAgent, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
+		dashboardURL, err := startProjectDashboard(ctx, *dashboardAddress, *runtimeState, c.Repository, peerProjects, operationMu, recoverAttempt, reconcile, dashboardAgent, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
@@ -1250,6 +1332,14 @@ func onlyFlags(fs *flag.FlagSet, allowed ...string) bool {
 	return ok
 }
 
+type stringList []string
+
+func (values *stringList) String() string { return strings.Join(*values, ",") }
+func (values *stringList) Set(value string) error {
+	*values = append(*values, value)
+	return nil
+}
+
 func effectiveServeInterval(fs *flag.FlagSet, configuredSeconds int, override time.Duration) time.Duration {
 	interval := time.Duration(configuredSeconds) * time.Second
 	fs.Visit(func(f *flag.Flag) {
@@ -1300,18 +1390,6 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	}
 	ctx, cancel := context.WithDeadline(ctx, started.Add(options.timeout))
 	defer cancel()
-	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
-	if err != nil {
-		return nil, fmt.Errorf("load GitHub cache: %w", err)
-	}
-	defer func() {
-		if resultErr != nil {
-			return
-		}
-		if err := cache.Save(); err != nil {
-			resultErr = fmt.Errorf("save GitHub cache: %w", err)
-		}
-	}()
 	c, err := config.Load(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("load configuration: %w", err)
@@ -1325,6 +1403,21 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 			return nil, fmt.Errorf("validate WSL filesystem: %w", err)
 		}
 	}
+	if err := bindDeployment(stateRoot, c.Repository); err != nil {
+		return nil, err
+	}
+	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
+	if err != nil {
+		return nil, fmt.Errorf("load GitHub cache: %w", err)
+	}
+	defer func() {
+		if resultErr != nil {
+			return
+		}
+		if err := cache.Save(); err != nil {
+			resultErr = fmt.Errorf("save GitHub cache: %w", err)
+		}
+	}()
 	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient, Cache: cache}
 	user, err := api.AuthenticatedUser(ctx)
 	if err != nil {
@@ -1380,7 +1473,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		return r.VerifyActive(ctx, manifest, head)
 	}
 	statuses, decisions := projectRecoveryStatuses(ctx, facts, issues, manifests, c.Concurrency, checkRuntime)
-	if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
+	if err := writeProjectStatusSnapshot(stateRoot, c.Repository, statuses); err != nil {
 		return statuses, fmt.Errorf("write status projection: %w", err)
 	}
 	if options.authorize != nil {
@@ -1394,7 +1487,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 			return statuses, fmt.Errorf("fetch operator messages: %w", err)
 		}
 		attachOperatorMessageStatuses(statuses, operatorMessages)
-		if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
+		if err := writeProjectStatusSnapshot(stateRoot, c.Repository, statuses); err != nil {
 			return statuses, fmt.Errorf("write status projection: %w", err)
 		}
 		return statuses, nil
@@ -1407,7 +1500,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		}
 		statuses, decisions = projectRecoveryStatuses(ctx, currentFacts, currentIssues, currentManifests, c.Concurrency, checkRuntime)
 		attachOperatorMessageStatuses(statuses, operatorMessages)
-		return currentManifests, decisions, writeStatusSnapshot(stateRoot, statuses)
+		return currentManifests, decisions, writeProjectStatusSnapshot(stateRoot, c.Repository, statuses)
 	}
 	// Governance may mutate GitHub only after authenticated repository access,
 	// exact proposal authorization, and the duplicate suppression below.
@@ -1438,7 +1531,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		return statuses, fmt.Errorf("fetch operator messages: %w", err)
 	}
 	attachOperatorMessageStatuses(statuses, operatorMessages)
-	if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
+	if err := writeProjectStatusSnapshot(stateRoot, c.Repository, statuses); err != nil {
 		return statuses, fmt.Errorf("write operator message status projection: %w", err)
 	}
 	if err := resumeHandoffs(ctx, &r, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
@@ -1724,6 +1817,13 @@ func writeStatusSnapshot(stateRoot string, statuses []orchestrator.RecoveryStatu
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+func writeProjectStatusSnapshot(stateRoot, repository string, statuses []orchestrator.RecoveryStatus) error {
+	if slices.ContainsFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Repository != repository }) {
+		return errors.New("refusing to write a cross-project status projection")
+	}
+	return writeStatusSnapshot(stateRoot, statuses)
 }
 
 func writeOperatorMessageStatus(stateRoot string, message internalgithub.OperatorMessage) error {
@@ -3719,6 +3819,7 @@ options:
 	--issue number  issue to inspect
 	--interval duration  override configured serve reconciliation interval (maximum 60s)
 	--dashboard-address address  dashboard listen address (serve only; loopback by default)
+	--dashboard-project URL  additional project dashboard to present read-only (serve only; repeatable)
 	--allow-unsafe-dashboard-network  permit non-loopback dashboard binding (requires password)
 	--dashboard-password-file path  coordinator-only HTTP Basic password file; username is agent-symphony
 	--offline     skip the GitHub probe in doctor or diagnostics

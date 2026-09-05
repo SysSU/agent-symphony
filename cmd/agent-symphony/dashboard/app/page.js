@@ -1,13 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-import { OrchestratorCard, StatusCard } from "./_components/status-card";
+import { StatusCard } from "./_components/status-card";
 import AttemptHistory from "./_components/attempt-history";
-import ReconcileButton from "./_components/reconcile-button";
+import ProjectNavigation, { ProjectAgentConsole, ProjectHeader, ProjectHealthControl, projectBoard, projectView } from "./_components/project-navigation";
 import { getMessageProposal, getOrchestratorStatus, getRelease, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
-import { attemptKey, groupStatusesByLane, overallHealth, partitionAttemptHistory, relativeTime } from "./health.mjs";
+import { attemptKey } from "./health.mjs";
 
 export default function Dashboard() {
   const [snapshot, setSnapshot] = useState(null);
@@ -26,6 +26,8 @@ export default function Dashboard() {
   const [messageProposal, setMessageProposal] = useState(null);
   const [messageError, setMessageError] = useState("Loading worker-message controls…");
   const [messageBusy, setMessageBusy] = useState("");
+  const [projects, setProjects] = useState([]);
+  const [selectedRepository, setSelectedRepository] = useState("");
   const closeTerminal = useCallback(() => setTerminal(null), []);
 
   useEffect(() => {
@@ -35,18 +37,21 @@ export default function Dashboard() {
       try {
         const orchestratorRequest = getOrchestratorStatus();
         const proposalRequest = getMessageProposal();
-        const [response, stateResponse, orchestratorResult, proposalResult] = await Promise.all([
+        const [response, stateResponse, projectsResponse, orchestratorResult, proposalResult] = await Promise.all([
           fetch("/status.json", { cache: "no-store" }),
           fetch("/dashboard-state.json", { cache: "no-store" }),
+          fetch("/projects.json", { cache: "no-store" }),
           orchestratorRequest,
           proposalRequest,
         ]);
         if (!response.ok) throw new Error(response.status === 404 ? "Waiting for the first reconciliation" : `Status request failed (${response.status})`);
         if (!stateResponse.ok) throw new Error(`Dashboard state request failed (${stateResponse.status})`);
-        const [next, nextState] = await Promise.all([response.json(), stateResponse.json()]);
+        if (!projectsResponse.ok) throw new Error(`Project request failed (${projectsResponse.status})`);
+        const [next, nextState, nextProjects] = await Promise.all([response.json(), stateResponse.json(), projectsResponse.json()]);
         if (active) {
           setSnapshot(next);
           setDashboardState(nextState);
+          setProjects(nextProjects.projects ?? []);
           setOrchestratorStatus(orchestratorResult.status);
           setOrchestratorError(orchestratorResult.error);
           setMessageProposal(proposalResult.proposal);
@@ -79,7 +84,7 @@ export default function Dashboard() {
     setWaiting(false);
     setActionNotice("");
     try {
-      const query = new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) });
+      const query = new URLSearchParams({ repository: status.repository, issue: String(status.issue), attempt: String(status.attempt) });
       const response = await postWithReconciliationRetry(`/actions/${action}?${query}`, async () => {
         setWaiting(true);
         await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -110,7 +115,7 @@ export default function Dashboard() {
     if (action === "investigate") setInvestigating(key);
     setActionNotice("");
     try {
-      const query = status ? `?${new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) })}` : "";
+      const query = status ? `?${new URLSearchParams({ repository: status.repository, issue: String(status.issue), attempt: String(status.attempt) })}` : "";
       const response = await postWithReconciliationRetry(`/actions/orchestrator/${action}${query}`);
       if (!response.ok) throw new Error((await response.text()).trim() || `Orchestrator ${action} failed (${response.status})`);
       const result = await response.json();
@@ -158,21 +163,14 @@ export default function Dashboard() {
     return () => clearInterval(timer);
   }, []);
 
-  const projected = useMemo(() => snapshot ? snapshot.statuses : [], [snapshot]);
-  const hidden = useMemo(() => new Set((dashboardState.hidden ?? []).map(attemptKey)), [dashboardState]);
-  const partitioned = useMemo(() => partitionAttemptHistory(projected), [projected]);
-  const statuses = partitioned.current.filter((status) => !hidden.has(attemptKey(status)));
-  const historical = partitioned.historical.filter((status) => !hidden.has(attemptKey(status)));
-  const counts = useMemo(() => Object.entries(statuses.reduce((result, status) => {
-    result[status.state] = (result[status.state] ?? 0) + 1;
-    return result;
-  }, {})).sort(([a], [b]) => a.localeCompare(b)), [statuses]);
-  const lanes = groupStatusesByLane(statuses);
-  const health = overallHealth(snapshot, error, statuses, now);
-  const openAttemptTerminal = useCallback((status, session) => {
+  const view = projectView(projects, selectedRepository, snapshot, dashboardState, error);
+  const { remote: remoteProject, snapshot: visibleSnapshot, error: visibleError } = view;
+  const { statuses, historical, counts, title, lanes, health } = projectBoard(view, now);
+  const remoteURL = remoteProject?.url || "";
+  const openAttemptTerminal = (status, session) => {
     const selected = session ?? { role: "implementation", name: status.session }, route = { implementation: "/terminal", reviewer: "/reviewer/terminal" }[selected.role];
-    if (route && selected.name) setTerminal({ endpoint: `${route}?${new URLSearchParams({ issue: String(status.issue), attempt: String(status.attempt) })}`, title: selected.name, eyebrow: `${selected.role} tmux session`, readOnly: selected.role === "reviewer" });
-  }, []);
+    if (!remoteURL && route && selected.name) setTerminal({ endpoint: `${route}?${new URLSearchParams({ repository: status.repository, issue: String(status.issue), attempt: String(status.attempt) })}`, title: selected.name, eyebrow: `${selected.role} tmux session`, readOnly: selected.role === "reviewer" });
+  };
   const openOrchestratorTerminal = useCallback(() => {
     if (!orchestratorStatus?.session) return;
     setTerminal({ endpoint: "/orchestrator/terminal", title: orchestratorStatus.session, eyebrow: "orchestrator tmux session" });
@@ -180,22 +178,9 @@ export default function Dashboard() {
 
   return (
     <main>
-      <header className="hero">
-        <div>
-          <p className="eyebrow">Agent Symphony</p>
-          <h1>{projected.length ? projected[0].repository : "Repository dashboard"}</h1>
-          <p className="freshness" aria-live="polite">{snapshot ? `Updated ${relativeTime(snapshot.updated_at, now)}` : "Loading status…"}</p>
-          <p className="release" aria-live="polite">{release ? <>Release <code>{release}</code></> : "Loading release…"}</p>
-        </div>
-        <div className="counts" aria-label="Issue counts by state">
-          {counts.map(([state, count]) => (
-            <div className="count" key={state}>
-              <strong>{count}</strong>
-              <span>{state}</span>
-            </div>
-          ))}
-        </div>
-      </header>
+      <ProjectHeader title={title} snapshot={visibleSnapshot} release={release} counts={counts} now={now} />
+
+      <ProjectNavigation projects={projects} remote={remoteProject} onSelect={setSelectedRepository} />
 
       <section className={`health health-${health.state}`} role="status" aria-live="polite" aria-atomic="true">
         <span className="healthDot" aria-hidden="true" />
@@ -203,10 +188,11 @@ export default function Dashboard() {
           <h2>{health.title}</h2>
           <p>{health.detail}</p>
         </div>
-        <ReconcileButton onNotice={setActionNotice} onSnapshot={setSnapshot} />
+        <ProjectHealthControl remote={remoteProject} onNotice={setActionNotice} onSnapshot={setSnapshot} />
       </section>
 
-      <OrchestratorCard
+      <ProjectAgentConsole
+        remote={remoteProject}
         status={orchestratorStatus}
         error={orchestratorError}
         busy={orchestratorBusy}
@@ -219,14 +205,14 @@ export default function Dashboard() {
       />
 
       {actionNotice ? <p className="notice" role="status">{actionNotice}</p> : null}
-      {!error && snapshot && statuses.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
+      {!visibleError && visibleSnapshot && statuses.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
 
       <section className="board" aria-label="Issue status board" tabIndex={0} onKeyDown={(event) => {
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
         event.preventDefault();
         event.currentTarget.scrollLeft += event.key === "ArrowLeft" ? -event.currentTarget.clientWidth : event.currentTarget.clientWidth;
       }}>
-        {snapshot ? lanes.map((lane) => (
+        {visibleSnapshot ? lanes.map((lane) => (
           <section className="lane" aria-labelledby={`lane-${lane.id}`} key={lane.id}>
             <header className="laneHeader">
               <h2 id={`lane-${lane.id}`}>{lane.title}
@@ -249,13 +235,14 @@ export default function Dashboard() {
                       waiting={waiting && busy === attemptKey(status)}
                       followUpEnabled={!messageError}
                       onNotice={setActionNotice}
+                      readOnly={Boolean(remoteProject)}
                     />
                   </li>
                 ))}
               </ol>
             ) : <p className="emptyLane">No attempts</p>}
           </section>
-        )) : <p className="boardState" role="status">{error ? "Issue status board unavailable." : "Loading issue status board…"}</p>}
+        )) : <p className="boardState" role="status">{visibleError ? "Issue status board unavailable." : "Loading issue status board…"}</p>}
       </section>
       <AttemptHistory statuses={historical} />
       {terminal ? <TerminalPanel config={terminal} onClose={closeTerminal} /> : null}

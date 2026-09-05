@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +55,100 @@ func TestDashboardServesEmbeddedNextPageAndStatus(t *testing.T) {
 		if response.Code != test.status || !strings.Contains(response.Body.String(), test.contains) {
 			t.Fatalf("%s %s: status=%d body=%q", test.method, test.path, response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestDashboardProjectURLs(t *testing.T) {
+	got, err := validateDashboardProjectURLs([]string{"http://127.0.0.1:8082/", "https://projects.example.test"})
+	if err != nil || !slices.Equal(got, []string{"http://127.0.0.1:8082", "https://projects.example.test"}) {
+		t.Fatalf("validated URLs=%v err=%v", got, err)
+	}
+	for _, value := range []string{"127.0.0.1:8082", "file:///tmp/status", "http://user:secret@localhost:8082", "http://localhost:8082/path", "http://localhost:8082?project=other"} {
+		if _, err := validateDashboardProjectURLs([]string{value}); err == nil {
+			t.Fatalf("accepted dashboard project %q", value)
+		}
+	}
+	if _, err := validateDashboardProjectURLs([]string{"http://localhost:8082", "http://localhost:8082/"}); err == nil {
+		t.Fatal("accepted duplicate dashboard projects")
+	}
+}
+
+func TestDashboardRejectsContaminatedPeerProjection(t *testing.T) {
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(dashboardProject{
+			Version:    1,
+			Repository: "owner/first",
+			Snapshot:   &dashboardStatusSnapshot{Statuses: []orchestrator.RecoveryStatus{{Repository: "owner/second", Issue: 7, Attempt: 1}}},
+			State:      &dashboardState{Version: 1, Hidden: []dashboardHiddenAttempt{}},
+		})
+	}))
+	defer peer.Close()
+	project := fetchDashboardProject(t.Context(), peer.URL)
+	if project.Repository != "" || project.Snapshot != nil || project.Error != "project status is invalid" {
+		t.Fatalf("contaminated peer project = %#v", project)
+	}
+}
+
+func TestDashboardAggregatesTwoProjectsReadOnlyAndRejectsCrossProjectRoutes(t *testing.T) {
+	firstRoot, secondRoot := t.TempDir(), t.TempDir()
+	firstRepository, secondRepository := "owner/first", "owner/second"
+	firstSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, firstRepository, 7, 1)
+	secondSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, secondRepository, 7, 1)
+	first := orchestrator.RecoveryStatus{Repository: firstRepository, Issue: 7, Attempt: 1, State: "active", Session: firstSession}
+	second := orchestrator.RecoveryStatus{Repository: secondRepository, Issue: 7, Attempt: 1, State: "blocked", Session: secondSession}
+	if err := bindDeployment(firstRoot, firstRepository); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindDeployment(secondRoot, secondRepository); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeProjectStatusSnapshot(firstRoot, firstRepository, []orchestrator.RecoveryStatus{first}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeProjectStatusSnapshot(secondRoot, secondRepository, []orchestrator.RecoveryStatus{second}); err != nil {
+		t.Fatal(err)
+	}
+	peer := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), secondRoot, secondRepository, nil, "tmux", &sync.Mutex{}, nil, nil, nil, false, ""))
+	defer peer.Close()
+	aggregator := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), firstRoot, firstRepository, []string{peer.URL}, "tmux", &sync.Mutex{}, nil, nil, nil, false, ""))
+	defer aggregator.Close()
+
+	response, err := http.Get(aggregator.URL + "/projects.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var projects struct {
+		Projects []dashboardProject `json:"projects"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&projects); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || len(projects.Projects) != 2 || projects.Projects[0].Repository != firstRepository || projects.Projects[1].Repository != secondRepository || projects.Projects[1].Local || projects.Projects[1].URL != peer.URL || projects.Projects[0].Snapshot.Statuses[0].Session != firstSession || projects.Projects[1].Snapshot.Statuses[0].Session != secondSession {
+		t.Fatalf("aggregated projects = %#v", projects.Projects)
+	}
+
+	request, _ := http.NewRequest(http.MethodPost, aggregator.URL+"/actions/archive?repository="+url.QueryEscape(secondRepository)+"&issue=7&attempt=1", nil)
+	request.Header.Set("Origin", aggregator.URL)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("cross-project action status = %d", response.StatusCode)
+	}
+
+	if err := writeStatusSnapshot(firstRoot, []orchestrator.RecoveryStatus{second}); err != nil {
+		t.Fatal(err)
+	}
+	response, err = http.Get(aggregator.URL + "/status.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("contaminated status response = %d", response.StatusCode)
 	}
 }
 
