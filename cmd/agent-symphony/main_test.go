@@ -575,6 +575,36 @@ func TestWriteOperatorMessageStatusProjectsQueuedAndTerminalStateImmediately(t *
 	}
 }
 
+func TestWriteOperatorMessageStatusRejectsMixedProjectSnapshotWithoutReplacingIt(t *testing.T) {
+	root := t.TempDir()
+	statuses := []orchestrator.RecoveryStatus{
+		{Repository: "o/r", Issue: 4, Attempt: 2, State: "active"},
+		{Repository: "other/project", Issue: 5, Attempt: 1, State: "active"},
+	}
+	if err := writeStatusSnapshot(root, statuses); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "status.json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := internalgithub.PrepareOperatorMessage("o/r", 4, 2, "Do not rewrite mixed project state.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOperatorMessageStatus(root, message); err == nil || !strings.Contains(err.Error(), "cross-project") {
+		t.Fatalf("mixed project status error = %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("mixed project status snapshot was replaced")
+	}
+}
+
 func TestStartupMessageRecoveryAcceptsCurrentStatusSchemaWithoutPendingWork(t *testing.T) {
 	root := t.TempDir()
 	statuses := []orchestrator.RecoveryStatus{{Issue: 161, OperatorMessages: []orchestrator.OperatorMessageStatus{{ID: strings.Repeat("a", 64), State: "delivered"}}}}

@@ -1857,7 +1857,7 @@ func writeOperatorMessageStatus(stateRoot string, message internalgithub.Operato
 	} else {
 		*messages = append(*messages, status)
 	}
-	return writeStatusSnapshot(stateRoot, snapshot.Statuses)
+	return writeProjectStatusSnapshot(stateRoot, message.Repository, snapshot.Statuses)
 }
 
 func seedAttemptSource(ctx context.Context, checkout, repositoryName, attemptRoot, baseBranch, baseSHA string) (string, error) {
