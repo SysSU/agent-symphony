@@ -101,7 +101,7 @@ test("opens and chats with both exact review modes", async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
-test("starts an issue-bound plan review from the attempt card", async ({ page }) => {
+test("reports a fresh plan review start from the retained-clean projection", async ({ page }) => {
   const { reviewPlanRequests } = await mockDashboard(page);
   await page.goto("/");
 

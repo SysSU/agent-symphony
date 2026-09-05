@@ -1029,7 +1029,7 @@ func TestDashboardRecoverRequiresSameOriginFreshRetryableProjection(t *testing.T
 	}
 }
 
-func TestDashboardPlanReviewActionStartsExactIssueBoundReviewer(t *testing.T) {
+func TestDashboardPlanReviewActionRestartsCleanIssueBoundReviewer(t *testing.T) {
 	source := gitRepository(t)
 	runGit(t, source, "config", "user.email", "test@example.invalid")
 	runGit(t, source, "config", "user.name", "test")
@@ -1050,6 +1050,11 @@ func TestDashboardPlanReviewActionStartsExactIssueBoundReviewer(t *testing.T) {
 	}
 	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "215-3", "agent.log")
 	manifest.State, manifest.CreatedAt, manifest.UpdatedAt = "running", time.Now().UTC(), time.Now().UTC()
+	binding := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, Body: "## Plan\nReview this operator-selected plan.", DispatchAuthorized: true, ActiveAttempt: &binding}
+	target, _ := reviewTarget(agentruntime.ReviewModePlan, issue, base, base)
+	manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget = "clean", agentruntime.ReviewModePlan, target
+	manifest.ReviewBase, manifest.ReviewHead = base, base
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1061,8 +1066,6 @@ func TestDashboardPlanReviewActionStartsExactIssueBoundReviewer(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Runner: &operatorMessageRunner{branch: manifest.Branch, head: base}, VerifyWorker: func(context.Context) error { return nil }}
-	binding := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}
-	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, Body: "## Plan\nReview this operator-selected plan.", DispatchAuthorized: true, ActiveAttempt: &binding}
 	snapshotRoot := filepath.Join(t.TempDir(), "snapshots")
 	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -1096,7 +1099,6 @@ func TestDashboardPlanReviewActionStartsExactIssueBoundReviewer(t *testing.T) {
 	request.Header.Set("Origin", "http://127.0.0.1")
 	response := httptest.NewRecorder()
 	server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
-	target, _ := reviewTarget(agentruntime.ReviewModePlan, issue, base, base)
 	stored, discoverErr := runtimeState.Discover()
 	if response.Code != http.StatusOK || calls != 1 || discoverErr != nil || len(stored) != 1 || stored[0].ReviewState != "running" || stored[0].ReviewMode != agentruntime.ReviewModePlan || stored[0].ReviewTarget != target {
 		t.Fatalf("status=%d body=%q calls=%d manifest=%#v err=%v", response.Code, response.Body.String(), calls, stored, discoverErr)

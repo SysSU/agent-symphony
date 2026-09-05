@@ -2735,9 +2735,6 @@ func startIssuePlanReview(ctx context.Context, runtimeState *agentruntime.Runtim
 			return errors.New("another review already owns the deterministic reviewer session")
 		}
 	}
-	if manifest.ReviewState == "clean" && manifest.ReviewMode == agentruntime.ReviewModePlan && manifest.ReviewTarget == target {
-		return nil
-	}
 	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
 	if err != nil {
 		return err
