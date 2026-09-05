@@ -1148,6 +1148,49 @@ func TestQueuedReviewHandoffTransitionsAreDurableAndImmutable(t *testing.T) {
 	}
 }
 
+func TestReviewModeAndTargetAreDurableAndValidated(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := attempt.BaseSHA + ".." + strings.Repeat("b", 40)
+	reviewer, _ := AttemptSessionName(SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
+	stored, err := r.RecordReview(attempt, "running", ReviewModeImplementation, target, attempt.BaseSHA, strings.Repeat("b", 40), "/review/snapshot", reviewer)
+	if err != nil || stored.ReviewMode != ReviewModeImplementation || stored.ReviewTarget != target {
+		t.Fatalf("review metadata was not persisted: %#v err=%v", stored, err)
+	}
+	for _, test := range []struct{ mode, target string }{
+		{"ui-review", target},
+		{ReviewModePlan, ""},
+		{ReviewModePlan, "owner/repo#1 plan sha256:not-a-digest"},
+		{ReviewModeImplementation, "garbage"},
+		{ReviewModeImplementation, "unsafe\ntarget"},
+	} {
+		invalid := stored
+		invalid.ReviewMode, invalid.ReviewTarget = test.mode, test.target
+		if err := r.validateManifest(attempt, invalid); err == nil {
+			t.Fatalf("invalid review metadata was accepted: %#v", test)
+		}
+	}
+	invalid := stored
+	invalid.ReviewTarget = strings.Repeat("c", 40) + ".." + strings.Repeat("b", 40)
+	if err := r.validateManifest(attempt, invalid); err == nil {
+		t.Fatal("review target detached from persisted base was accepted")
+	}
+	invalid = stored
+	invalid.ReviewMode = ReviewModePlan
+	invalid.ReviewTarget = fmt.Sprintf("%s#%d plan sha256:%s", attempt.Repository, attempt.Issue, strings.Repeat("c", 64))
+	invalid.ReviewHead = strings.Repeat("b", 40)
+	if err := r.validateManifest(attempt, invalid); err == nil {
+		t.Fatal("plan target detached from persisted attempt base was accepted")
+	}
+	manifest.ReviewState = ""
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		t.Fatalf("legacy manifest without review metadata was rejected: %v", err)
+	}
+}
+
 func TestStopInterruptsPaneZeroWhenAnotherPaneIsActive(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	manifest, err := r.PrepareAndStart(t.Context(), attempt)
