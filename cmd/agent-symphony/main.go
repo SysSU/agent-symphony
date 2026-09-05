@@ -1380,11 +1380,6 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		return r.VerifyActive(ctx, manifest, head)
 	}
 	statuses, decisions := projectRecoveryStatuses(ctx, facts, issues, manifests, c.Concurrency, checkRuntime)
-	operatorMessages, err := fetchOperatorMessages(ctx, api, prConfig, issues, remote, manifests)
-	if err != nil {
-		return statuses, fmt.Errorf("fetch operator messages: %w", err)
-	}
-	attachOperatorMessageStatuses(statuses, operatorMessages)
 	if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
 		return statuses, fmt.Errorf("write status projection: %w", err)
 	}
@@ -1394,8 +1389,17 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		}
 	}
 	if !options.transition {
+		operatorMessages, err := fetchOperatorMessages(ctx, api, prConfig, issues, remote, manifests)
+		if err != nil {
+			return statuses, fmt.Errorf("fetch operator messages: %w", err)
+		}
+		attachOperatorMessageStatuses(statuses, operatorMessages)
+		if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
+			return statuses, fmt.Errorf("write status projection: %w", err)
+		}
 		return statuses, nil
 	}
+	operatorMessages := map[string][]internalgithub.OperatorMessage{}
 	refreshProjection := func(currentFacts []orchestrator.AttemptFact, currentIssues []internalgithub.RecoveryIssueFact) ([]agentruntime.Manifest, []orchestrator.Decision, error) {
 		currentManifests, discoverErr := r.Discover()
 		if discoverErr != nil {
@@ -1420,6 +1424,22 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		if err != nil {
 			return statuses, fmt.Errorf("resume bound attempts: %w", err)
 		}
+	}
+	dispatchErr := dispatchIssues(ctx, api, &r, c, prConfig, issues, decisions)
+	remote, facts = recoveryAttemptFacts(remote, issues)
+	if _, _, err = refreshProjection(facts, issues); err != nil {
+		return statuses, errors.Join(fmt.Errorf("write dispatched status projection: %w", err), dispatchErr)
+	}
+	if dispatchErr != nil {
+		return statuses, fmt.Errorf("dispatch eligible issues: %w", dispatchErr)
+	}
+	operatorMessages, err = fetchOperatorMessages(ctx, api, prConfig, issues, remote, manifests)
+	if err != nil {
+		return statuses, fmt.Errorf("fetch operator messages: %w", err)
+	}
+	attachOperatorMessageStatuses(statuses, operatorMessages)
+	if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
+		return statuses, fmt.Errorf("write operator message status projection: %w", err)
 	}
 	if err := resumeHandoffs(ctx, &r, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
 		return statuses, fmt.Errorf("resume durable handoffs: %w", err)
@@ -1511,26 +1531,6 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	}
 	if operatorErr != nil {
 		return statuses, fmt.Errorf("resume operator messages: %w", operatorErr)
-	}
-	dispatchErr := dispatchIssues(ctx, api, &r, c, prConfig, freshIssues, decisions)
-	_, freshFacts = recoveryAttemptFacts(freshRemote, freshIssues)
-	if _, _, err = refreshProjection(freshFacts, freshIssues); err != nil {
-		return statuses, errors.Join(fmt.Errorf("write local dispatched status projection: %w", err), dispatchErr)
-	}
-	freshRemote, err = internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
-	if err != nil {
-		return statuses, errors.Join(fmt.Errorf("refresh dispatched pull request attempts: %w", err), dispatchErr)
-	}
-	freshIssues, err = internalgithub.FetchIssueFacts(ctx, api, prConfig, freshRemote, false)
-	if err != nil {
-		return statuses, errors.Join(fmt.Errorf("refresh dispatched issue controls: %w", err), dispatchErr)
-	}
-	_, freshFacts = recoveryAttemptFacts(freshRemote, freshIssues)
-	if _, _, err = refreshProjection(freshFacts, freshIssues); err != nil {
-		return statuses, errors.Join(fmt.Errorf("write dispatched status projection: %w", err), dispatchErr)
-	}
-	if dispatchErr != nil {
-		return statuses, fmt.Errorf("dispatch eligible issues: %w", dispatchErr)
 	}
 	if err := ctx.Err(); err != nil {
 		return statuses, fmt.Errorf("reconciliation exceeded the %s recovery target: %w", options.timeout, err)
@@ -1805,8 +1805,13 @@ func seedAttemptSource(ctx context.Context, checkout, repositoryName, attemptRoo
 }
 
 func startIssueAttempt(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact) (agentruntime.Manifest, error) {
-	prompt := implementationPrompt(issue)
-	return runtime.PrepareAndStart(ctx, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Context: prompt, Command: cfg.Commands.Implementation, Eligible: func() bool { return issue.DispatchAuthorized }})
+	attempt := agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Command: cfg.Commands.Implementation, Eligible: func() bool { return issue.DispatchAuthorized }}
+	identity, err := agentruntime.AttemptIdentity(runtime.Root, attempt)
+	if err != nil {
+		return agentruntime.Manifest{}, err
+	}
+	attempt.Context = implementationPrompt(issue, identity)
+	return runtime.PrepareAndStart(ctx, attempt)
 }
 
 func resumeBoundAttempts(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact) ([]agentruntime.Manifest, error) {
@@ -1842,7 +1847,15 @@ func dispatchIssues(ctx context.Context, api internalgithub.API, runtime *agentr
 			return errors.New("scheduler returned an unknown issue")
 		}
 		issue := issues[index]
-		if err := internalgithub.EnsureActiveAttempt(ctx, api, prConfig, issue.Issue, issue.Attempt, issue.BaseSHA); err != nil {
+		if !issue.Eligible || !issue.DispatchAuthorized {
+			return fmt.Errorf("dispatch %s#%d attempt %d: issue is not eligible", issue.Repository, issue.Issue, issue.Attempt)
+		}
+		identity, err := agentruntime.AttemptIdentity(runtime.Root, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA})
+		if err != nil {
+			return fmt.Errorf("identify dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
+		}
+		detail := fmt.Sprintf("Implementation session reserved.\n\n- Project: `%s`\n- Branch: `%s`\n- Worktree: `%s`\n- Session: `%s`", issue.Repository, identity.Branch, identity.Worktree, identity.Session)
+		if err := internalgithub.EnsureActiveAttempt(ctx, api, prConfig, issue.Issue, issue.Attempt, issue.BaseSHA, detail); err != nil {
 			return fmt.Errorf("bind dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
 		}
 		binding := internalgithub.RecoveryAttemptFact{Repository: issue.Repository, Issue: issue.Issue, Attempt: issue.Attempt, BaseSHA: issue.BaseSHA, State: "active"}
@@ -1855,8 +1868,8 @@ func dispatchIssues(ctx context.Context, api internalgithub.API, runtime *agentr
 	return nil
 }
 
-func implementationPrompt(issue internalgithub.RecoveryIssueFact) string {
-	return fmt.Sprintf("Repository: %s\nIssue: #%d\nAttempt: %d\n\n%s\n\nDirect status: use the installed gh CLI to post one unedited comment on issue #%d or its pull request: `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON`. A nonempty reason is required. Pair the comment with the `needs-attention` label on the bound issue: add it when setting status and remove it when clearing. Re-read both the comment and label before reporting the status changed; authentication, authorization, or partial-update errors are failures, never success. Other issue-authorized comments, labels, and Markdown links may also be updated directly with gh.\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Agent Symphony captures stdout outside the worktree. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.Body, issue.Issue)
+func implementationPrompt(issue internalgithub.RecoveryIssueFact, identity agentruntime.Manifest) string {
+	return fmt.Sprintf("Project: %s\nIssue: #%d\nAttempt: %d\nBase branch: %s\nBranch: %s\nWorktree: %s\nSession: %s\n\n%s\n\nDirect status: use the installed gh CLI to post one unedited comment on issue #%d or its pull request: `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON`. A nonempty reason is required. Pair the comment with the `needs-attention` label on the bound issue: add it when setting status and remove it when clearing. Re-read both the comment and label before reporting the status changed; authentication, authorization, or partial-update errors are failures, never success. Other issue-authorized comments, labels, and Markdown links may also be updated directly with gh.\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Agent Symphony captures stdout outside the worktree. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.BaseBranch, identity.Branch, identity.Worktree, identity.Session, issue.Body, issue.Issue)
 }
 
 type workerResult struct {

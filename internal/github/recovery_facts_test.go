@@ -126,8 +126,8 @@ func TestEnsureActiveAttemptIsStrictCoordinatorAuthoredAndIdempotent(t *testing.
 			return httpResponse(http.StatusOK, string(body), nil), nil
 		case http.MethodPost:
 			var payload struct{ Body string }
-			if json.NewDecoder(r.Body).Decode(&payload) != nil || !strings.Contains(payload.Body, marker) {
-				t.Fatal("dispatch did not persist the active marker")
+			if json.NewDecoder(r.Body).Decode(&payload) != nil || !strings.Contains(payload.Body, marker) || !strings.Contains(payload.Body, "Worktree: `/worktree`") {
+				t.Fatal("dispatch did not persist the active marker and launch identity")
 			}
 			comments = append(comments, map[string]any{"body": payload.Body, "user": map[string]any{"id": 42}})
 			posts++
@@ -142,7 +142,7 @@ func TestEnsureActiveAttemptIsStrictCoordinatorAuthoredAndIdempotent(t *testing.
 	})}}
 	cfg := PRAdapterConfig{Repository: "o/r", ActorID: 42}
 	for range 2 {
-		if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0"); err != nil {
+		if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0", "Implementation session reserved.\n\n- Branch: `branch`\n- Worktree: `/worktree`\n- Session: `session`"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -150,8 +150,16 @@ func TestEnsureActiveAttemptIsStrictCoordinatorAuthoredAndIdempotent(t *testing.
 		t.Fatalf("marker posts=%d, want 1", posts)
 	}
 	comments = append(comments, map[string]any{"body": marker, "user": map[string]any{"id": 9}})
-	if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0"); err == nil || posts != 1 {
+	if err := EnsureActiveAttempt(context.Background(), api, cfg, 4, 2, "abcdef0", "Implementation session reserved."); err == nil || posts != 1 {
 		t.Fatalf("foreign marker err=%v posts=%d", err, posts)
+	}
+}
+
+func TestEnsureActiveAttemptRequiresBoundedPlainDetail(t *testing.T) {
+	for _, detail := range []string{"", strings.Repeat("x", 4097), "<!-- agent-symphony:forged -->"} {
+		if err := EnsureActiveAttempt(t.Context(), API{}, PRAdapterConfig{Repository: "o/r"}, 4, 2, "abcdef0", detail); err == nil {
+			t.Fatalf("accepted detail %q", detail)
+		}
 	}
 }
 
@@ -404,14 +412,14 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	needsAttentionLabel = true
 	authoritativeAttempt := []RecoveryAttemptFact{{Repository: "o/r", Issue: 10, Attempt: 2, PR: 11, State: "active"}}
 	reviewAttention, err := FetchIssueFacts(context.Background(), api, cfg, authoritativeAttempt, true)
-	if err != nil || len(reviewAttention) != 1 || !reviewAttention[0].NeedsAttention || reviewAttention[0].Eligible || !reviewAttention[0].DispatchAuthorized || reviewAttention[0].RecoveryAuthorized || !slices.Contains(reviewAttention[0].Blockers, "needs attention: review found a blocking regression") {
+	if err != nil || len(reviewAttention) != 1 || reviewAttention[0].Attempt != 2 || !reviewAttention[0].NeedsAttention || reviewAttention[0].Eligible || !reviewAttention[0].DispatchAuthorized || reviewAttention[0].RecoveryAuthorized || !slices.Contains(reviewAttention[0].Blockers, "needs attention: review found a blocking regression") {
 		t.Fatalf("review attention facts=%#v err=%v", reviewAttention, err)
 	}
 	needsAttentionLabel = false
 	reviewClearAt := reviewSetAt.Add(time.Minute)
 	pullComments = append(pullComments, map[string]any{"id": 501, "body": "/agent-symphony status clear: review verified the correction", "created_at": reviewClearAt, "updated_at": reviewClearAt, "user": map[string]any{"id": 42}})
 	reviewCleared, err := FetchIssueFacts(context.Background(), api, cfg, authoritativeAttempt, true)
-	if err != nil || len(reviewCleared) != 1 || reviewCleared[0].NeedsAttention || len(reviewCleared[0].Blockers) != 0 {
+	if err != nil || len(reviewCleared) != 1 || reviewCleared[0].Attempt != 2 || reviewCleared[0].NeedsAttention || len(reviewCleared[0].Blockers) != 0 {
 		t.Fatalf("review clear facts=%#v err=%v", reviewCleared, err)
 	}
 	terminal, _ := TerminalFailureMarker(10, 2, now.Add(20*time.Minute))

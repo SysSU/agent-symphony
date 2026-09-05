@@ -263,12 +263,18 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 	if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/branches/%s", cfg.Repository, repository.DefaultBranch), "", &branch); err != nil {
 		return nil, err
 	}
-	active, completed, next := map[int]bool{}, map[int]bool{}, map[int]int{}
+	active, completed, next, published := map[int]bool{}, map[int]bool{}, map[int]int{}, map[int]int{}
 	for _, attempt := range attempts {
+		if attempt.Repository != cfg.Repository {
+			continue
+		}
 		if attempt.Attempt >= next[attempt.Issue] {
 			next[attempt.Issue] = attempt.Attempt + 1
 		}
-		active[attempt.Issue] = active[attempt.Issue] || attempt.State == "active" || attempt.State == "review-ready"
+		if attempt.State == "active" || attempt.State == "review-ready" {
+			active[attempt.Issue] = true
+			published[attempt.Issue] = max(published[attempt.Issue], attempt.Attempt)
+		}
 		completed[attempt.Issue] = completed[attempt.Issue] || attempt.State == "completed"
 	}
 	source := GitHubPRSource{API: api, Config: cfg}
@@ -325,7 +331,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 					continue
 				}
 				bindingFinal := slices.ContainsFunc(attempts, func(attempt RecoveryAttemptFact) bool {
-					return attempt.Issue == issue.Number && attempt.Attempt == candidate.Attempt
+					return attempt.Repository == cfg.Repository && attempt.Issue == issue.Number && attempt.Attempt == candidate.Attempt
 				})
 				if bindingFinal {
 					continue
@@ -346,7 +352,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			}
 			pullRequest := 0
 			for _, attempt := range attempts {
-				if attempt.Issue == issue.Number && attempt.Attempt >= next[issue.Number]-1 {
+				if attempt.Repository == cfg.Repository && attempt.Issue == issue.Number && attempt.Attempt == published[issue.Number] {
 					pullRequest = attempt.PR
 				}
 			}
@@ -357,6 +363,9 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			controls, _, retry, err := source.authorizedControlsWithIntake(ctx, issue.Number, intake)
 			if err != nil {
 				attempt := max(1, next[issue.Number])
+				if published[issue.Number] > 0 {
+					attempt = published[issue.Number]
+				}
 				var activeAttempt *RecoveryAttemptFact
 				if binding.Attempt > 0 {
 					attempt = binding.Attempt
@@ -399,6 +408,9 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			authorized := controls.Ready && filterMatches && !controls.Closed && !controls.Cancelled && len(blockers) == 0
 			bound := binding.Attempt > 0
 			attempt := max(1, next[issue.Number])
+			if published[issue.Number] > 0 {
+				attempt = published[issue.Number]
+			}
 			var activeAttempt *RecoveryAttemptFact
 			if bound {
 				attempt = binding.Attempt
@@ -464,10 +476,13 @@ func fetchActiveAttempts(ctx context.Context, api API, cfg PRAdapterConfig, issu
 	return nil, markerConflicts{}, errors.New("issue comments exceed bounded recovery limit")
 }
 
-func EnsureActiveAttempt(ctx context.Context, api API, cfg PRAdapterConfig, issue, attempt int, baseSHA string) error {
+func EnsureActiveAttempt(ctx context.Context, api API, cfg PRAdapterConfig, issue, attempt int, baseSHA, detail string) error {
 	marker, err := ActiveAttemptMarker(cfg.Repository, issue, attempt, baseSHA)
 	if err != nil {
 		return err
+	}
+	if strings.TrimSpace(detail) == "" || len(detail) > 4096 || strings.Contains(detail, "<!-- agent-symphony:") {
+		return errors.New("active attempt detail is invalid")
 	}
 	check := func() (bool, error) {
 		found, conflicts, err := fetchActiveAttempts(ctx, api, cfg, issue)
@@ -489,7 +504,7 @@ func EnsureActiveAttempt(ctx context.Context, api API, cfg PRAdapterConfig, issu
 	if present, err := check(); err != nil || present {
 		return err
 	}
-	message, _ := AttributedBody(issue, attempt, "Attempt bound for execution.")
+	message, _ := AttributedBody(issue, attempt, detail)
 	createErr := api.CreateIssueComment(ctx, cfg.Repository, issue, message+"\n\n"+marker, Mutation{Issue: issue, Attempt: attempt})
 	present, confirmErr := check()
 	if confirmErr != nil {
