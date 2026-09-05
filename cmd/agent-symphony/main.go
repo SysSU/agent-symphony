@@ -2171,6 +2171,9 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 	if preflightObjectID.MatchString(issue.BaseSHA) {
 		if issue.BaseSHA != manifest.BaseSHA && scanGit(ctx, root, nil, []string{"merge-base", "--is-ancestor", issue.BaseSHA, head}, nil) != nil {
 			findings := []string{fmt.Sprintf("Integrate current `%s` at exact commit `%s`, resolve conflicts, and rerun the relevant validation.", issue.BaseBranch, issue.BaseSHA)}
+			if err := ensureFindings(findings); err != nil {
+				return false, err
+			}
 			queued, err := runtimeState.RecordReviewFindings(attempt, head, findings, false, false)
 			if err != nil {
 				return false, err

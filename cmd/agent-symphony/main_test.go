@@ -1517,8 +1517,9 @@ func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testin
 	key := "independent-review-" + head
 	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(worktree, key), head})
 	ackResult, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
-	script := filepath.Join(t.TempDir(), "boundary")
-	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\ncase \"$payload\" in\n  *'\"operation\":\"export\"'*) printf '%%s' '%s';;\n  *) printf '%%s' '%s';;\nesac\n", exportResult, ackResult)
+	testRoot := t.TempDir()
+	events, failed, script := filepath.Join(testRoot, "events"), filepath.Join(testRoot, "failed"), filepath.Join(testRoot, "boundary")
+	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\ncase \"$payload\" in\n  *'\"operation\":\"export\"'*) printf '%%s' '%s';;\n  *) printf 'handoff\\n' >> %q; test -f %q || { : > %q; exit 1; }; printf '%%s' '%s';;\nesac\n", exportResult, events, failed, failed, ackResult)
 	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1526,15 +1527,60 @@ func TestCompletedCleanAttemptQueuesRequiredBaseDriftForImplementation(t *testin
 
 	currentBase := strings.Repeat("b", 40)
 	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1, BaseBranch: "main", BaseSHA: currentBase, DispatchAuthorized: true}
-	pending, err := publishWorkerResult(t.Context(), internalgithub.API{}, &agentruntime.Runtime{StateRoot: stateRoot}, config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}, issue, manifest, nil, stateRoot, nil, nil)
-	if err != nil || pending {
-		t.Fatalf("base refresh handoff pending=%v err=%v", pending, err)
+	var findingComments []string
+	api := internalgithub.API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		var body []byte
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/user":
+			body = []byte(`{"id":42,"login":"coordinator"}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues/23/comments":
+			comments := make([]map[string]any, len(findingComments))
+			for i, comment := range findingComments {
+				comments[i] = map[string]any{"body": comment, "user": map[string]any{"id": 42}}
+			}
+			body, _ = json.Marshal(comments)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/o/r/issues/23/comments":
+			var input struct{ Body string }
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			findingComments = append(findingComments, input.Body)
+			if err := os.WriteFile(events, []byte("github\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			status, body = http.StatusCreated, []byte(`{}`)
+		default:
+			t.Fatalf("unexpected GitHub request %s %s", request.Method, request.URL.String())
+		}
+		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d", status), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}}
+	runtimeState := &agentruntime.Runtime{StateRoot: stateRoot}
+	cfg := config.Config{Commands: config.Commands{Implementation: []string{"implementation"}}}
+	pending, err := publishWorkerResult(t.Context(), api, runtimeState, cfg, issue, manifest, nil, stateRoot, nil, nil)
+	if err == nil || pending {
+		t.Fatalf("first base refresh handoff pending=%v err=%v", pending, err)
 	}
 	storedBody, _ := os.ReadFile(manifestPath)
 	var stored agentruntime.Manifest
 	_ = json.Unmarshal(storedBody, &stored)
+	firstEvents, _ := os.ReadFile(events)
+	if len(findingComments) != 1 || !strings.Contains(findingComments[0], head) || !strings.Contains(findingComments[0], currentBase) || string(firstEvents) != "github\nhandoff\n" || stored.State != "completed" || stored.ReviewState != "findings-queued" || stored.ReviewHandoffAck {
+		t.Fatalf("first attempt comments=%q events=%q manifest=%#v", findingComments, firstEvents, stored)
+	}
+
+	pending, err = publishWorkerResult(t.Context(), api, runtimeState, cfg, issue, stored, nil, stateRoot, nil, nil)
+	if err != nil || pending {
+		t.Fatalf("retried base refresh handoff pending=%v err=%v", pending, err)
+	}
+	storedBody, _ = os.ReadFile(manifestPath)
+	_ = json.Unmarshal(storedBody, &stored)
 	if stored.State != "running" || !stored.ReviewHandoffAck || len(stored.ReviewFindings) != 1 || !strings.Contains(stored.ReviewFindings[0], currentBase) {
 		t.Fatalf("base drift was not durably handed back: %#v", stored)
+	}
+	finalEvents, _ := os.ReadFile(events)
+	if len(findingComments) != 1 || string(finalEvents) != "github\nhandoff\nhandoff\n" {
+		t.Fatalf("retry comments=%q events=%q", findingComments, finalEvents)
 	}
 	if got := runGit(t, remote, "rev-parse", "refs/heads/"+branch); got != base {
 		t.Fatalf("stale head was published: got %s want %s", got, base)
