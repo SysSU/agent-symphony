@@ -1107,6 +1107,19 @@ func TestDashboardPlanReviewActionRestartsCleanIssueBoundReviewer(t *testing.T) 
 	if stored[0].ReviewSession != wantSession || boundary.respawns != 1 || !slices.Contains(boundary.env, "AGENT_SYMPHONY_REVIEW_RESULT="+reviewResultPath(stored[0].ReviewSnapshot, target)) || !slices.Contains(boundary.env, "GH_REPO=o/r") || !strings.Contains(boundary.prompt, "Review mode: plan-review") || !strings.Contains(boundary.prompt, target) || !strings.Contains(boundary.prompt, "/agent-symphony status needs-attention") {
 		t.Fatalf("stored=%#v respawn=%q env=%q prompt=%q", stored[0], boundary.respawn, boundary.env, boundary.prompt)
 	}
+	manifest, err = runtimeState.RecordReview(attempt, "clean", agentruntime.ReviewModePlan, target, base, base, stored[0].ReviewSnapshot, stored[0].ReviewSession)
+	if err != nil || manifest.ReviewSnapshot == "" || manifest.ReviewSession == "" {
+		t.Fatalf("retain clean review resources: manifest=%#v err=%v", manifest, err)
+	}
+	boundary.cleanupErr = errors.New("transient reviewer cleanup failure")
+	respawns := boundary.respawns
+	cleanupRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?repository=o/r&issue=215&attempt=3", nil)
+	cleanupRequest.Header.Set("Origin", "http://127.0.0.1")
+	cleanupPending := httptest.NewRecorder()
+	server.handler(http.NotFoundHandler()).ServeHTTP(cleanupPending, cleanupRequest)
+	if cleanupPending.Code != http.StatusConflict || boundary.respawns != respawns || !strings.Contains(cleanupPending.Body.String(), "did not start") {
+		t.Fatalf("cleanup-pending status=%d body=%q new respawns=%d", cleanupPending.Code, cleanupPending.Body.String(), boundary.respawns-respawns)
+	}
 	t.Cleanup(func() {
 		_ = filepath.WalkDir(stored[0].ReviewSnapshot, func(path string, entry os.DirEntry, err error) error {
 			if err == nil && entry.IsDir() {

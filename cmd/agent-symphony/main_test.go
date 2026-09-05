@@ -3021,6 +3021,7 @@ type artifactReviewBoundary struct {
 	failReads     int
 	invalidReads  int
 	resultContent string
+	cleanupErr    error
 }
 
 type authenticationReviewBoundary struct {
@@ -3070,6 +3071,9 @@ func (b *artifactReviewBoundary) call(_ context.Context, operation string, comma
 			return agentruntime.Result{Output: b.paneOutput}, nil
 		}
 		return agentruntime.Result{Output: "1 0"}, nil
+	}
+	if slices.Contains(command.Args, "kill-session") && b.cleanupErr != nil {
+		return agentruntime.Result{}, b.cleanupErr
 	}
 	if slices.Contains(command.Args, "new-session") {
 		b.env = slices.Clone(command.Env)

@@ -2739,7 +2739,10 @@ func startIssuePlanReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if err != nil {
 		return err
 	}
-	_, _, err = runIndependentReview(ctx, runtimeState, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}, boundary, env, cfg.Commands.Reviewer, issue, manifest, source, manifest.BaseSHA, snapshotRoot, agentruntime.ReviewModePlan)
+	review, pending, err := runIndependentReview(ctx, runtimeState, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}, boundary, env, cfg.Commands.Reviewer, issue, manifest, source, manifest.BaseSHA, snapshotRoot, agentruntime.ReviewModePlan)
+	if err == nil && (!pending || review.Snapshot == "" || review.Session == "") {
+		err = errors.New("plan review did not start a reviewer session")
+	}
 	return err
 }
 

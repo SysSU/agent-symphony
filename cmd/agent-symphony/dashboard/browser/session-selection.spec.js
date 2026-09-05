@@ -38,7 +38,7 @@ const planCandidate = {
   ],
 };
 
-async function mockDashboard(page, closeReason = "") {
+async function mockDashboard(page, closeReason = "", reviewPlanResponse = { status: 200, json: { ok: true } }) {
   const sockets = [];
   const reviewPlanRequests = [];
   await page.route("**/release.json", (route) => route.fulfill({ json: { release: "0.5.0" } }));
@@ -49,7 +49,7 @@ async function mockDashboard(page, closeReason = "") {
   await page.route("**/orchestrator/proposal.json", (route) => route.fulfill({ status: 204 }));
   await page.route("**/actions/review-plan?*", (route) => {
     reviewPlanRequests.push(route.request().url());
-    return route.fulfill({ status: 200, json: { ok: true } });
+    return route.fulfill(reviewPlanResponse);
   });
   await page.routeWebSocket(/\/(?:reviewer\/)?terminal\?/, (socket) => {
     const record = { url: socket.url(), messages: [] };
@@ -110,6 +110,15 @@ test("reports a fresh plan review start from the retained-clean projection", asy
     `${new URL(page.url()).origin}/actions/review-plan?repository=SysSU%2Fagent-symphony&issue=165&attempt=1`,
   ]);
   await expect(page.getByRole("status").filter({ hasText: "Started plan review for issue #165, attempt 1." })).toBeVisible();
+});
+
+test("reports cleanup-pending plan review as not started", async ({ page }) => {
+  await mockDashboard(page, "", { status: 409, body: "plan review did not start a reviewer session" });
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Start plan review" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "plan review did not start a reviewer session" })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "Started plan review" })).toHaveCount(0);
 });
 
 test("keeps session selection and the terminal dialog inside a mobile viewport", async ({ page }) => {
