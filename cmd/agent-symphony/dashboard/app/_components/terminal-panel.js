@@ -24,8 +24,7 @@ export default function TerminalPanel({ config, onClose }) {
       if (disposed || !container.current) return;
       terminal = new Terminal({
         convertEol: true,
-        cursorBlink: !config.readOnly,
-        disableStdin: Boolean(config.readOnly),
+        cursorBlink: true,
         fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
         fontSize: 14,
         screenReaderMode: true,
@@ -35,7 +34,7 @@ export default function TerminalPanel({ config, onClose }) {
       terminal.loadAddon(fit);
       terminal.open(container.current);
       fit.fit();
-      if (!config.readOnly) terminal.focus();
+      terminal.focus();
 
       const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
       socket = new WebSocket(`${scheme}//${window.location.host}${config.endpoint}`);
@@ -46,7 +45,7 @@ export default function TerminalPanel({ config, onClose }) {
         }
       };
       socket.addEventListener("open", () => {
-        setConnection(config.readOnly ? "Connected · read-only" : "Connected");
+        setConnection("Connected");
         sendSize();
       });
       socket.addEventListener("message", (event) => terminal.write(new Uint8Array(event.data)));
@@ -56,11 +55,9 @@ export default function TerminalPanel({ config, onClose }) {
         setConnection(message);
         terminal.writeln(`\r\n\x1b[33m${message}\x1b[0m`);
       });
-      if (!config.readOnly) {
-        input = terminal.onData((data) => {
-          if (socket.readyState === WebSocket.OPEN) socket.send(new TextEncoder().encode(data));
-        });
-      }
+      input = terminal.onData((data) => {
+        if (socket.readyState === WebSocket.OPEN) socket.send(new TextEncoder().encode(data));
+      });
       resizeObserver = new ResizeObserver(() => {
         fit.fit();
         sendSize();
@@ -111,7 +108,7 @@ export default function TerminalPanel({ config, onClose }) {
       terminal?.dispose();
       opener.current?.focus();
     };
-  }, [config.endpoint, config.readOnly, onClose]);
+  }, [config.endpoint, onClose]);
 
   return (
     <div className="terminalBackdrop" role="dialog" aria-modal="true" aria-labelledby="terminalTitle" aria-describedby="terminalConnection">
@@ -124,7 +121,7 @@ export default function TerminalPanel({ config, onClose }) {
           </div>
           <button ref={closeButton} type="button" onClick={onClose}>Close</button>
         </header>
-        <div className="terminal" ref={container} aria-label={`${config.readOnly ? "Read-only terminal" : "Terminal"} for ${config.title}`} />
+        <div className="terminal" ref={container} aria-label={`Terminal for ${config.title}`} />
       </section>
     </div>
   );

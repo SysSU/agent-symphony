@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { postWithReconciliationRetry } from "../actions.mjs";
 import { canInvestigate, orchestratorPresentation } from "../health.mjs";
+import PlanReviewButton from "./plan-review-button";
 
 const attachableSessionRoles = new Set(["implementation", "reviewer"]);
 
@@ -45,10 +46,15 @@ function actionLabel(status, busy, waiting) {
   return status.state === "completed" ? "Archive" : "Abandon attempt";
 }
 
-function StatusActions({ status, onAction, onInvestigate, investigationEnabled, investigationBusy, busy, investigating, waiting, readOnly }) {
+function canPlanReview(status) {
+  return status.state === "active" && !status.sessions?.some((session) => session.role === "reviewer" && ["preparing", "running"].includes(session.state));
+}
+
+function StatusActions({ status, onAction, onInvestigate, onNotice, investigationEnabled, investigationBusy, busy, investigating, waiting, readOnly }) {
   const investigationAvailable = investigationEnabled && canInvestigate(status);
   const actionAvailable = status.state === "completed" || status.state === "orphaned" || status.retryable;
-  if (readOnly || (!investigationAvailable && !actionAvailable)) return null;
+  const planReviewAvailable = canPlanReview(status);
+  if (readOnly || (!investigationAvailable && !actionAvailable && !planReviewAvailable)) return null;
   const action = actionFor(status);
   const label = actionLabel(status, busy, waiting);
   return (
@@ -58,6 +64,7 @@ function StatusActions({ status, onAction, onInvestigate, investigationEnabled, 
           {investigating ? "Requesting…" : "Ask orchestrator to investigate"}
         </button>
       ) : null}
+      {planReviewAvailable ? <PlanReviewButton status={status} onNotice={onNotice} /> : null}
       {actionAvailable ? (
         <button className={status.state === "completed" ? "secondaryAction" : "dangerAction"} type="button" disabled={busy} onClick={() => onAction(action, status)}>
           {label}
@@ -68,10 +75,10 @@ function StatusActions({ status, onAction, onInvestigate, investigationEnabled, 
 }
 
 function OperatorFollowUp({ status, enabled, onNotice, readOnly }) {
-	const [message, setMessage] = useState("");
-	const [busy, setBusy] = useState(false);
-	const retryable = status.retryable && ["blocked", "orphaned"].includes(status.state);
-	if (readOnly || !enabled || (!retryable && !["active", "review-ready"].includes(status.state))) return null;
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const retryable = status.retryable && ["blocked", "orphaned"].includes(status.state);
+  if (readOnly || !enabled || (!retryable && !["active", "review-ready"].includes(status.state))) return null;
   const id = `follow-up-${status.issue}-${status.attempt}`;
   async function submit(event) {
     event.preventDefault();
@@ -139,7 +146,8 @@ export function StatusCard(props) {
         <Detail label="Session lifecycle">{sessions.map((session) => (
           <span className="line" key={session.role}>
             {session.role === "implementation" ? null : <><button className="terminalLink" type="button" disabled={sessionDisabled(readOnly, session.role)} onClick={() => onOpenTerminal(status, session)} aria-label={`Open ${session.role} terminal`}><code>{session.name}</code></button>{" · "}</>}
-            {`${session.role} · ${session.state}${session.current ? " · current" : ""}`}
+            {`${session.role}${session.mode ? ` · ${session.mode}` : ""} · ${session.state}${session.current ? " · current" : ""}`}
+            {session.target ? <> {" · target "}<code>{session.target}</code></> : null}
             {session.updated_at ? <> {" · "}<Timestamp value={session.updated_at} /></> : null}
           </span>
         ))}</Detail>

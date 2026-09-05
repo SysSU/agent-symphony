@@ -37,6 +37,8 @@ const (
 const (
 	SessionRoleImplementation = "implementation"
 	SessionRoleReviewer       = "reviewer"
+	ReviewModePlan            = "plan-review"
+	ReviewModeImplementation  = "implementation-review"
 )
 
 var component = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
@@ -143,6 +145,8 @@ type Manifest struct {
 	ImplementationAgent string    `json:"implementation_agent,omitempty"`
 	ReviewAgent         string    `json:"review_agent,omitempty"`
 	ReviewState         string    `json:"review_state,omitempty"`
+	ReviewMode          string    `json:"review_mode,omitempty"`
+	ReviewTarget        string    `json:"review_target,omitempty"`
 	ReviewBase          string    `json:"review_base,omitempty"`
 	ReviewHead          string    `json:"review_head,omitempty"`
 	ReviewSnapshot      string    `json:"review_snapshot,omitempty"`
@@ -154,14 +158,15 @@ type Manifest struct {
 	UpdatedAt           time.Time `json:"updated_at"`
 }
 
-func (r *Runtime) RecordReview(attempt Attempt, state, base, head, snapshot, session string) (Manifest, error) {
+func (r *Runtime) RecordReview(attempt Attempt, state, mode, target, base, head, snapshot, session string) (Manifest, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	manifest, err := r.readManifest(attempt)
 	if err != nil {
 		return Manifest{}, err
 	}
-	manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = state, base, head, snapshot, session
+	manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget = state, mode, target
+	manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = base, head, snapshot, session
 	if state != "findings-queued" {
 		manifest.ReviewFindings, manifest.ReviewHandoffQueued, manifest.ReviewHandoffAck = nil, false, false
 	}
@@ -333,6 +338,40 @@ var (
 )
 
 func PaneTarget(session string) string { return "=" + session + ":0.0" }
+
+func ValidReviewMetadata(mode, target string) bool {
+	if mode == "" && target == "" { // Accept manifests created before review metadata existed.
+		return true
+	}
+	return slices.Contains([]string{ReviewModePlan, ReviewModeImplementation}, mode) && strings.TrimSpace(target) != "" && len(target) <= 512 && !strings.ContainsAny(target, "\x00\r\n")
+}
+
+// ValidReviewTarget validates the mode-specific target grammar and public identity.
+func ValidReviewTarget(mode, target, repository string, issue int) bool {
+	switch mode {
+	case ReviewModePlan:
+		prefix := fmt.Sprintf("%s#%d plan sha256:", repository, issue)
+		digest := strings.TrimPrefix(target, prefix)
+		return strings.HasPrefix(target, prefix) && len(digest) == 64 && commitID.MatchString(digest)
+	case ReviewModeImplementation:
+		base, head, ok := strings.Cut(target, "..")
+		return ok && commitID.MatchString(base) && commitID.MatchString(head) && !strings.EqualFold(base, head)
+	default:
+		return false
+	}
+}
+
+// ValidReviewBinding validates a persisted target against its attested commits.
+func ValidReviewBinding(mode, target, repository string, issue int, base, head, attemptBase string) bool {
+	if !ValidReviewTarget(mode, target, repository, issue) || !commitID.MatchString(base) || !commitID.MatchString(head) {
+		return false
+	}
+	if mode == ReviewModePlan {
+		return strings.EqualFold(base, head) && strings.EqualFold(base, attemptBase)
+	}
+	targetBase, targetHead, _ := strings.Cut(target, "..")
+	return strings.EqualFold(targetBase, base) && strings.EqualFold(targetHead, head)
+}
 
 // AttemptSessionName returns the deterministic tmux name for a bounded role.
 func AttemptSessionName(role, repository string, issue, attempt int) (string, error) {
@@ -983,15 +1022,25 @@ func (r *Runtime) validateManifest(attempt Attempt, manifest Manifest) error {
 	}
 	switch manifest.ReviewState {
 	case "":
-		if manifest.ReviewSession != "" {
-			return errors.New("review session has no lifecycle state")
+		if manifest.ReviewMode != "" || manifest.ReviewTarget != "" || manifest.ReviewSession != "" {
+			return errors.New("review metadata has no lifecycle state")
 		}
 	case "preparing", "running", "clean", "findings-queued":
+		legacy := manifest.ReviewMode == "" && manifest.ReviewTarget == ""
+		if !legacy && (!ValidReviewMetadata(manifest.ReviewMode, manifest.ReviewTarget) || !ValidReviewTarget(manifest.ReviewMode, manifest.ReviewTarget, manifest.Repository, manifest.Issue)) {
+			return errors.New("review mode or target is invalid")
+		}
+		if !legacy && !ValidReviewBinding(manifest.ReviewMode, manifest.ReviewTarget, manifest.Repository, manifest.Issue, manifest.ReviewBase, manifest.ReviewHead, manifest.BaseSHA) {
+			return errors.New("review target does not match persisted identity")
+		}
 	default:
 		return fmt.Errorf("invalid review state %q", manifest.ReviewState)
 	}
 	if manifest.ReviewBase != "" && !commitID.MatchString(manifest.ReviewBase) {
 		return errors.New("review base is invalid")
+	}
+	if manifest.ReviewHead != "" && !commitID.MatchString(manifest.ReviewHead) {
+		return errors.New("review head is invalid")
 	}
 	if manifest.ReviewSession != "" {
 		wantReview, err := AttemptSessionName(SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
