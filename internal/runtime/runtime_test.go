@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,6 +25,10 @@ type fakeRunner struct {
 	sessions        map[string]*fakeSession
 	buffers         map[string]string
 	fail            string
+	failOutput      string
+	failErr         error
+	sessionAuth     bool
+	validAuth       string
 	failCode        map[string]int
 	ignoreInterrupt bool
 	keepAfterKill   bool
@@ -88,16 +93,27 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 	if len(command.Args) == 0 {
 		return Result{}, errors.New("missing tmux operation")
 	}
-	op := command.Args[0]
+	args := command.Args
+	if offset := slices.Index(args, ";"); offset >= 0 && offset+1 < len(args) {
+		args = args[offset+1:]
+	}
+	op := args[0]
 	if f.fail == op {
-		return Result{Output: "canary failure detail"}, errors.New("fake failure")
+		output, err := f.failOutput, f.failErr
+		if output == "" {
+			output = "canary failure detail"
+		}
+		if err == nil {
+			err = errors.New("fake failure")
+		}
+		return Result{Output: output}, err
 	}
 	if code, ok := f.failCode[op]; ok {
 		return Result{Output: "canary failure detail", Code: code, Exited: true}, errors.New("fake exit")
 	}
-	session := valueAfter(command.Args, "-s")
+	session := valueAfter(args, "-s")
 	if session == "" {
-		target := valueAfter(command.Args, "-t")
+		target := valueAfter(args, "-t")
 		if target != "" && !strings.HasPrefix(target, "=") {
 			return Result{}, errors.New("inexact tmux target")
 		}
@@ -110,37 +126,46 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 			return Result{Code: 1, Exited: true}, errors.New("missing session")
 		}
 	case "new-session":
+		if f.sessionAuth {
+			token := environmentValue(command.Env, "GH_TOKEN")
+			if token == "" {
+				return Result{}, errors.New("GitHub CLI authentication is missing")
+			}
+			if token != f.validAuth {
+				return Result{Output: "GitHub CLI authentication failed " + token}, errors.New("GitHub CLI authentication failed " + token)
+			}
+		}
 		if _, ok := f.sessions[session]; ok {
 			return Result{}, errors.New("existing session")
 		}
 		f.sessions[session] = &fakeSession{}
 	case "set-option":
-		if (slices.Contains(command.Args, "remain-on-exit") || slices.Contains(command.Args, "history-limit")) && !slices.Contains(command.Args, "-w") {
+		if (slices.Contains(args, "remain-on-exit") || slices.Contains(args, "history-limit")) && !slices.Contains(args, "-w") {
 			return Result{}, errors.New("window option missing -w")
 		}
 	case "respawn-pane":
-		separator := slices.Index(command.Args, "--")
-		if separator < 0 || separator == len(command.Args)-1 {
+		separator := slices.Index(args, "--")
+		if separator < 0 || separator == len(args)-1 {
 			return Result{}, errors.New("missing respawn command separator")
 		}
-		f.sessions[session].agent = slices.Clone(command.Args[separator+1:])
+		f.sessions[session].agent = slices.Clone(args[separator+1:])
 		if slices.Contains(f.sessions[session].agent, "fast-exit") {
 			f.sessions[session].dead, f.sessions[session].status = true, 42
 		}
 	case "load-buffer":
 		b, _ := io.ReadAll(command.Stdin)
-		f.buffers[valueAfter(command.Args, "-b")] = string(b)
+		f.buffers[valueAfter(args, "-b")] = string(b)
 	case "paste-buffer":
-		f.sessions[session].context = f.buffers[valueAfter(command.Args, "-b")]
+		f.sessions[session].context = f.buffers[valueAfter(args, "-b")]
 	case "display-message":
 		s := f.sessions[session]
 		if s == nil {
 			return Result{}, errors.New("missing session")
 		}
-		if slices.Contains(command.Args, "#{pane_start_command}") {
+		if slices.Contains(args, "#{pane_start_command}") {
 			return Result{Output: strings.Join(s.agent, " ")}, nil
 		}
-		if slices.Contains(command.Args, "#{pane_dead} #{pane_dead_status}") {
+		if slices.Contains(args, "#{pane_dead} #{pane_dead_status}") {
 			if s.dead {
 				return Result{Output: "1 " + strconv.Itoa(s.status)}, nil
 			}
@@ -153,7 +178,7 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 	case "capture-pane":
 		return Result{Output: f.sessions[session].output}, nil
 	case "send-keys":
-		if slices.Contains(command.Args, "C-c") && !f.ignoreInterrupt {
+		if slices.Contains(args, "C-c") && !f.ignoreInterrupt {
 			f.sessions[session].dead, f.sessions[session].stopped = true, true
 		}
 	case "kill-session":
@@ -162,6 +187,15 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 		}
 	}
 	return Result{}, nil
+}
+
+func environmentValue(environment []string, name string) string {
+	for _, entry := range environment {
+		if key, value, ok := strings.Cut(entry, "="); ok && key == name {
+			return value
+		}
+	}
+	return ""
 }
 
 func TestParsePaneStatus(t *testing.T) {
@@ -284,7 +318,7 @@ func valueAfter(args []string, flag string) string {
 	return ""
 }
 
-func TestLifecycleCreatesUncredentialedRepositoryAndPreservesPrimary(t *testing.T) {
+func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *testing.T) {
 	r, fake, attempt, primary := testRuntime(t)
 	before := gitOutput(t, primary, "status", "--porcelain=v1", "--branch")
 	t.Setenv("GITHUB_TOKEN", "credential-canary")
@@ -308,14 +342,20 @@ func TestLifecycleCreatesUncredentialedRepositoryAndPreservesPrimary(t *testing.
 	if got := gitOutput(t, primary, "status", "--porcelain=v1", "--branch"); got != before {
 		t.Fatalf("primary checkout changed: before %q after %q", before, got)
 	}
+	credentialAvailable, repositoryBound := false, false
 	for _, command := range fake.seen {
 		if command.Name != "tmux" {
 			continue
 		}
-		joined := strings.Join(append(command.Args, command.Env...), " ")
-		if strings.Contains(joined, "credential-canary") || strings.Contains(joined, "GITHUB_TOKEN") {
-			t.Fatalf("credential reached agent command: %#v", command)
+		args, env := strings.Join(command.Args, " "), strings.Join(command.Env, " ")
+		if strings.Contains(args, "credential-canary") {
+			t.Fatal("GitHub credential reached tmux argv")
 		}
+		credentialAvailable = credentialAvailable || strings.Contains(env, "GITHUB_TOKEN=credential-canary")
+		repositoryBound = repositoryBound || strings.Contains(env, "GH_REPO=owner/repo")
+	}
+	if !credentialAvailable || !repositoryBound {
+		t.Fatal("GitHub CLI authentication or repository binding was unavailable in the implementation session")
 	}
 	info, err := os.Stat(r.manifestPath(attempt))
 	if err != nil || info.Mode().Perm() != 0o600 {
@@ -592,6 +632,81 @@ printf %s "$6"`
 	code, err = captureWorker(t.Context(), tmux, "prompt-buffer", "", []string{"sh", "-c", `test "$TMPDIR" = /tmp && test "$(cat)" = "$1" && printf reviewer`, "reviewer", "line one\nline two"}, &reviewerOut, io.Discard, tempDir, false)
 	if err != nil || code != 0 || reviewerOut.String() != "reviewer" {
 		t.Fatalf("reviewer capture: code=%d output=%q err=%v", code, reviewerOut.String(), err)
+	}
+}
+
+func TestCaptureWorkerRedactsCredentialsBeforeEveryResultWrite(t *testing.T) {
+	const canary = "capture-auth-canary"
+	for _, mode := range []string{"initial", "replacement", "handoff"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			prompt := filepath.Join(dir, "prompt")
+			if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tmux := filepath.Join(dir, "tmux")
+			if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) :;; *) exit 2;; esac\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			resultPath := filepath.Join(dir, "result.json")
+			if mode != "initial" {
+				if err := os.WriteFile(resultPath, []byte(`{"type":"agent-symphony-result-v1","validation":"old","documentation":"safe"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ready, release := filepath.Join(dir, "ready"), filepath.Join(dir, "release")
+			t.Setenv("FAKE_PROMPT", prompt)
+			t.Setenv("GH_TOKEN", canary)
+			t.Setenv("EXPECTED_TOKEN", canary)
+			t.Setenv("READY", ready)
+			t.Setenv("RELEASE", release)
+			command := []string{"sh", "-c", `test "$GH_TOKEN" = "$EXPECTED_TOKEN" || exit 9
+printf '{"type":"agent-symphony-result-v1","validation":"authenticated","documentation":"%s"}' "$GH_TOKEN"
+: >"$READY"
+while test ! -e "$RELEASE"; do sleep 0.01; done`}
+			type captureResult struct {
+				code int
+				err  error
+			}
+			done := make(chan captureResult, 1)
+			go func() {
+				var code int
+				var err error
+				switch mode {
+				case "initial":
+					code, err = CaptureWorker(t.Context(), tmux, "buffer", resultPath, command, io.Discard, io.Discard)
+				case "replacement":
+					code, err = CaptureWorkerReplacingResult(t.Context(), tmux, "buffer", resultPath, command, io.Discard, io.Discard)
+				case "handoff":
+					code, err = CaptureWorkerReplacingResultAfterStart(t.Context(), tmux, "buffer", resultPath, command, io.Discard, io.Discard, func() error { return nil })
+				}
+				done <- captureResult{code, err}
+			}()
+			for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+				if _, err := os.Stat(ready); err == nil {
+					break
+				} else if time.Now().After(deadline) {
+					t.Fatalf("authenticated child did not produce output: %v", err)
+				}
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if body, err := os.ReadFile(filepath.Join(dir, entry.Name())); err == nil && bytes.Contains(body, []byte(canary)) {
+					t.Fatalf("credential reached in-flight artifact %s", entry.Name())
+				}
+			}
+			if err := os.WriteFile(release, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			captured := <-done
+			body, err := os.ReadFile(resultPath)
+			if captured.err != nil || captured.code != 0 || err != nil || bytes.Contains(body, []byte(canary)) || !bytes.Contains(body, []byte(`"documentation":"[REDACTED]"`)) {
+				t.Fatalf("capture code=%d err=%v artifact=%q read=%v", captured.code, captured.err, body, err)
+			}
+		})
 	}
 }
 
@@ -1079,6 +1194,149 @@ func TestForgetRemovesOnlyCleanedAttemptRecord(t *testing.T) {
 	}
 }
 
+func TestCredentialedSessionLaunchFailureIsRedacted(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	canary := "credential-canary"
+	t.Setenv("GITHUB_TOKEN", canary)
+	fake.fail = "new-session"
+	fake.failOutput, fake.failErr = "launch output "+canary, errors.New("launch failure "+canary)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err == nil || strings.Contains(err.Error(), canary) || strings.Contains(manifest.Diagnostic, canary) {
+		t.Fatal("credentialed launch failure was not safely redacted")
+	}
+	stored, readErr := os.ReadFile(r.manifestPath(attempt))
+	if readErr != nil || bytes.Contains(stored, []byte(canary)) {
+		t.Fatalf("credential reached persisted manifest: read=%v", readErr)
+	}
+	for _, command := range fake.seen {
+		if slices.Contains(command.Args, canary) || strings.Contains(strings.Join(command.Args, " "), canary) {
+			t.Fatal("credential reached tmux argv")
+		}
+	}
+	launch := fake.seen[slices.IndexFunc(fake.seen, func(command Command) bool { return slices.Contains(command.Args, "new-session") })]
+	if !slices.Contains(launch.Env, "GITHUB_TOKEN="+canary) || !strings.Contains(strings.Join(launch.Args, " "), "GITHUB_TOKEN") {
+		t.Fatal("tmux client did not receive the bounded credential environment")
+	}
+}
+
+func TestImplementationAuthenticationCrossesRuntimeBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name, token string
+		ok          bool
+	}{{"authenticated", "implementation-auth-canary", true}, {"missing", "", false}, {"invalid", "implementation-invalid-canary", false}} {
+		t.Run(test.name, func(t *testing.T) {
+			r, fake, attempt, _ := testRuntime(t)
+			fake.sessionAuth, fake.validAuth = true, "implementation-auth-canary"
+			t.Setenv("GH_TOKEN", test.token)
+			manifest, err := r.PrepareAndStart(t.Context(), attempt)
+			if test.ok {
+				if err != nil || manifest.State != "running" {
+					t.Fatal("authenticated implementation did not reach running state")
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "GitHub CLI authentication") || test.token != "" && (strings.Contains(err.Error(), test.token) || strings.Contains(manifest.Diagnostic, test.token)) {
+				t.Fatal("implementation authentication failure was unclear or exposed its credential")
+			}
+			for _, command := range fake.seen {
+				if test.token != "" && strings.Contains(strings.Join(command.Args, " "), test.token) {
+					t.Fatal("credential reached implementation command argv")
+				}
+			}
+			body, readErr := os.ReadFile(r.manifestPath(attempt))
+			if readErr != nil || test.token != "" && bytes.Contains(body, []byte(test.token)) {
+				t.Fatalf("credential reached implementation manifest: read=%v", readErr)
+			}
+		})
+	}
+}
+
+func TestCredentialedPaneOutputIsRedactedBeforeLogPersistence(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	canary := "pane-credential-canary"
+	t.Setenv("GH_TOKEN", canary)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.sessions[manifest.Session].dead = true
+	fake.sessions[manifest.Session].output = "agent failure " + canary
+	if _, err := r.Monitor(t.Context(), attempt); err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.ReadFile(manifest.LogPath)
+	if err != nil || bytes.Contains(log, []byte(canary)) || !bytes.Contains(log, []byte("[REDACTED]")) {
+		t.Fatalf("credentialed pane log was not redacted: read=%v", err)
+	}
+}
+
+func TestTmuxSessionImportsAuthenticationWithoutPuttingValuesInArgv(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	for _, test := range []struct {
+		name, token string
+		want        string
+	}{{"authenticated", "valid", "0"}, {"missing", "", "4"}, {"invalid", "invalid-canary", "5"}} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			bin := filepath.Join(root, "bin")
+			tmuxRoot, err := os.MkdirTemp("/tmp", "as217-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(tmuxRoot) })
+			if err := os.MkdirAll(bin, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			gh := filepath.Join(bin, "gh")
+			if err := os.WriteFile(gh, []byte("#!/bin/sh\ncase \"$GH_TOKEN\" in valid) exit 0;; '') exit 4;; *) exit 5;; esac\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			home, err := os.UserHomeDir()
+			if err != nil {
+				t.Fatal(err)
+			}
+			env := []string{"HOME=" + home, "PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "TMUX_TMPDIR=" + tmuxRoot}
+			if test.token != "" {
+				env = append(env, "GH_TOKEN="+test.token)
+			}
+			session := fmt.Sprintf("issue217-%d", time.Now().UnixNano())
+			cleanup := exec.Command(tmux, "-L", session, "kill-server")
+			cleanup.Env = env
+			t.Cleanup(func() { _ = cleanup.Run() })
+			args := append([]string{"-L", session}, TmuxNewSessionArgs(session, root, env)...)
+			if result, err := (ExecRunner{}).Run(t.Context(), Command{Name: tmux, Args: args, Env: env}); err != nil {
+				t.Fatalf("create isolated tmux session: %v: %s", err, result.Output)
+			}
+			for _, arg := range args {
+				if test.token != "" && strings.Contains(arg, test.token) {
+					t.Fatal("credential reached tmux argv")
+				}
+			}
+			status := filepath.Join(root, "status")
+			command := exec.Command(tmux, "-L", session, "respawn-pane", "-k", "-t", "="+session+":0.0", "--", "sh", "-c", "gh api /user >/dev/null 2>&1; printf %s $? > \"$1\"", "sh", status)
+			command.Env = env
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("start authentication probe: %v: %s", err, output)
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				body, err := os.ReadFile(status)
+				if err == nil && len(body) > 0 {
+					if string(body) != test.want {
+						t.Fatalf("authentication result=%q want=%q", body, test.want)
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("authentication probe did not finish")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+}
+
 func TestWorkerIdentityFailsClosedBeforeMutation(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	r.VerifyWorker = nil
@@ -1101,7 +1359,7 @@ func TestWorkerIdentityFailsClosedBeforeMutation(t *testing.T) {
 	if _, err := r.PrepareAndStart(context.Background(), missingCommand); err == nil || !strings.Contains(err.Error(), "command") {
 		t.Fatalf("missing command = %v", err)
 	}
-	r.AllowEnv = []string{"GITHUB_TOKEN"}
+	r.AllowEnv = []string{"SSH_AUTH_SOCK"}
 	if _, err := r.PrepareAndStart(context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "environment") {
 		t.Fatalf("environment filtering error = %v", err)
 	}
@@ -1206,20 +1464,20 @@ func TestLaunchConfiguresEmptySessionBeforeAgentAndRetainsFastExit(t *testing.T)
 		if command.Name != "tmux" {
 			continue
 		}
-		switch command.Args[0] {
-		case "new-session":
+		switch {
+		case slices.Contains(command.Args, "new-session"):
 			newIndex = i
 			if slices.Contains(command.Args, "fast-exit") {
 				t.Fatalf("new session contains agent command: %#v", command.Args)
 			}
-		case "set-option":
+		case command.Args[0] == "set-option":
 			if slices.Contains(command.Args, "remain-on-exit") {
 				remainIndex = i
 			}
 			if slices.Contains(command.Args, "history-limit") {
 				historyIndex = i
 			}
-		case "respawn-pane":
+		case command.Args[0] == "respawn-pane":
 			respawnIndex = i
 		}
 	}

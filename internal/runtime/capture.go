@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 )
 
 var (
@@ -175,8 +178,9 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 	stopped := make(chan struct{})
 	captured := make(chan error, 1)
 	destination, bounded := stdout, false
+	var output bytes.Buffer
 	if resultPath != "" {
-		destination, bounded = result, true
+		destination, bounded = &output, true
 	}
 	destination = readyWriter{Writer: destination, ready: markReady}
 	go func() { captured <- captureWorkerOutput(destination, pipeFD, stopped, bounded) }()
@@ -255,6 +259,17 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 	}
 	_ = pipe.Close()
 	_ = child.Wait()
+	if bounded {
+		redacted := internalgithub.RedactEnvironment(output.String(), child.Env)
+		if len(redacted) > WorkerResultMaxBytes {
+			return 1, ErrWorkerResultOverflow
+		}
+		if count, err := io.WriteString(result, redacted); err != nil {
+			return 1, fmt.Errorf("write worker result: %w", err)
+		} else if count != len(redacted) {
+			return 1, fmt.Errorf("write worker result: %w", io.ErrShortWrite)
+		}
+	}
 	if ctx.Err() != nil {
 		return 1, ctx.Err()
 	}

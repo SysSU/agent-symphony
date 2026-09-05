@@ -85,7 +85,7 @@ Users manage intent, priority, and governance rather than agent sessions. Execut
 - P1 work takes precedence over P2 and P3 while respecting dependencies and already-running safe work.
 - Conflicting issues do not execute concurrently; independent issues can.
 - Every active task has an isolated worktree and identifiable tmux session.
-- No GitHub credential is exposed to a sub-agent environment or persisted in logs.
+- GitHub CLI authentication is available to authorized agent roles but is never persisted in repository files or logs.
 - Agents cannot bypass repository permissions, required checks, reviews, or branch protections.
 - Every PR records documentation impact and updates affected repository documentation before completion.
 - Orchestration events and failures are traceable to an issue and execution attempt.
@@ -294,7 +294,7 @@ No migration guide is required for the greenfield MVP.
 ### Technical Architecture Considerations
 
 - Keep GitHub authoritative and reconstruct orchestration state from GitHub plus bounded local execution metadata.
-- Hold GitHub credentials in the orchestrator boundary; do not expose them to sub-agents.
+- Share GitHub CLI authentication with authorized roles through the bounded runtime environment; never copy it into repository files.
 - Poll current GitHub state at startup and at intervals no greater than 60 seconds.
 - Preserve deterministic issue-to-attempt, worktree, branch, tmux-session, and PR relationships.
 - Limit dashboard GitHub mutation to permission-gated fixed controls: **Recover attempt** may revalidate one exact retryable attempt, mark a stuck runtime failed, and post the fixed retry control; **Confirm and queue worker message** may record one digest-bound message for a freshly verified exact active attempt. Archive, Abandon, other orchestrator actions, and cancelled message proposals remain local and cannot alter GitHub policy.
@@ -344,7 +344,7 @@ No migration guide is required for the greenfield MVP.
 - **FR24:** A sub-agent can receive the approved issue context, repository guidance, and relevant prior execution context.
 - **FR25:** A sub-agent can implement changes, run relevant validation, and update the issue checklist.
 - **FR26:** The orchestrator can stop or cancel work that becomes ineligible or unsafe.
-- **FR27:** The orchestrator can prevent sub-agents from directly accessing GitHub credentials.
+- **FR27:** The orchestrator can expose GitHub CLI authentication only to authorized agent roles while filtering unrelated credentials.
 
 ### Pull Request Review and Completion
 
@@ -412,7 +412,7 @@ No migration guide is required for the greenfield MVP.
 
 - Every GitHub API response must be treated as untrusted input and validated at the integration boundary.
 - The authenticated GitHub CLI account must have only the repository permissions required by enabled features.
-- GitHub CLI credentials must never enter sub-agent environments, committed files, tmux history, or logs.
+- GitHub CLI credentials may enter authorized role environments but must never enter committed files, worktrees, snapshots, manifests, launch contracts, or logs.
 - Secrets must be redacted from diagnostics and error output.
 - Only authorized GitHub actors may change execution, review, or completion policy.
 - Repository permissions, required Checks, reviews, and branch protections must be reevaluated immediately before merge.

@@ -160,14 +160,17 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 	hostGOOS = "linux"
 	hostRoot = t.TempDir()
 	t.Cleanup(func() { hostGOOS, hostRoot, hostExecRunner = oldGOOS, oldRoot, oldExec })
+	var launched agentruntime.Command
 	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
-		return agentruntime.Result{Output: strings.Join(command.Env, "|")}, nil
+		launched = command
+		return agentruntime.Result{Output: "model-canary github-canary"}, nil
 	}
 	for mode, spec := range map[string]struct{ root, home string }{
 		"implementation": {"/var/lib/agent-symphony/attempts", "/var/lib/agent-symphony-worker"},
 		"review":         {"/var/lib/agent-symphony/snapshots", "/var/lib/agent-symphony-reviewer"},
 	} {
 		t.Run(mode, func(t *testing.T) {
+			t.Setenv("GH_TOKEN", "github-canary")
 			dir := filepath.Join(nativeRoot(spec.root), "fake-test")
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				t.Skipf("cannot create fake boundary root: %v", err)
@@ -175,16 +178,39 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 			payload, _ := json.Marshal(struct {
 				Operation string          `json:"operation"`
 				Command   boundaryCommand `json:"command"`
-			}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=model-canary", "PATH=/bin"}}})
+			}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=model-canary", "GH_TOKEN=github-canary", "PATH=/bin"}}})
 			var out bytes.Buffer
 			if err := agentHost(t.Context(), mode, bytes.NewReader(payload), &out); err != nil {
 				t.Fatal(err)
 			}
 			var result agentruntime.Result
-			if err := json.Unmarshal(out.Bytes(), &result); err != nil || !strings.Contains(result.Output, "MODEL_API_KEY=model-canary") || !strings.Contains(result.Output, "HOME="+spec.home) || strings.Contains(result.Output, os.Getenv("HOME")) || strings.Contains(result.Output, "GITHUB_TOKEN") {
-				t.Fatalf("result=%#v err=%v", result, err)
+			if err := json.Unmarshal(out.Bytes(), &result); err != nil || strings.Contains(result.Output, "model-canary") || strings.Contains(result.Output, "github-canary") || !slices.Contains(launched.Env, "MODEL_API_KEY=model-canary") || !slices.Contains(launched.Env, "GH_TOKEN=github-canary") || !slices.Contains(launched.Env, "HOME="+spec.home) || slices.Contains(launched.Env, "HOME="+os.Getenv("HOME")) {
+				t.Fatal("host boundary did not deliver and redact its filtered credential environment")
 			}
 		})
+	}
+}
+
+func TestAgentHostRedactsCredentialFromReturnedBoundaryError(t *testing.T) {
+	fakeHostIdentity(t, 1234, 5678)
+	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner
+	hostGOOS, hostRoot = "linux", t.TempDir()
+	t.Cleanup(func() { hostGOOS, hostRoot, hostExecRunner = oldGOOS, oldRoot, oldExec })
+	canary := "host-error-auth-canary"
+	hostExecRunner = func(context.Context, agentruntime.Command) (agentruntime.Result, error) {
+		return agentruntime.Result{}, errors.New("boundary failure " + canary)
+	}
+	dir := filepath.Join(nativeRoot("/var/lib/agent-symphony/attempts"), "fake-test")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"GH_TOKEN=" + canary, "PATH=/bin"}}})
+	err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{})
+	if err == nil || strings.Contains(err.Error(), canary) || !strings.Contains(err.Error(), "boundary failure") {
+		t.Fatal("host boundary returned an unredacted or unclear error")
 	}
 }
 
@@ -213,16 +239,30 @@ func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
 	if launched.Name != "tmux" || !slices.Equal(launched.Args, want) || launched.Dir != "/tmp" {
 		t.Fatalf("runtime command changed at boundary: %#v", launched)
 	}
-	newSession := []string{"new-session", "-d", "-s", "as-o-r-131-3", "-c", root}
+	canary := "host-boundary-auth-canary"
+	t.Setenv("TMUX_TMPDIR", "/tmp/denied-tmux-canary")
+	t.Setenv("UNRELATED_SECRET", "denied-secret-canary")
+	sessionEnv := []string{"PATH=/bin", "GH_TOKEN=" + canary}
+	newSession := agentruntime.TmuxNewSessionArgs("as-o-r-131-3", root, sessionEnv)
 	payload, _ = json.Marshal(struct {
 		Operation string          `json:"operation"`
 		Command   boundaryCommand `json:"command"`
-	}{"run", boundaryCommand{Name: "tmux", Args: newSession, Dir: root, Env: []string{"PATH=/bin"}}})
+	}{"run", boundaryCommand{Name: "tmux", Args: newSession, Dir: root, Env: sessionEnv}})
 	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(launched.Args, "HOME=/var/lib/agent-symphony-worker") || launched.Dir != "/tmp" {
-		t.Fatalf("new tmux session did not receive worker HOME from the host boundary: %#v", launched)
+	if !slices.Contains(launched.Args, "HOME=/var/lib/agent-symphony-worker") || launched.Dir != "/tmp" || !slices.Contains(launched.Env, "GH_TOKEN="+canary) || strings.Contains(strings.Join(launched.Args, " "), canary) || slices.ContainsFunc(launched.Env, func(value string) bool {
+		return strings.HasPrefix(value, "TMUX_TMPDIR=") || strings.HasPrefix(value, "UNRELATED_SECRET=")
+	}) {
+		t.Fatal("new tmux session did not receive a safely transported worker environment")
+	}
+	legacy := []string{"new-session", "-d", "-s", "as-o-r-131-3", "-c", root, "-e", "GH_TOKEN=" + canary}
+	payload, _ = json.Marshal(struct {
+		Operation string          `json:"operation"`
+		Command   boundaryCommand `json:"command"`
+	}{"run", boundaryCommand{Name: "tmux", Args: legacy, Dir: root, Env: sessionEnv}})
+	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{}); err == nil {
+		t.Fatal("credential-bearing tmux argv crossed the host boundary")
 	}
 	want[5] = "5001"
 	payload, _ = json.Marshal(struct {
@@ -290,7 +330,7 @@ func TestReviewerBoundaryAllowsOnlyExactOrchestratorTmuxLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(launched.Env, "|")
-	if !strings.Contains(joined, "HOME=/var/lib/agent-symphony-reviewer") || strings.Contains(joined, "GITHUB_TOKEN") {
+	if !strings.Contains(joined, "HOME=/var/lib/agent-symphony-reviewer") {
 		t.Fatalf("unsafe orchestrator environment: %s", joined)
 	}
 	for _, args := range [][]string{
@@ -309,8 +349,11 @@ func TestReviewerBoundaryAllowsOnlyExactOrchestratorTmuxLaunch(t *testing.T) {
 	if err := request([]string{"split-window", "-d", "-t", "=as-o-owner-repo:0.0", "-c", filepath.Dir(root), "--", "operator-agent"}, []string{"PATH=/bin"}); err == nil {
 		t.Fatal("orchestrator pane replacement escaped the snapshot root")
 	}
-	if err := request(respawn("=as-o-owner-repo:0.0"), []string{"GH_TOKEN=secret"}); err == nil {
-		t.Fatal("orchestrator launch accepted GitHub credentials")
+	if err := request(respawn("=as-o-owner-repo:0.0"), []string{"GH_TOKEN=secret"}); err != nil {
+		t.Fatal("orchestrator launch rejected GitHub CLI authentication")
+	}
+	if err := request(respawn("=as-o-owner-repo:0.0"), []string{"SSH_AUTH_SOCK=/tmp/agent"}); err == nil {
+		t.Fatal("orchestrator launch accepted SSH credentials")
 	}
 }
 
@@ -338,7 +381,7 @@ func TestHostOrchestratorLaunchContractIsReadOnlyAndCredentialFiltered(t *testin
 	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err != nil {
 		t.Fatal(err)
 	}
-	if got.Name != "operator-agent" || !slices.Equal(got.Args, []string{"--read-only", "sanitized context"}) || !slices.Contains(got.Env, "HOME=/reviewer-home") || slices.ContainsFunc(got.Env, func(value string) bool { return strings.HasPrefix(value, "GH_TOKEN=") }) {
+	if got.Name != "operator-agent" || !slices.Equal(got.Args, []string{"--read-only", "sanitized context"}) || !slices.Contains(got.Env, "HOME=/reviewer-home") || !slices.Contains(got.Env, "GH_TOKEN=github-canary") {
 		t.Fatalf("unsafe launch: %#v", got)
 	}
 	oneShot, _ := json.Marshal(struct {
@@ -598,12 +641,24 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		}
 		mustWriteFile(t, filepath.Join(identity.Worktree, ".agent-symphony", "handoffs", "receipt.json"), "metadata")
 		validation := "pane-zero-" + strings.Repeat("v", 240)
-		good := fmt.Sprintf(`{"type":"agent-symphony-result-v1","validation":%q,"documentation":"done"}`, validation)
+		const credential = "implementation-result-auth-canary"
+		good := fmt.Sprintf(`{"type":"agent-symphony-result-v1","validation":%q,"documentation":"[REDACTED]"}`, validation)
 		bad := `{"type":"agent-symphony-result-v1","validation":"wrong-window","documentation":"wrong"}`
 		resultPath := agentruntime.ResultPath(identity.Worktree)
-		if err := os.WriteFile(resultPath, []byte(good), 0o600); err != nil {
+		prompt, captureTmux := filepath.Join(t.TempDir(), "prompt"), filepath.Join(t.TempDir(), "tmux")
+		if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.WriteFile(captureTmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) :;; *) exit 2;; esac\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("FAKE_PROMPT", prompt)
+		t.Setenv("GH_TOKEN", credential)
+		t.Setenv("EXPECTED_TOKEN", credential)
+		if code, err := agentruntime.CaptureWorker(t.Context(), captureTmux, "buffer", resultPath, []string{"sh", "-c", `test "$GH_TOKEN" = "$EXPECTED_TOKEN" && printf '{"type":"agent-symphony-result-v1","validation":"%s","documentation":"%s"}' "$1" "$GH_TOKEN"`, "worker", validation}, io.Discard, io.Discard); err != nil || code != 0 {
+			t.Fatalf("capture implementation result: code=%d err=%v", code, err)
+		}
+		t.Setenv("GH_TOKEN", "")
 		tmux(t, "new-session", "-d", "-x", "80", "-s", identity.Session, "-c", identity.Worktree, "sh", "-c", "printf 'prompt echo\\n%s\\n%s\\n' '"+good+"' '"+good+"' >&2; sleep 30")
 		t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+identity.Session).Run() })
 		for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
@@ -669,8 +724,12 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 			t.Fatal(err)
 		}
 		var exported workerExport
-		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != validation || exported.HeadSHA == base {
+		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != validation || exported.Result.Documentation != "[REDACTED]" || strings.Contains(result.Output, credential) || exported.HeadSHA == base {
 			t.Fatalf("export=%#v err=%v", exported, err)
+		}
+		pullBody, err := internalgithub.PullRequestBody(23, 1, exported.Result.Validation, exported.Result.Documentation, exported.Result.Decisions)
+		if err != nil || strings.Contains(pullBody, credential) || !strings.Contains(pullBody, "[REDACTED]") {
+			t.Fatalf("unsafe generated pull request body: %q err=%v", pullBody, err)
 		}
 		second, err := call("implementation", manifest)
 		if err != nil {
@@ -1445,7 +1504,7 @@ func TestAgentHostRejectsWrongIdentityCredentialAndEscapingCommand(t *testing.T)
 		{Name: "git", Args: []string{"clone", "--no-local", "--no-checkout", "../../outside", "clone"}, Dir: filepath.Join(nativeRoot("/var/lib/agent-symphony/attempts"), "inside")},
 		{Name: "tmux", Args: []string{"-S", "../../outside/socket", "has-session", "-t", "=x"}, Dir: filepath.Join(nativeRoot("/var/lib/agent-symphony/attempts"), "inside")},
 		{Name: "tmux", Args: []string{"-f", "../../outside.conf", "new-session", "-d", "-s", "x", "-c", "."}, Dir: filepath.Join(nativeRoot("/var/lib/agent-symphony/attempts"), "inside")},
-		{Name: "git", Env: []string{"GITHUB_TOKEN=secret-canary"}},
+		{Name: "git", Env: []string{"RANDOM_TOKEN=secret-canary"}},
 		{Name: "git", Env: []string{"HTTPS_PROXY=https://secret-canary@example.invalid"}},
 		{Name: "git", Env: []string{"HOME=/coordinator-home"}},
 	} {
@@ -1625,6 +1684,10 @@ func TestBroadSudoAuthorityRejectsAnythingButManagedTuples(t *testing.T) {
 	if !exactSudoAuthority(managed, binary) {
 		t.Fatal("managed tuple rejected")
 	}
+	previous := []byte(strings.ReplaceAll(string(managed), "NOPASSWD:", "NOPASSWD:SETENV:"))
+	if exactSudoAuthority(previous, binary) || !installableSudoAuthority(previous, binary) {
+		t.Fatal("safe previous rules cannot be upgraded")
+	}
 	legacy := []byte("    (agent-symphony-worker : agent-symphony-attempt) NOPASSWD: " + binary + " agent-host implementation\n    (agent-symphony-reviewer : agent-symphony-snapshot) NOPASSWD: " + binary + " agent-host review\n")
 	if exactSudoAuthority(legacy, binary) || !installableSudoAuthority(legacy, binary) {
 		t.Fatal("safe pre-orchestrator rules cannot be upgraded")
@@ -1636,6 +1699,23 @@ func TestBroadSudoAuthorityRejectsAnythingButManagedTuples(t *testing.T) {
 	} {
 		if exactSudoAuthority([]byte(rule), binary) {
 			t.Fatalf("broad rule accepted: %s", rule)
+		}
+	}
+}
+
+func TestSudoPolicyPreservesOnlyBoundedGitHubEnvironment(t *testing.T) {
+	policy := sudoersPolicy("coordinator", "/usr/local/libexec/agent-symphony/1/agent-symphony")
+	if strings.Contains(policy, "SETENV") {
+		t.Fatal("sudo policy grants unbounded environment authority")
+	}
+	for _, name := range internalgithub.GitHubCLIEnvironmentNames() {
+		if !strings.Contains(policy, name) {
+			t.Fatalf("sudo policy omitted GitHub CLI variable %s", name)
+		}
+	}
+	for _, denied := range []string{"AGENT_SYMPHONY_LOCAL_ROOT", "TMUX_TMPDIR", "UNRELATED_SECRET"} {
+		if strings.Contains(policy, denied) {
+			t.Fatalf("sudo policy preserves denied variable %s", denied)
 		}
 	}
 }
@@ -1702,29 +1782,68 @@ func TestBoundarySelectionUsesLocalModeWhenHostIsolationIsNotInstalled(t *testin
 	}
 }
 
-func TestAgentHostLocalModeSkipsIdentityCheckAndUsesLocalRoot(t *testing.T) {
+func TestAdvancedBoundaryUsesExactSudoCommandWithoutSetenvArguments(t *testing.T) {
+	fakeHostIdentity(t, 1234, 5678)
+	stateRoot := t.TempDir()
+	for role, boundary := range map[string]workerBoundaryRunner{"implementation": implementationBoundary(stateRoot), "review": reviewBoundary(stateRoot)} {
+		if boundary.Command != "sudo" || len(boundary.Env) != 0 || slices.ContainsFunc(boundary.Args, func(arg string) bool {
+			return strings.Contains(arg, "preserve-env") || strings.Contains(arg, "SETENV") || strings.Contains(arg, "=")
+		}) {
+			t.Fatalf("unsafe advanced %s boundary: %#v", role, boundary)
+		}
+	}
+}
+
+func TestAdvancedAgentHostRejectsLocalRootSeamBeforeExecution(t *testing.T) {
+	fakeHostIdentity(t, 1234, 5678)
+	oldExec := hostExecRunner
+	executed := false
+	hostExecRunner = func(context.Context, agentruntime.Command) (agentruntime.Result, error) {
+		executed = true
+		return agentruntime.Result{}, nil
+	}
+	t.Cleanup(func() { hostExecRunner = oldExec })
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", t.TempDir())
+	for _, mode := range []string{"implementation", "review", "orchestrator"} {
+		if err := agentHost(t.Context(), mode, strings.NewReader(`{}`), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "disabled when host isolation is installed") {
+			t.Fatalf("advanced %s local-root seam did not fail closed: %v", mode, err)
+		}
+	}
+	if executed {
+		t.Fatal("advanced local-root seam reached command execution")
+	}
+}
+
+func TestAgentHostLocalModesSkipIdentityCheckAndUseLocalRoot(t *testing.T) {
 	oldExec := hostExecRunner
 	t.Cleanup(func() { hostExecRunner = oldExec })
+	var launched agentruntime.Command
 	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
-		return agentruntime.Result{Output: strings.Join(command.Env, "|")}, nil
+		launched = command
+		return agentruntime.Result{Output: "model-canary github-canary"}, nil
 	}
 	root := t.TempDir()
 	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
+	t.Setenv("GITHUB_TOKEN", "github-canary")
 	payload, _ := json.Marshal(struct {
 		Operation string          `json:"operation"`
 		Command   boundaryCommand `json:"command"`
-	}{"run", boundaryCommand{Name: "git", Args: []string{"-C", root, "rev-parse", "HEAD"}, Dir: root, Env: []string{"MODEL_API_KEY=model-canary", "PATH=/bin"}}})
-	var out bytes.Buffer
-	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &out); err != nil {
-		t.Fatal(err)
-	}
+	}{"run", boundaryCommand{Name: "git", Args: []string{"-C", root, "rev-parse", "HEAD"}, Dir: root, Env: []string{"MODEL_API_KEY=model-canary", "GITHUB_TOKEN=github-canary", "PATH=/bin"}}})
 	current, err := user.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var result agentruntime.Result
-	if err := json.Unmarshal(out.Bytes(), &result); err != nil || !strings.Contains(result.Output, "MODEL_API_KEY=model-canary") || !strings.Contains(result.Output, "HOME="+current.HomeDir) || strings.Contains(result.Output, "GITHUB_TOKEN") {
-		t.Fatalf("result=%#v err=%v", result, err)
+	for _, mode := range []string{"implementation", "review"} {
+		t.Run(mode, func(t *testing.T) {
+			var out bytes.Buffer
+			if err := agentHost(t.Context(), mode, bytes.NewReader(payload), &out); err != nil {
+				t.Fatal(err)
+			}
+			var result agentruntime.Result
+			if err := json.Unmarshal(out.Bytes(), &result); err != nil || strings.Contains(result.Output, "model-canary") || strings.Contains(result.Output, "github-canary") || !slices.Contains(launched.Env, "MODEL_API_KEY=model-canary") || !slices.Contains(launched.Env, "GITHUB_TOKEN=github-canary") || !slices.Contains(launched.Env, "HOME="+current.HomeDir) {
+				t.Fatal("local host boundary did not deliver and redact its filtered credential environment")
+			}
+		})
 	}
 }
 

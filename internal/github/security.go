@@ -8,6 +8,8 @@ import (
 
 var secretPattern = regexp.MustCompile(`(?i)(authorization|token|secret|password|passwd|private[_-]?key|api[_-]?key|github_pat)(\s*[:=]\s*|\s+)[^\s,;"']+`)
 
+var githubCLIEnvironment = []string{"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_REPO", "GH_CONFIG_DIR"}
+
 func Redact(value string, known ...string) string {
 	for _, secret := range known {
 		if secret != "" {
@@ -17,6 +19,18 @@ func Redact(value string, known ...string) string {
 	return secretPattern.ReplaceAllString(value, "$1$2[REDACTED]")
 }
 
+// RedactEnvironment removes credential values carried in an agent environment.
+func RedactEnvironment(value string, environment []string) string {
+	var known []string
+	for _, entry := range environment {
+		name, secret, ok := strings.Cut(entry, "=")
+		if ok && sensitiveEnvironmentVariable(name) {
+			known = append(known, secret)
+		}
+	}
+	return Redact(value, known...)
+}
+
 func AgentEnvironment(environment []string) []string {
 	result, _ := AgentEnvironmentWith(environment)
 	return result
@@ -24,6 +38,9 @@ func AgentEnvironment(environment []string) []string {
 
 func AgentEnvironmentWith(environment []string, allowed ...string) ([]string, error) {
 	safe := map[string]bool{"PATH": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "TERM": true, "COLORTERM": true, "NO_COLOR": true, "CODEX_HOME": true}
+	for _, name := range githubCLIEnvironment {
+		safe[name] = true
+	}
 	for _, name := range allowed {
 		if reservedAgentVariable(name) && !modelCredentialVariable(name) {
 			return nil, errors.New("reserved credential or coordinator variable " + name + " cannot be allowed")
@@ -48,7 +65,14 @@ func modelCredentialVariable(name string) bool {
 	return false
 }
 
+func sensitiveEnvironmentVariable(name string) bool {
+	return modelCredentialVariable(name) || name == "GH_TOKEN" || name == "GITHUB_TOKEN" || name == "GH_ENTERPRISE_TOKEN" || name == "GITHUB_ENTERPRISE_TOKEN"
+}
+
 func reservedAgentVariable(name string) bool {
+	if GitHubCLIEnvironmentVariable(name) {
+		return false
+	}
 	upper := strings.ToUpper(name)
 	if upper == "HOME" {
 		return true
@@ -68,3 +92,18 @@ func reservedAgentVariable(name string) bool {
 	}
 	return false
 }
+
+// GitHubCLIEnvironmentVariable reports variables used by gh to find its
+// authenticated session and target repository without copying credentials to
+// repository files.
+func GitHubCLIEnvironmentVariable(name string) bool {
+	for _, allowed := range githubCLIEnvironment {
+		if name == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// GitHubCLIEnvironmentNames returns the bounded environment allowlist used by gh.
+func GitHubCLIEnvironmentNames() []string { return append([]string(nil), githubCLIEnvironment...) }

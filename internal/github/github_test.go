@@ -59,6 +59,14 @@ func TestCLITransportUsesGitHubCLIAuthenticatedSession(t *testing.T) {
 	}
 }
 
+func TestRedactEnvironmentRemovesRawCredentialValues(t *testing.T) {
+	environment := []string{"GH_TOKEN=github-canary", "OPENAI_API_KEY=model-canary", "GH_REPO=owner/repo", "PATH=/bin"}
+	got := RedactEnvironment("github-canary model-canary owner/repo /bin", environment)
+	if strings.Contains(got, "github-canary") || strings.Contains(got, "model-canary") || !strings.Contains(got, "owner/repo /bin") {
+		t.Fatal("environment credential redaction did not preserve non-secret values")
+	}
+}
+
 func httpResponse(status int, body string, headers http.Header) *http.Response {
 	normalized := make(http.Header)
 	for name, values := range headers {
@@ -361,7 +369,7 @@ func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(env, "\n")
-	if strings.Contains(joined, "GITHUB_TOKEN") || strings.Contains(joined, "SSH_AUTH") || strings.Contains(joined, "SURPRISE_CREDENTIAL") || !strings.Contains(joined, "MODEL_API_KEY=allowed") {
+	if !strings.Contains(joined, "GITHUB_TOKEN=canary") || strings.Contains(joined, "SSH_AUTH") || strings.Contains(joined, "SURPRISE_CREDENTIAL") || !strings.Contains(joined, "MODEL_API_KEY=allowed") {
 		t.Fatalf("environment %s", joined)
 	}
 	if got := Redact("authorization: Bearer-canary password=hunter2", "Bearer-canary"); strings.Contains(got, "hunter2") || strings.Contains(got, "Bearer-canary") {
@@ -540,7 +548,7 @@ func TestMarkdownSectionStopsAtSameOrHigherHeading(t *testing.T) {
 }
 
 func TestAgentEnvironmentRejectsReservedExplicitNames(t *testing.T) {
-	for _, name := range []string{"GITHUB_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID", "AZURE_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDFLARE_API_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "FTP_PROXY", "APP_PEM", "MY_APP_KEY", "RANDOM_PASSWORD"} {
+	for _, name := range []string{"SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID", "AZURE_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDFLARE_API_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "FTP_PROXY", "APP_PEM", "MY_APP_KEY", "RANDOM_PASSWORD"} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := AgentEnvironmentWith([]string{name + "=value"}, name); err == nil {
 				t.Fatalf("reserved name %s accepted", name)
@@ -549,6 +557,12 @@ func TestAgentEnvironmentRejectsReservedExplicitNames(t *testing.T) {
 	}
 	if env, err := AgentEnvironmentWith([]string{"OPENAI_API_KEY=model", "PATH=/bin"}, "OPENAI_API_KEY"); err != nil || !strings.Contains(strings.Join(env, "\n"), "OPENAI_API_KEY=model") {
 		t.Fatalf("safe model credential rejected: %v %v", env, err)
+	}
+	for _, name := range []string{"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_REPO", "GH_CONFIG_DIR"} {
+		env, err := AgentEnvironmentWith([]string{name + "=value"}, name)
+		if err != nil || !strings.Contains(strings.Join(env, "\n"), name+"=value") {
+			t.Fatalf("GitHub CLI variable %s rejected", name)
+		}
 	}
 }
 

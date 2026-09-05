@@ -462,7 +462,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return misuse(stderr, wantsJSON, command, "usage: agent-symphony agent-host implementation|review|orchestrator|orchestrator-proposal|orchestrator-proposal-status")
 		}
 		if err := agentHost(context.Background(), fs.Arg(0), os.Stdin, stdout); err != nil {
-			return fail(stderr, false, command, err.Error())
+			return fail(stderr, false, command, internalgithub.RedactEnvironment(err.Error(), os.Environ()))
 		}
 		return 0
 	case "serve":
@@ -2567,6 +2567,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
 	}
+	env = append(slices.Clone(env), "GH_REPO="+issue.Repository)
 	reviewBase := attempt.BaseSHA
 	if preflightObjectID.MatchString(issue.BaseSHA) {
 		reviewBase = issue.BaseSHA
@@ -2677,10 +2678,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 		_ = os.RemoveAll(resultRoot)
 		return independentReviewResult{}, false, errors.New("prepare review result artifact")
 	}
-	args := []string{"new-session", "-d", "-s", session, "-c", snapshot}
-	for _, value := range env {
-		args = append(args, "-e", value)
-	}
+	args := agentruntime.TmuxNewSessionArgs(session, snapshot, env)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: args, Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}

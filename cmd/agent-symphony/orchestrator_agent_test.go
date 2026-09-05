@@ -69,7 +69,11 @@ func fakeAdvancedOrchestratorHost(t *testing.T) int {
 }
 
 func (r *orchestratorTestRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
-	switch command.Args[0] {
+	args := command.Args
+	if offset := slices.Index(args, ";"); offset >= 0 && offset+1 < len(args) {
+		args = args[offset+1:]
+	}
+	switch args[0] {
 	case "display-message":
 		if !r.live {
 			return agentruntime.Result{Exited: true, Code: 1}, errors.New("missing")
@@ -226,7 +230,7 @@ func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 		t.Fatalf("zero-admin launcher=%#v", agent.Launcher)
 	}
 	root := localSnapshotRoot(stateRoot)
-	if !slices.Contains(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+root) || !slices.Equal(agent.ProposalCommand, []string{binary, "agent-host", "orchestrator-proposal"}) || !slices.Equal(agent.ProposalStatusCommand, []string{binary, "agent-host", "orchestrator-proposal-status"}) || agent.AuditWorkspace != filepath.Join(root, "orchestrator-audit-"+internalgithub.RepositoryIdentifier(cfg.Repository)) || len(agent.AuditCommand) == 0 {
+	if !slices.Contains(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+root) || !slices.Contains(agent.Env, "GH_REPO="+cfg.Repository) || !slices.Equal(agent.ProposalCommand, []string{binary, "agent-host", "orchestrator-proposal"}) || !slices.Equal(agent.ProposalStatusCommand, []string{binary, "agent-host", "orchestrator-proposal-status"}) || agent.AuditWorkspace != filepath.Join(root, "orchestrator-audit-"+internalgithub.RepositoryIdentifier(cfg.Repository)) || len(agent.AuditCommand) == 0 {
 		t.Fatalf("zero-admin environment=%#v proposal=%#v status=%#v", agent.Env, agent.ProposalCommand, agent.ProposalStatusCommand)
 	}
 	agent.Runner = &orchestratorTestRunner{}
@@ -247,8 +251,8 @@ func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if launched.Name != "operator-agent" || launched.Dir != agent.Workspace || !slices.Contains(launched.Env, "HOME="+current.HomeDir) || slices.Contains(launched.Env, "HOME="+coordinatorHome) || !slices.Contains(launched.Env, "AGENT_SYMPHONY_ORCHESTRATOR_ROOT="+root) || slices.ContainsFunc(launched.Env, func(value string) bool {
-		return strings.HasPrefix(value, "GH_TOKEN=") || strings.HasPrefix(value, "TMUX=")
+	if launched.Name != "operator-agent" || launched.Dir != agent.Workspace || !slices.Contains(launched.Env, "HOME="+current.HomeDir) || slices.Contains(launched.Env, "HOME="+coordinatorHome) || !slices.Contains(launched.Env, "AGENT_SYMPHONY_ORCHESTRATOR_ROOT="+root) || !slices.Contains(launched.Env, "GH_TOKEN=coordinator-canary") || slices.ContainsFunc(launched.Env, func(value string) bool {
+		return strings.HasPrefix(value, "TMUX=")
 	}) {
 		t.Fatalf("unsafe zero-admin launch: %#v", launched)
 	}

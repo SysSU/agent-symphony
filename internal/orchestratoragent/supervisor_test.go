@@ -31,6 +31,9 @@ type fakeRunner struct {
 	auditStarts    atomic.Int32
 	auditGate      chan struct{}
 	attentionInput string
+	sessionAuth    bool
+	auditAuth      bool
+	validAuth      string
 }
 
 func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
@@ -39,6 +42,19 @@ func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (age
 	}
 	if command.Name != "tmux" {
 		f.auditStarts.Add(1)
+		if f.auditAuth {
+			token := environmentValue(command.Env, "GH_TOKEN")
+			valid := f.validAuth
+			if valid == "" {
+				valid = "valid"
+			}
+			if token == "" {
+				return agentruntime.Result{}, errors.New("GitHub CLI authentication is missing")
+			}
+			if token != valid {
+				return agentruntime.Result{}, errors.New("GitHub CLI authentication failed " + token)
+			}
+		}
 		if f.auditGate != nil {
 			select {
 			case <-f.auditGate:
@@ -63,7 +79,11 @@ func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (age
 	if len(command.Args) == 0 {
 		return agentruntime.Result{}, errors.New("unexpected command")
 	}
-	switch command.Args[0] {
+	args := command.Args
+	if offset := slices.Index(args, ";"); offset >= 0 && offset+1 < len(args) {
+		args = args[offset+1:]
+	}
+	switch args[0] {
 	case "display-message":
 		if !f.live {
 			return agentruntime.Result{Exited: true, Code: 1}, errors.New("missing")
@@ -71,6 +91,19 @@ func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (age
 		return agentruntime.Result{Output: "0\n"}, nil
 	case "new-session":
 		f.starts++
+		if f.sessionAuth {
+			token := environmentValue(command.Env, "GH_TOKEN")
+			valid := f.validAuth
+			if valid == "" {
+				valid = "valid"
+			}
+			if token == "" {
+				return agentruntime.Result{}, errors.New("GitHub CLI authentication is missing")
+			}
+			if token != valid {
+				return agentruntime.Result{}, errors.New("GitHub CLI authentication failed " + token)
+			}
+		}
 		if f.failStarts > 0 {
 			f.failStarts--
 			return agentruntime.Result{Exited: true, Code: 1}, errors.New("launch failed token=secret-value")
@@ -85,6 +118,15 @@ func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (age
 		f.live = false
 	}
 	return agentruntime.Result{}, nil
+}
+
+func environmentValue(environment []string, name string) string {
+	for _, entry := range environment {
+		if key, value, ok := strings.Cut(entry, "="); ok && key == name {
+			return value
+		}
+	}
+	return ""
 }
 
 func newTestSupervisor(t *testing.T, runner *fakeRunner, now *time.Time) *Supervisor {
@@ -348,6 +390,79 @@ func TestFailureBackoffAndRedaction(t *testing.T) {
 	}
 }
 
+func TestOrchestratorAuthenticationCrossesItsSessionBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name, token string
+		ok          bool
+	}{{"authenticated", "orchestrator-auth-canary", true}, {"missing", "", false}, {"invalid", "orchestrator-invalid-canary", false}} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 8, 15, 1, 2, 3, 0, time.UTC)
+			runner := &fakeRunner{sessionAuth: true, validAuth: "orchestrator-auth-canary"}
+			agent := newTestSupervisor(t, runner, &now)
+			agent.Launcher = []string{"agent-symphony", "agent-host", "orchestrator"}
+			agent.Env = []string{"PATH=/bin", "GH_REPO=" + agent.Repository}
+			if test.token != "" {
+				agent.Env = append(agent.Env, "GH_TOKEN="+test.token)
+			}
+			agent.projectionKnown = true
+			status, err := agent.Recover(t.Context())
+			if test.ok {
+				if err != nil || status.State != "running" {
+					t.Fatal("authenticated orchestrator did not reach running state")
+				}
+				contract, readErr := os.ReadFile(filepath.Join(agent.Workspace, "orchestrator-launch.json"))
+				if readErr != nil || bytes.Contains(contract, []byte(test.token)) {
+					t.Fatalf("credential reached orchestrator launch manifest: read=%v", readErr)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "GitHub CLI authentication") || test.token != "" && (strings.Contains(err.Error(), test.token) || strings.Contains(status.Diagnostic, test.token)) {
+				t.Fatal("orchestrator authentication failure was unclear or exposed its credential")
+			}
+			for _, command := range runner.commands {
+				if test.token != "" && strings.Contains(strings.Join(command.Args, " "), test.token) {
+					t.Fatal("credential reached orchestrator tmux argv")
+				}
+			}
+			state, readErr := os.ReadFile(filepath.Join(agent.Root, "orchestrator-agent.json"))
+			if readErr != nil || test.token != "" && bytes.Contains(state, []byte(test.token)) {
+				t.Fatalf("credential reached orchestrator state manifest: read=%v", readErr)
+			}
+		})
+	}
+}
+
+func TestHeartbeatAuthenticationCrossesItsOneShotBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name, token, state string
+	}{{"authenticated", "heartbeat-auth-canary", "completed"}, {"missing", "", "failed"}, {"invalid", "heartbeat-invalid-canary", "failed"}} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 8, 15, 1, 2, 3, 0, time.UTC)
+			runner := &fakeRunner{auditAuth: true, validAuth: "heartbeat-auth-canary", auditOutput: "VERIFIED: authenticated"}
+			agent := newTestSupervisor(t, runner, &now)
+			agent.Launcher = []string{"agent-symphony", "agent-host", "orchestrator"}
+			agent.AuditCommand = []string{"heartbeat-agent"}
+			agent.Env = []string{"PATH=/bin", "GH_REPO=" + agent.Repository}
+			if test.token != "" {
+				agent.Env = append(agent.Env, "GH_TOKEN="+test.token)
+			}
+			if _, err := agent.Observe(t.Context(), []orchestrator.RecoveryStatus{{Repository: agent.Repository, Issue: 1, Attempt: 1, State: "active"}}); err != nil {
+				t.Fatal(err)
+			}
+			report := waitHeartbeatReport(t, agent.Workspace, test.state)
+			waitAuditIdle(t, agent)
+			if test.state == "completed" && !strings.Contains(report.Report, "authenticated") {
+				t.Fatal("authenticated heartbeat did not produce its report")
+			}
+			if test.state == "failed" && !strings.Contains(report.Diagnostic, "GitHub CLI authentication") {
+				t.Fatal("heartbeat authentication failure was unclear")
+			}
+			body, readErr := os.ReadFile(filepath.Join(agent.Workspace, HeartbeatReportFile))
+			if readErr != nil || test.token != "" && bytes.Contains(body, []byte(test.token)) {
+				t.Fatalf("credential reached heartbeat report: read=%v", readErr)
+			}
+		})
+	}
+}
+
 func TestHeartbeatUsesSeparateOneShotAgentAndReplacesLatestReport(t *testing.T) {
 	now := time.Date(2026, 8, 20, 1, 2, 3, 0, time.UTC)
 	runner := &fakeRunner{auditOutput: "VERIFIED: the fake audit completed.", auditResult: true, runnerOutput: strings.Repeat("noisy runner transcript\n", maxAuditReportBytes)}
@@ -384,6 +499,7 @@ func TestHeartbeatUsesSeparateOneShotAgentAndReplacesLatestReport(t *testing.T) 
 		t.Fatalf("unsafe or incomplete audit contract=%q err=%v", contract, err)
 	}
 	report := waitHeartbeatReport(t, agent.Workspace, "completed")
+	waitAuditIdle(t, agent)
 	if _, err := os.Stat(filepath.Join(agent.AuditWorkspace, auditResultFile)); !errors.Is(err, os.ErrNotExist) || report.Report != runner.auditOutput || strings.Contains(report.Report, "noisy runner transcript") || report.ReconciliationDiagnostic == "" || strings.Contains(report.ReconciliationDiagnostic, "abc123") || runner.auditStarts.Load() != 2 {
 		t.Fatalf("audit report=%#v starts=%d", report, runner.auditStarts.Load())
 	}
@@ -430,6 +546,7 @@ func TestHeartbeatUsesSeparateOneShotAgentAndReplacesLatestReport(t *testing.T) 
 		t.Fatal(err)
 	}
 	waitHeartbeatReport(t, restarted.Workspace, "completed")
+	waitAuditIdle(t, restarted)
 	now = now.Add(heartbeatInterval)
 	if _, err := restarted.Observe(t.Context(), completed); err != nil || runner.auditStarts.Load() != 5 {
 		t.Fatalf("terminal work received periodic audit: audits=%d err=%v", runner.auditStarts.Load(), err)

@@ -1372,18 +1372,18 @@ func TestConfigureAgentCodexHomeLinksCapabilitiesAndIsolatesRuntimeState(t *test
 	}
 }
 
-func TestWorkerBoundaryStripsCredentialCanaries(t *testing.T) {
+func TestWorkerBoundaryCarriesGitHubCredentialsOnlyInBoundedInput(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "boundary")
-	body := "#!/bin/sh\nprintf '{\"Output\":\"%s|%s|%s\",\"Code\":0,\"Exited\":false}' \"$GITHUB_TOKEN\" \"$GH_TOKEN\" \"$MODEL_TOKEN\"\n"
+	body := "#!/bin/sh\ntest -z \"$GITHUB_TOKEN$GH_TOKEN$MODEL_TOKEN\" || exit 9\npayload=$(dd bs=1048576 count=1 2>/dev/null)\ncase \"$payload\" in *GITHUB_TOKEN=*GH_TOKEN=*) printf '{\"Output\":\"bounded\",\"Code\":0,\"Exited\":false}' ;; *) exit 8 ;; esac\n"
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GITHUB_TOKEN", "github-canary")
 	t.Setenv("GH_TOKEN", "gh-canary")
 	t.Setenv("MODEL_TOKEN", "model-canary")
-	result, err := (workerBoundaryRunner{Command: script}).call(context.Background(), "verify", agentruntime.Command{})
-	if err != nil || result.Output != "||" {
+	result, err := (workerBoundaryRunner{Command: script}).call(context.Background(), "run", agentruntime.Command{Env: []string{"GITHUB_TOKEN=github-canary", "GH_TOKEN=gh-canary"}})
+	if err != nil || result.Output != "bounded" {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
 }
@@ -2483,7 +2483,7 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	if err != nil || load < 0 || start < load || !strings.Contains(string(log), "worker-capture") {
 		t.Fatalf("review stdin was not loaded before reviewer start: %s err=%v", log, err)
 	}
-	if !strings.Contains(string(log), `OPENAI_API_KEY=model-canary`) || slices.ContainsFunc([]string{"github-canary", "ssh-canary", "cloud-canary", "proxy-canary", "app-canary", "/coordinator-home"}, func(secret string) bool { return strings.Contains(string(log), secret) }) {
+	if !strings.Contains(string(log), `OPENAI_API_KEY=model-canary`) || !strings.Contains(string(log), `GITHUB_TOKEN=github-canary`) || !strings.Contains(string(log), `GH_REPO=o/r`) || slices.ContainsFunc([]string{"ssh-canary", "cloud-canary", "proxy-canary", "app-canary", "/coordinator-home"}, func(secret string) bool { return strings.Contains(string(log), secret) }) {
 		t.Fatalf("review boundary environment was not safely filtered: %s", log)
 	}
 	if !strings.Contains(string(log), `"reviewer","--custom"`) || strings.Contains(string(log), "--output-last-message") {
@@ -2517,6 +2517,34 @@ type artifactReviewBoundary struct {
 	failReads     int
 	invalidReads  int
 	resultContent string
+}
+
+type authenticationReviewBoundary struct {
+	valid string
+	saw   bool
+}
+
+func (b *authenticationReviewBoundary) call(_ context.Context, _ string, command agentruntime.Command) (agentruntime.Result, error) {
+	if !slices.Contains(command.Args, "new-session") {
+		return agentruntime.Result{}, nil
+	}
+	b.saw = true
+	token := ""
+	for _, entry := range command.Env {
+		if name, value, ok := strings.Cut(entry, "="); ok && name == "GH_TOKEN" {
+			token = value
+		}
+	}
+	if token != "" && strings.Contains(strings.Join(command.Args, " "), token) {
+		return agentruntime.Result{}, errors.New("review credential reached tmux argv")
+	}
+	if token == "" {
+		return agentruntime.Result{}, errors.New("review GitHub CLI authentication is missing")
+	}
+	if token != b.valid {
+		return agentruntime.Result{}, errors.New("review GitHub CLI authentication is invalid")
+	}
+	return agentruntime.Result{}, nil
 }
 
 func (b *artifactReviewBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
@@ -2555,6 +2583,64 @@ func (b *artifactReviewBoundary) call(_ context.Context, operation string, comma
 		}
 	}
 	return agentruntime.Result{}, nil
+}
+
+func TestReviewAuthenticationCrossesIndependentReviewBoundary(t *testing.T) {
+	source := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}} {
+		if out, err := exec.Command("git", append([]string{"-C", source}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", source, "add", "file").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, err := exec.Command("git", "-C", source, "commit", "-q", "-m", "base").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	base := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", source, "rev-parse", "HEAD"))))
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("reviewed change"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", source, "commit", "-q", "-am", "change").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	head := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", source, "rev-parse", "HEAD"))))
+	for _, test := range []struct {
+		name, token string
+		ok          bool
+	}{{"authenticated", "review-auth-canary", true}, {"missing", "", false}, {"invalid", "review-invalid-canary", false}} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			boundary := &authenticationReviewBoundary{valid: "review-auth-canary"}
+			env := []string{"PATH=/bin"}
+			if test.token != "" {
+				env = append(env, "GH_TOKEN="+test.token)
+			}
+			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 217, Number: 1, BaseSHA: base}
+			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base}
+			snapshot, _ := reviewIdentity(attempt, root)
+			_, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, env, []string{"reviewer"}, issue, agentruntime.Manifest{}, source, head, root)
+			if test.ok {
+				if err != nil || !pending || !boundary.saw {
+					t.Fatal("authenticated review did not cross its launch boundary")
+				}
+			} else if err == nil || pending || !strings.Contains(err.Error(), "GitHub CLI authentication") || test.token != "" && strings.Contains(err.Error(), test.token) {
+				t.Fatal("review authentication failure was unclear or exposed its credential")
+			}
+			t.Cleanup(func() {
+				_ = filepath.WalkDir(snapshot, func(path string, entry os.DirEntry, err error) error {
+					if err == nil && entry.IsDir() {
+						_ = os.Chmod(path, 0o700)
+					}
+					return nil
+				})
+			})
+		})
+	}
 }
 
 func TestRunningReviewAcceptsBlankLivePaneStatus(t *testing.T) {
@@ -2682,7 +2768,8 @@ func TestInvalidReviewArtifactFailsWithoutRespawningReviewer(t *testing.T) {
 	}
 }
 
-func TestReviewCaptureHelperRoutesOnlyStdoutToArtifact(t *testing.T) {
+func TestReviewCaptureRedactsResultBeforeFindingsHandoff(t *testing.T) {
+	const credential = "review-result-auth-canary"
 	dir := t.TempDir()
 	tmux := filepath.Join(dir, "tmux")
 	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase \"$1\" in\nsave-buffer) printf 'review prompt';;\ndelete-buffer) :;;\n*) exit 1;;\nesac\n"), 0o700); err != nil {
@@ -2694,13 +2781,48 @@ func TestReviewCaptureHelperRoutesOnlyStdoutToArtifact(t *testing.T) {
 	}
 	resultPath := filepath.Join(resultRoot, "result.json")
 	var stdout, stderr bytes.Buffer
-	code, err := agentruntime.CaptureWorker(t.Context(), tmux, "buffer", resultPath, []string{"sh", "-c", `test "$(cat)" = "review prompt" || exit 9; printf '{"type":"agent-symphony-review-v1","status":"clean","findings":[]}'; printf 'diagnostic' >&2`}, &stdout, &stderr)
+	t.Setenv("GH_TOKEN", credential)
+	t.Setenv("EXPECTED_TOKEN", credential)
+	code, err := agentruntime.CaptureWorker(t.Context(), tmux, "buffer", resultPath, []string{"sh", "-c", `test "$(cat)" = "review prompt" && test "$GH_TOKEN" = "$EXPECTED_TOKEN" || exit 9; printf '{"type":"agent-symphony-review-v1","status":"findings","findings":["%s"]}' "$GH_TOKEN"; printf 'diagnostic' >&2`}, &stdout, &stderr)
 	if err != nil || code != 0 {
 		t.Fatalf("code=%d err=%v", code, err)
 	}
 	body, err := os.ReadFile(resultPath)
-	if err != nil || string(body) != `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}` || stdout.Len() != 0 || stderr.String() != "diagnostic" {
+	t.Setenv("GH_TOKEN", "")
+	result, parseErr := parseIndependentReview(string(body))
+	if err != nil || bytes.Contains(body, []byte(credential)) || result.Status != "findings" || !slices.Equal(result.Findings, []string{"[REDACTED]"}) || parseErr != nil || stdout.Len() != 0 || stderr.String() != "diagnostic" {
 		t.Fatalf("artifact=%q stdout=%q stderr=%q err=%v", body, stdout.String(), stderr.String(), err)
+	}
+
+	state, worktree := t.TempDir(), t.TempDir()
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1}
+	head, key := "abcdef1", "independent-review-abcdef1"
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", Worktree: worktree, Session: "as-23-1", LogPath: filepath.Join(worktree, "attempt.log"), ReviewState: "findings-queued", ReviewHead: head, ReviewFindings: result.Findings}
+	sum := sha256.Sum256([]byte(attempt.Repository))
+	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifestBody, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, manifestBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(worktree, key), head})
+	boundaryResult, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
+	boundaryLog, boundary := filepath.Join(worktree, "boundary.log"), filepath.Join(t.TempDir(), "boundary")
+	script := fmt.Sprintf("#!/bin/sh\npayload=$(cat)\nprintf '%%s' \"$payload\" > %q\nprintf '%%s' '%s'\n", boundaryLog, boundaryResult)
+	if err := os.WriteFile(boundary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := returnReviewFindings(t.Context(), &agentruntime.Runtime{StateRoot: state}, workerBoundaryRunner{Command: boundary}, attempt, manifest, head, result.Findings, nil, []string{"implementation"})
+	stored, storedErr := os.ReadFile(manifestPath)
+	handoff, handoffErr := os.ReadFile(boundaryLog)
+	var request struct {
+		Command boundaryCommand `json:"command"`
+	}
+	decodeErr := json.Unmarshal(handoff, &request)
+	if err != nil || pending || storedErr != nil || handoffErr != nil || decodeErr != nil || bytes.Contains(stored, []byte(credential)) || bytes.Contains(request.Command.Input, []byte(credential)) || !bytes.Contains(stored, []byte("[REDACTED]")) || !bytes.Contains(request.Command.Input, []byte("[REDACTED]")) {
+		t.Fatalf("unsafe review propagation: pending=%v err=%v stored=%q storedErr=%v handoff=%q handoffErr=%v decodeErr=%v", pending, err, stored, storedErr, request.Command.Input, handoffErr, decodeErr)
 	}
 }
 
@@ -3043,7 +3165,7 @@ func (b *recoveringReviewBoundary) call(_ context.Context, _ string, command age
 		b.displayErr = nil
 		return agentruntime.Result{}, err
 	}
-	if len(command.Args) > 0 && command.Args[0] == "new-session" {
+	if slices.Contains(command.Args, "new-session") {
 		b.started++
 	}
 	return agentruntime.Result{}, nil
@@ -3898,6 +4020,49 @@ func TestGitHubDiagnosticsVerifiesCLIIdentityAndRepository(t *testing.T) {
 	got := githubDiagnostics("owner/repo")
 	if len(got) != 3 || got[0].Status != "pass" || got[1].Status != "pass" || got[2].Status != "pass" || !strings.Contains(got[0].Message, "authenticated as coordinator") {
 		t.Fatalf("unexpected diagnostics: %#v", got)
+	}
+}
+
+func TestDaemonGitHubAuthenticationBoundary(t *testing.T) {
+	dir := t.TempDir()
+	gh := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'gh version 2.0.0'; exit 0; fi
+case "$GH_TOKEN" in
+valid)
+  case "$*" in
+    *'/user'*) body='{"id":42,"login":"coordinator"}' ;;
+    *) body='{"full_name":"owner/repo","permissions":{"pull":true,"push":true}}' ;;
+  esac
+  printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s' "$body" ;;
+'') echo 'GitHub CLI authentication is missing' >&2; exit 4 ;;
+*) echo "GitHub CLI authentication token=$GH_TOKEN is invalid" >&2; exit 5 ;;
+esac
+`
+	if err := os.WriteFile(gh, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI, githubClient = "https://api.github.com", &http.Client{Transport: internalgithub.CLITransport{Path: gh}}
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	for _, test := range []struct {
+		name, token string
+		ok          bool
+	}{{"authenticated", "valid", true}, {"missing", "", false}, {"invalid", "daemon-invalid-canary", false}} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("GH_TOKEN", test.token)
+			got := githubDiagnostics("owner/repo")
+			if test.ok {
+				if len(got) != 3 || got[0].Status != "pass" || got[1].Status != "pass" || got[2].Status != "pass" {
+					t.Fatal("authenticated daemon diagnostics did not pass")
+				}
+				return
+			}
+			if len(got) != 1 || got[0].Status != "fail" || !strings.Contains(got[0].Message, "authenticate GitHub CLI") || test.token != "" && strings.Contains(got[0].Message, test.token) {
+				t.Fatal("daemon authentication failure was unclear or exposed its credential")
+			}
+		})
 	}
 }
 

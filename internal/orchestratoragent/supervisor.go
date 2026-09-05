@@ -625,10 +625,7 @@ func (s *Supervisor) start(ctx context.Context, state persisted) (persisted, err
 		return s.failed(state, err)
 	}
 	_ = s.stop(ctx, state.Session)
-	args := []string{"new-session", "-d", "-s", state.Session, "-c", s.Workspace}
-	for _, value := range s.Env {
-		args = append(args, "-e", value)
-	}
+	args := agentruntime.TmuxNewSessionArgs(state.Session, s.Workspace, s.Env)
 	if _, err := s.run(ctx, "tmux", args, nil); err != nil {
 		return s.failed(state, err)
 	}
@@ -680,9 +677,10 @@ func (s *Supervisor) start(ctx context.Context, state persisted) (persisted, err
 }
 
 func (s *Supervisor) failed(state persisted, cause error) (persisted, error) {
+	cause = errors.New(internalgithub.RedactEnvironment(cause.Error(), s.Env))
 	state.Failures++
 	delay := time.Minute << min(state.Failures-1, 5)
-	state.State, state.Diagnostic = "degraded", bounded(internalgithub.Redact(cause.Error()))
+	state.State, state.Diagnostic = "degraded", bounded(cause.Error())
 	state.RetryAt, state.UpdatedAt = s.now().Add(delay), s.now()
 	return state, errors.Join(cause, s.writeState(state))
 }
@@ -762,10 +760,10 @@ func (s *Supervisor) runAudit(startedAt time.Time, projectionDigest, diagnostic 
 		}
 		_ = os.Remove(resultPath)
 	}
-	report := heartbeatReport{Version: stateVersion, StartedAt: startedAt, CompletedAt: s.now(), ProjectionDigest: projectionDigest, State: "completed", Report: clean(internalgithub.Redact(result.Output), maxAuditReportBytes), ReconciliationDiagnostic: diagnostic}
+	report := heartbeatReport{Version: stateVersion, StartedAt: startedAt, CompletedAt: s.now(), ProjectionDigest: projectionDigest, State: "completed", Report: clean(internalgithub.RedactEnvironment(result.Output, s.Env), maxAuditReportBytes), ReconciliationDiagnostic: diagnostic}
 	if runErr != nil {
 		report.State = "failed"
-		report.Diagnostic = bounded(internalgithub.Redact(runErr.Error()))
+		report.Diagnostic = bounded(internalgithub.RedactEnvironment(runErr.Error(), s.Env))
 	}
 	writeErr := s.writeHeartbeatReport(report)
 	s.mu.Lock()
@@ -847,7 +845,8 @@ func (s *Supervisor) run(ctx context.Context, name string, args []string, input 
 	command := agentruntime.Command{Name: name, Args: args, Dir: dir, Env: s.Env, Stdin: input}
 	result, err := runner.Run(ctx, command)
 	if err != nil {
-		return result, fmt.Errorf("%s %q: %w", name, args, err)
+		redact := func(value string) string { return internalgithub.RedactEnvironment(value, s.Env) }
+		return result, fmt.Errorf("%s %s: %s", name, redact(fmt.Sprint(args)), redact(err.Error()))
 	}
 	return result, nil
 }

@@ -194,7 +194,6 @@ func TestValidateRejectsUnsafePathsAndPolicy(t *testing.T) {
 		{"unsafe orchestrator", func(c *Config) { c.Commands.Orchestrator = []string{"codex", "bad\narg"} }, "unsafe argument"},
 		{"credential orchestrator", func(c *Config) { c.Commands.Orchestrator = []string{"codex", "--password=canary"} }, "credential-shaped"},
 		{"unsafe orchestrator audit", func(c *Config) { c.Commands.OrchestratorAudit = []string{"codex", "bad\narg"} }, "unsafe argument"},
-		{"credential environment", func(c *Config) { c.Commands.Environment = []string{"GITHUB_TOKEN"} }, "forbidden credential"},
 		{"invalid environment", func(c *Config) { c.Commands.Environment = []string{"bad-name"} }, "invalid variable"},
 	}
 	for _, test := range tests {
@@ -206,6 +205,11 @@ func TestValidateRejectsUnsafePathsAndPolicy(t *testing.T) {
 				t.Fatalf("got %v, want error containing %q", err, test.want)
 			}
 		})
+	}
+	c := Default("owner/repo")
+	c.Commands.Environment = []string{"GITHUB_TOKEN"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("GitHub CLI authentication environment rejected: %v", err)
 	}
 }
 

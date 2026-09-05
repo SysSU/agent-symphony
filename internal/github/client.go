@@ -72,7 +72,10 @@ func (a API) VerifyRepository(ctx context.Context, repository string) error {
 	return nil
 }
 
-type CLITransport struct{ Path string }
+type CLITransport struct {
+	Path string
+	Env  []string
+}
 
 func (t CLITransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	path := t.Path
@@ -93,6 +96,9 @@ func (t CLITransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		args = append(args, "--input", "-")
 	}
 	cmd := exec.CommandContext(req.Context(), path, args...)
+	if t.Env != nil {
+		cmd.Env = t.Env
+	}
 	cmd.Stdin = req.Body
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

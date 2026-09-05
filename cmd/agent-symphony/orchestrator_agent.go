@@ -67,7 +67,7 @@ func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratorage
 	if err != nil {
 		return nil, err
 	}
-	agent.Env = append(env, "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
+	agent.Env = append(env, "GH_REPO="+cfg.Repository, "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
 	if !hostIsolationInstalled() {
 		agent.Env = append(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+productionSnapshotRoot(stateRoot))
 		for _, path := range workspaces {
