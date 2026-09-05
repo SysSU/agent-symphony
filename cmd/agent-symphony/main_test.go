@@ -217,6 +217,7 @@ type operatorMessageRunner struct {
 	dead, interrupted     bool
 	missing               bool
 	branch, head, started string
+	buffer                string
 }
 
 type operatorMessageStore struct {
@@ -318,6 +319,10 @@ func (r *operatorMessageRunner) Run(_ context.Context, command agentruntime.Comm
 			return agentruntime.Result{Output: "1 0"}, nil
 		}
 		return agentruntime.Result{Output: "0"}, nil
+	case "load-buffer":
+		body, _ := io.ReadAll(command.Stdin)
+		r.buffer = string(body)
+		return agentruntime.Result{}, nil
 	case "send-keys":
 		r.interrupted = true
 		return agentruntime.Result{}, nil
@@ -634,6 +639,84 @@ func TestAttentionProposalRecordsDurableHumanOutcomeWithoutMutation(t *testing.T
 	handoffBody, err = os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.AttentionHandoffFile))
 	if err != nil || json.Unmarshal(handoffBody, &outcome) != nil || outcome.State != "human-attention" || outcome.Detail != proposal.Detail {
 		t.Fatalf("attention outcome=%s err=%v", handoffBody, err)
+	}
+}
+
+func TestMonitoringCheckInReachesTheExactOwnerAndRemainsDeduplicated(t *testing.T) {
+	root := t.TempDir()
+	agent := &orchestratoragent.Supervisor{
+		Root:                  root,
+		Workspace:             filepath.Join(root, "orchestrator-o-r"),
+		Repository:            "o/r",
+		Command:               []string{"agent"},
+		ProposalCommand:       []string{"proposal"},
+		ProposalStatusCommand: []string{"proposal-status"},
+		Runner:                &orchestratorTestRunner{},
+	}
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 219, 1)
+	active := []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 219, Attempt: 1, State: "active", CurrentPhase: "implementation", DispatchAuthorized: true, NeedsAttention: true, Blockers: []string{"needs attention: no verified progress across two heartbeats"}, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "running", Current: true}}}}
+	if _, err := agent.Observe(t.Context(), active); err != nil {
+		t.Fatal(err)
+	}
+	var handoff struct {
+		ID string `json:"id"`
+	}
+	handoffBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.AttentionHandoffFile))
+	if err != nil || json.Unmarshal(handoffBody, &handoff) != nil || handoff.ID == "" {
+		t.Fatalf("handoff=%s err=%v", handoffBody, err)
+	}
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 219, Attempt: 1, Action: orchestratoragent.ProposalActionCheckIn, RequestID: "check-in-219-1", HandoffID: handoff.ID}
+	body, _ := json.Marshal(proposal)
+	if err := os.WriteFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalFile), body, 0o620); err != nil {
+		t.Fatal(err)
+	}
+	oldReconcile, oldCheckIn := reconcileGitHubRun, monitorCheckInRun
+	checkIns := 0
+	reconcileGitHubRun = func(context.Context, string, string, string, bool) ([]orchestrator.RecoveryStatus, error) {
+		return active, nil
+	}
+	monitorCheckInRun = func(_ context.Context, stateRoot string, got orchestratoragent.MessageProposal) error {
+		checkIns++
+		if stateRoot != "runtime" || got.Repository != proposal.Repository || got.Issue != proposal.Issue || got.Attempt != proposal.Attempt || got.Message != "" {
+			t.Fatalf("check-in target=%#v state=%q", got, stateRoot)
+		}
+		return nil
+	}
+	t.Cleanup(func() { reconcileGitHubRun, monitorCheckInRun = oldReconcile, oldCheckIn })
+	processOrchestratorProposal(t.Context(), agent, &sync.Mutex{}, &operationCancellation{}, "config", "state", "runtime", io.Discard)
+	statusBody, err := os.ReadFile(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalStatusFile))
+	var status orchestratoragent.MessageProposalStatus
+	if err != nil || json.Unmarshal(statusBody, &status) != nil || checkIns != 1 || status.Resolution != "succeeded" || !strings.Contains(status.Detail, "exact implementation owner") {
+		t.Fatalf("check-ins=%d status=%s err=%v", checkIns, statusBody, err)
+	}
+	processOrchestratorProposal(t.Context(), agent, &sync.Mutex{}, &operationCancellation{}, "config", "state", "runtime", io.Discard)
+	if checkIns != 1 {
+		t.Fatalf("consumed monitoring proposal repeated: %d", checkIns)
+	}
+}
+
+func TestMonitoringCheckInUsesFixedExactTmuxDelivery(t *testing.T) {
+	runtimeState, attempt, manifest, runner := operatorMessageRuntime(t)
+	manifest.State = "running"
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Action: orchestratoragent.ProposalActionCheckIn, RequestID: "check-in-exact", HandoffID: strings.Repeat("a", 64)}
+	if err := sendMonitoringCheckIn(t.Context(), runtimeState, proposal); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.interrupted || !strings.Contains(runner.buffer, `"type":"agent-symphony-monitoring-check-in-v1"`) || !strings.Contains(runner.buffer, `"issue":131`) || strings.Contains(runner.buffer, proposal.RequestID) {
+		t.Fatalf("fixed check-in buffer=%q submitted=%v", runner.buffer, runner.interrupted)
+	}
+
+	valid := orchestrator.RecoveryStatus{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "active", CurrentPhase: "implementation", DispatchAuthorized: true, NeedsAttention: true, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: manifest.Session, State: "running", Current: true}}}
+	if err := validateMonitoringCheckIn(proposal, []orchestrator.RecoveryStatus{valid}); err != nil {
+		t.Fatalf("valid check-in rejected: %v", err)
+	}
+	valid.NeedsAttention = false
+	if err := validateMonitoringCheckIn(proposal, []orchestrator.RecoveryStatus{valid}); err == nil {
+		t.Fatal("healthy target accepted a monitoring check-in")
 	}
 }
 
