@@ -229,6 +229,39 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 	return latest, nil
 }
 
+func (s *GitHubPRSource) linkedPullRequest(ctx context.Context, issue int) (int, error) {
+	found := 0
+	for page := 1; ; page++ {
+		var events []struct {
+			Event  string
+			Source struct {
+				Issue struct {
+					Number        int
+					State         string
+					RepositoryURL string                `json:"repository_url"`
+					PullRequest   *struct{ URL string } `json:"pull_request"`
+				}
+			}
+		}
+		if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d/timeline?per_page=100&page=%d", s.Config.Repository, issue, page), "", &events); err != nil {
+			return 0, err
+		}
+		for _, event := range events {
+			candidate := event.Source.Issue
+			if event.Event != "cross-referenced" || candidate.State != "open" || candidate.Number < 1 || candidate.PullRequest == nil || !strings.HasSuffix(candidate.RepositoryURL, "/repos/"+s.Config.Repository) || !strings.HasSuffix(candidate.PullRequest.URL, fmt.Sprintf("/pulls/%d", candidate.Number)) {
+				continue
+			}
+			if found != 0 && found != candidate.Number {
+				return 0, errors.New("issue has multiple open linked pull requests for direct status")
+			}
+			found = candidate.Number
+		}
+		if len(events) < 100 {
+			return found, nil
+		}
+	}
+}
+
 type markerConflicts struct {
 	Any      bool
 	Attempts map[int]bool
@@ -352,6 +385,12 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 					pullRequest = attempt.PR
 				}
 			}
+			if pullRequest == 0 {
+				pullRequest, err = source.linkedPullRequest(ctx, issue.Number)
+				if err != nil {
+					return nil, fmt.Errorf("read linked pull request for issue #%d: %w", issue.Number, err)
+				}
+			}
 			status, err := source.directStatus(ctx, issue.Number, pullRequest)
 			if err != nil {
 				return nil, fmt.Errorf("read direct status for issue #%d: %w", issue.Number, err)
@@ -372,9 +411,6 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 				continue
 			}
 			blockers := []string{}
-			if status.NeedsAttention {
-				blockers = append(blockers, "needs attention: "+status.Reason)
-			}
 			if bindingConflicts.Any {
 				blockers = append(blockers, "active attempt marker is foreign, malformed, or contradictory")
 			}
@@ -410,11 +446,14 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 				activeAttempt = &RecoveryAttemptFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: "active"}
 			}
 			isActive := active[issue.Number] || bound || bindingConflicts.Any
-			eligible := authorized && !isActive && !completed[issue.Number]
-			recoveryAuthorized := controls.Ready && filterMatches && !controls.Closed && !controls.Cancelled && recoveryBlockers == 0 && !completed[issue.Number]
+			eligible := authorized && !status.NeedsAttention && !isActive && !completed[issue.Number]
+			recoveryAuthorized := controls.Ready && filterMatches && !controls.Closed && !controls.Cancelled && !status.NeedsAttention && recoveryBlockers == 0 && !completed[issue.Number]
 			recoveryAttempt := 0
 			if recoveryAuthorized && !isActive && slices.ContainsFunc(terminalAttempts, func(fact RecoveryAttemptFact) bool { return fact.Attempt == terminal.Attempt }) {
 				recoveryAttempt = terminal.Attempt
+			}
+			if status.NeedsAttention {
+				blockers = append(blockers, "needs attention: "+status.Reason)
 			}
 			result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts})
 		}

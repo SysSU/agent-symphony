@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -88,6 +89,16 @@ func TestDirectStatusAuthenticationFailureIsNotSuccess(t *testing.T) {
 	status, err := (&GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}).directStatus(t.Context(), 10, 0)
 	if err == nil || status.commentID != 0 || !strings.Contains(err.Error(), "GitHub read") {
 		t.Fatalf("status=%#v err=%v", status, err)
+	}
+}
+
+func TestDirectStatusRejectsAmbiguousLinkedPullRequests(t *testing.T) {
+	event := func(number int) map[string]any {
+		return map[string]any{"event": "cross-referenced", "source": map[string]any{"issue": map[string]any{"number": number, "state": "open", "repository_url": "https://api.example.test/repos/o/r", "pull_request": map[string]any{"url": fmt.Sprintf("https://api.example.test/repos/o/r/pulls/%d", number)}}}}
+	}
+	api := fixtureAPI(t, map[string]any{"/repos/o/r/issues/10/timeline?per_page=100&page=1": []any{event(11), event(12)}})
+	if pull, err := (&GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r"}}).linkedPullRequest(t.Context(), 10); err == nil || pull != 0 || !strings.Contains(err.Error(), "multiple open linked pull requests") {
+		t.Fatalf("linked pull=%d err=%v", pull, err)
 	}
 }
 
@@ -262,7 +273,8 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	now := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
 	body := "##\n## Context\nreason and evidence\n## Acceptance criteria\n- result\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n## ###\n"
 	var snapshotBodies []string
-	changed, needsAttentionLabel := false, false
+	changed, needsAttentionLabel, linkedPR := false, false, false
+	var pullComments []any
 	posts := 0
 	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		comments := []any{map[string]any{"id": 50, "body": "/approve", "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 5}}}
@@ -299,9 +311,14 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 					map[string]any{"id": 23, "event": "labeled", "label": map[string]any{"name": "P2"}, "created_at": now.Add(3 * time.Minute), "actor": map[string]any{"id": 5}},
 				)
 			}
+			if linkedPR {
+				events = append(events, map[string]any{"event": "cross-referenced", "source": map[string]any{"issue": map[string]any{"number": 11, "state": "open", "repository_url": "https://api.example.test/repos/o/r", "pull_request": map[string]any{"url": "https://api.example.test/repos/o/r/pulls/11"}}}})
+			}
 			response = events
 		case "GET /repos/o/r/issues/10/comments?per_page=100&page=1":
 			response = comments
+		case "GET /repos/o/r/issues/11/comments?per_page=100&page=1":
+			response = pullComments
 		case "POST /graphql":
 			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
 		case "GET /repos/o/r/issues/comments/50":
@@ -377,7 +394,7 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	snapshotBodies = append(snapshotBodies, "/agent-symphony status needs-attention: implementation needs an operator decision")
 	needsAttentionLabel = true
 	attention, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
-	if err != nil || len(attention) != 1 || !attention[0].NeedsAttention || attention[0].DispatchAuthorized || !slices.Contains(attention[0].Blockers, "needs attention: implementation needs an operator decision") {
+	if err != nil || len(attention) != 1 || !attention[0].NeedsAttention || attention[0].Eligible || !attention[0].DispatchAuthorized || attention[0].RecoveryAuthorized || !slices.Contains(attention[0].Blockers, "needs attention: implementation needs an operator decision") {
 		t.Fatalf("attention facts=%#v err=%v", attention, err)
 	}
 	snapshotBodies = append(snapshotBodies, "/agent-symphony status clear: operator decision recorded")
@@ -385,6 +402,20 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	cleared, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
 	if err != nil || len(cleared) != 1 || cleared[0].NeedsAttention || !cleared[0].DispatchAuthorized || len(cleared[0].Blockers) != 0 {
 		t.Fatalf("cleared facts=%#v err=%v", cleared, err)
+	}
+	linkedPR, needsAttentionLabel = true, true
+	reviewSetAt := now.Add(time.Hour)
+	pullComments = append(pullComments, map[string]any{"id": 500, "body": "/agent-symphony status needs-attention: review found a blocking regression", "created_at": reviewSetAt, "updated_at": reviewSetAt, "user": map[string]any{"id": 42}})
+	reviewAttention, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || len(reviewAttention) != 1 || !reviewAttention[0].NeedsAttention || reviewAttention[0].Eligible || !reviewAttention[0].DispatchAuthorized || reviewAttention[0].RecoveryAuthorized || !slices.Contains(reviewAttention[0].Blockers, "needs attention: review found a blocking regression") {
+		t.Fatalf("review attention facts=%#v err=%v", reviewAttention, err)
+	}
+	needsAttentionLabel = false
+	reviewClearAt := reviewSetAt.Add(time.Minute)
+	pullComments = append(pullComments, map[string]any{"id": 501, "body": "/agent-symphony status clear: review verified the correction", "created_at": reviewClearAt, "updated_at": reviewClearAt, "user": map[string]any{"id": 42}})
+	reviewCleared, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
+	if err != nil || len(reviewCleared) != 1 || reviewCleared[0].NeedsAttention || len(reviewCleared[0].Blockers) != 0 {
+		t.Fatalf("review clear facts=%#v err=%v", reviewCleared, err)
 	}
 	terminal, _ := TerminalFailureMarker(10, 2, now.Add(20*time.Minute))
 	snapshotBodies = append(snapshotBodies, "Attempt failed closed: worker produced no repository changes\n\n"+terminal)

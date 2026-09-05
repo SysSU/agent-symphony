@@ -54,7 +54,10 @@ func TestEffectiveServeInterval(t *testing.T) {
 	}
 }
 
-type revokedAttemptRunner struct{ live, interrupted bool }
+type revokedAttemptRunner struct {
+	live, interrupted bool
+	starts            int
+}
 
 type cleanupBoundary struct {
 	manifests  []agentruntime.Manifest
@@ -1177,9 +1180,12 @@ func (b *cleanupBoundary) call(_ context.Context, operation string, command agen
 	return agentruntime.Result{}, b.err
 }
 
-func (r *revokedAttemptRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+func (r *revokedAttemptRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if len(command.Args) == 0 {
 		return agentruntime.Result{}, errors.New("missing tmux operation")
+	}
+	if command.Name == "git" {
+		return agentruntime.ExecRunner{}.Run(ctx, command)
 	}
 	switch command.Args[0] {
 	case "has-session":
@@ -1197,6 +1203,16 @@ func (r *revokedAttemptRunner) Run(_ context.Context, command agentruntime.Comma
 		return agentruntime.Result{Output: "1"}, nil
 	case "kill-session":
 		r.live = false
+		return agentruntime.Result{}, nil
+	case "set-option":
+		if slices.Contains(command.Args, "new-session") {
+			r.live = true
+		}
+		return agentruntime.Result{}, nil
+	case "load-buffer":
+		return agentruntime.Result{}, nil
+	case "respawn-pane":
+		r.starts++
 		return agentruntime.Result{}, nil
 	default:
 		return agentruntime.Result{}, fmt.Errorf("unexpected tmux operation %q", command.Args[0])
@@ -1230,24 +1246,128 @@ func TestReviewPromptExposesTheSameDirectStatusContract(t *testing.T) {
 	}
 }
 
-func TestDirectAttentionBlocksDispatchAndProjectsWithoutReplacingLifecycle(t *testing.T) {
+func TestDirectAttentionSetReconcileClearPreservesRunningAttemptAndBlocksQueue(t *testing.T) {
+	source := gitRepository(t)
+	for _, args := range [][]string{{"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"switch", "-c", "main"}} {
+		runGit(t, source, args...)
+	}
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "file")
+	runGit(t, source, "commit", "-m", "base")
+	base := runGit(t, source, "rev-parse", "HEAD")
+
 	now := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
-	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 218, Attempt: 1, Priority: 1, CreatedAt: now, Eligible: false, NeedsAttention: true, Blockers: []string{"needs attention: operator decision required"}}
-	statuses, decisions := joinIssueProjection(nil, []internalgithub.RecoveryIssueFact{issue}, 1)
-	if len(statuses) != 1 || statuses[0].State != "blocked" || !statuses[0].NeedsAttention || !slices.Contains(statuses[0].Blockers, "needs attention: operator decision required") || len(decisions) != 1 || decisions[0].State != orchestrator.Blocked {
-		t.Fatalf("queued attention projection=%#v decisions=%#v", statuses, decisions)
+	activeMarker, _ := internalgithub.ActiveAttemptMarker("o/r", 218, 1, base)
+	var snapshots []string
+	set, clear := false, false
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		comments := make([]any, len(snapshots))
+		for i, snapshot := range snapshots {
+			comments[i] = map[string]any{"id": 60 + i, "body": snapshot, "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 42}}
+		}
+		comments = append(comments, map[string]any{"id": 65, "body": activeMarker, "created_at": now.Add(time.Minute), "updated_at": now.Add(time.Minute), "user": map[string]any{"id": 42}})
+		if set {
+			comments = append(comments, map[string]any{"id": 70, "body": "/agent-symphony status needs-attention: operator decision required", "created_at": now.Add(2 * time.Minute), "updated_at": now.Add(2 * time.Minute), "user": map[string]any{"id": 42}})
+		}
+		if clear {
+			comments = append(comments, map[string]any{"id": 71, "body": "/agent-symphony status clear: operator decision recorded", "created_at": now.Add(3 * time.Minute), "updated_at": now.Add(3 * time.Minute), "user": map[string]any{"id": 42}})
+		}
+		labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}}
+		if set && !clear {
+			labels = append(labels, map[string]any{"name": "needs-attention"})
+		}
+		var response any
+		switch request.Method + " " + request.URL.RequestURI() {
+		case "GET /repos/o/r":
+			response = map[string]any{"default_branch": "main"}
+		case "GET /repos/o/r/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": base}}
+		case "GET /repos/o/r/issues?state=open&per_page=100&page=1":
+			response = []any{map[string]any{"number": 218, "title": "Direct status", "body": completeImplementationIssueBody, "created_at": now}}
+		case "GET /repos/o/r/issues/218":
+			response = map[string]any{"number": 218, "node_id": "I_218", "state": "open", "title": "Direct status", "body": completeImplementationIssueBody, "created_at": now, "user": map[string]any{"id": 5}, "labels": labels}
+		case "GET /repos/o/r/issues/218/timeline?per_page=100&page=1":
+			response = []any{
+				map[string]any{"id": 20, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": 5}},
+				map[string]any{"id": 21, "event": "labeled", "label": map[string]any{"name": "P1"}, "created_at": now.Add(2 * time.Second), "actor": map[string]any{"id": 5}},
+			}
+		case "GET /repos/o/r/issues/218/comments?per_page=100&page=1":
+			response = comments
+		case "POST /graphql":
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+		case "GET /user/5":
+			response = map[string]any{"login": "maintainer"}
+		case "GET /repos/o/r/collaborators/maintainer/permission":
+			response = map[string]any{"permission": "maintain"}
+		case "POST /repos/o/r/issues/218/comments":
+			var input struct{ Body string }
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			snapshots = append(snapshots, input.Body)
+			return &http.Response{StatusCode: http.StatusCreated, Status: "201 Created", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+		default:
+			t.Fatalf("unexpected GitHub request %s", request.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}}
+	cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ReadyLabel: "ready", HumanReviewLabel: "review", AutonomousMergeLabel: "auto", PriorityP1Label: "P1", PriorityP2Label: "P2", PriorityP3Label: "P3", DependencySection: "Dependencies", DefaultCompletion: "human-review", ApprovalCommand: "/approve", CancelCommand: "/cancel", RetryCommand: "/retry", ActorID: 42}
+	facts, err := internalgithub.FetchIssueFacts(t.Context(), api, cfg, nil, true)
+	if err != nil || len(facts) != 1 || facts[0].Eligible || !facts[0].Active || !facts[0].DispatchAuthorized {
+		t.Fatalf("initial facts=%#v err=%v", facts, err)
 	}
 
-	issue.Active, issue.Eligible, issue.DispatchAuthorized = true, false, false
-	statuses, _ = joinIssueProjection([]orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 218, Attempt: 1, State: "review-ready"}}, []internalgithub.RecoveryIssueFact{issue}, 1)
-	if len(statuses) != 1 || statuses[0].State != "review-ready" || !statuses[0].NeedsAttention {
-		t.Fatalf("attention replaced active lifecycle: %#v", statuses)
+	stateRoot, _ := filepath.EvalSymlinks(t.TempDir())
+	attemptRoot, _ := filepath.EvalSymlinks(t.TempDir())
+	runner := &revokedAttemptRunner{}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Tmux: "tmux", Runner: runner, VerifyWorker: func(context.Context) error { return nil }}
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 218, Number: 1, BaseSHA: base, Command: []string{"agent"}}
+	manifest, err := runtimeState.PrepareAndStart(t.Context(), attempt)
+	if err != nil || manifest.State != "running" || !runner.live || runner.starts != 1 {
+		t.Fatalf("start manifest=%#v live=%v starts=%d err=%v", manifest, runner.live, runner.starts, err)
 	}
 
-	issue.NeedsAttention, issue.Blockers, issue.Eligible, issue.DispatchAuthorized = false, nil, true, true
-	statuses, _ = joinIssueProjection([]orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 218, Attempt: 1, State: "review-ready"}}, []internalgithub.RecoveryIssueFact{issue}, 1)
-	if len(statuses) != 1 || statuses[0].State != "review-ready" || statuses[0].NeedsAttention || len(statuses[0].Blockers) != 0 {
-		t.Fatalf("clear did not restore lifecycle projection: %#v", statuses)
+	set = true
+	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, nil, false)
+	if err != nil || len(facts) != 1 || !facts[0].NeedsAttention || facts[0].Eligible || !facts[0].DispatchAuthorized {
+		t.Fatalf("set facts=%#v err=%v", facts, err)
+	}
+	queued := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 219, Attempt: 1, Priority: 1, CreatedAt: now.Add(time.Minute), Eligible: false, DispatchAuthorized: true, NeedsAttention: true, Blockers: []string{"needs attention: queued operator decision required"}}
+	issues := append(facts, queued)
+	manifests, _ := runtimeState.Discover()
+	_, attemptFacts := recoveryAttemptFacts(nil, facts)
+	live := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
+	statuses, decisions := projectRecoveryStatuses(t.Context(), attemptFacts, issues, manifests, 2, live)
+	if err := monitorAttempts(t.Context(), runtimeState, statuses, manifests, issues); err != nil {
+		t.Fatal(err)
+	}
+	active := slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 })
+	queuedDecision := slices.IndexFunc(decisions, func(decision orchestrator.Decision) bool { return decision.Number == 219 })
+	stored, _ := runtimeState.Discover()
+	if active < 0 || statuses[active].State != "active" || !statuses[active].NeedsAttention || queuedDecision < 0 || decisions[queuedDecision].State != orchestrator.Blocked || len(stored) != 1 || stored[0].State != "running" || stored[0].Session != manifest.Session || !runner.live || runner.starts != 1 {
+		t.Fatalf("set reconcile statuses=%#v decisions=%#v manifests=%#v live=%v starts=%d", statuses, decisions, stored, runner.live, runner.starts)
+	}
+
+	clear = true
+	facts, err = internalgithub.FetchIssueFacts(t.Context(), api, cfg, nil, false)
+	if err != nil || len(facts) != 1 || facts[0].NeedsAttention || !facts[0].DispatchAuthorized {
+		t.Fatalf("clear facts=%#v err=%v", facts, err)
+	}
+	issues = append(facts, queued)
+	manifests, _ = runtimeState.Discover()
+	_, attemptFacts = recoveryAttemptFacts(nil, facts)
+	statuses, decisions = projectRecoveryStatuses(t.Context(), attemptFacts, issues, manifests, 2, live)
+	if err := monitorAttempts(t.Context(), runtimeState, statuses, manifests, issues); err != nil {
+		t.Fatal(err)
+	}
+	active = slices.IndexFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 218 })
+	queuedDecision = slices.IndexFunc(decisions, func(decision orchestrator.Decision) bool { return decision.Number == 219 })
+	stored, _ = runtimeState.Discover()
+	if active < 0 || statuses[active].State != "active" || statuses[active].NeedsAttention || queuedDecision < 0 || decisions[queuedDecision].State != orchestrator.Blocked || len(stored) != 1 || stored[0].State != "running" || stored[0].Session != manifest.Session || !runner.live || runner.starts != 1 {
+		t.Fatalf("clear reconcile statuses=%#v decisions=%#v manifests=%#v live=%v starts=%d", statuses, decisions, stored, runner.live, runner.starts)
 	}
 }
 
