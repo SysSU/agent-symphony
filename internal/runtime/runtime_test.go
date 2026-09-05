@@ -635,6 +635,81 @@ printf %s "$6"`
 	}
 }
 
+func TestCaptureWorkerRedactsCredentialsBeforeEveryResultWrite(t *testing.T) {
+	const canary = "capture-auth-canary"
+	for _, mode := range []string{"initial", "replacement", "handoff"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			prompt := filepath.Join(dir, "prompt")
+			if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tmux := filepath.Join(dir, "tmux")
+			if err := os.WriteFile(tmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) :;; *) exit 2;; esac\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			resultPath := filepath.Join(dir, "result.json")
+			if mode != "initial" {
+				if err := os.WriteFile(resultPath, []byte(`{"type":"agent-symphony-result-v1","validation":"old","documentation":"safe"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ready, release := filepath.Join(dir, "ready"), filepath.Join(dir, "release")
+			t.Setenv("FAKE_PROMPT", prompt)
+			t.Setenv("GH_TOKEN", canary)
+			t.Setenv("EXPECTED_TOKEN", canary)
+			t.Setenv("READY", ready)
+			t.Setenv("RELEASE", release)
+			command := []string{"sh", "-c", `test "$GH_TOKEN" = "$EXPECTED_TOKEN" || exit 9
+printf '{"type":"agent-symphony-result-v1","validation":"authenticated","documentation":"%s"}' "$GH_TOKEN"
+: >"$READY"
+while test ! -e "$RELEASE"; do sleep 0.01; done`}
+			type captureResult struct {
+				code int
+				err  error
+			}
+			done := make(chan captureResult, 1)
+			go func() {
+				var code int
+				var err error
+				switch mode {
+				case "initial":
+					code, err = CaptureWorker(t.Context(), tmux, "buffer", resultPath, command, io.Discard, io.Discard)
+				case "replacement":
+					code, err = CaptureWorkerReplacingResult(t.Context(), tmux, "buffer", resultPath, command, io.Discard, io.Discard)
+				case "handoff":
+					code, err = CaptureWorkerReplacingResultAfterStart(t.Context(), tmux, "buffer", resultPath, command, io.Discard, io.Discard, func() error { return nil })
+				}
+				done <- captureResult{code, err}
+			}()
+			for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+				if _, err := os.Stat(ready); err == nil {
+					break
+				} else if time.Now().After(deadline) {
+					t.Fatalf("authenticated child did not produce output: %v", err)
+				}
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if body, err := os.ReadFile(filepath.Join(dir, entry.Name())); err == nil && bytes.Contains(body, []byte(canary)) {
+					t.Fatalf("credential reached in-flight artifact %s", entry.Name())
+				}
+			}
+			if err := os.WriteFile(release, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			captured := <-done
+			body, err := os.ReadFile(resultPath)
+			if captured.err != nil || captured.code != 0 || err != nil || bytes.Contains(body, []byte(canary)) || !bytes.Contains(body, []byte(`"documentation":"[REDACTED]"`)) {
+				t.Fatalf("capture code=%d err=%v artifact=%q read=%v", captured.code, captured.err, body, err)
+			}
+		})
+	}
+}
+
 func TestPromptCommandBoundsStdoutAndPreservesExitStatus(t *testing.T) {
 	dir := t.TempDir()
 	prompt := filepath.Join(dir, "prompt")

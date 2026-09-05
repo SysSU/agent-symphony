@@ -641,12 +641,24 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		}
 		mustWriteFile(t, filepath.Join(identity.Worktree, ".agent-symphony", "handoffs", "receipt.json"), "metadata")
 		validation := "pane-zero-" + strings.Repeat("v", 240)
-		good := fmt.Sprintf(`{"type":"agent-symphony-result-v1","validation":%q,"documentation":"done"}`, validation)
+		const credential = "implementation-result-auth-canary"
+		good := fmt.Sprintf(`{"type":"agent-symphony-result-v1","validation":%q,"documentation":"[REDACTED]"}`, validation)
 		bad := `{"type":"agent-symphony-result-v1","validation":"wrong-window","documentation":"wrong"}`
 		resultPath := agentruntime.ResultPath(identity.Worktree)
-		if err := os.WriteFile(resultPath, []byte(good), 0o600); err != nil {
+		prompt, captureTmux := filepath.Join(t.TempDir(), "prompt"), filepath.Join(t.TempDir(), "tmux")
+		if err := os.WriteFile(prompt, []byte("prompt"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.WriteFile(captureTmux, []byte("#!/bin/sh\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) :;; *) exit 2;; esac\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("FAKE_PROMPT", prompt)
+		t.Setenv("GH_TOKEN", credential)
+		t.Setenv("EXPECTED_TOKEN", credential)
+		if code, err := agentruntime.CaptureWorker(t.Context(), captureTmux, "buffer", resultPath, []string{"sh", "-c", `test "$GH_TOKEN" = "$EXPECTED_TOKEN" && printf '{"type":"agent-symphony-result-v1","validation":"%s","documentation":"%s"}' "$1" "$GH_TOKEN"`, "worker", validation}, io.Discard, io.Discard); err != nil || code != 0 {
+			t.Fatalf("capture implementation result: code=%d err=%v", code, err)
+		}
+		t.Setenv("GH_TOKEN", "")
 		tmux(t, "new-session", "-d", "-x", "80", "-s", identity.Session, "-c", identity.Worktree, "sh", "-c", "printf 'prompt echo\\n%s\\n%s\\n' '"+good+"' '"+good+"' >&2; sleep 30")
 		t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+identity.Session).Run() })
 		for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
@@ -712,8 +724,12 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 			t.Fatal(err)
 		}
 		var exported workerExport
-		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != validation || exported.HeadSHA == base {
+		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != validation || exported.Result.Documentation != "[REDACTED]" || strings.Contains(result.Output, credential) || exported.HeadSHA == base {
 			t.Fatalf("export=%#v err=%v", exported, err)
+		}
+		pullBody, err := internalgithub.PullRequestBody(23, 1, exported.Result.Validation, exported.Result.Documentation, exported.Result.Decisions)
+		if err != nil || strings.Contains(pullBody, credential) || !strings.Contains(pullBody, "[REDACTED]") {
+			t.Fatalf("unsafe generated pull request body: %q err=%v", pullBody, err)
 		}
 		second, err := call("implementation", manifest)
 		if err != nil {
@@ -1798,7 +1814,7 @@ func TestAdvancedAgentHostRejectsLocalRootSeamBeforeExecution(t *testing.T) {
 	}
 }
 
-func TestAgentHostLocalModeSkipsIdentityCheckAndUsesLocalRoot(t *testing.T) {
+func TestAgentHostLocalModesSkipIdentityCheckAndUseLocalRoot(t *testing.T) {
 	oldExec := hostExecRunner
 	t.Cleanup(func() { hostExecRunner = oldExec })
 	var launched agentruntime.Command
@@ -1813,17 +1829,21 @@ func TestAgentHostLocalModeSkipsIdentityCheckAndUsesLocalRoot(t *testing.T) {
 		Operation string          `json:"operation"`
 		Command   boundaryCommand `json:"command"`
 	}{"run", boundaryCommand{Name: "git", Args: []string{"-C", root, "rev-parse", "HEAD"}, Dir: root, Env: []string{"MODEL_API_KEY=model-canary", "GITHUB_TOKEN=github-canary", "PATH=/bin"}}})
-	var out bytes.Buffer
-	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &out); err != nil {
-		t.Fatal(err)
-	}
 	current, err := user.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var result agentruntime.Result
-	if err := json.Unmarshal(out.Bytes(), &result); err != nil || strings.Contains(result.Output, "model-canary") || strings.Contains(result.Output, "github-canary") || !slices.Contains(launched.Env, "MODEL_API_KEY=model-canary") || !slices.Contains(launched.Env, "GITHUB_TOKEN=github-canary") || !slices.Contains(launched.Env, "HOME="+current.HomeDir) {
-		t.Fatal("local host boundary did not deliver and redact its filtered credential environment")
+	for _, mode := range []string{"implementation", "review"} {
+		t.Run(mode, func(t *testing.T) {
+			var out bytes.Buffer
+			if err := agentHost(t.Context(), mode, bytes.NewReader(payload), &out); err != nil {
+				t.Fatal(err)
+			}
+			var result agentruntime.Result
+			if err := json.Unmarshal(out.Bytes(), &result); err != nil || strings.Contains(result.Output, "model-canary") || strings.Contains(result.Output, "github-canary") || !slices.Contains(launched.Env, "MODEL_API_KEY=model-canary") || !slices.Contains(launched.Env, "GITHUB_TOKEN=github-canary") || !slices.Contains(launched.Env, "HOME="+current.HomeDir) {
+				t.Fatal("local host boundary did not deliver and redact its filtered credential environment")
+			}
+		})
 	}
 }
 
