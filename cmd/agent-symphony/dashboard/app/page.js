@@ -169,7 +169,7 @@ export default function Dashboard() {
   const remoteURL = remoteProject?.url || "";
   const openAttemptTerminal = (status, session) => {
     const selected = session ?? { role: "implementation", name: status.session }, route = { implementation: "/terminal", reviewer: "/reviewer/terminal" }[selected.role];
-    if (!remoteURL && route && selected.name) setTerminal({ endpoint: `${route}?${new URLSearchParams({ repository: status.repository, issue: String(status.issue), attempt: String(status.attempt) })}`, title: selected.name, eyebrow: `${selected.role} tmux session`, readOnly: selected.role === "reviewer" });
+    if (!remoteURL && route && selected.name) setTerminal({ endpoint: `${route}?${new URLSearchParams({ repository: status.repository, issue: String(status.issue), attempt: String(status.attempt) })}`, title: selected.name, eyebrow: `${selected.mode ?? selected.role} tmux session` });
   };
   const openOrchestratorTerminal = useCallback(() => {
     if (!orchestratorStatus?.session) return;

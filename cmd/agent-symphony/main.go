@@ -604,6 +604,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		recoverAttempt := func(ctx context.Context, issue, attempt int) error {
 			return recoverDashboardAttempt(ctx, *path, *statePath, *runtimeState, issue, attempt)
 		}
+		startPlanReview := func(ctx context.Context, issue, attempt int) error {
+			_, err := reconcileRetryRun(ctx, *path, *statePath, *runtimeState, reconcileOptions{timeout: 2 * time.Minute, planReviewIssue: issue, planReviewAttempt: attempt})
+			return err
+		}
 		operations := &operationCancellation{}
 		reconcile := func(ctx context.Context) error {
 			cycleCtx, finish := operations.begin(ctx)
@@ -647,7 +651,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 				}
 			}()
 		}}
-		dashboardURL, err := startProjectDashboard(ctx, *dashboardAddress, *runtimeState, c.Repository, peerProjects, operationMu, recoverAttempt, reconcile, dashboardAgent, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
+		dashboardURL, err := startProjectDashboard(ctx, *dashboardAddress, *runtimeState, c.Repository, peerProjects, operationMu, recoverAttempt, startPlanReview, reconcile, dashboardAgent, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
@@ -1352,11 +1356,13 @@ func acquireDaemonLock(path string) (*os.File, error) {
 func releaseDaemonLock(f *os.File) { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }
 
 type reconcileOptions struct {
-	transition bool
-	intake     bool
-	timeout    time.Duration
-	lock       bool
-	authorize  func([]orchestrator.RecoveryStatus) error
+	transition        bool
+	intake            bool
+	timeout           time.Duration
+	planReviewIssue   int
+	planReviewAttempt int
+	lock              bool
+	authorize         func([]orchestrator.RecoveryStatus) error
 }
 
 func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
@@ -1416,7 +1422,12 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		return nil, fmt.Errorf("fetch pull request attempts: %w", err)
 	}
 	prConfig := githubPRConfig(c, user.ID)
-	issues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, remote, options.intake)
+	var issues []internalgithub.RecoveryIssueFact
+	if options.planReviewIssue > 0 {
+		issues, err = internalgithub.FetchOperatorIssueFacts(ctx, api, prConfig, remote, options.planReviewIssue)
+	} else {
+		issues, err = internalgithub.FetchIssueFacts(ctx, api, prConfig, remote, options.intake)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("fetch issue controls: %w", err)
 	}
@@ -1442,6 +1453,15 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	manifests, err := r.Discover()
 	if err != nil {
 		return nil, fmt.Errorf("discover attempt manifests: %w", err)
+	}
+	if options.planReviewIssue > 0 {
+		if err := startIssuePlanReview(ctx, &r, reviewBoundary(stateRoot), c, issues, manifests, source, productionSnapshotRoot(stateRoot), options.planReviewIssue, options.planReviewAttempt); err != nil {
+			return nil, fmt.Errorf("start plan review: %w", err)
+		}
+		manifests, err = r.Discover()
+		if err != nil {
+			return nil, fmt.Errorf("rediscover plan review manifest: %w", err)
+		}
 	}
 	deferBoundResume := options.transition && options.authorize != nil
 	if options.transition && !deferBoundResume {
@@ -1527,12 +1547,13 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		return statuses, fmt.Errorf("rediscover queued attempts: %w", err)
 	}
 	monitorErr := monitorAttempts(ctx, &r, statuses, queuedManifests, issues)
+	planReviewErr := reconcilePlanReviews(ctx, &r, reviewBoundary(stateRoot), boundary, c, issues, queuedManifests, source, productionSnapshotRoot(stateRoot))
 	queuedManifests, decisions, err = refreshProjection(facts, issues)
 	if err != nil {
-		return statuses, errors.Join(fmt.Errorf("refresh monitored attempt projection: %w", err), monitorErr)
+		return statuses, errors.Join(fmt.Errorf("refresh monitored attempt projection: %w", err), monitorErr, planReviewErr)
 	}
-	if monitorErr != nil {
-		return statuses, fmt.Errorf("monitor live attempts: %w", monitorErr)
+	if monitorErr != nil || planReviewErr != nil {
+		return statuses, fmt.Errorf("monitor live attempts and plan reviews: %w", errors.Join(monitorErr, planReviewErr))
 	}
 	transitionErr := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, operatorMessages, statePath, stateRoot, func() error {
 		_, _, err := refreshProjection(facts, issues)
@@ -2448,8 +2469,16 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		}
 		reviewBase = issue.BaseSHA
 	}
-	if manifest.ReviewState != "clean" || manifest.ReviewBase != reviewBase || manifest.ReviewHead != head {
-		review, pending, err = runIndependentReview(ctx, runtimeState, attempt, reviewBoundary(stateRoot), reviewEnv, cfg.Commands.Reviewer, issue, manifest, root, head, snapshotRoot)
+	target, targetErr := reviewTarget(agentruntime.ReviewModeImplementation, issue, reviewBase, head)
+	if targetErr != nil {
+		return false, targetErr
+	}
+	storedMode, storedTarget := manifest.ReviewMode, manifest.ReviewTarget
+	if storedMode == "" && storedTarget == "" {
+		storedMode, storedTarget = agentruntime.ReviewModeImplementation, target
+	}
+	if manifest.ReviewState != "clean" || storedMode != agentruntime.ReviewModeImplementation || storedTarget != target || manifest.ReviewBase != reviewBase || manifest.ReviewHead != head {
+		review, pending, err = runIndependentReview(ctx, runtimeState, attempt, reviewBoundary(stateRoot), reviewEnv, cfg.Commands.Reviewer, issue, manifest, root, head, snapshotRoot, agentruntime.ReviewModeImplementation)
 	}
 	if err != nil {
 		return false, fmt.Errorf("independent review: %w", err)
@@ -2465,7 +2494,7 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 		return returnReviewFindings(ctx, runtimeState, boundary, attempt, queued, head, review.Findings, humanInstructions, cfg.Commands.Implementation)
 	}
 	if manifest.ReviewState != "clean" {
-		if _, err := runtimeState.RecordReview(attempt, "clean", reviewBase, head, "", ""); err != nil {
+		if _, err := runtimeState.RecordReview(attempt, "clean", agentruntime.ReviewModeImplementation, target, reviewBase, head, "", ""); err != nil {
 			return false, err
 		}
 		if refreshProjection != nil {
@@ -2593,11 +2622,15 @@ func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtim
 	return false, nil
 }
 
-func cleanupReviewOutcome(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env []string, manifest agentruntime.Manifest, snapshotRoot string) (agentruntime.Manifest, error) {
-	if err := cleanupReviewResources(ctx, boundary, env, attempt, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession, snapshotRoot); err != nil {
+func cleanupReviewOutcome(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env []string, manifest agentruntime.Manifest, snapshotRoot string, resultTarget ...string) (agentruntime.Manifest, error) {
+	target := manifest.ReviewTarget
+	if len(resultTarget) == 1 {
+		target = resultTarget[0]
+	}
+	if err := cleanupReviewResources(ctx, boundary, env, attempt, manifest.ReviewHead, target, manifest.ReviewSnapshot, manifest.ReviewSession, snapshotRoot); err != nil {
 		return manifest, err
 	}
-	return runtimeState.RecordReview(attempt, manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead, "", "")
+	return runtimeState.RecordReview(attempt, manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead, "", "")
 }
 
 func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, string) {
@@ -2606,12 +2639,12 @@ func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, 
 	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", repository, attempt.Issue, attempt.Number)), session
 }
 
-func reviewResultPath(snapshot, head string) string {
-	sum := sha256.Sum256([]byte(head))
+func reviewResultPath(snapshot, target string) string {
+	sum := sha256.Sum256([]byte(target))
 	return filepath.Join(fmt.Sprintf("%s.result-%x", snapshot, sum[:8]), "result.json")
 }
 
-func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, snapshot, session, snapshotRoot string) error {
+func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string) error {
 	expectedSnapshot, expectedSession := reviewIdentity(attempt, snapshotRoot)
 	if (snapshot != "" && snapshot != expectedSnapshot) || (session != "" && session != expectedSession) {
 		return errors.New("persisted reviewer cleanup identity mismatch")
@@ -2633,7 +2666,7 @@ func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []
 			return err
 		}
 	}
-	resultPath := reviewResultPath(expectedSnapshot, head)
+	resultPath := reviewResultPath(expectedSnapshot, manifestReviewTarget(head, target))
 	resultRoot := filepath.Dir(resultPath)
 	if info, err := os.Lstat(resultRoot); err == nil {
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || os.RemoveAll(resultRoot) != nil {
@@ -2664,13 +2697,122 @@ type independentReviewResult struct {
 	Session  string   `json:"-"`
 }
 
-func reviewPrompt(issue internalgithub.RecoveryIssueFact, base string) string {
-	return fmt.Sprintf("Review only the exact attested change at %s..HEAD for issue #%d attempt %d. Inspect that entire diff and its affected code for correctness, regressions, security, and missing behavioral tests. Use the installed gh CLI to post direct status on the issue or pull request as one unedited `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON` comment; pair it with adding or removing the bound issue's `needs-attention` label. A nonempty reason and a fresh re-read of both comment and label are required before reporting the status changed. Authentication, authorization, or partial-update errors are failures, never success. Make the entire final response exactly one bounded JSON object on stdout: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings. Do not wrap it in Markdown, emit prose, or emit another object.\n\n%s", base, issue.Issue, issue.Attempt, issue.Body)
+func startIssuePlanReview(ctx context.Context, runtimeState *agentruntime.Runtime, boundary boundaryCaller, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, source, snapshotRoot string, issueNumber, attemptNumber int) error {
+	index := slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
+		return issue.Repository == cfg.Repository && issue.Issue == issueNumber
+	})
+	if index < 0 || attemptNumber < 1 {
+		return errors.New("plan review target is not the exact current issue attempt")
+	}
+	issue := issues[index]
+	binding := issue.ActiveAttempt
+	if !issue.DispatchAuthorized || binding == nil || binding.Repository != issue.Repository || binding.Issue != issue.Issue || binding.Attempt != attemptNumber || binding.BaseSHA == "" {
+		return errors.New("plan review target is not an authorized active attempt")
+	}
+	matches := make([]agentruntime.Manifest, 0, 1)
+	for _, manifest := range manifests {
+		if manifest.Repository == binding.Repository && manifest.Issue == binding.Issue && manifest.Attempt == binding.Attempt && manifest.BaseSHA == binding.BaseSHA {
+			matches = append(matches, manifest)
+		}
+	}
+	if len(matches) != 1 || matches[0].State != "running" {
+		return errors.New("plan review target does not have one running deterministic implementation session")
+	}
+	manifest := matches[0]
+	if err := runtimeState.VerifyOwned(ctx, manifest); err != nil {
+		return fmt.Errorf("verify plan review runtime owner: %w", err)
+	}
+	issue.Attempt, issue.BaseSHA = attemptNumber, manifest.BaseSHA
+	target, err := reviewTarget(agentruntime.ReviewModePlan, issue, manifest.BaseSHA, manifest.BaseSHA)
+	if err != nil {
+		return err
+	}
+	if manifest.ReviewState == "findings-queued" {
+		return errors.New("plan review findings are already queued")
+	}
+	if manifest.ReviewState == "preparing" || manifest.ReviewState == "running" {
+		if manifest.ReviewMode != agentruntime.ReviewModePlan || manifest.ReviewTarget != target {
+			return errors.New("another review already owns the deterministic reviewer session")
+		}
+	}
+	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
+	if err != nil {
+		return err
+	}
+	review, pending, err := runIndependentReview(ctx, runtimeState, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}, boundary, env, cfg.Commands.Reviewer, issue, manifest, source, manifest.BaseSHA, snapshotRoot, agentruntime.ReviewModePlan)
+	if err == nil && (!pending || review.Snapshot == "" || review.Session == "") {
+		err = errors.New("plan review did not start a reviewer session")
+	}
+	return err
 }
 
-func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot string) (independentReviewResult, bool, error) {
+func reviewTarget(mode string, issue internalgithub.RecoveryIssueFact, base, head string) (string, error) {
+	if issue.Repository == "" || issue.Issue < 1 || issue.Attempt < 1 {
+		return "", errors.New("review issue target is invalid")
+	}
+	switch mode {
+	case agentruntime.ReviewModePlan:
+		sum := sha256.Sum256([]byte(issue.Body))
+		return fmt.Sprintf("%s#%d plan sha256:%x", issue.Repository, issue.Issue, sum), nil
+	case agentruntime.ReviewModeImplementation:
+		if !preflightObjectID.MatchString(base) || !preflightObjectID.MatchString(head) || strings.EqualFold(base, head) {
+			return "", errors.New("implementation review target is invalid")
+		}
+		return base + ".." + head, nil
+	default:
+		return "", fmt.Errorf("invalid review mode %q", mode)
+	}
+}
+
+func validReviewTarget(mode, target, repository string, issue int, head string) bool {
+	if !agentruntime.ValidReviewTarget(mode, target, repository, issue) {
+		return false
+	}
+	_, selectedHead, implementation := strings.Cut(target, "..")
+	return !implementation || strings.EqualFold(selectedHead, head)
+}
+
+func manifestReviewTarget(head, target string) string {
+	if target != "" {
+		return target
+	}
+	return head // Compatibility with result artifacts created before target metadata.
+}
+
+func reviewPrompt(mode, target string, issue internalgithub.RecoveryIssueFact) (string, error) {
+	var task string
+	switch mode {
+	case agentruntime.ReviewModePlan:
+		task = "Review only the bound issue plan at exact target " + target + ". Check its scope, acceptance criteria, dependencies, risks, and validation plan; do not perform an implementation or UI-specialist review."
+	case agentruntime.ReviewModeImplementation:
+		task = "Review only the exact attested implementation change at " + target + ". Inspect that entire diff and its affected code for correctness, regressions, security, and missing behavioral tests."
+	default:
+		return "", fmt.Errorf("invalid review mode %q", mode)
+	}
+	return fmt.Sprintf("Review mode: %s. %s Use the installed gh CLI to post direct status on the bound issue or pull request as one unedited `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON` comment; pair it with adding or removing the bound issue's `needs-attention` label. A nonempty reason and a fresh re-read of both comment and label are required before reporting the status changed. Authentication, authorization, or partial-update errors are failures, never success. Make the entire final response exactly one bounded JSON object on stdout: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings. Do not wrap it in Markdown, emit prose, or emit another object.\n\n%s", mode, task, issue.Body), nil
+}
+
+func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot string, selectedMode ...string) (independentReviewResult, bool, error) {
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
+	}
+	if issue.Repository != "" && issue.Repository != attempt.Repository || issue.Issue != 0 && issue.Issue != attempt.Issue || issue.Attempt != 0 && issue.Attempt != attempt.Number {
+		return independentReviewResult{}, false, errors.New("review issue target does not match the attempt")
+	}
+	if issue.Repository == "" {
+		issue.Repository = attempt.Repository
+	}
+	if issue.Issue == 0 {
+		issue.Issue = attempt.Issue
+	}
+	if issue.Attempt == 0 {
+		issue.Attempt = attempt.Number
+	}
+	mode := agentruntime.ReviewModeImplementation
+	if len(selectedMode) == 1 {
+		mode = selectedMode[0]
+	} else if len(selectedMode) > 1 {
+		return independentReviewResult{}, false, errors.New("exactly one review mode is required")
 	}
 	env = append(slices.Clone(env), "GH_REPO="+issue.Repository)
 	reviewBase := attempt.BaseSHA
@@ -2680,8 +2822,21 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if !preflightObjectID.MatchString(reviewBase) {
 		return independentReviewResult{}, false, errors.New("review base is missing or invalid")
 	}
+	target, err := reviewTarget(mode, issue, reviewBase, head)
+	if err != nil {
+		return independentReviewResult{}, false, err
+	}
+	currentTarget := target
+	if mode == agentruntime.ReviewModePlan && (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") && manifest.ReviewMode == mode && agentruntime.ValidReviewTarget(mode, manifest.ReviewTarget, attempt.Repository, attempt.Issue) {
+		target, reviewBase, head = manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead
+	}
 	snapshot, session := reviewIdentity(attempt, snapshotRoot)
-	if manifest.ReviewState == "running" && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
+	legacyHeadArtifact := manifest.ReviewState == "running" && manifest.ReviewMode == "" && manifest.ReviewTarget == ""
+	manifestMode, manifestTarget := manifest.ReviewMode, manifest.ReviewTarget
+	if manifestMode == "" && manifestTarget == "" {
+		manifestMode, manifestTarget = agentruntime.ReviewModeImplementation, target
+	}
+	if manifest.ReviewState == "running" && manifestMode == mode && manifestTarget == target && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
 		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_dead} #{pane_dead_status}"}, Dir: snapshot, Env: env})
 		if err == nil {
 			dead, status, statusErr := agentruntime.ParsePaneStatus(result.Output)
@@ -2693,7 +2848,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 			} else if status != 0 {
 				return independentReviewResult{}, false, fmt.Errorf("reviewer exited %d", status)
 			} else {
-				request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Head: head})
+				request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, Head: head, LegacyHeadArtifact: legacyHeadArtifact})
 				artifact, err := boundary.call(ctx, "review-result", agentruntime.Command{Stdin: bytes.NewReader(request)})
 				if err != nil {
 					if artifact.Exited && artifact.Code == reviewResultInvalidCode {
@@ -2710,16 +2865,20 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 					if parsed.Status == "findings" {
 						persisted, err = runtimeState.RecordReviewFindings(attempt, head, parsed.Findings, false, false)
 					} else {
-						persisted, err = runtimeState.RecordReview(attempt, "clean", reviewBase, head, snapshot, session)
+						persisted, err = runtimeState.RecordReview(attempt, "clean", mode, target, reviewBase, head, snapshot, session)
 					}
 					if err != nil {
 						return independentReviewResult{}, false, err
 					}
-					if _, err := cleanupReviewOutcome(ctx, runtimeState, attempt, boundary, env, persisted, snapshotRoot); err != nil {
+					cleanupTarget := target
+					if legacyHeadArtifact {
+						cleanupTarget = head
+					}
+					if _, err := cleanupReviewOutcome(ctx, runtimeState, attempt, boundary, env, persisted, snapshotRoot, cleanupTarget); err != nil {
 						return parsed, true, nil
 					}
 				} else {
-					if err := cleanupReviewResources(ctx, boundary, env, attempt, head, snapshot, session, snapshotRoot); err != nil {
+					if err := cleanupReviewResources(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot); err != nil {
 						return parsed, true, nil
 					}
 				}
@@ -2727,12 +2886,15 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 			}
 		}
 	}
+	if mode == agentruntime.ReviewModePlan && target != currentTarget {
+		return independentReviewResult{}, false, errors.New("plan review target no longer matches the current issue body")
+	}
 	if runtimeState != nil {
-		if _, err := runtimeState.RecordReview(attempt, "preparing", reviewBase, head, snapshot, session); err != nil {
+		if _, err := runtimeState.RecordReview(attempt, "preparing", mode, target, reviewBase, head, snapshot, session); err != nil {
 			return independentReviewResult{}, false, err
 		}
 	}
-	if err := cleanupReviewResources(ctx, boundary, env, attempt, head, snapshot, session, snapshotRoot); err != nil {
+	if err := cleanupReviewResources(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot); err != nil {
 		return independentReviewResult{}, true, nil
 	}
 	if out, err := exec.CommandContext(ctx, "git", "clone", "--no-local", "--no-checkout", source, snapshot).CombinedOutput(); err != nil {
@@ -2747,7 +2909,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if got, err := gitSingleLine(ctx, snapshot, "rev-parse", "HEAD"); err != nil || got != head {
 		return independentReviewResult{}, false, errors.New("review snapshot HEAD differs from attested worker head")
 	}
-	if err := scanGit(ctx, snapshot, nil, []string{"merge-base", "--is-ancestor", reviewBase, "HEAD"}, nil); err != nil || strings.EqualFold(reviewBase, head) {
+	if err := scanGit(ctx, snapshot, nil, []string{"merge-base", "--is-ancestor", reviewBase, "HEAD"}, nil); err != nil || mode == agentruntime.ReviewModeImplementation && strings.EqualFold(reviewBase, head) {
 		return independentReviewResult{}, false, errors.New("review base is unavailable or not an ancestor of attested HEAD")
 	}
 	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "remote", "remove", "origin").Run()
@@ -2777,7 +2939,8 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	}); err != nil {
 		return independentReviewResult{}, false, err
 	}
-	resultPath := reviewResultPath(snapshot, head)
+	resultPath := reviewResultPath(snapshot, target)
+	env = append(env, "AGENT_SYMPHONY_REVIEW_RESULT="+resultPath)
 	resultRoot := filepath.Dir(resultPath)
 	if err := os.Mkdir(resultRoot, 0o770); err != nil || reviewGID >= 0 && os.Chown(resultRoot, -1, reviewGID) != nil || os.Chmod(resultRoot, 0o770) != nil {
 		_ = os.RemoveAll(resultRoot)
@@ -2790,20 +2953,20 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-w", "-t", agentruntime.PaneTarget(session), "remain-on-exit", "on"}, Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
-	prompt := reviewPrompt(issue, reviewBase)
-	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"load-buffer", "-b", session, "-"}, Dir: snapshot, Env: env, Stdin: strings.NewReader(prompt)}); err != nil {
-		return independentReviewResult{}, false, err
-	}
-	binary, err := os.Executable()
+	prompt, err := reviewPrompt(mode, target, issue)
 	if err != nil {
 		return independentReviewResult{}, false, err
 	}
-	command = agentruntime.PromptCommand(binary, "tmux", session, resultPath, command)
+	prompt += "\n\nBefore exiting, atomically write the final JSON object to the path in AGENT_SYMPHONY_REVIEW_RESULT. The result file is the lifecycle authority; terminal text is only operator-visible conversation."
+	if slices.Equal(command, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
+		command = config.Default(attempt.Repository).Commands.Reviewer
+	}
+	command = append(slices.Clone(command), prompt)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
 	if runtimeState != nil {
-		if _, err := runtimeState.RecordReview(attempt, "running", reviewBase, head, snapshot, session); err != nil {
+		if _, err := runtimeState.RecordReview(attempt, "running", mode, target, reviewBase, head, snapshot, session); err != nil {
 			return independentReviewResult{}, false, err
 		}
 	}
@@ -2934,6 +3097,67 @@ func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuse
 		_, err := runtime.Monitor(ctx, agentruntime.Attempt{Repository: status.Repository, Issue: status.Issue, Number: status.Attempt, BaseSHA: manifest.BaseSHA, Eligible: func() bool { return authorized }})
 		if err != nil {
 			return fmt.Errorf("monitor %s#%d attempt %d: %w", status.Repository, status.Issue, status.Attempt, err)
+		}
+	}
+	return nil
+}
+
+func reconcilePlanReviews(ctx context.Context, runtimeState *agentruntime.Runtime, reviewBoundary boundaryCaller, implementationBoundary workerBoundaryRunner, cfg config.Config, issues []internalgithub.RecoveryIssueFact, _ []agentruntime.Manifest, source, snapshotRoot string) error {
+	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
+	if err != nil {
+		return err
+	}
+	manifests, err := runtimeState.Discover()
+	if err != nil {
+		return err
+	}
+	for _, manifest := range manifests {
+		if manifest.ReviewMode != agentruntime.ReviewModePlan || manifest.ReviewState != "preparing" && manifest.ReviewState != "running" && manifest.ReviewState != "clean" && manifest.ReviewState != "findings-queued" {
+			continue
+		}
+		index := slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
+			return issue.Repository == manifest.Repository && issue.Issue == manifest.Issue
+		})
+		if index < 0 {
+			return fmt.Errorf("plan review %s#%d has no authoritative issue", manifest.Repository, manifest.Issue)
+		}
+		issue := issues[index]
+		active := func() bool {
+			binding := issue.ActiveAttempt
+			return manifest.State == "running" && issue.DispatchAuthorized && binding != nil && binding.Repository == manifest.Repository && binding.Issue == manifest.Issue && binding.Attempt == manifest.Attempt && binding.BaseSHA == manifest.BaseSHA && slices.Contains([]string{"active", "review-ready"}, binding.State)
+		}
+		issue.Attempt = manifest.Attempt
+		attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: cfg.Commands.Implementation}
+		if active() && (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") {
+			_, pending, err := runIndependentReview(ctx, runtimeState, attempt, reviewBoundary, env, cfg.Commands.Reviewer, issue, manifest, source, manifest.ReviewHead, snapshotRoot, agentruntime.ReviewModePlan)
+			if err != nil {
+				return fmt.Errorf("%s#%d attempt %d: %w", manifest.Repository, manifest.Issue, manifest.Attempt, err)
+			}
+			if pending {
+				continue
+			}
+			current, err := runtimeState.Discover()
+			if err != nil {
+				return err
+			}
+			stored := slices.IndexFunc(current, func(candidate agentruntime.Manifest) bool {
+				return candidate.Repository == manifest.Repository && candidate.Issue == manifest.Issue && candidate.Attempt == manifest.Attempt
+			})
+			if stored < 0 {
+				return errors.New("completed plan review lost its attempt manifest")
+			}
+			manifest = current[stored]
+		}
+		if manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" {
+			manifest, err = cleanupReviewOutcome(ctx, runtimeState, attempt, reviewBoundary, env, manifest, snapshotRoot)
+			if err != nil {
+				return fmt.Errorf("clean up plan review %s#%d attempt %d: %w", manifest.Repository, manifest.Issue, manifest.Attempt, err)
+			}
+		}
+		if active() && manifest.ReviewState == "findings-queued" && !manifest.ReviewHandoffAck {
+			if _, err := returnReviewFindings(ctx, runtimeState, implementationBoundary, attempt, manifest, manifest.ReviewHead, manifest.ReviewFindings, nil, cfg.Commands.Implementation); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

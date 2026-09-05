@@ -247,7 +247,10 @@ func TestAuthorizedHumanInstructionsAmendIndependentReviewContractInOrder(t *tes
 	if !delivered || len(instructions) != 4 || !strings.Contains(instructions[0], first.Message) || !strings.Contains(instructions[1], feedback[0].Body) || !strings.Contains(instructions[2], feedback[1].Body) || !strings.Contains(instructions[3], later.Message) {
 		t.Fatalf("instructions=%#v", instructions)
 	}
-	prompt := reviewPrompt(amended, strings.Repeat("a", 40))
+	prompt, err := reviewPrompt(agentruntime.ReviewModeImplementation, strings.Repeat("a", 40)+".."+strings.Repeat("b", 40), amended)
+	if err != nil {
+		t.Fatal(err)
+	}
 	original, precedence, firstMessage, laterMessage := strings.Index(prompt, issue.Body), strings.Index(prompt, humanInstructionPrecedence), strings.Index(prompt, first.Message), strings.Index(prompt, later.Message)
 	if original < 0 || precedence <= original || firstMessage <= precedence || laterMessage <= firstMessage || strings.Contains(prompt, queued.Message) || strings.Contains(prompt, wrongAttempt.Message) {
 		t.Fatalf("review prompt did not preserve human instruction precedence: %q", prompt)
@@ -1408,7 +1411,10 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 }
 
 func TestReviewPromptExposesTheSameDirectStatusContract(t *testing.T) {
-	prompt := reviewPrompt(internalgithub.RecoveryIssueFact{Issue: 56, Attempt: 3, Body: "review contract"}, strings.Repeat("a", 40))
+	prompt, err := reviewPrompt(agentruntime.ReviewModeImplementation, strings.Repeat("a", 40)+".."+strings.Repeat("b", 40), internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 56, Attempt: 3, Body: "review contract"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{"/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "nonempty reason", "fresh re-read", "partial-update errors are failures, never success"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("review prompt omitted %q: %s", want, prompt)
@@ -2438,6 +2444,7 @@ esac
 		t.Fatal(err)
 	}
 	manifest.State, manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead = "running", "clean", base, head
+	manifest.ReviewMode, manifest.ReviewTarget = agentruntime.ReviewModeImplementation, base+".."+head
 	manifest.ReviewSession, _ = agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
 	manifest.CreatedAt, manifest.UpdatedAt = issueCreated, issueCreated
 	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
@@ -2931,7 +2938,11 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 	if info, err := os.Stat(filepath.Join(result.Snapshot, "file")); err != nil || info.Mode().Perm() != 0o440 {
 		t.Fatalf("snapshot file mode=%v err=%v", info.Mode().Perm(), err)
 	}
-	resultPath := reviewResultPath(result.Snapshot, head)
+	target, err := reviewTarget(agentruntime.ReviewModeImplementation, issue, reviewBase, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultPath := reviewResultPath(result.Snapshot, target)
 	if info, err := os.Stat(filepath.Dir(resultPath)); err != nil || info.Mode().Perm() != 0o770 {
 		t.Fatalf("review result directory=%v err=%v", info, err)
 	}
@@ -2939,9 +2950,9 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 		t.Fatalf("review result existed before capture: %v", err)
 	}
 	log, err := os.ReadFile(boundaryLog)
-	load, start := strings.Index(string(log), `"args":["load-buffer"`), strings.Index(string(log), `"args":["respawn-pane"`)
-	if err != nil || load < 0 || start < load || !strings.Contains(string(log), "worker-capture") {
-		t.Fatalf("review stdin was not loaded before reviewer start: %s err=%v", log, err)
+	start := strings.Index(string(log), `"args":["respawn-pane"`)
+	if err != nil || start < 0 || strings.Contains(string(log), "worker-capture") {
+		t.Fatalf("interactive reviewer was not launched directly: %s err=%v", log, err)
 	}
 	if !strings.Contains(string(log), `OPENAI_API_KEY=model-canary`) || !strings.Contains(string(log), `GITHUB_TOKEN=github-canary`) || !strings.Contains(string(log), `GH_REPO=o/r`) || slices.ContainsFunc([]string{"ssh-canary", "cloud-canary", "proxy-canary", "app-canary", "/coordinator-home"}, func(secret string) bool { return strings.Contains(string(log), secret) }) {
 		t.Fatalf("review boundary environment was not safely filtered: %s", log)
@@ -2958,12 +2969,43 @@ func TestIndependentReviewUsesReviewerBoundaryAndReadOnlySnapshot(t *testing.T) 
 		if decoder.Decode(&request) != nil {
 			break
 		}
-		if slices.Contains(request.Command.Args, "load-buffer") {
-			prompt = string(request.Command.Input)
+		if slices.Contains(request.Command.Args, "respawn-pane") {
+			prompt = request.Command.Args[len(request.Command.Args)-1]
 		}
 	}
-	if !strings.Contains(prompt, reviewBase+"..HEAD") || strings.Contains(prompt, base+"..HEAD") {
-		t.Fatalf("review prompt base is not current: %q", prompt)
+	if !strings.Contains(prompt, "Review mode: implementation-review") || !strings.Contains(prompt, target) || strings.Contains(prompt, base+".."+head) {
+		t.Fatalf("review prompt target is not current: %q", prompt)
+	}
+}
+
+func TestReviewModesBindExactTargetsAndStatusPermissions(t *testing.T) {
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 2, Body: "## Plan\nShip the bounded change."}
+	base, head := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	plan, err := reviewTarget(agentruntime.ReviewModePlan, issue, base, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := issue
+	changed.Body += "\nNew constraint."
+	changedPlan, err := reviewTarget(agentruntime.ReviewModePlan, changed, base, base)
+	if err != nil || changedPlan == plan || !validReviewTarget(agentruntime.ReviewModePlan, plan, issue.Repository, issue.Issue, base) {
+		t.Fatalf("plan targets were not exact: %q %q err=%v", plan, changedPlan, err)
+	}
+	implementation, err := reviewTarget(agentruntime.ReviewModeImplementation, issue, base, head)
+	if err != nil || implementation != base+".."+head || !validReviewTarget(agentruntime.ReviewModeImplementation, implementation, issue.Repository, issue.Issue, head) {
+		t.Fatalf("implementation target=%q err=%v", implementation, err)
+	}
+	for _, test := range []struct{ mode, target string }{{agentruntime.ReviewModePlan, plan}, {agentruntime.ReviewModeImplementation, implementation}} {
+		prompt, err := reviewPrompt(test.mode, test.target, issue)
+		if err != nil || !strings.Contains(prompt, "Review mode: "+test.mode) || !strings.Contains(prompt, test.target) || !strings.Contains(prompt, "Use the installed gh CLI") || !strings.Contains(prompt, "/agent-symphony status needs-attention: REASON") || !strings.Contains(prompt, "needs-attention` label") || strings.Contains(prompt, "ui-review") {
+			t.Fatalf("%s prompt did not preserve its exact target and permissions: %q err=%v", test.mode, prompt, err)
+		}
+	}
+	if _, err := reviewTarget("ui-review", issue, base, head); err == nil {
+		t.Fatal("specialized reviewer mode was accepted")
+	}
+	if _, err := reviewTarget(agentruntime.ReviewModeImplementation, issue, head, head); err == nil {
+		t.Fatal("empty implementation range was accepted")
 	}
 }
 
@@ -2971,12 +3013,15 @@ type artifactReviewBoundary struct {
 	root          string
 	terminal      string
 	paneOutput    string
+	prompt        string
+	env           []string
 	captureCalls  int
 	respawn       []string
 	respawns      int
 	failReads     int
 	invalidReads  int
 	resultContent string
+	cleanupErr    error
 }
 
 type authenticationReviewBoundary struct {
@@ -3027,6 +3072,16 @@ func (b *artifactReviewBoundary) call(_ context.Context, operation string, comma
 		}
 		return agentruntime.Result{Output: "1 0"}, nil
 	}
+	if slices.Contains(command.Args, "kill-session") && b.cleanupErr != nil {
+		return agentruntime.Result{}, b.cleanupErr
+	}
+	if slices.Contains(command.Args, "new-session") {
+		b.env = slices.Clone(command.Env)
+	}
+	if slices.Contains(command.Args, "load-buffer") {
+		body, _ := io.ReadAll(command.Stdin)
+		b.prompt = string(body)
+	}
 	if slices.Contains(command.Args, "capture-pane") {
 		b.captureCalls++
 		return agentruntime.Result{Output: b.terminal}, nil
@@ -3034,8 +3089,9 @@ func (b *artifactReviewBoundary) call(_ context.Context, operation string, comma
 	if slices.Contains(command.Args, "respawn-pane") {
 		b.respawn = slices.Clone(command.Args)
 		b.respawns++
-		for _, path := range command.Args {
-			if strings.HasPrefix(path, b.root+string(filepath.Separator)) && strings.Contains(filepath.Base(filepath.Dir(path)), ".result-") {
+		b.prompt = command.Args[len(command.Args)-1]
+		for _, entry := range command.Env {
+			if path := strings.TrimPrefix(entry, "AGENT_SYMPHONY_REVIEW_RESULT="); path != entry && strings.HasPrefix(path, b.root+string(filepath.Separator)) {
 				if err := os.WriteFile(path, []byte(b.resultContent), 0o660); err != nil {
 					return agentruntime.Result{}, err
 				}
@@ -3043,6 +3099,310 @@ func (b *artifactReviewBoundary) call(_ context.Context, operation string, comma
 		}
 	}
 	return agentruntime.Result{}, nil
+}
+
+func TestPlanReviewUsesExistingReviewerSessionAndExactArtifact(t *testing.T) {
+	source, root := t.TempDir(), t.TempDir()
+	runGit(t, source, "init")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "config", "user.name", "test")
+	runGit(t, source, "commit", "--allow-empty", "-m", "base")
+	head := runGit(t, source, "rev-parse", "HEAD")
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 2, BaseSHA: head}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: head, Body: "## Plan\nReview this exact plan."}
+	target, err := reviewTarget(agentruntime.ReviewModePlan, issue, head, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary := &artifactReviewBoundary{root: root}
+	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, []string{"reviewer"}, issue, agentruntime.Manifest{}, source, head, root, agentruntime.ReviewModePlan)
+	if err != nil || !pending || boundary.respawns != 1 || !slices.Contains(boundary.env, "AGENT_SYMPHONY_REVIEW_RESULT="+reviewResultPath(result.Snapshot, target)) {
+		t.Fatalf("plan review result=%#v target=%q respawn=%q pending=%v err=%v", result, target, boundary.respawn, pending, err)
+	}
+	wantSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
+	if result.Session != wantSession || strings.Contains(result.Session, "plan") || strings.Contains(result.Session, "ui") {
+		t.Fatalf("plan review used a specialized session: %q want %q", result.Session, wantSession)
+	}
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(result.Snapshot, func(path string, entry os.DirEntry, err error) error {
+			if err == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+}
+
+func TestReconcilePlanReviewCompletesWhileImplementationRemainsActive(t *testing.T) {
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptRoot, snapshotRoot := filepath.Join(stateRoot, "worktrees"), filepath.Join(stateRoot, "snapshots")
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := strings.Repeat("a", 40)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 2, BaseSHA: base}
+	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.State = "running"
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-2", "agent.log")
+	manifest.ReviewMode = agentruntime.ReviewModePlan
+	manifest.ReviewTarget = "o/r#23 plan sha256:" + strings.Repeat("b", 64)
+	manifest.ReviewBase, manifest.ReviewHead = base, base
+	manifest.ReviewState = "running"
+	manifest.ReviewSnapshot, manifest.ReviewSession = reviewIdentity(attempt, snapshotRoot)
+	manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(manifest.ReviewSnapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resultPath := reviewResultPath(manifest.ReviewSnapshot, manifest.ReviewTarget)
+	if err := os.MkdirAll(filepath.Dir(resultPath), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, resultPath, `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`)
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot}
+	binding := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "a changed plan body", DispatchAuthorized: true, ActiveAttempt: &binding}
+	boundary := &artifactReviewBoundary{root: snapshotRoot, paneOutput: "1 0"}
+	cfg := config.Config{Commands: config.Commands{Reviewer: []string{"reviewer"}, Implementation: []string{"implementation"}}}
+	if err := reconcilePlanReviews(t.Context(), runtimeState, boundary, workerBoundaryRunner{}, cfg, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, "", snapshotRoot); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := runtimeState.Discover()
+	if err != nil || len(stored) != 1 || stored[0].State != "running" || stored[0].ReviewState != "clean" || stored[0].ReviewTarget != manifest.ReviewTarget || stored[0].ReviewSession != "" || stored[0].ReviewSnapshot != "" {
+		t.Fatalf("stored=%#v err=%v", stored, err)
+	}
+	statuses, _ := projectRecoveryStatuses(t.Context(), []orchestrator.AttemptFact{{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}}, []internalgithub.RecoveryIssueFact{issue}, stored, 1, func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil })
+	if len(statuses) != 1 || statuses[0].CurrentPhase != "implementation" || slices.ContainsFunc(statuses[0].Sessions, func(session orchestrator.AttemptSession) bool {
+		return session.Role == agentruntime.SessionRoleReviewer
+	}) {
+		t.Fatalf("stale plan reviewer remained projected: %#v", statuses)
+	}
+}
+
+func TestReconcilePlanReviewRetriesRetainedCleanup(t *testing.T) {
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptRoot, snapshotRoot := filepath.Join(stateRoot, "worktrees"), filepath.Join(stateRoot, "snapshots")
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := strings.Repeat("a", 40)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 2, BaseSHA: base}
+	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "reviewed plan", DispatchAuthorized: true, ActiveAttempt: &binding}
+	manifest.State = "running"
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-2", "agent.log")
+	manifest.ReviewMode = agentruntime.ReviewModePlan
+	manifest.ReviewTarget, _ = reviewTarget(manifest.ReviewMode, issue, base, base)
+	manifest.ReviewBase, manifest.ReviewHead = base, base
+	manifest.ReviewState = "clean"
+	manifest.ReviewSnapshot, manifest.ReviewSession = reviewIdentity(attempt, snapshotRoot)
+	manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+	if err := os.MkdirAll(manifest.ReviewSnapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(manifest.ReviewSnapshot, "retained")
+	mustWriteFile(t, marker, "pending cleanup")
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot}
+	boundary := &blockingReviewBoundary{block: true, err: errors.New("transient cleanup failure")}
+	cfg := config.Config{Commands: config.Commands{Reviewer: []string{"reviewer"}, Implementation: []string{"implementation"}}}
+	if err := reconcilePlanReviews(t.Context(), runtimeState, boundary, workerBoundaryRunner{}, cfg, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, "", snapshotRoot); err == nil {
+		t.Fatal("transient cleanup failure was ignored")
+	}
+	stored, err := runtimeState.Discover()
+	if err != nil || len(stored) != 1 || stored[0].ReviewSnapshot == "" || stored[0].ReviewSession == "" {
+		t.Fatalf("cleanup retry state=%#v err=%v", stored, err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("retained cleanup resource changed: %v", err)
+	}
+	boundary.block, boundary.err = false, nil
+	if err := reconcilePlanReviews(t.Context(), runtimeState, boundary, workerBoundaryRunner{}, cfg, []internalgithub.RecoveryIssueFact{issue}, stored, "", snapshotRoot); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = runtimeState.Discover()
+	if err != nil || len(stored) != 1 || stored[0].State != "running" || stored[0].ReviewState != "clean" || stored[0].ReviewSnapshot != "" || stored[0].ReviewSession != "" {
+		t.Fatalf("retried cleanup state=%#v err=%v", stored, err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retained cleanup resource remains: %v", err)
+	}
+}
+
+func TestReconcilePlanReviewRetriesUnacknowledgedFindings(t *testing.T) {
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptRoot, snapshotRoot := filepath.Join(stateRoot, "worktrees"), filepath.Join(stateRoot, "snapshots")
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := strings.Repeat("a", 40)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 2, BaseSHA: base}
+	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "reviewed plan", DispatchAuthorized: true, ActiveAttempt: &binding}
+	manifest.State = "running"
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-2", "agent.log")
+	manifest.ReviewMode = agentruntime.ReviewModePlan
+	manifest.ReviewTarget, _ = reviewTarget(manifest.ReviewMode, issue, base, base)
+	manifest.ReviewBase, manifest.ReviewHead = base, base
+	manifest.ReviewState = "running"
+	manifest.ReviewSnapshot, manifest.ReviewSession = reviewIdentity(attempt, snapshotRoot)
+	manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+	if err := os.MkdirAll(manifest.ReviewSnapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resultPath := reviewResultPath(manifest.ReviewSnapshot, manifest.ReviewTarget)
+	if err := os.MkdirAll(filepath.Dir(resultPath), 0o770); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, resultPath, `{"type":"agent-symphony-review-v1","status":"findings","findings":["fix the plan"]}`)
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := "independent-review-" + base
+	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(manifest.Worktree, key), base})
+	result, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
+	calls, script := filepath.Join(t.TempDir(), "calls"), filepath.Join(t.TempDir(), "boundary")
+	scriptBody := fmt.Sprintf("#!/bin/sh\nn=0\ntest ! -f %q || n=$(cat %q)\nn=$((n+1))\nprintf '%%s' \"$n\" > %q\ntest \"$n\" -gt 1 || exit 1\nprintf '%%s' '%s'\n", calls, calls, calls, result)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot}
+	cfg := config.Config{Commands: config.Commands{Reviewer: []string{"reviewer"}, Implementation: []string{"implementation"}}}
+	issues := []internalgithub.RecoveryIssueFact{issue}
+	reviewBoundary := &artifactReviewBoundary{root: snapshotRoot, paneOutput: "1 0"}
+	if err := reconcilePlanReviews(t.Context(), runtimeState, reviewBoundary, workerBoundaryRunner{Command: script}, cfg, issues, []agentruntime.Manifest{manifest}, "", snapshotRoot); err == nil {
+		t.Fatal("transient findings handoff failure was ignored")
+	}
+	stored, err := runtimeState.Discover()
+	if err != nil || len(stored) != 1 || stored[0].ReviewState != "findings-queued" || stored[0].ReviewSnapshot != "" || stored[0].ReviewSession != "" || stored[0].ReviewHandoffQueued || stored[0].ReviewHandoffAck || !slices.Equal(stored[0].ReviewFindings, []string{"fix the plan"}) {
+		t.Fatalf("retained findings state=%#v err=%v", stored, err)
+	}
+	if err := reconcilePlanReviews(t.Context(), runtimeState, reviewBoundary, workerBoundaryRunner{Command: script}, cfg, issues, stored, "", snapshotRoot); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = runtimeState.Discover()
+	count, countErr := os.ReadFile(calls)
+	if err != nil || countErr != nil || string(count) != "2" || len(stored) != 1 || stored[0].State != "running" || !stored[0].ReviewHandoffQueued || !stored[0].ReviewHandoffAck {
+		t.Fatalf("retried findings state=%#v calls=%q err=%v countErr=%v", stored, count, err, countErr)
+	}
+}
+
+func TestReconcilePlanReviewOnlyCleansAfterCancellation(t *testing.T) {
+	for _, reviewState := range []string{"running", "findings-queued"} {
+		t.Run(reviewState, func(t *testing.T) {
+			stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			attemptRoot, snapshotRoot, source := filepath.Join(stateRoot, "worktrees"), filepath.Join(stateRoot, "snapshots"), t.TempDir()
+			if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, source, "init")
+			runGit(t, source, "config", "user.email", "test@example.invalid")
+			runGit(t, source, "config", "user.name", "test")
+			runGit(t, source, "commit", "--allow-empty", "-m", "base")
+			base := runGit(t, source, "rev-parse", "HEAD")
+			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 2, BaseSHA: base}
+			manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "reviewed plan"}
+			manifest.State = "running"
+			manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-2", "agent.log")
+			manifest.ReviewMode = agentruntime.ReviewModePlan
+			manifest.ReviewTarget, _ = reviewTarget(manifest.ReviewMode, issue, base, base)
+			manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewState = base, base, reviewState
+			manifest.ReviewSnapshot, manifest.ReviewSession = reviewIdentity(attempt, snapshotRoot)
+			if reviewState == "findings-queued" {
+				manifest.ReviewFindings = []string{"do not deliver after cancellation"}
+			}
+			manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+			if err := os.MkdirAll(manifest.ReviewSnapshot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(manifest.ReviewSnapshot, "retained")
+			mustWriteFile(t, marker, "cleanup allowed")
+			if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			body, _ := json.Marshal(manifest)
+			if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Runner: &revokedAttemptRunner{}}
+			stale, err := runtimeState.Discover()
+			if err != nil || len(stale) != 1 {
+				t.Fatalf("discover stale manifest=%#v err=%v", stale, err)
+			}
+			if _, err := runtimeState.Cancel(t.Context(), attempt, "cancelled between discovery and plan reconciliation"); err != nil {
+				t.Fatal(err)
+			}
+			key := "independent-review-" + base
+			ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(manifest.Worktree, key), base})
+			result, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
+			delivered, script := filepath.Join(t.TempDir(), "delivered"), filepath.Join(t.TempDir(), "boundary")
+			scriptBody := fmt.Sprintf("#!/bin/sh\nprintf delivered > %q\nprintf '%%s' '%s'\n", delivered, result)
+			if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			oldRoot := reviewSnapshotRoot
+			reviewSnapshotRoot = snapshotRoot
+			t.Cleanup(func() { reviewSnapshotRoot = oldRoot })
+			reviewBoundary := &recoveringReviewBoundary{displayErr: errors.New("reviewer became unobservable")}
+			cfg := config.Config{Commands: config.Commands{Reviewer: []string{"reviewer"}, Implementation: []string{"implementation"}}}
+			if err := reconcilePlanReviews(t.Context(), runtimeState, reviewBoundary, workerBoundaryRunner{Command: script}, cfg, []internalgithub.RecoveryIssueFact{issue}, stale, source, snapshotRoot); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := runtimeState.Discover()
+			if err != nil || len(stored) != 1 || stored[0].State != "cancelled" || stored[0].ReviewState != reviewState || stored[0].ReviewSnapshot != "" || stored[0].ReviewSession != "" || reviewBoundary.started != 0 {
+				t.Fatalf("cancelled review state=%#v starts=%d err=%v", stored, reviewBoundary.started, err)
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("cancelled review resource remains: %v", err)
+			}
+			if _, err := os.Stat(delivered); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("cancelled review delivered findings: %v", err)
+			}
+		})
+	}
 }
 
 func TestReviewAuthenticationCrossesIndependentReviewBoundary(t *testing.T) {
@@ -3127,6 +3487,52 @@ func TestRunningReviewWithDifferentBaseIsNotReused(t *testing.T) {
 	}
 }
 
+func TestLegacyDeadSuccessfulReviewResumesFromHeadArtifact(t *testing.T) {
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptRoot := filepath.Join(stateRoot, "worktrees")
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base, head := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: base}
+	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "23-1", "agent.log")
+	manifest.State, manifest.ReviewState, manifest.ReviewBase, manifest.ReviewHead = "completed", "running", base, head
+	manifest.ReviewSnapshot, manifest.ReviewSession = reviewIdentity(attempt, filepath.Join(stateRoot, "snapshots"))
+	manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+	if err := os.MkdirAll(manifest.ReviewSnapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const clean = `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`
+	legacyResult := reviewResultPath(manifest.ReviewSnapshot, head)
+	mustWriteFile(t, legacyResult, clean)
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot}
+	boundary := &artifactReviewBoundary{root: filepath.Join(stateRoot, "snapshots"), paneOutput: "1 0"}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base}
+	result, pending, err := runIndependentReview(t.Context(), runtimeState, attempt, boundary, nil, []string{"reviewer"}, issue, manifest, "", head, filepath.Join(stateRoot, "snapshots"), agentruntime.ReviewModeImplementation)
+	target, _ := reviewTarget(agentruntime.ReviewModeImplementation, issue, base, head)
+	stored, discoverErr := runtimeState.Discover()
+	if err != nil || pending || result.Status != "clean" || discoverErr != nil || len(stored) != 1 || stored[0].ReviewState != "clean" || stored[0].ReviewMode != agentruntime.ReviewModeImplementation || stored[0].ReviewTarget != target || stored[0].ReviewSnapshot != "" || stored[0].ReviewSession != "" || boundary.respawns != 0 {
+		t.Fatalf("result=%#v pending=%v manifest=%#v respawns=%d err=%v discover=%v", result, pending, stored, boundary.respawns, err, discoverErr)
+	}
+	if _, err := os.Stat(legacyResult); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy result was not cleaned: %v", err)
+	}
+}
+
 func TestIndependentReviewIgnoresEchoedAndDuplicatedTerminalResult(t *testing.T) {
 	source, root := t.TempDir(), t.TempDir()
 	runGit(t, source, "init")
@@ -3144,19 +3550,20 @@ func TestIndependentReviewIgnoresEchoedAndDuplicatedTerminalResult(t *testing.T)
 	}
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: base}
 	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "review this"}
-	defaultReviewer := config.Default(attempt.Repository).Commands.Reviewer
+	target, _ := reviewTarget(agentruntime.ReviewModeImplementation, issue, base, head)
+	defaultReviewer := []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"} // Existing generated configurations are upgraded at launch.
 	started, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, defaultReviewer, issue, agentruntime.Manifest{}, source, head, root)
 	if err != nil || !pending {
 		t.Fatalf("start pending=%v err=%v", pending, err)
 	}
-	if slices.Contains(boundary.respawn, "review") || slices.Contains(boundary.respawn, "--output-last-message") || !slices.Contains(boundary.respawn, reviewResultPath(started.Snapshot, head)) || !slices.Contains(boundary.respawn, "--dangerously-bypass-approvals-and-sandbox") || !slices.Contains(boundary.respawn, "-") {
-		t.Fatalf("default reviewer did not receive result artifact: %q", boundary.respawn)
+	if slices.Contains(boundary.respawn, "exec") || slices.Contains(boundary.respawn, "--output-last-message") || !slices.Contains(boundary.respawn, "--dangerously-bypass-approvals-and-sandbox") || !slices.Contains(boundary.respawn, "--no-alt-screen") || !slices.Contains(boundary.env, "AGENT_SYMPHONY_REVIEW_RESULT="+reviewResultPath(started.Snapshot, target)) {
+		t.Fatalf("default reviewer was not launched interactively with its result binding: %q env=%q", boundary.respawn, boundary.env)
 	}
 	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
 	if _, _, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, defaultReviewer, issue, manifest, source, head, root); err == nil {
 		t.Fatal("malformed artifact was accepted")
 	}
-	resultPath := reviewResultPath(started.Snapshot, head)
+	resultPath := reviewResultPath(started.Snapshot, target)
 	if _, err := os.Stat(resultPath); err != nil {
 		t.Fatalf("artifact was not preserved for retry: %v", err)
 	}
@@ -3190,7 +3597,7 @@ func TestReviewResultReadFailureRetriesWithoutRespawningReviewer(t *testing.T) {
 		t.Fatalf("start pending=%v err=%v", pending, err)
 	}
 	defer func() {
-		_ = cleanupReviewResources(t.Context(), boundary, nil, attempt, head, started.Snapshot, started.Session, root)
+		_ = cleanupReviewResources(t.Context(), boundary, nil, attempt, head, "", started.Snapshot, started.Session, root)
 	}()
 	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
 	if _, pending, err = runIndependentReview(t.Context(), nil, attempt, boundary, nil, command, issue, manifest, source, head, root); err != nil || !pending {
@@ -3220,7 +3627,7 @@ func TestInvalidReviewArtifactFailsWithoutRespawningReviewer(t *testing.T) {
 		t.Fatalf("start pending=%v err=%v", pending, err)
 	}
 	defer func() {
-		_ = cleanupReviewResources(t.Context(), boundary, nil, attempt, head, started.Snapshot, started.Session, root)
+		_ = cleanupReviewResources(t.Context(), boundary, nil, attempt, head, "", started.Snapshot, started.Session, root)
 	}()
 	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
 	if _, pending, err = runIndependentReview(t.Context(), nil, attempt, boundary, nil, command, issue, manifest, source, head, root); err == nil || pending || boundary.respawns != 1 {
@@ -3287,41 +3694,24 @@ func TestReviewCaptureRedactsResultBeforeFindingsHandoff(t *testing.T) {
 }
 
 func TestDefaultReviewerProductionShapeUsesExactDiffAndRejectsProse(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux is unavailable")
-	}
 	dir := t.TempDir()
 	codex := filepath.Join(dir, "codex")
 	const script = `#!/bin/sh
-test "$#" -eq 3 && test "$1" = exec && test "$2" = --dangerously-bypass-approvals-and-sandbox && test "$3" = - || exit 20
-prompt=$(cat) || exit 21
-printf '%s' "$prompt" | grep -F "$FAKE_REVIEW_BASE..HEAD" >/dev/null || exit 22
+test "$#" -eq 3 && test "$1" = --dangerously-bypass-approvals-and-sandbox && test "$2" = --no-alt-screen || exit 20
+prompt=$3
+printf '%s' "$prompt" | grep -F "$FAKE_REVIEW_BASE..$FAKE_REVIEW_HEAD" >/dev/null || exit 22
 diff=$(git -C "$FAKE_REVIEW_REPO" diff --no-ext-diff "$FAKE_REVIEW_BASE" HEAD) || exit 23
 printf '%s' "$diff" | grep -F '+first implementation commit' >/dev/null || exit 24
 printf '%s' "$diff" | grep -F '+second implementation commit' >/dev/null || exit 25
+read operator && test "$operator" = 'inspect the edge' || exit 26
 printf x >>"$FAKE_REVIEW_COUNT"
-printf '%s' "$FAKE_REVIEW_OUTPUT"
-printf 'review diagnostic\n' >&2`
+printf '%s' "$FAKE_REVIEW_OUTPUT" >"$AGENT_SYMPHONY_REVIEW_RESULT.tmp"
+mv "$AGENT_SYMPHONY_REVIEW_RESULT.tmp" "$AGENT_SYMPHONY_REVIEW_RESULT"
+printf 'received:%s\n' "$operator"`
 	if err := os.WriteFile(codex, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	tmuxRoot, err := os.MkdirTemp("/tmp", "agent-symphony-review-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(tmuxRoot) })
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
-	t.Setenv("TMUX", "")
-	t.Setenv("TMUX_PANE", "")
-	t.Setenv("TMUX_TMPDIR", tmuxRoot)
-	bootstrap := exec.Command("tmux", "-f", "/dev/null", "new-session", "-d", "-s", "agent-symphony-test-bootstrap")
-	if output, err := bootstrap.CombinedOutput(); err != nil {
-		t.Fatalf("start isolated tmux server: %v: %s", err, output)
-	}
-	t.Cleanup(func() {
-		command := exec.Command("tmux", "kill-session", "-t", "=agent-symphony-test-bootstrap")
-		_ = command.Run()
-	})
 	source := t.TempDir()
 	runGit(t, source, "init")
 	runGit(t, source, "config", "user.email", "test@example.invalid")
@@ -3342,8 +3732,10 @@ printf 'review diagnostic\n' >&2`
 	}
 	runGit(t, source, "add", "second")
 	runGit(t, source, "commit", "-m", "second implementation commit")
+	head := runGit(t, source, "rev-parse", "HEAD")
 	t.Setenv("FAKE_REVIEW_REPO", source)
 	t.Setenv("FAKE_REVIEW_BASE", base)
+	t.Setenv("FAKE_REVIEW_HEAD", head)
 	defaultReviewer := config.Default("o/r").Commands.Reviewer
 
 	for i, test := range []struct {
@@ -3357,22 +3749,21 @@ printf 'review diagnostic\n' >&2`
 			count := filepath.Join(dir, fmt.Sprintf("count-%d", i))
 			t.Setenv("FAKE_REVIEW_COUNT", count)
 			t.Setenv("FAKE_REVIEW_OUTPUT", test.output)
-			buffer := fmt.Sprintf("review-%d", i)
-			load := exec.Command("tmux", "load-buffer", "-b", buffer, "-")
-			load.Stdin = strings.NewReader(reviewPrompt(internalgithub.RecoveryIssueFact{Issue: 23 + i, Attempt: 1, Body: "Review the change."}, base))
-			if output, err := load.CombinedOutput(); err != nil {
-				t.Fatalf("load real tmux prompt: %v: %s", err, output)
+			prompt, err := reviewPrompt(agentruntime.ReviewModeImplementation, base+".."+head, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23 + i, Attempt: 1, Body: "Review the change."})
+			if err != nil {
+				t.Fatal(err)
 			}
 			resultRoot := filepath.Join(dir, fmt.Sprintf("result-%d", i))
 			if err := os.Mkdir(resultRoot, 0o700); err != nil {
 				t.Fatal(err)
 			}
 			resultPath := filepath.Join(resultRoot, "result.json")
-			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-			defer cancel()
-			code, err := agentruntime.CaptureWorker(ctx, "tmux", buffer, resultPath, defaultReviewer, io.Discard, io.Discard)
-			if err != nil || code != 0 {
-				t.Fatalf("default reviewer capture code=%d err=%v", code, err)
+			command := exec.Command(defaultReviewer[0], append(defaultReviewer[1:], prompt)...)
+			command.Dir, command.Stdin = source, strings.NewReader("inspect the edge\n")
+			command.Env = append(os.Environ(), "AGENT_SYMPHONY_REVIEW_RESULT="+resultPath)
+			output, err := command.CombinedOutput()
+			if err != nil || !strings.Contains(string(output), "received:inspect the edge") {
+				t.Fatalf("interactive reviewer output=%q err=%v", output, err)
 			}
 			body, err := os.ReadFile(resultPath)
 			_, parseErr := parseIndependentReview(string(body))
@@ -3688,6 +4079,25 @@ func TestRunningReviewUnobservableRebuildsWithoutDurableFailure(t *testing.T) {
 	}
 }
 
+func TestPlanReviewRestartRejectsChangedIssueBody(t *testing.T) {
+	root := t.TempDir()
+	base := strings.Repeat("a", 40)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: base}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "original reviewed plan"}
+	target, err := reviewTarget(agentruntime.ReviewModePlan, issue, base, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, session := reviewIdentity(attempt, root)
+	manifest := agentruntime.Manifest{ReviewState: "running", ReviewMode: agentruntime.ReviewModePlan, ReviewTarget: target, ReviewBase: base, ReviewHead: base, ReviewSnapshot: snapshot, ReviewSession: session}
+	issue.Body = "changed plan after coordinator restart"
+	boundary := &recoveringReviewBoundary{displayErr: errors.New("tmux session absent")}
+	_, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, []string{"reviewer"}, issue, manifest, "", base, root, agentruntime.ReviewModePlan)
+	if err == nil || !strings.Contains(err.Error(), "no longer matches") || pending || boundary.started != 0 {
+		t.Fatalf("changed plan restart pending=%v starts=%d err=%v", pending, boundary.started, err)
+	}
+}
+
 func TestReviewCleanupRejectsForeignOutsideAndSymlinkIdentity(t *testing.T) {
 	oldRoot := reviewSnapshotRoot
 	reviewSnapshotRoot = t.TempDir()
@@ -3709,7 +4119,7 @@ func TestReviewCleanupRejectsForeignOutsideAndSymlinkIdentity(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var boundary countingReviewBoundary
-			if err := cleanupReviewResources(t.Context(), &boundary, nil, attempt, strings.Repeat("a", 40), test.snapshot, test.session, reviewSnapshotRoot); err == nil {
+			if err := cleanupReviewResources(t.Context(), &boundary, nil, attempt, strings.Repeat("a", 40), "", test.snapshot, test.session, reviewSnapshotRoot); err == nil {
 				t.Fatal("unsafe cleanup identity accepted")
 			}
 			if boundary != 0 {
@@ -3738,7 +4148,7 @@ func TestReviewIdentitySeparatesRepositories(t *testing.T) {
 		t.Fatalf("review session exceeds runtime limit: %q", largestSession)
 	}
 	var boundary countingReviewBoundary
-	if err := cleanupReviewResources(t.Context(), &boundary, nil, first, strings.Repeat("a", 40), secondSnapshot, secondSession, root); err == nil {
+	if err := cleanupReviewResources(t.Context(), &boundary, nil, first, strings.Repeat("a", 40), "", secondSnapshot, secondSession, root); err == nil {
 		t.Fatal("cleanup accepted another repository identity")
 	}
 	if boundary != 0 {
@@ -3867,18 +4277,21 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	reviewSnapshotRoot = base
 	t.Cleanup(func() { reviewSnapshotRoot = "" })
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 1, BaseSHA: strings.Repeat("a", 40)}
+	head := strings.Repeat("b", 40)
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}
+	target, _ := reviewTarget(agentruntime.ReviewModeImplementation, issue, attempt.BaseSHA, head)
 	snapshot, session := reviewIdentity(attempt, base)
 	if err := os.Mkdir(snapshot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	resultPath := reviewResultPath(snapshot, "head")
+	resultPath := reviewResultPath(snapshot, target)
 	if err := os.MkdirAll(filepath.Dir(resultPath), 0o770); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(resultPath, []byte(`{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`), 0o660); err != nil {
 		t.Fatal(err)
 	}
-	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: "head", ReviewSnapshot: snapshot, ReviewSession: session}
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "completed", ReviewState: "running", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: target, ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
 	sum := sha256.Sum256([]byte(attempt.Repository))
 	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
@@ -3893,7 +4306,7 @@ func TestReviewCleanupCancellationRetainsStateAndRetries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	result, pending, err := runIndependentReview(ctx, &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 23, Attempt: 1}, manifest, "", "head", reviewSnapshotRoot)
+	result, pending, err := runIndependentReview(ctx, &agentruntime.Runtime{StateRoot: state}, attempt, boundary, nil, []string{"review"}, issue, manifest, "", head, reviewSnapshotRoot)
 	if err != nil || !pending || result.Status != "clean" || time.Since(started) > time.Second {
 		t.Fatalf("result=%#v pending=%v err=%v elapsed=%v", result, pending, err, time.Since(started))
 	}
@@ -4005,7 +4418,7 @@ func TestMonitorRetriesRetainedReviewCleanupBeforePublication(t *testing.T) {
 	if err := os.Mkdir(snapshot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Branch: "issue-23", BaseSHA: base, State: "completed", ReviewState: "clean", ReviewBase: base, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session, UpdatedAt: time.Now().UTC()}
+	manifest := agentruntime.Manifest{Version: 1, Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Branch: "issue-23", BaseSHA: base, State: "completed", ReviewState: "clean", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: base + ".." + head, ReviewBase: base, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session, UpdatedAt: time.Now().UTC()}
 	sum := sha256.Sum256([]byte(attempt.Repository))
 	manifestPath := filepath.Join(state, "attempts", fmt.Sprintf("o-r-%x", sum[:6]), "23-1", "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
@@ -4422,7 +4835,7 @@ func TestInitAndMisuseExitCodes(t *testing.T) {
 	if !slices.Equal(initialized.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
 		t.Fatalf("unexpected initialized implementation command: %q", initialized.Commands.Implementation)
 	}
-	if !slices.Equal(initialized.Commands.Reviewer, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
+	if !slices.Equal(initialized.Commands.Reviewer, []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
 		t.Fatalf("unexpected initialized reviewer command: %q", initialized.Commands.Reviewer)
 	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
