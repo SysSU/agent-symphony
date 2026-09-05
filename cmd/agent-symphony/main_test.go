@@ -1206,7 +1206,7 @@ func (r *revokedAttemptRunner) Run(_ context.Context, command agentruntime.Comma
 func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T) {
 	issue := internalgithub.RecoveryIssueFact{Repository: "owner/repo", Issue: 56, Attempt: 3, Body: "## Context\nunique issue contract\n\n## Validation\ngo test ./..."}
 	prompt := implementationPrompt(issue)
-	for _, want := range []string{"Repository: owner/repo", "Issue: #56", "Attempt: 3", issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "stdout", "stderr", "outside the worktree"} {
+	for _, want := range []string{"Repository: owner/repo", "Issue: #56", "Attempt: 3", issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "stdout", "stderr", "outside the worktree", "/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "Re-read both the comment and label", "partial-update errors are failures, never success"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt omitted %q: %s", want, prompt)
 		}
@@ -1218,6 +1218,36 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 	result, err := parseWorkerResult([]byte(line))
 	if err != nil || result.Validation == "" || result.Documentation == "" {
 		t.Fatalf("documented result was rejected: %#v, %v", result, err)
+	}
+}
+
+func TestReviewPromptExposesTheSameDirectStatusContract(t *testing.T) {
+	prompt := reviewPrompt(internalgithub.RecoveryIssueFact{Issue: 56, Attempt: 3, Body: "review contract"}, strings.Repeat("a", 40))
+	for _, want := range []string{"/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "nonempty reason", "fresh re-read", "partial-update errors are failures, never success"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("review prompt omitted %q: %s", want, prompt)
+		}
+	}
+}
+
+func TestDirectAttentionBlocksDispatchAndProjectsWithoutReplacingLifecycle(t *testing.T) {
+	now := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 218, Attempt: 1, Priority: 1, CreatedAt: now, Eligible: false, NeedsAttention: true, Blockers: []string{"needs attention: operator decision required"}}
+	statuses, decisions := joinIssueProjection(nil, []internalgithub.RecoveryIssueFact{issue}, 1)
+	if len(statuses) != 1 || statuses[0].State != "blocked" || !statuses[0].NeedsAttention || !slices.Contains(statuses[0].Blockers, "needs attention: operator decision required") || len(decisions) != 1 || decisions[0].State != orchestrator.Blocked {
+		t.Fatalf("queued attention projection=%#v decisions=%#v", statuses, decisions)
+	}
+
+	issue.Active, issue.Eligible, issue.DispatchAuthorized = true, false, false
+	statuses, _ = joinIssueProjection([]orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 218, Attempt: 1, State: "review-ready"}}, []internalgithub.RecoveryIssueFact{issue}, 1)
+	if len(statuses) != 1 || statuses[0].State != "review-ready" || !statuses[0].NeedsAttention {
+		t.Fatalf("attention replaced active lifecycle: %#v", statuses)
+	}
+
+	issue.NeedsAttention, issue.Blockers, issue.Eligible, issue.DispatchAuthorized = false, nil, true, true
+	statuses, _ = joinIssueProjection([]orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 218, Attempt: 1, State: "review-ready"}}, []internalgithub.RecoveryIssueFact{issue}, 1)
+	if len(statuses) != 1 || statuses[0].State != "review-ready" || statuses[0].NeedsAttention || len(statuses[0].Blockers) != 0 {
+		t.Fatalf("clear did not restore lifecycle projection: %#v", statuses)
 	}
 }
 

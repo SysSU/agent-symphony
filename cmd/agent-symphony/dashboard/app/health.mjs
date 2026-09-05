@@ -40,7 +40,7 @@ export function partitionAttemptHistory(statuses) {
 
 export function groupStatusesByLane(statuses) {
   const lanes = laneDefinitions.map(({ id, title }) => ({ id, title, statuses: [] }));
-  for (const status of statuses) lanes[laneByState.get(status.state) ?? 3].statuses.push(status);
+  for (const status of statuses) lanes[status.needs_attention ? 3 : laneByState.get(status.state) ?? 3].statuses.push(status);
   return lanes;
 }
 
@@ -66,7 +66,7 @@ export function overallHealth(snapshot, error, statuses, now) {
     return { state: "stale", title: "Status updates are stale", detail: "No fresh status has been posted for more than two minutes." };
   }
 
-  const attention = statuses.filter((status) => status.state !== "completed" && (
+  const attention = statuses.filter((status) => status.needs_attention || status.state !== "completed" && (
     (laneByState.get(status.state) ?? 3) === 3 || status.blockers?.length || status.diagnostic
   )).length;
   if (attention) {

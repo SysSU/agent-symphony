@@ -1425,6 +1425,9 @@ func (s *GitHubPRSource) readFeedback(ctx context.Context, number, issue, attemp
 }
 
 func (s *GitHubPRSource) excludedFeedback(source, body string, actor int) bool {
+	if strings.HasPrefix(strings.TrimSpace(body), directStatusPrefix) {
+		return true
+	}
 	if actor == s.Config.ActorID && coordinatorArtifact(body) {
 		return true
 	}

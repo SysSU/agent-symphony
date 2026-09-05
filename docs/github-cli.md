@@ -26,4 +26,6 @@ The authenticated account must be able to read issues, pull requests, reviews, c
 
 The daemon invokes `gh api` for reconciliation reads and writes. It discovers its stable coordinator identity from `gh api /user`, uses that user ID to recognize its own markers and comments, and publishes `agent-symphony/policy` as a commit status. Authorized agents invoke the same installed CLI directly. Git publication remains daemon-owned through `gh auth git-credential`; agent worktrees have no authenticated Git remote.
 
+Direct workflow status uses the two immutable comment commands documented in [GitHub controls](github-controls.md#direct-agent-status). Reconciliation reads the newest valid issue/PR command into the same projection served by the CLI and dashboard; no coordinator relay or dashboard mutation endpoint is involved.
+
 `serve` reads current GitHub state immediately at startup and then polls at the configured interval, capped at 60 seconds. `reconcile` performs the same authoritative read once. No inbound HTTP endpoint or event subscription is part of the integration.

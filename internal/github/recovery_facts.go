@@ -150,8 +150,83 @@ type RecoveryIssueFact struct {
 	DispatchAuthorized                            bool
 	RecoveryAuthorized                            bool
 	RecoveryAttempt                               int
+	NeedsAttention                                bool
 	ActiveAttempt                                 *RecoveryAttemptFact
 	TerminalAttempts                              []RecoveryAttemptFact
+}
+
+const (
+	directStatusPrefix = "/agent-symphony status "
+	directStatusLabel  = "needs-attention"
+)
+
+type directStatus struct {
+	NeedsAttention bool
+	Reason         string
+	createdAt      time.Time
+	commentID      int64
+}
+
+func parseDirectStatus(body string) (directStatus, bool) {
+	command, reason, found := strings.Cut(strings.TrimSpace(body), ":")
+	if !found || len(reason) > 1024 || strings.ContainsRune(reason, 0) {
+		return directStatus{}, false
+	}
+	status := directStatus{Reason: strings.TrimSpace(reason)}
+	if status.Reason == "" {
+		return directStatus{}, false
+	}
+	switch command {
+	case directStatusPrefix + "needs-attention":
+		status.NeedsAttention = true
+	case directStatusPrefix + "clear":
+	default:
+		return directStatus{}, false
+	}
+	return status, true
+}
+
+func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest int) (directStatus, error) {
+	var latest directStatus
+	for _, number := range []int{issue, pullRequest} {
+		if number == 0 {
+			continue
+		}
+		comments, err := s.issueComments(ctx, number)
+		if err != nil {
+			return directStatus{}, err
+		}
+		for _, comment := range comments {
+			status, ok := parseDirectStatus(comment.Body)
+			if !ok || comment.User.ID != s.Config.ActorID || !comment.CreatedAt.Equal(comment.UpdatedAt) {
+				continue
+			}
+			if latest.commentID == 0 || comment.CreatedAt.After(latest.createdAt) || comment.CreatedAt.Equal(latest.createdAt) && comment.ID > latest.commentID {
+				status.createdAt, status.commentID = comment.CreatedAt, comment.ID
+				latest = status
+			}
+		}
+	}
+	var current struct{ Labels []struct{ Name string } }
+	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", s.Config.Repository, issue), "", &current); err != nil {
+		return directStatus{}, err
+	}
+	labelPresent := slices.ContainsFunc(current.Labels, func(label struct{ Name string }) bool { return label.Name == directStatusLabel })
+	if latest.commentID == 0 {
+		if labelPresent {
+			return directStatus{NeedsAttention: true, Reason: "needs-attention label requires an explanatory status comment"}, nil
+		}
+		return latest, nil
+	}
+	if latest.NeedsAttention != labelPresent {
+		if labelPresent {
+			latest.Reason = "direct status clear is incomplete: needs-attention label remains"
+		} else {
+			latest.Reason = "direct needs-attention status is incomplete: needs-attention label is missing"
+		}
+		latest.NeedsAttention = true
+	}
+	return latest, nil
 }
 
 type markerConflicts struct {
@@ -271,6 +346,16 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 					next[issue.Number] = marker.Attempt + 1
 				}
 			}
+			pullRequest := 0
+			for _, attempt := range attempts {
+				if attempt.Issue == issue.Number && attempt.Attempt >= next[issue.Number]-1 {
+					pullRequest = attempt.PR
+				}
+			}
+			status, err := source.directStatus(ctx, issue.Number, pullRequest)
+			if err != nil {
+				return nil, fmt.Errorf("read direct status for issue #%d: %w", issue.Number, err)
+			}
 			controls, _, retry, err := source.authorizedControlsWithIntake(ctx, issue.Number, intake)
 			if err != nil {
 				attempt := max(1, next[issue.Number])
@@ -279,10 +364,17 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 					attempt = binding.Attempt
 					activeAttempt = &RecoveryAttemptFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: "active"}
 				}
-				result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Blockers: []string{err.Error()}, Active: active[issue.Number] || binding.Attempt > 0 || bindingConflicts.Any, Completed: completed[issue.Number], ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts})
+				blockers := []string{err.Error()}
+				if status.NeedsAttention {
+					blockers = append(blockers, "needs attention: "+status.Reason)
+				}
+				result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Blockers: blockers, Active: active[issue.Number] || binding.Attempt > 0 || bindingConflicts.Any, Completed: completed[issue.Number], NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts})
 				continue
 			}
 			blockers := []string{}
+			if status.NeedsAttention {
+				blockers = append(blockers, "needs attention: "+status.Reason)
+			}
 			if bindingConflicts.Any {
 				blockers = append(blockers, "active attempt marker is foreign, malformed, or contradictory")
 			}
@@ -324,7 +416,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			if recoveryAuthorized && !isActive && slices.ContainsFunc(terminalAttempts, func(fact RecoveryAttemptFact) bool { return fact.Attempt == terminal.Attempt }) {
 				recoveryAttempt = terminal.Attempt
 			}
-			result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts})
+			result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts})
 		}
 		if targetIssue > 0 || len(issues) < 100 {
 			return result, nil

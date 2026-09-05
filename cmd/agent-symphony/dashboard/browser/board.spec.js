@@ -151,6 +151,37 @@ test("provides the accessible web dashboard on desktop and mobile", async ({ pag
   await page.screenshot({ path: "test-results/web-dashboard-mobile.png", fullPage: true });
 });
 
+test("shows implementation needs-attention and the later review clear", async ({ page }) => {
+  const status = {
+    repository: "SysSU/agent-symphony",
+    issue: 218,
+    attempt: 1,
+    title: "Direct agent status",
+    state: "active",
+    needs_attention: true,
+    blockers: ["needs attention: implementation needs an operator decision"],
+  };
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await mockDashboard(page, [status]);
+  await page.goto("/");
+
+  const attention = page.locator(".lane").filter({ has: page.locator("#lane-needs-attention") });
+  await expect(attention.getByRole("link", { name: "#218 Direct agent status" })).toBeVisible();
+  await expect(attention.getByText("needs attention", { exact: true })).toBeVisible();
+  await expect(attention.getByText("needs attention: implementation needs an operator decision", { exact: true })).toBeVisible();
+  await page.screenshot({ path: "test-results/direct-status-attention-desktop.png", fullPage: true });
+
+  Object.assign(status, { state: "review-ready", needs_attention: false, blockers: [] });
+  await page.reload();
+  await expect(page.locator("#lane-needs-attention .laneCount")).toHaveText("0");
+  await expect(page.locator("#lane-in-review .laneCount")).toHaveText("1");
+  await expect(page.getByText("needs attention", { exact: true })).toHaveCount(0);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: "test-results/direct-status-cleared-mobile.png", fullPage: true });
+});
+
 test("refreshes the running release without reloading", async ({ page }) => {
   let release = "0.5.0";
   await page.clock.install();
