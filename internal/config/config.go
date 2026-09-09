@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
@@ -17,7 +18,11 @@ import (
 const (
 	DefaultPath                          = ".agent-symphony.yaml"
 	DefaultReconciliationIntervalSeconds = 60
+	ManagedWorkspacePlaceholder          = "{managed_workspace}"
+	OrchestratorWorkspacePlaceholder     = "{orchestrator_workspace}"
 )
+
+const workspaceTrustConfig = `projects={"{managed_workspace}"={trust_level="trusted"}}`
 
 type Config struct {
 	Version                       int                `json:"version"`
@@ -80,9 +85,9 @@ func Default(repository string) Config {
 		WorktreeRoot:                  ".worktrees",
 		DocsPaths:                     []string{"README.md", "docs"},
 		Commands: Commands{
-			Implementation: []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}, Reviewer: []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"},
+			Implementation: []string{"codex", "exec", "-c", workspaceTrustConfig, "--dangerously-bypass-approvals-and-sandbox", "-"}, Reviewer: []string{"codex", "-c", workspaceTrustConfig, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"},
 			Orchestrator:      []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"},
-			OrchestratorAudit: []string{"codex", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"},
+			OrchestratorAudit: []string{"codex", "--ask-for-approval", "never", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"},
 			Environment:       []string{"LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"},
 		},
 		Status: Status{Format: "human", Color: "auto"},
@@ -145,10 +150,47 @@ func load(path, root string) (Config, error) {
 }
 
 func normalizeLegacyCodexCommand(c *Config) {
-	command := c.Commands.Implementation
-	if len(command) == 3 && filepath.Base(command[0]) == "codex" && command[1] == "exec" && command[2] == "--dangerously-bypass-approvals-and-sandbox" {
-		c.Commands.Implementation = append(command, "-")
+	defaults := Default(c.Repository).Commands
+	c.Commands.Implementation = upgradeCodexCommand(c.Commands.Implementation, defaults.Implementation,
+		[]string{"exec", "--dangerously-bypass-approvals-and-sandbox"},
+		[]string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-"})
+	c.Commands.Reviewer = upgradeCodexCommand(c.Commands.Reviewer, defaults.Reviewer,
+		[]string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-"},
+		[]string{"--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"})
+	c.Commands.OrchestratorAudit = upgradeCodexCommand(c.Commands.OrchestratorAudit, defaults.OrchestratorAudit,
+		[]string{"exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"})
+}
+
+func upgradeCodexCommand(command, replacement []string, legacy ...[]string) []string {
+	if len(command) > 0 && filepath.Base(command[0]) == "codex" {
+		for _, args := range legacy {
+			if slices.Equal(command[1:], args) {
+				upgraded := slices.Clone(replacement)
+				upgraded[0] = command[0]
+				return upgraded
+			}
+		}
 	}
+	return command
+}
+
+// ExpandManagedWorkspace binds a configured command to one already validated
+// absolute runtime workspace without changing global Codex trust state.
+func ExpandManagedWorkspace(command []string, workspace string) ([]string, error) {
+	if !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace || strings.ContainsRune(workspace, 0) {
+		return nil, errors.New("managed workspace must be a clean absolute path")
+	}
+	quoted, err := json.Marshal(workspace)
+	if err != nil {
+		return nil, err
+	}
+	escaped := string(quoted[1 : len(quoted)-1])
+	expanded := append([]string(nil), command...)
+	for index := range expanded {
+		expanded[index] = strings.ReplaceAll(expanded[index], ManagedWorkspacePlaceholder, escaped)
+		expanded[index] = strings.ReplaceAll(expanded[index], OrchestratorWorkspacePlaceholder, escaped)
+	}
+	return expanded, nil
 }
 
 func GitRoot() (string, error) {

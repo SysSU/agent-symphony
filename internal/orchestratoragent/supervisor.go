@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
@@ -642,9 +643,9 @@ func (s *Supervisor) start(ctx context.Context, state persisted) (persisted, err
 			return s.failed(state, err)
 		}
 	}
-	configuredCommand := slices.Clone(s.Command)
-	for index := range configuredCommand {
-		configuredCommand[index] = strings.ReplaceAll(configuredCommand[index], "{orchestrator_workspace}", s.Workspace)
+	configuredCommand, err := config.ExpandManagedWorkspace(s.Command, s.Workspace)
+	if err != nil {
+		return s.failed(state, err)
 	}
 	command := append(slices.Clone(configuredCommand), string(contextBody))
 	if len(s.Launcher) > 0 {
@@ -727,9 +728,11 @@ func (s *Supervisor) prepareAudit(prompt string, startedAt time.Time, projection
 			return fmt.Errorf("remove stale orchestrator audit result: %w", err)
 		}
 	}
-	command := slices.Clone(s.AuditCommand)
+	command, err := config.ExpandManagedWorkspace(s.AuditCommand, s.AuditWorkspace)
+	if err != nil {
+		return err
+	}
 	for index := range command {
-		command[index] = strings.ReplaceAll(command[index], "{orchestrator_workspace}", s.AuditWorkspace)
 		command[index] = strings.ReplaceAll(command[index], auditResultPlaceholder, resultPath)
 	}
 	launch, err := json.MarshalIndent(struct {

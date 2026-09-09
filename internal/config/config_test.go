@@ -14,14 +14,14 @@ func TestLoadAndValidate(t *testing.T) {
 	if c.ReconciliationIntervalSeconds != 60 {
 		t.Fatalf("default reconciliation interval = %d", c.ReconciliationIntervalSeconds)
 	}
-	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
+	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "-c", `projects={"{managed_workspace}"={trust_level="trusted"}}`, "--dangerously-bypass-approvals-and-sandbox", "-"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "-c", `projects={"{managed_workspace}"={trust_level="trusted"}}`, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
 		t.Fatalf("unexpected default commands: %#v", c.Commands)
 	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
 	if !slices.Equal(c.Commands.Orchestrator, wantOrchestrator) {
 		t.Fatalf("unexpected default orchestrator: %#v", c.Commands.Orchestrator)
 	}
-	wantAudit := []string{"codex", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"}
+	wantAudit := []string{"codex", "--ask-for-approval", "never", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"}
 	if !slices.Equal(c.Commands.OrchestratorAudit, wantAudit) {
 		t.Fatalf("unexpected default orchestrator audit: %#v", c.Commands.OrchestratorAudit)
 	}
@@ -152,7 +152,10 @@ func TestNeedsAttentionLabelIsReservedFromEveryWorkflowLabel(t *testing.T) {
 
 func TestLoadNormalizesTheLegacyDefaultCodexStdinCommand(t *testing.T) {
 	c := Default("owner/repo")
-	c.Commands.Implementation = c.Commands.Implementation[:3]
+	implementationCodex := filepath.Join(t.TempDir(), "codex")
+	c.Commands.Implementation = []string{implementationCodex, "exec", "--dangerously-bypass-approvals-and-sandbox"}
+	c.Commands.Reviewer = []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}
+	c.Commands.OrchestratorAudit = []string{"codex", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"}
 	path := filepath.Join(t.TempDir(), DefaultPath)
 	if err := Write(path, c); err != nil {
 		t.Fatal(err)
@@ -161,8 +164,33 @@ func TestLoadNormalizesTheLegacyDefaultCodexStdinCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(loaded.Commands.Implementation, Default("owner/repo").Commands.Implementation) {
-		t.Fatalf("legacy implementation command was not normalized: %q", loaded.Commands.Implementation)
+	defaults := Default("owner/repo").Commands
+	wantImplementation := slices.Clone(defaults.Implementation)
+	wantImplementation[0] = implementationCodex
+	if !slices.Equal(loaded.Commands.Implementation, wantImplementation) || !slices.Equal(loaded.Commands.Reviewer, defaults.Reviewer) || !slices.Equal(loaded.Commands.OrchestratorAudit, defaults.OrchestratorAudit) {
+		t.Fatalf("legacy Codex commands were not normalized: %#v", loaded.Commands)
+	}
+}
+
+func TestExpandManagedWorkspaceUsesOneExactEscapedPath(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), `path with spaces [x] "quoted"`)
+	command := []string{"codex", "-c", workspaceTrustConfig, "--no-alt-screen"}
+	expanded, err := ExpandManagedWorkspace(command, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(workspace)
+	want := `projects={` + string(encoded) + `={trust_level="trusted"}}`
+	if !slices.Equal(expanded, []string{"codex", "-c", want, "--no-alt-screen"}) {
+		t.Fatalf("expanded command=%q, want exact workspace %q", expanded, want)
+	}
+	if command[2] != workspaceTrustConfig {
+		t.Fatalf("configured command mutated: %q", command)
+	}
+	for _, unsafe := range []string{"relative", workspace + string(filepath.Separator) + ".."} {
+		if _, err := ExpandManagedWorkspace(command, unsafe); err == nil {
+			t.Fatalf("unsafe workspace %q accepted", unsafe)
+		}
 	}
 }
 

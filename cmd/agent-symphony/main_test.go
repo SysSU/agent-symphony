@@ -1988,7 +1988,9 @@ if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true
 	if readErr != nil || json.Unmarshal(payload, &launched) != nil {
 		t.Fatalf("launch payload=%q err=%v", payload, readErr)
 	}
-	if len(launched.Command.Args) < 4 || !slices.Equal(launched.Command.Args[len(launched.Command.Args)-4:len(launched.Command.Args)-1], []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
+	encodedWorktree, _ := json.Marshal(manifest.Worktree)
+	trust := `projects={` + string(encodedWorktree) + `={trust_level="trusted"}}`
+	if len(launched.Command.Args) < 6 || !slices.Equal(launched.Command.Args[len(launched.Command.Args)-6:len(launched.Command.Args)-1], []string{"codex", "-c", trust, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
 		t.Fatalf("direct launch command=%q", launched.Command.Args)
 	}
 	prompt := launched.Command.Args[len(launched.Command.Args)-1]
@@ -3061,8 +3063,8 @@ func TestDefaultReviewerProductionShapeUsesExactDiffAndRejectsProse(t *testing.T
 	dir := t.TempDir()
 	codex := filepath.Join(dir, "codex")
 	const script = `#!/bin/sh
-test "$#" -eq 3 && test "$1" = --dangerously-bypass-approvals-and-sandbox && test "$2" = --no-alt-screen || exit 20
-prompt=$3
+test "$#" -eq 5 && test "$1" = -c && test "$2" = "projects={$FAKE_REVIEW_WORKSPACE={trust_level=\"trusted\"}}" && test "$3" = --dangerously-bypass-approvals-and-sandbox && test "$4" = --no-alt-screen || exit 20
+prompt=$5
 printf '%s' "$prompt" | grep -F "$FAKE_REVIEW_BASE..$FAKE_REVIEW_HEAD" >/dev/null || exit 22
 diff=$(git -C "$FAKE_REVIEW_REPO" diff --no-ext-diff "$FAKE_REVIEW_BASE" HEAD) || exit 23
 printf '%s' "$diff" | grep -F '+first implementation commit' >/dev/null || exit 24
@@ -3098,9 +3100,14 @@ printf 'received:%s\n' "$operator"`
 	runGit(t, source, "commit", "-m", "second implementation commit")
 	head := runGit(t, source, "rev-parse", "HEAD")
 	t.Setenv("FAKE_REVIEW_REPO", source)
+	encodedSource, _ := json.Marshal(source)
+	t.Setenv("FAKE_REVIEW_WORKSPACE", string(encodedSource))
 	t.Setenv("FAKE_REVIEW_BASE", base)
 	t.Setenv("FAKE_REVIEW_HEAD", head)
-	defaultReviewer := config.Default("o/r").Commands.Reviewer
+	defaultReviewer, err := config.ExpandManagedWorkspace(config.Default("o/r").Commands.Reviewer, source)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for i, test := range []struct {
 		name, output string
@@ -3136,6 +3143,79 @@ printf 'received:%s\n' "$operator"`
 			}
 			if body, err := os.ReadFile(count); err != nil || string(body) != "x" {
 				t.Fatalf("default reviewer runs=%q err=%v", body, err)
+			}
+		})
+	}
+}
+
+func TestManagedCodexLaunchesCarryExactTrustAndApprovalWithoutPriorState(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "codex")
+	const script = `#!/bin/sh
+test "$CODEX_HOME" = "$EXPECTED_CODEX_HOME" || exit 10
+trusted=0
+bypass=0
+never=0
+previous=
+for argument do
+  test "$argument" != "$EXPECTED_TRUST" || trusted=1
+  test "$argument" != --dangerously-bypass-approvals-and-sandbox || bypass=1
+  if test "$previous" = --ask-for-approval && test "$argument" = never; then never=1; fi
+  previous=$argument
+done
+test "$trusted" -eq 1 || { printf 'Do you trust the contents of this directory?'; exit 20; }
+case "$ROLE" in
+implementation|review) test "$bypass" -eq 1 || exit 21;;
+orchestrator|heartbeat) test "$never" -eq 1 || exit 22;;
+*) exit 23;;
+esac
+printf started`
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	freshHome := filepath.Join(dir, "fresh codex home")
+	if err := os.Mkdir(freshHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defaults := config.Default("o/r").Commands
+	implementation, interactive := interactiveImplementationCommand(defaults.Implementation)
+	if !interactive {
+		t.Fatal("default implementation command did not become an interactive session")
+	}
+	roles := []struct {
+		name      string
+		command   []string
+		workspace string
+		promptArg bool
+	}{
+		{"implementation", implementation, filepath.Join(dir, `implementation path [x] "quoted"`), true},
+		{"review", defaults.Reviewer, filepath.Join(dir, `review path [x] "quoted"`), true},
+		{"orchestrator", defaults.Orchestrator, filepath.Join(dir, `orchestrator path [x] "quoted"`), true},
+		{"heartbeat", defaults.OrchestratorAudit, filepath.Join(dir, `heartbeat path [x] "quoted"`), false},
+	}
+	for _, role := range roles {
+		t.Run(role.name, func(t *testing.T) {
+			if err := os.Mkdir(role.workspace, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			command, err := config.ExpandManagedWorkspace(role.command, role.workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for index := range command {
+				command[index] = strings.ReplaceAll(command[index], "{orchestrator_result}", filepath.Join(role.workspace, "result"))
+			}
+			command[0] = fake
+			if role.promptArg {
+				command = append(command, "task")
+			}
+			encoded, _ := json.Marshal(role.workspace)
+			process := exec.Command(command[0], command[1:]...)
+			process.Dir = role.workspace
+			process.Env = []string{"CODEX_HOME=" + freshHome, "EXPECTED_CODEX_HOME=" + freshHome, "EXPECTED_TRUST=projects={" + string(encoded) + `={trust_level="trusted"}}`, "ROLE=" + role.name}
+			process.Stdin = strings.NewReader("task")
+			if output, err := process.CombinedOutput(); err != nil || string(output) != "started" {
+				t.Fatalf("managed %s startup output=%q err=%v command=%q", role.name, output, err, command)
 			}
 		})
 	}
@@ -4226,10 +4306,10 @@ func TestInitAndMisuseExitCodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(initialized.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
+	if !slices.Equal(initialized.Commands.Implementation, config.Default("owner/repo").Commands.Implementation) {
 		t.Fatalf("unexpected initialized implementation command: %q", initialized.Commands.Implementation)
 	}
-	if !slices.Equal(initialized.Commands.Reviewer, []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
+	if !slices.Equal(initialized.Commands.Reviewer, config.Default("owner/repo").Commands.Reviewer) {
 		t.Fatalf("unexpected initialized reviewer command: %q", initialized.Commands.Reviewer)
 	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
