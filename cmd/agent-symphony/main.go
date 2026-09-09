@@ -545,6 +545,66 @@ func chatIssue(stateRoot string, issue int, stdin io.Reader, stdout, stderr io.W
 	return nil
 }
 
+func chatExactSession(stateRoot, repository, role string, issue, attempt int, timeout time.Duration, stdin io.Reader, stdout, stderr io.Writer) error {
+	deployment, err := readDeploymentIdentity(stateRoot)
+	if err != nil {
+		return fmt.Errorf("read deployment identity: %w", err)
+	}
+	if deployment.Repository != repository {
+		return fmt.Errorf("runtime state is bound to project %s, not %s", deployment.Repository, repository)
+	}
+	var session string
+	switch role {
+	case agentruntime.SessionRoleImplementation, agentruntime.SessionRoleReviewer:
+		if issue < 1 || attempt < 1 {
+			return errors.New("implementation and reviewer chat require an exact --issue and --attempt")
+		}
+		project := &dashboardServer{stateRoot: stateRoot, repository: repository}
+		projected, err := project.projectedSession(issue, attempt, role)
+		if err != nil {
+			return fmt.Errorf("%s session is not available for %s#%d attempt %d", role, repository, issue, attempt)
+		}
+		session = projected.Name
+	case "orchestrator":
+		if issue != 0 || attempt != 0 {
+			return errors.New("orchestrator chat does not accept --issue or --attempt")
+		}
+		requestID, err := newControlRequestID()
+		if err != nil {
+			return errors.New("create control request identity")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		result, err := callRunningDaemon(ctx, stateRoot, controlRequest{Version: controlVersion, RequestID: requestID, Repository: repository, Action: "orchestrator-session"})
+		if err != nil {
+			return err
+		}
+		if !result.OK {
+			return errors.New(result.Error)
+		}
+		var target orchestratoragent.AttachTarget
+		if json.Unmarshal(result.Data, &target) != nil || target.Session == "" || strings.ContainsAny(target.Session, "\x00\r\n") {
+			return errors.New("running daemon returned an invalid orchestrator session")
+		}
+		session = target.Session
+	default:
+		return errors.New("--role must be implementation, reviewer, or orchestrator")
+	}
+	if err := configureProjectTmux(stateRoot); err != nil {
+		return fmt.Errorf("configure project tmux: %w", err)
+	}
+	if !tmuxPaneLive(context.Background(), "tmux", session) {
+		return fmt.Errorf("%s session %s is missing or inactive", role, session)
+	}
+	fmt.Fprintf(stderr, "Attaching to %s (%s). Detach with Ctrl-b d.\n", session, role)
+	command := exec.Command("tmux", "attach-session", "-t", "="+session)
+	command.Dir, command.Stdin, command.Stdout, command.Stderr = "/tmp", stdin, stdout, stderr
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("%s session %s ended before attachment completed", role, session)
+	}
+	return nil
+}
+
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == "--version" {
 		fmt.Fprintln(stdout, releaseVersion())
@@ -628,6 +688,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	attemptsPath := fs.String("attempts", "", "authoritative attempt facts file")
 	runtimeState := fs.String("runtime-state", "", "local runtime state root")
 	issueNumber := fs.Int("issue", 0, "issue number to inspect")
+	attemptNumber := fs.Int("attempt", 0, "exact attempt number")
+	repository := fs.String("repository", "", "exact owner/repository identity")
+	role := fs.String("role", "", "session role: implementation, reviewer, or orchestrator")
+	action := fs.String("action", "", "running-daemon control action")
+	confirm := fs.Bool("confirm", false, "confirm a destructive control action")
+	requestID := fs.String("request-id", "", "bounded control request identity")
+	controlTimeout := fs.Duration("timeout", 30*time.Second, "running-daemon control timeout (maximum 2m)")
 	interval := fs.Duration("interval", orchestrator.MaxReconcileInterval, "override configured serve reconciliation interval (maximum 60s)")
 	dashboardAddress := fs.String("dashboard-address", "127.0.0.1:8080", "dashboard loopback listen address")
 	var dashboardProjects stringList
@@ -661,12 +728,49 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	case "chat":
-		if fs.NArg() != 0 || *issueNumber <= 0 || *runtimeState == "" || !onlyFlags(fs, "issue", "runtime-state") {
-			return misuse(stderr, wantsJSON, command, "usage: agent-symphony chat --issue number --runtime-state path")
+		if fs.NArg() != 0 || *repository == "" || *role == "" || *runtimeState == "" || *controlTimeout <= 0 || *controlTimeout > 2*time.Minute || !onlyFlags(fs, "repository", "role", "issue", "attempt", "runtime-state", "timeout") {
+			return misuse(stderr, wantsJSON, command, "usage: agent-symphony chat --repository owner/repo --role implementation|reviewer|orchestrator [--issue number --attempt number] --runtime-state path")
 		}
-		if err := chatIssue(*runtimeState, *issueNumber, os.Stdin, stdout, stderr); err != nil {
+		if err := chatExactSession(*runtimeState, *repository, *role, *issueNumber, *attemptNumber, *controlTimeout, os.Stdin, stdout, stderr); err != nil {
 			return fail(stderr, false, command, err.Error())
 		}
+		return 0
+	case "control":
+		if fs.NArg() != 0 || *repository == "" || *action == "" || *runtimeState == "" || *controlTimeout <= 0 || *controlTimeout > 2*time.Minute || !onlyFlags(fs, "repository", "action", "issue", "attempt", "runtime-state", "confirm", "request-id", "timeout", "json") {
+			return misuse(stderr, wantsJSON, command, "usage: agent-symphony control --repository owner/repo --action ACTION [--issue number --attempt number] [--confirm] --runtime-state path")
+		}
+		if *requestID == "" {
+			var err error
+			*requestID, err = newControlRequestID()
+			if err != nil {
+				return fail(stderr, *jsonOutput, command, "create control request identity")
+			}
+		}
+		request := controlRequest{Version: controlVersion, RequestID: *requestID, Repository: *repository, Action: *action, Issue: *issueNumber, Attempt: *attemptNumber, Confirm: *confirm}
+		if !validControlRequest(request, *repository) {
+			return misuse(stderr, wantsJSON, command, "invalid action identity or confirmation; archive and abandon require --confirm")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), *controlTimeout)
+		defer cancel()
+		result, err := callRunningDaemon(ctx, *runtimeState, request)
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, internalgithub.Redact(err.Error()))
+		}
+		if *jsonOutput {
+			code := writeJSON(stdout, envelope{Version: outputVersion, Command: command, OK: result.OK, Data: result, Error: result.Error})
+			if code != 0 || !result.OK {
+				return 1
+			}
+			return 0
+		}
+		if !result.OK {
+			return fail(stderr, false, command, result.Error)
+		}
+		fmt.Fprintf(stdout, "%s succeeded for %s", result.Action, *repository)
+		if request.Issue > 0 {
+			fmt.Fprintf(stdout, "#%d attempt %d", *issueNumber, *attemptNumber)
+		}
+		fmt.Fprintln(stdout)
 		return 0
 	case "serve":
 		if fs.NArg() != 0 || *statePath == "" || *runtimeState == "" {
@@ -747,6 +851,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
+		defer func() { _ = os.Remove(controlSocketPath(*runtimeState)) }()
 		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
 		lockedReconcile := func(ctx context.Context) error {
 			operationMu.Lock()
@@ -3464,7 +3569,8 @@ func usage(w io.Writer) {
 commands:
 	install-host  provision the native worker/reviewer boundary (run as root)
 	agent-host    execute the implementation, review, or orchestrator boundary
-	chat          attach to the active implementation session for an issue
+	chat          attach to an exact implementation, reviewer, or orchestrator session
+	control       invoke a guarded action in the running daemon
 	init          create .agent-symphony.yaml with project defaults
 	validate      validate configuration
 	config view   print validated configuration
@@ -3484,6 +3590,13 @@ options:
 	--runtime-state path  bounded runtime manifest root
 	--attempts path  offline authoritative attempt facts
 	--issue number  issue to inspect
+	--attempt number  exact attempt for control or chat
+	--repository owner/repo  exact project identity for control or chat
+	--role role  implementation, reviewer, or orchestrator session (chat only)
+	--action action  reconcile, attempt, or orchestrator action (control only)
+	--confirm     confirm archive or abandon cleanup (control only)
+	--request-id id  bounded idempotency identity (control only)
+	--timeout duration  bounded running-daemon request timeout (maximum 2m)
 	--interval duration  override configured serve reconciliation interval (maximum 60s)
 	--dashboard-address address  dashboard listen address (serve only; loopback by default)
 	--dashboard-project URL  additional project dashboard to present read-only (serve only; repeatable)

@@ -307,8 +307,8 @@ func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
 		t.Fatalf("help code=%d stderr=%q", code, stderr.String())
 	}
 	for _, want := range []string{
-		"install-host", "agent-host", "chat", "init", "validate", "config view", "serve", "status", "list", "inspect", "reconcile", "doctor", "diagnostics", "pr-governance", "help",
-		"--config", "--state", "--runtime-state", "--attempts", "--issue", "--interval", "--dashboard-address", "--allow-unsafe-dashboard-network", "--dashboard-password-file", "--offline", "--coordinator", "--json", "--help", "--version",
+		"install-host", "agent-host", "chat", "control", "init", "validate", "config view", "serve", "status", "list", "inspect", "reconcile", "doctor", "diagnostics", "pr-governance", "help",
+		"--config", "--state", "--runtime-state", "--attempts", "--issue", "--attempt", "--repository", "--role", "--action", "--confirm", "--request-id", "--timeout", "--interval", "--dashboard-address", "--allow-unsafe-dashboard-network", "--dashboard-password-file", "--offline", "--coordinator", "--json", "--help", "--version",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("help is missing %q", want)

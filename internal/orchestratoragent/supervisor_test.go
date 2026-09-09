@@ -803,6 +803,21 @@ func waitHeartbeatReport(t *testing.T, workspace, state string) heartbeatReport 
 	}
 }
 
+func TestCoordinatorContextUsesBoundedCLIControlsNotBrowserAutomation(t *testing.T) {
+	now := time.Date(2026, 9, 9, 1, 2, 3, 0, time.UTC)
+	agent := newTestSupervisor(t, &fakeRunner{}, &now)
+	body, err := agent.context("clear")
+	if err != nil {
+		t.Fatal(err)
+	}
+	context := string(body)
+	for _, want := range []string{"Use no browser automation", "agent-symphony", "control", "--repository", agent.Repository, "--runtime-state", agent.Root, "--action", "archive or abandon requires `--confirm`", "never retry forever"} {
+		if !strings.Contains(context, want) {
+			t.Errorf("coordinator context is missing %q", want)
+		}
+	}
+}
+
 func waitAuditStarts(t *testing.T, runner *fakeRunner, want int32) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

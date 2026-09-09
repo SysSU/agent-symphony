@@ -102,14 +102,22 @@ func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string,
 }
 
 func newProjectDashboardHandlerWithOptions(ctx context.Context, stateRoot, repository string, peerProjects []string, tmux string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
+	return newProjectDashboardServer(ctx, stateRoot, repository, peerProjects, tmux, operationMu, recover, planReview, reconcile, service, allowNet, password).webHandler()
+}
+
+func newProjectDashboardServer(ctx context.Context, stateRoot, repository string, peerProjects []string, tmux string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) *dashboardServer {
+	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, repository: repository, peerProjects: peerProjects, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, planReview: planReview, reconcile: reconcile, issueClosed: currentGitHubIssueClosed, mu: operationMu}
+	server.cleanup = server.cleanupAttempt
+	return server
+}
+
+func (s *dashboardServer) webHandler() http.Handler {
 	assets, err := fs.Sub(dashboardFiles, "dashboard/out")
 	if err != nil {
 		panic(err)
 	}
 	static := http.FileServer(http.FS(assets))
-	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, repository: repository, peerProjects: peerProjects, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, planReview: planReview, reconcile: reconcile, issueClosed: currentGitHubIssueClosed, mu: operationMu}
-	server.cleanup = server.cleanupAttempt
-	return server.handler(static)
+	return s.handler(static)
 }
 
 func (s *dashboardServer) handler(static http.Handler) http.Handler {
@@ -1086,7 +1094,12 @@ func startProjectDashboard(ctx context.Context, address, stateRoot, repository s
 	if err != nil {
 		return "", fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
-	server := &http.Server{Handler: newProjectDashboardHandlerWithOptions(ctx, stateRoot, repository, peerProjects, "tmux", operationMu, recover, planReview, reconcile, service, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
+	project := newProjectDashboardServer(ctx, stateRoot, repository, peerProjects, "tmux", operationMu, recover, planReview, reconcile, service, allowNet, password)
+	if err := startControlServer(ctx, project, log); err != nil {
+		_ = listener.Close()
+		return "", err
+	}
+	server := &http.Server{Handler: project.webHandler(), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
 		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password and session data are exposed in transit, and anyone with the password can use terminals and cleanup controls")
 	}
