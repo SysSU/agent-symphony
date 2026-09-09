@@ -144,6 +144,7 @@ type RecoveryIssueFact struct {
 	Issue, Attempt, CurrentAttempt, Priority      int
 	CreatedAt                                     time.Time
 	Dependencies                                  []int
+	SatisfiedDependencies                         []int
 	Paths                                         []string
 	Blockers                                      []string
 	Eligible, Active, Completed, Retry, Cancelled bool
@@ -162,11 +163,25 @@ const (
 )
 
 type directStatus struct {
-	NeedsAttention bool
-	Reason         string
-	incomplete     bool
-	createdAt      time.Time
-	commentID      int64
+	NeedsAttention       bool
+	Reason               string
+	requestedAttention   bool
+	monitoringDependency int
+	incomplete           bool
+	createdAt            time.Time
+	commentID            int64
+}
+
+func monitoringDependencyStatus(reason string, needsAttention bool) int {
+	state := "complete"
+	if needsAttention {
+		state = "incomplete"
+	}
+	var dependency int
+	if _, err := fmt.Sscanf(reason, "monitoring: dependency #%d is "+state, &dependency); err != nil || dependency < 1 || reason != fmt.Sprintf("monitoring: dependency #%d is %s", dependency, state) {
+		return 0
+	}
+	return dependency
 }
 
 func parseDirectStatus(body string) (directStatus, bool) {
@@ -179,10 +194,12 @@ func parseDirectStatus(body string) (directStatus, bool) {
 	switch command {
 	case directStatusPrefix + "needs-attention":
 		status.NeedsAttention = true
+		status.requestedAttention = true
 	case directStatusPrefix + "clear":
 	default:
 		return directStatus{}, false
 	}
+	status.monitoringDependency = monitoringDependencyStatus(reason, status.requestedAttention)
 	return status, true
 }
 
@@ -237,6 +254,49 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 		latest.NeedsAttention = true
 	}
 	return latest, nil
+}
+
+func (s *GitHubPRSource) clearResolvedMonitoringDependencyStatus(ctx context.Context, issue, pullRequest, attempt int, status directStatus) (directStatus, error) {
+	dependency := status.monitoringDependency
+	if dependency < 1 || attempt < 1 {
+		return status, errors.New("monitoring dependency status requires an issue, attempt, and dependency")
+	}
+	attribution := Mutation{Issue: issue, Attempt: attempt}
+	if status.requestedAttention {
+		body := fmt.Sprintf("%sclear: monitoring: dependency #%d is complete", directStatusPrefix, dependency)
+		if err := s.API.mutateAttributed(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", s.Config.Repository, issue), map[string]string{"body": body}, attribution); err != nil {
+			fresh, readErr := s.directStatus(ctx, issue, pullRequest)
+			if readErr != nil || fresh.requestedAttention || fresh.monitoringDependency != dependency {
+				return status, errors.Join(err, readErr)
+			}
+			status = fresh
+		}
+	}
+	if status.requestedAttention {
+		fresh, err := s.directStatus(ctx, issue, pullRequest)
+		if err != nil || fresh.requestedAttention || fresh.monitoringDependency != dependency {
+			return status, errors.Join(errors.New("monitoring dependency clear comment was not observed"), err)
+		}
+		status = fresh
+	}
+	if !status.NeedsAttention {
+		return status, nil
+	}
+	if err := s.API.SyncReviewLabel(ctx, s.Config.Repository, issue, NeedsAttentionLabel, true, false, attribution); err != nil {
+		fresh, readErr := s.directStatus(ctx, issue, pullRequest)
+		if readErr == nil {
+			status = fresh
+		}
+		return status, errors.Join(err, readErr)
+	}
+	fresh, err := s.directStatus(ctx, issue, pullRequest)
+	if err != nil {
+		return status, err
+	}
+	if fresh.NeedsAttention || fresh.requestedAttention || fresh.monitoringDependency != dependency {
+		return fresh, errors.New("monitoring dependency status remains after clear")
+	}
+	return fresh, nil
 }
 
 type markerConflicts struct {
@@ -417,6 +477,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 				continue
 			}
 			blockers := []string{}
+			var satisfiedDependencies []int
 			if bindingConflicts.Any {
 				blockers = append(blockers, "active attempt marker is foreign, malformed, or contradictory")
 			}
@@ -431,6 +492,17 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 				}
 				if !complete {
 					blockers = append(blockers, fmt.Sprintf("dependency #%d is incomplete", dependency))
+				} else {
+					satisfiedDependencies = append(satisfiedDependencies, dependency)
+				}
+			}
+			if intake && status.monitoringDependency > 0 && slices.Contains(controls.Dependencies, status.monitoringDependency) {
+				complete, err := source.dependencyComplete(ctx, status.monitoringDependency)
+				if err == nil && complete {
+					status, err = source.clearResolvedMonitoringDependencyStatus(ctx, issue.Number, pullRequest, max(1, currentAttempt), status)
+				}
+				if err != nil {
+					blockers = append(blockers, fmt.Sprintf("clear resolved monitoring dependency status: %v", err))
 				}
 			}
 			if terminal.Attempt > 0 && !retryAuthorizesFailure(controls, retry, terminal) {
@@ -462,7 +534,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			if status.NeedsAttention {
 				blockers = append(blockers, "needs attention: "+status.Reason)
 			}
-			result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, Closed: issue.State == "closed", DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts})
+			result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, SatisfiedDependencies: satisfiedDependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, Closed: issue.State == "closed", DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts})
 		}
 		if lastPage {
 			return result, nil

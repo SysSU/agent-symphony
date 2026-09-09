@@ -11,17 +11,18 @@ import (
 )
 
 type Issue struct {
-	Repository   string
-	Number       int
-	Priority     int
-	CreatedAt    time.Time
-	Dependencies []int
-	Paths        []string
-	Eligible     bool
-	Blockers     []string
-	Active       bool
-	Completed    bool
-	Cancelled    bool
+	Repository            string
+	Number                int
+	Priority              int
+	CreatedAt             time.Time
+	Dependencies          []int
+	SatisfiedDependencies []int
+	Paths                 []string
+	Eligible              bool
+	Blockers              []string
+	Active                bool
+	Completed             bool
+	Cancelled             bool
 }
 
 type Capacity struct {
@@ -121,6 +122,7 @@ func normalize(input []Issue) ([]Issue, map[string]bool) {
 	contradictions := make(map[string]bool)
 	for _, issue := range input {
 		issue.Dependencies = sortedUnique(issue.Dependencies)
+		issue.SatisfiedDependencies = sortedUnique(issue.SatisfiedDependencies)
 		issue.Paths = sortedUniqueStrings(issue.Paths)
 		issue.Blockers = sortedUniqueStrings(issue.Blockers)
 		k := key(issue)
@@ -142,7 +144,7 @@ func normalize(input []Issue) ([]Issue, map[string]bool) {
 
 func equalIssue(a, b Issue) bool {
 	return a.Repository == b.Repository && a.Number == b.Number && a.Priority == b.Priority && a.CreatedAt.Equal(b.CreatedAt) &&
-		slices.Equal(a.Dependencies, b.Dependencies) && slices.Equal(a.Paths, b.Paths) && a.Eligible == b.Eligible &&
+		slices.Equal(a.Dependencies, b.Dependencies) && slices.Equal(a.SatisfiedDependencies, b.SatisfiedDependencies) && slices.Equal(a.Paths, b.Paths) && a.Eligible == b.Eligible &&
 		slices.Equal(a.Blockers, b.Blockers) && a.Active == b.Active && a.Completed == b.Completed && a.Cancelled == b.Cancelled
 }
 
@@ -169,6 +171,9 @@ func dependencyCycles(repositories map[string]map[int]Issue) map[string]bool {
 			state[number] = 1
 			stack = append(stack, number)
 			for _, dependency := range issues[number].Dependencies {
+				if slices.Contains(issues[number].SatisfiedDependencies, dependency) {
+					continue
+				}
 				if _, known := issues[dependency]; !known {
 					continue
 				}
@@ -197,6 +202,9 @@ func dependencyCycles(repositories map[string]map[int]Issue) map[string]bool {
 
 func dependencyBlocker(issue Issue, known map[int]Issue) string {
 	for _, dependency := range issue.Dependencies {
+		if slices.Contains(issue.SatisfiedDependencies, dependency) {
+			continue
+		}
 		if dependency == issue.Number {
 			return "blocked: issue depends on itself"
 		}
