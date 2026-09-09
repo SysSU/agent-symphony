@@ -57,6 +57,7 @@ type RecoveryStatus struct {
 	Retryable           bool             `json:"retryable,omitempty"`
 	DispatchAuthorized  bool             `json:"dispatch_authorized,omitempty"`
 	NeedsAttention      bool             `json:"needs_attention,omitempty"`
+	IssueClosed         bool             `json:"issue_closed,omitempty"`
 }
 
 type AttemptSession struct {

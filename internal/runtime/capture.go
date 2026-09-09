@@ -90,12 +90,18 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 	save.Dir = tempDir
 	save.Stdout, save.Stderr = prompt, stderr
 	if err := save.Run(); err != nil {
+		if ctx.Err() != nil {
+			return 1, ctx.Err()
+		}
 		return 1, fmt.Errorf("save prompt buffer: %w", err)
 	}
 	deleteBuffer := exec.CommandContext(ctx, tmux, "delete-buffer", "-b", buffer)
 	deleteBuffer.Dir = tempDir
 	deleteBuffer.Stderr = stderr
 	if err := deleteBuffer.Run(); err != nil {
+		if ctx.Err() != nil {
+			return 1, ctx.Err()
+		}
 		return 1, fmt.Errorf("delete prompt buffer: %w", err)
 	}
 	if _, err := prompt.Seek(0, io.SeekStart); err != nil {

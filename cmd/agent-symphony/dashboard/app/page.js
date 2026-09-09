@@ -9,6 +9,13 @@ import { getOrchestratorStatus, getRelease, postWithReconciliationRetry } from "
 import TerminalPanel from "./_components/terminal-panel";
 import { attemptKey } from "./health.mjs";
 
+const actionDetails = {
+  abandon: ["Abandon", "This stops its tmux session and permanently deletes its local worktree, log, and retained attempt record.", "Abandoned"],
+  archive: ["Archive", "This stops its tmux session if needed, deletes its local worktree, and hides it from the Done lane.", "Archived"],
+  dismiss: ["Dismiss", "This hides only this card. Its manifest, logs, worktree diagnostics, GitHub issue, and pull request are retained.", "Dismissed"],
+  recover: ["Recover", "If the attempt is stuck, this stops only its named tmux session. It preserves the worktree and diagnostics, records the failure on GitHub, and requests a new attempt.", "Recovery requested for"],
+};
+
 export default function Dashboard() {
   const [snapshot, setSnapshot] = useState(null);
   const [dashboardState, setDashboardState] = useState({ hidden: [] });
@@ -65,12 +72,7 @@ export default function Dashboard() {
   }, []);
 
   const performAction = useCallback(async (action, status) => {
-    const verb = action === "archive" ? "Archive" : action === "recover" ? "Recover" : "Abandon";
-    const consequence = action === "archive"
-      ? "This stops its tmux session if needed, deletes its local worktree, and hides it from the Done lane."
-      : action === "recover"
-        ? "If the attempt is stuck, this stops only its named tmux session. It preserves the worktree and diagnostics, records the failure on GitHub, and requests a new attempt."
-      : "This stops its tmux session and permanently deletes its local worktree, log, and retained attempt record.";
+    const [verb, consequence, finished] = actionDetails[action] ?? actionDetails.abandon;
     if (!window.confirm(`${verb} issue #${status.issue}, attempt ${status.attempt}?\n\n${consequence}`)) return;
     const key = attemptKey(status);
     setBusy(key);
@@ -86,7 +88,6 @@ export default function Dashboard() {
       const stateResponse = await fetch("/dashboard-state.json", { cache: "no-store" });
       if (!stateResponse.ok) throw new Error(`${verb} finished, but dashboard state could not be refreshed.`);
       setDashboardState(await stateResponse.json());
-      const finished = action === "archive" ? "Archived" : action === "recover" ? "Recovery requested for" : "Abandoned";
       setActionNotice(`${finished} issue #${status.issue}, attempt ${status.attempt}.`);
     } catch (reason) {
       setActionNotice(reason instanceof Error ? reason.message : `${verb} failed.`);
@@ -208,7 +209,7 @@ export default function Dashboard() {
           </section>
         )) : <p className="boardState" role="status">{visibleError ? "Issue status board unavailable." : "Loading issue status board…"}</p>}
       </section>
-      <AttemptHistory statuses={historical} />
+      <AttemptHistory statuses={historical} onAction={performAction} busy={busy} waiting={waiting} readOnly={Boolean(remoteProject)} />
       {terminal ? <TerminalPanel config={terminal} onClose={closeTerminal} /> : null}
     </main>
   );

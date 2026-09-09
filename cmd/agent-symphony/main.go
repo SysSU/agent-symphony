@@ -1279,6 +1279,9 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		return r.VerifyActive(ctx, manifest, head)
 	}
 	statuses, decisions := projectRecoveryStatuses(ctx, facts, issues, manifests, c.Concurrency, checkRuntime)
+	if err := addClosedIssueProjection(ctx, api, c.Repository, statuses, issues); err != nil {
+		return statuses, fmt.Errorf("project closed issue state: %w", err)
+	}
 	if err := writeProjectStatusSnapshot(stateRoot, c.Repository, statuses); err != nil {
 		return statuses, fmt.Errorf("write status projection: %w", err)
 	}
@@ -1296,6 +1299,9 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 			return nil, nil, discoverErr
 		}
 		statuses, decisions = projectRecoveryStatuses(ctx, currentFacts, currentIssues, currentManifests, c.Concurrency, checkRuntime)
+		if err := addClosedIssueProjection(ctx, api, c.Repository, statuses, currentIssues); err != nil {
+			return nil, nil, err
+		}
 		return currentManifests, decisions, writeProjectStatusSnapshot(stateRoot, c.Repository, statuses)
 	}
 	// Governance may mutate GitHub only after authenticated repository access,
@@ -1418,6 +1424,32 @@ func projectRecoveryStatuses(ctx context.Context, facts []orchestrator.AttemptFa
 	return joinIssueProjection(orchestrator.RecoverChecked(ctx, facts, manifests, check), issues, capacity)
 }
 
+func addClosedIssueProjection(ctx context.Context, api internalgithub.API, repository string, statuses []orchestrator.RecoveryStatus, issues []internalgithub.RecoveryIssueFact) error {
+	known := make(map[int]bool, len(issues))
+	for _, issue := range issues {
+		known[issue.Issue] = issue.Closed
+	}
+	for i := range statuses {
+		if statuses[i].Repository != repository {
+			return errors.New("status projection contains another repository")
+		}
+		closed, ok := known[statuses[i].Issue]
+		if !ok && !slices.Contains([]string{"completed", "failed", "orphaned", "cancelled"}, statuses[i].State) {
+			continue
+		}
+		if !ok {
+			var err error
+			closed, err = githubIssueClosed(ctx, api, repository, statuses[i].Issue)
+			if err != nil {
+				return err
+			}
+			known[statuses[i].Issue] = closed
+		}
+		statuses[i].IssueClosed = closed
+	}
+	return nil
+}
+
 func cleanupCompletedAttempts(ctx context.Context, boundary boundaryCaller, facts []orchestrator.AttemptFact, manifests []agentruntime.Manifest) error {
 	for _, fact := range facts {
 		if fact.State != "completed" {
@@ -1503,6 +1535,7 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 		for j := range statuses {
 			if statuses[j].Repository == issue.Repository && statuses[j].Issue == issue.Issue {
 				statuses[j].Title, statuses[j].Priority, statuses[j].Dependencies = issue.Title, issue.Priority, issue.Dependencies
+				statuses[j].IssueClosed = issue.Closed
 				statuses[j].DispatchAuthorized = issue.DispatchAuthorized
 				statuses[j].NeedsAttention = statuses[j].Attempt == currentAttempt && issue.NeedsAttention
 				if statuses[j].Attempt == currentAttempt {
@@ -1524,7 +1557,7 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 			continue
 		}
 		decision := decisions[decisionIndex]
-		statuses = append(statuses, orchestrator.RecoveryStatus{Repository: issue.Repository, Issue: issue.Issue, Title: issue.Title, Attempt: issue.Attempt, State: string(decision.State), CurrentPhase: string(decision.State), Priority: issue.Priority, Dependencies: issue.Dependencies, Blockers: issue.Blockers, Action: decision.Explanation, NeedsAttention: issue.NeedsAttention})
+		statuses = append(statuses, orchestrator.RecoveryStatus{Repository: issue.Repository, Issue: issue.Issue, Title: issue.Title, Attempt: issue.Attempt, State: string(decision.State), CurrentPhase: string(decision.State), Priority: issue.Priority, Dependencies: issue.Dependencies, Blockers: issue.Blockers, Action: decision.Explanation, NeedsAttention: issue.NeedsAttention, IssueClosed: issue.Closed})
 	}
 	return statuses, decisions
 }

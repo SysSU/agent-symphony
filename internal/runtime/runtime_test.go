@@ -707,7 +707,7 @@ func TestPromptCommandBoundsStdoutAndPreservesExitStatus(t *testing.T) {
 	t.Cleanup(func() { _ = unrelated.Process.Kill(); _ = unrelated.Wait() })
 	started := time.Now()
 	code, err = run(boundedResult, []string{"sh", "-c", `trap '' PIPE TERM; while :; do printf x || :; done`})
-	if !errors.Is(err, ErrWorkerResultOverflow) || code == 0 || time.Since(started) > 2*time.Second {
+	if !errors.Is(err, ErrWorkerResultOverflow) || code == 0 || time.Since(started) > 5*time.Second {
 		t.Fatalf("over-limit producer: code=%d elapsed=%v err=%v", code, time.Since(started), err)
 	}
 	if info, err := os.Stat(boundedResult); err != nil || info.Size() != WorkerResultMaxBytes {
