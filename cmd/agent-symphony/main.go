@@ -2340,6 +2340,13 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 }
 
 func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtime, boundary workerBoundaryRunner, attempt agentruntime.Attempt, manifest agentruntime.Manifest, head string, findings, humanInstructions, command []string) (bool, error) {
+	if len(command) == 0 {
+		return false, errors.New("implementation command is missing")
+	}
+	command, err := config.ExpandManagedWorkspace(command, manifest.Worktree)
+	if err != nil {
+		return false, fmt.Errorf("bind review findings handoff command: %w", err)
+	}
 	key := "independent-review-" + head
 	outcomePath := handoffReceiptPath(manifest.Worktree, key)
 	handoff, _ := json.Marshal(struct {
@@ -2365,9 +2372,6 @@ func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtim
 			return errors.New("review findings handoff acceptance binding mismatch")
 		}
 		return nil
-	}
-	if len(command) == 0 {
-		return false, errors.New("implementation command is missing")
 	}
 	if !manifest.ReviewHandoffAck {
 		if err := accept(); err != nil {
@@ -2986,6 +2990,10 @@ func resumeHandoffs(ctx context.Context, runtimeState *agentruntime.Runtime, bou
 				return err
 			}
 		}
+		expandedCommand, err := config.ExpandManagedWorkspace(command, manifest.Worktree)
+		if err != nil {
+			return fmt.Errorf("bind durable handoff command: %w", err)
+		}
 		payload, _ := json.Marshal(struct {
 			Type, Key  string
 			PR         int
@@ -3002,7 +3010,7 @@ func resumeHandoffs(ctx context.Context, runtimeState *agentruntime.Runtime, bou
 			OutcomePath  string          `json:"outcome_path"`
 			OutcomeToken string          `json:"outcome_token"`
 			Command      []string        `json:"command"`
-		}{manifestBody, payload, outcomePath, outcomeToken, command})
+		}{manifestBody, payload, outcomePath, outcomeToken, expandedCommand})
 		accepted, err := boundary.call(ctx, "accept-handoff", agentruntime.Command{Stdin: bytes.NewReader(request)})
 		var ack handoffReceipt
 		decoder := json.NewDecoder(strings.NewReader(accepted.Output))

@@ -1276,8 +1276,8 @@ func TestReviewFindingsHandoffReachesImplementationWithoutOrchestrator(t *testin
 
 	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(manifest.Worktree, key), head})
 	result, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
-	calls, script := filepath.Join(worktree, "accepts"), filepath.Join(t.TempDir(), "boundary")
-	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\ncase \"$payload\" in *accept-handoff*) printf 'x\\n' >> %q;; esac\nprintf '%%s' '%s'\n", calls, result)
+	calls, requestPath, script := filepath.Join(worktree, "accepts"), filepath.Join(worktree, "request"), filepath.Join(t.TempDir(), "boundary")
+	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\nprintf '%%s' \"$payload\" > %q\ncase \"$payload\" in *accept-handoff*) printf 'x\\n' >> %q;; esac\nprintf '%%s' '%s'\n", requestPath, calls, result)
 	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1286,7 +1286,8 @@ func TestReviewFindingsHandoffReachesImplementationWithoutOrchestrator(t *testin
 	// The worker already accepted and executed before the coordinator crashed;
 	// the restarted coordinator recovers the bound receipt without rework.
 	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
-	pending, err := returnReviewFindings(t.Context(), restarted, boundary, attempt, manifest, head, manifest.ReviewFindings, nil, []string{"implementation"})
+	command := config.Default(attempt.Repository).Commands.Implementation
+	pending, err := returnReviewFindings(t.Context(), restarted, boundary, attempt, manifest, head, manifest.ReviewFindings, nil, command)
 	if err != nil || pending {
 		t.Fatalf("receipt recovery pending=%v err=%v", pending, err)
 	}
@@ -1302,6 +1303,32 @@ func TestReviewFindingsHandoffReachesImplementationWithoutOrchestrator(t *testin
 	accepts, _ := os.ReadFile(calls)
 	if strings.Count(string(accepts), "x\n") != 1 {
 		t.Fatalf("accept calls=%q", accepts)
+	}
+	requestBody, err := os.ReadFile(requestPath)
+	var outer struct {
+		Command boundaryCommand `json:"command"`
+	}
+	if err != nil || json.Unmarshal(requestBody, &outer) != nil {
+		t.Fatalf("handoff request=%q err=%v", requestBody, err)
+	}
+	var handoffRequest struct {
+		Command []string `json:"command"`
+	}
+	if err := json.Unmarshal(outer.Command.Input, &handoffRequest); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := config.ExpandManagedWorkspace(command, worktree)
+	if !slices.Equal(handoffRequest.Command, want) || strings.Contains(strings.Join(handoffRequest.Command, " "), config.ManagedWorkspacePlaceholder) {
+		t.Fatalf("review findings handoff command=%q want=%q", handoffRequest.Command, want)
+	}
+	unsafe := manifest
+	unsafe.Worktree = "relative"
+	if _, err := returnReviewFindings(t.Context(), restarted, boundary, attempt, unsafe, head, manifest.ReviewFindings, nil, command); err == nil || !strings.Contains(err.Error(), "bind review findings handoff command") {
+		t.Fatalf("unsafe review findings handoff error=%v", err)
+	}
+	accepts, _ = os.ReadFile(calls)
+	if strings.Count(string(accepts), "x\n") != 1 {
+		t.Fatalf("unsafe handoff reached boundary: %q", accepts)
 	}
 }
 
@@ -4237,13 +4264,15 @@ func TestResumeHandoffsDeliversConfiguredImplementationCommand(t *testing.T) {
 	}
 	t.Cleanup(func() { hostExecRunner = oldExec })
 
-	command := []string{"implementation", "--flag"}
+	command := config.Default(manifest.Repository).Commands.Implementation
 	boundary := &directHandoffBoundary{root: root}
 	if err := resumeHandoffs(t.Context(), nil, boundary, statePath, stateRoot, statuses, []agentruntime.Manifest{manifest}, command); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(respawn, command[0]) || !slices.Contains(respawn, command[1]) {
-		t.Fatalf("respawn omitted implementation command: %q", respawn)
+	wantCommand, _ := config.ExpandManagedWorkspace(command, worktree)
+	trust := wantCommand[3]
+	if !slices.Contains(respawn, command[0]) || !slices.Contains(respawn, "exec") || !slices.Contains(respawn, trust) || strings.Contains(strings.Join(respawn, " "), config.ManagedWorkspacePlaceholder) {
+		t.Fatalf("respawn omitted exact trusted implementation command: %q want=%q", respawn, wantCommand)
 	}
 	if !slices.Contains(respawn, agentruntime.ResultPath(worktree)) || !strings.Contains(prompt, "agent-symphony-result-v1") || !strings.Contains(prompt, "refs/remotes/agent-symphony/") {
 		t.Fatalf("handoff omitted capture contract: respawn=%q prompt=%q", respawn, prompt)
@@ -4278,6 +4307,23 @@ func TestResumeHandoffsLeavesUnauthorizedWorkQueued(t *testing.T) {
 		if err != nil || len(handoffs) != 1 || boundary.calls != 0 {
 			t.Fatalf("unauthorized handoff was consumed: handoffs=%#v calls=%d err=%v", handoffs, boundary.calls, err)
 		}
+	}
+}
+
+func TestResumeHandoffsRejectsUnsafeWorkspaceBeforeBoundary(t *testing.T) {
+	stateRoot := t.TempDir()
+	statePath := filepath.Join(stateRoot, "state.json")
+	state := []internalgithub.PRState{{Repository: "o/r", Number: 3, Issue: 4, Attempt: 2, HeadSHA: "abcdef0", Facts: internalgithub.PRFacts{Feedback: []internalgithub.Feedback{{ID: 55, Source: "conversation", Execution: internalgithub.FeedbackClaimed}}}}}
+	body, _ := json.Marshal(state)
+	if err := os.WriteFile(statePath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, State: "completed", Worktree: "relative", Session: "as-4-2"}
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 4, Attempt: 2, State: "review-ready", DispatchAuthorized: true}
+	boundary := &refusingHandoffBoundary{}
+	err := resumeHandoffs(t.Context(), nil, boundary, statePath, stateRoot, []orchestrator.RecoveryStatus{status}, []agentruntime.Manifest{manifest}, config.Default("o/r").Commands.Implementation)
+	if err == nil || !strings.Contains(err.Error(), "bind durable handoff command") || boundary.calls != 0 {
+		t.Fatalf("unsafe durable handoff error=%v boundary_calls=%d", err, boundary.calls)
 	}
 }
 
