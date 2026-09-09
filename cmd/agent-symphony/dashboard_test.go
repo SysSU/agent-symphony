@@ -783,6 +783,190 @@ func TestDashboardArchivesCompletedAndAbandonsOrphanedAttempts(t *testing.T) {
 	}
 }
 
+func TestClosedAttemptDismissalEligibility(t *testing.T) {
+	base := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 21, Attempt: 1, State: "failed", IssueClosed: true}
+	for _, test := range []struct {
+		name   string
+		change func(*orchestrator.RecoveryStatus)
+		want   bool
+	}{
+		{"closed failed attempt", func(*orchestrator.RecoveryStatus) {}, true},
+		{"open issue", func(status *orchestrator.RecoveryStatus) { status.IssueClosed = false }, false},
+		{"nonterminal projection", func(status *orchestrator.RecoveryStatus) { status.State = "active" }, false},
+		{"missing repository", func(status *orchestrator.RecoveryStatus) { status.Repository = "" }, false},
+		{"invalid issue", func(status *orchestrator.RecoveryStatus) { status.Issue = 0 }, false},
+		{"invalid attempt", func(status *orchestrator.RecoveryStatus) { status.Attempt = 0 }, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := base
+			test.change(&status)
+			if got := canDismissClosedAttempt(status); got != test.want {
+				t.Fatalf("eligibility=%v, want %v for %#v", got, test.want, status)
+			}
+		})
+	}
+	for _, state := range []string{"completed", "failed", "orphaned", "cancelled"} {
+		status := base
+		status.State = state
+		if !canDismissClosedAttempt(status) {
+			t.Errorf("closed %s attempt is not dismissible", state)
+		}
+	}
+}
+
+func TestCurrentGitHubIssueClosedRequiresExactClosedIssue(t *testing.T) {
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI = "https://example.test"
+	githubClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/repos/o/r/issues/21" {
+			t.Fatalf("unexpected GitHub path %s", request.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"number":21,"state":"closed"}`))}, nil
+	})}
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+
+	closed, err := currentGitHubIssueClosed(t.Context(), "o/r", 21)
+	if err != nil || !closed {
+		t.Fatalf("closed=%v err=%v", closed, err)
+	}
+}
+
+func TestDashboardDismissesClosedAttemptWithoutRemovingDiagnostics(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := writeDashboardManifest(t, root, 25, 1, "failed")
+	current := writeDashboardManifest(t, root, 25, 2, "completed")
+	if err := os.MkdirAll(previous.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	diagnostic := filepath.Join(previous.Worktree, "diagnostic.txt")
+	if err := os.WriteFile(diagnostic, []byte("retained"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statuses := []orchestrator.RecoveryStatus{
+		{Repository: previous.Repository, Issue: previous.Issue, Attempt: previous.Attempt, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session, IssueClosed: true},
+		{Repository: current.Repository, Issue: current.Issue, Attempt: current.Attempt, State: "completed", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session, IssueClosed: true},
+	}
+	if err := writeStatusSnapshot(root, statuses); err != nil {
+		t.Fatal(err)
+	}
+	githubReads, cleanupCalls := 0, 0
+	server := &dashboardServer{
+		stateRoot:  root,
+		repository: previous.Repository,
+		mu:         &sync.Mutex{},
+		issueClosed: func(_ context.Context, repository string, issue int) (bool, error) {
+			githubReads++
+			return repository == previous.Repository && issue == previous.Issue, nil
+		},
+		cleanup: func(context.Context, string, agentruntime.Manifest) error {
+			cleanupCalls++
+			return nil
+		},
+	}
+	assets, _ := fs.Sub(dashboardFiles, "dashboard/out")
+	handler := server.handler(http.FileServer(http.FS(assets)))
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/dismiss?repository=o%2Fr&issue=25&attempt=1", nil)
+	request.Header.Set("Origin", "http://127.0.0.1")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || githubReads != 1 || cleanupCalls != 0 {
+		t.Fatalf("dismiss status=%d body=%q github_reads=%d cleanup_calls=%d", response.Code, response.Body.String(), githubReads, cleanupCalls)
+	}
+
+	restarted := &dashboardServer{stateRoot: root, repository: previous.Repository}
+	state, err := restarted.readState()
+	if err != nil || !slices.Equal(state.Hidden, []dashboardHiddenAttempt{{Repository: "o/r", Issue: 25, Attempt: 1, Reason: "dismissed"}}) {
+		t.Fatalf("restarted dashboard state=%#v err=%v", state, err)
+	}
+	for _, path := range []string{filepath.Join(filepath.Dir(previous.LogPath), "manifest.json"), previous.LogPath, diagnostic, filepath.Join(filepath.Dir(current.LogPath), "manifest.json")} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("dismissal removed diagnostic artifact %s: %v", path, err)
+		}
+	}
+}
+
+func TestDashboardDismissalFailsClosedWithoutStateMutation(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := writeDashboardManifest(t, root, 26, 1, "failed")
+	status := orchestrator.RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "failed", Branch: manifest.Branch, Worktree: manifest.Worktree, Session: manifest.Session, IssueClosed: true}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	closed := true
+	server := &dashboardServer{stateRoot: root, repository: manifest.Repository, mu: &sync.Mutex{}, issueClosed: func(context.Context, string, int) (bool, error) { return closed, nil }}
+	assets, _ := fs.Sub(dashboardFiles, "dashboard/out")
+	handler := server.handler(http.FileServer(http.FS(assets)))
+	request := func(target, origin string) *httptest.ResponseRecorder {
+		before, _ := os.ReadFile(filepath.Join(root, "dashboard-state.json"))
+		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1"+target, nil)
+		r.Header.Set("Origin", origin)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		after, _ := os.ReadFile(filepath.Join(root, "dashboard-state.json"))
+		if !bytes.Equal(before, after) {
+			t.Fatalf("rejected dismissal mutated state: before=%q after=%q", before, after)
+		}
+		return w
+	}
+	path := "/actions/dismiss?repository=o%2Fr&issue=26&attempt=1"
+	if got := request(path, "https://evil.example"); got.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin status=%d", got.Code)
+	}
+	if got := request("/actions/dismiss?repository=other%2Frepo&issue=26&attempt=1", "http://127.0.0.1"); got.Code != http.StatusBadRequest {
+		t.Fatalf("repository mismatch status=%d", got.Code)
+	}
+	if got := request("/actions/dismiss?repository=o%2Fr&issue=26&attempt=2", "http://127.0.0.1"); got.Code != http.StatusConflict {
+		t.Fatalf("unknown attempt status=%d", got.Code)
+	}
+	closed = false
+	if got := request(path, "http://127.0.0.1"); got.Code != http.StatusConflict {
+		t.Fatalf("open issue status=%d", got.Code)
+	}
+	closed = true
+	status.IssueClosed = false
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	if got := request(path, "http://127.0.0.1"); got.Code != http.StatusConflict {
+		t.Fatalf("stale projection status=%d", got.Code)
+	}
+}
+
+func TestDashboardDismissalRejectsUnsafeStateFile(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := writeDashboardManifest(t, root, 27, 1, "failed")
+	status := orchestrator.RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "failed", Branch: manifest.Branch, Worktree: manifest.Worktree, Session: manifest.Session, IssueClosed: true}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "outside-state.json")
+	if err := os.WriteFile(target, []byte(`{"version":1,"hidden":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "dashboard-state.json")); err != nil {
+		t.Fatal(err)
+	}
+	server := &dashboardServer{stateRoot: root, repository: manifest.Repository, issueClosed: func(context.Context, string, int) (bool, error) { return true, nil }}
+	assets, _ := fs.Sub(dashboardFiles, "dashboard/out")
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/dismiss?repository=o%2Fr&issue=27&attempt=1", nil)
+	request.Header.Set("Origin", "http://127.0.0.1")
+	response := httptest.NewRecorder()
+	server.handler(http.FileServer(http.FS(assets))).ServeHTTP(response, request)
+	body, _ := os.ReadFile(target)
+	if response.Code != http.StatusInternalServerError || string(body) != `{"version":1,"hidden":[]}` {
+		t.Fatalf("unsafe state status=%d target=%q", response.Code, body)
+	}
+}
+
 func TestDashboardCleanupRejectsProjectionIdentityDrift(t *testing.T) {
 	root, _ := filepath.EvalSymlinks(t.TempDir())
 	manifest := writeDashboardManifest(t, root, 23, 1, "completed")
@@ -1046,6 +1230,7 @@ func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
 }
 
 func TestDashboardRoutesOperatorInputDirectlyToLaunchedImplementationWithoutOrchestrator(t *testing.T) {
+	t.Setenv("TMUX_TMPDIR", "/tmp")
 	tmuxBinary, err := exec.LookPath("tmux")
 	if err != nil {
 		t.Skip("tmux is unavailable")

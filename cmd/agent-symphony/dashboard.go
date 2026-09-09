@@ -53,6 +53,7 @@ type dashboardServer struct {
 	recover      func(context.Context, int, int) error
 	planReview   func(context.Context, int, int) error
 	reconcile    func(context.Context) error
+	issueClosed  func(context.Context, string, int) (bool, error)
 	mu           *sync.Mutex
 	localMu      sync.Mutex
 }
@@ -106,7 +107,7 @@ func newProjectDashboardHandlerWithOptions(ctx context.Context, stateRoot, repos
 		panic(err)
 	}
 	static := http.FileServer(http.FS(assets))
-	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, repository: repository, peerProjects: peerProjects, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, planReview: planReview, reconcile: reconcile, mu: operationMu}
+	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, repository: repository, peerProjects: peerProjects, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, planReview: planReview, reconcile: reconcile, issueClosed: currentGitHubIssueClosed, mu: operationMu}
 	server.cleanup = server.cleanupAttempt
 	return server.handler(static)
 }
@@ -123,7 +124,7 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		if !s.authenticate(w, r) {
 			return
 		}
-		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/recover" || r.URL.Path == "/actions/review-plan" {
+		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/dismiss" || r.URL.Path == "/actions/recover" || r.URL.Path == "/actions/review-plan" {
 			s.serveAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/"))
 			return
 		}
@@ -449,7 +450,7 @@ func fetchDashboardProject(ctx context.Context, projectURL string) dashboardProj
 
 func validDashboardState(state *dashboardState, repository string) bool {
 	return state != nil && state.Version == dashboardStateVersion && len(state.Hidden) <= 10_000 && !slices.ContainsFunc(state.Hidden, func(hidden dashboardHiddenAttempt) bool {
-		return hidden.Repository != repository || hidden.Issue < 1 || hidden.Attempt < 1 || hidden.Reason != "archived" && hidden.Reason != "abandoned"
+		return hidden.Repository != repository || hidden.Issue < 1 || hidden.Attempt < 1 || hidden.Reason != "archived" && hidden.Reason != "abandoned" && hidden.Reason != "dismissed"
 	})
 }
 
@@ -512,7 +513,7 @@ func (s *dashboardServer) readState() (dashboardState, error) {
 		return dashboardState{}, errors.New("invalid dashboard state")
 	}
 	for _, hidden := range state.Hidden {
-		if hidden.Repository == "" || s.repository != "" && hidden.Repository != s.repository || hidden.Issue < 1 || hidden.Attempt < 1 || (hidden.Reason != "archived" && hidden.Reason != "abandoned") {
+		if hidden.Repository == "" || s.repository != "" && hidden.Repository != s.repository || hidden.Issue < 1 || hidden.Attempt < 1 || (hidden.Reason != "archived" && hidden.Reason != "abandoned" && hidden.Reason != "dismissed") {
 			return dashboardState{}, errors.New("invalid dashboard state entry")
 		}
 	}
@@ -571,12 +572,12 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 	query := r.URL.Query()
 	issue, issueErr := strconv.Atoi(query.Get("issue"))
 	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
-	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || !s.validProjectQuery(query, "issue", "attempt") || (action != "archive" && action != "abandon" && action != "recover" && action != "review-plan") {
+	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || !s.validProjectQuery(query, "issue", "attempt") || (action != "archive" && action != "abandon" && action != "dismiss" && action != "recover" && action != "review-plan") {
 		http.Error(w, "invalid action", http.StatusBadRequest)
 		return
 	}
-	if action == "review-plan" && (r.ContentLength != 0 || len(r.TransferEncoding) != 0) {
-		http.Error(w, "invalid plan review action", http.StatusBadRequest)
+	if (action == "dismiss" || action == "review-plan") && (r.ContentLength != 0 || len(r.TransferEncoding) != 0) {
+		http.Error(w, "invalid action body", http.StatusBadRequest)
 		return
 	}
 	operationMu := s.mu
@@ -590,6 +591,26 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 	}
 	defer operationMu.Unlock()
 	status, err := s.projectedStatus(issue, attempt)
+	if action == "dismiss" {
+		if err != nil || !canDismissClosedAttempt(status) || s.issueClosed == nil {
+			http.Error(w, "attempt is not eligible for dismissal", http.StatusConflict)
+			return
+		}
+		closed, issueErr := s.issueClosed(r.Context(), status.Repository, issue)
+		if issueErr != nil || !closed {
+			http.Error(w, "attempt is not eligible for dismissal", http.StatusConflict)
+			return
+		}
+		if err := s.hideAttempt(status, "dismissed"); err != nil {
+			http.Error(w, "dashboard state could not be updated", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+		return
+	}
 	if action == "review-plan" {
 		if err != nil || status.State != "active" || s.planReview == nil {
 			http.Error(w, "attempt is not eligible for plan review", http.StatusConflict)
@@ -658,22 +679,11 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 			return
 		}
 	}
-	state, err := s.readState()
-	if err != nil {
-		http.Error(w, "attempt resources were cleaned but dashboard state could not be updated", http.StatusInternalServerError)
-		return
-	}
 	reason := "archived"
 	if action == "abandon" {
 		reason = "abandoned"
 	}
-	hidden := dashboardHiddenAttempt{Repository: status.Repository, Issue: issue, Attempt: attempt, Reason: reason}
-	if !slices.ContainsFunc(state.Hidden, func(entry dashboardHiddenAttempt) bool {
-		return entry.Repository == hidden.Repository && entry.Issue == hidden.Issue && entry.Attempt == hidden.Attempt
-	}) {
-		state.Hidden = append(state.Hidden, hidden)
-	}
-	if err := s.writeState(state); err != nil {
+	if err := s.hideAttempt(status, reason); err != nil {
 		http.Error(w, "attempt resources were cleaned but dashboard state could not be updated", http.StatusInternalServerError)
 		return
 	}
@@ -681,6 +691,45 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, `{"ok":true}`)
+}
+
+func canDismissClosedAttempt(status orchestrator.RecoveryStatus) bool {
+	return status.Repository != "" && status.Issue > 0 && status.Attempt > 0 && status.IssueClosed && slices.Contains([]string{"completed", "failed", "orphaned", "cancelled"}, status.State)
+}
+
+func currentGitHubIssueClosed(ctx context.Context, repository string, issue int) (bool, error) {
+	return githubIssueClosed(ctx, internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}, repository, issue)
+}
+
+func githubIssueClosed(ctx context.Context, api internalgithub.API, repository string, issue int) (bool, error) {
+	if repository == "" || issue < 1 {
+		return false, errors.New("invalid issue identity")
+	}
+	var current struct {
+		Number int
+		State  string
+	}
+	if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", repository, issue), "", &current); err != nil {
+		return false, err
+	}
+	if current.Number != issue || current.State != "open" && current.State != "closed" {
+		return false, errors.New("invalid GitHub issue state")
+	}
+	return current.State == "closed", nil
+}
+
+func (s *dashboardServer) hideAttempt(status orchestrator.RecoveryStatus, reason string) error {
+	state, err := s.readState()
+	if err != nil {
+		return err
+	}
+	hidden := dashboardHiddenAttempt{Repository: status.Repository, Issue: status.Issue, Attempt: status.Attempt, Reason: reason}
+	if !slices.ContainsFunc(state.Hidden, func(entry dashboardHiddenAttempt) bool {
+		return entry.Repository == hidden.Repository && entry.Issue == hidden.Issue && entry.Attempt == hidden.Attempt
+	}) {
+		state.Hidden = append(state.Hidden, hidden)
+	}
+	return s.writeState(state)
 }
 
 func (s *dashboardServer) cleanupAttempt(ctx context.Context, action string, manifest agentruntime.Manifest) error {

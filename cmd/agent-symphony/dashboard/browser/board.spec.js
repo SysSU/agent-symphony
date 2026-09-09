@@ -154,14 +154,15 @@ test("provides the accessible web dashboard on desktop and mobile", async ({ pag
 
 test("switches between two isolated project deployments without exposing peer controls", async ({ page }) => {
   const local = statuses[0];
-  const peer = { ...statuses[0], repository: "SysSU/second-project", issue: 7, title: "Peer work", session: "as-second-project-7-1", worktree: "/second/worktrees/7-1" };
-  const snapshot = (status) => ({ updated_at: new Date().toISOString(), statuses: [status] });
+  const peer = { ...statuses[0], repository: "SysSU/second-project", issue: 7, attempt: 2, title: "Peer work", session: "as-second-project-7-2", worktree: "/second/worktrees/7-2" };
+  const peerPrevious = { ...peer, attempt: 1, state: "failed", session: "as-second-project-7-1", issue_closed: true };
+  const snapshot = (attempts) => ({ updated_at: new Date().toISOString(), statuses: attempts });
   await mockDashboard(page, [local]);
   await page.route("**/projects.json", (route) => route.fulfill({ json: {
     version: 1,
     projects: [
-      { version: 1, repository: local.repository, local: true, snapshot: snapshot(local), state: { version: 1, hidden: [] } },
-      { version: 1, repository: peer.repository, url: "http://127.0.0.1:8082", snapshot: snapshot(peer), state: { version: 1, hidden: [] } },
+      { version: 1, repository: local.repository, local: true, snapshot: snapshot([local]), state: { version: 1, hidden: [] } },
+      { version: 1, repository: peer.repository, url: "http://127.0.0.1:8082", snapshot: snapshot([peerPrevious, peer]), state: { version: 1, hidden: [] } },
     ],
   } }));
   await page.goto("/");
@@ -174,7 +175,10 @@ test("switches between two isolated project deployments without exposing peer co
   await expect(page.getByText(peer.session, { exact: true })).toBeVisible();
   await expect(page.getByText("agent-symphony-161-1", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("link", { name: "Open project dashboard" })).toHaveAttribute("href", "http://127.0.0.1:8082");
-  await expect(page.getByRole("button", { name: /archive|recover|abandon|open terminal/i })).toHaveCount(0);
+  const history = page.locator("details.attemptHistory");
+  await history.locator("summary").click();
+  await expect(history.getByRole("button", { name: /dismiss/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /archive|recover|abandon|dismiss|open terminal/i })).toHaveCount(0);
   await expect(page.getByText("Peer status is read-only here.")).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });
@@ -273,6 +277,72 @@ test("moves superseded terminal attempts into read-only history", async ({ page 
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   await page.screenshot({ path: "test-results/board-attempt-history-mobile.png", fullPage: true });
+});
+
+test("dismisses one closed-issue attempt while retaining diagnostics", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  const previous = {
+    repository: "SysSU/agent-symphony",
+    issue: 218,
+    attempt: 1,
+    title: "Closed issue with retained attempts",
+    state: "failed",
+    issue_closed: true,
+    diagnostic: "attempt one diagnostic",
+  };
+  const current = { ...previous, attempt: 2, state: "completed", diagnostic: "attempt two diagnostic" };
+  const open = { ...previous, issue: 219, attempt: 1, title: "Open issue", state: "orphaned", issue_closed: false, diagnostic: "open issue diagnostic" };
+  const diagnosticArtifacts = new Map([[`${previous.repository}#${previous.issue}/${previous.attempt}`, {
+    manifest: "manifest.json",
+    log: "agent.log",
+    worktree: "diagnostic.txt",
+  }]]);
+  const dashboard = await mockDashboard(page, [previous, current, open]);
+  const requests = [];
+  await page.route("**/actions/dismiss?*", (route) => {
+    const url = new URL(route.request().url());
+    requests.push({
+      method: route.request().method(),
+      repository: url.searchParams.get("repository"),
+      issue: url.searchParams.get("issue"),
+      attempt: url.searchParams.get("attempt"),
+    });
+    dashboard.hide(previous, "dismissed");
+    return route.fulfill({ json: { ok: true } });
+  });
+  await page.goto("/");
+
+  const history = page.locator("details.attemptHistory");
+  await history.locator("summary").click();
+  const dismissPrevious = history.getByRole("button", { name: "Dismiss issue #218, attempt 1; keep diagnostics" });
+  await expect(dismissPrevious).toBeVisible();
+  await expect(page.getByRole("button", { name: "Dismiss issue #218, attempt 2; keep diagnostics" })).toBeVisible();
+  const openCard = page.locator(".card").filter({ has: page.getByRole("link", { name: "#219 Open issue" }) });
+  await expect(openCard.getByRole("button", { name: /dismiss/i })).toHaveCount(0);
+  await page.screenshot({ path: "test-results/closed-attempt-dismissal-desktop.png", fullPage: true });
+
+  let confirmation = "";
+  page.once("dialog", (dialog) => {
+    confirmation = dialog.message();
+    return dialog.accept();
+  });
+  await dismissPrevious.click();
+  await expect(page.getByRole("status").filter({ hasText: "Dismissed issue #218, attempt 1." })).toBeVisible();
+  expect(confirmation).toContain("manifest, logs, worktree diagnostics, GitHub issue, and pull request are retained");
+  expect(requests).toEqual([{ method: "POST", repository: previous.repository, issue: "218", attempt: "1" }]);
+  expect(diagnosticArtifacts.get(`${previous.repository}#${previous.issue}/${previous.attempt}`)).toEqual({
+    manifest: "manifest.json",
+    log: "agent.log",
+    worktree: "diagnostic.txt",
+  });
+
+  await page.reload();
+  await expect(page.getByText("attempt one diagnostic", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("attempt two diagnostic", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "#219 Open issue" })).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: "test-results/closed-attempt-dismissal-mobile.png", fullPage: true });
 });
 
 test("contains long attempt text inside a mobile viewport", async ({ page }) => {

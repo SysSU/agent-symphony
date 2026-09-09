@@ -57,9 +57,14 @@ func TestHostOrchestratorProposalWritesOnlyTheFixedValidatedArtifact(t *testing.
 	if err := os.Chmod(proposalPath, 0o620); err != nil {
 		t.Fatal(err)
 	}
-	oldGetwd := hostGetwd
+	proposalInfo, err := os.Stat(proposalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldGetwd, oldEGID := hostGetwd, hostEGID
 	hostGetwd = func() (string, error) { return workspace, nil }
-	t.Cleanup(func() { hostGetwd = oldGetwd })
+	hostEGID = func() int { return fileGID(proposalInfo) }
+	t.Cleanup(func() { hostGetwd, hostEGID = oldGetwd, oldEGID })
 	proposal := `{"version":1,"repository":"o/r","issue":131,"attempt":3,"action":"retry_transition","request_id":"retry-131-3"}`
 	var output bytes.Buffer
 	if err := writeHostOrchestratorProposal(root, strings.NewReader(proposal), &output); err != nil {
@@ -108,6 +113,13 @@ func TestHostTransitionRetryProposalReportsCoordinatorResolution(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workspace, orchestratoragent.MessageProposalStatusFile), status, 0o440); err != nil {
 		t.Fatal(err)
 	}
+	statusInfo, err := os.Stat(filepath.Join(workspace, orchestratoragent.MessageProposalStatusFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldEGID := hostEGID
+	hostEGID = func() int { return fileGID(statusInfo) }
+	t.Cleanup(func() { hostEGID = oldEGID })
 	var output bytes.Buffer
 	if err := reportHostOrchestratorProposalStatus(root, strings.NewReader(submitted), &output); err != nil || !strings.Contains(output.String(), `"state":"refused"`) || !strings.Contains(output.String(), `"detail":"target is stale"`) {
 		t.Fatalf("resolved proposal status=%q err=%v", output.String(), err)
@@ -141,6 +153,7 @@ func TestHostAttentionActionsRequireExactBoundedHandoff(t *testing.T) {
 
 func fakeHostIdentity(t *testing.T, uid, gid int) {
 	t.Helper()
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", "")
 	oldEUID, oldEGID, oldUser, oldGroup, oldOutput := hostEUID, hostEGID, hostLookupUser, hostLookupGroup, hostOutput
 	hostEUID, hostEGID = func() int { return uid }, func() int { return gid }
 	hostLookupUser = func(name string) (*user.User, error) {
@@ -478,8 +491,14 @@ func TestHostOrchestratorLaunchContractIsReadOnlyAndCredentialFiltered(t *testin
 	if err := os.WriteFile(path, launch, 0o440); err != nil {
 		t.Fatal(err)
 	}
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	oldGetwd, oldRun, oldEGID := hostGetwd, hostOrchestratorRun, hostEGID
+	expectedGID := fileGID(pathInfo)
 	hostGetwd = func() (string, error) { return dir, nil }
+	hostEGID = func() int { return expectedGID }
 	t.Cleanup(func() { hostGetwd, hostOrchestratorRun, hostEGID = oldGetwd, oldRun, oldEGID })
 	t.Setenv("GH_TOKEN", "github-canary")
 	var got agentruntime.Command
@@ -516,11 +535,11 @@ func TestHostOrchestratorLaunchContractIsReadOnlyAndCredentialFiltered(t *testin
 	if !slices.Equal(got.Args, []string{"--read-only", "-"}) || stdin != "audit prompt" {
 		t.Fatalf("one-shot launch args=%q stdin=%q", got.Args, stdin)
 	}
-	hostEGID = func() int { return oldEGID() + 1 }
+	hostEGID = func() int { return expectedGID + 1 }
 	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err == nil {
 		t.Fatal("launch contract outside the reviewer snapshot group was accepted")
 	}
-	hostEGID = oldEGID
+	hostEGID = func() int { return expectedGID }
 	if err := os.Chmod(path, 0o660); err != nil {
 		t.Fatal(err)
 	}

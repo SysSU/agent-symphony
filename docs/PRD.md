@@ -235,7 +235,7 @@ The MVP should reuse Symphony's proven boundaries where practical and validate t
 - If autonomous merge confidence is insufficient, default to human review.
 - If multi-agent coordination creates excessive conflicts, cap concurrency per repository.
 - If long-lived execution state cannot be safely resumed, reconstruct from GitHub and start a new traceable attempt.
-- Keep GitHub authoritative. Dashboard presentation state may hide locally archived or abandoned cards but must not become a parallel task database. Only the separately defined Recover action may write its fixed retry control.
+- Keep GitHub authoritative. Dashboard presentation state may hide locally archived, abandoned, or closed-issue dismissed cards but must not become a parallel task database. Only the separately defined Recover action may write its fixed retry control.
 
 ## Developer Tool Specific Requirements
 
@@ -397,6 +397,7 @@ No migration guide is required for the greenfield MVP.
 - **FR62:** A stakeholder can abandon a selected orphaned attempt by confirming cleanup of its exact local resources and retained manifest/log.
 - **FR63:** Dashboard terminal, recovery, and cleanup controls default to loopback and always require same-origin requests and server-resolved deterministic attempt identity; non-loopback binding requires an explicit unsafe-network opt-in and password authentication on every route.
 - **FR64:** A stakeholder can recover only the latest eligible failed or stuck attempt after fresh permission, state, and identity checks; recovery preserves diagnostics and may post only the fixed retry control.
+- **FR65:** A stakeholder can dismiss a terminal attempt whose issue is closed without changing GitHub or deleting its retained diagnostics.
 
 ## Non-Functional Requirements
 

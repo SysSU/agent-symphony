@@ -3999,6 +3999,36 @@ func TestAttentionProjectionAppliesOnlyToTheCurrentAttempt(t *testing.T) {
 	}
 }
 
+func TestIssueProjectionMarksEveryRetainedAttemptWhenIssueIsClosed(t *testing.T) {
+	statuses := []orchestrator.RecoveryStatus{
+		{Repository: "o/r", Issue: 218, Attempt: 1, State: "failed"},
+		{Repository: "o/r", Issue: 218, Attempt: 2, State: "completed"},
+	}
+	got, _ := joinIssueProjection(statuses, []internalgithub.RecoveryIssueFact{{Repository: "o/r", Issue: 218, Attempt: 2, Closed: true}}, 1)
+	if !got[0].IssueClosed || !got[1].IssueClosed {
+		t.Fatalf("closed issue state was not projected to every attempt: %#v", got)
+	}
+}
+
+func TestClosedIssueProjectionReadsUnmatchedRetainedAttemptOnce(t *testing.T) {
+	reads := 0
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		reads++
+		if request.URL.Path != "/repos/o/r/issues/218" {
+			t.Fatalf("unexpected issue read %s", request.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"number":218,"state":"closed"}`))}, nil
+	})}}
+	statuses := []orchestrator.RecoveryStatus{
+		{Repository: "o/r", Issue: 218, Attempt: 1, State: "orphaned"},
+		{Repository: "o/r", Issue: 218, Attempt: 2, State: "failed"},
+		{Repository: "o/r", Issue: 219, Attempt: 1, State: "active"},
+	}
+	if err := addClosedIssueProjection(t.Context(), api, "o/r", statuses, nil); err != nil || reads != 1 || !statuses[0].IssueClosed || !statuses[1].IssueClosed || statuses[2].IssueClosed {
+		t.Fatalf("statuses=%#v reads=%d err=%v", statuses, reads, err)
+	}
+}
+
 func TestIssueProjectionAllowsOnlyLatestUnblockedTerminalRecovery(t *testing.T) {
 	statuses := []orchestrator.RecoveryStatus{
 		{Repository: "o/r", Issue: 4, Attempt: 1, State: "failed", Retryable: true},

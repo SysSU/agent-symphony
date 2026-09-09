@@ -2,6 +2,7 @@ import { canInvestigate, orchestratorPresentation } from "../health.mjs";
 import PlanReviewButton from "./plan-review-button";
 
 const attachableSessionRoles = new Set(["implementation", "reviewer"]);
+const dismissibleStates = new Set(["completed", "failed", "orphaned", "cancelled"]);
 
 function sessionDisabled(readOnly, role) {
   return readOnly || !attachableSessionRoles.has(role);
@@ -47,11 +48,28 @@ function canPlanReview(status) {
   return status.state === "active" && !status.sessions?.some((session) => session.role === "reviewer" && ["preparing", "running"].includes(session.state));
 }
 
-function StatusActions({ status, onAction, onInvestigate, onNotice, investigationEnabled, investigationBusy, busy, investigating, waiting, readOnly }) {
+function attemptActionAvailable(status, historical) {
+  return !historical && (status.state === "completed" || status.state === "orphaned" || status.retryable);
+}
+
+function canDismiss(status) {
+  return status.issue_closed && dismissibleStates.has(status.state);
+}
+
+function DismissButton({ status, onAction, busy }) {
+  if (!canDismiss(status)) return null;
+  return (
+    <button className="secondaryAction" type="button" disabled={busy} onClick={() => onAction("dismiss", status)} aria-label={`Dismiss issue #${status.issue}, attempt ${status.attempt}; keep diagnostics`}>
+      Dismiss (keep diagnostics)
+    </button>
+  );
+}
+
+function StatusActions({ status, onAction, onInvestigate, onNotice, investigationEnabled, investigationBusy, busy, investigating, waiting, readOnly, historical }) {
   const investigationAvailable = investigationEnabled && canInvestigate(status);
-  const actionAvailable = status.state === "completed" || status.state === "orphaned" || status.retryable;
+  const actionAvailable = attemptActionAvailable(status, historical);
   const planReviewAvailable = canPlanReview(status);
-  if (readOnly || (!investigationAvailable && !actionAvailable && !planReviewAvailable)) return null;
+  if (readOnly || (!investigationAvailable && !actionAvailable && !canDismiss(status) && !planReviewAvailable)) return null;
   const action = actionFor(status);
   const label = actionLabel(status, busy, waiting);
   return (
@@ -62,6 +80,7 @@ function StatusActions({ status, onAction, onInvestigate, onNotice, investigatio
         </button>
       ) : null}
       {planReviewAvailable ? <PlanReviewButton status={status} onNotice={onNotice} /> : null}
+      <DismissButton status={status} onAction={onAction} busy={busy} />
       {actionAvailable ? (
         <button className={status.state === "completed" ? "secondaryAction" : "dangerAction"} type="button" disabled={busy} onClick={() => onAction(action, status)}>
           {label}
@@ -72,7 +91,7 @@ function StatusActions({ status, onAction, onInvestigate, onNotice, investigatio
 }
 
 export function StatusCard(props) {
-  const { status, onOpenTerminal, readOnly } = props;
+  const { status, onOpenTerminal, readOnly, historical } = props;
   const issueURL = githubURL(status.repository, "issues", status.issue);
   const prURL = githubURL(status.repository, "pull", status.pr);
   const issueLabel = status.title ? `#${status.issue} ${status.title}` : `Issue #${status.issue}`;
@@ -100,14 +119,14 @@ export function StatusCard(props) {
       </header>
       <dl>
         <Detail label="tmux session">
-          {status.session ? <button className="terminalLink" type="button" disabled={readOnly} onClick={() => onOpenTerminal(status)}><code>{status.session}</code></button> : null}
+          {status.session ? <button className="terminalLink" type="button" disabled={readOnly || historical} onClick={() => onOpenTerminal(status)}><code>{status.session}</code></button> : null}
         </Detail>
         <Detail label="Worktree"><code>{worktreeName(status.worktree)}</code></Detail>
         <Detail label="Branch"><code>{status.branch}</code></Detail>
         <Detail label="Current phase">{status.current_phase}</Detail>
         <Detail label="Session lifecycle">{sessions.map((session) => (
           <span className="line" key={session.role}>
-            {session.role === "implementation" ? null : <><button className="terminalLink" type="button" disabled={sessionDisabled(readOnly, session.role)} onClick={() => onOpenTerminal(status, session)} aria-label={`Open ${session.role} terminal`}><code>{session.name}</code></button>{" · "}</>}
+            {session.role === "implementation" ? null : <><button className="terminalLink" type="button" disabled={historical || sessionDisabled(readOnly, session.role)} onClick={() => onOpenTerminal(status, session)} aria-label={`Open ${session.role} terminal`}><code>{session.name}</code></button>{" · "}</>}
             {`${session.role}${session.mode ? ` · ${session.mode}` : ""} · ${session.state}${session.current ? " · current" : ""}`}
             {session.target ? <> {" · target "}<code>{session.target}</code></> : null}
             {session.updated_at ? <> {" · "}<Timestamp value={session.updated_at} /></> : null}

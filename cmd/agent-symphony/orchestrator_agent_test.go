@@ -26,12 +26,9 @@ type orchestratorTestRunner struct {
 
 func fakeAdvancedOrchestratorHost(t *testing.T) int {
 	t.Helper()
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", "")
 	snapshotRoot := t.TempDir()
-	info, err := os.Stat(snapshotRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	gid := fileGID(info)
+	gid := os.Getegid()
 	oldUser, oldGroup, oldSnapshotRoot := hostLookupUser, hostLookupGroup, reviewSnapshotRoot
 	hostLookupUser = func(name string) (*user.User, error) {
 		return &user.User{Username: name, Uid: strconv.Itoa(os.Geteuid()), Gid: strconv.Itoa(gid)}, nil
@@ -72,9 +69,6 @@ func (r *orchestratorTestRunner) Run(_ context.Context, command agentruntime.Com
 
 func TestConfiguredFullAccessOrchestratorProposesThroughDurableArtifact(t *testing.T) {
 	fakeAdvancedOrchestratorHost(t)
-	oldPrepare := orchestratorWorkspacePrepare
-	orchestratorWorkspacePrepare = func(path string, _ int) error { return os.MkdirAll(path, 0o750) }
-	t.Cleanup(func() { orchestratorWorkspacePrepare = oldPrepare })
 	cfg := config.Default("SysSU/example")
 	cfg.Commands.Orchestrator = []string{"codex", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
 	stateRoot := t.TempDir()
@@ -184,6 +178,9 @@ func TestConfiguredFullAccessOrchestratorProposesThroughDurableArtifact(t *testi
 func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 	fakeNoHostIsolation(t)
 	stateRoot := t.TempDir()
+	if err := os.Chown(stateRoot, -1, os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
 	coordinatorHome := t.TempDir()
 	t.Setenv("HOME", coordinatorHome)
 	t.Setenv("GH_TOKEN", "coordinator-canary")
