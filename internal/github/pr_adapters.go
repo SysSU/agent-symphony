@@ -697,10 +697,48 @@ func (s RecoverySignals) RerunValidation(ctx context.Context, state PRState) err
 // GitHubPRSource reconstructs PR identity and policy facts from GitHub on every read.
 // Attempt-local facts are joined through the durable issue #4 recovery owner.
 type GitHubPRSource struct {
-	API      API
-	Config   PRAdapterConfig
-	Recovery AttemptRecovery
-	Attempts map[int]RecoveryAttemptFact
+	API                        API
+	Config                     PRAdapterConfig
+	Recovery                   AttemptRecovery
+	Attempts                   map[int]RecoveryAttemptFact
+	dependencyCompletion       map[int]bool
+	dependencyCompletionErrors map[int]error
+}
+
+func (s *GitHubPRSource) dependencyComplete(ctx context.Context, issue int) (bool, error) {
+	if complete, ok := s.dependencyCompletion[issue]; ok {
+		return complete, nil
+	}
+	if err, ok := s.dependencyCompletionErrors[issue]; ok {
+		return false, err
+	}
+	var current struct{ State string }
+	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", s.Config.Repository, issue), "", &current); err != nil {
+		err = fmt.Errorf("read dependency #%d: %w", issue, err)
+		if s.dependencyCompletionErrors == nil {
+			s.dependencyCompletionErrors = map[int]error{}
+		}
+		s.dependencyCompletionErrors[issue] = err
+		return false, err
+	}
+	var complete bool
+	switch current.State {
+	case "closed":
+		complete = true
+	case "open":
+	default:
+		err := fmt.Errorf("read dependency #%d: GitHub issue state is missing or invalid", issue)
+		if s.dependencyCompletionErrors == nil {
+			s.dependencyCompletionErrors = map[int]error{}
+		}
+		s.dependencyCompletionErrors[issue] = err
+		return false, err
+	}
+	if s.dependencyCompletion == nil {
+		s.dependencyCompletion = map[int]bool{}
+	}
+	s.dependencyCompletion[issue] = complete
+	return complete, nil
 }
 
 func NewPRReconciler(api API, cfg PRAdapterConfig, recovery AttemptRecovery, attempts map[int]RecoveryAttemptFact, fullRead func() error) (Reconciler, error) {
@@ -982,11 +1020,11 @@ func (s *GitHubPRSource) authorizedControlsWithIntake(ctx context.Context, numbe
 	if section, ok := markdownSection(issue.Body, contract.DependencySection); ok {
 		for _, match := range issueReference.FindAllStringSubmatch(section, -1) {
 			dependency, _ := strconv.Atoi(match[1])
-			var current struct{ State string }
-			if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", s.Config.Repository, dependency), "", &current); err != nil {
+			complete, err := s.dependencyComplete(ctx, dependency)
+			if err != nil {
 				return Controls{}, false, nil, err
 			}
-			completed[dependency] = current.State == "closed"
+			completed[dependency] = complete
 		}
 	}
 	normalized := NormalizeIssue(input, contract, completed)

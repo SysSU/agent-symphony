@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -467,6 +468,166 @@ func TestContradictoryTerminalMarkersDoNotProjectFailedAttempt(t *testing.T) {
 	_, conflicts, err := fetchTerminalFailures(context.Background(), api, PRAdapterConfig{Repository: "o/r", ActorID: 42}, 4)
 	if err != nil || !conflicts.Any || !conflicts.Attempts[2] {
 		t.Fatalf("conflicts=%v err=%v", conflicts, err)
+	}
+}
+
+func TestDependencyCompleteCachesValidatedStateAndFailures(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		status       int
+		body         string
+		wantComplete bool
+		wantError    string
+	}{
+		{name: "closed", status: http.StatusOK, body: `{"state":"closed"}`, wantComplete: true},
+		{name: "open", status: http.StatusOK, body: `{"state":"open"}`},
+		{name: "missing", status: http.StatusNotFound, body: `{"message":"Not Found"}`, wantError: "read dependency #9"},
+		{name: "malformed", status: http.StatusOK, body: `{}`, wantError: "state is missing or invalid"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				return httpResponse(test.status, test.body, nil), nil
+			})}}
+			source := GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r"}}
+			for range 2 {
+				complete, err := source.dependencyComplete(t.Context(), 9)
+				if complete != test.wantComplete || test.wantError == "" && err != nil || test.wantError != "" && (err == nil || !strings.Contains(err.Error(), test.wantError)) {
+					t.Fatalf("complete=%v err=%v", complete, err)
+				}
+			}
+			if calls != 1 {
+				t.Fatalf("dependency reads=%d, want 1", calls)
+			}
+		})
+	}
+}
+
+func TestFetchIssueFactsRefreshesDependenciesAcrossNormalCycles(t *testing.T) {
+	now := time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC)
+	body := func(dependency string) string {
+		return "## Context\nprotect dependency reconciliation\n## Acceptance criteria\n- dispatch after completion\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\n" + dependency + "\n"
+	}
+	bodies := map[int]string{9: body("None."), 10: body("#9"), 11: body("#9"), 12: body("None.")}
+	snapshots := map[int][]any{}
+	dependencyMode := "closed"
+	dependencyReads := 0
+	issueRecord := func(number int) map[string]any {
+		return map[string]any{
+			"number": number, "node_id": fmt.Sprintf("I_%d", number), "state": "open", "title": fmt.Sprintf("issue %d", number),
+			"body": bodies[number], "created_at": now, "user": map[string]any{"id": 5},
+			"labels": []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}},
+		}
+	}
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var response any
+		switch {
+		case r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r":
+			response = map[string]any{"default_branch": "main"}
+		case r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": "abcdef0"}}
+		case r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r/issues?state=open&per_page=100&page=1":
+			response = []any{issueRecord(10), issueRecord(11), issueRecord(12)}
+			if dependencyMode == "open" {
+				response = append([]any{issueRecord(9)}, response.([]any)...)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/9":
+			dependencyReads++
+			switch dependencyMode {
+			case "failure":
+				return httpResponse(http.StatusServiceUnavailable, `{"message":"temporarily unavailable"}`, nil), nil
+			case "malformed":
+				response = map[string]any{}
+			default:
+				record := issueRecord(9)
+				record["state"] = dependencyMode
+				response = record
+			}
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/timeline"):
+			var number int
+			if _, err := fmt.Sscanf(r.URL.Path, "/repos/o/r/issues/%d/timeline", &number); err != nil {
+				t.Fatal(err)
+			}
+			response = []any{
+				map[string]any{"id": number*10 + 1, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now, "actor": map[string]any{"id": 5}},
+				map[string]any{"id": number*10 + 2, "event": "labeled", "label": map[string]any{"name": "P1"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": 5}},
+			}
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments"):
+			var number int
+			if _, err := fmt.Sscanf(r.URL.Path, "/repos/o/r/issues/%d/comments", &number); err != nil {
+				t.Fatal(err)
+			}
+			response = snapshots[number]
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/issues/"):
+			var number int
+			if _, err := fmt.Sscanf(r.URL.Path, "/repos/o/r/issues/%d", &number); err != nil {
+				t.Fatal(err)
+			}
+			response = issueRecord(number)
+		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+		case r.Method == http.MethodGet && r.URL.Path == "/user/5":
+			response = map[string]any{"login": "owner"}
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/collaborators/owner/permission":
+			response = map[string]any{"permission": "maintain"}
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments"):
+			var number int
+			if _, err := fmt.Sscanf(r.URL.Path, "/repos/o/r/issues/%d/comments", &number); err != nil {
+				t.Fatal(err)
+			}
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil {
+				t.Fatal("invalid snapshot request")
+			}
+			snapshots[number] = append(snapshots[number], map[string]any{"id": number, "body": payload.Body, "user": map[string]any{"id": 42}})
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		encoded, _ := json.Marshal(response)
+		return httpResponse(http.StatusOK, string(encoded), nil), nil
+	})}}
+	cfg := productionPRConfig()
+
+	initial, err := FetchIssueFacts(t.Context(), api, cfg, nil, true)
+	if err != nil || len(initial) != 3 || !slices.ContainsFunc(initial, func(f RecoveryIssueFact) bool { return f.Issue == 10 && f.Eligible }) || len(snapshots) != 3 {
+		t.Fatalf("initial facts=%#v snapshots=%d err=%v", initial, len(snapshots), err)
+	}
+
+	dependencyMode, dependencyReads = "open", 0
+	blocked, err := FetchIssueFacts(t.Context(), api, cfg, nil, false)
+	for _, number := range []int{10, 11} {
+		if index := slices.IndexFunc(blocked, func(f RecoveryIssueFact) bool { return f.Issue == number }); err != nil || index < 0 || blocked[index].Eligible || !slices.Contains(blocked[index].Blockers, "dependency #9 is incomplete") {
+			t.Fatalf("open dependency facts=%#v err=%v", blocked, err)
+		}
+	}
+
+	dependencyMode, dependencyReads = "closed", 0
+	closed, err := FetchIssueFacts(t.Context(), api, cfg, nil, false)
+	if err != nil || dependencyReads != 1 {
+		t.Fatalf("closed dependency reads=%d err=%v", dependencyReads, err)
+	}
+	for _, number := range []int{10, 11, 12} {
+		if index := slices.IndexFunc(closed, func(f RecoveryIssueFact) bool { return f.Issue == number }); index < 0 || !closed[index].Eligible || len(closed[index].Blockers) != 0 {
+			t.Fatalf("closed dependency facts=%#v", closed)
+		}
+	}
+
+	dependencyMode, dependencyReads = "failure", 0
+	unavailable, err := FetchIssueFacts(t.Context(), api, cfg, nil, false)
+	if err != nil || dependencyReads != 1 {
+		t.Fatalf("unavailable dependency reads=%d err=%v", dependencyReads, err)
+	}
+	for _, number := range []int{10, 11} {
+		index := slices.IndexFunc(unavailable, func(f RecoveryIssueFact) bool { return f.Issue == number })
+		if index < 0 || unavailable[index].Eligible || len(unavailable[index].Blockers) != 1 || !strings.Contains(unavailable[index].Blockers[0], "read dependency #9") {
+			t.Fatalf("unavailable dependency facts=%#v", unavailable)
+		}
+	}
+	unrelated := slices.IndexFunc(unavailable, func(f RecoveryIssueFact) bool { return f.Issue == 12 })
+	if unrelated < 0 || !unavailable[unrelated].Eligible || len(unavailable[unrelated].Blockers) != 0 {
+		t.Fatalf("unrelated issue was affected: %#v", unavailable)
 	}
 }
 

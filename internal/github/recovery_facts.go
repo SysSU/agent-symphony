@@ -424,14 +424,12 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 				blockers = append(blockers, "terminal attempt marker is contradictory")
 			}
 			for _, dependency := range controls.Dependencies {
-				if targetIssue > 0 && !completed[dependency] {
-					var current struct{ State string }
-					if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", cfg.Repository, dependency), "", &current); err != nil {
-						return nil, err
-					}
-					completed[dependency] = current.State == "closed"
+				complete, err := source.dependencyComplete(ctx, dependency)
+				if err != nil {
+					blockers = append(blockers, err.Error())
+					continue
 				}
-				if !completed[dependency] {
+				if !complete {
 					blockers = append(blockers, fmt.Sprintf("dependency #%d is incomplete", dependency))
 				}
 			}
