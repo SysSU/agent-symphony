@@ -1276,8 +1276,8 @@ func TestReviewFindingsHandoffReachesImplementationWithoutOrchestrator(t *testin
 
 	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", key, handoffReceiptPath(manifest.Worktree, key), head})
 	result, _ := json.Marshal(agentruntime.Result{Output: string(ack)})
-	calls, script := filepath.Join(worktree, "accepts"), filepath.Join(t.TempDir(), "boundary")
-	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\ncase \"$payload\" in *accept-handoff*) printf 'x\\n' >> %q;; esac\nprintf '%%s' '%s'\n", calls, result)
+	calls, requestPath, script := filepath.Join(worktree, "accepts"), filepath.Join(worktree, "request"), filepath.Join(t.TempDir(), "boundary")
+	scriptBody := fmt.Sprintf("#!/bin/sh\npayload=$(sed -n '1p')\nprintf '%%s' \"$payload\" > %q\ncase \"$payload\" in *accept-handoff*) printf 'x\\n' >> %q;; esac\nprintf '%%s' '%s'\n", requestPath, calls, result)
 	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1286,7 +1286,8 @@ func TestReviewFindingsHandoffReachesImplementationWithoutOrchestrator(t *testin
 	// The worker already accepted and executed before the coordinator crashed;
 	// the restarted coordinator recovers the bound receipt without rework.
 	restarted := &agentruntime.Runtime{StateRoot: state, Runner: boundary, Tmux: "tmux"}
-	pending, err := returnReviewFindings(t.Context(), restarted, boundary, attempt, manifest, head, manifest.ReviewFindings, nil, []string{"implementation"})
+	command := config.Default(attempt.Repository).Commands.Implementation
+	pending, err := returnReviewFindings(t.Context(), restarted, boundary, attempt, manifest, head, manifest.ReviewFindings, nil, command)
 	if err != nil || pending {
 		t.Fatalf("receipt recovery pending=%v err=%v", pending, err)
 	}
@@ -1302,6 +1303,32 @@ func TestReviewFindingsHandoffReachesImplementationWithoutOrchestrator(t *testin
 	accepts, _ := os.ReadFile(calls)
 	if strings.Count(string(accepts), "x\n") != 1 {
 		t.Fatalf("accept calls=%q", accepts)
+	}
+	requestBody, err := os.ReadFile(requestPath)
+	var outer struct {
+		Command boundaryCommand `json:"command"`
+	}
+	if err != nil || json.Unmarshal(requestBody, &outer) != nil {
+		t.Fatalf("handoff request=%q err=%v", requestBody, err)
+	}
+	var handoffRequest struct {
+		Command []string `json:"command"`
+	}
+	if err := json.Unmarshal(outer.Command.Input, &handoffRequest); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := config.ExpandManagedWorkspace(command, worktree)
+	if !slices.Equal(handoffRequest.Command, want) || strings.Contains(strings.Join(handoffRequest.Command, " "), config.ManagedWorkspacePlaceholder) {
+		t.Fatalf("review findings handoff command=%q want=%q", handoffRequest.Command, want)
+	}
+	unsafe := manifest
+	unsafe.Worktree = "relative"
+	if _, err := returnReviewFindings(t.Context(), restarted, boundary, attempt, unsafe, head, manifest.ReviewFindings, nil, command); err == nil || !strings.Contains(err.Error(), "bind review findings handoff command") {
+		t.Fatalf("unsafe review findings handoff error=%v", err)
+	}
+	accepts, _ = os.ReadFile(calls)
+	if strings.Count(string(accepts), "x\n") != 1 {
+		t.Fatalf("unsafe handoff reached boundary: %q", accepts)
 	}
 }
 
@@ -1988,7 +2015,9 @@ if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true
 	if readErr != nil || json.Unmarshal(payload, &launched) != nil {
 		t.Fatalf("launch payload=%q err=%v", payload, readErr)
 	}
-	if len(launched.Command.Args) < 4 || !slices.Equal(launched.Command.Args[len(launched.Command.Args)-4:len(launched.Command.Args)-1], []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
+	encodedWorktree, _ := json.Marshal(manifest.Worktree)
+	trust := `projects={` + string(encodedWorktree) + `={trust_level="trusted"}}`
+	if len(launched.Command.Args) < 6 || !slices.Equal(launched.Command.Args[len(launched.Command.Args)-6:len(launched.Command.Args)-1], []string{"codex", "-c", trust, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
 		t.Fatalf("direct launch command=%q", launched.Command.Args)
 	}
 	prompt := launched.Command.Args[len(launched.Command.Args)-1]
@@ -3061,8 +3090,8 @@ func TestDefaultReviewerProductionShapeUsesExactDiffAndRejectsProse(t *testing.T
 	dir := t.TempDir()
 	codex := filepath.Join(dir, "codex")
 	const script = `#!/bin/sh
-test "$#" -eq 3 && test "$1" = --dangerously-bypass-approvals-and-sandbox && test "$2" = --no-alt-screen || exit 20
-prompt=$3
+test "$#" -eq 5 && test "$1" = -c && test "$2" = "projects={$FAKE_REVIEW_WORKSPACE={trust_level=\"trusted\"}}" && test "$3" = --dangerously-bypass-approvals-and-sandbox && test "$4" = --no-alt-screen || exit 20
+prompt=$5
 printf '%s' "$prompt" | grep -F "$FAKE_REVIEW_BASE..$FAKE_REVIEW_HEAD" >/dev/null || exit 22
 diff=$(git -C "$FAKE_REVIEW_REPO" diff --no-ext-diff "$FAKE_REVIEW_BASE" HEAD) || exit 23
 printf '%s' "$diff" | grep -F '+first implementation commit' >/dev/null || exit 24
@@ -3098,9 +3127,14 @@ printf 'received:%s\n' "$operator"`
 	runGit(t, source, "commit", "-m", "second implementation commit")
 	head := runGit(t, source, "rev-parse", "HEAD")
 	t.Setenv("FAKE_REVIEW_REPO", source)
+	encodedSource, _ := json.Marshal(source)
+	t.Setenv("FAKE_REVIEW_WORKSPACE", string(encodedSource))
 	t.Setenv("FAKE_REVIEW_BASE", base)
 	t.Setenv("FAKE_REVIEW_HEAD", head)
-	defaultReviewer := config.Default("o/r").Commands.Reviewer
+	defaultReviewer, err := config.ExpandManagedWorkspace(config.Default("o/r").Commands.Reviewer, source)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for i, test := range []struct {
 		name, output string
@@ -3136,6 +3170,79 @@ printf 'received:%s\n' "$operator"`
 			}
 			if body, err := os.ReadFile(count); err != nil || string(body) != "x" {
 				t.Fatalf("default reviewer runs=%q err=%v", body, err)
+			}
+		})
+	}
+}
+
+func TestManagedCodexLaunchesCarryExactTrustAndApprovalWithoutPriorState(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "codex")
+	const script = `#!/bin/sh
+test "$CODEX_HOME" = "$EXPECTED_CODEX_HOME" || exit 10
+trusted=0
+bypass=0
+never=0
+previous=
+for argument do
+  test "$argument" != "$EXPECTED_TRUST" || trusted=1
+  test "$argument" != --dangerously-bypass-approvals-and-sandbox || bypass=1
+  if test "$previous" = --ask-for-approval && test "$argument" = never; then never=1; fi
+  previous=$argument
+done
+test "$trusted" -eq 1 || { printf 'Do you trust the contents of this directory?'; exit 20; }
+case "$ROLE" in
+implementation|review) test "$bypass" -eq 1 || exit 21;;
+orchestrator|heartbeat) test "$never" -eq 1 || exit 22;;
+*) exit 23;;
+esac
+printf started`
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	freshHome := filepath.Join(dir, "fresh codex home")
+	if err := os.Mkdir(freshHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defaults := config.Default("o/r").Commands
+	implementation, interactive := interactiveImplementationCommand(defaults.Implementation)
+	if !interactive {
+		t.Fatal("default implementation command did not become an interactive session")
+	}
+	roles := []struct {
+		name      string
+		command   []string
+		workspace string
+		promptArg bool
+	}{
+		{"implementation", implementation, filepath.Join(dir, `implementation path [x] "quoted"`), true},
+		{"review", defaults.Reviewer, filepath.Join(dir, `review path [x] "quoted"`), true},
+		{"orchestrator", defaults.Orchestrator, filepath.Join(dir, `orchestrator path [x] "quoted"`), true},
+		{"heartbeat", defaults.OrchestratorAudit, filepath.Join(dir, `heartbeat path [x] "quoted"`), false},
+	}
+	for _, role := range roles {
+		t.Run(role.name, func(t *testing.T) {
+			if err := os.Mkdir(role.workspace, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			command, err := config.ExpandManagedWorkspace(role.command, role.workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for index := range command {
+				command[index] = strings.ReplaceAll(command[index], "{orchestrator_result}", filepath.Join(role.workspace, "result"))
+			}
+			command[0] = fake
+			if role.promptArg {
+				command = append(command, "task")
+			}
+			encoded, _ := json.Marshal(role.workspace)
+			process := exec.Command(command[0], command[1:]...)
+			process.Dir = role.workspace
+			process.Env = []string{"CODEX_HOME=" + freshHome, "EXPECTED_CODEX_HOME=" + freshHome, "EXPECTED_TRUST=projects={" + string(encoded) + `={trust_level="trusted"}}`, "ROLE=" + role.name}
+			process.Stdin = strings.NewReader("task")
+			if output, err := process.CombinedOutput(); err != nil || string(output) != "started" {
+				t.Fatalf("managed %s startup output=%q err=%v command=%q", role.name, output, err, command)
 			}
 		})
 	}
@@ -4157,13 +4264,15 @@ func TestResumeHandoffsDeliversConfiguredImplementationCommand(t *testing.T) {
 	}
 	t.Cleanup(func() { hostExecRunner = oldExec })
 
-	command := []string{"implementation", "--flag"}
+	command := config.Default(manifest.Repository).Commands.Implementation
 	boundary := &directHandoffBoundary{root: root}
 	if err := resumeHandoffs(t.Context(), nil, boundary, statePath, stateRoot, statuses, []agentruntime.Manifest{manifest}, command); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(respawn, command[0]) || !slices.Contains(respawn, command[1]) {
-		t.Fatalf("respawn omitted implementation command: %q", respawn)
+	wantCommand, _ := config.ExpandManagedWorkspace(command, worktree)
+	trust := wantCommand[3]
+	if !slices.Contains(respawn, command[0]) || !slices.Contains(respawn, "exec") || !slices.Contains(respawn, trust) || strings.Contains(strings.Join(respawn, " "), config.ManagedWorkspacePlaceholder) {
+		t.Fatalf("respawn omitted exact trusted implementation command: %q want=%q", respawn, wantCommand)
 	}
 	if !slices.Contains(respawn, agentruntime.ResultPath(worktree)) || !strings.Contains(prompt, "agent-symphony-result-v1") || !strings.Contains(prompt, "refs/remotes/agent-symphony/") {
 		t.Fatalf("handoff omitted capture contract: respawn=%q prompt=%q", respawn, prompt)
@@ -4201,6 +4310,23 @@ func TestResumeHandoffsLeavesUnauthorizedWorkQueued(t *testing.T) {
 	}
 }
 
+func TestResumeHandoffsRejectsUnsafeWorkspaceBeforeBoundary(t *testing.T) {
+	stateRoot := t.TempDir()
+	statePath := filepath.Join(stateRoot, "state.json")
+	state := []internalgithub.PRState{{Repository: "o/r", Number: 3, Issue: 4, Attempt: 2, HeadSHA: "abcdef0", Facts: internalgithub.PRFacts{Feedback: []internalgithub.Feedback{{ID: 55, Source: "conversation", Execution: internalgithub.FeedbackClaimed}}}}}
+	body, _ := json.Marshal(state)
+	if err := os.WriteFile(statePath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, State: "completed", Worktree: "relative", Session: "as-4-2"}
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 4, Attempt: 2, State: "review-ready", DispatchAuthorized: true}
+	boundary := &refusingHandoffBoundary{}
+	err := resumeHandoffs(t.Context(), nil, boundary, statePath, stateRoot, []orchestrator.RecoveryStatus{status}, []agentruntime.Manifest{manifest}, config.Default("o/r").Commands.Implementation)
+	if err == nil || !strings.Contains(err.Error(), "bind durable handoff command") || boundary.calls != 0 {
+		t.Fatalf("unsafe durable handoff error=%v boundary_calls=%d", err, boundary.calls)
+	}
+}
+
 func TestConfigViewAcceptsConventionalSubcommandFlags(t *testing.T) {
 	root := gitRepository(t)
 	path := filepath.Join(root, config.DefaultPath)
@@ -4226,10 +4352,10 @@ func TestInitAndMisuseExitCodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(initialized.Commands.Implementation, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
+	if !slices.Equal(initialized.Commands.Implementation, config.Default("owner/repo").Commands.Implementation) {
 		t.Fatalf("unexpected initialized implementation command: %q", initialized.Commands.Implementation)
 	}
-	if !slices.Equal(initialized.Commands.Reviewer, []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
+	if !slices.Equal(initialized.Commands.Reviewer, config.Default("owner/repo").Commands.Reviewer) {
 		t.Fatalf("unexpected initialized reviewer command: %q", initialized.Commands.Reviewer)
 	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}

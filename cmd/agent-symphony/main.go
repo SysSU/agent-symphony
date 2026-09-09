@@ -1660,8 +1660,12 @@ func seedAttemptSource(ctx context.Context, checkout, repositoryName, attemptRoo
 
 func startIssueAttempt(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact) (agentruntime.Manifest, error) {
 	command, interactive := interactiveImplementationCommand(cfg.Commands.Implementation)
-	attempt := agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Command: command, Interactive: interactive, Eligible: func() bool { return issue.DispatchAuthorized }}
+	attempt := agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Interactive: interactive, Eligible: func() bool { return issue.DispatchAuthorized }}
 	identity, err := agentruntime.AttemptIdentity(runtime.Root, attempt)
+	if err != nil {
+		return agentruntime.Manifest{}, err
+	}
+	attempt.Command, err = config.ExpandManagedWorkspace(command, identity.Worktree)
 	if err != nil {
 		return agentruntime.Manifest{}, err
 	}
@@ -1670,8 +1674,12 @@ func startIssueAttempt(ctx context.Context, runtime *agentruntime.Runtime, cfg c
 }
 
 func interactiveImplementationCommand(command []string) ([]string, bool) {
-	if slices.Equal(command, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
-		return []string{"codex", "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}, true
+	defaults := config.Default("").Commands
+	legacy := []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-"}
+	if len(command) > 0 && filepath.Base(command[0]) == "codex" && (slices.Equal(command[1:], legacy) || slices.Equal(command[1:], defaults.Implementation[1:])) {
+		interactive := slices.Clone(defaults.Reviewer)
+		interactive[0] = command[0]
+		return interactive, true
 	}
 	return command, false
 }
@@ -2332,6 +2340,13 @@ func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeSta
 }
 
 func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtime, boundary workerBoundaryRunner, attempt agentruntime.Attempt, manifest agentruntime.Manifest, head string, findings, humanInstructions, command []string) (bool, error) {
+	if len(command) == 0 {
+		return false, errors.New("implementation command is missing")
+	}
+	command, err := config.ExpandManagedWorkspace(command, manifest.Worktree)
+	if err != nil {
+		return false, fmt.Errorf("bind review findings handoff command: %w", err)
+	}
 	key := "independent-review-" + head
 	outcomePath := handoffReceiptPath(manifest.Worktree, key)
 	handoff, _ := json.Marshal(struct {
@@ -2357,9 +2372,6 @@ func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtim
 			return errors.New("review findings handoff acceptance binding mismatch")
 		}
 		return nil
-	}
-	if len(command) == 0 {
-		return false, errors.New("implementation command is missing")
 	}
 	if !manifest.ReviewHandoffAck {
 		if err := accept(); err != nil {
@@ -2718,8 +2730,15 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 		return independentReviewResult{}, false, err
 	}
 	prompt += "\n\nBefore exiting, atomically write the final JSON object to the path in AGENT_SYMPHONY_REVIEW_RESULT. The result file is the lifecycle authority; terminal text is only operator-visible conversation."
-	if slices.Equal(command, []string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}) {
-		command = config.Default(attempt.Repository).Commands.Reviewer
+	legacy := []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-"}
+	if len(command) > 0 && filepath.Base(command[0]) == "codex" && slices.Equal(command[1:], legacy) {
+		reviewer := config.Default(attempt.Repository).Commands.Reviewer
+		reviewer[0] = command[0]
+		command = reviewer
+	}
+	command, err = config.ExpandManagedWorkspace(command, snapshot)
+	if err != nil {
+		return independentReviewResult{}, false, err
 	}
 	command = append(slices.Clone(command), prompt)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
@@ -2971,6 +2990,10 @@ func resumeHandoffs(ctx context.Context, runtimeState *agentruntime.Runtime, bou
 				return err
 			}
 		}
+		expandedCommand, err := config.ExpandManagedWorkspace(command, manifest.Worktree)
+		if err != nil {
+			return fmt.Errorf("bind durable handoff command: %w", err)
+		}
 		payload, _ := json.Marshal(struct {
 			Type, Key  string
 			PR         int
@@ -2987,7 +3010,7 @@ func resumeHandoffs(ctx context.Context, runtimeState *agentruntime.Runtime, bou
 			OutcomePath  string          `json:"outcome_path"`
 			OutcomeToken string          `json:"outcome_token"`
 			Command      []string        `json:"command"`
-		}{manifestBody, payload, outcomePath, outcomeToken, command})
+		}{manifestBody, payload, outcomePath, outcomeToken, expandedCommand})
 		accepted, err := boundary.call(ctx, "accept-handoff", agentruntime.Command{Stdin: bytes.NewReader(request)})
 		var ack handoffReceipt
 		decoder := json.NewDecoder(strings.NewReader(accepted.Output))
