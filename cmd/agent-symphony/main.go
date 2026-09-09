@@ -89,6 +89,8 @@ type workerBoundaryRunner struct {
 	Env     []string
 }
 
+const workerBoundaryDiagnosticLimit = 64 << 10
+
 type boundaryCaller interface {
 	call(context.Context, string, agentruntime.Command) (agentruntime.Result, error)
 }
@@ -174,12 +176,15 @@ func (b workerBoundaryRunner) call(ctx context.Context, operation string, comman
 	cmd.Env = append(minimalBoundaryEnvironment(), b.Env...)
 	cmd.Stdin = bytes.NewReader(payload)
 	out := limitedBuffer{Limit: 24 << 20}
-	stderr := limitedBuffer{Limit: 64 << 10}
+	stderr := limitedBuffer{Limit: workerBoundaryDiagnosticLimit}
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil {
 		detail := strings.TrimSpace(internalgithub.RedactEnvironment(stderr.String(), append(slices.Clone(command.Env), b.Env...)))
+		if len(detail) > workerBoundaryDiagnosticLimit {
+			detail = detail[:workerBoundaryDiagnosticLimit]
+		}
 		if detail != "" {
 			return agentruntime.Result{}, fmt.Errorf("worker boundary %s: %w: %s", operation, err, detail)
 		}

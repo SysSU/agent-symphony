@@ -1205,11 +1205,11 @@ func TestWorkerBoundaryCarriesGitHubCredentialsOnlyInBoundedInput(t *testing.T) 
 func TestWorkerBoundaryReturnsBoundedRedactedDiagnostic(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "boundary")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat >/dev/null\nprintf 'rejected GITHUB_TOKEN=github-canary' >&2\nexit 1\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat >/dev/null\ndd if=/dev/zero bs=1024 count=60 2>/dev/null | tr '\\000' x >&2\nexit 1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	_, err := (workerBoundaryRunner{Command: script}).call(t.Context(), "run", agentruntime.Command{Env: []string{"GITHUB_TOKEN=github-canary"}})
-	if err == nil || !strings.Contains(err.Error(), "rejected GITHUB_TOKEN=[REDACTED]") || strings.Contains(err.Error(), "github-canary") || len(err.Error()) > 64<<10+256 {
+	_, err := (workerBoundaryRunner{Command: script}).call(t.Context(), "run", agentruntime.Command{Env: []string{"GITHUB_TOKEN=x"}})
+	if err == nil || !strings.Contains(err.Error(), "[REDACTED]") || strings.Contains(err.Error(), strings.Repeat("x", 32)) || len(err.Error()) > workerBoundaryDiagnosticLimit+256 {
 		t.Fatalf("boundary diagnostic = %q", err)
 	}
 }
