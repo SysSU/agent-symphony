@@ -74,7 +74,7 @@ func reservedAgentVariable(name string) bool {
 		return false
 	}
 	upper := strings.ToUpper(name)
-	if upper == "HOME" {
+	if upper == "HOME" || upper == "TMUX_TMPDIR" {
 		return true
 	}
 	for _, prefix := range []string{"GITHUB_", "GH_", "SSH_", "AWS_", "AZURE_", "GOOGLE_", "GCP_", "CLOUD_", "OCI_", "CLOUDFLARE_", "DIGITALOCEAN_", "GIT_ASKPASS", "GIT_CONFIG", "APP_"} {
