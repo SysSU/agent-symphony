@@ -174,9 +174,15 @@ func (b workerBoundaryRunner) call(ctx context.Context, operation string, comman
 	cmd.Env = append(minimalBoundaryEnvironment(), b.Env...)
 	cmd.Stdin = bytes.NewReader(payload)
 	out := limitedBuffer{Limit: 24 << 20}
+	stderr := limitedBuffer{Limit: 64 << 10}
 	cmd.Stdout = &out
+	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil {
+		detail := strings.TrimSpace(internalgithub.RedactEnvironment(stderr.String(), append(slices.Clone(command.Env), b.Env...)))
+		if detail != "" {
+			return agentruntime.Result{}, fmt.Errorf("worker boundary %s: %w: %s", operation, err, detail)
+		}
 		return agentruntime.Result{}, fmt.Errorf("worker boundary %s: %w", operation, err)
 	}
 	var result agentruntime.Result
@@ -2690,8 +2696,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 }
 
 func configuredAgentEnvironment(allow []string) ([]string, error) {
-	env, err := internalgithub.AgentEnvironmentWith(os.Environ(), allow...)
-	return slices.DeleteFunc(env, func(value string) bool { return strings.HasPrefix(value, "GIT_CONFIG_") }), err
+	return internalgithub.AgentEnvironmentWith(os.Environ(), allow...)
 }
 
 func parseIndependentReview(output string) (independentReviewResult, error) {

@@ -548,7 +548,7 @@ func TestMarkdownSectionStopsAtSameOrHigherHeading(t *testing.T) {
 }
 
 func TestAgentEnvironmentRejectsReservedExplicitNames(t *testing.T) {
-	for _, name := range []string{"SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID", "AZURE_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDFLARE_API_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "FTP_PROXY", "APP_PEM", "MY_APP_KEY", "RANDOM_PASSWORD"} {
+	for _, name := range []string{"SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID", "AZURE_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDFLARE_API_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "FTP_PROXY", "APP_PEM", "MY_APP_KEY", "RANDOM_PASSWORD", "TMUX_TMPDIR"} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := AgentEnvironmentWith([]string{name + "=value"}, name); err == nil {
 				t.Fatalf("reserved name %s accepted", name)

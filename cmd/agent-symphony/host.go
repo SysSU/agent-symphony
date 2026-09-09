@@ -1018,11 +1018,7 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if err := validateBoundaryCommand(request.Command, root); err != nil {
 			return err
 		}
-		names := make([]string, 0, len(request.Command.Env))
-		for _, value := range request.Command.Env {
-			names = append(names, strings.SplitN(value, "=", 2)[0])
-		}
-		env, filterErr := internalgithub.AgentEnvironmentWith(request.Command.Env, names...)
+		env, filterErr := boundaryEnvironment(request.Command.Env)
 		if filterErr != nil {
 			return filterErr
 		}
@@ -1276,13 +1272,59 @@ func validateBoundaryCommand(c boundaryCommand, root string) error {
 	if (c.Name == "git" && !validGitBoundaryArgs(c.Args, c.Dir, root)) || (c.Name == "tmux" && !validTmuxBoundaryArgs(c.Args, c.Env, c.Dir, root)) {
 		return errors.New("boundary command arguments are not allowed")
 	}
-	for _, value := range c.Env {
-		name, _, ok := strings.Cut(value, "=")
-		if !ok || name == "" || strings.ContainsAny(name, " \t\r\n") || reservedHostEnvironment(name) {
-			return errors.New("invalid boundary environment")
-		}
+	if _, err := boundaryEnvironment(c.Env); err != nil {
+		return err
 	}
 	return nil
+}
+
+func boundaryEnvironment(environment []string) ([]string, error) {
+	requiredGit := internalgithub.AgentEnvironment(nil)
+	managedGit := make(map[string]bool, len(requiredGit))
+	for _, entry := range requiredGit {
+		managedGit[entry] = false
+	}
+	names := make([]string, 0, len(environment))
+	gitConfigSeen := false
+	noSystem := false
+	for _, entry := range environment {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok || name == "" || strings.ContainsAny(name, " \t\r\n") {
+			return nil, errors.New("invalid boundary environment")
+		}
+		if strings.HasPrefix(strings.ToUpper(name), "GIT_CONFIG") {
+			gitConfigSeen = true
+			if entry == "GIT_CONFIG_NOSYSTEM=1" && !noSystem {
+				noSystem = true
+				continue
+			}
+			seen, managed := managedGit[entry]
+			if !managed || seen {
+				return nil, errors.New("invalid boundary environment")
+			}
+			managedGit[entry] = true
+			continue
+		}
+		if reservedHostEnvironment(name) {
+			return nil, errors.New("invalid boundary environment")
+		}
+		names = append(names, name)
+	}
+	if gitConfigSeen {
+		for _, seen := range managedGit {
+			if !seen {
+				return nil, errors.New("invalid boundary environment")
+			}
+		}
+	}
+	filtered, err := internalgithub.AgentEnvironmentWith(environment, names...)
+	if err != nil {
+		return nil, err
+	}
+	if noSystem {
+		filtered = append(filtered, "GIT_CONFIG_NOSYSTEM=1")
+	}
+	return filtered, nil
 }
 
 func boundedCommandPath(path, dir, root string) bool {
@@ -1384,6 +1426,9 @@ func reservedHostEnvironment(name string) bool {
 		return false
 	}
 	upper := strings.ToUpper(name)
+	if strings.HasPrefix(upper, "AGENT_SYMPHONY_") {
+		return upper != "AGENT_SYMPHONY_IMPLEMENTATION_RESULT" && upper != "AGENT_SYMPHONY_REVIEW_RESULT"
+	}
 	if upper == "HOME" || upper == "TMUX_TMPDIR" {
 		return true
 	}
@@ -1392,7 +1437,7 @@ func reservedHostEnvironment(name string) bool {
 			return true
 		}
 	}
-	for _, prefix := range []string{"GITHUB_", "GH_", "SSH_", "AWS_", "AZURE_", "GOOGLE_", "GCP_", "CLOUD_", "OCI_", "CLOUDFLARE_", "DIGITALOCEAN_", "GIT_ASKPASS", "APP_"} {
+	for _, prefix := range []string{"GITHUB_", "GH_", "SSH_", "AWS_", "AZURE_", "GOOGLE_", "GCP_", "CLOUD_", "OCI_", "CLOUDFLARE_", "DIGITALOCEAN_", "GIT_ASKPASS", "GIT_CONFIG", "APP_"} {
 		if strings.HasPrefix(upper, prefix) {
 			return true
 		}

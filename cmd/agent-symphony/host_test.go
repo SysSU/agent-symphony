@@ -163,6 +163,7 @@ func fakeHostIdentity(t *testing.T, uid, gid int) {
 }
 
 func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", "")
 	fakeHostIdentity(t, 1234, 5678)
 	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner
 	hostGOOS = "linux"
@@ -186,7 +187,7 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 			payload, _ := json.Marshal(struct {
 				Operation string          `json:"operation"`
 				Command   boundaryCommand `json:"command"`
-			}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=model-canary", "GH_TOKEN=github-canary", "PATH=/bin"}}})
+			}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=model-canary", "GH_TOKEN=github-canary", "PATH=/bin", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="}}})
 			var out bytes.Buffer
 			if err := agentHost(t.Context(), mode, bytes.NewReader(payload), &out); err != nil {
 				t.Fatal(err)
@@ -194,6 +195,67 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 			var result agentruntime.Result
 			if err := json.Unmarshal(out.Bytes(), &result); err != nil || strings.Contains(result.Output, "model-canary") || strings.Contains(result.Output, "github-canary") || !slices.Contains(launched.Env, "MODEL_API_KEY=model-canary") || !slices.Contains(launched.Env, "GH_TOKEN=github-canary") || !slices.Contains(launched.Env, "HOME="+spec.home) || slices.Contains(launched.Env, "HOME="+os.Getenv("HOME")) {
 				t.Fatal("host boundary did not deliver and redact its filtered credential environment")
+			}
+			for _, entry := range []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="} {
+				if count := slices.Index(launched.Env, entry); count < 0 {
+					t.Fatalf("host boundary omitted managed Git environment %q", entry)
+				}
+			}
+		})
+	}
+}
+
+func TestLocalAgentHostProcess(t *testing.T) {
+	if os.Getenv("AGENT_SYMPHONY_TEST_LOCAL_HOST") == "" {
+		return
+	}
+	hostLookupUser = func(string) (*user.User, error) { return nil, errors.New("user: unknown user") }
+	os.Exit(run([]string{"agent-host", os.Getenv("AGENT_SYMPHONY_TEST_LOCAL_HOST")}, os.Stdout, os.Stderr))
+}
+
+func TestLocalAgentHostLaunchesImplementationAndReviewSessions(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	tmuxRoot, err := os.MkdirTemp("/tmp", "as-243-tmux-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmuxRoot) })
+	managed := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="}
+	for _, mode := range []string{"implementation", "review"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			session := fmt.Sprintf("as-243-%s-%d", mode, os.Getpid())
+			env := append([]string{"PATH=" + os.Getenv("PATH")}, managed...)
+			if mode == "implementation" {
+				env = append(env, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
+			}
+			boundary := workerBoundaryRunner{
+				Command: os.Args[0],
+				Args:    []string{"-test.run=^TestLocalAgentHostProcess$"},
+				Env:     []string{"AGENT_SYMPHONY_TEST_LOCAL_HOST=" + mode, "AGENT_SYMPHONY_LOCAL_ROOT=" + root, "TMUX_TMPDIR=" + tmuxRoot},
+			}
+			t.Cleanup(func() {
+				_, _ = boundary.call(t.Context(), "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", "=" + session}, Dir: root})
+			})
+			if result, err := boundary.Run(t.Context(), agentruntime.Command{Name: "tmux", Args: agentruntime.TmuxNewSessionArgs(session, root, env), Dir: root, Env: env}); err != nil {
+				t.Fatalf("launch: %v: %s", err, result.Output)
+			}
+			output := filepath.Join(root, "environment")
+			script := `printf '%s\n' "$GIT_CONFIG_COUNT" "$GIT_CONFIG_KEY_0" "$GIT_CONFIG_VALUE_0" > "$1"`
+			if _, err := boundary.Run(t.Context(), agentruntime.Command{Name: "tmux", Args: []string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--", "sh", "-c", script, "agent-host-test", output}, Dir: root, Env: env}); err != nil {
+				t.Fatal(err)
+			}
+			var body []byte
+			for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+				body, _ = os.ReadFile(output)
+				if len(body) > 0 {
+					break
+				}
+			}
+			if string(body) != "1\ncredential.helper\n\n" {
+				t.Fatalf("managed Git environment = %q", body)
 			}
 		})
 	}
@@ -219,6 +281,42 @@ func TestAgentHostRedactsCredentialFromReturnedBoundaryError(t *testing.T) {
 	err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{})
 	if err == nil || strings.Contains(err.Error(), canary) || !strings.Contains(err.Error(), "boundary failure") {
 		t.Fatal("host boundary returned an unredacted or unclear error")
+	}
+}
+
+func TestAgentHostRejectsReservedBoundaryEnvironment(t *testing.T) {
+	root := t.TempDir()
+	command := boundaryCommand{Name: "git", Args: []string{"-C", root, "rev-parse", "HEAD"}, Dir: root}
+	for _, entry := range []string{
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=credential.helper",
+		"GIT_CONFIG_VALUE_0=attacker",
+		"GIT_CONFIG_NOSYSTEM=0",
+		"HOME=/coordinator",
+		"TMUX_TMPDIR=/coordinator",
+		"SSH_AUTH_SOCK=/coordinator/agent.sock",
+		"RANDOM_TOKEN=credential",
+		"AGENT_SYMPHONY_LOCAL_ROOT=/coordinator",
+	} {
+		t.Run(strings.SplitN(entry, "=", 2)[0], func(t *testing.T) {
+			command.Env = []string{entry}
+			if err := validateBoundaryCommand(command, root); err == nil {
+				t.Fatalf("reserved boundary environment accepted: %s", entry)
+			}
+		})
+	}
+}
+
+func TestConfiguredReviewerEnvironmentRetainsManagedGitHardening(t *testing.T) {
+	env, err := configuredAgentEnvironment(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="} {
+		if !slices.Contains(env, entry) {
+			t.Fatalf("reviewer environment omitted %q", entry)
+		}
 	}
 }
 
