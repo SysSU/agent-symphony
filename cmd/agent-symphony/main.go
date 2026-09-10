@@ -2803,6 +2803,9 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 		target, reviewBase, head = manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead
 	}
 	snapshot, session := reviewIdentity(attempt, snapshotRoot)
+	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
+		return independentReviewResult{}, false, fmt.Errorf("prepare review snapshot root: %w", err)
+	}
 	legacyHeadArtifact := manifest.ReviewState == "running" && manifest.ReviewMode == "" && manifest.ReviewTarget == ""
 	manifestMode, manifestTarget := manifest.ReviewMode, manifest.ReviewTarget
 	if manifestMode == "" && manifestTarget == "" {
