@@ -978,6 +978,37 @@ func TestControlCLIBoundsBusyRetryByTimeout(t *testing.T) {
 			operation.Unlock()
 		}
 	}()
+	project := newProjectDashboardServer(t.Context(), root, "o/r", nil, "tmux", operation, nil, nil, func(context.Context) error { return nil }, nil, false, "")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	if err := startControlServer(ctx, project, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	started := time.Now()
+	code := run([]string{"control", "--repository", "o/r", "--action", "reconcile", "--runtime-state", root, "--request-id", "bounded-busy", "--timeout", "25ms"}, &stdout, &stderr)
+	elapsed := time.Since(started)
+	operation.Unlock()
+	locked = false
+	if code != 1 || elapsed > time.Second || !strings.Contains(stderr.String(), "remained busy until --timeout") {
+		t.Fatalf("code=%d elapsed=%s stdout=%q stderr=%q", code, elapsed, stdout.String(), stderr.String())
+	}
+}
+
+func TestControlExpiredQueuedRequestIsReplaySafe(t *testing.T) {
+	root := resolvedTempDir(t)
+	cleanupControlSocket(t, root)
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	operation := &sync.Mutex{}
+	operation.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			operation.Unlock()
+		}
+	}()
 	var calls atomic.Int32
 	project := newProjectDashboardServer(t.Context(), root, "o/r", nil, "tmux", operation, nil, nil, func(context.Context) error {
 		calls.Add(1)
@@ -988,39 +1019,40 @@ func TestControlCLIBoundsBusyRetryByTimeout(t *testing.T) {
 	if err := startControlServer(ctx, project, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	var stdout, stderr bytes.Buffer
-	type cliOutcome struct {
-		code    int
-		elapsed time.Duration
-	}
-	done := make(chan cliOutcome, 1)
+	request := controlRequest{Version: 1, RequestID: "bounded-busy", Repository: "o/r", Action: "reconcile"}
+	body, _ := json.Marshal(request)
+	deadline := time.Now().Add(25 * time.Millisecond)
+	httpRequest := httptest.NewRequest(http.MethodPost, "http://unix/v1/action", bytes.NewReader(body))
+	httpRequest.Header.Set(controlDeadline, strconv.FormatInt(deadline.UnixNano(), 10))
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
 	go func() {
-		started := time.Now()
-		code := run([]string{"control", "--repository", "o/r", "--action", "reconcile", "--runtime-state", root, "--request-id", "bounded-busy", "--timeout", "25ms"}, &stdout, &stderr)
-		done <- cliOutcome{code: code, elapsed: time.Since(started)}
+		controlHandler(project).ServeHTTP(response, httpRequest)
+		close(done)
 	}()
 	for project.controlMu.TryLock() {
 		project.controlMu.Unlock()
 		select {
-		case outcome := <-done:
-			t.Fatalf("control handler did not queue before timeout: code=%d elapsed=%s", outcome.code, outcome.elapsed)
+		case <-done:
+			t.Fatal("control handler did not queue behind the operation lock")
 		default:
 			runtime.Gosched()
 		}
 	}
-	outcome := <-done
+	if wait := time.Until(deadline); wait > 0 {
+		<-time.After(wait)
+	}
 	operation.Unlock()
 	locked = false
-	project.controlMu.Lock()
-	receipts, err := project.readControlReceipts()
-	project.controlMu.Unlock()
-	if outcome.code != 1 || outcome.elapsed > time.Second || !strings.Contains(stderr.String(), "remained busy until --timeout") {
-		t.Fatalf("code=%d elapsed=%s stdout=%q stderr=%q", outcome.code, outcome.elapsed, stdout.String(), stderr.String())
+	<-done
+	var expired controlResult
+	if json.Unmarshal(response.Body.Bytes(), &expired) != nil || !expired.Retryable || expired.Status != http.StatusServiceUnavailable {
+		t.Fatalf("expired result=%#v body=%q", expired, response.Body.String())
 	}
+	receipts, err := project.readControlReceipts()
 	if err != nil || len(receipts.Receipts) != 0 || calls.Load() != 0 {
 		t.Fatalf("canceled receipts=%#v calls=%d err=%v", receipts, calls.Load(), err)
 	}
-	request := controlRequest{Version: 1, RequestID: "bounded-busy", Repository: "o/r", Action: "reconcile"}
 	result, err := callRunningDaemon(t.Context(), root, request)
 	if err != nil || !result.OK || calls.Load() != 1 {
 		t.Fatalf("retry result=%#v calls=%d err=%v", result, calls.Load(), err)
