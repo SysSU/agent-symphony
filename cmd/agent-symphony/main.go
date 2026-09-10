@@ -619,6 +619,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	command := args[0]
+	if command == "pane-exit-status" {
+		if len(args) < 4 || args[2] != "--" {
+			return misuse(stderr, false, command, "invalid internal pane command invocation")
+		}
+		code, childSignal, err := agentruntime.RunPaneCommand(context.Background(), args[1], args[3:], os.Stdin, stdout, stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "error: "+err.Error())
+		}
+		if childSignal != 0 {
+			signal.Reset(childSignal)
+			if killErr := syscall.Kill(os.Getpid(), childSignal); killErr != nil {
+				fmt.Fprintln(stderr, "error: re-raise pane command signal: "+killErr.Error())
+			} else {
+				select {}
+			}
+		}
+		return code
+	}
 	if command == "worker-capture" || command == "worker-capture-replace" || command == "worker-capture-handoff" || command == "worker-capture-handoff-ready" {
 		if command == "worker-capture-handoff" || command == "worker-capture-handoff-ready" {
 			if len(args) < 9 || args[7] != "--" {
@@ -2951,7 +2969,10 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if err != nil {
 		return independentReviewResult{}, false, err
 	}
-	command = agentruntime.PaneExitStatusCommand("tmux", append(slices.Clone(command), prompt))
+	command = append(slices.Clone(command), prompt)
+	if runtimeState != nil && runtimeState.Helper != "" {
+		command = agentruntime.PaneExitStatusCommand(runtimeState.Helper, "tmux", command)
+	}
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}

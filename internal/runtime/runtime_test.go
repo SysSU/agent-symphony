@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -288,7 +289,12 @@ func TestParsePaneStatusFromRealTmux(t *testing.T) {
 		t.Fatalf("live pane: status=%#v err=%v", pane, err)
 	}
 	run("set-option", "-w", "-t", target, "remain-on-exit", "on")
-	run(append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(tmux, []string{"sh", "-c", "exit 17"})...)...)
+	helper := filepath.Join(t.TempDir(), "pane-helper")
+	helperScript := fmt.Sprintf("#!/bin/sh\nAGENT_SYMPHONY_PANE_HELPER=1 exec %q -test.run=^TestPaneExitStatusProcessHelper$ -- \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(helper, []byte(helperScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run(append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "exit 17"})...)...)
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat))
@@ -306,8 +312,11 @@ func TestParsePaneStatusFromRealTmux(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, "#{pane_dead}|||#{"+PaneExitStatusOption+"}")); err != nil || pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 17}) {
+		t.Fatalf("recorded fallback: status=%#v err=%v", pane, err)
+	}
 	run("set-option", "-p", "-t", target, PaneExitStatusOption, "")
-	run("respawn-pane", "-k", "-t", target, "--", "sh", "-c", "kill -TERM $$")
+	run(append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "kill -TERM $$"})...)...)
 	deadline = time.Now().Add(3 * time.Second)
 	for {
 		pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat))
@@ -325,6 +334,45 @@ func TestParsePaneStatusFromRealTmux(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	run(append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "exit 143"})...)...)
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pane.Ready {
+			if pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 143}) {
+				t.Fatalf("explicit exit 143 status=%#v", pane)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tmux explicit exit 143 did not become observable")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestPaneExitStatusProcessHelper(t *testing.T) {
+	if os.Getenv("AGENT_SYMPHONY_PANE_HELPER") != "1" {
+		return
+	}
+	separator := slices.Index(os.Args, "--")
+	if separator < 0 || separator+4 > len(os.Args) || os.Args[separator+1] != "pane-exit-status" || os.Args[separator+3] != "--" {
+		os.Exit(125)
+	}
+	code, childSignal, err := RunPaneCommand(context.Background(), os.Args[separator+2], os.Args[separator+4:], os.Stdin, os.Stdout, os.Stderr)
+	if err != nil {
+		os.Exit(126)
+	}
+	if childSignal != 0 {
+		signal.Reset(childSignal)
+		if syscall.Kill(os.Getpid(), childSignal) == nil {
+			select {}
+		}
+	}
+	os.Exit(code)
 }
 
 func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *testing.T) {
@@ -338,7 +386,7 @@ func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *tes
 	if manifest.State != "running" || fake.buffers[manifest.Session] != attempt.Context {
 		t.Fatalf("unexpected launch: %#v, %#v", manifest, fake.sessions[manifest.Session])
 	}
-	want := PaneExitStatusCommand("tmux", PromptCommand(r.Helper, "tmux", manifest.Session, ResultPath(manifest.Worktree), attempt.Command))
+	want := PaneExitStatusCommand(r.Helper, "tmux", PromptCommand(r.Helper, "tmux", manifest.Session, ResultPath(manifest.Worktree), attempt.Command))
 	if !slices.Equal(fake.sessions[manifest.Session].agent, want) {
 		t.Fatalf("agent command = %#v, want %#v", fake.sessions[manifest.Session].agent, want)
 	}
@@ -403,7 +451,7 @@ func TestInteractiveLifecycleKeepsAgentOnTmuxAndRequiresResult(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := PaneExitStatusCommand("tmux", []string{"interactive-agent", "--tty", attempt.Context})
+			want := PaneExitStatusCommand(r.Helper, "tmux", []string{"interactive-agent", "--tty", attempt.Context})
 			if !manifest.Interactive || fake.buffers[manifest.Session] != "" || !slices.Equal(fake.sessions[manifest.Session].agent, want) {
 				t.Fatalf("interactive launch manifest=%#v session=%#v buffers=%#v", manifest, fake.sessions[manifest.Session], fake.buffers)
 			}

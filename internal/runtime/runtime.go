@@ -347,14 +347,8 @@ func HandoffPromptCommand(helper, tmux, buffer, resultPath, launchedPath, recipi
 
 // PaneExitStatusCommand preserves a command's exit status in the pane before
 // the pane process exits. tmux 3.4 can otherwise leave pane_dead_status blank.
-func PaneExitStatusCommand(tmux string, command []string) []string {
-	const wrapper = `tmux=$1
-shift
-"$@"
-code=$?
-"$tmux" set-option -p -t "$TMUX_PANE" ` + PaneExitStatusOption + ` "$code"
-exit "$code"`
-	return append([]string{"sh", "-c", wrapper, "agent-symphony-pane", tmux}, command...)
+func PaneExitStatusCommand(helper, tmux string, command []string) []string {
+	return append([]string{helper, "pane-exit-status", tmux, "--"}, command...)
 }
 
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
@@ -477,7 +471,9 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	} else if attempt.Context != "" {
 		command = PromptCommand(r.Helper, r.tmux(), manifest.Session, ResultPath(manifest.Worktree), command)
 	}
-	command = PaneExitStatusCommand(r.tmux(), command)
+	if r.Helper != "" {
+		command = PaneExitStatusCommand(r.Helper, r.tmux(), command)
+	}
 	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
 		return failStop("start agent", err)
 	}
