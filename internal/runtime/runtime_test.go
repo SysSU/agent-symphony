@@ -746,30 +746,35 @@ func TestCaptureWorkerCancellationKillsAndReapsChildGroup(t *testing.T) {
 				resultPath = filepath.Join(dir, "cancelled.result.json")
 			}
 			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			ready := make(chan int, 1)
 			done := make(chan error, 1)
 			go func() {
-				_, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, []string{"sh", "-c", `trap '' INT TERM; sleep 30 & echo $! >"$1"; wait`, "consumer", pidPath}, io.Discard, io.Discard, dir, false)
+				_, err := captureWorkerAfterStart(ctx, tmux, "prompt-buffer", resultPath, []string{"sh", "-c", `trap '' INT TERM; sleep 30 & echo $! >"$1"; printf ready >&2; wait`, "consumer", pidPath}, io.Discard, io.Discard, dir, false, func() error {
+					body, err := os.ReadFile(pidPath)
+					if err != nil {
+						return err
+					}
+					pid, err := strconv.Atoi(strings.TrimSpace(string(body)))
+					if err == nil {
+						ready <- pid
+					}
+					return err
+				})
 				done <- err
 			}()
 			var pid int
-			for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-				body, err := os.ReadFile(pidPath)
-				if err == nil && strings.TrimSpace(string(body)) != "" {
-					pid, err = strconv.Atoi(strings.TrimSpace(string(body)))
-					if err != nil {
-						t.Fatal(err)
-					}
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatal("child descendant did not start")
-				}
+			select {
+			case pid = <-ready:
+			case err := <-done:
+				t.Fatalf("child descendant did not start: %v", err)
 			}
+			started := time.Now()
 			cancel()
 			select {
 			case err := <-done:
-				if !errors.Is(err, context.Canceled) {
-					t.Fatalf("capture cancellation = %v", err)
+				if !errors.Is(err, context.Canceled) || time.Since(started) > 2*time.Second {
+					t.Fatalf("capture cancellation elapsed=%v err=%v", time.Since(started), err)
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("capture cancellation did not return promptly")
@@ -970,6 +975,7 @@ func TestCaptureWorkerEscapedStdoutFailsPromptly(t *testing.T) {
 				}
 				t.Setenv("FAKE_PROMPT", prompt)
 				pidPath := filepath.Join(dir, "escaped.pid")
+				releasePath := filepath.Join(dir, "release")
 				t.Setenv("AGENT_SYMPHONY_ESCAPE_STDOUT", pidPath)
 				resultPath, output := "", "reviewer"
 				if captureResult {
@@ -980,8 +986,8 @@ func TestCaptureWorkerEscapedStdoutFailsPromptly(t *testing.T) {
 				if cancelWorker {
 					mode = "cancel"
 				}
-				command := []string{"sh", "-c", `set +m; "$1" -test.run=^TestCaptureWorkerEscapedStdoutHelper$ 2>/dev/null & while test ! -s "$4"; do sleep 0.01; done; printf %s "$2"; test "$3" = normal || sleep 30`, "consumer", os.Args[0], output, mode, pidPath}
-				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				command := []string{"sh", "-c", `set +m; "$1" -test.run=^TestCaptureWorkerEscapedStdoutHelper$ 2>/dev/null & while test ! -s "$4"; do sleep 0.01; done; printf ready >&2; while test ! -e "$5"; do sleep 0.01; done; printf %s "$2"; test "$3" = normal || sleep 30`, "consumer", os.Args[0], output, mode, pidPath, releasePath}
+				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				type outcome struct {
 					code int
@@ -994,28 +1000,33 @@ func TestCaptureWorkerEscapedStdoutFailsPromptly(t *testing.T) {
 				}
 				defer devNull.Close()
 				done := make(chan outcome, 1)
-				started := time.Now()
+				ready := make(chan int, 1)
 				go func() {
-					code, err := captureWorker(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir, false)
+					code, err := captureWorkerAfterStart(ctx, tmux, "prompt-buffer", resultPath, command, &stdout, devNull, dir, false, func() error {
+						body, err := os.ReadFile(pidPath)
+						if err != nil {
+							return err
+						}
+						pid, err := strconv.Atoi(strings.TrimSpace(string(body)))
+						if err == nil {
+							ready <- pid
+						}
+						return err
+					})
 					done <- outcome{code: code, err: err}
 				}()
 				var pid int
-				for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-					body, err := os.ReadFile(pidPath)
-					if err == nil && strings.TrimSpace(string(body)) != "" {
-						pid, err = strconv.Atoi(strings.TrimSpace(string(body)))
-						if err != nil {
-							t.Fatal(err)
-						}
-						break
-					}
-					if time.Now().After(deadline) {
-						t.Fatal("escaped stdout holder did not start")
-					}
+				select {
+				case pid = <-ready:
+				case got := <-done:
+					t.Fatalf("escaped stdout holder did not start: code=%d err=%v", got.code, got.err)
 				}
 				t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+				started := time.Now()
 				if cancelWorker {
 					cancel()
+				} else if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
+					t.Fatal(err)
 				}
 				select {
 				case got := <-done:
