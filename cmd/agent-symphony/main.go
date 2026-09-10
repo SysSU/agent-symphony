@@ -752,7 +752,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		request := controlRequest{Version: controlVersion, RequestID: *requestID, Repository: *repository, Action: *action, Issue: *issueNumber, Attempt: *attemptNumber, Confirm: *confirm}
 		if !validControlRequest(request, *repository) {
-			return misuse(stderr, wantsJSON, command, "invalid action identity or confirmation; archive and abandon require --confirm")
+			return misuse(stderr, wantsJSON, command, "invalid action identity or confirmation; archive, abandon, and remove require --confirm")
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), *controlTimeout)
 		defer cancel()
@@ -3696,7 +3696,7 @@ options:
 	--repository owner/repo  exact project identity for control or chat
 	--role role  implementation, reviewer, or orchestrator session (chat only)
 	--action action  reconcile, attempt, or orchestrator action (control only)
-	--confirm     confirm archive or abandon cleanup (control only)
+	--confirm     confirm archive, abandon, or permanent removal (control only)
 	--request-id id  bounded idempotency identity (control only)
 	--timeout duration  bounded running-daemon request timeout (maximum 2m)
 	--interval duration  override configured serve reconciliation interval (maximum 60s)

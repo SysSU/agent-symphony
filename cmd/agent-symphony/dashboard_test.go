@@ -967,6 +967,185 @@ func TestDashboardDismissalRejectsUnsafeStateFile(t *testing.T) {
 	}
 }
 
+func TestDashboardPermanentlyRemovesOnlyOneHistoricalAttempt(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := writeDashboardManifest(t, root, 28, 1, "failed")
+	current := writeDashboardManifest(t, root, 28, 2, "running")
+	other := writeDashboardManifest(t, root, 29, 1, "failed")
+	statuses := []orchestrator.RecoveryStatus{
+		{Repository: previous.Repository, Issue: previous.Issue, Attempt: previous.Attempt, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session},
+		{Repository: current.Repository, Issue: current.Issue, Attempt: current.Attempt, State: "active", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session},
+		{Repository: other.Repository, Issue: other.Issue, Attempt: other.Attempt, State: "failed", Branch: other.Branch, Worktree: other.Worktree, Session: other.Session},
+	}
+	if err := writeStatusSnapshot(root, statuses); err != nil {
+		t.Fatal(err)
+	}
+	operationMu := &sync.Mutex{}
+	var calls []string
+	server := &dashboardServer{
+		stateRoot:  root,
+		repository: previous.Repository,
+		mu:         operationMu,
+		reconcile: func(context.Context) error {
+			if operationMu.TryLock() {
+				operationMu.Unlock()
+				t.Fatal("removal reconciled outside the operation lock")
+			}
+			calls = append(calls, "reconcile")
+			return nil
+		},
+		remove: func(_ context.Context, operation string, manifest agentruntime.Manifest, head string) error {
+			if manifest.Repository != previous.Repository || manifest.Issue != previous.Issue || manifest.Attempt != previous.Attempt || head != previous.BaseSHA {
+				t.Fatalf("wrong implementation cleanup identity: %#v head=%q", manifest, head)
+			}
+			calls = append(calls, operation)
+			return nil
+		},
+		reviewCleanup: func(_ context.Context, manifest agentruntime.Manifest, remove bool) error {
+			if manifest.Issue != previous.Issue || manifest.Attempt != previous.Attempt {
+				t.Fatalf("wrong reviewer cleanup identity: %#v", manifest)
+			}
+			calls = append(calls, fmt.Sprintf("review-%v", remove))
+			return nil
+		},
+	}
+	handler := server.handler(http.NotFoundHandler())
+	request := func(issue, attempt int) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1/actions/remove?repository=o%%2Fr&issue=%d&attempt=%d", issue, attempt), nil)
+		r.Header.Set("Origin", "http://127.0.0.1")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, r)
+		return response
+	}
+	if response := request(current.Issue, current.Attempt); response.Code != http.StatusConflict || len(calls) != 1 {
+		t.Fatalf("current removal status=%d body=%q calls=%v", response.Code, response.Body.String(), calls)
+	}
+	if response := request(other.Issue, other.Attempt); response.Code != http.StatusConflict || len(calls) != 2 {
+		t.Fatalf("latest failed removal status=%d body=%q calls=%v", response.Code, response.Body.String(), calls)
+	}
+	if response := request(previous.Issue, previous.Attempt); response.Code != http.StatusOK {
+		t.Fatalf("historical removal status=%d body=%q", response.Code, response.Body.String())
+	}
+	if !slices.Equal(calls, []string{"reconcile", "reconcile", "reconcile", "validate-remove", "review-false", "review-true", "remove"}) {
+		t.Fatalf("removal calls=%v", calls)
+	}
+	if _, err := os.Stat(filepath.Dir(previous.LogPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("selected attempt record remains: %v", err)
+	}
+	for _, path := range []string{filepath.Join(filepath.Dir(current.LogPath), "manifest.json"), filepath.Join(filepath.Dir(other.LogPath), "manifest.json")} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("unrelated attempt was removed: %s: %v", path, err)
+		}
+	}
+	state, err := server.readState()
+	if err != nil || !slices.Equal(state.Hidden, []dashboardHiddenAttempt{{Repository: "o/r", Issue: 28, Attempt: 1, Reason: "removed"}}) {
+		t.Fatalf("dashboard state=%#v err=%v", state, err)
+	}
+	if response := request(previous.Issue, previous.Attempt); response.Code != http.StatusOK || len(calls) != 8 {
+		t.Fatalf("idempotent removal status=%d body=%q calls=%v", response.Code, response.Body.String(), calls)
+	}
+}
+
+func TestDashboardPermanentRemovalRetainsEntryWhenCleanupFails(t *testing.T) {
+	root, _ := filepath.EvalSymlinks(t.TempDir())
+	previous := writeDashboardManifest(t, root, 30, 1, "failed")
+	current := writeDashboardManifest(t, root, 30, 2, "running")
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{
+		{Repository: previous.Repository, Issue: 30, Attempt: 1, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session},
+		{Repository: current.Repository, Issue: 30, Attempt: 2, State: "active", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := &dashboardServer{
+		stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, reconcile: func(context.Context) error { return nil },
+		remove: func(context.Context, string, agentruntime.Manifest, string) error {
+			return errors.New("worktree has uncommitted changes")
+		},
+		reviewCleanup: func(context.Context, agentruntime.Manifest, bool) error {
+			t.Fatal("review cleanup should not run")
+			return nil
+		},
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/remove?repository=o%2Fr&issue=30&attempt=1", nil)
+	request.Header.Set("Origin", "http://127.0.0.1")
+	response := httptest.NewRecorder()
+	server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
+	state, stateErr := server.readState()
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "uncommitted changes") || stateErr != nil || len(state.Hidden) != 0 {
+		t.Fatalf("failed removal status=%d body=%q state=%#v err=%v", response.Code, response.Body.String(), state, stateErr)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(previous.LogPath), "manifest.json")); err != nil {
+		t.Fatalf("failed removal lost attempt record: %v", err)
+	}
+}
+
+func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testing.T) {
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(t.TempDir(), "review-boundary")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '{\"output\":\"\",\"code\":0,\"exited\":false}\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", helper)
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 31, Number: 1, BaseSHA: strings.Repeat("a", 40)}
+	snapshotRoot := productionSnapshotRoot(stateRoot)
+	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, session := reviewIdentity(attempt, snapshotRoot)
+	if err := os.Mkdir(snapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resultOne, resultTwo := snapshot+".result-0123456789abcdef", snapshot+".result-fedcba9876543210"
+	for _, path := range []string{resultOne, resultTwo} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sibling := filepath.Join(snapshotRoot, "unrelated")
+	if err := os.Mkdir(sibling, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, ReviewHead: strings.Repeat("b", 40), ReviewSnapshot: snapshot, ReviewSession: session}
+	server := &dashboardServer{stateRoot: stateRoot}
+	if err := server.cleanupAttemptReview(t.Context(), manifest, false); err != nil {
+		t.Fatalf("review preflight: %v", err)
+	}
+	for _, path := range []string{snapshot, resultOne, resultTwo} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("preflight removed %s: %v", path, err)
+		}
+	}
+	if err := server.cleanupAttemptReview(t.Context(), manifest, true); err != nil {
+		t.Fatalf("review cleanup: %v", err)
+	}
+	for _, path := range []string{snapshot, resultOne, resultTwo} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("review artifact remains %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(sibling); err != nil {
+		t.Fatalf("unrelated review resource removed: %v", err)
+	}
+
+	canary := t.TempDir()
+	unsafe := snapshot + ".result-aaaaaaaaaaaaaaaa"
+	if err := os.Symlink(canary, unsafe); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.cleanupAttemptReview(t.Context(), manifest, false); err == nil || !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("symlinked review result preflight=%v", err)
+	}
+	if _, err := os.Stat(canary); err != nil {
+		t.Fatalf("review symlink target changed: %v", err)
+	}
+}
+
 func TestDashboardCleanupRejectsProjectionIdentityDrift(t *testing.T) {
 	root, _ := filepath.EvalSymlinks(t.TempDir())
 	manifest := writeDashboardManifest(t, root, 23, 1, "completed")
