@@ -59,6 +59,15 @@ Run the complete local release gate from the clean `main` checkout:
 scripts/validate-release.sh "$version"
 ```
 
+Run the compiled deterministic operator journey and the authenticated pilot preflight:
+
+```sh
+AGENT_SYMPHONY_FULL_SYSTEM_E2E=1 go test ./cmd/agent-symphony -run '^TestFullSystemE2E$' -count=1 -timeout 10m
+AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID="live-$version" scripts/live-pilot.sh "live-$version.json"
+```
+
+The live command must name the exact private sample repository in its JSON report. A blocked report is a failed release gate, not permission to clean unrelated issues, pull requests, branches, worktrees, sessions, or runtime data.
+
 This generates the untracked dashboard export, then runs race tests, vet, security and workflow checks, reproducible builds, archive verification, packaged smoke tests, and the credential scan. A local pass does not replace the native macOS, Linux, and WSL2 jobs that run again for the tag.
 
 ## 4. Configure SSH tag signing
