@@ -59,11 +59,12 @@ if [ -n "${AGENT_SYMPHONY_REVIEW_RESULT:-}" ]; then
   printf '%s' '{"type":"agent-symphony-review-v1","status":"clean","findings":[]}' >"$AGENT_SYMPHONY_REVIEW_RESULT"
   exit 0
 fi
-printf '%s\n' "isolated live pilot" >LIVE_PILOT.md
+printf 'isolated live pilot %s\n' '__AGENT_SYMPHONY_LIVE_RUN_ID__' >LIVE_PILOT.md
 git add LIVE_PILOT.md
 git commit -qm "test: isolated live pilot"
 printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"live pilot commit and review lifecycle","documentation":"temporary live pilot marker"}' >"$AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
 EOF
+ruby -e 'path,run_id=ARGV; marker="__AGENT_SYMPHONY_LIVE_RUN_ID__"; body=File.read(path); abort "missing or duplicate live run marker" unless body.scan(marker).length==1; File.write(path,body.sub(marker,run_id))' "$fake_bin/codex" "$run_id"
 chmod 0700 "$fake_bin/codex"
 
 body=$(printf '## Context\n\nAuthenticated isolated pilot `%s`.\n\n## Acceptance criteria\n\n- Complete one implementation, review, pull request, checks, merge, and closure lifecycle.\n\n## Checklist\n\n- [ ] Run the isolated lifecycle.\n\n## Validation\n\nValidate GitHub state, dashboard projection, and exact cleanup.\n\n## Dependencies\n\nNone\n' "$run_id")
@@ -84,6 +85,7 @@ deadline=$((started + 300))
 while [ "$(date +%s)" -lt "$deadline" ]; do
   if [ "$(gh issue view "$issue" --repo "$repository" --json state --jq .state)" = CLOSED ]; then closed=true; break; fi
   if ! kill -0 "$server_pid" 2>/dev/null; then break; fi
+  if RUNTIME="$runtime" ruby -rjson -e 'exit Dir[File.join(ENV.fetch("RUNTIME"),"attempts","*","*","manifest.json")].any? { |path| JSON.parse(File.read(path))["state"]=="failed" } ? 0 : 1'; then break; fi
   sleep 2
 done
 resources=$(RUNTIME="$runtime" ruby -rjson -e '
