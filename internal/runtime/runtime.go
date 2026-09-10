@@ -32,6 +32,8 @@ const (
 	historyLimit            = "5000"
 	workerResultSuffix      = ".result.json"
 	WorkerResultEnvironment = "AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
+	PaneExitStatusOption    = "@agent-symphony-exit-status"
+	PaneStatusFormat        = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{@agent-symphony-exit-status}"
 )
 
 const (
@@ -43,6 +45,7 @@ const (
 
 var component = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 var commitID = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+var signalName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]{0,31}$`)
 
 type Command struct {
 	Name           string
@@ -57,6 +60,13 @@ type Result struct {
 	Output string
 	Code   int
 	Exited bool
+}
+
+type PaneStatus struct {
+	Dead       bool
+	Ready      bool
+	ExitStatus int
+	Signal     string
 }
 
 type Runner interface {
@@ -335,6 +345,12 @@ func HandoffPromptCommand(helper, tmux, buffer, resultPath, launchedPath, recipi
 	return append([]string{helper, "worker-capture-handoff-ready", tmux, buffer, resultPath, launchedPath, recipient, signal, "--"}, command...)
 }
 
+// PaneExitStatusCommand preserves a command's exit status in the pane before
+// the pane process exits. tmux 3.4 can otherwise leave pane_dead_status blank.
+func PaneExitStatusCommand(helper, tmux string, command []string) []string {
+	return append([]string{helper, "pane-exit-status", tmux, "--"}, command...)
+}
+
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -455,6 +471,9 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	} else if attempt.Context != "" {
 		command = PromptCommand(r.Helper, r.tmux(), manifest.Session, ResultPath(manifest.Worktree), command)
 	}
+	if r.Helper != "" {
+		command = PaneExitStatusCommand(r.Helper, r.tmux(), command)
+	}
 	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
 		return failStop("start agent", err)
 	}
@@ -478,15 +497,18 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 	if attempt.Eligible != nil && !attempt.Eligible() {
 		return r.cancel(ctx, attempt, manifest, "attempt is no longer eligible")
 	}
-	result, runErr := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", PaneTarget(manifest.Session), "#{pane_dead} #{pane_dead_status}"}, "", []string{}, nil)
+	result, runErr := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", PaneTarget(manifest.Session), PaneStatusFormat}, "", []string{}, nil)
 	if runErr != nil {
 		return manifest, fmt.Errorf("observe tmux session: %w", runErr)
 	}
-	dead, status, err := ParsePaneStatus(result.Output)
+	pane, err := ParsePaneStatus(result.Output)
 	if err != nil {
 		return manifest, fmt.Errorf("observe tmux session: %w", err)
 	}
-	if dead {
+	if pane.Dead && !pane.Ready {
+		return manifest, nil
+	}
+	if pane.Dead {
 		env, envErr := r.agentEnvironment(manifest.Repository, attempt.Env...)
 		capture, captureErr := r.run(ctx, r.tmux(), []string{"capture-pane", "-p", "-S", "-", "-t", PaneTarget(manifest.Session)}, "", []string{}, nil)
 		if envErr != nil {
@@ -503,7 +525,9 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 			manifest.State, manifest.Diagnostic = "failed", "agent exited; output was not preserved: "+diagnostic(cause)
 			manifest.UpdatedAt = time.Now().UTC()
 			return manifest, errors.Join(cause, r.writeManifest(attempt, manifest))
-		} else if status == 0 {
+		} else if pane.Signal != "" {
+			manifest.State, manifest.Diagnostic = "failed", fmt.Sprintf("agent terminated by signal %s; output preserved in %s", pane.Signal, manifest.LogPath)
+		} else if pane.ExitStatus == 0 {
 			if manifest.Interactive {
 				info, err := os.Lstat(ResultPath(manifest.Worktree))
 				if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() == 0 || info.Size() > WorkerResultMaxBytes {
@@ -515,7 +539,7 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 				manifest.State = "completed"
 			}
 		} else {
-			manifest.State, manifest.Diagnostic = "failed", fmt.Sprintf("agent exited with status %d; output preserved in %s", status, manifest.LogPath)
+			manifest.State, manifest.Diagnostic = "failed", fmt.Sprintf("agent exited with status %d; output preserved in %s", pane.ExitStatus, manifest.LogPath)
 		}
 	}
 	manifest.UpdatedAt = time.Now().UTC()
@@ -553,20 +577,59 @@ func TmuxNewSessionArgs(session, dir string, environment []string) []string {
 	return []string{"set-option", "-g", "update-environment", strings.Join(names, " "), ";", "new-session", "-d", "-s", session, "-c", dir}
 }
 
-// ParsePaneStatus parses tmux's pane_dead and pane_dead_status format.
-func ParsePaneStatus(output string) (bool, int, error) {
-	fields := strings.Fields(output)
-	if len(fields) == 1 && fields[0] == "0" {
-		return false, 0, nil
+// ParsePaneStatus parses PaneStatusFormat. A dead pane is not ready until tmux
+// has published either its normal exit status or terminating signal.
+func ParsePaneStatus(output string) (PaneStatus, error) {
+	fields := strings.Split(strings.TrimSpace(output), "|")
+	if len(fields) != 4 || (fields[0] != "0" && fields[0] != "1") {
+		return PaneStatus{}, fmt.Errorf("invalid pane status %q", strings.TrimSpace(output))
 	}
-	if len(fields) != 2 || fields[0] != "1" {
-		return false, 0, fmt.Errorf("invalid pane status %q", strings.TrimSpace(output))
+	var recordedStatus *int
+	if fields[3] != "" {
+		status, err := strconv.Atoi(fields[3])
+		if err != nil || status < 0 || status > 255 {
+			return PaneStatus{}, fmt.Errorf("invalid recorded pane exit status %q", fields[3])
+		}
+		recordedStatus = &status
+	}
+	if fields[0] == "0" {
+		if fields[1] != "" || fields[2] != "" {
+			return PaneStatus{}, fmt.Errorf("invalid live pane status %q", strings.TrimSpace(output))
+		}
+		return PaneStatus{}, nil
+	}
+	pane := PaneStatus{Dead: true}
+	if fields[1] == "" && fields[2] == "" {
+		if recordedStatus != nil {
+			pane.Ready, pane.ExitStatus = true, *recordedStatus
+		}
+		return pane, nil
+	}
+	if fields[1] != "" && fields[2] != "" {
+		return PaneStatus{}, fmt.Errorf("ambiguous dead pane status %q", strings.TrimSpace(output))
+	}
+	if fields[2] != "" {
+		signal := strings.ToLower(fields[2])
+		if number, err := strconv.Atoi(signal); err == nil {
+			if number < 1 || number > 127 {
+				return PaneStatus{}, fmt.Errorf("invalid pane signal %q", fields[2])
+			}
+			signal = strconv.Itoa(number)
+		} else if !signalName.MatchString(signal) {
+			return PaneStatus{}, fmt.Errorf("invalid pane signal %q", fields[2])
+		}
+		pane.Ready, pane.Signal = true, signal
+		return pane, nil
 	}
 	status, err := strconv.Atoi(fields[1])
 	if err != nil || status < 0 {
-		return false, 0, fmt.Errorf("invalid exit status %q", fields[1])
+		return PaneStatus{}, fmt.Errorf("invalid exit status %q", fields[1])
 	}
-	return true, status, nil
+	if recordedStatus != nil && status != *recordedStatus {
+		return PaneStatus{}, fmt.Errorf("pane exit status conflicts with recorded status %d", *recordedStatus)
+	}
+	pane.Ready, pane.ExitStatus = true, status
+	return pane, nil
 }
 
 // Deliver sends one control-plane-framed handoff through the verified worker
@@ -741,6 +804,24 @@ func (r *Runtime) Forget(manifest Manifest) error {
 		return err
 	}
 	stored, err := r.readManifest(attempt)
+	if errors.Is(err, os.ErrNotExist) {
+		dir := filepath.Dir(r.manifestPath(attempt))
+		if _, statErr := os.Lstat(dir); !errors.Is(statErr, os.ErrNotExist) {
+			if statErr == nil {
+				return errors.New("attempt record is incomplete")
+			}
+			return statErr
+		}
+		for _, path := range []string{manifest.Worktree, ResultPath(manifest.Worktree)} {
+			if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+				if statErr == nil {
+					return fmt.Errorf("attempt worker resource still exists: %s", path)
+				}
+				return statErr
+			}
+		}
+		return nil
+	}
 	if err != nil {
 		return err
 	}

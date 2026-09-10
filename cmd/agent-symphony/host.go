@@ -1050,6 +1050,11 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return errors.New("review boundary cannot abandon implementation attempts")
 		}
 		err = abandonAttempt(ctx, request.Command.Input, root)
+	case "validate-remove", "remove":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot permanently remove implementation attempts")
+		}
+		err = permanentlyRemoveAttempt(ctx, request.Command.Input, root, request.Operation == "remove")
 	case "accept-handoff":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot accept implementation handoffs")
@@ -1086,6 +1091,21 @@ func abandonAttempt(ctx context.Context, input []byte, root string) error {
 	return removeAttemptResources(ctx, input, root, false)
 }
 
+type permanentRemovalRequest struct {
+	Manifest      agentruntime.Manifest `json:"manifest"`
+	PublishedHead string                `json:"published_head,omitempty"`
+}
+
+func permanentlyRemoveAttempt(ctx context.Context, input []byte, root string, remove bool) error {
+	var request permanentRemovalRequest
+	decoder := json.NewDecoder(bytes.NewReader(input))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&request) != nil || decoder.Decode(&struct{}{}) != io.EOF || !preflightObjectID.MatchString(request.PublishedHead) {
+		return errors.New("invalid permanent removal request")
+	}
+	return removeVerifiedAttemptResources(ctx, request.Manifest, root, false, request.PublishedHead, remove)
+}
+
 func removeAttemptResources(ctx context.Context, input []byte, root string, completed bool) error {
 	var manifest agentruntime.Manifest
 	decoder := json.NewDecoder(bytes.NewReader(input))
@@ -1093,12 +1113,20 @@ func removeAttemptResources(ctx context.Context, input []byte, root string, comp
 	if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return errors.New("invalid attempt manifest")
 	}
+	return removeVerifiedAttemptResources(ctx, manifest, root, completed, "", true)
+}
+
+func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.Manifest, root string, completed bool, publishedHead string, remove bool) error {
 	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
 	want, err := agentruntime.AttemptIdentity(root, attempt)
 	validState := manifest.State == "preparing" || manifest.State == "running" || manifest.State == "completed" || manifest.State == "failed" || manifest.State == "cancelled"
 	if err != nil || manifest.Version != want.Version || !validState || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session ||
-		(completed && (manifest.State != "completed" || !preflightObjectID.MatchString(manifest.ReviewHead))) {
+		(completed && (manifest.State != "completed" || !preflightObjectID.MatchString(manifest.ReviewHead))) ||
+		(publishedHead != "" && !preflightObjectID.MatchString(publishedHead)) {
 		return errors.New("invalid attempt manifest")
+	}
+	if publishedHead != "" && manifest.State != "completed" && manifest.State != "failed" && manifest.State != "cancelled" {
+		return errors.New("permanent removal requires a terminal attempt")
 	}
 
 	worktreeInfo, worktreeErr := os.Lstat(want.Worktree)
@@ -1120,11 +1148,21 @@ func removeAttemptResources(ctx context.Context, input []byte, root string, comp
 		if topErr != nil || !samePath(top, want.Worktree) || gitDirErr != nil || !validAttemptGitDir(want.Worktree, gitDir, root) {
 			return errors.New("attempt worktree identity changed")
 		}
-		if completed {
+		if completed || publishedHead != "" {
 			branch, branchErr := run("branch", "--show-current")
 			head, headErr := run("rev-parse", "HEAD")
-			if branchErr != nil || branch != want.Branch || headErr != nil || head != manifest.ReviewHead {
+			wantHead := manifest.ReviewHead
+			if publishedHead != "" {
+				wantHead = publishedHead
+			}
+			if branchErr != nil || branch != want.Branch || headErr != nil || !strings.EqualFold(head, wantHead) {
 				return errors.New("cleanup worktree identity changed")
+			}
+		}
+		if publishedHead != "" {
+			status, statusErr := run("status", "--porcelain=v1", "--untracked-files=all")
+			if statusErr != nil || status != "" {
+				return errors.New("permanent removal refused because the worktree has uncommitted changes")
 			}
 		}
 	}
@@ -1136,6 +1174,9 @@ func removeAttemptResources(ctx context.Context, input []byte, root string, comp
 	}
 	if resultErr == nil && (!resultInfo.Mode().IsRegular() || resultInfo.Mode()&os.ModeSymlink != 0) {
 		return errors.New("cleanup result is not a regular non-symlink file")
+	}
+	if !remove {
+		return nil
 	}
 	if err := stopAttemptSession(ctx, want.Session); err != nil {
 		return err
@@ -1371,7 +1412,7 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	case "has-session", "kill-session":
 		return len(args) == 3 && args[1] == "-t" && validTmuxTarget(args[2], false)
 	case "display-message":
-		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", "#{pane_dead} #{pane_dead_status}", "#{pane_start_command}"}, args[4])
+		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, "#{pane_start_command}"}, args[4])
 	case "capture-pane":
 		return len(args) == 6 && slices.Equal(args[1:5], []string{"-p", "-S", "-", "-t"}) && validTmuxTarget(args[5], true)
 	case "set-option":
@@ -1741,12 +1782,15 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 		}
 	}
 	signal := buffer + "-launched"
-	command := agentruntime.HandoffPromptCommand(helper, "tmux", buffer, resultPath, launchedPath, recipient, signal, request.Command)
+	command := agentruntime.PaneExitStatusCommand(helper, "tmux", agentruntime.HandoffPromptCommand(helper, "tmux", buffer, resultPath, launchedPath, recipient, signal, request.Command))
 	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony handoff in the current worktree. It may contain review feedback or confirmed human instructions. %s Current source refs are available under refs/remotes/agent-symphony/. Do not push; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", humanInstructionPrecedence, request.Handoff)
 	if _, err := runHostTmux(ctx, []string{"load-buffer", "-b", buffer, "-"}, bytes.NewReader(prompt)); err != nil {
 		return "", err
 	}
 	if err := writeImmutable(launchingPath, []byte(recipient)); err != nil {
+		return "", err
+	}
+	if _, err := runHostTmux(ctx, []string{"set-option", "-p", "-t", pane, agentruntime.PaneExitStatusOption, ""}, nil); err != nil {
 		return "", err
 	}
 	tmuxArgs := append(append([]string{"respawn-pane", "-k", "-t", pane, "-c", request.Manifest.Worktree, "--"}, command...), ";", "wait-for", signal)
