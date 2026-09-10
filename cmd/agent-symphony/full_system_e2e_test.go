@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -20,19 +21,22 @@ import (
 
 	"github.com/SysSU/agent-symphony/internal/config"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
+	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
 type fullSystemGitHub struct {
-	mu       sync.Mutex
-	base     string
-	origin   string
-	comments []map[string]any
-	labels   map[string]bool
-	requests []string
-	failNext bool
-	pr       map[string]any
-	merged   bool
-	closed   bool
+	mu              sync.Mutex
+	base            string
+	origin          string
+	comments        []map[string]any
+	labels          map[string]bool
+	requests        []string
+	failNext        bool
+	pr              map[string]any
+	merged          bool
+	closed          bool
+	denyMutations   bool
+	deniedMutations []string
 }
 
 type synchronizedBuffer struct {
@@ -57,6 +61,11 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	f.requests = append(f.requests, r.Method+" "+r.URL.RequestURI())
 	w.Header().Set("Content-Type", "application/json")
+	if f.denyMutations && githubMutationRequest(r) {
+		f.deniedMutations = append(f.deniedMutations, r.Method+" "+r.URL.RequestURI())
+		http.Error(w, `{"message":"GitHub mutation forbidden during removal"}`, http.StatusInternalServerError)
+		return
+	}
 	if f.failNext {
 		f.failNext = false
 		http.Error(w, `{"message":"transient fixture failure"}`, http.StatusServiceUnavailable)
@@ -171,6 +180,10 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, fmt.Sprintf(`{"message":"unhandled fixture endpoint %s %s"}`, r.Method, r.URL.RequestURI()), http.StatusNotFound)
 	}
+}
+
+func githubMutationRequest(r *http.Request) bool {
+	return r.Method != http.MethodGet && r.Method != http.MethodHead && !(r.Method == http.MethodPost && r.URL.Path == "/graphql")
 }
 
 func writeFixtureJSON(w http.ResponseWriter, value any) {
@@ -558,7 +571,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	fixture.mu.Unlock()
 
 	restartAddress := freeAddress(t)
-	restarted := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", restartAddress, "--interval", serveInterval)
+	restarted := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", restartAddress, "--interval", "30s")
 	restarted.Dir, restarted.Env = repository, server.Env
 	var restartOutput synchronizedBuffer
 	restarted.Stdout, restarted.Stderr = &restartOutput, &restartOutput
@@ -604,6 +617,128 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	if createdBeforeRestart != 1 || mergedBeforeRestart != 1 || createdAfterRestart != 1 || mergedAfterRestart != 1 {
 		t.Fatalf("restart duplicated publication: PR creates=%d→%d merges=%d→%d", createdBeforeRestart, createdAfterRestart, mergedBeforeRestart, mergedAfterRestart)
 	}
+
+	runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot}
+	manifests, err := runtimeState.Discover()
+	if err != nil {
+		t.Fatal(err)
+	}
+	findAttempt := func(number int) agentruntime.Manifest {
+		index := slices.IndexFunc(manifests, func(manifest agentruntime.Manifest) bool {
+			return manifest.Repository == "o/r" && manifest.Issue == 73 && manifest.Attempt == number
+		})
+		if index < 0 {
+			t.Fatalf("attempt %d manifest missing before permanent-removal fixture: %#v", number, manifests)
+		}
+		return manifests[index]
+	}
+	removedManifest, retainedManifest := findAttempt(1), findAttempt(2)
+	if info, statErr := os.Stat(removedManifest.Worktree); statErr != nil || !info.IsDir() {
+		t.Fatalf("historical worktree is unavailable before removal: %v", statErr)
+	}
+	removedResult := agentruntime.ResultPath(removedManifest.Worktree)
+	if err := os.WriteFile(removedResult, []byte("historical result"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removedHandoff := filepath.Join(filepath.Dir(removedManifest.LogPath), "handoff.json")
+	retainedHandoff := filepath.Join(filepath.Dir(retainedManifest.LogPath), "unrelated-handoff.json")
+	for path, body := range map[string]string{removedHandoff: "selected", retainedHandoff: "unrelated"} {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removedAttempt := agentruntime.Attempt{Repository: "o/r", Issue: 73, Number: 1, BaseSHA: removedManifest.BaseSHA}
+	retainedAttempt := agentruntime.Attempt{Repository: "o/r", Issue: 73, Number: 2, BaseSHA: retainedManifest.BaseSHA}
+	snapshotRoot := productionSnapshotRoot(stateRoot)
+	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	removedSnapshot, removedReviewSession := reviewIdentity(removedAttempt, snapshotRoot)
+	retainedSnapshot, _ := reviewIdentity(retainedAttempt, snapshotRoot)
+	removedReviewResult := removedSnapshot + ".result-0123456789abcdef"
+	for _, path := range []string{removedSnapshot, removedReviewResult, retainedSnapshot} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tmuxEnvironment := append(os.Environ(), "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
+	unrelatedSession := "as-unrelated-permanent-removal"
+	for _, session := range []string{removedManifest.Session, removedReviewSession, unrelatedSession} {
+		ensureFullSystemTmuxSession(t, tmuxEnvironment, session, repository)
+	}
+	fixture.mu.Lock()
+	fixture.denyMutations = true
+	fixture.mu.Unlock()
+	journalPath := filepath.Join(stateRoot, "removal-state.json")
+	if _, err := os.Lstat(journalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected removal journal before partial-failure fixture: %v", err)
+	}
+	permissionChanged := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Lstat(journalPath); err == nil {
+				permissionChanged <- os.Chmod(stateRoot, 0o500)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		permissionChanged <- errors.New("removal journal was not observed")
+	}()
+	lateRemovalCLI := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "remove", "--issue", "73", "--attempt", "1", "--confirm", "--request-id", "full-system-late-removal", "--timeout", controlTimeout, "--json")
+	lateRemovalOutput, lateRemovalErr := lateRemovalCLI.CombinedOutput()
+	permissionErr := <-permissionChanged
+	restoreErr := os.Chmod(stateRoot, 0o700)
+	if permissionErr != nil || restoreErr != nil {
+		t.Fatalf("inject late dashboard-state failure: chmod=%v restore=%v", permissionErr, restoreErr)
+	}
+	if lateRemovalErr == nil {
+		t.Fatalf("late dashboard-state failure unexpectedly succeeded: %s", lateRemovalOutput)
+	}
+	if _, err := os.Lstat(filepath.Dir(removedManifest.LogPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("late failure did not occur after retained record cleanup: %v output=%s", err, lateRemovalOutput)
+	}
+	partialState, err := (&dashboardServer{stateRoot: stateRoot, repository: "o/r"}).readState()
+	if err != nil || slices.Contains(partialState.Hidden, dashboardHiddenAttempt{Repository: "o/r", Issue: 73, Attempt: 1, Reason: "removed"}) {
+		t.Fatalf("late failure incorrectly completed dashboard state: state=%#v err=%v output=%s", partialState, err, lateRemovalOutput)
+	}
+	removalPlaywright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "removal-playwright"))
+	removalPlaywright.Dir = source
+	removalPlaywright.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+restartAddress)
+	if removalOutput, removalErr := removalPlaywright.CombinedOutput(); removalErr != nil {
+		t.Fatalf("real permanent-removal Playwright: %v\n%s\nserve:\n%s", removalErr, removalOutput, restartOutput.String())
+	}
+	removeCLI := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "remove", "--issue", "73", "--attempt", "1", "--confirm", "--request-id", "full-system-removal-retry", "--timeout", controlTimeout, "--json")
+	removeOutput, err := removeCLI.CombinedOutput()
+	if err != nil || !strings.Contains(string(removeOutput), `"ok":true`) {
+		t.Fatalf("idempotent permanent-removal CLI: %v output=%s serve=%s", err, removeOutput, restartOutput.String())
+	}
+	for _, path := range []string{removedManifest.Worktree, removedResult, filepath.Dir(removedManifest.LogPath), removedSnapshot, removedReviewResult} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("selected resource remains after permanent removal: %s: %v", path, err)
+		}
+	}
+	for _, session := range []string{removedManifest.Session, removedReviewSession} {
+		if fullSystemTmuxSessionExists(tmuxEnvironment, session) {
+			t.Fatalf("selected tmux session remains after permanent removal: %s", session)
+		}
+	}
+	for _, path := range []string{filepath.Join(filepath.Dir(retainedManifest.LogPath), "manifest.json"), retainedHandoff, retainedSnapshot} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("unrelated resource changed during permanent removal: %s: %v", path, err)
+		}
+	}
+	for _, session := range []string{unrelatedSession} {
+		if !fullSystemTmuxSessionExists(tmuxEnvironment, session) {
+			t.Fatalf("unrelated tmux session changed during permanent removal: %s", session)
+		}
+	}
+	fixture.mu.Lock()
+	deniedMutations := append([]string(nil), fixture.deniedMutations...)
+	fixture.mu.Unlock()
+	if len(deniedMutations) != 0 {
+		t.Fatalf("permanent removal attempted GitHub mutations: %q", deniedMutations)
+	}
 	if err := restarted.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
 	}
@@ -611,6 +746,51 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatalf("restarted serve shutdown: %v output=%s", err, restartOutput.String())
 	}
 	restartedStopped = true
+
+	removalRestartAddress := freeAddress(t)
+	removalRestarted := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", removalRestartAddress, "--interval", "30s")
+	removalRestarted.Dir, removalRestarted.Env = repository, server.Env
+	var removalRestartOutput synchronizedBuffer
+	removalRestarted.Stdout, removalRestarted.Stderr = &removalRestartOutput, &removalRestartOutput
+	if err := removalRestarted.Start(); err != nil {
+		t.Fatal(err)
+	}
+	removalRestartStopped := false
+	t.Cleanup(func() {
+		if !removalRestartStopped {
+			_ = removalRestarted.Process.Kill()
+			_ = removalRestarted.Wait()
+		}
+	})
+	waitHTTP(t, "http://"+removalRestartAddress+"/status.json", deadline(15*time.Second), &removalRestartOutput)
+	reconcileAfterRemoval := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "reconcile", "--request-id", "full-system-after-removal", "--timeout", controlTimeout, "--json")
+	reconcileOutput, err := reconcileAfterRemoval.CombinedOutput()
+	if err != nil || !strings.Contains(string(reconcileOutput), `"ok":true`) {
+		t.Fatalf("post-removal restart reconcile: %v output=%s serve=%s", err, reconcileOutput, removalRestartOutput.String())
+	}
+	response, err = http.Get("http://" + removalRestartAddress + "/dashboard-state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var removalState dashboardState
+	decodeErr = json.NewDecoder(response.Body).Decode(&removalState)
+	_ = response.Body.Close()
+	if decodeErr != nil || !slices.Contains(removalState.Hidden, dashboardHiddenAttempt{Repository: "o/r", Issue: 73, Attempt: 1, Reason: "removed"}) {
+		t.Fatalf("removed attempt did not persist after restart/reconcile: state=%#v err=%v", removalState, decodeErr)
+	}
+	fixture.mu.Lock()
+	deniedMutations = append([]string(nil), fixture.deniedMutations...)
+	fixture.mu.Unlock()
+	if len(deniedMutations) != 0 {
+		t.Fatalf("restart/reconcile attempted GitHub mutations during removal proof: %q", deniedMutations)
+	}
+	if err := removalRestarted.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := removalRestarted.Wait(); err != nil {
+		t.Fatalf("post-removal serve shutdown: %v output=%s", err, removalRestartOutput.String())
+	}
+	removalRestartStopped = true
 	if err := stopFullSystemTmux(server.Env, currentSession); err != nil {
 		t.Fatal(err)
 	}
@@ -689,6 +869,24 @@ func waitFor(timeout time.Duration, ready func() bool) bool {
 		time.Sleep(25 * time.Millisecond)
 	}
 	return ready()
+}
+
+func ensureFullSystemTmuxSession(t *testing.T, environment []string, session, dir string) {
+	t.Helper()
+	if fullSystemTmuxSessionExists(environment, session) {
+		return
+	}
+	command := exec.Command("tmux", "new-session", "-d", "-s", session, "-c", dir, "sleep", "300")
+	command.Env = environment
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create exact fixture tmux session %s: %v: %s", session, err, output)
+	}
+}
+
+func fullSystemTmuxSessionExists(environment []string, session string) bool {
+	command := exec.Command("tmux", "has-session", "-t", "="+session)
+	command.Env = environment
+	return command.Run() == nil
 }
 
 func stopFullSystemTmux(environment []string, session string) error {

@@ -1200,6 +1200,18 @@ func TestForgetRemovesOnlyCleanedAttemptRecord(t *testing.T) {
 	if err := r.Forget(manifest); err != nil {
 		t.Fatal(err)
 	}
+	if err := r.Forget(manifest); err != nil {
+		t.Fatalf("idempotent forget after restart-style retry: %v", err)
+	}
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Forget(manifest); err == nil || !strings.Contains(err.Error(), "resource still exists") {
+		t.Fatalf("missing record accepted a reappeared worker resource: %v", err)
+	}
+	if err := os.RemoveAll(manifest.Worktree); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(filepath.Dir(manifest.LogPath)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("attempt record remains: %v", err)
 	}

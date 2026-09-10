@@ -989,7 +989,7 @@ func TestDashboardPermanentlyRemovesOnlyOneHistoricalAttempt(t *testing.T) {
 		stateRoot:  root,
 		repository: previous.Repository,
 		mu:         operationMu,
-		reconcile: func(context.Context) error {
+		removalRefresh: func(context.Context) error {
 			if operationMu.TryLock() {
 				operationMu.Unlock()
 				t.Fatal("removal reconciled outside the operation lock")
@@ -1060,7 +1060,7 @@ func TestDashboardPermanentRemovalRetainsEntryWhenCleanupFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := &dashboardServer{
-		stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, reconcile: func(context.Context) error { return nil },
+		stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
 		remove: func(context.Context, string, agentruntime.Manifest, string) error {
 			return errors.New("worktree has uncommitted changes")
 		},
@@ -1079,6 +1079,172 @@ func TestDashboardPermanentRemovalRetainsEntryWhenCleanupFails(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(previous.LogPath), "manifest.json")); err != nil {
 		t.Fatalf("failed removal lost attempt record: %v", err)
+	}
+}
+
+func TestDashboardPermanentRemovalConvergesAfterDestructiveStepFailureAndRestart(t *testing.T) {
+	for _, failAfter := range []string{"review", "implementation", "forget", "state"} {
+		t.Run(failAfter, func(t *testing.T) {
+			root, _ := filepath.EvalSymlinks(t.TempDir())
+			previous := writeDashboardManifest(t, root, 34, 1, "failed")
+			current := writeDashboardManifest(t, root, 34, 2, "running")
+			other := writeDashboardManifest(t, root, 35, 1, "failed")
+			if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{
+				{Repository: previous.Repository, Issue: previous.Issue, Attempt: previous.Attempt, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session},
+				{Repository: current.Repository, Issue: current.Issue, Attempt: current.Attempt, State: "active", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session},
+				{Repository: other.Repository, Issue: other.Issue, Attempt: other.Attempt, State: "failed", Branch: other.Branch, Worktree: other.Worktree, Session: other.Session},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			selectedReview := filepath.Join(root, "selected-review")
+			selectedImplementation := filepath.Join(root, "selected-implementation")
+			otherResource := filepath.Join(root, "unrelated-resource")
+			for _, path := range []string{selectedReview, selectedImplementation, otherResource} {
+				if err := os.WriteFile(path, []byte("owned"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			removeFile := func(path string) error {
+				err := os.Remove(path)
+				if errors.Is(err, os.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+			failed := false
+			runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(root), StateRoot: root}
+			server := &dashboardServer{
+				stateRoot: root, repository: previous.Repository, mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
+				remove: func(_ context.Context, operation string, manifest agentruntime.Manifest, _ string) error {
+					if manifest.Issue != previous.Issue || manifest.Attempt != previous.Attempt {
+						t.Fatalf("wrong implementation identity: %#v", manifest)
+					}
+					if operation != "remove" {
+						return nil
+					}
+					if err := removeFile(selectedImplementation); err != nil {
+						return err
+					}
+					if failAfter == "implementation" && !failed {
+						failed = true
+						return errors.New("injected failure after implementation cleanup")
+					}
+					return nil
+				},
+				reviewCleanup: func(_ context.Context, manifest agentruntime.Manifest, remove bool) error {
+					if manifest.Issue != previous.Issue || manifest.Attempt != previous.Attempt {
+						t.Fatalf("wrong review identity: %#v", manifest)
+					}
+					if !remove {
+						return nil
+					}
+					if err := removeFile(selectedReview); err != nil {
+						return err
+					}
+					if failAfter == "review" && !failed {
+						failed = true
+						return errors.New("injected failure after review cleanup")
+					}
+					return nil
+				},
+				forget: func(manifest agentruntime.Manifest) error {
+					if err := runtimeState.Forget(manifest); err != nil {
+						return err
+					}
+					if failAfter == "forget" && !failed {
+						failed = true
+						return errors.New("injected failure after retained record cleanup")
+					}
+					return nil
+				},
+			}
+			if failAfter == "state" {
+				server.stateWrite = func(dashboardState) error {
+					failed = true
+					return errors.New("injected dashboard state failure")
+				}
+			}
+			request := func(target *dashboardServer) *httptest.ResponseRecorder {
+				r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/remove?repository=o%2Fr&issue=34&attempt=1", nil)
+				r.Header.Set("Origin", "http://127.0.0.1")
+				response := httptest.NewRecorder()
+				target.handler(http.NotFoundHandler()).ServeHTTP(response, r)
+				return response
+			}
+			if response := request(server); response.Code != http.StatusConflict && response.Code != http.StatusInternalServerError {
+				t.Fatalf("injected failure status=%d body=%q", response.Code, response.Body.String())
+			}
+			if !failed {
+				t.Fatal("failure was not injected")
+			}
+			if _, found, err := server.removalIntent(previous.Repository, previous.Issue, previous.Attempt); err != nil || !found {
+				t.Fatalf("durable intent found=%v err=%v", found, err)
+			}
+			if state, err := server.readState(); err != nil || len(state.Hidden) != 0 {
+				t.Fatalf("failed cleanup hid the entry: state=%#v err=%v", state, err)
+			}
+			for _, path := range []string{filepath.Join(filepath.Dir(current.LogPath), "manifest.json"), filepath.Join(filepath.Dir(other.LogPath), "manifest.json"), otherResource} {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("failed cleanup changed unrelated resource %s: %v", path, err)
+				}
+			}
+
+			if failAfter == "state" {
+				if err := os.Remove(filepath.Join(root, "status.json")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			restarted := &dashboardServer{
+				stateRoot: root, repository: previous.Repository, mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
+				remove: server.remove, reviewCleanup: server.reviewCleanup,
+			}
+			if response := request(restarted); response.Code != http.StatusOK {
+				t.Fatalf("restart retry status=%d body=%q", response.Code, response.Body.String())
+			}
+			state, err := restarted.readState()
+			if err != nil || !slices.Equal(state.Hidden, []dashboardHiddenAttempt{{Repository: "o/r", Issue: 34, Attempt: 1, Reason: "removed"}}) {
+				t.Fatalf("final dashboard state=%#v err=%v", state, err)
+			}
+			if removal, err := restarted.readRemovalState(); err != nil || len(removal.Intents) != 0 {
+				t.Fatalf("final removal journal=%#v err=%v", removal, err)
+			}
+			if _, err := os.Stat(filepath.Dir(previous.LogPath)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("selected retained record remains: %v", err)
+			}
+			for _, path := range []string{filepath.Join(filepath.Dir(current.LogPath), "manifest.json"), filepath.Join(filepath.Dir(other.LogPath), "manifest.json"), otherResource} {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("retry changed unrelated resource %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDashboardPermanentRemovalReplacesPriorHiddenReason(t *testing.T) {
+	for _, reason := range []string{"dismissed", "archived"} {
+		t.Run(reason, func(t *testing.T) {
+			root, _ := filepath.EvalSymlinks(t.TempDir())
+			previous := writeDashboardManifest(t, root, 36, 1, "failed")
+			current := writeDashboardManifest(t, root, 36, 2, "running")
+			if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{
+				{Repository: previous.Repository, Issue: 36, Attempt: 1, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session},
+				{Repository: current.Repository, Issue: 36, Attempt: 2, State: "active", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			server := &dashboardServer{stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil }, remove: func(context.Context, string, agentruntime.Manifest, string) error { return nil }, reviewCleanup: func(context.Context, agentruntime.Manifest, bool) error { return nil }}
+			if err := server.writeState(dashboardState{Version: dashboardStateVersion, Hidden: []dashboardHiddenAttempt{{Repository: "o/r", Issue: 36, Attempt: 1, Reason: reason}}}); err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/remove?repository=o%2Fr&issue=36&attempt=1", nil)
+			request.Header.Set("Origin", "http://127.0.0.1")
+			response := httptest.NewRecorder()
+			server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
+			state, err := server.readState()
+			if response.Code != http.StatusOK || err != nil || !slices.Equal(state.Hidden, []dashboardHiddenAttempt{{Repository: "o/r", Issue: 36, Attempt: 1, Reason: "removed"}}) {
+				t.Fatalf("status=%d body=%q state=%#v err=%v", response.Code, response.Body.String(), state, err)
+			}
+		})
 	}
 }
 

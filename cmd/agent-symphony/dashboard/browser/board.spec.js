@@ -359,7 +359,7 @@ test("dismisses one closed-issue attempt while retaining diagnostics", async ({ 
   await page.screenshot({ path: "test-results/closed-attempt-dismissal-mobile.png", fullPage: true });
 });
 
-test("permanently removes one historical attempt and its managed resources", async ({ page }) => {
+test("confirms permanent removal and keeps unrelated attempts visible", async ({ page }) => {
   const previous = {
     repository: "SysSU/agent-symphony",
     issue: 220,
@@ -372,17 +372,11 @@ test("permanently removes one historical attempt and its managed resources", asy
   const current = { ...previous, attempt: 2, state: "active", diagnostic: "current work" };
   const other = { ...previous, issue: 221, attempt: 1, state: "failed", diagnostic: "unrelated failure" };
   const dashboard = await mockDashboard(page, [previous, current, other]);
-  const resources = new Map([
-    ["SysSU/agent-symphony#220/1", ["implementation session", "review session", "worktree", "manifest", "log", "snapshot", "result", "handoff"]],
-    ["SysSU/agent-symphony#220/2", ["implementation session", "worktree", "manifest"]],
-    ["SysSU/agent-symphony#221/1", ["worktree", "manifest", "log"]],
-  ]);
   const requests = [];
   await page.route("**/actions/remove?*", (route) => {
     const url = new URL(route.request().url());
     const key = `${url.searchParams.get("repository")}#${url.searchParams.get("issue")}/${url.searchParams.get("attempt")}`;
     requests.push({ method: route.request().method(), key });
-    resources.delete(key);
     dashboard.hide(previous, "removed");
     return route.fulfill({ json: { ok: true } });
   });
@@ -405,9 +399,6 @@ test("permanently removes one historical attempt and its managed resources", asy
   expect(confirmation).toContain("managed worktree, implementation and review sessions, logs, diagnostics, snapshots, and related artifacts");
   expect(confirmation).toContain("cannot be restored");
   expect(requests).toEqual([{ method: "POST", key: "SysSU/agent-symphony#220/1" }]);
-  expect(resources.has("SysSU/agent-symphony#220/1")).toBe(false);
-  expect(resources.has("SysSU/agent-symphony#220/2")).toBe(true);
-  expect(resources.has("SysSU/agent-symphony#221/1")).toBe(true);
 
   await page.reload();
   await expect(page.getByText("old failure", { exact: true })).toHaveCount(0);

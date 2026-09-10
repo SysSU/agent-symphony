@@ -877,7 +877,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 			}
 			return err
 		}
-		dashboardURL, err := startProjectDashboard(ctx, *dashboardAddress, *runtimeState, c.Repository, peerProjects, operationMu, recoverAttempt, startPlanReview, reconcile, agent, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
+		removalRefresh := func(ctx context.Context) error {
+			_, err := reconcileGitHubWith(ctx, *path, *statePath, *runtimeState, reconcileOptions{transition: false, intake: false, timeout: 2 * time.Minute})
+			return err
+		}
+		dashboardURL, err := startProjectDashboard(ctx, *dashboardAddress, *runtimeState, c.Repository, peerProjects, operationMu, recoverAttempt, startPlanReview, reconcile, removalRefresh, agent, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
