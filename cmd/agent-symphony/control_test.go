@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/SysSU/agent-symphony/internal/config"
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
@@ -48,13 +49,8 @@ type ownerTestFileInfo struct {
 func (i ownerTestFileInfo) Sys() any { return &i.stat }
 
 func TestControlServeHelper(t *testing.T) {
-	mode := os.Getenv("AGENT_SYMPHONY_CONTROL_SERVE_HELPER")
-	if mode == "" {
+	if os.Getenv("AGENT_SYMPHONY_CONTROL_SERVE_HELPER") == "" {
 		return
-	}
-	if mode == "matrix" {
-		runControlMatrixHelper()
-		os.Exit(0)
 	}
 	githubAPI = os.Getenv("AGENT_SYMPHONY_CONTROL_GITHUB_URL")
 	githubClient = http.DefaultClient
@@ -63,75 +59,6 @@ func TestControlServeHelper(t *testing.T) {
 		os.Exit(2)
 	}
 	os.Exit(run(args, io.Discard, io.Discard))
-}
-
-type matrixOrchestrator struct{ marker string }
-
-func (m matrixOrchestrator) Status(context.Context) (orchestratoragent.Status, error) {
-	return orchestratoragent.Status{Enabled: true, State: "running"}, nil
-}
-func (m matrixOrchestrator) AttachTarget(context.Context) (orchestratoragent.AttachTarget, error) {
-	return orchestratoragent.AttachTarget{Session: "as-o-o-r"}, nil
-}
-func (m matrixOrchestrator) action(name string) (orchestratoragent.Status, error) {
-	appendMatrixAction(m.marker, name)
-	return orchestratoragent.Status{Enabled: true, State: "running"}, nil
-}
-func (m matrixOrchestrator) Recover(context.Context) (orchestratoragent.Status, error) {
-	return m.action("orchestrator-recover")
-}
-func (m matrixOrchestrator) Clear(context.Context) (orchestratoragent.Status, error) {
-	return m.action("orchestrator-clear")
-}
-func (m matrixOrchestrator) Rebuild(context.Context) (orchestratoragent.Status, error) {
-	return m.action("orchestrator-rebuild")
-}
-func (m matrixOrchestrator) Investigate(context.Context, int, int) (orchestratoragent.Status, error) {
-	return m.action("orchestrator-investigate")
-}
-
-func appendMatrixAction(path, action string) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err == nil {
-		_, _ = fmt.Fprintln(file, action)
-		_ = file.Close()
-	}
-}
-
-func runControlMatrixHelper() {
-	root := os.Getenv("AGENT_SYMPHONY_CONTROL_ROOT")
-	marker := filepath.Join(root, "matrix-actions")
-	lock, err := acquireDaemonLock(filepath.Join(root, "daemon.lock"))
-	if err != nil {
-		os.Exit(2)
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	project := newProjectDashboardServer(ctx, root, "o/r", nil, "tmux", &sync.Mutex{}, func(context.Context, int, int) error {
-		appendMatrixAction(marker, "recover")
-		return nil
-	}, func(context.Context, int, int) error {
-		appendMatrixAction(marker, "review-plan")
-		return nil
-	}, func(context.Context) error {
-		appendMatrixAction(marker, "reconcile")
-		time.Sleep(300 * time.Millisecond)
-		return nil
-	}, matrixOrchestrator{marker: marker}, false, "dashboard-secret-canary")
-	project.issueClosed = func(context.Context, string, int) (bool, error) { return true, nil }
-	project.cleanup = func(_ context.Context, action string, _ agentruntime.Manifest) error {
-		appendMatrixAction(marker, action)
-		return nil
-	}
-	if startControlServer(ctx, project, io.Discard) != nil {
-		os.Exit(2)
-	}
-	if os.WriteFile(filepath.Join(root, "matrix-ready"), []byte("ready\n"), 0o600) != nil {
-		os.Exit(2)
-	}
-	<-ctx.Done()
-	stop()
-	_ = os.Remove(controlSocketPath(root))
-	releaseDaemonLock(lock)
 }
 
 func TestControlRequestRequiresExactIdentityAndConfirmation(t *testing.T) {
@@ -239,6 +166,14 @@ func TestRunningDaemonControlWorksWhileDaemonLockIsHeldAndReportsBusy(t *testing
 	operationMu.Unlock()
 	if err != nil || busy.OK || !busy.Retryable || busy.Status != http.StatusServiceUnavailable || recovered != 1 {
 		t.Fatalf("busy=%#v recovered=%d err=%v", busy, recovered, err)
+	}
+	retried, err := callRunningDaemon(t.Context(), root, request)
+	if err != nil || !retried.OK || retried.Status != http.StatusOK || recovered != 2 {
+		t.Fatalf("retried=%#v recovered=%d err=%v", retried, recovered, err)
+	}
+	replayedRetry, err := callRunningDaemon(t.Context(), root, request)
+	if err != nil || !replayedRetry.OK || replayedRetry.Status != http.StatusOK || recovered != 2 {
+		t.Fatalf("replayed retry=%#v recovered=%d err=%v", replayedRetry, recovered, err)
 	}
 	if err := os.Chmod(controlSocketPath(root), 0o666); err != nil {
 		t.Fatal(err)
@@ -350,14 +285,203 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 	stopped = true
 }
 
-func TestCompiledCLIInvokesEveryGuardedActionOnRunningControlProcess(t *testing.T) {
-	root := resolvedTempDir(t)
-	cleanupControlSocket(t, root)
-	if err := bindDeployment(root, "o/r"); err != nil {
+func TestCompiledCLIInvokesEveryGuardedActionOnActualServeProcess(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	sourceDir, err := os.Getwd()
+	if err != nil {
 		t.Fatal(err)
 	}
-	completed := writeDashboardManifest(t, root, 32, 1, "completed")
-	orphaned := writeDashboardManifest(t, root, 33, 1, "failed")
+	repositoryRoot, err := os.MkdirTemp("/tmp", "as-251-serve-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(repositoryRoot) })
+	repositoryRoot, err = filepath.EvalSymlinks(repositoryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "-C", repositoryRoot, "init", "-q", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	runGit(t, repositoryRoot, "config", "user.email", "test@example.invalid")
+	runGit(t, repositoryRoot, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(repositoryRoot, "README.md"), []byte("control integration\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repositoryRoot, "add", "README.md")
+	runGit(t, repositoryRoot, "commit", "-m", "initial")
+	base := runGit(t, repositoryRoot, "rev-parse", "HEAD")
+	stateRoot := filepath.Join(repositoryRoot, "runtime")
+	cleanupControlSocket(t, stateRoot)
+	cfg := config.Default("o/r")
+	cfg.Commands.Orchestrator = []string{"sh", "-c", "exec sleep 300"}
+	cfg.Commands.OrchestratorAudit = nil
+	configPath := filepath.Join(repositoryRoot, config.DefaultPath)
+	if err := config.Write(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(repositoryRoot, "pr-state.json")
+	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var githubReads atomic.Int32
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		githubReads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/user":
+			_, _ = io.WriteString(w, `{"id":42,"login":"coordinator"}`)
+		case "/repos/o/r":
+			_, _ = io.WriteString(w, `{"full_name":"o/r","default_branch":"main","permissions":{"pull":true}}`)
+		case "/repos/o/r/branches/main":
+			_, _ = fmt.Fprintf(w, `{"commit":{"sha":%q}}`, base)
+		case "/repos/o/r/issues/34":
+			_, _ = io.WriteString(w, `{"number":34,"state":"closed"}`)
+		case "/repos/o/r/issues", "/repos/o/r/pulls":
+			_, _ = io.WriteString(w, `[]`)
+		case "/graphql":
+			_, _ = io.WriteString(w, `{"data":{"repository":{"issue":null}}}`)
+		default:
+			http.Error(w, `{"message":"unexpected test endpoint"}`, http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	binary := filepath.Join(t.TempDir(), "agent-symphony")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	build.Dir = sourceDir
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v: %s", err, output)
+	}
+	curl, err := exec.LookPath("curl")
+	if err != nil {
+		t.Skip("curl is unavailable")
+	}
+	fakeBin := t.TempDir()
+	gh := filepath.Join(fakeBin, "gh")
+	ghScript := fmt.Sprintf(`#!/bin/sh
+method=GET
+endpoint=
+input=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --method) shift; method=$1 ;;
+    --input) shift; input=1 ;;
+    /*|graphql) endpoint=$1 ;;
+  esac
+  shift
+done
+test "$endpoint" = graphql && endpoint=/graphql
+if [ "$input" -eq 1 ]; then
+  exec %q -sS -i -X "$method" --data-binary @- "$FAKE_GITHUB_URL$endpoint"
+fi
+exec %q -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
+`, curl, curl)
+	if err := os.WriteFile(gh, []byte(ghScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	password := filepath.Join(repositoryRoot, "dashboard-password")
+	if err := os.WriteFile(password, []byte("dashboard-secret-canary\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", "127.0.0.1:0", "--dashboard-password-file", password, "--interval", "60s")
+	server.Dir = repositoryRoot
+	server.Env = append(os.Environ(), "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_GITHUB_URL="+github.URL, "GH_TOKEN=process-secret-canary", "CODEX_HOME="+t.TempDir())
+	var serverOutput bytes.Buffer
+	server.Stdout, server.Stderr = &serverOutput, &serverOutput
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	process, _ := exec.Command("ps", "-o", "command=", "-p", strconv.Itoa(server.Process.Pid)).Output()
+	if strings.Contains(string(process), "process-secret-canary") || strings.Contains(string(process), "dashboard-secret-canary") {
+		t.Fatalf("credential appeared in serve process listing: %q", process)
+	}
+	stopped := false
+	tmuxEnv := append(os.Environ(), "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
+	sessions := []string{orchestratoragent.Session("o/r")}
+	t.Cleanup(func() {
+		if !stopped {
+			_ = server.Process.Kill()
+			_ = server.Wait()
+		}
+		for _, session := range sessions {
+			command := exec.Command("tmux", "kill-session", "-t", "="+session)
+			command.Env = tmuxEnv
+			_ = command.Run()
+		}
+	})
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if info, socketErr := os.Lstat(controlSocketPath(stateRoot)); socketErr == nil && info.Mode()&os.ModeSocket != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("serve did not publish control socket: %q", serverOutput.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if lock, err := acquireDaemonLock(filepath.Join(stateRoot, "daemon.lock")); err == nil {
+		releaseDaemonLock(lock)
+		t.Fatal("serve process did not retain daemon lock")
+	}
+	invokeControl := func(name, requestID string, issue int, confirm bool) (string, error) {
+		t.Helper()
+		args := []string{"control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", name, "--request-id", requestID, "--timeout", "2m", "--json"}
+		if issue > 0 {
+			args = append(args, "--issue", strconv.Itoa(issue), "--attempt", "1")
+		}
+		if confirm {
+			args = append(args, "--confirm")
+		}
+		command := exec.Command(binary, args...)
+		command.Env = append(os.Environ(), "GITHUB_TOKEN=process-secret-canary")
+		var output bytes.Buffer
+		command.Stdout, command.Stderr = &output, &output
+		err := command.Run()
+		if strings.Contains(output.String(), "process-secret-canary") || strings.Contains(output.String(), "dashboard-secret-canary") {
+			t.Fatalf("%s output=%q", name, output.String())
+		}
+		return output.String(), err
+	}
+	for attempt := 0; ; attempt++ {
+		output, err := invokeControl("reconcile", "serve-reconcile-"+strconv.Itoa(attempt), 0, false)
+		if err == nil && strings.Contains(output, `"ok":true`) {
+			break
+		}
+		if attempt == 20 || !strings.Contains(output, `"retryable":true`) {
+			t.Fatalf("serve never completed initial reconciliation: err=%v output=%s", err, output)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	completed := writeDashboardManifest(t, stateRoot, 32, 1, "completed")
+	orphaned := writeDashboardManifest(t, stateRoot, 33, 1, "failed")
+	for index := range []agentruntime.Manifest{completed, orphaned} {
+		manifest := &completed
+		if index == 1 {
+			manifest = &orphaned
+		}
+		if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"init", "-b", manifest.Branch}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "test"}, {"commit", "--allow-empty", "-m", "attempt"}} {
+			runGit(t, manifest.Worktree, args...)
+		}
+		if manifest.State == "completed" {
+			manifest.ReviewHead = runGit(t, manifest.Worktree, "rev-parse", "HEAD")
+			body, _ := json.Marshal(manifest)
+			manifestPath := filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier("o/r"), fmt.Sprintf("%d-1", manifest.Issue), "manifest.json")
+			if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		sessions = append(sessions, manifest.Session)
+		command := exec.Command("tmux", "new-session", "-d", "-s", manifest.Session, "-c", manifest.Worktree)
+		command.Env = tmuxEnv
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("start cleanup session: %v: %s", err, output)
+		}
+	}
 	status := func(issue, attempt int, state string) orchestrator.RecoveryStatus {
 		session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", issue, attempt)
 		return orchestrator.RecoveryStatus{Repository: "o/r", Issue: issue, Attempt: attempt, State: state, Session: session}
@@ -372,90 +496,71 @@ func TestCompiledCLIInvokesEveryGuardedActionOnRunningControlProcess(t *testing.
 	dismiss := status(34, 1, "failed")
 	dismiss.IssueClosed = true
 	investigate := status(35, 1, "blocked")
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{recoverable, active, archive, abandon, dismiss, investigate}); err != nil {
+	statuses := []orchestrator.RecoveryStatus{recoverable, active, archive, abandon, dismiss, investigate}
+	if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
 		t.Fatal(err)
-	}
-	server := exec.Command(os.Args[0], "-test.run=^TestControlServeHelper$")
-	server.Env = append(os.Environ(), "AGENT_SYMPHONY_CONTROL_SERVE_HELPER=matrix", "AGENT_SYMPHONY_CONTROL_ROOT="+root)
-	var serverOutput bytes.Buffer
-	server.Stdout, server.Stderr = &serverOutput, &serverOutput
-	if err := server.Start(); err != nil {
-		t.Fatal(err)
-	}
-	stopped := false
-	t.Cleanup(func() {
-		if !stopped {
-			_ = server.Process.Kill()
-			_ = server.Wait()
-		}
-	})
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if _, err := os.Stat(filepath.Join(root, "matrix-ready")); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("control process did not become ready: %q", serverOutput.String())
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if lock, err := acquireDaemonLock(filepath.Join(root, "daemon.lock")); err == nil {
-		releaseDaemonLock(lock)
-		t.Fatal("running control process did not retain daemon lock")
-	}
-	binary := filepath.Join(t.TempDir(), "agent-symphony")
-	build := exec.Command("go", "build", "-o", binary, ".")
-	build.Dir = "."
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build CLI: %v: %s", err, output)
 	}
 	type action struct {
-		name           string
-		issue, attempt int
-		confirm        bool
+		name    string
+		issue   int
+		confirm bool
+		ok      bool
 	}
 	actions := []action{
-		{name: "reconcile"},
-		{name: "recover", issue: 30, attempt: 1},
-		{name: "review-plan", issue: 31, attempt: 1},
-		{name: "dismiss", issue: 34, attempt: 1},
-		{name: "archive", issue: 32, attempt: 1, confirm: true},
-		{name: "abandon", issue: 33, attempt: 1, confirm: true},
-		{name: "orchestrator-investigate", issue: 35, attempt: 1},
-		{name: "orchestrator-recover"},
-		{name: "orchestrator-clear"},
-		{name: "orchestrator-rebuild"},
+		{name: "dismiss", issue: 34, ok: true},
+		{name: "archive", issue: 32, confirm: true, ok: true},
+		{name: "abandon", issue: 33, confirm: true, ok: true},
+		{name: "orchestrator-recover", ok: true},
+		{name: "orchestrator-clear", ok: true},
+		{name: "orchestrator-rebuild", ok: true},
+		{name: "recover", issue: 30},
+		{name: "review-plan", issue: 31},
+		{name: "orchestrator-investigate", issue: 35},
 	}
 	for _, action := range actions {
-		args := []string{"control", "--repository", "o/r", "--runtime-state", root, "--action", action.name, "--request-id", "matrix-" + action.name, "--timeout", "2m", "--json"}
-		if action.issue > 0 {
-			args = append(args, "--issue", strconv.Itoa(action.issue), "--attempt", strconv.Itoa(action.attempt))
-		}
-		if action.confirm {
-			args = append(args, "--confirm")
-		}
-		command := exec.Command(binary, args...)
-		command.Env = append(os.Environ(), "GITHUB_TOKEN=process-secret-canary")
-		var output bytes.Buffer
-		command.Stdout, command.Stderr = &output, &output
-		if action.name == "reconcile" {
-			if err := command.Start(); err != nil {
+		if !action.ok {
+			if err := writeStatusSnapshot(stateRoot, statuses); err != nil {
 				t.Fatal(err)
 			}
-			time.Sleep(50 * time.Millisecond)
-			process, _ := exec.Command("ps", "-o", "command=", "-p", strconv.Itoa(command.Process.Pid)).Output()
-			if strings.Contains(string(process), "process-secret-canary") || strings.Contains(string(process), "dashboard-secret-canary") {
-				t.Fatalf("credential appeared in process listing: %q", process)
-			}
-			if err := command.Wait(); err != nil {
-				t.Fatalf("%s: %v output=%s", action.name, err, output.String())
-			}
-		} else if err := command.Run(); err != nil {
-			t.Fatalf("%s: %v output=%s", action.name, err, output.String())
 		}
-		if strings.Contains(output.String(), "process-secret-canary") || strings.Contains(output.String(), "dashboard-secret-canary") || !strings.Contains(output.String(), `"ok":true`) {
-			t.Fatalf("%s output=%q", action.name, output.String())
+		output, err := invokeControl(action.name, "serve-"+action.name, action.issue, action.confirm)
+		if action.ok && err != nil || !action.ok && err == nil {
+			t.Fatalf("%s: err=%v output=%s", action.name, err, output)
 		}
+		want := `"ok":true`
+		if !action.ok {
+			want = `"ok":false`
+		}
+		if !strings.Contains(output, want) {
+			t.Fatalf("%s output=%q", action.name, output)
+		}
+	}
+	if githubReads.Load() < 4 {
+		t.Fatalf("serve controls did not reach fake GitHub boundary: reads=%d", githubReads.Load())
+	}
+	for _, manifest := range []agentruntime.Manifest{completed, orphaned} {
+		if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("cleanup retained %s: %v", manifest.Worktree, err)
+		}
+		command := exec.Command("tmux", "has-session", "-t", "="+manifest.Session)
+		command.Env = tmuxEnv
+		if err := command.Run(); err == nil {
+			t.Fatalf("cleanup retained tmux session %s", manifest.Session)
+		}
+	}
+	stored, err := (&agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot}).Discover()
+	if err != nil || len(stored) != 1 || stored[0].Issue != completed.Issue {
+		t.Fatalf("post-cleanup manifests=%#v err=%v", stored, err)
+	}
+	var dashboard dashboardState
+	dashboardBody, err := os.ReadFile(filepath.Join(stateRoot, "dashboard-state.json"))
+	if err != nil || json.Unmarshal(dashboardBody, &dashboard) != nil || len(dashboard.Hidden) != 3 {
+		t.Fatalf("dashboard cleanup state=%s err=%v", dashboardBody, err)
+	}
+	orchestratorSession := exec.Command("tmux", "has-session", "-t", "="+orchestratoragent.Session("o/r"))
+	orchestratorSession.Env = tmuxEnv
+	if output, err := orchestratorSession.CombinedOutput(); err != nil {
+		t.Fatalf("orchestrator session was not live after rebuild: %v: %s", err, output)
 	}
 	if err := server.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
@@ -464,19 +569,6 @@ func TestCompiledCLIInvokesEveryGuardedActionOnRunningControlProcess(t *testing.
 		t.Fatalf("control process shutdown: %v output=%q", err, serverOutput.String())
 	}
 	stopped = true
-	marker, err := os.ReadFile(filepath.Join(root, "matrix-actions"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	counts := map[string]int{}
-	for _, line := range strings.Fields(string(marker)) {
-		counts[line]++
-	}
-	for _, want := range []string{"reconcile", "recover", "review-plan", "archive", "abandon", "orchestrator-investigate", "orchestrator-recover", "orchestrator-clear", "orchestrator-rebuild"} {
-		if counts[want] != 1 {
-			t.Errorf("action %s marker count in %q", want, marker)
-		}
-	}
 }
 
 func TestControlAndDashboardReturnTheSameRefusal(t *testing.T) {

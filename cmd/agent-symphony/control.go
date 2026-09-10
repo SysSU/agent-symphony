@@ -188,6 +188,13 @@ func (s *dashboardServer) performRecordedControl(ctx context.Context, request co
 	}
 	result = performDashboardControl(ctx, s, request)
 	result.Version, result.RequestID, result.Action = controlVersion, request.RequestID, request.Action
+	if result.Retryable {
+		receipts.Receipts = receipts.Receipts[:len(receipts.Receipts)-1]
+		if err := s.writeControlReceipts(receipts); err != nil {
+			return controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusInternalServerError, Error: "control retry state could not be recorded; replay was refused"}
+		}
+		return result
+	}
 	receipts.Receipts[len(receipts.Receipts)-1] = controlReceipt{Request: request, State: "completed", Result: &result}
 	if err := s.writeControlReceipts(receipts); err != nil {
 		return controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusInternalServerError, Error: "control outcome could not be recorded; replay was refused"}
