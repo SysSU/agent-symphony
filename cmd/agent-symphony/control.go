@@ -181,6 +181,16 @@ func (s *dashboardServer) performRecordedControl(ctx context.Context, request co
 		}
 		receipts.Receipts = slices.Delete(receipts.Receipts, completed, completed+1)
 	}
+	if request.Action != "orchestrator-session" {
+		operationMu := s.operationMutex()
+		operationMu.Lock()
+		defer operationMu.Unlock()
+		if ctx.Err() != nil {
+			result.Status, result.Retryable, result.Error = http.StatusServiceUnavailable, true, "reconciliation is in progress"
+			return result
+		}
+		ctx = context.WithValue(ctx, operationLockContextKey{}, operationMu)
+	}
 	receipts.Receipts = append(receipts.Receipts, controlReceipt{Request: request, State: "pending"})
 	if err := s.writeControlReceipts(receipts); err != nil {
 		result.Status, result.Error = http.StatusInternalServerError, "control request could not be recorded"

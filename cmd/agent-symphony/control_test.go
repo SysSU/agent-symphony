@@ -111,7 +111,7 @@ func TestControlOwnershipRejectsAnotherLocalIdentity(t *testing.T) {
 	}
 }
 
-func TestRunningDaemonControlWorksWhileDaemonLockIsHeldAndReportsBusy(t *testing.T) {
+func TestRunningDaemonControlWorksWhileDaemonLockIsHeldAndQueuesOperations(t *testing.T) {
 	root := resolvedTempDir(t)
 	cleanupControlSocket(t, root)
 	if err := bindDeployment(root, "o/r"); err != nil {
@@ -163,14 +163,21 @@ func TestRunningDaemonControlWorksWhileDaemonLockIsHeldAndReportsBusy(t *testing
 
 	operationMu.Lock()
 	request.RequestID = "busy-7-2"
-	busy, err := callRunningDaemon(t.Context(), root, request)
-	operationMu.Unlock()
-	if err != nil || busy.OK || !busy.Retryable || busy.Status != http.StatusServiceUnavailable || recovered != 1 {
-		t.Fatalf("busy=%#v recovered=%d err=%v", busy, recovered, err)
+	queued := make(chan controlResult, 1)
+	queuedErr := make(chan error, 1)
+	go func() {
+		result, err := callRunningDaemon(t.Context(), root, request)
+		queued <- result
+		queuedErr <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	if recovered != 1 {
+		t.Fatalf("recovery ran while reconciliation owned the operation lock: %d", recovered)
 	}
-	retried, err := callRunningDaemon(t.Context(), root, request)
-	if err != nil || !retried.OK || retried.Status != http.StatusOK || recovered != 2 {
-		t.Fatalf("retried=%#v recovered=%d err=%v", retried, recovered, err)
+	operationMu.Unlock()
+	completed, err := <-queued, <-queuedErr
+	if err != nil || !completed.OK || completed.Status != http.StatusOK || recovered != 2 {
+		t.Fatalf("completed=%#v recovered=%d err=%v", completed, recovered, err)
 	}
 	replayedRetry, err := callRunningDaemon(t.Context(), root, request)
 	if err != nil || !replayedRetry.OK || replayedRetry.Status != http.StatusOK || recovered != 2 {
@@ -836,6 +843,72 @@ func TestOldDaemonShutdownDoesNotRemoveReplacementControlSocket(t *testing.T) {
 	if err != nil || !result.OK {
 		t.Fatalf("replacement result=%#v err=%v", result, err)
 	}
+}
+
+func TestControlRecoveryQueuesBehindReconciliationAfterRestart(t *testing.T) {
+	root := resolvedTempDir(t)
+	cleanupControlSocket(t, root)
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 9, 1)
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 9, Attempt: 1, State: "failed", Retryable: true, Session: session, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "failed", Current: true}}}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+
+	operation := &sync.Mutex{}
+	project := newProjectDashboardServer(t.Context(), root, "o/r", nil, "tmux", operation, func(context.Context, int, int) error { return nil }, nil, nil, nil, false, "")
+	oldContext, stopOld := context.WithCancel(t.Context())
+	if err := startControlServer(oldContext, project, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	stopOld()
+	newContext, stopNew := context.WithCancel(t.Context())
+	defer stopNew()
+	if err := startControlServer(newContext, project, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	reconcileContext, stopReconcile := context.WithCancel(t.Context())
+	reconcileDone := make(chan error, 1)
+	var reconciling atomic.Bool
+	var overlaps atomic.Int32
+	var recoveries atomic.Int32
+	go func() {
+		reconcileDone <- orchestrator.ReconcileLoop(reconcileContext, time.Millisecond, func(context.Context) error {
+			operation.Lock()
+			defer operation.Unlock()
+			reconciling.Store(true)
+			defer reconciling.Store(false)
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			time.Sleep(5 * time.Millisecond)
+			return nil
+		})
+	}()
+	<-started
+	project.recover = func(context.Context, int, int) error {
+		recoveries.Add(1)
+		if reconciling.Load() {
+			overlaps.Add(1)
+		}
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"control", "--repository", "o/r", "--action", "recover", "--issue", "9", "--attempt", "1", "--runtime-state", root, "--request-id", "restart-recovery", "--timeout", "250ms", "--json"}, &stdout, &stderr)
+	if code != 0 || stderr.Len() != 0 || !strings.Contains(stdout.String(), `"ok":true`) || recoveries.Load() != 1 || overlaps.Load() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	stopReconcile()
+	if err := <-reconcileDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("reconcile loop: %v", err)
+	}
+	stopNew()
 }
 
 func TestControlCLIEmitsVersionedResult(t *testing.T) {
