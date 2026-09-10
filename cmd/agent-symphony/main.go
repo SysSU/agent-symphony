@@ -1447,15 +1447,16 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if staleReads, diagnostic := metrics.Stale(); staleReads > 0 {
 		failurePhase = "stale-github-read"
 		staleErr := fmt.Errorf("GitHub refresh used %d last verified cached response(s): %s", staleReads, diagnostic)
-		now := time.Now().UTC()
-		lastGood := time.Time{}
-		if previous, err := (&dashboardServer{stateRoot: stateRoot, repository: c.Repository}).readStatus(); err == nil {
-			lastGood = previous.UpdatedAt
+		previous, readErr := (&dashboardServer{stateRoot: stateRoot, repository: c.Repository}).readStatus()
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return nil, errors.Join(staleErr, fmt.Errorf("read last verified status projection: %w", readErr))
 		}
-		if err := writeDashboardStatusSnapshot(stateRoot, dashboardStatusSnapshot{UpdatedAt: lastGood, Statuses: statuses, ReconciliationError: staleErr.Error(), ReconciliationErrorAt: now}); err != nil {
+		previous.ReconciliationError = staleErr.Error()
+		previous.ReconciliationErrorAt = time.Now().UTC()
+		if err := writeDashboardStatusSnapshot(stateRoot, previous); err != nil {
 			return statuses, errors.Join(staleErr, fmt.Errorf("write stale status projection: %w", err))
 		}
-		return statuses, staleErr
+		return previous.Statuses, staleErr
 	}
 	if err := writeProjectStatusSnapshot(stateRoot, c.Repository, statuses); err != nil {
 		return statuses, fmt.Errorf("write status projection: %w", err)

@@ -315,7 +315,7 @@ type recoveryIssueRecord struct {
 	PullRequest        any       `json:"pull_request"`
 }
 
-const recoveryIssueConcurrency = 8
+const recoveryIssueConcurrency = 10
 
 // FetchIssueFacts returns the authorized issue-control projection used by both
 // scheduling and read-only status. Intake permits the reconciliation command

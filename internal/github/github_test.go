@@ -320,8 +320,10 @@ func TestAPIReadUsesLastVerifiedCacheOnlyBeforeMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	metrics := &CycleMetrics{}
+	var mutations atomic.Int32
 	api := API{BaseURL: "https://api.example.test", Cache: cache, Retries: 1, Metrics: metrics, Sleep: func(context.Context, time.Duration) error { return nil }, HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if request.Method == http.MethodPost {
+			mutations.Add(1)
 			return httpResponse(http.StatusCreated, `{}`, nil), nil
 		}
 		return httpResponse(http.StatusServiceUnavailable, `{"message":"outage"}`, nil), nil
@@ -334,11 +336,11 @@ func TestAPIReadUsesLastVerifiedCacheOnlyBeforeMutation(t *testing.T) {
 		t.Fatalf("stale=%d diagnostic=%q", stale, diagnostic)
 	}
 	body, _ := AttributedBody(5, 1, "mutation")
-	if err := api.Mutate(t.Context(), http.MethodPost, "/write", map[string]string{"body": body}, Mutation{Issue: 5, Attempt: 1}, nil); err != nil {
-		t.Fatal(err)
+	if err := api.Mutate(t.Context(), http.MethodPost, "/write", map[string]string{"body": body}, Mutation{Issue: 5, Attempt: 1}, nil); err == nil || !strings.Contains(err.Error(), "stale authoritative read") || mutations.Load() != 0 {
+		t.Fatalf("stale mutation err=%v requests=%d", err, mutations.Load())
 	}
-	if _, _, err := api.Read(t.Context(), "/read", "", &result); err == nil {
-		t.Fatal("post-mutation outage used stale cache")
+	if _, _, err := api.Read(t.Context(), "/read", "", &result); err != nil || result.State != "verified" {
+		t.Fatalf("blocked mutation invalidated last verified read: result=%#v err=%v", result, err)
 	}
 }
 

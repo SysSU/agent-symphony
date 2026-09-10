@@ -363,18 +363,13 @@ func reconcileLoop(ctx context.Context, interval time.Duration, reconcile func(c
 	_ = reconcile(ctx) // a bounded GitHub outage must not stop later recovery
 	for {
 		current := now()
-		if next.After(current) {
-			if err := wait(ctx, next.Sub(current)); err != nil {
-				return err
-			}
-		} else if err := ctx.Err(); err != nil {
-			return err
-		}
-		_ = reconcile(ctx)
-		current = now()
 		for !next.After(current) {
 			next = next.Add(interval)
 		}
+		if err := wait(ctx, next.Sub(current)); err != nil {
+			return err
+		}
+		_ = reconcile(ctx)
 	}
 }
 

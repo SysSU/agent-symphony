@@ -359,6 +359,9 @@ func (a API) Mutate(ctx context.Context, method, path string, body any, attribut
 
 func (a API) do(ctx context.Context, method, path, etag string, body []byte, attribution Mutation) (*http.Response, error) {
 	if attribution.Issue > 0 {
+		if stale, _ := a.Metrics.Stale(); stale > 0 {
+			return nil, errors.New("refusing GitHub mutation after a stale authoritative read")
+		}
 		a.snapshotClear()
 		if a.Metrics != nil {
 			a.Metrics.mutated.Store(true)

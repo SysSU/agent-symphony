@@ -4642,6 +4642,90 @@ func TestReconcileFailurePreservesLastGoodProjectionUntilRecovery(t *testing.T) 
 	}
 }
 
+func TestReconcileCachedFallbackRetainsActualLastVerifiedProjectionUntilRecovery(t *testing.T) {
+	root := gitRepository(t)
+	runGit(t, root, "config", "user.email", "test@example.invalid")
+	runGit(t, root, "config", "user.name", "test")
+	runGit(t, root, "switch", "-c", "main")
+	runGit(t, root, "commit", "--allow-empty", "-m", "fixture")
+	base := runGit(t, root, "rev-parse", "HEAD")
+	runGit(t, root, "update-ref", "refs/remotes/origin/main", base)
+	cfg := config.Default("o/r")
+	cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
+	configPath := filepath.Join(root, config.DefaultPath)
+	if err := config.Write(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	stateRoot := resolvedTempDir(t)
+	statePath := filepath.Join(stateRoot, "pr.json")
+	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, time.September, 9, 12, 0, 0, 0, time.UTC)
+	title, failPulls := "verified title", false
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var response any
+		switch {
+		case request.URL.Path == "/user":
+			response = map[string]any{"id": 42, "login": "coordinator"}
+		case request.URL.Path == "/repos/o/r":
+			response = map[string]any{"full_name": "o/r", "default_branch": "main", "permissions": map[string]any{"pull": true}}
+		case request.URL.Path == "/repos/o/r/pulls":
+			if failPulls {
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Status: "503 Service Unavailable", Header: http.Header{"Retry-After": []string{"0"}}, Body: io.NopCloser(strings.NewReader(`{"message":"temporary outage"}`))}, nil
+			}
+			response = []any{}
+		case request.URL.Path == "/repos/o/r/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": base}}
+		case request.URL.Path == "/repos/o/r/issues":
+			response = []any{map[string]any{"number": 9, "title": title, "body": "incomplete contract", "state": "open", "created_at": createdAt}}
+		case request.URL.Path == "/repos/o/r/issues/9":
+			response = map[string]any{"number": 9, "node_id": "I_9", "title": title, "body": "incomplete contract", "state": "open", "created_at": createdAt, "user": map[string]any{"id": 5}, "labels": []any{}}
+		case strings.HasSuffix(request.URL.Path, "/comments"), strings.HasSuffix(request.URL.Path, "/timeline"):
+			response = []any{}
+		default:
+			return nil, fmt.Errorf("unexpected GitHub request %s %s", request.Method, request.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		header := make(http.Header)
+		header.Set("ETag", `"v1"`)
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: header, Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI, githubClient = "https://example.test", client
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+
+	verified, err := reconcileGitHubWith(t.Context(), configPath, statePath, stateRoot, reconcileOptions{timeout: 5 * time.Second})
+	if err != nil || len(verified) != 1 || verified[0].Title != "verified title" {
+		t.Fatalf("verified=%#v err=%v", verified, err)
+	}
+	if cacheBody, err := os.ReadFile(filepath.Join(stateRoot, "github-etag-cache.json")); err != nil || !bytes.Contains(cacheBody, []byte("pulls")) {
+		t.Fatalf("verified cache=%s err=%v", cacheBody, err)
+	}
+	before, err := (&dashboardServer{stateRoot: stateRoot, repository: "o/r"}).readStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	title, failPulls = "unverified mixed title", true
+	stale, err := reconcileGitHubWith(t.Context(), configPath, statePath, stateRoot, reconcileOptions{timeout: 5 * time.Second})
+	if err == nil || !strings.Contains(err.Error(), "last verified cached response") || len(stale) != 1 || stale[0].Title != "verified title" {
+		t.Fatalf("stale=%#v err=%v", stale, err)
+	}
+	failed, err := (&dashboardServer{stateRoot: stateRoot, repository: "o/r"}).readStatus()
+	if err != nil || !reflect.DeepEqual(failed.Statuses, before.Statuses) || failed.UpdatedAt != before.UpdatedAt || failed.ReconciliationErrorAt.IsZero() || failed.ReconciliationError == "" {
+		t.Fatalf("failed=%#v before=%#v err=%v", failed, before, err)
+	}
+	failPulls = false
+	recovered, err := reconcileGitHubWith(t.Context(), configPath, statePath, stateRoot, reconcileOptions{timeout: 5 * time.Second})
+	if err != nil || len(recovered) != 1 || recovered[0].Title != "unverified mixed title" {
+		t.Fatalf("recovered=%#v err=%v", recovered, err)
+	}
+	after, err := (&dashboardServer{stateRoot: stateRoot, repository: "o/r"}).readStatus()
+	if err != nil || after.ReconciliationError != "" || !after.ReconciliationErrorAt.IsZero() || !after.UpdatedAt.After(before.UpdatedAt) {
+		t.Fatalf("after=%#v before=%#v err=%v", after, before, err)
+	}
+}
+
 func TestUnchangedReconcileDeduplicatesGitHubReadsAndReportsCycle(t *testing.T) {
 	root := gitRepository(t)
 	runGit(t, root, "config", "user.email", "test@example.invalid")
@@ -4707,6 +4791,11 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 	runGit(t, root, "commit", "-m", "fixture")
 	base := runGit(t, root, "rev-parse", "HEAD")
 	runGit(t, root, "update-ref", "refs/remotes/origin/main", base)
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("managed pull request head\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "commit", "-am", "managed head")
+	head := runGit(t, root, "rev-parse", "HEAD")
 	cfg := config.Default("o/r")
 	cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
 	configPath := filepath.Join(root, config.DefaultPath)
@@ -4720,14 +4809,39 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 	}
 
 	createdAt := time.Date(2026, time.September, 9, 12, 0, 0, 0, time.UTC)
+	issueBody := completeImplementationIssueBody
 	open := make([]any, 0, 30)
+	comments := make(map[int][]any, 20)
 	for number := 1; number <= 20; number++ {
-		open = append(open, map[string]any{"number": number, "title": fmt.Sprintf("Issue %d", number), "body": "incomplete fixture contract", "state": "open", "created_at": createdAt})
+		open = append(open, map[string]any{"number": number, "title": fmt.Sprintf("Issue %d", number), "body": issueBody, "state": "open", "created_at": createdAt})
+		anchor := internalgithub.Anchor{IssueNodeID: fmt.Sprintf("I_%d", number), CreatedAt: createdAt, ChangedAt: createdAt, AuthorID: 42}
+		provenance := []internalgithub.Provenance{
+			{Name: "ready", Value: "true", Source: "timeline", EventID: int64(number*10 + 1), ActorID: 42, CreatedAt: createdAt.Add(time.Minute)},
+			{Name: "priority", Value: "1", Source: "timeline", EventID: int64(number*10 + 2), ActorID: 42, CreatedAt: createdAt.Add(2 * time.Minute)},
+			{Name: "completion", Value: "human-review", Source: "creation", ActorID: 42, CreatedAt: createdAt},
+			{Name: "closed", Value: "false", Source: "creation", ActorID: 42, CreatedAt: createdAt},
+			{Name: "cancelled", Value: "false", Source: "creation", ActorID: 42, CreatedAt: createdAt},
+			{Name: "retry", Value: "false", Source: "creation", ActorID: 42, CreatedAt: createdAt},
+		}
+		controls := internalgithub.NormalizeIssue(internalgithub.IssueInput{Number: number, NodeID: anchor.IssueNodeID, State: "open", Body: issueBody, CreatedAt: createdAt, AuthorID: 42, Labels: []string{"agent-ready", "priority:P1"}}, internalgithub.ContractConfig{Ready: "agent-ready", P1: "priority:P1", P2: "priority:P2", P3: "priority:P3", DependencySection: "Dependencies", DefaultCompletion: "human-review"}, nil).Controls
+		snapshot, err := internalgithub.NewSnapshot(controls, issueBody, anchor, internalgithub.Approval{}, provenance, "/agent-symphony approve", func(int) bool { return true }, func(internalgithub.Provenance) bool { return true })
+		if err != nil {
+			t.Fatal(err)
+		}
+		comments[number] = []any{map[string]any{"id": number*100 + 1, "body": internalgithub.SnapshotComment(snapshot), "created_at": createdAt.Add(3 * time.Minute), "updated_at": createdAt.Add(3 * time.Minute), "user": map[string]any{"id": 42}}}
+		if number > 10 {
+			comments[number] = append(comments[number], map[string]any{"id": number*100 + 2, "body": "/agent-symphony status needs-attention: load fixture", "created_at": createdAt.Add(4 * time.Minute), "updated_at": createdAt.Add(4 * time.Minute), "user": map[string]any{"id": 42}})
+		}
 	}
 	pulls := make([]any, 0, 10)
-	for number := 101; number <= 110; number++ {
-		open = append(open, map[string]any{"number": number, "state": "open", "pull_request": map[string]any{"url": fmt.Sprintf("https://example.test/pulls/%d", number)}})
-		pulls = append(pulls, map[string]any{"number": number, "body": "unmanaged pull request", "state": "open"})
+	for issue := 1; issue <= 10; issue++ {
+		pr := 100 + issue
+		branch, _ := internalgithub.AttemptBranch("o/r", issue, 1)
+		marker, _ := internalgithub.AttemptMarker(issue, 1, branch, head, pr, "review")
+		active, _ := internalgithub.ActiveAttemptMarker("o/r", issue, 1, base)
+		comments[issue] = append(comments[issue], map[string]any{"id": issue*100 + 3, "body": marker + "\n" + active, "created_at": createdAt.Add(5 * time.Minute), "updated_at": createdAt.Add(5 * time.Minute), "user": map[string]any{"id": 42}})
+		open = append(open, map[string]any{"number": pr, "state": "open", "pull_request": map[string]any{"url": fmt.Sprintf("https://example.test/pulls/%d", pr)}})
+		pulls = append(pulls, map[string]any{"number": pr, "body": marker, "state": "closed", "merged_at": createdAt.Add(6 * time.Minute), "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": branch}, "base": map[string]any{"sha": base}})
 	}
 	var requestMu sync.Mutex
 	requestCount := 0
@@ -4748,20 +4862,51 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 			response = map[string]any{"id": 42, "login": "coordinator"}
 		case request.URL.Path == "/repos/o/r":
 			response = map[string]any{"full_name": "o/r", "default_branch": "main", "permissions": map[string]any{"pull": true}}
-		case request.URL.Path == "/repos/o/r/pulls":
-			response = pulls
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/pulls":
+			if request.URL.Query().Get("state") == "all" {
+				response = pulls
+			} else {
+				response = []any{}
+			}
 		case request.URL.Path == "/repos/o/r/branches/main":
 			response = map[string]any{"commit": map[string]any{"sha": base}}
 		case request.URL.Path == "/repos/o/r/issues":
 			response = open
-		case strings.HasSuffix(request.URL.Path, "/comments"), strings.HasSuffix(request.URL.Path, "/timeline"):
-			response = []any{}
+		case request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/comments"):
+			var number int
+			if _, err := fmt.Sscanf(request.URL.Path, "/repos/o/r/issues/%d/comments", &number); err != nil || number < 1 || number > 110 {
+				return nil, fmt.Errorf("unexpected comments path %s", request.URL.Path)
+			}
+			response = comments[number]
+		case request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/timeline"):
+			var number int
+			if _, err := fmt.Sscanf(request.URL.Path, "/repos/o/r/issues/%d/timeline", &number); err != nil || number < 1 || number > 20 {
+				return nil, fmt.Errorf("unexpected timeline path %s", request.URL.Path)
+			}
+			response = []any{
+				map[string]any{"id": number*10 + 1, "event": "labeled", "created_at": createdAt.Add(time.Minute), "actor": map[string]any{"id": 42}, "label": map[string]any{"name": "agent-ready"}},
+				map[string]any{"id": number*10 + 2, "event": "labeled", "created_at": createdAt.Add(2 * time.Minute), "actor": map[string]any{"id": 42}, "label": map[string]any{"name": "priority:P1"}},
+			}
+		case request.Method == http.MethodPost && request.URL.Path == "/graphql":
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+		case request.Method == http.MethodGet && request.URL.Path == "/user/42":
+			response = map[string]any{"login": "coordinator"}
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/collaborators/coordinator/permission":
+			response = map[string]any{"permission": "admin"}
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/commits/"+head+"/check-runs":
+			response = map[string]any{"check_runs": []any{map[string]any{"name": "ci", "status": "completed", "conclusion": "success"}}}
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/commits/"+head+"/status":
+			response = map[string]any{"statuses": []any{map[string]any{"context": "legacy-ci", "state": "success"}}}
 		case strings.HasPrefix(request.URL.Path, "/repos/o/r/issues/"):
 			var number int
 			if _, err := fmt.Sscanf(request.URL.Path, "/repos/o/r/issues/%d", &number); err != nil || number < 1 || number > 20 {
 				return nil, fmt.Errorf("unexpected issue path %s", request.URL.Path)
 			}
-			response = map[string]any{"number": number, "node_id": fmt.Sprintf("I_%d", number), "title": fmt.Sprintf("Issue %d", number), "body": "incomplete fixture contract", "state": "open", "created_at": createdAt, "user": map[string]any{"id": 5}, "labels": []any{}}
+			labels := []any{map[string]any{"name": "agent-ready"}, map[string]any{"name": "priority:P1"}}
+			if number > 10 {
+				labels = append(labels, map[string]any{"name": internalgithub.NeedsAttentionLabel})
+			}
+			response = map[string]any{"number": number, "node_id": fmt.Sprintf("I_%d", number), "title": fmt.Sprintf("Issue %d", number), "body": issueBody, "state": "open", "created_at": createdAt, "user": map[string]any{"id": 42}, "labels": labels}
 		default:
 			return nil, fmt.Errorf("unexpected GitHub request %s %s", request.Method, request.URL.String())
 		}
@@ -4774,13 +4919,19 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 
 	started := time.Now()
 	var observation reconcileCycleObservation
-	statuses, err := reconcileGitHubWith(t.Context(), configPath, statePath, stateRoot, reconcileOptions{timeout: 5 * time.Second, observe: func(got reconcileCycleObservation) { observation = got }})
+	statuses, err := reconcileGitHubWith(t.Context(), configPath, statePath, stateRoot, reconcileOptions{transition: true, intake: true, timeout: 5 * time.Second, observe: func(got reconcileCycleObservation) { observation = got }})
 	elapsed := time.Since(started)
 	requestMu.Lock()
 	requests := requestCount
 	requestMu.Unlock()
-	if err != nil || len(statuses) != 20 || elapsed >= 5*time.Second || observation.DurationMS >= 5000 || requests != 65 || observation.GitHubRequests != 65 {
-		t.Fatalf("statuses=%d requests=%d elapsed=%s observation=%#v err=%v", len(statuses), requests, elapsed, observation, err)
+	managed := 0
+	for _, status := range statuses {
+		if status.PR > 0 && slices.Contains(status.Checks, "ci:completed:success") && slices.Contains(status.Checks, "legacy-ci:success") {
+			managed++
+		}
+	}
+	if err != nil || len(statuses) != 20 || managed != 10 || elapsed >= 5*time.Second || observation.DurationMS >= 5000 || requests < 80 || observation.GitHubRequests != int64(requests) {
+		t.Fatalf("statuses=%#v requests=%d elapsed=%s observation=%#v err=%v", statuses, requests, elapsed, observation, err)
 	}
 	t.Logf("20 issues + 10 pull requests: duration=%s requests=%d", elapsed, requests)
 
