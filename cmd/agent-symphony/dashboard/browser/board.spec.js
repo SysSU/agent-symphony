@@ -91,6 +91,19 @@ test("shows loading then unavailable when the initial status request fails", asy
   browserErrors.set(page, []);
 });
 
+test("keeps the last projection visible when reconciliation is stale", async ({ page }) => {
+  const snapshot = { updated_at: new Date().toISOString(), statuses, reconciliation_error: "GitHub refresh timed out", reconciliation_error_at: new Date().toISOString() };
+  await page.route("**/orchestrator.json", (route) => route.fulfill({ json: { enabled: true, state: "running", session: "orchestrator" } }));
+  await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: { version: 1, hidden: [] } }));
+  await page.route("**/status.json", (route) => route.fulfill({ json: snapshot }));
+  await page.route("**/projects.json", (route) => route.fulfill({ json: { version: 1, projects: [{ version: 1, repository: statuses[0].repository, local: true, snapshot, state: { version: 1, hidden: [] } }] } }));
+  await page.goto("/");
+
+  await expect(page.getByRole("heading", { name: "Status refresh failed" })).toBeVisible();
+  await expect(page.getByText("GitHub refresh timed out")).toBeVisible();
+  await expect(page.getByRole("link", { name: "#161 Show attempt lanes" })).toBeVisible();
+});
+
 test("renders every board lane and keeps overflowing lanes keyboard reachable", async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 900 });
   await mockDashboard(page, statuses);

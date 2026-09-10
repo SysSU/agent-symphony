@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -607,6 +608,7 @@ func TestFetchIssueFactsRefreshesDependenciesAcrossNormalCycles(t *testing.T) {
 	needsAttention := map[int]bool{}
 	dependencyMode := "closed"
 	dependencyReads, clearPosts, labelDeletes := 0, 0, 0
+	var fixtureMu sync.Mutex
 	issueRecord := func(number int) map[string]any {
 		labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}}
 		if needsAttention[number] {
@@ -619,6 +621,8 @@ func TestFetchIssueFactsRefreshesDependenciesAcrossNormalCycles(t *testing.T) {
 		}
 	}
 	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		fixtureMu.Lock()
+		defer fixtureMu.Unlock()
 		var response any
 		switch {
 		case r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r":

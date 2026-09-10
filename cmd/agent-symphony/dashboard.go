@@ -72,8 +72,10 @@ type dashboardState struct {
 }
 
 type dashboardStatusSnapshot struct {
-	UpdatedAt time.Time                     `json:"updated_at"`
-	Statuses  []orchestrator.RecoveryStatus `json:"statuses"`
+	UpdatedAt             time.Time                     `json:"updated_at"`
+	Statuses              []orchestrator.RecoveryStatus `json:"statuses"`
+	ReconciliationError   string                        `json:"reconciliation_error,omitempty"`
+	ReconciliationErrorAt time.Time                     `json:"reconciliation_error_at,omitzero"`
 }
 
 type dashboardProject struct {

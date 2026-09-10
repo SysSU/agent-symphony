@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 const (
@@ -24,6 +25,7 @@ type readCacheEntry struct {
 }
 
 type ReadCache struct {
+	mu      sync.Mutex
 	path    string
 	entries map[string]readCacheEntry
 	used    map[string]bool
@@ -88,6 +90,8 @@ func LoadReadCache(path string) (*ReadCache, error) {
 }
 
 func (c *ReadCache) get(path string) (readCacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	entry, ok := c.entries[path]
 	if ok {
 		c.used[path] = true
@@ -96,6 +100,8 @@ func (c *ReadCache) get(path string) (readCacheEntry, bool) {
 }
 
 func (c *ReadCache) put(path, etag string, body []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.used[path] = true
 	old, present := c.entries[path]
 	if etag == "" {
@@ -132,6 +138,8 @@ func (c *ReadCache) put(path, etag string, body []byte) error {
 }
 
 func (c *ReadCache) Save() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for path, entry := range c.entries {
 		if c.used[path] {
 			continue

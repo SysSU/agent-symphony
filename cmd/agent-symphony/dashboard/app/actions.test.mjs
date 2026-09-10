@@ -36,4 +36,14 @@ test("dashboard actions retry transient reconciliation 503 responses", async (t)
   };
   await postWithReconciliationRetry("/actions/reconcile", undefined, { headers: { "Content-Type": "application/json" }, body: "{}" });
   assert.deepEqual(init, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+
+  requests = 0;
+  globalThis.fetch = async () => {
+    requests++;
+    return { status: 503, text: async () => "reconciliation is in progress", headers: new Headers({ "Retry-After": "1" }) };
+  };
+  const bounded = await postWithReconciliationRetry("/actions/reconcile", async () => {});
+  assert.equal(bounded.status, 503);
+  assert.equal(bounded.headers.get("Retry-After"), "1");
+  assert.equal(requests, 10);
 });

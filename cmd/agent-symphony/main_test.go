@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -4615,6 +4616,184 @@ func TestWriteStatusSnapshotPersistsBlockers(t *testing.T) {
 	}
 }
 
+func TestReconcileFailurePreservesLastGoodProjectionUntilRecovery(t *testing.T) {
+	root := t.TempDir()
+	want := []orchestrator.RecoveryStatus{{Repository: "o/r", Issue: 9, Attempt: 1, State: "active"}}
+	if err := writeProjectStatusSnapshot(root, "o/r", want); err != nil {
+		t.Fatal(err)
+	}
+	before, err := (&dashboardServer{stateRoot: root, repository: "o/r"}).readStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordReconcileFailure(root, "o/r", errors.New("GitHub unavailable token=secret-canary")); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := (&dashboardServer{stateRoot: root, repository: "o/r"}).readStatus()
+	if err != nil || !reflect.DeepEqual(failed.Statuses, want) || failed.UpdatedAt != before.UpdatedAt || failed.ReconciliationErrorAt.IsZero() || failed.ReconciliationError == "" || strings.Contains(failed.ReconciliationError, "secret-canary") {
+		t.Fatalf("failed projection=%#v err=%v", failed, err)
+	}
+	if err := writeProjectStatusSnapshot(root, "o/r", want); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := (&dashboardServer{stateRoot: root, repository: "o/r"}).readStatus()
+	if err != nil || recovered.ReconciliationError != "" || !recovered.ReconciliationErrorAt.IsZero() || recovered.UpdatedAt.Before(failed.UpdatedAt) {
+		t.Fatalf("recovered projection=%#v err=%v", recovered, err)
+	}
+}
+
+func TestUnchangedReconcileDeduplicatesGitHubReadsAndReportsCycle(t *testing.T) {
+	root := gitRepository(t)
+	runGit(t, root, "config", "user.email", "test@example.invalid")
+	runGit(t, root, "config", "user.name", "test")
+	runGit(t, root, "switch", "-c", "main")
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("latency fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", "README.md")
+	runGit(t, root, "commit", "-m", "fixture")
+	base := runGit(t, root, "rev-parse", "HEAD")
+	cfg := config.Default("o/r")
+	cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
+	configPath := filepath.Join(root, config.DefaultPath)
+	if err := config.Write(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	stateRoot := resolvedTempDir(t)
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		var response any
+		switch request.URL.Path {
+		case "/user":
+			response = map[string]any{"id": 42, "login": "coordinator"}
+		case "/repos/o/r":
+			response = map[string]any{"full_name": "o/r", "default_branch": "main", "permissions": map[string]any{"pull": true}}
+		case "/repos/o/r/pulls":
+			response = []any{}
+		case "/repos/o/r/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": base}}
+		case "/repos/o/r/issues":
+			response = []any{}
+		default:
+			t.Fatalf("unexpected GitHub request %s", request.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI, githubClient = "https://example.test", client
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	statePath := filepath.Join(stateRoot, "pr.json")
+	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var observation reconcileCycleObservation
+	statuses, err := reconcileGitHubWith(t.Context(), configPath, statePath, stateRoot, reconcileOptions{transition: true, intake: true, timeout: 5 * time.Second, observe: func(got reconcileCycleObservation) { observation = got }})
+	if err != nil || len(statuses) != 0 || requests != 5 || !observation.OK || observation.GitHubRequests != 5 || observation.Retries != 0 || observation.FailurePhase != "" {
+		t.Fatalf("statuses=%#v requests=%d observation=%#v err=%v", statuses, requests, observation, err)
+	}
+}
+
+func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServesProjection(t *testing.T) {
+	root := gitRepository(t)
+	runGit(t, root, "config", "user.email", "test@example.invalid")
+	runGit(t, root, "config", "user.name", "test")
+	runGit(t, root, "switch", "-c", "main")
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("delayed boundary fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", "README.md")
+	runGit(t, root, "commit", "-m", "fixture")
+	base := runGit(t, root, "rev-parse", "HEAD")
+	runGit(t, root, "update-ref", "refs/remotes/origin/main", base)
+	cfg := config.Default("o/r")
+	cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
+	configPath := filepath.Join(root, config.DefaultPath)
+	if err := config.Write(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	stateRoot := resolvedTempDir(t)
+	statePath := filepath.Join(stateRoot, "pr.json")
+	if err := os.WriteFile(statePath, []byte("[]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	createdAt := time.Date(2026, time.September, 9, 12, 0, 0, 0, time.UTC)
+	open := make([]any, 0, 30)
+	for number := 1; number <= 20; number++ {
+		open = append(open, map[string]any{"number": number, "title": fmt.Sprintf("Issue %d", number), "body": "incomplete fixture contract", "state": "open", "created_at": createdAt})
+	}
+	pulls := make([]any, 0, 10)
+	for number := 101; number <= 110; number++ {
+		open = append(open, map[string]any{"number": number, "state": "open", "pull_request": map[string]any{"url": fmt.Sprintf("https://example.test/pulls/%d", number)}})
+		pulls = append(pulls, map[string]any{"number": number, "body": "unmanaged pull request", "state": "open"})
+	}
+	var requestMu sync.Mutex
+	requestCount := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		timer := time.NewTimer(100 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-request.Context().Done():
+			return nil, request.Context().Err()
+		case <-timer.C:
+		}
+		requestMu.Lock()
+		requestCount++
+		requestMu.Unlock()
+		var response any
+		switch {
+		case request.URL.Path == "/user":
+			response = map[string]any{"id": 42, "login": "coordinator"}
+		case request.URL.Path == "/repos/o/r":
+			response = map[string]any{"full_name": "o/r", "default_branch": "main", "permissions": map[string]any{"pull": true}}
+		case request.URL.Path == "/repos/o/r/pulls":
+			response = pulls
+		case request.URL.Path == "/repos/o/r/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": base}}
+		case request.URL.Path == "/repos/o/r/issues":
+			response = open
+		case strings.HasSuffix(request.URL.Path, "/comments"), strings.HasSuffix(request.URL.Path, "/timeline"):
+			response = []any{}
+		case strings.HasPrefix(request.URL.Path, "/repos/o/r/issues/"):
+			var number int
+			if _, err := fmt.Sscanf(request.URL.Path, "/repos/o/r/issues/%d", &number); err != nil || number < 1 || number > 20 {
+				return nil, fmt.Errorf("unexpected issue path %s", request.URL.Path)
+			}
+			response = map[string]any{"number": number, "node_id": fmt.Sprintf("I_%d", number), "title": fmt.Sprintf("Issue %d", number), "body": "incomplete fixture contract", "state": "open", "created_at": createdAt, "user": map[string]any{"id": 5}, "labels": []any{}}
+		default:
+			return nil, fmt.Errorf("unexpected GitHub request %s %s", request.Method, request.URL.String())
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	oldAPI, oldClient := githubAPI, githubClient
+	githubAPI, githubClient = "https://example.test", client
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+
+	started := time.Now()
+	var observation reconcileCycleObservation
+	statuses, err := reconcileGitHubWith(t.Context(), configPath, statePath, stateRoot, reconcileOptions{timeout: 5 * time.Second, observe: func(got reconcileCycleObservation) { observation = got }})
+	elapsed := time.Since(started)
+	requestMu.Lock()
+	requests := requestCount
+	requestMu.Unlock()
+	if err != nil || len(statuses) != 20 || elapsed >= 5*time.Second || observation.DurationMS >= 5000 || requests != 65 || observation.GitHubRequests != 65 {
+		t.Fatalf("statuses=%d requests=%d elapsed=%s observation=%#v err=%v", len(statuses), requests, elapsed, observation, err)
+	}
+	t.Logf("20 issues + 10 pull requests: duration=%s requests=%d", elapsed, requests)
+
+	request := httptest.NewRequest(http.MethodGet, "/status.json", nil)
+	request.Host = "127.0.0.1"
+	response := httptest.NewRecorder()
+	dashboardHandler(stateRoot).ServeHTTP(response, request)
+	var served dashboardStatusSnapshot
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &served) != nil || len(served.Statuses) != 20 || served.UpdatedAt.IsZero() || served.ReconciliationError != "" {
+		t.Fatalf("served status=%d projection=%#v body=%q", response.Code, served, response.Body.String())
+	}
+}
+
 func TestRestartReplacesPersistedDependencyBlockerWithFreshProjection(t *testing.T) {
 	stateRoot := t.TempDir()
 	repository := "o/r"
@@ -4749,7 +4928,9 @@ func TestRecoverProposalAndDashboardShareOneIdempotentGuardedPath(t *testing.T) 
 	}
 	status := orchestrator.RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "failed", Branch: manifest.Branch, Worktree: manifest.Worktree, Session: manifest.Session, Retryable: true}
 	oldReconcile := reconcileGitHubRun
+	reconciles := 0
 	reconcileGitHubRun = func(context.Context, string, string, string, bool) ([]orchestrator.RecoveryStatus, error) {
+		reconciles++
 		return []orchestrator.RecoveryStatus{status}, nil
 	}
 	t.Cleanup(func() { reconcileGitHubRun = oldReconcile })
@@ -4817,8 +4998,8 @@ func TestRecoverProposalAndDashboardShareOneIdempotentGuardedPath(t *testing.T) 
 	if err := recoverDashboardAttempt(t.Context(), configPath, filepath.Join(stateRoot, "pr.json"), stateRoot, 24, 2); err != nil {
 		t.Fatal(err)
 	}
-	if posts != 1 {
-		t.Fatalf("retry posts=%d", posts)
+	if posts != 1 || reconciles != 5 {
+		t.Fatalf("retry posts=%d reconciles=%d", posts, reconciles)
 	}
 	for _, path := range []string{manifest.Worktree, manifest.LogPath, filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")} {
 		if _, err := os.Stat(path); err != nil {

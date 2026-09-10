@@ -796,6 +796,30 @@ func TestControlCLIEmitsVersionedResult(t *testing.T) {
 	}
 }
 
+func TestControlCLIBoundsBusyRetryByTimeout(t *testing.T) {
+	root := resolvedTempDir(t)
+	cleanupControlSocket(t, root)
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	operation := &sync.Mutex{}
+	operation.Lock()
+	defer operation.Unlock()
+	project := newProjectDashboardServer(t.Context(), root, "o/r", nil, "tmux", operation, nil, nil, func(context.Context) error { return nil }, nil, false, "")
+	ctx, cancel := context.WithCancel(t.Context())
+	if err := startControlServer(ctx, project, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	started := time.Now()
+	code := run([]string{"control", "--repository", "o/r", "--action", "reconcile", "--runtime-state", root, "--request-id", "bounded-busy", "--timeout", "25ms"}, &stdout, &stderr)
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+	if code != 1 || time.Since(started) > time.Second || !strings.Contains(stderr.String(), "remained busy until --timeout") {
+		t.Fatalf("code=%d elapsed=%s stdout=%q stderr=%q", code, time.Since(started), stdout.String(), stderr.String())
+	}
+}
+
 func TestChatSelectsExactReviewerAndRunningDaemonOrchestrator(t *testing.T) {
 	root := resolvedTempDir(t)
 	cleanupControlSocket(t, root)

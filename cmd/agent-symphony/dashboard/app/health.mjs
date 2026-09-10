@@ -61,6 +61,10 @@ export function overallHealth(snapshot, error, statuses, now) {
   if (error) return { state: "unavailable", title: "Agent Symphony is unavailable", detail: error };
   if (!snapshot) return { state: "loading", title: "Checking Agent Symphony", detail: "Waiting for status…" };
 
+  if (snapshot.reconciliation_error) {
+    return { state: "stale", title: "Status refresh failed", detail: snapshot.reconciliation_error };
+  }
+
   const updatedAt = new Date(snapshot.updated_at).getTime();
   if (!Number.isFinite(updatedAt) || now - updatedAt > staleAfter) {
     return { state: "stale", title: "Status updates are stale", detail: "No fresh status has been posted for more than two minutes." };

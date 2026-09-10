@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -703,9 +704,12 @@ type GitHubPRSource struct {
 	Attempts                   map[int]RecoveryAttemptFact
 	dependencyCompletion       map[int]bool
 	dependencyCompletionErrors map[int]error
+	dependencyMu               sync.Mutex
 }
 
 func (s *GitHubPRSource) dependencyComplete(ctx context.Context, issue int) (bool, error) {
+	s.dependencyMu.Lock()
+	defer s.dependencyMu.Unlock()
 	if complete, ok := s.dependencyCompletion[issue]; ok {
 		return complete, nil
 	}
@@ -780,8 +784,7 @@ func (s *GitHubPRSource) OpenPullRequests(ctx context.Context) ([]int, error) {
 }
 
 func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRState, error) {
-	snapshot := *s
-	snapshot.API = s.API.WithReadSnapshot()
+	snapshot := GitHubPRSource{API: s.API.WithReadSnapshot(), Config: s.Config, Recovery: s.Recovery, Attempts: s.Attempts}
 	return snapshot.freshPullRequest(ctx, number)
 }
 
