@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,6 +29,8 @@ import (
 const (
 	controlVersion      = 1
 	maxControlBodyBytes = 16 << 10
+	maxControlReceipts  = 128
+	controlReceiptsFile = "control-receipts.json"
 )
 
 var controlRequestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
@@ -51,6 +54,17 @@ type controlResult struct {
 	Status    int             `json:"status"`
 	Data      json.RawMessage `json:"data,omitempty"`
 	Error     string          `json:"error,omitempty"`
+}
+
+type controlReceipt struct {
+	Request controlRequest `json:"request"`
+	State   string         `json:"state"`
+	Result  *controlResult `json:"result,omitempty"`
+}
+
+type controlReceiptState struct {
+	Version  int              `json:"version"`
+	Receipts []controlReceipt `json:"receipts"`
 }
 
 func controlSocketPath(stateRoot string) string {
@@ -128,10 +142,103 @@ func controlHandler(project *dashboardServer) http.Handler {
 			writeControlResult(w, controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusBadRequest, Error: "invalid control request"})
 			return
 		}
-		response := performDashboardControl(r.Context(), project, request)
-		response.Version, response.RequestID, response.Action = controlVersion, request.RequestID, request.Action
+		response := project.performRecordedControl(r.Context(), request)
 		writeControlResult(w, response)
 	})
+}
+
+func (s *dashboardServer) performRecordedControl(ctx context.Context, request controlRequest) controlResult {
+	result := controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action}
+	if !s.controlMu.TryLock() {
+		result.Status, result.Retryable, result.Error = http.StatusServiceUnavailable, true, "another control request is in progress"
+		return result
+	}
+	defer s.controlMu.Unlock()
+	receipts, err := s.readControlReceipts()
+	if err != nil {
+		result.Status, result.Error = http.StatusInternalServerError, "control receipts are unavailable"
+		return result
+	}
+	for _, receipt := range receipts.Receipts {
+		if receipt.Request.RequestID != request.RequestID {
+			continue
+		}
+		if receipt.Request != request {
+			result.Status, result.Error = http.StatusConflict, "control request identity was already used for different input"
+			return result
+		}
+		if receipt.State == "completed" {
+			return *receipt.Result
+		}
+		result.Status, result.Error = http.StatusConflict, "control request outcome is unknown; replay was refused"
+		return result
+	}
+	if len(receipts.Receipts) == maxControlReceipts {
+		completed := slices.IndexFunc(receipts.Receipts, func(receipt controlReceipt) bool { return receipt.State == "completed" })
+		if completed < 0 {
+			result.Status, result.Retryable, result.Error = http.StatusServiceUnavailable, true, "control receipt capacity is unavailable"
+			return result
+		}
+		receipts.Receipts = slices.Delete(receipts.Receipts, completed, completed+1)
+	}
+	receipts.Receipts = append(receipts.Receipts, controlReceipt{Request: request, State: "pending"})
+	if err := s.writeControlReceipts(receipts); err != nil {
+		result.Status, result.Error = http.StatusInternalServerError, "control request could not be recorded"
+		return result
+	}
+	result = performDashboardControl(ctx, s, request)
+	result.Version, result.RequestID, result.Action = controlVersion, request.RequestID, request.Action
+	receipts.Receipts[len(receipts.Receipts)-1] = controlReceipt{Request: request, State: "completed", Result: &result}
+	if err := s.writeControlReceipts(receipts); err != nil {
+		return controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusInternalServerError, Error: "control outcome could not be recorded; replay was refused"}
+	}
+	return result
+}
+
+func (s *dashboardServer) readControlReceipts() (controlReceiptState, error) {
+	state := controlReceiptState{Version: controlVersion, Receipts: []controlReceipt{}}
+	path := filepath.Join(s.stateRoot, controlReceiptsFile)
+	info, statErr := os.Lstat(path)
+	if statErr == nil && (info.Mode().Perm() != 0o600 || !ownedByCurrentUser(info)) {
+		return controlReceiptState{}, errors.New("unsafe control receipts")
+	}
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return controlReceiptState{}, statErr
+	}
+	body, err := readDashboardFile(path, maxDashboardStateBytes)
+	if errors.Is(err, os.ErrNotExist) {
+		return state, nil
+	}
+	if err != nil {
+		return controlReceiptState{}, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&state) != nil || decoder.Decode(&struct{}{}) != io.EOF || state.Version != controlVersion || len(state.Receipts) > maxControlReceipts {
+		return controlReceiptState{}, errors.New("invalid control receipts")
+	}
+	seen := map[string]bool{}
+	for _, receipt := range state.Receipts {
+		validResult := receipt.Result != nil && validRecordedControlResult(*receipt.Result, receipt.Request)
+		if !validControlRequest(receipt.Request, s.repository) || seen[receipt.Request.RequestID] || receipt.State != "pending" && receipt.State != "completed" || receipt.State == "pending" && receipt.Result != nil || receipt.State == "completed" && !validResult {
+			return controlReceiptState{}, errors.New("invalid control receipt")
+		}
+		seen[receipt.Request.RequestID] = true
+	}
+	return state, nil
+}
+
+func validRecordedControlResult(result controlResult, request controlRequest) bool {
+	ok := result.Status >= 200 && result.Status < 300
+	return result.Version == controlVersion && result.RequestID == request.RequestID && result.Action == request.Action && result.Status >= 100 && result.Status <= 599 && result.OK == ok && result.Retryable == (result.Status == http.StatusServiceUnavailable) && (result.OK || result.Error != "") && (len(result.Data) == 0 || json.Valid(result.Data))
+}
+
+func (s *dashboardServer) writeControlReceipts(state controlReceiptState) error {
+	body, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writePrivateStateFile(s.stateRoot, controlReceiptsFile, ".control-receipts-*", append(body, '\n'), maxDashboardStateBytes)
 }
 
 func validControlRequest(request controlRequest, repository string) bool {

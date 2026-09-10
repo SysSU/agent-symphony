@@ -56,6 +56,7 @@ type dashboardServer struct {
 	issueClosed  func(context.Context, string, int) (bool, error)
 	mu           *sync.Mutex
 	localMu      sync.Mutex
+	controlMu    sync.Mutex
 }
 
 type dashboardHiddenAttempt struct {
@@ -533,17 +534,24 @@ func (s *dashboardServer) writeState(state dashboardState) error {
 	if err != nil || len(body) > maxDashboardStateBytes {
 		return errors.New("dashboard state is too large")
 	}
-	path := filepath.Join(s.stateRoot, "dashboard-state.json")
-	root, err := filepath.EvalSymlinks(s.stateRoot)
-	if err != nil || root != filepath.Clean(s.stateRoot) {
-		return errors.New("dashboard state root is unsafe")
+	return writePrivateStateFile(s.stateRoot, "dashboard-state.json", ".dashboard-state-*", append(body, '\n'), maxDashboardStateBytes)
+}
+
+func writePrivateStateFile(stateRoot, filename, pattern string, body []byte, limit int) error {
+	if len(body) > limit {
+		return errors.New("state file is too large")
+	}
+	path := filepath.Join(stateRoot, filename)
+	root, err := filepath.EvalSymlinks(stateRoot)
+	if err != nil || root != filepath.Clean(stateRoot) {
+		return errors.New("state root is unsafe")
 	}
 	if info, statErr := os.Lstat(path); statErr == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
-		return errors.New("dashboard state file is unsafe")
+		return errors.New("state file is unsafe")
 	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
-	temporary, err := os.CreateTemp(root, ".dashboard-state-*")
+	temporary, err := os.CreateTemp(root, pattern)
 	if err != nil {
 		return err
 	}
@@ -553,7 +561,7 @@ func (s *dashboardServer) writeState(state dashboardState) error {
 		temporary.Close()
 		return err
 	}
-	if _, err := temporary.Write(append(body, '\n')); err != nil {
+	if _, err := temporary.Write(body); err != nil {
 		temporary.Close()
 		return err
 	}

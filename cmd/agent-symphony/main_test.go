@@ -316,6 +316,30 @@ func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
 	}
 }
 
+func TestCoordinatorCLICommandContractParsesWithExactPlaceholders(t *testing.T) {
+	commands := orchestratoragent.CoordinatorCLICommands("o/r", filepath.Join(t.TempDir(), "missing-runtime"))
+	if len(commands) != 13 {
+		t.Fatalf("commands=%d", len(commands))
+	}
+	for _, command := range commands {
+		parsed := slices.Clone(command[1:])
+		for index := range parsed {
+			switch parsed[index] {
+			case "<issue>":
+				parsed[index] = "23"
+			case "<attempt>":
+				parsed[index] = "4"
+			case "<request-id>":
+				parsed[index] = "coordinator-test"
+			}
+		}
+		var stdout, stderr bytes.Buffer
+		if code := run(parsed, &stdout, &stderr); code == 2 {
+			t.Errorf("fixed command does not parse: %q stderr=%q", command, stderr.String())
+		}
+	}
+}
+
 func TestImplementationChatTargetRequiresOneRunningCurrentSession(t *testing.T) {
 	running, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 214, 2)
 	completed, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 214, 1)
