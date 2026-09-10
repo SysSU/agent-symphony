@@ -4779,7 +4779,7 @@ func TestUnchangedReconcileDeduplicatesGitHubReadsAndReportsCycle(t *testing.T) 
 	}
 }
 
-func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServesProjection(t *testing.T) {
+func TestReconcileLatencyBudget(t *testing.T) {
 	root := gitRepository(t)
 	runGit(t, root, "config", "user.email", "test@example.invalid")
 	runGit(t, root, "config", "user.name", "test")
@@ -4976,7 +4976,7 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 			managed++
 		}
 	}
-	if err != nil || len(statuses) != 20 || managed != 10 || governed != 10 || latestHeads != 10 || recoveryStatusHeads != 10 || governedHeads != 10 || governanceStatusHeads != 10 || elapsed >= 5*time.Second || observation.DurationMS >= 5000 || requests < 80 || observation.GitHubRequests != int64(requests) {
+	if err != nil || len(statuses) != 20 || managed != 10 || governed != 10 || latestHeads != 10 || recoveryStatusHeads != 10 || governedHeads != 10 || governanceStatusHeads != 10 || elapsed >= 5*time.Second || observation.DurationMS >= 5000 || requests != 467 || observation.GitHubRequests != int64(requests) {
 		t.Fatalf("statuses=%#v requests=%d governed=%d recovery checks/statuses=%d/%d governance checks/statuses=%d/%d elapsed=%s observation=%#v err=%v", statuses, requests, governed, latestHeads, recoveryStatusHeads, governedHeads, governanceStatusHeads, elapsed, observation, err)
 	}
 	t.Logf("20 issues + 10 pull requests: duration=%s requests=%d", elapsed, requests)

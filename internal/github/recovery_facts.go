@@ -330,7 +330,7 @@ type recoveryIssueRecord struct {
 	PullRequest        any       `json:"pull_request"`
 }
 
-const recoveryIssueConcurrency = 10
+const recoveryIssueConcurrency = 20
 const recoveryPullConcurrency = 10
 
 // FetchIssueFacts returns the authorized issue-control projection used by both
