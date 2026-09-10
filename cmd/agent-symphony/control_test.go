@@ -942,19 +942,45 @@ func TestControlCLIBoundsBusyRetryByTimeout(t *testing.T) {
 	}
 	operation := &sync.Mutex{}
 	operation.Lock()
-	defer operation.Unlock()
-	project := newProjectDashboardServer(t.Context(), root, "o/r", nil, "tmux", operation, nil, nil, func(context.Context) error { return nil }, nil, false, "")
+	locked := true
+	defer func() {
+		if locked {
+			operation.Unlock()
+		}
+	}()
+	var calls atomic.Int32
+	project := newProjectDashboardServer(t.Context(), root, "o/r", nil, "tmux", operation, nil, nil, func(context.Context) error {
+		calls.Add(1)
+		return nil
+	}, nil, false, "")
 	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 	if err := startControlServer(ctx, project, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
 	started := time.Now()
 	code := run([]string{"control", "--repository", "o/r", "--action", "reconcile", "--runtime-state", root, "--request-id", "bounded-busy", "--timeout", "25ms"}, &stdout, &stderr)
-	cancel()
-	time.Sleep(50 * time.Millisecond)
-	if code != 1 || time.Since(started) > time.Second || !strings.Contains(stderr.String(), "remained busy until --timeout") {
-		t.Fatalf("code=%d elapsed=%s stdout=%q stderr=%q", code, time.Since(started), stdout.String(), stderr.String())
+	elapsed := time.Since(started)
+	operation.Unlock()
+	locked = false
+	project.controlMu.Lock()
+	receipts, err := project.readControlReceipts()
+	project.controlMu.Unlock()
+	if code != 1 || elapsed > time.Second || !strings.Contains(stderr.String(), "remained busy until --timeout") {
+		t.Fatalf("code=%d elapsed=%s stdout=%q stderr=%q", code, elapsed, stdout.String(), stderr.String())
+	}
+	if err != nil || len(receipts.Receipts) != 0 || calls.Load() != 0 {
+		t.Fatalf("canceled receipts=%#v calls=%d err=%v", receipts, calls.Load(), err)
+	}
+	request := controlRequest{Version: 1, RequestID: "bounded-busy", Repository: "o/r", Action: "reconcile"}
+	result, err := callRunningDaemon(t.Context(), root, request)
+	if err != nil || !result.OK || calls.Load() != 1 {
+		t.Fatalf("retry result=%#v calls=%d err=%v", result, calls.Load(), err)
+	}
+	replayed, err := callRunningDaemon(t.Context(), root, request)
+	if err != nil || !replayed.OK || calls.Load() != 1 {
+		t.Fatalf("replay result=%#v calls=%d err=%v", replayed, calls.Load(), err)
 	}
 }
 
