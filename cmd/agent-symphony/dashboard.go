@@ -57,6 +57,27 @@ type dashboardServer struct {
 	mu           *sync.Mutex
 	localMu      sync.Mutex
 	controlMu    sync.Mutex
+	controlHook  func(controlRequest)
+}
+
+type operationLockContextKey struct{}
+
+func (s *dashboardServer) operationMutex() *sync.Mutex {
+	if s.mu != nil {
+		return s.mu
+	}
+	return &s.localMu
+}
+
+func (s *dashboardServer) enterOperation(ctx context.Context) (func(), bool) {
+	operationMu := s.operationMutex()
+	if ctx.Value(operationLockContextKey{}) == operationMu {
+		return func() {}, true
+	}
+	if !operationMu.TryLock() {
+		return nil, false
+	}
+	return operationMu.Unlock, true
 }
 
 type dashboardHiddenAttempt struct {
@@ -223,16 +244,13 @@ func (s *dashboardServer) serveReconcileAction(w http.ResponseWriter, r *http.Re
 		http.Error(w, "reconciliation is unavailable", http.StatusConflict)
 		return
 	}
-	operationMu := s.mu
-	if operationMu == nil {
-		operationMu = &s.localMu
-	}
-	if !operationMu.TryLock() {
+	leave, ok := s.enterOperation(r.Context())
+	if !ok {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
 		return
 	}
-	defer operationMu.Unlock()
+	defer leave()
 	if err := s.reconcile(r.Context()); err != nil {
 		http.Error(w, internalgithub.Redact(err.Error()), http.StatusInternalServerError)
 		return
@@ -598,16 +616,13 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 		http.Error(w, "invalid action body", http.StatusBadRequest)
 		return
 	}
-	operationMu := s.mu
-	if operationMu == nil {
-		operationMu = &s.localMu
-	}
-	if !operationMu.TryLock() {
+	leave, ok := s.enterOperation(r.Context())
+	if !ok {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
 		return
 	}
-	defer operationMu.Unlock()
+	defer leave()
 	status, err := s.projectedStatus(issue, attempt)
 	if action == "dismiss" {
 		if err != nil || !canDismissClosedAttempt(status) || s.issueClosed == nil {
@@ -792,16 +807,13 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 		http.Error(w, "invalid orchestrator action", http.StatusBadRequest)
 		return
 	}
-	operationMu := s.mu
-	if operationMu == nil {
-		operationMu = &s.localMu
-	}
-	if !operationMu.TryLock() {
+	leave, ok := s.enterOperation(r.Context())
+	if !ok {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
 		return
 	}
-	defer operationMu.Unlock()
+	defer leave()
 
 	var result orchestratoragent.Status
 	var err error

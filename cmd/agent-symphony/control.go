@@ -31,6 +31,7 @@ const (
 	maxControlBodyBytes = 16 << 10
 	maxControlReceipts  = 128
 	controlReceiptsFile = "control-receipts.json"
+	controlDeadline     = "X-Agent-Symphony-Deadline-Unix-Nano"
 )
 
 var controlRequestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
@@ -66,6 +67,8 @@ type controlReceiptState struct {
 	Version  int              `json:"version"`
 	Receipts []controlReceipt `json:"receipts"`
 }
+
+type controlDeadlineContextKey struct{}
 
 func controlSocketPath(stateRoot string) string {
 	digest := sha256.Sum256([]byte(filepath.Clean(stateRoot)))
@@ -142,6 +145,14 @@ func controlHandler(project *dashboardServer) http.Handler {
 			writeControlResult(w, controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusBadRequest, Error: "invalid control request"})
 			return
 		}
+		values := r.Header.Values(controlDeadline)
+		nanoseconds, err := strconv.ParseInt(r.Header.Get(controlDeadline), 10, 64)
+		deadline := time.Unix(0, nanoseconds)
+		if len(values) != 1 || err != nil || nanoseconds <= 0 || deadline.After(time.Now().Add(2*time.Minute)) {
+			writeControlResult(w, controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusBadRequest, Error: "invalid control request deadline"})
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), controlDeadlineContextKey{}, deadline))
 		response := project.performRecordedControl(r.Context(), request)
 		writeControlResult(w, response)
 	})
@@ -154,6 +165,9 @@ func (s *dashboardServer) performRecordedControl(ctx context.Context, request co
 		return result
 	}
 	defer s.controlMu.Unlock()
+	if s.controlHook != nil {
+		s.controlHook(request)
+	}
 	receipts, err := s.readControlReceipts()
 	if err != nil {
 		result.Status, result.Error = http.StatusInternalServerError, "control receipts are unavailable"
@@ -180,6 +194,17 @@ func (s *dashboardServer) performRecordedControl(ctx context.Context, request co
 			return result
 		}
 		receipts.Receipts = slices.Delete(receipts.Receipts, completed, completed+1)
+	}
+	if request.Action != "orchestrator-session" {
+		operationMu := s.operationMutex()
+		operationMu.Lock()
+		defer operationMu.Unlock()
+		ctx = context.WithValue(ctx, operationLockContextKey{}, operationMu)
+	}
+	deadline, _ := ctx.Value(controlDeadlineContextKey{}).(time.Time)
+	if ctx.Err() != nil || !deadline.IsZero() && !time.Now().Before(deadline) {
+		result.Status, result.Retryable, result.Error = http.StatusServiceUnavailable, true, "reconciliation is in progress"
+		return result
 	}
 	receipts.Receipts = append(receipts.Receipts, controlReceipt{Request: request, State: "pending"})
 	if err := s.writeControlReceipts(receipts); err != nil {
@@ -350,6 +375,11 @@ func callRunningDaemon(ctx context.Context, stateRoot string, request controlReq
 		return controlResult{}, err
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
+	deadline := time.Now().Add(2 * time.Minute)
+	if requested, ok := ctx.Deadline(); ok {
+		deadline = requested
+	}
+	httpRequest.Header.Set(controlDeadline, strconv.FormatInt(deadline.UnixNano(), 10))
 	response, err := client.Do(httpRequest)
 	if err != nil {
 		return controlResult{}, fmt.Errorf("contact running daemon: %w", err)
