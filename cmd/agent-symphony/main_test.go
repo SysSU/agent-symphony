@@ -4591,6 +4591,41 @@ func TestWriteStatusSnapshotPersistsBlockers(t *testing.T) {
 	}
 }
 
+func TestRestartReplacesPersistedDependencyBlockerWithFreshProjection(t *testing.T) {
+	stateRoot := t.TempDir()
+	repository := "o/r"
+	blockedIssue := internalgithub.RecoveryIssueFact{
+		Repository: repository, Issue: 20, Attempt: 1, Priority: 1, Dependencies: []int{19},
+		CreatedAt: time.Unix(1, 0), Blockers: []string{"dependency #19 is incomplete"},
+	}
+	blocked, _ := projectRecoveryStatuses(t.Context(), nil, []internalgithub.RecoveryIssueFact{blockedIssue}, nil, 1, nil)
+	if err := writeProjectStatusSnapshot(stateRoot, repository, blocked); err != nil {
+		t.Fatal(err)
+	}
+	before, err := (&dashboardServer{stateRoot: stateRoot, repository: repository}).readStatus()
+	if err != nil || len(before.Statuses) != 1 || !slices.Equal(before.Statuses[0].Blockers, []string{"dependency #19 is incomplete"}) {
+		t.Fatalf("blocked dashboard projection=%#v err=%v", before, err)
+	}
+
+	restarted := &agentruntime.Runtime{Root: filepath.Join(stateRoot, "attempts"), StateRoot: stateRoot}
+	manifests, err := restarted.Discover()
+	if err != nil || len(manifests) != 0 {
+		t.Fatalf("reconstructed manifests=%#v err=%v", manifests, err)
+	}
+	freshIssue := blockedIssue
+	freshIssue.Blockers = nil
+	freshIssue.Eligible = true
+	freshIssue.SatisfiedDependencies = []int{19}
+	fresh, _ := projectRecoveryStatuses(t.Context(), nil, []internalgithub.RecoveryIssueFact{freshIssue}, manifests, 1, nil)
+	if err := writeProjectStatusSnapshot(stateRoot, repository, fresh); err != nil {
+		t.Fatal(err)
+	}
+	after, err := (&dashboardServer{stateRoot: stateRoot, repository: repository}).readStatus()
+	if err != nil || len(after.Statuses) != 1 || after.Statuses[0].State != "runnable" || len(after.Statuses[0].Blockers) != 0 {
+		t.Fatalf("post-restart dashboard projection=%#v err=%v", after, err)
+	}
+}
+
 func TestDaemonLockIsSingleInstanceAndNoFollow(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.lock")
