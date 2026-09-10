@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1014,6 +1013,11 @@ func TestControlExpiredQueuedRequestIsReplaySafe(t *testing.T) {
 		calls.Add(1)
 		return nil
 	}, nil, false, "")
+	acquired := make(chan struct{})
+	var acquiredOnce sync.Once
+	project.controlHook = func(controlRequest) {
+		acquiredOnce.Do(func() { close(acquired) })
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	if err := startControlServer(ctx, project, &bytes.Buffer{}); err != nil {
@@ -1030,14 +1034,10 @@ func TestControlExpiredQueuedRequestIsReplaySafe(t *testing.T) {
 		controlHandler(project).ServeHTTP(response, httpRequest)
 		close(done)
 	}()
-	for project.controlMu.TryLock() {
-		project.controlMu.Unlock()
-		select {
-		case <-done:
-			t.Fatal("control handler did not queue behind the operation lock")
-		default:
-			runtime.Gosched()
-		}
+	select {
+	case <-acquired:
+	case <-done:
+		t.Fatal("control handler did not acquire the control lock")
 	}
 	if wait := time.Until(deadline); wait > 0 {
 		<-time.After(wait)

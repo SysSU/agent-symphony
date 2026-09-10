@@ -165,6 +165,9 @@ func (s *dashboardServer) performRecordedControl(ctx context.Context, request co
 		return result
 	}
 	defer s.controlMu.Unlock()
+	if s.controlHook != nil {
+		s.controlHook(request)
+	}
 	receipts, err := s.readControlReceipts()
 	if err != nil {
 		result.Status, result.Error = http.StatusInternalServerError, "control receipts are unavailable"

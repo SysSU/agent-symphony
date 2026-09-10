@@ -57,6 +57,7 @@ type dashboardServer struct {
 	mu           *sync.Mutex
 	localMu      sync.Mutex
 	controlMu    sync.Mutex
+	controlHook  func(controlRequest)
 }
 
 type operationLockContextKey struct{}
