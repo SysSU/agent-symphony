@@ -725,6 +725,7 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		calls := 0
 		recipient := ""
 		prompt := ""
+		statusCleared := false
 		var submission agentruntime.Command
 		hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 			calls++
@@ -736,12 +737,18 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 				return agentruntime.Result{Output: recipient}, nil
 			}
 			if command.Args[0] == "respawn-pane" {
+				if !statusCleared {
+					return agentruntime.Result{}, errors.New("prior pane exit status was not cleared")
+				}
 				submission = command
 				var err error
 				recipient, err = acknowledgeHandoffLaunch(command)
 				return agentruntime.Result{}, err
 			}
 			if command.Args[0] == "set-option" {
+				if slices.Contains(command.Args, agentruntime.PaneExitStatusOption) && command.Args[len(command.Args)-1] == "" {
+					statusCleared = true
+				}
 				recipient = command.Args[len(command.Args)-1]
 			}
 			return agentruntime.Result{}, nil
@@ -766,8 +773,8 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if _, err := acceptHandoff(t.Context(), request, root); err != nil {
 			t.Fatal(err)
 		}
-		if calls != 4 {
-			t.Fatalf("worker made %d tmux calls, want lookup, buffer load, launch, and ready binding", calls)
+		if calls != 5 {
+			t.Fatalf("worker made %d tmux calls, want lookup, buffer load, status clear, launch, and ready binding", calls)
 		}
 		if !slices.Contains(submission.Args, "worker-capture-handoff-ready") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
 			t.Fatalf("handoff did not use the stdin capture helper: %#v", submission.Args)
@@ -1205,6 +1212,71 @@ func TestAbandonAttemptAcceptsExactFailedWorktreeWithoutWeakeningCleanup(t *test
 	}
 	if _, err := os.Stat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("abandon retained worktree: %v", err)
+	}
+}
+
+func TestPermanentRemovalRejectsDirtyOrUnpublishedWorkAndRetriesSafely(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := cleanupTestManifest(t, root)
+	manifest.State = "failed"
+	publishedHead := runGit(t, manifest.Worktree, "rev-parse", "HEAD")
+	request := func(head string) []byte {
+		body, _ := json.Marshal(permanentRemovalRequest{Manifest: manifest, PublishedHead: head})
+		return body
+	}
+	mustWriteFile(t, filepath.Join(manifest.Worktree, "uncommitted"), "preserve me")
+	if err := permanentlyRemoveAttempt(t.Context(), request(publishedHead), root, false); err == nil || !strings.Contains(err.Error(), "uncommitted") {
+		t.Fatalf("dirty preflight = %v", err)
+	}
+	if _, err := os.Stat(manifest.Worktree); err != nil {
+		t.Fatalf("dirty worktree was removed: %v", err)
+	}
+	if err := os.Remove(filepath.Join(manifest.Worktree, "uncommitted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("git", "-C", manifest.Worktree, "commit", "--allow-empty", "-m", "unpublished").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := permanentlyRemoveAttempt(t.Context(), request(publishedHead), root, false); err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("unpublished preflight = %v", err)
+	}
+	publishedHead = runGit(t, manifest.Worktree, "rev-parse", "HEAD")
+	oldExec := hostExecRunner
+	live, kills := true, 0
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		switch command.Args[0] {
+		case "has-session":
+			if live {
+				return agentruntime.Result{}, nil
+			}
+			return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
+		case "kill-session":
+			live, kills = false, kills+1
+			return agentruntime.Result{}, nil
+		default:
+			return agentruntime.Result{}, fmt.Errorf("unexpected tmux command %v", command.Args)
+		}
+	}
+	t.Cleanup(func() { hostExecRunner = oldExec })
+	if err := permanentlyRemoveAttempt(t.Context(), request(publishedHead), root, false); err != nil {
+		t.Fatalf("safe preflight: %v", err)
+	}
+	if _, err := os.Stat(manifest.Worktree); err != nil || kills != 0 {
+		t.Fatalf("preflight mutated worktree/session: stat=%v kills=%d", err, kills)
+	}
+	for range 2 {
+		if err := permanentlyRemoveAttempt(t.Context(), request(publishedHead), root, true); err != nil {
+			t.Fatalf("idempotent removal: %v", err)
+		}
+	}
+	if kills != 1 {
+		t.Fatalf("tmux kills=%d, want 1", kills)
+	}
+	if _, err := os.Stat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worktree remains: %v", err)
 	}
 }
 
