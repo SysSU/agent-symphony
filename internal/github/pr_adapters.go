@@ -750,7 +750,7 @@ func NewPRReconciler(api API, cfg PRAdapterConfig, recovery AttemptRecovery, att
 		return Reconciler{}, errors.New("PR reconciliation requires repository policy, recovery, and issue reconciliation")
 	}
 	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery, Attempts: attempts}
-	return Reconciler{FullRead: fullRead, PullRequests: &PRCoordinator{API: api, Source: source, Signals: RecoverySignals{recovery}, ReviewLabel: cfg.HumanReviewLabel, MergeMethod: cfg.MergeMethod, ActorID: cfg.ActorID}}, nil
+	return Reconciler{FullRead: fullRead, PullRequests: &PRCoordinator{API: api, Source: source, Signals: RecoverySignals{recovery}, Attempts: attempts, ReviewLabel: cfg.HumanReviewLabel, MergeMethod: cfg.MergeMethod, ActorID: cfg.ActorID}}, nil
 }
 
 func (s *GitHubPRSource) OpenPullRequests(ctx context.Context) ([]int, error) {
