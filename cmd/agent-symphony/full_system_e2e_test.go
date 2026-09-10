@@ -506,13 +506,13 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		_, err := os.Lstat(filepath.Join(root, "reviewed-once"))
 		return err == nil
 	}) {
-		t.Fatalf("timed out waiting for first review finding: %s", output.String())
+		t.Fatalf("timed out waiting for first review finding: %s\n%s", fullSystemAttemptDiagnostics(address, stateRoot, currentSession, server.Env), output.String())
 	}
 	if !waitFor(deadline(30*time.Second), func() bool {
 		_, err := os.Lstat(filepath.Join(root, "reviewed-twice"))
 		return err == nil
 	}) {
-		t.Fatalf("timed out waiting for clean second review: %s", output.String())
+		t.Fatalf("timed out waiting for clean second review: %s\n%s", fullSystemAttemptDiagnostics(address, stateRoot, currentSession, server.Env), output.String())
 	}
 	if !waitFor(deadline(45*time.Second), func() bool {
 		fixture.mu.Lock()
@@ -870,6 +870,35 @@ func waitFor(timeout time.Duration, ready func() bool) bool {
 		time.Sleep(25 * time.Millisecond)
 	}
 	return ready()
+}
+
+func fullSystemAttemptDiagnostics(address, stateRoot, implementationSession string, environment []string) string {
+	var diagnostics strings.Builder
+	if response, err := http.Get("http://" + address + "/status.json"); err != nil {
+		fmt.Fprintf(&diagnostics, "status error=%v\n", err)
+	} else {
+		body, readErr := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		fmt.Fprintf(&diagnostics, "status=%s read=%v\n", body, readErr)
+	}
+	runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot}
+	manifests, err := runtimeState.Discover()
+	fmt.Fprintf(&diagnostics, "manifests=%#v discover=%v\n", manifests, err)
+	for _, manifest := range manifests {
+		for label, path := range map[string]string{"implementation log": manifest.LogPath, "implementation result": agentruntime.ResultPath(manifest.Worktree)} {
+			body, readErr := os.ReadFile(path)
+			fmt.Fprintf(&diagnostics, "%s=%q read=%v\n", label, body, readErr)
+		}
+	}
+	reviewSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 73, 2)
+	environment = append(slices.Clone(environment), "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
+	for label, session := range map[string]string{"implementation pane": implementationSession, "review pane": reviewSession} {
+		command := exec.Command("tmux", "display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat+"|#{pane_current_command}|#{pane_start_command}")
+		command.Env = environment
+		body, commandErr := command.CombinedOutput()
+		fmt.Fprintf(&diagnostics, "%s=%q inspect=%v\n", label, body, commandErr)
+	}
+	return diagnostics.String()
 }
 
 func ensureFullSystemTmuxSession(t *testing.T, environment []string, session, dir string) {

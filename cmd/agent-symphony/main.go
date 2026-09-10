@@ -619,6 +619,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	command := args[0]
+	if command == "pane-exit-status" {
+		if len(args) < 4 || args[2] != "--" {
+			return misuse(stderr, false, command, "invalid internal pane command invocation")
+		}
+		code, childSignal, err := agentruntime.RunPaneCommand(context.Background(), args[1], args[3:], os.Stdin, stdout, stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "error: "+err.Error())
+		}
+		if childSignal != 0 {
+			signal.Reset(childSignal)
+			if killErr := syscall.Kill(os.Getpid(), childSignal); killErr != nil {
+				fmt.Fprintln(stderr, "error: re-raise pane command signal: "+killErr.Error())
+			} else {
+				select {}
+			}
+		}
+		return code
+	}
 	if command == "worker-capture" || command == "worker-capture-replace" || command == "worker-capture-handoff" || command == "worker-capture-handoff-ready" {
 		if command == "worker-capture-handoff" || command == "worker-capture-handoff-ready" {
 			if len(args) < 9 || args[7] != "--" {
@@ -2816,16 +2834,20 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 		manifestMode, manifestTarget = agentruntime.ReviewModeImplementation, target
 	}
 	if manifest.ReviewState == "running" && manifestMode == mode && manifestTarget == target && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
-		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_dead} #{pane_dead_status}"}, Dir: snapshot, Env: env})
+		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
 		if err == nil {
-			dead, status, statusErr := agentruntime.ParsePaneStatus(result.Output)
-			if statusErr == nil && !dead {
+			pane, statusErr := agentruntime.ParsePaneStatus(result.Output)
+			if statusErr != nil {
+				return independentReviewResult{}, false, fmt.Errorf("observe reviewer tmux session: %w", statusErr)
+			}
+			if !pane.Dead || !pane.Ready {
 				return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
 			}
-			if statusErr != nil {
-				// The reviewer is temporarily unobservable; rebuild below.
-			} else if status != 0 {
-				return independentReviewResult{}, false, fmt.Errorf("reviewer exited %d; inspect reviewer session %s and retry the attempt after correcting the failure", status, session)
+			if pane.Signal != "" {
+				return independentReviewResult{}, false, fmt.Errorf("reviewer terminated by signal %s; inspect reviewer session %s and retry the attempt after correcting the failure", pane.Signal, session)
+			}
+			if pane.ExitStatus != 0 {
+				return independentReviewResult{}, false, fmt.Errorf("reviewer exited %d; inspect reviewer session %s and retry the attempt after correcting the failure", pane.ExitStatus, session)
 			} else {
 				request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, Head: head, LegacyHeadArtifact: legacyHeadArtifact})
 				artifact, err := boundary.call(ctx, "review-result", agentruntime.Command{Stdin: bytes.NewReader(request)})
@@ -2948,6 +2970,9 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 		return independentReviewResult{}, false, err
 	}
 	command = append(slices.Clone(command), prompt)
+	if runtimeState != nil && runtimeState.Helper != "" {
+		command = agentruntime.PaneExitStatusCommand(runtimeState.Helper, "tmux", command)
+	}
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}

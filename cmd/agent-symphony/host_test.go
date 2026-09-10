@@ -725,6 +725,7 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		calls := 0
 		recipient := ""
 		prompt := ""
+		statusCleared := false
 		var submission agentruntime.Command
 		hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 			calls++
@@ -736,12 +737,18 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 				return agentruntime.Result{Output: recipient}, nil
 			}
 			if command.Args[0] == "respawn-pane" {
+				if !statusCleared {
+					return agentruntime.Result{}, errors.New("prior pane exit status was not cleared")
+				}
 				submission = command
 				var err error
 				recipient, err = acknowledgeHandoffLaunch(command)
 				return agentruntime.Result{}, err
 			}
 			if command.Args[0] == "set-option" {
+				if slices.Contains(command.Args, agentruntime.PaneExitStatusOption) && command.Args[len(command.Args)-1] == "" {
+					statusCleared = true
+				}
 				recipient = command.Args[len(command.Args)-1]
 			}
 			return agentruntime.Result{}, nil
@@ -766,8 +773,8 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if _, err := acceptHandoff(t.Context(), request, root); err != nil {
 			t.Fatal(err)
 		}
-		if calls != 4 {
-			t.Fatalf("worker made %d tmux calls, want lookup, buffer load, launch, and ready binding", calls)
+		if calls != 5 {
+			t.Fatalf("worker made %d tmux calls, want lookup, buffer load, status clear, launch, and ready binding", calls)
 		}
 		if !slices.Contains(submission.Args, "worker-capture-handoff-ready") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
 			t.Fatalf("handoff did not use the stdin capture helper: %#v", submission.Args)

@@ -95,6 +95,35 @@ func TestControlRequestRequiresExactIdentityAndConfirmation(t *testing.T) {
 	}
 }
 
+func TestControlHandlerRejectsInvalidDeadline(t *testing.T) {
+	request := controlRequest{Version: 1, RequestID: "deadline", Repository: "o/r", Action: "reconcile"}
+	body, _ := json.Marshal(request)
+	var calls atomic.Int32
+	project := newProjectDashboardServer(t.Context(), t.TempDir(), "o/r", nil, "tmux", &sync.Mutex{}, nil, nil, func(context.Context) error {
+		calls.Add(1)
+		return nil
+	}, nil, false, "")
+	for name, values := range map[string][]string{
+		"missing":   nil,
+		"malformed": {"later"},
+		"unbounded": {strconv.FormatInt(time.Now().Add(3*time.Minute).UnixNano(), 10)},
+		"duplicate": {strconv.FormatInt(time.Now().Add(time.Minute).UnixNano(), 10), strconv.FormatInt(time.Now().Add(time.Minute).UnixNano(), 10)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			httpRequest := httptest.NewRequest(http.MethodPost, "http://unix/v1/action", bytes.NewReader(body))
+			for _, value := range values {
+				httpRequest.Header.Add(controlDeadline, value)
+			}
+			response := httptest.NewRecorder()
+			controlHandler(project).ServeHTTP(response, httpRequest)
+			var result controlResult
+			if json.Unmarshal(response.Body.Bytes(), &result) != nil || result.Status != http.StatusBadRequest || calls.Load() != 0 {
+				t.Fatalf("result=%#v calls=%d body=%q", result, calls.Load(), response.Body.String())
+			}
+		})
+	}
+}
+
 func TestControlOwnershipRejectsAnotherLocalIdentity(t *testing.T) {
 	info, err := os.Stat(t.TempDir())
 	if err != nil || !ownedByCurrentUser(info) {
@@ -111,7 +140,7 @@ func TestControlOwnershipRejectsAnotherLocalIdentity(t *testing.T) {
 	}
 }
 
-func TestRunningDaemonControlWorksWhileDaemonLockIsHeldAndReportsBusy(t *testing.T) {
+func TestRunningDaemonControlWorksWhileDaemonLockIsHeldAndQueuesOperations(t *testing.T) {
 	root := resolvedTempDir(t)
 	cleanupControlSocket(t, root)
 	if err := bindDeployment(root, "o/r"); err != nil {
@@ -163,14 +192,21 @@ func TestRunningDaemonControlWorksWhileDaemonLockIsHeldAndReportsBusy(t *testing
 
 	operationMu.Lock()
 	request.RequestID = "busy-7-2"
-	busy, err := callRunningDaemon(t.Context(), root, request)
-	operationMu.Unlock()
-	if err != nil || busy.OK || !busy.Retryable || busy.Status != http.StatusServiceUnavailable || recovered != 1 {
-		t.Fatalf("busy=%#v recovered=%d err=%v", busy, recovered, err)
+	queued := make(chan controlResult, 1)
+	queuedErr := make(chan error, 1)
+	go func() {
+		result, err := callRunningDaemon(t.Context(), root, request)
+		queued <- result
+		queuedErr <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	if recovered != 1 {
+		t.Fatalf("recovery ran while reconciliation owned the operation lock: %d", recovered)
 	}
-	retried, err := callRunningDaemon(t.Context(), root, request)
-	if err != nil || !retried.OK || retried.Status != http.StatusOK || recovered != 2 {
-		t.Fatalf("retried=%#v recovered=%d err=%v", retried, recovered, err)
+	operationMu.Unlock()
+	completed, err := <-queued, <-queuedErr
+	if err != nil || !completed.OK || completed.Status != http.StatusOK || recovered != 2 {
+		t.Fatalf("completed=%#v recovered=%d err=%v", completed, recovered, err)
 	}
 	replayedRetry, err := callRunningDaemon(t.Context(), root, request)
 	if err != nil || !replayedRetry.OK || replayedRetry.Status != http.StatusOK || recovered != 2 {
@@ -838,6 +874,72 @@ func TestOldDaemonShutdownDoesNotRemoveReplacementControlSocket(t *testing.T) {
 	}
 }
 
+func TestControlRecoveryQueuesBehindReconciliationAfterRestart(t *testing.T) {
+	root := resolvedTempDir(t)
+	cleanupControlSocket(t, root)
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 9, 1)
+	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 9, Attempt: 1, State: "failed", Retryable: true, Session: session, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: session, State: "failed", Current: true}}}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+
+	operation := &sync.Mutex{}
+	project := newProjectDashboardServer(t.Context(), root, "o/r", nil, "tmux", operation, func(context.Context, int, int) error { return nil }, nil, nil, nil, false, "")
+	oldContext, stopOld := context.WithCancel(t.Context())
+	if err := startControlServer(oldContext, project, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	stopOld()
+	newContext, stopNew := context.WithCancel(t.Context())
+	defer stopNew()
+	if err := startControlServer(newContext, project, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	reconcileContext, stopReconcile := context.WithCancel(t.Context())
+	reconcileDone := make(chan error, 1)
+	var reconciling atomic.Bool
+	var overlaps atomic.Int32
+	var recoveries atomic.Int32
+	go func() {
+		reconcileDone <- orchestrator.ReconcileLoop(reconcileContext, time.Millisecond, func(context.Context) error {
+			operation.Lock()
+			defer operation.Unlock()
+			reconciling.Store(true)
+			defer reconciling.Store(false)
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			time.Sleep(5 * time.Millisecond)
+			return nil
+		})
+	}()
+	<-started
+	project.recover = func(context.Context, int, int) error {
+		recoveries.Add(1)
+		if reconciling.Load() {
+			overlaps.Add(1)
+		}
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"control", "--repository", "o/r", "--action", "recover", "--issue", "9", "--attempt", "1", "--runtime-state", root, "--request-id", "restart-recovery", "--timeout", "250ms", "--json"}, &stdout, &stderr)
+	if code != 0 || stderr.Len() != 0 || !strings.Contains(stdout.String(), `"ok":true`) || recoveries.Load() != 1 || overlaps.Load() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	stopReconcile()
+	if err := <-reconcileDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("reconcile loop: %v", err)
+	}
+	stopNew()
+}
+
 func TestControlCLIEmitsVersionedResult(t *testing.T) {
 	root := resolvedTempDir(t)
 	cleanupControlSocket(t, root)
@@ -869,19 +971,95 @@ func TestControlCLIBoundsBusyRetryByTimeout(t *testing.T) {
 	}
 	operation := &sync.Mutex{}
 	operation.Lock()
-	defer operation.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			operation.Unlock()
+		}
+	}()
 	project := newProjectDashboardServer(t.Context(), root, "o/r", nil, "tmux", operation, nil, nil, func(context.Context) error { return nil }, nil, false, "")
 	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 	if err := startControlServer(ctx, project, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
 	started := time.Now()
 	code := run([]string{"control", "--repository", "o/r", "--action", "reconcile", "--runtime-state", root, "--request-id", "bounded-busy", "--timeout", "25ms"}, &stdout, &stderr)
-	cancel()
-	time.Sleep(50 * time.Millisecond)
-	if code != 1 || time.Since(started) > time.Second || !strings.Contains(stderr.String(), "remained busy until --timeout") {
-		t.Fatalf("code=%d elapsed=%s stdout=%q stderr=%q", code, time.Since(started), stdout.String(), stderr.String())
+	elapsed := time.Since(started)
+	operation.Unlock()
+	locked = false
+	if code != 1 || elapsed > time.Second || !strings.Contains(stderr.String(), "remained busy until --timeout") {
+		t.Fatalf("code=%d elapsed=%s stdout=%q stderr=%q", code, elapsed, stdout.String(), stderr.String())
+	}
+}
+
+func TestControlExpiredQueuedRequestIsReplaySafe(t *testing.T) {
+	root := resolvedTempDir(t)
+	cleanupControlSocket(t, root)
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	operation := &sync.Mutex{}
+	operation.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			operation.Unlock()
+		}
+	}()
+	var calls atomic.Int32
+	project := newProjectDashboardServer(t.Context(), root, "o/r", nil, "tmux", operation, nil, nil, func(context.Context) error {
+		calls.Add(1)
+		return nil
+	}, nil, false, "")
+	acquired := make(chan struct{})
+	var acquiredOnce sync.Once
+	project.controlHook = func(controlRequest) {
+		acquiredOnce.Do(func() { close(acquired) })
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	if err := startControlServer(ctx, project, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	request := controlRequest{Version: 1, RequestID: "bounded-busy", Repository: "o/r", Action: "reconcile"}
+	body, _ := json.Marshal(request)
+	deadline := time.Now().Add(25 * time.Millisecond)
+	httpRequest := httptest.NewRequest(http.MethodPost, "http://unix/v1/action", bytes.NewReader(body))
+	httpRequest.Header.Set(controlDeadline, strconv.FormatInt(deadline.UnixNano(), 10))
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		controlHandler(project).ServeHTTP(response, httpRequest)
+		close(done)
+	}()
+	select {
+	case <-acquired:
+	case <-done:
+		t.Fatal("control handler did not acquire the control lock")
+	}
+	if wait := time.Until(deadline); wait > 0 {
+		<-time.After(wait)
+	}
+	operation.Unlock()
+	locked = false
+	<-done
+	var expired controlResult
+	if json.Unmarshal(response.Body.Bytes(), &expired) != nil || !expired.Retryable || expired.Status != http.StatusServiceUnavailable {
+		t.Fatalf("expired result=%#v body=%q", expired, response.Body.String())
+	}
+	receipts, err := project.readControlReceipts()
+	if err != nil || len(receipts.Receipts) != 0 || calls.Load() != 0 {
+		t.Fatalf("canceled receipts=%#v calls=%d err=%v", receipts, calls.Load(), err)
+	}
+	result, err := callRunningDaemon(t.Context(), root, request)
+	if err != nil || !result.OK || calls.Load() != 1 {
+		t.Fatalf("retry result=%#v calls=%d err=%v", result, calls.Load(), err)
+	}
+	replayed, err := callRunningDaemon(t.Context(), root, request)
+	if err != nil || !replayed.OK || calls.Load() != 1 {
+		t.Fatalf("replay result=%#v calls=%d err=%v", replayed, calls.Load(), err)
 	}
 }
 

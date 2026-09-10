@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -70,6 +71,75 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 // replacement worker has started successfully.
 func CaptureWorkerReplacingResultAfterStart(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, afterStart func() error) (int, error) {
 	return captureWorkerAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", true, afterStart)
+}
+
+// RunPaneCommand preserves normal exit status while leaving signaled exits for
+// the caller to re-raise, so tmux retains the signal identity.
+func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer) (int, syscall.Signal, error) {
+	if len(command) == 0 || command[0] == "" {
+		return 1, 0, errors.New("pane command is missing")
+	}
+	record := func(code int) error {
+		statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		return RecordPaneExitStatus(statusCtx, tmux, code)
+	}
+	child := exec.CommandContext(ctx, command[0], command[1:]...)
+	child.Stdin, child.Stdout, child.Stderr = stdin, stdout, stderr
+	if err := child.Start(); err != nil {
+		return 1, 0, errors.Join(err, record(1))
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(signals)
+	waited := make(chan error, 1)
+	go func() { waited <- child.Wait() }()
+	var waitErr error
+	finished := false
+	for !finished {
+		select {
+		case waitErr = <-waited:
+			finished = true
+		case received := <-signals:
+			_ = child.Process.Signal(received)
+		}
+	}
+	status, ok := child.ProcessState.Sys().(syscall.WaitStatus)
+	if !ok {
+		return 1, 0, errors.New("pane command wait status is unavailable")
+	}
+	if status.Signaled() {
+		return 128 + int(status.Signal()), status.Signal(), nil
+	}
+	code := status.ExitStatus()
+	if code < 0 || code > 255 {
+		return 1, 0, fmt.Errorf("invalid pane command exit status %d", code)
+	}
+	if waitErr != nil {
+		var exit *exec.ExitError
+		if !errors.As(waitErr, &exit) {
+			return code, 0, waitErr
+		}
+	}
+	return code, 0, record(code)
+}
+
+// RecordPaneExitStatus preserves a normal child status when tmux leaves its
+// native pane exit fields unset after a rapid exit.
+func RecordPaneExitStatus(ctx context.Context, tmux string, code int) error {
+	pane := os.Getenv("TMUX_PANE")
+	if len(pane) < 2 || pane[0] != '%' {
+		return errors.New("tmux pane identity is unavailable")
+	}
+	if _, err := strconv.Atoi(pane[1:]); err != nil || code < 0 || code > 255 {
+		return errors.New("tmux pane exit status binding is invalid")
+	}
+	set := exec.CommandContext(ctx, tmux, "set-option", "-p", "-t", pane, PaneExitStatusOption, strconv.Itoa(code))
+	set.Dir = "/tmp"
+	if output, err := set.CombinedOutput(); err != nil {
+		return fmt.Errorf("record tmux pane exit status: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, tempDir string, replace bool, afterStart func() error) (int, error) {
