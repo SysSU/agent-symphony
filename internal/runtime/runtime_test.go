@@ -216,10 +216,10 @@ func TestParsePaneStatus(t *testing.T) {
 		wantErr string
 	}{
 		{name: "live blank status", output: "0 \n"},
+		{name: "dead status not ready", output: "1\n"},
 		{name: "dead zero", output: "1 0\n", dead: true},
 		{name: "dead nonzero", output: "1 127\n", dead: true, status: 127},
 		{name: "live with status", output: "0 0\n", wantErr: "invalid pane status"},
-		{name: "dead blank status", output: "1 \n", wantErr: "invalid pane status"},
 		{name: "negative exit", output: "1 -1\n", wantErr: "invalid exit status"},
 		{name: "unknown state", output: "2 0\n", wantErr: "invalid pane status"},
 		{name: "empty", wantErr: "invalid pane status"},
@@ -230,6 +230,59 @@ func TestParsePaneStatus(t *testing.T) {
 				t.Fatalf("ParsePaneStatus(%q) = %v, %d, %v", test.output, dead, status, err)
 			}
 		})
+	}
+}
+
+func TestParsePaneStatusFromRealTmux(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	root, err := os.MkdirTemp("/tmp", "as-pane-status-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	env := append(os.Environ(), "TMUX_TMPDIR="+root)
+	session := fmt.Sprintf("pane-status-%d", time.Now().UnixNano())
+	run := func(args ...string) string {
+		t.Helper()
+		command := exec.Command(tmux, append([]string{"-L", session, "-f", "/dev/null"}, args...)...)
+		command.Env = env
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("tmux %v: %v: %s", args, err, output)
+		}
+		return string(output)
+	}
+	t.Cleanup(func() {
+		command := exec.Command(tmux, "-L", session, "kill-server")
+		command.Env = env
+		_ = command.Run()
+	})
+	run("new-session", "-d", "-s", session, "sleep", "30")
+	target := PaneTarget(session)
+	if dead, status, err := ParsePaneStatus(run("display-message", "-p", "-t", target, "#{pane_dead} #{pane_dead_status}")); err != nil || dead || status != 0 {
+		t.Fatalf("live pane: dead=%v status=%d err=%v", dead, status, err)
+	}
+	run("set-option", "-w", "-t", target, "remain-on-exit", "on")
+	run("respawn-pane", "-k", "-t", target, "--", "sh", "-c", "exit 17")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		dead, status, err := ParsePaneStatus(run("display-message", "-p", "-t", target, "#{pane_dead} #{pane_dead_status}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dead {
+			if status != 17 {
+				t.Fatalf("dead pane status=%d want=17", status)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tmux pane exit status did not become observable")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

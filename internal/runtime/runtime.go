@@ -556,7 +556,9 @@ func TmuxNewSessionArgs(session, dir string, environment []string) []string {
 // ParsePaneStatus parses tmux's pane_dead and pane_dead_status format.
 func ParsePaneStatus(output string) (bool, int, error) {
 	fields := strings.Fields(output)
-	if len(fields) == 1 && fields[0] == "0" {
+	// tmux can report pane_dead before the child status is ready. Keep
+	// monitoring until pane_dead_status appears instead of failing the cycle.
+	if len(fields) == 1 && (fields[0] == "0" || fields[0] == "1") {
 		return false, 0, nil
 	}
 	if len(fields) != 2 || fields[0] != "1" {
