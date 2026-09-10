@@ -33,7 +33,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tmux
       - name: Run deterministic full-system gate
         if: matrix.os == 'ubuntu-latest'
-        run: AGENT_SYMPHONY_FULL_SYSTEM_E2E=1 go test ./cmd/agent-symphony -run '^TestFullSystemE2E$' -count=1 -timeout 10m
+        run: |
+          AGENT_SYMPHONY_FULL_SYSTEM_E2E=1 go test ./cmd/agent-symphony -run '^TestFullSystemE2E$' -count=1 -timeout 10m
+          AGENT_SYMPHONY_FULL_SYSTEM_E2E=1 AGENT_SYMPHONY_FULL_SYSTEM_RACE=1 go test -race ./cmd/agent-symphony -run '^TestFullSystemE2E$' -count=1 -timeout 10m
       - run: npm --prefix cmd/agent-symphony/dashboard run test:browser
       - run: rm -rf cmd/agent-symphony/dashboard/node_modules
       - run: scripts/validate-release.sh 0.0.0-ci
@@ -58,7 +60,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install WSL validation prerequisites' }
           wsl -d $distribution -- bash -lc 'rm -rf ~/agent-symphony-ci && mkdir ~/agent-symphony-ci'
           git archive --format=tar HEAD | wsl -d $distribution -- bash -lc 'tar -xf - -C ~/agent-symphony-ci'
-          wsl -d $distribution -- bash -lc "cd ~/agent-symphony-ci; chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh; git init -q; git remote add origin '$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git'; git add .; git -c user.name=ci -c user.email=ci@invalid commit -qm snapshot"
+          wsl -d $distribution -- bash -lc "cd ~/agent-symphony-ci; chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/live-pilot.sh scripts/live-pilot-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh; git init -q; git remote add origin '$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git'; git add .; git -c user.name=ci -c user.email=ci@invalid commit -qm snapshot"
           $goArchiveVersion = '1.26.0'
           $goDirective = (Select-String '^go ([0-9.]+)$' go.mod).Matches.Groups[1].Value
           $goDirectiveMatch = [regex]::Match($goDirective, '^(\d+)\.(\d+)(?:\.\d+)?$')

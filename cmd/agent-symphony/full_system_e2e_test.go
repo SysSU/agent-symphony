@@ -36,20 +36,20 @@ type fullSystemGitHub struct {
 }
 
 type synchronizedBuffer struct {
-	mu sync.Mutex
-	bytes.Buffer
+	mu     sync.Mutex
+	buffer bytes.Buffer
 }
 
 func (b *synchronizedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.Buffer.Write(p)
+	return b.buffer.Write(p)
 }
 
 func (b *synchronizedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.Buffer.String()
+	return b.buffer.String()
 }
 
 func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -194,6 +194,19 @@ func TestFullSystemE2E(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl is unavailable")
 	}
+	raceMode := os.Getenv("AGENT_SYMPHONY_FULL_SYSTEM_RACE") == "1"
+	deadline := func(normal time.Duration) time.Duration {
+		if raceMode {
+			return normal * 4
+		}
+		return normal
+	}
+	latencyBudget := 10 * time.Second
+	serveInterval, controlTimeout := "200ms", "30s"
+	if raceMode {
+		latencyBudget = 40 * time.Second
+		serveInterval, controlTimeout = "5s", "2m"
+	}
 
 	source, err := os.Getwd()
 	if err != nil {
@@ -231,7 +244,11 @@ func TestFullSystemE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(binDir, "agent-symphony")
-	runExternal(t, source, "go", "build", "-o", binary, ".")
+	buildArgs := []string{"build", "-o", binary, "."}
+	if raceMode {
+		buildArgs = []string{"build", "-race", "-o", binary, "."}
+	}
+	runExternal(t, source, "go", buildArgs...)
 	writeExecutable(t, filepath.Join(binDir, "gh"), `#!/bin/sh
 method=GET
 endpoint=
@@ -249,6 +266,9 @@ if [ "$input" -eq 1 ]; then exec curl -sS -i -X "$method" --data-binary @- "$FAK
 exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 `)
 	writeExecutable(t, filepath.Join(binDir, "codex"), `#!/bin/sh
+HOME=$FULL_SYSTEM_FIXTURE/empty-git-home
+export HOME
+mkdir -p "$HOME"
 trusted=0
 bypass=0
 want_trust=$(printf 'projects={"%s"={trust_level="trusted"}}' "$PWD")
@@ -276,7 +296,7 @@ fi
 	  case "$prompt" in
 	    *"Apply this authorized Agent Symphony handoff"*)
 	      printf 'reworked\n' >>change.txt
-	      git add change.txt && git commit -qm 'address independent review' || exit 27
+	      git add change.txt && git -c user.name='Full system fixture' -c user.email=fixture@example.invalid commit -qm 'address independent review' || exit 27
 	      printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"rework fixture passed","documentation":"none"}'
 	      exit 0
 	      ;;
@@ -297,7 +317,7 @@ printf '%s' '{"body":"/agent-symphony status clear: operator supplied the decisi
 gh api --method DELETE /repos/o/r/issues/73/labels/needs-attention >/dev/null || exit 25
 printf 'operator-message-received:%s\n' "$message"
 printf 'reviewed\n' >>change.txt
-git add change.txt && git commit -qm 'implement fixture journey' || exit 26
+git add change.txt && git -c user.name='Full system fixture' -c user.email=fixture@example.invalid commit -qm 'implement fixture journey' || exit 26
 printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixture passed","documentation":"none"}' >"$AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
 `)
 
@@ -314,7 +334,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatal(err)
 	}
 	address := freeAddress(t)
-	server := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", "200ms")
+	server := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", serveInterval)
 	server.Dir = repository
 	server.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_GITHUB_URL="+github.URL, "FULL_SYSTEM_FIXTURE="+root, "CODEX_HOME="+filepath.Join(root, "codex-home"), "TMUX_TMPDIR="+filepath.Join(root, "tmux"))
 	output := &synchronizedBuffer{}
@@ -332,7 +352,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 			_ = server.Wait()
 		}
 	})
-	waitHTTP(t, "http://"+address+"/status.json", 15*time.Second, output)
+	waitHTTP(t, "http://"+address+"/status.json", deadline(15*time.Second), output)
 	response, err := http.Get("http://" + address + "/status.json")
 	if err != nil {
 		t.Fatal(err)
@@ -343,7 +363,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	t.Logf("initial status=%s requests=%q", statusBody, fixture.requests)
 	fixture.mu.Unlock()
 	failureStarted := time.Now()
-	if !waitFor(15*time.Second, func() bool {
+	if !waitFor(deadline(15*time.Second), func() bool {
 		response, err := http.Get("http://" + address + "/status.json")
 		if err != nil {
 			return false
@@ -354,15 +374,15 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	}) {
 		t.Fatalf("scripted launch failure did not become recoverable: %s", output.String())
 	}
-	if elapsed := time.Since(failureStarted); elapsed >= 10*time.Second {
+	if elapsed := time.Since(failureStarted); elapsed >= latencyBudget {
 		t.Fatalf("launch failure projection latency=%s", elapsed)
 	}
-	recoverCLI := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "recover", "--issue", "73", "--attempt", "1", "--request-id", "full-system-launch-recovery", "--timeout", "30s", "--json")
+	recoverCLI := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "recover", "--issue", "73", "--attempt", "1", "--request-id", "full-system-launch-recovery", "--timeout", controlTimeout, "--json")
 	recoverOutput, err := recoverCLI.CombinedOutput()
 	if err != nil || !strings.Contains(string(recoverOutput), `"ok":true`) {
 		t.Fatalf("launch recovery CLI: %v output=%s serve=%s", err, recoverOutput, output.String())
 	}
-	if !waitFor(15*time.Second, func() bool {
+	if !waitFor(deadline(15*time.Second), func() bool {
 		response, err := http.Get("http://" + address + "/status.json")
 		if err != nil {
 			return false
@@ -399,7 +419,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatalf("implementation restart checkpoint manifests=%q", manifests)
 	}
 	address = freeAddress(t)
-	server = exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", "200ms")
+	server = exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", serveInterval)
 	server.Dir = repository
 	server.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_GITHUB_URL="+github.URL, "FULL_SYSTEM_FIXTURE="+root, "CODEX_HOME="+filepath.Join(root, "codex-home"), "TMUX_TMPDIR="+filepath.Join(root, "tmux"))
 	output = &synchronizedBuffer{}
@@ -408,11 +428,11 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatal(err)
 	}
 	stopped = false
-	waitHTTP(t, "http://"+address+"/status.json", 15*time.Second, output)
+	waitHTTP(t, "http://"+address+"/status.json", deadline(15*time.Second), output)
 
 	playwright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "playwright"))
 	playwright.Dir = source
-	playwright.Env = append(os.Environ(), "AGENT_SYMPHONY_FULL_SYSTEM_URL=http://"+address)
+	playwright.Env = append(os.Environ(), "AGENT_SYMPHONY_FULL_SYSTEM_URL=http://"+address, "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(raceMode))
 	playwrightOutput, err := playwright.CombinedOutput()
 	if err != nil {
 		response, _ := http.Get("http://" + address + "/status.json")
@@ -446,7 +466,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatalf("review restart checkpoint manifests=%q PR creates=%d", manifests, createdAtReviewRestart)
 	}
 	address = freeAddress(t)
-	server = exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", "200ms")
+	server = exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", serveInterval)
 	server.Dir = repository
 	server.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_GITHUB_URL="+github.URL, "FULL_SYSTEM_FIXTURE="+root, "CODEX_HOME="+filepath.Join(root, "codex-home"), "TMUX_TMPDIR="+filepath.Join(root, "tmux"))
 	output = &synchronizedBuffer{}
@@ -455,30 +475,20 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatal(err)
 	}
 	stopped = false
-	waitHTTP(t, "http://"+address+"/status.json", 15*time.Second, output)
-	if !waitFor(30*time.Second, func() bool {
-		matches, _ := filepath.Glob(filepath.Join(stateRoot, "worktrees", "*", "change.txt"))
-		if len(matches) != 1 {
-			return false
-		}
-		body, _ := os.ReadFile(matches[0])
-		return strings.Contains(string(body), "reworked")
+	waitHTTP(t, "http://"+address+"/status.json", deadline(15*time.Second), output)
+	if !waitFor(deadline(30*time.Second), func() bool {
+		_, err := os.Lstat(filepath.Join(root, "reviewed-once"))
+		return err == nil
 	}) {
-		manifests, _ := filepath.Glob(filepath.Join(stateRoot, "attempts", "*", "73-*", "manifest.json"))
-		var manifest []byte
-		if len(manifests) == 1 {
-			manifest, _ = os.ReadFile(manifests[0])
-		}
-		entries, _ := filepath.Glob(filepath.Join(stateRoot, "snapshots", "*"))
-		t.Fatalf("timed out waiting for review finding rework commit: manifest=%s snapshots=%q serve=%s", manifest, entries, output.String())
+		t.Fatalf("timed out waiting for first review finding: %s", output.String())
 	}
-	if !waitFor(30*time.Second, func() bool {
+	if !waitFor(deadline(30*time.Second), func() bool {
 		_, err := os.Lstat(filepath.Join(root, "reviewed-twice"))
 		return err == nil
 	}) {
 		t.Fatalf("timed out waiting for clean second review: %s", output.String())
 	}
-	if !waitFor(45*time.Second, func() bool {
+	if !waitFor(deadline(45*time.Second), func() bool {
 		fixture.mu.Lock()
 		defer fixture.mu.Unlock()
 		return fixture.merged && fixture.closed
@@ -493,8 +503,12 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		}
 		t.Fatalf("timed out waiting for pull request merge and issue closure: requests=%q manifest=%s serve=%s", requests, manifest, output.String())
 	}
+	mergedChange := runExternal(t, "", "git", "--git-dir", origin, "show", "refs/heads/main:change.txt")
+	if !strings.Contains(mergedChange, "reviewed") || !strings.Contains(mergedChange, "reworked") {
+		t.Fatalf("merged change does not contain implementation and review rework: %q", mergedChange)
+	}
 	cyclesAfterMerge := strings.Count(output.String(), `"ok":true`)
-	if !waitFor(15*time.Second, func() bool {
+	if !waitFor(deadline(15*time.Second), func() bool {
 		return strings.Count(output.String(), `"ok":true`) > cyclesAfterMerge
 	}) {
 		t.Fatalf("merged state did not reconcile: %s", output.String())
@@ -531,7 +545,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	fixture.mu.Unlock()
 
 	restartAddress := freeAddress(t)
-	restarted := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", restartAddress, "--interval", "200ms")
+	restarted := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", restartAddress, "--interval", serveInterval)
 	restarted.Dir, restarted.Env = repository, server.Env
 	var restartOutput synchronizedBuffer
 	restarted.Stdout, restarted.Stderr = &restartOutput, &restartOutput
@@ -545,11 +559,11 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 			_ = restarted.Wait()
 		}
 	})
-	waitHTTP(t, "http://"+restartAddress+"/status.json", 15*time.Second, &restartOutput)
+	waitHTTP(t, "http://"+restartAddress+"/status.json", deadline(15*time.Second), &restartOutput)
 	fixture.mu.Lock()
 	fixture.failNext = true
 	fixture.mu.Unlock()
-	control := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "reconcile", "--request-id", "full-system-post-merge", "--timeout", "30s", "--json")
+	control := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "reconcile", "--request-id", "full-system-post-merge", "--timeout", controlTimeout, "--json")
 	controlOutput, err := control.CombinedOutput()
 	if err != nil || !strings.Contains(string(controlOutput), `"ok":true`) {
 		t.Fatalf("post-restart CLI recovery: %v output=%s serve=%s", err, controlOutput, restartOutput.String())

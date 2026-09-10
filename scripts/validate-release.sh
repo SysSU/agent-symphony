@@ -18,6 +18,7 @@ test "$(git ls-files cmd/agent-symphony/dashboard/out | grep -vc '/.gitkeep$' ||
 git check-ignore -q cmd/agent-symphony/dashboard/out/index.html
 test -s cmd/agent-symphony/dashboard/package-lock.json
 scripts/credential-scan-test.sh
+scripts/live-pilot-test.sh
 for script in scripts/*.sh; do
   ! grep -q "$(printf '\r')" "$script"
   test "$(git check-attr eol -- "$script")" = "$script: eol: lf"
@@ -36,7 +37,7 @@ runs = workflow.fetch("jobs").fetch("wsl2").fetch("steps").map { |step| step["ru
 snapshots = runs.flat_map(&:lines).grep(/commit -qm snapshot/)
 abort "expected one WSL snapshot command" unless snapshots.length == 1
 commands = snapshots.first.match(/bash -lc "(.*)"\s*$/)&.captures&.first&.split(/;\s*/)
-chmod = "chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh"
+chmod = "chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/live-pilot.sh scripts/live-pilot-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh"
 abort "invalid WSL snapshot chmod" unless File.read(path).scan(/\bchmod\b/).length == 1 && commands&.count(chmod) == 1
 index = commands.index(chmod)
 abort "WSL snapshot chmod must immediately precede git init" unless index && commands[index + 1] == "git init -q"

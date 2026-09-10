@@ -10,31 +10,34 @@ if [ "${AGENT_SYMPHONY_LIVE_PILOT:-}" != 1 ]; then
   exit 2
 fi
 case "$run_id" in *[!A-Za-z0-9._-]*|'') echo "invalid live pilot run ID" >&2; exit 2;; esac
-command -v gh >/dev/null
-command -v ruby >/dev/null
+for command in gh git go ruby tmux; do command -v "$command" >/dev/null; done
 
 identity=$(gh repo view "$repository" --json nameWithOwner,isPrivate --jq '[.nameWithOwner,.isPrivate] | @tsv')
 if [ "$identity" != "$(printf '%s\ttrue' "$repository")" ]; then
   echo "sample repository identity or privacy does not match" >&2
   exit 2
 fi
-open_issues=$(gh issue list --repo "$repository" --state open --limit 100 --json number,title,url,labels)
-open_prs=$(gh pr list --repo "$repository" --state open --limit 100 --json number,headRefName,mergeStateStatus,url)
+issue_pages=$(gh api --paginate --slurp "/repos/$repository/issues?state=all&per_page=100")
+pr_pages=$(gh api --paginate --slurp "/repos/$repository/pulls?state=open&per_page=100")
+open_issues=$(PAGES="$issue_pages" ruby -rjson -e 'puts JSON.parse(ENV.fetch("PAGES")).flatten.reject { |item| item.key?("pull_request") || item["state"]!="open" }.map { |item| {number:item["number"],title:item["title"],url:item["html_url"],labels:item.fetch("labels",[])} }.to_json')
+open_prs=$(PAGES="$pr_pages" ruby -rjson -e 'puts JSON.parse(ENV.fetch("PAGES")).flatten.map { |item| {number:item["number"],title:item["title"],url:item["html_url"],headRefName:item.dig("head","ref"),mergeStateStatus:item["mergeable_state"]} }.to_json')
+used=$(PAGES="$issue_pages" TITLE="Live pilot $run_id" ruby -rjson -e 'puts JSON.parse(ENV.fetch("PAGES")).flatten.reject { |item| item.key?("pull_request") }.select { |item| item["title"]==ENV.fetch("TITLE") }.map { |item| {number:item["number"],state:item["state"],url:item["html_url"]} }.to_json')
 eligible=$(printf '%s' "$open_issues" | ruby -rjson -e 'puts JSON.parse(STDIN.read).select { |issue| issue.fetch("labels").any? { |label| label.fetch("name")=="agent-ready" } }.to_json')
 managed=$(printf '%s' "$open_prs" | ruby -rjson -e 'puts JSON.parse(STDIN.read).select { |pr| pr.fetch("headRefName").start_with?("agent-symphony/") }.to_json')
 status=ready
 blocker=
-if [ "$eligible" != '[]' ] || [ "$managed" != '[]' ]; then
+if [ "$used" != '[]' ]; then
+  status=blocked
+  blocker='live pilot run ID was already used'
+elif [ "$eligible" != '[]' ] || [ "$managed" != '[]' ]; then
   status=blocked
   blocker='pre-existing eligible issues or managed pull requests make repository-wide governance isolation unsafe'
 fi
 
-result=$(RUN_ID="$run_id" REPOSITORY="$repository" STATUS="$status" BLOCKER="$blocker" OPEN_ISSUES="$open_issues" OPEN_PRS="$open_prs" ELIGIBLE="$eligible" MANAGED="$managed" ruby -rjson -e 'puts JSON.generate({schema:"agent-symphony-live-pilot-v1",run_id:ENV.fetch("RUN_ID"),repository:ENV.fetch("REPOSITORY"),status:ENV.fetch("STATUS"),blocker:ENV.fetch("BLOCKER"),preflight:{open_issues:JSON.parse(ENV.fetch("OPEN_ISSUES")),open_pull_requests:JSON.parse(ENV.fetch("OPEN_PRS")),eligible_issues:JSON.parse(ENV.fetch("ELIGIBLE")),managed_pull_requests:JSON.parse(ENV.fetch("MANAGED"))},created:{issues:[],pull_requests:[],branches:[],sessions:[],worktrees:[],runtime_roots:[]},cleanup:{performed:false,commands:[]}})')
+result=$(RUN_ID="$run_id" REPOSITORY="$repository" STATUS="$status" BLOCKER="$blocker" OPEN_ISSUES="$open_issues" OPEN_PRS="$open_prs" ELIGIBLE="$eligible" MANAGED="$managed" USED="$used" ruby -rjson -e 'puts JSON.generate({schema:"agent-symphony-live-pilot-v1",run_id:ENV.fetch("RUN_ID"),repository:ENV.fetch("REPOSITORY"),status:ENV.fetch("STATUS"),blocker:ENV.fetch("BLOCKER"),preflight:{open_issues:JSON.parse(ENV.fetch("OPEN_ISSUES")),open_pull_requests:JSON.parse(ENV.fetch("OPEN_PRS")),eligible_issues:JSON.parse(ENV.fetch("ELIGIBLE")),managed_pull_requests:JSON.parse(ENV.fetch("MANAGED")),used_run_id:JSON.parse(ENV.fetch("USED"))},created:{issues:[],pull_requests:[],branches:[],sessions:[],worktrees:[],review_snapshots:[],runtime_roots:[]},cleanup:{performed:false,commands:[]}})')
 printf '%s\n' "$result"
-if [ "$status" = blocked ]; then
-  if [ -n "$report" ]; then umask 077; printf '%s\n' "$result" >"$report"; fi
-  exit 3
-fi
+if [ -n "$report" ]; then umask 077; printf '%s\n' "$result" >"$report"; fi
+if [ "$status" = blocked ]; then exit 3; fi
 
 project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 pilot_root=$(mktemp -d "/tmp/agent-symphony-${run_id}.XXXXXX")
@@ -42,6 +45,62 @@ checkout="$pilot_root/repository"
 runtime="$pilot_root/runtime"
 binary="$pilot_root/agent-symphony"
 fake_bin="$pilot_root/bin"
+issue=
+issue_url=
+server_pid=
+pr='[]'
+resources=
+mutation_started=false
+completed=false
+
+collect_resources() {
+  RUNTIME="$runtime" ruby -rjson -e '
+    manifests=Dir[File.join(ENV.fetch("RUNTIME"),"attempts","*","*","manifest.json")].sort.map { |path| JSON.parse(File.read(path)).merge("manifest"=>path) }
+    puts JSON.generate({
+      attempts:manifests.map { |item| {repository:item["repository"],issue:item["issue"],attempt:item["attempt"],manifest:item["manifest"]} },
+      branches:manifests.map { |item| item["branch"] }.compact.reject(&:empty?).uniq,
+      sessions:manifests.flat_map { |item| [item["session"],item["review_session"]] }.compact.reject(&:empty?).uniq,
+      worktrees:manifests.map { |item| item["worktree"] }.compact.reject(&:empty?).uniq,
+      review_snapshots:manifests.map { |item| item["review_snapshot"] }.compact.reject(&:empty?).uniq,
+      runtime_roots:[ENV.fetch("RUNTIME")]
+    })'
+}
+
+report_failure() {
+  exit_status=$1
+  trap - EXIT HUP INT TERM
+  set +e
+  if [ "$completed" = true ] || [ "$mutation_started" != true ]; then exit "$exit_status"; fi
+  latest=$(collect_resources 2>/dev/null)
+  if [ -n "$latest" ]; then resources=$latest; fi
+  if [ -n "$server_pid" ]; then
+    kill -INT "$server_pid" 2>/dev/null
+    wait "$server_pid" 2>/dev/null
+  fi
+  TMUX_TMPDIR="$runtime/tmux" tmux kill-server 2>/dev/null
+  latest_pr=$(gh pr list --repo "$repository" --state all --search "$run_id in:title" --limit 100 --json number,url,state,isDraft,headRefName,mergedAt 2>/dev/null)
+  if printf '%s' "$latest_pr" | ruby -rjson -e 'JSON.parse(STDIN.read)' >/dev/null 2>&1; then pr=$latest_pr; fi
+  result=$(RUN_ID="$run_id" REPOSITORY="$repository" ISSUE="$issue" ISSUE_URL="$issue_url" ROOT="$pilot_root" PID="$server_pid" RUNTIME="$runtime" RESOURCES="$resources" PR="$pr" EXIT_STATUS="$exit_status" ruby -rjson -rshellwords -e '
+    resources=ENV.fetch("RESOURCES","").empty? ? {attempts:[],branches:[],sessions:[],worktrees:[],review_snapshots:[],runtime_roots:[ENV.fetch("RUNTIME")]} : JSON.parse(ENV.fetch("RESOURCES"))
+    prs=JSON.parse(ENV.fetch("PR")); commands=[]
+    commands << "kill -INT #{ENV.fetch("PID")}" unless ENV.fetch("PID","").empty?
+    commands << "TMUX_TMPDIR=#{Shellwords.escape(ENV.fetch("RUNTIME")+"/tmux")} tmux kill-server"
+    commands << "gh issue close #{ENV.fetch("ISSUE")} --repo #{ENV.fetch("REPOSITORY")}" unless ENV.fetch("ISSUE","").empty?
+    prs.each { |item| commands << "gh pr close #{item.fetch("number")} --repo #{ENV.fetch("REPOSITORY")}" unless item["state"]=="MERGED" }
+    (resources.fetch("branches",[])+prs.map { |item| item["headRefName"] }).compact.uniq.each { |branch| commands << "git -C #{Shellwords.escape(ENV.fetch("ROOT")+"/repository")} push origin --delete #{Shellwords.escape(branch)}" }
+    commands << "rm -rf -- #{Shellwords.escape(ENV.fetch("ROOT"))} # only after preserving diagnostics"
+    issues=ENV.fetch("ISSUE","").empty? ? [] : [{number:ENV.fetch("ISSUE").to_i,url:ENV.fetch("ISSUE_URL")}]
+    puts JSON.generate({schema:"agent-symphony-live-pilot-v1",run_id:ENV.fetch("RUN_ID"),repository:ENV.fetch("REPOSITORY"),status:"failed",exit_status:ENV.fetch("EXIT_STATUS").to_i,created:resources.merge(issues:issues,pull_requests:prs),cleanup:{performed:false,processes_stopped:true,diagnostics_preserved:true,commands:commands}})')
+  printf '%s\n' "$result" >&2
+  if [ -n "$report" ]; then umask 077; printf '%s\n' "$result" >"$report"; fi
+  exit "$exit_status"
+}
+
+trap 'report_failure $?' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 mkdir -m 700 "$fake_bin"
 (cd "$project_root" && go build -o "$binary" ./cmd/agent-symphony)
 gh repo clone "$repository" "$checkout" -- --quiet
@@ -51,7 +110,7 @@ git -C "$checkout" config user.email "live-pilot@example.invalid"
   cd "$checkout"
   "$binary" init
 )
-ruby -rjson -e 'path=ARGV.fetch(0); config=JSON.parse(File.read(path)); config["reconciliation_interval_seconds"]=1; config["commands"]["orchestrator"]=nil; config["commands"]["orchestrator_audit"]=nil; File.write(path, JSON.pretty_generate(config)+"\n")' "$checkout/.agent-symphony.yaml"
+ruby -rjson -e 'path=ARGV.fetch(0); config=JSON.parse(File.read(path)); config["reconciliation_interval_seconds"]=1; config["commands"]["orchestrator"]=nil; config["commands"]["orchestrator_audit"]=nil; File.write(path,JSON.pretty_generate(config)+"\n")' "$checkout/.agent-symphony.yaml"
 cat >"$fake_bin/codex" <<'EOF'
 #!/bin/sh
 set -eu
@@ -68,6 +127,7 @@ ruby -e 'path,run_id=ARGV; marker="__AGENT_SYMPHONY_LIVE_RUN_ID__"; body=File.re
 chmod 0700 "$fake_bin/codex"
 
 body=$(printf '## Context\n\nAuthenticated isolated pilot `%s`.\n\n## Acceptance criteria\n\n- Complete one implementation, review, pull request, checks, merge, and closure lifecycle.\n\n## Checklist\n\n- [ ] Run the isolated lifecycle.\n\n## Validation\n\nValidate GitHub state, dashboard projection, and exact cleanup.\n\n## Dependencies\n\nNone\n' "$run_id")
+mutation_started=true
 issue_url=$(gh issue create --repo "$repository" --title "Live pilot $run_id" --body "$body" --label agent-ready --label priority:P1 --label autonomous-merge)
 issue=${issue_url##*/}
 port=$(ruby -rsocket -e 'socket=TCPServer.new("127.0.0.1",0); puts socket.addr[1]; socket.close')
@@ -76,7 +136,7 @@ printf '[]\n' >"$state"
 started=$(date +%s)
 (
   cd "$checkout"
-  exec env PATH="$fake_bin:$PATH" AGENT_SYMPHONY_LIVE_RUN_ID="$run_id" CODEX_HOME="$pilot_root/codex-home" TMUX_TMPDIR="$runtime/tmux" "$binary" serve --config "$checkout/.agent-symphony.yaml" --state "$state" --runtime-state "$runtime" --dashboard-address "127.0.0.1:$port" --interval 200ms
+  exec env PATH="$fake_bin:$PATH" CODEX_HOME="$pilot_root/codex-home" TMUX_TMPDIR="$runtime/tmux" "$binary" serve --config "$checkout/.agent-symphony.yaml" --state "$state" --runtime-state "$runtime" --dashboard-address "127.0.0.1:$port" --interval 200ms
 ) >"$pilot_root/serve.log" 2>&1 &
 server_pid=$!
 
@@ -88,31 +148,13 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   if RUNTIME="$runtime" ruby -rjson -e 'exit Dir[File.join(ENV.fetch("RUNTIME"),"attempts","*","*","manifest.json")].any? { |path| JSON.parse(File.read(path))["state"]=="failed" } ? 0 : 1'; then break; fi
   sleep 2
 done
-resources=$(RUNTIME="$runtime" ruby -rjson -e '
-  manifests=Dir[File.join(ENV.fetch("RUNTIME"),"attempts","*","*","manifest.json")].sort.map { |path| JSON.parse(File.read(path)).merge("manifest"=>path) }
-  puts JSON.generate({
-    attempts:manifests.map { |item| {repository:item["repository"],issue:item["issue"],attempt:item["attempt"],manifest:item["manifest"]} },
-    sessions:manifests.flat_map { |item| [item["session"],item["review_session"]] }.compact.reject(&:empty?).uniq,
-    worktrees:manifests.map { |item| item["worktree"] }.compact.reject(&:empty?).uniq,
-    review_snapshots:manifests.map { |item| item["review_snapshot"] }.compact.reject(&:empty?).uniq,
-    runtime_roots:[ENV.fetch("RUNTIME")]
-  })')
+resources=$(collect_resources)
 kill -INT "$server_pid" 2>/dev/null || true
 wait "$server_pid" 2>/dev/null || true
 TMUX_TMPDIR="$runtime/tmux" tmux kill-server 2>/dev/null || true
 
-pr=$(gh pr list --repo "$repository" --state all --search "$run_id in:title" --limit 2 --json number,url,state,isDraft,headRefName,mergedAt)
-if [ "$closed" != true ] || [ "$(printf '%s' "$pr" | ruby -rjson -e 'rows=JSON.parse(STDIN.read); puts rows.length==1 && rows[0]["state"]=="MERGED" ? "true" : "false"')" != true ]; then
-  result=$(RUN_ID="$run_id" REPOSITORY="$repository" ISSUE="$issue" ISSUE_URL="$issue_url" ROOT="$pilot_root" PID="$server_pid" RUNTIME="$runtime" RESOURCES="$resources" PR="$pr" ruby -rjson -rshellwords -e '
-    prs=JSON.parse(ENV.fetch("PR")); resources=JSON.parse(ENV.fetch("RESOURCES"))
-    commands=["kill -INT #{ENV.fetch("PID")}","TMUX_TMPDIR=#{Shellwords.escape(ENV.fetch("RUNTIME")+"/tmux")} tmux kill-server","gh issue close #{ENV.fetch("ISSUE")} --repo #{ENV.fetch("REPOSITORY")}"]
-    prs.each { |item| commands << "gh pr close #{item.fetch("number")} --repo #{ENV.fetch("REPOSITORY")}" unless item["state"]=="MERGED"; commands << "git -C #{Shellwords.escape(ENV.fetch("ROOT")+"/repository")} push origin --delete #{Shellwords.escape(item.fetch("headRefName"))}" }
-    commands << "rm -rf -- #{Shellwords.escape(ENV.fetch("ROOT"))} # only after preserving diagnostics"
-    puts JSON.generate({schema:"agent-symphony-live-pilot-v1",run_id:ENV.fetch("RUN_ID"),repository:ENV.fetch("REPOSITORY"),status:"failed",created:resources.merge(issues:[{number:ENV.fetch("ISSUE").to_i,url:ENV.fetch("ISSUE_URL")}],pull_requests:prs),cleanup:{performed:false,commands:commands}})')
-  printf '%s\n' "$result"
-  if [ -n "$report" ]; then umask 077; printf '%s\n' "$result" >"$report"; fi
-  exit 5
-fi
+pr=$(gh pr list --repo "$repository" --state all --search "$run_id in:title" --limit 100 --json number,url,state,isDraft,headRefName,mergedAt)
+if [ "$closed" != true ] || [ "$(printf '%s' "$pr" | ruby -rjson -e 'rows=JSON.parse(STDIN.read); puts rows.length==1 && rows[0]["state"]=="MERGED" ? "true" : "false"')" != true ]; then exit 5; fi
 
 branch=$(printf '%s' "$pr" | ruby -rjson -e 'puts JSON.parse(STDIN.read).fetch(0).fetch("headRefName")')
 if git -C "$checkout" ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null 2>&1; then
@@ -134,3 +176,4 @@ result=$(RUN_ID="$run_id" REPOSITORY="$repository" ISSUE="$issue" ISSUE_URL="$is
   puts JSON.generate({schema:"agent-symphony-live-pilot-v1",run_id:ENV.fetch("RUN_ID"),repository:ENV.fetch("REPOSITORY"),status:"passed",created:resources.merge(issues:[{number:ENV.fetch("ISSUE").to_i,url:ENV.fetch("ISSUE_URL")}],pull_requests:JSON.parse(ENV.fetch("PR")),branches:[ENV.fetch("BRANCH")]),timings:{total_seconds:ENV.fetch("ELAPSED").to_i},cleanup:{performed:true,verified:{remote_branch_absent:true,tmux_server_absent:true,runtime_root_absent:true},commands:[]}})')
 printf '%s\n' "$result"
 if [ -n "$report" ]; then umask 077; printf '%s\n' "$result" >"$report"; fi
+completed=true
