@@ -1077,8 +1077,97 @@ func TestDashboardPermanentRemovalRetainsEntryWhenCleanupFails(t *testing.T) {
 	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "uncommitted changes") || stateErr != nil || len(state.Hidden) != 0 {
 		t.Fatalf("failed removal status=%d body=%q state=%#v err=%v", response.Code, response.Body.String(), state, stateErr)
 	}
+	if intent, found, err := server.removalIntent(previous.Repository, previous.Issue, previous.Attempt); err != nil || !found || intent.CleanupStarted {
+		t.Fatalf("preflight failure intent=%#v found=%v err=%v", intent, found, err)
+	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(previous.LogPath), "manifest.json")); err != nil {
 		t.Fatalf("failed removal lost attempt record: %v", err)
+	}
+}
+
+func TestDashboardPermanentRemovalRevalidatesPendingIntentBeforeCleanup(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*testing.T, string, agentruntime.Manifest, agentruntime.Manifest)
+	}{
+		{name: "attempt became current", change: func(t *testing.T, root string, previous, _ agentruntime.Manifest) {
+			if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{{Repository: previous.Repository, Issue: previous.Issue, Attempt: previous.Attempt, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session}}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "manifest became active", change: func(t *testing.T, _ string, previous, _ agentruntime.Manifest) {
+			previous.State = "running"
+			body, _ := json.Marshal(previous)
+			if err := os.WriteFile(filepath.Join(filepath.Dir(previous.LogPath), "manifest.json"), body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "review became active", change: func(t *testing.T, _ string, previous, _ agentruntime.Manifest) {
+			previous.ReviewState = "running"
+			body, _ := json.Marshal(previous)
+			if err := os.WriteFile(filepath.Join(filepath.Dir(previous.LogPath), "manifest.json"), body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, _ := filepath.EvalSymlinks(t.TempDir())
+			previous := writeDashboardManifest(t, root, 37, 1, "failed")
+			current := writeDashboardManifest(t, root, 37, 2, "running")
+			statuses := []orchestrator.RecoveryStatus{
+				{Repository: previous.Repository, Issue: previous.Issue, Attempt: previous.Attempt, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session},
+				{Repository: current.Repository, Issue: current.Issue, Attempt: current.Attempt, State: "active", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session},
+			}
+			if err := writeStatusSnapshot(root, statuses); err != nil {
+				t.Fatal(err)
+			}
+			server := &dashboardServer{
+				stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
+				remove: func(context.Context, string, agentruntime.Manifest, string) error {
+					return errors.New("worktree has uncommitted changes")
+				},
+				reviewCleanup: func(context.Context, agentruntime.Manifest, bool) error {
+					t.Fatal("review cleanup ran after failed implementation preflight")
+					return nil
+				},
+			}
+			request := func() *httptest.ResponseRecorder {
+				r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/remove?repository=o%2Fr&issue=37&attempt=1", nil)
+				r.Header.Set("Origin", "http://127.0.0.1")
+				response := httptest.NewRecorder()
+				server.handler(http.NotFoundHandler()).ServeHTTP(response, r)
+				return response
+			}
+			if response := request(); response.Code != http.StatusConflict {
+				t.Fatalf("initial preflight status=%d body=%q", response.Code, response.Body.String())
+			}
+			intent, found, err := server.removalIntent(previous.Repository, previous.Issue, previous.Attempt)
+			if err != nil || !found || intent.CleanupStarted {
+				t.Fatalf("pending intent=%#v found=%v err=%v", intent, found, err)
+			}
+			test.change(t, root, previous, current)
+			cleanupCalls := 0
+			server.remove = func(context.Context, string, agentruntime.Manifest, string) error {
+				cleanupCalls++
+				return nil
+			}
+			server.reviewCleanup = func(context.Context, agentruntime.Manifest, bool) error {
+				cleanupCalls++
+				return nil
+			}
+			if response := request(); response.Code != http.StatusConflict {
+				t.Fatalf("unsafe retry status=%d body=%q", response.Code, response.Body.String())
+			}
+			if cleanupCalls != 0 {
+				t.Fatalf("unsafe retry invoked %d cleanup boundaries", cleanupCalls)
+			}
+			if _, err := os.Stat(filepath.Join(filepath.Dir(previous.LogPath), "manifest.json")); err != nil {
+				t.Fatalf("unsafe retry removed retained manifest: %v", err)
+			}
+			if state, err := server.readState(); err != nil || len(state.Hidden) != 0 {
+				t.Fatalf("unsafe retry hid attempt: state=%#v err=%v", state, err)
+			}
+		})
 	}
 }
 
@@ -1177,8 +1266,8 @@ func TestDashboardPermanentRemovalConvergesAfterDestructiveStepFailureAndRestart
 			if !failed {
 				t.Fatal("failure was not injected")
 			}
-			if _, found, err := server.removalIntent(previous.Repository, previous.Issue, previous.Attempt); err != nil || !found {
-				t.Fatalf("durable intent found=%v err=%v", found, err)
+			if intent, found, err := server.removalIntent(previous.Repository, previous.Issue, previous.Attempt); err != nil || !found || !intent.CleanupStarted {
+				t.Fatalf("durable cleanup intent=%#v found=%v err=%v", intent, found, err)
 			}
 			if state, err := server.readState(); err != nil || len(state.Hidden) != 0 {
 				t.Fatalf("failed cleanup hid the entry: state=%#v err=%v", state, err)

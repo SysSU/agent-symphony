@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -79,8 +80,9 @@ type dashboardState struct {
 }
 
 type dashboardRemovalIntent struct {
-	Manifest      agentruntime.Manifest `json:"manifest"`
-	PublishedHead string                `json:"published_head"`
+	Manifest       agentruntime.Manifest `json:"manifest"`
+	PublishedHead  string                `json:"published_head"`
+	CleanupStarted bool                  `json:"cleanup_started,omitempty"`
 }
 
 type dashboardRemovalState struct {
@@ -632,6 +634,21 @@ func (s *dashboardServer) writeRemovalIntent(intent dashboardRemovalIntent) erro
 	return s.writeRemovalState(state)
 }
 
+func (s *dashboardServer) markRemovalStarted(repository string, issue, attempt int) error {
+	state, err := s.readRemovalState()
+	if err != nil {
+		return err
+	}
+	index := slices.IndexFunc(state.Intents, func(intent dashboardRemovalIntent) bool {
+		return intent.Manifest.Repository == repository && intent.Manifest.Issue == issue && intent.Manifest.Attempt == attempt
+	})
+	if index < 0 {
+		return errors.New("permanent removal intent is missing")
+	}
+	state.Intents[index].CleanupStarted = true
+	return s.writeRemovalState(state)
+}
+
 func (s *dashboardServer) clearRemovalIntent(repository string, issue, attempt int) error {
 	state, err := s.readRemovalState()
 	if err != nil {
@@ -853,7 +870,7 @@ func (s *dashboardServer) serveRemoveAction(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	status := orchestrator.RecoveryStatus{Repository: intent.Manifest.Repository, Issue: issue, Attempt: attempt, Branch: intent.Manifest.Branch, Worktree: intent.Manifest.Worktree, Session: intent.Manifest.Session}
-	if !found {
+	if !found || !intent.CleanupStarted {
 		status, err = s.projectedStatus(issue, attempt)
 		if err != nil || !s.historicalTerminal(status) {
 			http.Error(w, "attempt is not an eligible historical terminal attempt", http.StatusConflict)
@@ -871,10 +888,18 @@ func (s *dashboardServer) serveRemoveAction(w http.ResponseWriter, r *http.Reque
 			http.Error(w, "local attempt identity or lifecycle does not match the historical projection", http.StatusConflict)
 			return
 		}
-		intent = dashboardRemovalIntent{Manifest: matches[0], PublishedHead: firstNonempty(status.HeadSHA, matches[0].BaseSHA)}
-		if err := s.writeRemovalIntent(intent); err != nil {
-			http.Error(w, "permanent removal intent could not be recorded", http.StatusInternalServerError)
-			return
+		publishedHead := firstNonempty(status.HeadSHA, matches[0].BaseSHA)
+		if found {
+			if !reflect.DeepEqual(intent.Manifest, matches[0]) || intent.PublishedHead != publishedHead {
+				http.Error(w, "retained attempt no longer matches its pending permanent removal", http.StatusConflict)
+				return
+			}
+		} else {
+			intent = dashboardRemovalIntent{Manifest: matches[0], PublishedHead: publishedHead}
+			if err := s.writeRemovalIntent(intent); err != nil {
+				http.Error(w, "permanent removal intent could not be recorded", http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 	manifest, publishedHead := intent.Manifest, intent.PublishedHead
@@ -885,6 +910,12 @@ func (s *dashboardServer) serveRemoveAction(w http.ResponseWriter, r *http.Reque
 	if err := s.reviewCleanup(r.Context(), manifest, false); err != nil {
 		http.Error(w, "permanent removal refused: "+internalgithub.Redact(err.Error()), http.StatusConflict)
 		return
+	}
+	if !intent.CleanupStarted {
+		if err := s.markRemovalStarted(manifest.Repository, issue, attempt); err != nil {
+			http.Error(w, "permanent removal could not record cleanup start", http.StatusInternalServerError)
+			return
+		}
 	}
 	if err := s.reviewCleanup(r.Context(), manifest, true); err != nil {
 		http.Error(w, "permanent removal could not clean reviewer resources: "+internalgithub.Redact(err.Error()), http.StatusConflict)

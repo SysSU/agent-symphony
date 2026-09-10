@@ -677,13 +677,14 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	go func() {
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
-			if _, err := os.Lstat(journalPath); err == nil {
+			state, err := (&dashboardServer{stateRoot: stateRoot, repository: "o/r"}).readRemovalState()
+			if err == nil && len(state.Intents) == 1 && state.Intents[0].CleanupStarted {
 				permissionChanged <- os.Chmod(stateRoot, 0o500)
 				return
 			}
 			time.Sleep(time.Millisecond)
 		}
-		permissionChanged <- errors.New("removal journal was not observed")
+		permissionChanged <- errors.New("removal cleanup start was not observed")
 	}()
 	lateRemovalCLI := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "remove", "--issue", "73", "--attempt", "1", "--confirm", "--request-id", "full-system-late-removal", "--timeout", controlTimeout, "--json")
 	lateRemovalOutput, lateRemovalErr := lateRemovalCLI.CombinedOutput()
