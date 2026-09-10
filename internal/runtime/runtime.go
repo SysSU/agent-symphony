@@ -780,6 +780,24 @@ func (r *Runtime) Forget(manifest Manifest) error {
 		return err
 	}
 	stored, err := r.readManifest(attempt)
+	if errors.Is(err, os.ErrNotExist) {
+		dir := filepath.Dir(r.manifestPath(attempt))
+		if _, statErr := os.Lstat(dir); !errors.Is(statErr, os.ErrNotExist) {
+			if statErr == nil {
+				return errors.New("attempt record is incomplete")
+			}
+			return statErr
+		}
+		for _, path := range []string{manifest.Worktree, ResultPath(manifest.Worktree)} {
+			if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+				if statErr == nil {
+					return fmt.Errorf("attempt worker resource still exists: %s", path)
+				}
+				return statErr
+			}
+		}
+		return nil
+	}
 	if err != nil {
 		return err
 	}

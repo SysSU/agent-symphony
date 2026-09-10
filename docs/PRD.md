@@ -398,6 +398,7 @@ No migration guide is required for the greenfield MVP.
 - **FR63:** Dashboard terminal, recovery, and cleanup controls default to loopback and always require same-origin requests and server-resolved deterministic attempt identity; non-loopback binding requires an explicit unsafe-network opt-in and password authentication on every route.
 - **FR64:** A stakeholder can recover only the latest eligible failed or stuck attempt after fresh permission, state, and identity checks; recovery preserves diagnostics and may post only the fixed retry control.
 - **FR65:** A stakeholder can dismiss a terminal attempt whose issue is closed without changing GitHub or deleting its retained diagnostics.
+- **FR66:** A stakeholder can permanently remove one non-current terminal attempt after fresh lifecycle, publication, identity, and path-safety checks delete only its managed local resources while leaving GitHub unchanged.
 
 ## Non-Functional Requirements
 

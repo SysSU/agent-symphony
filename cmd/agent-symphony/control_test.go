@@ -82,7 +82,7 @@ func TestControlRequestRequiresExactIdentityAndConfirmation(t *testing.T) {
 			}
 		})
 	}
-	for _, action := range []string{"archive", "abandon"} {
+	for _, action := range []string{"archive", "abandon", "remove"} {
 		request := valid
 		request.Action = action
 		if validControlRequest(request, "o/r") {

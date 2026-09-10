@@ -65,11 +65,24 @@ function DismissButton({ status, onAction, busy }) {
   );
 }
 
+function canPermanentlyRemove(status, historical) {
+  return historical && ["failed", "orphaned", "cancelled"].includes(status.state) && !status.retryable;
+}
+
+function PermanentRemoveButton({ status, onAction, busy, historical }) {
+  if (!canPermanentlyRemove(status, historical)) return null;
+  return (
+    <button className="dangerAction" type="button" disabled={busy} onClick={() => onAction("remove", status)} aria-label={`Permanently remove issue #${status.issue}, attempt ${status.attempt}`}>
+      Permanently remove
+    </button>
+  );
+}
+
 function StatusActions({ status, onAction, onInvestigate, onNotice, investigationEnabled, investigationBusy, busy, investigating, waiting, readOnly, historical }) {
   const investigationAvailable = investigationEnabled && canInvestigate(status);
   const actionAvailable = attemptActionAvailable(status, historical);
   const planReviewAvailable = canPlanReview(status);
-  if (readOnly || (!investigationAvailable && !actionAvailable && !canDismiss(status) && !planReviewAvailable)) return null;
+  if (readOnly || (!investigationAvailable && !actionAvailable && !canDismiss(status) && !canPermanentlyRemove(status, historical) && !planReviewAvailable)) return null;
   const action = actionFor(status);
   const label = actionLabel(status, busy, waiting);
   return (
@@ -81,6 +94,7 @@ function StatusActions({ status, onAction, onInvestigate, onNotice, investigatio
       ) : null}
       {planReviewAvailable ? <PlanReviewButton status={status} onNotice={onNotice} /> : null}
       <DismissButton status={status} onAction={onAction} busy={busy} />
+      <PermanentRemoveButton status={status} onAction={onAction} busy={busy} historical={historical} />
       {actionAvailable ? (
         <button className={status.state === "completed" ? "secondaryAction" : "dangerAction"} type="button" disabled={busy} onClick={() => onAction(action, status)}>
           {label}
