@@ -4848,7 +4848,9 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 	requestCount := 0
 	governanceReads := make(map[int]int, 10)
 	latestCheckReads := make(map[string]int, 10)
+	recoveryStatusReads := make(map[string]int, 10)
 	governanceCheckReads := make(map[string]int, 10)
+	governanceStatusReads := make(map[string]int, 10)
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		timer := time.NewTimer(100 * time.Millisecond)
 		defer timer.Stop()
@@ -4904,8 +4906,16 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 			requestMu.Unlock()
 			response = map[string]any{"check_runs": []any{map[string]any{"name": "ci", "status": "completed", "conclusion": "success"}}}
 		case request.Method == http.MethodGet && strings.Contains(request.URL.Path, "/commits/") && strings.HasSuffix(request.URL.Path, "/status"):
+			head := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, "/repos/o/r/commits/"), "/status")
+			requestMu.Lock()
+			recoveryStatusReads[head]++
+			requestMu.Unlock()
 			response = map[string]any{"statuses": []any{map[string]any{"context": "legacy-ci", "state": "success"}}}
 		case request.Method == http.MethodGet && strings.Contains(request.URL.Path, "/commits/") && strings.HasSuffix(request.URL.Path, "/statuses"):
+			head := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, "/repos/o/r/commits/"), "/statuses")
+			requestMu.Lock()
+			governanceStatusReads[head]++
+			requestMu.Unlock()
 			response = []any{map[string]any{"context": internalgithub.PolicyCheck, "state": "failure", "creator": map[string]any{"id": 42}}}
 		case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/repos/o/r/pulls/") && !strings.HasSuffix(request.URL.Path, "/comments") && !strings.HasSuffix(request.URL.Path, "/reviews"):
 			var pr int
@@ -4958,7 +4968,7 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 			governed++
 		}
 	}
-	latestHeads, governedHeads := len(latestCheckReads), len(governanceCheckReads)
+	latestHeads, recoveryStatusHeads, governedHeads, governanceStatusHeads := len(latestCheckReads), len(recoveryStatusReads), len(governanceCheckReads), len(governanceStatusReads)
 	requestMu.Unlock()
 	managed := 0
 	for _, status := range statuses {
@@ -4966,8 +4976,8 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 			managed++
 		}
 	}
-	if err != nil || len(statuses) != 20 || managed != 10 || governed != 10 || latestHeads != 10 || governedHeads != 10 || elapsed >= 5*time.Second || observation.DurationMS >= 5000 || requests < 80 || observation.GitHubRequests != int64(requests) {
-		t.Fatalf("statuses=%#v requests=%d governed=%d latest heads=%d governed heads=%d elapsed=%s observation=%#v err=%v", statuses, requests, governed, latestHeads, governedHeads, elapsed, observation, err)
+	if err != nil || len(statuses) != 20 || managed != 10 || governed != 10 || latestHeads != 10 || recoveryStatusHeads != 10 || governedHeads != 10 || governanceStatusHeads != 10 || elapsed >= 5*time.Second || observation.DurationMS >= 5000 || requests < 80 || observation.GitHubRequests != int64(requests) {
+		t.Fatalf("statuses=%#v requests=%d governed=%d recovery checks/statuses=%d/%d governance checks/statuses=%d/%d elapsed=%s observation=%#v err=%v", statuses, requests, governed, latestHeads, recoveryStatusHeads, governedHeads, governanceStatusHeads, elapsed, observation, err)
 	}
 	t.Logf("20 issues + 10 pull requests: duration=%s requests=%d", elapsed, requests)
 
