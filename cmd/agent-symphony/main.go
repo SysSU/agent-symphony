@@ -2951,7 +2951,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if err != nil {
 		return independentReviewResult{}, false, err
 	}
-	command = append(slices.Clone(command), prompt)
+	command = agentruntime.PaneExitStatusCommand("tmux", append(slices.Clone(command), prompt))
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}

@@ -168,15 +168,15 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 		}
 		if slices.Contains(args, PaneStatusFormat) {
 			if !s.dead {
-				return Result{Output: "0||\n"}, nil
+				return Result{Output: "0|||\n"}, nil
 			}
 			if s.pending {
-				return Result{Output: "1||\n"}, nil
+				return Result{Output: "1|||\n"}, nil
 			}
 			if s.signal != "" {
-				return Result{Output: "1||" + s.signal + "\n"}, nil
+				return Result{Output: "1||" + s.signal + "|\n"}, nil
 			}
-			return Result{Output: "1|" + strconv.Itoa(s.status) + "|\n"}, nil
+			return Result{Output: "1|" + strconv.Itoa(s.status) + "||\n"}, nil
 		}
 		if s.dead {
 			return Result{Output: "1"}, nil
@@ -221,21 +221,29 @@ func TestParsePaneStatus(t *testing.T) {
 		want    PaneStatus
 		wantErr string
 	}{
-		{name: "live", output: "0||\n"},
-		{name: "dead status not ready", output: "1||\n", want: PaneStatus{Dead: true}},
-		{name: "dead zero", output: "1|0|\n", want: PaneStatus{Dead: true, Ready: true}},
-		{name: "dead nonzero", output: "1|127|\n", want: PaneStatus{Dead: true, Ready: true, ExitStatus: 127}},
-		{name: "dead signal", output: "1||term\n", want: PaneStatus{Dead: true, Ready: true, Signal: "term"}},
-		{name: "dead numeric signal", output: "1||15\n", want: PaneStatus{Dead: true, Ready: true, Signal: "15"}},
-		{name: "dead uppercase signal", output: "1||TERM\n", want: PaneStatus{Dead: true, Ready: true, Signal: "term"}},
+		{name: "live", output: "0|||\n"},
+		{name: "live with prior recorded status", output: "0|||17\n"},
+		{name: "dead status not ready", output: "1|||\n", want: PaneStatus{Dead: true}},
+		{name: "dead recorded zero", output: "1|||0\n", want: PaneStatus{Dead: true, Ready: true}},
+		{name: "dead recorded nonzero", output: "1|||42\n", want: PaneStatus{Dead: true, Ready: true, ExitStatus: 42}},
+		{name: "dead zero", output: "1|0||\n", want: PaneStatus{Dead: true, Ready: true}},
+		{name: "dead nonzero", output: "1|127||\n", want: PaneStatus{Dead: true, Ready: true, ExitStatus: 127}},
+		{name: "dead matching native and recorded", output: "1|17||17\n", want: PaneStatus{Dead: true, Ready: true, ExitStatus: 17}},
+		{name: "dead signal", output: "1||term|\n", want: PaneStatus{Dead: true, Ready: true, Signal: "term"}},
+		{name: "dead numeric signal", output: "1||15|\n", want: PaneStatus{Dead: true, Ready: true, Signal: "15"}},
+		{name: "dead uppercase signal", output: "1||TERM|\n", want: PaneStatus{Dead: true, Ready: true, Signal: "term"}},
 		{name: "legacy ambiguous", output: "1\n", wantErr: "invalid pane status"},
-		{name: "live with status", output: "0|0|\n", wantErr: "invalid live pane status"},
-		{name: "dead status and signal", output: "1|17|term\n", wantErr: "ambiguous dead pane status"},
-		{name: "negative exit", output: "1|-1|\n", wantErr: "invalid exit status"},
-		{name: "zero signal", output: "1||0", wantErr: "invalid pane signal"},
-		{name: "out of range signal", output: "1||128", wantErr: "invalid pane signal"},
-		{name: "garbage signal", output: "1||15x", wantErr: "invalid pane signal"},
-		{name: "unknown state", output: "2||\n", wantErr: "invalid pane status"},
+		{name: "live with status", output: "0|0||\n", wantErr: "invalid live pane status"},
+		{name: "dead status and signal", output: "1|17|term|\n", wantErr: "ambiguous dead pane status"},
+		{name: "negative exit", output: "1|-1||\n", wantErr: "invalid exit status"},
+		{name: "conflicting recorded exit", output: "1|17||42\n", wantErr: "conflicts"},
+		{name: "negative recorded exit", output: "1|||-1\n", wantErr: "invalid recorded pane exit status"},
+		{name: "out of range recorded exit", output: "1|||256\n", wantErr: "invalid recorded pane exit status"},
+		{name: "garbage recorded exit", output: "1|||x\n", wantErr: "invalid recorded pane exit status"},
+		{name: "zero signal", output: "1||0|", wantErr: "invalid pane signal"},
+		{name: "out of range signal", output: "1||128|", wantErr: "invalid pane signal"},
+		{name: "garbage signal", output: "1||15x|", wantErr: "invalid pane signal"},
+		{name: "unknown state", output: "2|||\n", wantErr: "invalid pane status"},
 		{name: "empty", wantErr: "invalid pane status"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -280,7 +288,7 @@ func TestParsePaneStatusFromRealTmux(t *testing.T) {
 		t.Fatalf("live pane: status=%#v err=%v", pane, err)
 	}
 	run("set-option", "-w", "-t", target, "remain-on-exit", "on")
-	run("respawn-pane", "-k", "-t", target, "--", "sh", "-c", "exit 17")
+	run(append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(tmux, []string{"sh", "-c", "exit 17"})...)...)
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat))
@@ -298,6 +306,7 @@ func TestParsePaneStatusFromRealTmux(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	run("set-option", "-p", "-t", target, PaneExitStatusOption, "")
 	run("respawn-pane", "-k", "-t", target, "--", "sh", "-c", "kill -TERM $$")
 	deadline = time.Now().Add(3 * time.Second)
 	for {
@@ -329,7 +338,7 @@ func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *tes
 	if manifest.State != "running" || fake.buffers[manifest.Session] != attempt.Context {
 		t.Fatalf("unexpected launch: %#v, %#v", manifest, fake.sessions[manifest.Session])
 	}
-	want := PromptCommand(r.Helper, "tmux", manifest.Session, ResultPath(manifest.Worktree), attempt.Command)
+	want := PaneExitStatusCommand("tmux", PromptCommand(r.Helper, "tmux", manifest.Session, ResultPath(manifest.Worktree), attempt.Command))
 	if !slices.Equal(fake.sessions[manifest.Session].agent, want) {
 		t.Fatalf("agent command = %#v, want %#v", fake.sessions[manifest.Session].agent, want)
 	}
@@ -394,7 +403,8 @@ func TestInteractiveLifecycleKeepsAgentOnTmuxAndRequiresResult(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !manifest.Interactive || fake.buffers[manifest.Session] != "" || !slices.Equal(fake.sessions[manifest.Session].agent, []string{"interactive-agent", "--tty", attempt.Context}) {
+			want := PaneExitStatusCommand("tmux", []string{"interactive-agent", "--tty", attempt.Context})
+			if !manifest.Interactive || fake.buffers[manifest.Session] != "" || !slices.Equal(fake.sessions[manifest.Session].agent, want) {
 				t.Fatalf("interactive launch manifest=%#v session=%#v buffers=%#v", manifest, fake.sessions[manifest.Session], fake.buffers)
 			}
 			info, err := os.Lstat(ResultPath(manifest.Worktree))

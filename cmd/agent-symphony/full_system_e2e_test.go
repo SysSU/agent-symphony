@@ -891,6 +891,7 @@ func fullSystemAttemptDiagnostics(address, stateRoot, implementationSession stri
 		}
 	}
 	reviewSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 73, 2)
+	environment = append(slices.Clone(environment), "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
 	for label, session := range map[string]string{"implementation pane": implementationSession, "review pane": reviewSession} {
 		command := exec.Command("tmux", "display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat+"|#{pane_current_command}|#{pane_start_command}")
 		command.Env = environment

@@ -32,7 +32,8 @@ const (
 	historyLimit            = "5000"
 	workerResultSuffix      = ".result.json"
 	WorkerResultEnvironment = "AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
-	PaneStatusFormat        = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}"
+	PaneExitStatusOption    = "@agent-symphony-exit-status"
+	PaneStatusFormat        = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{@agent-symphony-exit-status}"
 )
 
 const (
@@ -344,6 +345,18 @@ func HandoffPromptCommand(helper, tmux, buffer, resultPath, launchedPath, recipi
 	return append([]string{helper, "worker-capture-handoff-ready", tmux, buffer, resultPath, launchedPath, recipient, signal, "--"}, command...)
 }
 
+// PaneExitStatusCommand preserves a command's exit status in the pane before
+// the pane process exits. tmux 3.4 can otherwise leave pane_dead_status blank.
+func PaneExitStatusCommand(tmux string, command []string) []string {
+	const wrapper = `tmux=$1
+shift
+"$@"
+code=$?
+"$tmux" set-option -p -t "$TMUX_PANE" ` + PaneExitStatusOption + ` "$code"
+exit "$code"`
+	return append([]string{"sh", "-c", wrapper, "agent-symphony-pane", tmux}, command...)
+}
+
 func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -464,6 +477,7 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	} else if attempt.Context != "" {
 		command = PromptCommand(r.Helper, r.tmux(), manifest.Session, ResultPath(manifest.Worktree), command)
 	}
+	command = PaneExitStatusCommand(r.tmux(), command)
 	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
 		return failStop("start agent", err)
 	}
@@ -571,8 +585,16 @@ func TmuxNewSessionArgs(session, dir string, environment []string) []string {
 // has published either its normal exit status or terminating signal.
 func ParsePaneStatus(output string) (PaneStatus, error) {
 	fields := strings.Split(strings.TrimSpace(output), "|")
-	if len(fields) != 3 || (fields[0] != "0" && fields[0] != "1") {
+	if len(fields) != 4 || (fields[0] != "0" && fields[0] != "1") {
 		return PaneStatus{}, fmt.Errorf("invalid pane status %q", strings.TrimSpace(output))
+	}
+	var recordedStatus *int
+	if fields[3] != "" {
+		status, err := strconv.Atoi(fields[3])
+		if err != nil || status < 0 || status > 255 {
+			return PaneStatus{}, fmt.Errorf("invalid recorded pane exit status %q", fields[3])
+		}
+		recordedStatus = &status
 	}
 	if fields[0] == "0" {
 		if fields[1] != "" || fields[2] != "" {
@@ -582,6 +604,9 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 	}
 	pane := PaneStatus{Dead: true}
 	if fields[1] == "" && fields[2] == "" {
+		if recordedStatus != nil {
+			pane.Ready, pane.ExitStatus = true, *recordedStatus
+		}
 		return pane, nil
 	}
 	if fields[1] != "" && fields[2] != "" {
@@ -603,6 +628,9 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 	status, err := strconv.Atoi(fields[1])
 	if err != nil || status < 0 {
 		return PaneStatus{}, fmt.Errorf("invalid exit status %q", fields[1])
+	}
+	if recordedStatus != nil && status != *recordedStatus {
+		return PaneStatus{}, fmt.Errorf("pane exit status conflicts with recorded status %d", *recordedStatus)
 	}
 	pane.Ready, pane.ExitStatus = true, status
 	return pane, nil

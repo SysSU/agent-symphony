@@ -283,9 +283,9 @@ func (r *attemptRunner) Run(_ context.Context, command agentruntime.Command) (ag
 		}
 		if slices.Contains(command.Args, agentruntime.PaneStatusFormat) {
 			if r.dead || r.interrupted {
-				return agentruntime.Result{Output: "1|0|"}, nil
+				return agentruntime.Result{Output: "1|0||"}, nil
 			}
-			return agentruntime.Result{Output: "0||"}, nil
+			return agentruntime.Result{Output: "0|||"}, nil
 		}
 		if r.dead || r.interrupted {
 			return agentruntime.Result{Output: "1"}, nil
@@ -765,9 +765,9 @@ func (r *revokedAttemptRunner) Run(ctx context.Context, command agentruntime.Com
 	case "display-message":
 		if slices.Contains(command.Args, agentruntime.PaneStatusFormat) {
 			if r.interrupted {
-				return agentruntime.Result{Output: "1||term"}, nil
+				return agentruntime.Result{Output: "1||term|"}, nil
 			}
-			return agentruntime.Result{Output: "0||"}, nil
+			return agentruntime.Result{Output: "0|||"}, nil
 		}
 		if !r.interrupted {
 			return agentruntime.Result{Output: "0"}, nil
@@ -1097,10 +1097,11 @@ func TestWorkerCaptureInternalCLIAndHandoffPreStartRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmux := filepath.Join(dir, "tmux")
-	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ntest \"$PWD\" = /tmp || exit 3\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer) exit 0;; wait-for) test -z \"$FAKE_SIGNAL_FAILURE\" || exit 1; printf %s \"$3\" >\"$FAKE_SIGNAL\";; *) exit 2;; esac\n"), 0o700); err != nil {
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\ntest \"$PWD\" = /tmp || exit 3\ncase $1 in save-buffer) cat \"$FAKE_PROMPT\";; delete-buffer|set-option) exit 0;; wait-for) test -z \"$FAKE_SIGNAL_FAILURE\" || exit 1; printf %s \"$3\" >\"$FAKE_SIGNAL\";; *) exit 2;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("FAKE_PROMPT", prompt)
+	t.Setenv("TMUX_PANE", "%7")
 	signalPath := filepath.Join(dir, "launch-signal")
 	t.Setenv("FAKE_SIGNAL", signalPath)
 	t.Setenv("TMPDIR", filepath.Join(dir, "inaccessible"))
@@ -1699,7 +1700,7 @@ case "$payload" in
   *'"operation":"verify"'*) printf '{"Code":0}';;
   *'"branch","--show-current"'*) printf '{"Output":"%s"}';;
   *'"rev-parse","HEAD"'*) printf '{"Output":"%s"}';;
-  *'"display-message"'*) printf '{"Output":"1|0|"}';;
+  *'"display-message"'*) printf '{"Output":"1|0||"}';;
   *'"capture-pane"'*) printf '{"Output":"completed"}';;
   *'"operation":"export"'*) printf '%%s' '%s';;
   *) printf '{"Code":0}';;
@@ -1716,7 +1717,7 @@ esac
 payload=$(cat)
 case "$payload" in
   *'"operation":"review-result"'*) printf '%%s' '%s';;
-  *'"display-message"'*) printf '{"Output":"1|0|"}';;
+  *'"display-message"'*) printf '{"Output":"1|0||"}';;
   *'"respawn-pane"'*) printf 'x\n' >> %q; printf '{"Code":0}';;
   *) printf '{"Code":0}';;
 esac
@@ -1965,7 +1966,7 @@ case "$payload" in
   *'"has-session"'*) if test -f %q; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true}'; fi; exit 0;;
   *'"new-session"'*) touch %q;;
   *'"respawn-pane"'*) printf '%%s' "$payload" >%q;;
-  *'"display-message"'*) printf '{"Output":"0||"}'; exit 0;;
+  *'"display-message"'*) printf '{"Output":"0|||"}'; exit 0;;
   *) printf '{"Code":0}'; exit 0;;
 esac
 if test $? -eq 0; then printf '{"Code":0}'; else printf '{"Code":1,"Exited":true}'; fi
@@ -2309,7 +2310,7 @@ func TestIndependentReviewStartsWithoutOrchestratorAndUsesReadOnlySnapshot(t *te
 	source = imported
 	script := filepath.Join(t.TempDir(), "review-boundary")
 	boundaryLog := filepath.Join(t.TempDir(), "boundary.log")
-	body := fmt.Sprintf("#!/bin/sh\ntee -a %q >/dev/null\nprintf '{\"Output\":\"1|0|\",\"Code\":0,\"Exited\":false}'\n", boundaryLog)
+	body := fmt.Sprintf("#!/bin/sh\ntee -a %q >/dev/null\nprintf '{\"Output\":\"1|0||\",\"Code\":0,\"Exited\":false}'\n", boundaryLog)
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -2483,7 +2484,7 @@ func (b *artifactReviewBoundary) call(_ context.Context, operation string, comma
 		if b.paneOutput != "" {
 			return agentruntime.Result{Output: b.paneOutput}, nil
 		}
-		return agentruntime.Result{Output: "1|0|"}, nil
+		return agentruntime.Result{Output: "1|0||"}, nil
 	}
 	if slices.Contains(command.Args, "kill-session") && b.cleanupErr != nil {
 		return agentruntime.Result{}, b.cleanupErr
@@ -2587,7 +2588,7 @@ func TestReconcilePlanReviewCompletesWhileImplementationRemainsActive(t *testing
 	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot}
 	binding := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}
 	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Body: "a changed plan body", DispatchAuthorized: true, ActiveAttempt: &binding}
-	boundary := &artifactReviewBoundary{root: snapshotRoot, paneOutput: "1|0|"}
+	boundary := &artifactReviewBoundary{root: snapshotRoot, paneOutput: "1|0||"}
 	cfg := config.Config{Commands: config.Commands{Reviewer: []string{"reviewer"}, Implementation: []string{"implementation"}}}
 	if err := reconcilePlanReviews(t.Context(), runtimeState, boundary, workerBoundaryRunner{}, cfg, []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, "", snapshotRoot); err != nil {
 		t.Fatal(err)
@@ -2718,7 +2719,7 @@ func TestReconcilePlanReviewRetriesUnacknowledgedFindings(t *testing.T) {
 	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot}
 	cfg := config.Config{Commands: config.Commands{Reviewer: []string{"reviewer"}, Implementation: []string{"implementation"}}}
 	issues := []internalgithub.RecoveryIssueFact{issue}
-	reviewBoundary := &artifactReviewBoundary{root: snapshotRoot, paneOutput: "1|0|"}
+	reviewBoundary := &artifactReviewBoundary{root: snapshotRoot, paneOutput: "1|0||"}
 	if err := reconcilePlanReviews(t.Context(), runtimeState, reviewBoundary, workerBoundaryRunner{Command: script}, cfg, issues, []agentruntime.Manifest{manifest}, "", snapshotRoot); err == nil {
 		t.Fatal("transient findings handoff failure was ignored")
 	}
@@ -2881,7 +2882,7 @@ func TestRunningReviewAcceptsBlankLivePaneStatus(t *testing.T) {
 	head, root := strings.Repeat("b", 40), t.TempDir()
 	snapshot, session := reviewIdentity(attempt, root)
 	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
-	boundary := &artifactReviewBoundary{paneOutput: "0||\n"}
+	boundary := &artifactReviewBoundary{paneOutput: "0|||\n"}
 
 	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, []string{"reviewer"}, internalgithub.RecoveryIssueFact{}, manifest, "", head, root)
 	if err != nil || !pending || result.Snapshot != snapshot || result.Session != session || boundary.respawns != 0 {
@@ -2894,7 +2895,7 @@ func TestRunningReviewWaitsForPendingPaneStatus(t *testing.T) {
 	head, root := strings.Repeat("b", 40), t.TempDir()
 	snapshot, session := reviewIdentity(attempt, root)
 	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
-	boundary := &artifactReviewBoundary{paneOutput: "1||"}
+	boundary := &artifactReviewBoundary{paneOutput: "1|||"}
 
 	result, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, nil, []string{"reviewer"}, internalgithub.RecoveryIssueFact{}, manifest, "", head, root)
 	if err != nil || !pending || result.Session != session || boundary.respawns != 0 {
@@ -2910,7 +2911,7 @@ func TestFailedReviewReturnsActionableSessionStatus(t *testing.T) {
 	snapshot, session := reviewIdentity(attempt, t.TempDir())
 	manifest := agentruntime.Manifest{ReviewState: "running", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: target, ReviewBase: base, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
 
-	_, pending, err := runIndependentReview(t.Context(), nil, attempt, &artifactReviewBoundary{paneOutput: "1|9|"}, nil, []string{"reviewer"}, issue, manifest, "", head, filepath.Dir(snapshot))
+	_, pending, err := runIndependentReview(t.Context(), nil, attempt, &artifactReviewBoundary{paneOutput: "1|9||"}, nil, []string{"reviewer"}, issue, manifest, "", head, filepath.Dir(snapshot))
 	if err == nil || pending || !strings.Contains(err.Error(), session) || !strings.Contains(err.Error(), "retry the attempt") {
 		t.Fatalf("pending=%v err=%v", pending, err)
 	}
@@ -2924,7 +2925,7 @@ func TestSignaledReviewReturnsActionableSessionStatus(t *testing.T) {
 	snapshot, session := reviewIdentity(attempt, t.TempDir())
 	manifest := agentruntime.Manifest{ReviewState: "running", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: target, ReviewBase: base, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
 
-	_, pending, err := runIndependentReview(t.Context(), nil, attempt, &artifactReviewBoundary{paneOutput: "1||term"}, nil, []string{"reviewer"}, issue, manifest, "", head, filepath.Dir(snapshot))
+	_, pending, err := runIndependentReview(t.Context(), nil, attempt, &artifactReviewBoundary{paneOutput: "1||term|"}, nil, []string{"reviewer"}, issue, manifest, "", head, filepath.Dir(snapshot))
 	if err == nil || pending || !strings.Contains(err.Error(), "signal term") || !strings.Contains(err.Error(), session) {
 		t.Fatalf("pending=%v err=%v", pending, err)
 	}
@@ -2936,7 +2937,7 @@ func TestRunningReviewWithDifferentBaseIsNotReused(t *testing.T) {
 	snapshot, session := reviewIdentity(attempt, root)
 	manifest := agentruntime.Manifest{ReviewState: "running", ReviewBase: attempt.BaseSHA, ReviewHead: head, ReviewSnapshot: snapshot, ReviewSession: session}
 	issue := internalgithub.RecoveryIssueFact{BaseSHA: strings.Repeat("c", 40)}
-	if _, pending, err := runIndependentReview(t.Context(), nil, attempt, &artifactReviewBoundary{paneOutput: "0||"}, nil, []string{"reviewer"}, issue, manifest, "", head, root); err == nil || pending {
+	if _, pending, err := runIndependentReview(t.Context(), nil, attempt, &artifactReviewBoundary{paneOutput: "0|||"}, nil, []string{"reviewer"}, issue, manifest, "", head, root); err == nil || pending {
 		t.Fatalf("mismatched-base review was reused: pending=%v err=%v", pending, err)
 	}
 }
@@ -2974,7 +2975,7 @@ func TestLegacyDeadSuccessfulReviewResumesFromHeadArtifact(t *testing.T) {
 	legacyResult := reviewResultPath(manifest.ReviewSnapshot, head)
 	mustWriteFile(t, legacyResult, clean)
 	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot}
-	boundary := &artifactReviewBoundary{root: filepath.Join(stateRoot, "snapshots"), paneOutput: "1|0|"}
+	boundary := &artifactReviewBoundary{root: filepath.Join(stateRoot, "snapshots"), paneOutput: "1|0||"}
 	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base}
 	result, pending, err := runIndependentReview(t.Context(), runtimeState, attempt, boundary, nil, []string{"reviewer"}, issue, manifest, "", head, filepath.Join(stateRoot, "snapshots"), agentruntime.ReviewModeImplementation)
 	target, _ := reviewTarget(agentruntime.ReviewModeImplementation, issue, base, head)
@@ -3690,7 +3691,7 @@ func TestReviewIdentitySeparatesRepositories(t *testing.T) {
 
 func (b *blockingReviewBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
 	if slices.Contains(command.Args, "display-message") {
-		return agentruntime.Result{Output: "1|0|"}, nil
+		return agentruntime.Result{Output: "1|0||"}, nil
 	}
 	if operation == "review-result" {
 		return agentruntime.Result{Output: `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`}, nil
