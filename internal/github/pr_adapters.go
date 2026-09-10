@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -703,9 +704,12 @@ type GitHubPRSource struct {
 	Attempts                   map[int]RecoveryAttemptFact
 	dependencyCompletion       map[int]bool
 	dependencyCompletionErrors map[int]error
+	dependencyMu               sync.Mutex
 }
 
 func (s *GitHubPRSource) dependencyComplete(ctx context.Context, issue int) (bool, error) {
+	s.dependencyMu.Lock()
+	defer s.dependencyMu.Unlock()
 	if complete, ok := s.dependencyCompletion[issue]; ok {
 		return complete, nil
 	}
@@ -746,7 +750,7 @@ func NewPRReconciler(api API, cfg PRAdapterConfig, recovery AttemptRecovery, att
 		return Reconciler{}, errors.New("PR reconciliation requires repository policy, recovery, and issue reconciliation")
 	}
 	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery, Attempts: attempts}
-	return Reconciler{FullRead: fullRead, PullRequests: &PRCoordinator{API: api, Source: source, Signals: RecoverySignals{recovery}, ReviewLabel: cfg.HumanReviewLabel, MergeMethod: cfg.MergeMethod, ActorID: cfg.ActorID}}, nil
+	return Reconciler{FullRead: fullRead, PullRequests: &PRCoordinator{API: api, Source: source, Signals: RecoverySignals{recovery}, Attempts: attempts, ReviewLabel: cfg.HumanReviewLabel, MergeMethod: cfg.MergeMethod, ActorID: cfg.ActorID}}, nil
 }
 
 func (s *GitHubPRSource) OpenPullRequests(ctx context.Context) ([]int, error) {
@@ -780,8 +784,7 @@ func (s *GitHubPRSource) OpenPullRequests(ctx context.Context) ([]int, error) {
 }
 
 func (s *GitHubPRSource) FreshPullRequest(ctx context.Context, number int) (PRState, error) {
-	snapshot := *s
-	snapshot.API = s.API.WithReadSnapshot()
+	snapshot := GitHubPRSource{API: s.API.WithReadSnapshot(), Config: s.Config, Recovery: s.Recovery, Attempts: s.Attempts}
 	return snapshot.freshPullRequest(ctx, number)
 }
 
@@ -830,13 +833,32 @@ func (s *GitHubPRSource) freshPullRequest(ctx context.Context, number int) (PRSt
 		return PRState{}, err
 	}
 	state.Facts.IssueOpen = issueData.State == "open"
-	if err := s.readAuthorizedControls(ctx, issue, &state.Facts); err != nil {
-		return PRState{}, err
-	}
-	if err := s.readIssueComments(ctx, issue, attempt, &state); err != nil {
-		return PRState{}, err
-	}
-	recoveredFeedback := slices.Clone(state.Facts.Feedback)
+	controlFacts := PRFacts{IssueOpen: state.Facts.IssueOpen}
+	commentState := state
+	commentState.Decisions = slices.Clone(state.Decisions)
+	commentState.Facts.Feedback = slices.Clone(state.Facts.Feedback)
+	var repository struct{ Permissions struct{ Push bool } }
+	var comments []feedbackRecord
+	var controlErr, commentErr, repositoryErr, feedbackErr error
+	var independentReads sync.WaitGroup
+	independentReads.Add(4)
+	go func() {
+		defer independentReads.Done()
+		controlErr = s.readAuthorizedControls(ctx, issue, &controlFacts)
+	}()
+	go func() {
+		defer independentReads.Done()
+		commentErr = s.readIssueComments(ctx, issue, attempt, &commentState)
+	}()
+	go func() {
+		defer independentReads.Done()
+		_, _, repositoryErr = s.API.Read(ctx, "/repos/"+s.Config.Repository, "", &repository)
+	}()
+	go func() {
+		defer independentReads.Done()
+		comments, feedbackErr = s.readFeedback(ctx, number, issue, attempt)
+	}()
+	var policyErr error
 	state.ReviewLabelPresent = slices.ContainsFunc(pull.Labels, func(label struct{ Name string }) bool { return label.Name == s.Config.HumanReviewLabel })
 	var protection struct {
 		RequiredStatusChecks struct {
@@ -858,7 +880,7 @@ func (s *GitHubPRSource) freshPullRequest(ctx context.Context, number int) (PRSt
 		case isBranchProtectionUnavailable(err, classicProtectionDocumentationURL):
 			classicProtectionKnown = false
 		default:
-			return PRState{}, err
+			policyErr = err
 		}
 	}
 	required := protection.RequiredStatusChecks.Checks
@@ -873,29 +895,44 @@ func (s *GitHubPRSource) freshPullRequest(ctx context.Context, number int) (PRSt
 		state.Facts.CodeOwnerApprovalRequired, state.Facts.LastPushApprovalRequired = p.CodeOwners, p.LastPush
 		reviewCount, dismissStale = p.Count, p.DismissStale
 	}
-	if err := s.readRules(ctx, pull.Base.Ref, &required, &reviewCount, &dismissStale, &state.Facts); err != nil {
-		return PRState{}, err
+	if policyErr == nil {
+		policyErr = s.readRules(ctx, pull.Base.Ref, &required, &reviewCount, &dismissStale, &state.Facts)
 	}
 	state.Facts.ApprovalRequired = state.Facts.ApprovalRequired || reviewCount > 0 || state.Facts.CodeOwnerApprovalRequired || state.Facts.LastPushApprovalRequired
-	if err := s.readApprovals(ctx, number, &state.Facts); err != nil {
-		return PRState{}, err
-	}
 	state.Facts.PolicyCheckRequired = slices.ContainsFunc(required, func(r requiredCheck) bool { return r.Context == PolicyCheck && r.AppID == 0 })
-	if err := s.readReviews(ctx, number, &state.Facts); err != nil {
+	if policyErr == nil {
+		approvalFacts, reviewFacts, checkState := state.Facts, state.Facts, state
+		var approvalErr, reviewErr, checksErr error
+		var policyReads sync.WaitGroup
+		policyReads.Add(3)
+		go func() {
+			defer policyReads.Done()
+			approvalErr = s.readApprovals(ctx, number, &approvalFacts)
+		}()
+		go func() {
+			defer policyReads.Done()
+			reviewErr = s.readReviews(ctx, number, &reviewFacts)
+		}()
+		go func() {
+			defer policyReads.Done()
+			checksErr = s.readRequiredChecks(ctx, pull.Head.SHA, required, &checkState)
+		}()
+		policyReads.Wait()
+		policyErr = errors.Join(approvalErr, reviewErr, checksErr)
+		state.Facts.Approved, state.Facts.CodeOwnerApproved, state.Facts.LastPushApproved = approvalFacts.Approved, approvalFacts.CodeOwnerApproved, approvalFacts.LastPushApproved
+		state.Facts.ChangesRequested = approvalFacts.ChangesRequested || reviewFacts.ChangesRequested
+		state.CheckHead, state.PolicyStatus, state.Facts.RequiredChecksPass = checkState.CheckHead, checkState.PolicyStatus, checkState.Facts.RequiredChecksPass
+	}
+	independentReads.Wait()
+	if err := errors.Join(controlErr, commentErr, repositoryErr, feedbackErr, policyErr); err != nil {
 		return PRState{}, err
 	}
-	if err := s.readRequiredChecks(ctx, pull.Head.SHA, required, &state); err != nil {
-		return PRState{}, err
-	}
-	var repository struct{ Permissions struct{ Push bool } }
-	if _, _, err := s.API.Read(ctx, "/repos/"+s.Config.Repository, "", &repository); err != nil {
-		return PRState{}, err
-	}
+	state.Facts.IssueEligible, state.Facts.NeedsHumanReview, state.Facts.AutonomousMerge = controlFacts.IssueEligible, controlFacts.NeedsHumanReview, controlFacts.AutonomousMerge
+	state.MergeAttemptSHA, state.MergePhase = commentState.MergeAttemptSHA, commentState.MergePhase
+	state.Facts.ValidationSHA, state.Facts.DocumentationSHA, state.Facts.Feedback = commentState.Facts.ValidationSHA, commentState.Facts.DocumentationSHA, commentState.Facts.Feedback
+	state.Decisions, state.PendingDispositions, state.ConfirmedDispositions = commentState.Decisions, commentState.PendingDispositions, commentState.ConfirmedDispositions
+	recoveredFeedback := slices.Clone(state.Facts.Feedback)
 	state.Facts.MergePermission = repository.Permissions.Push
-	comments, err := s.readFeedback(ctx, number, issue, attempt)
-	if err != nil {
-		return PRState{}, err
-	}
 	recovered := make(map[string]Feedback, len(recoveredFeedback))
 	for _, f := range recoveredFeedback {
 		recovered[f.identity()] = f

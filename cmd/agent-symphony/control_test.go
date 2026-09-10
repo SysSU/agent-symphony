@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -197,6 +198,8 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 	}
 	runGit(t, root, "add", "README.md")
 	runGit(t, root, "commit", "-m", "initial")
+	base := runGit(t, root, "rev-parse", "HEAD")
+	runGit(t, root, "update-ref", "refs/remotes/origin/main", base)
 	stateRoot := filepath.Join(root, "runtime")
 	cleanupControlSocket(t, stateRoot)
 	cfg := config.Default("o/r")
@@ -210,6 +213,7 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	var githubReads atomic.Int32
+	var showIssue atomic.Bool
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		githubReads.Add(1)
 		w.Header().Set("Content-Type", "application/json")
@@ -219,13 +223,31 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 		case "/repos/o/r":
 			_, _ = io.WriteString(w, `{"full_name":"o/r","default_branch":"main","permissions":{"pull":true}}`)
 		case "/repos/o/r/branches/main":
-			_, _ = io.WriteString(w, `{"commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`)
+			_, _ = fmt.Fprintf(w, `{"commit":{"sha":%q}}`, base)
+		case "/repos/o/r/issues":
+			if showIssue.Load() {
+				_, _ = io.WriteString(w, `[{"number":9,"title":"Externally visible issue","body":"incomplete contract","state":"open","created_at":"2026-09-09T12:00:00Z"}]`)
+			} else {
+				_, _ = io.WriteString(w, `[]`)
+			}
+		case "/repos/o/r/issues/9":
+			_, _ = io.WriteString(w, `{"number":9,"node_id":"I_9","title":"Externally visible issue","body":"incomplete contract","state":"open","created_at":"2026-09-09T12:00:00Z","user":{"id":42},"labels":[]}`)
+		case "/repos/o/r/issues/9/comments", "/repos/o/r/issues/9/timeline":
+			_, _ = io.WriteString(w, `[]`)
 		default:
 			_, _ = io.WriteString(w, `[]`)
 		}
 	}))
 	defer github.Close()
-	args := []string{"serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", "127.0.0.1:0", "--interval", "60s"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dashboardAddress := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", dashboardAddress, "--interval", "200ms"}
 	encodedArgs, _ := json.Marshal(args)
 	command := exec.Command(os.Args[0], "-test.run=^TestControlServeHelper$")
 	command.Dir = root
@@ -261,6 +283,49 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 	if lock, err := acquireDaemonLock(filepath.Join(stateRoot, "daemon.lock")); err == nil {
 		releaseDaemonLock(lock)
 		t.Fatal("compiled serve process did not retain the daemon lock")
+	}
+	readStatuses := func() ([]orchestrator.RecoveryStatus, error) {
+		response, err := http.Get("http://" + dashboardAddress + "/status.json")
+		if err != nil {
+			return nil, err
+		}
+		defer response.Body.Close()
+		var snapshot dashboardStatusSnapshot
+		if response.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("dashboard status=%d", response.StatusCode)
+		}
+		if err := json.NewDecoder(response.Body).Decode(&snapshot); err != nil {
+			return nil, err
+		}
+		return snapshot.Statuses, nil
+	}
+	for {
+		statuses, err := readStatuses()
+		if err == nil && len(statuses) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("compiled dashboard did not serve initial projection: statuses=%#v err=%v output=%q", statuses, err, childOutput.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	changedAt := time.Now()
+	showIssue.Store(true)
+	propagationDeadline := changedAt.Add(2200 * time.Millisecond)
+	for {
+		statuses, err := readStatuses()
+		if err == nil && len(statuses) == 1 && statuses[0].Issue == 9 && statuses[0].Title == "Externally visible issue" {
+			if elapsed := time.Since(changedAt); elapsed > 2200*time.Millisecond {
+				t.Fatalf("compiled dashboard propagation=%s", elapsed)
+			} else {
+				t.Logf("compiled serve-loop dashboard propagation=%s", elapsed)
+			}
+			break
+		}
+		if time.Now().After(propagationDeadline) {
+			t.Fatalf("external issue did not reach compiled served dashboard: statuses=%#v err=%v output=%q", statuses, err, childOutput.String())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	var result controlResult
 	for attempt := 1; ; attempt++ {
@@ -793,6 +858,30 @@ func TestControlCLIEmitsVersionedResult(t *testing.T) {
 	var response envelope
 	if json.Unmarshal(stdout.Bytes(), &response) != nil || response.Version != 1 || response.Command != "control" || !response.OK {
 		t.Fatalf("response=%q", stdout.String())
+	}
+}
+
+func TestControlCLIBoundsBusyRetryByTimeout(t *testing.T) {
+	root := resolvedTempDir(t)
+	cleanupControlSocket(t, root)
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	operation := &sync.Mutex{}
+	operation.Lock()
+	defer operation.Unlock()
+	project := newProjectDashboardServer(t.Context(), root, "o/r", nil, "tmux", operation, nil, nil, func(context.Context) error { return nil }, nil, false, "")
+	ctx, cancel := context.WithCancel(t.Context())
+	if err := startControlServer(ctx, project, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	started := time.Now()
+	code := run([]string{"control", "--repository", "o/r", "--action", "reconcile", "--runtime-state", root, "--request-id", "bounded-busy", "--timeout", "25ms"}, &stdout, &stderr)
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+	if code != 1 || time.Since(started) > time.Second || !strings.Contains(stderr.String(), "remained busy until --timeout") {
+		t.Fatalf("code=%d elapsed=%s stdout=%q stderr=%q", code, time.Since(started), stdout.String(), stderr.String())
 	}
 }
 

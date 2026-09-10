@@ -338,8 +338,12 @@ func bindDeployment(stateRoot, repository string) error {
 	return nil
 }
 
-func prepareProjectDeployment(ctx context.Context, stateRoot, repository string) (internalgithub.API, internalgithub.AuthenticatedUser, error) {
+func prepareProjectDeployment(ctx context.Context, stateRoot, repository string, metrics ...*internalgithub.CycleMetrics) (internalgithub.API, internalgithub.AuthenticatedUser, error) {
 	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
+	if len(metrics) > 0 {
+		api.Metrics = metrics[0]
+	}
+	api = api.WithReadSnapshot()
 	user, err := api.AuthenticatedUser(ctx)
 	if err != nil {
 		return api, user, fmt.Errorf("authenticate GitHub: %w", err)
@@ -752,7 +756,27 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), *controlTimeout)
 		defer cancel()
-		result, err := callRunningDaemon(ctx, *runtimeState, request)
+		var result controlResult
+		var err error
+		for {
+			result, err = callRunningDaemon(ctx, *runtimeState, request)
+			if err != nil && ctx.Err() != nil {
+				err = errors.New("running daemon remained busy until --timeout; retry the same request ID")
+			}
+			if err != nil || !result.Retryable {
+				break
+			}
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				err = errors.New("running daemon remained busy until --timeout; retry the same request ID")
+			case <-timer.C:
+			}
+			if err != nil {
+				break
+			}
+		}
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, internalgithub.Redact(err.Error()))
 		}
@@ -834,9 +858,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		reconcile := func(ctx context.Context) error {
 			cycleCtx, finish := operations.begin(ctx)
 			defer finish()
-			statuses, err := reconcileGitHubServing(cycleCtx, *path, *statePath, *runtimeState, true)
+			statuses, err := reconcileGitHubWith(cycleCtx, *path, *statePath, *runtimeState, reconcileOptions{transition: true, intake: true, timeout: 5 * time.Minute, observe: func(observation reconcileCycleObservation) {
+				body, _ := json.Marshal(observation)
+				fmt.Fprintln(stderr, "reconcile-cycle: "+string(body))
+			}})
 			if err != nil && !errors.Is(err, context.Canceled) {
 				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
+				if projectionErr := recordReconcileFailure(*runtimeState, c.Repository, err); projectionErr != nil {
+					fmt.Fprintln(stderr, "reconcile projection: "+internalgithub.Redact(projectionErr.Error()))
+				}
 			}
 			if errors.Is(err, context.Canceled) && ctx.Err() == nil {
 				return err
@@ -1269,18 +1299,36 @@ type reconcileOptions struct {
 	planReviewAttempt int
 	lock              bool
 	authorize         func([]orchestrator.RecoveryStatus) error
+	observe           func(reconcileCycleObservation)
+}
+
+type reconcileCycleObservation struct {
+	DurationMS     int64  `json:"duration_ms"`
+	GitHubRequests int64  `json:"github_requests"`
+	Retries        int64  `json:"retries"`
+	FailurePhase   string `json:"failure_phase,omitempty"`
+	OK             bool   `json:"ok"`
 }
 
 func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
 	return reconcileGitHubWith(ctx, configPath, statePath, stateRoot, reconcileOptions{transition: transition, intake: transition, timeout: 5 * time.Minute, lock: transition})
 }
 
-func reconcileGitHubServing(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
-	return reconcileGitHubWith(ctx, configPath, statePath, stateRoot, reconcileOptions{transition: transition, intake: transition, timeout: 5 * time.Minute})
-}
-
 func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot string, options reconcileOptions) (result []orchestrator.RecoveryStatus, resultErr error) {
 	started := time.Now()
+	metrics := &internalgithub.CycleMetrics{}
+	failurePhase := "load-configuration"
+	defer func() {
+		if options.observe == nil {
+			return
+		}
+		requests, retries := metrics.Snapshot()
+		observation := reconcileCycleObservation{DurationMS: time.Since(started).Milliseconds(), GitHubRequests: requests, Retries: retries, OK: resultErr == nil}
+		if resultErr != nil {
+			observation.FailurePhase = failurePhase
+		}
+		options.observe(observation)
+	}()
 	if options.timeout <= 0 {
 		options.timeout = 2 * time.Minute
 	}
@@ -1299,7 +1347,8 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 			return nil, fmt.Errorf("validate WSL filesystem: %w", err)
 		}
 	}
-	api, user, err := prepareProjectDeployment(ctx, stateRoot, c.Repository)
+	failurePhase = "verify-deployment"
+	api, user, err := prepareProjectDeployment(ctx, stateRoot, c.Repository, metrics)
 	if err != nil {
 		return nil, err
 	}
@@ -1315,7 +1364,8 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		return nil, fmt.Errorf("load GitHub cache: %w", err)
 	}
 	defer func() {
-		if resultErr != nil {
+		staleReads, _ := metrics.Stale()
+		if resultErr != nil && staleReads == 0 {
 			return
 		}
 		if err := cache.Save(); err != nil {
@@ -1323,12 +1373,14 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		}
 	}()
 	api.Cache = cache
+	failurePhase = "fetch-attempts"
 	remote, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch pull request attempts: %w", err)
 	}
 	prConfig := githubPRConfig(c, user.ID)
 	var issues []internalgithub.RecoveryIssueFact
+	failurePhase = "fetch-issue-controls"
 	if options.planReviewIssue > 0 {
 		issues, err = internalgithub.FetchIssueFactsForIssue(ctx, api, prConfig, remote, options.planReviewIssue)
 	} else {
@@ -1348,6 +1400,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if len(issues) > 0 {
 		baseBranch, baseSHA = issues[0].BaseBranch, issues[0].BaseSHA
 	}
+	failurePhase = "refresh-attempt-source"
 	source, err := seedAttemptSource(ctx, root, c.Repository, attemptRoot, baseBranch, baseSHA)
 	if err != nil {
 		return nil, fmt.Errorf("refresh attempt source: %w", err)
@@ -1356,11 +1409,13 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		_, err := boundary.call(ctx, "verify", agentruntime.Command{})
 		return err
 	}}
+	failurePhase = "discover-attempts"
 	manifests, err := r.Discover()
 	if err != nil {
 		return nil, fmt.Errorf("discover attempt manifests: %w", err)
 	}
 	if options.planReviewIssue > 0 {
+		failurePhase = "start-plan-review"
 		if err := startIssuePlanReview(ctx, &r, reviewBoundary(stateRoot), c, issues, manifests, source, productionSnapshotRoot(stateRoot), options.planReviewIssue, options.planReviewAttempt); err != nil {
 			return nil, fmt.Errorf("start plan review: %w", err)
 		}
@@ -1371,6 +1426,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	}
 	deferBoundResume := options.transition && options.authorize != nil
 	if options.transition && !deferBoundResume {
+		failurePhase = "resume-attempts"
 		manifests, err = resumeBoundAttempts(ctx, &r, c, issues, manifests, remote)
 		if err != nil {
 			return nil, fmt.Errorf("resume bound attempts: %w", err)
@@ -1383,9 +1439,24 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		}
 		return r.VerifyActive(ctx, manifest, head)
 	}
+	failurePhase = "project-status"
 	statuses, decisions := projectRecoveryStatuses(ctx, facts, issues, manifests, c.Concurrency, checkRuntime)
 	if err := addClosedIssueProjection(ctx, api, c.Repository, statuses, issues); err != nil {
 		return statuses, fmt.Errorf("project closed issue state: %w", err)
+	}
+	if staleReads, diagnostic := metrics.Stale(); staleReads > 0 {
+		failurePhase = "stale-github-read"
+		staleErr := fmt.Errorf("GitHub refresh used %d last verified cached response(s): %s", staleReads, diagnostic)
+		previous, readErr := (&dashboardServer{stateRoot: stateRoot, repository: c.Repository}).readStatus()
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return nil, errors.Join(staleErr, fmt.Errorf("read last verified status projection: %w", readErr))
+		}
+		previous.ReconciliationError = staleErr.Error()
+		previous.ReconciliationErrorAt = time.Now().UTC()
+		if err := writeDashboardStatusSnapshot(stateRoot, previous); err != nil {
+			return statuses, errors.Join(staleErr, fmt.Errorf("write stale status projection: %w", err))
+		}
+		return previous.Statuses, staleErr
 	}
 	if err := writeProjectStatusSnapshot(stateRoot, c.Repository, statuses); err != nil {
 		return statuses, fmt.Errorf("write status projection: %w", err)
@@ -1396,6 +1467,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 		}
 	}
 	if !options.transition {
+		failurePhase = ""
 		return statuses, nil
 	}
 	refreshProjection := func(currentFacts []orchestrator.AttemptFact, currentIssues []internalgithub.RecoveryIssueFact) ([]agentruntime.Manifest, []orchestrator.Decision, error) {
@@ -1425,6 +1497,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 			return statuses, fmt.Errorf("resume bound attempts: %w", err)
 		}
 	}
+	failurePhase = "dispatch-issues"
 	dispatchErr := dispatchIssues(ctx, api, &r, c, prConfig, issues, decisions)
 	remote, facts = recoveryAttemptFacts(remote, issues)
 	if _, _, err = refreshProjection(facts, issues); err != nil {
@@ -1433,6 +1506,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if dispatchErr != nil {
 		return statuses, fmt.Errorf("dispatch eligible issues: %w", dispatchErr)
 	}
+	failurePhase = "resume-handoffs"
 	if err := resumeHandoffs(ctx, &r, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
 		return statuses, fmt.Errorf("resume durable handoffs: %w", err)
 	}
@@ -1440,6 +1514,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if err != nil {
 		return statuses, fmt.Errorf("rediscover queued attempts: %w", err)
 	}
+	failurePhase = "monitor-attempts"
 	monitorErr := monitorAttempts(ctx, &r, statuses, queuedManifests, issues)
 	planReviewErr := reconcilePlanReviews(ctx, &r, reviewBoundary(stateRoot), boundary, c, issues, queuedManifests, source, productionSnapshotRoot(stateRoot))
 	queuedManifests, decisions, err = refreshProjection(facts, issues)
@@ -1449,6 +1524,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if monitorErr != nil || planReviewErr != nil {
 		return statuses, fmt.Errorf("monitor live attempts and plan reviews: %w", errors.Join(monitorErr, planReviewErr))
 	}
+	failurePhase = "process-results"
 	transitionErr := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, statePath, stateRoot, func() error {
 		_, _, err := refreshProjection(facts, issues)
 		return err
@@ -1460,21 +1536,25 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if transitionErr != nil {
 		return statuses, fmt.Errorf("process completed worker results: %w", transitionErr)
 	}
+	failurePhase = "cleanup-attempts"
 	if err := cleanupCompletedAttempts(ctx, boundary, facts, queuedManifests); err != nil {
 		return statuses, fmt.Errorf("clean completed attempts: %w", err)
 	}
 	if err := ensurePublishedEvidence(ctx, api, facts, queuedManifests, user.ID); err != nil {
 		return statuses, fmt.Errorf("repair published evidence: %w", err)
 	}
+	failurePhase = "pull-request-governance"
 	if err := internalgithub.RunPRReconciliation(ctx, api, prConfig, statePath); err != nil {
 		return statuses, fmt.Errorf("reconcile pull request governance: %w", err)
 	}
 	// Re-read GitHub after governance and monitoring so remote terminal state
 	// wins before local cleanup.
+	failurePhase = "refresh-attempts"
 	freshRemote, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
 	if err != nil {
 		return statuses, fmt.Errorf("refresh pull request attempts: %w", err)
 	}
+	failurePhase = "refresh-issue-controls"
 	freshIssues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, freshRemote, false)
 	if err != nil {
 		return statuses, fmt.Errorf("refresh issue controls: %w", err)
@@ -1490,6 +1570,7 @@ func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot s
 	if err := ctx.Err(); err != nil {
 		return statuses, fmt.Errorf("reconciliation exceeded the %s recovery target: %w", options.timeout, err)
 	}
+	failurePhase = ""
 	return statuses, nil
 }
 
@@ -1668,6 +1749,10 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 }
 
 func writeStatusSnapshot(stateRoot string, statuses []orchestrator.RecoveryStatus) error {
+	return writeDashboardStatusSnapshot(stateRoot, dashboardStatusSnapshot{UpdatedAt: time.Now().UTC(), Statuses: statuses})
+}
+
+func writeDashboardStatusSnapshot(stateRoot string, snapshot dashboardStatusSnapshot) error {
 	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
 		return err
 	}
@@ -1677,10 +1762,7 @@ func writeStatusSnapshot(stateRoot string, statuses []orchestrator.RecoveryStatu
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	body, err := json.MarshalIndent(struct {
-		UpdatedAt time.Time                     `json:"updated_at"`
-		Statuses  []orchestrator.RecoveryStatus `json:"statuses"`
-	}{time.Now().UTC(), statuses}, "", "  ")
+	body, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -1706,6 +1788,19 @@ func writeStatusSnapshot(stateRoot string, statuses []orchestrator.RecoveryStatu
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+func recordReconcileFailure(stateRoot, repository string, cause error) error {
+	server := dashboardServer{stateRoot: stateRoot, repository: repository}
+	snapshot, err := server.readStatus()
+	if errors.Is(err, os.ErrNotExist) {
+		snapshot = dashboardStatusSnapshot{}
+	} else if err != nil {
+		return err
+	}
+	snapshot.ReconciliationError = internalgithub.Redact(cause.Error())
+	snapshot.ReconciliationErrorAt = time.Now().UTC()
+	return writeDashboardStatusSnapshot(stateRoot, snapshot)
 }
 
 func writeProjectStatusSnapshot(stateRoot, repository string, statuses []orchestrator.RecoveryStatus) error {
@@ -2959,7 +3054,11 @@ func recoverDashboardAttempt(ctx context.Context, configPath, statePath, stateRo
 			return err
 		}
 	}
-	return internalgithub.EnsureRetryCommand(ctx, api, prConfig, issueNumber, attemptNumber)
+	if err := internalgithub.EnsureRetryCommand(ctx, api, prConfig, issueNumber, attemptNumber); err != nil {
+		return err
+	}
+	_, err = reconcileGitHubRun(ctx, configPath, statePath, stateRoot, false)
+	return err
 }
 
 func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, issues []internalgithub.RecoveryIssueFact) error {

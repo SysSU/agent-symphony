@@ -148,6 +148,7 @@ func TestDecodeRejectsTrailingAndOversizedJSON(t *testing.T) {
 
 func TestAPIReadRetriesMutationDoesNotAndRedacts(t *testing.T) {
 	var reads, writes atomic.Int32
+	metrics := &CycleMetrics{}
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodGet {
 			if reads.Add(1) == 1 {
@@ -158,7 +159,7 @@ func TestAPIReadRetriesMutationDoesNotAndRedacts(t *testing.T) {
 		writes.Add(1)
 		return httpResponse(http.StatusServiceUnavailable, `token=server-canary`, nil), nil
 	})}
-	api := API{BaseURL: "https://api.example.test", HTTP: client, Sleep: func(context.Context, time.Duration) error { return nil }}
+	api := API{BaseURL: "https://api.example.test", HTTP: client, Sleep: func(context.Context, time.Duration) error { return nil }, Metrics: metrics}
 	var result struct {
 		OK bool `json:"ok"`
 	}
@@ -179,6 +180,9 @@ func TestAPIReadRetriesMutationDoesNotAndRedacts(t *testing.T) {
 	}
 	if err := api.Mutate(context.Background(), http.MethodPost, "/write", map[string]string{"note": update, "body": "missing marker"}, Mutation{Issue: 5, Attempt: 1}, nil); err == nil {
 		t.Fatal("attribution outside body accepted")
+	}
+	if requests, retries := metrics.Snapshot(); requests != 3 || retries != 1 {
+		t.Fatalf("cycle metrics requests=%d retries=%d", requests, retries)
 	}
 }
 
@@ -227,13 +231,14 @@ func TestAPIReadPersistsETagAndBody(t *testing.T) {
 
 func TestAPIReadSnapshotDeduplicatesUntilMutation(t *testing.T) {
 	var reads atomic.Int32
+	metrics := &CycleMetrics{}
 	api := API{BaseURL: "https://api.example.test", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodGet {
 			reads.Add(1)
 			return httpResponse(http.StatusOK, `{"ok":true}`, nil), nil
 		}
 		return httpResponse(http.StatusCreated, `{}`, nil), nil
-	})}}.WithReadSnapshot()
+	})}, Metrics: metrics}.WithReadSnapshot()
 	var result struct {
 		OK bool `json:"ok"`
 	}
@@ -250,6 +255,130 @@ func TestAPIReadSnapshotDeduplicatesUntilMutation(t *testing.T) {
 	}
 	if _, _, err := api.Read(t.Context(), "/read", "", &result); err != nil || reads.Load() != 2 {
 		t.Fatalf("post-mutation read: reads=%d err=%v", reads.Load(), err)
+	}
+	if requests, retries := metrics.Snapshot(); requests != 3 || retries != 0 {
+		t.Fatalf("cycle metrics requests=%d retries=%d", requests, retries)
+	}
+}
+
+func TestAPIReadSnapshotDoesNotRestoreResponseStartedBeforeMutation(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var reads atomic.Int32
+	api := API{BaseURL: "https://api.example.test", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet {
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		}
+		if reads.Add(1) == 1 {
+			close(started)
+			<-release
+			return httpResponse(http.StatusOK, `{"state":"before"}`, nil), nil
+		}
+		return httpResponse(http.StatusOK, `{"state":"after"}`, nil), nil
+	})}}.WithReadSnapshot()
+	first := make(chan error, 1)
+	go func() {
+		var result struct{ State string }
+		_, _, err := api.Read(t.Context(), "/read", "", &result)
+		if err == nil && result.State != "before" {
+			err = fmt.Errorf("first state = %q", result.State)
+		}
+		first <- err
+	}()
+	<-started
+	body, _ := AttributedBody(5, 1, "done")
+	if err := api.Mutate(t.Context(), http.MethodPost, "/write", map[string]string{"body": body}, Mutation{Issue: 5, Attempt: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	var result struct{ State string }
+	if _, _, err := api.Read(t.Context(), "/read", "", &result); err != nil || result.State != "after" || reads.Load() != 2 {
+		t.Fatalf("post-mutation state=%q reads=%d err=%v", result.State, reads.Load(), err)
+	}
+}
+
+func TestAPIReadUsesLastVerifiedCacheOnlyBeforeMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "github-etag-cache.json")
+	cache, err := LoadReadCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := API{BaseURL: "https://api.example.test", Cache: cache, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return httpResponse(http.StatusOK, `{"state":"verified"}`, http.Header{"ETag": []string{`"v1"`}}), nil
+	})}}
+	var result struct{ State string }
+	if _, _, err := seed.Read(t.Context(), "/read", "", &result); err != nil || result.State != "verified" {
+		t.Fatalf("seed result=%#v err=%v", result, err)
+	}
+	if err := cache.Save(); err != nil {
+		t.Fatal(err)
+	}
+	cache, err = LoadReadCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := &CycleMetrics{}
+	var mutations atomic.Int32
+	api := API{BaseURL: "https://api.example.test", Cache: cache, Retries: 1, Metrics: metrics, Sleep: func(context.Context, time.Duration) error { return nil }, HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost {
+			mutations.Add(1)
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		}
+		return httpResponse(http.StatusServiceUnavailable, `{"message":"outage"}`, nil), nil
+	})}}.WithReadSnapshot()
+	result.State = ""
+	if _, _, err := api.Read(t.Context(), "/read", "", &result); err != nil || result.State != "verified" {
+		t.Fatalf("cached result=%#v err=%v", result, err)
+	}
+	if stale, diagnostic := metrics.Stale(); stale != 1 || !strings.Contains(diagnostic, "503") {
+		t.Fatalf("stale=%d diagnostic=%q", stale, diagnostic)
+	}
+	body, _ := AttributedBody(5, 1, "mutation")
+	if err := api.Mutate(t.Context(), http.MethodPost, "/write", map[string]string{"body": body}, Mutation{Issue: 5, Attempt: 1}, nil); err == nil || !strings.Contains(err.Error(), "stale authoritative read") || mutations.Load() != 0 {
+		t.Fatalf("stale mutation err=%v requests=%d", err, mutations.Load())
+	}
+	if _, _, err := api.Read(t.Context(), "/read", "", &result); err != nil || result.State != "verified" {
+		t.Fatalf("blocked mutation invalidated last verified read: result=%#v err=%v", result, err)
+	}
+}
+
+func TestAPIReadDoesNotFallBackAfterConcurrentMutationStarts(t *testing.T) {
+	cache, err := LoadReadCache(filepath.Join(t.TempDir(), "github-etag-cache.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.put("/read", `"v1"`, []byte(`{"state":"verified"}`)); err != nil {
+		t.Fatal(err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	metrics := &CycleMetrics{}
+	api := API{BaseURL: "https://api.example.test", Cache: cache, Retries: -1, Metrics: metrics, HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost {
+			close(started)
+			<-release
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		}
+		return httpResponse(http.StatusServiceUnavailable, `{"message":"outage"}`, nil), nil
+	})}}
+	body, _ := AttributedBody(5, 1, "mutation")
+	mutation := make(chan error, 1)
+	go func() {
+		mutation <- api.Mutate(t.Context(), http.MethodPost, "/write", map[string]string{"body": body}, Mutation{Issue: 5, Attempt: 1}, nil)
+	}()
+	<-started
+	var result struct{ State string }
+	_, _, readErr := api.Read(t.Context(), "/read", "", &result)
+	close(release)
+	if err := <-mutation; err != nil {
+		t.Fatal(err)
+	}
+	if readErr == nil || result.State != "" {
+		t.Fatalf("read after mutation used stale cache: result=%#v err=%v", result, readErr)
+	}
+	if stale, _ := metrics.Stale(); stale != 0 {
+		t.Fatalf("stale reads=%d after mutation started", stale)
 	}
 }
 

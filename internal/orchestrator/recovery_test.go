@@ -63,36 +63,33 @@ func TestReconcileLoopRunsAtStartupAndRecoversAfterTransientOutage(t *testing.T)
 	}
 }
 
-func TestReconcileLoopWaitsAfterSlowCycle(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	const interval = 20 * time.Millisecond
-	started := make(chan struct{})
-	release := make(chan struct{})
-	done := make(chan error, 1)
-	var completed time.Time
-	var wait time.Duration
-	calls := 0
-	go func() {
-		done <- ReconcileLoop(ctx, interval, func(context.Context) error {
-			calls++
-			switch calls {
-			case 1:
-				close(started)
-				<-release
-				completed = time.Now()
-			case 2:
-				wait = time.Since(completed)
-				cancel()
+func TestReconcileLoopKeepsStableCadenceAfterSlowCycle(t *testing.T) {
+	for _, cycleDuration := range []time.Duration{6 * time.Second, 26 * time.Second} {
+		t.Run(cycleDuration.String(), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			now := time.Unix(0, 0)
+			waits := []time.Duration{}
+			calls := 0
+			err := reconcileLoop(ctx, 10*time.Second, func(context.Context) error {
+				calls++
+				if calls == 1 {
+					now = now.Add(cycleDuration)
+				} else if calls == 2 {
+					cancel()
+				}
+				return nil
+			}, func() time.Time { return now }, func(ctx context.Context, delay time.Duration) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				waits = append(waits, delay)
+				now = now.Add(delay)
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) || calls != 2 || !slices.Equal(waits, []time.Duration{4 * time.Second}) {
+				t.Fatalf("calls=%d waits=%v err=%v", calls, waits, err)
 			}
-			return nil
 		})
-	}()
-	<-started
-	time.Sleep(2 * interval)
-	close(release)
-	if err := <-done; !errors.Is(err, context.Canceled) || calls != 2 || wait < interval {
-		t.Fatalf("calls=%d wait=%s err=%v", calls, wait, err)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -120,10 +121,13 @@ type PRCoordinator struct {
 	API         API
 	Source      PRSource
 	Signals     PRSignals
+	Attempts    map[int]RecoveryAttemptFact
 	ReviewLabel string
 	MergeMethod string
 	ActorID     int
 }
+
+const prReconcileConcurrency = 10
 
 // Reconcile discovers every open PR and derives all effects from fresh facts.
 func (c PRCoordinator) Reconcile(ctx context.Context) error {
@@ -134,12 +138,55 @@ func (c PRCoordinator) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var errs []error
-	for _, number := range numbers {
-		if err := c.reconcileOne(ctx, number); err != nil {
-			errs = append(errs, fmt.Errorf("reconcile pull request %d: %w", number, err))
-		}
+	type candidate struct {
+		index, number, attempt int
 	}
+	groups := map[int][]candidate{}
+	var groupOrder []int
+	for index, number := range numbers {
+		fact, verified := c.Attempts[number]
+		issue := 0 // Unknown candidates retain the historical serial behavior.
+		if verified {
+			issue = fact.Issue
+		}
+		if _, ok := groups[issue]; !ok {
+			groupOrder = append(groupOrder, issue)
+		}
+		groups[issue] = append(groups[issue], candidate{index: index, number: number, attempt: fact.Attempt})
+	}
+	for _, group := range groups {
+		slices.SortFunc(group, func(a, b candidate) int {
+			if a.attempt != b.attempt {
+				return cmp.Compare(a.attempt, b.attempt)
+			}
+			return cmp.Compare(a.number, b.number)
+		})
+	}
+	errs := make([]error, len(numbers))
+	semaphore := make(chan struct{}, prReconcileConcurrency)
+	var workers sync.WaitGroup
+	for _, issue := range groupOrder {
+		group := groups[issue]
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				for _, candidate := range group {
+					errs[candidate.index] = fmt.Errorf("reconcile pull request %d: %w", candidate.number, ctx.Err())
+				}
+				return
+			}
+			for _, candidate := range group {
+				if err := c.reconcileOne(ctx, candidate.number); err != nil {
+					errs[candidate.index] = fmt.Errorf("reconcile pull request %d: %w", candidate.number, err)
+				}
+			}
+		}()
+	}
+	workers.Wait()
 	return errors.Join(errs...)
 }
 

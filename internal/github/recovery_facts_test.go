@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -607,6 +610,7 @@ func TestFetchIssueFactsRefreshesDependenciesAcrossNormalCycles(t *testing.T) {
 	needsAttention := map[int]bool{}
 	dependencyMode := "closed"
 	dependencyReads, clearPosts, labelDeletes := 0, 0, 0
+	var fixtureMu sync.Mutex
 	issueRecord := func(number int) map[string]any {
 		labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}}
 		if needsAttention[number] {
@@ -619,6 +623,8 @@ func TestFetchIssueFactsRefreshesDependenciesAcrossNormalCycles(t *testing.T) {
 		}
 	}
 	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		fixtureMu.Lock()
+		defer fixtureMu.Unlock()
 		var response any
 		switch {
 		case r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r":
@@ -773,6 +779,73 @@ func TestFetchIssueFactsRefreshesDependenciesAcrossNormalCycles(t *testing.T) {
 	}
 	if direct < 0 || !recovered[direct].NeedsAttention || recovered[direct].Eligible || !needsAttention[11] || !slices.Contains(recovered[direct].Blockers, "needs attention: implementation needs an operator decision") {
 		t.Fatalf("unrelated direct status changed: %#v labels=%v", recovered, needsAttention)
+	}
+}
+
+func TestFetchIssueFactsRefusesIntakeMutationAfterCachedFallback(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "github-etag-cache.json")
+	cache, err := LoadReadCache(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commentsPath := "/repos/o/r/issues/10/comments?per_page=100&page=1"
+	seed := API{BaseURL: "https://example.test", Cache: cache, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("ETag", `"comments-v1"`)
+		return httpResponse(http.StatusOK, `[]`, header), nil
+	})}}
+	var comments []any
+	if _, _, err := seed.Read(t.Context(), commentsPath, "", &comments); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Save(); err != nil {
+		t.Fatal(err)
+	}
+	cache, err = LoadReadCache(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC)
+	body := "## Context\nprotect stale authority\n## Acceptance criteria\n- no unsafe mutation\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
+	var mutations atomic.Int32
+	metrics := &CycleMetrics{}
+	api := API{BaseURL: "https://example.test", Cache: cache, Retries: -1, Metrics: metrics, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet && r.URL.Path != "/graphql" {
+			mutations.Add(1)
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		}
+		var response any
+		switch {
+		case r.Method == http.MethodGet && r.URL.RequestURI() == commentsPath:
+			return httpResponse(http.StatusServiceUnavailable, `{"message":"temporary outage"}`, http.Header{"Retry-After": []string{"0"}}), nil
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r":
+			response = map[string]any{"default_branch": "main"}
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": "abcdef0"}}
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues":
+			response = []any{map[string]any{"number": 10, "title": "stale authority", "body": body, "state": "open", "created_at": now}}
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/10":
+			response = map[string]any{"number": 10, "node_id": "I_10", "title": "stale authority", "body": body, "state": "open", "created_at": now, "user": map[string]any{"id": 5}, "labels": []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}}}
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/10/timeline":
+			response = []any{map[string]any{"id": 1, "event": "labeled", "created_at": now.Add(time.Minute), "actor": map[string]any{"id": 5}, "label": map[string]any{"name": "ready"}}, map[string]any{"id": 2, "event": "labeled", "created_at": now.Add(2 * time.Minute), "actor": map[string]any{"id": 5}, "label": map[string]any{"name": "P1"}}}
+		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+		case r.Method == http.MethodGet && r.URL.Path == "/user/5":
+			response = map[string]any{"login": "owner"}
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/collaborators/owner/permission":
+			response = map[string]any{"permission": "maintain"}
+		default:
+			return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		encoded, _ := json.Marshal(response)
+		return httpResponse(http.StatusOK, string(encoded), nil), nil
+	})}}.WithReadSnapshot()
+	facts, err := FetchIssueFacts(t.Context(), api, productionPRConfig(), nil, true)
+	if err != nil || len(facts) != 1 || mutations.Load() != 0 || !slices.ContainsFunc(facts[0].Blockers, func(blocker string) bool { return strings.Contains(blocker, "stale authoritative read") }) {
+		t.Fatalf("facts=%#v mutations=%d err=%v", facts, mutations.Load(), err)
+	}
+	if stale, _ := metrics.Stale(); stale != 1 {
+		t.Fatalf("stale reads=%d, want 1", stale)
 	}
 }
 

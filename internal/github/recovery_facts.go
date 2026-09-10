@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -137,6 +138,21 @@ type RecoveryAttemptFact struct {
 	PublicationConfirmed    bool
 	Diagnostic              string
 	Checks                  []string
+}
+
+type recoveryPullRecord struct {
+	Number      int `json:"number"`
+	Body, State string
+	MergedAt    any `json:"merged_at"`
+	User        struct {
+		ID int `json:"id"`
+	} `json:"user"`
+	Head struct {
+		SHA, Ref string
+	} `json:"head"`
+	Base struct {
+		SHA string `json:"sha"`
+	} `json:"base"`
 }
 
 type RecoveryIssueFact struct {
@@ -307,6 +323,16 @@ type markerConflicts struct {
 	Attempts map[int]bool
 }
 
+type recoveryIssueRecord struct {
+	Number             int
+	Title, Body, State string
+	CreatedAt          time.Time `json:"created_at"`
+	PullRequest        any       `json:"pull_request"`
+}
+
+const recoveryIssueConcurrency = 10
+const recoveryPullConcurrency = 10
+
 // FetchIssueFacts returns the authorized issue-control projection used by both
 // scheduling and read-only status. Intake permits the reconciliation command
 // to create a missing control snapshot; status calls remain read-only.
@@ -361,20 +387,14 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			}
 		}
 	}
-	source := GitHubPRSource{API: api, Config: cfg}
+	source := &GitHubPRSource{API: api, Config: cfg}
 	var result []RecoveryIssueFact
-	type issueRecord struct {
-		Number             int
-		Title, Body, State string
-		CreatedAt          time.Time `json:"created_at"`
-		PullRequest        any       `json:"pull_request"`
-	}
 	seenIssues := map[int]bool{}
 	for page := 1; page <= recoveryPageLimit; page++ {
-		var issues []issueRecord
+		var issues []recoveryIssueRecord
 		lastPage := targetIssue > 0
 		if targetIssue > 0 {
-			var issue issueRecord
+			var issue recoveryIssueRecord
 			if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", cfg.Repository, targetIssue), "", &issue); err != nil {
 				return nil, err
 			}
@@ -389,10 +409,10 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			lastPage = len(issues) < 100
 			if lastPage {
 				for _, issueNumber := range completedIssues {
-					if seenIssues[issueNumber] || slices.ContainsFunc(issues, func(issue issueRecord) bool { return issue.Number == issueNumber }) {
+					if seenIssues[issueNumber] || slices.ContainsFunc(issues, func(issue recoveryIssueRecord) bool { return issue.Number == issueNumber }) {
 						continue
 					}
-					var issue issueRecord
+					var issue recoveryIssueRecord
 					if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", cfg.Repository, issueNumber), "", &issue); err != nil {
 						return nil, err
 					}
@@ -402,148 +422,188 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 				}
 			}
 		}
-		for _, issue := range issues {
+		pageFacts := make([]RecoveryIssueFact, len(issues))
+		included := make([]bool, len(issues))
+		workCtx, cancel := context.WithCancel(ctx)
+		semaphore := make(chan struct{}, recoveryIssueConcurrency)
+		var workers sync.WaitGroup
+		var firstErr error
+		var errMu sync.Mutex
+		for i, issue := range issues {
 			seenIssues[issue.Number] = true
 			if issue.PullRequest != nil {
 				continue
 			}
-			bindings, bindingConflicts, err := fetchActiveAttempts(ctx, api, cfg, issue.Number)
-			if err != nil {
-				return nil, err
-			}
-			terminals, terminalConflicts, err := fetchTerminalFailures(ctx, api, cfg, issue.Number)
-			if err != nil {
-				return nil, err
-			}
-			var terminal terminalMarkerPayload
-			if len(terminals) > 0 {
-				terminal = terminals[len(terminals)-1]
-			}
-			terminalByAttempt := make(map[int]terminalMarkerPayload, len(terminals))
-			for _, marker := range terminals {
-				terminalByAttempt[marker.Attempt] = marker
-			}
-			var binding activeMarkerPayload
-			var terminalAttempts []RecoveryAttemptFact
-			for _, candidate := range bindings {
-				if failed, ok := terminalByAttempt[candidate.Attempt]; ok && !bindingConflicts.Attempts[candidate.Attempt] && !terminalConflicts.Attempts[candidate.Attempt] {
-					terminalAttempts = append(terminalAttempts, RecoveryAttemptFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: candidate.Attempt, BaseSHA: candidate.BaseSHA, State: "failed", Diagnostic: failed.Diagnostic})
-					continue
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				select {
+				case semaphore <- struct{}{}:
+					defer func() { <-semaphore }()
+				case <-workCtx.Done():
+					return
 				}
-				bindingFinal := slices.ContainsFunc(attempts, func(attempt RecoveryAttemptFact) bool {
-					return attempt.Repository == cfg.Repository && attempt.Issue == issue.Number && attempt.Attempt == candidate.Attempt
-				})
-				if bindingFinal {
-					continue
-				}
-				if binding.Attempt != 0 {
-					bindingConflicts.Any = true
-					continue
-				}
-				binding = candidate
-			}
-			if binding.Attempt >= next[issue.Number] {
-				next[issue.Number] = binding.Attempt + 1
-			}
-			for _, marker := range terminals {
-				if marker.Attempt >= next[issue.Number] {
-					next[issue.Number] = marker.Attempt + 1
-				}
-			}
-			currentAttempt := max(currentPR[issue.Number], terminal.Attempt, binding.Attempt)
-			pullRequest := 0
-			for _, attempt := range attempts {
-				if attempt.Repository == cfg.Repository && attempt.Issue == issue.Number && attempt.Attempt == currentAttempt {
-					pullRequest = attempt.PR
-				}
-			}
-			status, err := source.directStatus(ctx, issue.Number, pullRequest)
-			if err != nil {
-				return nil, fmt.Errorf("read direct status for issue #%d: %w", issue.Number, err)
-			}
-			controls, _, retry, err := source.authorizedControlsWithIntake(ctx, issue.Number, intake && issue.State != "closed")
-			if err != nil {
-				attempt := max(1, next[issue.Number])
-				if published[issue.Number] > 0 {
-					attempt = published[issue.Number]
-				}
-				var activeAttempt *RecoveryAttemptFact
-				if binding.Attempt > 0 {
-					attempt = binding.Attempt
-					activeAttempt = &RecoveryAttemptFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: "active"}
-				}
-				blockers := []string{err.Error()}
-				if status.NeedsAttention {
-					blockers = append(blockers, "needs attention: "+status.Reason)
-				}
-				result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Blockers: blockers, Active: active[issue.Number] || binding.Attempt > 0 || bindingConflicts.Any, Completed: completed[issue.Number], Closed: issue.State == "closed", NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts})
-				continue
-			}
-			blockers := []string{}
-			var satisfiedDependencies []int
-			if bindingConflicts.Any {
-				blockers = append(blockers, "active attempt marker is foreign, malformed, or contradictory")
-			}
-			if terminalConflicts.Any {
-				blockers = append(blockers, "terminal attempt marker is contradictory")
-			}
-			for _, dependency := range controls.Dependencies {
-				complete, err := source.dependencyComplete(ctx, dependency)
+				fact, err := fetchRecoveryIssueFact(workCtx, api, cfg, source, issue, attempts, active, completed, next[issue.Number], published[issue.Number], currentPR[issue.Number], intake, repository.DefaultBranch, branch.Commit.SHA)
 				if err != nil {
-					blockers = append(blockers, err.Error())
-					continue
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+						cancel()
+					}
+					errMu.Unlock()
+					return
 				}
-				if !complete {
-					blockers = append(blockers, fmt.Sprintf("dependency #%d is incomplete", dependency))
-				} else {
-					satisfiedDependencies = append(satisfiedDependencies, dependency)
-				}
+				pageFacts[i], included[i] = fact, true
+			}()
+		}
+		workers.Wait()
+		cancel()
+		if firstErr != nil {
+			return nil, firstErr
+		}
+		for i := range pageFacts {
+			if included[i] {
+				result = append(result, pageFacts[i])
 			}
-			if intake && status.monitoringDependency > 0 && slices.Contains(controls.Dependencies, status.monitoringDependency) {
-				complete, err := source.dependencyComplete(ctx, status.monitoringDependency)
-				if err == nil && complete {
-					status, err = source.clearResolvedMonitoringDependencyStatus(ctx, issue.Number, pullRequest, max(1, currentAttempt), status)
-				}
-				if err != nil {
-					blockers = append(blockers, fmt.Sprintf("clear resolved monitoring dependency status: %v", err))
-				}
-			}
-			if terminal.Attempt > 0 && !retryAuthorizesFailure(controls, retry, terminal) {
-				blockers = append(blockers, fmt.Sprintf("attempt %d has a coordinator-authored terminal failure requiring a later authorized retry", terminal.Attempt))
-			}
-			recoveryBlockers := len(blockers)
-			if terminal.Attempt > 0 && !retryAuthorizesFailure(controls, retry, terminal) {
-				recoveryBlockers-- // Recover exists to resolve this one expected blocker.
-			}
-			filterMatches := cfg.IssueFilterLabel == "" || controls.IssueFilter
-			authorized := controls.Ready && filterMatches && !controls.Closed && !controls.Cancelled && len(blockers) == 0
-			bound := binding.Attempt > 0
-			attempt := max(1, next[issue.Number])
-			if published[issue.Number] > 0 {
-				attempt = published[issue.Number]
-			}
-			var activeAttempt *RecoveryAttemptFact
-			if bound {
-				attempt = binding.Attempt
-				activeAttempt = &RecoveryAttemptFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: "active"}
-			}
-			isActive := active[issue.Number] || bound || bindingConflicts.Any
-			eligible := authorized && !status.NeedsAttention && !isActive && !completed[issue.Number]
-			recoveryAuthorized := controls.Ready && filterMatches && !controls.Closed && !controls.Cancelled && !status.NeedsAttention && recoveryBlockers == 0 && !completed[issue.Number]
-			recoveryAttempt := 0
-			if recoveryAuthorized && !isActive && slices.ContainsFunc(terminalAttempts, func(fact RecoveryAttemptFact) bool { return fact.Attempt == terminal.Attempt }) {
-				recoveryAttempt = terminal.Attempt
-			}
-			if status.NeedsAttention {
-				blockers = append(blockers, "needs attention: "+status.Reason)
-			}
-			result = append(result, RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: branch.Commit.SHA, BaseBranch: repository.DefaultBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, SatisfiedDependencies: satisfiedDependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, Closed: issue.State == "closed", DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts})
 		}
 		if lastPage {
 			return result, nil
 		}
 	}
 	return nil, errors.New("open issues exceed bounded recovery limit")
+}
+
+func fetchRecoveryIssueFact(ctx context.Context, api API, cfg PRAdapterConfig, source *GitHubPRSource, issue recoveryIssueRecord, attempts []RecoveryAttemptFact, active, completed map[int]bool, nextAttempt, publishedAttempt, currentPRAttempt int, intake bool, baseBranch, baseSHA string) (RecoveryIssueFact, error) {
+	bindings, bindingConflicts, err := fetchActiveAttempts(ctx, api, cfg, issue.Number)
+	if err != nil {
+		return RecoveryIssueFact{}, err
+	}
+	terminals, terminalConflicts, err := fetchTerminalFailures(ctx, api, cfg, issue.Number)
+	if err != nil {
+		return RecoveryIssueFact{}, err
+	}
+	var terminal terminalMarkerPayload
+	if len(terminals) > 0 {
+		terminal = terminals[len(terminals)-1]
+	}
+	terminalByAttempt := make(map[int]terminalMarkerPayload, len(terminals))
+	for _, marker := range terminals {
+		terminalByAttempt[marker.Attempt] = marker
+	}
+	var binding activeMarkerPayload
+	var terminalAttempts []RecoveryAttemptFact
+	for _, candidate := range bindings {
+		if failed, ok := terminalByAttempt[candidate.Attempt]; ok && !bindingConflicts.Attempts[candidate.Attempt] && !terminalConflicts.Attempts[candidate.Attempt] {
+			terminalAttempts = append(terminalAttempts, RecoveryAttemptFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: candidate.Attempt, BaseSHA: candidate.BaseSHA, State: "failed", Diagnostic: failed.Diagnostic})
+			continue
+		}
+		bindingFinal := slices.ContainsFunc(attempts, func(attempt RecoveryAttemptFact) bool {
+			return attempt.Repository == cfg.Repository && attempt.Issue == issue.Number && attempt.Attempt == candidate.Attempt
+		})
+		if bindingFinal {
+			continue
+		}
+		if binding.Attempt != 0 {
+			bindingConflicts.Any = true
+			continue
+		}
+		binding = candidate
+	}
+	if binding.Attempt >= nextAttempt {
+		nextAttempt = binding.Attempt + 1
+	}
+	for _, marker := range terminals {
+		if marker.Attempt >= nextAttempt {
+			nextAttempt = marker.Attempt + 1
+		}
+	}
+	currentAttempt := max(currentPRAttempt, terminal.Attempt, binding.Attempt)
+	pullRequest := 0
+	for _, attempt := range attempts {
+		if attempt.Repository == cfg.Repository && attempt.Issue == issue.Number && attempt.Attempt == currentAttempt {
+			pullRequest = attempt.PR
+		}
+	}
+	status, err := source.directStatus(ctx, issue.Number, pullRequest)
+	if err != nil {
+		return RecoveryIssueFact{}, fmt.Errorf("read direct status for issue #%d: %w", issue.Number, err)
+	}
+	controls, _, retry, err := source.authorizedControlsWithIntake(ctx, issue.Number, intake && issue.State != "closed")
+	if err != nil {
+		attempt := max(1, nextAttempt)
+		if publishedAttempt > 0 {
+			attempt = publishedAttempt
+		}
+		var activeAttempt *RecoveryAttemptFact
+		if binding.Attempt > 0 {
+			attempt = binding.Attempt
+			activeAttempt = &RecoveryAttemptFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: "active"}
+		}
+		blockers := []string{err.Error()}
+		if status.NeedsAttention {
+			blockers = append(blockers, "needs attention: "+status.Reason)
+		}
+		return RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: baseSHA, BaseBranch: baseBranch, CreatedAt: issue.CreatedAt, Blockers: blockers, Active: active[issue.Number] || binding.Attempt > 0 || bindingConflicts.Any, Completed: completed[issue.Number], Closed: issue.State == "closed", NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts}, nil
+	}
+	blockers := []string{}
+	var satisfiedDependencies []int
+	if bindingConflicts.Any {
+		blockers = append(blockers, "active attempt marker is foreign, malformed, or contradictory")
+	}
+	if terminalConflicts.Any {
+		blockers = append(blockers, "terminal attempt marker is contradictory")
+	}
+	for _, dependency := range controls.Dependencies {
+		complete, err := source.dependencyComplete(ctx, dependency)
+		if err != nil {
+			blockers = append(blockers, err.Error())
+			continue
+		}
+		if !complete {
+			blockers = append(blockers, fmt.Sprintf("dependency #%d is incomplete", dependency))
+		} else {
+			satisfiedDependencies = append(satisfiedDependencies, dependency)
+		}
+	}
+	if intake && status.monitoringDependency > 0 && slices.Contains(controls.Dependencies, status.monitoringDependency) {
+		complete, err := source.dependencyComplete(ctx, status.monitoringDependency)
+		if err == nil && complete {
+			status, err = source.clearResolvedMonitoringDependencyStatus(ctx, issue.Number, pullRequest, max(1, currentAttempt), status)
+		}
+		if err != nil {
+			blockers = append(blockers, fmt.Sprintf("clear resolved monitoring dependency status: %v", err))
+		}
+	}
+	if terminal.Attempt > 0 && !retryAuthorizesFailure(controls, retry, terminal) {
+		blockers = append(blockers, fmt.Sprintf("attempt %d has a coordinator-authored terminal failure requiring a later authorized retry", terminal.Attempt))
+	}
+	recoveryBlockers := len(blockers)
+	if terminal.Attempt > 0 && !retryAuthorizesFailure(controls, retry, terminal) {
+		recoveryBlockers-- // Recover exists to resolve this one expected blocker.
+	}
+	filterMatches := cfg.IssueFilterLabel == "" || controls.IssueFilter
+	authorized := controls.Ready && filterMatches && !controls.Closed && !controls.Cancelled && len(blockers) == 0
+	bound := binding.Attempt > 0
+	attempt := max(1, nextAttempt)
+	if publishedAttempt > 0 {
+		attempt = publishedAttempt
+	}
+	var activeAttempt *RecoveryAttemptFact
+	if bound {
+		attempt = binding.Attempt
+		activeAttempt = &RecoveryAttemptFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: binding.Attempt, BaseSHA: binding.BaseSHA, State: "active"}
+	}
+	isActive := active[issue.Number] || bound || bindingConflicts.Any
+	eligible := authorized && !status.NeedsAttention && !isActive && !completed[issue.Number]
+	recoveryAuthorized := controls.Ready && filterMatches && !controls.Closed && !controls.Cancelled && !status.NeedsAttention && recoveryBlockers == 0 && !completed[issue.Number]
+	recoveryAttempt := 0
+	if recoveryAuthorized && !isActive && slices.ContainsFunc(terminalAttempts, func(fact RecoveryAttemptFact) bool { return fact.Attempt == terminal.Attempt }) {
+		recoveryAttempt = terminal.Attempt
+	}
+	if status.NeedsAttention {
+		blockers = append(blockers, "needs attention: "+status.Reason)
+	}
+	return RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: baseSHA, BaseBranch: baseBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, SatisfiedDependencies: satisfiedDependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, Closed: issue.State == "closed", DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts}, nil
 }
 
 func fetchActiveAttempts(ctx context.Context, api API, cfg PRAdapterConfig, issue int) ([]activeMarkerPayload, markerConflicts, error) {
@@ -768,20 +828,7 @@ func FetchAttemptFacts(ctx context.Context, api API, repository string, actorID 
 func fetchAttemptFacts(ctx context.Context, api API, repository string, actorID, targetIssue, targetAttempt int, includeChecks bool) ([]RecoveryAttemptFact, error) {
 	var facts []RecoveryAttemptFact
 	for page := 1; ; page++ {
-		var pulls []struct {
-			Number      int `json:"number"`
-			Body, State string
-			MergedAt    any `json:"merged_at"`
-			User        struct {
-				ID int `json:"id"`
-			} `json:"user"`
-			Head struct {
-				SHA, Ref string
-			} `json:"head"`
-			Base struct {
-				SHA string `json:"sha"`
-			} `json:"base"`
-		}
+		var pulls []recoveryPullRecord
 		path := fmt.Sprintf("/repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=%d&page=%d", repository, recoveryPullsPerPage, page)
 		if targetIssue > 0 {
 			branch, err := AttemptBranch(repository, targetIssue, targetAttempt)
@@ -794,126 +841,155 @@ func fetchAttemptFacts(ctx context.Context, api API, repository string, actorID,
 		if _, _, err := api.Read(ctx, path, "", &pulls); err != nil {
 			return nil, err
 		}
-		for _, pull := range pulls {
-			marker, markerErr := parseAttemptMarker(pull.Body)
-			if markerErr != nil {
-				continue
-			}
-			issue, attempt := marker.Issue, marker.Attempt
-			if targetIssue > 0 && (issue != targetIssue || attempt != targetAttempt) {
-				continue
-			}
-			wantBranch, err := AttemptBranch(repository, issue, attempt)
-			if err != nil || marker.Branch != wantBranch || marker.Branch != pull.Head.Ref || marker.Head != pull.Head.SHA || marker.PR != pull.Number || pull.User.ID != actorID {
-				continue
-			}
-			if pull.Number < 1 || issue < 1 || attempt < 1 || pull.Head.SHA == "" || pull.Base.SHA == "" {
-				return nil, errors.New("marked pull request has incomplete identity")
-			}
-			var currentIssue struct {
-				State  string
-				Labels []struct{ Name string }
-			}
-			if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", repository, issue), "", &currentIssue); err != nil {
-				return nil, err
-			}
-			var comments []struct {
-				Body string `json:"body"`
-				User struct {
-					ID int `json:"id"`
-				} `json:"user"`
-			}
-			for commentPage := 1; commentPage <= recoveryPageLimit; commentPage++ {
-				var page []struct {
-					Body string `json:"body"`
-					User struct {
-						ID int `json:"id"`
-					} `json:"user"`
+		pageFacts := make([]RecoveryAttemptFact, len(pulls))
+		included := make([]bool, len(pulls))
+		errs := make([]error, len(pulls))
+		semaphore := make(chan struct{}, recoveryPullConcurrency)
+		var workers sync.WaitGroup
+		for i, pull := range pulls {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				select {
+				case semaphore <- struct{}{}:
+					defer func() { <-semaphore }()
+				case <-ctx.Done():
+					errs[i] = ctx.Err()
+					return
 				}
-				if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100&page=%d", repository, issue, commentPage), "", &page); err != nil {
-					return nil, err
-				}
-				comments = append(comments, page...)
-				if len(page) < 100 {
-					break
-				}
-				if commentPage == recoveryPageLimit {
-					return nil, errors.New("issue comments exceed bounded recovery limit")
-				}
+				pageFacts[i], included[i], errs[i] = fetchRecoveryAttemptFact(ctx, api, repository, actorID, targetIssue, targetAttempt, includeChecks, pull)
+			}()
+		}
+		workers.Wait()
+		for i, err := range errs {
+			if err != nil {
+				return nil, fmt.Errorf("pull request %d: %w", pulls[i].Number, err)
 			}
-			authoritative := false
-			boundBase := ""
-			baseConflict := false
-			for _, comment := range comments {
-				if comment.User.ID != actorID {
-					continue
-				}
-				got, err := parseAttemptMarker(comment.Body)
-				if err == nil && got == marker {
-					authoritative = true
-				}
-				binding, err := parseActiveAttemptMarker(comment.Body)
-				if err == nil && binding.Issue == issue && binding.Attempt == attempt && binding.Branch == wantBranch {
-					baseConflict = boundBase != "" && boundBase != binding.BaseSHA
-					boundBase = binding.BaseSHA
-				}
+			if included[i] {
+				facts = append(facts, pageFacts[i])
 			}
-			if !authoritative || baseConflict {
-				continue
-			}
-			if boundBase == "" { // Compatibility with attempts published before active bindings existed.
-				boundBase = pull.Base.SHA
-			}
-			state := "active"
-			if pull.MergedAt != nil {
-				state = "completed"
-			} else if pull.State != "open" || currentIssue.State == "closed" {
-				state = "blocked"
-			}
-			var checks []string
-			if includeChecks {
-				var allRuns []struct{ Name, Status, Conclusion string }
-				for checkPage := 1; checkPage <= recoveryPageLimit; checkPage++ {
-					var runs struct {
-						CheckRuns []struct{ Name, Status, Conclusion string } `json:"check_runs"`
-					}
-					if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/commits/%s/check-runs?filter=latest&per_page=100&page=%d", repository, pull.Head.SHA, checkPage), "", &runs); err != nil {
-						return nil, err
-					}
-					allRuns = append(allRuns, runs.CheckRuns...)
-					if len(runs.CheckRuns) < 100 {
-						break
-					}
-					if checkPage == recoveryPageLimit {
-						return nil, errors.New("check runs exceed bounded recovery limit")
-					}
-				}
-				checksPass := len(allRuns) > 0
-				for _, run := range allRuns {
-					checks = append(checks, run.Name+":"+run.Status+":"+run.Conclusion)
-					checksPass = checksPass && run.Status == "completed" && (run.Conclusion == "success" || run.Conclusion == "neutral" || run.Conclusion == "skipped")
-				}
-				var statuses struct {
-					Statuses []struct{ Context, State string }
-				}
-				if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/commits/%s/status", repository, pull.Head.SHA), "", &statuses); err != nil {
-					return nil, err
-				}
-				checksPass = checksPass || len(statuses.Statuses) > 0
-				for _, status := range statuses.Statuses {
-					checks = append(checks, status.Context+":"+status.State)
-					checksPass = checksPass && status.State == "success"
-				}
-				if state == "active" && checksPass {
-					state = "review-ready"
-				}
-			}
-			facts = append(facts, RecoveryAttemptFact{Repository: repository, Issue: issue, Attempt: attempt, BaseSHA: boundBase, HeadSHA: pull.Head.SHA, PR: pull.Number, State: state, PublicationConfirmed: true, Checks: checks})
 		}
 		if targetIssue > 0 || len(pulls) < recoveryPullsPerPage {
 			return facts, nil
 		}
 	}
+}
+
+func fetchRecoveryAttemptFact(ctx context.Context, api API, repository string, actorID, targetIssue, targetAttempt int, includeChecks bool, pull recoveryPullRecord) (RecoveryAttemptFact, bool, error) {
+	marker, markerErr := parseAttemptMarker(pull.Body)
+	if markerErr != nil {
+		return RecoveryAttemptFact{}, false, nil
+	}
+	issue, attempt := marker.Issue, marker.Attempt
+	if targetIssue > 0 && (issue != targetIssue || attempt != targetAttempt) {
+		return RecoveryAttemptFact{}, false, nil
+	}
+	wantBranch, err := AttemptBranch(repository, issue, attempt)
+	if err != nil || marker.Branch != wantBranch || marker.Branch != pull.Head.Ref || marker.Head != pull.Head.SHA || marker.PR != pull.Number || pull.User.ID != actorID {
+		return RecoveryAttemptFact{}, false, nil
+	}
+	if pull.Number < 1 || issue < 1 || attempt < 1 || pull.Head.SHA == "" || pull.Base.SHA == "" {
+		return RecoveryAttemptFact{}, false, errors.New("marked pull request has incomplete identity")
+	}
+	var currentIssue struct {
+		State  string
+		Labels []struct{ Name string }
+	}
+	if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", repository, issue), "", &currentIssue); err != nil {
+		return RecoveryAttemptFact{}, false, err
+	}
+	var comments []struct {
+		Body string `json:"body"`
+		User struct {
+			ID int `json:"id"`
+		} `json:"user"`
+	}
+	for commentPage := 1; commentPage <= recoveryPageLimit; commentPage++ {
+		var page []struct {
+			Body string `json:"body"`
+			User struct {
+				ID int `json:"id"`
+			} `json:"user"`
+		}
+		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100&page=%d", repository, issue, commentPage), "", &page); err != nil {
+			return RecoveryAttemptFact{}, false, err
+		}
+		comments = append(comments, page...)
+		if len(page) < 100 {
+			break
+		}
+		if commentPage == recoveryPageLimit {
+			return RecoveryAttemptFact{}, false, errors.New("issue comments exceed bounded recovery limit")
+		}
+	}
+	authoritative := false
+	boundBase := ""
+	baseConflict := false
+	for _, comment := range comments {
+		if comment.User.ID != actorID {
+			continue
+		}
+		got, err := parseAttemptMarker(comment.Body)
+		if err == nil && got == marker {
+			authoritative = true
+		}
+		binding, err := parseActiveAttemptMarker(comment.Body)
+		if err == nil && binding.Issue == issue && binding.Attempt == attempt && binding.Branch == wantBranch {
+			baseConflict = boundBase != "" && boundBase != binding.BaseSHA
+			boundBase = binding.BaseSHA
+		}
+	}
+	if !authoritative || baseConflict {
+		return RecoveryAttemptFact{}, false, nil
+	}
+	if boundBase == "" { // Compatibility with attempts published before active bindings existed.
+		boundBase = pull.Base.SHA
+	}
+	state := "active"
+	if pull.MergedAt != nil {
+		state = "completed"
+	} else if pull.State != "open" || currentIssue.State == "closed" {
+		state = "blocked"
+	}
+	var checks []string
+	if includeChecks {
+		var allRuns []struct{ Name, Status, Conclusion string }
+		for checkPage := 1; checkPage <= recoveryPageLimit; checkPage++ {
+			var runs struct {
+				CheckRuns []struct{ Name, Status, Conclusion string } `json:"check_runs"`
+			}
+			if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/commits/%s/check-runs?filter=latest&per_page=100&page=%d", repository, pull.Head.SHA, checkPage), "", &runs); err != nil {
+				return RecoveryAttemptFact{}, false, err
+			}
+			allRuns = append(allRuns, runs.CheckRuns...)
+			if len(runs.CheckRuns) < 100 {
+				break
+			}
+			if checkPage == recoveryPageLimit {
+				return RecoveryAttemptFact{}, false, errors.New("check runs exceed bounded recovery limit")
+			}
+		}
+		checksPass := len(allRuns) > 0
+		for _, run := range allRuns {
+			checks = append(checks, run.Name+":"+run.Status+":"+run.Conclusion)
+			checksPass = checksPass && run.Status == "completed" && (run.Conclusion == "success" || run.Conclusion == "neutral" || run.Conclusion == "skipped")
+		}
+		var statuses struct {
+			Statuses []struct{ Context, State string }
+		}
+		if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/commits/%s/status", repository, pull.Head.SHA), "", &statuses); err != nil {
+			return RecoveryAttemptFact{}, false, err
+		}
+		checksPass = checksPass || len(statuses.Statuses) > 0
+		for _, status := range statuses.Statuses {
+			checks = append(checks, status.Context+":"+status.State)
+			checksPass = checksPass && status.State == "success"
+		}
+		if state == "active" && checksPass {
+			state = "review-ready"
+		}
+	}
+	return RecoveryAttemptFact{Repository: repository, Issue: issue, Attempt: attempt, BaseSHA: boundBase, HeadSHA: pull.Head.SHA, PR: pull.Number, State: state, PublicationConfirmed: true, Checks: checks}, true, nil
 }
 
 // FindPublishedAttempt reconstructs publication even while the PR body or issue

@@ -14,6 +14,7 @@ test("overall dashboard health", () => {
   assert.equal(overallHealth(fresh, "", [{ state: "active", needs_attention: true }, { state: "completed", needs_attention: true }], now).state, "attention");
   assert.equal(overallHealth(fresh, "", [{ state: "completed", diagnostic: "old" }], now).state, "good");
   assert.equal(overallHealth({ updated_at: "2026-08-13T11:57:59Z" }, "", [], now).state, "stale");
+  assert.deepEqual(overallHealth({ ...fresh, reconciliation_error: "GitHub refresh timed out" }, "", [], now), { state: "stale", title: "Status refresh failed", detail: "GitHub refresh timed out" });
   assert.equal(overallHealth(fresh, "Status request failed", [], now).state, "unavailable");
 });
 

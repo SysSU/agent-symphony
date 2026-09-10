@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,16 +22,119 @@ type API struct {
 	BaseURL  string
 	HTTP     *http.Client
 	Cache    *ReadCache
-	snapshot map[string]json.RawMessage
+	snapshot *readSnapshot
 	Sleep    func(context.Context, time.Duration) error
 	Retries  int
+	Metrics  *CycleMetrics
+}
+
+type readSnapshot struct {
+	mu         sync.RWMutex
+	generation uint64
+	responses  map[string]json.RawMessage
+	pathLocks  map[string]*sync.Mutex
+}
+
+type CycleMetrics struct {
+	requests atomic.Int64
+	retries  atomic.Int64
+	stale    atomic.Int64
+	mutated  atomic.Bool
+	mu       sync.Mutex
+	error    string
+}
+
+func (m *CycleMetrics) Snapshot() (requests, retries int64) {
+	if m == nil {
+		return 0, 0
+	}
+	return m.requests.Load(), m.retries.Load()
+}
+
+func (m *CycleMetrics) Stale() (reads int64, diagnostic string) {
+	if m == nil {
+		return 0, ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.stale.Load(), m.error
+}
+
+func (m *CycleMetrics) markStale(err error) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mutated.Load() {
+		return false
+	}
+	m.stale.Add(1)
+	m.error = Redact(err.Error())
+	return true
+}
+
+func (m *CycleMetrics) beginMutation() bool {
+	if m == nil {
+		return true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stale.Load() > 0 {
+		return false
+	}
+	m.mutated.Store(true)
+	return true
 }
 
 // WithReadSnapshot deduplicates identical reads during one authoritative
 // projection. Mutations still invalidate the snapshot before they run.
 func (a API) WithReadSnapshot() API {
-	a.snapshot = map[string]json.RawMessage{}
+	a.snapshot = &readSnapshot{responses: map[string]json.RawMessage{}, pathLocks: map[string]*sync.Mutex{}}
 	return a
+}
+
+func (a API) snapshotLock(path string) func() {
+	if a.snapshot == nil {
+		return func() {}
+	}
+	a.snapshot.mu.Lock()
+	lock := a.snapshot.pathLocks[path]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		a.snapshot.pathLocks[path] = lock
+	}
+	a.snapshot.mu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+func (a API) snapshotRead(path string) (json.RawMessage, bool, uint64) {
+	if a.snapshot == nil {
+		return nil, false, 0
+	}
+	a.snapshot.mu.RLock()
+	defer a.snapshot.mu.RUnlock()
+	body, ok := a.snapshot.responses[path]
+	return append(json.RawMessage(nil), body...), ok, a.snapshot.generation
+}
+
+func (a API) snapshotStore(path string, body json.RawMessage, generation uint64) {
+	if a.snapshot == nil {
+		return
+	}
+	a.snapshot.mu.Lock()
+	defer a.snapshot.mu.Unlock()
+	if a.snapshot.generation == generation {
+		a.snapshot.responses[path] = append(json.RawMessage(nil), body...)
+	}
+}
+
+func (a API) snapshotClear() {
+	if a.snapshot == nil {
+		return
+	}
+	a.snapshot.mu.Lock()
+	a.snapshot.generation++
+	clear(a.snapshot.responses)
+	a.snapshot.mu.Unlock()
 }
 
 const maxJSONBody = 1 << 20
@@ -143,7 +248,10 @@ func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool
 	if !strings.HasPrefix(path, "/") {
 		return "", false, errors.New("GitHub API path must start with /")
 	}
-	if body, ok := a.snapshot[path]; ok {
+	unlock := a.snapshotLock(path)
+	defer unlock()
+	body, ok, generation := a.snapshotRead(path)
+	if ok {
 		return "", false, decodeJSON(bytes.NewReader(body), dst)
 	}
 	var cached readCacheEntry
@@ -163,9 +271,7 @@ func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool
 				if err := decodeJSON(bytes.NewReader(cached.Body), dst); err != nil {
 					return "", false, fmt.Errorf("decode cached GitHub read: %w", err)
 				}
-				if a.snapshot != nil {
-					a.snapshot[path] = append(json.RawMessage(nil), cached.Body...)
-				}
+				a.snapshotStore(path, cached.Body, generation)
 			}
 			responseETag := resp.Header.Get("ETag")
 			if responseETag == "" {
@@ -185,9 +291,7 @@ func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool
 					return "", false, fmt.Errorf("cache GitHub read: %w", err)
 				}
 			}
-			if a.snapshot != nil {
-				a.snapshot[path] = append(json.RawMessage(nil), body.Bytes()...)
-			}
+			a.snapshotStore(path, body.Bytes(), generation)
 			return responseETag, true, nil
 		}
 		if err == nil && !transient(resp) {
@@ -195,11 +299,25 @@ func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool
 			return "", false, responseError("GitHub read", resp)
 		}
 		if attempt >= retries {
+			var finalErr error
 			if err != nil {
-				return "", false, fmt.Errorf("GitHub read: %w", err)
+				finalErr = fmt.Errorf("GitHub read: %w", err)
+			} else {
+				defer resp.Body.Close()
+				finalErr = responseError("GitHub read after retries", resp)
 			}
-			defer resp.Body.Close()
-			return "", false, responseError("GitHub read after retries", resp)
+			if len(cached.Body) > 0 && a.Metrics != nil {
+				if a.Metrics.markStale(finalErr) {
+					if decodeErr := decodeJSON(bytes.NewReader(cached.Body), dst); decodeErr == nil {
+						a.snapshotStore(path, cached.Body, generation)
+						return cached.ETag, false, nil
+					}
+				}
+			}
+			return "", false, finalErr
+		}
+		if a.Metrics != nil {
+			a.Metrics.retries.Add(1)
 		}
 		delay := retryDelay(resp, attempt)
 		if resp != nil {
@@ -241,7 +359,6 @@ func (a API) Mutate(ctx context.Context, method, path string, body any, attribut
 	if json.Unmarshal(b, &object) != nil || json.Unmarshal(object["body"], &persistedBody) != nil || !strings.Contains(persistedBody, marker) {
 		return errors.New("GitHub mutation body must persist issue and attempt attribution")
 	}
-	clear(a.snapshot)
 	resp, err := a.do(ctx, method, path, "", b, attribution)
 	if err != nil {
 		return &ambiguousMutationError{fmt.Errorf("GitHub mutation outcome is ambiguous; reconcile issue #%d attempt %d: %w", attribution.Issue, attribution.Attempt, err)}
@@ -259,6 +376,15 @@ func (a API) Mutate(ctx context.Context, method, path string, body any, attribut
 }
 
 func (a API) do(ctx context.Context, method, path, etag string, body []byte, attribution Mutation) (*http.Response, error) {
+	if attribution.Issue > 0 {
+		if !a.Metrics.beginMutation() {
+			return nil, errors.New("refusing GitHub mutation after a stale authoritative read")
+		}
+		a.snapshotClear()
+	}
+	if a.Metrics != nil {
+		a.Metrics.requests.Add(1)
+	}
 	var input io.Reader
 	if body != nil {
 		input = bytes.NewReader(body)

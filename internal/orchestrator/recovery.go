@@ -340,23 +340,36 @@ func runtimeWorktreeBlocker(err error) string {
 
 // ReconcileLoop reconciles immediately, then repeats at most every interval.
 func ReconcileLoop(ctx context.Context, interval time.Duration, reconcile func(context.Context) error) error {
-	if reconcile == nil {
-		return errors.New("reconcile function is required")
-	}
-	if interval <= 0 || interval > MaxReconcileInterval {
-		return fmt.Errorf("reconcile interval must be between 1ns and %s", MaxReconcileInterval)
-	}
-	_ = reconcile(ctx) // a bounded GitHub outage must not stop later recovery
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
+	return reconcileLoop(ctx, interval, reconcile, time.Now, func(ctx context.Context, delay time.Duration) error {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
-			_ = reconcile(ctx)
-			ticker.Reset(interval)
+		case <-timer.C:
+			return nil
 		}
+	})
+}
+
+func reconcileLoop(ctx context.Context, interval time.Duration, reconcile func(context.Context) error, now func() time.Time, wait func(context.Context, time.Duration) error) error {
+	if reconcile == nil {
+		return errors.New("reconcile function is required")
+	}
+	if interval <= 0 || interval > MaxReconcileInterval || now == nil || wait == nil {
+		return fmt.Errorf("reconcile interval must be between 1ns and %s", MaxReconcileInterval)
+	}
+	next := now().Add(interval)
+	_ = reconcile(ctx) // a bounded GitHub outage must not stop later recovery
+	for {
+		current := now()
+		for !next.After(current) {
+			next = next.Add(interval)
+		}
+		if err := wait(ctx, next.Sub(current)); err != nil {
+			return err
+		}
+		_ = reconcile(ctx)
 	}
 }
 

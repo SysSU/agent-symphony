@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -481,6 +482,99 @@ func (s *multiPRSource) FreshPullRequest(_ context.Context, number int) (PRState
 		return PRState{}, errors.New("malformed")
 	}
 	return s.prSourceStub.FreshPullRequest(context.Background(), number)
+}
+
+type overlappingAttemptSource struct {
+	firstMutationStarted                  <-chan struct{}
+	secondReadStarted                     chan struct{}
+	issueClosed, firstMutationComplete    *atomic.Bool
+	secondReadBeforeMutation, secondReads atomic.Int32
+}
+
+func (s *overlappingAttemptSource) OpenPullRequests(context.Context) ([]int, error) {
+	return []int{11, 12}, nil
+}
+
+func (s *overlappingAttemptSource) FreshPullRequest(_ context.Context, number int) (PRState, error) {
+	attempt, head := 1, "aaaaaaa"
+	facts := eligiblePR()
+	if number == 11 {
+		facts.AutonomousMerge = false
+	} else {
+		attempt, head = 2, "bbbbbbb"
+		closed := s.issueClosed.Load()
+		if s.secondReads.Add(1) == 1 {
+			if !s.firstMutationComplete.Load() {
+				s.secondReadBeforeMutation.Store(1)
+			}
+			close(s.secondReadStarted)
+			<-s.firstMutationStarted
+		}
+		facts.IssueOpen, facts.IssueEligible = !closed, !closed
+	}
+	facts.HeadSHA, facts.ValidationSHA, facts.DocumentationSHA = head, head, head
+	status := "success"
+	if !facts.IssueOpen {
+		status = "failure"
+	}
+	checkHead := head
+	if number == 11 {
+		checkHead = ""
+	}
+	return PRState{Repository: "o/r", Number: number, Issue: 7, Attempt: attempt, HeadSHA: head, CheckHead: checkHead, PolicyStatus: status, Facts: facts}, nil
+}
+
+func (*overlappingAttemptSource) FreshFeedback(context.Context, PRState, Feedback) (Feedback, error) {
+	return Feedback{}, errors.New("unexpected feedback read")
+}
+
+func TestPRCoordinatorSerializesAttemptsForOneIssueAcrossMutation(t *testing.T) {
+	mutationStarted, releaseMutation := make(chan struct{}), make(chan struct{})
+	secondReadStarted := make(chan struct{})
+	var issueClosed, mutationComplete atomic.Bool
+	source := &overlappingAttemptSource{firstMutationStarted: mutationStarted, secondReadStarted: secondReadStarted, issueClosed: &issueClosed, firstMutationComplete: &mutationComplete}
+	var secondMutations atomic.Int32
+	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/repos/o/r/statuses/aaaaaaa" {
+			close(mutationStarted)
+			<-releaseMutation
+			mutationComplete.Store(true)
+		}
+		if request.Header.Get("X-Agent-Symphony-Attempt") == "2" {
+			secondMutations.Add(1)
+		}
+		return httpResponse(http.StatusCreated, `{"merged":true}`, nil), nil
+	})}}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- (PRCoordinator{API: api, Source: source, Signals: &prSignalsStub{}, Attempts: map[int]RecoveryAttemptFact{
+			11: {Issue: 7, Attempt: 1, PR: 11},
+			12: {Issue: 7, Attempt: 2, PR: 12},
+		}, MergeMethod: "squash"}).Reconcile(ctx)
+	}()
+	select {
+	case <-mutationStarted:
+	case err := <-done:
+		t.Fatalf("first attempt did not reach its mutation: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	unsafeOverlap := false
+	select {
+	case <-secondReadStarted:
+		unsafeOverlap = true
+	default:
+	}
+	issueClosed.Store(true)
+	close(releaseMutation)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if unsafeOverlap || source.secondReadBeforeMutation.Load() != 0 || source.secondReads.Load() != 2 || secondMutations.Load() != 0 {
+		t.Fatalf("second pre-mutation reads=%d total reads=%d mutations=%d", source.secondReadBeforeMutation.Load(), source.secondReads.Load(), secondMutations.Load())
+	}
 }
 
 func TestPRCoordinatorIsolatesAndAggregatesPRErrors(t *testing.T) {
