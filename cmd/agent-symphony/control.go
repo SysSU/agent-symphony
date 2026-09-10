@@ -257,7 +257,7 @@ func validControlRequest(request controlRequest, repository string) bool {
 		return request.Issue == 0 && request.Attempt == 0 && !request.Confirm
 	case "recover", "review-plan", "dismiss", "orchestrator-investigate":
 		return request.Issue > 0 && request.Attempt > 0 && !request.Confirm
-	case "archive", "abandon":
+	case "archive", "abandon", "remove":
 		return request.Issue > 0 && request.Attempt > 0 && request.Confirm
 	default:
 		return false

@@ -257,7 +257,7 @@ test("refreshes the running release without reloading", async ({ page }) => {
   await expect(metadata).toHaveText("Release 0.6.0");
 });
 
-test("moves superseded terminal attempts into read-only history", async ({ page }) => {
+test("moves superseded terminal attempts into history", async ({ page }) => {
   const failed = {
     repository: "SysSU/agent-symphony",
     issue: 187,
@@ -284,7 +284,8 @@ test("moves superseded terminal attempts into read-only history", async ({ page 
   await history.locator("summary").click();
   await expect(history).toContainText("Attempt 1");
   await expect(history).toContainText("checkout base failed");
-  await expect(history.getByRole("button")).toBeDisabled();
+  await expect(history.getByRole("button", { name: /as-agent-symphony-187-/ })).toBeDisabled();
+  await expect(history.getByRole("button", { name: "Permanently remove issue #187, attempt 1" })).toBeEnabled();
   await expect(history.getByRole("button", { name: /investigate|recover|abandon/i })).toHaveCount(0);
   await page.screenshot({ path: "test-results/board-attempt-history-desktop.png", fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -356,6 +357,53 @@ test("dismisses one closed-issue attempt while retaining diagnostics", async ({ 
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   await page.screenshot({ path: "test-results/closed-attempt-dismissal-mobile.png", fullPage: true });
+});
+
+test("confirms permanent removal and keeps unrelated attempts visible", async ({ page }) => {
+  const previous = {
+    repository: "SysSU/agent-symphony",
+    issue: 220,
+    attempt: 1,
+    title: "Attempt cleanup",
+    state: "failed",
+    issue_closed: true,
+    diagnostic: "old failure",
+  };
+  const current = { ...previous, attempt: 2, state: "active", diagnostic: "current work" };
+  const other = { ...previous, issue: 221, attempt: 1, state: "failed", diagnostic: "unrelated failure" };
+  const dashboard = await mockDashboard(page, [previous, current, other]);
+  const requests = [];
+  await page.route("**/actions/remove?*", (route) => {
+    const url = new URL(route.request().url());
+    const key = `${url.searchParams.get("repository")}#${url.searchParams.get("issue")}/${url.searchParams.get("attempt")}`;
+    requests.push({ method: route.request().method(), key });
+    dashboard.hide(previous, "removed");
+    return route.fulfill({ json: { ok: true } });
+  });
+  await page.goto("/");
+
+  const history = page.locator("details.attemptHistory");
+  await history.locator("summary").click();
+  const remove = history.getByRole("button", { name: "Permanently remove issue #220, attempt 1" });
+  await expect(remove).toBeVisible();
+  await expect(page.getByRole("button", { name: "Permanently remove issue #220, attempt 2" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Dismiss issue #220, attempt 1; keep diagnostics" })).toBeVisible();
+
+  let confirmation = "";
+  page.once("dialog", (dialog) => {
+    confirmation = dialog.message();
+    return dialog.accept();
+  });
+  await remove.click();
+  await expect(page.getByRole("status").filter({ hasText: "Permanently removed issue #220, attempt 1." })).toBeVisible();
+  expect(confirmation).toContain("managed worktree, implementation and review sessions, logs, diagnostics, snapshots, and related artifacts");
+  expect(confirmation).toContain("cannot be restored");
+  expect(requests).toEqual([{ method: "POST", key: "SysSU/agent-symphony#220/1" }]);
+
+  await page.reload();
+  await expect(page.getByText("old failure", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("current work", { exact: true })).toBeVisible();
+  await expect(page.getByText("unrelated failure", { exact: true })).toBeVisible();
 });
 
 test("contains long attempt text inside a mobile viewport", async ({ page }) => {

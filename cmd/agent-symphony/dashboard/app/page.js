@@ -13,6 +13,7 @@ const actionDetails = {
   abandon: ["Abandon", "This stops its tmux session and permanently deletes its local worktree, log, and retained attempt record.", "Abandoned"],
   archive: ["Archive", "This stops its tmux session if needed, deletes its local worktree, and hides it from the Done lane.", "Archived"],
   dismiss: ["Dismiss", "This hides only this card. Its manifest, logs, worktree diagnostics, GitHub issue, and pull request are retained.", "Dismissed"],
+  remove: ["Permanently remove", "This permanently deletes this exact historical attempt's managed worktree, implementation and review sessions, logs, diagnostics, snapshots, and related artifacts. It cannot be restored. The GitHub issue and pull request are unchanged.", "Permanently removed"],
   recover: ["Recover", "If the attempt is stuck, this stops only its named tmux session. It preserves the worktree and diagnostics, records the failure on GitHub, and requests a new attempt.", "Recovery requested for"],
 };
 
