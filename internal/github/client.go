@@ -60,11 +60,28 @@ func (m *CycleMetrics) Stale() (reads int64, diagnostic string) {
 	return m.stale.Load(), m.error
 }
 
-func (m *CycleMetrics) markStale(err error) {
-	m.stale.Add(1)
+func (m *CycleMetrics) markStale(err error) bool {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mutated.Load() {
+		return false
+	}
+	m.stale.Add(1)
 	m.error = Redact(err.Error())
-	m.mu.Unlock()
+	return true
+}
+
+func (m *CycleMetrics) beginMutation() bool {
+	if m == nil {
+		return true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stale.Load() > 0 {
+		return false
+	}
+	m.mutated.Store(true)
+	return true
 }
 
 // WithReadSnapshot deduplicates identical reads during one authoritative
@@ -289,11 +306,12 @@ func (a API) Read(ctx context.Context, path, etag string, dst any) (string, bool
 				defer resp.Body.Close()
 				finalErr = responseError("GitHub read after retries", resp)
 			}
-			if len(cached.Body) > 0 && a.Metrics != nil && !a.Metrics.mutated.Load() {
-				if decodeErr := decodeJSON(bytes.NewReader(cached.Body), dst); decodeErr == nil {
-					a.snapshotStore(path, cached.Body, generation)
-					a.Metrics.markStale(finalErr)
-					return cached.ETag, false, nil
+			if len(cached.Body) > 0 && a.Metrics != nil {
+				if a.Metrics.markStale(finalErr) {
+					if decodeErr := decodeJSON(bytes.NewReader(cached.Body), dst); decodeErr == nil {
+						a.snapshotStore(path, cached.Body, generation)
+						return cached.ETag, false, nil
+					}
 				}
 			}
 			return "", false, finalErr
@@ -359,13 +377,10 @@ func (a API) Mutate(ctx context.Context, method, path string, body any, attribut
 
 func (a API) do(ctx context.Context, method, path, etag string, body []byte, attribution Mutation) (*http.Response, error) {
 	if attribution.Issue > 0 {
-		if stale, _ := a.Metrics.Stale(); stale > 0 {
+		if !a.Metrics.beginMutation() {
 			return nil, errors.New("refusing GitHub mutation after a stale authoritative read")
 		}
 		a.snapshotClear()
-		if a.Metrics != nil {
-			a.Metrics.mutated.Store(true)
-		}
 	}
 	if a.Metrics != nil {
 		a.Metrics.requests.Add(1)

@@ -4791,11 +4791,6 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 	runGit(t, root, "commit", "-m", "fixture")
 	base := runGit(t, root, "rev-parse", "HEAD")
 	runGit(t, root, "update-ref", "refs/remotes/origin/main", base)
-	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("managed pull request head\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, root, "commit", "-am", "managed head")
-	head := runGit(t, root, "rev-parse", "HEAD")
 	cfg := config.Default("o/r")
 	cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
 	configPath := filepath.Join(root, config.DefaultPath)
@@ -4834,17 +4829,26 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 		}
 	}
 	pulls := make([]any, 0, 10)
+	heads := make([]string, 11)
 	for issue := 1; issue <= 10; issue++ {
 		pr := 100 + issue
+		head := fmt.Sprintf("%040x", issue)
+		heads[issue] = head
 		branch, _ := internalgithub.AttemptBranch("o/r", issue, 1)
 		marker, _ := internalgithub.AttemptMarker(issue, 1, branch, head, pr, "review")
 		active, _ := internalgithub.ActiveAttemptMarker("o/r", issue, 1, base)
 		comments[issue] = append(comments[issue], map[string]any{"id": issue*100 + 3, "body": marker + "\n" + active, "created_at": createdAt.Add(5 * time.Minute), "updated_at": createdAt.Add(5 * time.Minute), "user": map[string]any{"id": 42}})
+		policy, _ := internalgithub.PolicyFailureBody(issue, 1, head, "", []string{"validation evidence is missing or stale", "documentation impact assessment is missing or stale"})
+		comments[pr] = []any{map[string]any{"id": issue*100 + 4, "body": policy, "created_at": createdAt.Add(6 * time.Minute), "updated_at": createdAt.Add(6 * time.Minute), "user": map[string]any{"id": 42}}}
+		prBody := fmt.Sprintf("Closes #%d\n\n<!-- agent-symphony:issue:%d:attempt:1 -->\n\n%s", issue, issue, marker)
 		open = append(open, map[string]any{"number": pr, "state": "open", "pull_request": map[string]any{"url": fmt.Sprintf("https://example.test/pulls/%d", pr)}})
-		pulls = append(pulls, map[string]any{"number": pr, "body": marker, "state": "closed", "merged_at": createdAt.Add(6 * time.Minute), "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": branch}, "base": map[string]any{"sha": base}})
+		pulls = append(pulls, map[string]any{"number": pr, "body": prBody, "state": "open", "merged_at": nil, "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": branch}, "base": map[string]any{"sha": base}})
 	}
 	var requestMu sync.Mutex
 	requestCount := 0
+	governanceReads := make(map[int]int, 10)
+	latestCheckReads := make(map[string]int, 10)
+	governanceCheckReads := make(map[string]int, 10)
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		timer := time.NewTimer(100 * time.Millisecond)
 		defer timer.Stop()
@@ -4861,18 +4865,14 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 		case request.URL.Path == "/user":
 			response = map[string]any{"id": 42, "login": "coordinator"}
 		case request.URL.Path == "/repos/o/r":
-			response = map[string]any{"full_name": "o/r", "default_branch": "main", "permissions": map[string]any{"pull": true}}
+			response = map[string]any{"full_name": "o/r", "default_branch": "main", "permissions": map[string]any{"pull": true, "push": true}}
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/pulls":
-			if request.URL.Query().Get("state") == "all" {
-				response = pulls
-			} else {
-				response = []any{}
-			}
+			response = pulls
 		case request.URL.Path == "/repos/o/r/branches/main":
 			response = map[string]any{"commit": map[string]any{"sha": base}}
 		case request.URL.Path == "/repos/o/r/issues":
 			response = open
-		case request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/comments"):
+		case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/repos/o/r/issues/") && strings.HasSuffix(request.URL.Path, "/comments"):
 			var number int
 			if _, err := fmt.Sscanf(request.URL.Path, "/repos/o/r/issues/%d/comments", &number); err != nil || number < 1 || number > 110 {
 				return nil, fmt.Errorf("unexpected comments path %s", request.URL.Path)
@@ -4888,15 +4888,44 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 				map[string]any{"id": number*10 + 2, "event": "labeled", "created_at": createdAt.Add(2 * time.Minute), "actor": map[string]any{"id": 42}, "label": map[string]any{"name": "priority:P1"}},
 			}
 		case request.Method == http.MethodPost && request.URL.Path == "/graphql":
-			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}, "pullRequest": map[string]any{"reviewDecision": nil}}}}
 		case request.Method == http.MethodGet && request.URL.Path == "/user/42":
 			response = map[string]any{"login": "coordinator"}
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/collaborators/coordinator/permission":
 			response = map[string]any{"permission": "admin"}
-		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/commits/"+head+"/check-runs":
+		case request.Method == http.MethodGet && strings.Contains(request.URL.Path, "/commits/") && strings.HasSuffix(request.URL.Path, "/check-runs"):
+			head := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, "/repos/o/r/commits/"), "/check-runs")
+			requestMu.Lock()
+			if request.URL.Query().Get("filter") == "latest" {
+				latestCheckReads[head]++
+			} else if request.URL.Query().Get("filter") == "all" {
+				governanceCheckReads[head]++
+			}
+			requestMu.Unlock()
 			response = map[string]any{"check_runs": []any{map[string]any{"name": "ci", "status": "completed", "conclusion": "success"}}}
-		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/commits/"+head+"/status":
+		case request.Method == http.MethodGet && strings.Contains(request.URL.Path, "/commits/") && strings.HasSuffix(request.URL.Path, "/status"):
 			response = map[string]any{"statuses": []any{map[string]any{"context": "legacy-ci", "state": "success"}}}
+		case request.Method == http.MethodGet && strings.Contains(request.URL.Path, "/commits/") && strings.HasSuffix(request.URL.Path, "/statuses"):
+			response = []any{map[string]any{"context": internalgithub.PolicyCheck, "state": "failure", "creator": map[string]any{"id": 42}}}
+		case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/repos/o/r/pulls/") && !strings.HasSuffix(request.URL.Path, "/comments") && !strings.HasSuffix(request.URL.Path, "/reviews"):
+			var pr int
+			if _, err := fmt.Sscanf(request.URL.Path, "/repos/o/r/pulls/%d", &pr); err != nil || request.URL.Path != fmt.Sprintf("/repos/o/r/pulls/%d", pr) || pr < 101 || pr > 110 {
+				return nil, fmt.Errorf("unexpected pull request path %s", request.URL.Path)
+			}
+			issue := pr - 100
+			branch, _ := internalgithub.AttemptBranch("o/r", issue, 1)
+			marker, _ := internalgithub.AttemptMarker(issue, 1, branch, heads[issue], pr, "review")
+			prBody := fmt.Sprintf("Closes #%d\n\n<!-- agent-symphony:issue:%d:attempt:1 -->\n\n%s", issue, issue, marker)
+			requestMu.Lock()
+			governanceReads[pr]++
+			requestMu.Unlock()
+			response = map[string]any{"number": pr, "body": prBody, "state": "open", "merged": false, "mergeable": true, "mergeable_state": "clean", "user": map[string]any{"id": 42}, "head": map[string]any{"sha": heads[issue], "ref": branch}, "base": map[string]any{"sha": base, "ref": "main"}, "labels": []any{}}
+		case request.Method == http.MethodGet && (strings.HasSuffix(request.URL.Path, "/comments") || strings.HasSuffix(request.URL.Path, "/reviews")):
+			response = []any{}
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/branches/main/protection":
+			return &http.Response{StatusCode: http.StatusNotFound, Status: "404 Not Found", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"message":"not protected"}`))}, nil
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/rules/branches/main":
+			response = []any{}
 		case strings.HasPrefix(request.URL.Path, "/repos/o/r/issues/"):
 			var number int
 			if _, err := fmt.Sscanf(request.URL.Path, "/repos/o/r/issues/%d", &number); err != nil || number < 1 || number > 20 {
@@ -4923,6 +4952,13 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 	elapsed := time.Since(started)
 	requestMu.Lock()
 	requests := requestCount
+	governed := 0
+	for _, reads := range governanceReads {
+		if reads >= 2 {
+			governed++
+		}
+	}
+	latestHeads, governedHeads := len(latestCheckReads), len(governanceCheckReads)
 	requestMu.Unlock()
 	managed := 0
 	for _, status := range statuses {
@@ -4930,8 +4966,8 @@ func TestReconcileTwentyIssuesTenPullRequestsMeetsDelayedBoundaryBudgetAndServes
 			managed++
 		}
 	}
-	if err != nil || len(statuses) != 20 || managed != 10 || elapsed >= 5*time.Second || observation.DurationMS >= 5000 || requests < 80 || observation.GitHubRequests != int64(requests) {
-		t.Fatalf("statuses=%#v requests=%d elapsed=%s observation=%#v err=%v", statuses, requests, elapsed, observation, err)
+	if err != nil || len(statuses) != 20 || managed != 10 || governed != 10 || latestHeads != 10 || governedHeads != 10 || elapsed >= 5*time.Second || observation.DurationMS >= 5000 || requests < 80 || observation.GitHubRequests != int64(requests) {
+		t.Fatalf("statuses=%#v requests=%d governed=%d latest heads=%d governed heads=%d elapsed=%s observation=%#v err=%v", statuses, requests, governed, latestHeads, governedHeads, elapsed, observation, err)
 	}
 	t.Logf("20 issues + 10 pull requests: duration=%s requests=%d", elapsed, requests)
 

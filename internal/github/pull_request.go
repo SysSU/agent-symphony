@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -125,6 +126,8 @@ type PRCoordinator struct {
 	ActorID     int
 }
 
+const prReconcileConcurrency = 10
+
 // Reconcile discovers every open PR and derives all effects from fresh facts.
 func (c PRCoordinator) Reconcile(ctx context.Context) error {
 	if c.Source == nil || c.Signals == nil {
@@ -134,12 +137,26 @@ func (c PRCoordinator) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var errs []error
-	for _, number := range numbers {
-		if err := c.reconcileOne(ctx, number); err != nil {
-			errs = append(errs, fmt.Errorf("reconcile pull request %d: %w", number, err))
-		}
+	errs := make([]error, len(numbers))
+	semaphore := make(chan struct{}, prReconcileConcurrency)
+	var workers sync.WaitGroup
+	for i, number := range numbers {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				errs[i] = ctx.Err()
+				return
+			}
+			if err := c.reconcileOne(ctx, number); err != nil {
+				errs[i] = fmt.Errorf("reconcile pull request %d: %w", number, err)
+			}
+		}()
 	}
+	workers.Wait()
 	return errors.Join(errs...)
 }
 
