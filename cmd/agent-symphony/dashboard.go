@@ -56,6 +56,7 @@ type dashboardServer struct {
 	issueClosed  func(context.Context, string, int) (bool, error)
 	mu           *sync.Mutex
 	localMu      sync.Mutex
+	controlMu    sync.Mutex
 }
 
 type dashboardHiddenAttempt struct {
@@ -102,14 +103,22 @@ func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string,
 }
 
 func newProjectDashboardHandlerWithOptions(ctx context.Context, stateRoot, repository string, peerProjects []string, tmux string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
+	return newProjectDashboardServer(ctx, stateRoot, repository, peerProjects, tmux, operationMu, recover, planReview, reconcile, service, allowNet, password).webHandler()
+}
+
+func newProjectDashboardServer(ctx context.Context, stateRoot, repository string, peerProjects []string, tmux string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) *dashboardServer {
+	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, repository: repository, peerProjects: peerProjects, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, planReview: planReview, reconcile: reconcile, issueClosed: currentGitHubIssueClosed, mu: operationMu}
+	server.cleanup = server.cleanupAttempt
+	return server
+}
+
+func (s *dashboardServer) webHandler() http.Handler {
 	assets, err := fs.Sub(dashboardFiles, "dashboard/out")
 	if err != nil {
 		panic(err)
 	}
 	static := http.FileServer(http.FS(assets))
-	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, repository: repository, peerProjects: peerProjects, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, planReview: planReview, reconcile: reconcile, issueClosed: currentGitHubIssueClosed, mu: operationMu}
-	server.cleanup = server.cleanupAttempt
-	return server.handler(static)
+	return s.handler(static)
 }
 
 func (s *dashboardServer) handler(static http.Handler) http.Handler {
@@ -525,17 +534,24 @@ func (s *dashboardServer) writeState(state dashboardState) error {
 	if err != nil || len(body) > maxDashboardStateBytes {
 		return errors.New("dashboard state is too large")
 	}
-	path := filepath.Join(s.stateRoot, "dashboard-state.json")
-	root, err := filepath.EvalSymlinks(s.stateRoot)
-	if err != nil || root != filepath.Clean(s.stateRoot) {
-		return errors.New("dashboard state root is unsafe")
+	return writePrivateStateFile(s.stateRoot, "dashboard-state.json", ".dashboard-state-*", append(body, '\n'), maxDashboardStateBytes)
+}
+
+func writePrivateStateFile(stateRoot, filename, pattern string, body []byte, limit int) error {
+	if len(body) > limit {
+		return errors.New("state file is too large")
+	}
+	path := filepath.Join(stateRoot, filename)
+	root, err := filepath.EvalSymlinks(stateRoot)
+	if err != nil || root != filepath.Clean(stateRoot) {
+		return errors.New("state root is unsafe")
 	}
 	if info, statErr := os.Lstat(path); statErr == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
-		return errors.New("dashboard state file is unsafe")
+		return errors.New("state file is unsafe")
 	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
-	temporary, err := os.CreateTemp(root, ".dashboard-state-*")
+	temporary, err := os.CreateTemp(root, pattern)
 	if err != nil {
 		return err
 	}
@@ -545,7 +561,7 @@ func (s *dashboardServer) writeState(state dashboardState) error {
 		temporary.Close()
 		return err
 	}
-	if _, err := temporary.Write(append(body, '\n')); err != nil {
+	if _, err := temporary.Write(body); err != nil {
 		temporary.Close()
 		return err
 	}
@@ -1086,7 +1102,12 @@ func startProjectDashboard(ctx context.Context, address, stateRoot, repository s
 	if err != nil {
 		return "", fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
-	server := &http.Server{Handler: newProjectDashboardHandlerWithOptions(ctx, stateRoot, repository, peerProjects, "tmux", operationMu, recover, planReview, reconcile, service, allowNet, password), ReadHeaderTimeout: 5 * time.Second}
+	project := newProjectDashboardServer(ctx, stateRoot, repository, peerProjects, "tmux", operationMu, recover, planReview, reconcile, service, allowNet, password)
+	if err := startControlServer(ctx, project, log); err != nil {
+		_ = listener.Close()
+		return "", err
+	}
+	server := &http.Server{Handler: project.webHandler(), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
 		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password and session data are exposed in transit, and anyone with the password can use terminals and cleanup controls")
 	}

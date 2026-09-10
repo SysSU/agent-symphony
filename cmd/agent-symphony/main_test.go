@@ -307,11 +307,35 @@ func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
 		t.Fatalf("help code=%d stderr=%q", code, stderr.String())
 	}
 	for _, want := range []string{
-		"install-host", "agent-host", "chat", "init", "validate", "config view", "serve", "status", "list", "inspect", "reconcile", "doctor", "diagnostics", "pr-governance", "help",
-		"--config", "--state", "--runtime-state", "--attempts", "--issue", "--interval", "--dashboard-address", "--allow-unsafe-dashboard-network", "--dashboard-password-file", "--offline", "--coordinator", "--json", "--help", "--version",
+		"install-host", "agent-host", "chat", "control", "init", "validate", "config view", "serve", "status", "list", "inspect", "reconcile", "doctor", "diagnostics", "pr-governance", "help",
+		"--config", "--state", "--runtime-state", "--attempts", "--issue", "--attempt", "--repository", "--role", "--action", "--confirm", "--request-id", "--timeout", "--interval", "--dashboard-address", "--allow-unsafe-dashboard-network", "--dashboard-password-file", "--offline", "--coordinator", "--json", "--help", "--version",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("help is missing %q", want)
+		}
+	}
+}
+
+func TestCoordinatorCLICommandContractParsesWithExactPlaceholders(t *testing.T) {
+	commands := orchestratoragent.CoordinatorCLICommands("o/r", filepath.Join(t.TempDir(), "missing-runtime"))
+	if len(commands) != 13 {
+		t.Fatalf("commands=%d", len(commands))
+	}
+	for _, command := range commands {
+		parsed := slices.Clone(command[1:])
+		for index := range parsed {
+			switch parsed[index] {
+			case "<issue>":
+				parsed[index] = "23"
+			case "<attempt>":
+				parsed[index] = "4"
+			case "<request-id>":
+				parsed[index] = "coordinator-test"
+			}
+		}
+		var stdout, stderr bytes.Buffer
+		if code := run(parsed, &stdout, &stderr); code == 2 {
+			t.Errorf("fixed command does not parse: %q stderr=%q", command, stderr.String())
 		}
 	}
 }

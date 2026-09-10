@@ -803,6 +803,59 @@ func waitHeartbeatReport(t *testing.T, workspace, state string) heartbeatReport 
 	}
 }
 
+func TestCoordinatorContextUsesBoundedCLIControlsNotBrowserAutomation(t *testing.T) {
+	now := time.Date(2026, 9, 9, 1, 2, 3, 0, time.UTC)
+	agent := newTestSupervisor(t, &fakeRunner{}, &now)
+	body, err := agent.context("clear")
+	if err != nil {
+		t.Fatal(err)
+	}
+	context := string(body)
+	for _, want := range []string{"Use no browser automation", "agent-symphony", "control", "--repository", agent.Repository, "--runtime-state", agent.Root, "--action", "--confirm", "--request-id", "<request-id>", "reuse that same identity after a timeout", "--role", "implementation", "reviewer", "orchestrator", "<issue>", "<attempt>", "<reason>", "never retry forever"} {
+		if !strings.Contains(context, want) {
+			t.Errorf("coordinator context is missing %q", want)
+		}
+	}
+	commands := CoordinatorCLICommands(agent.Repository, agent.Root)
+	actions, roles := map[string][]string{}, map[string][]string{}
+	for _, command := range commands {
+		if index := slices.Index(command, "--action"); index >= 0 && index+1 < len(command) {
+			actions[command[index+1]] = command
+		}
+		if index := slices.Index(command, "--role"); index >= 0 && index+1 < len(command) {
+			roles[command[index+1]] = command
+		}
+	}
+	for _, action := range []string{"recover", "review-plan", "dismiss", "orchestrator-investigate"} {
+		if command := actions[action]; !slices.Contains(command, "--issue") || !slices.Contains(command, "--attempt") || !slices.Contains(command, "--request-id") || slices.Contains(command, "--confirm") {
+			t.Errorf("attempt action %s is incomplete: %q", action, command)
+		}
+	}
+	for _, action := range []string{"archive", "abandon"} {
+		if command := actions[action]; !slices.Contains(command, "--issue") || !slices.Contains(command, "--attempt") || !slices.Contains(command, "--confirm") || !slices.Contains(command, "--request-id") {
+			t.Errorf("cleanup action %s is incomplete: %q", action, command)
+		}
+	}
+	for _, role := range []string{"implementation", "reviewer", "orchestrator"} {
+		if len(roles[role]) == 0 {
+			t.Errorf("role %s command is missing", role)
+		}
+	}
+	statusCommands := CoordinatorGitHubStatusCommands(agent.Repository)
+	if len(statusCommands) != 6 {
+		t.Fatalf("status commands=%d", len(statusCommands))
+	}
+	for _, command := range statusCommands {
+		joined := strings.Join(command, " ")
+		if command[0] != "gh" || !strings.Contains(joined, "<number>") || !strings.Contains(joined, agent.Repository) {
+			t.Errorf("status command is incomplete: %q", command)
+		}
+		if slices.Contains(command, "comment") && (!strings.Contains(joined, "monitoring: <reason>") || !strings.Contains(joined, "<reason>")) {
+			t.Errorf("status comment has no monitoring reason parameter: %q", command)
+		}
+	}
+}
+
 func waitAuditStarts(t *testing.T, runner *fakeRunner, want int32) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
