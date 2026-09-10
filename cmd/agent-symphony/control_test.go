@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,6 +93,35 @@ func TestControlRequestRequiresExactIdentityAndConfirmation(t *testing.T) {
 		if !validControlRequest(request, "o/r") {
 			t.Fatalf("confirmed %s was rejected", action)
 		}
+	}
+}
+
+func TestControlHandlerRejectsInvalidDeadline(t *testing.T) {
+	request := controlRequest{Version: 1, RequestID: "deadline", Repository: "o/r", Action: "reconcile"}
+	body, _ := json.Marshal(request)
+	var calls atomic.Int32
+	project := newProjectDashboardServer(t.Context(), t.TempDir(), "o/r", nil, "tmux", &sync.Mutex{}, nil, nil, func(context.Context) error {
+		calls.Add(1)
+		return nil
+	}, nil, false, "")
+	for name, values := range map[string][]string{
+		"missing":   nil,
+		"malformed": {"later"},
+		"unbounded": {strconv.FormatInt(time.Now().Add(3*time.Minute).UnixNano(), 10)},
+		"duplicate": {strconv.FormatInt(time.Now().Add(time.Minute).UnixNano(), 10), strconv.FormatInt(time.Now().Add(time.Minute).UnixNano(), 10)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			httpRequest := httptest.NewRequest(http.MethodPost, "http://unix/v1/action", bytes.NewReader(body))
+			for _, value := range values {
+				httpRequest.Header.Add(controlDeadline, value)
+			}
+			response := httptest.NewRecorder()
+			controlHandler(project).ServeHTTP(response, httpRequest)
+			var result controlResult
+			if json.Unmarshal(response.Body.Bytes(), &result) != nil || result.Status != http.StatusBadRequest || calls.Load() != 0 {
+				t.Fatalf("result=%#v calls=%d body=%q", result, calls.Load(), response.Body.String())
+			}
+		})
 	}
 }
 
@@ -959,16 +989,33 @@ func TestControlCLIBoundsBusyRetryByTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	started := time.Now()
-	code := run([]string{"control", "--repository", "o/r", "--action", "reconcile", "--runtime-state", root, "--request-id", "bounded-busy", "--timeout", "25ms"}, &stdout, &stderr)
-	elapsed := time.Since(started)
+	type cliOutcome struct {
+		code    int
+		elapsed time.Duration
+	}
+	done := make(chan cliOutcome, 1)
+	go func() {
+		started := time.Now()
+		code := run([]string{"control", "--repository", "o/r", "--action", "reconcile", "--runtime-state", root, "--request-id", "bounded-busy", "--timeout", "25ms"}, &stdout, &stderr)
+		done <- cliOutcome{code: code, elapsed: time.Since(started)}
+	}()
+	for project.controlMu.TryLock() {
+		project.controlMu.Unlock()
+		select {
+		case outcome := <-done:
+			t.Fatalf("control handler did not queue before timeout: code=%d elapsed=%s", outcome.code, outcome.elapsed)
+		default:
+			runtime.Gosched()
+		}
+	}
+	outcome := <-done
 	operation.Unlock()
 	locked = false
 	project.controlMu.Lock()
 	receipts, err := project.readControlReceipts()
 	project.controlMu.Unlock()
-	if code != 1 || elapsed > time.Second || !strings.Contains(stderr.String(), "remained busy until --timeout") {
-		t.Fatalf("code=%d elapsed=%s stdout=%q stderr=%q", code, elapsed, stdout.String(), stderr.String())
+	if outcome.code != 1 || outcome.elapsed > time.Second || !strings.Contains(stderr.String(), "remained busy until --timeout") {
+		t.Fatalf("code=%d elapsed=%s stdout=%q stderr=%q", outcome.code, outcome.elapsed, stdout.String(), stderr.String())
 	}
 	if err != nil || len(receipts.Receipts) != 0 || calls.Load() != 0 {
 		t.Fatalf("canceled receipts=%#v calls=%d err=%v", receipts, calls.Load(), err)
