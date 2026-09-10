@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -13,20 +14,23 @@ import (
 
 func TestDirectStatusRequiresTheSmallVocabularyAndReason(t *testing.T) {
 	for _, test := range []struct {
-		body            string
-		wantOK, wantSet bool
-		wantReason      string
+		body                     string
+		wantOK, wantSet          bool
+		wantReason               string
+		wantMonitoringDependency int
 	}{
-		{"/agent-symphony status needs-attention: failing browser validation", true, true, "failing browser validation"},
-		{"/agent-symphony status clear: browser validation now passes", true, false, "browser validation now passes"},
-		{"/agent-symphony status needs-attention:", false, false, ""},
-		{"/agent-symphony status clear", false, false, ""},
-		{"/agent-symphony status blocked: reason", false, false, ""},
-		{"/agent-symphony status needs-attention: \t" + strings.Repeat("x", 1024) + " \n", true, true, strings.Repeat("x", 1024)},
-		{"/agent-symphony status needs-attention: " + strings.Repeat("x", 1025), false, false, ""},
+		{"/agent-symphony status needs-attention: failing browser validation", true, true, "failing browser validation", 0},
+		{"/agent-symphony status clear: browser validation now passes", true, false, "browser validation now passes", 0},
+		{"/agent-symphony status needs-attention: monitoring: dependency #9 is incomplete", true, true, "monitoring: dependency #9 is incomplete", 9},
+		{"/agent-symphony status clear: monitoring: dependency #9 is complete", true, false, "monitoring: dependency #9 is complete", 9},
+		{"/agent-symphony status needs-attention:", false, false, "", 0},
+		{"/agent-symphony status clear", false, false, "", 0},
+		{"/agent-symphony status blocked: reason", false, false, "", 0},
+		{"/agent-symphony status needs-attention: \t" + strings.Repeat("x", 1024) + " \n", true, true, strings.Repeat("x", 1024), 0},
+		{"/agent-symphony status needs-attention: " + strings.Repeat("x", 1025), false, false, "", 0},
 	} {
 		got, ok := parseDirectStatus(test.body)
-		if ok != test.wantOK || got.NeedsAttention != test.wantSet || got.Reason != test.wantReason {
+		if ok != test.wantOK || got.NeedsAttention != test.wantSet || got.Reason != test.wantReason || got.monitoringDependency != test.wantMonitoringDependency {
 			t.Fatalf("parseDirectStatus(%q) = %#v, %v", test.body, got, ok)
 		}
 	}
@@ -97,6 +101,96 @@ func TestDirectStatusAuthenticationFailureIsNotSuccess(t *testing.T) {
 	status, err := (&GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}).directStatus(t.Context(), 10, 0)
 	if err == nil || status.commentID != 0 || !strings.Contains(err.Error(), "GitHub read") {
 		t.Fatalf("status=%#v err=%v", status, err)
+	}
+}
+
+func TestMonitoringDependencyClearResolvesLabelRemovalOutcomes(t *testing.T) {
+	for _, test := range []struct {
+		name                    string
+		applied                 bool
+		confirmationUnavailable bool
+	}{
+		{name: "definite failure retries"},
+		{name: "transport failure after application is success", applied: true},
+		{name: "transport failure without confirmation fails closed", applied: true, confirmationUnavailable: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC)
+			comments := []map[string]any{{"id": 1, "body": "/agent-symphony status needs-attention: monitoring: dependency #9 is incomplete", "created_at": now, "updated_at": now, "user": map[string]any{"id": 42}}}
+			labelPresent, failDelete, deleteFailed := true, true, false
+			posts, deletes := 0, 0
+			api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				switch r.Method + " " + r.URL.RequestURI() {
+				case "GET /repos/o/r/issues/10/comments?per_page=100&page=1":
+					body, _ := json.Marshal(comments)
+					return httpResponse(http.StatusOK, string(body), nil), nil
+				case "GET /repos/o/r/issues/10":
+					if deleteFailed && test.confirmationUnavailable {
+						return nil, fmt.Errorf("confirmation unavailable")
+					}
+					labels := []any{}
+					if labelPresent {
+						labels = append(labels, map[string]any{"name": NeedsAttentionLabel})
+					}
+					body, _ := json.Marshal(map[string]any{"labels": labels})
+					return httpResponse(http.StatusOK, string(body), nil), nil
+				case "POST /repos/o/r/issues/10/comments":
+					var payload struct{ Body string }
+					if json.NewDecoder(r.Body).Decode(&payload) != nil || payload.Body != "/agent-symphony status clear: monitoring: dependency #9 is complete" {
+						t.Fatalf("clear payload=%q", payload.Body)
+					}
+					posts++
+					createdAt := now.Add(time.Minute)
+					comments = append(comments, map[string]any{"id": 2, "body": payload.Body, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
+					return httpResponse(http.StatusCreated, `{}`, nil), nil
+				case "DELETE /repos/o/r/issues/10/labels/needs-attention":
+					deletes++
+					if failDelete {
+						failDelete = false
+						deleteFailed = true
+						if test.applied {
+							labelPresent = false
+							return nil, fmt.Errorf("response lost after applying delete")
+						}
+						return httpResponse(http.StatusServiceUnavailable, `{"message":"retry"}`, nil), nil
+					}
+					labelPresent = false
+					return httpResponse(http.StatusNoContent, ``, nil), nil
+				default:
+					t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+				}
+				return nil, nil
+			})}}
+			source := GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
+			status, err := source.directStatus(t.Context(), 10, 0)
+			if err != nil || !status.NeedsAttention || status.monitoringDependency != 9 {
+				t.Fatalf("initial status=%#v err=%v", status, err)
+			}
+			status, err = source.clearResolvedMonitoringDependencyStatus(t.Context(), 10, 0, 1, status)
+			if test.confirmationUnavailable {
+				if err == nil || !status.NeedsAttention || posts != 1 || deletes != 1 {
+					t.Fatalf("unconfirmed clear status=%#v posts=%d deletes=%d err=%v", status, posts, deletes, err)
+				}
+				return
+			}
+			if test.applied {
+				if err != nil || status.NeedsAttention || posts != 1 || deletes != 1 || labelPresent {
+					t.Fatalf("confirmed clear status=%#v posts=%d deletes=%d label=%v err=%v", status, posts, deletes, labelPresent, err)
+				}
+				status, err = source.clearResolvedMonitoringDependencyStatus(t.Context(), 10, 0, 1, status)
+				if err != nil || status.NeedsAttention || posts != 1 || deletes != 1 {
+					t.Fatalf("repeated confirmed clear status=%#v posts=%d deletes=%d err=%v", status, posts, deletes, err)
+				}
+				return
+			}
+			if err == nil || status.requestedAttention || status.monitoringDependency != 9 || posts != 1 || deletes != 1 || !labelPresent {
+				t.Fatalf("interrupted clear status=%#v posts=%d deletes=%d label=%v err=%v", status, posts, deletes, labelPresent, err)
+			}
+			status, err = source.clearResolvedMonitoringDependencyStatus(t.Context(), 10, 0, 1, status)
+			if err != nil || status.NeedsAttention || posts != 1 || deletes != 2 || labelPresent {
+				t.Fatalf("retried clear status=%#v posts=%d deletes=%d label=%v err=%v", status, posts, deletes, labelPresent, err)
+			}
+		})
 	}
 }
 
@@ -467,6 +561,218 @@ func TestContradictoryTerminalMarkersDoNotProjectFailedAttempt(t *testing.T) {
 	_, conflicts, err := fetchTerminalFailures(context.Background(), api, PRAdapterConfig{Repository: "o/r", ActorID: 42}, 4)
 	if err != nil || !conflicts.Any || !conflicts.Attempts[2] {
 		t.Fatalf("conflicts=%v err=%v", conflicts, err)
+	}
+}
+
+func TestDependencyCompleteCachesValidatedStateAndFailures(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		status       int
+		body         string
+		wantComplete bool
+		wantError    string
+	}{
+		{name: "closed", status: http.StatusOK, body: `{"state":"closed"}`, wantComplete: true},
+		{name: "open", status: http.StatusOK, body: `{"state":"open"}`},
+		{name: "missing", status: http.StatusNotFound, body: `{"message":"Not Found"}`, wantError: "read dependency #9"},
+		{name: "malformed", status: http.StatusOK, body: `{}`, wantError: "state is missing or invalid"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				return httpResponse(test.status, test.body, nil), nil
+			})}}
+			source := GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r"}}
+			for range 2 {
+				complete, err := source.dependencyComplete(t.Context(), 9)
+				if complete != test.wantComplete || test.wantError == "" && err != nil || test.wantError != "" && (err == nil || !strings.Contains(err.Error(), test.wantError)) {
+					t.Fatalf("complete=%v err=%v", complete, err)
+				}
+			}
+			if calls != 1 {
+				t.Fatalf("dependency reads=%d, want 1", calls)
+			}
+		})
+	}
+}
+
+func TestFetchIssueFactsRefreshesDependenciesAcrossNormalCycles(t *testing.T) {
+	now := time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC)
+	body := func(dependency string) string {
+		return "## Context\nprotect dependency reconciliation\n## Acceptance criteria\n- dispatch after completion\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\n" + dependency + "\n"
+	}
+	bodies := map[int]string{9: body("None."), 10: body("#9"), 11: body("#9"), 12: body("None.")}
+	snapshots := map[int][]any{}
+	needsAttention := map[int]bool{}
+	dependencyMode := "closed"
+	dependencyReads, clearPosts, labelDeletes := 0, 0, 0
+	issueRecord := func(number int) map[string]any {
+		labels := []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}}
+		if needsAttention[number] {
+			labels = append(labels, map[string]any{"name": NeedsAttentionLabel})
+		}
+		return map[string]any{
+			"number": number, "node_id": fmt.Sprintf("I_%d", number), "state": "open", "title": fmt.Sprintf("issue %d", number),
+			"body": bodies[number], "created_at": now, "user": map[string]any{"id": 5},
+			"labels": labels,
+		}
+	}
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var response any
+		switch {
+		case r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r":
+			response = map[string]any{"default_branch": "main"}
+		case r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": "abcdef0"}}
+		case r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r/issues?state=open&per_page=100&page=1":
+			response = []any{issueRecord(10), issueRecord(11), issueRecord(12)}
+			if dependencyMode == "open" {
+				response = append([]any{issueRecord(9)}, response.([]any)...)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/9":
+			dependencyReads++
+			switch dependencyMode {
+			case "failure":
+				return httpResponse(http.StatusServiceUnavailable, `{"message":"temporarily unavailable"}`, nil), nil
+			case "malformed":
+				response = map[string]any{}
+			default:
+				record := issueRecord(9)
+				record["state"] = dependencyMode
+				response = record
+			}
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/timeline"):
+			var number int
+			if _, err := fmt.Sscanf(r.URL.Path, "/repos/o/r/issues/%d/timeline", &number); err != nil {
+				t.Fatal(err)
+			}
+			response = []any{
+				map[string]any{"id": number*10 + 1, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now, "actor": map[string]any{"id": 5}},
+				map[string]any{"id": number*10 + 2, "event": "labeled", "label": map[string]any{"name": "P1"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": 5}},
+			}
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments"):
+			var number int
+			if _, err := fmt.Sscanf(r.URL.Path, "/repos/o/r/issues/%d/comments", &number); err != nil {
+				t.Fatal(err)
+			}
+			response = snapshots[number]
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/issues/"):
+			var number int
+			if _, err := fmt.Sscanf(r.URL.Path, "/repos/o/r/issues/%d", &number); err != nil {
+				t.Fatal(err)
+			}
+			response = issueRecord(number)
+		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+		case r.Method == http.MethodGet && r.URL.Path == "/user/5":
+			response = map[string]any{"login": "owner"}
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/collaborators/owner/permission":
+			response = map[string]any{"permission": "maintain"}
+		case r.Method == http.MethodDelete && strings.HasSuffix(r.URL.Path, "/labels/"+NeedsAttentionLabel):
+			var number int
+			if _, err := fmt.Sscanf(r.URL.Path, "/repos/o/r/issues/%d/labels/"+NeedsAttentionLabel, &number); err != nil {
+				t.Fatal(err)
+			}
+			if r.Header.Get("X-Agent-Symphony-Issue") != fmt.Sprint(number) || r.Header.Get("X-Agent-Symphony-Attempt") != "1" {
+				t.Fatalf("missing monitoring clear attribution: %v", r.Header)
+			}
+			needsAttention[number] = false
+			labelDeletes++
+			return httpResponse(http.StatusNoContent, ``, nil), nil
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments"):
+			var number int
+			if _, err := fmt.Sscanf(r.URL.Path, "/repos/o/r/issues/%d/comments", &number); err != nil {
+				t.Fatal(err)
+			}
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil {
+				t.Fatal("invalid snapshot request")
+			}
+			createdAt := now.Add(time.Duration(len(snapshots[number])+1) * time.Minute)
+			snapshots[number] = append(snapshots[number], map[string]any{"id": number*100 + len(snapshots[number]), "body": payload.Body, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
+			if strings.HasPrefix(payload.Body, directStatusPrefix+"clear:") {
+				if r.Header.Get("X-Agent-Symphony-Issue") != fmt.Sprint(number) || r.Header.Get("X-Agent-Symphony-Attempt") != "1" {
+					t.Fatalf("missing monitoring clear attribution: %v", r.Header)
+				}
+				clearPosts++
+			}
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		encoded, _ := json.Marshal(response)
+		return httpResponse(http.StatusOK, string(encoded), nil), nil
+	})}}
+	cfg := productionPRConfig()
+
+	initial, err := FetchIssueFacts(t.Context(), api, cfg, nil, true)
+	if err != nil || len(initial) != 3 || !slices.ContainsFunc(initial, func(f RecoveryIssueFact) bool { return f.Issue == 10 && f.Eligible }) || len(snapshots) != 3 {
+		t.Fatalf("initial facts=%#v snapshots=%d err=%v", initial, len(snapshots), err)
+	}
+
+	dependencyMode, dependencyReads = "open", 0
+	blocked, err := FetchIssueFacts(t.Context(), api, cfg, nil, false)
+	for _, number := range []int{10, 11} {
+		if index := slices.IndexFunc(blocked, func(f RecoveryIssueFact) bool { return f.Issue == number }); err != nil || index < 0 || blocked[index].Eligible || !slices.Contains(blocked[index].Blockers, "dependency #9 is incomplete") {
+			t.Fatalf("open dependency facts=%#v err=%v", blocked, err)
+		}
+	}
+
+	dependencyMode, dependencyReads = "closed", 0
+	closed, err := FetchIssueFacts(t.Context(), api, cfg, nil, false)
+	if err != nil || dependencyReads != 1 {
+		t.Fatalf("closed dependency reads=%d err=%v", dependencyReads, err)
+	}
+	for _, number := range []int{10, 11, 12} {
+		if index := slices.IndexFunc(closed, func(f RecoveryIssueFact) bool { return f.Issue == number }); index < 0 || !closed[index].Eligible || len(closed[index].Blockers) != 0 || number != 12 && !slices.Contains(closed[index].SatisfiedDependencies, 9) {
+			t.Fatalf("closed dependency facts=%#v", closed)
+		}
+	}
+
+	dependencyMode, dependencyReads = "failure", 0
+	unavailable, err := FetchIssueFacts(t.Context(), api, cfg, nil, false)
+	if err != nil || dependencyReads != 1 {
+		t.Fatalf("unavailable dependency reads=%d err=%v", dependencyReads, err)
+	}
+	for _, number := range []int{10, 11} {
+		index := slices.IndexFunc(unavailable, func(f RecoveryIssueFact) bool { return f.Issue == number })
+		if index < 0 || unavailable[index].Eligible || len(unavailable[index].Blockers) != 1 || !strings.Contains(unavailable[index].Blockers[0], "read dependency #9") {
+			t.Fatalf("unavailable dependency facts=%#v", unavailable)
+		}
+	}
+	unrelated := slices.IndexFunc(unavailable, func(f RecoveryIssueFact) bool { return f.Issue == 12 })
+	if unrelated < 0 || !unavailable[unrelated].Eligible || len(unavailable[unrelated].Blockers) != 0 {
+		t.Fatalf("unrelated issue was affected: %#v", unavailable)
+	}
+
+	addStatus := func(number int, command string) {
+		createdAt := now.Add(time.Duration(len(snapshots[number])+1) * time.Minute)
+		snapshots[number] = append(snapshots[number], map[string]any{"id": number*100 + len(snapshots[number]), "body": command, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
+		needsAttention[number] = true
+	}
+	addStatus(10, "/agent-symphony status needs-attention: monitoring: dependency #9 is incomplete")
+	addStatus(11, "/agent-symphony status needs-attention: implementation needs an operator decision")
+	dependencyMode = "open"
+	monitored, err := FetchIssueFacts(t.Context(), api, cfg, nil, false)
+	if err != nil || !slices.ContainsFunc(monitored, func(f RecoveryIssueFact) bool {
+		return f.Issue == 10 && f.NeedsAttention && slices.Contains(f.Blockers, "dependency #9 is incomplete")
+	}) {
+		t.Fatalf("monitoring stale state=%#v err=%v", monitored, err)
+	}
+
+	dependencyMode, dependencyReads = "closed", 0
+	recovered, err := FetchIssueFacts(t.Context(), api, cfg, nil, true)
+	if err != nil || dependencyReads != 1 || clearPosts != 1 || labelDeletes != 1 || needsAttention[10] {
+		t.Fatalf("monitoring recovery=%#v reads=%d clear_posts=%d label_deletes=%d labels=%v err=%v", recovered, dependencyReads, clearPosts, labelDeletes, needsAttention, err)
+	}
+	monitoring := slices.IndexFunc(recovered, func(f RecoveryIssueFact) bool { return f.Issue == 10 })
+	direct := slices.IndexFunc(recovered, func(f RecoveryIssueFact) bool { return f.Issue == 11 })
+	if monitoring < 0 || recovered[monitoring].NeedsAttention || !recovered[monitoring].Eligible || len(recovered[monitoring].Blockers) != 0 {
+		t.Fatalf("resolved monitoring status remained: %#v", recovered)
+	}
+	if direct < 0 || !recovered[direct].NeedsAttention || recovered[direct].Eligible || !needsAttention[11] || !slices.Contains(recovered[direct].Blockers, "needs attention: implementation needs an operator decision") {
+		t.Fatalf("unrelated direct status changed: %#v labels=%v", recovered, needsAttention)
 	}
 }
 

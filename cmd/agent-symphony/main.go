@@ -1628,7 +1628,7 @@ func addTerminalAttemptBlockers(issues []internalgithub.RecoveryIssueFact, manif
 func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []internalgithub.RecoveryIssueFact, capacity int) ([]orchestrator.RecoveryStatus, []orchestrator.Decision) {
 	scheduled := make([]orchestrator.Issue, len(issues))
 	for i, issue := range issues {
-		scheduled[i] = orchestrator.Issue{Repository: issue.Repository, Number: issue.Issue, Priority: issue.Priority, CreatedAt: issue.CreatedAt, Dependencies: issue.Dependencies, Paths: issue.Paths, Eligible: issue.Eligible, Blockers: issue.Blockers, Active: issue.Active, Completed: issue.Completed}
+		scheduled[i] = orchestrator.Issue{Repository: issue.Repository, Number: issue.Issue, Priority: issue.Priority, CreatedAt: issue.CreatedAt, Dependencies: issue.Dependencies, SatisfiedDependencies: issue.SatisfiedDependencies, Paths: issue.Paths, Eligible: issue.Eligible, Blockers: issue.Blockers, Active: issue.Active, Completed: issue.Completed}
 	}
 	decisions := orchestrator.Schedule(scheduled, orchestrator.Capacity{Global: capacity, Repositories: map[string]int{}})
 	for _, issue := range issues {

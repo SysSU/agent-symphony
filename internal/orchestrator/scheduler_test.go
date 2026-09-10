@@ -127,6 +127,14 @@ func TestSelfDependencyExplanationPrecedesCycle(t *testing.T) {
 	}
 }
 
+func TestSatisfiedDependencyDoesNotRequireAnOpenIssueProjection(t *testing.T) {
+	issue := Issue{Repository: "a/repo", Number: 2, Priority: 1, CreatedAt: time.Unix(1, 0), Dependencies: []int{1}, SatisfiedDependencies: []int{1}, Paths: []string{"safe"}, Eligible: true}
+	got := Schedule([]Issue{issue}, Capacity{Global: 1})
+	if len(got) != 1 || got[0].State != Runnable {
+		t.Fatalf("closed dependency without open issue projection: %#v", got)
+	}
+}
+
 func hundredDecision(decision Decision, issues []Issue) Issue {
 	for _, issue := range issues {
 		if issue.Repository == decision.Repository && issue.Number == decision.Number {
