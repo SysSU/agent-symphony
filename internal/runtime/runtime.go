@@ -588,10 +588,16 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 		return PaneStatus{}, fmt.Errorf("ambiguous dead pane status %q", strings.TrimSpace(output))
 	}
 	if fields[2] != "" {
-		if !signalName.MatchString(fields[2]) {
+		signal := strings.ToLower(fields[2])
+		if number, err := strconv.Atoi(signal); err == nil {
+			if number < 1 || number > 127 {
+				return PaneStatus{}, fmt.Errorf("invalid pane signal %q", fields[2])
+			}
+			signal = strconv.Itoa(number)
+		} else if !signalName.MatchString(signal) {
 			return PaneStatus{}, fmt.Errorf("invalid pane signal %q", fields[2])
 		}
-		pane.Ready, pane.Signal = true, fields[2]
+		pane.Ready, pane.Signal = true, signal
 		return pane, nil
 	}
 	status, err := strconv.Atoi(fields[1])
