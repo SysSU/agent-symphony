@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -554,6 +555,171 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	}
 }
 
+func TestFetchIssueFactsKeepsReadAndMutationConcurrencySeparate(t *testing.T) {
+	const issueCount = 20
+	now := time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)
+	body := "## Context\nprotect bounded intake\n## Acceptance criteria\n- converge\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
+	issues := make([]any, issueCount)
+	for i := range issues {
+		issues[i] = map[string]any{"number": i + 1, "title": fmt.Sprintf("issue %d", i+1), "body": body, "state": "open", "created_at": now}
+	}
+
+	var stateMu sync.Mutex
+	snapshots := map[int]string{}
+	firstCommentRead := map[int]bool{}
+	var activeReads, maxReads, activePosts, maxPosts, initialReads, permissionReads, posts atomic.Int32
+	readBarrier := make(chan struct{})
+	permissionBarrier := make(chan struct{})
+	tenPosts := make(chan struct{})
+	releasePosts := make(chan struct{})
+	updateMax := func(maximum *atomic.Int32, current int32) {
+		for {
+			observed := maximum.Load()
+			if current <= observed || maximum.CompareAndSwap(observed, current) {
+				return
+			}
+		}
+	}
+	issueNumber := func(path string) int {
+		part := strings.SplitN(strings.TrimPrefix(path, "/repos/o/r/issues/"), "/", 2)[0]
+		number, _ := strconv.Atoi(part)
+		return number
+	}
+
+	mutationSlots := make(chan struct{}, recoveryMutationConcurrency)
+	api := API{BaseURL: "https://example.test", Retries: -1, mutationSlots: mutationSlots, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			current := activeReads.Add(1)
+			updateMax(&maxReads, current)
+			defer activeReads.Add(-1)
+		}
+		var response any
+		switch {
+		case r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r":
+			response = map[string]any{"default_branch": "main"}
+		case r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r/branches/main":
+			response = map[string]any{"commit": map[string]any{"sha": "abcdef0"}}
+		case r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r/issues?state=open&per_page=100&page=1":
+			response = issues
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/issues/comments/"):
+			id, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/repos/o/r/issues/comments/"))
+			response = map[string]any{"id": id, "body": "/approve", "created_at": now.Add(3 * time.Minute), "updated_at": now.Add(3 * time.Minute), "user": map[string]any{"id": 5}}
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments"):
+			number := issueNumber(r.URL.Path)
+			stateMu.Lock()
+			first := !firstCommentRead[number]
+			firstCommentRead[number] = true
+			snapshot := snapshots[number]
+			stateMu.Unlock()
+			if first {
+				if initialReads.Add(1) == issueCount {
+					close(readBarrier)
+				}
+				select {
+				case <-readBarrier:
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
+				}
+			}
+			response = []any{map[string]any{"id": 1000 + number, "body": "/approve", "created_at": now.Add(3 * time.Minute), "updated_at": now.Add(3 * time.Minute), "user": map[string]any{"id": 5}}}
+			if snapshot != "" {
+				response = append(response.([]any), map[string]any{"id": 2000 + number, "body": snapshot, "created_at": now.Add(4 * time.Minute), "updated_at": now.Add(4 * time.Minute), "user": map[string]any{"id": 42}})
+			}
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/timeline"):
+			number := issueNumber(r.URL.Path)
+			response = []any{
+				map[string]any{"id": number*10 + 1, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now.Add(time.Minute), "actor": map[string]any{"id": 5}},
+				map[string]any{"id": number*10 + 2, "event": "labeled", "label": map[string]any{"name": "P1"}, "created_at": now.Add(2 * time.Minute), "actor": map[string]any{"id": 5}},
+			}
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/issues/"):
+			number := issueNumber(r.URL.Path)
+			response = map[string]any{"number": number, "node_id": fmt.Sprintf("I_%d", number), "title": fmt.Sprintf("issue %d", number), "body": body, "state": "open", "created_at": now, "user": map[string]any{"id": 5}, "labels": []any{map[string]any{"name": "ready"}, map[string]any{"name": "P1"}}}
+		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
+			response = map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}}}}
+		case r.Method == http.MethodGet && r.URL.Path == "/user/5":
+			response = map[string]any{"login": "owner"}
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/collaborators/owner/permission":
+			if count := permissionReads.Add(1); count <= issueCount {
+				if count == issueCount {
+					close(permissionBarrier)
+				}
+				select {
+				case <-permissionBarrier:
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
+				}
+			}
+			response = map[string]any{"permission": "maintain"}
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments"):
+			current := activePosts.Add(1)
+			updateMax(&maxPosts, current)
+			defer activePosts.Add(-1)
+			if posts.Add(1) == recoveryMutationConcurrency {
+				close(tenPosts)
+			}
+			select {
+			case <-releasePosts:
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+			var payload struct{ Body string }
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				return nil, err
+			}
+			if _, err := ParseSnapshotComment(payload.Body, 42, 42); err != nil {
+				return nil, err
+			}
+			stateMu.Lock()
+			snapshots[issueNumber(r.URL.Path)] = payload.Body
+			stateMu.Unlock()
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		default:
+			return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		encoded, _ := json.Marshal(response)
+		return httpResponse(http.StatusOK, string(encoded), nil), nil
+	})}}
+
+	type result struct {
+		facts []RecoveryIssueFact
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		facts, err := FetchIssueFacts(t.Context(), api, productionPRConfig(), nil, true)
+		done <- result{facts: facts, err: err}
+	}()
+	select {
+	case <-tenPosts:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ten concurrent snapshot mutations were not reached")
+	}
+	if initialReads.Load() != issueCount || maxReads.Load() < issueCount || permissionReads.Load() < issueCount || len(mutationSlots) != recoveryMutationConcurrency || activePosts.Load() != recoveryMutationConcurrency {
+		t.Fatalf("initial_reads=%d max_reads=%d permission_reads=%d mutation_slots=%d active_posts=%d", initialReads.Load(), maxReads.Load(), permissionReads.Load(), len(mutationSlots), activePosts.Load())
+	}
+	close(releasePosts)
+	got := <-done
+	if got.err != nil || len(got.facts) != issueCount || maxPosts.Load() > recoveryMutationConcurrency || posts.Load() != issueCount || slices.ContainsFunc(got.facts, func(f RecoveryIssueFact) bool { return !f.Eligible }) {
+		t.Fatalf("facts=%d max_posts=%d posts=%d err=%v", len(got.facts), maxPosts.Load(), posts.Load(), got.err)
+	}
+	stateMu.Lock()
+	if len(snapshots) != issueCount {
+		stateMu.Unlock()
+		t.Fatalf("snapshots=%d, want %d", len(snapshots), issueCount)
+	}
+	for number, snapshot := range snapshots {
+		if _, err := ParseSnapshotComment(snapshot, 42, 42); err != nil {
+			stateMu.Unlock()
+			t.Fatalf("issue %d snapshot: %v", number, err)
+		}
+	}
+	stateMu.Unlock()
+	facts, err := FetchIssueFacts(t.Context(), api, productionPRConfig(), nil, true)
+	if err != nil || len(facts) != issueCount || posts.Load() != issueCount {
+		t.Fatalf("converged facts=%d posts=%d err=%v", len(facts), posts.Load(), err)
+	}
+}
+
 func TestContradictoryTerminalMarkersDoNotProjectFailedAttempt(t *testing.T) {
 	first, _ := TerminalFailureMarker(4, 2, time.Unix(10, 0))
 	second, _ := TerminalFailureMarker(4, 2, time.Unix(20, 0))
@@ -809,7 +975,8 @@ func TestFetchIssueFactsRefusesIntakeMutationAfterCachedFallback(t *testing.T) {
 	body := "## Context\nprotect stale authority\n## Acceptance criteria\n- no unsafe mutation\n## Checklist\n- [ ] implement\n## Validation\ngo test ./...\n## Dependencies\nNone.\n"
 	var mutations atomic.Int32
 	metrics := &CycleMetrics{}
-	api := API{BaseURL: "https://example.test", Cache: cache, Retries: -1, Metrics: metrics, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	mutationSlots := make(chan struct{}, recoveryMutationConcurrency)
+	api := API{BaseURL: "https://example.test", Cache: cache, Retries: -1, Metrics: metrics, mutationSlots: mutationSlots, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method != http.MethodGet && r.URL.Path != "/graphql" {
 			mutations.Add(1)
 			return httpResponse(http.StatusCreated, `{}`, nil), nil
@@ -841,8 +1008,8 @@ func TestFetchIssueFactsRefusesIntakeMutationAfterCachedFallback(t *testing.T) {
 		return httpResponse(http.StatusOK, string(encoded), nil), nil
 	})}}.WithReadSnapshot()
 	facts, err := FetchIssueFacts(t.Context(), api, productionPRConfig(), nil, true)
-	if err != nil || len(facts) != 1 || mutations.Load() != 0 || !slices.ContainsFunc(facts[0].Blockers, func(blocker string) bool { return strings.Contains(blocker, "stale authoritative read") }) {
-		t.Fatalf("facts=%#v mutations=%d err=%v", facts, mutations.Load(), err)
+	if err != nil || len(facts) != 1 || mutations.Load() != 0 || len(mutationSlots) != 0 || !slices.ContainsFunc(facts[0].Blockers, func(blocker string) bool { return strings.Contains(blocker, "stale authoritative read") }) {
+		t.Fatalf("facts=%#v mutations=%d mutation_slots=%d err=%v", facts, mutations.Load(), len(mutationSlots), err)
 	}
 	if stale, _ := metrics.Stale(); stale != 1 {
 		t.Fatalf("stale reads=%d, want 1", stale)

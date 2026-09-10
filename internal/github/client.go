@@ -26,6 +26,8 @@ type API struct {
 	Sleep    func(context.Context, time.Duration) error
 	Retries  int
 	Metrics  *CycleMetrics
+
+	mutationSlots chan struct{}
 }
 
 type readSnapshot struct {
@@ -377,6 +379,14 @@ func (a API) Mutate(ctx context.Context, method, path string, body any, attribut
 
 func (a API) do(ctx context.Context, method, path, etag string, body []byte, attribution Mutation) (*http.Response, error) {
 	if attribution.Issue > 0 {
+		if a.mutationSlots != nil {
+			select {
+			case a.mutationSlots <- struct{}{}:
+				defer func() { <-a.mutationSlots }()
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 		if !a.Metrics.beginMutation() {
 			return nil, errors.New("refusing GitHub mutation after a stale authoritative read")
 		}

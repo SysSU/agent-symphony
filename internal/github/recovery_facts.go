@@ -331,6 +331,7 @@ type recoveryIssueRecord struct {
 }
 
 const recoveryIssueConcurrency = 20
+const recoveryMutationConcurrency = 10
 const recoveryPullConcurrency = 10
 
 // FetchIssueFacts returns the authorized issue-control projection used by both
@@ -349,6 +350,9 @@ func FetchIssueFactsForIssue(ctx context.Context, api API, cfg PRAdapterConfig, 
 }
 
 func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts []RecoveryAttemptFact, intake bool, targetIssue int) ([]RecoveryIssueFact, error) {
+	if api.mutationSlots == nil {
+		api.mutationSlots = make(chan struct{}, recoveryMutationConcurrency)
+	}
 	var repository struct {
 		DefaultBranch string `json:"default_branch"`
 	}
