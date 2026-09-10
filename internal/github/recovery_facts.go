@@ -286,6 +286,9 @@ func (s *GitHubPRSource) clearResolvedMonitoringDependencyStatus(ctx context.Con
 		fresh, readErr := s.directStatus(ctx, issue, pullRequest)
 		if readErr == nil {
 			status = fresh
+			if !fresh.NeedsAttention && !fresh.requestedAttention && fresh.monitoringDependency == dependency {
+				return fresh, nil
+			}
 		}
 		return status, errors.Join(err, readErr)
 	}
