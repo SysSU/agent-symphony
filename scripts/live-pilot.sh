@@ -10,7 +10,7 @@ if [ "${AGENT_SYMPHONY_LIVE_PILOT:-}" != 1 ]; then
   exit 2
 fi
 case "$run_id" in *[!A-Za-z0-9._-]*|'') echo "invalid live pilot run ID" >&2; exit 2;; esac
-for command in gh git go ruby tmux; do command -v "$command" >/dev/null; done
+for command in gh git go ps ruby tmux; do command -v "$command" >/dev/null; done
 
 identity=$(gh repo view "$repository" --json nameWithOwner,isPrivate --jq '[.nameWithOwner,.isPrivate] | @tsv')
 if [ "$identity" != "$(printf '%s\ttrue' "$repository")" ]; then
@@ -52,6 +52,8 @@ pr='[]'
 resources=
 mutation_started=false
 completed=false
+processes_stopped=true
+tmux_stopped=true
 
 collect_resources() {
   RUNTIME="$runtime" ruby -rjson -e '
@@ -66,6 +68,27 @@ collect_resources() {
     })'
 }
 
+stop_server() {
+  processes_stopped=true
+  if [ -z "$server_pid" ] || ! kill -0 "$server_pid" 2>/dev/null; then return 0; fi
+  kill -INT "$server_pid" 2>/dev/null || true
+  attempts=0
+  while kill -0 "$server_pid" 2>/dev/null && [ "$attempts" -lt 20 ]; do
+    process_state=$(ps -o stat= -p "$server_pid" 2>/dev/null || true)
+    case "$process_state" in *Z*) wait "$server_pid" 2>/dev/null || true; return 0;; esac
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  if kill -0 "$server_pid" 2>/dev/null; then processes_stopped=false; return 1; fi
+  wait "$server_pid" 2>/dev/null || true
+}
+
+stop_tmux() {
+  tmux_stopped=true
+  TMUX_TMPDIR="$runtime/tmux" tmux kill-server 2>/dev/null || true
+  if TMUX_TMPDIR="$runtime/tmux" tmux list-sessions >/dev/null 2>&1; then tmux_stopped=false; return 1; fi
+}
+
 report_failure() {
   exit_status=$1
   trap - EXIT HUP INT TERM
@@ -73,24 +96,23 @@ report_failure() {
   if [ "$completed" = true ] || [ "$mutation_started" != true ]; then exit "$exit_status"; fi
   latest=$(collect_resources 2>/dev/null)
   if [ -n "$latest" ]; then resources=$latest; fi
-  if [ -n "$server_pid" ]; then
-    kill -INT "$server_pid" 2>/dev/null
-    wait "$server_pid" 2>/dev/null
-  fi
-  TMUX_TMPDIR="$runtime/tmux" tmux kill-server 2>/dev/null
+  stop_server || true
+  stop_tmux || true
+  diagnostics_preserved=false
+  if [ -d "$pilot_root" ]; then diagnostics_preserved=true; fi
   latest_pr=$(gh pr list --repo "$repository" --state all --search "$run_id in:title" --limit 100 --json number,url,state,isDraft,headRefName,mergedAt 2>/dev/null)
   if printf '%s' "$latest_pr" | ruby -rjson -e 'JSON.parse(STDIN.read)' >/dev/null 2>&1; then pr=$latest_pr; fi
-  result=$(RUN_ID="$run_id" REPOSITORY="$repository" ISSUE="$issue" ISSUE_URL="$issue_url" ROOT="$pilot_root" PID="$server_pid" RUNTIME="$runtime" RESOURCES="$resources" PR="$pr" EXIT_STATUS="$exit_status" ruby -rjson -rshellwords -e '
+  result=$(RUN_ID="$run_id" REPOSITORY="$repository" ISSUE="$issue" ISSUE_URL="$issue_url" ROOT="$pilot_root" PID="$server_pid" RUNTIME="$runtime" RESOURCES="$resources" PR="$pr" EXIT_STATUS="$exit_status" PROCESSES_STOPPED="$processes_stopped" TMUX_STOPPED="$tmux_stopped" DIAGNOSTICS_PRESERVED="$diagnostics_preserved" ruby -rjson -rshellwords -e '
     resources=ENV.fetch("RESOURCES","").empty? ? {attempts:[],branches:[],sessions:[],worktrees:[],review_snapshots:[],runtime_roots:[ENV.fetch("RUNTIME")]} : JSON.parse(ENV.fetch("RESOURCES"))
     prs=JSON.parse(ENV.fetch("PR")); commands=[]
-    commands << "kill -INT #{ENV.fetch("PID")}" unless ENV.fetch("PID","").empty?
-    commands << "TMUX_TMPDIR=#{Shellwords.escape(ENV.fetch("RUNTIME")+"/tmux")} tmux kill-server"
+    commands << "kill -TERM #{ENV.fetch("PID")} # verified still running after bounded SIGINT" unless ENV.fetch("PID","").empty? || ENV.fetch("PROCESSES_STOPPED")=="true"
+    commands << "TMUX_TMPDIR=#{Shellwords.escape(ENV.fetch("RUNTIME")+"/tmux")} tmux kill-server" unless ENV.fetch("TMUX_STOPPED")=="true"
     commands << "gh issue close #{ENV.fetch("ISSUE")} --repo #{ENV.fetch("REPOSITORY")}" unless ENV.fetch("ISSUE","").empty?
     prs.each { |item| commands << "gh pr close #{item.fetch("number")} --repo #{ENV.fetch("REPOSITORY")}" unless item["state"]=="MERGED" }
     (resources.fetch("branches",[])+prs.map { |item| item["headRefName"] }).compact.uniq.each { |branch| commands << "git -C #{Shellwords.escape(ENV.fetch("ROOT")+"/repository")} push origin --delete #{Shellwords.escape(branch)}" }
     commands << "rm -rf -- #{Shellwords.escape(ENV.fetch("ROOT"))} # only after preserving diagnostics"
     issues=ENV.fetch("ISSUE","").empty? ? [] : [{number:ENV.fetch("ISSUE").to_i,url:ENV.fetch("ISSUE_URL")}]
-    puts JSON.generate({schema:"agent-symphony-live-pilot-v1",run_id:ENV.fetch("RUN_ID"),repository:ENV.fetch("REPOSITORY"),status:"failed",exit_status:ENV.fetch("EXIT_STATUS").to_i,created:resources.merge(issues:issues,pull_requests:prs),cleanup:{performed:false,processes_stopped:true,diagnostics_preserved:true,commands:commands}})')
+    puts JSON.generate({schema:"agent-symphony-live-pilot-v1",run_id:ENV.fetch("RUN_ID"),repository:ENV.fetch("REPOSITORY"),status:"failed",exit_status:ENV.fetch("EXIT_STATUS").to_i,created:resources.merge(issues:issues,pull_requests:prs),cleanup:{performed:false,processes_stopped:ENV.fetch("PROCESSES_STOPPED")=="true",tmux_stopped:ENV.fetch("TMUX_STOPPED")=="true",diagnostics_preserved:ENV.fetch("DIAGNOSTICS_PRESERVED")=="true",commands:commands}})')
   printf '%s\n' "$result" >&2
   if [ -n "$report" ]; then umask 077; printf '%s\n' "$result" >"$report"; fi
   exit "$exit_status"
@@ -149,9 +171,8 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep 2
 done
 resources=$(collect_resources)
-kill -INT "$server_pid" 2>/dev/null || true
-wait "$server_pid" 2>/dev/null || true
-TMUX_TMPDIR="$runtime/tmux" tmux kill-server 2>/dev/null || true
+stop_server || exit 6
+stop_tmux || exit 6
 
 pr=$(gh pr list --repo "$repository" --state all --search "$run_id in:title" --limit 100 --json number,url,state,isDraft,headRefName,mergedAt)
 if [ "$closed" != true ] || [ "$(printf '%s' "$pr" | ruby -rjson -e 'rows=JSON.parse(STDIN.read); puts rows.length==1 && rows[0]["state"]=="MERGED" ? "true" : "false"')" != true ]; then exit 5; fi

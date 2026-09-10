@@ -280,7 +280,11 @@ test "$trusted" -eq 1 || { printf 'Do you trust the contents of this directory?\
 test "$bypass" -eq 1 || { printf 'Approval required\n' >&2; exit 19; }
 if [ -n "${AGENT_SYMPHONY_REVIEW_RESULT:-}" ]; then
 	  sleep 1
-	  if [ ! -e "$FULL_SYSTEM_FIXTURE/reviewed-once" ]; then
+	  if ! grep -qx reworked change.txt; then
+	    if [ ! -e "$FULL_SYSTEM_FIXTURE/reviewed-once" ]; then
+	    : >"$FULL_SYSTEM_FIXTURE/review-started"
+	    while [ ! -e "$FULL_SYSTEM_FIXTURE/allow-review" ]; do sleep 0.05; done
+	    fi
 	    : >"$FULL_SYSTEM_FIXTURE/reviewed-once"
 	    result='{"type":"agent-symphony-review-v1","status":"findings","findings":["append the reviewed marker"]}'
 	  else
@@ -452,6 +456,12 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		})
 		t.Fatalf("real-server Playwright: %v\n%s\nstatus=%s\nrequests=%q\ndiagnostics=%s\nserve:\n%s", err, playwrightOutput, latest, requests, diagnostics.String(), output.String())
 	}
+	if !waitFor(deadline(15*time.Second), func() bool {
+		_, err := os.Lstat(filepath.Join(root, "review-started"))
+		return err == nil
+	}) {
+		t.Fatalf("review session did not reach the durable restart checkpoint: %s", output.String())
+	}
 	if err := server.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
 	}
@@ -476,6 +486,9 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	}
 	stopped = false
 	waitHTTP(t, "http://"+address+"/status.json", deadline(15*time.Second), output)
+	if err := os.WriteFile(filepath.Join(root, "allow-review"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if !waitFor(deadline(30*time.Second), func() bool {
 		_, err := os.Lstat(filepath.Join(root, "reviewed-once"))
 		return err == nil

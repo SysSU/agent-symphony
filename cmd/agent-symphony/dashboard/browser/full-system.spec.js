@@ -38,8 +38,8 @@ test("operator reaches the real implementation session and sees prompt status cl
   await expect(dialog.locator(".xterm-rows")).toContainText("operator-message-received", { timeout: latencyBudget });
   await dialog.getByRole("button", { name: "Close" }).click();
 
-  await expect(inProgress).toContainText("review", { timeout: raceMode ? 100_000 : 25_000 });
   await expect(page.getByText("needs attention", { exact: true })).toHaveCount(0, { timeout: latencyBudget });
+  await expect(inProgress.getByRole("link", { name: /#73 Deterministic full-system journey/ })).toBeVisible({ timeout: latencyBudget });
   expect(Date.now() - recoveryStarted).toBeLessThan(latencyBudget);
   expect(errors).toEqual([]);
 });
