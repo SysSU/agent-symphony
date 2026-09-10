@@ -2812,16 +2812,20 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 		manifestMode, manifestTarget = agentruntime.ReviewModeImplementation, target
 	}
 	if manifest.ReviewState == "running" && manifestMode == mode && manifestTarget == target && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
-		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_dead} #{pane_dead_status}"}, Dir: snapshot, Env: env})
+		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
 		if err == nil {
-			dead, status, statusErr := agentruntime.ParsePaneStatus(result.Output)
-			if statusErr == nil && !dead {
+			pane, statusErr := agentruntime.ParsePaneStatus(result.Output)
+			if statusErr != nil {
+				return independentReviewResult{}, false, fmt.Errorf("observe reviewer tmux session: %w", statusErr)
+			}
+			if !pane.Dead || !pane.Ready {
 				return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
 			}
-			if statusErr != nil {
-				// The reviewer is temporarily unobservable; rebuild below.
-			} else if status != 0 {
-				return independentReviewResult{}, false, fmt.Errorf("reviewer exited %d; inspect reviewer session %s and retry the attempt after correcting the failure", status, session)
+			if pane.Signal != "" {
+				return independentReviewResult{}, false, fmt.Errorf("reviewer terminated by signal %s; inspect reviewer session %s and retry the attempt after correcting the failure", pane.Signal, session)
+			}
+			if pane.ExitStatus != 0 {
+				return independentReviewResult{}, false, fmt.Errorf("reviewer exited %d; inspect reviewer session %s and retry the attempt after correcting the failure", pane.ExitStatus, session)
 			} else {
 				request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, Head: head, LegacyHeadArtifact: legacyHeadArtifact})
 				artifact, err := boundary.call(ctx, "review-result", agentruntime.Command{Stdin: bytes.NewReader(request)})

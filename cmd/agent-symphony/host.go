@@ -1371,7 +1371,7 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	case "has-session", "kill-session":
 		return len(args) == 3 && args[1] == "-t" && validTmuxTarget(args[2], false)
 	case "display-message":
-		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", "#{pane_dead} #{pane_dead_status}", "#{pane_start_command}"}, args[4])
+		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, "#{pane_start_command}"}, args[4])
 	case "capture-pane":
 		return len(args) == 6 && slices.Equal(args[1:5], []string{"-p", "-S", "-", "-t"}) && validTmuxTarget(args[5], true)
 	case "set-option":

@@ -36,11 +36,12 @@ type fakeRunner struct {
 }
 
 type fakeSession struct {
-	dead, stopped bool
-	status        int
-	output        string
-	context       string
-	agent         []string
+	dead, stopped, pending bool
+	status                 int
+	signal                 string
+	output                 string
+	context                string
+	agent                  []string
 }
 
 func newFakeRunner() *fakeRunner {
@@ -165,11 +166,17 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 		if slices.Contains(args, "#{pane_start_command}") {
 			return Result{Output: strings.Join(s.agent, " ")}, nil
 		}
-		if slices.Contains(args, "#{pane_dead} #{pane_dead_status}") {
-			if s.dead {
-				return Result{Output: "1 " + strconv.Itoa(s.status)}, nil
+		if slices.Contains(args, PaneStatusFormat) {
+			if !s.dead {
+				return Result{Output: "0||\n"}, nil
 			}
-			return Result{Output: "0 \n"}, nil
+			if s.pending {
+				return Result{Output: "1||\n"}, nil
+			}
+			if s.signal != "" {
+				return Result{Output: "1||" + s.signal + "\n"}, nil
+			}
+			return Result{Output: "1|" + strconv.Itoa(s.status) + "|\n"}, nil
 		}
 		if s.dead {
 			return Result{Output: "1"}, nil
@@ -211,23 +218,26 @@ func TestParsePaneStatus(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		output  string
-		dead    bool
-		status  int
+		want    PaneStatus
 		wantErr string
 	}{
-		{name: "live blank status", output: "0 \n"},
-		{name: "dead status not ready", output: "1\n"},
-		{name: "dead zero", output: "1 0\n", dead: true},
-		{name: "dead nonzero", output: "1 127\n", dead: true, status: 127},
-		{name: "live with status", output: "0 0\n", wantErr: "invalid pane status"},
-		{name: "negative exit", output: "1 -1\n", wantErr: "invalid exit status"},
-		{name: "unknown state", output: "2 0\n", wantErr: "invalid pane status"},
+		{name: "live", output: "0||\n"},
+		{name: "dead status not ready", output: "1||\n", want: PaneStatus{Dead: true}},
+		{name: "dead zero", output: "1|0|\n", want: PaneStatus{Dead: true, Ready: true}},
+		{name: "dead nonzero", output: "1|127|\n", want: PaneStatus{Dead: true, Ready: true, ExitStatus: 127}},
+		{name: "dead signal", output: "1||term\n", want: PaneStatus{Dead: true, Ready: true, Signal: "term"}},
+		{name: "legacy ambiguous", output: "1\n", wantErr: "invalid pane status"},
+		{name: "live with status", output: "0|0|\n", wantErr: "invalid live pane status"},
+		{name: "dead status and signal", output: "1|17|term\n", wantErr: "ambiguous dead pane status"},
+		{name: "negative exit", output: "1|-1|\n", wantErr: "invalid exit status"},
+		{name: "invalid signal", output: "1||term;echo", wantErr: "invalid pane signal"},
+		{name: "unknown state", output: "2||\n", wantErr: "invalid pane status"},
 		{name: "empty", wantErr: "invalid pane status"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			dead, status, err := ParsePaneStatus(test.output)
-			if dead != test.dead || status != test.status || test.wantErr == "" && err != nil || test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
-				t.Fatalf("ParsePaneStatus(%q) = %v, %d, %v", test.output, dead, status, err)
+			got, err := ParsePaneStatus(test.output)
+			if got != test.want || test.wantErr == "" && err != nil || test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("ParsePaneStatus(%q) = %#v, %v", test.output, got, err)
 			}
 		})
 	}
@@ -262,25 +272,43 @@ func TestParsePaneStatusFromRealTmux(t *testing.T) {
 	})
 	run("new-session", "-d", "-s", session, "sleep", "30")
 	target := PaneTarget(session)
-	if dead, status, err := ParsePaneStatus(run("display-message", "-p", "-t", target, "#{pane_dead} #{pane_dead_status}")); err != nil || dead || status != 0 {
-		t.Fatalf("live pane: dead=%v status=%d err=%v", dead, status, err)
+	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat)); err != nil || pane != (PaneStatus{}) {
+		t.Fatalf("live pane: status=%#v err=%v", pane, err)
 	}
 	run("set-option", "-w", "-t", target, "remain-on-exit", "on")
 	run("respawn-pane", "-k", "-t", target, "--", "sh", "-c", "exit 17")
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		dead, status, err := ParsePaneStatus(run("display-message", "-p", "-t", target, "#{pane_dead} #{pane_dead_status}"))
+		pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if dead {
-			if status != 17 {
-				t.Fatalf("dead pane status=%d want=17", status)
+		if pane.Ready {
+			if pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 17}) {
+				t.Fatalf("dead pane status=%#v", pane)
 			}
 			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("tmux pane exit status did not become observable")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	run("respawn-pane", "-k", "-t", target, "--", "sh", "-c", "kill -TERM $$")
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pane.Ready {
+			if pane != (PaneStatus{Dead: true, Ready: true, Signal: "term"}) {
+				t.Fatalf("signaled pane status=%#v", pane)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tmux pane signal did not become observable")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1543,6 +1571,28 @@ func TestLaunchConfiguresEmptySessionBeforeAgentAndRetainsFastExit(t *testing.T)
 	got, err := r.Monitor(context.Background(), attempt)
 	if err != nil || got.State != "failed" || !strings.Contains(got.Diagnostic, "status 42") || !fake.sessions[manifest.Session].dead {
 		t.Fatalf("fast exit = %#v, %v", got, err)
+	}
+}
+
+func TestMonitorWaitsForPaneStatusThenReportsSignal(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := fake.sessions[manifest.Session]
+	session.dead, session.pending = true, true
+	pending, err := r.Monitor(t.Context(), attempt)
+	if err != nil || pending.State != "running" || !pending.UpdatedAt.Equal(manifest.UpdatedAt) {
+		t.Fatalf("pending pane status changed progress: manifest=%#v err=%v", pending, err)
+	}
+	session.pending, session.signal, session.output = false, "term", "terminated output\n"
+	failed, err := r.Monitor(t.Context(), attempt)
+	if err != nil || failed.State != "failed" || !strings.Contains(failed.Diagnostic, "signal term") {
+		t.Fatalf("signaled pane status=%#v err=%v", failed, err)
+	}
+	if output, err := os.ReadFile(failed.LogPath); err != nil || string(output) != session.output {
+		t.Fatalf("signaled pane log=%q err=%v", output, err)
 	}
 }
 
