@@ -113,6 +113,8 @@ type dashboardRemovalState struct {
 
 type dashboardStatusSnapshot struct {
 	UpdatedAt             time.Time                     `json:"updated_at"`
+	OwnerEpoch            uint64                        `json:"owner_epoch,omitempty"`
+	OwnerRevision         uint64                        `json:"owner_revision,omitempty"`
 	Statuses              []orchestrator.RecoveryStatus `json:"statuses"`
 	ReconciliationError   string                        `json:"reconciliation_error,omitempty"`
 	ReconciliationErrorAt time.Time                     `json:"reconciliation_error_at,omitzero"`

@@ -173,6 +173,107 @@ type RecoveryIssueFact struct {
 	TerminalAttempts                              []RecoveryAttemptFact
 }
 
+type IssueUpdateProposalKind string
+
+const (
+	IssueUpdateControlSnapshot IssueUpdateProposalKind = "control-snapshot"
+	IssueUpdateDependencyClear IssueUpdateProposalKind = "dependency-clear"
+)
+
+// IssueUpdateProposal is an ephemeral, fully typed mutation proposal produced
+// by read-only collection. Only its digest/identity is admitted to owner state;
+// Body is retained by the caller solely for immediate execution.
+type IssueUpdateProposal struct {
+	Kind                IssueUpdateProposalKind
+	Repository          string
+	Issue               int
+	AttributionAttempt  int
+	Dependency          int
+	PullRequest         int
+	ControlSnapshotBody string
+}
+
+type RecoveryIssueCollection struct {
+	Facts     []RecoveryIssueFact
+	Proposals []IssueUpdateProposal
+}
+
+func RevalidateIssueUpdateProposal(ctx context.Context, api API, cfg PRAdapterConfig, expected IssueUpdateProposal) (bool, error) {
+	applied, err := issueUpdateApplied(ctx, api, cfg, expected)
+	if err != nil || applied {
+		return applied, err
+	}
+	attempts, err := FetchAttemptFacts(ctx, api, cfg.Repository, cfg.ActorID)
+	if err != nil {
+		return false, err
+	}
+	collection, err := CollectIssueFactsForIssueV2(ctx, api, cfg, attempts, expected.Issue)
+	if err != nil {
+		return false, err
+	}
+	if slices.Contains(collection.Proposals, expected) {
+		return false, nil
+	}
+	return false, errors.New("issue update proposal is no longer current")
+}
+
+func ExecuteIssueUpdateProposal(ctx context.Context, api API, cfg PRAdapterConfig, proposal IssueUpdateProposal) error {
+	applied, err := issueUpdateApplied(ctx, api, cfg, proposal)
+	if err != nil || applied {
+		return err
+	}
+	source := &GitHubPRSource{API: api, Config: cfg}
+	switch proposal.Kind {
+	case IssueUpdateControlSnapshot:
+		err = api.createControlSnapshot(ctx, proposal.Repository, proposal.Issue, proposal.ControlSnapshotBody)
+	case IssueUpdateDependencyClear:
+		status, readErr := source.directStatus(ctx, proposal.Issue, proposal.PullRequest)
+		if readErr != nil || status.monitoringDependency != proposal.Dependency || !status.NeedsAttention {
+			return errors.Join(errors.New("monitoring dependency proposal is no longer current"), readErr)
+		}
+		complete, readErr := source.dependencyComplete(ctx, proposal.Dependency)
+		if readErr != nil || !complete {
+			return errors.Join(errors.New("monitoring dependency is not complete"), readErr)
+		}
+		_, err = source.clearResolvedMonitoringDependencyStatus(ctx, proposal.Issue, proposal.PullRequest, proposal.AttributionAttempt, status)
+	default:
+		return errors.New("unknown issue update proposal")
+	}
+	applied, verifyErr := issueUpdateApplied(ctx, api, cfg, proposal)
+	if applied {
+		return nil
+	}
+	return errors.Join(err, verifyErr, errors.New("issue update postcondition was not observed"))
+}
+
+func issueUpdateApplied(ctx context.Context, api API, cfg PRAdapterConfig, proposal IssueUpdateProposal) (bool, error) {
+	if proposal.Repository != cfg.Repository || proposal.Issue < 1 {
+		return false, errors.New("issue update proposal identity is invalid")
+	}
+	source := &GitHubPRSource{API: api, Config: cfg}
+	switch proposal.Kind {
+	case IssueUpdateControlSnapshot:
+		if proposal.AttributionAttempt != 0 || proposal.ControlSnapshotBody == "" || proposal.Dependency != 0 || proposal.PullRequest != 0 {
+			return false, errors.New("control snapshot proposal is invalid")
+		}
+		comments, err := source.issueComments(ctx, proposal.Issue)
+		if err != nil {
+			return false, err
+		}
+		return slices.ContainsFunc(comments, func(comment issueCommentRecord) bool {
+			return comment.User.ID == cfg.ActorID && comment.Body == proposal.ControlSnapshotBody
+		}), nil
+	case IssueUpdateDependencyClear:
+		if proposal.AttributionAttempt < 1 || proposal.Dependency < 1 || proposal.ControlSnapshotBody != "" || proposal.PullRequest < 0 {
+			return false, errors.New("dependency clear proposal is invalid")
+		}
+		status, err := source.directStatus(ctx, proposal.Issue, proposal.PullRequest)
+		return err == nil && !status.NeedsAttention && !status.requestedAttention && status.monitoringDependency == proposal.Dependency, err
+	default:
+		return false, errors.New("unknown issue update proposal")
+	}
+}
+
 const (
 	directStatusPrefix  = "/agent-symphony status "
 	NeedsAttentionLabel = "needs-attention"
@@ -334,11 +435,24 @@ const recoveryIssueConcurrency = 20
 const recoveryMutationConcurrency = 10
 const recoveryPullConcurrency = 10
 
+type issueFactMode uint8
+
+const (
+	issueFactsReadOnly issueFactMode = iota
+	issueFactsLegacyIntake
+	issueFactsProposeUpdates
+)
+
 // FetchIssueFacts returns the authorized issue-control projection used by both
 // scheduling and read-only status. Intake permits the reconciliation command
 // to create a missing control snapshot; status calls remain read-only.
 func FetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts []RecoveryAttemptFact, intake bool) ([]RecoveryIssueFact, error) {
-	return fetchIssueFacts(ctx, api, cfg, attempts, intake, 0)
+	mode := issueFactsReadOnly
+	if intake {
+		mode = issueFactsLegacyIntake
+	}
+	collection, err := fetchIssueFacts(ctx, api, cfg, attempts, mode, 0)
+	return collection.Facts, err
 }
 
 // FetchIssueFactsForIssue reads only the issue named by a bounded control action.
@@ -346,10 +460,29 @@ func FetchIssueFactsForIssue(ctx context.Context, api API, cfg PRAdapterConfig, 
 	if issue < 1 {
 		return nil, errors.New("targeted issue lookup requires a positive issue")
 	}
-	return fetchIssueFacts(ctx, api, cfg, attempts, false, issue)
+	collection, err := fetchIssueFacts(ctx, api, cfg, attempts, issueFactsReadOnly, issue)
+	return collection.Facts, err
 }
 
-func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts []RecoveryAttemptFact, intake bool, targetIssue int) ([]RecoveryIssueFact, error) {
+// CollectIssueFactsV2 reads facts and proposes required coordinator-authored
+// issue updates without performing them.
+func CollectIssueFactsV2(ctx context.Context, api API, cfg PRAdapterConfig, attempts []RecoveryAttemptFact) (RecoveryIssueCollection, error) {
+	return collectIssueFactsV2(ctx, api, cfg, attempts, 0)
+}
+
+func CollectIssueFactsForIssueV2(ctx context.Context, api API, cfg PRAdapterConfig, attempts []RecoveryAttemptFact, issue int) (RecoveryIssueCollection, error) {
+	if issue < 1 {
+		return RecoveryIssueCollection{}, errors.New("targeted issue lookup requires a positive issue")
+	}
+	return collectIssueFactsV2(ctx, api, cfg, attempts, issue)
+}
+
+func collectIssueFactsV2(ctx context.Context, api API, cfg PRAdapterConfig, attempts []RecoveryAttemptFact, targetIssue int) (RecoveryIssueCollection, error) {
+	return fetchIssueFacts(ctx, api, cfg, attempts, issueFactsProposeUpdates, targetIssue)
+}
+
+func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts []RecoveryAttemptFact, mode issueFactMode, targetIssue int) (RecoveryIssueCollection, error) {
+	var collection RecoveryIssueCollection
 	if api.mutationSlots == nil {
 		api.mutationSlots = make(chan struct{}, recoveryMutationConcurrency)
 	}
@@ -357,16 +490,16 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 		DefaultBranch string `json:"default_branch"`
 	}
 	if _, _, err := api.Read(ctx, "/repos/"+cfg.Repository, "", &repository); err != nil {
-		return nil, err
+		return collection, err
 	}
 	var branch struct {
 		Commit struct{ SHA string } `json:"commit"`
 	}
 	if repository.DefaultBranch == "" {
-		return nil, errors.New("repository default branch is missing")
+		return collection, errors.New("repository default branch is missing")
 	}
 	if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/branches/%s", cfg.Repository, repository.DefaultBranch), "", &branch); err != nil {
-		return nil, err
+		return collection, err
 	}
 	active, completed, next, published, currentPR := map[int]bool{}, map[int]bool{}, map[int]int{}, map[int]int{}, map[int]int{}
 	var completedIssues []int
@@ -392,7 +525,6 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 		}
 	}
 	source := &GitHubPRSource{API: api, Config: cfg}
-	var result []RecoveryIssueFact
 	seenIssues := map[int]bool{}
 	for page := 1; page <= recoveryPageLimit; page++ {
 		var issues []recoveryIssueRecord
@@ -400,15 +532,15 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 		if targetIssue > 0 {
 			var issue recoveryIssueRecord
 			if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", cfg.Repository, targetIssue), "", &issue); err != nil {
-				return nil, err
+				return collection, err
 			}
 			if issue.PullRequest != nil || issue.State != "open" && !completed[issue.Number] {
-				return result, nil
+				return collection, nil
 			}
 			issues = append(issues, issue)
 		} else {
 			if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues?state=open&per_page=100&page=%d", cfg.Repository, page), "", &issues); err != nil {
-				return nil, err
+				return collection, err
 			}
 			lastPage = len(issues) < 100
 			if lastPage {
@@ -418,7 +550,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 					}
 					var issue recoveryIssueRecord
 					if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", cfg.Repository, issueNumber), "", &issue); err != nil {
-						return nil, err
+						return collection, err
 					}
 					if issue.State == "closed" && issue.PullRequest == nil {
 						issues = append(issues, issue)
@@ -427,6 +559,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 			}
 		}
 		pageFacts := make([]RecoveryIssueFact, len(issues))
+		pageProposals := make([][]IssueUpdateProposal, len(issues))
 		included := make([]bool, len(issues))
 		workCtx, cancel := context.WithCancel(ctx)
 		semaphore := make(chan struct{}, recoveryIssueConcurrency)
@@ -447,7 +580,7 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 				case <-workCtx.Done():
 					return
 				}
-				fact, err := fetchRecoveryIssueFact(workCtx, api, cfg, source, issue, attempts, active, completed, next[issue.Number], published[issue.Number], currentPR[issue.Number], intake, repository.DefaultBranch, branch.Commit.SHA)
+				fact, proposals, err := fetchRecoveryIssueFact(workCtx, api, cfg, source, issue, attempts, active, completed, next[issue.Number], published[issue.Number], currentPR[issue.Number], mode, repository.DefaultBranch, branch.Commit.SHA)
 				if err != nil {
 					errMu.Lock()
 					if firstErr == nil {
@@ -457,34 +590,36 @@ func fetchIssueFacts(ctx context.Context, api API, cfg PRAdapterConfig, attempts
 					errMu.Unlock()
 					return
 				}
-				pageFacts[i], included[i] = fact, true
+				pageFacts[i], pageProposals[i], included[i] = fact, proposals, true
 			}()
 		}
 		workers.Wait()
 		cancel()
 		if firstErr != nil {
-			return nil, firstErr
+			return collection, firstErr
 		}
 		for i := range pageFacts {
 			if included[i] {
-				result = append(result, pageFacts[i])
+				collection.Facts = append(collection.Facts, pageFacts[i])
+				collection.Proposals = append(collection.Proposals, pageProposals[i]...)
 			}
 		}
 		if lastPage {
-			return result, nil
+			return collection, nil
 		}
 	}
-	return nil, errors.New("open issues exceed bounded recovery limit")
+	return collection, errors.New("open issues exceed bounded recovery limit")
 }
 
-func fetchRecoveryIssueFact(ctx context.Context, api API, cfg PRAdapterConfig, source *GitHubPRSource, issue recoveryIssueRecord, attempts []RecoveryAttemptFact, active, completed map[int]bool, nextAttempt, publishedAttempt, currentPRAttempt int, intake bool, baseBranch, baseSHA string) (RecoveryIssueFact, error) {
+func fetchRecoveryIssueFact(ctx context.Context, api API, cfg PRAdapterConfig, source *GitHubPRSource, issue recoveryIssueRecord, attempts []RecoveryAttemptFact, active, completed map[int]bool, nextAttempt, publishedAttempt, currentPRAttempt int, mode issueFactMode, baseBranch, baseSHA string) (RecoveryIssueFact, []IssueUpdateProposal, error) {
+	var proposals []IssueUpdateProposal
 	bindings, bindingConflicts, err := fetchActiveAttempts(ctx, api, cfg, issue.Number)
 	if err != nil {
-		return RecoveryIssueFact{}, err
+		return RecoveryIssueFact{}, nil, err
 	}
 	terminals, terminalConflicts, err := fetchTerminalFailures(ctx, api, cfg, issue.Number)
 	if err != nil {
-		return RecoveryIssueFact{}, err
+		return RecoveryIssueFact{}, nil, err
 	}
 	var terminal terminalMarkerPayload
 	if len(terminals) > 0 {
@@ -530,9 +665,19 @@ func fetchRecoveryIssueFact(ctx context.Context, api API, cfg PRAdapterConfig, s
 	}
 	status, err := source.directStatus(ctx, issue.Number, pullRequest)
 	if err != nil {
-		return RecoveryIssueFact{}, fmt.Errorf("read direct status for issue #%d: %w", issue.Number, err)
+		return RecoveryIssueFact{}, nil, fmt.Errorf("read direct status for issue #%d: %w", issue.Number, err)
 	}
-	controls, _, retry, err := source.authorizedControlsWithIntake(ctx, issue.Number, intake && issue.State != "closed")
+	var proposedSnapshot *Snapshot
+	var controls Controls
+	var retry *Provenance
+	if mode == issueFactsProposeUpdates && issue.State != "closed" {
+		controls, _, retry, err = source.authorizedControlsWithProposal(ctx, issue.Number, true, func(snapshot Snapshot) { proposedSnapshot = &snapshot })
+	} else {
+		controls, _, retry, err = source.authorizedControlsWithIntake(ctx, issue.Number, mode == issueFactsLegacyIntake && issue.State != "closed")
+	}
+	if proposedSnapshot != nil {
+		proposals = append(proposals, IssueUpdateProposal{Kind: IssueUpdateControlSnapshot, Repository: cfg.Repository, Issue: issue.Number, ControlSnapshotBody: SnapshotComment(*proposedSnapshot)})
+	}
 	if err != nil {
 		attempt := max(1, nextAttempt)
 		if publishedAttempt > 0 {
@@ -547,7 +692,7 @@ func fetchRecoveryIssueFact(ctx context.Context, api API, cfg PRAdapterConfig, s
 		if status.NeedsAttention {
 			blockers = append(blockers, "needs attention: "+status.Reason)
 		}
-		return RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: baseSHA, BaseBranch: baseBranch, CreatedAt: issue.CreatedAt, Blockers: blockers, Active: active[issue.Number] || binding.Attempt > 0 || bindingConflicts.Any, Completed: completed[issue.Number], Closed: issue.State == "closed", NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts}, nil
+		return RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: baseSHA, BaseBranch: baseBranch, CreatedAt: issue.CreatedAt, Blockers: blockers, Active: active[issue.Number] || binding.Attempt > 0 || bindingConflicts.Any, Completed: completed[issue.Number], Closed: issue.State == "closed", NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts}, proposals, nil
 	}
 	blockers := []string{}
 	var satisfiedDependencies []int
@@ -569,10 +714,14 @@ func fetchRecoveryIssueFact(ctx context.Context, api API, cfg PRAdapterConfig, s
 			satisfiedDependencies = append(satisfiedDependencies, dependency)
 		}
 	}
-	if intake && status.monitoringDependency > 0 && slices.Contains(controls.Dependencies, status.monitoringDependency) {
+	if mode != issueFactsReadOnly && status.monitoringDependency > 0 && slices.Contains(controls.Dependencies, status.monitoringDependency) {
 		complete, err := source.dependencyComplete(ctx, status.monitoringDependency)
 		if err == nil && complete {
-			status, err = source.clearResolvedMonitoringDependencyStatus(ctx, issue.Number, pullRequest, max(1, currentAttempt), status)
+			if mode == issueFactsProposeUpdates {
+				proposals = append(proposals, IssueUpdateProposal{Kind: IssueUpdateDependencyClear, Repository: cfg.Repository, Issue: issue.Number, AttributionAttempt: max(1, currentAttempt), Dependency: status.monitoringDependency, PullRequest: pullRequest})
+			} else {
+				status, err = source.clearResolvedMonitoringDependencyStatus(ctx, issue.Number, pullRequest, max(1, currentAttempt), status)
+			}
 		}
 		if err != nil {
 			blockers = append(blockers, fmt.Sprintf("clear resolved monitoring dependency status: %v", err))
@@ -607,7 +756,7 @@ func fetchRecoveryIssueFact(ctx context.Context, api API, cfg PRAdapterConfig, s
 	if status.NeedsAttention {
 		blockers = append(blockers, "needs attention: "+status.Reason)
 	}
-	return RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: baseSHA, BaseBranch: baseBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, SatisfiedDependencies: satisfiedDependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, Closed: issue.State == "closed", DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts}, nil
+	return RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: baseSHA, BaseBranch: baseBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, SatisfiedDependencies: satisfiedDependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, Closed: issue.State == "closed", DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts}, proposals, nil
 }
 
 func fetchActiveAttempts(ctx context.Context, api API, cfg PRAdapterConfig, issue int) ([]activeMarkerPayload, markerConflicts, error) {
@@ -659,23 +808,7 @@ func EnsureActiveAttempt(ctx context.Context, api API, cfg PRAdapterConfig, issu
 	if strings.TrimSpace(detail) == "" || len(detail) > 4096 || strings.Contains(detail, "<!-- agent-symphony:") {
 		return errors.New("active attempt detail is invalid")
 	}
-	check := func() (bool, error) {
-		found, conflicts, err := fetchActiveAttempts(ctx, api, cfg, issue)
-		if err != nil {
-			return false, err
-		}
-		if conflicts.Any {
-			return false, errors.New("active attempt marker conflicts with dispatch")
-		}
-		present := false
-		for _, marker := range found {
-			if marker.Attempt > attempt || marker.Attempt == attempt && marker.BaseSHA != baseSHA {
-				return false, errors.New("active attempt marker conflicts with dispatch")
-			}
-			present = present || marker.Attempt == attempt
-		}
-		return present, nil
-	}
+	check := func() (bool, error) { return ActiveAttemptPresent(ctx, api, cfg, issue, attempt, baseSHA) }
 	if present, err := check(); err != nil || present {
 		return err
 	}
@@ -692,6 +825,25 @@ func EnsureActiveAttempt(ctx context.Context, api API, cfg PRAdapterConfig, issu
 		return createErr
 	}
 	return errors.New("active attempt marker creation was not observable")
+}
+
+// ActiveAttemptPresent verifies the exact current coordinator-authored binding.
+func ActiveAttemptPresent(ctx context.Context, api API, cfg PRAdapterConfig, issue, attempt int, baseSHA string) (bool, error) {
+	found, conflicts, err := fetchActiveAttempts(ctx, api, cfg, issue)
+	if err != nil {
+		return false, err
+	}
+	if conflicts.Any {
+		return false, errors.New("active attempt marker conflicts with dispatch")
+	}
+	present := false
+	for _, marker := range found {
+		if marker.Attempt > attempt || marker.Attempt == attempt && marker.BaseSHA != baseSHA {
+			return false, errors.New("active attempt marker conflicts with dispatch")
+		}
+		present = present || marker.Attempt == attempt
+	}
+	return present, nil
 }
 
 func retryAuthorizesFailure(controls Controls, retry *Provenance, terminal terminalMarkerPayload) bool {
@@ -774,6 +926,28 @@ func EnsureRetryCommand(ctx context.Context, api API, cfg PRAdapterConfig, issue
 		return &ambiguousMutationError{fmt.Errorf("GitHub retry command outcome is ambiguous; reconcile issue #%d attempt %d: %w", issue, attempt, mutationErr)}
 	}
 	return errors.New("GitHub retry command creation was not observable")
+}
+
+// RetryCommandApplied reports only an exact coordinator-authored retry paired
+// with the bound terminal attempt and failure time.
+func RetryCommandApplied(ctx context.Context, api API, cfg PRAdapterConfig, issue, attempt int, failedAt time.Time) (bool, error) {
+	if cfg.Repository == "" || cfg.ActorID <= 0 || cfg.RetryCommand == "" || issue < 1 || attempt < 1 || failedAt.IsZero() {
+		return false, errors.New("retry command requires repository, actor, issue, attempt, and failure time")
+	}
+	terminals, conflicts, err := fetchTerminalFailures(ctx, api, cfg, issue)
+	if err != nil || conflicts.Any || len(terminals) == 0 {
+		return false, err
+	}
+	terminal := terminals[len(terminals)-1]
+	if terminal.Attempt != attempt || !terminal.FailedAt.Equal(failedAt.UTC()) {
+		return false, nil
+	}
+	comments, err := (&GitHubPRSource{API: api, Config: cfg}).issueComments(ctx, issue)
+	if err != nil {
+		return false, err
+	}
+	latest, name := latestControlCommand(comments, cfg.CancelCommand, cfg.RetryCommand)
+	return latest != nil && name == "retry" && latest.User.ID == cfg.ActorID && latest.CreatedAt.After(terminal.FailedAt), nil
 }
 
 func fetchTerminalFailures(ctx context.Context, api API, cfg PRAdapterConfig, issue int) ([]terminalMarkerPayload, markerConflicts, error) {

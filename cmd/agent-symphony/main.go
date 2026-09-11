@@ -2787,6 +2787,14 @@ func reviewPrompt(mode, target string, issue internalgithub.RecoveryIssueFact) (
 }
 
 func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot string, selectedMode ...string) (independentReviewResult, bool, error) {
+	return runIndependentReviewCore(ctx, runtimeState, true, attempt, boundary, env, command, issue, manifest, source, head, snapshotRoot, selectedMode...)
+}
+
+func runIndependentReviewV2(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot, mode string) (independentReviewResult, bool, error) {
+	return runIndependentReviewCore(ctx, nil, false, attempt, boundary, env, command, issue, manifest, source, head, snapshotRoot, mode)
+}
+
+func runIndependentReviewCore(ctx context.Context, runtimeState *agentruntime.Runtime, cleanupUnowned bool, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot string, selectedMode ...string) (independentReviewResult, bool, error) {
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
 	}
@@ -2878,7 +2886,7 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 					if _, err := cleanupReviewOutcome(ctx, runtimeState, attempt, boundary, env, persisted, snapshotRoot, cleanupTarget); err != nil {
 						return parsed, true, nil
 					}
-				} else {
+				} else if cleanupUnowned {
 					if err := cleanupReviewResources(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot); err != nil {
 						return parsed, true, nil
 					}

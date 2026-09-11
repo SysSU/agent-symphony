@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
@@ -34,16 +35,18 @@ var (
 )
 
 type runtimeOwnerState struct {
-	Version            int                             `json:"version"`
-	Repository         string                          `json:"repository"`
-	Epoch              uint64                          `json:"epoch"`
-	Revision           uint64                          `json:"revision"`
-	IssueGenerations   map[string]uint64               `json:"issue_generations"`
-	AttemptGenerations map[string]uint64               `json:"attempt_generations"`
-	Attempts           map[string]runtimeAttemptRecord `json:"attempts"`
-	Tombstones         map[string]runtimeTombstone     `json:"tombstones"`
-	Effects            map[string]runtimeEffectIntent  `json:"effects"`
-	ControlReceipts    []controlReceipt                `json:"control_receipts"`
+	Version            int                                  `json:"version"`
+	Repository         string                               `json:"repository"`
+	Epoch              uint64                               `json:"epoch"`
+	Revision           uint64                               `json:"revision"`
+	IssueGenerations   map[string]uint64                    `json:"issue_generations"`
+	AttemptGenerations map[string]uint64                    `json:"attempt_generations"`
+	Attempts           map[string]runtimeAttemptRecord      `json:"attempts"`
+	Observations       map[string]reconciliationObservation `json:"observations"`
+	Recoveries         map[string]runtimePRRecovery         `json:"recoveries"`
+	Tombstones         map[string]runtimeTombstone          `json:"tombstones"`
+	Effects            map[string]runtimeEffectIntent       `json:"effects"`
+	ControlReceipts    []controlReceipt                     `json:"control_receipts"`
 }
 
 type runtimeAttemptRecord struct {
@@ -51,6 +54,12 @@ type runtimeAttemptRecord struct {
 	ObservationEpoch uint64                `json:"observation_epoch,omitempty"`
 	LastCycleID      uint64                `json:"last_cycle_id,omitempty"`
 	Manifest         agentruntime.Manifest `json:"manifest"`
+}
+
+type runtimePRRecovery struct {
+	IssueGeneration   uint64                 `json:"issue_generation"`
+	AttemptGeneration uint64                 `json:"attempt_generation"`
+	State             internalgithub.PRState `json:"state"`
 }
 
 type runtimeTombstone struct {
@@ -69,20 +78,22 @@ type runtimeTombstone struct {
 }
 
 type runtimeEffectIntent struct {
-	ID                string                         `json:"id"`
-	Action            string                         `json:"action"`
-	Repository        string                         `json:"repository"`
-	Issue             int                            `json:"issue"`
-	Attempt           int                            `json:"attempt"`
-	IssueGeneration   uint64                         `json:"issue_generation"`
-	AttemptGeneration uint64                         `json:"attempt_generation"`
-	IntentEpoch       uint64                         `json:"intent_epoch,omitempty"`
-	IntentRevision    uint64                         `json:"intent_revision"`
-	State             string                         `json:"state"`
-	RequestDigest     string                         `json:"request_digest"`
-	Reason            string                         `json:"reason,omitempty"`
-	Review            *agentruntime.ReviewTransition `json:"review,omitempty"`
-	Diagnostic        string                         `json:"diagnostic,omitempty"`
+	ID                   string                         `json:"id"`
+	Action               string                         `json:"action"`
+	Repository           string                         `json:"repository"`
+	Issue                int                            `json:"issue"`
+	Attempt              int                            `json:"attempt"`
+	IssueGeneration      uint64                         `json:"issue_generation"`
+	AttemptGeneration    uint64                         `json:"attempt_generation"`
+	IntentEpoch          uint64                         `json:"intent_epoch,omitempty"`
+	IntentRevision       uint64                         `json:"intent_revision"`
+	State                string                         `json:"state"`
+	RequestDigest        string                         `json:"request_digest"`
+	Reason               string                         `json:"reason,omitempty"`
+	Review               *agentruntime.ReviewTransition `json:"review,omitempty"`
+	Reconciliation       *reconciliationEffectRequest   `json:"reconciliation,omitempty"`
+	ReconciliationResult *reconciliationEffectResult    `json:"reconciliation_result,omitempty"`
+	Diagnostic           string                         `json:"diagnostic,omitempty"`
 }
 
 type stateResultIdentity struct {
@@ -164,6 +175,34 @@ type authorizeRuntimeEffectCommand struct {
 	Action   agentruntime.EffectAction
 }
 
+type beginReconciliationEffectCommand struct {
+	Identity stateResultIdentity
+	Request  reconciliationEffectRequest
+}
+
+type authorizeReconciliationEffectCommand struct {
+	Identity stateResultIdentity
+	Action   reconciliationEffectAction
+}
+
+type finishReconciliationEffectCommand struct {
+	Identity stateResultIdentity
+	Result   reconciliationEffectResult
+}
+
+type diagnoseReconciliationEffectCommand struct {
+	Identity   stateResultIdentity
+	Action     reconciliationEffectAction
+	Diagnostic string
+}
+
+type mutatePRRecoveryCommand struct {
+	Identity stateResultIdentity
+	Kind     prRecoveryMutationKind
+	State    internalgithub.PRState
+	Feedback internalgithub.Feedback
+}
+
 type recordControlReceiptCommand struct {
 	Receipt controlReceipt
 }
@@ -181,22 +220,34 @@ const (
 	stateOwnerBeginRuntimeEffect
 	stateOwnerFinishRuntimeEffect
 	stateOwnerAuthorizeRuntimeEffect
+	stateOwnerApplyReconciliation
+	stateOwnerBeginReconciliationEffect
+	stateOwnerAuthorizeReconciliationEffect
+	stateOwnerFinishReconciliationEffect
+	stateOwnerDiagnoseReconciliationEffect
+	stateOwnerMutatePRRecovery
 	stateOwnerRecordControlReceipt
 )
 
 type stateOwnerCommand struct {
-	kind       stateOwnerCommandKind
-	issue      advanceIssueGenerationCommand
-	upsert     upsertAttemptCommand
-	invalidate invalidateAttemptCommand
-	apply      applyAttemptResultCommand
-	record     recordEffectCommand
-	complete   completeEffectCommand
-	begin      beginRuntimeEffectCommand
-	finish     finishRuntimeEffectCommand
-	authorize  authorizeRuntimeEffectCommand
-	receipt    recordControlReceiptCommand
-	reply      chan stateOwnerResult
+	kind                    stateOwnerCommandKind
+	issue                   advanceIssueGenerationCommand
+	upsert                  upsertAttemptCommand
+	invalidate              invalidateAttemptCommand
+	apply                   applyAttemptResultCommand
+	record                  recordEffectCommand
+	complete                completeEffectCommand
+	begin                   beginRuntimeEffectCommand
+	finish                  finishRuntimeEffectCommand
+	authorize               authorizeRuntimeEffectCommand
+	reconcile               applyReconciliationCommand
+	beginReconciliation     beginReconciliationEffectCommand
+	authorizeReconciliation authorizeReconciliationEffectCommand
+	finishReconciliation    finishReconciliationEffectCommand
+	diagnoseReconciliation  diagnoseReconciliationEffectCommand
+	mutatePRRecovery        mutatePRRecoveryCommand
+	receipt                 recordControlReceiptCommand
+	reply                   chan stateOwnerResult
 }
 
 type stateOwnerResult struct {
@@ -221,6 +272,11 @@ type pendingStateCommit struct {
 	command   stateOwnerCommand
 	candidate runtimeOwnerState
 	effect    *runtimeEffectIntent
+}
+
+type appliedReconciliationCycle struct {
+	cycle  uint64
+	digest string
 }
 
 // stateOwner is the sole in-process commit authority for a v2 runtime ledger.
@@ -283,17 +339,19 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 	var persistenceResult <-chan error
 	var stopReply chan error
 	var cycleID uint64
+	appliedCycles := map[string]appliedReconciliationCycle{}
 
 	startNext := func() {
 		for inFlight == nil && len(queue) > 0 {
 			command := queue[0]
 			queue = queue[1:]
-			candidate, effect, err := applyStateOwnerCommand(o.attemptRoot, o.stateRoot, committed, command)
+			candidate, effect, err := applyStateOwnerCommand(o.attemptRoot, o.stateRoot, committed, command, appliedCycles)
 			if err != nil {
 				command.reply <- stateOwnerResult{err: err}
 				continue
 			}
 			if reflect.DeepEqual(candidate, committed) {
+				recordAppliedReconciliationCycles(appliedCycles, command, committed)
 				command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(effect)}
 				continue
 			}
@@ -344,6 +402,7 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 		case err := <-persistenceResult:
 			if err == nil {
 				committed = inFlight.candidate
+				recordAppliedReconciliationCycles(appliedCycles, inFlight.command, committed)
 				inFlight.command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(inFlight.effect)}
 			} else {
 				inFlight.command.reply <- stateOwnerResult{err: err}
@@ -472,7 +531,7 @@ func (o *stateOwner) recordControlReceipt(ctx context.Context, receipt controlRe
 	return result.snapshot, err
 }
 
-func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwnerState, command stateOwnerCommand) (runtimeOwnerState, *runtimeEffectIntent, error) {
+func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwnerState, command stateOwnerCommand, appliedCycles map[string]appliedReconciliationCycle) (runtimeOwnerState, *runtimeEffectIntent, error) {
 	candidate := cloneRuntimeOwnerState(committed)
 	if command.kind == stateOwnerStart {
 		if candidate.Epoch == ^uint64(0) {
@@ -528,6 +587,35 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		}
 	case stateOwnerAuthorizeRuntimeEffect:
 		if err := applyAuthorizeRuntimeEffect(candidate, command.authorize); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerApplyReconciliation:
+		if err := applyReconciliation(&candidate, command.reconcile, appliedCycles); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerBeginReconciliationEffect:
+		effect, err := applyBeginReconciliationEffect(attemptRoot, stateRoot, &candidate, command.beginReconciliation)
+		if err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+		if effect.ID != "" {
+			return candidate, cloneEffect(effect), nil
+		}
+		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect)
+	case stateOwnerAuthorizeReconciliationEffect:
+		if err := applyAuthorizeReconciliationEffect(stateRoot, candidate, command.authorizeReconciliation); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerFinishReconciliationEffect:
+		if err := applyFinishReconciliationEffect(stateRoot, &candidate, command.finishReconciliation); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerDiagnoseReconciliationEffect:
+		if err := applyDiagnoseReconciliationEffect(&candidate, command.diagnoseReconciliation); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerMutatePRRecovery:
+		if err := applyMutatePRRecovery(stateRoot, &candidate, command.mutatePRRecovery); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerRecordControlReceipt:
@@ -815,6 +903,8 @@ func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueG
 		return errors.New("issue generation overflow")
 	}
 	state.IssueGenerations[key] = generation + 1
+	delete(state.Observations, key)
+	deleteIssueRecoveries(state, command.Repository, command.Issue)
 	for id, effect := range state.Effects {
 		if effect.Repository == command.Repository && effect.Issue == command.Issue && !effectAuthorizedByTombstone(*state, effect) {
 			delete(state.Effects, id)
@@ -860,10 +950,6 @@ func applyUpsertAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState,
 	if issueGeneration != command.ExpectedIssueGeneration {
 		return errStaleStateResult
 	}
-	if issueGeneration == 0 {
-		issueGeneration = 1
-		state.IssueGenerations[issueKey] = issueGeneration
-	}
 	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned {
 		return errAttemptTombstoned
 	}
@@ -872,6 +958,14 @@ func applyUpsertAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState,
 		return errStaleStateResult
 	}
 	if generation == 0 {
+		if issueGeneration == ^uint64(0) {
+			return errors.New("issue generation overflow")
+		}
+		issueGeneration++
+		state.IssueGenerations[issueKey] = issueGeneration
+		delete(state.Observations, issueKey)
+		deleteIssueRecoveries(state, manifest.Repository, manifest.Issue)
+		deleteIssueScopedEffects(state, manifest.Repository, manifest.Issue)
 		generation = 1
 	} else {
 		if generation == ^uint64(0) {
@@ -879,8 +973,12 @@ func applyUpsertAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState,
 		}
 		generation++
 		deleteAttemptEffects(state, manifest.Repository, manifest.Issue, manifest.Attempt)
+		delete(state.Recoveries, attemptKey)
 	}
 	state.AttemptGenerations[attemptKey] = generation
+	if err := deleteAttemptObservation(state, manifest.Repository, manifest.Issue, manifest.Attempt); err != nil {
+		return err
+	}
 	previous := state.Attempts[attemptKey]
 	state.Attempts[attemptKey] = runtimeAttemptRecord{Generation: generation, ObservationEpoch: previous.ObservationEpoch, LastCycleID: previous.LastCycleID, Manifest: manifest}
 	return nil
@@ -927,6 +1025,10 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 	}
 	state.AttemptGenerations[attemptKey] = generation
 	delete(state.Attempts, attemptKey)
+	if err := deleteAttemptObservation(state, command.Repository, command.Issue, command.Attempt); err != nil {
+		return nil, err
+	}
+	delete(state.Recoveries, attemptKey)
 	deleteAttemptEffects(state, command.Repository, command.Issue, command.Attempt)
 	state.Tombstones[attemptKey] = runtimeTombstone{
 		Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt, Action: command.Action,
@@ -1246,7 +1348,7 @@ func writeRuntimeOwnerState(stateRoot, attemptRoot string, state runtimeOwnerSta
 }
 
 func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot string, persisted bool) error {
-	if state.Version != runtimeOwnerStateVersion || strings.TrimSpace(state.Repository) == "" || state.IssueGenerations == nil || state.AttemptGenerations == nil || state.Attempts == nil || state.Tombstones == nil || state.Effects == nil || state.ControlReceipts == nil || persisted && (state.Epoch == 0 || state.Revision == 0) {
+	if state.Version != runtimeOwnerStateVersion || strings.TrimSpace(state.Repository) == "" || state.IssueGenerations == nil || state.AttemptGenerations == nil || state.Attempts == nil || state.Observations == nil || state.Recoveries == nil || state.Tombstones == nil || state.Effects == nil || state.ControlReceipts == nil || persisted && (state.Epoch == 0 || state.Revision == 0) {
 		return errors.New("runtime owner ledger is invalid")
 	}
 	for key, generation := range state.IssueGenerations {
@@ -1268,6 +1370,12 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, record.Manifest); err != nil {
 			return err
 		}
+	}
+	if err := validateReconciliationObservations(state); err != nil {
+		return err
+	}
+	if err := validateRuntimePRRecoveries(state); err != nil {
+		return err
 	}
 	for key, tombstone := range state.Tombstones {
 		if key != ownerAttemptKey(tombstone.Repository, tombstone.Issue, tombstone.Attempt) || tombstone.Repository != state.Repository || !validTombstoneAction(tombstone.Action) || !validCleanupPhase(tombstone.CleanupPhase) || tombstone.Generation == 0 || tombstone.InvalidatedGeneration >= tombstone.Generation || state.AttemptGenerations[key] != tombstone.Generation || tombstone.Revision > state.Revision || persisted && tombstone.Revision == 0 {
@@ -1303,6 +1411,17 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		}
 		issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 		issueCurrent := state.IssueGenerations[issueKey] == effect.IssueGeneration || effectAuthorizedByTombstone(state, effect)
+		if effect.Reconciliation != nil {
+			issueScoped := reconciliationEffectIssueScoped(*effect.Reconciliation)
+			attemptCurrent := issueScoped && effect.Attempt == 0 && effect.AttemptGeneration == 0 || !issueScoped && effect.Attempt > 0 && effect.AttemptGeneration > 0 && state.AttemptGenerations[attemptKey] == effect.AttemptGeneration
+			if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Action == "" || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" || !issueCurrent || !attemptCurrent || !validPersistedReconciliationEffect(state, effect) {
+				return errors.New("runtime owner reconciliation effect intent is invalid")
+			}
+			continue
+		}
+		if effect.ReconciliationResult != nil {
+			return errors.New("runtime owner effect payload is invalid")
+		}
 		if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Attempt < 1 || effect.Action == "" || effect.IssueGeneration == 0 || effect.AttemptGeneration == 0 || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" || !issueCurrent || state.AttemptGenerations[attemptKey] != effect.AttemptGeneration {
 			return errors.New("runtime owner effect intent is invalid")
 		}
@@ -1351,7 +1470,7 @@ func runtimeOwnerAttemptRoot(stateRoot string) string {
 }
 
 func newRuntimeOwnerState(repository string) runtimeOwnerState {
-	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ControlReceipts: []controlReceipt{}}
+	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ControlReceipts: []controlReceipt{}}
 }
 
 func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
@@ -1362,6 +1481,15 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 	for key, record := range state.Attempts {
 		record.Manifest = cloneManifest(record.Manifest)
 		clone.Attempts[key] = record
+	}
+	clone.Observations = make(map[string]reconciliationObservation, len(state.Observations))
+	for key, observation := range state.Observations {
+		clone.Observations[key] = cloneReconciliationObservation(observation)
+	}
+	clone.Recoveries = make(map[string]runtimePRRecovery, len(state.Recoveries))
+	for key, recovery := range state.Recoveries {
+		recovery.State = clonePRState(recovery.State)
+		clone.Recoveries[key] = recovery
 	}
 	clone.Tombstones = make(map[string]runtimeTombstone, len(state.Tombstones))
 	for key, tombstone := range state.Tombstones {
@@ -1374,6 +1502,8 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 	clone.Effects = make(map[string]runtimeEffectIntent, len(state.Effects))
 	for key, effect := range state.Effects {
 		effect.Review = cloneReviewTransition(effect.Review)
+		effect.Reconciliation = cloneReconciliationEffectRequest(effect.Reconciliation)
+		effect.ReconciliationResult = cloneReconciliationEffectResult(effect.ReconciliationResult)
 		clone.Effects[key] = effect
 	}
 	clone.ControlReceipts = make([]controlReceipt, len(state.ControlReceipts))
@@ -1411,6 +1541,8 @@ func cloneEffect(effect *runtimeEffectIntent) *runtimeEffectIntent {
 	}
 	clone := *effect
 	clone.Review = cloneReviewTransition(effect.Review)
+	clone.Reconciliation = cloneReconciliationEffectRequest(effect.Reconciliation)
+	clone.ReconciliationResult = cloneReconciliationEffectResult(effect.ReconciliationResult)
 	return &clone
 }
 

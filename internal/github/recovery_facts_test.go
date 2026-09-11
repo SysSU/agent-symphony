@@ -392,6 +392,8 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 			response = map[string]any{"default_branch": "main"}
 		case "GET /repos/o/r/branches/main":
 			response = map[string]any{"commit": map[string]any{"sha": "abcdef0"}}
+		case "GET /repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1":
+			response = []any{}
 		case "GET /repos/o/r/issues?state=open&per_page=100&page=1":
 			response = []any{map[string]any{"number": 10, "title": "approved", "body": body, "created_at": now}}
 		case "GET /repos/o/r/issues/10":
@@ -454,6 +456,22 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 		return httpResponse(http.StatusOK, string(encoded), nil), nil
 	})}}
 	cfg := productionPRConfig()
+	collected, err := CollectIssueFactsV2(context.Background(), api, cfg, nil)
+	if err != nil || len(collected.Facts) != 1 || collected.Facts[0].Eligible || len(collected.Proposals) != 1 || collected.Proposals[0].Kind != IssueUpdateControlSnapshot || posts != 0 {
+		t.Fatalf("v2 collection=%#v posts=%d err=%v", collected, posts, err)
+	}
+	if _, err := ParseSnapshotComment(collected.Proposals[0].ControlSnapshotBody, 42, 42); err != nil {
+		t.Fatalf("v2 proposed snapshot is not canonical: %v", err)
+	}
+	applied, err := RevalidateIssueUpdateProposal(context.Background(), api, cfg, collected.Proposals[0])
+	if err != nil || applied || posts != 0 {
+		t.Fatalf("v2 proposal revalidation applied=%v posts=%d err=%v", applied, posts, err)
+	}
+	changedProposal := collected.Proposals[0]
+	changedProposal.ControlSnapshotBody += "changed"
+	if _, err := RevalidateIssueUpdateProposal(context.Background(), api, cfg, changedProposal); err == nil || posts != 0 {
+		t.Fatalf("changed proposal revalidation posts=%d err=%v", posts, err)
+	}
 	readOnly, err := FetchIssueFacts(context.Background(), api, cfg, nil, false)
 	if err != nil || len(readOnly) != 1 || readOnly[0].Eligible || posts != 0 {
 		t.Fatalf("read-only facts=%#v posts=%d err=%v", readOnly, posts, err)
@@ -466,6 +484,9 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	}
 	if posts != 1 {
 		t.Fatalf("snapshot posts=%d, want 1", posts)
+	}
+	if err := ExecuteIssueUpdateProposal(context.Background(), api, cfg, collected.Proposals[0]); err != nil || posts != 1 {
+		t.Fatalf("idempotent v2 execution posts=%d err=%v", posts, err)
 	}
 	changed = true
 	changedFacts, err := FetchIssueFacts(context.Background(), api, cfg, nil, true)
@@ -934,6 +955,13 @@ func TestFetchIssueFactsRefreshesDependenciesAcrossNormalCycles(t *testing.T) {
 	}
 
 	dependencyMode, dependencyReads = "closed", 0
+	proposed, err := CollectIssueFactsV2(t.Context(), api, cfg, nil)
+	if err != nil || clearPosts != 0 || labelDeletes != 0 || !needsAttention[10] || !slices.ContainsFunc(proposed.Proposals, func(proposal IssueUpdateProposal) bool {
+		return proposal.Kind == IssueUpdateDependencyClear && proposal.Issue == 10 && proposal.AttributionAttempt == 1 && proposal.Dependency == 9
+	}) || !slices.ContainsFunc(proposed.Facts, func(f RecoveryIssueFact) bool { return f.Issue == 10 && f.NeedsAttention }) {
+		t.Fatalf("v2 monitoring proposal=%#v clear_posts=%d label_deletes=%d labels=%v err=%v", proposed, clearPosts, labelDeletes, needsAttention, err)
+	}
+	dependencyReads = 0
 	recovered, err := FetchIssueFacts(t.Context(), api, cfg, nil, true)
 	if err != nil || dependencyReads != 1 || clearPosts != 1 || labelDeletes != 1 || needsAttention[10] {
 		t.Fatalf("monitoring recovery=%#v reads=%d clear_posts=%d label_deletes=%d labels=%v err=%v", recovered, dependencyReads, clearPosts, labelDeletes, needsAttention, err)
