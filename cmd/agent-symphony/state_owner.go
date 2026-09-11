@@ -69,16 +69,20 @@ type runtimeTombstone struct {
 }
 
 type runtimeEffectIntent struct {
-	ID                string `json:"id"`
-	Action            string `json:"action"`
-	Repository        string `json:"repository"`
-	Issue             int    `json:"issue"`
-	Attempt           int    `json:"attempt"`
-	IssueGeneration   uint64 `json:"issue_generation"`
-	AttemptGeneration uint64 `json:"attempt_generation"`
-	IntentRevision    uint64 `json:"intent_revision"`
-	State             string `json:"state"`
-	Diagnostic        string `json:"diagnostic,omitempty"`
+	ID                string                         `json:"id"`
+	Action            string                         `json:"action"`
+	Repository        string                         `json:"repository"`
+	Issue             int                            `json:"issue"`
+	Attempt           int                            `json:"attempt"`
+	IssueGeneration   uint64                         `json:"issue_generation"`
+	AttemptGeneration uint64                         `json:"attempt_generation"`
+	IntentEpoch       uint64                         `json:"intent_epoch,omitempty"`
+	IntentRevision    uint64                         `json:"intent_revision"`
+	State             string                         `json:"state"`
+	RequestDigest     string                         `json:"request_digest"`
+	Reason            string                         `json:"reason,omitempty"`
+	Review            *agentruntime.ReviewTransition `json:"review,omitempty"`
+	Diagnostic        string                         `json:"diagnostic,omitempty"`
 }
 
 type stateResultIdentity struct {
@@ -88,6 +92,7 @@ type stateResultIdentity struct {
 	IssueGeneration   uint64
 	AttemptGeneration uint64
 	EffectID          string
+	RequestDigest     string
 }
 
 type stateOwnerSnapshot struct {
@@ -119,6 +124,7 @@ type invalidateAttemptCommand struct {
 	Manifest                  *agentruntime.Manifest
 	Diagnostic                string
 	EffectAction              string
+	EffectRequestDigest       string
 }
 
 type applyAttemptResultCommand struct {
@@ -138,6 +144,26 @@ type completeEffectCommand struct {
 	Diagnostic string
 }
 
+type beginRuntimeEffectCommand struct {
+	Identity      stateResultIdentity
+	Action        agentruntime.EffectAction
+	Manifest      agentruntime.Manifest
+	Reason        string
+	RequestDigest string
+	Review        *agentruntime.ReviewTransition
+}
+
+type finishRuntimeEffectCommand struct {
+	Identity stateResultIdentity
+	Action   agentruntime.EffectAction
+	Manifest agentruntime.Manifest
+}
+
+type authorizeRuntimeEffectCommand struct {
+	Identity stateResultIdentity
+	Action   agentruntime.EffectAction
+}
+
 type recordControlReceiptCommand struct {
 	Receipt controlReceipt
 }
@@ -152,6 +178,9 @@ const (
 	stateOwnerApplyAttemptResult
 	stateOwnerRecordEffect
 	stateOwnerCompleteEffect
+	stateOwnerBeginRuntimeEffect
+	stateOwnerFinishRuntimeEffect
+	stateOwnerAuthorizeRuntimeEffect
 	stateOwnerRecordControlReceipt
 )
 
@@ -163,6 +192,9 @@ type stateOwnerCommand struct {
 	apply      applyAttemptResultCommand
 	record     recordEffectCommand
 	complete   completeEffectCommand
+	begin      beginRuntimeEffectCommand
+	finish     finishRuntimeEffectCommand
+	authorize  authorizeRuntimeEffectCommand
 	receipt    recordControlReceiptCommand
 	reply      chan stateOwnerResult
 }
@@ -303,10 +335,12 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				request.reply <- stateOwnerResult{err: errStateOwnerStopped}
 				continue
 			}
+			id := uint64(0)
 			if request.cycle {
 				cycleID++
+				id = cycleID
 			}
-			request.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed), CycleID: cycleID}}
+			request.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed), CycleID: id}}
 		case err := <-persistenceResult:
 			if err == nil {
 				committed = inFlight.candidate
@@ -418,6 +452,21 @@ func (o *stateOwner) completeEffect(ctx context.Context, command completeEffectC
 	return result.snapshot, err
 }
 
+func (o *stateOwner) beginRuntimeEffect(ctx context.Context, command beginRuntimeEffectCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerBeginRuntimeEffect, begin: command})
+	return result.snapshot, result.effect, err
+}
+
+func (o *stateOwner) finishRuntimeEffect(ctx context.Context, command finishRuntimeEffectCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerFinishRuntimeEffect, finish: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) authorizeRuntimeEffect(ctx context.Context, command authorizeRuntimeEffectCommand) error {
+	_, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerAuthorizeRuntimeEffect, authorize: command})
+	return err
+}
+
 func (o *stateOwner) recordControlReceipt(ctx context.Context, receipt controlReceipt) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRecordControlReceipt, receipt: recordControlReceiptCommand{Receipt: receipt}})
 	return result.snapshot, err
@@ -464,6 +513,23 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if err := applyCompleteEffect(&candidate, command.complete); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
+	case stateOwnerBeginRuntimeEffect:
+		effect, err := applyBeginRuntimeEffect(attemptRoot, stateRoot, &candidate, command.begin)
+		if err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+		if effect.ID != "" {
+			return candidate, cloneEffect(effect), nil
+		}
+		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect)
+	case stateOwnerFinishRuntimeEffect:
+		if err := applyFinishRuntimeEffect(attemptRoot, stateRoot, &candidate, command.finish); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerAuthorizeRuntimeEffect:
+		if err := applyAuthorizeRuntimeEffect(candidate, command.authorize); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
 	case stateOwnerRecordControlReceipt:
 		if err := applyControlReceipt(&candidate, command.receipt.Receipt); err != nil {
 			return runtimeOwnerState{}, nil, err
@@ -475,6 +541,265 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		return candidate, nil, nil
 	}
 	return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, nil)
+}
+
+func applyAuthorizeRuntimeEffect(state runtimeOwnerState, command authorizeRuntimeEffectCommand) error {
+	identity := command.Identity
+	if !validRuntimeEffectAction(command.Action) || identity.EffectID == "" || identity.SourceRevision == 0 || !agentruntime.ValidEffectRequestDigest(identity.RequestDigest) {
+		return errStaleStateResult
+	}
+	effect, ok := state.Effects[identity.EffectID]
+	if !ok || effect.State != "pending" || effect.Action != string(command.Action) || effect.IntentEpoch != identity.Epoch || effect.IntentRevision != identity.SourceRevision || effect.IssueGeneration != identity.IssueGeneration || effect.AttemptGeneration != identity.AttemptGeneration || effect.RequestDigest != identity.RequestDigest {
+		return errStaleStateResult
+	}
+	issueKey := ownerIssueKey(effect.Repository, effect.Issue)
+	attemptKey := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+	if state.AttemptGenerations[attemptKey] != identity.AttemptGeneration || state.IssueGenerations[issueKey] != identity.IssueGeneration && !effectAuthorizedByTombstone(state, effect) {
+		return errStaleStateResult
+	}
+	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned && !effectAuthorizedByTombstone(state, effect) {
+		return errAttemptTombstoned
+	}
+	return nil
+}
+
+func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerState, command beginRuntimeEffectCommand) (*runtimeEffectIntent, error) {
+	manifest, identity := cloneManifest(command.Manifest), command.Identity
+	if !validRuntimeEffectInput(command.Action, command.Reason) || !agentruntime.ValidEffectRequestDigest(command.RequestDigest) || command.Action == agentruntime.EffectCleanup || identity.Epoch != state.Epoch || identity.EffectID != "" {
+		return nil, errStaleStateResult
+	}
+	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil {
+		return nil, err
+	}
+	if !validOwnerRuntimeEffectInput(attemptRoot, stateRoot, command.Action, manifest, command.Reason, command.Review) {
+		return nil, errStateConflict
+	}
+	issueKey, attemptKey := ownerIssueKey(manifest.Repository, manifest.Issue), ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	if command.Action == agentruntime.EffectStop {
+		for _, effect := range state.Effects {
+			record, exists := state.Attempts[attemptKey]
+			if effect.Repository == manifest.Repository && effect.Issue == manifest.Issue && effect.Attempt == manifest.Attempt && effect.State == "pending" && effect.Action == string(agentruntime.EffectStop) {
+				if exists && record.Generation == effect.AttemptGeneration && reflect.DeepEqual(record.Manifest, manifest) && effect.IssueGeneration == state.IssueGenerations[issueKey] && effect.RequestDigest == command.RequestDigest && effect.Reason == command.Reason {
+					return cloneEffect(&effect), nil
+				}
+				return nil, errStateConflict
+			}
+		}
+	}
+	if identity.SourceRevision != state.Revision {
+		return nil, errStaleStateResult
+	}
+	if state.IssueGenerations[issueKey] != identity.IssueGeneration || state.AttemptGenerations[attemptKey] != identity.AttemptGeneration {
+		return nil, errStaleStateResult
+	}
+	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned {
+		return nil, errAttemptTombstoned
+	}
+	for _, effect := range state.Effects {
+		if effect.Repository == manifest.Repository && effect.Issue == manifest.Issue && effect.Attempt == manifest.Attempt && effect.State == "pending" && command.Action != agentruntime.EffectStop {
+			return nil, errStateConflict
+		}
+	}
+	switch command.Action {
+	case agentruntime.EffectPrepare:
+		if _, exists := state.Attempts[attemptKey]; exists || identity.AttemptGeneration != 0 || hasAttemptEffect(*state, manifest.Repository, manifest.Issue, manifest.Attempt) {
+			return nil, errStateConflict
+		}
+		if err := applyUpsertAttempt(attemptRoot, stateRoot, state, upsertAttemptCommand{Manifest: manifest, ExpectedIssueGeneration: identity.IssueGeneration, ExpectedAttemptGeneration: 0}); err != nil {
+			return nil, err
+		}
+		identity.IssueGeneration = state.IssueGenerations[issueKey]
+		identity.AttemptGeneration = state.AttemptGenerations[attemptKey]
+	case agentruntime.EffectStop:
+		record, exists := state.Attempts[attemptKey]
+		if !exists || !reflect.DeepEqual(record.Manifest, manifest) {
+			return nil, errStateConflict
+		}
+		if err := applyUpsertAttempt(attemptRoot, stateRoot, state, upsertAttemptCommand{Manifest: manifest, ExpectedIssueGeneration: identity.IssueGeneration, ExpectedAttemptGeneration: identity.AttemptGeneration}); err != nil {
+			return nil, err
+		}
+		identity.IssueGeneration = state.IssueGenerations[issueKey]
+		identity.AttemptGeneration = state.AttemptGenerations[attemptKey]
+	default:
+		record, exists := state.Attempts[attemptKey]
+		if !exists || record.Generation != identity.AttemptGeneration || !reflect.DeepEqual(record.Manifest, manifest) {
+			return nil, errStaleStateResult
+		}
+		pruneCompletedAttemptEffects(state, manifest.Repository, manifest.Issue, manifest.Attempt)
+	}
+	return &runtimeEffectIntent{Action: string(command.Action), Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: identity.IssueGeneration, AttemptGeneration: identity.AttemptGeneration, IntentEpoch: state.Epoch, State: "pending", RequestDigest: command.RequestDigest, Reason: command.Reason, Review: cloneReviewTransition(command.Review)}, nil
+}
+
+func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerState, command finishRuntimeEffectCommand) error {
+	identity := command.Identity
+	if !validRuntimeEffectAction(command.Action) || identity.EffectID == "" || identity.SourceRevision == 0 {
+		return errStaleStateResult
+	}
+	effect, ok := state.Effects[identity.EffectID]
+	if !ok || effect.Action != string(command.Action) || effect.IntentEpoch != identity.Epoch || effect.IntentRevision != identity.SourceRevision || effect.IssueGeneration != identity.IssueGeneration || effect.AttemptGeneration != identity.AttemptGeneration || effect.RequestDigest != identity.RequestDigest {
+		return errStaleStateResult
+	}
+	issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+	if state.IssueGenerations[issueKey] != identity.IssueGeneration && !effectAuthorizedByTombstone(*state, effect) || state.AttemptGenerations[attemptKey] != identity.AttemptGeneration {
+		return errStaleStateResult
+	}
+	manifest := cloneManifest(command.Manifest)
+	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || manifest.Repository != effect.Repository || manifest.Issue != effect.Issue || manifest.Attempt != effect.Attempt {
+		return errStateConflict
+	}
+	if runtimeEffectAppliesManifest(command.Action) {
+		if _, tombstoned := state.Tombstones[attemptKey]; tombstoned {
+			return errAttemptTombstoned
+		}
+		record, exists := state.Attempts[attemptKey]
+		if !exists || record.Generation != identity.AttemptGeneration {
+			return errStaleStateResult
+		}
+		if !validRuntimeEffectResult(command.Action, effect, record.Manifest, manifest) {
+			return errStateConflict
+		}
+		if effect.State == "completed" {
+			if reflect.DeepEqual(record.Manifest, manifest) && effect.Diagnostic == manifest.Diagnostic {
+				return nil
+			}
+			return errStateConflict
+		}
+		record.Manifest = manifest
+		state.Attempts[attemptKey] = record
+	} else {
+		stored := manifest
+		if tombstone, ok := state.Tombstones[attemptKey]; ok && tombstone.Manifest != nil {
+			stored = *tombstone.Manifest
+		} else if record, ok := state.Attempts[attemptKey]; ok {
+			stored = record.Manifest
+		}
+		if !reflect.DeepEqual(stored, manifest) {
+			return errStateConflict
+		}
+	}
+	if !runtimeEffectAppliesManifest(command.Action) && effect.State == "completed" {
+		if effect.Diagnostic == manifest.Diagnostic {
+			return nil
+		}
+		return errStateConflict
+	}
+	effect.State, effect.Diagnostic = "completed", manifest.Diagnostic
+	state.Effects[effect.ID] = effect
+	if tombstone, ok := state.Tombstones[attemptKey]; ok && tombstone.EffectID == effect.ID {
+		tombstone.CleanupPhase = "completed"
+		state.Tombstones[attemptKey] = tombstone
+	}
+	return nil
+}
+
+func validRuntimeEffectResult(action agentruntime.EffectAction, effect runtimeEffectIntent, current, result agentruntime.Manifest) bool {
+	if !sameRuntimeEffectManifestBase(current, result, action == agentruntime.EffectReview) {
+		return false
+	}
+	switch action {
+	case agentruntime.EffectPrepare:
+		return result.State == "preparing" && result.Diagnostic == current.Diagnostic || result.State == "failed" && result.Diagnostic != ""
+	case agentruntime.EffectStart, agentruntime.EffectHandoff:
+		return result.State == "running" && result.Diagnostic == "" || action == agentruntime.EffectStart && result.State == "failed" && result.Diagnostic != ""
+	case agentruntime.EffectStop:
+		return result.State == "cancelled" && result.Diagnostic == effect.Reason
+	case agentruntime.EffectMonitor:
+		return result.State == "running" && result.Diagnostic == current.Diagnostic || result.State == "completed" && result.Diagnostic == "" || result.State == "failed" && result.Diagnostic != ""
+	case agentruntime.EffectReview:
+		return effect.Review != nil && reviewTransitionMatches(*effect.Review, current, result)
+	default:
+		return false
+	}
+}
+
+func validOwnerRuntimeEffectInput(attemptRoot, stateRoot string, action agentruntime.EffectAction, manifest agentruntime.Manifest, reason string, review *agentruntime.ReviewTransition) bool {
+	if !validRuntimeEffectInput(action, reason) || (action == agentruntime.EffectReview) != (review != nil) {
+		return false
+	}
+	switch action {
+	case agentruntime.EffectPrepare, agentruntime.EffectStart:
+		return manifest.State == "preparing"
+	case agentruntime.EffectMonitor:
+		return manifest.State == "running"
+	case agentruntime.EffectStop:
+		return manifest.State == "preparing" || manifest.State == "running"
+	case agentruntime.EffectReview:
+		_, err := agentruntime.ReviewEffectResult(attemptRoot, stateRoot, manifest, *review)
+		return err == nil
+	case agentruntime.EffectHandoff:
+		return manifest.State == "completed" || manifest.State == "running"
+	default:
+		return false
+	}
+}
+
+func sameRuntimeEffectManifestBase(current, result agentruntime.Manifest, review bool) bool {
+	copy := cloneManifest(result)
+	copy.State, copy.Diagnostic, copy.UpdatedAt = current.State, current.Diagnostic, current.UpdatedAt
+	if review {
+		copy.ReviewState, copy.ReviewMode, copy.ReviewTarget = current.ReviewState, current.ReviewMode, current.ReviewTarget
+		copy.ReviewBase, copy.ReviewHead, copy.ReviewSnapshot, copy.ReviewSession = current.ReviewBase, current.ReviewHead, current.ReviewSnapshot, current.ReviewSession
+		copy.ReviewFindings = slices.Clone(current.ReviewFindings)
+		copy.ReviewHandoffQueued, copy.ReviewHandoffAck = current.ReviewHandoffQueued, current.ReviewHandoffAck
+	}
+	return reflect.DeepEqual(copy, current)
+}
+
+func reviewTransitionMatches(review agentruntime.ReviewTransition, current, result agentruntime.Manifest) bool {
+	wantState, wantDiagnostic := current.State, current.Diagnostic
+	if review.HandoffAcknowledged && current.State == "completed" {
+		wantState, wantDiagnostic = "running", ""
+	}
+	wantFindings := review.Findings
+	wantQueued, wantAcknowledged := review.HandoffQueued, review.HandoffAcknowledged
+	if review.State != "findings-queued" {
+		wantFindings, wantQueued, wantAcknowledged = nil, false, false
+	}
+	return result.State == wantState && result.Diagnostic == wantDiagnostic && result.ReviewState == review.State && result.ReviewMode == review.Mode && result.ReviewTarget == review.Target && result.ReviewBase == review.Base && result.ReviewHead == review.Head && result.ReviewSnapshot == review.Snapshot && result.ReviewSession == review.Session && slices.Equal(result.ReviewFindings, wantFindings) && result.ReviewHandoffQueued == wantQueued && result.ReviewHandoffAck == wantAcknowledged
+}
+
+func validRuntimeEffectAction(action agentruntime.EffectAction) bool {
+	return slices.Contains([]agentruntime.EffectAction{
+		agentruntime.EffectPrepare,
+		agentruntime.EffectStart,
+		agentruntime.EffectMonitor,
+		agentruntime.EffectStop,
+		agentruntime.EffectReview,
+		agentruntime.EffectHandoff,
+		agentruntime.EffectCleanup,
+	}, action)
+}
+
+func validRuntimeEffectInput(action agentruntime.EffectAction, reason string) bool {
+	if !validRuntimeEffectAction(action) || len(reason) > 4096 || strings.ContainsRune(reason, 0) {
+		return false
+	}
+	return action == agentruntime.EffectStop && strings.TrimSpace(reason) != "" || action != agentruntime.EffectStop && reason == ""
+}
+
+func runtimeEffectAppliesManifest(action agentruntime.EffectAction) bool {
+	return action != agentruntime.EffectCleanup
+}
+
+func hasAttemptEffect(state runtimeOwnerState, repository string, issue, attempt int) bool {
+	for _, effect := range state.Effects {
+		if effect.Repository == repository && effect.Issue == issue && effect.Attempt == attempt {
+			return true
+		}
+	}
+	return false
+}
+
+func pruneCompletedAttemptEffects(state *runtimeOwnerState, repository string, issue, attempt int) {
+	tombstoneEffect := ""
+	if tombstone, ok := state.Tombstones[ownerAttemptKey(repository, issue, attempt)]; ok {
+		tombstoneEffect = tombstone.EffectID
+	}
+	for id, effect := range state.Effects {
+		if id != tombstoneEffect && effect.Repository == repository && effect.Issue == issue && effect.Attempt == attempt && effect.State == "completed" {
+			delete(state.Effects, id)
+		}
+	}
 }
 
 func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueGenerationCommand) error {
@@ -577,7 +902,7 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 			return nil, nil
 		}
 		effect, ok := state.Effects[existing.EffectID]
-		if !ok || effect.Action != command.EffectAction || effect.Repository != command.Repository || effect.Issue != command.Issue || effect.Attempt != command.Attempt {
+		if !ok || effect.Action != command.EffectAction || effect.RequestDigest != command.EffectRequestDigest || effect.Repository != command.Repository || effect.Issue != command.Issue || effect.Attempt != command.Attempt {
 			return nil, errStateConflict
 		}
 		return cloneEffect(&effect), nil
@@ -611,7 +936,10 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 	if command.EffectAction == "" {
 		return nil, nil
 	}
-	return &runtimeEffectIntent{Action: command.EffectAction, Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt, IssueGeneration: command.ExpectedIssueGeneration, AttemptGeneration: generation, State: "pending"}, nil
+	if command.EffectAction != string(agentruntime.EffectCleanup) || !agentruntime.ValidEffectRequestDigest(command.EffectRequestDigest) {
+		return nil, errStateConflict
+	}
+	return &runtimeEffectIntent{Action: command.EffectAction, Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt, IssueGeneration: command.ExpectedIssueGeneration, AttemptGeneration: generation, IntentEpoch: state.Epoch, State: "pending", RequestDigest: command.EffectRequestDigest}, nil
 }
 
 func applyAttemptResult(attemptRoot, stateRoot string, state *runtimeOwnerState, command applyAttemptResultCommand) error {
@@ -625,6 +953,9 @@ func applyAttemptResult(attemptRoot, stateRoot string, state *runtimeOwnerState,
 	}
 	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned {
 		return errAttemptTombstoned
+	}
+	if hasPendingTypedRuntimeEffect(*state, manifest.Repository, manifest.Issue, manifest.Attempt) {
+		return errStateConflict
 	}
 	if identity.EffectID != "" {
 		effect, ok := state.Effects[identity.EffectID]
@@ -644,6 +975,15 @@ func applyAttemptResult(attemptRoot, stateRoot string, state *runtimeOwnerState,
 	}
 	state.Attempts[attemptKey] = runtimeAttemptRecord{Generation: identity.AttemptGeneration, ObservationEpoch: identity.Epoch, LastCycleID: identity.CycleID, Manifest: manifest}
 	return nil
+}
+
+func hasPendingTypedRuntimeEffect(state runtimeOwnerState, repository string, issue, attempt int) bool {
+	for _, effect := range state.Effects {
+		if effect.Repository == repository && effect.Issue == issue && effect.Attempt == attempt && effect.State == "pending" && effect.RequestDigest != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func applyRecordEffect(state *runtimeOwnerState, command recordEffectCommand) (*runtimeEffectIntent, error) {
@@ -966,6 +1306,18 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Attempt < 1 || effect.Action == "" || effect.IssueGeneration == 0 || effect.AttemptGeneration == 0 || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" || !issueCurrent || state.AttemptGenerations[attemptKey] != effect.AttemptGeneration {
 			return errors.New("runtime owner effect intent is invalid")
 		}
+		if effect.RequestDigest != "" && (!agentruntime.ValidEffectRequestDigest(effect.RequestDigest) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || !validRuntimeEffectInput(agentruntime.EffectAction(effect.Action), effect.Reason) || (effect.Action == string(agentruntime.EffectReview)) != (effect.Review != nil)) {
+			return errors.New("runtime owner typed effect intent is invalid")
+		}
+		if effect.RequestDigest != "" && effect.Action == string(agentruntime.EffectReview) {
+			record, ok := state.Attempts[attemptKey]
+			if !ok {
+				return errors.New("runtime owner review effect has no attempt")
+			}
+			if _, err := agentruntime.ReviewEffectResult(attemptRoot, stateRoot, record.Manifest, *effect.Review); err != nil {
+				return errors.New("runtime owner review effect transition is invalid")
+			}
+		}
 	}
 	if len(state.ControlReceipts) > maxControlReceipts {
 		return errors.New("runtime owner control receipts are invalid")
@@ -1021,6 +1373,7 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 	}
 	clone.Effects = make(map[string]runtimeEffectIntent, len(state.Effects))
 	for key, effect := range state.Effects {
+		effect.Review = cloneReviewTransition(effect.Review)
 		clone.Effects[key] = effect
 	}
 	clone.ControlReceipts = make([]controlReceipt, len(state.ControlReceipts))
@@ -1057,6 +1410,16 @@ func cloneEffect(effect *runtimeEffectIntent) *runtimeEffectIntent {
 		return nil
 	}
 	clone := *effect
+	clone.Review = cloneReviewTransition(effect.Review)
+	return &clone
+}
+
+func cloneReviewTransition(review *agentruntime.ReviewTransition) *agentruntime.ReviewTransition {
+	if review == nil {
+		return nil
+	}
+	clone := *review
+	clone.Findings = slices.Clone(review.Findings)
 	return &clone
 }
 
@@ -1097,7 +1460,7 @@ func validCleanupPhase(phase string) bool {
 }
 
 func runtimeEffectID(effect runtimeEffectIntent) string {
-	material := fmt.Sprintf("%s\x00%s\x00%d\x00%d\x00%d\x00%d\x00%d", effect.Action, effect.Repository, effect.Issue, effect.Attempt, effect.IssueGeneration, effect.AttemptGeneration, effect.IntentRevision)
+	material := fmt.Sprintf("%s\x00%s\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%s\x00%s", effect.Action, effect.Repository, effect.Issue, effect.Attempt, effect.IssueGeneration, effect.AttemptGeneration, effect.IntentRevision, effect.IntentEpoch, effect.RequestDigest, effect.Reason)
 	digest := sha256.Sum256([]byte(material))
 	return hex.EncodeToString(digest[:16])
 }

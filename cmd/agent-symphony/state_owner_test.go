@@ -179,7 +179,7 @@ func TestStateOwnerPersistenceFailureKeepsCommittedSnapshotAndDispatchesNothing(
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	result := make(chan error, 1)
 	go func() {
-		_, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 43, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "dismissed", CleanupPhase: "pending", Manifest: &manifest, EffectAction: "cleanup"})
+		_, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 43, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "dismissed", CleanupPhase: "pending", Manifest: &manifest, EffectAction: "cleanup", EffectRequestDigest: strings.Repeat("a", 64)})
 		result <- err
 	}()
 	<-entered
@@ -232,11 +232,11 @@ func TestStateOwnerRevisionGenerationTombstoneAndOutOfOrderResults(t *testing.T)
 		t.Fatalf("out-of-order err=%v", err)
 	}
 	beforeDelete, _ := owner.snapshot(t.Context())
-	deleted, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 44, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "dismissed", CleanupPhase: "pending", Manifest: &newer, EffectAction: "cleanup"})
+	deleted, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 44, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "dismissed", CleanupPhase: "pending", Manifest: &newer, EffectAction: "cleanup", EffectRequestDigest: strings.Repeat("a", 64)})
 	if err != nil || effect == nil || effect.State != "pending" || deleted.State.Revision != 4 || deleted.State.AttemptGenerations[attemptKey] != 2 || deleted.State.Tombstones[attemptKey].InvalidatedGeneration != 1 {
 		t.Fatalf("deleted=%#v effect=%#v err=%v persisted=%#v", deleted, effect, err, persisted)
 	}
-	replayed, replayedEffect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 44, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "dismissed", CleanupPhase: "pending", Manifest: &newer, EffectAction: "cleanup"})
+	replayed, replayedEffect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 44, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "dismissed", CleanupPhase: "pending", Manifest: &newer, EffectAction: "cleanup", EffectRequestDigest: strings.Repeat("a", 64)})
 	if err != nil || replayed.State.Revision != deleted.State.Revision || replayedEffect == nil || replayedEffect.ID != effect.ID {
 		t.Fatalf("replayed=%#v effect=%#v err=%v", replayed, replayedEffect, err)
 	}
@@ -326,7 +326,7 @@ func TestStateOwnerCompletesTombstoneCleanupAfterIssueGenerationChanges(t *testi
 	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
 		t.Fatal(err)
 	}
-	deleted, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 48, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "abandoned", CleanupPhase: "cleanup-started", Manifest: &manifest, EffectAction: "cleanup"})
+	deleted, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 48, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "abandoned", CleanupPhase: "cleanup-started", Manifest: &manifest, EffectAction: "cleanup", EffectRequestDigest: strings.Repeat("a", 64)})
 	if err != nil || effect == nil {
 		t.Fatalf("deleted=%#v effect=%#v err=%v", deleted, effect, err)
 	}
@@ -388,7 +388,7 @@ func TestStateOwnerRejectsUnrecoverablePendingTombstones(t *testing.T) {
 			if test.manifest {
 				identity = &manifest
 			}
-			_, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 49, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: test.action, CleanupPhase: "pending", PublishedHead: test.publishedHead, Manifest: identity, EffectAction: "cleanup"})
+			_, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 49, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: test.action, CleanupPhase: "pending", PublishedHead: test.publishedHead, Manifest: identity, EffectAction: "cleanup", EffectRequestDigest: strings.Repeat("a", 64)})
 			if err == nil || !strings.Contains(err.Error(), test.want) || effect != nil {
 				t.Fatalf("effect=%#v err=%v", effect, err)
 			}
