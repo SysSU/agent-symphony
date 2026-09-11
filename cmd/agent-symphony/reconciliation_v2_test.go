@@ -237,15 +237,14 @@ func TestCompleteAttemptAbsenceWithChangedGenerationCountsStaleOnce(t *testing.T
 	issueKey, attemptKey := ownerIssueKey("o/r", 178), ownerAttemptKey("o/r", 178, 1)
 	fact := attemptFact(178, 1, "old generation")
 	issue := issueFact(178, "issue")
-	state := newRuntimeOwnerState("o/r")
-	state.Epoch, state.Revision = 1, 1
-	state.IssueGenerations[issueKey], state.AttemptGenerations[attemptKey] = 1, 2
-	state.Attempts[attemptKey] = runtimeAttemptRecord{Generation: 2, Manifest: manifest}
-	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
+		t.Fatal(err)
+	}
 	initial := repositoryInput(true, issue)
 	initial.Attempts = []internalgithub.RecoveryAttemptFact{fact}
 	applyReconciliationInput(t, owner, initial)
@@ -254,13 +253,16 @@ func TestCompleteAttemptAbsenceWithChangedGenerationCountsStaleOnce(t *testing.T
 		t.Fatal(err)
 	}
 	collection := mustCollection(t, snapshot, repositoryInput(true, issue))
-	collection.AttemptGenerations[attemptKey] = 1 // The complete scan captured the prior attempt generation.
+	current := mustOwnerSnapshot(t, owner)
+	if _, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 178, Attempt: 1, ExpectedIssueGeneration: current.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: current.State.AttemptGenerations[attemptKey], Action: "dismissed", CleanupPhase: "completed"}); err != nil {
+		t.Fatal(err)
+	}
 	applied := applyCollection(t, owner, collection)
 	if applied.State.StaleReconciliations != 1 {
 		t.Fatalf("stale complete-absence count=%d want 1", applied.State.StaleReconciliations)
 	}
-	if !applied.State.Observations[issueKey].Attempts[attemptKey].Present {
-		t.Fatal("stale complete absence removed the newer-generation attempt observation")
+	if _, exists := applied.State.Attempts[attemptKey]; exists || len(applied.State.Observations[issueKey].Attempts) != 0 || applied.State.Tombstones[attemptKey].Action != "dismissed" {
+		t.Fatalf("stale complete absence resurrected invalidated attempt: %#v", applied.State)
 	}
 }
 

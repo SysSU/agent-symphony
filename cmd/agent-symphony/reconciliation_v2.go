@@ -651,9 +651,6 @@ func applyReconciliationIssue(state *runtimeOwnerState, collection reconciliatio
 			}
 			captured, capturedOK := collection.AttemptGenerations[attemptKey]
 			if !capturedOK || state.AttemptGenerations[attemptKey] != captured {
-				if err := countStaleReconciliation(state); err != nil {
-					return err
-				}
 				continue
 			}
 			generation := old.Generation
@@ -710,6 +707,12 @@ func staleReconciliationAttemptKeys(state runtimeOwnerState, collection reconcil
 	for _, proposal := range group.IssueUpdates {
 		if proposal.Kind == githubIssueDependencyClear && proposal.AttributionAttempt > 0 {
 			check(proposal.Repository, proposal.Issue, proposal.AttributionAttempt)
+		}
+	}
+	for key := range collection.AttemptGenerations {
+		repository, issue, attempt, ok := parseOwnerAttemptKey(key)
+		if ok && repository == group.Fact.Repository && issue == group.Fact.Issue {
+			check(repository, issue, attempt)
 		}
 	}
 	return stale
