@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"syscall"
 )
@@ -209,4 +210,81 @@ func removeReconciliationEffectMarker(stateRoot string, identity stateResultIden
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+func reclaimOrphanReconciliationMarkers(stateRoot string, pending map[string]bool) error {
+	directory, err := reconciliationMarkerDirectory(stateRoot, false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	var orphans []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(name, ".done") {
+			return errors.New("reconciliation effect marker directory contains an unsafe entry")
+		}
+		id := strings.TrimSuffix(name, ".done")
+		path, err := reconciliationMarkerPath(directory, id)
+		if err != nil {
+			return err
+		}
+		listed, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		opened, statErr := file.Stat()
+		body, readErr := io.ReadAll(io.LimitReader(file, maxReconciliationMarkerBytes+1))
+		closeErr := file.Close()
+		if statErr != nil || readErr != nil || closeErr != nil || !os.SameFile(listed, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 || !ownedByCurrentUser(opened) || len(body) > maxReconciliationMarkerBytes {
+			return errors.New("reconciliation effect marker is unsafe")
+		}
+		var marker reconciliationEffectMarker
+		decoder := json.NewDecoder(strings.NewReader(string(body)))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&marker) != nil || decoder.Decode(&struct{}{}) != io.EOF || !validOrphanReconciliationMarker(marker, id) {
+			return errors.New("reconciliation effect marker is invalid")
+		}
+		if !pending[id] {
+			orphans = append(orphans, path)
+		}
+	}
+	for _, path := range orphans {
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+	if len(orphans) == 0 {
+		return nil
+	}
+	dir, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func validOrphanReconciliationMarker(marker reconciliationEffectMarker, id string) bool {
+	identity := marker.Identity
+	if marker.Version != 1 || identity.EffectID != id || identity.Repository == "" || identity.Issue < 1 || identity.Epoch == 0 || identity.SourceRevision == 0 || identity.IssueGeneration == 0 || !validDigest(identity.RequestDigest) || marker.Result.Action != identity.Action {
+		return false
+	}
+	if !slices.Contains([]reconciliationEffectAction{reconciliationGitHubBind, reconciliationGitHubPublish, reconciliationGitHubIssueUpdate, reconciliationGitHubPRGovernance, reconciliationReviewer, reconciliationHandoffDeliver, reconciliationRetireCompleted, reconciliationMonitoringCheckIn}, identity.Action) {
+		return false
+	}
+	if identity.Attempt == 0 && identity.AttemptGeneration != 0 || identity.Attempt > 0 && identity.AttemptGeneration == 0 {
+		return false
+	}
+	return countTrue([]bool{marker.Result.GitHubBind != nil, marker.Result.GitHubPublish != nil, marker.Result.GitHubIssueUpdate != nil, marker.Result.GitHubPRGovernance != nil, marker.Result.Reviewer != nil, marker.Result.Handoff != nil, marker.Result.Retire != nil, marker.Result.CheckIn != nil}) == 1
 }

@@ -183,8 +183,14 @@ func TestReconciliationRejectsStaleEpochAndDiscardsStaleGeneration(t *testing.T)
 	snapshot, _ := owner.reconciliationSnapshot(t.Context())
 	staleEpoch := mustCollection(t, snapshot, repositoryInput(true, issueFact(76, "stale")))
 	staleEpoch.Identity.Epoch++
-	if _, err := owner.applyReconciliation(t.Context(), staleEpoch); !errors.Is(err, errStaleStateResult) {
+	if _, err := owner.applyReconciliation(t.Context(), staleEpoch); err != nil {
 		t.Fatalf("stale epoch err=%v", err)
+	}
+	futureSnapshot, _ := owner.reconciliationSnapshot(t.Context())
+	staleSource := mustCollection(t, futureSnapshot, repositoryInput(true, issueFact(76, "stale source")))
+	staleSource.Identity.SourceRevision++
+	if _, err := owner.applyReconciliation(t.Context(), staleSource); err != nil {
+		t.Fatalf("stale source err=%v", err)
 	}
 
 	collection := mustCollection(t, snapshot, repositoryInput(true, issueFact(76, "stale")))
@@ -196,7 +202,7 @@ func TestReconciliationRejectsStaleEpochAndDiscardsStaleGeneration(t *testing.T)
 	if _, exists := state.State.Observations[ownerIssueKey("o/r", 76)]; exists {
 		t.Fatal("stale issue generation restored an observation")
 	}
-	if state.State.StaleReconciliations != 1 {
+	if state.State.StaleReconciliations != 3 {
 		t.Fatalf("stale issue result count=%d", state.State.StaleReconciliations)
 	}
 
@@ -219,6 +225,9 @@ func TestReconciliationRejectsStaleEpochAndDiscardsStaleGeneration(t *testing.T)
 	attemptState, _ := attemptOwner.snapshot(t.Context())
 	if len(attemptState.State.Observations[ownerIssueKey("o/r", 176)].Attempts) != 0 {
 		t.Fatal("stale attempt generation restored an observation")
+	}
+	if attemptState.State.StaleReconciliations != 1 {
+		t.Fatalf("stale attempt result count=%d", attemptState.State.StaleReconciliations)
 	}
 }
 

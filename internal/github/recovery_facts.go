@@ -218,7 +218,9 @@ func RevalidateIssueUpdateProposal(ctx context.Context, api API, cfg PRAdapterCo
 }
 
 func ExecuteIssueUpdateProposal(ctx context.Context, api API, cfg PRAdapterConfig, proposal IssueUpdateProposal) error {
-	applied, err := issueUpdateApplied(ctx, api, cfg, proposal)
+	// Recollect immediately before mutation. The proposal may have changed
+	// after the daemon's earlier owner-authorization read.
+	applied, err := RevalidateIssueUpdateProposal(ctx, api, cfg, proposal)
 	if err != nil || applied {
 		return err
 	}

@@ -536,8 +536,17 @@ func planReconciliationBinds(snapshot stateOwnerSnapshot, cfg internalgithub.PRA
 	for key, record := range snapshot.State.Attempts {
 		manifest := record.Manifest
 		observation, ok := snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
-		if !ok || !observation.Present || observation.OwnerGeneration != snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)] || record.Generation != snapshot.State.AttemptGenerations[key] || manifest.State != "preparing" || !observation.Fact.DispatchAuthorized || observation.Fact.Attempt != manifest.Attempt || observation.Fact.BaseSHA != manifest.BaseSHA {
+		if !ok || !observation.Present || observation.OwnerGeneration != snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)] || record.Generation != snapshot.State.AttemptGenerations[key] || manifest.State != "preparing" || !observation.Fact.DispatchAuthorized || observation.Fact.BaseSHA != manifest.BaseSHA {
 			continue
+		}
+		if observation.Fact.Attempt != manifest.Attempt {
+			replacement, err := currentPreparingReplacement(snapshot.State, observation, observation.Fact.Attempt)
+			if err != nil {
+				return nil, err
+			}
+			if replacement != manifest.Attempt || reconciliationObservationHasActiveBinding(observation) {
+				continue
+			}
 		}
 		if fact, observed := observedReconciliationAttempt(observation, manifest.Attempt); observed && (fact.State == "active" || fact.State == "review-ready") && fact.BaseSHA == manifest.BaseSHA {
 			continue
@@ -550,6 +559,15 @@ func planReconciliationBinds(snapshot stateOwnerSnapshot, cfg internalgithub.PRA
 	}
 	sortReconciliationPlans(plans)
 	return plans, nil
+}
+
+func reconciliationObservationHasActiveBinding(observation reconciliationObservation) bool {
+	for _, attempt := range observation.Attempts {
+		if attempt.Present && (attempt.Fact.State == "active" || attempt.Fact.State == "review-ready") {
+			return true
+		}
+	}
+	return false
 }
 
 func planReconciliationRetirements(snapshot stateOwnerSnapshot) []reconciliationPlannedEffect {
@@ -897,6 +915,7 @@ func (c *runtimeEffectCoordinator) beginReconciliation(ctx context.Context, plan
 		return reconciliationPlannedEffect{}, err
 	}
 	plan.Identity = ownerReconciliationEffectIdentity(*effect)
+	plan.Request = cloneReconciliationRequest(*effect.Reconciliation)
 	return plan, nil
 }
 

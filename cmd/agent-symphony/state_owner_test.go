@@ -467,6 +467,50 @@ func TestStateOwnerCancellationAfterPersistenceDispatchStillCommits(t *testing.T
 	}
 }
 
+func TestStateOwnerCancellationWhileQueuedSkipsPersistence(t *testing.T) {
+	root := resolvedTempDir(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	writes := 0
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error {
+		writes++
+		if writes == 2 {
+			close(entered)
+			<-release
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	first := make(chan error, 1)
+	go func() {
+		_, err := owner.recordControlReceipt(context.Background(), controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: "first", Repository: "o/r", Action: "reconcile"}, State: "pending"})
+		first <- err
+	}()
+	<-entered
+	ctx, cancel := context.WithCancel(t.Context())
+	queued := stateOwnerCommand{
+		kind:    stateOwnerRecordControlReceipt,
+		context: ctx,
+		receipt: recordControlReceiptCommand{Receipt: controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: "canceled", Repository: "o/r", Action: "reconcile"}, State: "pending"}},
+		reply:   make(chan stateOwnerResult, 1),
+	}
+	owner.commands <- queued
+	cancel()
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if result := <-queued.reply; !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("queued result=%#v", result)
+	}
+	snapshot := mustOwnerSnapshot(t, owner)
+	if writes != 2 || snapshot.State.Revision != 2 || len(snapshot.State.ControlReceipts) != 1 || snapshot.State.ControlReceipts[0].Request.RequestID != "first" {
+		t.Fatalf("writes=%d state=%#v", writes, snapshot.State)
+	}
+}
+
 func TestStateOwnerInstalledPersistenceErrorPoisonsAdmission(t *testing.T) {
 	root := resolvedTempDir(t)
 	writes := 0
@@ -686,8 +730,8 @@ func TestStateOwnerShutdownDrainsWriteAndRejectsAcceptedQueue(t *testing.T) {
 		requests[index] = stateOwnerCommand{kind: stateOwnerRecordControlReceipt, receipt: recordControlReceiptCommand{Receipt: controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: fmt.Sprintf("queued-%d", index), Repository: "o/r", Action: "reconcile"}, State: "pending"}}, reply: make(chan stateOwnerResult, 1)}
 		owner.commands <- requests[index]
 	}
-	stopReply := make(chan error, 1)
-	owner.stop <- stateOwnerStopRequest{reply: stopReply}
+	closed := make(chan error, 1)
+	go func() { closed <- owner.close(context.Background()) }()
 	for _, request := range requests {
 		if result := <-request.reply; !errors.Is(result.err, errStateOwnerStopped) {
 			t.Fatalf("queued result=%#v", result)
@@ -697,7 +741,7 @@ func TestStateOwnerShutdownDrainsWriteAndRejectsAcceptedQueue(t *testing.T) {
 	if result := <-first.reply; result.err != nil || result.snapshot.State.Revision != 2 {
 		t.Fatalf("in-flight result=%#v", result)
 	}
-	if err := <-stopReply; err != nil {
+	if err := <-closed; err != nil {
 		t.Fatal(err)
 	}
 	if _, err := owner.snapshot(t.Context()); !errors.Is(err, errStateOwnerStopped) {
@@ -747,6 +791,54 @@ func TestStateOwnerShutdownStartsWithAlreadyCanceledWaitContext(t *testing.T) {
 	case <-owner.done:
 	case <-t.Context().Done():
 		t.Fatal(t.Context().Err())
+	}
+}
+
+func TestStateOwnerConcurrentCloseIsIdempotent(t *testing.T) {
+	root := resolvedTempDir(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	writes := 0
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error {
+		writes++
+		if writes == 2 {
+			close(entered)
+			<-release
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed := make(chan error, 1)
+	go func() {
+		_, err := owner.recordControlReceipt(context.Background(), controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: "drain", Repository: "o/r", Action: "reconcile"}, State: "pending"})
+		committed <- err
+	}()
+	<-entered
+	const callers = 16
+	ready, start, results := make(chan struct{}, callers), make(chan struct{}), make(chan error, callers)
+	for range callers {
+		go func() {
+			ready <- struct{}{}
+			<-start
+			results <- owner.close(context.Background())
+		}()
+	}
+	for range callers {
+		<-ready
+	}
+	close(start)
+	close(release)
+	if err := <-committed; err != nil {
+		t.Fatal(err)
+	}
+	for range callers {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if writes != 2 {
+		t.Fatalf("writes=%d", writes)
 	}
 }
 

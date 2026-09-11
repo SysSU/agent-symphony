@@ -151,15 +151,46 @@ func TestPlanRuntimeLifecycleNeverReusesOwnedAttemptAfterRestart(t *testing.T) {
 	if err != nil || len(plans) != 1 || plans[0].Request.Action != agentruntime.EffectPrepare || plans[0].Request.Attempt.Number != 2 {
 		t.Fatalf("plans=%#v err=%v", plans, err)
 	}
-
-	active := reconciliationAttemptFact{Repository: "o/r", Issue: 10, Attempt: 1, BaseSHA: base, State: "active"}
-	observation := state.Observations[issueKey]
-	observation.Fact.Active, observation.Fact.ActiveAttempt = true, &active
-	observation.Attempts[attemptOne] = reconciliationAttemptObservation{Present: true, Generation: 1, OwnerGeneration: 2, SourceIssueGeneration: 1, ObservationEpoch: 2, LastCycleID: 2, Fact: active}
-	state.Observations[issueKey] = observation
+	replacement := plans[0].Request.Manifest
+	attemptTwo := ownerAttemptKey("o/r", 10, 2)
+	state.AttemptGenerations[attemptTwo] = 1
+	state.Attempts[attemptTwo] = runtimeAttemptRecord{Generation: 1, Manifest: replacement}
 	plans, err = planRuntimeLifecycle(stateOwnerSnapshot{State: state}, batch, config.Default("o/r"), time.Unix(2, 0).UTC(), attemptRoot, root)
 	if err != nil || len(plans) != 0 {
-		t.Fatalf("tombstoned remote attempt planned: %#v err=%v", plans, err)
+		t.Fatalf("preparing replacement allocated another attempt: %#v err=%v", plans, err)
+	}
+	binds, err := planReconciliationBinds(stateOwnerSnapshot{State: state}, internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1})
+	if err != nil || len(binds) != 1 || binds[0].Request.Attempt != 2 {
+		t.Fatalf("replacement binds=%#v err=%v", binds, err)
+	}
+
+	duplicate := replacement
+	duplicate.Attempt = 3
+	duplicate.Branch = strings.TrimSuffix(duplicate.Branch, "-2") + "-3"
+	duplicate.Worktree = strings.TrimSuffix(duplicate.Worktree, "-2") + "-3"
+	duplicate.Session = strings.TrimSuffix(duplicate.Session, "-2") + "-3"
+	attemptThree := ownerAttemptKey("o/r", 10, 3)
+	state.AttemptGenerations[attemptThree] = 1
+	state.Attempts[attemptThree] = runtimeAttemptRecord{Generation: 1, Manifest: duplicate}
+	if _, err := planRuntimeLifecycle(stateOwnerSnapshot{State: state}, batch, config.Default("o/r"), time.Unix(3, 0).UTC(), attemptRoot, root); !errors.Is(err, errStateConflict) {
+		t.Fatalf("multiple replacements err=%v", err)
+	}
+	delete(state.AttemptGenerations, attemptThree)
+	delete(state.Attempts, attemptThree)
+
+	active := reconciliationAttemptFact{Repository: "o/r", Issue: 10, Attempt: 2, BaseSHA: base, State: "active"}
+	observation := state.Observations[issueKey]
+	observation.Fact.Attempt = 2
+	observation.Fact.Active, observation.Fact.ActiveAttempt = true, &active
+	observation.Attempts[attemptTwo] = reconciliationAttemptObservation{Present: true, Generation: 1, OwnerGeneration: 1, SourceIssueGeneration: 1, ObservationEpoch: 2, LastCycleID: 2, Fact: active}
+	state.Observations[issueKey] = observation
+	batch.Input.Issues[0].Attempt = 2
+	batch.Input.Issues[0].Active = true
+	batch.Input.Issues[0].ActiveAttempt = &internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 10, Attempt: 2, BaseSHA: base, State: "active"}
+	batch.Input.Attempts = []internalgithub.RecoveryAttemptFact{*batch.Input.Issues[0].ActiveAttempt}
+	plans, err = planRuntimeLifecycle(stateOwnerSnapshot{State: state}, batch, config.Default("o/r"), time.Unix(4, 0).UTC(), attemptRoot, root)
+	if err != nil || len(plans) != 1 || plans[0].Request.Action != agentruntime.EffectStart || plans[0].Request.Attempt.Number != 2 {
+		t.Fatalf("confirmed replacement start=%#v err=%v", plans, err)
 	}
 }
 
@@ -801,7 +832,7 @@ func TestStartupMarkerSweepLeavesOperatorEffectsToReceiptRecovery(t *testing.T) 
 	if err != nil || effect == nil {
 		t.Fatalf("effect=%#v err=%v", effect, err)
 	}
-	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
+	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, executor: agentruntime.EffectExecutor{Runtime: &agentruntime.Runtime{StateRoot: owner.stateRoot, Root: owner.attemptRoot}}, active: map[string]*activeRuntimeEffect{}}
 	production := &productionReconciliation{owner: owner, effects: effects, stateRoot: owner.stateRoot}
 	if err := production.sweepPendingMarkers(t.Context()); err != nil {
 		t.Fatal(err)
@@ -812,7 +843,7 @@ func TestStartupMarkerSweepLeavesOperatorEffectsToReceiptRecovery(t *testing.T) 
 	}
 }
 
-func TestStartupMarkerSweepReclaimsProofForAlreadyCommittedCompletion(t *testing.T) {
+func TestStartupMarkerSweepReclaimsOrphanProofAbsentFromLedger(t *testing.T) {
 	test := reconciliationEffectCaseNamed(t, "issue-control-snapshot")
 	root, owner, snapshot := reconciliationEffectPersistentOwner(t, test.request)
 	request := bindEffectObservation(snapshot, test.request)
@@ -831,6 +862,7 @@ func TestStartupMarkerSweepReclaimsProofForAlreadyCommittedCompletion(t *testing
 	if err := owner.close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	delete(finished.State.Effects, effect.ID) // Simulate ledger replacement after the effect was retired.
 	restarted, err := startTestStateOwner(t, root, finished.State, func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -843,7 +875,7 @@ func TestStartupMarkerSweepReclaimsProofForAlreadyCommittedCompletion(t *testing
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(filepath.Join(root, "reconciliation-effects", effect.ID+".done")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("committed marker was not reclaimed after restart: %v", err)
+		t.Fatalf("orphan marker was not reclaimed after restart: %v", err)
 	}
 }
 

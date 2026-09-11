@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -217,6 +218,13 @@ type recordControlReceiptCommand struct {
 	Receipt controlReceipt
 }
 
+type recordOperatorDiagnosticCommand struct {
+	RequestID  string
+	Phase      string
+	EffectID   string
+	Diagnostic string
+}
+
 type beginOperatorMutationCommand struct {
 	Request               controlRequest
 	Identity              stateResultIdentity
@@ -271,6 +279,7 @@ const (
 	stateOwnerDiagnoseReconciliationEffect
 	stateOwnerMutatePRRecovery
 	stateOwnerRecordControlReceipt
+	stateOwnerRecordOperatorDiagnostic
 	stateOwnerBeginOperatorMutation
 	stateOwnerStartOperatorCleanup
 	stateOwnerFinishOperatorRuntimeEffect
@@ -296,12 +305,14 @@ type stateOwnerCommand struct {
 	diagnoseReconciliation  diagnoseReconciliationEffectCommand
 	mutatePRRecovery        mutatePRRecoveryCommand
 	receipt                 recordControlReceiptCommand
+	operatorDiagnostic      recordOperatorDiagnosticCommand
 	beginOperator           beginOperatorMutationCommand
 	startOperatorCleanup    startOperatorCleanupCommand
 	finishOperatorRuntime   finishOperatorRuntimeEffectCommand
 	finishOperatorReconcile finishOperatorReconciliationEffectCommand
 	advanceOperatorRecovery advanceOperatorRecoveryCommand
 	cycleOutcome            recordCycleOutcomeCommand
+	context                 context.Context
 	reply                   chan stateOwnerResult
 }
 
@@ -321,8 +332,6 @@ type stateOwnerSnapshotRequest struct {
 	cycle bool
 	reply chan stateOwnerResult
 }
-
-type stateOwnerStopRequest struct{ reply chan error }
 
 type statePersistenceRequest struct {
 	state runtimeOwnerState
@@ -351,7 +360,8 @@ type stateOwner struct {
 	attemptRoot string
 	commands    chan stateOwnerCommand
 	snapshots   chan stateOwnerSnapshotRequest
-	stop        chan stateOwnerStopRequest
+	stop        chan struct{}
+	stopOnce    sync.Once
 	done        chan struct{}
 	commits     chan stateOwnerSnapshot
 }
@@ -376,7 +386,7 @@ func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial
 		attemptRoot: attempts,
 		commands:    make(chan stateOwnerCommand),
 		snapshots:   make(chan stateOwnerSnapshotRequest),
-		stop:        make(chan stateOwnerStopRequest, 1),
+		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
 		commits:     make(chan stateOwnerSnapshot, 1),
 	}
@@ -405,7 +415,7 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 	var queue []stateOwnerCommand
 	var inFlight *pendingStateCommit
 	var persistenceResult <-chan error
-	var stopReply chan error
+	stopping := false
 	var poisoned error
 	var cycleID uint64
 	appliedCycles := map[string]appliedReconciliationCycle{}
@@ -426,6 +436,10 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 		for inFlight == nil && len(queue) > 0 {
 			command := queue[0]
 			queue = queue[1:]
+			if command.context != nil && command.context.Err() != nil {
+				command.reply <- stateOwnerResult{err: command.context.Err()}
+				continue
+			}
 			if poisoned != nil {
 				command.reply <- stateOwnerResult{err: poisoned}
 				continue
@@ -436,24 +450,33 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				continue
 			}
 			if reflect.DeepEqual(candidate, committed) {
-				recordAppliedReconciliationCycles(appliedCycles, command, committed)
+				recordAppliedReconciliationCycles(appliedCycles, command, committed, false)
 				command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(effect)}
 				continue
 			}
 			reply := make(chan error, 1)
-			persistence <- statePersistenceRequest{state: candidate, reply: reply}
+			request := statePersistenceRequest{state: candidate, reply: reply}
+			if command.context == nil {
+				persistence <- request
+			} else {
+				select {
+				case persistence <- request:
+				case <-command.context.Done():
+					command.reply <- stateOwnerResult{err: command.context.Err()}
+					continue
+				}
+			}
 			inFlight = &pendingStateCommit{command: command, candidate: candidate, effect: effect}
 			persistenceResult = reply
 		}
 	}
 
 	finish := func() bool {
-		if stopReply == nil || inFlight != nil {
+		if !stopping || inFlight != nil {
 			return false
 		}
 		close(persistence)
 		<-persistenceDone
-		stopReply <- nil
 		return true
 	}
 
@@ -466,9 +489,13 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 		if len(queue) == stateOwnerQueueSize {
 			commandInput = nil
 		}
+		stopInput := (<-chan struct{})(o.stop)
+		if stopping {
+			stopInput = nil
+		}
 		select {
 		case command := <-commandInput:
-			if stopReply != nil {
+			if stopping {
 				command.reply <- stateOwnerResult{err: errStateOwnerStopped}
 			} else if poisoned != nil {
 				command.reply <- stateOwnerResult{err: poisoned}
@@ -476,7 +503,7 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				queue = append(queue, command)
 			}
 		case request := <-o.snapshots:
-			if stopReply != nil {
+			if stopping {
 				request.reply <- stateOwnerResult{err: errStateOwnerStopped}
 			} else if poisoned != nil {
 				request.reply <- stateOwnerResult{err: poisoned}
@@ -492,7 +519,7 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 			if err == nil {
 				committed = inFlight.candidate
 				publish()
-				recordAppliedReconciliationCycles(appliedCycles, inFlight.command, committed)
+				recordAppliedReconciliationCycles(appliedCycles, inFlight.command, committed, true)
 				inFlight.command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(inFlight.effect)}
 			} else {
 				inFlight.command.reply <- stateOwnerResult{err: err}
@@ -506,12 +533,8 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				}
 			}
 			inFlight, persistenceResult = nil, nil
-		case request := <-o.stop:
-			if stopReply != nil {
-				request.reply <- errStateOwnerStopped
-				continue
-			}
-			stopReply = request.reply
+		case <-stopInput:
+			stopping = true
 			for _, command := range queue {
 				command.reply <- stateOwnerResult{err: errStateOwnerStopped}
 			}
@@ -521,20 +544,15 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 }
 
 func (o *stateOwner) close(ctx context.Context) error {
-	reply := make(chan error, 1)
 	select {
 	case <-o.done:
 		return nil
 	default:
 	}
+	o.stopOnce.Do(func() { close(o.stop) })
 	select {
 	case <-o.done:
 		return nil
-	case o.stop <- stateOwnerStopRequest{reply: reply}:
-	}
-	select {
-	case err := <-reply:
-		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -569,6 +587,7 @@ func (o *stateOwner) submit(ctx context.Context, command stateOwnerCommand) (sta
 	if err := ctx.Err(); err != nil {
 		return stateOwnerResult{}, err
 	}
+	command.context = ctx
 	command.reply = make(chan stateOwnerResult, 1)
 	select {
 	case <-o.done:
@@ -618,6 +637,11 @@ func (o *stateOwner) authorizeRuntimeEffect(ctx context.Context, command authori
 
 func (o *stateOwner) recordControlReceipt(ctx context.Context, receipt controlReceipt) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRecordControlReceipt, receipt: recordControlReceiptCommand{Receipt: receipt}})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) recordOperatorDiagnostic(ctx context.Context, command recordOperatorDiagnosticCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRecordOperatorDiagnostic, operatorDiagnostic: command})
 	return result.snapshot, err
 }
 
@@ -731,6 +755,10 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		}
 	case stateOwnerRecordControlReceipt:
 		if err := applyControlReceipt(&candidate, command.receipt.Receipt); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerRecordOperatorDiagnostic:
+		if err := applyRecordOperatorDiagnostic(&candidate, command.operatorDiagnostic); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerBeginOperatorMutation:
@@ -1279,6 +1307,24 @@ func applyControlReceipt(state *runtimeOwnerState, receipt controlReceipt) error
 	}
 	state.ControlReceipts = append(state.ControlReceipts, cloneControlReceipt(receipt))
 	return nil
+}
+
+func applyRecordOperatorDiagnostic(state *runtimeOwnerState, command recordOperatorDiagnosticCommand) error {
+	if command.RequestID == "" || command.Phase != operatorPhaseTerminalAwait && command.Phase != operatorPhaseRetryAwait || !boundedText(command.Diagnostic, maxReconciliationStringBytes, true) {
+		return errStateConflict
+	}
+	for index := range state.ControlReceipts {
+		receipt := &state.ControlReceipts[index]
+		if receipt.Request.RequestID != command.RequestID {
+			continue
+		}
+		if receipt.State != "pending" || receipt.Phase != command.Phase || receipt.EffectID != command.EffectID {
+			return errStaleStateResult
+		}
+		receipt.Diagnostic = command.Diagnostic
+		return nil
+	}
+	return errStaleStateResult
 }
 
 func loadOrMigrateRuntimeOwnerState(stateRoot, legacyRecoveryPath, repository string) (runtimeOwnerState, bool, error) {

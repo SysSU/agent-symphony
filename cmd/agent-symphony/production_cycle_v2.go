@@ -94,7 +94,30 @@ func (p *productionReconciliation) sweepPendingMarkers(ctx context.Context) erro
 			return err
 		}
 	}
-	return nil
+	current, err := p.owner.snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	runtimePending := map[string]bool{}
+	reconciliationPending := map[string]bool{}
+	for id, effect := range current.State.Effects {
+		if effect.State != "pending" {
+			continue
+		}
+		if effect.Reconciliation == nil {
+			runtimePending[id] = true
+		} else {
+			reconciliationPending[id] = true
+		}
+	}
+	if p.effects.executor.Runtime == nil {
+		if len(runtimePending) > 0 {
+			return errors.New("runtime marker recovery is unavailable")
+		}
+	} else if err := p.effects.executor.Runtime.ReclaimOrphanEffectMarkers(runtimePending); err != nil {
+		return err
+	}
+	return reclaimOrphanReconciliationMarkers(p.stateRoot, reconciliationPending)
 }
 
 var errReconciliationRecollect = errors.New("reconciliation requires fresh external observations")
@@ -803,7 +826,15 @@ func planRuntimeLifecycle(snapshot stateOwnerSnapshot, batch reconciliationV2Bat
 		currentRecord, locallyOwned := snapshot.State.Attempts[initialKey]
 		locallyOwned = locallyOwned && currentRecord.Generation == snapshot.State.AttemptGenerations[initialKey]
 		if !remotelyActive && !locallyOwned {
-			attemptNumber = firstUnreservedAttempt(snapshot.State, issue.Repository, issue.Issue, attemptNumber)
+			replacement, err := currentPreparingReplacement(snapshot.State, observation, attemptNumber)
+			if err != nil {
+				return nil, err
+			}
+			if replacement > 0 {
+				attemptNumber = replacement
+			} else {
+				attemptNumber = firstUnreservedAttempt(snapshot.State, issue.Repository, issue.Issue, attemptNumber)
+			}
 			if attemptNumber < 1 {
 				continue
 			}
@@ -868,6 +899,24 @@ func planRuntimeLifecycle(snapshot stateOwnerSnapshot, batch reconciliationV2Bat
 		return cmp.Compare(a.Request.Action, b.Request.Action)
 	})
 	return plans, nil
+}
+
+func currentPreparingReplacement(state runtimeOwnerState, observation reconciliationObservation, proposed int) (int, error) {
+	replacement := 0
+	for key, record := range state.Attempts {
+		manifest := record.Manifest
+		if manifest.Repository != observation.Fact.Repository || manifest.Issue != observation.Fact.Issue || manifest.Attempt <= proposed || manifest.State != "preparing" || record.Generation != state.AttemptGenerations[key] {
+			continue
+		}
+		if _, tombstoned := state.Tombstones[key]; tombstoned {
+			continue
+		}
+		if replacement != 0 && replacement != manifest.Attempt {
+			return 0, errStateConflict
+		}
+		replacement = manifest.Attempt
+	}
+	return replacement, nil
 }
 
 func firstUnreservedAttempt(state runtimeOwnerState, repository string, issue, proposed int) int {

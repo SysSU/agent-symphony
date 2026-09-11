@@ -58,11 +58,12 @@ type controlResult struct {
 }
 
 type controlReceipt struct {
-	Request  controlRequest `json:"request"`
-	State    string         `json:"state"`
-	Phase    string         `json:"phase,omitempty"`
-	EffectID string         `json:"effect_id,omitempty"`
-	Result   *controlResult `json:"result,omitempty"`
+	Request    controlRequest `json:"request"`
+	State      string         `json:"state"`
+	Phase      string         `json:"phase,omitempty"`
+	EffectID   string         `json:"effect_id,omitempty"`
+	Diagnostic string         `json:"diagnostic,omitempty"`
+	Result     *controlResult `json:"result,omitempty"`
 }
 
 type controlReceiptState struct {

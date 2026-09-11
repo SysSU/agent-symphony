@@ -272,6 +272,12 @@ func applyBeginReconciliationEffect(attemptRoot, stateRoot string, state *runtim
 		if effect.Action == string(request.Action) && effect.RequestDigest == digest && effect.IssueGeneration == identity.IssueGeneration && effect.AttemptGeneration == attemptGeneration {
 			return cloneEffect(&effect), nil
 		}
+		// Retry authorization is about one failed attempt, not the collection
+		// cycle that happened to observe it. A dashboard Recover and the
+		// background reconciler must converge on the already-durable retry.
+		if samePendingRetryEffect(effect, request, identity.IssueGeneration, attemptGeneration) {
+			return cloneEffect(&effect), nil
+		}
 		return nil, errStateConflict
 	}
 	if identity.SourceRevision != state.Revision {
@@ -286,6 +292,18 @@ func applyBeginReconciliationEffect(attemptRoot, stateRoot string, state *runtim
 		return nil, err
 	}
 	return &runtimeEffectIntent{Action: string(request.Action), Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, IssueGeneration: identity.IssueGeneration, AttemptGeneration: attemptGeneration, IntentEpoch: state.Epoch, State: "pending", RequestDigest: digest, Reconciliation: &request}, nil
+}
+
+func samePendingRetryEffect(effect runtimeEffectIntent, request reconciliationEffectRequest, issueGeneration, attemptGeneration uint64) bool {
+	return effect.State == "pending" && effect.Reconciliation != nil &&
+		effect.Action == string(reconciliationGitHubIssueUpdate) && request.Action == reconciliationGitHubIssueUpdate &&
+		effect.Reconciliation.GitHubIssueUpdate != nil && request.GitHubIssueUpdate != nil &&
+		effect.Reconciliation.GitHubIssueUpdate.Kind == githubIssueRetry && request.GitHubIssueUpdate.Kind == githubIssueRetry &&
+		effect.Repository == request.Repository && effect.Issue == request.Issue && effect.Attempt == request.Attempt &&
+		effect.IssueGeneration == issueGeneration && effect.AttemptGeneration == attemptGeneration &&
+		reflect.DeepEqual(effect.Reconciliation.Manifest, request.Manifest) &&
+		effect.Reconciliation.GitHubIssueUpdate.FailedAtUnixNano == request.GitHubIssueUpdate.FailedAtUnixNano &&
+		effect.Reconciliation.BodyDigest == request.BodyDigest && effect.Reconciliation.ExecutionDigest == request.ExecutionDigest
 }
 
 func applyReconciliationBeginTransition(state *runtimeOwnerState, request reconciliationEffectRequest) error {
@@ -344,6 +362,12 @@ func applyFinishReconciliationEffect(stateRoot string, state *runtimeOwnerState,
 	}
 	effect.State, effect.ReconciliationResult, effect.Diagnostic = "completed", &result, ""
 	state.Effects[effect.ID] = effect
+	if effect.Reconciliation.Action == reconciliationGitHubIssueUpdate && effect.Reconciliation.GitHubIssueUpdate != nil &&
+		effect.Reconciliation.GitHubIssueUpdate.Kind == githubIssueTerminalFailure &&
+		advanceRecoverReceipts(state, effect.ID, operatorPhaseTerminal, operatorPhaseRetryAwait) {
+		return nil
+	}
+	completeOperatorReceipts(state, effect.ID)
 	return nil
 }
 

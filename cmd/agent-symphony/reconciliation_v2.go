@@ -406,8 +406,11 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 		return err
 	}
 	identity := collection.Identity
-	if identity.Epoch != state.Epoch || identity.SourceRevision == 0 || identity.SourceRevision > state.Revision {
-		return errStaleStateResult
+	if identity.Epoch != state.Epoch {
+		return countStaleReconciliation(state)
+	}
+	if identity.SourceRevision == 0 || identity.SourceRevision > state.Revision {
+		return countStaleReconciliation(state)
 	}
 	seen := make(map[string]bool, len(collection.Issues))
 	for _, group := range collection.Issues {
@@ -519,11 +522,18 @@ func countStaleReconciliation(state *runtimeOwnerState) error {
 	return nil
 }
 
-func recordAppliedReconciliationCycles(applied map[string]appliedReconciliationCycle, command stateOwnerCommand, state runtimeOwnerState) {
+func recordAppliedReconciliationCycles(applied map[string]appliedReconciliationCycle, command stateOwnerCommand, state runtimeOwnerState, changed bool) {
 	if command.kind != stateOwnerApplyReconciliation {
 		return
 	}
 	collection := command.reconcile.Collection
+	maxSourceRevision := state.Revision
+	if changed && maxSourceRevision > 0 {
+		maxSourceRevision--
+	}
+	if collection.Identity.Epoch != state.Epoch || collection.Identity.SourceRevision == 0 || collection.Identity.SourceRevision > maxSourceRevision {
+		return
+	}
 	seen := make(map[string]bool, len(collection.Issues))
 	for _, group := range collection.Issues {
 		key := ownerIssueKey(group.Fact.Repository, group.Fact.Issue)
@@ -576,6 +586,11 @@ func reconciliationIssueGenerationMatches(state runtimeOwnerState, key string, c
 
 func applyReconciliationIssue(state *runtimeOwnerState, collection reconciliationCollection, group reconciliationIssueGroup) error {
 	identity, key := collection.Identity, ownerIssueKey(group.Fact.Repository, group.Fact.Issue)
+	for range staleReconciliationAttemptKeys(*state, collection, group) {
+		if err := countStaleReconciliation(state); err != nil {
+			return err
+		}
+	}
 	group = prepareReconciliationIssueGroup(*state, collection, group)
 	digest := reconciliationInputDigest(collection.Scope, collection.Complete, key, &group)
 	previous, exists := state.Observations[key]
@@ -664,6 +679,33 @@ func applyReconciliationIssue(state *runtimeOwnerState, collection reconciliatio
 		state.Recoveries[attemptKey] = runtimePRRecovery{IssueGeneration: ownerIssueGeneration, AttemptGeneration: observation.OwnerGeneration, State: pr}
 	}
 	return nil
+}
+
+func staleReconciliationAttemptKeys(state runtimeOwnerState, collection reconciliationCollection, group reconciliationIssueGroup) map[string]bool {
+	stale := map[string]bool{}
+	check := func(repository string, issue, attempt int) {
+		key := ownerAttemptKey(repository, issue, attempt)
+		captured, capturedOK := collection.AttemptGenerations[key]
+		_, tombstoned := state.Tombstones[key]
+		if tombstoned || !capturedOK || captured != state.AttemptGenerations[key] {
+			stale[key] = true
+		}
+	}
+	if group.Fact.ActiveAttempt != nil {
+		check(group.Fact.ActiveAttempt.Repository, group.Fact.ActiveAttempt.Issue, group.Fact.ActiveAttempt.Attempt)
+	}
+	for _, fact := range group.Fact.TerminalAttempts {
+		check(fact.Repository, fact.Issue, fact.Attempt)
+	}
+	for _, fact := range group.Attempts {
+		check(fact.Repository, fact.Issue, fact.Attempt)
+	}
+	for _, proposal := range group.IssueUpdates {
+		if proposal.Kind == githubIssueDependencyClear && proposal.AttributionAttempt > 0 {
+			check(proposal.Repository, proposal.Issue, proposal.AttributionAttempt)
+		}
+	}
+	return stale
 }
 
 func prepareReconciliationIssueGroup(state runtimeOwnerState, collection reconciliationCollection, group reconciliationIssueGroup) reconciliationIssueGroup {

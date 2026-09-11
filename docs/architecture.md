@@ -80,7 +80,7 @@ GitHub stores durable execution facts using machine-readable HTML markers in coo
 -->
 ```
 
-The marker schemas are strict and size-bounded and are parsed only from the authenticated coordinator user returned by `gh api /user`. Dispatch first commits a typed Prepare intent and preparing manifest to the owner ledger. Bind then persists the active GitHub marker for the approved base and deterministic branch. Only after the owner records that verified Bind result may Start seed the worktree and launch the process. A matching final PR marker or terminal marker later supersedes the active marker. Human-readable text accompanies each marker. GitHub proposes the integer after its highest valid marker; the owner advances past any attempt numbers already reserved locally. Branch `agent-symphony/<repo-id>/<issue>-<attempt>`, worktree `<root>/<repo-id>-<issue>-<attempt>`, and tmux session `as-<repo-id>-<issue>-<attempt>` are deterministic. A PR contains `Closes #N` and the final attempt marker. These identifiers make discovery possible without local files.
+The marker schemas are strict and size-bounded and are parsed only from the authenticated coordinator user returned by `gh api /user`. Dispatch first commits a typed Prepare intent and preparing manifest to the owner ledger. Prepare creates the isolated repository, checks out the deterministic branch at the approved base, and verifies the resulting worktree. Bind then persists the active GitHub marker for that base and branch. Only after the owner records that verified Bind result may Start launch the process in the prepared worktree. A matching final PR marker or terminal marker later supersedes the active marker. Human-readable text accompanies each marker. GitHub proposes the integer after its highest valid marker; the owner advances past any attempt numbers already reserved locally. Branch `agent-symphony/<repo-id>/<issue>-<attempt>`, worktree `<root>/<repo-id>-<issue>-<attempt>`, and tmux session `as-<repo-id>-<issue>-<attempt>` are deterministic. A PR contains `Closes #N` and the final attempt marker. These identifiers make discovery possible without local files.
 
 Issue/PR state, labels, comments, reviews, check runs, branch heads, and repository rules always beat local metadata. A contradiction blocks mutation, emits diagnostics, and requests reconciliation. Local files may never make completed work eligible again.
 
@@ -102,9 +102,10 @@ orchestrator-context.md      # mode 0600 bounded advisory context
 snapshots/.../orchestrator-attention-handoff.json # mode 0440 current exact attention handoff
 worktrees/                   # default same-user attempt roots
 snapshots/                   # review snapshots and managed orchestrator workspaces
-attempts/<repo-id>/<issue>-<n>/manifest.json
 attempts/<repo-id>/<issue>-<n>/agent.log
 ```
+
+Legacy per-attempt `manifest.json` files are migration input only. The v2 ledger contains the authoritative manifest.
 
 `deployment.json` version 2 is a one-way deployment fence. `serve` authenticates first, acquires `daemon.lock`, installs and syncs the fence, then installs or loads `runtime-state.json` before admitting dashboard, control, proposal, or reconciliation work. A pre-v2 writer rejects the fence. If the process stops after the fence but before the first ledger commit, the next v2 process completes the migration while holding the same lock. An existing valid v2 ledger is never re-imported from legacy files.
 

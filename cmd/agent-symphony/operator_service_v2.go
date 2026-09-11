@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
@@ -45,8 +46,9 @@ type operatorWork struct {
 }
 
 type operatorReceiptStatus struct {
-	Phase    string `json:"phase"`
-	EffectID string `json:"effect_id,omitempty"`
+	Phase      string `json:"phase"`
+	EffectID   string `json:"effect_id,omitempty"`
+	Diagnostic string `json:"diagnostic,omitempty"`
 }
 
 func newOperatorMutationService(lifecycle context.Context, owner *stateOwner, effects *runtimeEffectCoordinator, cleanup operatorCleanupExecutor, collector reconciliationV2Collector, reviewer boundaryCaller, reviewSource string, reviewEnvironment, reviewCommand []string) (*operatorMutationService, error) {
@@ -205,6 +207,14 @@ func (s *operatorMutationService) recoveryAttachCommand(snapshot stateOwnerSnaps
 		if !exists || !operatorReceiptMatchesEffect(receipt, effect) {
 			return beginOperatorMutationCommand{Request: request}, true
 		}
+		observation := snapshot.State.Observations[ownerIssueKey(request.Repository, request.Issue)]
+		return beginOperatorMutationCommand{
+			Request: request, Manifest: cloneManifest(record.Manifest),
+			ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, ObservationBodyDigest: observation.Fact.BodyDigest,
+			Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], AttemptGeneration: snapshot.State.AttemptGenerations[key]},
+		}, true
+	}
+	if effect := currentRetryEffect(snapshot.State, request.Repository, request.Issue, request.Attempt); effect != nil {
 		observation := snapshot.State.Observations[ownerIssueKey(request.Repository, request.Issue)]
 		return beginOperatorMutationCommand{
 			Request: request, Manifest: cloneManifest(record.Manifest),
@@ -425,7 +435,27 @@ func bindOperatorWorkIdentity(work *operatorWork, effect runtimeEffectIntent) {
 	}
 	if work.plan != nil {
 		work.plan.Identity = ownerReconciliationEffectIdentity(effect)
+		work.plan.Request = cloneReconciliationRequest(*effect.Reconciliation)
 	}
+}
+
+func currentRetryEffect(state runtimeOwnerState, repository string, issue, attempt int) *runtimeEffectIntent {
+	issueGeneration := state.IssueGenerations[ownerIssueKey(repository, issue)]
+	attemptGeneration := state.AttemptGenerations[ownerAttemptKey(repository, issue, attempt)]
+	var found *runtimeEffectIntent
+	for _, effect := range state.Effects {
+		if effect.Repository != repository || effect.Issue != issue || effect.Attempt != attempt || effect.Reconciliation == nil ||
+			effect.Reconciliation.Action != reconciliationGitHubIssueUpdate || effect.Reconciliation.GitHubIssueUpdate == nil ||
+			effect.Reconciliation.GitHubIssueUpdate.Kind != githubIssueRetry || effect.IssueGeneration != issueGeneration ||
+			effect.AttemptGeneration != attemptGeneration || effect.State != "pending" && effect.State != "completed" {
+			continue
+		}
+		if found != nil {
+			return nil
+		}
+		found = cloneEffect(&effect)
+	}
+	return found
 }
 
 func (s *operatorMutationService) dispatch(work operatorWork) {
@@ -455,18 +485,38 @@ func (s *operatorMutationService) executeOnce(work operatorWork, reserved string
 	if key == reserved {
 		return s.execute(work)
 	}
-	if !s.reserve(key) {
+	reservedSuccessor := reserved != ""
+	if reservedSuccessor && !s.reserveSuccessor(reserved, key) || !reservedSuccessor && !s.reserve(key) {
 		return nil
 	}
 	defer s.release(key)
 	return s.execute(work)
 }
 
+// reserveSuccessor lets work admitted before shutdown finish its already-
+// durable multi-stage transition without opening admission for unrelated work.
+func (s *operatorMutationService) reserveSuccessor(current, next string) bool {
+	if current == "" || next == "" || current == next {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active[current] || s.active[next] {
+		return false
+	}
+	s.active[next] = true
+	return true
+}
+
 func (s *operatorMutationService) execute(work operatorWork) error {
+	return s.executeReserved(work, operatorWorkEffectID(work))
+}
+
+func (s *operatorMutationService) executeReserved(work operatorWork, reserved string) error {
 	if work.runtime != nil {
 		result, err := s.effects.executeOperator(*work.runtime)
 		if result.Disposition == agentruntime.EffectResultReady && work.requestID != "" {
-			err = errors.Join(err, s.resumeReceipt(s.lifecycle, work.requestID))
+			err = errors.Join(err, s.resumeReceiptReserved(s.lifecycle, work.requestID, reserved))
 		}
 		return err
 	}
@@ -476,13 +526,13 @@ func (s *operatorMutationService) execute(work operatorWork) error {
 	if work.reviewer != nil {
 		result, pending, err := s.effects.executeOperatorReviewer(s.reviewer, *work.plan, *work.reviewer)
 		if !pending && result.Action != "" && work.requestID != "" {
-			err = errors.Join(err, s.resumeReceipt(s.lifecycle, work.requestID))
+			err = errors.Join(err, s.resumeReceiptReserved(s.lifecycle, work.requestID, reserved))
 		}
 		return err
 	}
 	result, err := s.effects.executeOperatorIssueUpdate(s.collector.API, *work.plan)
 	if result.Action != "" && work.requestID != "" {
-		err = errors.Join(err, s.resumeReceipt(s.lifecycle, work.requestID))
+		err = errors.Join(err, s.resumeReceiptReserved(s.lifecycle, work.requestID, reserved))
 	}
 	return err
 }
@@ -619,7 +669,7 @@ func operatorResultForReceipt(snapshot stateOwnerSnapshot, receipt controlReceip
 	if receipt.State == "completed" {
 		return *receipt.Result
 	}
-	body, _ := json.Marshal(operatorReceiptStatus{Phase: receipt.Phase, EffectID: receipt.EffectID})
+	body, _ := json.Marshal(operatorReceiptStatus{Phase: receipt.Phase, EffectID: receipt.EffectID, Diagnostic: receipt.Diagnostic})
 	return controlResult{Version: controlVersion, RequestID: receipt.Request.RequestID, Action: receipt.Request.Action, OK: true, Status: http.StatusAccepted, OwnerRevision: snapshot.State.Revision, Data: body}
 }
 
@@ -661,11 +711,11 @@ func (s *operatorMutationService) resumeReceiptReserved(ctx context.Context, req
 		}
 		fresh, batch, err := s.collectIssue(ctx, receipt.Request.Issue)
 		if err != nil {
-			return err
+			return errors.Join(err, s.recordAwaitingDiagnostic(receipt, err))
 		}
 		command, work, err := s.prepareRecoveryAdmission(fresh, batch, receipt.Request, kind)
 		if err != nil {
-			return err
+			return errors.Join(err, s.recordAwaitingDiagnostic(receipt, err))
 		}
 		committed, effect, err := s.owner.advanceOperatorRecovery(ctx, advanceOperatorRecoveryCommand{RequestID: requestID, Identity: command.Identity, Reconciliation: *command.Reconciliation})
 		if err != nil {
@@ -719,6 +769,15 @@ func (s *operatorMutationService) resumeReceiptReserved(ctx context.Context, req
 		return errStateConflict
 	}
 	return s.executeOnce(operatorWork{requestID: requestID, runtime: &bound}, reserved)
+}
+
+func (s *operatorMutationService) recordAwaitingDiagnostic(receipt controlReceipt, cause error) error {
+	diagnostic := strings.ToValidUTF8("recovery admission remains pending: "+internalgithub.Redact(cause.Error()), "?")
+	if len(diagnostic) > maxReconciliationStringBytes {
+		diagnostic = diagnostic[:maxReconciliationStringBytes]
+	}
+	_, err := s.owner.recordOperatorDiagnostic(s.lifecycle, recordOperatorDiagnosticCommand{RequestID: receipt.Request.RequestID, Phase: receipt.Phase, EffectID: receipt.EffectID, Diagnostic: diagnostic})
+	return err
 }
 
 func (s *operatorMutationService) reconstructRuntimeRequest(snapshot stateOwnerSnapshot, effect runtimeEffectIntent) (agentruntime.EffectRequest, error) {
@@ -803,6 +862,9 @@ func (s *operatorMutationService) resumePending(ctx context.Context) error {
 			continue
 		}
 		if receipt.Phase == operatorPhaseTerminalAwait || receipt.Phase == operatorPhaseRetryAwait {
+			if receipt.Diagnostic != "" {
+				continue
+			}
 			s.dispatchResume(requestID)
 			continue
 		}
@@ -816,6 +878,7 @@ func (s *operatorMutationService) resumePending(ctx context.Context) error {
 				return verifyErr
 			}
 			if result != nil {
+				s.dispatchResume(requestID)
 				continue
 			}
 			s.dispatchResume(requestID)
@@ -832,8 +895,12 @@ func (s *operatorMutationService) resumePending(ctx context.Context) error {
 		if reconstructErr != nil {
 			return reconstructErr
 		}
-		if _, verifyErr := s.effects.verifyPendingOperator(ctx, snapshot, effect, request); verifyErr != nil {
+		verification, verifyErr := s.effects.verifyPendingOperator(ctx, snapshot, effect, request)
+		if verifyErr != nil {
 			return verifyErr
+		}
+		if verification.Disposition == agentruntime.EffectVerified {
+			s.dispatchResume(requestID)
 		}
 	}
 	return nil

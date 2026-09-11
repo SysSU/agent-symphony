@@ -212,6 +212,7 @@ func applyStartOperatorCleanup(state *runtimeOwnerState, command startOperatorCl
 	for index := range state.ControlReceipts {
 		if state.ControlReceipts[index].EffectID == effect.ID && state.ControlReceipts[index].State == "pending" {
 			state.ControlReceipts[index].Phase = operatorPhaseCleanupStarted
+			state.ControlReceipts[index].Diagnostic = ""
 		}
 	}
 	return nil
@@ -228,15 +229,7 @@ func applyFinishOperatorRuntimeEffect(attemptRoot, stateRoot string, state *runt
 }
 
 func applyFinishOperatorReconciliationEffect(stateRoot string, state *runtimeOwnerState, command finishOperatorReconciliationEffectCommand) error {
-	if err := applyFinishReconciliationEffect(stateRoot, state, command.Finish); err != nil {
-		return err
-	}
-	effect := state.Effects[command.Finish.Identity.EffectID]
-	if effect.Reconciliation != nil && effect.Reconciliation.Action == reconciliationGitHubIssueUpdate && effect.Reconciliation.GitHubIssueUpdate != nil && effect.Reconciliation.GitHubIssueUpdate.Kind == githubIssueTerminalFailure && advanceRecoverReceipts(state, effect.ID, operatorPhaseTerminal, operatorPhaseRetryAwait) {
-		return nil
-	}
-	completeOperatorReceipts(state, command.Finish.Identity.EffectID)
-	return nil
+	return applyFinishReconciliationEffect(stateRoot, state, command.Finish)
 }
 
 func applyAdvanceOperatorRecovery(attemptRoot, stateRoot string, state *runtimeOwnerState, command advanceOperatorRecoveryCommand) (*runtimeEffectIntent, error) {
@@ -283,6 +276,7 @@ func applyAdvanceOperatorRecovery(attemptRoot, stateRoot string, state *runtimeO
 		if candidate.Request.Action == "recover" && candidate.State == "pending" && candidate.Phase == receipt.Phase && candidate.EffectID == receipt.EffectID {
 			candidate.Phase = phase
 			candidate.EffectID = ""
+			candidate.Diagnostic = ""
 		}
 	}
 	return effect, nil
@@ -294,6 +288,7 @@ func advanceRecoverReceipts(state *runtimeOwnerState, effectID, from, to string)
 		receipt := &state.ControlReceipts[index]
 		if receipt.Request.Action == "recover" && receipt.State == "pending" && receipt.Phase == from && receipt.EffectID == effectID {
 			receipt.Phase = to
+			receipt.Diagnostic = ""
 			advanced = true
 		}
 	}
@@ -305,6 +300,7 @@ func completeOperatorReceipts(state *runtimeOwnerState, effectID string) {
 		receipt := &state.ControlReceipts[index]
 		if receipt.EffectID == effectID && receipt.State == "pending" {
 			receipt.State, receipt.Phase = "completed", operatorPhaseCompleted
+			receipt.Diagnostic = ""
 			receipt.Result = successfulOperatorResult(receipt.Request, state.Revision+1)
 		}
 	}
@@ -319,6 +315,7 @@ func supersedePendingOperatorWorkflows(state *runtimeOwnerState, repository stri
 		}
 		remove[receipt.EffectID] = true
 		receipt.State, receipt.Phase, receipt.EffectID = "completed", operatorPhaseCompleted, ""
+		receipt.Diagnostic = ""
 		receipt.Result = &controlResult{Version: controlVersion, RequestID: receipt.Request.RequestID, Action: receipt.Request.Action, Status: http.StatusConflict, Error: "operator workflow superseded by " + action, OwnerRevision: state.Revision + 1}
 	}
 	for effectID := range remove {
@@ -419,6 +416,21 @@ func attachOperatorRecovery(state *runtimeOwnerState, command beginOperatorMutat
 			return nil, true, err
 		}
 		return cloneEffect(&effect), true, nil
+	}
+	if effect := currentRetryEffect(*state, command.Request.Repository, command.Request.Issue, command.Request.Attempt); effect != nil {
+		if command.Identity.IssueGeneration != effect.IssueGeneration || command.Identity.AttemptGeneration != effect.AttemptGeneration ||
+			effect.Reconciliation.Manifest == nil || !sameRuntimeEffectManifestBase(*effect.Reconciliation.Manifest, manifest, false) {
+			return nil, true, errStateConflict
+		}
+		receipt := controlReceipt{Request: command.Request, State: "pending", Phase: operatorPhaseRetryPending, EffectID: effect.ID}
+		if effect.State == "completed" {
+			receipt.State, receipt.Phase = "completed", operatorPhaseCompleted
+			receipt.Result = successfulOperatorResult(command.Request, state.Revision+1)
+		}
+		if err := appendOperatorReceipt(state, receipt); err != nil {
+			return nil, true, err
+		}
+		return cloneEffect(effect), true, nil
 	}
 	return nil, false, nil
 }
@@ -524,15 +536,15 @@ func validDestructiveOperatorStatus(action string, status orchestrator.RecoveryS
 
 func validOperatorReceiptBinding(receipt controlReceipt) bool {
 	if receipt.Phase == "" {
-		return receipt.EffectID == ""
+		return receipt.EffectID == "" && receipt.Diagnostic == ""
 	}
 	if !slices.Contains([]string{operatorPhaseCleanupPending, operatorPhaseCleanupStarted, operatorPhaseStopPending, operatorPhaseTerminalAwait, operatorPhaseTerminal, operatorPhaseRetryAwait, operatorPhaseRetryPending, operatorPhaseReviewPending, operatorPhaseCompleted}, receipt.Phase) {
 		return false
 	}
 	if receipt.State == "completed" {
-		return receipt.Phase == operatorPhaseCompleted && receipt.Result != nil
+		return receipt.Phase == operatorPhaseCompleted && receipt.Result != nil && receipt.Diagnostic == ""
 	}
-	return receipt.State == "pending" && receipt.Phase != operatorPhaseCompleted && receipt.EffectID != "" && receipt.Result == nil
+	return receipt.State == "pending" && receipt.Phase != operatorPhaseCompleted && receipt.EffectID != "" && receipt.Result == nil && boundedText(receipt.Diagnostic, maxReconciliationStringBytes, false)
 }
 
 func sameOperatorBeginIdentity(begin, operator stateResultIdentity) bool {

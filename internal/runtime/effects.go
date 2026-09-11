@@ -331,6 +331,13 @@ func (r *Runtime) readEffectMarker(identity EffectIdentity, action EffectAction)
 	if err != nil {
 		return nil, err
 	}
+	listed, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -343,7 +350,7 @@ func (r *Runtime) readEffectMarker(identity EffectIdentity, action EffectAction)
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || info.Size() < 2 || info.Size() > 1<<20 {
+	if !os.SameFile(listed, info) || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || !runtimeOwnedByCurrentUser(info) || info.Size() < 2 || info.Size() > 1<<20 {
 		return nil, errors.New("runtime effect marker is unsafe")
 	}
 	body, err := io.ReadAll(io.LimitReader(file, 1<<20+1))
@@ -369,6 +376,83 @@ func (r *Runtime) readEffectMarker(identity EffectIdentity, action EffectAction)
 	return &result, nil
 }
 
+// ReclaimOrphanEffectMarkers removes only fully validated immutable proofs
+// that have no pending authoritative effect. It validates the whole directory
+// before deleting anything so malformed entries fail closed.
+func (r *Runtime) ReclaimOrphanEffectMarkers(pending map[string]bool) error {
+	directory := filepath.Join(r.StateRoot, "runtime-effects")
+	if err := rejectSymlinkPath(r.StateRoot, directory, true); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	info, err := os.Lstat(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 || !runtimeOwnedByCurrentUser(info) {
+		return errors.New("runtime effect marker directory is unsafe")
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	var orphans []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(name, ".done") {
+			return errors.New("runtime effect marker directory contains an unsafe entry")
+		}
+		id := strings.TrimSuffix(name, ".done")
+		if _, err := effectMarkerPath(directory, id); err != nil {
+			return err
+		}
+		path := filepath.Join(directory, name)
+		file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		listed, statErr := os.Lstat(path)
+		opened, openErr := file.Stat()
+		body, readErr := io.ReadAll(io.LimitReader(file, 1<<20+1))
+		closeErr := file.Close()
+		if statErr != nil || openErr != nil || readErr != nil || closeErr != nil || !os.SameFile(listed, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 || !runtimeOwnedByCurrentUser(opened) || len(body) > 1<<20 {
+			return errors.New("runtime effect marker is unsafe")
+		}
+		var marker effectResultMarker
+		decoder := json.NewDecoder(strings.NewReader(string(body)))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&marker) != nil || decoder.Decode(&struct{}{}) != io.EOF || marker.Version != 1 || marker.Result.Identity.EffectID != id {
+			return errors.New("runtime effect marker is invalid")
+		}
+		if _, err := r.readEffectMarker(marker.Result.Identity, marker.Result.Action); err != nil {
+			return err
+		}
+		if !pending[id] {
+			orphans = append(orphans, path)
+		}
+	}
+	for _, path := range orphans {
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+	if len(orphans) == 0 {
+		return nil
+	}
+	dir, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func runtimeOwnedByCurrentUser(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && int(stat.Uid) == os.Getuid()
+}
+
 // RemoveEffectMarker reclaims completion proof only after the owner has
 // durably committed that completion. A missing marker is already reclaimed.
 func (r *Runtime) RemoveEffectMarker(identity EffectIdentity) error {
@@ -382,7 +466,7 @@ func (r *Runtime) RemoveEffectMarker(identity EffectIdentity) error {
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 || !runtimeOwnedByCurrentUser(info) {
 		return errors.New("runtime effect marker directory is unsafe")
 	}
 	path, err := effectMarkerPath(directory, identity.EffectID)

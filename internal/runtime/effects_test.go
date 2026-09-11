@@ -60,6 +60,46 @@ func TestEffectExecutorPrepareAndStartNeverWritesManifest(t *testing.T) {
 	}
 }
 
+func TestReclaimOrphanEffectMarkersRetainsPendingAndFailsClosed(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(2, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r}
+	request := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "c")
+	result, err := executor.Execute(t.Context(), request)
+	if err != nil || result.Disposition != EffectResultReady {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	path := filepath.Join(r.StateRoot, "runtime-effects", request.Identity.EffectID+".done")
+	if err := r.ReclaimOrphanEffectMarkers(map[string]bool{request.Identity.EffectID: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("pending marker was removed: %v", err)
+	}
+	unsafe := filepath.Join(r.StateRoot, "runtime-effects", strings.Repeat("d", 32)+".done")
+	if err := os.WriteFile(unsafe, []byte("not-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReclaimOrphanEffectMarkers(nil); err == nil {
+		t.Fatal("malformed marker directory did not fail closed")
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("valid orphan was removed before full validation: %v", err)
+	}
+	if err := os.Remove(unsafe); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReclaimOrphanEffectMarkers(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan marker was not removed: %v", err)
+	}
+}
+
 func TestEffectVerificationRejectsChangedRuntimeAndAllowedEnvironment(t *testing.T) {
 	t.Run("source", func(t *testing.T) {
 		r, _, attempt, _ := testRuntime(t)

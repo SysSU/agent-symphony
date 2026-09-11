@@ -32,6 +32,45 @@ func TestReconciliationMarkersRoundTripEveryClosedVariant(t *testing.T) {
 	}
 }
 
+func TestReclaimOrphanReconciliationMarkersRetainsPendingAndFailsClosed(t *testing.T) {
+	test := reconciliationEffectCaseNamed(t, "issue-control-snapshot")
+	root, owner, snapshot := reconciliationEffectPersistentOwner(t, test.request)
+	request := bindEffectObservation(snapshot, test.request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReconciliationEffectMarker(root, ownerReconciliationEffectIdentity(*effect), request, test.result(request)); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "reconciliation-effects", effect.ID+".done")
+	if err := reclaimOrphanReconciliationMarkers(root, map[string]bool{effect.ID: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("pending marker was removed: %v", err)
+	}
+	unsafe := filepath.Join(root, "reconciliation-effects", strings.Repeat("e", 32)+".done")
+	if err := os.WriteFile(unsafe, []byte("not-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := reclaimOrphanReconciliationMarkers(root, nil); err == nil {
+		t.Fatal("malformed marker directory did not fail closed")
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("valid orphan was removed before full validation: %v", err)
+	}
+	if err := os.Remove(unsafe); err != nil {
+		t.Fatal(err)
+	}
+	if err := reclaimOrphanReconciliationMarkers(root, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan marker was not removed: %v", err)
+	}
+}
+
 func TestReconciliationMarkerDirectorySyncsParentAfterFirstLink(t *testing.T) {
 	root := resolvedTempDir(t)
 	previous := immutableDirSync

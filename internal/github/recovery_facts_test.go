@@ -472,6 +472,11 @@ func TestFetchIssueFactsCreatesSnapshotThenRereadsEligible(t *testing.T) {
 	if _, err := RevalidateIssueUpdateProposal(context.Background(), api, cfg, changedProposal); err == nil || posts != 0 {
 		t.Fatalf("changed proposal revalidation posts=%d err=%v", posts, err)
 	}
+	changed = true
+	if err := ExecuteIssueUpdateProposal(context.Background(), api, cfg, collected.Proposals[0]); err == nil || posts != 0 {
+		t.Fatalf("proposal changed after revalidation posts=%d err=%v", posts, err)
+	}
+	changed = false
 	readOnly, err := FetchIssueFacts(context.Background(), api, cfg, nil, false)
 	if err != nil || len(readOnly) != 1 || readOnly[0].Eligible || posts != 0 {
 		t.Fatalf("read-only facts=%#v posts=%d err=%v", readOnly, posts, err)
