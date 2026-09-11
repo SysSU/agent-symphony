@@ -24,7 +24,6 @@ export default function Dashboard() {
   const [error, setError] = useState("");
   const [actionNotice, setActionNotice] = useState("");
   const [busy, setBusy] = useState("");
-  const [waiting, setWaiting] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const [terminal, setTerminal] = useState(null);
   const [orchestratorStatus, setOrchestratorStatus] = useState(null);
@@ -77,14 +76,10 @@ export default function Dashboard() {
     if (!window.confirm(`${verb} issue #${status.issue}, attempt ${status.attempt}?\n\n${consequence}`)) return;
     const key = attemptKey(status);
     setBusy(key);
-    setWaiting(false);
     setActionNotice("");
     try {
       const query = new URLSearchParams({ repository: status.repository, issue: String(status.issue), attempt: String(status.attempt) });
-      const response = await postWithReconciliationRetry(`/actions/${action}?${query}`, async () => {
-        setWaiting(true);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      });
+      const response = await fetch(`/actions/${action}?${query}`, { method: "POST" });
       if (!response.ok) throw new Error((await response.text()).trim() || `${verb} failed (${response.status})`);
       const stateResponse = await fetch("/dashboard-state.json", { cache: "no-store" });
       if (!stateResponse.ok) throw new Error(`${verb} finished, but dashboard state could not be refreshed.`);
@@ -94,7 +89,6 @@ export default function Dashboard() {
       setActionNotice(reason instanceof Error ? reason.message : `${verb} failed.`);
     } finally {
       setBusy("");
-      setWaiting(false);
     }
   }, []);
 
@@ -199,7 +193,6 @@ export default function Dashboard() {
                       investigationBusy={Boolean(orchestratorBusy)}
                       busy={busy === attemptKey(status)}
                       investigating={investigating === attemptKey(status)}
-                      waiting={waiting && busy === attemptKey(status)}
                       onNotice={setActionNotice}
                       readOnly={Boolean(remoteProject)}
                     />
@@ -210,7 +203,7 @@ export default function Dashboard() {
           </section>
         )) : <p className="boardState" role="status">{visibleError ? "Issue status board unavailable." : "Loading issue status board…"}</p>}
       </section>
-      <AttemptHistory statuses={historical} onAction={performAction} busy={busy} waiting={waiting} readOnly={Boolean(remoteProject)} />
+      <AttemptHistory statuses={historical} onAction={performAction} busy={busy} readOnly={Boolean(remoteProject)} />
       {terminal ? <TerminalPanel config={terminal} onClose={closeTerminal} /> : null}
     </main>
   );

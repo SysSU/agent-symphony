@@ -545,10 +545,6 @@ for (const scenario of [
         issue: url.searchParams.get("issue"),
         attempt: url.searchParams.get("attempt"),
       });
-      if (scenario.action === "recover" && requests.length === 1) {
-        await route.fulfill({ status: 503, body: "reconciliation in progress" });
-        return;
-      }
       await actionPending;
       if (scenario.action === "archive" || scenario.action === "abandon") {
         dashboard.hide(scenario.status, scenario.action === "archive" ? "archived" : "abandoned");
@@ -573,8 +569,8 @@ for (const scenario of [
     await action.click();
     const actionControl = card.locator(scenario.action === "archive" ? ".secondaryAction" : ".dangerAction");
     await expect(actionControl).toBeDisabled();
-    await expect(actionControl).toHaveText(scenario.action === "recover" ? "Waiting for reconciliation…" : "Working…");
-    const expectedRequests = scenario.action === "recover" ? 2 : 1;
+    await expect(actionControl).toHaveText("Working…");
+    const expectedRequests = 1;
     await expect.poll(() => requests.length).toBe(expectedRequests);
     expect(requests).toEqual(Array.from({ length: expectedRequests }, () => ({
       method: "POST",
@@ -584,11 +580,28 @@ for (const scenario of [
 
     releaseAction();
     await expect(page.getByRole("status").filter({ hasText: scenario.notice })).toBeVisible();
-    if (scenario.action === "archive" || scenario.action === "abandon") await expect(card).toBeHidden();
-    else await expect(action).toBeEnabled();
-    if (scenario.action === "recover") {
-      expect(browserErrors.get(page)).toEqual(["console: Failed to load resource: the server responded with a status of 503 (Service Unavailable)"]);
-      browserErrors.set(page, []);
+    if (scenario.action === "archive" || scenario.action === "abandon") {
+      await expect(card).toBeHidden();
+      await page.reload();
+      await expect(page.getByRole("link", { name: new RegExp(`#${scenario.status.issue}\\b`) })).toHaveCount(0);
     }
+    else await expect(action).toBeEnabled();
   });
 }
+
+test("reports a rejected destructive mutation once without retrying", async ({ page }) => {
+  const status = { ...statuses[0], issue: 206, attempt: 1, state: "orphaned", retryable: false };
+  await mockDashboard(page, [status]);
+  const requests = [];
+  await page.route("**/actions/abandon?*", async (route) => {
+    requests.push(route.request().url());
+    await route.fulfill({ status: 503, body: "cleanup is unavailable" });
+  });
+  await page.goto("/");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Abandon attempt" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "cleanup is unavailable" })).toBeVisible({ timeout: 500 });
+  expect(requests).toHaveLength(1);
+  await expect(page.getByRole("button", { name: "Abandon attempt" })).toBeEnabled();
+  browserErrors.set(page, []);
+});

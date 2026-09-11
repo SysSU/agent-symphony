@@ -1050,6 +1050,11 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return errors.New("review boundary cannot abandon implementation attempts")
 		}
 		err = abandonAttempt(ctx, request.Command.Input, root)
+	case "validate-abandon":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot validate implementation attempt abandonment")
+		}
+		err = validateAbandonAttempt(ctx, request.Command.Input, root)
 	case "validate-remove", "remove":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot permanently remove implementation attempts")
@@ -1084,11 +1089,15 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 }
 
 func cleanupAttempt(ctx context.Context, input []byte, root string) error {
-	return removeAttemptResources(ctx, input, root, true)
+	return removeAttemptResources(ctx, input, root, true, true)
 }
 
 func abandonAttempt(ctx context.Context, input []byte, root string) error {
-	return removeAttemptResources(ctx, input, root, false)
+	return removeAttemptResources(ctx, input, root, false, true)
+}
+
+func validateAbandonAttempt(ctx context.Context, input []byte, root string) error {
+	return removeAttemptResources(ctx, input, root, false, false)
 }
 
 type permanentRemovalRequest struct {
@@ -1106,14 +1115,14 @@ func permanentlyRemoveAttempt(ctx context.Context, input []byte, root string, re
 	return removeVerifiedAttemptResources(ctx, request.Manifest, root, false, request.PublishedHead, remove)
 }
 
-func removeAttemptResources(ctx context.Context, input []byte, root string, completed bool) error {
+func removeAttemptResources(ctx context.Context, input []byte, root string, completed, remove bool) error {
 	var manifest agentruntime.Manifest
 	decoder := json.NewDecoder(bytes.NewReader(input))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return errors.New("invalid attempt manifest")
 	}
-	return removeVerifiedAttemptResources(ctx, manifest, root, completed, "", true)
+	return removeVerifiedAttemptResources(ctx, manifest, root, completed, "", remove)
 }
 
 func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.Manifest, root string, completed bool, publishedHead string, remove bool) error {

@@ -1,6 +1,6 @@
 import { StatusCard } from "./status-card";
 
-export default function AttemptHistory({ statuses, onAction, busy, waiting, readOnly }) {
+export default function AttemptHistory({ statuses, onAction, busy, readOnly }) {
   if (!statuses.length) return null;
   return (
     <details className="attemptHistory">
@@ -8,7 +8,7 @@ export default function AttemptHistory({ statuses, onAction, busy, waiting, read
       <ol className="historyCards">
         {statuses.map((status) => (
           <li key={`${status.repository}-${status.issue}-${status.attempt}`}>
-            <StatusCard status={status} historical readOnly={readOnly} onAction={onAction} busy={busy === `${status.repository}#${status.issue}/${status.attempt}`} waiting={waiting} />
+            <StatusCard status={status} historical readOnly={readOnly} onAction={onAction} busy={busy === `${status.repository}#${status.issue}/${status.attempt}`} />
           </li>
         ))}
       </ol>

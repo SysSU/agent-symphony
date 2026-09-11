@@ -1207,6 +1207,12 @@ func TestAbandonAttemptAcceptsExactFailedWorktreeWithoutWeakeningCleanup(t *test
 		return agentruntime.Result{}, fmt.Errorf("unexpected tmux command %v", command.Args)
 	}
 	t.Cleanup(func() { hostExecRunner = oldExec })
+	if err := validateAbandonAttempt(t.Context(), body, root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manifest.Worktree); err != nil {
+		t.Fatalf("abandon preflight changed worktree: %v", err)
+	}
 	if err := abandonAttempt(t.Context(), body, root); err != nil {
 		t.Fatal(err)
 	}

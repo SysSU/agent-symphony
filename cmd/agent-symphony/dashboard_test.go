@@ -729,6 +729,7 @@ func TestDashboardArchivesCompletedAndAbandonsOrphanedAttempts(t *testing.T) {
 	operationMu := &sync.Mutex{}
 	locked := true
 	server := &dashboardServer{ctx: t.Context(), stateRoot: root, tmux: "tmux", mu: operationMu}
+	server.reviewCleanup = func(context.Context, agentruntime.Manifest, bool) error { return nil }
 	server.cleanup = func(_ context.Context, action string, manifest agentruntime.Manifest) error {
 		if operationMu.TryLock() {
 			operationMu.Unlock()
@@ -753,12 +754,6 @@ func TestDashboardArchivesCompletedAndAbandonsOrphanedAttempts(t *testing.T) {
 	if response := requestAction("/actions/archive?issue=22&attempt=1", "http://127.0.0.1"); response.Code != http.StatusConflict {
 		t.Fatalf("wrong-state archive status=%d body=%q", response.Code, response.Body.String())
 	}
-	operationMu.Lock()
-	response := requestAction("/actions/archive?issue=21&attempt=1", "http://127.0.0.1")
-	operationMu.Unlock()
-	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != "1" || !strings.Contains(response.Body.String(), "reconciliation is in progress") || len(actions) != 0 {
-		t.Fatalf("busy reconciliation status=%d retry=%q body=%q actions=%v", response.Code, response.Header().Get("Retry-After"), response.Body.String(), actions)
-	}
 	if response := requestAction("/actions/archive?issue=21&attempt=1", "http://127.0.0.1"); response.Code != http.StatusOK {
 		t.Fatalf("archive status=%d body=%q", response.Code, response.Body.String())
 	}
@@ -771,7 +766,7 @@ func TestDashboardArchivesCompletedAndAbandonsOrphanedAttempts(t *testing.T) {
 	if _, err := os.Stat(filepath.Dir(orphaned.LogPath)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("abandon retained attempt record: %v", err)
 	}
-	if strings.Join(actions, ",") != "archive:21,abandon:22" {
+	if strings.Join(actions, ",") != "archive:21,validate-abandon:22,abandon:22" {
 		t.Fatalf("cleanup actions=%v", actions)
 	}
 	if !locked {
@@ -780,6 +775,140 @@ func TestDashboardArchivesCompletedAndAbandonsOrphanedAttempts(t *testing.T) {
 	state, err := server.readState()
 	if err != nil || len(state.Hidden) != 2 || state.Hidden[0].Reason != "archived" || state.Hidden[1].Reason != "abandoned" {
 		t.Fatalf("dashboard state=%#v err=%v", state, err)
+	}
+}
+
+func TestAttemptMutationsPreemptReconciliationAndFinishServerState(t *testing.T) {
+	for _, action := range []string{"dismiss", "abandon", "remove"} {
+		t.Run(action, func(t *testing.T) {
+			root, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected := writeDashboardManifest(t, root, 40, 1, "failed")
+			if err := os.MkdirAll(selected.Worktree, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(agentruntime.ResultPath(selected.Worktree), []byte("result"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			status := orchestrator.RecoveryStatus{Repository: selected.Repository, Issue: selected.Issue, Attempt: selected.Attempt, State: "orphaned", Branch: selected.Branch, Worktree: selected.Worktree, Session: selected.Session}
+			statuses := []orchestrator.RecoveryStatus{status}
+			if action == "dismiss" {
+				status.State, status.IssueClosed = "failed", true
+				statuses = []orchestrator.RecoveryStatus{status}
+			}
+			if action == "remove" {
+				status.State = "failed"
+				current := writeDashboardManifest(t, root, selected.Issue, 2, "running")
+				statuses = []orchestrator.RecoveryStatus{status, {Repository: current.Repository, Issue: current.Issue, Attempt: current.Attempt, State: "active", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session}}
+			}
+			if err := writeStatusSnapshot(root, statuses); err != nil {
+				t.Fatal(err)
+			}
+
+			operationMu := &sync.Mutex{}
+			operations := &operationCancellation{}
+			cycleCtx, finishCycle := operations.begin(t.Context())
+			operationMu.Lock()
+			cycleErr := make(chan error, 1)
+			go func() {
+				<-cycleCtx.Done()
+				// A cancelled cycle may finish an already-started atomic snapshot write.
+				// Persist its stale view before releasing the operation lock to prove
+				// that the mutation's durable marker still wins after the cycle ends.
+				cycleErr <- writeStatusSnapshot(root, statuses)
+				finishCycle()
+				operationMu.Unlock()
+			}()
+
+			reviewArtifact := filepath.Join(root, "selected-review")
+			if err := os.WriteFile(reviewArtifact, []byte("review"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			server := &dashboardServer{
+				stateRoot: root, repository: selected.Repository, mu: operationMu, interrupt: operations.interrupt,
+				issueClosed: func(context.Context, string, int) (bool, error) { return true, nil },
+				cleanup: func(_ context.Context, gotAction string, manifest agentruntime.Manifest) error {
+					validAction := gotAction == action || action == "abandon" && gotAction == "validate-abandon"
+					if !validAction || manifest.Issue != selected.Issue || manifest.Attempt != selected.Attempt {
+						return errors.New("wrong cleanup identity")
+					}
+					if gotAction == "validate-abandon" {
+						return nil
+					}
+					if err := os.RemoveAll(manifest.Worktree); err != nil {
+						return err
+					}
+					return os.Remove(agentruntime.ResultPath(manifest.Worktree))
+				},
+				remove: func(_ context.Context, operation string, manifest agentruntime.Manifest, _ string) error {
+					if manifest.Issue != selected.Issue || manifest.Attempt != selected.Attempt {
+						return errors.New("wrong removal identity")
+					}
+					if operation == "remove" {
+						if err := os.RemoveAll(manifest.Worktree); err != nil {
+							return err
+						}
+						return os.Remove(agentruntime.ResultPath(manifest.Worktree))
+					}
+					return nil
+				},
+				reviewCleanup: func(_ context.Context, manifest agentruntime.Manifest, remove bool) error {
+					if manifest.Issue != selected.Issue || manifest.Attempt != selected.Attempt {
+						return errors.New("wrong review identity")
+					}
+					if remove {
+						return os.Remove(reviewArtifact)
+					}
+					return nil
+				},
+			}
+			request := httptest.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1/actions/%s?repository=o%%2Fr&issue=%d&attempt=%d", action, selected.Issue, selected.Attempt), nil)
+			request.Header.Set("Origin", "http://127.0.0.1")
+			response := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("attempt mutation did not promptly preempt reconciliation")
+			}
+			if err := <-cycleErr; err != nil {
+				t.Fatal(err)
+			}
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+			}
+			state, err := server.readState()
+			if err != nil || len(state.Hidden) != 1 || state.Hidden[0].Reason != map[string]string{"dismiss": "dismissed", "abandon": "abandoned", "remove": "removed"}[action] {
+				t.Fatalf("durable dashboard state=%#v err=%v", state, err)
+			}
+			if _, err := server.projectedStatus(selected.Issue, selected.Attempt); err != nil {
+				t.Fatalf("cancelled reconciliation did not finish its stale snapshot: %v", err)
+			}
+			if action == "dismiss" {
+				for _, path := range []string{selected.Worktree, filepath.Dir(selected.LogPath), reviewArtifact} {
+					if _, err := os.Stat(path); err != nil {
+						t.Fatalf("dismiss removed retained artifact %s: %v", path, err)
+					}
+				}
+				return
+			}
+			for _, path := range []string{selected.Worktree, filepath.Dir(selected.LogPath)} {
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("%s returned before server cleanup removed %s: %v", action, path, err)
+				}
+			}
+			if action == "remove" || action == "abandon" {
+				if _, err := os.Stat(reviewArtifact); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("%s returned before reviewer cleanup: %v", action, err)
+				}
+			}
+		})
 	}
 }
 
@@ -989,14 +1118,6 @@ func TestDashboardPermanentlyRemovesOnlyOneHistoricalAttempt(t *testing.T) {
 		stateRoot:  root,
 		repository: previous.Repository,
 		mu:         operationMu,
-		removalRefresh: func(context.Context) error {
-			if operationMu.TryLock() {
-				operationMu.Unlock()
-				t.Fatal("removal reconciled outside the operation lock")
-			}
-			calls = append(calls, "reconcile")
-			return nil
-		},
 		remove: func(_ context.Context, operation string, manifest agentruntime.Manifest, head string) error {
 			if manifest.Repository != previous.Repository || manifest.Issue != previous.Issue || manifest.Attempt != previous.Attempt || head != previous.BaseSHA {
 				t.Fatalf("wrong implementation cleanup identity: %#v head=%q", manifest, head)
@@ -1020,16 +1141,16 @@ func TestDashboardPermanentlyRemovesOnlyOneHistoricalAttempt(t *testing.T) {
 		handler.ServeHTTP(response, r)
 		return response
 	}
-	if response := request(current.Issue, current.Attempt); response.Code != http.StatusConflict || len(calls) != 1 {
+	if response := request(current.Issue, current.Attempt); response.Code != http.StatusConflict || len(calls) != 0 {
 		t.Fatalf("current removal status=%d body=%q calls=%v", response.Code, response.Body.String(), calls)
 	}
-	if response := request(other.Issue, other.Attempt); response.Code != http.StatusConflict || len(calls) != 2 {
+	if response := request(other.Issue, other.Attempt); response.Code != http.StatusConflict || len(calls) != 0 {
 		t.Fatalf("latest failed removal status=%d body=%q calls=%v", response.Code, response.Body.String(), calls)
 	}
 	if response := request(previous.Issue, previous.Attempt); response.Code != http.StatusOK {
 		t.Fatalf("historical removal status=%d body=%q", response.Code, response.Body.String())
 	}
-	if !slices.Equal(calls, []string{"reconcile", "reconcile", "reconcile", "validate-remove", "review-false", "review-true", "remove"}) {
+	if !slices.Equal(calls, []string{"validate-remove", "review-false", "review-true", "remove"}) {
 		t.Fatalf("removal calls=%v", calls)
 	}
 	if _, err := os.Stat(filepath.Dir(previous.LogPath)); !errors.Is(err, os.ErrNotExist) {
@@ -1044,7 +1165,7 @@ func TestDashboardPermanentlyRemovesOnlyOneHistoricalAttempt(t *testing.T) {
 	if err != nil || !slices.Equal(state.Hidden, []dashboardHiddenAttempt{{Repository: "o/r", Issue: 28, Attempt: 1, Reason: "removed"}}) {
 		t.Fatalf("dashboard state=%#v err=%v", state, err)
 	}
-	if response := request(previous.Issue, previous.Attempt); response.Code != http.StatusOK || len(calls) != 8 {
+	if response := request(previous.Issue, previous.Attempt); response.Code != http.StatusOK || len(calls) != 4 {
 		t.Fatalf("idempotent removal status=%d body=%q calls=%v", response.Code, response.Body.String(), calls)
 	}
 }
@@ -1060,7 +1181,7 @@ func TestDashboardPermanentRemovalRetainsEntryWhenCleanupFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := &dashboardServer{
-		stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
+		stateRoot: root, repository: "o/r", mu: &sync.Mutex{},
 		remove: func(context.Context, string, agentruntime.Manifest, string) error {
 			return errors.New("worktree has uncommitted changes")
 		},
@@ -1122,7 +1243,7 @@ func TestDashboardPermanentRemovalRevalidatesPendingIntentBeforeCleanup(t *testi
 				t.Fatal(err)
 			}
 			server := &dashboardServer{
-				stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
+				stateRoot: root, repository: "o/r", mu: &sync.Mutex{},
 				remove: func(context.Context, string, agentruntime.Manifest, string) error {
 					return errors.New("worktree has uncommitted changes")
 				},
@@ -1203,7 +1324,7 @@ func TestDashboardPermanentRemovalConvergesAfterDestructiveStepFailureAndRestart
 			failed := false
 			runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(root), StateRoot: root}
 			server := &dashboardServer{
-				stateRoot: root, repository: previous.Repository, mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
+				stateRoot: root, repository: previous.Repository, mu: &sync.Mutex{},
 				remove: func(_ context.Context, operation string, manifest agentruntime.Manifest, _ string) error {
 					if manifest.Issue != previous.Issue || manifest.Attempt != previous.Attempt {
 						t.Fatalf("wrong implementation identity: %#v", manifest)
@@ -1284,7 +1405,7 @@ func TestDashboardPermanentRemovalConvergesAfterDestructiveStepFailureAndRestart
 				}
 			}
 			restarted := &dashboardServer{
-				stateRoot: root, repository: previous.Repository, mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
+				stateRoot: root, repository: previous.Repository, mu: &sync.Mutex{},
 				remove: server.remove, reviewCleanup: server.reviewCleanup,
 			}
 			if response := request(restarted); response.Code != http.StatusOK {
@@ -1321,7 +1442,7 @@ func TestDashboardPermanentRemovalReplacesPriorHiddenReason(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			server := &dashboardServer{stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil }, remove: func(context.Context, string, agentruntime.Manifest, string) error { return nil }, reviewCleanup: func(context.Context, agentruntime.Manifest, bool) error { return nil }}
+			server := &dashboardServer{stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, remove: func(context.Context, string, agentruntime.Manifest, string) error { return nil }, reviewCleanup: func(context.Context, agentruntime.Manifest, bool) error { return nil }}
 			if err := server.writeState(dashboardState{Version: dashboardStateVersion, Hidden: []dashboardHiddenAttempt{{Repository: "o/r", Issue: 36, Attempt: 1, Reason: reason}}}); err != nil {
 				t.Fatal(err)
 			}

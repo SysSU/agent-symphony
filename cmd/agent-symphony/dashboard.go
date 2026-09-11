@@ -44,28 +44,28 @@ const (
 var dashboardFiles embed.FS
 
 type dashboardServer struct {
-	ctx            context.Context
-	stateRoot      string
-	repository     string
-	peerProjects   []string
-	tmux           string
-	allowNet       bool
-	password       string
-	orchestrator   orchestratoragent.Service
-	cleanup        func(context.Context, string, agentruntime.Manifest) error
-	remove         func(context.Context, string, agentruntime.Manifest, string) error
-	reviewCleanup  func(context.Context, agentruntime.Manifest, bool) error
-	forget         func(agentruntime.Manifest) error
-	removalRefresh func(context.Context) error
-	stateWrite     func(dashboardState) error
-	recover        func(context.Context, int, int) error
-	planReview     func(context.Context, int, int) error
-	reconcile      func(context.Context) error
-	issueClosed    func(context.Context, string, int) (bool, error)
-	mu             *sync.Mutex
-	localMu        sync.Mutex
-	controlMu      sync.Mutex
-	controlHook    func(controlRequest)
+	ctx           context.Context
+	stateRoot     string
+	repository    string
+	peerProjects  []string
+	tmux          string
+	allowNet      bool
+	password      string
+	orchestrator  orchestratoragent.Service
+	cleanup       func(context.Context, string, agentruntime.Manifest) error
+	remove        func(context.Context, string, agentruntime.Manifest, string) error
+	reviewCleanup func(context.Context, agentruntime.Manifest, bool) error
+	forget        func(agentruntime.Manifest) error
+	stateWrite    func(dashboardState) error
+	recover       func(context.Context, int, int) error
+	planReview    func(context.Context, int, int) error
+	reconcile     func(context.Context) error
+	issueClosed   func(context.Context, string, int) (bool, error)
+	mu            *sync.Mutex
+	localMu       sync.Mutex
+	controlMu     sync.Mutex
+	controlHook   func(controlRequest)
+	interrupt     func()
 }
 
 type operationLockContextKey struct{}
@@ -86,6 +86,23 @@ func (s *dashboardServer) enterOperation(ctx context.Context) (func(), bool) {
 		return nil, false
 	}
 	return operationMu.Unlock, true
+}
+
+func (s *dashboardServer) enterAttemptMutation(ctx context.Context) (func(), bool) {
+	if s.interrupt != nil {
+		s.interrupt()
+	}
+	operationMu := s.operationMutex()
+	operationMu.Lock()
+	if ctx.Err() != nil {
+		operationMu.Unlock()
+		return nil, false
+	}
+	return operationMu.Unlock, true
+}
+
+func independentAttemptMutation(action string) bool {
+	return action == "archive" || action == "abandon" || action == "dismiss" || action == "remove"
 }
 
 type dashboardHiddenAttempt struct {
@@ -737,10 +754,20 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 		http.Error(w, "invalid action body", http.StatusBadRequest)
 		return
 	}
-	leave, ok := s.enterOperation(r.Context())
+	var leave func()
+	var ok bool
+	if independentAttemptMutation(action) {
+		leave, ok = s.enterAttemptMutation(r.Context())
+	} else {
+		leave, ok = s.enterOperation(r.Context())
+	}
 	if !ok {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
+		if independentAttemptMutation(action) {
+			http.Error(w, "action was cancelled", http.StatusRequestTimeout)
+		} else {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
+		}
 		return
 	}
 	defer leave()
@@ -827,6 +854,16 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 		http.Error(w, "completed projection does not have a completed local attempt", http.StatusConflict)
 		return
 	}
+	if action == "abandon" {
+		if s.reviewCleanup == nil || s.cleanup(r.Context(), "validate-abandon", matches[0]) != nil || s.reviewCleanup(r.Context(), matches[0], false) != nil {
+			http.Error(w, "attempt cleanup was refused", http.StatusConflict)
+			return
+		}
+		if err := s.reviewCleanup(r.Context(), matches[0], true); err != nil {
+			http.Error(w, "attempt reviewer cleanup was refused", http.StatusConflict)
+			return
+		}
+	}
 	if err := s.cleanup(r.Context(), action, matches[0]); err != nil {
 		http.Error(w, "attempt cleanup was refused", http.StatusConflict)
 		return
@@ -852,12 +889,8 @@ func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, ac
 }
 
 func (s *dashboardServer) serveRemoveAction(w http.ResponseWriter, r *http.Request, issue, attempt int) {
-	if s.removalRefresh == nil || s.remove == nil || s.reviewCleanup == nil {
+	if s.remove == nil || s.reviewCleanup == nil {
 		http.Error(w, "permanent removal is unavailable", http.StatusConflict)
-		return
-	}
-	if err := s.removalRefresh(r.Context()); err != nil {
-		http.Error(w, "fresh reconciliation required before permanent removal", http.StatusConflict)
 		return
 	}
 	state, err := s.readState()
@@ -1019,8 +1052,8 @@ func (s *dashboardServer) hideAttempt(status orchestrator.RecoveryStatus, reason
 
 func (s *dashboardServer) cleanupAttempt(ctx context.Context, action string, manifest agentruntime.Manifest) error {
 	operation := "cleanup"
-	if action == "abandon" {
-		operation = "abandon"
+	if action == "abandon" || action == "validate-abandon" {
+		operation = action
 	}
 	body, _ := json.Marshal(manifest)
 	_, err := implementationBoundary(s.stateRoot).call(ctx, operation, agentruntime.Command{Stdin: strings.NewReader(string(body))})
@@ -1412,7 +1445,7 @@ func startDashboard(ctx context.Context, address, stateRoot string, operationMu 
 	return startProjectDashboard(ctx, address, stateRoot, "", nil, operationMu, recover, planReview, reconcile, nil, service, allowNet, password, log)
 }
 
-func startProjectDashboard(ctx context.Context, address, stateRoot, repository string, peerProjects []string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile, removalRefresh func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
+func startProjectDashboard(ctx context.Context, address, stateRoot, repository string, peerProjects []string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, interrupt func(), service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", fmt.Errorf("dashboard address: %w", err)
@@ -1433,7 +1466,7 @@ func startProjectDashboard(ctx context.Context, address, stateRoot, repository s
 		return "", fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
 	project := newProjectDashboardServer(ctx, stateRoot, repository, peerProjects, "tmux", operationMu, recover, planReview, reconcile, service, allowNet, password)
-	project.removalRefresh = removalRefresh
+	project.interrupt = interrupt
 	if err := startControlServer(ctx, project, log); err != nil {
 		_ = listener.Close()
 		return "", err

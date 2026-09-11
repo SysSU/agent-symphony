@@ -195,7 +195,7 @@ func (s *dashboardServer) performRecordedControl(ctx context.Context, request co
 		}
 		receipts.Receipts = slices.Delete(receipts.Receipts, completed, completed+1)
 	}
-	if request.Action != "orchestrator-session" {
+	if request.Action != "orchestrator-session" && !independentAttemptMutation(request.Action) {
 		operationMu := s.operationMutex()
 		operationMu.Lock()
 		defer operationMu.Unlock()

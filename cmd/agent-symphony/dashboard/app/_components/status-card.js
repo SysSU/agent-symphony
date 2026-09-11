@@ -37,8 +37,7 @@ function actionFor(status) {
   return status.state === "completed" ? "archive" : "abandon";
 }
 
-function actionLabel(status, busy, waiting) {
-  if (waiting) return "Waiting for reconciliation…";
+function actionLabel(status, busy) {
   if (busy) return "Working…";
   if (status.retryable) return "Recover attempt";
   return status.state === "completed" ? "Archive" : "Abandon attempt";
@@ -78,13 +77,13 @@ function PermanentRemoveButton({ status, onAction, busy, historical }) {
   );
 }
 
-function StatusActions({ status, onAction, onInvestigate, onNotice, investigationEnabled, investigationBusy, busy, investigating, waiting, readOnly, historical }) {
+function StatusActions({ status, onAction, onInvestigate, onNotice, investigationEnabled, investigationBusy, busy, investigating, readOnly, historical }) {
   const investigationAvailable = investigationEnabled && canInvestigate(status);
   const actionAvailable = attemptActionAvailable(status, historical);
   const planReviewAvailable = canPlanReview(status);
   if (readOnly || (!investigationAvailable && !actionAvailable && !canDismiss(status) && !canPermanentlyRemove(status, historical) && !planReviewAvailable)) return null;
   const action = actionFor(status);
-  const label = actionLabel(status, busy, waiting);
+  const label = actionLabel(status, busy);
   return (
     <footer className="cardActions">
       {investigationAvailable ? (

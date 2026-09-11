@@ -759,18 +759,23 @@ func TestControlConfirmedCleanupUsesExactDashboardMutation(t *testing.T) {
 			if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
 				t.Fatal(err)
 			}
-			cleaned := ""
+			var cleaned []string
 			project := newProjectDashboardServer(t.Context(), root, "o/r", nil, "tmux", &sync.Mutex{}, nil, nil, nil, nil, false, "")
+			project.reviewCleanup = func(context.Context, agentruntime.Manifest, bool) error { return nil }
 			project.cleanup = func(_ context.Context, action string, got agentruntime.Manifest) error {
 				if got.Repository != "o/r" || got.Issue != 12 || got.Attempt != 1 {
 					t.Fatalf("cleaned wrong manifest %#v", got)
 				}
-				cleaned = action
+				cleaned = append(cleaned, action)
 				return nil
 			}
 			request := controlRequest{Version: 1, RequestID: test.action + "-12-1", Repository: "o/r", Action: test.action, Issue: 12, Attempt: 1, Confirm: true}
 			result := performDashboardControl(t.Context(), project, request)
-			if !result.OK || cleaned != test.action {
+			wantCleaned := []string{test.action}
+			if test.action == "abandon" {
+				wantCleaned = []string{"validate-abandon", "abandon"}
+			}
+			if !result.OK || strings.Join(cleaned, ",") != strings.Join(wantCleaned, ",") {
 				t.Fatalf("result=%#v cleaned=%q", result, cleaned)
 			}
 			state, err := project.readState()
