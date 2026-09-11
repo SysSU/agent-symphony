@@ -63,18 +63,19 @@ type runtimePRRecovery struct {
 }
 
 type runtimeTombstone struct {
-	Repository            string                 `json:"repository"`
-	Issue                 int                    `json:"issue"`
-	Attempt               int                    `json:"attempt"`
-	Action                string                 `json:"action"`
-	InvalidatedGeneration uint64                 `json:"invalidated_generation"`
-	Generation            uint64                 `json:"generation"`
-	Revision              uint64                 `json:"revision"`
-	CleanupPhase          string                 `json:"cleanup_phase"`
-	PublishedHead         string                 `json:"published_head,omitempty"`
-	Manifest              *agentruntime.Manifest `json:"manifest,omitempty"`
-	EffectID              string                 `json:"effect_id,omitempty"`
-	Diagnostic            string                 `json:"diagnostic,omitempty"`
+	Repository            string                            `json:"repository"`
+	Issue                 int                               `json:"issue"`
+	Attempt               int                               `json:"attempt"`
+	Action                string                            `json:"action"`
+	InvalidatedGeneration uint64                            `json:"invalidated_generation"`
+	Generation            uint64                            `json:"generation"`
+	Revision              uint64                            `json:"revision"`
+	CleanupPhase          string                            `json:"cleanup_phase"`
+	PublishedHead         string                            `json:"published_head,omitempty"`
+	Manifest              *agentruntime.Manifest            `json:"manifest,omitempty"`
+	CleanupPolicy         *agentruntime.EffectCleanupPolicy `json:"cleanup_policy,omitempty"`
+	EffectID              string                            `json:"effect_id,omitempty"`
+	Diagnostic            string                            `json:"diagnostic,omitempty"`
 }
 
 type runtimeEffectIntent struct {
@@ -133,6 +134,7 @@ type invalidateAttemptCommand struct {
 	CleanupPhase              string
 	PublishedHead             string
 	Manifest                  *agentruntime.Manifest
+	CleanupPolicy             *agentruntime.EffectCleanupPolicy
 	Diagnostic                string
 	EffectAction              string
 	EffectRequestDigest       string
@@ -207,6 +209,41 @@ type recordControlReceiptCommand struct {
 	Receipt controlReceipt
 }
 
+type beginOperatorMutationCommand struct {
+	Request               controlRequest
+	Identity              stateResultIdentity
+	ObservationGeneration uint64
+	ObservationCycleID    uint64
+	ObservationBodyDigest string
+	Manifest              agentruntime.Manifest
+	PublishedHead         string
+	CleanupDigest         string
+	CleanupPolicy         agentruntime.EffectCleanupPolicy
+	IssueClosed           bool
+	CleanupValid          bool
+	LivenessFailed        bool
+	Runtime               *beginRuntimeEffectCommand
+	Reconciliation        *beginReconciliationEffectCommand
+}
+
+type startOperatorCleanupCommand struct {
+	Identity stateResultIdentity
+}
+
+type finishOperatorRuntimeEffectCommand struct {
+	Finish finishRuntimeEffectCommand
+}
+
+type finishOperatorReconciliationEffectCommand struct {
+	Finish finishReconciliationEffectCommand
+}
+
+type advanceOperatorRecoveryCommand struct {
+	RequestID      string
+	Identity       stateResultIdentity
+	Reconciliation beginReconciliationEffectCommand
+}
+
 type stateOwnerCommandKind uint8
 
 const (
@@ -227,6 +264,11 @@ const (
 	stateOwnerDiagnoseReconciliationEffect
 	stateOwnerMutatePRRecovery
 	stateOwnerRecordControlReceipt
+	stateOwnerBeginOperatorMutation
+	stateOwnerStartOperatorCleanup
+	stateOwnerFinishOperatorRuntimeEffect
+	stateOwnerFinishOperatorReconciliationEffect
+	stateOwnerAdvanceOperatorRecovery
 )
 
 type stateOwnerCommand struct {
@@ -247,6 +289,11 @@ type stateOwnerCommand struct {
 	diagnoseReconciliation  diagnoseReconciliationEffectCommand
 	mutatePRRecovery        mutatePRRecoveryCommand
 	receipt                 recordControlReceiptCommand
+	beginOperator           beginOperatorMutationCommand
+	startOperatorCleanup    startOperatorCleanupCommand
+	finishOperatorRuntime   finishOperatorRuntimeEffectCommand
+	finishOperatorReconcile finishOperatorReconciliationEffectCommand
+	advanceOperatorRecovery advanceOperatorRecoveryCommand
 	reply                   chan stateOwnerResult
 }
 
@@ -465,6 +512,9 @@ func (o *stateOwner) requestSnapshot(ctx context.Context, cycle bool) (stateOwne
 }
 
 func (o *stateOwner) submit(ctx context.Context, command stateOwnerCommand) (stateOwnerResult, error) {
+	if err := ctx.Err(); err != nil {
+		return stateOwnerResult{}, err
+	}
 	command.reply = make(chan stateOwnerResult, 1)
 	select {
 	case <-o.done:
@@ -529,6 +579,31 @@ func (o *stateOwner) authorizeRuntimeEffect(ctx context.Context, command authori
 func (o *stateOwner) recordControlReceipt(ctx context.Context, receipt controlReceipt) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRecordControlReceipt, receipt: recordControlReceiptCommand{Receipt: receipt}})
 	return result.snapshot, err
+}
+
+func (o *stateOwner) beginOperatorMutation(ctx context.Context, command beginOperatorMutationCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerBeginOperatorMutation, beginOperator: command})
+	return result.snapshot, result.effect, err
+}
+
+func (o *stateOwner) startOperatorCleanup(ctx context.Context, command startOperatorCleanupCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerStartOperatorCleanup, startOperatorCleanup: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) finishOperatorRuntimeEffect(ctx context.Context, command finishOperatorRuntimeEffectCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerFinishOperatorRuntimeEffect, finishOperatorRuntime: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) finishOperatorReconciliationEffect(ctx context.Context, command finishOperatorReconciliationEffectCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerFinishOperatorReconciliationEffect, finishOperatorReconcile: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) advanceOperatorRecovery(ctx context.Context, command advanceOperatorRecoveryCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerAdvanceOperatorRecovery, advanceOperatorRecovery: command})
+	return result.snapshot, result.effect, err
 }
 
 func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwnerState, command stateOwnerCommand, appliedCycles map[string]appliedReconciliationCycle) (runtimeOwnerState, *runtimeEffectIntent, error) {
@@ -622,6 +697,39 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if err := applyControlReceipt(&candidate, command.receipt.Receipt); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
+	case stateOwnerBeginOperatorMutation:
+		effect, err := applyBeginOperatorMutation(attemptRoot, stateRoot, &candidate, command.beginOperator)
+		if err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+		if reflect.DeepEqual(candidate, committed) {
+			return candidate, cloneEffect(effect), nil
+		}
+		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect, command.beginOperator.Request.RequestID)
+	case stateOwnerStartOperatorCleanup:
+		if err := applyStartOperatorCleanup(&candidate, command.startOperatorCleanup); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerFinishOperatorRuntimeEffect:
+		if err := applyFinishOperatorRuntimeEffect(attemptRoot, stateRoot, &candidate, command.finishOperatorRuntime); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerFinishOperatorReconciliationEffect:
+		if err := applyFinishOperatorReconciliationEffect(stateRoot, &candidate, command.finishOperatorReconcile); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerAdvanceOperatorRecovery:
+		effect, err := applyAdvanceOperatorRecovery(attemptRoot, stateRoot, &candidate, command.advanceOperatorRecovery)
+		if err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+		requestIDs := []string{}
+		for _, receipt := range candidate.ControlReceipts {
+			if receipt.Request.Action == "recover" && receipt.State == "pending" && receipt.EffectID == "" && (receipt.Phase == operatorPhaseTerminal || receipt.Phase == operatorPhaseRetryPending) {
+				requestIDs = append(requestIDs, receipt.Request.RequestID)
+			}
+		}
+		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect, requestIDs...)
 	default:
 		return runtimeOwnerState{}, nil, errors.New("unknown state owner command")
 	}
@@ -884,7 +992,7 @@ func pruneCompletedAttemptEffects(state *runtimeOwnerState, repository string, i
 		tombstoneEffect = tombstone.EffectID
 	}
 	for id, effect := range state.Effects {
-		if id != tombstoneEffect && effect.Repository == repository && effect.Issue == issue && effect.Attempt == attempt && effect.State == "completed" {
+		if id != tombstoneEffect && !effectReferencedByReceipt(*state, id) && effect.Repository == repository && effect.Issue == issue && effect.Attempt == attempt && effect.State == "completed" {
 			delete(state.Effects, id)
 		}
 	}
@@ -913,12 +1021,12 @@ func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueG
 	return nil
 }
 
-func finishRuntimeOwnerTransition(attemptRoot, stateRoot string, candidate runtimeOwnerState, effect *runtimeEffectIntent) (runtimeOwnerState, *runtimeEffectIntent, error) {
+func finishRuntimeOwnerTransition(attemptRoot, stateRoot string, candidate runtimeOwnerState, effect *runtimeEffectIntent, operatorRequestIDs ...string) (runtimeOwnerState, *runtimeEffectIntent, error) {
 	if candidate.Revision == ^uint64(0) {
 		return runtimeOwnerState{}, nil, errors.New("runtime revision overflow")
 	}
 	candidate.Revision++
-	if effect != nil {
+	if effect != nil && effect.ID == "" {
 		effect.IntentRevision = candidate.Revision
 		effect.ID = runtimeEffectID(*effect)
 		candidate.Effects[effect.ID] = *effect
@@ -927,6 +1035,9 @@ func finishRuntimeOwnerTransition(attemptRoot, stateRoot string, candidate runti
 			tombstone.EffectID = effect.ID
 			candidate.Tombstones[attemptKey] = tombstone
 		}
+	}
+	for _, requestID := range operatorRequestIDs {
+		bindOperatorReceipt(&candidate, requestID, effect, candidate.Revision)
 	}
 	for key, tombstone := range candidate.Tombstones {
 		if tombstone.Revision == 0 {
@@ -993,7 +1104,7 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 		return nil, errStaleStateResult
 	}
 	if existing, ok := state.Tombstones[attemptKey]; ok {
-		if existing.InvalidatedGeneration != command.ExpectedAttemptGeneration || existing.Action != command.Action || existing.CleanupPhase != command.CleanupPhase || existing.PublishedHead != command.PublishedHead || existing.Diagnostic != command.Diagnostic || !sameOptionalAttemptIdentity(existing.Manifest, command.Manifest) {
+		if existing.InvalidatedGeneration != command.ExpectedAttemptGeneration || existing.Action != command.Action || existing.CleanupPhase != command.CleanupPhase || existing.PublishedHead != command.PublishedHead || existing.Diagnostic != command.Diagnostic || !sameOptionalAttemptIdentity(existing.Manifest, command.Manifest) || !reflect.DeepEqual(existing.CleanupPolicy, command.CleanupPolicy) {
 			return nil, errStateConflict
 		}
 		if command.EffectAction == "" && existing.EffectID == "" {
@@ -1033,7 +1144,7 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 	state.Tombstones[attemptKey] = runtimeTombstone{
 		Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt, Action: command.Action,
 		InvalidatedGeneration: invalidated, Generation: generation, CleanupPhase: command.CleanupPhase,
-		PublishedHead: command.PublishedHead, Manifest: command.Manifest, Diagnostic: command.Diagnostic,
+		PublishedHead: command.PublishedHead, Manifest: command.Manifest, CleanupPolicy: cloneCleanupPolicy(command.CleanupPolicy), Diagnostic: command.Diagnostic,
 	}
 	if command.EffectAction == "" {
 		return nil, nil
@@ -1135,7 +1246,7 @@ func applyCompleteEffect(state *runtimeOwnerState, command completeEffectCommand
 }
 
 func applyControlReceipt(state *runtimeOwnerState, receipt controlReceipt) error {
-	if !validControlRequest(receipt.Request, state.Repository) || receipt.State != "pending" && receipt.State != "completed" || receipt.State == "pending" && receipt.Result != nil || receipt.State == "completed" && (receipt.Result == nil || !validRecordedControlResult(*receipt.Result, receipt.Request)) {
+	if !validControlRequest(receipt.Request, state.Repository) || receipt.State != "pending" && receipt.State != "completed" || receipt.State == "pending" && receipt.Result != nil || receipt.State == "completed" && (receipt.Result == nil || !validRecordedControlResult(*receipt.Result, receipt.Request)) || !validOperatorReceiptBinding(receipt) {
 		return errStateConflict
 	}
 	for index, existing := range state.ControlReceipts {
@@ -1240,13 +1351,6 @@ func migrateLegacyRuntimeState(stateRoot, repository string) (runtimeOwnerState,
 		if err := migrateLegacyTombstone(&state, manifest.Repository, manifest.Issue, manifest.Attempt, "removed", phase, removal.PublishedHead, &manifest); err != nil {
 			return runtimeOwnerState{}, err
 		}
-		attemptKey := ownerAttemptKey(repository, manifest.Issue, manifest.Attempt)
-		tombstone := state.Tombstones[attemptKey]
-		effect := runtimeEffectIntent{Action: "remove", Repository: repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: state.IssueGenerations[ownerIssueKey(repository, manifest.Issue)], AttemptGeneration: tombstone.Generation, IntentRevision: 1, State: "pending"}
-		effect.ID = runtimeEffectID(effect)
-		state.Effects[effect.ID] = effect
-		tombstone.EffectID = effect.ID
-		state.Tombstones[attemptKey] = tombstone
 	}
 	receipts, err := server.readControlReceipts()
 	if err != nil {
@@ -1291,9 +1395,32 @@ func migrateLegacyTombstone(state *runtimeOwnerState, repository string, issue, 
 	} else if existing.Manifest != nil && !sameAttemptIdentity(*existing.Manifest, *manifest) {
 		return fmt.Errorf("legacy attempt %s has conflicting resource identity", attemptKey)
 	}
+	if existing.EffectID != "" {
+		delete(state.Effects, existing.EffectID)
+	}
 	delete(state.Attempts, attemptKey)
 	state.AttemptGenerations[attemptKey] = generation
-	state.Tombstones[attemptKey] = runtimeTombstone{Repository: repository, Issue: issue, Attempt: attempt, Action: action, InvalidatedGeneration: invalidated, Generation: generation, CleanupPhase: phase, PublishedHead: publishedHead, Manifest: manifest}
+	tombstone := runtimeTombstone{Repository: repository, Issue: issue, Attempt: attempt, Action: action, InvalidatedGeneration: invalidated, Generation: generation, CleanupPhase: phase, PublishedHead: publishedHead, Manifest: manifest}
+	if action != "dismissed" {
+		policy := agentruntime.EffectCleanupPolicy{Action: map[string]string{"archived": "archive", "abandoned": "abandon", "removed": "remove"}[action], PublishedHead: publishedHead}
+		if manifest != nil {
+			manifestSeen, logSeen, err := compatibilityResources(*manifest)
+			if err != nil {
+				return err
+			}
+			policy.CompatibilityManifestSeen, policy.CompatibilityLogSeen = manifestSeen, logSeen
+		}
+		tombstone.CleanupPolicy = &policy
+		effectState := "pending"
+		if phase == "completed" {
+			effectState = "completed"
+		}
+		effect := runtimeEffectIntent{Action: string(agentruntime.EffectCleanup), Repository: repository, Issue: issue, Attempt: attempt, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: generation, IntentRevision: 1, State: effectState}
+		effect.ID = runtimeEffectID(effect)
+		state.Effects[effect.ID] = effect
+		tombstone.EffectID = effect.ID
+	}
+	state.Tombstones[attemptKey] = tombstone
 	return nil
 }
 
@@ -1389,6 +1516,9 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 				return errors.New("runtime owner tombstone manifest is invalid")
 			}
 		}
+		if !validTombstoneCleanupPolicy(tombstone) {
+			return errors.New("runtime owner tombstone cleanup policy is invalid")
+		}
 		if tombstone.CleanupPhase != "completed" && tombstone.Manifest == nil {
 			return errors.New("pending tombstone lacks resource identity")
 		}
@@ -1397,11 +1527,11 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		}
 		if tombstone.EffectID != "" {
 			effect, ok := state.Effects[tombstone.EffectID]
-			if !ok || effect.Repository != tombstone.Repository || effect.Issue != tombstone.Issue || effect.Attempt != tombstone.Attempt || effect.AttemptGeneration != tombstone.Generation || tombstone.CleanupPhase == "completed" && effect.State != "completed" || tombstone.CleanupPhase != "completed" && effect.State != "pending" {
+			if !ok || effect.Action != string(agentruntime.EffectCleanup) || effect.Repository != tombstone.Repository || effect.Issue != tombstone.Issue || effect.Attempt != tombstone.Attempt || effect.AttemptGeneration != tombstone.Generation || tombstone.CleanupPhase == "completed" && effect.State != "completed" || tombstone.CleanupPhase != "completed" && effect.State != "pending" {
 				return errors.New("runtime owner tombstone effect is invalid")
 			}
-		} else if tombstone.CleanupPhase != "completed" {
-			return errors.New("pending tombstone lacks its cleanup effect")
+		} else if tombstone.Action != "dismissed" {
+			return errors.New("destructive tombstone lacks its cleanup effect")
 		}
 	}
 	for key, effect := range state.Effects {
@@ -1410,10 +1540,11 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			maxRevision++
 		}
 		issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
-		issueCurrent := state.IssueGenerations[issueKey] == effect.IssueGeneration || effectAuthorizedByTombstone(state, effect)
+		receiptBoundCompletion := effect.State == "completed" && effectReferencedByReceipt(state, effect.ID)
+		issueCurrent := state.IssueGenerations[issueKey] == effect.IssueGeneration || effectAuthorizedByTombstone(state, effect) || receiptBoundCompletion
 		if effect.Reconciliation != nil {
 			issueScoped := reconciliationEffectIssueScoped(*effect.Reconciliation)
-			attemptCurrent := issueScoped && effect.Attempt == 0 && effect.AttemptGeneration == 0 || !issueScoped && effect.Attempt > 0 && effect.AttemptGeneration > 0 && state.AttemptGenerations[attemptKey] == effect.AttemptGeneration
+			attemptCurrent := issueScoped && effect.Attempt == 0 && effect.AttemptGeneration == 0 || !issueScoped && effect.Attempt > 0 && effect.AttemptGeneration > 0 && (state.AttemptGenerations[attemptKey] == effect.AttemptGeneration || receiptBoundCompletion)
 			if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Action == "" || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" || !issueCurrent || !attemptCurrent || !validPersistedReconciliationEffect(state, effect) {
 				return errors.New("runtime owner reconciliation effect intent is invalid")
 			}
@@ -1422,7 +1553,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if effect.ReconciliationResult != nil {
 			return errors.New("runtime owner effect payload is invalid")
 		}
-		if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Attempt < 1 || effect.Action == "" || effect.IssueGeneration == 0 || effect.AttemptGeneration == 0 || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" || !issueCurrent || state.AttemptGenerations[attemptKey] != effect.AttemptGeneration {
+		if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Attempt < 1 || effect.Action == "" || effect.IssueGeneration == 0 || effect.AttemptGeneration == 0 || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" || !issueCurrent || state.AttemptGenerations[attemptKey] != effect.AttemptGeneration && !receiptBoundCompletion {
 			return errors.New("runtime owner effect intent is invalid")
 		}
 		if effect.RequestDigest != "" && (!agentruntime.ValidEffectRequestDigest(effect.RequestDigest) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || !validRuntimeEffectInput(agentruntime.EffectAction(effect.Action), effect.Reason) || (effect.Action == string(agentruntime.EffectReview)) != (effect.Review != nil)) {
@@ -1443,8 +1574,17 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 	}
 	seenReceipts := map[string]bool{}
 	for _, receipt := range state.ControlReceipts {
-		if seenReceipts[receipt.Request.RequestID] || !validControlRequest(receipt.Request, state.Repository) || receipt.State != "pending" && receipt.State != "completed" || receipt.State == "pending" && receipt.Result != nil || receipt.State == "completed" && (receipt.Result == nil || !validRecordedControlResult(*receipt.Result, receipt.Request)) {
+		if seenReceipts[receipt.Request.RequestID] || !validControlRequest(receipt.Request, state.Repository) || receipt.State != "pending" && receipt.State != "completed" || receipt.State == "pending" && receipt.Result != nil || receipt.State == "completed" && (receipt.Result == nil || !validRecordedControlResult(*receipt.Result, receipt.Request)) || !validOperatorReceiptBinding(receipt) {
 			return errors.New("runtime owner control receipt is invalid")
+		}
+		if receipt.Phase != "" && receipt.State == "completed" && (receipt.Result.OwnerRevision == 0 || receipt.Result.OwnerRevision > state.Revision) {
+			return errors.New("runtime owner control receipt revision is invalid")
+		}
+		if receipt.EffectID != "" {
+			effect, ok := state.Effects[receipt.EffectID]
+			if !ok || effect.State != operatorReceiptEffectState(receipt) || !operatorReceiptMatchesEffect(receipt, effect) {
+				return errors.New("runtime owner control receipt effect is invalid")
+			}
 		}
 		seenReceipts[receipt.Request.RequestID] = true
 	}
@@ -1497,6 +1637,7 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 			manifest := cloneManifest(*tombstone.Manifest)
 			tombstone.Manifest = &manifest
 		}
+		tombstone.CleanupPolicy = cloneCleanupPolicy(tombstone.CleanupPolicy)
 		clone.Tombstones[key] = tombstone
 	}
 	clone.Effects = make(map[string]runtimeEffectIntent, len(state.Effects))
@@ -1524,6 +1665,14 @@ func cloneMap(source map[string]uint64) map[string]uint64 {
 func cloneManifest(manifest agentruntime.Manifest) agentruntime.Manifest {
 	manifest.ReviewFindings = slices.Clone(manifest.ReviewFindings)
 	return manifest
+}
+
+func cloneCleanupPolicy(policy *agentruntime.EffectCleanupPolicy) *agentruntime.EffectCleanupPolicy {
+	if policy == nil {
+		return nil
+	}
+	clone := *policy
+	return &clone
 }
 
 func cloneControlReceipt(receipt controlReceipt) controlReceipt {
@@ -1610,7 +1759,7 @@ func sameOptionalAttemptIdentity(left, right *agentruntime.Manifest) bool {
 
 func deleteAttemptEffects(state *runtimeOwnerState, repository string, issue, attempt int) {
 	for id, effect := range state.Effects {
-		if effect.Repository == repository && effect.Issue == issue && effect.Attempt == attempt {
+		if !effectReferencedByReceipt(*state, id) && effect.Repository == repository && effect.Issue == issue && effect.Attempt == attempt {
 			delete(state.Effects, id)
 		}
 	}

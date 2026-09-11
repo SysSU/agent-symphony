@@ -47,20 +47,23 @@ type controlRequest struct {
 }
 
 type controlResult struct {
-	Version   int             `json:"version"`
-	RequestID string          `json:"request_id"`
-	Action    string          `json:"action"`
-	OK        bool            `json:"ok"`
-	Retryable bool            `json:"retryable,omitempty"`
-	Status    int             `json:"status"`
-	Data      json.RawMessage `json:"data,omitempty"`
-	Error     string          `json:"error,omitempty"`
+	Version       int             `json:"version"`
+	RequestID     string          `json:"request_id"`
+	Action        string          `json:"action"`
+	OK            bool            `json:"ok"`
+	Retryable     bool            `json:"retryable,omitempty"`
+	Status        int             `json:"status"`
+	OwnerRevision uint64          `json:"owner_revision,omitempty"`
+	Data          json.RawMessage `json:"data,omitempty"`
+	Error         string          `json:"error,omitempty"`
 }
 
 type controlReceipt struct {
-	Request controlRequest `json:"request"`
-	State   string         `json:"state"`
-	Result  *controlResult `json:"result,omitempty"`
+	Request  controlRequest `json:"request"`
+	State    string         `json:"state"`
+	Phase    string         `json:"phase,omitempty"`
+	EffectID string         `json:"effect_id,omitempty"`
+	Result   *controlResult `json:"result,omitempty"`
 }
 
 type controlReceiptState struct {
@@ -152,13 +155,22 @@ func controlHandler(project *dashboardServer) http.Handler {
 			writeControlResult(w, controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusBadRequest, Error: "invalid control request deadline"})
 			return
 		}
-		r = r.WithContext(context.WithValue(r.Context(), controlDeadlineContextKey{}, deadline))
+		requestContext := context.WithValue(r.Context(), controlDeadlineContextKey{}, deadline)
+		if project.operator != nil {
+			var cancel context.CancelFunc
+			requestContext, cancel = context.WithDeadline(requestContext, deadline)
+			defer cancel()
+		}
+		r = r.WithContext(requestContext)
 		response := project.performRecordedControl(r.Context(), request)
 		writeControlResult(w, response)
 	})
 }
 
 func (s *dashboardServer) performRecordedControl(ctx context.Context, request controlRequest) controlResult {
+	if s.operator != nil && validOperatorRequest(request, s.repository) {
+		return s.operator.perform(ctx, request)
+	}
 	result := controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action}
 	if !s.controlMu.TryLock() {
 		result.Status, result.Retryable, result.Error = http.StatusServiceUnavailable, true, "another control request is in progress"
@@ -252,7 +264,7 @@ func (s *dashboardServer) readControlReceipts() (controlReceiptState, error) {
 	seen := map[string]bool{}
 	for _, receipt := range state.Receipts {
 		validResult := receipt.Result != nil && validRecordedControlResult(*receipt.Result, receipt.Request)
-		if !validControlRequest(receipt.Request, s.repository) || seen[receipt.Request.RequestID] || receipt.State != "pending" && receipt.State != "completed" || receipt.State == "pending" && receipt.Result != nil || receipt.State == "completed" && !validResult {
+		if !validControlRequest(receipt.Request, s.repository) || seen[receipt.Request.RequestID] || receipt.State != "pending" && receipt.State != "completed" || receipt.State == "pending" && receipt.Result != nil || receipt.State == "completed" && !validResult || !validOperatorReceiptBinding(receipt) {
 			return controlReceiptState{}, errors.New("invalid control receipt")
 		}
 		seen[receipt.Request.RequestID] = true
@@ -280,7 +292,7 @@ func validControlRequest(request controlRequest, repository string) bool {
 	switch request.Action {
 	case "reconcile", "orchestrator-recover", "orchestrator-clear", "orchestrator-rebuild", "orchestrator-session":
 		return request.Issue == 0 && request.Attempt == 0 && !request.Confirm
-	case "recover", "review-plan", "dismiss", "orchestrator-investigate":
+	case "recover", "review-plan", "dismiss", "cancel", "orchestrator-investigate":
 		return request.Issue > 0 && request.Attempt > 0 && !request.Confirm
 	case "archive", "abandon", "remove":
 		return request.Issue > 0 && request.Attempt > 0 && request.Confirm

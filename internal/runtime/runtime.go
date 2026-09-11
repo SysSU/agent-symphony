@@ -794,6 +794,23 @@ func (r *Runtime) Discover() ([]Manifest, error) {
 // Forget removes one exact retained attempt record after its worker resources
 // have already been cleaned up by the implementation boundary.
 func (r *Runtime) Forget(manifest Manifest) error {
+	return r.forget(manifest, false)
+}
+
+// ForgetCompatibility removes a retained v1 manifest/log record after v2 has
+// already proved its worker resources absent. A native v2 attempt may have a
+// log directory without a v1 manifest, which is also safe to remove here.
+func (r *Runtime) ForgetCompatibility(manifest Manifest) error {
+	return r.forget(manifest, true)
+}
+
+// VerifyResourcesGone checks the implementation session/worktree/result
+// postconditions without mutating them.
+func (r *Runtime) VerifyResourcesGone(ctx context.Context, manifest Manifest) error {
+	return r.verifyResourcesGone(ctx, manifest)
+}
+
+func (r *Runtime) forget(manifest Manifest, allowMissingManifest bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.canonicalizeStateRoot(); err != nil {
@@ -806,11 +823,14 @@ func (r *Runtime) Forget(manifest Manifest) error {
 	stored, err := r.readManifest(attempt)
 	if errors.Is(err, os.ErrNotExist) {
 		dir := filepath.Dir(r.manifestPath(attempt))
-		if _, statErr := os.Lstat(dir); !errors.Is(statErr, os.ErrNotExist) {
-			if statErr == nil {
+		info, statErr := os.Lstat(dir)
+		if !errors.Is(statErr, os.ErrNotExist) {
+			if statErr == nil && (!allowMissingManifest || !info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
 				return errors.New("attempt record is incomplete")
 			}
-			return statErr
+			if statErr != nil {
+				return statErr
+			}
 		}
 		for _, path := range []string{manifest.Worktree, ResultPath(manifest.Worktree)} {
 			if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
@@ -820,7 +840,13 @@ func (r *Runtime) Forget(manifest Manifest) error {
 				return statErr
 			}
 		}
-		return nil
+		if errors.Is(statErr, os.ErrNotExist) {
+			return nil
+		}
+		if err := rejectSymlinkPath(r.StateRoot, dir, false); err != nil {
+			return err
+		}
+		return os.RemoveAll(dir)
 	}
 	if err != nil {
 		return err

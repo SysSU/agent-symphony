@@ -245,7 +245,7 @@ func TestRuntimeEffectsSerializeSameAttemptAndOverlapDifferentAttempts(t *testin
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	runner := &barrierEffectRunner{entered: make(chan struct{}, 2), release: make(chan struct{})}
 	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Runner: runner, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
-	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
+	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState, Cleanup: func(context.Context, agentruntime.EffectRequest) error { return nil }, VerifyCleanup: func(context.Context, agentruntime.EffectRequest) (bool, error) { return true, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,7 +668,7 @@ func TestRuntimeTombstoneCleanupUsesTypedAtomicIntent(t *testing.T) {
 	deleted, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{
 		Repository: "o/r", Issue: 81, Attempt: 1,
 		ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1,
-		Action: "dismissed", CleanupPhase: "cleanup-started", Manifest: &manifest,
+		Action: "abandoned", CleanupPhase: "cleanup-started", Manifest: &manifest, CleanupPolicy: &agentruntime.EffectCleanupPolicy{Action: "abandon"},
 		EffectAction: string(agentruntime.EffectCleanup), EffectRequestDigest: digest,
 	})
 	if err != nil || effect == nil || effect.IntentEpoch != snapshot.State.Epoch || effect.RequestDigest != digest {
@@ -807,7 +807,7 @@ func runtimeEffectTestCoordinator(t *testing.T, issue int) (*runtimeEffectCoordi
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	runner := &barrierEffectRunner{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Runner: runner, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
-	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
+	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState, Cleanup: func(context.Context, agentruntime.EffectRequest) error { return nil }, VerifyCleanup: func(context.Context, agentruntime.EffectRequest) (bool, error) { return true, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -837,7 +837,11 @@ func beginRuntimeTestEffectRequest(t *testing.T, coordinator *runtimeEffectCoord
 }
 
 func runtimeTestRequest(action agentruntime.EffectAction, manifest agentruntime.Manifest, reason string) agentruntime.EffectRequest {
-	return agentruntime.EffectRequest{Action: action, Attempt: agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: []string{"worker"}, Interactive: manifest.Interactive}, Manifest: manifest, Eligible: true, Reason: reason}
+	request := agentruntime.EffectRequest{Action: action, Attempt: agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: []string{"worker"}, Interactive: manifest.Interactive}, Manifest: manifest, Eligible: true, Reason: reason}
+	if action == agentruntime.EffectCleanup {
+		request.Cleanup.Action = "abandon"
+	}
+	return request
 }
 
 func mustOwnerSnapshot(t *testing.T, owner *stateOwner) stateOwnerSnapshot {

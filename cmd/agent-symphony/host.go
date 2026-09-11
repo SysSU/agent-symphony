@@ -1040,16 +1040,16 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return errors.New("review boundary cannot export implementation attempts")
 		}
 		result.Output, err = exportAttempt(ctx, request.Command.Input, root)
-	case "cleanup":
+	case "validate-cleanup", "cleanup":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot clean implementation attempts")
 		}
-		err = cleanupAttempt(ctx, request.Command.Input, root)
-	case "abandon":
+		err = validateOrCleanupAttempt(ctx, request.Command.Input, root, request.Operation == "cleanup")
+	case "validate-abandon", "abandon":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot abandon implementation attempts")
 		}
-		err = abandonAttempt(ctx, request.Command.Input, root)
+		err = validateOrAbandonAttempt(ctx, request.Command.Input, root, request.Operation == "abandon")
 	case "validate-remove", "remove":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot permanently remove implementation attempts")
@@ -1084,11 +1084,19 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 }
 
 func cleanupAttempt(ctx context.Context, input []byte, root string) error {
-	return removeAttemptResources(ctx, input, root, true)
+	return validateOrCleanupAttempt(ctx, input, root, true)
 }
 
 func abandonAttempt(ctx context.Context, input []byte, root string) error {
-	return removeAttemptResources(ctx, input, root, false)
+	return validateOrAbandonAttempt(ctx, input, root, true)
+}
+
+func validateOrCleanupAttempt(ctx context.Context, input []byte, root string, remove bool) error {
+	return removeAttemptResources(ctx, input, root, true, remove)
+}
+
+func validateOrAbandonAttempt(ctx context.Context, input []byte, root string, remove bool) error {
+	return removeAttemptResources(ctx, input, root, false, remove)
 }
 
 type permanentRemovalRequest struct {
@@ -1106,14 +1114,14 @@ func permanentlyRemoveAttempt(ctx context.Context, input []byte, root string, re
 	return removeVerifiedAttemptResources(ctx, request.Manifest, root, false, request.PublishedHead, remove)
 }
 
-func removeAttemptResources(ctx context.Context, input []byte, root string, completed bool) error {
+func removeAttemptResources(ctx context.Context, input []byte, root string, completed, remove bool) error {
 	var manifest agentruntime.Manifest
 	decoder := json.NewDecoder(bytes.NewReader(input))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return errors.New("invalid attempt manifest")
 	}
-	return removeVerifiedAttemptResources(ctx, manifest, root, completed, "", true)
+	return removeVerifiedAttemptResources(ctx, manifest, root, completed, "", remove)
 }
 
 func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.Manifest, root string, completed bool, publishedHead string, remove bool) error {

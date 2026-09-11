@@ -711,7 +711,7 @@ func deleteIssueRecoveries(state *runtimeOwnerState, repository string, issue in
 
 func deleteIssueScopedEffects(state *runtimeOwnerState, repository string, issue int) {
 	for id, effect := range state.Effects {
-		if effect.Repository == repository && effect.Issue == issue && effect.Attempt == 0 {
+		if !effectReferencedByReceipt(*state, id) && effect.Repository == repository && effect.Issue == issue && effect.Attempt == 0 {
 			delete(state.Effects, id)
 		}
 	}

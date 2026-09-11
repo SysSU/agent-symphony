@@ -808,9 +808,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if !result.OK {
 			return fail(stderr, false, command, result.Error)
 		}
-		fmt.Fprintf(stdout, "%s succeeded for %s", result.Action, *repository)
+		if result.Status == http.StatusAccepted {
+			fmt.Fprintf(stdout, "%s accepted for %s", result.Action, *repository)
+		} else {
+			fmt.Fprintf(stdout, "%s succeeded for %s", result.Action, *repository)
+		}
 		if request.Issue > 0 {
 			fmt.Fprintf(stdout, "#%d attempt %d", *issueNumber, *attemptNumber)
+		}
+		if result.Status == http.StatusAccepted {
+			var status operatorReceiptStatus
+			if json.Unmarshal(result.Data, &status) == nil && status.Phase != "" {
+				fmt.Fprintf(stdout, " (phase %s)", status.Phase)
+			}
 		}
 		fmt.Fprintln(stdout)
 		return 0

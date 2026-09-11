@@ -466,6 +466,14 @@ func reviewerExecutionDigest(request reconciliationEffectRequest, material revie
 }
 
 func (c *runtimeEffectCoordinator) executeReviewer(_ context.Context, boundary boundaryCaller, plan reconciliationPlannedEffect, material reviewerExecutionMaterial) (reconciliationEffectResult, bool, error) {
+	return c.executeReviewerMode(boundary, plan, material, false)
+}
+
+func (c *runtimeEffectCoordinator) executeOperatorReviewer(boundary boundaryCaller, plan reconciliationPlannedEffect, material reviewerExecutionMaterial) (reconciliationEffectResult, bool, error) {
+	return c.executeReviewerMode(boundary, plan, material, true)
+}
+
+func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, plan reconciliationPlannedEffect, material reviewerExecutionMaterial, operator bool) (reconciliationEffectResult, bool, error) {
 	request := plan.Request
 	if request.Action != reconciliationReviewer || request.Reviewer == nil || reviewerExecutionDigest(request, material) != request.ExecutionDigest || digestText(material.Issue.Body) != request.BodyDigest {
 		return reconciliationEffectResult{}, false, errStateConflict
@@ -497,7 +505,7 @@ func (c *runtimeEffectCoordinator) executeReviewer(_ context.Context, boundary b
 			}
 		}
 		result := reconciliationEffectResult{Action: request.Action, Reviewer: &reviewerEffectResult{Phase: request.Reviewer.Phase, Status: "cleaned", Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, BaseSHA: request.Reviewer.BaseSHA, HeadSHA: request.Reviewer.HeadSHA, Snapshot: request.Reviewer.Snapshot, Session: request.Reviewer.Session}}
-		if err := c.finishReconciliationWithMarker(plan.Identity, request, result); err != nil {
+		if err := c.finishReconciliationMarker(plan.Identity, request, result, operator); err != nil {
 			return reconciliationEffectResult{}, false, err
 		}
 		return result, false, nil
@@ -511,7 +519,7 @@ func (c *runtimeEffectCoordinator) executeReviewer(_ context.Context, boundary b
 		return reconciliationEffectResult{}, pending, err
 	}
 	result := reconciliationEffectResult{Action: request.Action, Reviewer: &reviewerEffectResult{Phase: request.Reviewer.Phase, Status: review.Status, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, BaseSHA: request.Reviewer.BaseSHA, HeadSHA: request.Reviewer.HeadSHA, Snapshot: request.Reviewer.Snapshot, Session: request.Reviewer.Session, Findings: slices.Clone(review.Findings)}}
-	if err := c.finishReconciliationWithMarker(plan.Identity, request, result); err != nil {
+	if err := c.finishReconciliationMarker(plan.Identity, request, result, operator); err != nil {
 		return reconciliationEffectResult{}, false, err
 	}
 	return result, false, nil
@@ -884,6 +892,14 @@ func (c *runtimeEffectCoordinator) beginReconciliation(ctx context.Context, plan
 }
 
 func (c *runtimeEffectCoordinator) executeIssueUpdate(_ context.Context, api internalgithub.API, plan reconciliationPlannedEffect) (reconciliationEffectResult, error) {
+	return c.executeIssueUpdateMode(api, plan, false)
+}
+
+func (c *runtimeEffectCoordinator) executeOperatorIssueUpdate(api internalgithub.API, plan reconciliationPlannedEffect) (reconciliationEffectResult, error) {
+	return c.executeIssueUpdateMode(api, plan, true)
+}
+
+func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API, plan reconciliationPlannedEffect, operator bool) (reconciliationEffectResult, error) {
 	request := plan.Request
 	if request.Action != reconciliationGitHubIssueUpdate || request.GitHubIssueUpdate == nil || issueUpdateExecutionDigest(request, plan.Material) != request.ExecutionDigest {
 		return reconciliationEffectResult{}, errStateConflict
@@ -930,7 +946,7 @@ func (c *runtimeEffectCoordinator) executeIssueUpdate(_ context.Context, api int
 		}
 	}
 	result := reconciliationEffectResult{Action: request.Action, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: request.GitHubIssueUpdate.Kind, Observed: true}}
-	if err := c.finishReconciliationWithMarker(plan.Identity, request, result); err != nil {
+	if err := c.finishReconciliationMarker(plan.Identity, request, result, operator); err != nil {
 		return reconciliationEffectResult{}, err
 	}
 	return result, nil
@@ -1027,19 +1043,37 @@ func attemptIssueUpdateApplied(ctx context.Context, api internalgithub.API, requ
 }
 
 func (c *runtimeEffectCoordinator) finishReconciliationWithMarker(identity stateResultIdentity, request reconciliationEffectRequest, result reconciliationEffectResult) error {
+	return c.finishReconciliationMarker(identity, request, result, false)
+}
+
+func (c *runtimeEffectCoordinator) finishReconciliationMarker(identity stateResultIdentity, request reconciliationEffectRequest, result reconciliationEffectResult, operator bool) error {
 	if c == nil || c.owner == nil {
 		return errors.New("runtime effect coordinator is unavailable")
 	}
 	if err := writeReconciliationEffectMarker(c.owner.stateRoot, identity, request, result); err != nil {
 		return err
 	}
-	_, err := c.owner.finishReconciliationEffect(c.lifecycle, finishReconciliationEffectCommand{Identity: identity, Result: result})
+	finish := finishReconciliationEffectCommand{Identity: identity, Result: result}
+	var err error
+	if operator {
+		_, err = c.owner.finishOperatorReconciliationEffect(c.lifecycle, finishOperatorReconciliationEffectCommand{Finish: finish})
+	} else {
+		_, err = c.owner.finishReconciliationEffect(c.lifecycle, finish)
+	}
 	return err
 }
 
 // verifyPendingReconciliation commits a previously verified result without
 // reconstructing ephemeral execution input or repeating external work.
 func (c *runtimeEffectCoordinator) verifyPendingReconciliation(ctx context.Context, effect runtimeEffectIntent) (*reconciliationEffectResult, error) {
+	return c.verifyPendingReconciliationMode(ctx, effect, false)
+}
+
+func (c *runtimeEffectCoordinator) verifyPendingOperatorReconciliation(ctx context.Context, effect runtimeEffectIntent) (*reconciliationEffectResult, error) {
+	return c.verifyPendingReconciliationMode(ctx, effect, true)
+}
+
+func (c *runtimeEffectCoordinator) verifyPendingReconciliationMode(ctx context.Context, effect runtimeEffectIntent, operator bool) (*reconciliationEffectResult, error) {
 	if c == nil || c.owner == nil || effect.Reconciliation == nil || effect.State != "pending" && effect.State != "completed" {
 		return nil, errStateConflict
 	}
@@ -1049,8 +1083,15 @@ func (c *runtimeEffectCoordinator) verifyPendingReconciliation(ctx context.Conte
 		return result, err
 	}
 	if effect.State == "pending" {
-		if _, err := c.owner.finishReconciliationEffect(ctx, finishReconciliationEffectCommand{Identity: identity, Result: *result}); err != nil {
-			return nil, err
+		finish := finishReconciliationEffectCommand{Identity: identity, Result: *result}
+		var finishErr error
+		if operator {
+			_, finishErr = c.owner.finishOperatorReconciliationEffect(ctx, finishOperatorReconciliationEffectCommand{Finish: finish})
+		} else {
+			_, finishErr = c.owner.finishReconciliationEffect(ctx, finish)
+		}
+		if finishErr != nil {
+			return nil, finishErr
 		}
 	} else if effect.ReconciliationResult == nil || !reflect.DeepEqual(*effect.ReconciliationResult, *result) {
 		return nil, errStateConflict

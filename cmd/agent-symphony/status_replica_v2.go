@@ -65,6 +65,29 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 	})
 	_, facts := recoveryAttemptFacts(remote, issues)
 	statuses, _ := projectRecoveryStatuses(context.Background(), facts, issues, manifests, capacity, nil)
+	for _, effect := range snapshot.State.Effects {
+		if effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Phase != "run-observe" {
+			continue
+		}
+		reviewer := effect.Reconciliation.Reviewer
+		for index := range statuses {
+			status := &statuses[index]
+			if status.Repository != effect.Repository || status.Issue != effect.Issue || status.Attempt != effect.Attempt || slices.ContainsFunc(status.Sessions, func(session orchestrator.AttemptSession) bool {
+				return session.Role == agentruntime.SessionRoleReviewer
+			}) {
+				continue
+			}
+			status.Sessions = append(status.Sessions, orchestrator.AttemptSession{Role: agentruntime.SessionRoleReviewer, Name: reviewer.Session, State: "preparing", Mode: reviewer.Mode, Target: reviewer.Target, Current: true})
+		}
+	}
+	for index := range statuses {
+		status := &statuses[index]
+		key := ownerAttemptKey(status.Repository, status.Issue, status.Attempt)
+		if record, ok := snapshot.State.Attempts[key]; ok && record.Manifest.State == "completed" && (status.State == "failed" || status.State == "cancelled" || status.Retryable) {
+			status.Retryable = false
+			status.Action = "inspect inconsistent completed local attempt before recovery"
+		}
+	}
 	slices.SortFunc(statuses, func(a, b orchestrator.RecoveryStatus) int {
 		if ordered := cmp.Compare(a.Repository, b.Repository); ordered != 0 {
 			return ordered

@@ -66,6 +66,7 @@ type dashboardServer struct {
 	localMu        sync.Mutex
 	controlMu      sync.Mutex
 	controlHook    func(controlRequest)
+	operator       *operatorMutationService
 }
 
 type operationLockContextKey struct{}
@@ -96,8 +97,9 @@ type dashboardHiddenAttempt struct {
 }
 
 type dashboardState struct {
-	Version int                      `json:"version"`
-	Hidden  []dashboardHiddenAttempt `json:"hidden"`
+	Version       int                      `json:"version"`
+	OwnerRevision uint64                   `json:"owner_revision,omitempty"`
+	Hidden        []dashboardHiddenAttempt `json:"hidden"`
 }
 
 type dashboardRemovalIntent struct {
@@ -181,7 +183,11 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		if !s.authenticate(w, r) {
 			return
 		}
-		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/dismiss" || r.URL.Path == "/actions/remove" || r.URL.Path == "/actions/recover" || r.URL.Path == "/actions/review-plan" {
+		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/dismiss" || r.URL.Path == "/actions/remove" || r.URL.Path == "/actions/cancel" || r.URL.Path == "/actions/recover" || r.URL.Path == "/actions/review-plan" {
+			if s.operator != nil {
+				s.serveOperatorAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/"))
+				return
+			}
 			s.serveAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/"))
 			return
 		}
@@ -364,6 +370,13 @@ func validateDashboardProjectURLs(values []string) ([]string, error) {
 }
 
 func (s *dashboardServer) readStatus() (dashboardStatusSnapshot, error) {
+	if s.operator != nil {
+		snapshot, err := s.operator.owner.snapshot(s.ctx)
+		if err != nil {
+			return dashboardStatusSnapshot{}, err
+		}
+		return projectOwnerStatus(snapshot, maxReconciliationAttemptCount, time.Now())
+	}
 	body, err := readDashboardStatus(filepath.Join(s.stateRoot, "status.json"))
 	if err != nil {
 		return dashboardStatusSnapshot{}, err
@@ -553,6 +566,26 @@ func (s *dashboardServer) serveState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *dashboardServer) readState() (dashboardState, error) {
+	if s.operator != nil {
+		snapshot, err := s.operator.owner.snapshot(s.ctx)
+		if err != nil {
+			return dashboardState{}, err
+		}
+		state := dashboardState{Version: dashboardStateVersion, OwnerRevision: snapshot.State.Revision, Hidden: []dashboardHiddenAttempt{}}
+		for _, tombstone := range snapshot.State.Tombstones {
+			state.Hidden = append(state.Hidden, dashboardHiddenAttempt{Repository: tombstone.Repository, Issue: tombstone.Issue, Attempt: tombstone.Attempt, Reason: tombstone.Action})
+		}
+		slices.SortFunc(state.Hidden, func(a, b dashboardHiddenAttempt) int {
+			if ordered := strings.Compare(a.Repository, b.Repository); ordered != 0 {
+				return ordered
+			}
+			if a.Issue != b.Issue {
+				return a.Issue - b.Issue
+			}
+			return a.Attempt - b.Attempt
+		})
+		return state, nil
+	}
 	state := dashboardState{Version: dashboardStateVersion, Hidden: []dashboardHiddenAttempt{}}
 	body, err := readDashboardFile(filepath.Join(s.stateRoot, "dashboard-state.json"), maxDashboardStateBytes)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1036,8 +1069,12 @@ func (s *dashboardServer) removeAttempt(ctx context.Context, operation string, m
 }
 
 func (s *dashboardServer) cleanupAttemptReview(ctx context.Context, manifest agentruntime.Manifest, remove bool) error {
+	return cleanupAttemptReviewResources(ctx, s.stateRoot, reviewBoundary(s.stateRoot), manifest, remove)
+}
+
+func cleanupAttemptReviewResources(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool) error {
 	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
-	snapshotRoot := productionSnapshotRoot(s.stateRoot)
+	snapshotRoot := productionSnapshotRoot(stateRoot)
 	if root, err := filepath.EvalSymlinks(snapshotRoot); err == nil {
 		if root != filepath.Clean(snapshotRoot) {
 			return errors.New("review snapshot root is unsafe")
@@ -1082,7 +1119,7 @@ func (s *dashboardServer) cleanupAttemptReview(ctx context.Context, manifest age
 	if !remove {
 		return nil
 	}
-	if err := cleanupReviewResources(ctx, reviewBoundary(s.stateRoot), nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot); err != nil {
+	if err := cleanupReviewResources(ctx, boundary, nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot); err != nil {
 		return err
 	}
 	for _, path := range resultPaths {

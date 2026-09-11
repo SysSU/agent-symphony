@@ -56,6 +56,15 @@ function canDismiss(status) {
   return status.issue_closed && dismissibleStates.has(status.state);
 }
 
+function CancelButton({ status, onAction, busy }) {
+  if (!["active", "review-ready"].includes(status.state)) return null;
+  return (
+    <button className="dangerAction" type="button" disabled={busy} onClick={() => onAction("cancel", status)} aria-label={`Cancel issue #${status.issue}, attempt ${status.attempt}; retain diagnostics`}>
+      {busy ? "Working…" : "Cancel attempt"}
+    </button>
+  );
+}
+
 function DismissButton({ status, onAction, busy }) {
   if (!canDismiss(status)) return null;
   return (
@@ -82,7 +91,8 @@ function StatusActions({ status, onAction, onInvestigate, onNotice, investigatio
   const investigationAvailable = investigationEnabled && canInvestigate(status);
   const actionAvailable = attemptActionAvailable(status, historical);
   const planReviewAvailable = canPlanReview(status);
-  if (readOnly || (!investigationAvailable && !actionAvailable && !canDismiss(status) && !canPermanentlyRemove(status, historical) && !planReviewAvailable)) return null;
+  const cancelAvailable = !historical && ["active", "review-ready"].includes(status.state);
+  if (readOnly || (!investigationAvailable && !actionAvailable && !canDismiss(status) && !canPermanentlyRemove(status, historical) && !planReviewAvailable && !cancelAvailable)) return null;
   const action = actionFor(status);
   const label = actionLabel(status, busy, waiting);
   return (
@@ -93,6 +103,7 @@ function StatusActions({ status, onAction, onInvestigate, onNotice, investigatio
         </button>
       ) : null}
       {planReviewAvailable ? <PlanReviewButton status={status} onNotice={onNotice} /> : null}
+      <CancelButton status={status} onAction={onAction} busy={busy} />
       <DismissButton status={status} onAction={onAction} busy={busy} />
       <PermanentRemoveButton status={status} onAction={onAction} busy={busy} historical={historical} />
       {actionAvailable ? (

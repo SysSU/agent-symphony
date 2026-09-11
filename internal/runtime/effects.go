@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"syscall"
@@ -70,6 +71,16 @@ type EffectRequest struct {
 	Eligible bool
 	Reason   string
 	Review   ReviewTransition
+	Cleanup  EffectCleanupPolicy
+}
+
+// EffectCleanupPolicy binds destructive authorization to one closed resource
+// policy. Exact paths remain part of the immutable manifest identity.
+type EffectCleanupPolicy struct {
+	Action                    string
+	PublishedHead             string
+	CompatibilityManifestSeen bool
+	CompatibilityLogSeen      bool
 }
 
 // EffectRuntime is the process configuration and environment snapshot used by
@@ -118,7 +129,11 @@ type EffectVerification struct {
 
 // EffectExecutor performs runtime I/O without reading or writing authoritative
 // manifests. The caller owns command sequencing and result application.
-type EffectExecutor struct{ Runtime *Runtime }
+type EffectExecutor struct {
+	Runtime       *Runtime
+	Cleanup       func(context.Context, EffectRequest) error
+	VerifyCleanup func(context.Context, EffectRequest) (bool, error)
+}
 
 // BindRequest captures all runtime inputs before intent persistence.
 func (e EffectExecutor) BindRequest(request EffectRequest) (EffectRequest, error) {
@@ -155,7 +170,15 @@ func (e EffectExecutor) Execute(ctx context.Context, request EffectRequest) (Eff
 	case EffectHandoff:
 		manifest, err = r.handoffEffect(ctx, request)
 	case EffectCleanup:
-		err = r.verifyResourcesGone(ctx, manifest)
+		if e.Cleanup == nil || e.VerifyCleanup == nil {
+			err = errors.New("runtime cleanup executor is missing")
+		} else if err = e.Cleanup(ctx, request); err == nil {
+			var complete bool
+			complete, err = e.VerifyCleanup(ctx, request)
+			if err == nil && !complete {
+				err = ErrRuntimeResourcesRemain
+			}
+		}
 	}
 	result := EffectResult{Identity: request.Identity, Action: request.Action, Manifest: manifest, Disposition: EffectResultAmbiguous}
 	if err == nil || definitiveFailedEffect(request.Action, manifest) {
@@ -233,9 +256,9 @@ func (e EffectExecutor) VerifyPending(ctx context.Context, request EffectRequest
 	case EffectReview:
 		return EffectVerification{Disposition: EffectPending}, nil
 	case EffectCleanup:
-		if err := r.verifyResourcesGone(ctx, request.Manifest); err == nil {
+		if complete, err := e.VerifyCleanup(ctx, request); err == nil && complete {
 			return verified(request.Manifest), nil
-		} else if errors.Is(err, errRuntimeResourcesRemain) {
+		} else if err == nil {
 			return retry, nil
 		} else {
 			return EffectVerification{}, err
@@ -354,7 +377,8 @@ func effectMarkerPath(directory, effectID string) (string, error) {
 	return filepath.Join(directory, effectID+".done"), nil
 }
 
-var errRuntimeResourcesRemain = errors.New("runtime resources remain")
+// ErrRuntimeResourcesRemain reports that cleanup is safe to retry but incomplete.
+var ErrRuntimeResourcesRemain = errors.New("runtime resources remain")
 
 func (e EffectExecutor) validate(request EffectRequest) error {
 	if err := e.validateIdentity(request.Action, request.Identity); err != nil {
@@ -417,8 +441,28 @@ func (e EffectExecutor) ValidateRequest(request EffectRequest) error {
 		if request.Manifest.State != "completed" && request.Manifest.State != "running" || !request.Eligible {
 			return errors.New("handoff effect input is invalid")
 		}
+	case EffectCleanup:
+		if e.Cleanup == nil || e.VerifyCleanup == nil || !validEffectCleanupPolicy(request.Cleanup) {
+			return errors.New("cleanup effect policy is invalid")
+		}
+	}
+	if request.Action != EffectCleanup && request.Cleanup != (EffectCleanupPolicy{}) {
+		return errors.New("runtime effect cleanup policy is invalid")
 	}
 	return nil
+}
+
+var effectObjectID = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
+
+func validEffectCleanupPolicy(policy EffectCleanupPolicy) bool {
+	switch policy.Action {
+	case "archive", "abandon":
+		return policy.PublishedHead == ""
+	case "remove":
+		return effectObjectID.MatchString(policy.PublishedHead)
+	default:
+		return false
+	}
 }
 
 func invalidEffectLaunchInput(request EffectRequest) bool {
@@ -444,7 +488,13 @@ func (e EffectExecutor) validateIdentity(action EffectAction, identity EffectIde
 // persisting command context or environment values that may contain secrets.
 func EffectRequestDigest(request EffectRequest) (string, error) {
 	material := struct {
-		Action EffectAction
+		Action  EffectAction
+		Attempt struct {
+			Repository string
+			Issue      int
+			Number     int
+			BaseSHA    string
+		}
 		Launch *struct {
 			Context     string
 			Command     []string
@@ -455,7 +505,10 @@ func EffectRequestDigest(request EffectRequest) (string, error) {
 		Eligible bool
 		Reason   string
 		Review   ReviewTransition
+		Cleanup  EffectCleanupPolicy
 	}{Action: request.Action, Manifest: request.Manifest, Runtime: request.Runtime}
+	material.Attempt.Repository, material.Attempt.Issue = request.Attempt.Repository, request.Attempt.Issue
+	material.Attempt.Number, material.Attempt.BaseSHA = request.Attempt.Number, request.Attempt.BaseSHA
 	if slices.Contains([]EffectAction{EffectPrepare, EffectStart}, request.Action) {
 		material.Launch = &struct {
 			Context     string
@@ -471,6 +524,9 @@ func EffectRequestDigest(request EffectRequest) (string, error) {
 	}
 	if request.Action == EffectReview {
 		material.Review = request.Review
+	}
+	if request.Action == EffectCleanup {
+		material.Cleanup = request.Cleanup
 	}
 	body, err := json.Marshal(material)
 	if err != nil {
@@ -893,14 +949,14 @@ func (r *Runtime) verifyResourcesGone(ctx context.Context, manifest Manifest) er
 		return err
 	}
 	if live {
-		return errRuntimeResourcesRemain
+		return ErrRuntimeResourcesRemain
 	}
 	for _, path := range []string{manifest.Worktree, ResultPath(manifest.Worktree), manifest.ReviewSnapshot} {
 		if path == "" {
 			continue
 		}
 		if _, err := os.Lstat(path); err == nil {
-			return errRuntimeResourcesRemain
+			return ErrRuntimeResourcesRemain
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}

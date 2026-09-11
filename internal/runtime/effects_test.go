@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -218,6 +219,55 @@ func TestEffectVerificationReconstructsStopFromDurableReason(t *testing.T) {
 	verification, err := executor.VerifyPending(t.Context(), request)
 	if err != nil || verification.Disposition != EffectVerified || verification.Result == nil || verification.Result.Manifest.State != "cancelled" || verification.Result.Manifest.Diagnostic != "issue closed" {
 		t.Fatalf("verification=%#v err=%v", verification, err)
+	}
+}
+
+func TestEffectCleanupPolicyIsClosedAndDigestBound(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(4, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, Cleanup: func(context.Context, EffectRequest) error { return nil }, VerifyCleanup: func(context.Context, EffectRequest) (bool, error) { return true, nil }}
+	base, err := executor.BindRequest(EffectRequest{Action: EffectCleanup, Attempt: attempt, Manifest: manifest, Eligible: true, Cleanup: EffectCleanupPolicy{Action: "archive"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.ValidateRequest(base); err != nil {
+		t.Fatal(err)
+	}
+	baseDigest, err := EffectRequestDigest(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, policy := range []EffectCleanupPolicy{{Action: "abandon"}, {Action: "remove", PublishedHead: strings.Repeat("a", 40)}} {
+		changed := base
+		changed.Cleanup = policy
+		if err := executor.ValidateRequest(changed); err != nil {
+			t.Fatalf("policy=%#v: %v", policy, err)
+		}
+		digest, err := EffectRequestDigest(changed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if digest == baseDigest {
+			t.Fatalf("cleanup policy was not digest-bound: %#v", policy)
+		}
+	}
+	for _, policy := range []EffectCleanupPolicy{{}, {Action: "dismiss"}, {Action: "archive", PublishedHead: "unexpected"}, {Action: "remove"}, {Action: "remove", PublishedHead: strings.Repeat("A", 40)}} {
+		invalid := base
+		invalid.Cleanup = policy
+		if err := executor.ValidateRequest(invalid); err == nil {
+			t.Fatalf("accepted cleanup policy %#v", policy)
+		}
+	}
+	prepare := EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true, Cleanup: EffectCleanupPolicy{Action: "archive"}}
+	prepare, err = executor.BindRequest(prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.ValidateRequest(prepare); err == nil {
+		t.Fatal("accepted cleanup policy on prepare")
 	}
 }
 

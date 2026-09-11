@@ -103,9 +103,44 @@ func (c *runtimeEffectCoordinator) execute(_ context.Context, request agentrunti
 	return result, err
 }
 
+func (c *runtimeEffectCoordinator) executeOperator(request agentruntime.EffectRequest) (agentruntime.EffectResult, error) {
+	run, err := c.acquire(c.lifecycle, request)
+	if err != nil {
+		return agentruntime.EffectResult{}, err
+	}
+	defer c.release(request, run)
+	identity := ownerEffectIdentity(request.Identity)
+	if request.Action == agentruntime.EffectCleanup {
+		if _, err := c.owner.startOperatorCleanup(c.lifecycle, startOperatorCleanupCommand{Identity: identity}); err != nil {
+			return agentruntime.EffectResult{}, err
+		}
+	} else if err := c.owner.authorizeRuntimeEffect(c.lifecycle, authorizeRuntimeEffectCommand{Identity: identity, Action: request.Action}); err != nil {
+		return agentruntime.EffectResult{}, err
+	}
+	if err := run.ctx.Err(); err != nil {
+		return agentruntime.EffectResult{}, err
+	}
+	result, err := c.executor.Execute(run.ctx, request)
+	if result.Disposition != agentruntime.EffectResultReady {
+		return result, err
+	}
+	if _, finishErr := c.owner.finishOperatorRuntimeEffect(c.lifecycle, finishOperatorRuntimeEffectCommand{Finish: finishRuntimeEffectCommand{Identity: ownerEffectIdentity(result.Identity), Action: result.Action, Manifest: result.Manifest}}); finishErr != nil {
+		return result, errors.Join(err, finishErr)
+	}
+	return result, err
+}
+
 // verifyPending checks external state after restart and commits only a proven,
 // generation-current outcome. Retry and ambiguous review/monitor work stay pending.
 func (c *runtimeEffectCoordinator) verifyPending(ctx context.Context, snapshot stateOwnerSnapshot, effect runtimeEffectIntent, request agentruntime.EffectRequest) (agentruntime.EffectVerification, error) {
+	return c.verifyPendingMode(ctx, snapshot, effect, request, false)
+}
+
+func (c *runtimeEffectCoordinator) verifyPendingOperator(ctx context.Context, snapshot stateOwnerSnapshot, effect runtimeEffectIntent, request agentruntime.EffectRequest) (agentruntime.EffectVerification, error) {
+	return c.verifyPendingMode(ctx, snapshot, effect, request, true)
+}
+
+func (c *runtimeEffectCoordinator) verifyPendingMode(ctx context.Context, snapshot stateOwnerSnapshot, effect runtimeEffectIntent, request agentruntime.EffectRequest, operator bool) (agentruntime.EffectVerification, error) {
 	if snapshot.CycleID != 0 || effect.State != "pending" {
 		return agentruntime.EffectVerification{}, errStateConflict
 	}
@@ -120,12 +155,19 @@ func (c *runtimeEffectCoordinator) verifyPending(ctx context.Context, snapshot s
 		return verification, err
 	}
 	result := verification.Result
-	if _, err := c.owner.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{
+	finish := finishRuntimeEffectCommand{
 		Identity: ownerEffectIdentity(result.Identity),
 		Action:   result.Action,
 		Manifest: result.Manifest,
-	}); err != nil {
-		return agentruntime.EffectVerification{}, err
+	}
+	var finishErr error
+	if operator {
+		_, finishErr = c.owner.finishOperatorRuntimeEffect(ctx, finishOperatorRuntimeEffectCommand{Finish: finish})
+	} else {
+		_, finishErr = c.owner.finishRuntimeEffect(ctx, finish)
+	}
+	if finishErr != nil {
+		return agentruntime.EffectVerification{}, finishErr
 	}
 	return verification, nil
 }
