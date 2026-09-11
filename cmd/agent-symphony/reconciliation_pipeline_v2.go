@@ -1069,7 +1069,10 @@ func (c *runtimeEffectCoordinator) finishReconciliationMarker(identity stateResu
 	} else {
 		_, err = c.owner.finishReconciliationEffect(c.lifecycle, finish)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return removeReconciliationEffectMarker(c.owner.stateRoot, identity)
 }
 
 // verifyPendingReconciliation commits a previously verified result without
@@ -1106,6 +1109,9 @@ func (c *runtimeEffectCoordinator) verifyPendingReconciliationMode(ctx context.C
 		return nil, errStateConflict
 	}
 	if err := cleanupCompletedHandoffOutcome(c.owner.stateRoot, *effect.Reconciliation); err != nil {
+		return nil, err
+	}
+	if err := removeReconciliationEffectMarker(c.owner.stateRoot, identity); err != nil {
 		return nil, err
 	}
 	return result, nil

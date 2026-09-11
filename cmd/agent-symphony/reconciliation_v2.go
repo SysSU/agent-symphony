@@ -219,7 +219,24 @@ func (r *reconciliationTriggerRunner) triggerAndWait(ctx context.Context) error 
 	case <-r.done:
 		return errStateOwnerStopped
 	case <-ctx.Done():
+		r.removeWaiter(wait)
 		return ctx.Err()
+	}
+}
+
+func (r *reconciliationTriggerRunner) removeWaiter(wait chan error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, waits := range r.waiters {
+		for index := range waits {
+			if waits[index] == wait {
+				r.waiters[id] = slices.Delete(waits, index, index+1)
+				if len(r.waiters[id]) == 0 {
+					delete(r.waiters, id)
+				}
+				return
+			}
+		}
 	}
 }
 
@@ -397,6 +414,9 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 		key := ownerIssueKey(group.Fact.Repository, group.Fact.Issue)
 		seen[key] = true
 		if !reconciliationIssueGenerationMatches(*state, key, collection.IssueGenerations[key]) {
+			if err := countStaleReconciliation(state); err != nil {
+				return err
+			}
 			continue
 		}
 		group = prepareReconciliationIssueGroup(*state, collection, group)
@@ -404,6 +424,11 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 		if applied, ok := appliedCycles[key]; ok && identity.CycleID <= applied.cycle {
 			if identity.CycleID == applied.cycle && digest != applied.digest {
 				return errStateConflict
+			}
+			if identity.CycleID < applied.cycle {
+				if err := countStaleReconciliation(state); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -434,6 +459,9 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 	}
 	for _, key := range keys {
 		if !reconciliationIssueGenerationMatches(*state, key, collection.IssueGenerations[key]) {
+			if err := countStaleReconciliation(state); err != nil {
+				return err
+			}
 			continue
 		}
 		digest := reconciliationInputDigest(collection.Scope, collection.Complete, key, nil)
@@ -441,12 +469,22 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 			if identity.CycleID == applied.cycle && digest != applied.digest {
 				return errStateConflict
 			}
+			if identity.CycleID < applied.cycle {
+				if err := countStaleReconciliation(state); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		previous, exists := state.Observations[key]
 		if exists && previous.ObservationEpoch == identity.Epoch && identity.CycleID <= previous.LastCycleID {
 			if identity.CycleID == previous.LastCycleID && previous.InputDigest != digest {
 				return errStateConflict
+			}
+			if identity.CycleID < previous.LastCycleID {
+				if err := countStaleReconciliation(state); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -470,6 +508,14 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 		}
 		state.Observations[key] = next
 	}
+	return nil
+}
+
+func countStaleReconciliation(state *runtimeOwnerState) error {
+	if state.StaleReconciliations == ^uint64(0) {
+		return errors.New("stale reconciliation count overflow")
+	}
+	state.StaleReconciliations++
 	return nil
 }
 

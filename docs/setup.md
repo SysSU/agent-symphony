@@ -93,21 +93,7 @@ The optional `needs-human-review` label adds an explicit review-policy label and
 
 See [Issue eligibility and recorded blockers](cli.md#issue-eligibility-and-recorded-blockers) for every remaining dispatch and merge restriction. The latest blockers are persisted at `<runtime-state>/status.json`.
 
-With `serve` running, request one reconciliation:
-
-```sh
-agent-symphony reconcile \
-  --state ~/.local/state/agent-symphony/pr.json \
-  --runtime-state ~/.local/state/agent-symphony
-
-agent-symphony status \
-  --state ~/.local/state/agent-symphony/pr.json \
-  --runtime-state ~/.local/state/agent-symphony
-```
-
-Success means the issue appears in the status output and its `action` explains the next step. If it does not start, use its `blockers`, `diagnostic`, and `action` fields with the [status interpretation guide](cli.md#status-and-next-actions).
-
-For continuous operation, use `serve`; it admits owner-backed controls, starts the first reconciliation asynchronously, and then polls GitHub every `reconciliation_interval_seconds` (60 seconds by default). Set the machine-local `.agent-symphony.yaml` to 20 seconds for faster intake; keep this git-ignored file out of pull requests:
+Start `serve` in one terminal. It admits owner-backed controls, starts the first reconciliation asynchronously, and then polls GitHub every `reconciliation_interval_seconds` (60 seconds by default). Set the machine-local `.agent-symphony.yaml` to 20 seconds for faster intake; keep this git-ignored file out of pull requests:
 
 ```json
 "reconciliation_interval_seconds": 20
@@ -121,6 +107,20 @@ agent-symphony serve \
   --runtime-state ~/.local/state/agent-symphony \
   --dashboard-address 127.0.0.1:8080
 ```
+
+In a second terminal, request one reconciliation and inspect the resulting owner projection:
+
+```sh
+agent-symphony reconcile \
+  --state ~/.local/state/agent-symphony/pr.json \
+  --runtime-state ~/.local/state/agent-symphony
+
+agent-symphony status \
+  --state ~/.local/state/agent-symphony/pr.json \
+  --runtime-state ~/.local/state/agent-symphony
+```
+
+Success means the issue appears in the status output and its `action` explains the next step. If it does not start, use its `blockers`, `diagnostic`, and `action` fields with the [status interpretation guide](cli.md#status-and-next-actions).
 
 Open the dashboard URL printed by `serve` in a browser. This web dashboard is the supported graphical interface; there is no desktop client to install or configure. The running application release appears below the repository name in the dashboard header and matches `agent-symphony --version`. The dashboard stays on loopback by default because it provides direct implementation and reviewer terminal access plus confirmed recovery and cleanup controls for exact attempts shown in current status.
 
@@ -141,7 +141,7 @@ Create the password file as the coordinator user with mode `0600`; it must conta
 
 ## Stop the daemon
 
-Press `Ctrl-C` in the terminal running `serve`. A service manager should send `SIGTERM`. Agent Symphony stops new admission, cancels external work, joins the dashboard, reconciliation, effect, status, and supervisor lifecycles, then closes the state owner. The next start verifies completion markers and reconstructs pending work from the owner ledger and fresh external observations.
+Press `Ctrl-C` in the terminal running `serve`. A service manager should send `SIGTERM`. Agent Symphony stops new admission, cancels external work, joins the dashboard, reconciliation, effect, status, and supervisor lifecycles, then initiates state-owner shutdown even if the caller's wait deadline has expired. The wait context bounds the join; it does not skip the stop request. The next start verifies completion markers and reconstructs pending work from the owner ledger and fresh external observations.
 
 ## Multiple repositories on one host
 

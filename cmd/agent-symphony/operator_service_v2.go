@@ -17,9 +17,8 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
-// operatorMutationService is the dormant v2 request path. It commits owner
-// state before launching any external work and never participates in the v1
-// operation mutex or compatibility writers.
+// operatorMutationService commits owner state before launching external work.
+// It is the production path for dashboard, control, and orchestrator mutations.
 type operatorMutationService struct {
 	lifecycle         context.Context
 	owner             *stateOwner
@@ -51,13 +50,14 @@ type operatorReceiptStatus struct {
 }
 
 func newOperatorMutationService(lifecycle context.Context, owner *stateOwner, effects *runtimeEffectCoordinator, cleanup operatorCleanupExecutor, collector reconciliationV2Collector, reviewer boundaryCaller, reviewSource string, reviewEnvironment, reviewCommand []string) (*operatorMutationService, error) {
-	if lifecycle == nil || owner == nil || effects == nil || effects.owner != owner || effects.executor.Runtime == nil || cleanup.runtime != effects.executor.Runtime || cleanup.stateRoot != owner.stateRoot || collector.API.HTTP == nil || collector.Config.Repository == "" || collector.Config.ActorID < 1 || reviewer == nil {
+	if lifecycle == nil || owner == nil || effects == nil || effects.owner != owner || effects.executor.Runtime == nil || cleanup.runtime == nil || cleanup.stateRoot != owner.stateRoot || collector.API.HTTP == nil || collector.Config.Repository == "" || collector.Config.ActorID < 1 || reviewer == nil {
 		return nil, errors.New("operator mutation service is incomplete")
 	}
 	snapshot, err := owner.snapshot(lifecycle)
 	if err != nil || snapshot.State.Repository != collector.Config.Repository {
 		return nil, errors.New("operator mutation service repository does not match owner")
 	}
+	cleanup.runtime = effects.executor.Runtime
 	effects.executor.Cleanup = cleanup.execute
 	effects.executor.VerifyCleanup = cleanup.verify
 	service := &operatorMutationService{
@@ -294,7 +294,7 @@ func (s *operatorMutationService) prepareAdmission(ctx context.Context, snapshot
 		work.runtime = &effect
 	case "recover":
 		if manifest.State == "running" && (status.State == "active" || status.State == "review-ready" || status.State == "blocked" && status.Retryable) {
-			if err := s.effects.executor.Runtime.VerifyOwned(ctx, manifest); err == nil {
+			if err := freshRuntime(s.effects.executor.Runtime, s.effects.executor.Runtime.Source).VerifyOwned(ctx, manifest); err == nil {
 				return beginOperatorMutationCommand{}, operatorWork{}, errStateConflict
 			} else if ctx.Err() != nil {
 				return beginOperatorMutationCommand{}, operatorWork{}, ctx.Err()
@@ -402,7 +402,7 @@ func (s *operatorMutationService) prepareRecoveryAdmission(snapshot stateOwnerSn
 }
 
 func (s *operatorMutationService) preparePlanReview(ctx context.Context, snapshot stateOwnerSnapshot, manifest agentruntime.Manifest) (reconciliationPlannedEffect, reviewerExecutionMaterial, error) {
-	if err := s.effects.executor.Runtime.VerifyOwned(ctx, manifest); err != nil {
+	if err := freshRuntime(s.effects.executor.Runtime, s.effects.executor.Runtime.Source).VerifyOwned(ctx, manifest); err != nil {
 		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, err
 	}
 	observation := snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
@@ -430,7 +430,11 @@ func bindOperatorWorkIdentity(work *operatorWork, effect runtimeEffectIntent) {
 
 func (s *operatorMutationService) dispatch(work operatorWork) {
 	key := operatorWorkEffectID(work)
-	s.start(key, func() { _ = s.execute(work) })
+	s.start(key, func() {
+		if err := s.execute(work); err != nil {
+			s.classifyWorkerFailure(work.requestID, err)
+		}
+	})
 }
 
 func operatorWorkEffectID(work operatorWork) string {
@@ -490,7 +494,58 @@ func (s *operatorMutationService) dispatchResume(requestID string) {
 			key, reserved = receipt.EffectID, receipt.EffectID
 		}
 	}
-	s.start(key, func() { _ = s.resumeReceiptReserved(s.lifecycle, requestID, reserved) })
+	s.start(key, func() {
+		if err := s.resumeReceiptReserved(s.lifecycle, requestID, reserved); err != nil {
+			s.classifyWorkerFailure(requestID, err)
+		}
+	})
+}
+
+// classifyWorkerFailure makes one marker/postcondition check, then leaves an
+// exact durable diagnostic on work that is still pending. It never retries the
+// external mutation.
+func (s *operatorMutationService) classifyWorkerFailure(requestID string, workErr error) {
+	if requestID == "" || workErr == nil || s.lifecycle.Err() != nil {
+		return
+	}
+	snapshot, err := s.owner.snapshot(s.lifecycle)
+	if err != nil {
+		return
+	}
+	receipt, ok := operatorReceiptByID(snapshot.State, requestID)
+	if !ok || receipt.State != "pending" {
+		return
+	}
+	effect, ok := snapshot.State.Effects[receipt.EffectID]
+	if !ok || effect.State != "pending" {
+		return
+	}
+	diagnostic := "operator worker stopped with pending durable intent: " + internalgithub.Redact(workErr.Error())
+	if effect.Reconciliation != nil {
+		result, verifyErr := s.effects.verifyPendingOperatorReconciliation(s.lifecycle, effect)
+		if result != nil || verifyErr == nil {
+			if result != nil {
+				return
+			}
+		} else {
+			diagnostic += "; marker verification failed: " + internalgithub.Redact(verifyErr.Error())
+		}
+		_, _ = s.owner.diagnoseReconciliationEffect(s.lifecycle, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: effect.Reconciliation.Action, Diagnostic: diagnostic})
+		return
+	}
+	request, reconstructErr := s.reconstructRuntimeRequest(snapshot, effect)
+	if reconstructErr == nil {
+		verification, verifyErr := s.effects.verifyPendingOperator(s.lifecycle, snapshot, effect, request)
+		if verifyErr == nil && verification.Disposition == agentruntime.EffectVerified {
+			return
+		}
+		if verifyErr != nil {
+			diagnostic += "; marker verification failed: " + internalgithub.Redact(verifyErr.Error())
+		}
+	} else {
+		diagnostic += "; reconstruction failed: " + internalgithub.Redact(reconstructErr.Error())
+	}
+	_, _ = s.owner.diagnoseRuntimeEffect(s.lifecycle, diagnoseRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), Action: agentruntime.EffectAction(effect.Action), Diagnostic: diagnostic})
 }
 
 func (s *operatorMutationService) start(key string, work func()) bool {
@@ -745,6 +800,10 @@ func (s *operatorMutationService) resumePending(ctx context.Context) error {
 		}
 		receipt, ok := operatorReceiptByID(snapshot.State, requestID)
 		if !ok || receipt.State != "pending" {
+			continue
+		}
+		if receipt.Phase == operatorPhaseTerminalAwait || receipt.Phase == operatorPhaseRetryAwait {
+			s.dispatchResume(requestID)
 			continue
 		}
 		effect, ok := snapshot.State.Effects[receipt.EffectID]

@@ -130,6 +130,88 @@ func TestPlanRuntimeLifecycleEmitsOneGenerationCurrentActionPerAttempt(t *testin
 	}
 }
 
+func TestPlanRuntimeLifecycleNeverReusesOwnedAttemptAfterRestart(t *testing.T) {
+	root := resolvedTempDir(t)
+	attemptRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base, body := strings.Repeat("a", 40), "stale attempt proposal"
+	issueKey, attemptOne := ownerIssueKey("o/r", 10), ownerAttemptKey("o/r", 10, 1)
+	state := newRuntimeOwnerState("o/r")
+	state.Epoch, state.Revision, state.IssueGenerations[issueKey], state.AttemptGenerations[attemptOne] = 2, 3, 1, 2
+	state.Tombstones[attemptOne] = runtimeTombstone{Repository: "o/r", Issue: 10, Attempt: 1, Generation: 2, InvalidatedGeneration: 1, Action: "abandoned", CleanupPhase: "completed"}
+	state.Observations[issueKey] = reconciliationObservation{
+		Present: true, Generation: 1, OwnerGeneration: 1, ObservationEpoch: 2, LastCycleID: 1,
+		Fact:     reconciliationIssueFact{Repository: "o/r", Issue: 10, Attempt: 1, Priority: 1, CreatedAtUnixNano: time.Unix(1, 0).UnixNano(), Eligible: true, DispatchAuthorized: true, BaseSHA: base, BaseBranch: "main", BodyDigest: digestText(body)},
+		Attempts: map[string]reconciliationAttemptObservation{},
+	}
+	batch := reconciliationV2Batch{Input: reconciliationInput{Issues: []internalgithub.RecoveryIssueFact{{Repository: "o/r", Issue: 10, Attempt: 1, Priority: 1, CreatedAt: time.Unix(1, 0), Eligible: true, DispatchAuthorized: true, BaseSHA: base, BaseBranch: "main", Body: body}}}}
+	plans, err := planRuntimeLifecycle(stateOwnerSnapshot{State: state}, batch, config.Default("o/r"), time.Unix(1, 0).UTC(), attemptRoot, root)
+	if err != nil || len(plans) != 1 || plans[0].Request.Action != agentruntime.EffectPrepare || plans[0].Request.Attempt.Number != 2 {
+		t.Fatalf("plans=%#v err=%v", plans, err)
+	}
+
+	active := reconciliationAttemptFact{Repository: "o/r", Issue: 10, Attempt: 1, BaseSHA: base, State: "active"}
+	observation := state.Observations[issueKey]
+	observation.Fact.Active, observation.Fact.ActiveAttempt = true, &active
+	observation.Attempts[attemptOne] = reconciliationAttemptObservation{Present: true, Generation: 1, OwnerGeneration: 2, SourceIssueGeneration: 1, ObservationEpoch: 2, LastCycleID: 2, Fact: active}
+	state.Observations[issueKey] = observation
+	plans, err = planRuntimeLifecycle(stateOwnerSnapshot{State: state}, batch, config.Default("o/r"), time.Unix(2, 0).UTC(), attemptRoot, root)
+	if err != nil || len(plans) != 0 {
+		t.Fatalf("tombstoned remote attempt planned: %#v err=%v", plans, err)
+	}
+}
+
+func TestPreBindAbandonRestartReservesAttemptAndRejectsStaleWork(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 11, "orphaned", false)
+	for _, path := range []string{manifest.Worktree, productionSnapshotRoot(owner.stateRoot)} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	request := operatorRequest("pre-bind-abandon", "abandon", manifest, true)
+	command, _, err := service.prepareAdmission(t.Context(), mustOwnerSnapshot(t, owner), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, _, err := owner.beginOperatorMutation(t.Context(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := ownerAttemptKey("o/r", 11, 1)
+	if committed.State.AttemptGenerations[key] != 2 || committed.State.Tombstones[key].Action != "abandoned" {
+		t.Fatalf("abandon did not reserve attempt 1: %#v", committed.State)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, committed.State, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	body, base := "stale GitHub proposal", manifest.BaseSHA
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 11, Attempt: 1, Priority: 1, CreatedAt: time.Unix(1, 0).UTC(), Eligible: true, DispatchAuthorized: true, BaseSHA: base, BaseBranch: "main", Body: body}
+	input := repositoryInput(true, issue)
+	accepted := applyReconciliationInput(t, restarted, input)
+	plans, err := planRuntimeLifecycle(accepted, reconciliationV2Batch{Input: input}, config.Default("o/r"), time.Unix(2, 0).UTC(), restarted.attemptRoot, restarted.stateRoot)
+	if err != nil || len(plans) != 1 || plans[0].Request.Action != agentruntime.EffectPrepare || plans[0].Request.Attempt.Number != 2 {
+		t.Fatalf("plans=%#v err=%v", plans, err)
+	}
+	stale := plans[0].Request
+	stale.Attempt.Number = 1
+	stale.Manifest, err = agentruntime.PreparingManifest(restarted.attemptRoot, restarted.stateRoot, stale.Attempt, time.Unix(2, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := stateResultIdentity{Epoch: accepted.State.Epoch, SourceRevision: accepted.State.Revision, IssueGeneration: accepted.State.IssueGenerations[ownerIssueKey("o/r", 11)], AttemptGeneration: accepted.State.AttemptGenerations[key]}
+	if _, _, err := restarted.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectPrepare, Manifest: stale.Manifest, RequestDigest: strings.Repeat("f", 64)}); !errors.Is(err, errAttemptTombstoned) {
+		t.Fatalf("stale attempt 1 begin err=%v", err)
+	}
+}
+
 func TestProductionTriggerImmediatelyCoalescesRecollectWithoutFailure(t *testing.T) {
 	started := make(chan int, 2)
 	secondDone := make(chan struct{})
@@ -295,7 +377,7 @@ func TestBindNoOpDoesNotRequestRecollection(t *testing.T) {
 		t.Fatalf("fresh accepted bind observation changed=%v err=%v", changed, err)
 	}
 	markers, err := os.ReadDir(filepath.Join(owner.stateRoot, "reconciliation-effects"))
-	if err != nil || len(markers) != 1 {
+	if err != nil || len(markers) != 0 {
 		t.Fatalf("bind marker growth=%d err=%v", len(markers), err)
 	}
 }
@@ -436,7 +518,7 @@ func TestGovernanceNoOpDoesNotRequestRecollectionOrGrowProofs(t *testing.T) {
 		t.Fatalf("restart resume=%v err=%v", resumed, err)
 	}
 	markers, err := os.ReadDir(filepath.Join(root, "reconciliation-effects"))
-	if err != nil || len(markers) != 2 || mutations != 0 || len(mustOwnerSnapshot(t, owner).State.Effects) != 1 {
+	if err != nil || len(markers) != 0 || mutations != 0 || len(mustOwnerSnapshot(t, owner).State.Effects) != 1 {
 		t.Fatalf("markers=%d effects=%d mutations=%d err=%v", len(markers), len(mustOwnerSnapshot(t, owner).State.Effects), mutations, err)
 	}
 }
@@ -730,6 +812,41 @@ func TestStartupMarkerSweepLeavesOperatorEffectsToReceiptRecovery(t *testing.T) 
 	}
 }
 
+func TestStartupMarkerSweepReclaimsProofForAlreadyCommittedCompletion(t *testing.T) {
+	test := reconciliationEffectCaseNamed(t, "issue-control-snapshot")
+	root, owner, snapshot := reconciliationEffectPersistentOwner(t, test.request)
+	request := bindEffectObservation(snapshot, test.request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, result := ownerReconciliationEffectIdentity(*effect), test.result(request)
+	if err := writeReconciliationEffectMarker(root, identity, request, result); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: result})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, root, finished.State, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	runtimeState := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: root, Runner: &barrierEffectRunner{}, VerifyWorker: func(context.Context) error { return nil }}
+	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: runtimeState}, active: map[string]*activeRuntimeEffect{}}
+	production := &productionReconciliation{owner: restarted, effects: coordinator, stateRoot: root}
+	if err := production.sweepPendingMarkers(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "reconciliation-effects", effect.ID+".done")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("committed marker was not reclaimed after restart: %v", err)
+	}
+}
+
 func TestProductionRuntimeFinishesOperatorMarkerBeforeAdmission(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 48, "running", false)
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
@@ -924,7 +1041,7 @@ func TestProductionRuntimeShutdownCancelsEffectsWhilePersistenceDrains(t *testin
 	}()
 	mutation := make(chan error, 1)
 	go func() {
-		_, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: ownerTestManifest(t, root, 49, 1, "running")})
+		_, err := owner.recordControlReceipt(t.Context(), controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: "shutdown-persistence", Repository: "o/r", Action: "reconcile"}, State: "pending"})
 		mutation <- err
 	}()
 	<-persisted
@@ -1090,8 +1207,8 @@ func TestMonitoringCheckInIsGenerationBoundAndDurablyCompleted(t *testing.T) {
 	if after.State.Effects[plan.Identity.EffectID].State != "completed" || runner.deliveries != 1 {
 		t.Fatalf("effect=%#v deliveries=%d", after.State.Effects[plan.Identity.EffectID], runner.deliveries)
 	}
-	if marker, err := readReconciliationEffectMarker(owner.stateRoot, plan.Identity, plan.Request); err != nil || marker == nil || marker.CheckIn == nil || !marker.CheckIn.Observed {
-		t.Fatalf("marker=%#v err=%v", marker, err)
+	if marker, err := readReconciliationEffectMarker(owner.stateRoot, plan.Identity, plan.Request); err != nil || marker != nil {
+		t.Fatalf("committed check-in marker was not reclaimed: marker=%#v err=%v", marker, err)
 	}
 	current := mustOwnerSnapshot(t, owner)
 	if _, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -423,49 +424,6 @@ func TestStateOwnerPersistenceFailureKeepsCommittedSnapshotAndDispatchesNothing(
 	}
 }
 
-func TestStateOwnerCanceledQueuedCommandNeverReachesPersistence(t *testing.T) {
-	root := resolvedTempDir(t)
-	entered, release := make(chan struct{}), make(chan struct{})
-	writes := 0
-	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error {
-		writes++
-		if writes == 2 {
-			close(entered)
-			<-release
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = owner.close(context.Background()) })
-	first := ownerTestManifest(t, root, 51, 1, "running")
-	firstDone := make(chan error, 1)
-	go func() {
-		_, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: first})
-		firstDone <- err
-	}()
-	<-entered
-	ctx, cancel := context.WithCancel(t.Context())
-	reply := make(chan stateOwnerResult, 1)
-	accepted := make(chan struct{})
-	command := stateOwnerCommand{kind: stateOwnerUpsertAttempt, upsert: upsertAttemptCommand{Manifest: ownerTestManifest(t, root, 52, 1, "running")}, reply: reply, canceled: ctx.Done()}
-	go func() { owner.commands <- command; close(accepted) }()
-	<-accepted
-	cancel()
-	close(release)
-	if err := <-firstDone; err != nil {
-		t.Fatal(err)
-	}
-	if result := <-reply; !errors.Is(result.err, context.Canceled) {
-		t.Fatalf("queued result=%v", result.err)
-	}
-	state := mustOwnerSnapshot(t, owner).State
-	if writes != 2 || state.IssueGenerations[ownerIssueKey("o/r", 52)] != 0 {
-		t.Fatalf("writes=%d state=%#v", writes, state)
-	}
-}
-
 func TestStateOwnerCancellationAfterPersistenceDispatchStillCommits(t *testing.T) {
 	root := resolvedTempDir(t)
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -484,17 +442,24 @@ func TestStateOwnerCancellationAfterPersistenceDispatchStillCommits(t *testing.T
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	<-owner.commits
 	ctx, cancel := context.WithCancel(t.Context())
-	manifest := ownerTestManifest(t, root, 54, 1, "running")
 	result := make(chan error, 1)
-	go func() { _, err := owner.upsertAttempt(ctx, upsertAttemptCommand{Manifest: manifest}); result <- err }()
+	go func() {
+		_, err := owner.recordControlReceipt(ctx, controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: "admitted", Repository: "o/r", Action: "reconcile"}, State: "pending"})
+		result <- err
+	}()
 	<-entered
 	cancel()
-	if err := <-result; !errors.Is(err, context.Canceled) {
-		t.Fatalf("caller result=%v", err)
+	select {
+	case err := <-result:
+		t.Fatalf("caller returned before durable result: %v", err)
+	default:
 	}
 	close(release)
+	if err := <-result; err != nil {
+		t.Fatalf("caller result=%v", err)
+	}
 	committed := <-owner.commits
-	if _, ok := committed.State.Attempts[ownerAttemptKey("o/r", 54, 1)]; !ok {
+	if receipt, ok := operatorReceiptByID(committed.State, "admitted"); !ok || receipt.State != "pending" {
 		t.Fatalf("dispatched command was not committed: %#v", committed.State)
 	}
 	if writes != 2 {
@@ -532,7 +497,7 @@ func TestStateOwnerInstalledPersistenceErrorPoisonsAdmission(t *testing.T) {
 	}
 }
 
-func TestStateOwnerRevisionGenerationTombstoneAndOutOfOrderResults(t *testing.T) {
+func TestStateOwnerGenerationTombstoneAndSnapshotIsolation(t *testing.T) {
 	root := resolvedTempDir(t)
 	var persisted runtimeOwnerState
 	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(state runtimeOwnerState) error {
@@ -549,38 +514,24 @@ func TestStateOwnerRevisionGenerationTombstoneAndOutOfOrderResults(t *testing.T)
 		t.Fatal(err)
 	}
 	issueKey, attemptKey := ownerIssueKey("o/r", 44), ownerAttemptKey("o/r", 44, 1)
-	if created.State.Revision != 2 || created.State.IssueGenerations[issueKey] != 1 || created.State.AttemptGenerations[attemptKey] != 1 {
+	if created.State.IssueGenerations[issueKey] != 1 || created.State.AttemptGenerations[attemptKey] != 1 {
 		t.Fatalf("created=%#v", created)
-	}
-	cycleOne, _ := owner.reconciliationSnapshot(t.Context())
-	cycleTwo, _ := owner.reconciliationSnapshot(t.Context())
-	newer := cloneManifest(manifest)
-	newer.Diagnostic = "newer"
-	identity := stateResultIdentity{Epoch: cycleTwo.State.Epoch, SourceRevision: cycleTwo.State.Revision, CycleID: cycleTwo.CycleID, IssueGeneration: 1, AttemptGeneration: 1}
-	if _, err := owner.applyAttemptResult(t.Context(), applyAttemptResultCommand{Identity: identity, Manifest: newer}); err != nil {
-		t.Fatal(err)
-	}
-	older := cloneManifest(manifest)
-	older.Diagnostic = "older"
-	identity.CycleID = cycleOne.CycleID
-	if _, err := owner.applyAttemptResult(t.Context(), applyAttemptResultCommand{Identity: identity, Manifest: older}); !errors.Is(err, errStaleStateResult) {
-		t.Fatalf("out-of-order err=%v", err)
 	}
 	beforeDelete, _ := owner.snapshot(t.Context())
 	policy := &agentruntime.EffectCleanupPolicy{Action: "abandon"}
-	deleted, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 44, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "abandoned", CleanupPhase: "pending", Manifest: &newer, CleanupPolicy: policy, EffectAction: "cleanup", EffectRequestDigest: strings.Repeat("a", 64)})
-	if err != nil || effect == nil || effect.State != "pending" || deleted.State.Revision != 4 || deleted.State.AttemptGenerations[attemptKey] != 2 || deleted.State.Tombstones[attemptKey].InvalidatedGeneration != 1 {
+	deleted, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 44, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "abandoned", CleanupPhase: "pending", Manifest: &manifest, CleanupPolicy: policy, EffectAction: "cleanup", EffectRequestDigest: strings.Repeat("a", 64)})
+	if err != nil || effect == nil || effect.State != "pending" || deleted.State.Revision != beforeDelete.State.Revision+1 || deleted.State.AttemptGenerations[attemptKey] != 2 || deleted.State.Tombstones[attemptKey].InvalidatedGeneration != 1 {
 		t.Fatalf("deleted=%#v effect=%#v err=%v persisted=%#v", deleted, effect, err, persisted)
 	}
-	replayed, replayedEffect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 44, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "abandoned", CleanupPhase: "pending", Manifest: &newer, CleanupPolicy: policy, EffectAction: "cleanup", EffectRequestDigest: strings.Repeat("a", 64)})
+	replayed, replayedEffect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 44, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "abandoned", CleanupPhase: "pending", Manifest: &manifest, CleanupPolicy: policy, EffectAction: "cleanup", EffectRequestDigest: strings.Repeat("a", 64)})
 	if err != nil || replayed.State.Revision != deleted.State.Revision || replayedEffect == nil || replayedEffect.ID != effect.ID {
 		t.Fatalf("replayed=%#v effect=%#v err=%v", replayed, replayedEffect, err)
 	}
-	identity = stateResultIdentity{Epoch: beforeDelete.State.Epoch, SourceRevision: beforeDelete.State.Revision, CycleID: cycleTwo.CycleID + 1, IssueGeneration: 1, AttemptGeneration: 1}
-	if _, err := owner.applyAttemptResult(t.Context(), applyAttemptResultCommand{Identity: identity, Manifest: manifest}); !errors.Is(err, errStaleStateResult) {
-		t.Fatalf("invalidated result err=%v", err)
-	}
-	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 2}); !errors.Is(err, errAttemptTombstoned) {
+	current := mustOwnerSnapshot(t, owner)
+	identity := stateResultIdentity{Epoch: current.State.Epoch, SourceRevision: current.State.Revision, IssueGeneration: 1, AttemptGeneration: 2}
+	preparing := cloneManifest(manifest)
+	preparing.State, preparing.Diagnostic = "preparing", ""
+	if _, _, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectPrepare, Manifest: preparing, RequestDigest: strings.Repeat("f", 64)}); !errors.Is(err, errAttemptTombstoned) {
 		t.Fatalf("resurrection err=%v", err)
 	}
 	alias, _ := owner.snapshot(t.Context())
@@ -590,34 +541,6 @@ func TestStateOwnerRevisionGenerationTombstoneAndOutOfOrderResults(t *testing.T)
 	stable, _ := owner.snapshot(t.Context())
 	if stable.State.AttemptGenerations[attemptKey] != 2 || stable.State.Tombstones[attemptKey].Action != "abandoned" || len(stable.State.ControlReceipts) != 0 {
 		t.Fatalf("snapshot aliases owner state: %#v", stable)
-	}
-}
-
-func TestStateOwnerSynchronousAttemptChangeInvalidatesOlderResult(t *testing.T) {
-	root := resolvedTempDir(t)
-	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = owner.close(context.Background()) })
-	manifest := ownerTestManifest(t, root, 45, 1, "running")
-	created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cycle, err := owner.reconciliationSnapshot(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	changed := cloneManifest(manifest)
-	changed.Diagnostic = "user mutation"
-	committed, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: changed, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1})
-	if err != nil || committed.State.AttemptGenerations[ownerAttemptKey("o/r", 45, 1)] != 2 {
-		t.Fatalf("committed=%#v err=%v", committed, err)
-	}
-	identity := stateResultIdentity{Epoch: created.State.Epoch, SourceRevision: cycle.State.Revision, CycleID: cycle.CycleID, IssueGeneration: 1, AttemptGeneration: 1}
-	if _, err := owner.applyAttemptResult(t.Context(), applyAttemptResultCommand{Identity: identity, Manifest: manifest}); !errors.Is(err, errStaleStateResult) {
-		t.Fatalf("older result err=%v", err)
 	}
 }
 
@@ -659,6 +582,7 @@ func TestStateOwnerCompletesTombstoneCleanupAfterIssueGenerationChanges(t *testi
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	manifest := ownerTestManifest(t, root, 48, 1, "failed")
+	manifest.Diagnostic = "test failure"
 	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
 		t.Fatal(err)
 	}
@@ -752,18 +676,23 @@ func TestStateOwnerShutdownDrainsWriteAndRejectsAcceptedQueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := stateOwnerCommand{kind: stateOwnerUpsertAttempt, upsert: upsertAttemptCommand{Manifest: ownerTestManifest(t, root, 50, 1, "running")}, reply: make(chan stateOwnerResult, 1)}
+	first := stateOwnerCommand{kind: stateOwnerRecordControlReceipt, receipt: recordControlReceiptCommand{Receipt: controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: "first", Repository: "o/r", Action: "reconcile"}, State: "pending"}}, reply: make(chan stateOwnerResult, 1)}
 	owner.commands <- first
 	<-entered
 
 	const queued = 8
 	requests := make([]stateOwnerCommand, queued)
 	for index := range requests {
-		requests[index] = stateOwnerCommand{kind: stateOwnerUpsertAttempt, upsert: upsertAttemptCommand{Manifest: ownerTestManifest(t, root, 51+index, 1, "running")}, reply: make(chan stateOwnerResult, 1)}
+		requests[index] = stateOwnerCommand{kind: stateOwnerRecordControlReceipt, receipt: recordControlReceiptCommand{Receipt: controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: fmt.Sprintf("queued-%d", index), Repository: "o/r", Action: "reconcile"}, State: "pending"}}, reply: make(chan stateOwnerResult, 1)}
 		owner.commands <- requests[index]
 	}
 	stopReply := make(chan error, 1)
 	owner.stop <- stateOwnerStopRequest{reply: stopReply}
+	for _, request := range requests {
+		if result := <-request.reply; !errors.Is(result.err, errStateOwnerStopped) {
+			t.Fatalf("queued result=%#v", result)
+		}
+	}
 	close(release)
 	if result := <-first.reply; result.err != nil || result.snapshot.State.Revision != 2 {
 		t.Fatalf("in-flight result=%#v", result)
@@ -771,16 +700,53 @@ func TestStateOwnerShutdownDrainsWriteAndRejectsAcceptedQueue(t *testing.T) {
 	if err := <-stopReply; err != nil {
 		t.Fatal(err)
 	}
-	for _, request := range requests {
-		if result := <-request.reply; !errors.Is(result.err, errStateOwnerStopped) {
-			t.Fatalf("queued result=%#v", result)
-		}
-	}
 	if _, err := owner.snapshot(t.Context()); !errors.Is(err, errStateOwnerStopped) {
 		t.Fatalf("snapshot after shutdown err=%v", err)
 	}
 	if _, err := owner.submit(t.Context(), stateOwnerCommand{kind: stateOwnerStart}); !errors.Is(err, errStateOwnerStopped) {
 		t.Fatalf("command after shutdown err=%v", err)
+	}
+}
+
+func TestStateOwnerShutdownStartsWithAlreadyCanceledWaitContext(t *testing.T) {
+	root := resolvedTempDir(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	writes := 0
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error {
+		writes++
+		if writes == 2 {
+			close(entered)
+			<-release
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := owner.recordControlReceipt(t.Context(), controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: "in-flight", Repository: "o/r", Action: "reconcile"}, State: "pending"})
+		result <- err
+	}()
+	<-entered
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := owner.close(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	select {
+	case <-owner.done:
+		t.Fatal("owner stopped before the admitted write finished")
+	default:
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-owner.done:
+	case <-t.Context().Done():
+		t.Fatal(t.Context().Err())
 	}
 }
 
@@ -862,7 +828,7 @@ func TestStateOwnerTransitionsUseBoundIdentityWithoutFilesystemAccess(t *testing
 	}
 	snapshot, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
 	key := ownerAttemptKey("o/r", 61, 1)
-	if err != nil || snapshot.State.Revision != 2 || snapshot.State.Attempts[key].Manifest.Worktree != manifest.Worktree {
+	if err != nil || snapshot.State.Revision <= 1 || snapshot.State.Attempts[key].Manifest.Worktree != manifest.Worktree {
 		t.Fatalf("snapshot=%#v err=%v", snapshot, err)
 	}
 }
@@ -883,6 +849,73 @@ func startTestStateOwner(t *testing.T, stateRoot string, state runtimeOwnerState
 		t.Fatal(err)
 	}
 	return startStateOwner(t.Context(), stateRoot, canonical, state, persist)
+}
+
+// upsertAttempt is test-only compatibility for fixtures that predate the
+// production cutover. It builds authority through the typed runtime path; the
+// untyped production owner command no longer exists.
+func (o *stateOwner) upsertAttempt(ctx context.Context, command upsertAttemptCommand) (stateOwnerSnapshot, error) {
+	snapshot, err := o.snapshot(ctx)
+	if err != nil {
+		return stateOwnerSnapshot{}, err
+	}
+	key := ownerAttemptKey(command.Manifest.Repository, command.Manifest.Issue, command.Manifest.Attempt)
+	if _, exists := snapshot.State.Attempts[key]; exists {
+		return stateOwnerSnapshot{}, errors.New("test fixture cannot replace existing attempt authority")
+	}
+	target := cloneManifest(command.Manifest)
+	manifest := cloneManifest(target)
+	manifest.State, manifest.Diagnostic = "preparing", ""
+	identity := stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)]}
+	committed, effect, err := o.beginRuntimeEffect(ctx, beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectPrepare, Manifest: manifest, RequestDigest: strings.Repeat("1", 64)})
+	if err != nil {
+		return stateOwnerSnapshot{}, err
+	}
+	committed, err = o.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectPrepare, Manifest: manifest})
+	if err != nil || target.State == "preparing" {
+		return committed, err
+	}
+	identity = stateResultIdentity{Epoch: committed.State.Epoch, SourceRevision: committed.State.Revision, IssueGeneration: committed.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: committed.State.AttemptGenerations[key]}
+	_, effect, err = o.beginRuntimeEffect(ctx, beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStart, Manifest: manifest, RequestDigest: strings.Repeat("2", 64)})
+	if err != nil {
+		return stateOwnerSnapshot{}, err
+	}
+	running := cloneManifest(target)
+	running.State, running.Diagnostic = "running", ""
+	committed, err = o.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectStart, Manifest: running})
+	if err != nil || target.State == "running" {
+		return committed, err
+	}
+	identity = stateResultIdentity{Epoch: committed.State.Epoch, SourceRevision: committed.State.Revision, IssueGeneration: committed.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: committed.State.AttemptGenerations[key]}
+	action, reason := agentruntime.EffectMonitor, ""
+	if target.State == "cancelled" {
+		action, reason = agentruntime.EffectStop, target.Diagnostic
+		if reason == "" {
+			reason = "test cancellation"
+			target.Diagnostic = reason
+		}
+	}
+	_, effect, err = o.beginRuntimeEffect(ctx, beginRuntimeEffectCommand{Identity: identity, Action: action, Manifest: running, Reason: reason, RequestDigest: strings.Repeat("3", 64)})
+	if err != nil {
+		return stateOwnerSnapshot{}, err
+	}
+	return o.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: action, Manifest: target})
+}
+
+func advanceTestAttemptGeneration(t *testing.T, owner *stateOwner, manifest agentruntime.Manifest) stateOwnerSnapshot {
+	t.Helper()
+	snapshot := mustOwnerSnapshot(t, owner)
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	identity := stateResultIdentity{
+		Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision,
+		IssueGeneration:   snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)],
+		AttemptGeneration: snapshot.State.AttemptGenerations[key],
+	}
+	committed, _, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStop, Manifest: manifest, Reason: "test generation advance", RequestDigest: strings.Repeat("4", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return committed
 }
 
 func TestRuntimeOwnerRejectsInvalidIssueGenerationKey(t *testing.T) {

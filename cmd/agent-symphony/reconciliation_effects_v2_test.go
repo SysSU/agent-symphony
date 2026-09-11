@@ -299,7 +299,7 @@ func TestFirstAttemptReservationInvalidatesIssueScopedEffect(t *testing.T) {
 	}
 	manifest := ownerTestManifest(t, root, 190, 1, "preparing")
 	reserved, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest, ExpectedIssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey("o/r", 190)]})
-	if err != nil || len(reserved.State.Effects) != 0 || reserved.State.IssueGenerations[ownerIssueKey("o/r", 190)] != 2 {
+	if _, oldEffectSurvived := reserved.State.Effects[effect.ID]; err != nil || oldEffectSurvived || reserved.State.IssueGenerations[ownerIssueKey("o/r", 190)] != 2 {
 		t.Fatalf("reservation=%#v err=%v", reserved.State, err)
 	}
 }
@@ -395,7 +395,7 @@ func TestOwnerGenerationChangesDeletePRRecovery(t *testing.T) {
 			case "issue":
 				result, err = owner.advanceIssueGeneration(t.Context(), advanceIssueGenerationCommand{Repository: "o/r", Issue: 190, ExpectedGeneration: 1})
 			case "attempt":
-				result, err = owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: snapshot.State.Attempts[key].Manifest, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1})
+				result = advanceTestAttemptGeneration(t, owner, snapshot.State.Attempts[key].Manifest)
 			case "tombstone":
 				result, _, err = owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 190, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "dismissed", CleanupPhase: "completed"})
 			}

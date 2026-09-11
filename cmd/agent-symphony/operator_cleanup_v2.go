@@ -69,7 +69,7 @@ func (e operatorCleanupExecutor) execute(ctx context.Context, request agentrunti
 		return err
 	}
 	if request.Cleanup.Action == "abandon" || request.Cleanup.Action == "remove" {
-		return e.runtime.ForgetCompatibility(request.Manifest)
+		return freshRuntime(e.runtime, e.runtime.Source).ForgetCompatibility(request.Manifest)
 	}
 	return nil
 }
@@ -78,7 +78,7 @@ func (e operatorCleanupExecutor) verify(ctx context.Context, request agentruntim
 	if e.reviewer == nil || e.runtime == nil {
 		return false, errors.New("operator cleanup verifier is invalid")
 	}
-	if err := e.runtime.VerifyResourcesGone(ctx, request.Manifest); err != nil {
+	if err := freshRuntime(e.runtime, e.runtime.Source).VerifyResourcesGone(ctx, request.Manifest); err != nil {
 		if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
 			return false, nil
 		}

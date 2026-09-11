@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -157,7 +158,7 @@ func TestReconciliationNewerIdenticalCycleIsDurableNoopButAdvancesOrdering(t *te
 	}
 	applyCollection(t, owner, olderChanged)
 	current, _ := owner.snapshot(t.Context())
-	if current.State.Revision != initial.State.Revision || current.State.Observations[ownerIssueKey("o/r", 74)].Fact.Title != "same" {
+	if current.State.Revision != initial.State.Revision+1 || current.State.StaleReconciliations != 1 || current.State.Observations[ownerIssueKey("o/r", 74)].Fact.Title != "same" {
 		t.Fatalf("older changed result applied after identical high-water: %#v", current.State.Observations[ownerIssueKey("o/r", 74)])
 	}
 }
@@ -195,6 +196,9 @@ func TestReconciliationRejectsStaleEpochAndDiscardsStaleGeneration(t *testing.T)
 	if _, exists := state.State.Observations[ownerIssueKey("o/r", 76)]; exists {
 		t.Fatal("stale issue generation restored an observation")
 	}
+	if state.State.StaleReconciliations != 1 {
+		t.Fatalf("stale issue result count=%d", state.State.StaleReconciliations)
+	}
 
 	root := resolvedTempDir(t)
 	attemptOwner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
@@ -210,10 +214,7 @@ func TestReconciliationRejectsStaleEpochAndDiscardsStaleGeneration(t *testing.T)
 	attemptInput := repositoryInput(true, issueFact(176, "issue"))
 	attemptInput.Attempts = []internalgithub.RecoveryAttemptFact{attemptFact(176, 1, "stale")}
 	attemptCollection := mustCollection(t, attemptSnapshot, attemptInput)
-	manifest.Diagnostic = "operator mutation"
-	if _, err := attemptOwner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1}); err != nil {
-		t.Fatal(err)
-	}
+	advanceTestAttemptGeneration(t, attemptOwner, manifest)
 	applyCollection(t, attemptOwner, attemptCollection)
 	attemptState, _ := attemptOwner.snapshot(t.Context())
 	if len(attemptState.State.Observations[ownerIssueKey("o/r", 176)].Attempts) != 0 {
@@ -275,10 +276,8 @@ func TestReconciliationGenerationAdvanceMasksNestedAttemptFacts(t *testing.T) {
 				issue.TerminalAttempts = []internalgithub.RecoveryAttemptFact{remote}
 			}
 			collection := mustCollection(t, snapshot, repositoryInput(true, issue))
+			advanceTestAttemptGeneration(t, owner, manifest)
 			manifest.State, manifest.ReviewHead = "completed", remote.HeadSHA
-			if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1}); err != nil {
-				t.Fatal(err)
-			}
 			applied := applyCollection(t, owner, collection)
 			observation := applied.State.Observations[ownerIssueKey("o/r", 177)]
 			if observation.Fact.ActiveAttempt != nil || len(observation.Fact.TerminalAttempts) != 0 {
@@ -467,15 +466,10 @@ func TestRecoverAdmissionRemainsResponsiveDuringBlockedReconciliation(t *testing
 	go func() { _, err := runner.run(t.Context()); done <- err }()
 	<-entered
 	service := operatorTestMutationService(t, owner)
-	stop, err := service.prepareStop(manifest, "dashboard recovery: runtime liveness mismatch")
-	if err != nil {
-		t.Fatal(err)
-	}
-	command := operatorCommand(mustOwnerSnapshot(t, owner), operatorRequest("recover-during-reconcile", "recover", manifest, false), manifest)
-	command.LivenessFailed = true
-	command.Runtime = &beginRuntimeEffectCommand{Identity: command.Identity, Action: stop.Action, Manifest: manifest, Reason: stop.Reason, RequestDigest: stop.Identity.RequestDigest}
-	if _, effect, err := owner.beginOperatorMutation(t.Context(), command); err != nil || effect == nil {
-		t.Fatalf("effect=%#v err=%v", effect, err)
+	service.effects.stopped = true
+	result := service.perform(t.Context(), operatorRequest("recover-during-reconcile", "recover", manifest, false))
+	if !result.OK || result.Status != http.StatusAccepted {
+		t.Fatalf("recover result=%#v", result)
 	}
 	close(release)
 	if err := <-done; err != nil && !errors.Is(err, errStaleStateResult) {
@@ -616,6 +610,36 @@ func TestReconciliationWaiterFollowsRequiredFreshCycle(t *testing.T) {
 	if err := <-result; err != nil {
 		t.Fatal(err)
 	}
+	if err := triggered.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCanceledReconciliationWaiterUnregistersWhileCycleRemainsBlocked(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	triggered, err := newReconciliationTrigger(t.Context(), func(context.Context) error {
+		close(entered)
+		<-release
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- triggered.triggerAndWait(ctx) }()
+	<-entered
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("waiter result=%v", err)
+	}
+	triggered.mu.Lock()
+	waiters, running := len(triggered.waiters), triggered.running
+	triggered.mu.Unlock()
+	if waiters != 0 || !running {
+		t.Fatalf("waiters=%d running=%v", waiters, running)
+	}
+	close(release)
 	if err := triggered.shutdown(t.Context()); err != nil {
 		t.Fatal(err)
 	}

@@ -37,23 +37,24 @@ var (
 )
 
 type runtimeOwnerState struct {
-	Version            int                                  `json:"version"`
-	Repository         string                               `json:"repository"`
-	Epoch              uint64                               `json:"epoch"`
-	Revision           uint64                               `json:"revision"`
-	IssueGenerations   map[string]uint64                    `json:"issue_generations"`
-	AttemptGenerations map[string]uint64                    `json:"attempt_generations"`
-	Attempts           map[string]runtimeAttemptRecord      `json:"attempts"`
-	Observations       map[string]reconciliationObservation `json:"observations"`
-	Recoveries         map[string]runtimePRRecovery         `json:"recoveries"`
-	Tombstones         map[string]runtimeTombstone          `json:"tombstones"`
-	Effects            map[string]runtimeEffectIntent       `json:"effects"`
-	ControlReceipts    []controlReceipt                     `json:"control_receipts"`
-	CycleDiagnostic    string                               `json:"cycle_diagnostic,omitempty"`
-	CycleDiagnosticAt  time.Time                            `json:"cycle_diagnostic_at,omitzero"`
-	CycleOutcomeEpoch  uint64                               `json:"cycle_outcome_epoch,omitempty"`
-	CycleOutcomeID     uint64                               `json:"cycle_outcome_id,omitempty"`
-	CycleOutcomeSource uint64                               `json:"cycle_outcome_source_revision,omitempty"`
+	Version              int                                  `json:"version"`
+	Repository           string                               `json:"repository"`
+	Epoch                uint64                               `json:"epoch"`
+	Revision             uint64                               `json:"revision"`
+	IssueGenerations     map[string]uint64                    `json:"issue_generations"`
+	AttemptGenerations   map[string]uint64                    `json:"attempt_generations"`
+	Attempts             map[string]runtimeAttemptRecord      `json:"attempts"`
+	Observations         map[string]reconciliationObservation `json:"observations"`
+	Recoveries           map[string]runtimePRRecovery         `json:"recoveries"`
+	Tombstones           map[string]runtimeTombstone          `json:"tombstones"`
+	Effects              map[string]runtimeEffectIntent       `json:"effects"`
+	ControlReceipts      []controlReceipt                     `json:"control_receipts"`
+	CycleDiagnostic      string                               `json:"cycle_diagnostic,omitempty"`
+	CycleDiagnosticAt    time.Time                            `json:"cycle_diagnostic_at,omitzero"`
+	CycleOutcomeEpoch    uint64                               `json:"cycle_outcome_epoch,omitempty"`
+	CycleOutcomeID       uint64                               `json:"cycle_outcome_id,omitempty"`
+	CycleOutcomeSource   uint64                               `json:"cycle_outcome_source_revision,omitempty"`
+	StaleReconciliations uint64                               `json:"stale_reconciliations,omitempty"`
 }
 
 type runtimeAttemptRecord struct {
@@ -145,12 +146,6 @@ type invalidateAttemptCommand struct {
 	Diagnostic                string
 	EffectAction              string
 	EffectRequestDigest       string
-}
-
-type applyAttemptResultCommand struct {
-	Identity stateResultIdentity
-	Manifest agentruntime.Manifest
-	Global   bool
 }
 
 type recordEffectCommand struct {
@@ -262,9 +257,7 @@ type stateOwnerCommandKind uint8
 const (
 	stateOwnerStart stateOwnerCommandKind = iota + 1
 	stateOwnerAdvanceIssueGeneration
-	stateOwnerUpsertAttempt
 	stateOwnerInvalidateAttempt
-	stateOwnerApplyAttemptResult
 	stateOwnerRecordEffect
 	stateOwnerCompleteEffect
 	stateOwnerBeginRuntimeEffect
@@ -289,9 +282,7 @@ const (
 type stateOwnerCommand struct {
 	kind                    stateOwnerCommandKind
 	issue                   advanceIssueGenerationCommand
-	upsert                  upsertAttemptCommand
 	invalidate              invalidateAttemptCommand
-	apply                   applyAttemptResultCommand
 	record                  recordEffectCommand
 	complete                completeEffectCommand
 	begin                   beginRuntimeEffectCommand
@@ -312,7 +303,6 @@ type stateOwnerCommand struct {
 	advanceOperatorRecovery advanceOperatorRecoveryCommand
 	cycleOutcome            recordCycleOutcomeCommand
 	reply                   chan stateOwnerResult
-	canceled                <-chan struct{}
 }
 
 type recordCycleOutcomeCommand struct {
@@ -386,7 +376,7 @@ func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial
 		attemptRoot: attempts,
 		commands:    make(chan stateOwnerCommand),
 		snapshots:   make(chan stateOwnerSnapshotRequest),
-		stop:        make(chan stateOwnerStopRequest),
+		stop:        make(chan stateOwnerStopRequest, 1),
 		done:        make(chan struct{}),
 		commits:     make(chan stateOwnerSnapshot, 1),
 	}
@@ -440,12 +430,6 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				command.reply <- stateOwnerResult{err: poisoned}
 				continue
 			}
-			select {
-			case <-command.canceled:
-				command.reply <- stateOwnerResult{err: context.Canceled}
-				continue
-			default:
-			}
 			candidate, effect, err := applyStateOwnerCommand(o.attemptRoot, o.stateRoot, committed, command, appliedCycles)
 			if err != nil {
 				command.reply <- stateOwnerResult{err: err}
@@ -457,13 +441,9 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				continue
 			}
 			reply := make(chan error, 1)
-			select {
-			case persistence <- statePersistenceRequest{state: candidate, reply: reply}:
-				inFlight = &pendingStateCommit{command: command, candidate: candidate, effect: effect}
-				persistenceResult = reply
-			case <-command.canceled:
-				command.reply <- stateOwnerResult{err: context.Canceled}
-			}
+			persistence <- statePersistenceRequest{state: candidate, reply: reply}
+			inFlight = &pendingStateCommit{command: command, candidate: candidate, effect: effect}
+			persistenceResult = reply
 		}
 	}
 
@@ -545,9 +525,12 @@ func (o *stateOwner) close(ctx context.Context) error {
 	select {
 	case <-o.done:
 		return nil
+	default:
+	}
+	select {
+	case <-o.done:
+		return nil
 	case o.stop <- stateOwnerStopRequest{reply: reply}:
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 	select {
 	case err := <-reply:
@@ -587,7 +570,6 @@ func (o *stateOwner) submit(ctx context.Context, command stateOwnerCommand) (sta
 		return stateOwnerResult{}, err
 	}
 	command.reply = make(chan stateOwnerResult, 1)
-	command.canceled = ctx.Done()
 	select {
 	case <-o.done:
 		return stateOwnerResult{}, errStateOwnerStopped
@@ -595,19 +577,8 @@ func (o *stateOwner) submit(ctx context.Context, command stateOwnerCommand) (sta
 	case <-ctx.Done():
 		return stateOwnerResult{}, ctx.Err()
 	}
-	select {
-	case result := <-command.reply:
-		return result, result.err
-	case <-o.done:
-		return stateOwnerResult{}, errStateOwnerStopped
-	case <-ctx.Done():
-		return stateOwnerResult{}, ctx.Err()
-	}
-}
-
-func (o *stateOwner) upsertAttempt(ctx context.Context, command upsertAttemptCommand) (stateOwnerSnapshot, error) {
-	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerUpsertAttempt, upsert: command})
-	return result.snapshot, err
+	result := <-command.reply
+	return result, result.err
 }
 
 func (o *stateOwner) advanceIssueGeneration(ctx context.Context, command advanceIssueGenerationCommand) (stateOwnerSnapshot, error) {
@@ -618,11 +589,6 @@ func (o *stateOwner) advanceIssueGeneration(ctx context.Context, command advance
 func (o *stateOwner) invalidateAttempt(ctx context.Context, command invalidateAttemptCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerInvalidateAttempt, invalidate: command})
 	return result.snapshot, result.effect, err
-}
-
-func (o *stateOwner) applyAttemptResult(ctx context.Context, command applyAttemptResultCommand) (stateOwnerSnapshot, error) {
-	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerApplyAttemptResult, apply: command})
-	return result.snapshot, err
 }
 
 func (o *stateOwner) recordEffect(ctx context.Context, command recordEffectCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
@@ -694,10 +660,6 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if err := applyAdvanceIssueGeneration(&candidate, command.issue); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
-	case stateOwnerUpsertAttempt:
-		if err := applyUpsertAttempt(attemptRoot, stateRoot, &candidate, command.upsert); err != nil {
-			return runtimeOwnerState{}, nil, err
-		}
 	case stateOwnerInvalidateAttempt:
 		effect, err := applyInvalidateAttempt(attemptRoot, stateRoot, &candidate, command.invalidate)
 		if err != nil {
@@ -707,10 +669,6 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 			return candidate, effect, nil
 		}
 		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect)
-	case stateOwnerApplyAttemptResult:
-		if err := applyAttemptResult(attemptRoot, stateRoot, &candidate, command.apply); err != nil {
-			return runtimeOwnerState{}, nil, err
-		}
 	case stateOwnerRecordEffect:
 		effect, err := applyRecordEffect(&candidate, command.record)
 		if err != nil {
@@ -1250,50 +1208,6 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 		return nil, errStateConflict
 	}
 	return &runtimeEffectIntent{Action: command.EffectAction, Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt, IssueGeneration: command.ExpectedIssueGeneration, AttemptGeneration: generation, IntentEpoch: state.Epoch, State: "pending", RequestDigest: command.EffectRequestDigest}, nil
-}
-
-func applyAttemptResult(attemptRoot, stateRoot string, state *runtimeOwnerState, command applyAttemptResultCommand) error {
-	identity, manifest := command.Identity, cloneManifest(command.Manifest)
-	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || identity.Epoch != state.Epoch || identity.SourceRevision == 0 || identity.SourceRevision > state.Revision || command.Global && identity.SourceRevision != state.Revision || identity.CycleID == 0 {
-		return errStaleStateResult
-	}
-	issueKey, attemptKey := ownerIssueKey(manifest.Repository, manifest.Issue), ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
-	if state.IssueGenerations[issueKey] != identity.IssueGeneration || state.AttemptGenerations[attemptKey] != identity.AttemptGeneration {
-		return errStaleStateResult
-	}
-	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned {
-		return errAttemptTombstoned
-	}
-	if hasPendingTypedRuntimeEffect(*state, manifest.Repository, manifest.Issue, manifest.Attempt) {
-		return errStateConflict
-	}
-	if identity.EffectID != "" {
-		effect, ok := state.Effects[identity.EffectID]
-		if !ok || effect.State != "pending" || effect.IssueGeneration != identity.IssueGeneration || effect.AttemptGeneration != identity.AttemptGeneration {
-			return errStaleStateResult
-		}
-	}
-	record := state.Attempts[attemptKey]
-	if record.ObservationEpoch == identity.Epoch && identity.CycleID < record.LastCycleID {
-		return errStaleStateResult
-	}
-	if record.ObservationEpoch == identity.Epoch && identity.CycleID == record.LastCycleID {
-		if reflect.DeepEqual(record.Manifest, manifest) {
-			return nil
-		}
-		return errStateConflict
-	}
-	state.Attempts[attemptKey] = runtimeAttemptRecord{Generation: identity.AttemptGeneration, ObservationEpoch: identity.Epoch, LastCycleID: identity.CycleID, Manifest: manifest}
-	return nil
-}
-
-func hasPendingTypedRuntimeEffect(state runtimeOwnerState, repository string, issue, attempt int) bool {
-	for _, effect := range state.Effects {
-		if effect.Repository == repository && effect.Issue == issue && effect.Attempt == attempt && effect.State == "pending" && effect.RequestDigest != "" {
-			return true
-		}
-	}
-	return false
 }
 
 func applyRecordEffect(state *runtimeOwnerState, command recordEffectCommand) (*runtimeEffectIntent, error) {

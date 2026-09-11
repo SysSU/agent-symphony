@@ -369,6 +369,40 @@ func (r *Runtime) readEffectMarker(identity EffectIdentity, action EffectAction)
 	return &result, nil
 }
 
+// RemoveEffectMarker reclaims completion proof only after the owner has
+// durably committed that completion. A missing marker is already reclaimed.
+func (r *Runtime) RemoveEffectMarker(identity EffectIdentity) error {
+	directory := filepath.Join(r.StateRoot, "runtime-effects")
+	if err := rejectSymlinkPath(r.StateRoot, directory, true); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	info, err := os.Lstat(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("runtime effect marker directory is unsafe")
+	}
+	path, err := effectMarkerPath(directory, identity.EffectID)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	dir, err := os.Open(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
 func effectMarkerPath(directory, effectID string) (string, error) {
 	decoded, err := hex.DecodeString(effectID)
 	if err != nil || len(decoded) != 16 {

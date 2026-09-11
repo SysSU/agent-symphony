@@ -160,6 +160,9 @@ func TestReconciliationMarkerFinishesAfterPersistenceFailureAndRestart(t *testin
 	if got := finished.State.Effects[effect.ID]; got.State != "completed" || got.Diagnostic != "" || !reflect.DeepEqual(got.ReconciliationResult, &result) {
 		t.Fatalf("restart did not commit marked result: %#v", got)
 	}
+	if _, err := os.Lstat(filepath.Join(root, "reconciliation-effects", effect.ID+".done")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restart did not reclaim committed marker: %v", err)
+	}
 }
 
 func TestReconciliationResultCancellationAfterPersistenceDispatchStillCommits(t *testing.T) {
@@ -192,18 +195,16 @@ func TestReconciliationResultCancellationAfterPersistenceDispatchStillCommits(t 
 		t.Fatalf("result marker was not durable before owner finish: %v", err)
 	}
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("finish caller err=%v want cancellation", err)
-	}
 	close(persistRelease)
-	for committed := range owner.commits {
-		if committed.State.Effects[effect.ID].State == "completed" {
-			break
-		}
+	if err := <-done; err != nil {
+		t.Fatalf("admitted finish returned err=%v", err)
 	}
 	current := mustOwnerSnapshot(t, owner)
 	if current.State.Effects[effect.ID].State != "completed" {
 		t.Fatalf("linearized finish did not commit after cancellation: %#v", current.State.Effects[effect.ID])
+	}
+	if _, err := os.Lstat(filepath.Join(root, "reconciliation-effects", effect.ID+".done")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("committed finish marker was not reclaimed: %v", err)
 	}
 }
 

@@ -56,29 +56,6 @@ func TestRuntimeEffectDispatchRegistersBeforeSpawnAndShutdownJoins(t *testing.T)
 	}
 }
 
-func TestRuntimeEffectPendingIntentRejectsOlderGenericAttemptResult(t *testing.T) {
-	coordinator, owner, _, manifest := runtimeEffectTestCoordinator(t, 91)
-	cycle, err := owner.reconciliationSnapshot(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	monitor := beginRuntimeTestEffect(t, coordinator, owner, agentruntime.EffectMonitor, manifest, "")
-	changed := manifest
-	changed.State, changed.Diagnostic, changed.UpdatedAt = "completed", "", time.Now().UTC()
-	identity := stateResultIdentity{
-		Epoch: cycle.State.Epoch, SourceRevision: cycle.State.Revision, CycleID: cycle.CycleID,
-		IssueGeneration: 1, AttemptGeneration: 1,
-	}
-	if _, err := owner.applyAttemptResult(t.Context(), applyAttemptResultCommand{Identity: identity, Manifest: changed}); !errors.Is(err, errStateConflict) {
-		t.Fatalf("generic result during typed effect err=%v", err)
-	}
-	snapshot := mustOwnerSnapshot(t, owner)
-	key := ownerAttemptKey("o/r", 91, 1)
-	if snapshot.State.Attempts[key].Manifest.State != "running" || snapshot.State.Effects[monitor.Identity.EffectID].State != "pending" {
-		t.Fatalf("older generic result changed state: %#v", snapshot.State)
-	}
-}
-
 func TestRuntimeEffectStopCancelsAuthorizedBlockedMonitor(t *testing.T) {
 	coordinator, owner, runner, manifest := runtimeEffectTestCoordinator(t, 72)
 	monitor := beginRuntimeTestEffect(t, coordinator, owner, agentruntime.EffectMonitor, manifest, "")
@@ -561,10 +538,6 @@ func assertNoRuntimeEffectCanary(t *testing.T, body []byte, canaries ...string) 
 
 func TestRuntimeEffectOwnerRejectsInvalidResultTransitions(t *testing.T) {
 	coordinator, owner, _, manifest := runtimeEffectTestCoordinator(t, 79)
-	manifest.ReviewState = "clean"
-	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1}); err != nil {
-		t.Fatal(err)
-	}
 	request := beginRuntimeTestEffect(t, coordinator, owner, agentruntime.EffectMonitor, manifest, "")
 	for _, mutate := range []func(*agentruntime.Manifest){
 		func(result *agentruntime.Manifest) { result.ReviewState = "changes-requested" },

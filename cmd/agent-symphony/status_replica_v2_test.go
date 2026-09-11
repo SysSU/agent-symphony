@@ -47,6 +47,12 @@ func TestOwnerStatusProjectionMatchesRecoveryProjection(t *testing.T) {
 		t.Run(lifecycle, func(t *testing.T) {
 			owner := newReconciliationTestOwner(t)
 			manifest := ownerTestManifest(t, owner.stateRoot, 186, 1, lifecycle)
+			if lifecycle == "failed" {
+				manifest.Diagnostic = "test failure"
+			}
+			if lifecycle == "cancelled" {
+				manifest.Diagnostic = "test cancellation"
+			}
 			if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
 				t.Fatal(err)
 			}

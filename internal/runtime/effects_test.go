@@ -166,6 +166,12 @@ func TestEffectResultMarkerIsBoundedValidatedAndImmutable(t *testing.T) {
 	if _, err := (EffectExecutor{Runtime: r}).VerifyPending(t.Context(), request); err == nil || !strings.Contains(err.Error(), "marker") {
 		t.Fatalf("tampered marker err=%v", err)
 	}
+	if err := r.RemoveEffectMarker(request.Identity); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reclaimed marker remains: %v", err)
+	}
 }
 
 func TestEffectVerificationRejectsChangedInputAndDoesNotInferFromLiveness(t *testing.T) {

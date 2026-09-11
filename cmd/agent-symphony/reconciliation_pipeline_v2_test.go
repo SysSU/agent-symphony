@@ -763,7 +763,7 @@ func TestRetirementFinishRemovesLocalAuthorityAndDoesNotReplan(t *testing.T) {
 	}) {
 		t.Fatalf("remote completion missing after retirement: %#v err=%v", status.Statuses, err)
 	}
-	if matches, _ := filepath.Glob(filepath.Join(root, "reconciliation-effects", "*.done")); len(matches) != 1 {
+	if matches, _ := filepath.Glob(filepath.Join(root, "reconciliation-effects", "*.done")); len(matches) != 0 {
 		t.Fatalf("retirement completion marker=%v", matches)
 	}
 }

@@ -41,13 +41,26 @@ func (p *productionReconciliation) sweepPendingMarkers(ctx context.Context) erro
 	}
 	ids := make([]string, 0, len(snapshot.State.Effects))
 	for id, effect := range snapshot.State.Effects {
-		if effect.State == "pending" && !operatorEffects[id] {
+		if effect.State == "completed" || effect.State == "pending" && !operatorEffects[id] {
 			ids = append(ids, id)
 		}
 	}
 	slices.Sort(ids)
 	for _, id := range ids {
 		effect := snapshot.State.Effects[id]
+		if effect.State == "completed" {
+			if effect.Reconciliation != nil {
+				if err := cleanupCompletedHandoffOutcome(p.stateRoot, *effect.Reconciliation); err != nil {
+					return err
+				}
+				if err := removeReconciliationEffectMarker(p.stateRoot, ownerReconciliationEffectIdentity(effect)); err != nil {
+					return err
+				}
+			} else if err := p.effects.executor.Runtime.RemoveEffectMarker(effectRequestIdentity(effect)); err != nil {
+				return err
+			}
+			continue
+		}
 		if effect.Reconciliation != nil {
 			result, verifyErr := p.effects.verifyPendingReconciliation(ctx, effect)
 			if verifyErr != nil {
@@ -784,13 +797,24 @@ func planRuntimeLifecycle(snapshot stateOwnerSnapshot, batch reconciliationV2Bat
 		if attemptNumber < 1 {
 			continue
 		}
+		remote, remotelyBound := observedReconciliationAttempt(observation, attemptNumber)
+		remotelyActive := remotelyBound && (remote.State == "active" || remote.State == "review-ready")
+		initialKey := ownerAttemptKey(issue.Repository, issue.Issue, attemptNumber)
+		currentRecord, locallyOwned := snapshot.State.Attempts[initialKey]
+		locallyOwned = locallyOwned && currentRecord.Generation == snapshot.State.AttemptGenerations[initialKey]
+		if !remotelyActive && !locallyOwned {
+			attemptNumber = firstUnreservedAttempt(snapshot.State, issue.Repository, issue.Issue, attemptNumber)
+			if attemptNumber < 1 {
+				continue
+			}
+			remote, remotelyBound = observedReconciliationAttempt(observation, attemptNumber)
+		}
 		attemptKey := ownerAttemptKey(issue.Repository, issue.Issue, attemptNumber)
 		if _, tombstoned := snapshot.State.Tombstones[attemptKey]; tombstoned || pendingAttemptEffect(snapshot.State, attemptKey) {
 			continue
 		}
 		record, exists := snapshot.State.Attempts[attemptKey]
 		if !exists {
-			remote, remotelyBound := observedReconciliationAttempt(observation, attemptNumber)
 			if !runnable[issueKey] && (!remotelyBound || remote.State != "active" && remote.State != "review-ready") {
 				continue
 			}
@@ -844,6 +868,21 @@ func planRuntimeLifecycle(snapshot stateOwnerSnapshot, batch reconciliationV2Bat
 		return cmp.Compare(a.Request.Action, b.Request.Action)
 	})
 	return plans, nil
+}
+
+func firstUnreservedAttempt(state runtimeOwnerState, repository string, issue, proposed int) int {
+	for proposed > 0 {
+		key := ownerAttemptKey(repository, issue, proposed)
+		if state.AttemptGenerations[key] == 0 {
+			if _, owned := state.Attempts[key]; !owned {
+				if _, tombstoned := state.Tombstones[key]; !tombstoned {
+					return proposed
+				}
+			}
+		}
+		proposed++
+	}
+	return 0
 }
 
 func currentReconciliationObservation(state runtimeOwnerState, key string, observation reconciliationObservation) bool {

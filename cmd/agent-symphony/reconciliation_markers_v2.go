@@ -187,3 +187,26 @@ func reconciliationMarkerPath(directory, effectID string) (string, error) {
 	}
 	return filepath.Join(directory, effectID+".done"), nil
 }
+
+func removeReconciliationEffectMarker(stateRoot string, identity stateResultIdentity) error {
+	directory, err := reconciliationMarkerDirectory(stateRoot, false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	path, err := reconciliationMarkerPath(directory, identity.EffectID)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	dir, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}

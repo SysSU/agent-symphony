@@ -109,7 +109,10 @@ func (c *runtimeEffectCoordinator) executeHandoffOutcome(_ context.Context, plan
 	if _, err := c.owner.finishReconciliationEffect(c.lifecycle, finishReconciliationEffectCommand{Identity: plan.Identity, Result: result}); err != nil {
 		return reconciliationEffectResult{}, err
 	}
-	return result, cleanupCompletedHandoffOutcome(c.owner.stateRoot, request)
+	if err := cleanupCompletedHandoffOutcome(c.owner.stateRoot, request); err != nil {
+		return reconciliationEffectResult{}, err
+	}
+	return result, removeReconciliationEffectMarker(c.owner.stateRoot, plan.Identity)
 }
 
 func cleanupCompletedHandoffOutcome(stateRoot string, request reconciliationEffectRequest) error {

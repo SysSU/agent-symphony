@@ -392,7 +392,237 @@ func TestOperatorServiceNewRecoveryRequestAttachesAcrossDurablePhases(t *testing
 	}
 }
 
-func TestOperatorRestartRetriesUnmarkedTerminalEffectOnlyFromMatchingFreshInput(t *testing.T) {
+func TestOperatorServiceCancellationAfterOwnerAdmissionReturnsCommittedReceipt(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 344, 1, "running")
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "active", false)
+	state.Epoch, state.Revision = 1, 1
+	entered, release := make(chan struct{}), make(chan struct{})
+	writes := 0
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error {
+		writes++
+		if writes == 3 {
+			close(entered)
+			<-release
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
+	service := operatorTestMutationService(t, owner)
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan controlResult, 1)
+	go func() {
+		result <- service.perform(ctx, operatorRequest("cancel-after-admission", "cancel", manifest, false))
+	}()
+	<-entered
+	cancel()
+	select {
+	case got := <-result:
+		t.Fatalf("operator returned before the admitted owner command completed: %#v", got)
+	default:
+	}
+	close(release)
+	got := <-result
+	if !got.OK || got.Status != http.StatusAccepted {
+		t.Fatalf("result=%#v", got)
+	}
+	if receipt, ok := operatorReceiptByID(mustOwnerSnapshot(t, owner).State, got.RequestID); !ok || receipt.State != "pending" || receipt.EffectID == "" {
+		t.Fatalf("receipt=%#v exists=%v", receipt, ok)
+	}
+}
+
+func TestOperatorWorkerFailureIsClassifiedOnceWithoutRetry(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 345, 1, "completed")
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "completed", false)
+	state.Epoch, state.Revision = 1, 1
+	classified := make(chan struct{})
+	var once sync.Once
+	owner, err := startTestStateOwner(t, root, state, func(candidate runtimeOwnerState) error {
+		for _, effect := range candidate.Effects {
+			if effect.Diagnostic != "" {
+				once.Do(func() { close(classified) })
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
+	for _, path := range []string{manifest.Worktree, productionSnapshotRoot(root)} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	boundary := &operatorCleanupBoundary{path: manifest.Worktree, err: errors.New("injected cleanup failure")}
+	service := operatorServiceWithCleanup(t, owner, t.Context(), boundary)
+	result := service.perform(t.Context(), operatorRequest("worker-failure", "archive", manifest, true))
+	if !result.OK || result.Status != http.StatusAccepted {
+		t.Fatalf("result=%#v", result)
+	}
+	<-classified
+	final := mustOwnerSnapshot(t, owner).State
+	receipt, _ := operatorReceiptByID(final, result.RequestID)
+	effect := final.Effects[receipt.EffectID]
+	if boundary.calls.Load() != 1 || receipt.State != "pending" || effect.State != "pending" || !strings.Contains(effect.Diagnostic, "injected cleanup failure") {
+		t.Fatalf("calls=%d receipt=%#v effect=%#v", boundary.calls.Load(), receipt, effect)
+	}
+}
+
+func TestOperatorVerificationForDifferentAttemptsDoesNotSerialize(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifests := []agentruntime.Manifest{
+		ownerTestManifest(t, root, 346, 1, "running"),
+		ownerTestManifest(t, root, 347, 1, "running"),
+	}
+	state := newRuntimeOwnerState("o/r")
+	for _, manifest := range manifests {
+		issueKey, attemptKey := ownerIssueKey("o/r", manifest.Issue), ownerAttemptKey("o/r", manifest.Issue, 1)
+		state.IssueGenerations[issueKey], state.AttemptGenerations[attemptKey] = 1, 1
+		state.Attempts[attemptKey] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
+		addOperatorObservation(&state, manifest, "active", false)
+		if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state.Epoch, state.Revision = 1, 1
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
+	runner := &concurrentOwnedRunner{branches: map[string]string{manifests[0].Worktree: manifests[0].Branch, manifests[1].Worktree: manifests[1].Branch}, entered: make(chan struct{}), release: make(chan struct{})}
+	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: runner, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
+	effects, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := operatorTestMutationService(t, owner)
+	service.effects = effects
+	results := make(chan controlResult, 2)
+	for index, manifest := range manifests {
+		go func(index int, manifest agentruntime.Manifest) {
+			results <- service.perform(t.Context(), operatorRequest(fmt.Sprintf("parallel-verify-%d", index), "recover", manifest, false))
+		}(index, manifest)
+	}
+	<-runner.entered
+	close(runner.release)
+	for range manifests {
+		if result := <-results; result.Status != http.StatusConflict && result.Status != http.StatusAccepted {
+			t.Fatalf("result=%#v", result)
+		}
+	}
+}
+
+func TestConcurrentConflictingDestructiveActionsCommitOnlyOneTombstone(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 349, "completed", true)
+	for _, path := range []string{manifest.Worktree, productionSnapshotRoot(owner.stateRoot)} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	service.issueClosed = func(context.Context, string, int) (bool, error) { return true, nil }
+	service.effects.stopped = true
+	start := make(chan struct{})
+	results := make(chan controlResult, 2)
+	for _, action := range []string{"dismiss", "archive"} {
+		go func(action string) {
+			<-start
+			results <- service.perform(t.Context(), operatorRequest("conflicting-"+action, action, manifest, action == "archive"))
+		}(action)
+	}
+	close(start)
+	accepted, conflicts := 0, 0
+	for range 2 {
+		switch result := <-results; result.Status {
+		case http.StatusOK, http.StatusAccepted:
+			accepted++
+		case http.StatusConflict:
+			conflicts++
+		default:
+			t.Fatalf("unexpected result=%#v", result)
+		}
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	key := ownerAttemptKey("o/r", manifest.Issue, manifest.Attempt)
+	if accepted != 1 || conflicts != 1 || len(state.Tombstones) != 1 || state.Tombstones[key].Generation != 2 || len(state.ControlReceipts) != 1 {
+		t.Fatalf("accepted=%d conflicts=%d state=%#v", accepted, conflicts, state)
+	}
+}
+
+func TestCleanupInvalidatesBlockedGitHubBindBeforeMutation(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 350, 1, "preparing")
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "orphaned", false)
+	issueKey := ownerIssueKey("o/r", manifest.Issue)
+	observation := state.Observations[issueKey]
+	observation.Fact.DispatchAuthorized = true
+	observation.Fact.BaseSHA = manifest.BaseSHA
+	state.Observations[issueKey] = observation
+	state.Epoch, state.Revision = 1, 1
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
+	for _, path := range []string{manifest.Worktree, productionSnapshotRoot(root)} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}
+	plans, err := planReconciliationBinds(mustOwnerSnapshot(t, owner), cfg)
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%#v err=%v", plans, err)
+	}
+	entered := make(chan struct{})
+	var requests atomic.Int32
+	api := internalgithub.API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		close(entered)
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})}, Retries: -1}
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	effects := service.effects
+	plan, err := effects.beginReconciliation(t.Context(), plans[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := effects.executeGitHubBind(t.Context(), api, plan)
+		done <- err
+	}()
+	<-entered
+	result := service.perform(t.Context(), operatorRequest("abandon-blocked-bind", "abandon", manifest, true))
+	if !result.OK || result.Status != http.StatusAccepted {
+		t.Fatalf("abandon result=%#v", result)
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("bind err=%v", err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("GitHub bind performed %d requests after invalidation", requests.Load())
+	}
+	if tombstone := mustOwnerSnapshot(t, owner).State.Tombstones[ownerAttemptKey("o/r", manifest.Issue, 1)]; tombstone.Action != "abandoned" {
+		t.Fatalf("tombstone=%#v", tombstone)
+	}
+}
+
+func TestGitHubInputChangesWhileRecoverEffectIsInFlightRetainsIntentWithoutMutation(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 343, "active", false)
 	snapshot := mustOwnerSnapshot(t, owner)
 	request := operatorRequest("recover-unmarked-restart", "recover", manifest, false)
@@ -436,6 +666,11 @@ func TestOperatorRestartRetriesUnmarkedTerminalEffectOnlyFromMatchingFreshInput(
 	service := operatorTestMutationService(t, restarted)
 	service.collector.Config.ActorID = 42
 	service.collector.Config.RetryCommand = "/agent-symphony retry"
+	var githubRequests atomic.Int32
+	service.collector.API = internalgithub.API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		githubRequests.Add(1)
+		return nil, fmt.Errorf("unexpected GitHub mutation after changed input: %s", request.URL.String())
+	})}, Retries: -1}
 	tampered := activeInput
 	tampered.Issues = slices.Clone(activeInput.Issues)
 	tampered.Issues[0].Body = "changed after durable authorization"
@@ -458,6 +693,128 @@ func TestOperatorRestartRetriesUnmarkedTerminalEffectOnlyFromMatchingFreshInput(
 	case <-completed:
 		t.Fatal("changed external input completed the old durable intent")
 	default:
+	}
+	if githubRequests.Load() != 0 {
+		t.Fatalf("changed GitHub input caused %d external requests", githubRequests.Load())
+	}
+}
+
+func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		checkpoint string
+		marked     bool
+	}{
+		{name: "terminal-awaiting", checkpoint: operatorPhaseTerminalAwait},
+		{name: "retry-awaiting", checkpoint: operatorPhaseRetryAwait},
+		{name: "terminal-marker", checkpoint: operatorPhaseTerminal, marked: true},
+		{name: "retry-marker", checkpoint: operatorPhaseRetryPending, marked: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner, manifest := operatorTestOwner(t, 348, "active", false)
+			request := operatorRequest("recover-checkpoint", "recover", manifest, false)
+			command := operatorCommand(mustOwnerSnapshot(t, owner), request, manifest)
+			command.LivenessFailed = true
+			command.Runtime = &beginRuntimeEffectCommand{Identity: command.Identity, Action: agentruntime.EffectStop, Manifest: manifest, Reason: "dashboard recovery: runtime liveness mismatch", RequestDigest: strings.Repeat("e", 64)}
+			_, stopEffect, err := owner.beginOperatorMutation(t.Context(), command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cancelled := manifest
+			cancelled.State, cancelled.Diagnostic, cancelled.UpdatedAt = "cancelled", command.Runtime.Reason, time.Unix(80, 0).UTC()
+			if _, err := owner.finishOperatorRuntimeEffect(t.Context(), finishOperatorRuntimeEffectCommand{Finish: finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*stopEffect)), Action: agentruntime.EffectStop, Manifest: cancelled}}); err != nil {
+				t.Fatal(err)
+			}
+			active := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 348, Attempt: 1, BaseSHA: manifest.BaseSHA, State: "active", Checks: []string{}}
+			activeIssue := issueFact(348, "recover")
+			activeIssue.Attempt, activeIssue.CurrentAttempt, activeIssue.Active, activeIssue.ActiveAttempt = 1, 1, true, &active
+			activeInput := repositoryInput(true, activeIssue)
+			activeInput.Attempts = []internalgithub.RecoveryAttemptFact{active}
+			failed := active
+			failed.State = "failed"
+			failedIssue := issueFact(348, "recover")
+			failedIssue.Attempt, failedIssue.CurrentAttempt, failedIssue.RecoveryAuthorized = 1, 1, true
+			failedIssue.TerminalAttempts = []internalgithub.RecoveryAttemptFact{failed}
+			failedInput := repositoryInput(true, failedIssue)
+			failedInput.Attempts = []internalgithub.RecoveryAttemptFact{failed}
+
+			var terminalEffect, retryEffect *runtimeEffectIntent
+			if test.checkpoint != operatorPhaseTerminalAwait {
+				terminal := applyAndPlanRecover(t, owner, activeInput, activeInput.Attempts, githubIssueTerminalFailure)
+				terminalEffect = advanceOperatorRecoverPlan(t, owner, request.RequestID, terminal)
+				if test.checkpoint != operatorPhaseTerminal {
+					result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueTerminalFailure, Observed: true}}
+					if _, err := owner.finishOperatorReconciliationEffect(t.Context(), finishOperatorReconciliationEffectCommand{Finish: finishReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(*terminalEffect), Result: result}}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if test.checkpoint == operatorPhaseRetryPending {
+				retry := applyAndPlanRecover(t, owner, failedInput, failedInput.Attempts, githubIssueRetry)
+				retryEffect = advanceOperatorRecoverPlan(t, owner, request.RequestID, retry)
+			}
+			service := operatorTestMutationService(t, owner)
+			attachedRequest := operatorRequest("recover-checkpoint-attached", "recover", manifest, false)
+			attach, ok := service.recoveryAttachCommand(mustOwnerSnapshot(t, owner), attachedRequest)
+			if !ok {
+				t.Fatal("recovery checkpoint did not accept attached receipt")
+			}
+			if _, _, err := owner.beginOperatorMutation(t.Context(), attach); err != nil {
+				t.Fatal(err)
+			}
+			if test.marked {
+				effect := terminalEffect
+				kind := githubIssueTerminalFailure
+				if retryEffect != nil {
+					effect, kind = retryEffect, githubIssueRetry
+				}
+				result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: kind, Observed: true}}
+				if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*effect), *effect.Reconciliation, result); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := mustOwnerSnapshot(t, owner)
+			if err := owner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := startTestStateOwner(t, owner.stateRoot, before.State, func(runtimeOwnerState) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = restarted.close(context.Background()) })
+			service = operatorTestMutationService(t, restarted)
+			service.collector.Config.ActorID = 42
+			service.collector.Config.RetryCommand = "/agent-symphony retry"
+			inputs := []reconciliationInput{}
+			switch test.checkpoint {
+			case operatorPhaseTerminalAwait:
+				inputs = []reconciliationInput{activeInput, failedInput}
+			case operatorPhaseRetryAwait, operatorPhaseTerminal:
+				inputs = []reconciliationInput{failedInput}
+			}
+			service.collect = func(_ context.Context, _ stateOwnerSnapshot, _ int) (reconciliationV2Batch, error) {
+				if len(inputs) == 0 {
+					return reconciliationV2Batch{}, errors.New("unexpected duplicate recovery collection")
+				}
+				input := inputs[0]
+				inputs = inputs[1:]
+				return reconciliationV2Batch{Input: input}, nil
+			}
+			terminalMarker, _ := internalgithub.TerminalFailureMarker(348, 1, cancelled.UpdatedAt)
+			service.collector.API = issueUpdateAppliedAPI(t, map[int][]map[string]any{348: {
+				{"id": 1, "body": terminalMarker, "created_at": cancelled.UpdatedAt, "updated_at": cancelled.UpdatedAt, "user": map[string]any{"id": 42}},
+				{"id": 2, "body": "/agent-symphony retry", "created_at": cancelled.UpdatedAt.Add(time.Second), "updated_at": cancelled.UpdatedAt.Add(time.Second), "user": map[string]any{"id": 42}},
+			}})
+			if err := service.resumeReceipt(t.Context(), request.RequestID); err != nil {
+				t.Fatal(err)
+			}
+			final := mustOwnerSnapshot(t, restarted).State
+			original, _ := operatorReceiptByID(final, request.RequestID)
+			attached, _ := operatorReceiptByID(final, attachedRequest.RequestID)
+			if original.State != "completed" || attached.State != "completed" || original.EffectID != attached.EffectID || len(final.Effects) != 2 || len(inputs) != 0 {
+				t.Fatalf("original=%#v attached=%#v effects=%#v remaining_inputs=%d", original, attached, final.Effects, len(inputs))
+			}
+		})
 	}
 }
 
@@ -1068,6 +1425,11 @@ func TestV2AbandonAndRemoveSurviveBlockedReconciliation(t *testing.T) {
 			}
 			service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
 			service.effects.stopped = true
+			t.Cleanup(func() {
+				if err := service.shutdown(context.Background()); err != nil {
+					t.Error(err)
+				}
+			})
 			server := &dashboardServer{ctx: t.Context(), stateRoot: owner.stateRoot, repository: "o/r", operator: service}
 			entered, release := make(chan struct{}), make(chan struct{})
 			var once sync.Once
@@ -1210,6 +1572,9 @@ func TestOperatorMarkerSurvivesFinishPersistenceFailureAndFinalizesAfterRestart(
 	if receipt.State != "completed" || final.Effects[effect.ID].State != "completed" || final.Attempts[ownerAttemptKey("o/r", 341, 1)].Manifest.State != "cancelled" {
 		t.Fatalf("state=%#v receipt=%#v", final, receipt)
 	}
+	if _, err := os.Lstat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restart did not reclaim committed marker: %v", err)
+	}
 }
 
 type operatorOwnedRunner struct{ manifest agentruntime.Manifest }
@@ -1217,6 +1582,38 @@ type operatorOwnedRunner struct{ manifest agentruntime.Manifest }
 func (r operatorOwnedRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if command.Name == "git" && slices.Contains(command.Args, "--show-current") {
 		return agentruntime.Result{Output: r.manifest.Branch + "\n"}, nil
+	}
+	if command.Name == "tmux" && slices.Contains(command.Args, "has-session") {
+		return agentruntime.Result{}, nil
+	}
+	return agentruntime.Result{}, fmt.Errorf("unexpected ownership command %s %v", command.Name, command.Args)
+}
+
+type concurrentOwnedRunner struct {
+	branches map[string]string
+	entered  chan struct{}
+	release  chan struct{}
+	calls    atomic.Int32
+	once     sync.Once
+}
+
+func (r *concurrentOwnedRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+	if r.calls.Add(1) <= 2 {
+		if r.calls.Load() == 2 {
+			r.once.Do(func() { close(r.entered) })
+		}
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			return agentruntime.Result{}, ctx.Err()
+		}
+	}
+	if command.Name == "git" && slices.Contains(command.Args, "--show-current") {
+		path := ""
+		if index := slices.Index(command.Args, "-C"); index >= 0 && index+1 < len(command.Args) {
+			path = command.Args[index+1]
+		}
+		return agentruntime.Result{Output: r.branches[path] + "\n"}, nil
 	}
 	if command.Name == "tmux" && slices.Contains(command.Args, "has-session") {
 		return agentruntime.Result{}, nil
@@ -1237,6 +1634,7 @@ type operatorCleanupBoundary struct {
 	entered, exited chan struct{}
 	enterOnce       sync.Once
 	calls           atomic.Int32
+	err             error
 }
 
 func (b *operatorCleanupBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
@@ -1247,6 +1645,9 @@ func (b *operatorCleanupBoundary) call(ctx context.Context, operation string, co
 		return agentruntime.Result{}, fmt.Errorf("unexpected cleanup operation %q", operation)
 	}
 	b.calls.Add(1)
+	if b.err != nil {
+		return agentruntime.Result{}, b.err
+	}
 	if b.entered != nil {
 		b.enterOnce.Do(func() { close(b.entered) })
 		<-ctx.Done()

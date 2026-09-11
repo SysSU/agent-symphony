@@ -11,8 +11,8 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
-// runtimeEffectCoordinator is the dormant v2 bridge between durable owner
-// intents and slow runtime I/O. Production activation is deferred to #277.
+// runtimeEffectCoordinator bridges durable owner intents and slow runtime I/O.
+// It serializes only effects that target the same attempt.
 type runtimeEffectCoordinator struct {
 	lifecycle context.Context
 	owner     *stateOwner
@@ -33,6 +33,7 @@ func newRuntimeEffectCoordinator(lifecycle context.Context, owner *stateOwner, e
 	if lifecycle == nil || owner == nil || executor.Runtime == nil {
 		return nil, errors.New("runtime effect coordinator is incomplete")
 	}
+	executor.Runtime = freshRuntime(executor.Runtime, executor.Runtime.Source)
 	return &runtimeEffectCoordinator{lifecycle: lifecycle, owner: owner, executor: executor, active: map[string]*activeRuntimeEffect{}}, nil
 }
 
@@ -81,14 +82,17 @@ func (c *runtimeEffectCoordinator) beginWithSource(ctx context.Context, snapshot
 }
 
 func (c *runtimeEffectCoordinator) bindWithSource(request agentruntime.EffectRequest, source string) (agentruntime.EffectRequest, agentruntime.EffectExecutor, error) {
-	runtime := c.executor.Runtime
-	boundRuntime := &agentruntime.Runtime{
-		Root: runtime.Root, StateRoot: runtime.StateRoot, Source: source, Git: runtime.Git, Tmux: runtime.Tmux,
-		Helper: runtime.Helper, Runner: runtime.Runner, AllowEnv: slices.Clone(runtime.AllowEnv), StopWait: runtime.StopWait, VerifyWorker: runtime.VerifyWorker,
-	}
+	boundRuntime := freshRuntime(c.executor.Runtime, source)
 	executor := agentruntime.EffectExecutor{Runtime: boundRuntime, Cleanup: c.executor.Cleanup, VerifyCleanup: c.executor.VerifyCleanup}
 	bound, err := executor.BindRequest(request)
 	return bound, executor, err
+}
+
+func freshRuntime(runtime *agentruntime.Runtime, source string) *agentruntime.Runtime {
+	return &agentruntime.Runtime{
+		Root: runtime.Root, StateRoot: runtime.StateRoot, Source: source, Git: runtime.Git, Tmux: runtime.Tmux,
+		Helper: runtime.Helper, Runner: runtime.Runner, AllowEnv: slices.Clone(runtime.AllowEnv), StopWait: runtime.StopWait, VerifyWorker: runtime.VerifyWorker,
+	}
 }
 
 func (o *stateOwner) diagnoseRuntimeEffect(ctx context.Context, command diagnoseRuntimeEffectCommand) (stateOwnerSnapshot, error) {
@@ -138,6 +142,9 @@ func (c *runtimeEffectCoordinator) executeWithRun(request agentruntime.EffectReq
 	}); finishErr != nil {
 		return result, errors.Join(err, finishErr)
 	}
+	if markerErr := c.executor.Runtime.RemoveEffectMarker(result.Identity); markerErr != nil {
+		return result, errors.Join(err, markerErr)
+	}
 	return result, err
 }
 
@@ -178,6 +185,9 @@ func (c *runtimeEffectCoordinator) executeOperator(request agentruntime.EffectRe
 	}
 	if _, finishErr := c.owner.finishOperatorRuntimeEffect(c.lifecycle, finishOperatorRuntimeEffectCommand{Finish: finishRuntimeEffectCommand{Identity: ownerEffectIdentity(result.Identity), Action: result.Action, Manifest: result.Manifest}}); finishErr != nil {
 		return result, errors.Join(err, finishErr)
+	}
+	if markerErr := c.executor.Runtime.RemoveEffectMarker(result.Identity); markerErr != nil {
+		return result, errors.Join(err, markerErr)
 	}
 	return result, err
 }
@@ -220,6 +230,9 @@ func (c *runtimeEffectCoordinator) verifyPendingMode(ctx context.Context, snapsh
 	}
 	if finishErr != nil {
 		return agentruntime.EffectVerification{}, finishErr
+	}
+	if markerErr := c.executor.Runtime.RemoveEffectMarker(result.Identity); markerErr != nil {
+		return agentruntime.EffectVerification{}, markerErr
 	}
 	return verification, nil
 }
