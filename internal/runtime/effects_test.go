@@ -23,6 +23,9 @@ func TestEffectExecutorPrepareAndStartNeverWritesManifest(t *testing.T) {
 	if err != nil || prepared.Manifest.State != "preparing" {
 		t.Fatalf("prepared=%#v err=%v", prepared, err)
 	}
+	if temporary, err := filepath.Glob(filepath.Join(r.StateRoot, "runtime-effects", ".effect-*")); err != nil || len(temporary) != 0 {
+		t.Fatalf("runtime marker temporaries=%v err=%v", temporary, err)
+	}
 	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
 	if info, err := os.Stat(filepath.Dir(manifestPath)); err != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("private attempt state directory info=%v err=%v", info, err)
@@ -73,11 +76,23 @@ func TestReclaimOrphanEffectMarkersRetainsPendingAndFailsClosed(t *testing.T) {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
 	path := filepath.Join(r.StateRoot, "runtime-effects", request.Identity.EffectID+".done")
-	if err := r.ReclaimOrphanEffectMarkers(map[string]bool{request.Identity.EffectID: true}); err != nil {
+	temporary := filepath.Join(r.StateRoot, "runtime-effects", ".effect-12345")
+	if err := os.WriteFile(temporary, []byte("crash residue"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &Runtime{Root: r.Root, StateRoot: r.StateRoot}
+	if err := restarted.ReclaimOrphanEffectMarkers(map[string]bool{request.Identity.EffectID: true}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(path); err != nil {
 		t.Fatalf("pending marker was removed: %v", err)
+	}
+	if _, err := os.Lstat(temporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("validated crash temporary was not removed: %v", err)
+	}
+	unsafeTemporary := filepath.Join(r.StateRoot, "runtime-effects", ".effect-67890")
+	if err := os.WriteFile(unsafeTemporary, []byte("unsafe"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	unsafe := filepath.Join(r.StateRoot, "runtime-effects", strings.Repeat("d", 32)+".done")
 	if err := os.WriteFile(unsafe, []byte("not-json\n"), 0o600); err != nil {
@@ -89,14 +104,50 @@ func TestReclaimOrphanEffectMarkersRetainsPendingAndFailsClosed(t *testing.T) {
 	if _, err := os.Lstat(path); err != nil {
 		t.Fatalf("valid orphan was removed before full validation: %v", err)
 	}
+	if _, err := os.Lstat(unsafeTemporary); err != nil {
+		t.Fatalf("unsafe temporary was removed before full validation: %v", err)
+	}
 	if err := os.Remove(unsafe); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.ReclaimOrphanEffectMarkers(nil); err != nil {
+	if err := os.Remove(unsafeTemporary); err != nil {
+		t.Fatal(err)
+	}
+	symlinkTemporary := filepath.Join(r.StateRoot, "runtime-effects", ".effect-13579")
+	if err := os.Symlink(path, symlinkTemporary); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ReclaimOrphanEffectMarkers(nil); err == nil {
+		t.Fatal("symlink temporary did not fail closed")
+	}
+	if err := os.Remove(symlinkTemporary); err != nil {
+		t.Fatal(err)
+	}
+	unknownTemporary := filepath.Join(r.StateRoot, "runtime-effects", ".effect-invalid")
+	if err := os.WriteFile(unknownTemporary, []byte("unknown"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ReclaimOrphanEffectMarkers(nil); err == nil {
+		t.Fatal("unknown temporary namespace did not fail closed")
+	}
+	if err := os.Remove(unknownTemporary); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ReclaimOrphanEffectMarkers(nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("orphan marker was not removed: %v", err)
+	}
+	temporary = filepath.Join(r.StateRoot, "runtime-effects", ".effect-24680")
+	if err := os.WriteFile(temporary, []byte("crash residue"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ReclaimOrphanEffectMarkers(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(temporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temp-only crash residue was not removed: %v", err)
 	}
 }
 

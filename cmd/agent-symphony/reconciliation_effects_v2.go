@@ -550,7 +550,8 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 	fact, remotelyObserved := observedReconciliationAttempt(observation, request.Attempt)
 	switch request.Action {
 	case reconciliationGitHubBind:
-		return manifest.State == "preparing" && observation.Fact.DispatchAuthorized && observation.Fact.Attempt == request.Attempt && observation.Fact.BaseSHA == manifest.BaseSHA
+		matches, err := reconciliationBindMatchesObservation(state, observation, manifest)
+		return err == nil && matches
 	case reconciliationGitHubPublish:
 		publish := request.GitHubPublish
 		if manifest.State != "completed" || manifest.ReviewState != "clean" || manifest.ReviewMode != agentruntime.ReviewModeImplementation || manifest.ReviewHead != publish.HeadSHA || manifest.ReviewBase == "" || manifest.ReviewTarget != manifest.ReviewBase+".."+publish.HeadSHA || publish.Title != observation.Fact.Title || publish.BaseBranch != observation.Fact.BaseBranch {

@@ -34,7 +34,7 @@ type reconciliationEffectMarker struct {
 	Result   reconciliationEffectResult   `json:"result"`
 }
 
-func writeReconciliationEffectMarker(stateRoot string, identity stateResultIdentity, request reconciliationEffectRequest, result reconciliationEffectResult) error {
+func writeReconciliationEffectMarker(stateRoot string, identity stateResultIdentity, request reconciliationEffectRequest, result reconciliationEffectResult) (returnErr error) {
 	marker, err := newReconciliationEffectMarker(identity, request, result)
 	if err != nil {
 		return err
@@ -56,7 +56,7 @@ func writeReconciliationEffectMarker(stateRoot string, identity stateResultIdent
 		return err
 	}
 	name := temporary.Name()
-	defer os.Remove(name)
+	defer func() { returnErr = errors.Join(returnErr, removeReconciliationMarkerTemporary(directory, name)) }()
 	if err := temporary.Chmod(0o600); err != nil {
 		temporary.Close()
 		return err
@@ -80,6 +80,18 @@ func writeReconciliationEffectMarker(stateRoot string, identity stateResultIdent
 		if readErr != nil || existing == nil || !reflect.DeepEqual(*existing, result) {
 			return errors.New("reconciliation effect marker is immutable")
 		}
+	}
+	dir, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func removeReconciliationMarkerTemporary(directory, path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	dir, err := os.Open(directory)
 	if err != nil {
@@ -224,9 +236,17 @@ func reclaimOrphanReconciliationMarkers(stateRoot string, pending map[string]boo
 	if err != nil {
 		return err
 	}
-	var orphans []string
+	var remove []string
 	for _, entry := range entries {
 		name := entry.Name()
+		if reconciliationMarkerTemporaryName(name) {
+			path := filepath.Join(directory, name)
+			if err := validateReconciliationMarkerTemporary(path); err != nil {
+				return err
+			}
+			remove = append(remove, path)
+			continue
+		}
 		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(name, ".done") {
 			return errors.New("reconciliation effect marker directory contains an unsafe entry")
 		}
@@ -256,15 +276,15 @@ func reclaimOrphanReconciliationMarkers(stateRoot string, pending map[string]boo
 			return errors.New("reconciliation effect marker is invalid")
 		}
 		if !pending[id] {
-			orphans = append(orphans, path)
+			remove = append(remove, path)
 		}
 	}
-	for _, path := range orphans {
+	for _, path := range remove {
 		if err := os.Remove(path); err != nil {
 			return err
 		}
 	}
-	if len(orphans) == 0 {
+	if len(remove) == 0 {
 		return nil
 	}
 	dir, err := os.Open(directory)
@@ -273,6 +293,36 @@ func reclaimOrphanReconciliationMarkers(stateRoot string, pending map[string]boo
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+func reconciliationMarkerTemporaryName(name string) bool {
+	suffix := strings.TrimPrefix(name, ".effect-")
+	if suffix == "" || suffix == name {
+		return false
+	}
+	for _, character := range suffix {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func validateReconciliationMarkerTemporary(path string) error {
+	listed, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	opened, statErr := file.Stat()
+	closeErr := file.Close()
+	if statErr != nil || closeErr != nil || !os.SameFile(listed, opened) || !opened.Mode().IsRegular() || opened.Mode()&os.ModeSymlink != 0 || opened.Mode().Perm() != 0o600 || !ownedByCurrentUser(opened) {
+		return errors.New("reconciliation effect marker temporary file is unsafe")
+	}
+	return nil
 }
 
 func validOrphanReconciliationMarker(marker reconciliationEffectMarker, id string) bool {

@@ -646,7 +646,14 @@ func applyReconciliationIssue(state *runtimeOwnerState, collection reconciliatio
 	}
 	if collection.Complete {
 		for attemptKey, old := range attempts {
-			if seenAttempts[attemptKey] || old.SourceIssueGeneration != issueGeneration || old.ObservationEpoch == identity.Epoch && identity.CycleID <= old.LastCycleID || state.AttemptGenerations[attemptKey] != collection.AttemptGenerations[attemptKey] {
+			if seenAttempts[attemptKey] || old.SourceIssueGeneration != issueGeneration || old.ObservationEpoch == identity.Epoch && identity.CycleID <= old.LastCycleID {
+				continue
+			}
+			captured, capturedOK := collection.AttemptGenerations[attemptKey]
+			if !capturedOK || state.AttemptGenerations[attemptKey] != captured {
+				if err := countStaleReconciliation(state); err != nil {
+					return err
+				}
 				continue
 			}
 			generation := old.Generation

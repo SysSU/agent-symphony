@@ -231,6 +231,39 @@ func TestReconciliationRejectsStaleEpochAndDiscardsStaleGeneration(t *testing.T)
 	}
 }
 
+func TestCompleteAttemptAbsenceWithChangedGenerationCountsStaleOnce(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 178, 1, "running")
+	issueKey, attemptKey := ownerIssueKey("o/r", 178), ownerAttemptKey("o/r", 178, 1)
+	fact := attemptFact(178, 1, "old generation")
+	issue := issueFact(178, "issue")
+	state := newRuntimeOwnerState("o/r")
+	state.Epoch, state.Revision = 1, 1
+	state.IssueGenerations[issueKey], state.AttemptGenerations[attemptKey] = 1, 2
+	state.Attempts[attemptKey] = runtimeAttemptRecord{Generation: 2, Manifest: manifest}
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	initial := repositoryInput(true, issue)
+	initial.Attempts = []internalgithub.RecoveryAttemptFact{fact}
+	applyReconciliationInput(t, owner, initial)
+	snapshot, err := owner.reconciliationSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection := mustCollection(t, snapshot, repositoryInput(true, issue))
+	collection.AttemptGenerations[attemptKey] = 1 // The complete scan captured the prior attempt generation.
+	applied := applyCollection(t, owner, collection)
+	if applied.State.StaleReconciliations != 1 {
+		t.Fatalf("stale complete-absence count=%d want 1", applied.State.StaleReconciliations)
+	}
+	if !applied.State.Observations[issueKey].Attempts[attemptKey].Present {
+		t.Fatal("stale complete absence removed the newer-generation attempt observation")
+	}
+}
+
 func TestReconciliationTombstoneMasksAttempt(t *testing.T) {
 	root := resolvedTempDir(t)
 	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -313,8 +314,16 @@ type stateOwnerCommand struct {
 	advanceOperatorRecovery advanceOperatorRecoveryCommand
 	cycleOutcome            recordCycleOutcomeCommand
 	context                 context.Context
+	arbitration             *stateOwnerCommandArbitration
 	reply                   chan stateOwnerResult
 }
+
+type stateOwnerCommandArbitration struct{ state atomic.Uint32 }
+
+const (
+	stateOwnerCommandCanceled uint32 = iota + 1
+	stateOwnerCommandClaimed
+)
 
 type recordCycleOutcomeCommand struct {
 	Identity   stateResultIdentity
@@ -436,8 +445,8 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 		for inFlight == nil && len(queue) > 0 {
 			command := queue[0]
 			queue = queue[1:]
-			if command.context != nil && command.context.Err() != nil {
-				command.reply <- stateOwnerResult{err: command.context.Err()}
+			if command.arbitration != nil && command.arbitration.state.Load() == stateOwnerCommandCanceled {
+				command.reply <- stateOwnerResult{err: commandCancellationError(command)}
 				continue
 			}
 			if poisoned != nil {
@@ -450,22 +459,21 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				continue
 			}
 			if reflect.DeepEqual(candidate, committed) {
+				if !claimStateOwnerCommand(command) {
+					command.reply <- stateOwnerResult{err: commandCancellationError(command)}
+					continue
+				}
 				recordAppliedReconciliationCycles(appliedCycles, command, committed, false)
 				command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(effect)}
 				continue
 			}
 			reply := make(chan error, 1)
 			request := statePersistenceRequest{state: candidate, reply: reply}
-			if command.context == nil {
-				persistence <- request
-			} else {
-				select {
-				case persistence <- request:
-				case <-command.context.Done():
-					command.reply <- stateOwnerResult{err: command.context.Err()}
-					continue
-				}
+			if !claimStateOwnerCommand(command) {
+				command.reply <- stateOwnerResult{err: commandCancellationError(command)}
+				continue
 			}
+			persistence <- request
 			inFlight = &pendingStateCommit{command: command, candidate: candidate, effect: effect}
 			persistenceResult = reply
 		}
@@ -584,10 +592,15 @@ func (o *stateOwner) requestSnapshot(ctx context.Context, cycle bool) (stateOwne
 }
 
 func (o *stateOwner) submit(ctx context.Context, command stateOwnerCommand) (stateOwnerResult, error) {
+	return o.submitWithAdmission(ctx, command, nil)
+}
+
+func (o *stateOwner) submitWithAdmission(ctx context.Context, command stateOwnerCommand, admitted chan<- struct{}) (stateOwnerResult, error) {
 	if err := ctx.Err(); err != nil {
 		return stateOwnerResult{}, err
 	}
 	command.context = ctx
+	command.arbitration = &stateOwnerCommandArbitration{}
 	command.reply = make(chan stateOwnerResult, 1)
 	select {
 	case <-o.done:
@@ -596,8 +609,30 @@ func (o *stateOwner) submit(ctx context.Context, command stateOwnerCommand) (sta
 	case <-ctx.Done():
 		return stateOwnerResult{}, ctx.Err()
 	}
-	result := <-command.reply
-	return result, result.err
+	if admitted != nil {
+		close(admitted)
+	}
+	select {
+	case result := <-command.reply:
+		return result, result.err
+	case <-ctx.Done():
+		if command.arbitration.state.CompareAndSwap(0, stateOwnerCommandCanceled) {
+			return stateOwnerResult{}, ctx.Err()
+		}
+		result := <-command.reply
+		return result, result.err
+	}
+}
+
+func claimStateOwnerCommand(command stateOwnerCommand) bool {
+	return command.arbitration == nil || command.arbitration.state.CompareAndSwap(0, stateOwnerCommandClaimed)
+}
+
+func commandCancellationError(command stateOwnerCommand) error {
+	if command.context != nil && command.context.Err() != nil {
+		return command.context.Err()
+	}
+	return context.Canceled
 }
 
 func (o *stateOwner) advanceIssueGeneration(ctx context.Context, command advanceIssueGenerationCommand) (stateOwnerSnapshot, error) {

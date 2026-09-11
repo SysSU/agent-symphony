@@ -536,17 +536,15 @@ func planReconciliationBinds(snapshot stateOwnerSnapshot, cfg internalgithub.PRA
 	for key, record := range snapshot.State.Attempts {
 		manifest := record.Manifest
 		observation, ok := snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
-		if !ok || !observation.Present || observation.OwnerGeneration != snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)] || record.Generation != snapshot.State.AttemptGenerations[key] || manifest.State != "preparing" || !observation.Fact.DispatchAuthorized || observation.Fact.BaseSHA != manifest.BaseSHA {
+		if !ok || !observation.Present || observation.OwnerGeneration != snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)] || record.Generation != snapshot.State.AttemptGenerations[key] {
 			continue
 		}
-		if observation.Fact.Attempt != manifest.Attempt {
-			replacement, err := currentPreparingReplacement(snapshot.State, observation, observation.Fact.Attempt)
-			if err != nil {
-				return nil, err
-			}
-			if replacement != manifest.Attempt || reconciliationObservationHasActiveBinding(observation) {
-				continue
-			}
+		matches, err := reconciliationBindMatchesObservation(snapshot.State, observation, manifest)
+		if err != nil {
+			return nil, err
+		}
+		if !matches {
+			continue
 		}
 		if fact, observed := observedReconciliationAttempt(observation, manifest.Attempt); observed && (fact.State == "active" || fact.State == "review-ready") && fact.BaseSHA == manifest.BaseSHA {
 			continue

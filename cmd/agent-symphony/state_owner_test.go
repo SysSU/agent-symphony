@@ -490,23 +490,32 @@ func TestStateOwnerCancellationWhileQueuedSkipsPersistence(t *testing.T) {
 	}()
 	<-entered
 	ctx, cancel := context.WithCancel(t.Context())
+	admitted := make(chan struct{})
 	queued := stateOwnerCommand{
 		kind:    stateOwnerRecordControlReceipt,
-		context: ctx,
 		receipt: recordControlReceiptCommand{Receipt: controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: "canceled", Repository: "o/r", Action: "reconcile"}, State: "pending"}},
-		reply:   make(chan stateOwnerResult, 1),
 	}
-	owner.commands <- queued
+	queuedResult := make(chan error, 1)
+	go func() {
+		_, err := owner.submitWithAdmission(ctx, queued, admitted)
+		queuedResult <- err
+	}()
+	<-admitted
 	cancel()
+	if err := <-queuedResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("queued result=%v", err)
+	}
+	select {
+	case err := <-first:
+		t.Fatalf("unrelated persistence completed before release: %v", err)
+	default:
+	}
 	close(release)
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}
-	if result := <-queued.reply; !errors.Is(result.err, context.Canceled) {
-		t.Fatalf("queued result=%#v", result)
-	}
 	snapshot := mustOwnerSnapshot(t, owner)
-	if writes != 2 || snapshot.State.Revision != 2 || len(snapshot.State.ControlReceipts) != 1 || snapshot.State.ControlReceipts[0].Request.RequestID != "first" {
+	if writes != 2 || snapshot.State.Revision != 2 || len(snapshot.State.ControlReceipts) != 1 || snapshot.State.ControlReceipts[0].Request.RequestID != "first" || len(snapshot.State.Effects) != 0 || len(snapshot.State.Tombstones) != 0 {
 		t.Fatalf("writes=%d state=%#v", writes, snapshot.State)
 	}
 }

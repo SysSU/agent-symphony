@@ -43,12 +43,26 @@ func TestReclaimOrphanReconciliationMarkersRetainsPendingAndFailsClosed(t *testi
 	if err := writeReconciliationEffectMarker(root, ownerReconciliationEffectIdentity(*effect), request, test.result(request)); err != nil {
 		t.Fatal(err)
 	}
+	if temporary, err := filepath.Glob(filepath.Join(root, "reconciliation-effects", ".effect-*")); err != nil || len(temporary) != 0 {
+		t.Fatalf("reconciliation marker temporaries=%v err=%v", temporary, err)
+	}
 	path := filepath.Join(root, "reconciliation-effects", effect.ID+".done")
+	temporary := filepath.Join(root, "reconciliation-effects", ".effect-12345")
+	if err := os.WriteFile(temporary, []byte("crash residue"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := reclaimOrphanReconciliationMarkers(root, map[string]bool{effect.ID: true}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(path); err != nil {
 		t.Fatalf("pending marker was removed: %v", err)
+	}
+	if _, err := os.Lstat(temporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("validated crash temporary was not removed: %v", err)
+	}
+	unsafeTemporary := filepath.Join(root, "reconciliation-effects", ".effect-67890")
+	if err := os.WriteFile(unsafeTemporary, []byte("unsafe"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	unsafe := filepath.Join(root, "reconciliation-effects", strings.Repeat("e", 32)+".done")
 	if err := os.WriteFile(unsafe, []byte("not-json\n"), 0o600); err != nil {
@@ -60,7 +74,33 @@ func TestReclaimOrphanReconciliationMarkersRetainsPendingAndFailsClosed(t *testi
 	if _, err := os.Lstat(path); err != nil {
 		t.Fatalf("valid orphan was removed before full validation: %v", err)
 	}
+	if _, err := os.Lstat(unsafeTemporary); err != nil {
+		t.Fatalf("unsafe temporary was removed before full validation: %v", err)
+	}
 	if err := os.Remove(unsafe); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(unsafeTemporary); err != nil {
+		t.Fatal(err)
+	}
+	symlinkTemporary := filepath.Join(root, "reconciliation-effects", ".effect-13579")
+	if err := os.Symlink(path, symlinkTemporary); err != nil {
+		t.Fatal(err)
+	}
+	if err := reclaimOrphanReconciliationMarkers(root, nil); err == nil {
+		t.Fatal("symlink temporary did not fail closed")
+	}
+	if err := os.Remove(symlinkTemporary); err != nil {
+		t.Fatal(err)
+	}
+	unknownTemporary := filepath.Join(root, "reconciliation-effects", ".effect-invalid")
+	if err := os.WriteFile(unknownTemporary, []byte("unknown"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := reclaimOrphanReconciliationMarkers(root, nil); err == nil {
+		t.Fatal("unknown temporary namespace did not fail closed")
+	}
+	if err := os.Remove(unknownTemporary); err != nil {
 		t.Fatal(err)
 	}
 	if err := reclaimOrphanReconciliationMarkers(root, nil); err != nil {
@@ -68,6 +108,16 @@ func TestReclaimOrphanReconciliationMarkersRetainsPendingAndFailsClosed(t *testi
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("orphan marker was not removed: %v", err)
+	}
+	temporary = filepath.Join(root, "reconciliation-effects", ".effect-24680")
+	if err := os.WriteFile(temporary, []byte("crash residue"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := reclaimOrphanReconciliationMarkers(root, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(temporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temp-only crash residue was not removed: %v", err)
 	}
 }
 

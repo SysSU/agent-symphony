@@ -194,6 +194,85 @@ func TestPlanRuntimeLifecycleNeverReusesOwnedAttemptAfterRestart(t *testing.T) {
 	}
 }
 
+func TestReplacementLifecycleCommitsPrepareBindAndStartOnOneReservation(t *testing.T) {
+	root := resolvedTempDir(t)
+	attemptRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base, body := strings.Repeat("a", 40), "replacement proposal"
+	issueKey, attemptOne := ownerIssueKey("o/r", 12), ownerAttemptKey("o/r", 12, 1)
+	state := newRuntimeOwnerState("o/r")
+	state.IssueGenerations[issueKey], state.AttemptGenerations[attemptOne] = 1, 2
+	state.Tombstones[attemptOne] = runtimeTombstone{Repository: "o/r", Issue: 12, Attempt: 1, Generation: 2, InvalidatedGeneration: 1, Action: "removed", CleanupPhase: "completed"}
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+
+	proposal := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 12, Attempt: 1, Priority: 1, CreatedAt: time.Unix(1, 0).UTC(), Eligible: true, DispatchAuthorized: true, BaseSHA: base, BaseBranch: "main", Body: body}
+	input := repositoryInput(true, proposal)
+	accepted := applyReconciliationInput(t, owner, input)
+	batch := reconciliationV2Batch{Input: input}
+	plans, err := planRuntimeLifecycle(accepted, batch, config.Default("o/r"), time.Unix(2, 0).UTC(), attemptRoot, root)
+	if err != nil || len(plans) != 1 || plans[0].Request.Action != agentruntime.EffectPrepare || plans[0].Request.Manifest.Attempt != 2 {
+		t.Fatalf("prepare plans=%#v err=%v", plans, err)
+	}
+	prepare := plans[0]
+	_, prepareEffect, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: stateResultIdentity{Epoch: prepare.Snapshot.State.Epoch, SourceRevision: prepare.Snapshot.State.Revision, IssueGeneration: prepare.Snapshot.State.IssueGenerations[issueKey]}, Action: agentruntime.EffectPrepare, Manifest: prepare.Request.Manifest, RequestDigest: strings.Repeat("1", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*prepareEffect)), Action: agentruntime.EffectPrepare, Manifest: prepare.Request.Manifest}); err != nil {
+		t.Fatal(err)
+	}
+	prepared := applyReconciliationInput(t, owner, input)
+	if again, err := planRuntimeLifecycle(prepared, batch, config.Default("o/r"), time.Unix(3, 0).UTC(), attemptRoot, root); err != nil || len(again) != 0 {
+		t.Fatalf("preparing reservation allocated another attempt: plans=%#v err=%v", again, err)
+	}
+
+	binds, err := planReconciliationBinds(prepared, internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1})
+	if err != nil || len(binds) != 1 || binds[0].Request.Attempt != 2 {
+		t.Fatalf("bind plans=%#v err=%v", binds, err)
+	}
+	_, bindEffect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: binds[0].Identity, Request: binds[0].Request})
+	if err != nil {
+		t.Fatalf("replacement bind admission: %v", err)
+	}
+	if _, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(*bindEffect), Result: reconciliationEffectResult{Action: reconciliationGitHubBind, GitHubBind: &githubBindEffectResult{Observed: true}}}); err != nil {
+		t.Fatalf("replacement bind finish: %v", err)
+	}
+
+	remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 12, Attempt: 2, BaseSHA: base, State: "active"}
+	confirmed := proposal
+	confirmed.Attempt, confirmed.CurrentAttempt, confirmed.Active, confirmed.ActiveAttempt = 2, 2, true, &remote
+	confirmedInput := repositoryInput(true, confirmed)
+	confirmedInput.Attempts = []internalgithub.RecoveryAttemptFact{remote}
+	confirmedSnapshot := applyReconciliationInput(t, owner, confirmedInput)
+	startPlans, err := planRuntimeLifecycle(confirmedSnapshot, reconciliationV2Batch{Input: confirmedInput}, config.Default("o/r"), time.Unix(4, 0).UTC(), attemptRoot, root)
+	if err != nil || len(startPlans) != 1 || startPlans[0].Request.Action != agentruntime.EffectStart || startPlans[0].Request.Manifest.Attempt != 2 {
+		t.Fatalf("start plans=%#v err=%v", startPlans, err)
+	}
+	start := startPlans[0]
+	_, startEffect, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: stateResultIdentity{Epoch: start.Snapshot.State.Epoch, SourceRevision: start.Snapshot.State.Revision, IssueGeneration: start.Snapshot.State.IssueGenerations[issueKey], AttemptGeneration: start.Snapshot.State.AttemptGenerations[ownerAttemptKey("o/r", 12, 2)]}, Action: agentruntime.EffectStart, Manifest: start.Request.Manifest, RequestDigest: strings.Repeat("2", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running := cloneManifest(start.Request.Manifest)
+	running.State = "running"
+	finished, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*startEffect)), Action: agentruntime.EffectStart, Manifest: running})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := finished.State.Attempts[ownerAttemptKey("o/r", 12, 2)].Manifest.State; got != "running" {
+		t.Fatalf("attempt 2 state=%q", got)
+	}
+	if _, exists := finished.State.AttemptGenerations[ownerAttemptKey("o/r", 12, 3)]; exists {
+		t.Fatal("replacement lifecycle allocated attempt 3")
+	}
+}
+
 func TestPreBindAbandonRestartReservesAttemptAndRejectsStaleWork(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 11, "orphaned", false)
 	for _, path := range []string{manifest.Worktree, productionSnapshotRoot(owner.stateRoot)} {
@@ -855,6 +934,17 @@ func TestStartupMarkerSweepReclaimsOrphanProofAbsentFromLedger(t *testing.T) {
 	if err := writeReconciliationEffectMarker(root, identity, request, result); err != nil {
 		t.Fatal(err)
 	}
+	if err := prepareProductionMarkerDirectories(root); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(root, "reconciliation-effects", ".effect-12345"),
+		filepath.Join(root, "runtime-effects", ".effect-67890"),
+	} {
+		if err := os.WriteFile(path, []byte("crash residue"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	finished, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: result})
 	if err != nil {
 		t.Fatal(err)
@@ -876,6 +966,14 @@ func TestStartupMarkerSweepReclaimsOrphanProofAbsentFromLedger(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(root, "reconciliation-effects", effect.ID+".done")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("orphan marker was not reclaimed after restart: %v", err)
+	}
+	for _, path := range []string{
+		filepath.Join(root, "reconciliation-effects", ".effect-12345"),
+		filepath.Join(root, "runtime-effects", ".effect-67890"),
+	} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("crash temporary was not reclaimed after restart: %s: %v", path, err)
+		}
 	}
 }
 

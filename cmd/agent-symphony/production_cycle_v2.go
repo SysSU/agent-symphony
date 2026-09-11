@@ -919,6 +919,20 @@ func currentPreparingReplacement(state runtimeOwnerState, observation reconcilia
 	return replacement, nil
 }
 
+func reconciliationBindMatchesObservation(state runtimeOwnerState, observation reconciliationObservation, manifest agentruntime.Manifest) (bool, error) {
+	if manifest.State != "preparing" || !observation.Fact.DispatchAuthorized || observation.Fact.BaseSHA != manifest.BaseSHA {
+		return false, nil
+	}
+	if observation.Fact.Attempt == manifest.Attempt {
+		return true, nil
+	}
+	replacement, err := currentPreparingReplacement(state, observation, observation.Fact.Attempt)
+	if err != nil {
+		return false, err
+	}
+	return replacement == manifest.Attempt && !reconciliationObservationHasActiveBinding(observation), nil
+}
+
 func firstUnreservedAttempt(state runtimeOwnerState, repository string, issue, proposed int) int {
 	for proposed > 0 {
 		key := ownerAttemptKey(repository, issue, proposed)

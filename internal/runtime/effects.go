@@ -273,7 +273,7 @@ type effectResultMarker struct {
 	Result  EffectResult `json:"result"`
 }
 
-func (r *Runtime) writeEffectMarker(result EffectResult) error {
+func (r *Runtime) writeEffectMarker(result EffectResult) (returnErr error) {
 	directory := filepath.Join(r.StateRoot, "runtime-effects")
 	if err := mkdirBelow(r.StateRoot, directory, 0o700); err != nil {
 		return err
@@ -292,7 +292,7 @@ func (r *Runtime) writeEffectMarker(result EffectResult) error {
 		return err
 	}
 	name := temporary.Name()
-	defer os.Remove(name)
+	defer func() { returnErr = errors.Join(returnErr, removeEffectMarkerTemporary(directory, name)) }()
 	if err := temporary.Chmod(0o600); err != nil {
 		temporary.Close()
 		return err
@@ -316,6 +316,18 @@ func (r *Runtime) writeEffectMarker(result EffectResult) error {
 		if readErr != nil || !reflect.DeepEqual(existing, &result) {
 			return errors.New("runtime effect result marker is immutable")
 		}
+	}
+	dir, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func removeEffectMarkerTemporary(directory, path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	dir, err := os.Open(directory)
 	if err != nil {
@@ -397,9 +409,17 @@ func (r *Runtime) ReclaimOrphanEffectMarkers(pending map[string]bool) error {
 	if err != nil {
 		return err
 	}
-	var orphans []string
+	var remove []string
 	for _, entry := range entries {
 		name := entry.Name()
+		if effectMarkerTemporaryName(name) {
+			path := filepath.Join(directory, name)
+			if err := validateEffectMarkerTemporary(path); err != nil {
+				return err
+			}
+			remove = append(remove, path)
+			continue
+		}
 		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(name, ".done") {
 			return errors.New("runtime effect marker directory contains an unsafe entry")
 		}
@@ -429,15 +449,15 @@ func (r *Runtime) ReclaimOrphanEffectMarkers(pending map[string]bool) error {
 			return err
 		}
 		if !pending[id] {
-			orphans = append(orphans, path)
+			remove = append(remove, path)
 		}
 	}
-	for _, path := range orphans {
+	for _, path := range remove {
 		if err := os.Remove(path); err != nil {
 			return err
 		}
 	}
-	if len(orphans) == 0 {
+	if len(remove) == 0 {
 		return nil
 	}
 	dir, err := os.Open(directory)
@@ -446,6 +466,36 @@ func (r *Runtime) ReclaimOrphanEffectMarkers(pending map[string]bool) error {
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+func effectMarkerTemporaryName(name string) bool {
+	suffix := strings.TrimPrefix(name, ".effect-")
+	if suffix == "" || suffix == name {
+		return false
+	}
+	for _, character := range suffix {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func validateEffectMarkerTemporary(path string) error {
+	listed, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	opened, statErr := file.Stat()
+	closeErr := file.Close()
+	if statErr != nil || closeErr != nil || !os.SameFile(listed, opened) || !opened.Mode().IsRegular() || opened.Mode()&os.ModeSymlink != 0 || opened.Mode().Perm() != 0o600 || !runtimeOwnedByCurrentUser(opened) {
+		return errors.New("runtime effect marker temporary file is unsafe")
+	}
+	return nil
 }
 
 func runtimeOwnedByCurrentUser(info os.FileInfo) bool {
