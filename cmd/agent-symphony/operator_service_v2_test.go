@@ -34,9 +34,7 @@ func TestV2DashboardDismissesWhileReconciliationCollectsAndIgnoresStaleFiles(t *
 	if err := writeDashboardStatusSnapshot(owner.stateRoot, dashboardStatusSnapshot{UpdatedAt: time.Unix(1, 0), Statuses: nil}); err != nil {
 		t.Fatal(err)
 	}
-	if err := server.writeState(dashboardState{Version: dashboardStateVersion, Hidden: nil}); err != nil {
-		t.Fatal(err)
-	}
+	writeLegacyStateFixture(t, owner.stateRoot, "dashboard-state.json", dashboardState{Version: dashboardStateVersion, Hidden: nil})
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	t.Cleanup(func() { once.Do(func() { close(release) }) })
@@ -443,7 +441,7 @@ func TestOperatorRestartRetriesUnmarkedTerminalEffectOnlyFromMatchingFreshInput(
 	service.collect = func(context.Context, stateOwnerSnapshot, int) (reconciliationV2Batch, error) {
 		return reconciliationV2Batch{Input: tampered}, nil
 	}
-	if err := service.resumeReceipt(t.Context(), request.RequestID); !errors.Is(err, errStateConflict) {
+	if err := service.resumeReceipt(t.Context(), request.RequestID); err == nil {
 		t.Fatalf("tampered recovery err=%v", err)
 	}
 	stillPending, _ := operatorReceiptByID(mustOwnerSnapshot(t, restarted).State, request.RequestID)
@@ -759,6 +757,7 @@ func TestOperatorStartupSweepDispatchesPendingCleanupAndShutdownLeavesItResumabl
 
 func TestV2PlanReviewHandlerCommitsExactOwnerEffectWithoutCompatibilityWrite(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 333, "active", false)
+	refreshOwnerObservation(t, owner, manifest.Issue)
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}

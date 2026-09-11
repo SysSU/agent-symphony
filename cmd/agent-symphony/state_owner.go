@@ -15,6 +15,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
@@ -47,6 +49,11 @@ type runtimeOwnerState struct {
 	Tombstones         map[string]runtimeTombstone          `json:"tombstones"`
 	Effects            map[string]runtimeEffectIntent       `json:"effects"`
 	ControlReceipts    []controlReceipt                     `json:"control_receipts"`
+	CycleDiagnostic    string                               `json:"cycle_diagnostic,omitempty"`
+	CycleDiagnosticAt  time.Time                            `json:"cycle_diagnostic_at,omitzero"`
+	CycleOutcomeEpoch  uint64                               `json:"cycle_outcome_epoch,omitempty"`
+	CycleOutcomeID     uint64                               `json:"cycle_outcome_id,omitempty"`
+	CycleOutcomeSource uint64                               `json:"cycle_outcome_source_revision,omitempty"`
 }
 
 type runtimeAttemptRecord struct {
@@ -177,6 +184,12 @@ type authorizeRuntimeEffectCommand struct {
 	Action   agentruntime.EffectAction
 }
 
+type diagnoseRuntimeEffectCommand struct {
+	Identity   stateResultIdentity
+	Action     agentruntime.EffectAction
+	Diagnostic string
+}
+
 type beginReconciliationEffectCommand struct {
 	Identity stateResultIdentity
 	Request  reconciliationEffectRequest
@@ -257,6 +270,7 @@ const (
 	stateOwnerBeginRuntimeEffect
 	stateOwnerFinishRuntimeEffect
 	stateOwnerAuthorizeRuntimeEffect
+	stateOwnerDiagnoseRuntimeEffect
 	stateOwnerApplyReconciliation
 	stateOwnerBeginReconciliationEffect
 	stateOwnerAuthorizeReconciliationEffect
@@ -269,6 +283,7 @@ const (
 	stateOwnerFinishOperatorRuntimeEffect
 	stateOwnerFinishOperatorReconciliationEffect
 	stateOwnerAdvanceOperatorRecovery
+	stateOwnerRecordCycleOutcome
 )
 
 type stateOwnerCommand struct {
@@ -282,6 +297,7 @@ type stateOwnerCommand struct {
 	begin                   beginRuntimeEffectCommand
 	finish                  finishRuntimeEffectCommand
 	authorize               authorizeRuntimeEffectCommand
+	diagnoseRuntime         diagnoseRuntimeEffectCommand
 	reconcile               applyReconciliationCommand
 	beginReconciliation     beginReconciliationEffectCommand
 	authorizeReconciliation authorizeReconciliationEffectCommand
@@ -294,7 +310,14 @@ type stateOwnerCommand struct {
 	finishOperatorRuntime   finishOperatorRuntimeEffectCommand
 	finishOperatorReconcile finishOperatorReconciliationEffectCommand
 	advanceOperatorRecovery advanceOperatorRecoveryCommand
+	cycleOutcome            recordCycleOutcomeCommand
 	reply                   chan stateOwnerResult
+}
+
+type recordCycleOutcomeCommand struct {
+	Identity   stateResultIdentity
+	Diagnostic string
+	At         time.Time
 }
 
 type stateOwnerResult struct {
@@ -326,8 +349,7 @@ type appliedReconciliationCycle struct {
 	digest string
 }
 
-// stateOwner is the sole in-process commit authority for a v2 runtime ledger.
-// Production activation is intentionally deferred until every v1 writer is removed.
+// stateOwner is the sole in-process commit authority for the runtime ledger.
 type stateOwner struct {
 	stateRoot   string
 	attemptRoot string
@@ -335,6 +357,7 @@ type stateOwner struct {
 	snapshots   chan stateOwnerSnapshotRequest
 	stop        chan stateOwnerStopRequest
 	done        chan struct{}
+	commits     chan stateOwnerSnapshot
 }
 
 func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial runtimeOwnerState, persist func(runtimeOwnerState) error) (*stateOwner, error) {
@@ -359,6 +382,7 @@ func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial
 		snapshots:   make(chan stateOwnerSnapshotRequest),
 		stop:        make(chan stateOwnerStopRequest),
 		done:        make(chan struct{}),
+		commits:     make(chan stateOwnerSnapshot, 1),
 	}
 	persistRequests := make(chan statePersistenceRequest, 1)
 	persistDone := make(chan struct{})
@@ -380,6 +404,7 @@ func runStatePersistence(requests <-chan statePersistenceRequest, done chan<- st
 
 func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersistenceRequest, persistenceDone <-chan struct{}) {
 	defer close(o.done)
+	defer close(o.commits)
 	committed := cloneRuntimeOwnerState(initial)
 	var queue []stateOwnerCommand
 	var inFlight *pendingStateCommit
@@ -387,6 +412,18 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 	var stopReply chan error
 	var cycleID uint64
 	appliedCycles := map[string]appliedReconciliationCycle{}
+	publish := func() {
+		snapshot := stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}
+		select {
+		case o.commits <- snapshot:
+		default:
+			select {
+			case <-o.commits:
+			default:
+			}
+			o.commits <- snapshot
+		}
+	}
 
 	startNext := func() {
 		for inFlight == nil && len(queue) > 0 {
@@ -449,6 +486,7 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 		case err := <-persistenceResult:
 			if err == nil {
 				committed = inFlight.candidate
+				publish()
 				recordAppliedReconciliationCycles(appliedCycles, inFlight.command, committed)
 				inFlight.command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(inFlight.effect)}
 			} else {
@@ -664,6 +702,10 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if err := applyAuthorizeRuntimeEffect(candidate, command.authorize); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
+	case stateOwnerDiagnoseRuntimeEffect:
+		if err := applyDiagnoseRuntimeEffect(&candidate, command.diagnoseRuntime); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
 	case stateOwnerApplyReconciliation:
 		if err := applyReconciliation(&candidate, command.reconcile, appliedCycles); err != nil {
 			return runtimeOwnerState{}, nil, err
@@ -730,6 +772,25 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 			}
 		}
 		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect, requestIDs...)
+	case stateOwnerRecordCycleOutcome:
+		outcome := command.cycleOutcome
+		if outcome.Identity.Epoch != candidate.Epoch || outcome.Identity.CycleID == 0 || outcome.Identity.SourceRevision == 0 || outcome.Identity.SourceRevision > candidate.Revision || !boundedText(outcome.Diagnostic, maxReconciliationStringBytes, false) || (outcome.Diagnostic == "") != outcome.At.IsZero() {
+			return runtimeOwnerState{}, nil, errStateConflict
+		}
+		if candidate.CycleOutcomeEpoch == outcome.Identity.Epoch && outcome.Identity.CycleID < candidate.CycleOutcomeID {
+			return runtimeOwnerState{}, nil, errStaleStateResult
+		}
+		if candidate.CycleOutcomeEpoch == outcome.Identity.Epoch && outcome.Identity.CycleID == candidate.CycleOutcomeID {
+			if candidate.CycleOutcomeSource == outcome.Identity.SourceRevision && candidate.CycleDiagnostic == outcome.Diagnostic && candidate.CycleDiagnosticAt.Equal(outcome.At) {
+				return candidate, nil, nil
+			}
+			return runtimeOwnerState{}, nil, errStateConflict
+		}
+		candidate.CycleDiagnostic = outcome.Diagnostic
+		candidate.CycleDiagnosticAt = outcome.At.UTC()
+		candidate.CycleOutcomeEpoch = outcome.Identity.Epoch
+		candidate.CycleOutcomeID = outcome.Identity.CycleID
+		candidate.CycleOutcomeSource = outcome.Identity.SourceRevision
 	default:
 		return runtimeOwnerState{}, nil, errors.New("unknown state owner command")
 	}
@@ -1270,7 +1331,7 @@ func applyControlReceipt(state *runtimeOwnerState, receipt controlReceipt) error
 	return nil
 }
 
-func loadOrMigrateRuntimeOwnerState(stateRoot, repository string) (runtimeOwnerState, bool, error) {
+func loadOrMigrateRuntimeOwnerState(stateRoot, legacyRecoveryPath, repository string) (runtimeOwnerState, bool, error) {
 	state, err := readRuntimeOwnerState(stateRoot, repository)
 	if err == nil {
 		return state, false, nil
@@ -1278,7 +1339,7 @@ func loadOrMigrateRuntimeOwnerState(stateRoot, repository string) (runtimeOwnerS
 	if !errors.Is(err, os.ErrNotExist) {
 		return runtimeOwnerState{}, false, err
 	}
-	state, err = migrateLegacyRuntimeState(stateRoot, repository)
+	state, err = migrateLegacyRuntimeState(stateRoot, legacyRecoveryPath, repository)
 	return state, true, err
 }
 
@@ -1310,7 +1371,7 @@ func readRuntimeOwnerState(stateRoot, repository string) (runtimeOwnerState, err
 	return state, nil
 }
 
-func migrateLegacyRuntimeState(stateRoot, repository string) (runtimeOwnerState, error) {
+func migrateLegacyRuntimeState(stateRoot, legacyRecoveryPath, repository string) (runtimeOwnerState, error) {
 	identity, err := readDeploymentIdentity(stateRoot)
 	if err != nil {
 		return runtimeOwnerState{}, fmt.Errorf("read deployment identity: %w", err)
@@ -1325,6 +1386,9 @@ func migrateLegacyRuntimeState(stateRoot, repository string) (runtimeOwnerState,
 		return runtimeOwnerState{}, fmt.Errorf("migrate attempt manifests: %w", err)
 	}
 	for _, manifest := range manifests {
+		if manifest.ReviewState == "preparing" || manifest.ReviewState == "running" {
+			return runtimeOwnerState{}, fmt.Errorf("legacy attempt %d/%d has an active reviewer", manifest.Issue, manifest.Attempt)
+		}
 		issueKey, attemptKey := ownerIssueKey(repository, manifest.Issue), ownerAttemptKey(repository, manifest.Issue, manifest.Attempt)
 		state.IssueGenerations[issueKey], state.AttemptGenerations[attemptKey] = 1, 1
 		state.Attempts[attemptKey] = runtimeAttemptRecord{Generation: 1, Manifest: cloneManifest(manifest)}
@@ -1356,14 +1420,63 @@ func migrateLegacyRuntimeState(stateRoot, repository string) (runtimeOwnerState,
 	if err != nil {
 		return runtimeOwnerState{}, fmt.Errorf("migrate control receipts: %w", err)
 	}
-	state.ControlReceipts = make([]controlReceipt, len(receipts.Receipts))
-	for index, receipt := range receipts.Receipts {
-		state.ControlReceipts[index] = cloneControlReceipt(receipt)
+	for _, receipt := range receipts.Receipts {
+		if receipt.State == "pending" {
+			return runtimeOwnerState{}, fmt.Errorf("legacy control receipt %s is pending without a v2 effect proof", receipt.Request.RequestID)
+		}
+		state.ControlReceipts = append(state.ControlReceipts, cloneControlReceipt(receipt))
+	}
+	recoveries, err := readLegacyPRRecoveries(legacyRecoveryPath)
+	if err != nil {
+		return runtimeOwnerState{}, fmt.Errorf("migrate pull-request recovery state: %w", err)
+	}
+	seenPRs := map[int]bool{}
+	for _, recovery := range recoveries {
+		key := ownerAttemptKey(recovery.Repository, recovery.Issue, recovery.Attempt)
+		if !validPRState(recovery) || recovery.Repository != repository || seenPRs[recovery.Number] {
+			return runtimeOwnerState{}, errors.New("legacy pull-request recovery identity is invalid")
+		}
+		seenPRs[recovery.Number] = true
+		if _, tombstoned := state.Tombstones[key]; tombstoned {
+			continue
+		}
+		if _, duplicate := state.Recoveries[key]; duplicate {
+			return runtimeOwnerState{}, errors.New("legacy pull-request recovery attempt is duplicated")
+		}
+		if _, current := state.Attempts[key]; !current {
+			return runtimeOwnerState{}, errors.New("legacy pull-request recovery has no current attempt")
+		}
+		state.Recoveries[key] = runtimePRRecovery{IssueGeneration: state.IssueGenerations[ownerIssueKey(repository, recovery.Issue)], AttemptGeneration: state.AttemptGenerations[key], State: recovery}
 	}
 	if err := validateRuntimeOwnerState(state, runtimeOwnerAttemptRoot(stateRoot), stateRoot, false); err != nil {
 		return runtimeOwnerState{}, err
 	}
 	return state, nil
+}
+
+func readLegacyPRRecoveries(path string) ([]internalgithub.PRState, error) {
+	if path == "" {
+		return nil, errors.New("legacy pull-request recovery path is required")
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || !ownedByCurrentUser(info) || info.Size() > maxRuntimeOwnerState {
+		return nil, errors.New("legacy pull-request recovery file is unsafe")
+	}
+	var states []internalgithub.PRState
+	decoder := json.NewDecoder(io.LimitReader(file, maxRuntimeOwnerState+1))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&states) != nil || decoder.Decode(&struct{}{}) != io.EOF || len(states) > maxPRRecoveryEntries {
+		return nil, errors.New("legacy pull-request recovery file is invalid")
+	}
+	return states, nil
 }
 
 func migrateLegacyTombstone(state *runtimeOwnerState, repository string, issue, attempt int, action, phase, publishedHead string, manifest *agentruntime.Manifest) error {
@@ -1477,6 +1590,12 @@ func writeRuntimeOwnerState(stateRoot, attemptRoot string, state runtimeOwnerSta
 func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot string, persisted bool) error {
 	if state.Version != runtimeOwnerStateVersion || strings.TrimSpace(state.Repository) == "" || state.IssueGenerations == nil || state.AttemptGenerations == nil || state.Attempts == nil || state.Observations == nil || state.Recoveries == nil || state.Tombstones == nil || state.Effects == nil || state.ControlReceipts == nil || persisted && (state.Epoch == 0 || state.Revision == 0) {
 		return errors.New("runtime owner ledger is invalid")
+	}
+	if !boundedText(state.CycleDiagnostic, maxReconciliationStringBytes, false) || (state.CycleDiagnostic == "") != state.CycleDiagnosticAt.IsZero() {
+		return errors.New("runtime owner cycle outcome is invalid")
+	}
+	if (state.CycleOutcomeEpoch == 0) != (state.CycleOutcomeID == 0) || (state.CycleOutcomeEpoch == 0) != (state.CycleOutcomeSource == 0) || state.CycleOutcomeEpoch > state.Epoch || state.CycleOutcomeSource > state.Revision {
+		return errors.New("runtime owner cycle outcome identity is invalid")
 	}
 	for key, generation := range state.IssueGenerations {
 		issue := issueFromOwnerKey(key)

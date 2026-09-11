@@ -147,12 +147,14 @@ type reconciliationRunner struct {
 
 type reconciliationTriggerRunner struct {
 	mu      sync.Mutex
-	runner  reconciliationRunner
+	run     func(context.Context) error
 	ctx     context.Context
 	cancel  context.CancelFunc
 	wake    chan struct{}
 	done    chan struct{}
+	changed chan struct{}
 	stopped bool
+	running bool
 	runs    uint64
 	lastErr error
 }
@@ -182,10 +184,46 @@ func newReconciliationTriggerRunner(ctx context.Context, runner reconciliationRu
 	if ctx == nil || runner.owner == nil || runner.collect == nil {
 		return nil, errors.New("reconciliation trigger runner is incomplete")
 	}
+	return newReconciliationTrigger(ctx, func(ctx context.Context) error {
+		_, err := runner.run(ctx)
+		return err
+	})
+}
+
+func newProductionReconciliationTriggerRunner(ctx context.Context, cycle func(context.Context) error) (*reconciliationTriggerRunner, error) {
+	if ctx == nil || cycle == nil {
+		return nil, errors.New("production reconciliation trigger is incomplete")
+	}
+	return newReconciliationTrigger(ctx, cycle)
+}
+
+func newReconciliationTrigger(ctx context.Context, run func(context.Context) error) (*reconciliationTriggerRunner, error) {
 	lifecycle, cancel := context.WithCancel(ctx)
-	r := &reconciliationTriggerRunner{runner: runner, ctx: lifecycle, cancel: cancel, wake: make(chan struct{}, 1), done: make(chan struct{})}
+	r := &reconciliationTriggerRunner{run: run, ctx: lifecycle, cancel: cancel, wake: make(chan struct{}, 1), done: make(chan struct{}), changed: make(chan struct{})}
 	go r.loop()
 	return r, nil
+}
+
+func (r *reconciliationTriggerRunner) triggerAndWait(ctx context.Context) error {
+	if err := r.trigger(); err != nil {
+		return err
+	}
+	for {
+		r.mu.Lock()
+		idle := !r.running && len(r.wake) == 0
+		lastErr, changed := r.lastErr, r.changed
+		r.mu.Unlock()
+		if idle {
+			return lastErr
+		}
+		select {
+		case <-changed:
+		case <-r.done:
+			return errStateOwnerStopped
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func (r *reconciliationTriggerRunner) trigger() error {
@@ -229,10 +267,26 @@ func (r *reconciliationTriggerRunner) loop() {
 		case <-r.ctx.Done():
 			return
 		case <-r.wake:
-			_, err := r.runner.run(r.ctx)
+			r.mu.Lock()
+			r.running = true
+			r.mu.Unlock()
+			err := r.run(r.ctx)
+			recollect := errors.Is(err, errReconciliationRecollect)
+			if recollect {
+				err = nil
+			}
 			r.mu.Lock()
 			r.runs++
 			r.lastErr = err
+			if recollect && r.ctx.Err() == nil {
+				select {
+				case r.wake <- struct{}{}:
+				default:
+				}
+			}
+			r.running = false
+			close(r.changed)
+			r.changed = make(chan struct{})
 			r.mu.Unlock()
 			if r.ctx.Err() != nil {
 				return
@@ -243,6 +297,11 @@ func (r *reconciliationTriggerRunner) loop() {
 
 func (o *stateOwner) applyReconciliation(ctx context.Context, collection reconciliationCollection) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerApplyReconciliation, reconcile: applyReconciliationCommand{Collection: cloneReconciliationCollection(collection)}})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) recordCycleOutcome(ctx context.Context, command recordCycleOutcomeCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRecordCycleOutcome, cycleOutcome: command})
 	return result.snapshot, err
 }
 
@@ -513,7 +572,7 @@ func applyReconciliationIssue(state *runtimeOwnerState, collection reconciliatio
 		}
 	}
 	next := reconciliationObservation{Present: true, Generation: issueGeneration, OwnerGeneration: ownerIssueGeneration, ObservationEpoch: identity.Epoch, LastCycleID: identity.CycleID, InputDigest: digest, Fact: cloneReconciliationIssueFact(group.Fact), IssueUpdates: slices.Clone(group.IssueUpdates), Attempts: attempts}
-	if exists && reconciliationObservationContentEqual(previous, next) {
+	if exists && previous.ObservationEpoch == identity.Epoch && reconciliationObservationContentEqual(previous, next) {
 		return nil
 	}
 	state.Observations[key] = next

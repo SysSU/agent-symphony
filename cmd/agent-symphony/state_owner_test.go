@@ -7,12 +7,25 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
+
+func writeLegacyStateFixture(t *testing.T, root, name string, value any) {
+	t.Helper()
+	body, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, name), append(body, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestRuntimeOwnerMigratesLegacyStateWithoutInstallingLedger(t *testing.T) {
 	root := resolvedTempDir(t)
@@ -20,19 +33,9 @@ func TestRuntimeOwnerMigratesLegacyStateWithoutInstallingLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := writeDashboardManifest(t, root, 41, 1, "failed")
-	server := dashboardServer{stateRoot: root, repository: "o/r"}
-	if err := server.writeState(dashboardState{Version: dashboardStateVersion, Hidden: []dashboardHiddenAttempt{{Repository: "o/r", Issue: 41, Attempt: 1, Reason: "dismissed"}}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.writeRemovalState(dashboardRemovalState{Version: removalStateVersion, Intents: []dashboardRemovalIntent{{Manifest: manifest, PublishedHead: manifest.BaseSHA, CleanupStarted: true}}}); err != nil {
-		t.Fatal(err)
-	}
-	receipt := controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: "migration-41-1", Repository: "o/r", Action: "remove", Issue: 41, Attempt: 1, Confirm: true}, State: "pending"}
-	if err := server.writeControlReceipts(controlReceiptState{Version: controlVersion, Receipts: []controlReceipt{receipt}}); err != nil {
-		t.Fatal(err)
-	}
-
-	state, migrated, err := loadOrMigrateRuntimeOwnerState(root, "o/r")
+	writeLegacyStateFixture(t, root, "dashboard-state.json", dashboardState{Version: dashboardStateVersion, Hidden: []dashboardHiddenAttempt{{Repository: "o/r", Issue: 41, Attempt: 1, Reason: "dismissed"}}})
+	writeLegacyStateFixture(t, root, "removal-state.json", dashboardRemovalState{Version: removalStateVersion, Intents: []dashboardRemovalIntent{{Manifest: manifest, PublishedHead: manifest.BaseSHA, CleanupStarted: true}}})
+	state, migrated, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r")
 	if err != nil || !migrated {
 		t.Fatalf("migrated=%v err=%v", migrated, err)
 	}
@@ -41,7 +44,7 @@ func TestRuntimeOwnerMigratesLegacyStateWithoutInstallingLedger(t *testing.T) {
 	if tombstone.Action != "removed" || tombstone.CleanupPhase != "cleanup-started" || tombstone.PublishedHead != manifest.BaseSHA || tombstone.Manifest == nil || !sameAttemptIdentity(*tombstone.Manifest, manifest) || tombstone.CleanupPolicy == nil || tombstone.CleanupPolicy.Action != "remove" || state.AttemptGenerations[key] != 3 || tombstone.InvalidatedGeneration != 2 {
 		t.Fatalf("tombstone=%#v generation=%d", tombstone, state.AttemptGenerations[key])
 	}
-	if len(state.Attempts) != 0 || len(state.Effects) != 1 || len(state.ControlReceipts) != 1 || !reflect.DeepEqual(state.ControlReceipts[0], receipt) {
+	if len(state.Attempts) != 0 || len(state.Effects) != 1 || len(state.ControlReceipts) != 0 {
 		t.Fatalf("state=%#v", state)
 	}
 	for _, effect := range state.Effects {
@@ -54,13 +57,38 @@ func TestRuntimeOwnerMigratesLegacyStateWithoutInstallingLedger(t *testing.T) {
 	}
 }
 
+func refreshOwnerObservation(t *testing.T, owner *stateOwner, issue int) stateOwnerSnapshot {
+	t.Helper()
+	snapshot, err := owner.reconciliationSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	issueKey := ownerIssueKey(snapshot.State.Repository, issue)
+	observation, ok := snapshot.State.Observations[issueKey]
+	if !ok {
+		t.Fatalf("issue %d has no observation", issue)
+	}
+	group := reconciliationIssueGroup{Fact: cloneReconciliationIssueFact(observation.Fact), IssueUpdates: slices.Clone(observation.IssueUpdates)}
+	issueGenerations := map[string]uint64{issueKey: snapshot.State.IssueGenerations[issueKey]}
+	attemptGenerations := map[string]uint64{}
+	for key, accepted := range observation.Attempts {
+		group.Attempts = append(group.Attempts, cloneReconciliationAttemptFact(accepted.Fact))
+		attemptGenerations[key] = snapshot.State.AttemptGenerations[key]
+	}
+	committed, err := owner.applyReconciliation(t.Context(), reconciliationCollection{Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, CycleID: snapshot.CycleID}, Scope: issueScope(issue), Complete: true, IssueGenerations: issueGenerations, AttemptGenerations: attemptGenerations, Issues: []reconciliationIssueGroup{group}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return committed
+}
+
 func TestRuntimeOwnerMigrationMissingMalformedConflictingAndInterruptedState(t *testing.T) {
 	t.Run("missing optional files", func(t *testing.T) {
 		root := resolvedTempDir(t)
 		if err := bindDeployment(root, "o/r"); err != nil {
 			t.Fatal(err)
 		}
-		state, migrated, err := loadOrMigrateRuntimeOwnerState(root, "o/r")
+		state, migrated, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r")
 		if err != nil || !migrated || len(state.Attempts) != 0 || len(state.Tombstones) != 0 || state.Epoch != 0 || state.Revision != 0 {
 			t.Fatalf("state=%#v migrated=%v err=%v", state, migrated, err)
 		}
@@ -74,7 +102,7 @@ func TestRuntimeOwnerMigrationMissingMalformedConflictingAndInterruptedState(t *
 		if err := os.WriteFile(filepath.Join(root, "dashboard-state.json"), []byte(`{"version":1,"hidden":[],"extra":true}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := loadOrMigrateRuntimeOwnerState(root, "o/r"); err == nil || !strings.Contains(err.Error(), "dashboard") {
+		if _, _, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r"); err == nil || !strings.Contains(err.Error(), "dashboard") {
 			t.Fatalf("err=%v", err)
 		}
 	})
@@ -84,15 +112,12 @@ func TestRuntimeOwnerMigrationMissingMalformedConflictingAndInterruptedState(t *
 		if err := bindDeployment(root, "o/r"); err != nil {
 			t.Fatal(err)
 		}
-		server := dashboardServer{stateRoot: root, repository: "o/r"}
 		state := dashboardState{Version: dashboardStateVersion, Hidden: []dashboardHiddenAttempt{
 			{Repository: "o/r", Issue: 42, Attempt: 1, Reason: "archived"},
 			{Repository: "o/r", Issue: 42, Attempt: 1, Reason: "dismissed"},
 		}}
-		if err := server.writeState(state); err != nil {
-			t.Fatal(err)
-		}
-		if _, _, err := loadOrMigrateRuntimeOwnerState(root, "o/r"); err == nil || !strings.Contains(err.Error(), "conflicting") {
+		writeLegacyStateFixture(t, root, "dashboard-state.json", state)
+		if _, _, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r"); err == nil || !strings.Contains(err.Error(), "conflicting") {
 			t.Fatalf("err=%v", err)
 		}
 	})
@@ -105,10 +130,131 @@ func TestRuntimeOwnerMigrationMissingMalformedConflictingAndInterruptedState(t *
 		if err := os.WriteFile(filepath.Join(root, ".runtime-state-interrupted"), []byte("partial"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, migrated, err := loadOrMigrateRuntimeOwnerState(root, "o/r"); err != nil || !migrated {
+		if _, migrated, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r"); err != nil || !migrated {
 			t.Fatalf("migrated=%v err=%v", migrated, err)
 		}
 	})
+}
+
+func TestRuntimeOwnerMigrationRejectsUnprovedLegacyWork(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, string)
+		want  string
+	}{
+		{
+			name: "pending control receipt",
+			setup: func(t *testing.T, root string) {
+				receipt := controlReceipt{Request: controlRequest{Version: controlVersion, RequestID: "migration-41-1", Repository: "o/r", Action: "remove", Issue: 41, Attempt: 1, Confirm: true}, State: "pending"}
+				writeLegacyStateFixture(t, root, controlReceiptsFile, controlReceiptState{Version: controlVersion, Receipts: []controlReceipt{receipt}})
+			},
+			want: "pending without a v2 effect proof",
+		},
+		{
+			name: "active reviewer",
+			setup: func(t *testing.T, root string) {
+				manifest := writeDashboardManifest(t, root, 41, 1, "completed")
+				manifest.ReviewState = "running"
+				body, _ := json.Marshal(manifest)
+				if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "active reviewer",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := resolvedTempDir(t)
+			if err := bindDeployment(root, "o/r"); err != nil {
+				t.Fatal(err)
+			}
+			test.setup(t, root)
+			if _, _, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r"); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+func TestRuntimeOwnerMigrationImportsLegacyPRRecoveryOnce(t *testing.T) {
+	root := resolvedTempDir(t)
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	manifest := writeDashboardManifest(t, root, 41, 1, "running")
+	legacy := []internalgithub.PRState{{Repository: "o/r", Number: 7, Issue: 41, Attempt: 1, HeadSHA: manifest.BaseSHA}}
+	body, _ := json.Marshal(legacy)
+	path := filepath.Join(root, "pr-state.json")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, migrated, err := loadOrMigrateRuntimeOwnerState(root, path, "o/r")
+	key := ownerAttemptKey("o/r", 41, 1)
+	if err != nil || !migrated || !reflect.DeepEqual(state.Recoveries[key].State, legacy[0]) || state.Recoveries[key].IssueGeneration != 1 || state.Recoveries[key].AttemptGeneration != 1 {
+		t.Fatalf("state=%#v migrated=%v err=%v", state, migrated, err)
+	}
+	owner, err := startTestStateOwner(t, root, state, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), state)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("malformed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted, migrated, err := loadOrMigrateRuntimeOwnerState(root, path, "o/r")
+	if err != nil || migrated || !reflect.DeepEqual(restarted.Recoveries[key].State, legacy[0]) {
+		t.Fatalf("state=%#v migrated=%v err=%v", restarted, migrated, err)
+	}
+}
+
+func TestDeploymentFenceFailsOldBinaryClosedAndResumesBeforeLedger(t *testing.T) {
+	root := resolvedTempDir(t)
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	if err := installDeploymentFence(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDeploymentIdentityVersion(root, legacyDeploymentIdentityVersion); err == nil {
+		t.Fatal("v1 deployment reader accepted the v2 fence")
+	}
+	fenceBefore, err := os.ReadFile(filepath.Join(root, "deployment.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bindDeployment(root, "o/r"); err == nil {
+		t.Fatal("legacy deployment writer gate accepted the v2 fence")
+	}
+	fenceAfter, err := os.ReadFile(filepath.Join(root, "deployment.json"))
+	if err != nil || !slices.Equal(fenceBefore, fenceAfter) {
+		t.Fatalf("legacy writer changed the v2 fence: err=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, runtimeOwnerStateFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fence crash window unexpectedly has a ledger: %v", err)
+	}
+	initial, migrated, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r")
+	if err != nil || !migrated {
+		t.Fatalf("migrated=%v err=%v", migrated, err)
+	}
+	owner, err := startTestStateOwner(t, root, initial, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), state)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readRuntimeOwnerState(root, "o/r"); err != nil {
+		t.Fatalf("fenced restart did not install the ledger: %v", err)
+	}
+	if err := installDeploymentFence(root, "o/r"); err != nil {
+		t.Fatalf("fence replay: %v", err)
+	}
 }
 
 func TestRuntimeOwnerExistingLedgerIsOneWayAndRestartIncrementsEpoch(t *testing.T) {
@@ -116,7 +262,7 @@ func TestRuntimeOwnerExistingLedgerIsOneWayAndRestartIncrementsEpoch(t *testing.
 	if err := bindDeployment(root, "o/r"); err != nil {
 		t.Fatal(err)
 	}
-	initial, _, err := loadOrMigrateRuntimeOwnerState(root, "o/r")
+	initial, _, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,14 +275,14 @@ func TestRuntimeOwnerExistingLedgerIsOneWayAndRestartIncrementsEpoch(t *testing.
 	if err := owner.close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	first, migrated, err := loadOrMigrateRuntimeOwnerState(root, "o/r")
+	first, migrated, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r")
 	if err != nil || migrated || first.Epoch != 1 || first.Revision != 1 {
 		t.Fatalf("first=%#v migrated=%v err=%v", first, migrated, err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "dashboard-state.json"), []byte("malformed"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	loaded, migrated, err := loadOrMigrateRuntimeOwnerState(root, "o/r")
+	loaded, migrated, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r")
 	if err != nil || migrated || !reflect.DeepEqual(loaded, first) {
 		t.Fatalf("one-way loaded=%#v migrated=%v err=%v", loaded, migrated, err)
 	}

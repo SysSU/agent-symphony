@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"io"
 	"slices"
 	"sync"
 	"time"
@@ -17,6 +18,62 @@ type ownerStatusReplicaWriter struct {
 	stateRoot           string
 	mu                  sync.Mutex
 	epoch, lastRevision uint64
+}
+
+type ownerStatusReplica struct {
+	done chan struct{}
+}
+
+func startOwnerStatusReplica(ctx context.Context, owner *stateOwner, capacity int, log io.Writer) (*ownerStatusReplica, error) {
+	if ctx == nil || owner == nil || capacity < 1 || log == nil {
+		return nil, errors.New("owner status replica is incomplete")
+	}
+	replica := &ownerStatusReplica{done: make(chan struct{})}
+	writer := &ownerStatusReplicaWriter{stateRoot: owner.stateRoot}
+	initial, err := owner.snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	status, err := projectOwnerStatus(initial, capacity, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	if err := writer.write(status); err != nil {
+		return nil, err
+	}
+	go func() {
+		defer close(replica.done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case snapshot, ok := <-owner.commits:
+				if !ok {
+					return
+				}
+				status, err := projectOwnerStatus(snapshot, capacity, time.Now().UTC())
+				if err == nil {
+					err = writer.write(status)
+				}
+				if err != nil {
+					_, _ = io.WriteString(log, "status projection: "+internalgithub.Redact(err.Error())+"\n")
+				}
+			}
+		}
+	}()
+	return replica, nil
+}
+
+func (r *ownerStatusReplica) wait(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	select {
+	case <-r.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time) (dashboardStatusSnapshot, error) {
@@ -97,7 +154,7 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 		}
 		return cmp.Compare(a.Attempt, b.Attempt)
 	})
-	return dashboardStatusSnapshot{UpdatedAt: now.UTC(), OwnerEpoch: snapshot.State.Epoch, OwnerRevision: snapshot.State.Revision, Statuses: statuses}, nil
+	return dashboardStatusSnapshot{UpdatedAt: now.UTC(), OwnerEpoch: snapshot.State.Epoch, OwnerRevision: snapshot.State.Revision, Statuses: statuses, ReconciliationError: snapshot.State.CycleDiagnostic, ReconciliationErrorAt: snapshot.State.CycleDiagnosticAt}, nil
 }
 
 func expandIssueFact(fact reconciliationIssueFact) internalgithub.RecoveryIssueFact {

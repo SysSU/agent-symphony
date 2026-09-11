@@ -38,6 +38,7 @@ const (
 	reconciliationReviewer           reconciliationEffectAction = "reviewer"
 	reconciliationHandoffDeliver     reconciliationEffectAction = "handoff-deliver"
 	reconciliationRetireCompleted    reconciliationEffectAction = "retire-completed"
+	reconciliationMonitoringCheckIn  reconciliationEffectAction = "monitoring-check-in"
 )
 
 type githubIssueUpdateKind string
@@ -68,6 +69,7 @@ type reconciliationEffectRequest struct {
 	Reviewer              *reviewerEffectRequest          `json:"reviewer,omitempty"`
 	Handoff               *handoffEffectRequest           `json:"handoff,omitempty"`
 	Retire                *retireCompletedEffectRequest   `json:"retire,omitempty"`
+	CheckIn               *monitoringCheckInEffectRequest `json:"check_in,omitempty"`
 }
 
 type githubBindEffectRequest struct{ BaseSHA, Branch, Detail string }
@@ -112,6 +114,10 @@ type retireCompletedEffectRequest struct {
 	Mode, HeadSHA string
 }
 
+type monitoringCheckInEffectRequest struct {
+	Session, Binding, Payload string
+}
+
 type reconciliationEffectResult struct {
 	Action             reconciliationEffectAction     `json:"action"`
 	GitHubBind         *githubBindEffectResult        `json:"github_bind,omitempty"`
@@ -121,6 +127,7 @@ type reconciliationEffectResult struct {
 	Reviewer           *reviewerEffectResult          `json:"reviewer,omitempty"`
 	Handoff            *handoffEffectResult           `json:"handoff,omitempty"`
 	Retire             *retireCompletedEffectResult   `json:"retire,omitempty"`
+	CheckIn            *monitoringCheckInEffectResult `json:"check_in,omitempty"`
 }
 
 type githubBindEffectResult struct{ Observed bool }
@@ -147,6 +154,10 @@ type handoffEffectResult struct {
 	Observed                             bool
 }
 type retireCompletedEffectResult struct{ ResourcesGone bool }
+type monitoringCheckInEffectResult struct {
+	Session  string
+	Observed bool
+}
 
 func (o *stateOwner) beginReconciliationEffect(ctx context.Context, command beginReconciliationEffectCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
 	command.Request = cloneReconciliationRequest(command.Request)
@@ -325,7 +336,7 @@ func applyFinishReconciliationEffect(stateRoot string, state *runtimeOwnerState,
 		}
 		return errStateConflict
 	}
-	if err := reconciliationEffectCurrent(stateRoot, *state, effect); err != nil {
+	if err := reconciliationEffectFinishCurrent(stateRoot, *state, effect); err != nil {
 		return err
 	}
 	if err := applyReconciliationEffectOutcome(state, *effect.Reconciliation, result); err != nil {
@@ -367,7 +378,33 @@ func reconciliationEffectCurrent(stateRoot string, state runtimeOwnerState, effe
 	return nil
 }
 
+// reconciliationEffectFinishCurrent intentionally does not require a current
+// observation epoch. An immutable completion marker proves that the external
+// effect finished before restart; generations and state bindings still prevent
+// a marker from completing invalidated work.
+func reconciliationEffectFinishCurrent(stateRoot string, state runtimeOwnerState, effect runtimeEffectIntent) error {
+	request := effect.Reconciliation
+	if request == nil || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !reconciliationObservationMatches(state, *request) || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
+		return errStaleStateResult
+	}
+	if request.Attempt == 0 {
+		return nil
+	}
+	key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+	if state.AttemptGenerations[key] != effect.AttemptGeneration {
+		return errStaleStateResult
+	}
+	if _, tombstoned := state.Tombstones[key]; tombstoned {
+		return errAttemptTombstoned
+	}
+	return nil
+}
+
 func reconciliationObservationCurrent(state runtimeOwnerState, request reconciliationEffectRequest) bool {
+	return reconciliationObservationMatches(state, request) && state.Observations[ownerIssueKey(request.Repository, request.Issue)].ObservationEpoch == state.Epoch
+}
+
+func reconciliationObservationMatches(state runtimeOwnerState, request reconciliationEffectRequest) bool {
 	observation, ok := state.Observations[ownerIssueKey(request.Repository, request.Issue)]
 	return ok && observation.Present && observation.Generation == request.ObservationGeneration && observation.OwnerGeneration == state.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)] && observation.Fact.BodyDigest == request.BodyDigest
 }
@@ -395,7 +432,7 @@ func validReconciliationEffectRequest(repository string, request reconciliationE
 	if issueScoped != (request.Attempt == 0 && request.Manifest == nil) || !issueScoped && (request.Attempt < 1 || request.Manifest == nil) {
 		return false
 	}
-	variants := []bool{request.GitHubBind != nil, request.GitHubPublish != nil, request.GitHubIssueUpdate != nil, request.GitHubPRGovernance != nil, request.Reviewer != nil, request.Handoff != nil, request.Retire != nil}
+	variants := []bool{request.GitHubBind != nil, request.GitHubPublish != nil, request.GitHubIssueUpdate != nil, request.GitHubPRGovernance != nil, request.Reviewer != nil, request.Handoff != nil, request.Retire != nil, request.CheckIn != nil}
 	if countTrue(variants) != 1 {
 		return false
 	}
@@ -415,6 +452,8 @@ func validReconciliationEffectRequest(repository string, request reconciliationE
 		valid = request.Handoff != nil && validHandoffRequest(*request.Handoff)
 	case reconciliationRetireCompleted:
 		valid = request.Retire != nil && validRetireRequest(*request.Retire)
+	case reconciliationMonitoringCheckIn:
+		valid = request.CheckIn != nil && boundedText(request.CheckIn.Session, 512, true) && validDigest(request.CheckIn.Binding) && boundedText(request.CheckIn.Payload, 4096, true)
 	}
 	if valid {
 		valid = validReconciliationEffectBindings(request)
@@ -459,6 +498,8 @@ func validReconciliationEffectBindings(request reconciliationEffectRequest) bool
 			mode = "abandon"
 		}
 		return request.Retire.Mode == mode
+	case reconciliationMonitoringCheckIn:
+		return request.Manifest != nil && request.CheckIn.Session == request.Manifest.Session
 	default:
 		return true
 	}
@@ -520,6 +561,8 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 			return (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued") && reviewManifestMatches(manifest, reviewer)
 		}
 		return manifest.ReviewState == "" || (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") && reviewManifestMatches(manifest, reviewer)
+	case reconciliationMonitoringCheckIn:
+		return manifest.State == "running" && observation.Fact.DispatchAuthorized && observation.Fact.NeedsAttention && remotelyObserved && (fact.State == "active" || fact.State == "review-ready") && fact.BaseSHA == manifest.BaseSHA
 	case reconciliationHandoffDeliver:
 		if request.Handoff.Kind == "review-findings" {
 			return manifest.ReviewState == "findings-queued" && manifest.ReviewHead == request.Handoff.HeadSHA && slices.Equal(manifest.ReviewFindings, request.Handoff.Findings) && !manifest.ReviewHandoffAck
@@ -729,7 +772,7 @@ func pruneStaleReconciliationEffects(state *runtimeOwnerState, issueKey string) 
 }
 
 func validReconciliationEffectResult(request reconciliationEffectRequest, result reconciliationEffectResult) bool {
-	if result.Action != request.Action || countTrue([]bool{result.GitHubBind != nil, result.GitHubPublish != nil, result.GitHubIssueUpdate != nil, result.GitHubPRGovernance != nil, result.Reviewer != nil, result.Handoff != nil, result.Retire != nil}) != 1 {
+	if result.Action != request.Action || countTrue([]bool{result.GitHubBind != nil, result.GitHubPublish != nil, result.GitHubIssueUpdate != nil, result.GitHubPRGovernance != nil, result.Reviewer != nil, result.Handoff != nil, result.Retire != nil, result.CheckIn != nil}) != 1 {
 		return false
 	}
 	valid := false
@@ -748,6 +791,8 @@ func validReconciliationEffectResult(request reconciliationEffectRequest, result
 		valid = result.Handoff != nil && result.Handoff.Kind == request.Handoff.Kind && result.Handoff.Key == request.Handoff.Key && result.Handoff.OutcomePath == request.Handoff.OutcomePath && result.Handoff.OutcomeToken == request.Handoff.OutcomeToken && result.Handoff.Observed
 	case reconciliationRetireCompleted:
 		valid = result.Retire != nil && result.Retire.ResourcesGone
+	case reconciliationMonitoringCheckIn:
+		valid = result.CheckIn != nil && result.CheckIn.Observed && result.CheckIn.Session == request.CheckIn.Session
 	}
 	body, err := json.Marshal(result)
 	return valid && err == nil && len(body) <= maxReconciliationEffectBytes
@@ -970,6 +1015,10 @@ func cloneReconciliationRequest(request reconciliationEffectRequest) reconciliat
 		value := *request.Retire
 		request.Retire = &value
 	}
+	if request.CheckIn != nil {
+		value := *request.CheckIn
+		request.CheckIn = &value
+	}
 	return request
 }
 
@@ -1039,6 +1088,10 @@ func cloneReconciliationResult(result reconciliationEffectResult) reconciliation
 	if result.Retire != nil {
 		value := *result.Retire
 		result.Retire = &value
+	}
+	if result.CheckIn != nil {
+		value := *result.CheckIn
+		result.CheckIn = &value
 	}
 	return result
 }

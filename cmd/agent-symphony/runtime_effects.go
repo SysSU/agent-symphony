@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,14 +38,18 @@ func newRuntimeEffectCoordinator(lifecycle context.Context, owner *stateOwner, e
 
 // begin commits the exact effect intent before any external work is admitted.
 func (c *runtimeEffectCoordinator) begin(ctx context.Context, snapshot stateOwnerSnapshot, request agentruntime.EffectRequest) (agentruntime.EffectRequest, error) {
+	return c.beginWithSource(ctx, snapshot, request, c.executor.Runtime.Source)
+}
+
+func (c *runtimeEffectCoordinator) beginWithSource(ctx context.Context, snapshot stateOwnerSnapshot, request agentruntime.EffectRequest, source string) (agentruntime.EffectRequest, error) {
 	if snapshot.CycleID != 0 || snapshot.State.Epoch == 0 || snapshot.State.Revision == 0 {
 		return agentruntime.EffectRequest{}, errStaleStateResult
 	}
-	request, err := c.executor.BindRequest(request)
+	request, executor, err := c.bindWithSource(request, source)
 	if err != nil {
 		return agentruntime.EffectRequest{}, err
 	}
-	if err := c.executor.ValidateRequest(request); err != nil {
+	if err := executor.ValidateRequest(request); err != nil {
 		return agentruntime.EffectRequest{}, err
 	}
 	manifest := request.Manifest
@@ -73,6 +78,35 @@ func (c *runtimeEffectCoordinator) begin(ctx context.Context, snapshot stateOwne
 		c.cancelOlder(manifest, effect.AttemptGeneration)
 	}
 	return request, nil
+}
+
+func (c *runtimeEffectCoordinator) bindWithSource(request agentruntime.EffectRequest, source string) (agentruntime.EffectRequest, agentruntime.EffectExecutor, error) {
+	runtime := c.executor.Runtime
+	boundRuntime := &agentruntime.Runtime{
+		Root: runtime.Root, StateRoot: runtime.StateRoot, Source: source, Git: runtime.Git, Tmux: runtime.Tmux,
+		Helper: runtime.Helper, Runner: runtime.Runner, AllowEnv: slices.Clone(runtime.AllowEnv), StopWait: runtime.StopWait, VerifyWorker: runtime.VerifyWorker,
+	}
+	executor := agentruntime.EffectExecutor{Runtime: boundRuntime, Cleanup: c.executor.Cleanup, VerifyCleanup: c.executor.VerifyCleanup}
+	bound, err := executor.BindRequest(request)
+	return bound, executor, err
+}
+
+func (o *stateOwner) diagnoseRuntimeEffect(ctx context.Context, command diagnoseRuntimeEffectCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerDiagnoseRuntimeEffect, diagnoseRuntime: command})
+	return result.snapshot, err
+}
+
+func applyDiagnoseRuntimeEffect(state *runtimeOwnerState, command diagnoseRuntimeEffectCommand) error {
+	effect, ok := state.Effects[command.Identity.EffectID]
+	if !ok || effect.State != "pending" || effect.Reconciliation != nil || effect.Action != string(command.Action) || effect.IntentEpoch != command.Identity.Epoch || effect.IntentRevision != command.Identity.SourceRevision || effect.IssueGeneration != command.Identity.IssueGeneration || effect.AttemptGeneration != command.Identity.AttemptGeneration || effect.RequestDigest != command.Identity.RequestDigest {
+		return errStaleStateResult
+	}
+	if strings.TrimSpace(command.Diagnostic) == "" || len(command.Diagnostic) > 4096 || strings.ContainsRune(command.Diagnostic, 0) {
+		return errStateConflict
+	}
+	effect.Diagnostic = command.Diagnostic
+	state.Effects[effect.ID] = effect
+	return nil
 }
 
 // execute runs outside the owner, one effect at a time for an attempt. A

@@ -1106,15 +1106,16 @@ func (c reconciliationV2Collector) collect(ctx context.Context, snapshot stateOw
 	if ctx == nil || c.Config.Repository == "" || c.Config.Repository != snapshot.State.Repository || !validReconciliationScope(snapshot.State.Repository, c.Scope) {
 		return reconciliationV2Batch{}, errors.New("v2 reconciliation collector is invalid")
 	}
-	attempts, err := internalgithub.FetchAttemptFacts(ctx, c.API, c.Config.Repository, c.Config.ActorID)
+	api := c.API.WithReadSnapshot()
+	attempts, err := internalgithub.FetchAttemptFacts(ctx, api, c.Config.Repository, c.Config.ActorID)
 	if err != nil {
 		return reconciliationV2Batch{}, err
 	}
 	var collected internalgithub.RecoveryIssueCollection
 	if c.Scope.Kind == reconciliationIssueScope {
-		collected, err = internalgithub.CollectIssueFactsForIssueV2(ctx, c.API, c.Config, attempts, c.Scope.Issue)
+		collected, err = internalgithub.CollectIssueFactsForIssueV2(ctx, api, c.Config, attempts, c.Scope.Issue)
 	} else {
-		collected, err = internalgithub.CollectIssueFactsV2(ctx, c.API, c.Config, attempts)
+		collected, err = internalgithub.CollectIssueFactsV2(ctx, api, c.Config, attempts)
 	}
 	if err != nil {
 		return reconciliationV2Batch{}, err

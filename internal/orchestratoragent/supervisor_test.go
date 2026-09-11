@@ -36,6 +36,24 @@ type fakeRunner struct {
 	validAuth      string
 }
 
+func TestBoundLifecycleDoesNotReplaceForegroundRequestCancellation(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	agent := newTestSupervisor(t, &fakeRunner{}, &now)
+	lifecycle, stop := context.WithCancel(t.Context())
+	defer stop()
+	if err := agent.BindLifecycle(lifecycle); err != nil {
+		t.Fatal(err)
+	}
+	request, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := agent.Status(request); err == nil {
+		t.Fatal("cancelled foreground request used the daemon lifecycle")
+	}
+	if _, err := agent.Status(t.Context()); err != nil {
+		t.Fatalf("cancelled request retained the reservation: %v", err)
+	}
+}
+
 func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if f.honorCtx && ctx.Err() != nil {
 		return agentruntime.Result{}, ctx.Err()

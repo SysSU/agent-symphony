@@ -18,17 +18,91 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 	"github.com/coder/websocket"
 )
+
+type fakeDashboardOrchestrator struct {
+	status  orchestratoragent.Status
+	target  orchestratoragent.AttachTarget
+	err     error
+	actions []string
+}
+
+func (f *fakeDashboardOrchestrator) Status(context.Context) (orchestratoragent.Status, error) {
+	return f.status, f.err
+}
+func (f *fakeDashboardOrchestrator) AttachTarget(context.Context) (orchestratoragent.AttachTarget, error) {
+	return f.target, f.err
+}
+func (f *fakeDashboardOrchestrator) action(name string) (orchestratoragent.Status, error) {
+	f.actions = append(f.actions, name)
+	if name == "clear" || name == "rebuild" {
+		f.status.Generation++
+		f.status.ContextMode = name
+		f.status.RebuiltAt = time.Now().UTC()
+	}
+	if name == "recover" {
+		f.status.State = "running"
+	}
+	return f.status, f.err
+}
+func (f *fakeDashboardOrchestrator) Recover(context.Context) (orchestratoragent.Status, error) {
+	return f.action("recover")
+}
+func (f *fakeDashboardOrchestrator) Clear(context.Context) (orchestratoragent.Status, error) {
+	return f.action("clear")
+}
+func (f *fakeDashboardOrchestrator) Rebuild(context.Context) (orchestratoragent.Status, error) {
+	return f.action("rebuild")
+}
+func (f *fakeDashboardOrchestrator) Investigate(_ context.Context, issue, attempt int) (orchestratoragent.Status, error) {
+	return f.action(fmt.Sprintf("investigate:%d:%d", issue, attempt))
+}
+
+func writeDashboardManifest(t *testing.T, stateRoot string, issue, attemptNumber int, state string) agentruntime.Manifest {
+	t.Helper()
+	repository := "o/r"
+	attemptRoot := filepath.Join(stateRoot, "worktrees")
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	attempt := agentruntime.Attempt{Repository: repository, Issue: issue, Number: attemptNumber, BaseSHA: strings.Repeat("a", 40)}
+	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(repository), fmt.Sprintf("%d-%d", issue, attemptNumber))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest.LogPath = filepath.Join(dir, "agent.log")
+	manifest.State = state
+	manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
+	if state == "completed" {
+		manifest.ReviewHead = strings.Repeat("b", 40)
+	}
+	body, _ := json.Marshal(manifest)
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest.LogPath, []byte("diagnostic"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return manifest
+}
+
+func dashboardOrchestratorHandler(ctx context.Context, stateRoot, tmux string, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
+	server := newProjectDashboardServer(ctx, stateRoot, "", nil, tmux, nil, service, allowNet, password)
+	server.operator = &operatorMutationService{}
+	return server.webHandler()
+}
 
 func TestDashboardServesEmbeddedNextPageAndStatus(t *testing.T) {
 	requireDashboardBuild(t)
@@ -110,9 +184,9 @@ func TestDashboardAggregatesTwoProjectsReadOnlyAndRejectsCrossProjectRoutes(t *t
 	if err := writeProjectStatusSnapshot(secondRoot, secondRepository, []orchestrator.RecoveryStatus{second}); err != nil {
 		t.Fatal(err)
 	}
-	peer := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), secondRoot, secondRepository, nil, "tmux", &sync.Mutex{}, nil, nil, nil, nil, false, ""))
+	peer := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), secondRoot, secondRepository, nil, "tmux", nil, false, ""))
 	defer peer.Close()
-	aggregator := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), firstRoot, firstRepository, []string{peer.URL}, "tmux", &sync.Mutex{}, nil, nil, nil, nil, false, ""))
+	aggregator := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), firstRoot, firstRepository, []string{peer.URL}, "tmux", nil, false, ""))
 	defer aggregator.Close()
 
 	response, err := http.Get(aggregator.URL + "/projects.json")
@@ -137,7 +211,7 @@ func TestDashboardAggregatesTwoProjectsReadOnlyAndRejectsCrossProjectRoutes(t *t
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusBadRequest {
+	if response.StatusCode != http.StatusConflict {
 		t.Fatalf("cross-project action status = %d", response.StatusCode)
 	}
 
@@ -228,7 +302,7 @@ func TestDashboardRejectsNonLoopbackRequestHost(t *testing.T) {
 }
 
 func TestWebDashboardStartsWithoutDesktopRuntimeAndStopsWithContext(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, nil, false, "", io.Discard); err == nil {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, false, "", io.Discard); err == nil {
 		t.Fatal("non-loopback dashboard address accepted")
 	}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -239,7 +313,7 @@ func TestWebDashboardStartsWithoutDesktopRuntimeAndStopsWithContext(t *testing.T
 		t.Fatal(err)
 	}
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running", Session: "as-o-test"}}
-	url, err := startDashboard(ctx, "127.0.0.1:0", root, nil, nil, nil, nil, service, false, "", &log)
+	url, err := startDashboard(ctx, "127.0.0.1:0", root, service, false, "", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,12 +354,12 @@ func TestWebDashboardStartsWithoutDesktopRuntimeAndStopsWithContext(t *testing.T
 }
 
 func TestDashboardUnsafeNetworkRequiresPassword(t *testing.T) {
-	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "dashboard password is required") {
+	if _, err := startDashboard(t.Context(), "0.0.0.0:0", t.TempDir(), nil, true, "", io.Discard); err == nil || !strings.Contains(err.Error(), "dashboard password is required") {
 		t.Fatalf("unsafe dashboard without password error=%v", err)
 	}
 
 	password := "test-dashboard-password"
-	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, nil, nil, true, password)
+	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", nil, true, password)
 	for _, test := range []struct {
 		name, method, path, username, password string
 		status                                 int
@@ -336,7 +410,7 @@ func TestDashboardUnsafeNetworkBindingWarnsAndAcceptsAuthentication(t *testing.T
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var log bytes.Buffer
-	boundURL, err := startDashboard(ctx, "0.0.0.0:0", t.TempDir(), nil, nil, nil, nil, nil, true, "test-dashboard-password", &log)
+	boundURL, err := startDashboard(ctx, "0.0.0.0:0", t.TempDir(), nil, true, "test-dashboard-password", &log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,96 +437,6 @@ func TestDashboardUnsafeNetworkBindingWarnsAndAcceptsAuthentication(t *testing.T
 	}
 }
 
-func TestDashboardReconcileActionRunsUnderSharedLock(t *testing.T) {
-	operationMu := &sync.Mutex{}
-	calls := 0
-	failing := false
-	server := &dashboardServer{mu: operationMu, reconcile: func(context.Context) error {
-		if operationMu.TryLock() {
-			operationMu.Unlock()
-			t.Fatal("reconciliation ran outside the shared operation lock")
-		}
-		calls++
-		if failing {
-			return errors.New("token=canary")
-		}
-		return nil
-	}}
-	handler := server.handler(http.NotFoundHandler())
-	request := func(method, path, origin string, body io.Reader) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(method, "http://127.0.0.1"+path, body)
-		r.Header.Set("Origin", origin)
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, r)
-		return w
-	}
-
-	if response := request(http.MethodGet, "/actions/reconcile", "http://127.0.0.1", nil); response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != "POST" {
-		t.Fatalf("GET status=%d allow=%q", response.Code, response.Header().Get("Allow"))
-	}
-	if response := request(http.MethodPost, "/actions/reconcile", "https://evil.example", nil); response.Code != http.StatusForbidden {
-		t.Fatalf("cross-origin status=%d", response.Code)
-	}
-	if response := request(http.MethodPost, "/actions/reconcile", "http://127.0.0.1", strings.NewReader("payload")); response.Code != http.StatusBadRequest {
-		t.Fatalf("request body status=%d", response.Code)
-	}
-	if response := request(http.MethodPost, "/actions/reconcile?again=1", "http://127.0.0.1", nil); response.Code != http.StatusBadRequest {
-		t.Fatalf("query status=%d", response.Code)
-	}
-	operationMu.Lock()
-	busy := request(http.MethodPost, "/actions/reconcile", "http://127.0.0.1", nil)
-	operationMu.Unlock()
-	if busy.Code != http.StatusServiceUnavailable || busy.Header().Get("Retry-After") != "1" || calls != 0 {
-		t.Fatalf("busy status=%d retry=%q calls=%d", busy.Code, busy.Header().Get("Retry-After"), calls)
-	}
-	if response := request(http.MethodPost, "/actions/reconcile", "http://127.0.0.1", nil); response.Code != http.StatusNoContent || calls != 1 {
-		t.Fatalf("success status=%d body=%q calls=%d", response.Code, response.Body.String(), calls)
-	}
-	failing = true
-	response := request(http.MethodPost, "/actions/reconcile", "http://127.0.0.1", nil)
-	if response.Code != http.StatusInternalServerError || strings.Contains(response.Body.String(), "canary") || !strings.Contains(response.Body.String(), "[REDACTED]") || calls != 2 {
-		t.Fatalf("failure status=%d body=%q calls=%d", response.Code, response.Body.String(), calls)
-	}
-}
-
-type fakeDashboardOrchestrator struct {
-	status  orchestratoragent.Status
-	target  orchestratoragent.AttachTarget
-	err     error
-	actions []string
-}
-
-func (f *fakeDashboardOrchestrator) Status(context.Context) (orchestratoragent.Status, error) {
-	return f.status, f.err
-}
-func (f *fakeDashboardOrchestrator) AttachTarget(context.Context) (orchestratoragent.AttachTarget, error) {
-	return f.target, f.err
-}
-func (f *fakeDashboardOrchestrator) action(name string) (orchestratoragent.Status, error) {
-	f.actions = append(f.actions, name)
-	if name == "clear" || name == "rebuild" {
-		f.status.Generation++
-		f.status.ContextMode = name
-		f.status.RebuiltAt = time.Now().UTC()
-	}
-	if name == "recover" {
-		f.status.State = "running"
-	}
-	return f.status, f.err
-}
-func (f *fakeDashboardOrchestrator) Recover(context.Context) (orchestratoragent.Status, error) {
-	return f.action("recover")
-}
-func (f *fakeDashboardOrchestrator) Clear(context.Context) (orchestratoragent.Status, error) {
-	return f.action("clear")
-}
-func (f *fakeDashboardOrchestrator) Rebuild(context.Context) (orchestratoragent.Status, error) {
-	return f.action("rebuild")
-}
-func (f *fakeDashboardOrchestrator) Investigate(_ context.Context, issue, attempt int) (orchestratoragent.Status, error) {
-	return f.action(fmt.Sprintf("investigate:%d:%d", issue, attempt))
-}
-
 func TestDashboardOrchestratorStatusAndActions(t *testing.T) {
 	root := t.TempDir()
 	statuses := []orchestrator.RecoveryStatus{
@@ -464,8 +448,9 @@ func TestDashboardOrchestratorStatusAndActions(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, UpdatedAt: now, Enabled: true, State: "running", Session: "as-o-test", Generation: 2, ContextMode: "rebuild", RebuiltAt: now, Diagnostic: "password=hunter2", NextAction: "none"}}
-	operationMu := &sync.Mutex{}
-	handler := newDashboardHandlerWithOptions(t.Context(), root, "tmux", operationMu, nil, nil, nil, service, false, "")
+	server := newProjectDashboardServer(t.Context(), root, "", nil, "tmux", nil, service, false, "")
+	server.operator = &operatorMutationService{}
+	handler := server.webHandler()
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/orchestrator.json", nil)
 	response := httptest.NewRecorder()
@@ -511,12 +496,6 @@ func TestDashboardOrchestratorStatusAndActions(t *testing.T) {
 		t.Fatalf("non-running investigate status=%d body=%q", got.Code, got.Body.String())
 	}
 	service.status.State = "running"
-	operationMu.Lock()
-	got := post("/actions/orchestrator/recover", "http://127.0.0.1")
-	operationMu.Unlock()
-	if got.Code != http.StatusServiceUnavailable || got.Header().Get("Retry-After") != "1" {
-		t.Fatalf("busy recover status=%d retry=%q", got.Code, got.Header().Get("Retry-After"))
-	}
 	if got := post("/actions/orchestrator/recover", "http://127.0.0.1"); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"ok":true`) {
 		t.Fatalf("recover status=%d body=%q", got.Code, got.Body.String())
 	}
@@ -534,7 +513,7 @@ func TestDashboardRemoteProxyInvestigationRequiresExactForwardedOrigin(t *testin
 		t.Fatal(err)
 	}
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running"}}
-	handler := newDashboardHandlerWithOptions(t.Context(), root, "tmux", &sync.Mutex{}, nil, nil, nil, service, false, "password")
+	handler := dashboardOrchestratorHandler(t.Context(), root, "tmux", service, false, "password")
 	request := func(origin, forwardedHost, forwardedProto, login, remoteAddr string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/orchestrator/investigate?issue=31&attempt=2", nil)
 		r.Header.Set("Origin", origin)
@@ -575,7 +554,7 @@ func TestDashboardRemoteProxyInvestigationRequiresExactForwardedOrigin(t *testin
 
 func TestDashboardOrchestratorClearAndRebuildAreBodylessPOSTsWithContextTransitions(t *testing.T) {
 	service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running", Generation: 4, ContextMode: "rebuild"}}
-	handler := newDashboardHandlerWithOptions(t.Context(), t.TempDir(), "tmux", &sync.Mutex{}, nil, nil, nil, service, false, "")
+	handler := dashboardOrchestratorHandler(t.Context(), t.TempDir(), "tmux", service, false, "")
 
 	for _, action := range []string{"clear", "rebuild"} {
 		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/actions/orchestrator/"+action, nil)
@@ -621,7 +600,7 @@ func TestDashboardOrchestratorTerminalIsExactAndLoopbackOnly(t *testing.T) {
 	}
 	t.Setenv("EXPECTED_SESSION", session)
 
-	unsafe := newDashboardHandlerWithOptions(t.Context(), root, script, &sync.Mutex{}, nil, nil, nil, service, true, "password")
+	unsafe := newDashboardHandlerWithOptions(t.Context(), root, script, service, true, "password")
 	request := httptest.NewRequest(http.MethodGet, "http://192.0.2.10/orchestrator/terminal", nil)
 	request.Header.Set("Origin", "http://192.0.2.10")
 	request.SetBasicAuth("agent-symphony", "password")
@@ -631,7 +610,7 @@ func TestDashboardOrchestratorTerminalIsExactAndLoopbackOnly(t *testing.T) {
 		t.Fatalf("non-loopback orchestrator terminal status=%d", response.Code)
 	}
 
-	server := httptest.NewServer(newDashboardHandlerWithOptions(t.Context(), root, script, &sync.Mutex{}, nil, nil, nil, service, false, ""))
+	server := httptest.NewServer(newDashboardHandlerWithOptions(t.Context(), root, script, service, false, ""))
 	defer server.Close()
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/orchestrator/terminal"
 	connection, responseHTTP, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
@@ -711,78 +690,6 @@ func TestDashboardPasswordLoadsOnlyFromPrivateCoordinatorFile(t *testing.T) {
 	}
 }
 
-func TestDashboardArchivesCompletedAndAbandonsOrphanedAttempts(t *testing.T) {
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	completed := writeDashboardManifest(t, root, 21, 1, "completed")
-	orphaned := writeDashboardManifest(t, root, 22, 1, "failed")
-	statuses := []orchestrator.RecoveryStatus{
-		{Repository: completed.Repository, Issue: completed.Issue, Attempt: completed.Attempt, State: "completed", Branch: completed.Branch, Worktree: completed.Worktree, Session: completed.Session},
-		{Repository: orphaned.Repository, Issue: orphaned.Issue, Attempt: orphaned.Attempt, State: "orphaned", Branch: orphaned.Branch, Worktree: orphaned.Worktree, Session: orphaned.Session},
-	}
-	if err := writeStatusSnapshot(root, statuses); err != nil {
-		t.Fatal(err)
-	}
-	var actions []string
-	operationMu := &sync.Mutex{}
-	locked := true
-	server := &dashboardServer{ctx: t.Context(), stateRoot: root, tmux: "tmux", mu: operationMu}
-	server.cleanup = func(_ context.Context, action string, manifest agentruntime.Manifest) error {
-		if operationMu.TryLock() {
-			operationMu.Unlock()
-			locked = false
-		}
-		actions = append(actions, action+":"+strconv.Itoa(manifest.Issue))
-		return nil
-	}
-	assets, _ := fs.Sub(dashboardFiles, "dashboard/out")
-	handler := server.handler(http.FileServer(http.FS(assets)))
-
-	requestAction := func(path, origin string) *httptest.ResponseRecorder {
-		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1"+path, nil)
-		request.Header.Set("Origin", origin)
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, request)
-		return response
-	}
-	if response := requestAction("/actions/archive?issue=21&attempt=1", "https://evil.example"); response.Code != http.StatusForbidden {
-		t.Fatalf("cross-origin archive status=%d", response.Code)
-	}
-	if response := requestAction("/actions/archive?issue=22&attempt=1", "http://127.0.0.1"); response.Code != http.StatusConflict {
-		t.Fatalf("wrong-state archive status=%d body=%q", response.Code, response.Body.String())
-	}
-	operationMu.Lock()
-	response := requestAction("/actions/archive?issue=21&attempt=1", "http://127.0.0.1")
-	operationMu.Unlock()
-	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != "1" || !strings.Contains(response.Body.String(), "reconciliation is in progress") || len(actions) != 0 {
-		t.Fatalf("busy reconciliation status=%d retry=%q body=%q actions=%v", response.Code, response.Header().Get("Retry-After"), response.Body.String(), actions)
-	}
-	if response := requestAction("/actions/archive?issue=21&attempt=1", "http://127.0.0.1"); response.Code != http.StatusOK {
-		t.Fatalf("archive status=%d body=%q", response.Code, response.Body.String())
-	}
-	if _, err := os.Stat(filepath.Join(filepath.Dir(completed.LogPath), "manifest.json")); err != nil {
-		t.Fatalf("archive removed retained manifest: %v", err)
-	}
-	if response := requestAction("/actions/abandon?issue=22&attempt=1", "http://127.0.0.1"); response.Code != http.StatusOK {
-		t.Fatalf("abandon status=%d body=%q", response.Code, response.Body.String())
-	}
-	if _, err := os.Stat(filepath.Dir(orphaned.LogPath)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("abandon retained attempt record: %v", err)
-	}
-	if strings.Join(actions, ",") != "archive:21,abandon:22" {
-		t.Fatalf("cleanup actions=%v", actions)
-	}
-	if !locked {
-		t.Fatal("cleanup ran outside the shared reconciliation lock")
-	}
-	state, err := server.readState()
-	if err != nil || len(state.Hidden) != 2 || state.Hidden[0].Reason != "archived" || state.Hidden[1].Reason != "abandoned" {
-		t.Fatalf("dashboard state=%#v err=%v", state, err)
-	}
-}
-
 func TestClosedAttemptDismissalEligibility(t *testing.T) {
 	base := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 21, Attempt: 1, State: "failed", IssueClosed: true}
 	for _, test := range []struct {
@@ -831,512 +738,6 @@ func TestCurrentGitHubIssueClosedRequiresExactClosedIssue(t *testing.T) {
 	}
 }
 
-func TestDashboardDismissesClosedAttemptWithoutRemovingDiagnostics(t *testing.T) {
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	previous := writeDashboardManifest(t, root, 25, 1, "failed")
-	current := writeDashboardManifest(t, root, 25, 2, "completed")
-	if err := os.MkdirAll(previous.Worktree, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	diagnostic := filepath.Join(previous.Worktree, "diagnostic.txt")
-	if err := os.WriteFile(diagnostic, []byte("retained"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	statuses := []orchestrator.RecoveryStatus{
-		{Repository: previous.Repository, Issue: previous.Issue, Attempt: previous.Attempt, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session, IssueClosed: true},
-		{Repository: current.Repository, Issue: current.Issue, Attempt: current.Attempt, State: "completed", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session, IssueClosed: true},
-	}
-	if err := writeStatusSnapshot(root, statuses); err != nil {
-		t.Fatal(err)
-	}
-	githubReads, cleanupCalls := 0, 0
-	server := &dashboardServer{
-		stateRoot:  root,
-		repository: previous.Repository,
-		mu:         &sync.Mutex{},
-		issueClosed: func(_ context.Context, repository string, issue int) (bool, error) {
-			githubReads++
-			return repository == previous.Repository && issue == previous.Issue, nil
-		},
-		cleanup: func(context.Context, string, agentruntime.Manifest) error {
-			cleanupCalls++
-			return nil
-		},
-	}
-	assets, _ := fs.Sub(dashboardFiles, "dashboard/out")
-	handler := server.handler(http.FileServer(http.FS(assets)))
-	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/dismiss?repository=o%2Fr&issue=25&attempt=1", nil)
-	request.Header.Set("Origin", "http://127.0.0.1")
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || githubReads != 1 || cleanupCalls != 0 {
-		t.Fatalf("dismiss status=%d body=%q github_reads=%d cleanup_calls=%d", response.Code, response.Body.String(), githubReads, cleanupCalls)
-	}
-
-	restarted := &dashboardServer{stateRoot: root, repository: previous.Repository}
-	state, err := restarted.readState()
-	if err != nil || !slices.Equal(state.Hidden, []dashboardHiddenAttempt{{Repository: "o/r", Issue: 25, Attempt: 1, Reason: "dismissed"}}) {
-		t.Fatalf("restarted dashboard state=%#v err=%v", state, err)
-	}
-	for _, path := range []string{filepath.Join(filepath.Dir(previous.LogPath), "manifest.json"), previous.LogPath, diagnostic, filepath.Join(filepath.Dir(current.LogPath), "manifest.json")} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("dismissal removed diagnostic artifact %s: %v", path, err)
-		}
-	}
-}
-
-func TestDashboardDismissalFailsClosedWithoutStateMutation(t *testing.T) {
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := writeDashboardManifest(t, root, 26, 1, "failed")
-	status := orchestrator.RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "failed", Branch: manifest.Branch, Worktree: manifest.Worktree, Session: manifest.Session, IssueClosed: true}
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
-		t.Fatal(err)
-	}
-	closed := true
-	server := &dashboardServer{stateRoot: root, repository: manifest.Repository, mu: &sync.Mutex{}, issueClosed: func(context.Context, string, int) (bool, error) { return closed, nil }}
-	assets, _ := fs.Sub(dashboardFiles, "dashboard/out")
-	handler := server.handler(http.FileServer(http.FS(assets)))
-	request := func(target, origin string) *httptest.ResponseRecorder {
-		before, _ := os.ReadFile(filepath.Join(root, "dashboard-state.json"))
-		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1"+target, nil)
-		r.Header.Set("Origin", origin)
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, r)
-		after, _ := os.ReadFile(filepath.Join(root, "dashboard-state.json"))
-		if !bytes.Equal(before, after) {
-			t.Fatalf("rejected dismissal mutated state: before=%q after=%q", before, after)
-		}
-		return w
-	}
-	path := "/actions/dismiss?repository=o%2Fr&issue=26&attempt=1"
-	if got := request(path, "https://evil.example"); got.Code != http.StatusForbidden {
-		t.Fatalf("cross-origin status=%d", got.Code)
-	}
-	if got := request("/actions/dismiss?repository=other%2Frepo&issue=26&attempt=1", "http://127.0.0.1"); got.Code != http.StatusBadRequest {
-		t.Fatalf("repository mismatch status=%d", got.Code)
-	}
-	if got := request("/actions/dismiss?repository=o%2Fr&issue=26&attempt=2", "http://127.0.0.1"); got.Code != http.StatusConflict {
-		t.Fatalf("unknown attempt status=%d", got.Code)
-	}
-	closed = false
-	if got := request(path, "http://127.0.0.1"); got.Code != http.StatusConflict {
-		t.Fatalf("open issue status=%d", got.Code)
-	}
-	closed = true
-	status.IssueClosed = false
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
-		t.Fatal(err)
-	}
-	if got := request(path, "http://127.0.0.1"); got.Code != http.StatusConflict {
-		t.Fatalf("stale projection status=%d", got.Code)
-	}
-}
-
-func TestDashboardDismissalRejectsUnsafeStateFile(t *testing.T) {
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := writeDashboardManifest(t, root, 27, 1, "failed")
-	status := orchestrator.RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "failed", Branch: manifest.Branch, Worktree: manifest.Worktree, Session: manifest.Session, IssueClosed: true}
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
-		t.Fatal(err)
-	}
-	target := filepath.Join(root, "outside-state.json")
-	if err := os.WriteFile(target, []byte(`{"version":1,"hidden":[]}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, filepath.Join(root, "dashboard-state.json")); err != nil {
-		t.Fatal(err)
-	}
-	server := &dashboardServer{stateRoot: root, repository: manifest.Repository, issueClosed: func(context.Context, string, int) (bool, error) { return true, nil }}
-	assets, _ := fs.Sub(dashboardFiles, "dashboard/out")
-	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/dismiss?repository=o%2Fr&issue=27&attempt=1", nil)
-	request.Header.Set("Origin", "http://127.0.0.1")
-	response := httptest.NewRecorder()
-	server.handler(http.FileServer(http.FS(assets))).ServeHTTP(response, request)
-	body, _ := os.ReadFile(target)
-	if response.Code != http.StatusInternalServerError || string(body) != `{"version":1,"hidden":[]}` {
-		t.Fatalf("unsafe state status=%d target=%q", response.Code, body)
-	}
-}
-
-func TestDashboardPermanentlyRemovesOnlyOneHistoricalAttempt(t *testing.T) {
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	previous := writeDashboardManifest(t, root, 28, 1, "failed")
-	current := writeDashboardManifest(t, root, 28, 2, "running")
-	other := writeDashboardManifest(t, root, 29, 1, "failed")
-	statuses := []orchestrator.RecoveryStatus{
-		{Repository: previous.Repository, Issue: previous.Issue, Attempt: previous.Attempt, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session},
-		{Repository: current.Repository, Issue: current.Issue, Attempt: current.Attempt, State: "active", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session},
-		{Repository: other.Repository, Issue: other.Issue, Attempt: other.Attempt, State: "failed", Branch: other.Branch, Worktree: other.Worktree, Session: other.Session},
-	}
-	if err := writeStatusSnapshot(root, statuses); err != nil {
-		t.Fatal(err)
-	}
-	operationMu := &sync.Mutex{}
-	var calls []string
-	server := &dashboardServer{
-		stateRoot:  root,
-		repository: previous.Repository,
-		mu:         operationMu,
-		removalRefresh: func(context.Context) error {
-			if operationMu.TryLock() {
-				operationMu.Unlock()
-				t.Fatal("removal reconciled outside the operation lock")
-			}
-			calls = append(calls, "reconcile")
-			return nil
-		},
-		remove: func(_ context.Context, operation string, manifest agentruntime.Manifest, head string) error {
-			if manifest.Repository != previous.Repository || manifest.Issue != previous.Issue || manifest.Attempt != previous.Attempt || head != previous.BaseSHA {
-				t.Fatalf("wrong implementation cleanup identity: %#v head=%q", manifest, head)
-			}
-			calls = append(calls, operation)
-			return nil
-		},
-		reviewCleanup: func(_ context.Context, manifest agentruntime.Manifest, remove bool) error {
-			if manifest.Issue != previous.Issue || manifest.Attempt != previous.Attempt {
-				t.Fatalf("wrong reviewer cleanup identity: %#v", manifest)
-			}
-			calls = append(calls, fmt.Sprintf("review-%v", remove))
-			return nil
-		},
-	}
-	handler := server.handler(http.NotFoundHandler())
-	request := func(issue, attempt int) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1/actions/remove?repository=o%%2Fr&issue=%d&attempt=%d", issue, attempt), nil)
-		r.Header.Set("Origin", "http://127.0.0.1")
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, r)
-		return response
-	}
-	if response := request(current.Issue, current.Attempt); response.Code != http.StatusConflict || len(calls) != 1 {
-		t.Fatalf("current removal status=%d body=%q calls=%v", response.Code, response.Body.String(), calls)
-	}
-	if response := request(other.Issue, other.Attempt); response.Code != http.StatusConflict || len(calls) != 2 {
-		t.Fatalf("latest failed removal status=%d body=%q calls=%v", response.Code, response.Body.String(), calls)
-	}
-	if response := request(previous.Issue, previous.Attempt); response.Code != http.StatusOK {
-		t.Fatalf("historical removal status=%d body=%q", response.Code, response.Body.String())
-	}
-	if !slices.Equal(calls, []string{"reconcile", "reconcile", "reconcile", "validate-remove", "review-false", "review-true", "remove"}) {
-		t.Fatalf("removal calls=%v", calls)
-	}
-	if _, err := os.Stat(filepath.Dir(previous.LogPath)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("selected attempt record remains: %v", err)
-	}
-	for _, path := range []string{filepath.Join(filepath.Dir(current.LogPath), "manifest.json"), filepath.Join(filepath.Dir(other.LogPath), "manifest.json")} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("unrelated attempt was removed: %s: %v", path, err)
-		}
-	}
-	state, err := server.readState()
-	if err != nil || !slices.Equal(state.Hidden, []dashboardHiddenAttempt{{Repository: "o/r", Issue: 28, Attempt: 1, Reason: "removed"}}) {
-		t.Fatalf("dashboard state=%#v err=%v", state, err)
-	}
-	if response := request(previous.Issue, previous.Attempt); response.Code != http.StatusOK || len(calls) != 8 {
-		t.Fatalf("idempotent removal status=%d body=%q calls=%v", response.Code, response.Body.String(), calls)
-	}
-}
-
-func TestDashboardPermanentRemovalRetainsEntryWhenCleanupFails(t *testing.T) {
-	root, _ := filepath.EvalSymlinks(t.TempDir())
-	previous := writeDashboardManifest(t, root, 30, 1, "failed")
-	current := writeDashboardManifest(t, root, 30, 2, "running")
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{
-		{Repository: previous.Repository, Issue: 30, Attempt: 1, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session},
-		{Repository: current.Repository, Issue: 30, Attempt: 2, State: "active", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	server := &dashboardServer{
-		stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
-		remove: func(context.Context, string, agentruntime.Manifest, string) error {
-			return errors.New("worktree has uncommitted changes")
-		},
-		reviewCleanup: func(context.Context, agentruntime.Manifest, bool) error {
-			t.Fatal("review cleanup should not run")
-			return nil
-		},
-	}
-	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/remove?repository=o%2Fr&issue=30&attempt=1", nil)
-	request.Header.Set("Origin", "http://127.0.0.1")
-	response := httptest.NewRecorder()
-	server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
-	state, stateErr := server.readState()
-	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "uncommitted changes") || stateErr != nil || len(state.Hidden) != 0 {
-		t.Fatalf("failed removal status=%d body=%q state=%#v err=%v", response.Code, response.Body.String(), state, stateErr)
-	}
-	if intent, found, err := server.removalIntent(previous.Repository, previous.Issue, previous.Attempt); err != nil || !found || intent.CleanupStarted {
-		t.Fatalf("preflight failure intent=%#v found=%v err=%v", intent, found, err)
-	}
-	if _, err := os.Stat(filepath.Join(filepath.Dir(previous.LogPath), "manifest.json")); err != nil {
-		t.Fatalf("failed removal lost attempt record: %v", err)
-	}
-}
-
-func TestDashboardPermanentRemovalRevalidatesPendingIntentBeforeCleanup(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		change func(*testing.T, string, agentruntime.Manifest, agentruntime.Manifest)
-	}{
-		{name: "attempt became current", change: func(t *testing.T, root string, previous, _ agentruntime.Manifest) {
-			if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{{Repository: previous.Repository, Issue: previous.Issue, Attempt: previous.Attempt, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session}}); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{name: "manifest became active", change: func(t *testing.T, _ string, previous, _ agentruntime.Manifest) {
-			previous.State = "running"
-			body, _ := json.Marshal(previous)
-			if err := os.WriteFile(filepath.Join(filepath.Dir(previous.LogPath), "manifest.json"), body, 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{name: "review became active", change: func(t *testing.T, _ string, previous, _ agentruntime.Manifest) {
-			previous.ReviewState = "running"
-			body, _ := json.Marshal(previous)
-			if err := os.WriteFile(filepath.Join(filepath.Dir(previous.LogPath), "manifest.json"), body, 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			root, _ := filepath.EvalSymlinks(t.TempDir())
-			previous := writeDashboardManifest(t, root, 37, 1, "failed")
-			current := writeDashboardManifest(t, root, 37, 2, "running")
-			statuses := []orchestrator.RecoveryStatus{
-				{Repository: previous.Repository, Issue: previous.Issue, Attempt: previous.Attempt, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session},
-				{Repository: current.Repository, Issue: current.Issue, Attempt: current.Attempt, State: "active", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session},
-			}
-			if err := writeStatusSnapshot(root, statuses); err != nil {
-				t.Fatal(err)
-			}
-			server := &dashboardServer{
-				stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
-				remove: func(context.Context, string, agentruntime.Manifest, string) error {
-					return errors.New("worktree has uncommitted changes")
-				},
-				reviewCleanup: func(context.Context, agentruntime.Manifest, bool) error {
-					t.Fatal("review cleanup ran after failed implementation preflight")
-					return nil
-				},
-			}
-			request := func() *httptest.ResponseRecorder {
-				r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/remove?repository=o%2Fr&issue=37&attempt=1", nil)
-				r.Header.Set("Origin", "http://127.0.0.1")
-				response := httptest.NewRecorder()
-				server.handler(http.NotFoundHandler()).ServeHTTP(response, r)
-				return response
-			}
-			if response := request(); response.Code != http.StatusConflict {
-				t.Fatalf("initial preflight status=%d body=%q", response.Code, response.Body.String())
-			}
-			intent, found, err := server.removalIntent(previous.Repository, previous.Issue, previous.Attempt)
-			if err != nil || !found || intent.CleanupStarted {
-				t.Fatalf("pending intent=%#v found=%v err=%v", intent, found, err)
-			}
-			test.change(t, root, previous, current)
-			cleanupCalls := 0
-			server.remove = func(context.Context, string, agentruntime.Manifest, string) error {
-				cleanupCalls++
-				return nil
-			}
-			server.reviewCleanup = func(context.Context, agentruntime.Manifest, bool) error {
-				cleanupCalls++
-				return nil
-			}
-			if response := request(); response.Code != http.StatusConflict {
-				t.Fatalf("unsafe retry status=%d body=%q", response.Code, response.Body.String())
-			}
-			if cleanupCalls != 0 {
-				t.Fatalf("unsafe retry invoked %d cleanup boundaries", cleanupCalls)
-			}
-			if _, err := os.Stat(filepath.Join(filepath.Dir(previous.LogPath), "manifest.json")); err != nil {
-				t.Fatalf("unsafe retry removed retained manifest: %v", err)
-			}
-			if state, err := server.readState(); err != nil || len(state.Hidden) != 0 {
-				t.Fatalf("unsafe retry hid attempt: state=%#v err=%v", state, err)
-			}
-		})
-	}
-}
-
-func TestDashboardPermanentRemovalConvergesAfterDestructiveStepFailureAndRestart(t *testing.T) {
-	for _, failAfter := range []string{"review", "implementation", "forget", "state"} {
-		t.Run(failAfter, func(t *testing.T) {
-			root, _ := filepath.EvalSymlinks(t.TempDir())
-			previous := writeDashboardManifest(t, root, 34, 1, "failed")
-			current := writeDashboardManifest(t, root, 34, 2, "running")
-			other := writeDashboardManifest(t, root, 35, 1, "failed")
-			if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{
-				{Repository: previous.Repository, Issue: previous.Issue, Attempt: previous.Attempt, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session},
-				{Repository: current.Repository, Issue: current.Issue, Attempt: current.Attempt, State: "active", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session},
-				{Repository: other.Repository, Issue: other.Issue, Attempt: other.Attempt, State: "failed", Branch: other.Branch, Worktree: other.Worktree, Session: other.Session},
-			}); err != nil {
-				t.Fatal(err)
-			}
-			selectedReview := filepath.Join(root, "selected-review")
-			selectedImplementation := filepath.Join(root, "selected-implementation")
-			otherResource := filepath.Join(root, "unrelated-resource")
-			for _, path := range []string{selectedReview, selectedImplementation, otherResource} {
-				if err := os.WriteFile(path, []byte("owned"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			removeFile := func(path string) error {
-				err := os.Remove(path)
-				if errors.Is(err, os.ErrNotExist) {
-					return nil
-				}
-				return err
-			}
-			failed := false
-			runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(root), StateRoot: root}
-			server := &dashboardServer{
-				stateRoot: root, repository: previous.Repository, mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
-				remove: func(_ context.Context, operation string, manifest agentruntime.Manifest, _ string) error {
-					if manifest.Issue != previous.Issue || manifest.Attempt != previous.Attempt {
-						t.Fatalf("wrong implementation identity: %#v", manifest)
-					}
-					if operation != "remove" {
-						return nil
-					}
-					if err := removeFile(selectedImplementation); err != nil {
-						return err
-					}
-					if failAfter == "implementation" && !failed {
-						failed = true
-						return errors.New("injected failure after implementation cleanup")
-					}
-					return nil
-				},
-				reviewCleanup: func(_ context.Context, manifest agentruntime.Manifest, remove bool) error {
-					if manifest.Issue != previous.Issue || manifest.Attempt != previous.Attempt {
-						t.Fatalf("wrong review identity: %#v", manifest)
-					}
-					if !remove {
-						return nil
-					}
-					if err := removeFile(selectedReview); err != nil {
-						return err
-					}
-					if failAfter == "review" && !failed {
-						failed = true
-						return errors.New("injected failure after review cleanup")
-					}
-					return nil
-				},
-				forget: func(manifest agentruntime.Manifest) error {
-					if err := runtimeState.Forget(manifest); err != nil {
-						return err
-					}
-					if failAfter == "forget" && !failed {
-						failed = true
-						return errors.New("injected failure after retained record cleanup")
-					}
-					return nil
-				},
-			}
-			if failAfter == "state" {
-				server.stateWrite = func(dashboardState) error {
-					failed = true
-					return errors.New("injected dashboard state failure")
-				}
-			}
-			request := func(target *dashboardServer) *httptest.ResponseRecorder {
-				r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/remove?repository=o%2Fr&issue=34&attempt=1", nil)
-				r.Header.Set("Origin", "http://127.0.0.1")
-				response := httptest.NewRecorder()
-				target.handler(http.NotFoundHandler()).ServeHTTP(response, r)
-				return response
-			}
-			if response := request(server); response.Code != http.StatusConflict && response.Code != http.StatusInternalServerError {
-				t.Fatalf("injected failure status=%d body=%q", response.Code, response.Body.String())
-			}
-			if !failed {
-				t.Fatal("failure was not injected")
-			}
-			if intent, found, err := server.removalIntent(previous.Repository, previous.Issue, previous.Attempt); err != nil || !found || !intent.CleanupStarted {
-				t.Fatalf("durable cleanup intent=%#v found=%v err=%v", intent, found, err)
-			}
-			if state, err := server.readState(); err != nil || len(state.Hidden) != 0 {
-				t.Fatalf("failed cleanup hid the entry: state=%#v err=%v", state, err)
-			}
-			for _, path := range []string{filepath.Join(filepath.Dir(current.LogPath), "manifest.json"), filepath.Join(filepath.Dir(other.LogPath), "manifest.json"), otherResource} {
-				if _, err := os.Stat(path); err != nil {
-					t.Fatalf("failed cleanup changed unrelated resource %s: %v", path, err)
-				}
-			}
-
-			if failAfter == "state" {
-				if err := os.Remove(filepath.Join(root, "status.json")); err != nil {
-					t.Fatal(err)
-				}
-			}
-			restarted := &dashboardServer{
-				stateRoot: root, repository: previous.Repository, mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil },
-				remove: server.remove, reviewCleanup: server.reviewCleanup,
-			}
-			if response := request(restarted); response.Code != http.StatusOK {
-				t.Fatalf("restart retry status=%d body=%q", response.Code, response.Body.String())
-			}
-			state, err := restarted.readState()
-			if err != nil || !slices.Equal(state.Hidden, []dashboardHiddenAttempt{{Repository: "o/r", Issue: 34, Attempt: 1, Reason: "removed"}}) {
-				t.Fatalf("final dashboard state=%#v err=%v", state, err)
-			}
-			if removal, err := restarted.readRemovalState(); err != nil || len(removal.Intents) != 0 {
-				t.Fatalf("final removal journal=%#v err=%v", removal, err)
-			}
-			if _, err := os.Stat(filepath.Dir(previous.LogPath)); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("selected retained record remains: %v", err)
-			}
-			for _, path := range []string{filepath.Join(filepath.Dir(current.LogPath), "manifest.json"), filepath.Join(filepath.Dir(other.LogPath), "manifest.json"), otherResource} {
-				if _, err := os.Stat(path); err != nil {
-					t.Fatalf("retry changed unrelated resource %s: %v", path, err)
-				}
-			}
-		})
-	}
-}
-
-func TestDashboardPermanentRemovalReplacesPriorHiddenReason(t *testing.T) {
-	for _, reason := range []string{"dismissed", "archived"} {
-		t.Run(reason, func(t *testing.T) {
-			root, _ := filepath.EvalSymlinks(t.TempDir())
-			previous := writeDashboardManifest(t, root, 36, 1, "failed")
-			current := writeDashboardManifest(t, root, 36, 2, "running")
-			if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{
-				{Repository: previous.Repository, Issue: 36, Attempt: 1, State: "failed", Branch: previous.Branch, Worktree: previous.Worktree, Session: previous.Session},
-				{Repository: current.Repository, Issue: 36, Attempt: 2, State: "active", Branch: current.Branch, Worktree: current.Worktree, Session: current.Session},
-			}); err != nil {
-				t.Fatal(err)
-			}
-			server := &dashboardServer{stateRoot: root, repository: "o/r", mu: &sync.Mutex{}, removalRefresh: func(context.Context) error { return nil }, remove: func(context.Context, string, agentruntime.Manifest, string) error { return nil }, reviewCleanup: func(context.Context, agentruntime.Manifest, bool) error { return nil }}
-			if err := server.writeState(dashboardState{Version: dashboardStateVersion, Hidden: []dashboardHiddenAttempt{{Repository: "o/r", Issue: 36, Attempt: 1, Reason: reason}}}); err != nil {
-				t.Fatal(err)
-			}
-			request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/remove?repository=o%2Fr&issue=36&attempt=1", nil)
-			request.Header.Set("Origin", "http://127.0.0.1")
-			response := httptest.NewRecorder()
-			server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
-			state, err := server.readState()
-			if response.Code != http.StatusOK || err != nil || !slices.Equal(state.Hidden, []dashboardHiddenAttempt{{Repository: "o/r", Issue: 36, Attempt: 1, Reason: "removed"}}) {
-				t.Fatalf("status=%d body=%q state=%#v err=%v", response.Code, response.Body.String(), state, err)
-			}
-		})
-	}
-}
-
 func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testing.T) {
 	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -1367,8 +768,7 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 		t.Fatal(err)
 	}
 	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, ReviewHead: strings.Repeat("b", 40), ReviewSnapshot: snapshot, ReviewSession: session}
-	server := &dashboardServer{stateRoot: stateRoot}
-	if err := server.cleanupAttemptReview(t.Context(), manifest, false); err != nil {
+	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, false); err != nil {
 		t.Fatalf("review preflight: %v", err)
 	}
 	for _, path := range []string{snapshot, resultOne, resultTwo} {
@@ -1376,7 +776,7 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 			t.Fatalf("preflight removed %s: %v", path, err)
 		}
 	}
-	if err := server.cleanupAttemptReview(t.Context(), manifest, true); err != nil {
+	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true); err != nil {
 		t.Fatalf("review cleanup: %v", err)
 	}
 	for _, path := range []string{snapshot, resultOne, resultTwo} {
@@ -1393,212 +793,12 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	if err := os.Symlink(canary, unsafe); err != nil {
 		t.Fatal(err)
 	}
-	if err := server.cleanupAttemptReview(t.Context(), manifest, false); err == nil || !strings.Contains(err.Error(), "invalid") {
+	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, false); err == nil || !strings.Contains(err.Error(), "invalid") {
 		t.Fatalf("symlinked review result preflight=%v", err)
 	}
 	if _, err := os.Stat(canary); err != nil {
 		t.Fatalf("review symlink target changed: %v", err)
 	}
-}
-
-func TestDashboardCleanupRejectsProjectionIdentityDrift(t *testing.T) {
-	root, _ := filepath.EvalSymlinks(t.TempDir())
-	manifest := writeDashboardManifest(t, root, 23, 1, "completed")
-	status := orchestrator.RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "completed", Branch: "substituted", Worktree: manifest.Worktree, Session: manifest.Session}
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
-		t.Fatal(err)
-	}
-	called := false
-	server := &dashboardServer{ctx: t.Context(), stateRoot: root, cleanup: func(context.Context, string, agentruntime.Manifest) error {
-		called = true
-		return nil
-	}}
-	assets, _ := fs.Sub(dashboardFiles, "dashboard/out")
-	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/archive?issue=23&attempt=1", nil)
-	request.Header.Set("Origin", "http://127.0.0.1")
-	response := httptest.NewRecorder()
-	server.handler(http.FileServer(http.FS(assets))).ServeHTTP(response, request)
-	if response.Code != http.StatusConflict || called {
-		t.Fatalf("identity drift status=%d cleanup_called=%v", response.Code, called)
-	}
-}
-
-func TestDashboardRecoverRequiresSameOriginFreshRetryableProjection(t *testing.T) {
-	root := t.TempDir()
-	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 24, Attempt: 2, State: "failed", Retryable: true, Session: "as-" + internalgithub.RepositoryIdentifier("o/r") + "-24-2"}
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
-		t.Fatal(err)
-	}
-	operationMu := &sync.Mutex{}
-	calls := 0
-	server := &dashboardServer{ctx: t.Context(), stateRoot: root, tmux: "tmux", mu: operationMu, recover: func(_ context.Context, issue, attempt int) error {
-		calls++
-		if issue != 24 || attempt != 2 {
-			t.Fatalf("recovered %d/%d", issue, attempt)
-		}
-		return nil
-	}}
-	assets, _ := fs.Sub(dashboardFiles, "dashboard/out")
-	handler := server.handler(http.FileServer(http.FS(assets)))
-	request := func(origin string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/recover?issue=24&attempt=2", nil)
-		r.Header.Set("Origin", origin)
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, r)
-		return w
-	}
-	if response := request("https://evil.example"); response.Code != http.StatusForbidden || calls != 0 {
-		t.Fatalf("cross-origin status=%d calls=%d", response.Code, calls)
-	}
-	operationMu.Lock()
-	busy := request("http://127.0.0.1")
-	operationMu.Unlock()
-	if busy.Code != http.StatusServiceUnavailable || calls != 0 {
-		t.Fatalf("busy status=%d calls=%d", busy.Code, calls)
-	}
-	if response := request("http://127.0.0.1"); response.Code != http.StatusOK || calls != 1 {
-		t.Fatalf("recover status=%d body=%q calls=%d", response.Code, response.Body.String(), calls)
-	}
-	status.Retryable = false
-	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
-		t.Fatal(err)
-	}
-	if response := request("http://127.0.0.1"); response.Code != http.StatusConflict || calls != 1 {
-		t.Fatalf("stale status=%d calls=%d", response.Code, calls)
-	}
-}
-
-func TestDashboardPlanReviewActionRestartsCleanIssueBoundReviewer(t *testing.T) {
-	source := gitRepository(t)
-	runGit(t, source, "config", "user.email", "test@example.invalid")
-	runGit(t, source, "config", "user.name", "test")
-	runGit(t, source, "commit", "--allow-empty", "-m", "base")
-	base := runGit(t, source, "rev-parse", "HEAD")
-	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	attemptRoot := filepath.Join(stateRoot, "worktrees")
-	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 215, Number: 3, BaseSHA: base}
-	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "215-3", "agent.log")
-	manifest.State, manifest.CreatedAt, manifest.UpdatedAt = "running", time.Now().UTC(), time.Now().UTC()
-	binding := internalgithub.RecoveryAttemptFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "active"}
-	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, Body: "## Plan\nReview this operator-selected plan.", DispatchAuthorized: true, ActiveAttempt: &binding}
-	target, _ := reviewTarget(agentruntime.ReviewModePlan, issue, base, base)
-	manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget = "clean", agentruntime.ReviewModePlan, target
-	manifest.ReviewBase, manifest.ReviewHead = base, base
-	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	body, _ := json.Marshal(manifest)
-	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Runner: &attemptRunner{branch: manifest.Branch, head: base}, VerifyWorker: func(context.Context) error { return nil }}
-	snapshotRoot := filepath.Join(t.TempDir(), "snapshots")
-	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	boundary := &artifactReviewBoundary{root: snapshotRoot}
-	status := orchestrator.RecoveryStatus{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "active", Branch: manifest.Branch, Worktree: manifest.Worktree, Session: manifest.Session}
-	if err := writeStatusSnapshot(stateRoot, []orchestrator.RecoveryStatus{status}); err != nil {
-		t.Fatal(err)
-	}
-	operationMu := &sync.Mutex{}
-	calls := 0
-	server := &dashboardServer{ctx: t.Context(), stateRoot: stateRoot, repository: attempt.Repository, tmux: "tmux", mu: operationMu, planReview: func(ctx context.Context, issueNumber, attemptNumber int) error {
-		calls++
-		return startIssuePlanReview(ctx, runtimeState, boundary, config.Default(attempt.Repository), []internalgithub.RecoveryIssueFact{issue}, []agentruntime.Manifest{manifest}, source, snapshotRoot, issueNumber, attemptNumber)
-	}}
-	wrongProject := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?repository=x/y&issue=215&attempt=3", nil)
-	wrongProject.Header.Set("Origin", "http://127.0.0.1")
-	wrongProjectResponse := httptest.NewRecorder()
-	server.handler(http.NotFoundHandler()).ServeHTTP(wrongProjectResponse, wrongProject)
-	if wrongProjectResponse.Code != http.StatusBadRequest || calls != 0 {
-		t.Fatalf("wrong project status=%d calls=%d", wrongProjectResponse.Code, calls)
-	}
-	invalid := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?repository=o/r&issue=215&attempt=3", strings.NewReader("unexpected"))
-	invalid.Header.Set("Origin", "http://127.0.0.1")
-	invalidResponse := httptest.NewRecorder()
-	server.handler(http.NotFoundHandler()).ServeHTTP(invalidResponse, invalid)
-	if invalidResponse.Code != http.StatusBadRequest || calls != 0 {
-		t.Fatalf("invalid status=%d calls=%d", invalidResponse.Code, calls)
-	}
-	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?repository=o/r&issue=215&attempt=3", nil)
-	request.Header.Set("Origin", "http://127.0.0.1")
-	response := httptest.NewRecorder()
-	server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
-	stored, discoverErr := runtimeState.Discover()
-	if response.Code != http.StatusOK || calls != 1 || discoverErr != nil || len(stored) != 1 || stored[0].ReviewState != "running" || stored[0].ReviewMode != agentruntime.ReviewModePlan || stored[0].ReviewTarget != target {
-		t.Fatalf("status=%d body=%q calls=%d manifest=%#v err=%v", response.Code, response.Body.String(), calls, stored, discoverErr)
-	}
-	wantSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
-	if stored[0].ReviewSession != wantSession || boundary.respawns != 1 || !slices.Contains(boundary.env, "AGENT_SYMPHONY_REVIEW_RESULT="+reviewResultPath(stored[0].ReviewSnapshot, target)) || !slices.Contains(boundary.env, "GH_REPO=o/r") || !strings.Contains(boundary.prompt, "Review mode: plan-review") || !strings.Contains(boundary.prompt, target) || !strings.Contains(boundary.prompt, "/agent-symphony status needs-attention") {
-		t.Fatalf("stored=%#v respawn=%q env=%q prompt=%q", stored[0], boundary.respawn, boundary.env, boundary.prompt)
-	}
-	manifest, err = runtimeState.RecordReview(attempt, "clean", agentruntime.ReviewModePlan, target, base, base, stored[0].ReviewSnapshot, stored[0].ReviewSession)
-	if err != nil || manifest.ReviewSnapshot == "" || manifest.ReviewSession == "" {
-		t.Fatalf("retain clean review resources: manifest=%#v err=%v", manifest, err)
-	}
-	boundary.cleanupErr = errors.New("transient reviewer cleanup failure")
-	respawns := boundary.respawns
-	cleanupRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/review-plan?repository=o/r&issue=215&attempt=3", nil)
-	cleanupRequest.Header.Set("Origin", "http://127.0.0.1")
-	cleanupPending := httptest.NewRecorder()
-	server.handler(http.NotFoundHandler()).ServeHTTP(cleanupPending, cleanupRequest)
-	if cleanupPending.Code != http.StatusConflict || boundary.respawns != respawns || !strings.Contains(cleanupPending.Body.String(), "did not start") {
-		t.Fatalf("cleanup-pending status=%d body=%q new respawns=%d", cleanupPending.Code, cleanupPending.Body.String(), boundary.respawns-respawns)
-	}
-	t.Cleanup(func() {
-		_ = filepath.WalkDir(stored[0].ReviewSnapshot, func(path string, entry os.DirEntry, err error) error {
-			if err == nil && entry.IsDir() {
-				_ = os.Chmod(path, 0o700)
-			}
-			return nil
-		})
-	})
-}
-
-func writeDashboardManifest(t *testing.T, stateRoot string, issue, attemptNumber int, state string) agentruntime.Manifest {
-	t.Helper()
-	repository := "o/r"
-	attemptRoot := filepath.Join(stateRoot, "worktrees")
-	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	attempt := agentruntime.Attempt{Repository: repository, Issue: issue, Number: attemptNumber, BaseSHA: strings.Repeat("a", 40)}
-	manifest, err := agentruntime.AttemptIdentity(attemptRoot, attempt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(repository), fmt.Sprintf("%d-%d", issue, attemptNumber))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	manifest.LogPath = filepath.Join(dir, "agent.log")
-	manifest.State = state
-	manifest.CreatedAt, manifest.UpdatedAt = time.Now().UTC(), time.Now().UTC()
-	if state == "completed" {
-		manifest.ReviewHead = strings.Repeat("b", 40)
-	}
-	body, _ := json.Marshal(manifest)
-	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(manifest.LogPath, []byte("diagnostic"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return manifest
 }
 
 func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
@@ -1617,7 +817,7 @@ func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("EXPECTED_SESSION", session)
-	server := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), root, repository, nil, script, &sync.Mutex{}, nil, nil, nil, nil, false, ""))
+	server := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), root, repository, nil, script, nil, false, ""))
 	defer server.Close()
 
 	dial := func(origin string, selectedIssue int) (*websocket.Conn, *http.Response, error) {
@@ -1930,7 +1130,7 @@ func TestDashboardRoutesOperatorInputDirectlyToReviewerWithoutOrchestrator(t *te
 		t.Fatal(err)
 	}
 	t.Setenv("EXPECTED_SESSION", reviewer)
-	server := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), root, repository, nil, script, &sync.Mutex{}, nil, nil, nil, nil, false, ""))
+	server := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), root, repository, nil, script, nil, false, ""))
 	defer server.Close()
 	dial := func(path, extraQuery string) (*websocket.Conn, *http.Response, error) {
 		endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + path + "?repository=" + url.QueryEscape(repository) + "&issue=23&attempt=2"
@@ -1988,114 +1188,6 @@ func TestDashboardRoutesOperatorInputDirectlyToReviewerWithoutOrchestrator(t *te
 	}
 	if _, err := (&dashboardServer{stateRoot: root}).projectedSession(issue, attempt, agentruntime.SessionRoleReviewer); err == nil {
 		t.Fatal("malformed newline-free reviewer target accepted")
-	}
-}
-
-type liveReviewBoundary struct{ root string }
-
-func (b liveReviewBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
-	if operation == "review-result" {
-		input, _ := io.ReadAll(command.Stdin)
-		output, err := readReviewResult(input, b.root)
-		return agentruntime.Result{Output: output}, err
-	}
-	return (agentruntime.ExecRunner{}).Run(ctx, command)
-}
-
-func TestDashboardInputReachesLaunchedReviewerAndReturnsVisibleResponse(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux is unavailable")
-	}
-	tmuxRoot, err := os.MkdirTemp("/tmp", "agent-symphony-live-review-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(tmuxRoot) })
-	t.Setenv("TMUX", "")
-	t.Setenv("TMUX_PANE", "")
-	t.Setenv("TMUX_TMPDIR", tmuxRoot)
-
-	source := t.TempDir()
-	runGit(t, source, "init", "-q")
-	runGit(t, source, "config", "user.email", "test@example.invalid")
-	runGit(t, source, "config", "user.name", "test")
-	runGit(t, source, "commit", "--allow-empty", "-qm", "base")
-	base := runGit(t, source, "rev-parse", "HEAD")
-	runGit(t, source, "commit", "--allow-empty", "-qm", "head")
-	head := runGit(t, source, "rev-parse", "HEAD")
-	snapshotRoot := t.TempDir()
-	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 23, Number: 2, BaseSHA: base}
-	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, Body: "Review the operator flow."}
-	target, _ := reviewTarget(agentruntime.ReviewModeImplementation, issue, base, head)
-	reviewer := filepath.Join(t.TempDir(), "reviewer")
-	script := `#!/bin/sh
-case "$1" in *"Review mode: implementation-review"*"$FAKE_TARGET"*) ;; *) exit 20;; esac
-printf 'reviewer-ready\n'
-IFS= read -r message || exit 21
-printf 'reviewer-received:%s\n' "$message"
-printf '%s' '{"type":"agent-symphony-review-v1","status":"clean","findings":[]}' >"$AGENT_SYMPHONY_REVIEW_RESULT.tmp" || exit 22
-mv "$AGENT_SYMPHONY_REVIEW_RESULT.tmp" "$AGENT_SYMPHONY_REVIEW_RESULT"`
-	if err := os.WriteFile(reviewer, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	boundary := liveReviewBoundary{root: snapshotRoot}
-	reviewEnv := []string{"PATH=" + os.Getenv("PATH"), "TERM=xterm-256color", "TMUX_TMPDIR=" + tmuxRoot, "FAKE_TARGET=" + target}
-	started, pending, err := runIndependentReview(t.Context(), nil, attempt, boundary, reviewEnv, []string{reviewer}, issue, agentruntime.Manifest{}, source, head, snapshotRoot)
-	if err != nil || !pending {
-		t.Fatalf("launch pending=%v err=%v", pending, err)
-	}
-	t.Cleanup(func() {
-		_ = exec.Command("tmux", "kill-session", "-t", "="+started.Session).Run()
-		_ = filepath.WalkDir(started.Snapshot, func(path string, entry os.DirEntry, err error) error {
-			if err == nil && entry.IsDir() {
-				_ = os.Chmod(path, 0o700)
-			}
-			return nil
-		})
-	})
-
-	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, attempt.Repository, attempt.Issue, attempt.Number)
-	statusRoot := t.TempDir()
-	status := orchestrator.RecoveryStatus{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "running"}, {Role: agentruntime.SessionRoleReviewer, Name: started.Session, State: "running", Mode: agentruntime.ReviewModeImplementation, Target: target, Current: true}}}
-	if err := writeStatusSnapshot(statusRoot, []orchestrator.RecoveryStatus{status}); err != nil {
-		t.Fatal(err)
-	}
-	server := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), statusRoot, attempt.Repository, nil, "tmux", &sync.Mutex{}, nil, nil, nil, nil, false, ""))
-	defer server.Close()
-	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/reviewer/terminal?repository=o%2Fr&issue=23&attempt=2"
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	connection, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
-	if err != nil {
-		t.Fatalf("dial response=%v err=%v", response, err)
-	}
-	if err := connection.Write(ctx, websocket.MessageBinary, []byte("inspect the dependency edge\n")); err != nil {
-		t.Fatal(err)
-	}
-	var output strings.Builder
-	for !strings.Contains(output.String(), "reviewer-received:inspect the dependency edge") {
-		kind, message, err := connection.Read(ctx)
-		if err != nil {
-			t.Fatalf("visible output=%q err=%v", output.String(), err)
-		}
-		if kind == websocket.MessageBinary {
-			output.Write(message)
-		}
-	}
-	connection.CloseNow()
-
-	deadline := time.Now().Add(5 * time.Second)
-	manifest := agentruntime.Manifest{ReviewState: "running", ReviewMode: agentruntime.ReviewModeImplementation, ReviewTarget: target, ReviewBase: base, ReviewHead: head, ReviewSnapshot: started.Snapshot, ReviewSession: started.Session}
-	var result independentReviewResult
-	for {
-		result, pending, err = runIndependentReview(t.Context(), nil, attempt, boundary, reviewEnv, []string{reviewer}, issue, manifest, source, head, snapshotRoot)
-		if err != nil || !pending || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if err != nil || pending || result.Status != "clean" {
-		t.Fatalf("result=%#v pending=%v err=%v output=%q", result, pending, err, output.String())
 	}
 }
 

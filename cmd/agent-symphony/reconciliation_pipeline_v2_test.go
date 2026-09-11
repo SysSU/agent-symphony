@@ -483,7 +483,7 @@ func TestPublicationPlannerBeginsInitialAndCompletedOutcomeTransitions(t *testin
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = restarted.close(context.Background()) })
-		current, _ := restarted.snapshot(t.Context())
+		current := refreshOwnerObservation(t, restarted, request.Issue)
 		candidate := publicationExecutionMaterial{Issue: issueFact(request.Issue, "title"), Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}, Root: root, Head: newHead, Validation: "tests", Documentation: "none"}
 		candidate.Issue.Attempt, candidate.Issue.BaseBranch = request.Attempt, "main"
 		plans, _, err := planReconciliationPublications(current, []publicationExecutionMaterial{candidate})
@@ -531,7 +531,7 @@ func TestPublicationPlannerBeginsInitialAndCompletedOutcomeTransitions(t *testin
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = restarted.close(context.Background()) })
-		current, _ := restarted.snapshot(t.Context())
+		current := refreshOwnerObservation(t, restarted, plan.Request.Issue)
 		candidate := publicationExecutionMaterial{Issue: issueFact(plan.Request.Issue, "title"), Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}, Root: root, Head: newHead, Validation: "tests", Documentation: "none"}
 		candidate.Issue.Attempt, candidate.Issue.BaseBranch = plan.Request.Attempt, "main"
 		plans, _, err := planReconciliationPublications(current, []publicationExecutionMaterial{candidate})

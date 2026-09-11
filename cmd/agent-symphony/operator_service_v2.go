@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"sync"
 
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
@@ -28,6 +29,9 @@ type operatorMutationService struct {
 	reviewEnvironment []string
 	reviewCommand     []string
 	issueClosed       func(context.Context, string, int) (bool, error)
+	mu                sync.Mutex
+	wg                sync.WaitGroup
+	stopped           bool
 }
 
 type operatorWork struct {
@@ -65,6 +69,17 @@ func newOperatorMutationService(lifecycle context.Context, owner *stateOwner, ef
 }
 
 func (s *operatorMutationService) perform(ctx context.Context, request controlRequest) controlResult {
+	return s.performMode(ctx, request, false)
+}
+
+// performSynchronously uses the same durable operator command path without
+// launching duplicate background work. It returns only after the receipt is
+// terminal or execution reports that the durable intent remains pending.
+func (s *operatorMutationService) performSynchronously(ctx context.Context, request controlRequest) controlResult {
+	return s.performMode(ctx, request, true)
+}
+
+func (s *operatorMutationService) performMode(ctx context.Context, request controlRequest, synchronous bool) controlResult {
 	if s == nil || s.owner == nil || s.effects == nil || ctx == nil || !validOperatorRequest(request, s.collector.Config.Repository) {
 		return operatorErrorResult(request, http.StatusBadRequest, "invalid operator request")
 	}
@@ -80,6 +95,12 @@ func (s *operatorMutationService) perform(ctx context.Context, request controlRe
 			return operatorErrorResult(request, http.StatusConflict, "operator request identity was already used for different input")
 		}
 		if receipt.State == "pending" {
+			if synchronous {
+				if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+					return operatorResultForError(request, err)
+				}
+				return s.currentReceiptResult(ctx, request)
+			}
 			s.dispatchResume(request.RequestID)
 		}
 		return operatorResultForReceipt(snapshot, receipt)
@@ -90,6 +111,12 @@ func (s *operatorMutationService) perform(ctx context.Context, request controlRe
 			return operatorResultForError(request, err)
 		}
 		if effect != nil && effect.State == "pending" {
+			if synchronous {
+				if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+					return operatorResultForError(request, err)
+				}
+				return s.currentReceiptResult(ctx, request)
+			}
 			s.dispatchResume(request.RequestID)
 		}
 		receipt, found := operatorReceiptByID(committed.State, request.RequestID)
@@ -102,6 +129,12 @@ func (s *operatorMutationService) perform(ctx context.Context, request controlRe
 		committed, _, err := s.owner.beginOperatorMutation(ctx, attach)
 		if err != nil {
 			return operatorResultForError(request, err)
+		}
+		if synchronous {
+			if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+				return operatorResultForError(request, err)
+			}
+			return s.currentReceiptResult(ctx, request)
 		}
 		s.dispatchResume(request.RequestID)
 		receipt, found := operatorReceiptByID(committed.State, request.RequestID)
@@ -123,6 +156,12 @@ func (s *operatorMutationService) perform(ctx context.Context, request controlRe
 	if effect != nil {
 		work.requestID = request.RequestID
 		bindOperatorWorkIdentity(&work, *effect)
+		if synchronous {
+			if err := s.execute(work); err != nil {
+				return operatorResultForError(request, err)
+			}
+			return s.currentReceiptResult(ctx, request)
+		}
 		s.dispatch(work)
 	}
 	receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
@@ -130,6 +169,18 @@ func (s *operatorMutationService) perform(ctx context.Context, request controlRe
 		return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
 	}
 	return operatorResultForReceipt(committed, receipt)
+}
+
+func (s *operatorMutationService) currentReceiptResult(ctx context.Context, request controlRequest) controlResult {
+	snapshot, err := s.owner.snapshot(ctx)
+	if err != nil {
+		return operatorResultForError(request, err)
+	}
+	receipt, ok := operatorReceiptByID(snapshot.State, request.RequestID)
+	if !ok {
+		return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
+	}
+	return operatorResultForReceipt(snapshot, receipt)
 }
 
 func (s *operatorMutationService) recoveryAttachCommand(snapshot stateOwnerSnapshot, request controlRequest) (beginOperatorMutationCommand, bool) {
@@ -373,7 +424,7 @@ func bindOperatorWorkIdentity(work *operatorWork, effect runtimeEffectIntent) {
 }
 
 func (s *operatorMutationService) dispatch(work operatorWork) {
-	go func() { _ = s.execute(work) }()
+	s.start(func() { _ = s.execute(work) })
 }
 
 func (s *operatorMutationService) execute(work operatorWork) error {
@@ -402,7 +453,41 @@ func (s *operatorMutationService) execute(work operatorWork) error {
 }
 
 func (s *operatorMutationService) dispatchResume(requestID string) {
-	go func() { _ = s.resumeReceipt(s.lifecycle, requestID) }()
+	s.start(func() { _ = s.resumeReceipt(s.lifecycle, requestID) })
+}
+
+func (s *operatorMutationService) start(work func()) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return false
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		work()
+	}()
+	return true
+}
+
+func (s *operatorMutationService) shutdown(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	s.stopped = true
+	s.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func operatorResultForReceipt(snapshot stateOwnerSnapshot, receipt controlReceipt) controlResult {
@@ -521,18 +606,8 @@ func (s *operatorMutationService) resumeUnmarkedReconciliation(ctx context.Conte
 		return errStateConflict
 	}
 	if effect.Reconciliation.Action == reconciliationGitHubIssueUpdate {
-		fresh, err := s.owner.reconciliationSnapshot(ctx)
+		fresh, batch, err := s.collectIssue(ctx, receipt.Request.Issue)
 		if err != nil {
-			return err
-		}
-		if s.collect == nil {
-			return errors.New("operator collector is unavailable")
-		}
-		batch, err := s.collect(ctx, fresh, receipt.Request.Issue)
-		if err != nil {
-			return err
-		}
-		if _, err := collectionFromSnapshot(fresh, batch.Input); err != nil {
 			return err
 		}
 		plans, err := planReconciliationAttemptIssueUpdates(fresh, batch, s.collector.Config)
@@ -540,6 +615,9 @@ func (s *operatorMutationService) resumeUnmarkedReconciliation(ctx context.Conte
 			return err
 		}
 		for _, plan := range plans {
+			plan.Request.ObservationCycleID = effect.Reconciliation.ObservationCycleID
+			material := plan.Material
+			plan.Request.ExecutionDigest = issueUpdateExecutionDigest(plan.Request, material)
 			if reflect.DeepEqual(plan.Request, *effect.Reconciliation) {
 				plan.Identity = ownerReconciliationEffectIdentity(effect)
 				return s.execute(operatorWork{requestID: receipt.Request.RequestID, plan: &plan})
@@ -554,7 +632,14 @@ func (s *operatorMutationService) resumeUnmarkedReconciliation(ctx context.Conte
 		}
 		plan, material, err := s.preparePlanReview(ctx, snapshot, record.Manifest)
 		if err != nil || !reflect.DeepEqual(plan.Request, *effect.Reconciliation) {
-			return errStateConflict
+			if err != nil {
+				return err
+			}
+			plan.Request.ObservationCycleID = effect.Reconciliation.ObservationCycleID
+			plan.Request.ExecutionDigest = reviewerExecutionDigest(plan.Request, material)
+			if !reflect.DeepEqual(plan.Request, *effect.Reconciliation) {
+				return errStateConflict
+			}
 		}
 		plan.Identity = ownerReconciliationEffectIdentity(effect)
 		return s.execute(operatorWork{requestID: receipt.Request.RequestID, plan: &plan, reviewer: &material})
@@ -579,7 +664,7 @@ func newProjectDashboardServerV2(ctx context.Context, stateRoot, repository stri
 	if service == nil || service.owner == nil || service.owner.stateRoot != stateRoot || service.collector.Config.Repository != repository {
 		return nil, errors.New("v2 dashboard owner binding is invalid")
 	}
-	server := newProjectDashboardServer(ctx, stateRoot, repository, peerProjects, tmux, nil, nil, nil, nil, nil, allowNet, password)
+	server := newProjectDashboardServer(ctx, stateRoot, repository, peerProjects, tmux, nil, nil, allowNet, password)
 	server.operator = service
 	return server, nil
 }
