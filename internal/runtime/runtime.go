@@ -1009,6 +1009,14 @@ func (r *Runtime) validateManifest(attempt Attempt, manifest Manifest) error {
 	}
 }
 
+// ValidateManifest verifies a persisted manifest against its deterministic
+// repository resources without reading or writing runtime state.
+func ValidateManifest(root, stateRoot string, manifest Manifest) error {
+	r := Runtime{Root: root, StateRoot: stateRoot}
+	attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
+	return r.validateManifest(attempt, manifest)
+}
+
 func below(root, name string) (string, error) {
 	if !filepath.IsAbs(root) {
 		return "", fmt.Errorf("runtime root must be absolute")
