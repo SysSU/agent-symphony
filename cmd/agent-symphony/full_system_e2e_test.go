@@ -32,6 +32,7 @@ type fullSystemGitHub struct {
 	labels          map[string]bool
 	requests        []string
 	failNext        bool
+	failedRequest   string
 	pr              map[string]any
 	merged          bool
 	closed          bool
@@ -68,6 +69,7 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if f.failNext {
 		f.failNext = false
+		f.failedRequest = r.Method + " " + r.URL.RequestURI()
 		http.Error(w, `{"message":"transient fixture failure"}`, http.StatusServiceUnavailable)
 		return
 	}
@@ -428,12 +430,14 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatalf("implementation-checkpoint shutdown: %v output=%s", err, output.String())
 	}
 	stopped = true
-	implementationManifests, _ := filepath.Glob(filepath.Join(stateRoot, "attempts", "*", "73-*", "manifest.json"))
-	if len(implementationManifests) == 0 {
-		t.Fatal("implementation restart checkpoint has no durable attempt")
+	implementationState, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if manifests, _ := filepath.Glob(filepath.Join(stateRoot, "attempts", "*", "73-*", "manifest.json")); len(manifests) != len(implementationManifests) {
-		t.Fatalf("implementation restart checkpoint manifests=%q", manifests)
+	implementationKey := ownerAttemptKey("o/r", 73, 2)
+	implementationAttempt, ok := implementationState.Attempts[implementationKey]
+	if !ok {
+		t.Fatal("implementation restart checkpoint has no durable attempt")
 	}
 	address = freeAddress(t)
 	server = exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", serveInterval)
@@ -473,7 +477,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		_, err := os.Lstat(filepath.Join(root, "review-started"))
 		return err == nil
 	}) {
-		t.Fatalf("review session did not reach the durable restart checkpoint: %s", output.String())
+		t.Fatalf("review session did not reach the durable restart checkpoint: %s\n%s", fullSystemAttemptDiagnostics(address, stateRoot, currentSession, server.Env), output.String())
 	}
 	if err := server.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
@@ -485,8 +489,10 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	fixture.mu.Lock()
 	createdAtReviewRestart := countRequest(fixture.requests, "POST /repos/o/r/pulls")
 	fixture.mu.Unlock()
-	if manifests, _ := filepath.Glob(filepath.Join(stateRoot, "attempts", "*", "73-*", "manifest.json")); len(manifests) != len(implementationManifests) || createdAtReviewRestart != 0 {
-		t.Fatalf("review restart checkpoint manifests=%q PR creates=%d", manifests, createdAtReviewRestart)
+	reviewState, err := readRuntimeOwnerState(stateRoot, "o/r")
+	reviewAttempt, reviewOK := reviewState.Attempts[implementationKey]
+	if err != nil || !reviewOK || len(reviewState.Attempts) != len(implementationState.Attempts) || reviewAttempt.Generation != implementationAttempt.Generation || createdAtReviewRestart != 0 {
+		t.Fatalf("review restart checkpoint attempt=%#v attempts=%d PR creates=%d err=%v", reviewAttempt, len(reviewState.Attempts), createdAtReviewRestart, err)
 	}
 	address = freeAddress(t)
 	server = exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", serveInterval)
@@ -522,38 +528,28 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		fixture.mu.Lock()
 		requests := append([]string(nil), fixture.requests...)
 		fixture.mu.Unlock()
-		manifests, _ := filepath.Glob(filepath.Join(stateRoot, "attempts", "*", "73-*", "manifest.json"))
-		var manifest []byte
-		if len(manifests) == 1 {
-			manifest, _ = os.ReadFile(manifests[0])
-		}
-		t.Fatalf("timed out waiting for pull request merge and issue closure: requests=%q manifest=%s serve=%s", requests, manifest, output.String())
+		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
+		t.Fatalf("timed out waiting for pull request merge and issue closure: requests=%q ledger=%s serve=%s", requests, ledger, output.String())
 	}
 	mergedChange := runExternal(t, "", "git", "--git-dir", origin, "show", "refs/heads/main:change.txt")
 	if !strings.Contains(mergedChange, "reviewed") || !strings.Contains(mergedChange, "reworked") {
 		t.Fatalf("merged change does not contain implementation and review rework: %q", mergedChange)
 	}
-	cyclesAfterMerge := strings.Count(output.String(), `"ok":true`)
-	if !waitFor(deadline(15*time.Second), func() bool {
-		return strings.Count(output.String(), `"ok":true`) > cyclesAfterMerge
-	}) {
-		t.Fatalf("merged state did not reconcile: %s", output.String())
-	}
 	var completed dashboardStatusSnapshot
-	response, err = http.Get("http://" + address + "/status.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if decodeErr := json.NewDecoder(response.Body).Decode(&completed); decodeErr != nil {
-		_ = response.Body.Close()
-		t.Fatal(decodeErr)
-	}
-	_ = response.Body.Close()
-	completedAttempt := slices.IndexFunc(completed.Statuses, func(status orchestrator.RecoveryStatus) bool {
-		return status.Attempt == 2 && status.Issue == 73 && status.State == "completed" && status.IssueClosed && status.PR == 91
-	})
-	if completedAttempt < 0 {
-		t.Fatalf("post-merge dashboard projection=%#v", completed.Statuses)
+	if !waitFor(deadline(15*time.Second), func() bool {
+		response, requestErr := http.Get("http://" + address + "/status.json")
+		if requestErr != nil {
+			return false
+		}
+		defer response.Body.Close()
+		if json.NewDecoder(response.Body).Decode(&completed) != nil {
+			return false
+		}
+		return slices.ContainsFunc(completed.Statuses, func(status orchestrator.RecoveryStatus) bool {
+			return status.Attempt == 2 && status.Issue == 73 && status.State == "completed" && status.IssueClosed && status.PR == 91
+		})
+	}) {
+		t.Fatalf("merged state did not reach the owner projection: statuses=%#v serve=%s", completed.Statuses, output.String())
 	}
 	if err := server.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
@@ -562,9 +558,6 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatalf("serve shutdown: %v\n%s", err, output.String())
 	}
 	stopped = true
-	if strings.Count(output.String(), `"ok":true`) < 2 {
-		t.Fatalf("expected repeated real reconciliation, output:\n%s", output.String())
-	}
 	fixture.mu.Lock()
 	createdBeforeRestart := countRequest(fixture.requests, "POST /repos/o/r/pulls")
 	mergedBeforeRestart := countRequest(fixture.requests, "PUT /repos/o/r/pulls/91/merge")
@@ -587,15 +580,19 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	})
 	waitHTTP(t, "http://"+restartAddress+"/status.json", deadline(15*time.Second), &restartOutput)
 	fixture.mu.Lock()
-	fixture.failNext = true
+	restartRequestStart := len(fixture.requests)
+	fixture.failNext, fixture.failedRequest = true, ""
 	fixture.mu.Unlock()
 	control := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "reconcile", "--request-id", "full-system-post-merge", "--timeout", controlTimeout, "--json")
 	controlOutput, err := control.CombinedOutput()
 	if err != nil || !strings.Contains(string(controlOutput), `"ok":true`) {
 		t.Fatalf("post-restart CLI recovery: %v output=%s serve=%s", err, controlOutput, restartOutput.String())
 	}
-	if !strings.Contains(restartOutput.String(), `"retries":1`) {
-		t.Fatalf("transient GitHub failure was not observably retried: %s", restartOutput.String())
+	fixture.mu.Lock()
+	failedRequest, postRestartRequests := fixture.failedRequest, append([]string(nil), fixture.requests[restartRequestStart:]...)
+	fixture.mu.Unlock()
+	if failedRequest == "" || countRequest(postRestartRequests, failedRequest) < 2 {
+		t.Fatalf("transient GitHub request was not observably retried: failed=%q requests=%q", failedRequest, postRestartRequests)
 	}
 	var afterRestart dashboardStatusSnapshot
 	response, err = http.Get("http://" + restartAddress + "/status.json")
@@ -618,21 +615,16 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatalf("restart duplicated publication: PR creates=%d→%d merges=%d→%d", createdBeforeRestart, createdAfterRestart, mergedBeforeRestart, mergedAfterRestart)
 	}
 
-	runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot}
-	manifests, err := runtimeState.Discover()
+	removalOwnerState, err := readRuntimeOwnerState(stateRoot, "o/r")
 	if err != nil {
 		t.Fatal(err)
 	}
-	findAttempt := func(number int) agentruntime.Manifest {
-		index := slices.IndexFunc(manifests, func(manifest agentruntime.Manifest) bool {
-			return manifest.Repository == "o/r" && manifest.Issue == 73 && manifest.Attempt == number
-		})
-		if index < 0 {
-			t.Fatalf("attempt %d manifest missing before permanent-removal fixture: %#v", number, manifests)
-		}
-		return manifests[index]
+	removedKey := ownerAttemptKey("o/r", 73, 1)
+	removedRecord, ok := removalOwnerState.Attempts[removedKey]
+	if !ok {
+		t.Fatalf("attempt 1 owner record missing before permanent removal: %#v", removalOwnerState.Attempts)
 	}
-	removedManifest, retainedManifest := findAttempt(1), findAttempt(2)
+	removedManifest := removedRecord.Manifest
 	if info, statErr := os.Stat(removedManifest.Worktree); statErr != nil || !info.IsDir() {
 		t.Fatalf("historical worktree is unavailable before removal: %v", statErr)
 	}
@@ -641,22 +633,25 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatal(err)
 	}
 	removedHandoff := filepath.Join(filepath.Dir(removedManifest.LogPath), "handoff.json")
-	retainedHandoff := filepath.Join(filepath.Dir(retainedManifest.LogPath), "unrelated-handoff.json")
-	for path, body := range map[string]string{removedHandoff: "selected", retainedHandoff: "unrelated"} {
+	unrelatedRoot := filepath.Join(productionAttemptRoot(stateRoot), "unrelated-resource")
+	if err := os.MkdirAll(unrelatedRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedHandoff := filepath.Join(unrelatedRoot, "unrelated-handoff.json")
+	for path, body := range map[string]string{removedHandoff: "selected", unrelatedHandoff: "unrelated"} {
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	removedAttempt := agentruntime.Attempt{Repository: "o/r", Issue: 73, Number: 1, BaseSHA: removedManifest.BaseSHA}
-	retainedAttempt := agentruntime.Attempt{Repository: "o/r", Issue: 73, Number: 2, BaseSHA: retainedManifest.BaseSHA}
 	snapshotRoot := productionSnapshotRoot(stateRoot)
 	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	removedSnapshot, removedReviewSession := reviewIdentity(removedAttempt, snapshotRoot)
-	retainedSnapshot, _ := reviewIdentity(retainedAttempt, snapshotRoot)
+	unrelatedSnapshot := filepath.Join(snapshotRoot, "unrelated-snapshot")
 	removedReviewResult := removedSnapshot + ".result-0123456789abcdef"
-	for _, path := range []string{removedSnapshot, removedReviewResult, retainedSnapshot} {
+	for _, path := range []string{removedSnapshot, removedReviewResult, unrelatedSnapshot} {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -669,50 +664,30 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	fixture.mu.Lock()
 	fixture.denyMutations = true
 	fixture.mu.Unlock()
-	journalPath := filepath.Join(stateRoot, "removal-state.json")
-	if _, err := os.Lstat(journalPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unexpected removal journal before partial-failure fixture: %v", err)
-	}
-	permissionChanged := make(chan error, 1)
-	go func() {
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) {
-			state, err := (&dashboardServer{stateRoot: stateRoot, repository: "o/r"}).readRemovalState()
-			if err == nil && len(state.Intents) == 1 && state.Intents[0].CleanupStarted {
-				permissionChanged <- os.Chmod(stateRoot, 0o500)
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
-		permissionChanged <- errors.New("removal cleanup start was not observed")
-	}()
-	lateRemovalCLI := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "remove", "--issue", "73", "--attempt", "1", "--confirm", "--request-id", "full-system-late-removal", "--timeout", controlTimeout, "--json")
-	lateRemovalOutput, lateRemovalErr := lateRemovalCLI.CombinedOutput()
-	permissionErr := <-permissionChanged
-	restoreErr := os.Chmod(stateRoot, 0o700)
-	if permissionErr != nil || restoreErr != nil {
-		t.Fatalf("inject late dashboard-state failure: chmod=%v restore=%v", permissionErr, restoreErr)
-	}
-	if lateRemovalErr == nil {
-		t.Fatalf("late dashboard-state failure unexpectedly succeeded: %s", lateRemovalOutput)
-	}
-	if _, err := os.Lstat(filepath.Dir(removedManifest.LogPath)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("late failure did not occur after retained record cleanup: %v output=%s", err, lateRemovalOutput)
-	}
-	partialState, err := (&dashboardServer{stateRoot: stateRoot, repository: "o/r"}).readState()
-	if err != nil || slices.Contains(partialState.Hidden, dashboardHiddenAttempt{Repository: "o/r", Issue: 73, Attempt: 1, Reason: "removed"}) {
-		t.Fatalf("late failure incorrectly completed dashboard state: state=%#v err=%v output=%s", partialState, err, lateRemovalOutput)
-	}
 	removalPlaywright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "removal-playwright"))
 	removalPlaywright.Dir = source
 	removalPlaywright.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+restartAddress)
 	if removalOutput, removalErr := removalPlaywright.CombinedOutput(); removalErr != nil {
-		t.Fatalf("real permanent-removal Playwright: %v\n%s\nserve:\n%s", removalErr, removalOutput, restartOutput.String())
+		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
+		t.Fatalf("real permanent-removal Playwright: %v\n%s\nledger=%s\nserve:\n%s", removalErr, removalOutput, ledger, restartOutput.String())
 	}
 	removeCLI := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "remove", "--issue", "73", "--attempt", "1", "--confirm", "--request-id", "full-system-removal-retry", "--timeout", controlTimeout, "--json")
 	removeOutput, err := removeCLI.CombinedOutput()
 	if err != nil || !strings.Contains(string(removeOutput), `"ok":true`) {
 		t.Fatalf("idempotent permanent-removal CLI: %v output=%s serve=%s", err, removeOutput, restartOutput.String())
+	}
+	var removedState runtimeOwnerState
+	var tombstone runtimeTombstone
+	if !waitFor(deadline(15*time.Second), func() bool {
+		var readErr error
+		removedState, readErr = readRuntimeOwnerState(stateRoot, "o/r")
+		tombstone = removedState.Tombstones[removedKey]
+		return readErr == nil && tombstone.Action == "removed" && tombstone.CleanupPhase == "completed"
+	}) {
+		t.Fatalf("permanent removal was not durably completed: tombstone=%#v", tombstone)
+	}
+	if _, exists := removedState.Attempts[removedKey]; exists {
+		t.Fatal("permanently removed attempt remains authoritative")
 	}
 	for _, path := range []string{removedManifest.Worktree, removedResult, filepath.Dir(removedManifest.LogPath), removedSnapshot, removedReviewResult} {
 		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
@@ -724,7 +699,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 			t.Fatalf("selected tmux session remains after permanent removal: %s", session)
 		}
 	}
-	for _, path := range []string{filepath.Join(filepath.Dir(retainedManifest.LogPath), "manifest.json"), retainedHandoff, retainedSnapshot} {
+	for _, path := range []string{unrelatedRoot, unrelatedHandoff, unrelatedSnapshot} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("unrelated resource changed during permanent removal: %s: %v", path, err)
 		}
@@ -881,6 +856,8 @@ func fullSystemAttemptDiagnostics(address, stateRoot, implementationSession stri
 		_ = response.Body.Close()
 		fmt.Fprintf(&diagnostics, "status=%s read=%v\n", body, readErr)
 	}
+	ledger, ledgerErr := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
+	fmt.Fprintf(&diagnostics, "ledger=%s read=%v\n", ledger, ledgerErr)
 	runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot}
 	manifests, err := runtimeState.Discover()
 	fmt.Fprintf(&diagnostics, "manifests=%#v discover=%v\n", manifests, err)

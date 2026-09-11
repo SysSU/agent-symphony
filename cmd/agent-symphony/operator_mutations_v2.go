@@ -50,12 +50,16 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 	if !ok || !observation.Present || command.ObservationGeneration != observation.Generation || command.ObservationCycleID != observation.LastCycleID || command.ObservationBodyDigest != observation.Fact.BodyDigest {
 		return nil, errStaleStateResult
 	}
+	tombstone, tombstoned := state.Tombstones[attemptKey]
+	if observation.ObservationEpoch != state.Epoch && (!tombstoned || tombstone.CleanupPhase != "completed") {
+		return nil, errStaleStateResult
+	}
 	if request.Action == "recover" {
 		if effect, attached, err := attachOperatorRecovery(state, command, manifest); attached || err != nil {
 			return effect, err
 		}
 	}
-	if tombstone, ok := state.Tombstones[attemptKey]; ok {
+	if tombstoned {
 		if command.Identity.AttemptGeneration != tombstone.InvalidatedGeneration && command.Identity.AttemptGeneration != tombstone.Generation {
 			return nil, errStaleStateResult
 		}
@@ -132,7 +136,8 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 			return nil, errStateConflict
 		}
 		if command.Runtime != nil {
-			if status.State != "blocked" || !status.Retryable || status.PR > 0 || !slices.Equal(status.Blockers, []string{"runtime liveness mismatch"}) || !command.LivenessFailed || command.Reconciliation != nil || command.Runtime.Action != agentruntime.EffectStop || !strings.HasPrefix(command.Runtime.Reason, "dashboard recovery: ") || strings.TrimSpace(strings.TrimPrefix(command.Runtime.Reason, "dashboard recovery: ")) == "" || !reflect.DeepEqual(command.Runtime.Manifest, manifest) {
+			livenessRecoverable := status.State == "active" || status.State == "review-ready" || status.State == "blocked" && status.Retryable && slices.Equal(status.Blockers, []string{"runtime liveness mismatch"})
+			if manifest.State != "running" || !livenessRecoverable || status.PR > 0 || !command.LivenessFailed || command.Reconciliation != nil || command.Runtime.Action != agentruntime.EffectStop || !strings.HasPrefix(command.Runtime.Reason, "dashboard recovery: ") || strings.TrimSpace(strings.TrimPrefix(command.Runtime.Reason, "dashboard recovery: ")) == "" || !reflect.DeepEqual(command.Runtime.Manifest, manifest) {
 				return nil, errStateConflict
 			}
 			begin := *command.Runtime
@@ -474,11 +479,18 @@ func validTombstoneCleanupPolicy(tombstone runtimeTombstone) bool {
 	if tombstone.Action == "dismissed" {
 		return tombstone.CleanupPolicy == nil && tombstone.PublishedHead == "" && tombstone.CleanupPhase == "completed" && tombstone.EffectID == ""
 	}
+	if bareCompletedRemoval(tombstone) {
+		return true
+	}
 	if tombstone.CleanupPolicy == nil || tombstone.EffectID == "" {
 		return false
 	}
 	want := map[string]string{"archived": "archive", "abandoned": "abandon", "removed": "remove"}[tombstone.Action]
 	return want != "" && tombstone.CleanupPolicy.Action == want && tombstone.CleanupPolicy.PublishedHead == tombstone.PublishedHead && (want == "remove" && preflightObjectID.MatchString(tombstone.PublishedHead) || want != "remove" && tombstone.PublishedHead == "")
+}
+
+func bareCompletedRemoval(tombstone runtimeTombstone) bool {
+	return tombstone.Action == "removed" && tombstone.CleanupPhase == "completed" && tombstone.PublishedHead == "" && tombstone.Manifest == nil && tombstone.CleanupPolicy == nil && tombstone.EffectID == ""
 }
 
 func ownerOperatorStatus(state runtimeOwnerState, issue, attempt int) (orchestrator.RecoveryStatus, []orchestrator.RecoveryStatus, error) {

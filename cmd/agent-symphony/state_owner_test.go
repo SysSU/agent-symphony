@@ -11,8 +11,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
@@ -41,19 +43,94 @@ func TestRuntimeOwnerMigratesLegacyStateWithoutInstallingLedger(t *testing.T) {
 	}
 	key := ownerAttemptKey("o/r", 41, 1)
 	tombstone := state.Tombstones[key]
-	if tombstone.Action != "removed" || tombstone.CleanupPhase != "cleanup-started" || tombstone.PublishedHead != manifest.BaseSHA || tombstone.Manifest == nil || !sameAttemptIdentity(*tombstone.Manifest, manifest) || tombstone.CleanupPolicy == nil || tombstone.CleanupPolicy.Action != "remove" || state.AttemptGenerations[key] != 3 || tombstone.InvalidatedGeneration != 2 {
+	if tombstone.Action != "removed" || tombstone.CleanupPhase != "cleanup-started" || tombstone.PublishedHead != manifest.BaseSHA || tombstone.Manifest == nil || !sameAttemptIdentity(*tombstone.Manifest, manifest) || tombstone.CleanupPolicy == nil || tombstone.CleanupPolicy.Action != "remove" || state.AttemptGenerations[key] != 2 || tombstone.InvalidatedGeneration != 1 {
 		t.Fatalf("tombstone=%#v generation=%d", tombstone, state.AttemptGenerations[key])
 	}
-	if len(state.Attempts) != 0 || len(state.Effects) != 1 || len(state.ControlReceipts) != 0 {
+	if len(state.Attempts) != 0 || len(state.Effects) != 1 || len(state.ControlReceipts) != 1 {
 		t.Fatalf("state=%#v", state)
 	}
 	for _, effect := range state.Effects {
-		if effect.State != "pending" || effect.Action != string(agentruntime.EffectCleanup) || effect.AttemptGeneration != 3 || effect.IntentRevision != 1 {
+		if effect.State != "pending" || effect.Action != string(agentruntime.EffectCleanup) || effect.AttemptGeneration != 2 || effect.IntentEpoch != 1 || effect.IntentRevision != 1 || !agentruntime.ValidEffectRequestDigest(effect.RequestDigest) {
 			t.Fatalf("effect=%#v", effect)
 		}
 	}
+	if receipt := state.ControlReceipts[0]; receipt.State != "pending" || receipt.Phase != operatorPhaseCleanupStarted || receipt.EffectID != tombstone.EffectID || receipt.Request.Action != "remove" {
+		t.Fatalf("receipt=%#v", receipt)
+	}
 	if _, err := os.Lstat(filepath.Join(root, runtimeOwnerStateFile)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("dormant migration installed a ledger: %v", err)
+	}
+}
+
+func TestRuntimeOwnerMigratesCompletedLegacyRemovalWithoutResourceIdentity(t *testing.T) {
+	root := resolvedTempDir(t)
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	writeLegacyStateFixture(t, root, "dashboard-state.json", dashboardState{Version: dashboardStateVersion, Hidden: []dashboardHiddenAttempt{{Repository: "o/r", Issue: 42, Attempt: 1, Reason: "removed"}}})
+	state, migrated, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r")
+	if err != nil || !migrated {
+		t.Fatalf("migrated=%v err=%v", migrated, err)
+	}
+	key := ownerAttemptKey("o/r", 42, 1)
+	tombstone := state.Tombstones[key]
+	if !bareCompletedRemoval(tombstone) || state.AttemptGenerations[key] != tombstone.Generation || len(state.Effects) != 0 || len(state.ControlReceipts) != 0 {
+		t.Fatalf("state=%#v tombstone=%#v", state, tombstone)
+	}
+	state.Epoch, state.Revision, tombstone.Revision = 1, 1, 1
+	state.Tombstones[key] = tombstone
+	if err := validateRuntimeOwnerState(state, runtimeOwnerAttemptRoot(root), root, true); err != nil {
+		t.Fatalf("persisted terminal removal: %v", err)
+	}
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 42, Attempt: 1, PR: 9, BaseSHA: strings.Repeat("a", 40), HeadSHA: strings.Repeat("b", 40), State: "active", Checks: []string{}}
+	issue := issueFact(42, "stale")
+	issue.Active, issue.ActiveAttempt = true, &remote
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{remote}
+	accepted := applyReconciliationInput(t, owner, input)
+	projected, err := projectOwnerStatus(accepted, 1, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(projected.Statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 42 && status.Attempt == 1 }) {
+		t.Fatalf("completed removal was resurrected: %#v", projected.Statuses)
+	}
+}
+
+func TestRuntimeOwnerMigratedPendingRemovalResumesTypedCleanup(t *testing.T) {
+	root := resolvedTempDir(t)
+	if err := bindDeployment(root, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	manifest := writeDashboardManifest(t, root, 43, 1, "failed")
+	writeLegacyStateFixture(t, root, "removal-state.json", dashboardRemovalState{Version: removalStateVersion, Intents: []dashboardRemovalIntent{{Manifest: manifest, PublishedHead: manifest.BaseSHA, CleanupStarted: true}}})
+	state, migrated, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r")
+	if err != nil || !migrated {
+		t.Fatalf("migrated=%v err=%v", migrated, err)
+	}
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	if err := os.MkdirAll(productionSnapshotRoot(root), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	requestID := mustOwnerSnapshot(t, owner).State.ControlReceipts[0].Request.RequestID
+	if err := service.resumeReceipt(t.Context(), requestID); err != nil {
+		t.Fatal(err)
+	}
+	final := mustOwnerSnapshot(t, owner).State
+	key := ownerAttemptKey("o/r", 43, 1)
+	tombstone := final.Tombstones[key]
+	if tombstone.CleanupPhase != "completed" || final.Effects[tombstone.EffectID].State != "completed" || len(final.ControlReceipts) != 1 || final.ControlReceipts[0].State != "completed" {
+		t.Fatalf("state=%#v", final)
 	}
 }
 
@@ -343,6 +420,115 @@ func TestStateOwnerPersistenceFailureKeepsCommittedSnapshotAndDispatchesNothing(
 	snapshot, err = owner.snapshot(t.Context())
 	if err != nil || snapshot.State.Revision != 1 || len(snapshot.State.Tombstones) != 0 || len(snapshot.State.Effects) != 0 || len(snapshot.State.Attempts) != 1 {
 		t.Fatalf("committed snapshot=%#v err=%v", snapshot, err)
+	}
+}
+
+func TestStateOwnerCanceledQueuedCommandNeverReachesPersistence(t *testing.T) {
+	root := resolvedTempDir(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	writes := 0
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error {
+		writes++
+		if writes == 2 {
+			close(entered)
+			<-release
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	first := ownerTestManifest(t, root, 51, 1, "running")
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: first})
+		firstDone <- err
+	}()
+	<-entered
+	ctx, cancel := context.WithCancel(t.Context())
+	reply := make(chan stateOwnerResult, 1)
+	accepted := make(chan struct{})
+	command := stateOwnerCommand{kind: stateOwnerUpsertAttempt, upsert: upsertAttemptCommand{Manifest: ownerTestManifest(t, root, 52, 1, "running")}, reply: reply, canceled: ctx.Done()}
+	go func() { owner.commands <- command; close(accepted) }()
+	<-accepted
+	cancel()
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if result := <-reply; !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("queued result=%v", result.err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	if writes != 2 || state.IssueGenerations[ownerIssueKey("o/r", 52)] != 0 {
+		t.Fatalf("writes=%d state=%#v", writes, state)
+	}
+}
+
+func TestStateOwnerCancellationAfterPersistenceDispatchStillCommits(t *testing.T) {
+	root := resolvedTempDir(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	writes := 0
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error {
+		writes++
+		if writes == 2 {
+			close(entered)
+			<-release
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	<-owner.commits
+	ctx, cancel := context.WithCancel(t.Context())
+	manifest := ownerTestManifest(t, root, 54, 1, "running")
+	result := make(chan error, 1)
+	go func() { _, err := owner.upsertAttempt(ctx, upsertAttemptCommand{Manifest: manifest}); result <- err }()
+	<-entered
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("caller result=%v", err)
+	}
+	close(release)
+	committed := <-owner.commits
+	if _, ok := committed.State.Attempts[ownerAttemptKey("o/r", 54, 1)]; !ok {
+		t.Fatalf("dispatched command was not committed: %#v", committed.State)
+	}
+	if writes != 2 {
+		t.Fatalf("writes=%d", writes)
+	}
+}
+
+func TestStateOwnerInstalledPersistenceErrorPoisonsAdmission(t *testing.T) {
+	root := resolvedTempDir(t)
+	writes := 0
+	installed := statePersistenceInstalledError{err: errors.New("injected directory sync failure")}
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error {
+		writes++
+		if writes == 2 {
+			return installed
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	manifest := ownerTestManifest(t, root, 53, 1, "running")
+	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); !errors.Is(err, installed.err) {
+		t.Fatalf("installed error=%v", err)
+	}
+	if _, err := owner.snapshot(t.Context()); !errors.Is(err, installed.err) {
+		t.Fatalf("snapshot after installed error=%v", err)
+	}
+	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); !errors.Is(err, installed.err) {
+		t.Fatalf("mutation after installed error=%v", err)
+	}
+	if writes != 2 {
+		t.Fatalf("poisoned owner performed %d writes", writes)
 	}
 }
 

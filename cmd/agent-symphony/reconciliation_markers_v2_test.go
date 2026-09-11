@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -27,6 +29,60 @@ func TestReconciliationMarkersRoundTripEveryClosedVariant(t *testing.T) {
 				t.Fatalf("loaded=%#v want=%#v err=%v", loaded, result, err)
 			}
 		})
+	}
+}
+
+func TestReconciliationMarkerDirectorySyncsParentAfterFirstLink(t *testing.T) {
+	root := resolvedTempDir(t)
+	previous := immutableDirSync
+	t.Cleanup(func() { immutableDirSync = previous })
+	called := false
+	immutableDirSync = func(path string) error {
+		called = true
+		if path != root {
+			t.Fatalf("synced %q want %q", path, root)
+		}
+		if info, err := os.Lstat(filepath.Join(root, "reconciliation-effects")); err != nil || !info.IsDir() {
+			t.Fatalf("marker directory was not linked before parent sync: info=%v err=%v", info, err)
+		}
+		return errors.New("injected parent sync failure")
+	}
+	if _, err := reconciliationMarkerDirectory(root, true); err == nil || !strings.Contains(err.Error(), "injected parent sync failure") || !called {
+		t.Fatalf("called=%v err=%v", called, err)
+	}
+}
+
+func TestProductionMarkerDirectoriesSyncEachNewParentLink(t *testing.T) {
+	root := resolvedTempDir(t)
+	previous := immutableDirSync
+	t.Cleanup(func() { immutableDirSync = previous })
+	var calls int
+	immutableDirSync = func(path string) error {
+		calls++
+		if path != root {
+			t.Fatalf("synced %q want %q", path, root)
+		}
+		if info, err := os.Lstat(filepath.Join(root, "reconciliation-effects")); err != nil || !info.IsDir() {
+			t.Fatalf("reconciliation marker directory missing before sync: info=%v err=%v", info, err)
+		}
+		if calls == 2 {
+			if info, err := os.Lstat(filepath.Join(root, "runtime-effects")); err != nil || !info.IsDir() {
+				t.Fatalf("runtime marker directory missing before sync: info=%v err=%v", info, err)
+			}
+		}
+		return nil
+	}
+	if err := prepareProductionMarkerDirectories(root); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("parent sync calls=%d want 2", calls)
+	}
+	if err := prepareProductionMarkerDirectories(root); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("existing directories were synced again: calls=%d", calls)
 	}
 }
 
@@ -103,6 +159,51 @@ func TestReconciliationMarkerFinishesAfterPersistenceFailureAndRestart(t *testin
 	finished, _ := restarted.snapshot(t.Context())
 	if got := finished.State.Effects[effect.ID]; got.State != "completed" || got.Diagnostic != "" || !reflect.DeepEqual(got.ReconciliationResult, &result) {
 		t.Fatalf("restart did not commit marked result: %#v", got)
+	}
+}
+
+func TestReconciliationResultCancellationAfterPersistenceDispatchStillCommits(t *testing.T) {
+	test := reconciliationEffectCaseNamed(t, "github-bind")
+	persistEntered, persistRelease := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	root, owner, snapshot := reconciliationEffectPersistentOwnerWithPersist(t, test.request, func(state runtimeOwnerState) error {
+		for _, effect := range state.Effects {
+			if effect.State == "completed" && effect.Reconciliation != nil {
+				once.Do(func() { close(persistEntered) })
+				<-persistRelease
+				break
+			}
+		}
+		return nil
+	})
+	request := bindEffectObservation(snapshot, test.request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, cancel := context.WithCancel(t.Context())
+	coordinator := runtimeEffectCoordinator{lifecycle: lifecycle, owner: owner, active: map[string]*activeRuntimeEffect{}}
+	done := make(chan error, 1)
+	go func() {
+		done <- coordinator.finishReconciliationWithMarker(ownerReconciliationEffectIdentity(*effect), request, test.result(request))
+	}()
+	<-persistEntered
+	if _, err := os.Lstat(filepath.Join(root, "reconciliation-effects", effect.ID+".done")); err != nil {
+		t.Fatalf("result marker was not durable before owner finish: %v", err)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("finish caller err=%v want cancellation", err)
+	}
+	close(persistRelease)
+	for committed := range owner.commits {
+		if committed.State.Effects[effect.ID].State == "completed" {
+			break
+		}
+	}
+	current := mustOwnerSnapshot(t, owner)
+	if current.State.Effects[effect.ID].State != "completed" {
+		t.Fatalf("linearized finish did not commit after cancellation: %#v", current.State.Effects[effect.ID])
 	}
 }
 

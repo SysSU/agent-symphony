@@ -909,7 +909,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		project, err := newProjectDashboardServerV2(ctx, *runtimeState, c.Repository, peerProjects, "tmux", runtime.operator, *allowUnsafeDashboardNetwork, dashboardPassword)
+		project, err := newProjectDashboardServerV2(ctx, *runtimeState, c.Repository, peerProjects, "tmux", runtime.operator, c.Concurrency, *allowUnsafeDashboardNetwork, dashboardPassword)
 		if err != nil {
 			_ = runtime.shutdown(context.Background())
 			return fail(stderr, *jsonOutput, command, err.Error())
@@ -928,8 +928,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 			case <-ctx.Done():
 				ticker.Stop()
 				shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				dashboardErr := dashboard.shutdown(shutdown)
-				runtimeErr := runtime.shutdown(shutdown)
+				dashboardDone, runtimeDone := make(chan error, 1), make(chan error, 1)
+				go func() { dashboardDone <- dashboard.shutdown(shutdown) }()
+				go func() { runtimeDone <- runtime.shutdown(shutdown) }()
+				dashboardErr, runtimeErr := <-dashboardDone, <-runtimeDone
 				cancel()
 				if err := errors.Join(dashboardErr, runtimeErr); err != nil {
 					return fail(stderr, *jsonOutput, command, err.Error())
@@ -1961,6 +1963,10 @@ func reviewTarget(mode string, issue internalgithub.RecoveryIssueFact, base, hea
 	}
 }
 
+func missingTmuxPaneStatus(result agentruntime.Result) bool {
+	return !result.Exited && result.Code == 0 && strings.TrimSpace(result.Output) == "|||"
+}
+
 func validReviewTarget(mode, target, repository string, issue int, head string) bool {
 	if !agentruntime.ValidReviewTarget(mode, target, repository, issue) {
 		return false
@@ -2043,6 +2049,11 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if manifest.ReviewState == "running" && manifestMode == mode && manifestTarget == target && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
 		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
 		if err == nil {
+			// tmux reports a missing exact target as success with empty format
+			// fields. That is the pre-launch state for a durable reviewer intent.
+			if missingTmuxPaneStatus(result) {
+				goto launch
+			}
 			pane, statusErr := agentruntime.ParsePaneStatus(result.Output)
 			if statusErr != nil {
 				return independentReviewResult{}, false, fmt.Errorf("observe reviewer tmux session: %w", statusErr)
@@ -2075,6 +2086,8 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if mode == agentruntime.ReviewModePlan && target != currentTarget {
 		return independentReviewResult{}, false, errors.New("plan review target no longer matches the current issue body")
 	}
+
+launch:
 	if err := cleanupReviewResources(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot); err != nil {
 		return independentReviewResult{}, true, nil
 	}

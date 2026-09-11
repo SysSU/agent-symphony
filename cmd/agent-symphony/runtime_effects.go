@@ -116,6 +116,10 @@ func (c *runtimeEffectCoordinator) execute(_ context.Context, request agentrunti
 	if err != nil {
 		return agentruntime.EffectResult{}, err
 	}
+	return c.executeWithRun(request, run)
+}
+
+func (c *runtimeEffectCoordinator) executeWithRun(request agentruntime.EffectRequest, run *activeRuntimeEffect) (agentruntime.EffectResult, error) {
 	defer c.release(request, run)
 	if err := c.owner.authorizeRuntimeEffect(c.lifecycle, authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: request.Action}); err != nil {
 		return agentruntime.EffectResult{}, err
@@ -135,6 +139,20 @@ func (c *runtimeEffectCoordinator) execute(_ context.Context, request agentrunti
 		return result, errors.Join(err, finishErr)
 	}
 	return result, err
+}
+
+func (c *runtimeEffectCoordinator) dispatch(request agentruntime.EffectRequest, finished func()) error {
+	run, err := c.acquire(c.lifecycle, request)
+	if err != nil {
+		return err
+	}
+	go func() {
+		_, _ = c.executeWithRun(request, run)
+		if finished != nil {
+			finished()
+		}
+	}()
+	return nil
 }
 
 func (c *runtimeEffectCoordinator) executeOperator(request agentruntime.EffectRequest) (agentruntime.EffectResult, error) {

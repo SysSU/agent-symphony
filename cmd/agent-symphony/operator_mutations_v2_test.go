@@ -134,6 +134,7 @@ func TestOperatorDifferentAttemptsAdmitFromOneSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
 	snapshot := mustOwnerSnapshot(t, owner)
 	commands := make([]beginOperatorMutationCommand, len(manifests))
 	for index, manifest := range manifests {
@@ -163,6 +164,7 @@ func TestOperatorReceiptReplaySurvivesLaterRevisionAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	refreshOperatorObservation(t, owner)
 	snapshot := mustOwnerSnapshot(t, owner)
 	request := operatorRequest("dismiss-restart", "dismiss", manifest, false)
 	command := operatorCommand(snapshot, request, manifest)
@@ -409,6 +411,28 @@ func TestOperatorAdmissionRejectsStaleSameIssueObservationProof(t *testing.T) {
 	}
 }
 
+func TestOperatorAdmissionAndStatusRejectPreviousEpochObservation(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 315, "completed", true)
+	persisted := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, persisted, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	snapshot := mustOwnerSnapshot(t, restarted)
+	command := operatorCommand(snapshot, operatorRequest("dismiss-before-recollect", "dismiss", manifest, false), manifest)
+	if _, _, err := restarted.beginOperatorMutation(t.Context(), command); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("previous-epoch admission err=%v", err)
+	}
+	status, err := projectOwnerStatus(snapshot, 1, time.Unix(1, 0))
+	if err != nil || len(status.Statuses) != 1 || status.Statuses[0].State != "orphaned" || status.Statuses[0].DispatchAuthorized {
+		t.Fatalf("status=%#v err=%v", status, err)
+	}
+}
+
 func TestOwnerProjectionAndAdmissionRejectRemoteFailedLocalCompletedRecovery(t *testing.T) {
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, 314, 1, "completed")
@@ -422,6 +446,7 @@ func TestOwnerProjectionAndAdmissionRejectRemoteFailedLocalCompletedRecovery(t *
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
 	snapshot := mustOwnerSnapshot(t, owner)
 	projected, err := projectOwnerStatus(snapshot, 1, time.Unix(1, 0))
 	if err != nil || len(projected.Statuses) != 1 || projected.Statuses[0].Retryable || projected.Statuses[0].Action != "inspect inconsistent completed local attempt before recovery" {
@@ -526,7 +551,26 @@ func operatorTestOwner(t *testing.T, issue int, status string, closed bool) (*st
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
 	return owner, manifest
+}
+
+func refreshOperatorObservation(t *testing.T, owner *stateOwner) {
+	t.Helper()
+	snapshot := mustOwnerSnapshot(t, owner)
+	input := reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: snapshot.State.Repository}, Complete: true}
+	for _, observation := range snapshot.State.Observations {
+		if !observation.Present {
+			continue
+		}
+		input.Issues = append(input.Issues, expandIssueFact(observation.Fact))
+		for _, attempt := range observation.Attempts {
+			if attempt.Present {
+				input.Attempts = append(input.Attempts, expandAttemptFact(attempt.Fact))
+			}
+		}
+	}
+	applyReconciliationInput(t, owner, input)
 }
 
 func addOperatorObservation(state *runtimeOwnerState, manifest agentruntime.Manifest, status string, closed bool) {

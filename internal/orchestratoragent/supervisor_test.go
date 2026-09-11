@@ -54,6 +54,28 @@ func TestBoundLifecycleDoesNotReplaceForegroundRequestCancellation(t *testing.T)
 	}
 }
 
+func TestAuditCompletionReservationIsCanceledByLifecycle(t *testing.T) {
+	lifecycle, cancel := context.WithCancel(t.Context())
+	agent := &Supervisor{auditGeneration: 1}
+	if err := agent.BindLifecycle(lifecycle); err != nil {
+		t.Fatal(err)
+	}
+	run, generation, ok := agent.claimAuditCompletion(1)
+	if !ok || run == nil || generation == 0 {
+		t.Fatalf("run=%v generation=%d ok=%v", run, generation, ok)
+	}
+	cancel()
+	select {
+	case <-run.Done():
+	case <-t.Context().Done():
+		t.Fatal(t.Context().Err())
+	}
+	agent.release(generation)
+	if err := agent.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if f.honorCtx && ctx.Err() != nil {
 		return agentruntime.Result{}, ctx.Err()
@@ -1015,6 +1037,7 @@ func TestProjectionIsSanitizedBoundedAndInvestigateIsExact(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitHeartbeatReport(t, agent.Workspace, "completed")
+	waitAuditIdle(t, agent)
 	if runner.auditStarts.Load() != 2 {
 		t.Fatalf("investigate audits=%d want=2", runner.auditStarts.Load())
 	}

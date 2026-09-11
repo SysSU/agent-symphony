@@ -146,17 +146,21 @@ type reconciliationRunner struct {
 }
 
 type reconciliationTriggerRunner struct {
-	mu      sync.Mutex
-	run     func(context.Context) error
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wake    chan struct{}
-	done    chan struct{}
-	changed chan struct{}
-	stopped bool
-	running bool
-	runs    uint64
-	lastErr error
+	mu        sync.Mutex
+	run       func(context.Context) error
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wake      chan uint64
+	done      chan struct{}
+	stopped   bool
+	running   bool
+	runs      uint64
+	lastErr   error
+	nextID    uint64
+	queuedID  uint64
+	runningID uint64
+	waiters   map[uint64][]chan error
+	beforeRun func()
 }
 
 type applyReconciliationCommand struct{ Collection reconciliationCollection }
@@ -199,34 +203,31 @@ func newProductionReconciliationTriggerRunner(ctx context.Context, cycle func(co
 
 func newReconciliationTrigger(ctx context.Context, run func(context.Context) error) (*reconciliationTriggerRunner, error) {
 	lifecycle, cancel := context.WithCancel(ctx)
-	r := &reconciliationTriggerRunner{run: run, ctx: lifecycle, cancel: cancel, wake: make(chan struct{}, 1), done: make(chan struct{}), changed: make(chan struct{})}
+	r := &reconciliationTriggerRunner{run: run, ctx: lifecycle, cancel: cancel, wake: make(chan uint64, 1), done: make(chan struct{}), waiters: map[uint64][]chan error{}}
 	go r.loop()
 	return r, nil
 }
 
 func (r *reconciliationTriggerRunner) triggerAndWait(ctx context.Context) error {
-	if err := r.trigger(); err != nil {
+	wait := make(chan error, 1)
+	if err := r.request(wait); err != nil {
 		return err
 	}
-	for {
-		r.mu.Lock()
-		idle := !r.running && len(r.wake) == 0
-		lastErr, changed := r.lastErr, r.changed
-		r.mu.Unlock()
-		if idle {
-			return lastErr
-		}
-		select {
-		case <-changed:
-		case <-r.done:
-			return errStateOwnerStopped
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	select {
+	case err := <-wait:
+		return err
+	case <-r.done:
+		return errStateOwnerStopped
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
 func (r *reconciliationTriggerRunner) trigger() error {
+	return r.request(nil)
+}
+
+func (r *reconciliationTriggerRunner) request(wait chan error) error {
 	if r == nil {
 		return errors.New("reconciliation trigger runner is nil")
 	}
@@ -235,9 +236,14 @@ func (r *reconciliationTriggerRunner) trigger() error {
 	if r.stopped {
 		return errStateOwnerStopped
 	}
-	select {
-	case r.wake <- struct{}{}:
-	default:
+	id := r.queuedID
+	if id == 0 {
+		r.nextID++
+		id, r.queuedID = r.nextID, r.nextID
+		r.wake <- id
+	}
+	if wait != nil {
+		r.waiters[id] = append(r.waiters[id], wait)
 	}
 	return nil
 }
@@ -261,13 +267,28 @@ func (r *reconciliationTriggerRunner) shutdown(ctx context.Context) error {
 }
 
 func (r *reconciliationTriggerRunner) loop() {
-	defer close(r.done)
+	defer func() {
+		r.mu.Lock()
+		for _, waits := range r.waiters {
+			for _, wait := range waits {
+				wait <- errStateOwnerStopped
+			}
+		}
+		r.waiters = nil
+		r.mu.Unlock()
+		close(r.done)
+	}()
 	for {
 		select {
 		case <-r.ctx.Done():
 			return
-		case <-r.wake:
+		case id := <-r.wake:
+			if r.beforeRun != nil {
+				r.beforeRun()
+			}
 			r.mu.Lock()
+			r.queuedID = 0
+			r.runningID = id
 			r.running = true
 			r.mu.Unlock()
 			err := r.run(r.ctx)
@@ -279,14 +300,21 @@ func (r *reconciliationTriggerRunner) loop() {
 			r.runs++
 			r.lastErr = err
 			if recollect && r.ctx.Err() == nil {
-				select {
-				case r.wake <- struct{}{}:
-				default:
+				target := r.queuedID
+				if target == 0 {
+					r.nextID++
+					target, r.queuedID = r.nextID, r.nextID
+					r.wake <- target
+				}
+				r.waiters[target] = append(r.waiters[target], r.waiters[id]...)
+			} else {
+				for _, wait := range r.waiters[id] {
+					wait <- err
 				}
 			}
+			delete(r.waiters, id)
+			r.runningID = 0
 			r.running = false
-			close(r.changed)
-			r.changed = make(chan struct{})
 			r.mu.Unlock()
 			if r.ctx.Err() != nil {
 				return
@@ -441,7 +469,6 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 			continue
 		}
 		state.Observations[key] = next
-		pruneStaleReconciliationEffects(state, key)
 	}
 	return nil
 }
@@ -590,7 +617,6 @@ func applyReconciliationIssue(state *runtimeOwnerState, collection reconciliatio
 		}
 		state.Recoveries[attemptKey] = runtimePRRecovery{IssueGeneration: ownerIssueGeneration, AttemptGeneration: observation.OwnerGeneration, State: pr}
 	}
-	pruneStaleReconciliationEffects(state, key)
 	return nil
 }
 
@@ -652,9 +678,14 @@ func deleteAttemptObservation(state *runtimeOwnerState, repository string, issue
 		}{observation.Fact, updates})
 		digest := sha256.Sum256(body)
 		observation.InputDigest = hex.EncodeToString(digest[:])
+		for id, effect := range state.Effects {
+			request := effect.Reconciliation
+			if effect.State == "pending" && request != nil && request.GitHubIssueUpdate != nil && request.Repository == repository && request.Issue == issue && request.GitHubIssueUpdate.Kind == githubIssueDependencyClear && request.GitHubIssueUpdate.AttributionAttempt == attempt {
+				delete(state.Effects, id)
+			}
+		}
 	}
 	state.Observations[key] = observation
-	pruneStaleReconciliationEffects(state, key)
 	return nil
 }
 

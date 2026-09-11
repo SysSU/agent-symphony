@@ -291,25 +291,31 @@ func (s *Supervisor) release(generation uint64) {
 	s.mu.Unlock()
 }
 
-func (s *Supervisor) claimAuditCompletion(generation uint64) (uint64, bool) {
+func (s *Supervisor) claimAuditCompletion(generation uint64) (context.Context, uint64, bool) {
 	for {
 		s.mu.Lock()
 		if s.stopped || generation != s.auditGeneration {
 			s.mu.Unlock()
-			return 0, false
+			return nil, 0, false
 		}
 		if !s.active {
 			if s.activeGeneration == ^uint64(0) {
 				s.mu.Unlock()
-				return 0, false
+				return nil, 0, false
 			}
 			s.activeGeneration++
+			lifecycle := s.lifecycle
+			if lifecycle == nil {
+				lifecycle = context.Background()
+			}
+			run, cancel := context.WithCancel(lifecycle)
 			s.active = true
+			s.activeCancel = cancel
 			s.activeDone = make(chan struct{})
 			token := s.activeGeneration
 			s.wg.Add(1)
 			s.mu.Unlock()
-			return token, true
+			return run, token, true
 		}
 		done, lifecycle := s.activeDone, s.lifecycle
 		s.mu.Unlock()
@@ -319,7 +325,7 @@ func (s *Supervisor) claimAuditCompletion(generation uint64) (uint64, bool) {
 		select {
 		case <-done:
 		case <-lifecycle.Done():
-			return 0, false
+			return nil, 0, false
 		}
 	}
 }
@@ -939,7 +945,7 @@ func (s *Supervisor) runAudit(generation uint64, startedAt time.Time, projection
 		report.State = "failed"
 		report.Diagnostic = bounded(internalgithub.RedactEnvironment(runErr.Error(), s.Env))
 	}
-	completion, current := s.claimAuditCompletion(generation)
+	completionCtx, completion, current := s.claimAuditCompletion(generation)
 	if !current {
 		return
 	}
@@ -953,7 +959,7 @@ func (s *Supervisor) runAudit(generation uint64, startedAt time.Time, projection
 		_ = s.writeState(state)
 	}
 	if stateErr == nil && projectionDigest == digest(items) {
-		if attentionErr := s.startAttentionHandoff(context.Background(), &state, items, projectionDigest); attentionErr != nil {
+		if attentionErr := s.startAttentionHandoff(completionCtx, &state, items, projectionDigest); attentionErr != nil {
 			state.Diagnostic, state.UpdatedAt = bounded("start attention handoff: "+attentionErr.Error()), s.now()
 			_ = s.writeState(state)
 		}

@@ -560,7 +560,7 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 		if reviewer.Phase == "cleanup" {
 			return (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued") && reviewManifestMatches(manifest, reviewer)
 		}
-		return manifest.ReviewState == "" || (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") && reviewManifestMatches(manifest, reviewer)
+		return manifest.ReviewState == "" || (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") && reviewManifestMatches(manifest, reviewer) || manifest.ReviewState == "findings-queued" && manifest.ReviewHandoffAck && manifest.ReviewSnapshot == "" && manifest.ReviewSession == "" && manifest.ReviewHead != reviewer.HeadSHA
 	case reconciliationMonitoringCheckIn:
 		return manifest.State == "running" && observation.Fact.DispatchAuthorized && observation.Fact.NeedsAttention && remotelyObserved && (fact.State == "active" || fact.State == "review-ready") && fact.BaseSHA == manifest.BaseSHA
 	case reconciliationHandoffDeliver:
@@ -755,17 +755,6 @@ func deleteIssueRecoveries(state *runtimeOwnerState, repository string, issue in
 func deleteIssueScopedEffects(state *runtimeOwnerState, repository string, issue int) {
 	for id, effect := range state.Effects {
 		if !effectReferencedByReceipt(*state, id) && effect.Repository == repository && effect.Issue == issue && effect.Attempt == 0 {
-			delete(state.Effects, id)
-		}
-	}
-}
-
-func pruneStaleReconciliationEffects(state *runtimeOwnerState, issueKey string) {
-	for id, effect := range state.Effects {
-		if ownerIssueKey(effect.Repository, effect.Issue) != issueKey || effect.State != "pending" || effect.Reconciliation == nil {
-			continue
-		}
-		if !reconciliationObservationCurrent(*state, *effect.Reconciliation) {
 			delete(state.Effects, id)
 		}
 	}

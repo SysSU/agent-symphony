@@ -83,7 +83,7 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 	var remote []internalgithub.RecoveryAttemptFact
 	var issues []internalgithub.RecoveryIssueFact
 	for issueKey, observation := range snapshot.State.Observations {
-		if !observation.Present || observation.OwnerGeneration != snapshot.State.IssueGenerations[issueKey] {
+		if !observation.Present || observation.ObservationEpoch != snapshot.State.Epoch || observation.OwnerGeneration != snapshot.State.IssueGenerations[issueKey] {
 			continue
 		}
 		issue := expandIssueFact(observation.Fact)
@@ -121,7 +121,12 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 		return cmp.Compare(a.Attempt, b.Attempt)
 	})
 	_, facts := recoveryAttemptFacts(remote, issues)
-	statuses, _ := projectRecoveryStatuses(context.Background(), facts, issues, manifests, capacity, nil)
+	// A generation-current owner manifest is the last committed local runtime
+	// observation. Slow liveness checks run as monitor effects and update that
+	// manifest; projection must not reinterpret the absence of I/O here as a
+	// failed liveness check.
+	committedLiveness := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
+	statuses, _ := projectRecoveryStatuses(context.Background(), facts, issues, manifests, capacity, committedLiveness)
 	for _, effect := range snapshot.State.Effects {
 		if effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Phase != "run-observe" {
 			continue

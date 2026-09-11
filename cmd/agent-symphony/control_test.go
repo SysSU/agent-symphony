@@ -371,7 +371,7 @@ func TestControlCLIEmitsVersionedResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := operatorTestMutationService(t, owner)
-	project, err := newProjectDashboardServerV2(t.Context(), root, "o/r", nil, "tmux", service, false, "")
+	project, err := newProjectDashboardServerV2(t.Context(), root, "o/r", nil, "tmux", service, 1, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +412,7 @@ func TestChatSelectsExactReviewerAndRunningDaemonOrchestrator(t *testing.T) {
 	orchestratorSession := "as-o-o-r"
 	service := &fakeDashboardOrchestrator{target: orchestratoragent.AttachTarget{Session: orchestratorSession}}
 	operator := operatorTestMutationService(t, owner)
-	project, err := newProjectDashboardServerV2(t.Context(), root, "o/r", nil, "tmux", operator, false, "")
+	project, err := newProjectDashboardServerV2(t.Context(), root, "o/r", nil, "tmux", operator, 1, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

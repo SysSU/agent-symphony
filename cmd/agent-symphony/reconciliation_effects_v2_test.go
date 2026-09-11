@@ -141,8 +141,17 @@ func TestReconciliationEffectSurvivesIdenticalCycleAndRejectsChangedObservation(
 	changed := reconciliationEffectObservationInput(request, "changed")
 	applyReconciliationInput(t, owner, changed)
 	state, _ := owner.snapshot(t.Context())
-	if _, exists := state.State.Effects[effect.ID]; exists {
-		t.Fatal("changed observation retained stale pending effect")
+	retained, exists := state.State.Effects[effect.ID]
+	if !exists || retained.State != "pending" {
+		t.Fatalf("changed observation lost ambiguous pending effect: %#v", retained)
+	}
+	production := &productionReconciliation{owner: owner, effects: &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}}
+	if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{}); err != nil || resumed {
+		t.Fatalf("changed observation recovery=%v err=%v", resumed, err)
+	}
+	retained = mustOwnerSnapshot(t, owner).State.Effects[effect.ID]
+	if retained.State != "pending" || retained.Diagnostic == "" {
+		t.Fatalf("ambiguous changed-observation effect was not retained and diagnosed: %#v", retained)
 	}
 	if _, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: reconciliationIntentIdentity(*effect), Result: test.result(request)}); !errors.Is(err, errStaleStateResult) {
 		t.Fatalf("changed observation finish err=%v", err)
@@ -567,6 +576,8 @@ func reconciliationEffectCases(t *testing.T) []reconciliationEffectCase {
 				result.Handoff = &handoffEffectResult{Kind: request.Handoff.Kind, Key: request.Handoff.Key, OutcomePath: request.Handoff.OutcomePath, OutcomeToken: request.Handoff.OutcomeToken, Observed: true}
 			case reconciliationRetireCompleted:
 				result.Retire = &retireCompletedEffectResult{ResourcesGone: true}
+			case reconciliationMonitoringCheckIn:
+				result.CheckIn = &monitoringCheckInEffectResult{Session: request.CheckIn.Session, Observed: true}
 			}
 			_ = value
 			return result
@@ -618,6 +629,8 @@ func reconciliationEffectCases(t *testing.T) []reconciliationEffectCase {
 	recoveryOutcome.Handoff.Outcome = &internalgithub.HandoffOutcome{Key: recovery.Key, ValidationResult: "passed", ValidationEvidence: "tests passed"}
 	retire := common(reconciliationRetireCompleted)
 	retire.Retire = &retireCompletedEffectRequest{Mode: "abandon", HeadSHA: base}
+	checkIn := common(reconciliationMonitoringCheckIn)
+	checkIn.CheckIn = &monitoringCheckInEffectRequest{Binding: digest, Payload: `{\"type\":\"agent-symphony-monitoring-check-in-v1\"}`}
 	return []reconciliationEffectCase{
 		{"github-bind", bind, observed(reconciliationGitHubBind, nil)},
 		{"github-publish", publish, publishResult},
@@ -635,6 +648,7 @@ func reconciliationEffectCases(t *testing.T) []reconciliationEffectCase {
 		{"handoff-recovery", recoveryHandoff, observed(reconciliationHandoffDeliver, nil)},
 		{"handoff-recovery-outcome", recoveryOutcome, observed(reconciliationHandoffDeliver, nil)},
 		{"retire-completed", retire, observed(reconciliationRetireCompleted, nil)},
+		{"monitoring-check-in", checkIn, observed(reconciliationMonitoringCheckIn, nil)},
 	}
 }
 
@@ -750,6 +764,9 @@ func configureEffectFixture(root string, request reconciliationEffectRequest, ma
 	case reconciliationRetireCompleted:
 		manifest.State, manifest.ReviewHead = "running", head
 		request.Retire.HeadSHA = head
+	case reconciliationMonitoringCheckIn:
+		manifest.State = "running"
+		request.CheckIn.Session = manifest.Session
 	case reconciliationGitHubIssueUpdate:
 		switch request.GitHubIssueUpdate.Kind {
 		case githubIssueTerminalFailure, githubIssueRetry:
@@ -795,6 +812,10 @@ func reconciliationEffectObservationInput(request reconciliationEffectRequest, t
 			fact.State, fact.PublicationConfirmed = "active", true
 		}
 		if request.Action == reconciliationGitHubBind || request.Reviewer != nil && request.Reviewer.Mode == agentruntime.ReviewModePlan {
+			fact.HeadSHA, fact.State = "", "active"
+		}
+		if request.Action == reconciliationMonitoringCheckIn {
+			issue.NeedsAttention = true
 			fact.HeadSHA, fact.State = "", "active"
 		}
 		if request.GitHubIssueUpdate != nil && (request.GitHubIssueUpdate.Kind == githubIssueTerminalFailure || request.GitHubIssueUpdate.Kind == githubIssueRetry || request.GitHubIssueUpdate.Kind == githubIssueFindings) {

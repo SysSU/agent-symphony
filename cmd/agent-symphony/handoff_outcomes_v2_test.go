@@ -87,6 +87,34 @@ func TestCompletedHandoffOutcomeCrashCleanupUsesExactProof(t *testing.T) {
 	}
 }
 
+func TestUnmarkedHandoffOutcomeIntentResumesFromExactFile(t *testing.T) {
+	test := reconciliationEffectCaseNamed(t, "handoff-recovery-outcome")
+	root, owner, snapshot := reconciliationEffectPersistentOwner(t, test.request)
+	path := writeTestHandoffOutcome(t, root, snapshot, test.request)
+	plans, _, err := collectHandoffOutcomePlans(snapshot, root)
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%#v err=%v", plans, err)
+	}
+	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
+	plan, err := coordinator.beginReconciliation(t.Context(), plans[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner = restartOwnerWithInput(t, owner, reconciliationEffectObservationInput(plan.Request, "title"))
+	coordinator.owner = owner
+	production := &productionReconciliation{owner: owner, effects: coordinator, stateRoot: root}
+	if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{}); err != nil || !resumed {
+		t.Fatalf("resume=%v err=%v", resumed, err)
+	}
+	current := mustOwnerSnapshot(t, owner).State.Effects[plan.Identity.EffectID]
+	if current.State != "completed" {
+		t.Fatalf("effect=%#v", current)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("completed outcome was not removed: %v", err)
+	}
+}
+
 func TestHandoffOutcomeCollectionRejectsAmbiguousAndUnsafeFiles(t *testing.T) {
 	root := resolvedTempDir(t)
 	directory := filepath.Join(root, "handoff-outcomes")

@@ -451,6 +451,38 @@ func TestReconciliationCollectionDoesNotBlockOwnerMutations(t *testing.T) {
 	}
 }
 
+func TestRecoverAdmissionRemainsResponsiveDuringBlockedReconciliation(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 78, "active", false)
+	entered, release := make(chan struct{}), make(chan struct{})
+	runner := reconciliationRunner{owner: owner, collect: func(ctx context.Context, _ stateOwnerSnapshot) (reconciliationInput, error) {
+		close(entered)
+		select {
+		case <-release:
+			return repositoryInput(true), nil
+		case <-ctx.Done():
+			return reconciliationInput{}, ctx.Err()
+		}
+	}}
+	done := make(chan error, 1)
+	go func() { _, err := runner.run(t.Context()); done <- err }()
+	<-entered
+	service := operatorTestMutationService(t, owner)
+	stop, err := service.prepareStop(manifest, "dashboard recovery: runtime liveness mismatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := operatorCommand(mustOwnerSnapshot(t, owner), operatorRequest("recover-during-reconcile", "recover", manifest, false), manifest)
+	command.LivenessFailed = true
+	command.Runtime = &beginRuntimeEffectCommand{Identity: command.Identity, Action: stop.Action, Manifest: manifest, Reason: stop.Reason, RequestDigest: stop.Identity.RequestDigest}
+	if _, effect, err := owner.beginOperatorMutation(t.Context(), command); err != nil || effect == nil {
+		t.Fatalf("effect=%#v err=%v", effect, err)
+	}
+	close(release)
+	if err := <-done; err != nil && !errors.Is(err, errStaleStateResult) {
+		t.Fatal(err)
+	}
+}
+
 func TestReconciliationTriggersCoalesceToOneRerun(t *testing.T) {
 	owner := newReconciliationTestOwner(t)
 	entered := make(chan int, 3)
@@ -526,6 +558,66 @@ func TestReconciliationTriggerShutdownCancelsAndDrains(t *testing.T) {
 	triggered.mu.Unlock()
 	if runs != 1 || !errors.Is(lastErr, context.Canceled) {
 		t.Fatalf("shutdown runs=%d err=%v", runs, lastErr)
+	}
+}
+
+func TestReconciliationWaiterDoesNotReturnWhenWakeIsOnlyConsumed(t *testing.T) {
+	consumed, release, ran := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	triggered, err := newReconciliationTrigger(t.Context(), func(context.Context) error {
+		close(ran)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	triggered.beforeRun = func() {
+		close(consumed)
+		<-release
+	}
+	result := make(chan error, 1)
+	go func() { result <- triggered.triggerAndWait(t.Context()) }()
+	<-consumed
+	select {
+	case err := <-result:
+		t.Fatalf("wait returned before satisfying cycle ran: %v", err)
+	default:
+	}
+	close(release)
+	<-ran
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if err := triggered.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconciliationWaiterFollowsRequiredFreshCycle(t *testing.T) {
+	first, release, second := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	runs := 0
+	triggered, err := newReconciliationTrigger(t.Context(), func(context.Context) error {
+		runs++
+		if runs == 1 {
+			close(first)
+			<-release
+			return errReconciliationRecollect
+		}
+		close(second)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- triggered.triggerAndWait(t.Context()) }()
+	<-first
+	close(release)
+	<-second
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if err := triggered.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 }
 

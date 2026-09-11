@@ -199,6 +199,7 @@ func retryProposalOwner(t *testing.T, issue int) (*stateOwner, agentruntime.Mani
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = owner.close(t.Context()) })
+	refreshOperatorObservation(t, owner)
 	snapshot := mustOwnerSnapshot(t, owner)
 	projected, err := projectOwnerStatus(snapshot, 1, time.Now().UTC())
 	if err != nil || validateTransitionRetry(orchestratoragent.MessageProposal{Repository: manifest.Repository, Issue: issue, Attempt: 1}, projected.Statuses) != nil {

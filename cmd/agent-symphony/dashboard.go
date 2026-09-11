@@ -54,6 +54,7 @@ type dashboardServer struct {
 	reconcile    func(context.Context) error
 	issueClosed  func(context.Context, string, int) (bool, error)
 	operator     *operatorMutationService
+	capacity     int
 }
 
 type dashboardHiddenAttempt struct {
@@ -329,7 +330,7 @@ func (s *dashboardServer) readStatus() (dashboardStatusSnapshot, error) {
 		if err != nil {
 			return dashboardStatusSnapshot{}, err
 		}
-		return projectOwnerStatus(snapshot, maxReconciliationAttemptCount, time.Now())
+		return projectOwnerStatus(snapshot, s.capacity, time.Now())
 	}
 	body, err := readDashboardStatus(filepath.Join(s.stateRoot, "status.json"))
 	if err != nil {

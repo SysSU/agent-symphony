@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -155,6 +156,12 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	if _, err = p.owner.applyReconciliation(ctx, collection); err != nil {
 		return err
 	}
+	if resumed, err := p.resumePendingReconciliation(ctx, api, batch); err != nil || resumed {
+		if err != nil {
+			return err
+		}
+		return errReconciliationRecollect
+	}
 	if changed, err := p.runIssueUpdatePhase(ctx, api, batch, false); err != nil || changed {
 		if err != nil {
 			return err
@@ -225,6 +232,169 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 		return errReconciliationRecollect
 	}
 	return p.runRetirementPhase(ctx)
+}
+
+func (p *productionReconciliation) resumePendingReconciliation(ctx context.Context, api internalgithub.API, batch reconciliationV2Batch) (bool, error) {
+	snapshot, err := p.owner.snapshot(ctx)
+	if err != nil {
+		return false, err
+	}
+	operatorEffects := map[string]bool{}
+	for _, receipt := range snapshot.State.ControlReceipts {
+		if receipt.State == "pending" && receipt.EffectID != "" {
+			operatorEffects[receipt.EffectID] = true
+		}
+	}
+	ids := make([]string, 0, len(snapshot.State.Effects))
+	for id, effect := range snapshot.State.Effects {
+		if effect.State == "pending" && effect.Reconciliation != nil && !operatorEffects[id] {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	for _, id := range ids {
+		effect := snapshot.State.Effects[id]
+		if result, verifyErr := p.effects.verifyPendingReconciliation(ctx, effect); verifyErr != nil {
+			if _, err := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: effect.Reconciliation.Action, Diagnostic: "pending effect marker verification failed: " + internalgithub.Redact(verifyErr.Error())}); err != nil {
+				return false, err
+			}
+			continue
+		} else if result != nil {
+			return true, nil
+		}
+		resumed, resumeErr := p.resumeUnmarkedReconciliation(ctx, api, batch, snapshot, effect)
+		if resumeErr != nil {
+			if _, err := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: effect.Reconciliation.Action, Diagnostic: "pending effect reconstruction failed: " + internalgithub.Redact(resumeErr.Error())}); err != nil {
+				return false, err
+			}
+			continue
+		}
+		if resumed {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (p *productionReconciliation) resumeUnmarkedReconciliation(ctx context.Context, api internalgithub.API, batch reconciliationV2Batch, snapshot stateOwnerSnapshot, effect runtimeEffectIntent) (bool, error) {
+	request := *cloneReconciliationEffectRequest(effect.Reconciliation)
+	plan := reconciliationPlannedEffect{Identity: ownerReconciliationEffectIdentity(effect), Request: request}
+	rawIssues := map[string]internalgithub.RecoveryIssueFact{}
+	rawAttempts := map[string]internalgithub.RecoveryAttemptFact{}
+	for _, issue := range batch.Input.Issues {
+		rawIssues[ownerIssueKey(issue.Repository, issue.Issue)] = issue
+	}
+	for _, attempt := range batch.Input.Attempts {
+		rawAttempts[ownerAttemptKey(attempt.Repository, attempt.Issue, attempt.Attempt)] = attempt
+	}
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	switch request.Action {
+	case reconciliationGitHubBind:
+		plan.Material.Config = p.collector.Config
+		if githubBindExecutionDigest(request, p.collector.Config) != request.ExecutionDigest {
+			return false, errStateConflict
+		}
+		_, err := p.effects.executeGitHubBind(ctx, api, plan)
+		return err == nil, err
+	case reconciliationGitHubPublish:
+		record, ok := snapshot.State.Attempts[key]
+		issue, supplied := rawIssues[ownerIssueKey(request.Repository, request.Issue)]
+		if !ok || !supplied {
+			return false, errStaleStateResult
+		}
+		result, head, root, err := importWorkerExport(ctx, p.implementation, record.Manifest)
+		if err != nil {
+			return false, err
+		}
+		issue.Attempt = record.Manifest.Attempt
+		material := publicationExecutionMaterial{Issue: issue, Config: p.collector.Config, Root: root, Head: head, Validation: result.Validation, Documentation: result.Documentation, Decisions: result.Decisions}
+		if publicationExecutionDigest(request, material) != request.ExecutionDigest {
+			return false, errStateConflict
+		}
+		_, err = p.effects.executePublication(ctx, api, plan, material)
+		return err == nil, err
+	case reconciliationGitHubIssueUpdate:
+		if reconciliationEffectIssueScoped(request) {
+			update := request.GitHubIssueUpdate
+			accepted := reconciliationIssueUpdateProposal{Repository: request.Repository, Issue: request.Issue, Kind: update.Kind, ControlSnapshotDigest: update.ControlSnapshotDigest, AttributionAttempt: update.AttributionAttempt, Dependency: update.Dependency, PullRequest: update.PullRequest}
+			for _, material := range batch.IssueUpdates {
+				plan.Material = material
+				if reflect.DeepEqual(material.Proposal, accepted) && issueUpdateExecutionDigest(request, material) == request.ExecutionDigest {
+					_, err := p.effects.executeIssueUpdate(ctx, api, plan)
+					return err == nil, err
+				}
+			}
+			return false, errStaleStateResult
+		}
+		issue, issueOK := rawIssues[ownerIssueKey(request.Repository, request.Issue)]
+		attempt, attemptOK := rawAttempts[key]
+		if !issueOK {
+			return false, errStaleStateResult
+		}
+		plan.Material = reconciliationIssueUpdateMaterial{Config: p.collector.Config, Issue: &issue}
+		if attemptOK {
+			plan.Material.Attempt = &attempt
+		}
+		if issueUpdateExecutionDigest(request, plan.Material) != request.ExecutionDigest {
+			return false, errStateConflict
+		}
+		_, err := p.effects.executeIssueUpdate(ctx, api, plan)
+		return err == nil, err
+	case reconciliationGitHubPRGovernance:
+		attempt, ok := rawAttempts[key]
+		if !ok || governanceExecutionDigest(request, attempt) != request.ExecutionDigest {
+			return false, errStaleStateResult
+		}
+		plan.Attempt = &attempt
+		_, err := p.effects.executeGovernance(ctx, api, plan)
+		return err == nil, err
+	case reconciliationReviewer:
+		record, ok := snapshot.State.Attempts[key]
+		issue, supplied := rawIssues[ownerIssueKey(request.Repository, request.Issue)]
+		if !ok || !supplied {
+			return false, errStaleStateResult
+		}
+		_, head, source, err := importWorkerExport(ctx, p.implementation, record.Manifest)
+		if err != nil {
+			return false, err
+		}
+		issue.Attempt = record.Manifest.Attempt
+		material := reviewerExecutionMaterial{Issue: issue, Source: source, HeadSHA: head, Env: slices.Clone(p.reviewEnv), Command: slices.Clone(p.config.Commands.Reviewer)}
+		if reviewerExecutionDigest(request, material) != request.ExecutionDigest || digestText(issue.Body) != request.BodyDigest {
+			return false, errStateConflict
+		}
+		_, _, err = p.effects.executeReviewer(ctx, p.reviewer, plan, material)
+		return err == nil, err
+	case reconciliationHandoffDeliver:
+		if request.Handoff.Outcome != nil {
+			path := filepath.Join(p.stateRoot, "handoff-outcomes", request.Handoff.Key+".json")
+			if handoffOutcomeExecutionDigest(request, path) != request.ExecutionDigest {
+				return false, errStateConflict
+			}
+			_, err := p.effects.executeHandoffOutcome(ctx, plan, path)
+			return err == nil, err
+		}
+		expanded, err := config.ExpandManagedWorkspace(p.config.Commands.Implementation, request.Manifest.Worktree)
+		if err != nil {
+			return false, err
+		}
+		material := handoffExecutionMaterial{Command: expanded}
+		if handoffExecutionDigest(request, material) != request.ExecutionDigest {
+			return false, errStateConflict
+		}
+		_, err = p.effects.executeHandoff(ctx, p.implementation, plan, material)
+		return err == nil, err
+	case reconciliationRetireCompleted:
+		if retirementExecutionDigest(request) != request.ExecutionDigest {
+			return false, errStateConflict
+		}
+		_, err := p.effects.executeRetirement(ctx, p.implementation, plan)
+		return err == nil, err
+	case reconciliationMonitoringCheckIn:
+		return false, errors.New("check-in delivery has no safe unmarked completion proof")
+	default:
+		return false, errStateConflict
+	}
 }
 
 func (p *productionReconciliation) resumePendingRuntime(ctx context.Context, batch reconciliationV2Batch, source string) error {
@@ -303,12 +473,13 @@ func (p *productionReconciliation) resumePendingRuntime(ctx context.Context, bat
 				return err
 			}
 		case agentruntime.EffectRetry:
-			go func(request agentruntime.EffectRequest) {
-				_, _ = p.effects.execute(p.effects.lifecycle, request)
+			if err := p.effects.dispatch(bound, func() {
 				if p.wake != nil {
 					_ = p.wake()
 				}
-			}(bound)
+			}); err != nil {
+				return err
+			}
 		case agentruntime.EffectPending:
 			_, err = p.owner.diagnoseRuntimeEffect(ctx, diagnoseRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: action, Diagnostic: "external completion remains ambiguous"})
 			if err != nil {
@@ -344,12 +515,13 @@ func (p *productionReconciliation) runRuntimePhase(ctx context.Context, batch re
 			return err
 		}
 		if action == agentruntime.EffectMonitor {
-			go func() {
-				_, _ = p.effects.execute(p.effects.lifecycle, request)
+			if err := p.effects.dispatch(request, func() {
 				if p.wake != nil {
 					_ = p.wake()
 				}
-			}()
+			}); err != nil {
+				return err
+			}
 			continue
 		}
 		if _, err := p.effects.execute(ctx, request); err != nil {
@@ -393,8 +565,10 @@ func (p *productionReconciliation) runBindPhase(ctx context.Context, api interna
 	if err != nil {
 		return false, err
 	}
+	metrics := &internalgithub.CycleMetrics{}
+	api.Metrics = metrics
 	_, err = p.effects.executeGitHubBind(ctx, api, plan)
-	return err == nil, err
+	return metrics.Mutated(), err
 }
 
 func (p *productionReconciliation) executionCandidates(ctx context.Context, snapshot stateOwnerSnapshot, batch reconciliationV2Batch) ([]reviewerExecutionMaterial, []publicationExecutionMaterial, error) {
@@ -525,8 +699,10 @@ func (p *productionReconciliation) runGovernancePhase(ctx context.Context, api i
 	if err != nil {
 		return false, err
 	}
+	metrics := &internalgithub.CycleMetrics{}
+	api.Metrics = metrics
 	_, err = p.effects.executeGovernance(ctx, api, plan)
-	return err == nil, err
+	return metrics.Mutated(), err
 }
 
 func (p *productionReconciliation) runRetirementPhase(ctx context.Context) error {

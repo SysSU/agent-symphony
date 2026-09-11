@@ -312,6 +312,7 @@ type stateOwnerCommand struct {
 	advanceOperatorRecovery advanceOperatorRecoveryCommand
 	cycleOutcome            recordCycleOutcomeCommand
 	reply                   chan stateOwnerResult
+	canceled                <-chan struct{}
 }
 
 type recordCycleOutcomeCommand struct {
@@ -337,6 +338,11 @@ type statePersistenceRequest struct {
 	state runtimeOwnerState
 	reply chan error
 }
+
+type statePersistenceInstalledError struct{ err error }
+
+func (e statePersistenceInstalledError) Error() string { return e.err.Error() }
+func (e statePersistenceInstalledError) Unwrap() error { return e.err }
 
 type pendingStateCommit struct {
 	command   stateOwnerCommand
@@ -410,6 +416,7 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 	var inFlight *pendingStateCommit
 	var persistenceResult <-chan error
 	var stopReply chan error
+	var poisoned error
 	var cycleID uint64
 	appliedCycles := map[string]appliedReconciliationCycle{}
 	publish := func() {
@@ -429,6 +436,16 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 		for inFlight == nil && len(queue) > 0 {
 			command := queue[0]
 			queue = queue[1:]
+			if poisoned != nil {
+				command.reply <- stateOwnerResult{err: poisoned}
+				continue
+			}
+			select {
+			case <-command.canceled:
+				command.reply <- stateOwnerResult{err: context.Canceled}
+				continue
+			default:
+			}
 			candidate, effect, err := applyStateOwnerCommand(o.attemptRoot, o.stateRoot, committed, command, appliedCycles)
 			if err != nil {
 				command.reply <- stateOwnerResult{err: err}
@@ -440,9 +457,13 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				continue
 			}
 			reply := make(chan error, 1)
-			persistence <- statePersistenceRequest{state: candidate, reply: reply}
-			inFlight = &pendingStateCommit{command: command, candidate: candidate, effect: effect}
-			persistenceResult = reply
+			select {
+			case persistence <- statePersistenceRequest{state: candidate, reply: reply}:
+				inFlight = &pendingStateCommit{command: command, candidate: candidate, effect: effect}
+				persistenceResult = reply
+			case <-command.canceled:
+				command.reply <- stateOwnerResult{err: context.Canceled}
+			}
 		}
 	}
 
@@ -469,12 +490,16 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 		case command := <-commandInput:
 			if stopReply != nil {
 				command.reply <- stateOwnerResult{err: errStateOwnerStopped}
+			} else if poisoned != nil {
+				command.reply <- stateOwnerResult{err: poisoned}
 			} else {
 				queue = append(queue, command)
 			}
 		case request := <-o.snapshots:
 			if stopReply != nil {
 				request.reply <- stateOwnerResult{err: errStateOwnerStopped}
+			} else if poisoned != nil {
+				request.reply <- stateOwnerResult{err: poisoned}
 				continue
 			}
 			id := uint64(0)
@@ -491,6 +516,14 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				inFlight.command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(inFlight.effect)}
 			} else {
 				inFlight.command.reply <- stateOwnerResult{err: err}
+				var installed statePersistenceInstalledError
+				if errors.As(err, &installed) {
+					poisoned = err
+					for _, command := range queue {
+						command.reply <- stateOwnerResult{err: err}
+					}
+					queue = nil
+				}
 			}
 			inFlight, persistenceResult = nil, nil
 		case request := <-o.stop:
@@ -554,6 +587,7 @@ func (o *stateOwner) submit(ctx context.Context, command stateOwnerCommand) (sta
 		return stateOwnerResult{}, err
 	}
 	command.reply = make(chan stateOwnerResult, 1)
+	command.canceled = ctx.Done()
 	select {
 	case <-o.done:
 		return stateOwnerResult{}, errStateOwnerStopped
@@ -566,6 +600,8 @@ func (o *stateOwner) submit(ctx context.Context, command stateOwnerCommand) (sta
 		return result, result.err
 	case <-o.done:
 		return stateOwnerResult{}, errStateOwnerStopped
+	case <-ctx.Done():
+		return stateOwnerResult{}, ctx.Err()
 	}
 }
 
@@ -1421,10 +1457,10 @@ func migrateLegacyRuntimeState(stateRoot, legacyRecoveryPath, repository string)
 		return runtimeOwnerState{}, fmt.Errorf("migrate control receipts: %w", err)
 	}
 	for _, receipt := range receipts.Receipts {
-		if receipt.State == "pending" {
-			return runtimeOwnerState{}, fmt.Errorf("legacy control receipt %s is pending without a v2 effect proof", receipt.Request.RequestID)
-		}
 		state.ControlReceipts = append(state.ControlReceipts, cloneControlReceipt(receipt))
+	}
+	if err := bindMigratedRemovalReceipts(&state); err != nil {
+		return runtimeOwnerState{}, err
 	}
 	recoveries, err := readLegacyPRRecoveries(legacyRecoveryPath)
 	if err != nil {
@@ -1497,8 +1533,11 @@ func migrateLegacyTombstone(state *runtimeOwnerState, repository string, issue, 
 		}
 		return fmt.Errorf("legacy attempt %s has conflicting lifecycle state", attemptKey)
 	}
-	if action == "removed" && manifest == nil {
-		return errors.New("legacy permanent removal is missing its manifest identity")
+	if exists && action == "removed" {
+		invalidated, generation = existing.InvalidatedGeneration, existing.Generation
+	}
+	if action == "removed" && manifest == nil && phase != "completed" {
+		return errors.New("legacy pending permanent removal is missing its manifest identity")
 	}
 	if manifest == nil {
 		if record, ok := state.Attempts[attemptKey]; ok {
@@ -1514,7 +1553,7 @@ func migrateLegacyTombstone(state *runtimeOwnerState, repository string, issue, 
 	delete(state.Attempts, attemptKey)
 	state.AttemptGenerations[attemptKey] = generation
 	tombstone := runtimeTombstone{Repository: repository, Issue: issue, Attempt: attempt, Action: action, InvalidatedGeneration: invalidated, Generation: generation, CleanupPhase: phase, PublishedHead: publishedHead, Manifest: manifest}
-	if action != "dismissed" {
+	if action != "dismissed" && !(action == "removed" && phase == "completed" && manifest == nil) {
 		policy := agentruntime.EffectCleanupPolicy{Action: map[string]string{"archived": "archive", "abandoned": "abandon", "removed": "remove"}[action], PublishedHead: publishedHead}
 		if manifest != nil {
 			manifestSeen, logSeen, err := compatibilityResources(*manifest)
@@ -1529,11 +1568,61 @@ func migrateLegacyTombstone(state *runtimeOwnerState, repository string, issue, 
 			effectState = "completed"
 		}
 		effect := runtimeEffectIntent{Action: string(agentruntime.EffectCleanup), Repository: repository, Issue: issue, Attempt: attempt, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: generation, IntentRevision: 1, State: effectState}
+		if phase != "completed" {
+			request := agentruntime.EffectRequest{Action: agentruntime.EffectCleanup, Attempt: operatorEffectAttempt(*manifest), Manifest: cloneManifest(*manifest), Runtime: agentruntime.EffectRuntime{Tmux: "tmux"}, Cleanup: policy}
+			digest, err := agentruntime.EffectRequestDigest(request)
+			if err != nil {
+				return err
+			}
+			effect.IntentEpoch, effect.RequestDigest = 1, digest
+		}
 		effect.ID = runtimeEffectID(effect)
 		state.Effects[effect.ID] = effect
 		tombstone.EffectID = effect.ID
 	}
 	state.Tombstones[attemptKey] = tombstone
+	return nil
+}
+
+func bindMigratedRemovalReceipts(state *runtimeOwnerState) error {
+	bound := map[string]bool{}
+	for index := range state.ControlReceipts {
+		receipt := &state.ControlReceipts[index]
+		if receipt.State != "pending" {
+			continue
+		}
+		key := ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)
+		tombstone, ok := state.Tombstones[key]
+		if receipt.Request.Action != "remove" || !ok || tombstone.Action != "removed" {
+			return fmt.Errorf("legacy control receipt %s is pending without a v2 effect proof", receipt.Request.RequestID)
+		}
+		if bareCompletedRemoval(tombstone) {
+			receipt.State, receipt.Phase, receipt.EffectID = "completed", operatorPhaseCompleted, ""
+			receipt.Result = successfulOperatorResult(receipt.Request, 1)
+			continue
+		}
+		if tombstone.EffectID == "" || tombstone.CleanupPhase == "completed" {
+			return fmt.Errorf("legacy control receipt %s has invalid removal proof", receipt.Request.RequestID)
+		}
+		receipt.Phase, receipt.EffectID = operatorPhaseCleanupPending, tombstone.EffectID
+		if tombstone.CleanupPhase == "cleanup-started" {
+			receipt.Phase = operatorPhaseCleanupStarted
+		}
+		bound[tombstone.EffectID] = true
+	}
+	for key, tombstone := range state.Tombstones {
+		if tombstone.Action != "removed" || tombstone.CleanupPhase == "completed" || bound[tombstone.EffectID] {
+			continue
+		}
+		request := controlRequest{Version: controlVersion, RequestID: "migration-" + tombstone.EffectID, Repository: tombstone.Repository, Action: "remove", Issue: tombstone.Issue, Attempt: tombstone.Attempt, Confirm: true}
+		phase := operatorPhaseCleanupPending
+		if tombstone.CleanupPhase == "cleanup-started" {
+			phase = operatorPhaseCleanupStarted
+		}
+		if err := appendOperatorReceipt(state, controlReceipt{Request: request, State: "pending", Phase: phase, EffectID: tombstone.EffectID}); err != nil {
+			return fmt.Errorf("migrate removal %s receipt: %w", key, err)
+		}
+	}
 	return nil
 }
 
@@ -1581,10 +1670,13 @@ func writeRuntimeOwnerState(stateRoot, attemptRoot string, state runtimeOwnerSta
 	}
 	directory, err := os.Open(root)
 	if err != nil {
-		return err
+		return statePersistenceInstalledError{err: err}
 	}
 	defer directory.Close()
-	return directory.Sync()
+	if err := directory.Sync(); err != nil {
+		return statePersistenceInstalledError{err: err}
+	}
+	return nil
 }
 
 func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot string, persisted bool) error {
@@ -1649,14 +1741,16 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			if !ok || effect.Action != string(agentruntime.EffectCleanup) || effect.Repository != tombstone.Repository || effect.Issue != tombstone.Issue || effect.Attempt != tombstone.Attempt || effect.AttemptGeneration != tombstone.Generation || tombstone.CleanupPhase == "completed" && effect.State != "completed" || tombstone.CleanupPhase != "completed" && effect.State != "pending" {
 				return errors.New("runtime owner tombstone effect is invalid")
 			}
-		} else if tombstone.Action != "dismissed" {
+		} else if tombstone.Action != "dismissed" && !bareCompletedRemoval(tombstone) {
 			return errors.New("destructive tombstone lacks its cleanup effect")
 		}
 	}
 	for key, effect := range state.Effects {
 		maxRevision := state.Revision
+		maxEpoch := state.Epoch
 		if !persisted {
 			maxRevision++
+			maxEpoch++
 		}
 		issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 		receiptBoundCompletion := effect.State == "completed" && effectReferencedByReceipt(state, effect.ID)
@@ -1675,7 +1769,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Attempt < 1 || effect.Action == "" || effect.IssueGeneration == 0 || effect.AttemptGeneration == 0 || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" || !issueCurrent || state.AttemptGenerations[attemptKey] != effect.AttemptGeneration && !receiptBoundCompletion {
 			return errors.New("runtime owner effect intent is invalid")
 		}
-		if effect.RequestDigest != "" && (!agentruntime.ValidEffectRequestDigest(effect.RequestDigest) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || !validRuntimeEffectInput(agentruntime.EffectAction(effect.Action), effect.Reason) || (effect.Action == string(agentruntime.EffectReview)) != (effect.Review != nil)) {
+		if effect.RequestDigest != "" && (!agentruntime.ValidEffectRequestDigest(effect.RequestDigest) || effect.IntentEpoch == 0 || effect.IntentEpoch > maxEpoch || !validRuntimeEffectInput(agentruntime.EffectAction(effect.Action), effect.Reason) || (effect.Action == string(agentruntime.EffectReview)) != (effect.Review != nil)) {
 			return errors.New("runtime owner typed effect intent is invalid")
 		}
 		if effect.RequestDigest != "" && effect.Action == string(agentruntime.EffectReview) {
@@ -1696,7 +1790,11 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if seenReceipts[receipt.Request.RequestID] || !validControlRequest(receipt.Request, state.Repository) || receipt.State != "pending" && receipt.State != "completed" || receipt.State == "pending" && receipt.Result != nil || receipt.State == "completed" && (receipt.Result == nil || !validRecordedControlResult(*receipt.Result, receipt.Request)) || !validOperatorReceiptBinding(receipt) {
 			return errors.New("runtime owner control receipt is invalid")
 		}
-		if receipt.Phase != "" && receipt.State == "completed" && (receipt.Result.OwnerRevision == 0 || receipt.Result.OwnerRevision > state.Revision) {
+		maxRevision := state.Revision
+		if !persisted {
+			maxRevision++
+		}
+		if receipt.Phase != "" && receipt.State == "completed" && (receipt.Result.OwnerRevision == 0 || receipt.Result.OwnerRevision > maxRevision) {
 			return errors.New("runtime owner control receipt revision is invalid")
 		}
 		if receipt.EffectID != "" {

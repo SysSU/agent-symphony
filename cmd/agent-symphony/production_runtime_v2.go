@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
@@ -42,6 +43,9 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	}
 	if err := os.MkdirAll(attemptRoot, mode); err != nil {
 		return nil, fmt.Errorf("prepare attempt root: %w", err)
+	}
+	if err := prepareProductionMarkerDirectories(stateRoot); err != nil {
+		return nil, err
 	}
 	initial, _, err := loadOrMigrateRuntimeOwnerState(stateRoot, legacyRecoveryPath, cfg.Repository)
 	if err != nil {
@@ -140,31 +144,62 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	return runtime, nil
 }
 
+func prepareProductionMarkerDirectories(stateRoot string) error {
+	if _, err := reconciliationMarkerDirectory(stateRoot, true); err != nil {
+		return err
+	}
+	directory := filepath.Join(stateRoot, "runtime-effects")
+	created := false
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+	} else {
+		created = true
+	}
+	info, err := os.Lstat(directory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
+		return errors.New("runtime effect marker directory is unsafe")
+	}
+	if created {
+		return immutableDirSync(stateRoot)
+	}
+	return nil
+}
+
 func (r *productionRuntimeV2) shutdown(ctx context.Context) error {
 	if r == nil {
 		return nil
 	}
-	var result error
 	if r.cancel != nil {
 		r.cancel()
 	}
+	joins := []func() error{}
 	if r.proposal != nil {
-		result = errors.Join(result, r.proposal.shutdown(ctx))
+		joins = append(joins, func() error { return r.proposal.shutdown(ctx) })
 	}
 	if r.trigger != nil {
-		result = errors.Join(result, r.trigger.shutdown(ctx))
+		joins = append(joins, func() error { return r.trigger.shutdown(ctx) })
 	}
 	if r.operator != nil {
-		result = errors.Join(result, r.operator.shutdown(ctx))
+		joins = append(joins, func() error { return r.operator.shutdown(ctx) })
 	}
 	if r.effects != nil {
-		result = errors.Join(result, r.effects.shutdown(ctx))
+		joins = append(joins, func() error { return r.effects.shutdown(ctx) })
 	}
 	if r.status != nil {
-		result = errors.Join(result, r.status.wait(ctx))
+		joins = append(joins, func() error { return r.status.wait(ctx) })
 	}
 	if r.agent != nil {
-		result = errors.Join(result, r.agent.Shutdown(ctx))
+		joins = append(joins, func() error { return r.agent.Shutdown(ctx) })
+	}
+	results := make(chan error, len(joins))
+	for _, join := range joins {
+		go func() { results <- join() }()
+	}
+	var result error
+	for range joins {
+		result = errors.Join(result, <-results)
 	}
 	if r.owner != nil {
 		result = errors.Join(result, r.owner.close(ctx))

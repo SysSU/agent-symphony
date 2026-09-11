@@ -20,8 +20,13 @@ test("permanently removes one real historical attempt", async ({ page }) => {
     await dialog.accept();
   });
   await remove.click();
-  await expect(page.getByRole("status").filter({ hasText: "Permanently removed issue #73, attempt 1." })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "Permanently remove accepted for issue #73, attempt 1." })).toBeVisible();
   expect(confirmation).toContain("cannot be restored");
+
+  await expect.poll(async () => {
+    const state = await fetch(`${baseURL}/dashboard-state.json`, { cache: "no-store" }).then((response) => response.json());
+    return state.hidden?.some((attempt) => attempt.repository === "o/r" && attempt.issue === 73 && attempt.attempt === 1 && attempt.reason === "removed");
+  }, { timeout: 15_000 }).toBe(true);
 
   await page.reload();
   await expect(page.getByRole("button", { name: "Permanently remove issue #73, attempt 1" })).toHaveCount(0);

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
@@ -250,11 +251,24 @@ func TestExecuteEveryGitHubIssueUpdateVariantFromDurableIntent(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			plan := reconciliationPlannedEffect{Identity: ownerReconciliationEffectIdentity(*effect), Request: request, Material: material}
+			freshInput := reconciliationEffectObservationInput(request, "title")
+			freshInput.Issues[0].BaseSHA = snapshot.State.Observations[ownerIssueKey("o/r", request.Issue)].Fact.BaseSHA
+			owner = restartOwnerWithInput(t, owner, freshInput)
 			api := issueUpdateAppliedAPI(t, comments)
-			coordinator := runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
-			if _, err := coordinator.executeIssueUpdate(t.Context(), api, plan); err != nil {
-				t.Fatalf("execute %s: %v", name, err)
+			coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
+			batch := reconciliationV2Batch{}
+			if request.Attempt == 0 {
+				batch.IssueUpdates = []reconciliationIssueUpdateMaterial{material}
+			} else {
+				batch.Input.Issues = []internalgithub.RecoveryIssueFact{*material.Issue}
+				if material.Attempt != nil {
+					batch.Input.Attempts = []internalgithub.RecoveryAttemptFact{*material.Attempt}
+				}
+			}
+			production := &productionReconciliation{owner: owner, effects: coordinator, collector: reconciliationV2Collector{Config: cfg}}
+			if resumed, err := production.resumePendingReconciliation(t.Context(), api, batch); err != nil || !resumed {
+				current := mustOwnerSnapshot(t, owner)
+				t.Fatalf("resume %s: resumed=%v err=%v effect=%#v observation=%#v", name, resumed, err, current.State.Effects[effect.ID], current.State.Observations[ownerIssueKey("o/r", request.Issue)])
 			}
 			current, _ := owner.snapshot(t.Context())
 			if current.State.Effects[effect.ID].State != "completed" {
@@ -310,27 +324,13 @@ func TestPlanReconciliationGovernanceBindsAcceptedAttempt(t *testing.T) {
 	}
 }
 
-func TestGitHubBindPlannerExecutorUsesExactObservedBinding(t *testing.T) {
+func TestGitHubBindPlannerSkipsExactObservedBinding(t *testing.T) {
 	test := reconciliationEffectCaseNamed(t, "github-bind")
-	_, owner, snapshot := reconciliationEffectPersistentOwner(t, test.request)
+	_, _, snapshot := reconciliationEffectPersistentOwner(t, test.request)
 	cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}
 	plans, err := planReconciliationBinds(snapshot, cfg)
-	if err != nil || len(plans) != 1 {
-		t.Fatalf("plans=%#v err=%v", plans, err)
-	}
-	coordinator := runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
-	plan, err := coordinator.beginReconciliation(t.Context(), plans[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	marker, _ := internalgithub.ActiveAttemptMarker(plan.Request.Repository, plan.Request.Issue, plan.Request.Attempt, plan.Request.GitHubBind.BaseSHA)
-	comments := map[int][]map[string]any{plan.Request.Issue: {{"id": 1, "body": marker, "created_at": time.Unix(1, 0).UTC(), "updated_at": time.Unix(1, 0).UTC(), "user": map[string]any{"id": 42}}}}
-	if _, err := coordinator.executeGitHubBind(t.Context(), issueUpdateAppliedAPI(t, comments), plan); err != nil {
-		t.Fatal(err)
-	}
-	current, _ := owner.snapshot(t.Context())
-	if current.State.Effects[plan.Identity.EffectID].State != "completed" {
-		t.Fatalf("bind effect pending: %#v", current.State.Effects[plan.Identity.EffectID])
+	if err != nil || len(plans) != 0 {
+		t.Fatalf("plans=%#v observation=%#v err=%v", plans, snapshot.State.Observations[ownerIssueKey("o/r", test.request.Issue)], err)
 	}
 }
 
@@ -361,6 +361,18 @@ func TestReviewerPlannerUsesVerifiedCompletedHeadAndFullEnvironmentDigest(t *tes
 	changed.Env[0] = "GH_TOKEN=two"
 	if reviewerExecutionDigest(plans[0].Request, changed) == plans[0].Request.ExecutionDigest {
 		t.Fatal("changed effective environment reused reviewer authorization")
+	}
+	key := ownerAttemptKey("o/r", test.request.Issue, test.request.Attempt)
+	record := snapshot.State.Attempts[key]
+	oldHead := strings.Repeat("c", 40)
+	record.Manifest.ReviewState, record.Manifest.ReviewMode = "findings-queued", agentruntime.ReviewModeImplementation
+	record.Manifest.ReviewBase, record.Manifest.ReviewHead = record.Manifest.BaseSHA, oldHead
+	record.Manifest.ReviewTarget = record.Manifest.BaseSHA + ".." + oldHead
+	record.Manifest.ReviewHandoffQueued, record.Manifest.ReviewHandoffAck = true, true
+	snapshot.State.Attempts[key] = record
+	plans, _, err = planReconciliationReviewers(snapshot, root, []reviewerExecutionMaterial{candidate})
+	if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "run-observe" || plans[0].Request.Reviewer.HeadSHA != candidate.HeadSHA || !validReconciliationEffectStateBindings(root, snapshot.State, plans[0].Request) {
+		t.Fatalf("new worker head after findings handoff plans=%#v err=%v", plans, err)
 	}
 }
 
@@ -398,6 +410,26 @@ func TestReviewerCleanupRequiresExactSessionAbsenceBeforeFinish(t *testing.T) {
 	}
 }
 
+func TestCompletedReviewerCleanupDoesNotReplan(t *testing.T) {
+	test := reconciliationEffectCaseNamed(t, "reviewer-cleanup")
+	root, owner, snapshot := reconciliationEffectPersistentOwner(t, test.request)
+	request := bindEffectObservation(snapshot, test.request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(*effect), Result: test.result(request)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	material := reviewerExecutionMaterial{Issue: issueFact(request.Issue, "title"), Source: root, HeadSHA: request.Reviewer.HeadSHA, Command: []string{"reviewer"}}
+	material.Issue.Attempt = request.Attempt
+	plans, _, err := planReconciliationReviewers(finished, root, []reviewerExecutionMaterial{material})
+	if err != nil || len(plans) != 0 {
+		t.Fatalf("completed cleanup replanned: plans=%#v err=%v", plans, err)
+	}
+}
+
 type appliedHandoffBoundary struct{ handoff *handoffEffectRequest }
 
 func (b appliedHandoffBoundary) call(_ context.Context, operation string, _ agentruntime.Command) (agentruntime.Result, error) {
@@ -406,6 +438,20 @@ func (b appliedHandoffBoundary) call(_ context.Context, operation string, _ agen
 	}
 	body, _ := json.Marshal(handoffReceipt{Type: "agent-symphony-handoff-executed-v1", Key: b.handoff.Key, OutcomePath: b.handoff.OutcomePath, OutcomeToken: b.handoff.OutcomeToken})
 	return agentruntime.Result{Output: string(body)}, nil
+}
+
+func workerBoundaryResult(t *testing.T, output string) workerBoundaryRunner {
+	t.Helper()
+	return workerBoundaryResultValue(t, agentruntime.Result{Output: output})
+}
+
+func workerBoundaryResultValue(t *testing.T, result agentruntime.Result) workerBoundaryRunner {
+	t.Helper()
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `cat >/dev/null; printf %s "$BOUNDARY_RESULT"`}, Env: []string{"BOUNDARY_RESULT=" + string(encoded)}}
 }
 
 func TestHandoffPlannerExecutorCommitsExactReviewAndRecoveryAcknowledgements(t *testing.T) {
@@ -417,15 +463,21 @@ func TestHandoffPlannerExecutorCommitsExactReviewAndRecoveryAcknowledgements(t *
 			if err != nil || len(plans) != 1 {
 				t.Fatalf("plans=%#v err=%v", plans, err)
 			}
-			coordinator := runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
+			coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
 			plan, err := coordinator.beginReconciliation(t.Context(), plans[0])
 			if err != nil {
 				t.Fatal(err)
 			}
-			key := ownerAttemptKey(plan.Request.Repository, plan.Request.Issue, plan.Request.Attempt)
-			if _, err := coordinator.executeHandoff(t.Context(), appliedHandoffBoundary{plan.Request.Handoff}, plan, materials[key]); err != nil {
-				t.Fatal(err)
+			owner = restartOwnerWithInput(t, owner, reconciliationEffectObservationInput(plan.Request, "title"))
+			coordinator.owner = owner
+			cfg := config.Default("o/r")
+			cfg.Commands.Implementation = []string{"worker"}
+			ack, _ := json.Marshal(handoffReceipt{Type: "agent-symphony-handoff-executed-v1", Key: plan.Request.Handoff.Key, OutcomePath: plan.Request.Handoff.OutcomePath, OutcomeToken: plan.Request.Handoff.OutcomeToken})
+			production := &productionReconciliation{owner: owner, effects: coordinator, stateRoot: owner.stateRoot, config: cfg, implementation: workerBoundaryResult(t, string(ack))}
+			if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{}); err != nil || !resumed {
+				t.Fatalf("resume handoff=%v err=%v material=%#v", resumed, err, materials)
 			}
+			key := ownerAttemptKey(plan.Request.Repository, plan.Request.Issue, plan.Request.Attempt)
 			current, _ := owner.snapshot(t.Context())
 			if current.State.Effects[plan.Identity.EffectID].State != "completed" {
 				t.Fatalf("handoff effect pending: %#v", current.State.Effects[plan.Identity.EffectID])
@@ -689,13 +741,16 @@ func TestRetirementFinishRemovesLocalAuthorityAndDoesNotReplan(t *testing.T) {
 	if len(plans) != 1 {
 		t.Fatalf("retirement plans=%#v", plans)
 	}
-	plan, err := (&runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}).beginReconciliation(t.Context(), plans[0])
+	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
+	plan, err := coordinator.beginReconciliation(t.Context(), plans[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = (&runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}).executeRetirement(t.Context(), absentSessionBoundary{}, plan)
-	if err != nil {
-		t.Fatal(err)
+	owner = restartOwnerWithInput(t, owner, reconciliationEffectObservationInput(plan.Request, "title"))
+	coordinator.owner = owner
+	production := &productionReconciliation{owner: owner, effects: coordinator, implementation: workerBoundaryResultValue(t, agentruntime.Result{Exited: true, Code: 1})}
+	if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{}); err != nil || !resumed {
+		t.Fatalf("resume=%v err=%v", resumed, err)
 	}
 	finished, _ := owner.snapshot(t.Context())
 	key := ownerAttemptKey(plan.Request.Repository, plan.Request.Issue, plan.Request.Attempt)
@@ -720,6 +775,26 @@ func (absentSessionBoundary) call(_ context.Context, operation string, command a
 		return agentruntime.Result{Exited: true, Code: 1}, errors.New("session not found")
 	}
 	return agentruntime.Result{}, errors.New("unexpected boundary operation")
+}
+
+type retirementDirBoundary struct{ dir string }
+
+func (b *retirementDirBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if operation != "run" || command.Name != "tmux" || !slices.Contains(command.Args, "has-session") {
+		return agentruntime.Result{}, errors.New("unexpected boundary operation")
+	}
+	b.dir = command.Dir
+	return agentruntime.Result{Exited: true, Code: 1}, errors.New("session not found")
+}
+
+func TestRetirementSessionProbeUsesImplementationBoundaryRoot(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 191, 1, "completed")
+	boundary := &retirementDirBoundary{}
+	gone, err := retiredResourcesGone(t.Context(), boundary, manifest, root)
+	if err != nil || !gone || boundary.dir != productionAttemptRoot(root) {
+		t.Fatalf("gone=%v dir=%q want=%q err=%v", gone, boundary.dir, productionAttemptRoot(root), err)
+	}
 }
 
 func TestIssueUpdateRevalidationCancelsAfterOwnerInvalidationWithoutMutation(t *testing.T) {

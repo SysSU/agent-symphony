@@ -33,6 +33,29 @@ func TestRuntimeEffectSupersededBeforeExecutionPerformsNoIO(t *testing.T) {
 	}
 }
 
+func TestRuntimeEffectDispatchRegistersBeforeSpawnAndShutdownJoins(t *testing.T) {
+	coordinator, owner, _, manifest := runtimeEffectTestCoordinator(t, 72)
+	request := beginRuntimeTestEffect(t, coordinator, owner, agentruntime.EffectMonitor, manifest, "")
+	if err := coordinator.dispatch(request, nil); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.mu.Lock()
+	active := len(coordinator.active)
+	coordinator.mu.Unlock()
+	if active != 1 {
+		t.Fatalf("dispatch returned with %d registered effects", active)
+	}
+	if err := coordinator.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.mu.Lock()
+	active = len(coordinator.active)
+	coordinator.mu.Unlock()
+	if active != 0 {
+		t.Fatalf("shutdown left %d effects", active)
+	}
+}
+
 func TestRuntimeEffectPendingIntentRejectsOlderGenericAttemptResult(t *testing.T) {
 	coordinator, owner, _, manifest := runtimeEffectTestCoordinator(t, 91)
 	cycle, err := owner.reconciliationSnapshot(t.Context())

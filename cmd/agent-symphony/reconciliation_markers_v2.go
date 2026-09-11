@@ -155,9 +155,14 @@ func reconciliationMarkerIdentityFor(identity stateResultIdentity, request recon
 
 func reconciliationMarkerDirectory(stateRoot string, create bool) (string, error) {
 	directory := filepath.Join(stateRoot, "reconciliation-effects")
+	created := false
 	if create {
-		if err := os.Mkdir(directory, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-			return "", err
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			if !errors.Is(err, os.ErrExist) {
+				return "", err
+			}
+		} else {
+			created = true
 		}
 	}
 	info, err := os.Lstat(directory)
@@ -166,6 +171,11 @@ func reconciliationMarkerDirectory(stateRoot string, create bool) (string, error
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
 		return "", errors.New("reconciliation effect marker directory is unsafe")
+	}
+	if created {
+		if err := immutableDirSync(stateRoot); err != nil {
+			return "", err
+		}
 	}
 	return directory, nil
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
@@ -63,7 +64,8 @@ func TestOwnerStatusProjectionMatchesRecoveryProjection(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, facts := recoveryAttemptFacts(input.Attempts, input.Issues)
-			want, _ := projectRecoveryStatuses(context.Background(), facts, input.Issues, []agentruntime.Manifest{manifest}, 1, nil)
+			committedLiveness := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
+			want, _ := projectRecoveryStatuses(context.Background(), facts, input.Issues, []agentruntime.Manifest{manifest}, 1, committedLiveness)
 			if !reflect.DeepEqual(got.Statuses, want) {
 				t.Fatalf("owner projection=%#v\nv1 projection=%#v", got.Statuses, want)
 			}

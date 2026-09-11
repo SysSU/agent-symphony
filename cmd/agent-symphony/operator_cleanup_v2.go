@@ -87,7 +87,7 @@ func (e operatorCleanupExecutor) verify(ctx context.Context, request agentruntim
 	attempt := agentruntime.Attempt{Repository: request.Manifest.Repository, Issue: request.Manifest.Issue, Number: request.Manifest.Attempt, BaseSHA: request.Manifest.BaseSHA}
 	snapshotRoot := productionSnapshotRoot(e.stateRoot)
 	expectedSnapshot, expectedSession := reviewIdentity(attempt, snapshotRoot)
-	result, err := e.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + expectedSession}, Dir: e.stateRoot})
+	result, err := e.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + expectedSession}, Dir: snapshotRoot})
 	if err == nil {
 		return false, nil
 	}

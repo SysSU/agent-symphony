@@ -422,15 +422,18 @@ func planReconciliationReviewers(snapshot stateOwnerSnapshot, stateRoot string, 
 		}
 		phase, mode, target, base, head := "run-observe", manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead
 		snapshotPath, session := reviewIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(stateRoot))
-		if manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued" {
+		if manifest.State == "completed" && validOptionalObjectID(candidate.HeadSHA) && candidate.HeadSHA != "" && candidate.HeadSHA != manifest.BaseSHA && candidate.HeadSHA != manifest.ReviewHead {
+			mode, base, head, target = agentruntime.ReviewModeImplementation, manifest.BaseSHA, candidate.HeadSHA, manifest.BaseSHA+".."+candidate.HeadSHA
+		} else if manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued" {
+			if manifest.ReviewSnapshot == "" && manifest.ReviewSession == "" {
+				continue
+			}
 			phase, mode, target, base, head, snapshotPath, session = "cleanup", manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession
 		} else if manifest.ReviewState == "preparing" || manifest.ReviewState == "running" {
 			expected := reviewerEffectRequest{Mode: mode, Target: target, BaseSHA: base, HeadSHA: head, Snapshot: snapshotPath, Session: session}
 			if !reviewManifestMatches(manifest, &expected) {
 				continue
 			}
-		} else if manifest.State == "completed" && manifest.ReviewState == "" && validOptionalObjectID(candidate.HeadSHA) && candidate.HeadSHA != "" && candidate.HeadSHA != manifest.BaseSHA {
-			mode, base, head, target = agentruntime.ReviewModeImplementation, manifest.BaseSHA, candidate.HeadSHA, manifest.BaseSHA+".."+candidate.HeadSHA
 		} else {
 			continue
 		}
@@ -536,6 +539,9 @@ func planReconciliationBinds(snapshot stateOwnerSnapshot, cfg internalgithub.PRA
 		if !ok || !observation.Present || observation.OwnerGeneration != snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)] || record.Generation != snapshot.State.AttemptGenerations[key] || manifest.State != "preparing" || !observation.Fact.DispatchAuthorized || observation.Fact.Attempt != manifest.Attempt || observation.Fact.BaseSHA != manifest.BaseSHA {
 			continue
 		}
+		if fact, observed := observedReconciliationAttempt(observation, manifest.Attempt); observed && (fact.State == "active" || fact.State == "review-ready") && fact.BaseSHA == manifest.BaseSHA {
+			continue
+		}
 		detail := "Implementation session reserved.\n\n- Project: `" + manifest.Repository + "`\n- Branch: `" + manifest.Branch + "`\n- Worktree: `" + manifest.Worktree + "`\n- Session: `" + manifest.Session + "`"
 		request := reconciliationEffectRequest{Action: reconciliationGitHubBind, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Manifest: ptrManifest(manifest), ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, GitHubBind: &githubBindEffectRequest{BaseSHA: manifest.BaseSHA, Branch: manifest.Branch, Detail: detail}}
 		material := reconciliationIssueUpdateMaterial{Config: cfg}
@@ -618,7 +624,7 @@ func retiredResourcesGone(ctx context.Context, boundary boundaryCaller, manifest
 			return false, err
 		}
 	}
-	result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + manifest.Session}, Dir: stateRoot})
+	result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + manifest.Session}, Dir: productionAttemptRoot(stateRoot)})
 	if result.Exited && result.Code == 1 {
 		return true, nil
 	}
@@ -700,6 +706,9 @@ func planReconciliationGovernance(snapshot stateOwnerSnapshot, cfg internalgithu
 			remote := expandAttemptFact(fact)
 			request := reconciliationEffectRequest{Action: reconciliationGitHubPRGovernance, Repository: fact.Repository, Issue: fact.Issue, Attempt: fact.Attempt, Manifest: ptrManifest(record.Manifest), ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, GitHubPRGovernance: &githubGovernanceEffectRequest{PR: fact.PR, HeadSHA: fact.HeadSHA, Policy: cfg}}
 			request.ExecutionDigest = governanceExecutionDigest(request, remote)
+			if completedReconciliationRequest(snapshot.State, request) {
+				continue
+			}
 			plans = append(plans, reconciliationPlannedEffect{Identity: ownerReconciliationBeginIdentity(snapshot, request), Request: request, Attempt: &remote})
 		}
 	}
