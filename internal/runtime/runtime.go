@@ -867,32 +867,14 @@ func (r *Runtime) identify(a Attempt) (Manifest, error) {
 
 // AttemptIdentity returns the exact boundary-visible resources for an attempt.
 func AttemptIdentity(root string, a Attempt) (Manifest, error) {
-	parts := strings.Split(a.Repository, "/")
-	if len(parts) != 2 || !component.MatchString(parts[0]) || !component.MatchString(parts[1]) || a.Issue < 1 || a.Number < 1 || !commitID.MatchString(a.BaseSHA) {
-		return Manifest{}, fmt.Errorf("invalid attempt identity or base SHA")
+	if !filepath.IsAbs(root) {
+		return Manifest{}, errors.New("runtime root must be absolute")
 	}
-	repoID := internalgithub.RepositoryIdentifier(a.Repository)
-	name := fmt.Sprintf("%s-%d-%d", repoID, a.Issue, a.Number)
-	branch, err := internalgithub.AttemptBranch(a.Repository, a.Issue, a.Number)
+	canonical, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		return Manifest{}, err
+		return Manifest{}, fmt.Errorf("resolve runtime root: %w", err)
 	}
-	session, err := AttemptSessionName(SessionRoleImplementation, a.Repository, a.Issue, a.Number)
-	if err != nil {
-		return Manifest{}, err
-	}
-	if len(name) > maxResourceName || len(branch) > maxResourceName || len(session) > maxResourceName {
-		return Manifest{}, fmt.Errorf("attempt resource name exceeds %d bytes", maxResourceName)
-	}
-	worktree, err := below(root, name)
-	if err != nil {
-		return Manifest{}, err
-	}
-	if len(worktree) > maxPathLength || len(ResultPath(worktree)) > maxPathLength {
-		return Manifest{}, fmt.Errorf("attempt path must be absolute and at most %d bytes", maxPathLength)
-	}
-	return Manifest{Version: manifestVersion, Repository: a.Repository, Issue: a.Issue, Attempt: a.Number,
-		Branch: branch, Worktree: worktree, Session: session, BaseSHA: a.BaseSHA, Interactive: a.Interactive}, nil
+	return attemptIdentity(canonical, a)
 }
 
 func (r *Runtime) rejectCaseCollision(repository string) error {
@@ -969,6 +951,10 @@ func (r *Runtime) validateManifest(attempt Attempt, manifest Manifest) error {
 	if err != nil {
 		return err
 	}
+	return validateManifestIdentity(want, manifest)
+}
+
+func validateManifestIdentity(want, manifest Manifest) error {
 	if manifest.Version != want.Version || manifest.Repository != want.Repository || manifest.Issue != want.Issue || manifest.Attempt != want.Attempt ||
 		manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session || manifest.BaseSHA != want.BaseSHA || manifest.LogPath != want.LogPath {
 		return fmt.Errorf("manifest does not match deterministic attempt resources")
@@ -1009,28 +995,54 @@ func (r *Runtime) validateManifest(attempt Attempt, manifest Manifest) error {
 	}
 }
 
-// ValidateManifest verifies a persisted manifest against its deterministic
-// repository resources without reading or writing runtime state.
+// ValidateManifest verifies a persisted manifest against deterministic
+// identities rooted at caller-canonicalized paths. It performs no I/O.
 func ValidateManifest(root, stateRoot string, manifest Manifest) error {
-	r := Runtime{Root: root, StateRoot: stateRoot}
 	attempt := Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
-	return r.validateManifest(attempt, manifest)
+	want, err := attemptIdentity(root, attempt)
+	if err != nil {
+		return err
+	}
+	if !filepath.IsAbs(stateRoot) || filepath.Clean(stateRoot) != stateRoot {
+		return errors.New("runtime state root must be canonical and absolute")
+	}
+	want.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), fmt.Sprintf("%d-%d", attempt.Issue, attempt.Number), "agent.log")
+	if len(want.LogPath) > maxPathLength {
+		return fmt.Errorf("attempt path must be absolute and at most %d bytes", maxPathLength)
+	}
+	return validateManifestIdentity(want, manifest)
 }
 
-func below(root, name string) (string, error) {
-	if !filepath.IsAbs(root) {
-		return "", fmt.Errorf("runtime root must be absolute")
+func attemptIdentity(root string, a Attempt) (Manifest, error) {
+	if !filepath.IsAbs(root) || filepath.Clean(root) != root {
+		return Manifest{}, errors.New("attempt root must be canonical and absolute")
 	}
-	root, err := filepath.EvalSymlinks(root)
+	parts := strings.Split(a.Repository, "/")
+	if len(parts) != 2 || !component.MatchString(parts[0]) || !component.MatchString(parts[1]) || a.Issue < 1 || a.Number < 1 || !commitID.MatchString(a.BaseSHA) {
+		return Manifest{}, fmt.Errorf("invalid attempt identity or base SHA")
+	}
+	repoID := internalgithub.RepositoryIdentifier(a.Repository)
+	name := fmt.Sprintf("%s-%d-%d", repoID, a.Issue, a.Number)
+	branch, err := internalgithub.AttemptBranch(a.Repository, a.Issue, a.Number)
 	if err != nil {
-		return "", fmt.Errorf("resolve runtime root: %w", err)
+		return Manifest{}, err
 	}
-	path := filepath.Join(root, name)
-	rel, err := filepath.Rel(root, path)
+	session, err := AttemptSessionName(SessionRoleImplementation, a.Repository, a.Issue, a.Number)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if len(name) > maxResourceName || len(branch) > maxResourceName || len(session) > maxResourceName {
+		return Manifest{}, fmt.Errorf("attempt resource name exceeds %d bytes", maxResourceName)
+	}
+	worktree := filepath.Join(root, name)
+	rel, err := filepath.Rel(root, worktree)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("attempt path escapes runtime root")
+		return Manifest{}, errors.New("attempt path escapes canonical root")
 	}
-	return path, nil
+	if len(worktree) > maxPathLength || len(ResultPath(worktree)) > maxPathLength {
+		return Manifest{}, fmt.Errorf("attempt path must be absolute and at most %d bytes", maxPathLength)
+	}
+	return Manifest{Version: manifestVersion, Repository: a.Repository, Issue: a.Issue, Attempt: a.Number, Branch: branch, Worktree: worktree, Session: session, BaseSHA: a.BaseSHA, Interactive: a.Interactive}, nil
 }
 
 func (r *Runtime) manifestPath(a Attempt) string {

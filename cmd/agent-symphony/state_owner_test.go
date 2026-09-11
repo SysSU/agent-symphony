@@ -120,7 +120,9 @@ func TestRuntimeOwnerExistingLedgerIsOneWayAndRestartIncrementsEpoch(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner, err := startStateOwner(t.Context(), root, initial, func(state runtimeOwnerState) error { return writeRuntimeOwnerState(root, state) })
+	owner, err := startTestStateOwner(t, root, initial, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), state)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +140,9 @@ func TestRuntimeOwnerExistingLedgerIsOneWayAndRestartIncrementsEpoch(t *testing.
 	if err != nil || migrated || !reflect.DeepEqual(loaded, first) {
 		t.Fatalf("one-way loaded=%#v migrated=%v err=%v", loaded, migrated, err)
 	}
-	owner, err = startStateOwner(t.Context(), root, loaded, func(state runtimeOwnerState) error { return writeRuntimeOwnerState(root, state) })
+	owner, err = startTestStateOwner(t, root, loaded, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), state)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +164,7 @@ func TestStateOwnerPersistenceFailureKeepsCommittedSnapshotAndDispatchesNothing(
 	initial.Attempts[attemptKey] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
 	entered, release := make(chan struct{}), make(chan struct{})
 	writes := 0
-	owner, err := startStateOwner(t.Context(), root, initial, func(runtimeOwnerState) error {
+	owner, err := startTestStateOwner(t, root, initial, func(runtimeOwnerState) error {
 		writes++
 		if writes == 1 {
 			return nil
@@ -196,7 +200,7 @@ func TestStateOwnerPersistenceFailureKeepsCommittedSnapshotAndDispatchesNothing(
 func TestStateOwnerRevisionGenerationTombstoneAndOutOfOrderResults(t *testing.T) {
 	root := resolvedTempDir(t)
 	var persisted runtimeOwnerState
-	owner, err := startStateOwner(t.Context(), root, newRuntimeOwnerState("o/r"), func(state runtimeOwnerState) error {
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(state runtimeOwnerState) error {
 		persisted = cloneRuntimeOwnerState(state)
 		return nil
 	})
@@ -255,7 +259,7 @@ func TestStateOwnerRevisionGenerationTombstoneAndOutOfOrderResults(t *testing.T)
 
 func TestStateOwnerSynchronousAttemptChangeInvalidatesOlderResult(t *testing.T) {
 	root := resolvedTempDir(t)
-	owner, err := startStateOwner(t.Context(), root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +287,7 @@ func TestStateOwnerSynchronousAttemptChangeInvalidatesOlderResult(t *testing.T) 
 
 func TestStateOwnerRejectsEffectCompletionAfterIssueGenerationChanges(t *testing.T) {
 	root := resolvedTempDir(t)
-	owner, err := startStateOwner(t.Context(), root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,14 +310,14 @@ func TestStateOwnerRejectsEffectCompletionAfterIssueGenerationChanges(t *testing
 		t.Fatalf("completion err=%v", err)
 	}
 	state, _ := owner.snapshot(t.Context())
-	if len(state.State.Effects) != 0 || validateRuntimeOwnerState(state.State, root, true) != nil {
+	if len(state.State.Effects) != 0 || validateRuntimeOwnerState(state.State, runtimeOwnerAttemptRoot(root), root, true) != nil {
 		t.Fatalf("state=%#v", state)
 	}
 }
 
 func TestStateOwnerCompletesTombstoneCleanupAfterIssueGenerationChanges(t *testing.T) {
 	root := resolvedTempDir(t)
-	owner, err := startStateOwner(t.Context(), root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +340,7 @@ func TestStateOwnerCompletesTombstoneCleanupAfterIssueGenerationChanges(t *testi
 		t.Fatal(err)
 	}
 	tombstone := completed.State.Tombstones[ownerAttemptKey("o/r", 48, 1)]
-	if tombstone.CleanupPhase != "completed" || completed.State.Effects[effect.ID].State != "completed" || validateRuntimeOwnerState(completed.State, root, true) != nil {
+	if tombstone.CleanupPhase != "completed" || completed.State.Effects[effect.ID].State != "completed" || validateRuntimeOwnerState(completed.State, runtimeOwnerAttemptRoot(root), root, true) != nil {
 		t.Fatalf("completed=%#v", completed)
 	}
 }
@@ -352,7 +356,7 @@ func TestRuntimeOwnerValidationRejectsEffectWithStaleIssueGeneration(t *testing.
 	effect := runtimeEffectIntent{Action: "monitor", Repository: "o/r", Issue: 47, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, IntentRevision: 2, State: "pending"}
 	effect.ID = runtimeEffectID(effect)
 	state.Effects[effect.ID] = effect
-	if err := validateRuntimeOwnerState(state, root, true); err == nil {
+	if err := validateRuntimeOwnerState(state, runtimeOwnerAttemptRoot(root), root, true); err == nil {
 		t.Fatal("effect with stale issue generation was accepted")
 	}
 }
@@ -375,7 +379,7 @@ func TestStateOwnerRejectsUnrecoverablePendingTombstones(t *testing.T) {
 			issueKey, attemptKey := ownerIssueKey("o/r", 49), ownerAttemptKey("o/r", 49, 1)
 			initial.IssueGenerations[issueKey], initial.AttemptGenerations[attemptKey] = 1, 1
 			initial.Attempts[attemptKey] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
-			owner, err := startStateOwner(t.Context(), root, initial, func(runtimeOwnerState) error { return nil })
+			owner, err := startTestStateOwner(t, root, initial, func(runtimeOwnerState) error { return nil })
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -400,7 +404,7 @@ func TestStateOwnerShutdownDrainsWriteAndRejectsAcceptedQueue(t *testing.T) {
 	root := resolvedTempDir(t)
 	entered, release := make(chan struct{}), make(chan struct{})
 	writes := 0
-	owner, err := startStateOwner(t.Context(), root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error {
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error {
 		writes++
 		if writes == 2 {
 			close(entered)
@@ -447,7 +451,7 @@ func TestRuntimeOwnerWriterRoundTripsPrivateValidatedState(t *testing.T) {
 	root := resolvedTempDir(t)
 	state := newRuntimeOwnerState("o/r")
 	state.Epoch, state.Revision = 1, 1
-	if err := writeRuntimeOwnerState(root, state); err != nil {
+	if err := writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), state); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := readRuntimeOwnerState(root, "o/r")
@@ -468,7 +472,7 @@ func TestRuntimeOwnerWriterRoundTripsPrivateValidatedState(t *testing.T) {
 
 func TestStateOwnerControlReceiptTransitionIsDurableAndIdempotent(t *testing.T) {
 	root := resolvedTempDir(t)
-	owner, err := startStateOwner(t.Context(), root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +501,7 @@ func TestStateOwnerControlReceiptTransitionIsDurableAndIdempotent(t *testing.T) 
 
 func TestStateOwnerRejectsManifestRootChosenByCaller(t *testing.T) {
 	root, foreign := resolvedTempDir(t), resolvedTempDir(t)
-	owner, err := startStateOwner(t.Context(), root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,23 +512,55 @@ func TestStateOwnerRejectsManifestRootChosenByCaller(t *testing.T) {
 	}
 }
 
+func TestStateOwnerTransitionsUseBoundIdentityWithoutFilesystemAccess(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 61, 1, "running")
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	key := ownerAttemptKey("o/r", 61, 1)
+	if err != nil || snapshot.State.Revision != 2 || snapshot.State.Attempts[key].Manifest.Worktree != manifest.Worktree {
+		t.Fatalf("snapshot=%#v err=%v", snapshot, err)
+	}
+}
+
 func ownerTestManifest(t *testing.T, stateRoot string, issue, attempt int, state string) agentruntime.Manifest {
 	t.Helper()
 	return writeDashboardManifest(t, stateRoot, issue, attempt, state)
+}
+
+func startTestStateOwner(t *testing.T, stateRoot string, state runtimeOwnerState, persist func(runtimeOwnerState) error) (*stateOwner, error) {
+	t.Helper()
+	attemptRoot := productionAttemptRoot(stateRoot)
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := filepath.EvalSymlinks(attemptRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return startStateOwner(t.Context(), stateRoot, canonical, state, persist)
 }
 
 func TestRuntimeOwnerRejectsInvalidIssueGenerationKey(t *testing.T) {
 	state := newRuntimeOwnerState("o/r")
 	state.Epoch, state.Revision = 1, 1
 	state.IssueGenerations["o/r#0"] = 1
-	if err := validateRuntimeOwnerState(state, resolvedTempDir(t), true); err == nil {
+	root := resolvedTempDir(t)
+	if err := validateRuntimeOwnerState(state, runtimeOwnerAttemptRoot(root), root, true); err == nil {
 		t.Fatal("issue zero generation was accepted")
 	}
 }
 
 func TestStateOwnerConcurrentSnapshotsDoNotAlias(t *testing.T) {
 	root := resolvedTempDir(t)
-	owner, err := startStateOwner(t.Context(), root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
+	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}

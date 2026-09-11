@@ -194,14 +194,15 @@ type pendingStateCommit struct {
 // stateOwner is the sole in-process commit authority for a v2 runtime ledger.
 // Production activation is intentionally deferred until every v1 writer is removed.
 type stateOwner struct {
-	stateRoot string
-	commands  chan stateOwnerCommand
-	snapshots chan stateOwnerSnapshotRequest
-	stop      chan stateOwnerStopRequest
-	done      chan struct{}
+	stateRoot   string
+	attemptRoot string
+	commands    chan stateOwnerCommand
+	snapshots   chan stateOwnerSnapshotRequest
+	stop        chan stateOwnerStopRequest
+	done        chan struct{}
 }
 
-func startStateOwner(ctx context.Context, stateRoot string, initial runtimeOwnerState, persist func(runtimeOwnerState) error) (*stateOwner, error) {
+func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial runtimeOwnerState, persist func(runtimeOwnerState) error) (*stateOwner, error) {
 	if persist == nil {
 		return nil, errors.New("state persistence is required")
 	}
@@ -209,15 +210,20 @@ func startStateOwner(ctx context.Context, stateRoot string, initial runtimeOwner
 	if err != nil || root != filepath.Clean(stateRoot) {
 		return nil, errors.New("runtime state root is unsafe")
 	}
-	if err := validateRuntimeOwnerState(initial, root, false); err != nil {
+	attempts, err := filepath.EvalSymlinks(attemptRoot)
+	if err != nil || attempts != filepath.Clean(attemptRoot) {
+		return nil, errors.New("runtime attempt root is unsafe")
+	}
+	if err := validateRuntimeOwnerState(initial, attempts, root, false); err != nil {
 		return nil, err
 	}
 	owner := &stateOwner{
-		stateRoot: root,
-		commands:  make(chan stateOwnerCommand),
-		snapshots: make(chan stateOwnerSnapshotRequest),
-		stop:      make(chan stateOwnerStopRequest),
-		done:      make(chan struct{}),
+		stateRoot:   root,
+		attemptRoot: attempts,
+		commands:    make(chan stateOwnerCommand),
+		snapshots:   make(chan stateOwnerSnapshotRequest),
+		stop:        make(chan stateOwnerStopRequest),
+		done:        make(chan struct{}),
 	}
 	persistRequests := make(chan statePersistenceRequest, 1)
 	persistDone := make(chan struct{})
@@ -250,7 +256,7 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 		for inFlight == nil && len(queue) > 0 {
 			command := queue[0]
 			queue = queue[1:]
-			candidate, effect, err := applyStateOwnerCommand(o.stateRoot, committed, command)
+			candidate, effect, err := applyStateOwnerCommand(o.attemptRoot, o.stateRoot, committed, command)
 			if err != nil {
 				command.reply <- stateOwnerResult{err: err}
 				continue
@@ -417,14 +423,14 @@ func (o *stateOwner) recordControlReceipt(ctx context.Context, receipt controlRe
 	return result.snapshot, err
 }
 
-func applyStateOwnerCommand(stateRoot string, committed runtimeOwnerState, command stateOwnerCommand) (runtimeOwnerState, *runtimeEffectIntent, error) {
+func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwnerState, command stateOwnerCommand) (runtimeOwnerState, *runtimeEffectIntent, error) {
 	candidate := cloneRuntimeOwnerState(committed)
 	if command.kind == stateOwnerStart {
 		if candidate.Epoch == ^uint64(0) {
 			return runtimeOwnerState{}, nil, errors.New("runtime epoch overflow")
 		}
 		candidate.Epoch++
-		return finishRuntimeOwnerTransition(stateRoot, candidate, nil)
+		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, nil)
 	}
 	switch command.kind {
 	case stateOwnerAdvanceIssueGeneration:
@@ -432,20 +438,20 @@ func applyStateOwnerCommand(stateRoot string, committed runtimeOwnerState, comma
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerUpsertAttempt:
-		if err := applyUpsertAttempt(stateRoot, &candidate, command.upsert); err != nil {
+		if err := applyUpsertAttempt(attemptRoot, stateRoot, &candidate, command.upsert); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerInvalidateAttempt:
-		effect, err := applyInvalidateAttempt(stateRoot, &candidate, command.invalidate)
+		effect, err := applyInvalidateAttempt(attemptRoot, stateRoot, &candidate, command.invalidate)
 		if err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 		if reflect.DeepEqual(candidate, committed) {
 			return candidate, effect, nil
 		}
-		return finishRuntimeOwnerTransition(stateRoot, candidate, effect)
+		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect)
 	case stateOwnerApplyAttemptResult:
-		if err := applyAttemptResult(stateRoot, &candidate, command.apply); err != nil {
+		if err := applyAttemptResult(attemptRoot, stateRoot, &candidate, command.apply); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerRecordEffect:
@@ -453,7 +459,7 @@ func applyStateOwnerCommand(stateRoot string, committed runtimeOwnerState, comma
 		if err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
-		return finishRuntimeOwnerTransition(stateRoot, candidate, effect)
+		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect)
 	case stateOwnerCompleteEffect:
 		if err := applyCompleteEffect(&candidate, command.complete); err != nil {
 			return runtimeOwnerState{}, nil, err
@@ -468,7 +474,7 @@ func applyStateOwnerCommand(stateRoot string, committed runtimeOwnerState, comma
 	if reflect.DeepEqual(candidate, committed) {
 		return candidate, nil, nil
 	}
-	return finishRuntimeOwnerTransition(stateRoot, candidate, nil)
+	return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, nil)
 }
 
 func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueGenerationCommand) error {
@@ -492,7 +498,7 @@ func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueG
 	return nil
 }
 
-func finishRuntimeOwnerTransition(stateRoot string, candidate runtimeOwnerState, effect *runtimeEffectIntent) (runtimeOwnerState, *runtimeEffectIntent, error) {
+func finishRuntimeOwnerTransition(attemptRoot, stateRoot string, candidate runtimeOwnerState, effect *runtimeEffectIntent) (runtimeOwnerState, *runtimeEffectIntent, error) {
 	if candidate.Revision == ^uint64(0) {
 		return runtimeOwnerState{}, nil, errors.New("runtime revision overflow")
 	}
@@ -513,15 +519,15 @@ func finishRuntimeOwnerTransition(stateRoot string, candidate runtimeOwnerState,
 			candidate.Tombstones[key] = tombstone
 		}
 	}
-	if err := validateRuntimeOwnerState(candidate, stateRoot, true); err != nil {
+	if err := validateRuntimeOwnerState(candidate, attemptRoot, stateRoot, true); err != nil {
 		return runtimeOwnerState{}, nil, err
 	}
 	return candidate, cloneEffect(effect), nil
 }
 
-func applyUpsertAttempt(stateRoot string, state *runtimeOwnerState, command upsertAttemptCommand) error {
+func applyUpsertAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState, command upsertAttemptCommand) error {
 	manifest := cloneManifest(command.Manifest)
-	if err := validateOwnerManifest(state.Repository, stateRoot, manifest); err != nil {
+	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil {
 		return err
 	}
 	issueKey, attemptKey := ownerIssueKey(manifest.Repository, manifest.Issue), ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
@@ -555,7 +561,7 @@ func applyUpsertAttempt(stateRoot string, state *runtimeOwnerState, command upse
 	return nil
 }
 
-func applyInvalidateAttempt(stateRoot string, state *runtimeOwnerState, command invalidateAttemptCommand) (*runtimeEffectIntent, error) {
+func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState, command invalidateAttemptCommand) (*runtimeEffectIntent, error) {
 	if command.Repository != state.Repository || command.Issue < 1 || command.Attempt < 1 || !validTombstoneAction(command.Action) || !validCleanupPhase(command.CleanupPhase) {
 		return nil, errStateConflict
 	}
@@ -581,7 +587,7 @@ func applyInvalidateAttempt(stateRoot string, state *runtimeOwnerState, command 
 	}
 	if command.Manifest != nil {
 		manifest := cloneManifest(*command.Manifest)
-		if err := validateOwnerManifest(state.Repository, stateRoot, manifest); err != nil || manifest.Issue != command.Issue || manifest.Attempt != command.Attempt {
+		if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || manifest.Issue != command.Issue || manifest.Attempt != command.Attempt {
 			return nil, errStateConflict
 		}
 		command.Manifest = &manifest
@@ -608,9 +614,9 @@ func applyInvalidateAttempt(stateRoot string, state *runtimeOwnerState, command 
 	return &runtimeEffectIntent{Action: command.EffectAction, Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt, IssueGeneration: command.ExpectedIssueGeneration, AttemptGeneration: generation, State: "pending"}, nil
 }
 
-func applyAttemptResult(stateRoot string, state *runtimeOwnerState, command applyAttemptResultCommand) error {
+func applyAttemptResult(attemptRoot, stateRoot string, state *runtimeOwnerState, command applyAttemptResultCommand) error {
 	identity, manifest := command.Identity, cloneManifest(command.Manifest)
-	if err := validateOwnerManifest(state.Repository, stateRoot, manifest); err != nil || identity.Epoch != state.Epoch || identity.SourceRevision == 0 || identity.SourceRevision > state.Revision || command.Global && identity.SourceRevision != state.Revision || identity.CycleID == 0 {
+	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || identity.Epoch != state.Epoch || identity.SourceRevision == 0 || identity.SourceRevision > state.Revision || command.Global && identity.SourceRevision != state.Revision || identity.CycleID == 0 {
 		return errStaleStateResult
 	}
 	issueKey, attemptKey := ownerIssueKey(manifest.Repository, manifest.Issue), ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
@@ -742,7 +748,7 @@ func readRuntimeOwnerState(stateRoot, repository string) (runtimeOwnerState, err
 	if decoder.Decode(&state) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return runtimeOwnerState{}, errors.New("runtime owner ledger is invalid")
 	}
-	if err := validateRuntimeOwnerState(state, stateRoot, true); err != nil || state.Repository != repository {
+	if err := validateRuntimeOwnerState(state, runtimeOwnerAttemptRoot(stateRoot), stateRoot, true); err != nil || state.Repository != repository {
 		if err == nil {
 			err = fmt.Errorf("runtime state is bound to project %s, not %s", state.Repository, repository)
 		}
@@ -808,7 +814,7 @@ func migrateLegacyRuntimeState(stateRoot, repository string) (runtimeOwnerState,
 	for index, receipt := range receipts.Receipts {
 		state.ControlReceipts[index] = cloneControlReceipt(receipt)
 	}
-	if err := validateRuntimeOwnerState(state, stateRoot, false); err != nil {
+	if err := validateRuntimeOwnerState(state, runtimeOwnerAttemptRoot(stateRoot), stateRoot, false); err != nil {
 		return runtimeOwnerState{}, err
 	}
 	return state, nil
@@ -849,8 +855,8 @@ func migrateLegacyTombstone(state *runtimeOwnerState, repository string, issue, 
 	return nil
 }
 
-func writeRuntimeOwnerState(stateRoot string, state runtimeOwnerState) error {
-	if err := validateRuntimeOwnerState(state, stateRoot, true); err != nil {
+func writeRuntimeOwnerState(stateRoot, attemptRoot string, state runtimeOwnerState) error {
+	if err := validateRuntimeOwnerState(state, attemptRoot, stateRoot, true); err != nil {
 		return err
 	}
 	body, err := json.MarshalIndent(state, "", "  ")
@@ -899,7 +905,7 @@ func writeRuntimeOwnerState(stateRoot string, state runtimeOwnerState) error {
 	return directory.Sync()
 }
 
-func validateRuntimeOwnerState(state runtimeOwnerState, stateRoot string, persisted bool) error {
+func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot string, persisted bool) error {
 	if state.Version != runtimeOwnerStateVersion || strings.TrimSpace(state.Repository) == "" || state.IssueGenerations == nil || state.AttemptGenerations == nil || state.Attempts == nil || state.Tombstones == nil || state.Effects == nil || state.ControlReceipts == nil || persisted && (state.Epoch == 0 || state.Revision == 0) {
 		return errors.New("runtime owner ledger is invalid")
 	}
@@ -919,7 +925,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, stateRoot string, persis
 		if state.AttemptGenerations[key] != record.Generation || record.Generation == 0 || record.ObservationEpoch > state.Epoch || record.ObservationEpoch == 0 && record.LastCycleID != 0 || record.ObservationEpoch != 0 && record.LastCycleID == 0 || key != ownerAttemptKey(record.Manifest.Repository, record.Manifest.Issue, record.Manifest.Attempt) {
 			return errors.New("runtime owner attempt record is invalid")
 		}
-		if err := validateOwnerManifest(state.Repository, stateRoot, record.Manifest); err != nil {
+		if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, record.Manifest); err != nil {
 			return err
 		}
 	}
@@ -931,7 +937,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, stateRoot string, persis
 			return errors.New("runtime owner tombstone conflicts with an attempt")
 		}
 		if tombstone.Manifest != nil {
-			if err := validateOwnerManifest(state.Repository, stateRoot, *tombstone.Manifest); err != nil || tombstone.Manifest.Issue != tombstone.Issue || tombstone.Manifest.Attempt != tombstone.Attempt {
+			if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, *tombstone.Manifest); err != nil || tombstone.Manifest.Issue != tombstone.Issue || tombstone.Manifest.Attempt != tombstone.Attempt {
 				return errors.New("runtime owner tombstone manifest is invalid")
 			}
 		}
@@ -974,14 +980,22 @@ func validateRuntimeOwnerState(state runtimeOwnerState, stateRoot string, persis
 	return nil
 }
 
-func validateOwnerManifest(repository, stateRoot string, manifest agentruntime.Manifest) error {
+func validateOwnerManifest(repository, attemptRoot, stateRoot string, manifest agentruntime.Manifest) error {
 	if manifest.Repository != repository || manifest.Issue < 1 || manifest.Attempt < 1 {
 		return errors.New("runtime owner manifest is invalid")
 	}
 	if !filepath.IsAbs(stateRoot) {
 		return errors.New("runtime owner state root is invalid")
 	}
-	return agentruntime.ValidateManifest(productionAttemptRoot(stateRoot), stateRoot, manifest)
+	return agentruntime.ValidateManifest(attemptRoot, stateRoot, manifest)
+}
+
+func runtimeOwnerAttemptRoot(stateRoot string) string {
+	root := productionAttemptRoot(stateRoot)
+	if canonical, err := filepath.EvalSymlinks(root); err == nil {
+		return canonical
+	}
+	return filepath.Clean(root)
 }
 
 func newRuntimeOwnerState(repository string) runtimeOwnerState {
