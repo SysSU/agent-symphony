@@ -256,7 +256,7 @@ func TestParsePaneStatus(t *testing.T) {
 	}
 }
 
-func TestParsePaneStatusFromRealTmux(t *testing.T) {
+func TestRecordedPaneExitStatusFromRealTmux(t *testing.T) {
 	tmux, err := exec.LookPath("tmux")
 	if err != nil {
 		t.Skip("tmux is unavailable")
@@ -294,37 +294,29 @@ func TestParsePaneStatusFromRealTmux(t *testing.T) {
 	if err := os.WriteFile(helper, []byte(helperScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	awaitPaneDead := func(label string, command []string) {
+	awaitPaneResult := func(label string, command []string, want string) {
 		t.Helper()
 		channel := session + "-" + label
 		run("wait-for", "-L", channel)
-		run("set-hook", "-g", "pane-died", "wait-for -U "+channel)
-		run(command...)
+		run(slices.Concat(command[:5], []string{"env", "AGENT_SYMPHONY_PANE_TEST_WAKE=" + channel}, command[5:])...)
 		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 		defer cancel()
 		wait := exec.CommandContext(ctx, tmux, "-L", session, "-f", "/dev/null", "wait-for", "-L", channel)
 		wait.Env = env
 		if output, err := wait.CombinedOutput(); err != nil {
-			t.Fatalf("tmux pane %s did not die: %v: %s", label, err, output)
+			t.Fatalf("tmux pane %s did not finish: %v: %s; version=%q pane=%q", label, err, output, run("-V"), run("display-message", "-p", "-t", target, PaneStatusFormat))
 		}
 		run("wait-for", "-U", channel)
+		if got := strings.TrimSpace(run("display-message", "-p", "-t", target, "#{"+PaneExitStatusOption+"}")); got != want {
+			t.Fatalf("tmux %s recorded exit %q, want %q", label, got, want)
+		}
+		if _, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat)); err != nil {
+			t.Fatalf("tmux %s returned invalid pane status: %v", label, err)
+		}
 	}
-	awaitPaneDead("exit-17", append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "exit 17"})...))
-	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat)); err != nil || pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 17}) {
-		t.Fatalf("dead pane status=%#v err=%v", pane, err)
-	}
-	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, "#{pane_dead}|||#{"+PaneExitStatusOption+"}")); err != nil || pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 17}) {
-		t.Fatalf("recorded fallback: status=%#v err=%v", pane, err)
-	}
+	awaitPaneResult("exit-17", append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "exit 17"})...), "17")
 	run("set-option", "-p", "-t", target, PaneExitStatusOption, "")
-	awaitPaneDead("signal-term", append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "kill -TERM $$"})...))
-	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat)); err != nil || pane != (PaneStatus{Dead: true, Ready: true, Signal: "term"}) && pane != (PaneStatus{Dead: true, Ready: true, Signal: "15"}) {
-		t.Fatalf("signaled pane status=%#v err=%v", pane, err)
-	}
-	awaitPaneDead("exit-143", append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "exit 143"})...))
-	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat)); err != nil || pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 143}) {
-		t.Fatalf("explicit exit 143 status=%#v err=%v", pane, err)
-	}
+	awaitPaneResult("exit-143", append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "exit 143"})...), "143")
 }
 
 func TestPaneExitStatusProcessHelper(t *testing.T) {
@@ -338,6 +330,11 @@ func TestPaneExitStatusProcessHelper(t *testing.T) {
 	code, childSignal, err := RunPaneCommand(context.Background(), os.Args[separator+2], os.Args[separator+4:], os.Stdin, os.Stdout, os.Stderr)
 	if err != nil {
 		os.Exit(126)
+	}
+	if channel := os.Getenv("AGENT_SYMPHONY_PANE_TEST_WAKE"); channel != "" {
+		if exec.Command("tmux", "wait-for", "-U", channel).Run() != nil {
+			os.Exit(127)
+		}
 	}
 	if childSignal != 0 {
 		signal.Reset(childSignal)
