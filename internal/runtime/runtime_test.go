@@ -294,63 +294,36 @@ func TestParsePaneStatusFromRealTmux(t *testing.T) {
 	if err := os.WriteFile(helper, []byte(helperScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	run(append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "exit 17"})...)...)
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat))
-		if err != nil {
-			t.Fatal(err)
+	awaitPaneDead := func(label string, command []string) {
+		t.Helper()
+		channel := session + "-" + label
+		run("wait-for", "-L", channel)
+		run("set-hook", "-g", "pane-died", "wait-for -U "+channel)
+		run(command...)
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		wait := exec.CommandContext(ctx, tmux, "-L", session, "-f", "/dev/null", "wait-for", "-L", channel)
+		wait.Env = env
+		if output, err := wait.CombinedOutput(); err != nil {
+			t.Fatalf("tmux pane %s did not die: %v: %s", label, err, output)
 		}
-		if pane.Ready {
-			if pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 17}) {
-				t.Fatalf("dead pane status=%#v", pane)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("tmux pane exit status did not become observable")
-		}
-		time.Sleep(10 * time.Millisecond)
+		run("wait-for", "-U", channel)
+	}
+	awaitPaneDead("exit-17", append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "exit 17"})...))
+	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat)); err != nil || pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 17}) {
+		t.Fatalf("dead pane status=%#v err=%v", pane, err)
 	}
 	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, "#{pane_dead}|||#{"+PaneExitStatusOption+"}")); err != nil || pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 17}) {
 		t.Fatalf("recorded fallback: status=%#v err=%v", pane, err)
 	}
 	run("set-option", "-p", "-t", target, PaneExitStatusOption, "")
-	run(append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "kill -TERM $$"})...)...)
-	deadline = time.Now().Add(3 * time.Second)
-	for {
-		pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if pane.Ready {
-			if pane != (PaneStatus{Dead: true, Ready: true, Signal: "term"}) && pane != (PaneStatus{Dead: true, Ready: true, Signal: "15"}) {
-				t.Fatalf("signaled pane status=%#v", pane)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("tmux pane signal did not become observable")
-		}
-		time.Sleep(10 * time.Millisecond)
+	awaitPaneDead("signal-term", append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "kill -TERM $$"})...))
+	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat)); err != nil || pane != (PaneStatus{Dead: true, Ready: true, Signal: "term"}) && pane != (PaneStatus{Dead: true, Ready: true, Signal: "15"}) {
+		t.Fatalf("signaled pane status=%#v err=%v", pane, err)
 	}
-	run(append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "exit 143"})...)...)
-	deadline = time.Now().Add(3 * time.Second)
-	for {
-		pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if pane.Ready {
-			if pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 143}) {
-				t.Fatalf("explicit exit 143 status=%#v", pane)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("tmux explicit exit 143 did not become observable")
-		}
-		time.Sleep(10 * time.Millisecond)
+	awaitPaneDead("exit-143", append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "exit 143"})...))
+	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat)); err != nil || pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 143}) {
+		t.Fatalf("explicit exit 143 status=%#v err=%v", pane, err)
 	}
 }
 

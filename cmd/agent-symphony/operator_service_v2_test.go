@@ -294,8 +294,25 @@ func TestV2DashboardCancelRespondsWhileReconciliationCollectsAndRejectsStaleResu
 	}
 	state := mustOwnerSnapshot(t, owner).State
 	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
-	if state.AttemptGenerations[key] != 2 || state.Attempts[key].Generation != 2 || len(state.Effects) != 1 || state.ControlReceipts[0].Phase != operatorPhaseStopPending {
+	if state.AttemptGenerations[key] != 2 || state.Attempts[key].Generation != 2 || len(state.Effects) != 1 || len(state.ControlReceipts) != 1 {
 		t.Fatalf("cancel was overwritten: %#v", state)
+	}
+	receipt := state.ControlReceipts[0]
+	effect, exists := state.Effects[receipt.EffectID]
+	if !exists || effect.Action != string(agentruntime.EffectStop) || receipt.Request.Action != "cancel" {
+		t.Fatalf("Cancel receipt lost its exact stop effect: receipt=%#v effect=%#v", receipt, effect)
+	}
+	switch {
+	case receipt.State == "pending" && receipt.Phase == operatorPhaseStopPending:
+		if effect.State != "pending" || receipt.Result != nil {
+			t.Fatalf("pending Cancel was not durable: receipt=%#v effect=%#v", receipt, effect)
+		}
+	case receipt.State == "completed" && receipt.Phase == operatorPhaseCompleted:
+		if effect.State != "completed" || state.Attempts[key].Manifest.State != "cancelled" || receipt.Result == nil || !receipt.Result.OK {
+			t.Fatalf("completed Cancel lost its terminal outcome: receipt=%#v effect=%#v manifest=%#v", receipt, effect, state.Attempts[key].Manifest)
+		}
+	default:
+		t.Fatalf("Cancel reached an invalid phase: receipt=%#v effect=%#v", receipt, effect)
 	}
 }
 
