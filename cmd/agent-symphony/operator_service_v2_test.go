@@ -1878,7 +1878,7 @@ type completedPlanReviewBoundary struct {
 func (b *completedPlanReviewBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
 	if operation == "run" && command.Name == "tmux" && slices.Contains(command.Args, "display-message") {
 		b.panes.Add(1)
-		return agentruntime.Result{Output: "1|0||"}, nil
+		return agentruntime.Result{Output: "1|0|||"}, nil
 	}
 	if operation == "review-result" {
 		b.results.Add(1)
