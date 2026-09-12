@@ -5,13 +5,14 @@ import { useCallback, useEffect, useState } from "react";
 import { StatusCard } from "./_components/status-card";
 import AttemptHistory from "./_components/attempt-history";
 import ProjectNavigation, { ProjectAgentConsole, ProjectHeader, ProjectHealthControl, projectBoard, projectView } from "./_components/project-navigation";
-import { getOrchestratorStatus, getRelease, postWithReconciliationRetry } from "./actions.mjs";
+import { getOrchestratorStatus, getRelease, operatorActionNotice, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
 import { attemptKey } from "./health.mjs";
 
 const actionDetails = {
   abandon: ["Abandon", "This stops its tmux session and permanently deletes its local worktree, log, and retained attempt record.", "Abandoned"],
   archive: ["Archive", "This stops its tmux session if needed, deletes its local worktree, and hides it from the Done lane.", "Archived"],
+  cancel: ["Cancel", "This stops the exact implementation session and retains its worktree, logs, and diagnostics.", "Cancelled"],
   dismiss: ["Dismiss", "This hides only this card. Its manifest, logs, worktree diagnostics, GitHub issue, and pull request are retained.", "Dismissed"],
   remove: ["Permanently remove", "This permanently deletes this exact historical attempt's managed worktree, implementation and review sessions, logs, diagnostics, snapshots, and related artifacts. It cannot be restored. The GitHub issue and pull request are unchanged.", "Permanently removed"],
   recover: ["Recover", "If the attempt is stuck, this stops only its named tmux session. It preserves the worktree and diagnostics, records the failure on GitHub, and requests a new attempt.", "Recovery requested for"],
@@ -86,10 +87,11 @@ export default function Dashboard() {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       });
       if (!response.ok) throw new Error((await response.text()).trim() || `${verb} failed (${response.status})`);
+      const notice = await operatorActionNotice(response, verb, finished, status.issue, status.attempt);
       const stateResponse = await fetch("/dashboard-state.json", { cache: "no-store" });
-      if (!stateResponse.ok) throw new Error(`${verb} finished, but dashboard state could not be refreshed.`);
+      if (!stateResponse.ok) throw new Error(`${verb} was accepted, but dashboard state could not be refreshed.`);
       setDashboardState(await stateResponse.json());
-      setActionNotice(`${finished} issue #${status.issue}, attempt ${status.attempt}.`);
+      setActionNotice(notice);
     } catch (reason) {
       setActionNotice(reason instanceof Error ? reason.message : `${verb} failed.`);
     } finally {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,7 +24,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -48,9 +48,6 @@ func releaseVersion() string {
 var (
 	githubAPI          = "https://api.github.com"
 	githubClient       = &http.Client{Transport: internalgithub.CLITransport{}}
-	reconcileGitHubRun = reconcileGitHub
-	reconcileRetryRun  = reconcileGitHubWith
-	monitorCheckInRun  = deliverMonitoringCheckIn
 	reviewSnapshotRoot = ""
 	runningOnWSL       = func() bool { return runtime.GOOS == "linux" && isWSL() }
 	immutableCreate    = os.CreateTemp
@@ -93,32 +90,6 @@ const workerBoundaryDiagnosticLimit = 64 << 10
 
 type boundaryCaller interface {
 	call(context.Context, string, agentruntime.Command) (agentruntime.Result, error)
-}
-
-type operationCancellation struct {
-	mu     sync.Mutex
-	cancel context.CancelFunc
-}
-
-func (o *operationCancellation) begin(ctx context.Context) (context.Context, func()) {
-	operationCtx, cancel := context.WithCancel(ctx)
-	o.mu.Lock()
-	o.cancel = cancel
-	o.mu.Unlock()
-	return operationCtx, func() {
-		cancel()
-		o.mu.Lock()
-		o.cancel = nil
-		o.mu.Unlock()
-	}
-}
-
-func (o *operationCancellation) interrupt() {
-	o.mu.Lock()
-	if o.cancel != nil {
-		o.cancel()
-	}
-	o.mu.Unlock()
 }
 
 type limitedBuffer struct {
@@ -274,7 +245,10 @@ func productionSnapshotRoot(stateRoot string) string {
 
 func projectTmuxRoot(stateRoot string) string { return filepath.Join(stateRoot, "tmux") }
 
-const deploymentIdentityVersion = 1
+const (
+	legacyDeploymentIdentityVersion = 1
+	deploymentIdentityVersion       = 2
+)
 
 type deploymentIdentity struct {
 	Version    int    `json:"version"`
@@ -282,6 +256,10 @@ type deploymentIdentity struct {
 }
 
 func readDeploymentIdentity(stateRoot string) (deploymentIdentity, error) {
+	return readDeploymentIdentityVersion(stateRoot, deploymentIdentityVersion)
+}
+
+func readDeploymentIdentityVersion(stateRoot string, supportedVersion int) (deploymentIdentity, error) {
 	body, err := readDashboardFile(filepath.Join(stateRoot, "deployment.json"), maxDashboardStateBytes)
 	if err != nil {
 		return deploymentIdentity{}, err
@@ -289,7 +267,7 @@ func readDeploymentIdentity(stateRoot string) (deploymentIdentity, error) {
 	var identity deploymentIdentity
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&identity) != nil || decoder.Decode(&struct{}{}) != io.EOF || identity.Version != deploymentIdentityVersion || identity.Repository == "" {
+	if decoder.Decode(&identity) != nil || decoder.Decode(&struct{}{}) != io.EOF || identity.Version < legacyDeploymentIdentityVersion || identity.Version > supportedVersion || identity.Repository == "" {
 		return deploymentIdentity{}, errors.New("runtime state has an invalid deployment identity")
 	}
 	return identity, nil
@@ -308,8 +286,8 @@ func bindDeployment(stateRoot, repository string) error {
 		return fmt.Errorf("inspect runtime state root: %w", err)
 	}
 	path := filepath.Join(stateRoot, "deployment.json")
-	want := deploymentIdentity{deploymentIdentityVersion, repository}
-	if current, err := readDeploymentIdentity(stateRoot); err == nil {
+	want := deploymentIdentity{legacyDeploymentIdentityVersion, repository}
+	if current, err := readDeploymentIdentityVersion(stateRoot, legacyDeploymentIdentityVersion); err == nil {
 		if current.Repository != repository {
 			return fmt.Errorf("runtime state is bound to project %s, not %s", current.Repository, repository)
 		}
@@ -338,7 +316,55 @@ func bindDeployment(stateRoot, repository string) error {
 	return nil
 }
 
-func prepareProjectDeployment(ctx context.Context, stateRoot, repository string, metrics ...*internalgithub.CycleMetrics) (internalgithub.API, internalgithub.AuthenticatedUser, error) {
+// installDeploymentFence is the one-way production cutover boundary. It must
+// run while the daemon lock is held and before the v2 ledger is installed. A
+// v1 binary rejects the new identity version, including the crash window where
+// the fence is durable but the first ledger commit is not.
+func installDeploymentFence(stateRoot, repository string) error {
+	identity, err := readDeploymentIdentity(stateRoot)
+	if err != nil {
+		return fmt.Errorf("read deployment identity: %w", err)
+	}
+	if identity.Repository != repository {
+		return fmt.Errorf("runtime state is bound to project %s, not %s", identity.Repository, repository)
+	}
+	if identity.Version == deploymentIdentityVersion {
+		return nil
+	}
+	body, _ := json.Marshal(deploymentIdentity{Version: deploymentIdentityVersion, Repository: repository})
+	path := filepath.Join(stateRoot, "deployment.json")
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || !ownedByCurrentUser(info) {
+		return errors.New("deployment identity is unsafe")
+	}
+	temporary, err := os.CreateTemp(stateRoot, ".deployment-fence-*")
+	if err != nil {
+		return err
+	}
+	name := temporary.Name()
+	defer os.Remove(name)
+	if err = temporary.Chmod(0o600); err == nil {
+		_, err = temporary.Write(append(body, '\n'))
+	}
+	if err == nil {
+		err = temporary.Sync()
+	}
+	if closeErr := temporary.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(name, path)
+	}
+	if err == nil {
+		err = immutableDirSync(stateRoot)
+	}
+	if err != nil {
+		return fmt.Errorf("install deployment fence: %w", err)
+	}
+	return nil
+}
+
+func authenticateProjectDeployment(ctx context.Context, repository string, metrics ...*internalgithub.CycleMetrics) (internalgithub.API, internalgithub.AuthenticatedUser, error) {
 	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
 	if len(metrics) > 0 {
 		api.Metrics = metrics[0]
@@ -351,18 +377,36 @@ func prepareProjectDeployment(ctx context.Context, stateRoot, repository string,
 	if err := api.VerifyRepository(ctx, repository); err != nil {
 		return api, user, fmt.Errorf("verify GitHub repository: %w", err)
 	}
-	if err := bindDeployment(stateRoot, repository); err != nil {
-		return api, user, err
-	}
+	return api, user, nil
+}
+
+func configureProjectRuntimeState(stateRoot string) error {
 	if err := configureProjectTmux(stateRoot); err != nil {
-		return api, user, err
+		return err
 	}
 	if !hostIsolationInstalled() {
 		if err := configureAgentCodexHome(stateRoot); err != nil {
-			return api, user, err
+			return err
 		}
 	}
-	return api, user, nil
+	return nil
+}
+
+func prepareProductionDeploymentLocked(stateRoot, repository string) error {
+	identity, err := readDeploymentIdentity(stateRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := bindDeployment(stateRoot, repository); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return fmt.Errorf("read deployment identity: %w", err)
+	} else if identity.Repository != repository {
+		return fmt.Errorf("runtime state is bound to project %s, not %s", identity.Repository, repository)
+	}
+	if err := configureProjectRuntimeState(stateRoot); err != nil {
+		return err
+	}
+	return installDeploymentFence(stateRoot, repository)
 }
 
 var agentCodexAssets = []string{"auth.json", "config.toml", "AGENTS.md", "rules", "skills", "plugins", "cache", "installation_id"}
@@ -774,26 +818,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), *controlTimeout)
 		defer cancel()
-		var result controlResult
-		var err error
-		for {
-			result, err = callRunningDaemon(ctx, *runtimeState, request)
-			if err != nil && ctx.Err() != nil {
-				err = errors.New("running daemon remained busy until --timeout; retry the same request ID")
-			}
-			if err != nil || !result.Retryable {
-				break
-			}
-			timer := time.NewTimer(time.Second)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				err = errors.New("running daemon remained busy until --timeout; retry the same request ID")
-			case <-timer.C:
-			}
-			if err != nil {
-				break
-			}
+		result, err := callRunningDaemon(ctx, *runtimeState, request)
+		if err != nil && ctx.Err() != nil {
+			err = errors.New("running daemon did not answer before --timeout; replay the same request ID")
 		}
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, internalgithub.Redact(err.Error()))
@@ -808,9 +835,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if !result.OK {
 			return fail(stderr, false, command, result.Error)
 		}
-		fmt.Fprintf(stdout, "%s succeeded for %s", result.Action, *repository)
+		if result.Status == http.StatusAccepted {
+			fmt.Fprintf(stdout, "%s accepted for %s", result.Action, *repository)
+		} else {
+			fmt.Fprintf(stdout, "%s succeeded for %s", result.Action, *repository)
+		}
 		if request.Issue > 0 {
 			fmt.Fprintf(stdout, "#%d attempt %d", *issueNumber, *attemptNumber)
+		}
+		if result.Status == http.StatusAccepted {
+			var status operatorReceiptStatus
+			if json.Unmarshal(result.Data, &status) == nil && status.Phase != "" {
+				fmt.Fprintf(stdout, " (phase %s)", status.Phase)
+			}
 		}
 		fmt.Fprintln(stdout)
 		return 0
@@ -850,7 +887,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return fail(stderr, *jsonOutput, command, rootErr.Error())
 			}
 		}
-		if _, _, err := prepareProjectDeployment(context.Background(), *runtimeState, c.Repository); err != nil {
+		api, user, err := authenticateProjectDeployment(context.Background(), c.Repository)
+		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		lock, err := acquireDaemonLock(filepath.Join(*runtimeState, "daemon.lock"))
@@ -858,63 +896,53 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		defer releaseDaemonLock(lock)
+		if err := prepareProductionDeploymentLocked(*runtimeState, c.Repository); err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		agent, err := newOrchestratorAgent(c, *runtimeState)
+		checkout, err := config.GitRoot()
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		operationMu := &sync.Mutex{}
-		recoverAttempt := func(ctx context.Context, issue, attempt int) error {
-			return recoverDashboardAttempt(ctx, *path, *statePath, *runtimeState, issue, attempt)
+		runtime, err := startProductionRuntimeV2(ctx, c, api, user, *runtimeState, *statePath, checkout, stderr)
+		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		startPlanReview := func(ctx context.Context, issue, attempt int) error {
-			_, err := reconcileRetryRun(ctx, *path, *statePath, *runtimeState, reconcileOptions{timeout: 2 * time.Minute, planReviewIssue: issue, planReviewAttempt: attempt})
-			return err
+		project, err := newProjectDashboardServerV2(ctx, *runtimeState, c.Repository, peerProjects, "tmux", runtime.operator, c.Concurrency, *allowUnsafeDashboardNetwork, dashboardPassword)
+		if err != nil {
+			_ = runtime.shutdown(context.Background())
+			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		operations := &operationCancellation{}
-		reconcile := func(ctx context.Context) error {
-			cycleCtx, finish := operations.begin(ctx)
-			defer finish()
-			statuses, err := reconcileGitHubWith(cycleCtx, *path, *statePath, *runtimeState, reconcileOptions{transition: true, intake: true, timeout: 5 * time.Minute, observe: func(observation reconcileCycleObservation) {
-				body, _ := json.Marshal(observation)
-				fmt.Fprintln(stderr, "reconcile-cycle: "+string(body))
-			}})
-			if err != nil && !errors.Is(err, context.Canceled) {
-				fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
-				if projectionErr := recordReconcileFailure(*runtimeState, c.Repository, err); projectionErr != nil {
-					fmt.Fprintln(stderr, "reconcile projection: "+internalgithub.Redact(projectionErr.Error()))
+		project.orchestrator = runtime.agent
+		project.reconcile = runtime.trigger.triggerAndWait
+		dashboardURL, dashboard, err := startDashboardServerWaitable(*dashboardAddress, project, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
+		if err != nil {
+			_ = runtime.shutdown(context.Background())
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
+		ticker := time.NewTicker(*interval)
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				dashboardDone, runtimeDone := make(chan error, 1), make(chan error, 1)
+				go func() { dashboardDone <- dashboard.shutdown(shutdown) }()
+				go func() { runtimeDone <- runtime.shutdown(shutdown) }()
+				dashboardErr, runtimeErr := <-dashboardDone, <-runtimeDone
+				cancel()
+				if err := errors.Join(dashboardErr, runtimeErr); err != nil {
+					return fail(stderr, *jsonOutput, command, err.Error())
+				}
+				return 0
+			case <-ticker.C:
+				if err := runtime.trigger.trigger(); err != nil && !errors.Is(err, errStateOwnerStopped) {
+					fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
 				}
 			}
-			if errors.Is(err, context.Canceled) && ctx.Err() == nil {
-				return err
-			}
-			_, agentErr := agent.ObserveCycle(ctx, statuses, err)
-			if agentErr != nil {
-				fmt.Fprintln(stderr, "orchestrator agent: "+internalgithub.Redact(agentErr.Error()))
-			}
-			return err
 		}
-		removalRefresh := func(ctx context.Context) error {
-			_, err := reconcileGitHubWith(ctx, *path, *statePath, *runtimeState, reconcileOptions{transition: false, intake: false, timeout: 2 * time.Minute})
-			return err
-		}
-		dashboardURL, err := startProjectDashboard(ctx, *dashboardAddress, *runtimeState, c.Repository, peerProjects, operationMu, recoverAttempt, startPlanReview, reconcile, removalRefresh, agent, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
-		if err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
-		defer func() { _ = os.Remove(controlSocketPath(*runtimeState)) }()
-		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
-		lockedReconcile := func(ctx context.Context) error {
-			operationMu.Lock()
-			defer operationMu.Unlock()
-			return reconcile(ctx)
-		}
-		go watchOrchestratorProposals(ctx, agent, operationMu, operations, *path, *statePath, *runtimeState, stderr)
-		if err := orchestrator.ReconcileLoop(ctx, *interval, lockedReconcile); err != nil && !errors.Is(err, context.Canceled) {
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
-		return 0
 	case "status", "list", "inspect", "reconcile":
 		if fs.NArg() != 0 {
 			return misuse(stderr, wantsJSON, command, command+" accepts no positional arguments")
@@ -925,7 +953,26 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if *statePath == "" || *runtimeState == "" {
 				return misuse(stderr, wantsJSON, command, command+" requires --state and --runtime-state unless --attempts is supplied")
 			}
-			statuses, err = reconcileGitHubRun(context.Background(), *path, *statePath, *runtimeState, command == "reconcile")
+			c, loadErr := config.Load(*path)
+			if loadErr != nil {
+				return fail(stderr, *jsonOutput, command, loadErr.Error())
+			}
+			if command == "reconcile" {
+				requestID, idErr := newControlRequestID()
+				if idErr != nil {
+					return fail(stderr, *jsonOutput, command, "create reconciliation request identity")
+				}
+				controlCtx, cancel := context.WithTimeout(context.Background(), *controlTimeout)
+				result, controlErr := callRunningDaemon(controlCtx, *runtimeState, controlRequest{Version: controlVersion, RequestID: requestID, Repository: c.Repository, Action: "reconcile"})
+				cancel()
+				if controlErr != nil {
+					return fail(stderr, *jsonOutput, command, internalgithub.Redact(controlErr.Error()))
+				}
+				if !result.OK {
+					return fail(stderr, *jsonOutput, command, result.Error)
+				}
+			}
+			statuses, err = readOwnerStatuses(*runtimeState, c.Repository, c.Concurrency)
 		} else {
 			statuses, err = recoveryStatuses(*attemptsPath, *runtimeState)
 		}
@@ -1025,29 +1072,27 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if fs.NArg() != 0 {
 			return misuse(stderr, wantsJSON, command, "pr-governance accepts no positional arguments")
 		}
-		if *statePath == "" {
-			return fail(stderr, *jsonOutput, command, "--state is required")
-		}
-		if info, err := os.Lstat(*statePath); err == nil && !info.Mode().IsRegular() || err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fail(stderr, *jsonOutput, command, "--state must name a regular recovery file or an absent file in an existing directory")
+		if *runtimeState == "" {
+			return fail(stderr, *jsonOutput, command, "--runtime-state is required")
 		}
 		c, err := config.Load(*path)
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
-		user, err := api.AuthenticatedUser(context.Background())
+		requestID, err := newControlRequestID()
 		if err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
+			return fail(stderr, *jsonOutput, command, "create reconciliation request identity")
 		}
-		if err := api.VerifyRepository(context.Background(), c.Repository); err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
-		prConfig := githubPRConfig(c, user.ID)
-		if err := internalgithub.RunPRReconciliation(context.Background(), api, prConfig, *statePath); err != nil {
+		controlCtx, cancel := context.WithTimeout(context.Background(), *controlTimeout)
+		result, err := callRunningDaemon(controlCtx, *runtimeState, controlRequest{Version: controlVersion, RequestID: requestID, Repository: c.Repository, Action: "reconcile"})
+		cancel()
+		if err != nil {
 			return fail(stderr, *jsonOutput, command, internalgithub.Redact(err.Error()))
 		}
-		return success(stdout, *jsonOutput, command, map[string]string{"state": *statePath}, "pull-request governance reconciliation complete")
+		if !result.OK {
+			return fail(stderr, *jsonOutput, command, result.Error)
+		}
+		return success(stdout, *jsonOutput, command, map[string]string{"runtime_state": *runtimeState}, "pull-request governance reconciliation complete")
 
 	case "doctor", "diagnostics":
 		if fs.NArg() != 0 {
@@ -1086,117 +1131,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-func watchOrchestratorProposals(ctx context.Context, agent *orchestratoragent.Supervisor, operationMu *sync.Mutex, operations *operationCancellation, configPath, statePath, stateRoot string, log io.Writer) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		processOrchestratorProposal(ctx, agent, operationMu, operations, configPath, statePath, stateRoot, log)
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-func processOrchestratorProposal(ctx context.Context, agent *orchestratoragent.Supervisor, operationMu *sync.Mutex, operations *operationCancellation, configPath, statePath, stateRoot string, log io.Writer) {
-	proposal, err := agent.MessageProposal(ctx)
-	if errors.Is(err, orchestratoragent.ErrNoMessageProposal) {
-		return
-	}
-	if err != nil {
-		fmt.Fprintln(log, "orchestrator proposal: "+internalgithub.Redact(err.Error()))
-		return
-	}
-	if !slices.Contains([]string{orchestratoragent.ProposalActionCheckIn, orchestratoragent.ProposalActionRetry, orchestratoragent.ProposalActionRecover, orchestratoragent.ProposalActionAttention}, proposal.Action) || !operationMu.TryLock() {
-		return
-	}
-	defer operationMu.Unlock()
-	operationCtx, finish := operations.begin(ctx)
-	defer finish()
-	controlCtx, cancel := context.WithTimeout(operationCtx, 10*time.Minute)
-	defer cancel()
-	running := false
-	switch proposal.Action {
-	case orchestratoragent.ProposalActionRetry:
-		_, err = reconcileRetryRun(controlCtx, configPath, statePath, stateRoot, reconcileOptions{
-			transition: true,
-			timeout:    10 * time.Minute,
-			authorize: func(statuses []orchestrator.RecoveryStatus) error {
-				if validateErr := validateTransitionRetry(proposal, statuses); validateErr != nil {
-					return transitionRetryRefusal{validateErr}
-				}
-				if validateErr := agent.ValidateAttentionProposal(proposal, statuses); validateErr != nil {
-					return transitionRetryRefusal{validateErr}
-				}
-				if resolveErr := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "running", "the coordinator validated the exact completed attempt and is running bounded reconciliation"); resolveErr != nil {
-					return fmt.Errorf("record running retry: %w", resolveErr)
-				}
-				running = true
-				return nil
-			},
-		})
-	case orchestratoragent.ProposalActionCheckIn, orchestratoragent.ProposalActionRecover, orchestratoragent.ProposalActionAttention:
-		var statuses []orchestrator.RecoveryStatus
-		statuses, err = reconcileGitHubRun(controlCtx, configPath, statePath, stateRoot, false)
-		if err == nil {
-			if validateErr := agent.ValidateAttentionProposal(proposal, statuses); validateErr != nil {
-				err = transitionRetryRefusal{validateErr}
-			}
-		}
-		if err == nil && proposal.Action == orchestratoragent.ProposalActionCheckIn {
-			if validateErr := validateMonitoringCheckIn(proposal, statuses); validateErr != nil {
-				err = transitionRetryRefusal{validateErr}
-			}
-		}
-		if err == nil {
-			detail := "the coordinator re-verified the exact attention target"
-			if proposal.Action == orchestratoragent.ProposalActionRecover {
-				detail += " and is running guarded attempt recovery"
-			} else if proposal.Action == orchestratoragent.ProposalActionCheckIn {
-				detail += " and is delivering the fixed monitoring check-in"
-			}
-			err = agent.ResolveMessageProposal(controlCtx, proposal.Binding, "running", detail)
-			running = err == nil
-		}
-		if err == nil && proposal.Action == orchestratoragent.ProposalActionRecover {
-			err = recoverDashboardAttempt(controlCtx, configPath, statePath, stateRoot, proposal.Issue, proposal.Attempt)
-		} else if err == nil && proposal.Action == orchestratoragent.ProposalActionCheckIn {
-			err = monitorCheckInRun(controlCtx, stateRoot, proposal)
-		}
-	}
-	if err != nil {
-		resolution := "failed"
-		var refusal transitionRetryRefusal
-		if errors.As(err, &refusal) {
-			resolution = "refused"
-		}
-		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resolveErr := agent.ResolveMessageProposal(resolveCtx, proposal.Binding, resolution, err.Error())
-		resolveCancel()
-		if resolveErr != nil {
-			fmt.Fprintln(log, "orchestrator proposal outcome: "+internalgithub.Redact(resolveErr.Error()))
-		}
-		fmt.Fprintln(log, "orchestrator proposal "+resolution+": "+internalgithub.Redact(err.Error()))
-		return
-	}
-	if !running {
-		fmt.Fprintln(log, "orchestrator proposal failed: coordinator processing skipped authorization")
-		return
-	}
-	detail := "the validated bounded coordinator action completed; waiting for a fresh projection"
-	if proposal.Action == orchestratoragent.ProposalActionAttention {
-		detail = proposal.Detail
-	} else if proposal.Action == orchestratoragent.ProposalActionCheckIn {
-		detail = "the fixed monitoring check-in reached the exact implementation owner; waiting for fresh status evidence"
-	}
-	if err := agent.ResolveMessageProposal(controlCtx, proposal.Binding, "succeeded", detail); err != nil {
-		fmt.Fprintln(log, "orchestrator proposal outcome: "+internalgithub.Redact(err.Error()))
-	}
-}
-
-type transitionRetryRefusal struct{ error }
-
 func validateTransitionRetry(proposal orchestratoragent.MessageProposal, statuses []orchestrator.RecoveryStatus) error {
 	matches := make([]orchestrator.RecoveryStatus, 0, 1)
 	for _, status := range statuses {
@@ -1227,36 +1161,6 @@ func validateMonitoringCheckIn(proposal orchestratoragent.MessageProposal, statu
 		return errors.New("monitoring check-in target is not the exact active implementation owner")
 	}
 	return nil
-}
-
-func deliverMonitoringCheckIn(ctx context.Context, stateRoot string, proposal orchestratoragent.MessageProposal) error {
-	boundary := implementationBoundary(stateRoot)
-	runtimeState := agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot, Runner: boundary, VerifyWorker: func(ctx context.Context) error {
-		_, err := boundary.call(ctx, "verify", agentruntime.Command{})
-		return err
-	}}
-	return sendMonitoringCheckIn(ctx, &runtimeState, proposal)
-}
-
-func sendMonitoringCheckIn(ctx context.Context, runtimeState *agentruntime.Runtime, proposal orchestratoragent.MessageProposal) error {
-	manifests, err := runtimeState.Discover()
-	if err != nil {
-		return err
-	}
-	matches := slices.DeleteFunc(manifests, func(manifest agentruntime.Manifest) bool {
-		return manifest.Repository != proposal.Repository || manifest.Issue != proposal.Issue || manifest.Attempt != proposal.Attempt || manifest.State != "running"
-	})
-	if len(matches) != 1 || runtimeState.VerifyOwned(ctx, matches[0]) != nil {
-		return errors.New("monitoring check-in target does not have one verified live implementation owner")
-	}
-	payload, _ := json.Marshal(struct {
-		Type       string `json:"type"`
-		Repository string `json:"repository"`
-		Issue      int    `json:"issue"`
-		Attempt    int    `json:"attempt"`
-		Request    string `json:"request"`
-	}{"agent-symphony-monitoring-check-in-v1", proposal.Repository, proposal.Issue, proposal.Attempt, "Report current progress and the next step in this session. Continue only the implementation you already own. If blocked, set needs-attention with a specific reason through the direct GitHub status contract; clear a prior monitoring status only after fresh evidence shows recovery."})
-	return runtimeState.Deliver(ctx, matches[0], payload)
 }
 
 func githubPRConfig(c config.Config, actorID int) internalgithub.PRAdapterConfig {
@@ -1313,287 +1217,20 @@ func acquireDaemonLock(path string) (*os.File, error) {
 
 func releaseDaemonLock(f *os.File) { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }
 
-type reconcileOptions struct {
-	transition        bool
-	intake            bool
-	timeout           time.Duration
-	planReviewIssue   int
-	planReviewAttempt int
-	lock              bool
-	authorize         func([]orchestrator.RecoveryStatus) error
-	observe           func(reconcileCycleObservation)
-}
-
-type reconcileCycleObservation struct {
-	DurationMS     int64  `json:"duration_ms"`
-	GitHubRequests int64  `json:"github_requests"`
-	Retries        int64  `json:"retries"`
-	FailurePhase   string `json:"failure_phase,omitempty"`
-	OK             bool   `json:"ok"`
-}
-
-func reconcileGitHub(ctx context.Context, configPath, statePath, stateRoot string, transition bool) ([]orchestrator.RecoveryStatus, error) {
-	return reconcileGitHubWith(ctx, configPath, statePath, stateRoot, reconcileOptions{transition: transition, intake: transition, timeout: 5 * time.Minute, lock: transition})
-}
-
-func reconcileGitHubWith(ctx context.Context, configPath, statePath, stateRoot string, options reconcileOptions) (result []orchestrator.RecoveryStatus, resultErr error) {
-	started := time.Now()
-	metrics := &internalgithub.CycleMetrics{}
-	failurePhase := "load-configuration"
-	defer func() {
-		if options.observe == nil {
-			return
-		}
-		requests, retries := metrics.Snapshot()
-		observation := reconcileCycleObservation{DurationMS: time.Since(started).Milliseconds(), GitHubRequests: requests, Retries: retries, OK: resultErr == nil}
-		if resultErr != nil {
-			observation.FailurePhase = failurePhase
-		}
-		options.observe(observation)
-	}()
-	if options.timeout <= 0 {
-		options.timeout = 2 * time.Minute
+func readOwnerStatuses(stateRoot, repository string, capacity int) ([]orchestrator.RecoveryStatus, error) {
+	identity, err := readDeploymentIdentity(stateRoot)
+	if err != nil || identity.Version != deploymentIdentityVersion || identity.Repository != repository {
+		return nil, errors.New("runtime owner deployment is unavailable")
 	}
-	ctx, cancel := context.WithDeadline(ctx, started.Add(options.timeout))
-	defer cancel()
-	c, err := config.Load(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("load configuration: %w", err)
-	}
-	root, err := config.GitRoot()
-	if err != nil {
-		return nil, fmt.Errorf("resolve repository root: %w", err)
-	}
-	if runningOnWSL() {
-		if err := validateWSLFilesystem(root, filepath.Join(root, c.WorktreeRoot), stateRoot, "/proc/mounts"); err != nil {
-			return nil, fmt.Errorf("validate WSL filesystem: %w", err)
-		}
-	}
-	failurePhase = "verify-deployment"
-	api, user, err := prepareProjectDeployment(ctx, stateRoot, c.Repository, metrics)
+	state, err := readRuntimeOwnerState(stateRoot, repository)
 	if err != nil {
 		return nil, err
 	}
-	if options.lock {
-		lock, lockErr := acquireDaemonLock(filepath.Join(stateRoot, "daemon.lock"))
-		if lockErr != nil {
-			return nil, lockErr
-		}
-		defer releaseDaemonLock(lock)
-	}
-	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
+	status, err := projectOwnerStatus(stateOwnerSnapshot{State: state}, capacity, time.Now().UTC())
 	if err != nil {
-		return nil, fmt.Errorf("load GitHub cache: %w", err)
+		return nil, err
 	}
-	defer func() {
-		staleReads, _ := metrics.Stale()
-		if resultErr != nil && staleReads == 0 {
-			return
-		}
-		if err := cache.Save(); err != nil {
-			resultErr = fmt.Errorf("save GitHub cache: %w", err)
-		}
-	}()
-	api.Cache = cache
-	failurePhase = "fetch-attempts"
-	remote, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
-	if err != nil {
-		return nil, fmt.Errorf("fetch pull request attempts: %w", err)
-	}
-	prConfig := githubPRConfig(c, user.ID)
-	var issues []internalgithub.RecoveryIssueFact
-	failurePhase = "fetch-issue-controls"
-	if options.planReviewIssue > 0 {
-		issues, err = internalgithub.FetchIssueFactsForIssue(ctx, api, prConfig, remote, options.planReviewIssue)
-	} else {
-		issues, err = internalgithub.FetchIssueFacts(ctx, api, prConfig, remote, options.intake)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("fetch issue controls: %w", err)
-	}
-	remote, facts := recoveryAttemptFacts(remote, issues)
-	boundary := implementationBoundary(stateRoot)
-	binary, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("resolve coordinator executable: %w", err)
-	}
-	attemptRoot := productionAttemptRoot(stateRoot)
-	baseBranch, baseSHA := "", ""
-	if len(issues) > 0 {
-		baseBranch, baseSHA = issues[0].BaseBranch, issues[0].BaseSHA
-	}
-	failurePhase = "refresh-attempt-source"
-	source, err := seedAttemptSource(ctx, root, c.Repository, attemptRoot, baseBranch, baseSHA)
-	if err != nil {
-		return nil, fmt.Errorf("refresh attempt source: %w", err)
-	}
-	r := agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Helper: binary, Runner: boundary, AllowEnv: c.Commands.Environment, VerifyWorker: func(ctx context.Context) error {
-		_, err := boundary.call(ctx, "verify", agentruntime.Command{})
-		return err
-	}}
-	failurePhase = "discover-attempts"
-	manifests, err := r.Discover()
-	if err != nil {
-		return nil, fmt.Errorf("discover attempt manifests: %w", err)
-	}
-	if options.planReviewIssue > 0 {
-		failurePhase = "start-plan-review"
-		if err := startIssuePlanReview(ctx, &r, reviewBoundary(stateRoot), c, issues, manifests, source, productionSnapshotRoot(stateRoot), options.planReviewIssue, options.planReviewAttempt); err != nil {
-			return nil, fmt.Errorf("start plan review: %w", err)
-		}
-		manifests, err = r.Discover()
-		if err != nil {
-			return nil, fmt.Errorf("rediscover plan review manifest: %w", err)
-		}
-	}
-	deferBoundResume := options.transition && options.authorize != nil
-	if options.transition && !deferBoundResume {
-		failurePhase = "resume-attempts"
-		manifests, err = resumeBoundAttempts(ctx, &r, c, issues, manifests, remote)
-		if err != nil {
-			return nil, fmt.Errorf("resume bound attempts: %w", err)
-		}
-	}
-	checkRuntime := func(ctx context.Context, manifest agentruntime.Manifest, fact orchestrator.AttemptFact) error {
-		head := fact.HeadSHA
-		if head == "" {
-			head = fact.BaseSHA
-		}
-		return r.VerifyActive(ctx, manifest, head)
-	}
-	failurePhase = "project-status"
-	statuses, decisions := projectRecoveryStatuses(ctx, facts, issues, manifests, c.Concurrency, checkRuntime)
-	if err := addClosedIssueProjection(ctx, api, c.Repository, statuses, issues); err != nil {
-		return statuses, fmt.Errorf("project closed issue state: %w", err)
-	}
-	if staleReads, diagnostic := metrics.Stale(); staleReads > 0 {
-		failurePhase = "stale-github-read"
-		staleErr := fmt.Errorf("GitHub refresh used %d last verified cached response(s): %s", staleReads, diagnostic)
-		previous, readErr := (&dashboardServer{stateRoot: stateRoot, repository: c.Repository}).readStatus()
-		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-			return nil, errors.Join(staleErr, fmt.Errorf("read last verified status projection: %w", readErr))
-		}
-		previous.ReconciliationError = staleErr.Error()
-		previous.ReconciliationErrorAt = time.Now().UTC()
-		if err := writeDashboardStatusSnapshot(stateRoot, previous); err != nil {
-			return statuses, errors.Join(staleErr, fmt.Errorf("write stale status projection: %w", err))
-		}
-		return previous.Statuses, staleErr
-	}
-	if err := writeProjectStatusSnapshot(stateRoot, c.Repository, statuses); err != nil {
-		return statuses, fmt.Errorf("write status projection: %w", err)
-	}
-	if options.authorize != nil {
-		if err := options.authorize(statuses); err != nil {
-			return statuses, fmt.Errorf("authorize requested transition: %w", err)
-		}
-	}
-	if !options.transition {
-		failurePhase = ""
-		return statuses, nil
-	}
-	refreshProjection := func(currentFacts []orchestrator.AttemptFact, currentIssues []internalgithub.RecoveryIssueFact) ([]agentruntime.Manifest, []orchestrator.Decision, error) {
-		currentManifests, discoverErr := r.Discover()
-		if discoverErr != nil {
-			return nil, nil, discoverErr
-		}
-		statuses, decisions = projectRecoveryStatuses(ctx, currentFacts, currentIssues, currentManifests, c.Concurrency, checkRuntime)
-		if err := addClosedIssueProjection(ctx, api, c.Repository, statuses, currentIssues); err != nil {
-			return nil, nil, err
-		}
-		return currentManifests, decisions, writeProjectStatusSnapshot(stateRoot, c.Repository, statuses)
-	}
-	// Governance may mutate GitHub only after authenticated repository access,
-	// exact proposal authorization, and the duplicate suppression below.
-	if slices.ContainsFunc(statuses, func(s orchestrator.RecoveryStatus) bool {
-		return s.State == "blocked" && strings.Contains(s.Diagnostic, "duplicate")
-	}) {
-		if options.authorize != nil {
-			return statuses, errors.New("requested transition is blocked by a duplicate attempt projection")
-		}
-		return statuses, nil
-	}
-	if deferBoundResume {
-		manifests, err = resumeBoundAttempts(ctx, &r, c, issues, manifests, remote)
-		if err != nil {
-			return statuses, fmt.Errorf("resume bound attempts: %w", err)
-		}
-	}
-	failurePhase = "dispatch-issues"
-	dispatchErr := dispatchIssues(ctx, api, &r, c, prConfig, issues, decisions)
-	remote, facts = recoveryAttemptFacts(remote, issues)
-	if _, _, err = refreshProjection(facts, issues); err != nil {
-		return statuses, errors.Join(fmt.Errorf("write dispatched status projection: %w", err), dispatchErr)
-	}
-	if dispatchErr != nil {
-		return statuses, fmt.Errorf("dispatch eligible issues: %w", dispatchErr)
-	}
-	failurePhase = "resume-handoffs"
-	if err := resumeHandoffs(ctx, &r, boundary, statePath, stateRoot, statuses, manifests, c.Commands.Implementation); err != nil {
-		return statuses, fmt.Errorf("resume durable handoffs: %w", err)
-	}
-	queuedManifests, err := r.Discover()
-	if err != nil {
-		return statuses, fmt.Errorf("rediscover queued attempts: %w", err)
-	}
-	failurePhase = "monitor-attempts"
-	monitorErr := monitorAttempts(ctx, &r, statuses, queuedManifests, issues)
-	planReviewErr := reconcilePlanReviews(ctx, &r, reviewBoundary(stateRoot), boundary, c, issues, queuedManifests, source, productionSnapshotRoot(stateRoot))
-	queuedManifests, decisions, err = refreshProjection(facts, issues)
-	if err != nil {
-		return statuses, errors.Join(fmt.Errorf("refresh monitored attempt projection: %w", err), monitorErr, planReviewErr)
-	}
-	if monitorErr != nil || planReviewErr != nil {
-		return statuses, fmt.Errorf("monitor live attempts and plan reviews: %w", errors.Join(monitorErr, planReviewErr))
-	}
-	failurePhase = "process-results"
-	transitionErr := monitorQueuedAttempts(ctx, api, &r, c, issues, queuedManifests, remote, statePath, stateRoot, func() error {
-		_, _, err := refreshProjection(facts, issues)
-		return err
-	})
-	queuedManifests, decisions, err = refreshProjection(facts, issues)
-	if err != nil {
-		return statuses, errors.Join(fmt.Errorf("refresh completed attempt projection: %w", err), transitionErr)
-	}
-	if transitionErr != nil {
-		return statuses, fmt.Errorf("process completed worker results: %w", transitionErr)
-	}
-	failurePhase = "cleanup-attempts"
-	if err := cleanupCompletedAttempts(ctx, boundary, facts, queuedManifests); err != nil {
-		return statuses, fmt.Errorf("clean completed attempts: %w", err)
-	}
-	if err := ensurePublishedEvidence(ctx, api, facts, queuedManifests, user.ID); err != nil {
-		return statuses, fmt.Errorf("repair published evidence: %w", err)
-	}
-	failurePhase = "pull-request-governance"
-	if err := internalgithub.RunPRReconciliation(ctx, api, prConfig, statePath); err != nil {
-		return statuses, fmt.Errorf("reconcile pull request governance: %w", err)
-	}
-	// Re-read GitHub after governance and monitoring so remote terminal state
-	// wins before local cleanup.
-	failurePhase = "refresh-attempts"
-	freshRemote, err := internalgithub.FetchAttemptFacts(ctx, api, c.Repository, user.ID)
-	if err != nil {
-		return statuses, fmt.Errorf("refresh pull request attempts: %w", err)
-	}
-	failurePhase = "refresh-issue-controls"
-	freshIssues, err := internalgithub.FetchIssueFacts(ctx, api, prConfig, freshRemote, false)
-	if err != nil {
-		return statuses, fmt.Errorf("refresh issue controls: %w", err)
-	}
-	_, freshFacts := recoveryAttemptFacts(freshRemote, freshIssues)
-	if err := cleanupCompletedAttempts(ctx, boundary, freshFacts, queuedManifests); err != nil {
-		return statuses, fmt.Errorf("clean newly completed attempts: %w", err)
-	}
-	_, decisions, err = refreshProjection(freshFacts, freshIssues)
-	if err != nil {
-		return statuses, fmt.Errorf("write fresh status projection: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return statuses, fmt.Errorf("reconciliation exceeded the %s recovery target: %w", options.timeout, err)
-	}
-	failurePhase = ""
-	return statuses, nil
+	return status.Statuses, nil
 }
 
 func recoveryAttemptFacts(remote []internalgithub.RecoveryAttemptFact, issues []internalgithub.RecoveryIssueFact) ([]internalgithub.RecoveryAttemptFact, []orchestrator.AttemptFact) {
@@ -1686,23 +1323,6 @@ func cleanupCompletedAttempts(ctx context.Context, boundary boundaryCaller, fact
 	return nil
 }
 
-func ensurePublishedEvidence(ctx context.Context, api internalgithub.API, facts []orchestrator.AttemptFact, manifests []agentruntime.Manifest, actorID int) error {
-	for _, fact := range facts {
-		if fact.State != "active" && fact.State != "review-ready" {
-			continue
-		}
-		if !slices.ContainsFunc(manifests, func(manifest agentruntime.Manifest) bool {
-			return orchestrator.MatchesPublishedAttempt(manifest, fact)
-		}) {
-			continue
-		}
-		if err := api.EnsureEvidence(ctx, fact.Repository, fact.Issue, fact.Attempt, fact.HeadSHA, actorID); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func addTerminalAttemptBlockers(issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, facts []orchestrator.AttemptFact) {
 	for i := range issues {
 		for _, manifest := range manifests {
@@ -1770,10 +1390,6 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 	return statuses, decisions
 }
 
-func writeStatusSnapshot(stateRoot string, statuses []orchestrator.RecoveryStatus) error {
-	return writeDashboardStatusSnapshot(stateRoot, dashboardStatusSnapshot{UpdatedAt: time.Now().UTC(), Statuses: statuses})
-}
-
 func writeDashboardStatusSnapshot(stateRoot string, snapshot dashboardStatusSnapshot) error {
 	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
 		return err
@@ -1812,27 +1428,15 @@ func writeDashboardStatusSnapshot(stateRoot string, snapshot dashboardStatusSnap
 	return os.Rename(tmpName, path)
 }
 
-func recordReconcileFailure(stateRoot, repository string, cause error) error {
-	server := dashboardServer{stateRoot: stateRoot, repository: repository}
-	snapshot, err := server.readStatus()
-	if errors.Is(err, os.ErrNotExist) {
-		snapshot = dashboardStatusSnapshot{}
-	} else if err != nil {
-		return err
-	}
-	snapshot.ReconciliationError = internalgithub.Redact(cause.Error())
-	snapshot.ReconciliationErrorAt = time.Now().UTC()
-	return writeDashboardStatusSnapshot(stateRoot, snapshot)
-}
-
-func writeProjectStatusSnapshot(stateRoot, repository string, statuses []orchestrator.RecoveryStatus) error {
-	if slices.ContainsFunc(statuses, func(status orchestrator.RecoveryStatus) bool { return status.Repository != repository }) {
-		return errors.New("refusing to write a cross-project status projection")
-	}
-	return writeStatusSnapshot(stateRoot, statuses)
-}
-
 func seedAttemptSource(ctx context.Context, checkout, repositoryName, attemptRoot, baseBranch, baseSHA string) (string, error) {
+	return seedAttemptSourceMode(ctx, checkout, repositoryName, attemptRoot, baseBranch, baseSHA, false)
+}
+
+func seedImmutableAttemptSource(ctx context.Context, checkout, repositoryName, attemptRoot, baseBranch, baseSHA string) (string, error) {
+	return seedAttemptSourceMode(ctx, checkout, repositoryName, attemptRoot, baseBranch, baseSHA, true)
+}
+
+func seedAttemptSourceMode(ctx context.Context, checkout, repositoryName, attemptRoot, baseBranch, baseSHA string, immutable bool) (string, error) {
 	mode := os.FileMode(0o770)
 	if !hostIsolationInstalled() {
 		mode = 0o700
@@ -1873,26 +1477,61 @@ func seedAttemptSource(ctx context.Context, checkout, repositoryName, attemptRoo
 	if err := os.Chmod(name, 0o640); err != nil {
 		return "", err
 	}
-	path := filepath.Join(attemptRoot, internalgithub.RepositoryIdentifier(repositoryName)+".source.bundle")
-	if err := os.Rename(name, path); err != nil {
+	if !immutable {
+		path := filepath.Join(attemptRoot, internalgithub.RepositoryIdentifier(repositoryName)+".source.bundle")
+		if err := os.Rename(name, path); err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+	bundle, err := os.Open(name)
+	if err != nil {
+		return "", err
+	}
+	if err := bundle.Sync(); err != nil {
+		_ = bundle.Close()
+		return "", fmt.Errorf("sync worker source bundle: %w", err)
+	}
+	digest := sha256.New()
+	_, copyErr := io.Copy(digest, bundle)
+	closeErr := bundle.Close()
+	if copyErr != nil || closeErr != nil {
+		return "", errors.Join(copyErr, closeErr)
+	}
+	path := filepath.Join(attemptRoot, internalgithub.RepositoryIdentifier(repositoryName)+"-"+hex.EncodeToString(digest.Sum(nil))+".source.bundle")
+	if err := installContentAddressedBundle(name, path); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
-func startIssueAttempt(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact) (agentruntime.Manifest, error) {
-	command, interactive := interactiveImplementationCommand(cfg.Commands.Implementation)
-	attempt := agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA, Interactive: interactive, Eligible: func() bool { return issue.DispatchAuthorized }}
-	identity, err := agentruntime.AttemptIdentity(runtime.Root, attempt)
-	if err != nil {
-		return agentruntime.Manifest{}, err
+func installContentAddressedBundle(temporary, path string) error {
+	if err := os.Link(temporary, path); err == nil {
+		return immutableDirSync(filepath.Dir(path))
+	} else if !errors.Is(err, os.ErrExist) {
+		return err
 	}
-	attempt.Command, err = config.ExpandManagedWorkspace(command, identity.Worktree)
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return agentruntime.Manifest{}, err
+		return err
 	}
-	attempt.Context = implementationPrompt(issue, identity, interactive)
-	return runtime.PrepareAndStart(ctx, attempt)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o640 || !ownedByCurrentUser(info) {
+		return errors.New("worker source bundle is unsafe")
+	}
+	want, got := sha256.New(), sha256.New()
+	temporaryFile, err := os.Open(temporary)
+	if err != nil {
+		return err
+	}
+	_, wantErr := io.Copy(want, temporaryFile)
+	closeErr := temporaryFile.Close()
+	_, gotErr := io.Copy(got, file)
+	if wantErr != nil || closeErr != nil || gotErr != nil || !bytes.Equal(want.Sum(nil), got.Sum(nil)) {
+		return errors.New("worker source bundle collision")
+	}
+	return immutableDirSync(filepath.Dir(path))
 }
 
 func interactiveImplementationCommand(command []string) ([]string, bool) {
@@ -1904,60 +1543,6 @@ func interactiveImplementationCommand(command []string) ([]string, bool) {
 		return interactive, true
 	}
 	return command, false
-}
-
-func resumeBoundAttempts(ctx context.Context, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact) ([]agentruntime.Manifest, error) {
-	for _, issue := range issues {
-		binding := issue.ActiveAttempt
-		remoteConflict := slices.ContainsFunc(remote, func(fact internalgithub.RecoveryAttemptFact) bool {
-			return fact.PR > 0 && fact.Repository == issue.Repository && fact.Issue == issue.Issue && (fact.State == "active" || fact.State == "review-ready" || fact.State == "completed")
-		})
-		if binding == nil || !issue.DispatchAuthorized || remoteConflict || slices.ContainsFunc(manifests, func(manifest agentruntime.Manifest) bool {
-			return manifest.Repository == binding.Repository && manifest.Issue == binding.Issue && manifest.Attempt == binding.Attempt
-		}) {
-			continue
-		}
-		issue.Attempt, issue.BaseSHA = binding.Attempt, binding.BaseSHA
-		manifest, err := startIssueAttempt(ctx, runtime, cfg, issue)
-		if err != nil {
-			return manifests, fmt.Errorf("resume bound %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
-		}
-		manifests = append(manifests, manifest)
-	}
-	return manifests, nil
-}
-
-func dispatchIssues(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, prConfig internalgithub.PRAdapterConfig, issues []internalgithub.RecoveryIssueFact, decisions []orchestrator.Decision) error {
-	for _, decision := range decisions {
-		if decision.State != orchestrator.Runnable {
-			continue
-		}
-		index := slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
-			return issue.Repository == decision.Repository && issue.Issue == decision.Number
-		})
-		if index < 0 {
-			return errors.New("scheduler returned an unknown issue")
-		}
-		issue := issues[index]
-		if !issue.Eligible || !issue.DispatchAuthorized {
-			return fmt.Errorf("dispatch %s#%d attempt %d: issue is not eligible", issue.Repository, issue.Issue, issue.Attempt)
-		}
-		identity, err := agentruntime.AttemptIdentity(runtime.Root, agentruntime.Attempt{Repository: issue.Repository, Issue: issue.Issue, Number: issue.Attempt, BaseSHA: issue.BaseSHA})
-		if err != nil {
-			return fmt.Errorf("identify dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
-		}
-		detail := fmt.Sprintf("Implementation session reserved.\n\n- Project: `%s`\n- Branch: `%s`\n- Worktree: `%s`\n- Session: `%s`", issue.Repository, identity.Branch, identity.Worktree, identity.Session)
-		if err := internalgithub.EnsureActiveAttempt(ctx, api, prConfig, issue.Issue, issue.Attempt, issue.BaseSHA, detail); err != nil {
-			return fmt.Errorf("bind dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
-		}
-		binding := internalgithub.RecoveryAttemptFact{Repository: issue.Repository, Issue: issue.Issue, Attempt: issue.Attempt, BaseSHA: issue.BaseSHA, State: "active"}
-		issues[index].Active, issues[index].Eligible, issues[index].ActiveAttempt = true, false, &binding
-		issue.DispatchAuthorized = issue.Eligible
-		if _, err := startIssueAttempt(ctx, runtime, cfg, issue); err != nil {
-			return fmt.Errorf("dispatch %s#%d attempt %d: %w", issue.Repository, issue.Issue, issue.Attempt, err)
-		}
-	}
-	return nil
 }
 
 func implementationPrompt(issue internalgithub.RecoveryIssueFact, identity agentruntime.Manifest, interactive bool) string {
@@ -2296,337 +1881,6 @@ func amendIssueWithHumanInstructions(issue internalgithub.RecoveryIssueFact, fee
 	return issue, bodies
 }
 
-func monitorQueuedAttempts(ctx context.Context, api internalgithub.API, runtime *agentruntime.Runtime, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, remote []internalgithub.RecoveryAttemptFact, statePath, stateRoot string, refreshProjection func() error) error {
-	recovery := &internalgithub.FileRecovery{Path: statePath}
-	for _, manifest := range manifests {
-		var prepared internalgithub.PreparedPublication
-		preparedOK := false
-		if statePath != "" {
-			var err error
-			prepared, preparedOK, err = recovery.PreparedHandoffPublication(ctx, manifest.Repository, manifest.Issue, manifest.Attempt)
-			if err != nil {
-				return err
-			}
-		}
-		remoteIndex := slices.IndexFunc(remote, func(f internalgithub.RecoveryAttemptFact) bool {
-			return f.Repository == manifest.Repository && f.Issue == manifest.Issue && f.Attempt == manifest.Attempt
-		})
-		issueIndex := slices.IndexFunc(issues, func(i internalgithub.RecoveryIssueFact) bool {
-			return i.Repository == manifest.Repository && i.Issue == manifest.Issue
-		})
-		if issueIndex < 0 {
-			continue
-		}
-		issue := issues[issueIndex]
-		var bound internalgithub.RecoveryAttemptFact
-		if remoteIndex >= 0 {
-			bound = remote[remoteIndex]
-		} else if issue.ActiveAttempt != nil {
-			bound = *issue.ActiveAttempt
-		}
-		if !preparedOK && (bound.Repository != manifest.Repository || bound.Issue != manifest.Issue || bound.Attempt != manifest.Attempt || bound.BaseSHA != manifest.BaseSHA) {
-			continue
-		}
-		issue.Attempt = manifest.Attempt
-		var (
-			handoff internalgithub.RecoveryHandoff
-			err     error
-		)
-		if preparedOK {
-			handoff = prepared.Handoff
-		} else if bound.PR > 0 {
-			published := bound
-			var received bool
-			handoff, received, err = recovery.ReceivedHandoff(ctx, manifest.Repository, published.PR, manifest.Issue, manifest.Attempt, published.HeadSHA)
-			if err != nil {
-				return err
-			}
-			if !received {
-				continue
-			}
-		}
-		if !issue.DispatchAuthorized {
-			continue
-		}
-		issue, humanInstructions := amendIssueWithHumanInstructions(issue, handoff.Feedback)
-		current := manifest
-		if manifest.State == "preparing" || manifest.State == "running" {
-			continue // monitorAttempts owns live bound attempts from the same snapshot.
-		}
-		if current.State == "completed" {
-			var completed internalgithub.PreparedPublication
-			var prepare func(string) error
-			if handoff.PR > 0 {
-				prepare = func(head string) error {
-					outcome := internalgithub.HandoffOutcome{Key: handoff.Key}
-					if handoff.Validation {
-						outcome.ValidationResult = "blocked"
-						outcome.ValidationEvidence = "pull request head changed to " + head + "; validation must run against the published feedback head"
-					}
-					for _, feedback := range handoff.Feedback {
-						outcome.Feedback = append(outcome.Feedback, internalgithub.FeedbackOutcome{ID: feedback.ID, Source: feedback.Source, State: internalgithub.FeedbackAddressed, Evidence: "published in head " + head})
-					}
-					completed = internalgithub.PreparedPublication{Handoff: handoff, Outcome: outcome, HeadSHA: head}
-					return recovery.PrepareHandoffPublication(ctx, handoff, head, outcome)
-				}
-			} else if bound.PR > 0 {
-				prepare = func(head string) error {
-					if head == bound.HeadSHA {
-						return nil
-					}
-					var err error
-					completed, err = recovery.PrepareAttemptPublication(ctx, manifest.Repository, bound.PR, manifest.Issue, manifest.Attempt, bound.HeadSHA, head)
-					return err
-				}
-			}
-			pending, err := publishWorkerResult(ctx, api, runtime, cfg, issue, current, humanInstructions, stateRoot, prepare, refreshProjection)
-			if err != nil {
-				return errors.Join(err, durableAttemptFailure(ctx, api, issue, current, err))
-			}
-			if pending {
-				continue
-			}
-			if completed.HeadSHA == "" {
-				continue
-			}
-			if err := recovery.CompleteHandoffPublication(ctx, completed); err != nil {
-				return err
-			}
-		} else if current.State == "failed" || current.State == "cancelled" {
-			if err := durableAttemptFailure(ctx, api, issue, current, errors.New(current.Diagnostic)); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func publishWorkerResult(ctx context.Context, api internalgithub.API, runtimeState *agentruntime.Runtime, cfg config.Config, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, humanInstructions []string, stateRoot string, preparePublication func(string) error, refreshProjection func() error) (bool, error) {
-	boundary := implementationBoundary(stateRoot)
-	snapshotRoot := productionSnapshotRoot(stateRoot)
-	reviewEnv, err := configuredAgentEnvironment(cfg.Commands.Environment)
-	if err != nil {
-		return false, err
-	}
-	result, head, root, err := importWorkerExport(ctx, boundary, manifest)
-	if err != nil {
-		return false, err
-	}
-	review := independentReviewResult{Type: "agent-symphony-review-v1", Status: "clean"}
-	pending := false
-	command, interactive := interactiveImplementationCommand(cfg.Commands.Implementation)
-	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: command, Interactive: interactive}
-	ensureFindings := func(findings []string) error {
-		user, err := api.AuthenticatedUser(ctx)
-		if err != nil {
-			return err
-		}
-		return api.EnsureReviewFindings(ctx, issue.Repository, issue.Issue, issue.Attempt, head, findings, user.ID)
-	}
-	if (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued") && manifest.ReviewHead == head && (manifest.ReviewSnapshot != "" || manifest.ReviewSession != "") {
-		var cleanupErr error
-		manifest, cleanupErr = cleanupReviewOutcome(ctx, runtimeState, attempt, reviewBoundary(stateRoot), reviewEnv, manifest, snapshotRoot)
-		if cleanupErr != nil {
-			return true, nil
-		}
-		if refreshProjection != nil {
-			if err := refreshProjection(); err != nil {
-				return false, err
-			}
-		}
-	}
-	if manifest.ReviewState == "findings-queued" && manifest.ReviewHead == head {
-		if err := ensureFindings(manifest.ReviewFindings); err != nil {
-			return false, err
-		}
-		return returnReviewFindings(ctx, runtimeState, boundary, attempt, manifest, head, manifest.ReviewFindings, humanInstructions, cfg.Commands.Implementation)
-	}
-	reviewBase := manifest.BaseSHA
-	if preflightObjectID.MatchString(issue.BaseSHA) {
-		if issue.BaseSHA != manifest.BaseSHA && scanGit(ctx, root, nil, []string{"merge-base", "--is-ancestor", issue.BaseSHA, head}, nil) != nil {
-			findings := []string{fmt.Sprintf("Integrate current `%s` at exact commit `%s`, resolve conflicts, and rerun the relevant validation.", issue.BaseBranch, issue.BaseSHA)}
-			if err := ensureFindings(findings); err != nil {
-				return false, err
-			}
-			queued, err := runtimeState.RecordReviewFindings(attempt, head, findings, false, false)
-			if err != nil {
-				return false, err
-			}
-			return returnReviewFindings(ctx, runtimeState, boundary, attempt, queued, head, findings, humanInstructions, cfg.Commands.Implementation)
-		}
-		reviewBase = issue.BaseSHA
-	}
-	target, targetErr := reviewTarget(agentruntime.ReviewModeImplementation, issue, reviewBase, head)
-	if targetErr != nil {
-		return false, targetErr
-	}
-	storedMode, storedTarget := manifest.ReviewMode, manifest.ReviewTarget
-	if storedMode == "" && storedTarget == "" {
-		storedMode, storedTarget = agentruntime.ReviewModeImplementation, target
-	}
-	if manifest.ReviewState != "clean" || storedMode != agentruntime.ReviewModeImplementation || storedTarget != target || manifest.ReviewBase != reviewBase || manifest.ReviewHead != head {
-		review, pending, err = runIndependentReview(ctx, runtimeState, attempt, reviewBoundary(stateRoot), reviewEnv, cfg.Commands.Reviewer, issue, manifest, root, head, snapshotRoot, agentruntime.ReviewModeImplementation)
-	}
-	if err != nil {
-		return false, fmt.Errorf("independent review: %w", err)
-	}
-	if pending {
-		return true, nil
-	}
-	if len(review.Findings) > 0 {
-		if err := ensureFindings(review.Findings); err != nil {
-			return false, err
-		}
-		queued, err := runtimeState.RecordReviewFindings(attempt, head, review.Findings, false, false)
-		if err != nil {
-			return false, err
-		}
-		return returnReviewFindings(ctx, runtimeState, boundary, attempt, queued, head, review.Findings, humanInstructions, cfg.Commands.Implementation)
-	}
-	if manifest.ReviewState != "clean" {
-		if _, err := runtimeState.RecordReview(attempt, "clean", agentruntime.ReviewModeImplementation, target, reviewBase, head, "", ""); err != nil {
-			return false, err
-		}
-		if refreshProjection != nil {
-			if err := refreshProjection(); err != nil {
-				return false, err
-			}
-		}
-	}
-	result.Validation = fmt.Sprintf("Independent review passed for exact head `%s`.", head)
-	run := func(dir string, args ...string) (string, error) {
-		out, err := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "-C", dir}, args...)...).CombinedOutput()
-		return strings.TrimSpace(string(out)), err
-	}
-	if preparePublication != nil {
-		if err := preparePublication(head); err != nil {
-			return false, err
-		}
-	}
-	if _, err := run(root, "push", "origin", "FETCH_HEAD:refs/heads/"+manifest.Branch); err != nil {
-		return false, fmt.Errorf("publish verified worker head: %w", err)
-	}
-	body, err := internalgithub.PullRequestBody(issue.Issue, issue.Attempt, result.Validation, result.Documentation, result.Decisions)
-	if err != nil {
-		return false, err
-	}
-	mutation := internalgithub.Mutation{Issue: issue.Issue, Attempt: issue.Attempt}
-	user, err := api.AuthenticatedUser(ctx)
-	if err != nil {
-		return false, err
-	}
-	pr, currentBody, err := internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, user.ID)
-	if err != nil {
-		return false, err
-	}
-	if pr.Number == 0 {
-		pr, err = api.CreatePullRequest(ctx, issue.Repository, issue.Title, manifest.Branch, issue.BaseBranch, body, mutation)
-		if err != nil {
-			// An ambiguous create is recovered by deterministic head lookup.
-			pr, currentBody, _ = internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, user.ID)
-			if pr.Number == 0 {
-				return false, err
-			}
-		}
-	}
-	bound, err := internalgithub.BindPullRequestBody(body, issue.Issue, issue.Attempt, manifest.Branch, head, pr.Number)
-	if err != nil {
-		return false, err
-	}
-	if currentBody != bound {
-		// Re-read before mutation so a restart or concurrent edit cannot create a second PR.
-		fresh, freshBody, findErr := internalgithub.FindPublishedAttempt(ctx, api, issue.Repository, manifest.Branch, head, user.ID)
-		if findErr != nil || fresh.Number != pr.Number {
-			return false, errors.New("pull request identity changed before binding")
-		}
-		currentBody = freshBody
-	}
-	if currentBody != bound {
-		if err := api.UpdatePullRequest(ctx, issue.Repository, pr.Number, bound, mutation); err != nil {
-			return false, err
-		}
-	}
-	if err := api.EnsureEvidence(ctx, issue.Repository, issue.Issue, issue.Attempt, head, user.ID); err != nil {
-		return false, err
-	}
-	marker, _ := internalgithub.AttemptMarker(issue.Issue, issue.Attempt, manifest.Branch, head, pr.Number, "review")
-	comment, _ := internalgithub.AttributedBody(issue.Issue, issue.Attempt, "Attempt published for review.")
-	present, err := internalgithub.HasAttemptComment(ctx, api, issue.Repository, issue.Issue, marker, user.ID)
-	if err != nil {
-		return false, err
-	}
-	if present {
-		return false, nil
-	}
-	return false, api.CreateIssueComment(ctx, issue.Repository, issue.Issue, comment+"\n\n"+marker, mutation)
-}
-
-func returnReviewFindings(ctx context.Context, runtimeState *agentruntime.Runtime, boundary workerBoundaryRunner, attempt agentruntime.Attempt, manifest agentruntime.Manifest, head string, findings, humanInstructions, command []string) (bool, error) {
-	if len(command) == 0 {
-		return false, errors.New("implementation command is missing")
-	}
-	command, err := config.ExpandManagedWorkspace(command, manifest.Worktree)
-	if err != nil {
-		return false, fmt.Errorf("bind review findings handoff command: %w", err)
-	}
-	key := "independent-review-" + head
-	outcomePath := handoffReceiptPath(manifest.Worktree, key)
-	handoff, _ := json.Marshal(struct {
-		Type, Key, Findings string
-		HumanInstructions   []string `json:"human_instructions,omitempty"`
-	}{"agent-symphony-handoff-v1", key, strings.Join(findings, "\n"), humanInstructions})
-	accept := func() error {
-		request, _ := json.Marshal(struct {
-			Manifest     agentruntime.Manifest `json:"manifest"`
-			Handoff      json.RawMessage       `json:"handoff"`
-			OutcomePath  string                `json:"outcome_path"`
-			OutcomeToken string                `json:"outcome_token"`
-			Command      []string              `json:"command"`
-		}{manifest, handoff, outcomePath, head, command})
-		accepted, err := boundary.call(ctx, "accept-handoff", agentruntime.Command{Stdin: bytes.NewReader(request)})
-		if err != nil {
-			return err
-		}
-		var ack handoffReceipt
-		decoder := json.NewDecoder(strings.NewReader(accepted.Output))
-		decoder.DisallowUnknownFields()
-		if decoder.Decode(&ack) != nil || decoder.Decode(&struct{}{}) != io.EOF || ack.Type != "agent-symphony-handoff-executed-v1" || ack.Key != key || ack.OutcomePath != outcomePath || ack.OutcomeToken != head {
-			return errors.New("review findings handoff acceptance binding mismatch")
-		}
-		return nil
-	}
-	if !manifest.ReviewHandoffAck {
-		if err := accept(); err != nil {
-			if manifest.ReviewHandoffQueued {
-				return true, nil
-			}
-			return false, err
-		}
-		if !manifest.ReviewHandoffQueued {
-			var err error
-			manifest, err = runtimeState.RecordReviewFindings(attempt, head, findings, true, false)
-			if err != nil {
-				return false, err
-			}
-		}
-		if _, err := runtimeState.RecordReviewFindings(attempt, head, findings, true, true); err != nil {
-			return false, err
-		}
-	}
-	return false, nil
-}
-
-func cleanupReviewOutcome(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env []string, manifest agentruntime.Manifest, snapshotRoot string, resultTarget ...string) (agentruntime.Manifest, error) {
-	target := manifest.ReviewTarget
-	if len(resultTarget) == 1 {
-		target = resultTarget[0]
-	}
-	if err := cleanupReviewResources(ctx, boundary, env, attempt, manifest.ReviewHead, target, manifest.ReviewSnapshot, manifest.ReviewSession, snapshotRoot); err != nil {
-		return manifest, err
-	}
-	return runtimeState.RecordReview(attempt, manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead, "", "")
-}
-
 func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, string) {
 	repository := internalgithub.RepositoryIdentifier(attempt.Repository)
 	session, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
@@ -2691,55 +1945,6 @@ type independentReviewResult struct {
 	Session  string   `json:"-"`
 }
 
-func startIssuePlanReview(ctx context.Context, runtimeState *agentruntime.Runtime, boundary boundaryCaller, cfg config.Config, issues []internalgithub.RecoveryIssueFact, manifests []agentruntime.Manifest, source, snapshotRoot string, issueNumber, attemptNumber int) error {
-	index := slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
-		return issue.Repository == cfg.Repository && issue.Issue == issueNumber
-	})
-	if index < 0 || attemptNumber < 1 {
-		return errors.New("plan review target is not the exact current issue attempt")
-	}
-	issue := issues[index]
-	binding := issue.ActiveAttempt
-	if !issue.DispatchAuthorized || binding == nil || binding.Repository != issue.Repository || binding.Issue != issue.Issue || binding.Attempt != attemptNumber || binding.BaseSHA == "" {
-		return errors.New("plan review target is not an authorized active attempt")
-	}
-	matches := make([]agentruntime.Manifest, 0, 1)
-	for _, manifest := range manifests {
-		if manifest.Repository == binding.Repository && manifest.Issue == binding.Issue && manifest.Attempt == binding.Attempt && manifest.BaseSHA == binding.BaseSHA {
-			matches = append(matches, manifest)
-		}
-	}
-	if len(matches) != 1 || matches[0].State != "running" {
-		return errors.New("plan review target does not have one running deterministic implementation session")
-	}
-	manifest := matches[0]
-	if err := runtimeState.VerifyOwned(ctx, manifest); err != nil {
-		return fmt.Errorf("verify plan review runtime owner: %w", err)
-	}
-	issue.Attempt, issue.BaseSHA = attemptNumber, manifest.BaseSHA
-	target, err := reviewTarget(agentruntime.ReviewModePlan, issue, manifest.BaseSHA, manifest.BaseSHA)
-	if err != nil {
-		return err
-	}
-	if manifest.ReviewState == "findings-queued" {
-		return errors.New("plan review findings are already queued")
-	}
-	if manifest.ReviewState == "preparing" || manifest.ReviewState == "running" {
-		if manifest.ReviewMode != agentruntime.ReviewModePlan || manifest.ReviewTarget != target {
-			return errors.New("another review already owns the deterministic reviewer session")
-		}
-	}
-	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
-	if err != nil {
-		return err
-	}
-	review, pending, err := runIndependentReview(ctx, runtimeState, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}, boundary, env, cfg.Commands.Reviewer, issue, manifest, source, manifest.BaseSHA, snapshotRoot, agentruntime.ReviewModePlan)
-	if err == nil && (!pending || review.Snapshot == "" || review.Session == "") {
-		err = errors.New("plan review did not start a reviewer session")
-	}
-	return err
-}
-
 func reviewTarget(mode string, issue internalgithub.RecoveryIssueFact, base, head string) (string, error) {
 	if issue.Repository == "" || issue.Issue < 1 || issue.Attempt < 1 {
 		return "", errors.New("review issue target is invalid")
@@ -2756,6 +1961,10 @@ func reviewTarget(mode string, issue internalgithub.RecoveryIssueFact, base, hea
 	default:
 		return "", fmt.Errorf("invalid review mode %q", mode)
 	}
+}
+
+func missingTmuxPaneStatus(result agentruntime.Result) bool {
+	return !result.Exited && result.Code == 0 && strings.TrimSpace(result.Output) == "|||"
 }
 
 func validReviewTarget(mode, target, repository string, issue int, head string) bool {
@@ -2786,7 +1995,11 @@ func reviewPrompt(mode, target string, issue internalgithub.RecoveryIssueFact) (
 	return fmt.Sprintf("Review mode: %s. %s Use the installed gh CLI to post direct status on the bound issue or pull request as one unedited `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON` comment; pair it with adding or removing the bound issue's `needs-attention` label. A nonempty reason and a fresh re-read of both comment and label are required before reporting the status changed. Authentication, authorization, or partial-update errors are failures, never success. Make the entire final response exactly one bounded JSON object on stdout: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings. Do not wrap it in Markdown, emit prose, or emit another object.\n\n%s", mode, task, issue.Body), nil
 }
 
-func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtime, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot string, selectedMode ...string) (independentReviewResult, bool, error) {
+func runIndependentReviewV2(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot, mode string) (independentReviewResult, bool, error) {
+	return runIndependentReviewCore(ctx, attempt, boundary, env, command, issue, manifest, source, head, snapshotRoot, mode)
+}
+
+func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot string, selectedMode ...string) (independentReviewResult, bool, error) {
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
 	}
@@ -2836,6 +2049,11 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if manifest.ReviewState == "running" && manifestMode == mode && manifestTarget == target && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
 		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
 		if err == nil {
+			// tmux reports a missing exact target as success with empty format
+			// fields. That is the pre-launch state for a durable reviewer intent.
+			if missingTmuxPaneStatus(result) {
+				goto launch
+			}
 			pane, statusErr := agentruntime.ParsePaneStatus(result.Output)
 			if statusErr != nil {
 				return independentReviewResult{}, false, fmt.Errorf("observe reviewer tmux session: %w", statusErr)
@@ -2861,28 +2079,6 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 				if err != nil {
 					return independentReviewResult{}, false, err
 				}
-				if runtimeState != nil {
-					var persisted agentruntime.Manifest
-					if parsed.Status == "findings" {
-						persisted, err = runtimeState.RecordReviewFindings(attempt, head, parsed.Findings, false, false)
-					} else {
-						persisted, err = runtimeState.RecordReview(attempt, "clean", mode, target, reviewBase, head, snapshot, session)
-					}
-					if err != nil {
-						return independentReviewResult{}, false, err
-					}
-					cleanupTarget := target
-					if legacyHeadArtifact {
-						cleanupTarget = head
-					}
-					if _, err := cleanupReviewOutcome(ctx, runtimeState, attempt, boundary, env, persisted, snapshotRoot, cleanupTarget); err != nil {
-						return parsed, true, nil
-					}
-				} else {
-					if err := cleanupReviewResources(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot); err != nil {
-						return parsed, true, nil
-					}
-				}
 				return parsed, false, nil
 			}
 		}
@@ -2890,11 +2086,8 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 	if mode == agentruntime.ReviewModePlan && target != currentTarget {
 		return independentReviewResult{}, false, errors.New("plan review target no longer matches the current issue body")
 	}
-	if runtimeState != nil {
-		if _, err := runtimeState.RecordReview(attempt, "preparing", mode, target, reviewBase, head, snapshot, session); err != nil {
-			return independentReviewResult{}, false, err
-		}
-	}
+
+launch:
 	if err := cleanupReviewResources(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot); err != nil {
 		return independentReviewResult{}, true, nil
 	}
@@ -2970,16 +2163,8 @@ func runIndependentReview(ctx context.Context, runtimeState *agentruntime.Runtim
 		return independentReviewResult{}, false, err
 	}
 	command = append(slices.Clone(command), prompt)
-	if runtimeState != nil && runtimeState.Helper != "" {
-		command = agentruntime.PaneExitStatusCommand(runtimeState.Helper, "tmux", command)
-	}
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
-	}
-	if runtimeState != nil {
-		if _, err := runtimeState.RecordReview(attempt, "running", mode, target, reviewBase, head, snapshot, session); err != nil {
-			return independentReviewResult{}, false, err
-		}
 	}
 	return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
 }
@@ -3031,235 +2216,6 @@ func durableAttemptFailure(ctx context.Context, api internalgithub.API, issue in
 	}
 	if err := api.CreateIssueComment(ctx, issue.Repository, issue.Issue, body+"\n\n"+marker, internalgithub.Mutation{Issue: issue.Issue, Attempt: issue.Attempt}); err != nil {
 		return err
-	}
-	return nil
-}
-
-func recoverDashboardAttempt(ctx context.Context, configPath, statePath, stateRoot string, issueNumber, attemptNumber int) error {
-	if issueNumber < 1 || attemptNumber < 1 {
-		return errors.New("invalid recovery attempt")
-	}
-	statuses, err := reconcileGitHubRun(ctx, configPath, statePath, stateRoot, false)
-	if err != nil {
-		return err
-	}
-	c, err := config.Load(configPath)
-	if err != nil {
-		return err
-	}
-	matches := slices.DeleteFunc(slices.Clone(statuses), func(status orchestrator.RecoveryStatus) bool {
-		return status.Repository != c.Repository || status.Issue != issueNumber || status.Attempt != attemptNumber
-	})
-	if len(matches) != 1 || !matches[0].Retryable || matches[0].PR > 0 || (matches[0].State != "failed" && matches[0].State != "blocked") {
-		return errors.New("fresh authoritative state does not permit recovery")
-	}
-	status := matches[0]
-	if status.State == "blocked" && !slices.Equal(status.Blockers, []string{"runtime liveness mismatch"}) {
-		return errors.New("only an exact runtime liveness mismatch can be recovered")
-	}
-	boundary := implementationBoundary(stateRoot)
-	runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot, Runner: boundary}
-	manifests, err := runtimeState.Discover()
-	if err != nil {
-		return err
-	}
-	local := slices.DeleteFunc(slices.Clone(manifests), func(manifest agentruntime.Manifest) bool {
-		return manifest.Repository != c.Repository || manifest.Issue != issueNumber || manifest.Attempt != attemptNumber
-	})
-	if len(local) != 1 || local[0].Branch != status.Branch || local[0].Worktree != status.Worktree || local[0].Session != status.Session {
-		return errors.New("local attempt identity no longer matches the fresh projection")
-	}
-	manifest := local[0]
-	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
-	user, err := api.AuthenticatedUser(ctx)
-	if err != nil {
-		return err
-	}
-	prConfig := internalgithub.PRAdapterConfig{Repository: c.Repository, CancelCommand: "/agent-symphony cancel", RetryCommand: "/agent-symphony retry", ActorID: user.ID}
-	if status.State == "blocked" {
-		manifest, err = runtimeState.Cancel(ctx, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}, "dashboard recovery: "+status.Diagnostic)
-		if err != nil {
-			return err
-		}
-		issue := internalgithub.RecoveryIssueFact{Repository: c.Repository, Issue: issueNumber, Attempt: attemptNumber}
-		if err := durableAttemptFailure(ctx, api, issue, manifest, errors.New(status.Diagnostic)); err != nil {
-			return err
-		}
-	}
-	if err := internalgithub.EnsureRetryCommand(ctx, api, prConfig, issueNumber, attemptNumber); err != nil {
-		return err
-	}
-	_, err = reconcileGitHubRun(ctx, configPath, statePath, stateRoot, false)
-	return err
-}
-
-func monitorAttempts(ctx context.Context, runtime *agentruntime.Runtime, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, issues []internalgithub.RecoveryIssueFact) error {
-	for _, status := range statuses {
-		if status.State != "active" && status.State != "review-ready" && !(status.State == "blocked" && slices.Equal(status.Blockers, []string{"runtime liveness mismatch"})) {
-			continue
-		}
-		manifestIndex := slices.IndexFunc(manifests, func(manifest agentruntime.Manifest) bool {
-			return manifest.Repository == status.Repository && manifest.Issue == status.Issue && manifest.Attempt == status.Attempt && manifest.State == "running"
-		})
-		if manifestIndex < 0 {
-			continue
-		}
-		manifest := manifests[manifestIndex]
-		authorized := slices.ContainsFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
-			return issue.Repository == status.Repository && issue.Issue == status.Issue && issue.DispatchAuthorized
-		})
-		_, err := runtime.Monitor(ctx, agentruntime.Attempt{Repository: status.Repository, Issue: status.Issue, Number: status.Attempt, BaseSHA: manifest.BaseSHA, Eligible: func() bool { return authorized }})
-		if err != nil {
-			return fmt.Errorf("monitor %s#%d attempt %d: %w", status.Repository, status.Issue, status.Attempt, err)
-		}
-	}
-	return nil
-}
-
-func reconcilePlanReviews(ctx context.Context, runtimeState *agentruntime.Runtime, reviewBoundary boundaryCaller, implementationBoundary workerBoundaryRunner, cfg config.Config, issues []internalgithub.RecoveryIssueFact, _ []agentruntime.Manifest, source, snapshotRoot string) error {
-	env, err := configuredAgentEnvironment(cfg.Commands.Environment)
-	if err != nil {
-		return err
-	}
-	manifests, err := runtimeState.Discover()
-	if err != nil {
-		return err
-	}
-	for _, manifest := range manifests {
-		if manifest.ReviewMode != agentruntime.ReviewModePlan || manifest.ReviewState != "preparing" && manifest.ReviewState != "running" && manifest.ReviewState != "clean" && manifest.ReviewState != "findings-queued" {
-			continue
-		}
-		index := slices.IndexFunc(issues, func(issue internalgithub.RecoveryIssueFact) bool {
-			return issue.Repository == manifest.Repository && issue.Issue == manifest.Issue
-		})
-		if index < 0 {
-			return fmt.Errorf("plan review %s#%d has no authoritative issue", manifest.Repository, manifest.Issue)
-		}
-		issue := issues[index]
-		active := func() bool {
-			binding := issue.ActiveAttempt
-			return manifest.State == "running" && issue.DispatchAuthorized && binding != nil && binding.Repository == manifest.Repository && binding.Issue == manifest.Issue && binding.Attempt == manifest.Attempt && binding.BaseSHA == manifest.BaseSHA && slices.Contains([]string{"active", "review-ready"}, binding.State)
-		}
-		issue.Attempt = manifest.Attempt
-		attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA, Command: cfg.Commands.Implementation}
-		if active() && (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") {
-			_, pending, err := runIndependentReview(ctx, runtimeState, attempt, reviewBoundary, env, cfg.Commands.Reviewer, issue, manifest, source, manifest.ReviewHead, snapshotRoot, agentruntime.ReviewModePlan)
-			if err != nil {
-				return fmt.Errorf("%s#%d attempt %d: %w", manifest.Repository, manifest.Issue, manifest.Attempt, err)
-			}
-			if pending {
-				continue
-			}
-			current, err := runtimeState.Discover()
-			if err != nil {
-				return err
-			}
-			stored := slices.IndexFunc(current, func(candidate agentruntime.Manifest) bool {
-				return candidate.Repository == manifest.Repository && candidate.Issue == manifest.Issue && candidate.Attempt == manifest.Attempt
-			})
-			if stored < 0 {
-				return errors.New("completed plan review lost its attempt manifest")
-			}
-			manifest = current[stored]
-		}
-		if manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" {
-			manifest, err = cleanupReviewOutcome(ctx, runtimeState, attempt, reviewBoundary, env, manifest, snapshotRoot)
-			if err != nil {
-				return fmt.Errorf("clean up plan review %s#%d attempt %d: %w", manifest.Repository, manifest.Issue, manifest.Attempt, err)
-			}
-		}
-		if active() && manifest.ReviewState == "findings-queued" && !manifest.ReviewHandoffAck {
-			if _, err := returnReviewFindings(ctx, runtimeState, implementationBoundary, attempt, manifest, manifest.ReviewHead, manifest.ReviewFindings, nil, cfg.Commands.Implementation); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func resumeHandoffs(ctx context.Context, runtimeState *agentruntime.Runtime, boundary boundaryCaller, statePath, stateRoot string, statuses []orchestrator.RecoveryStatus, manifests []agentruntime.Manifest, command []string) error {
-	info, err := os.Lstat(statePath)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("safe durable handoff state is unavailable")
-	}
-	if len(command) == 0 {
-		return errors.New("implementation command is missing")
-	}
-	live := map[string]agentruntime.Manifest{}
-	for _, status := range statuses {
-		if (status.State == "active" || status.State == "review-ready") && status.DispatchAuthorized && len(status.Blockers) == 0 {
-			for _, manifest := range manifests {
-				if manifest.Repository == status.Repository && manifest.Issue == status.Issue && manifest.Attempt == status.Attempt && (manifest.State == "running" || manifest.State == "completed") {
-					live[fmt.Sprintf("%s#%d/%d", status.Repository, status.Issue, status.Attempt)] = manifest
-				}
-			}
-		}
-	}
-	recovery := &internalgithub.FileRecovery{Path: statePath}
-	outcomeRoot := filepath.Join(stateRoot, "handoff-outcomes")
-	if err := os.MkdirAll(outcomeRoot, 0o700); err != nil {
-		return err
-	}
-	if err := completeHandoffOutcomes(ctx, recovery, outcomeRoot); err != nil {
-		return err
-	}
-	// Claim only after a safe owner is proven; otherwise work remains queued.
-	if len(live) == 0 {
-		return nil
-	}
-	owners := make(map[string]bool, len(live))
-	for key := range live {
-		owners[key] = true
-	}
-	handoffs, err := recovery.ClaimHandoffsFor(ctx, owners)
-	if err != nil {
-		return err
-	}
-	for _, handoff := range handoffs {
-		manifest, ok := live[fmt.Sprintf("%s#%d/%d", handoff.Repository, handoff.Issue, handoff.Attempt)]
-		if !ok {
-			return errors.New("claimed handoff has no verified owning runtime; refusing execution")
-		}
-		if runtimeState != nil {
-			manifest, err = runtimeState.ResumeHandoff(ctx, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA})
-			if err != nil {
-				return err
-			}
-		}
-		expandedCommand, err := config.ExpandManagedWorkspace(command, manifest.Worktree)
-		if err != nil {
-			return fmt.Errorf("bind durable handoff command: %w", err)
-		}
-		payload, _ := json.Marshal(struct {
-			Type, Key  string
-			PR         int
-			HeadSHA    string
-			Validation bool
-			Feedback   []internalgithub.Feedback
-		}{"agent-symphony-handoff-v1", handoff.Key, handoff.PR, handoff.HeadSHA, handoff.Validation, handoff.Feedback})
-		manifestBody, _ := json.Marshal(manifest)
-		outcomePath := handoffReceiptPath(manifest.Worktree, handoff.Key)
-		outcomeToken := fmt.Sprintf("%x", sha256.Sum256([]byte("handoff-outcome\x00"+handoff.Key)))
-		request, _ := json.Marshal(struct {
-			Manifest     json.RawMessage `json:"manifest"`
-			Handoff      json.RawMessage `json:"handoff"`
-			OutcomePath  string          `json:"outcome_path"`
-			OutcomeToken string          `json:"outcome_token"`
-			Command      []string        `json:"command"`
-		}{manifestBody, payload, outcomePath, outcomeToken, expandedCommand})
-		accepted, err := boundary.call(ctx, "accept-handoff", agentruntime.Command{Stdin: bytes.NewReader(request)})
-		var ack handoffReceipt
-		decoder := json.NewDecoder(strings.NewReader(accepted.Output))
-		decoder.DisallowUnknownFields()
-		if err != nil {
-			return fmt.Errorf("worker-owned handoff acceptance: %w", err)
-		}
-		if decoder.Decode(&ack) != nil || decoder.Decode(&struct{}{}) != io.EOF || ack.Type != "agent-symphony-handoff-executed-v1" || ack.Key != handoff.Key || ack.OutcomePath != outcomePath || ack.OutcomeToken != outcomeToken {
-			return errors.New("worker-owned handoff acceptance binding mismatch")
-		}
-		if err := recovery.ReceiptHandoff(ctx, handoff); err != nil {
-			return err
-		}
 	}
 	return nil
 }

@@ -1654,3 +1654,48 @@ func TestRawReviewsNeverAuthorizeApproval(t *testing.T) {
 		t.Fatalf("facts=%#v err=%v", facts, err)
 	}
 }
+
+func TestRecoveryStateHelpersRejectInvalidClaimsAndOverflow(t *testing.T) {
+	state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: "abcdef0", ValidationGeneration: ^uint64(0)}
+	if err := QueueValidationState(&state, state.HeadSHA); err == nil || state.ValidationQueuedSHA != "" || state.ValidationGeneration != ^uint64(0) {
+		t.Fatalf("overflowing validation queue state=%#v err=%v", state, err)
+	}
+	invalid := Feedback{ID: 4, Source: "issue", ActorID: 5, Body: "fix", CreatedAt: time.Now(), Execution: FeedbackClaimed, Authorized: true}
+	if claimed, err := ClaimFeedbackState(&state, invalid); err == nil || claimed || len(state.Facts.Feedback) != 0 {
+		t.Fatalf("invalid feedback claimed=%v state=%#v err=%v", claimed, state, err)
+	}
+	valid := invalid
+	valid.Execution = ""
+	if claimed, err := ClaimFeedbackState(&state, valid); err != nil || !claimed || len(state.Facts.Feedback) != 1 || state.Facts.Feedback[0].Execution != FeedbackClaimed {
+		t.Fatalf("valid feedback claimed=%v state=%#v err=%v", claimed, state, err)
+	}
+	if claimed, err := ClaimFeedbackState(&state, valid); err != nil || claimed {
+		t.Fatalf("duplicate feedback claimed=%v err=%v", claimed, err)
+	}
+}
+
+func TestPreparePublicationStateRejectsInFlightFallbackAndAcceptsCompletedOutcomeProof(t *testing.T) {
+	head, next := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	busy := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: head, ValidationQueuedSHA: head, HandoffReceipts: map[string]bool{}}
+	fallback := PreparedPublication{Handoff: RecoveryHandoff{Repository: "o/r", PR: 3, Issue: 10, Attempt: 2, HeadSHA: head}, HeadSHA: next}
+	if err := PreparePublicationState(&busy, fallback); err == nil || busy.PreparedPublication != nil {
+		t.Fatalf("in-flight recovery accepted no-handoff publication: state=%#v err=%v", busy, err)
+	}
+
+	state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: head, ValidationInFlightSHA: head, ValidationGeneration: 1, HandoffReceipts: map[string]bool{}}
+	handoff, runnable, err := ClaimHandoffState(&state)
+	if err != nil || !runnable {
+		t.Fatalf("handoff=%#v runnable=%v err=%v", handoff, runnable, err)
+	}
+	if err := ReceiptHandoffState(&state, handoff); err != nil {
+		t.Fatal(err)
+	}
+	outcome := HandoffOutcome{Key: handoff.Key, ValidationResult: "passed", ValidationEvidence: "tests passed"}
+	if err := ApplyHandoffOutcome(&state, handoff, outcome); err != nil {
+		t.Fatal(err)
+	}
+	prepared := PreparedPublication{Handoff: handoff, Outcome: outcome, HeadSHA: next}
+	if err := PreparePublicationState(&state, prepared); err != nil || state.PreparedPublication == nil || !reflect.DeepEqual(*state.PreparedPublication, prepared) {
+		t.Fatalf("completed outcome was not accepted as publication proof: state=%#v err=%v", state, err)
+	}
+}

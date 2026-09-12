@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -44,48 +43,18 @@ const (
 var dashboardFiles embed.FS
 
 type dashboardServer struct {
-	ctx            context.Context
-	stateRoot      string
-	repository     string
-	peerProjects   []string
-	tmux           string
-	allowNet       bool
-	password       string
-	orchestrator   orchestratoragent.Service
-	cleanup        func(context.Context, string, agentruntime.Manifest) error
-	remove         func(context.Context, string, agentruntime.Manifest, string) error
-	reviewCleanup  func(context.Context, agentruntime.Manifest, bool) error
-	forget         func(agentruntime.Manifest) error
-	removalRefresh func(context.Context) error
-	stateWrite     func(dashboardState) error
-	recover        func(context.Context, int, int) error
-	planReview     func(context.Context, int, int) error
-	reconcile      func(context.Context) error
-	issueClosed    func(context.Context, string, int) (bool, error)
-	mu             *sync.Mutex
-	localMu        sync.Mutex
-	controlMu      sync.Mutex
-	controlHook    func(controlRequest)
-}
-
-type operationLockContextKey struct{}
-
-func (s *dashboardServer) operationMutex() *sync.Mutex {
-	if s.mu != nil {
-		return s.mu
-	}
-	return &s.localMu
-}
-
-func (s *dashboardServer) enterOperation(ctx context.Context) (func(), bool) {
-	operationMu := s.operationMutex()
-	if ctx.Value(operationLockContextKey{}) == operationMu {
-		return func() {}, true
-	}
-	if !operationMu.TryLock() {
-		return nil, false
-	}
-	return operationMu.Unlock, true
+	ctx          context.Context
+	stateRoot    string
+	repository   string
+	peerProjects []string
+	tmux         string
+	allowNet     bool
+	password     string
+	orchestrator orchestratoragent.Service
+	reconcile    func(context.Context) error
+	issueClosed  func(context.Context, string, int) (bool, error)
+	operator     *operatorMutationService
+	capacity     int
 }
 
 type dashboardHiddenAttempt struct {
@@ -96,8 +65,9 @@ type dashboardHiddenAttempt struct {
 }
 
 type dashboardState struct {
-	Version int                      `json:"version"`
-	Hidden  []dashboardHiddenAttempt `json:"hidden"`
+	Version       int                      `json:"version"`
+	OwnerRevision uint64                   `json:"owner_revision,omitempty"`
+	Hidden        []dashboardHiddenAttempt `json:"hidden"`
 }
 
 type dashboardRemovalIntent struct {
@@ -113,6 +83,8 @@ type dashboardRemovalState struct {
 
 type dashboardStatusSnapshot struct {
 	UpdatedAt             time.Time                     `json:"updated_at"`
+	OwnerEpoch            uint64                        `json:"owner_epoch,omitempty"`
+	OwnerRevision         uint64                        `json:"owner_revision,omitempty"`
 	Statuses              []orchestrator.RecoveryStatus `json:"statuses"`
 	ReconciliationError   string                        `json:"reconciliation_error,omitempty"`
 	ReconciliationErrorAt time.Time                     `json:"reconciliation_error_at,omitzero"`
@@ -133,29 +105,19 @@ func dashboardHandler(stateRoot string) http.Handler {
 }
 
 func newDashboardHandler(ctx context.Context, stateRoot, tmux string) http.Handler {
-	return newDashboardHandlerWithMutex(ctx, stateRoot, tmux, &sync.Mutex{})
+	return newDashboardHandlerWithOptions(ctx, stateRoot, tmux, nil, false, "")
 }
 
-func newDashboardHandlerWithMutex(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex) http.Handler {
-	return newDashboardHandlerWithOptions(ctx, stateRoot, tmux, operationMu, nil, nil, nil, nil, false, "")
+func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
+	return newProjectDashboardHandlerWithOptions(ctx, stateRoot, "", nil, tmux, service, allowNet, password)
 }
 
-func newDashboardHandlerWithOptions(ctx context.Context, stateRoot, tmux string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
-	return newProjectDashboardHandlerWithOptions(ctx, stateRoot, "", nil, tmux, operationMu, recover, planReview, reconcile, service, allowNet, password)
+func newProjectDashboardHandlerWithOptions(ctx context.Context, stateRoot, repository string, peerProjects []string, tmux string, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
+	return newProjectDashboardServer(ctx, stateRoot, repository, peerProjects, tmux, nil, service, allowNet, password).webHandler()
 }
 
-func newProjectDashboardHandlerWithOptions(ctx context.Context, stateRoot, repository string, peerProjects []string, tmux string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) http.Handler {
-	return newProjectDashboardServer(ctx, stateRoot, repository, peerProjects, tmux, operationMu, recover, planReview, reconcile, service, allowNet, password).webHandler()
-}
-
-func newProjectDashboardServer(ctx context.Context, stateRoot, repository string, peerProjects []string, tmux string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) *dashboardServer {
-	server := &dashboardServer{ctx: ctx, stateRoot: stateRoot, repository: repository, peerProjects: peerProjects, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, recover: recover, planReview: planReview, reconcile: reconcile, issueClosed: currentGitHubIssueClosed, mu: operationMu}
-	server.cleanup = server.cleanupAttempt
-	server.remove = server.removeAttempt
-	server.reviewCleanup = server.cleanupAttemptReview
-	server.forget = (&agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot}).Forget
-	server.stateWrite = server.writeState
-	return server
+func newProjectDashboardServer(ctx context.Context, stateRoot, repository string, peerProjects []string, tmux string, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string) *dashboardServer {
+	return &dashboardServer{ctx: ctx, stateRoot: stateRoot, repository: repository, peerProjects: peerProjects, tmux: tmux, allowNet: allowNet, password: password, orchestrator: service, reconcile: reconcile, issueClosed: currentGitHubIssueClosed}
 }
 
 func (s *dashboardServer) webHandler() http.Handler {
@@ -179,8 +141,12 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 		if !s.authenticate(w, r) {
 			return
 		}
-		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/dismiss" || r.URL.Path == "/actions/remove" || r.URL.Path == "/actions/recover" || r.URL.Path == "/actions/review-plan" {
-			s.serveAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/"))
+		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/dismiss" || r.URL.Path == "/actions/remove" || r.URL.Path == "/actions/cancel" || r.URL.Path == "/actions/recover" || r.URL.Path == "/actions/review-plan" {
+			if s.operator == nil {
+				http.Error(w, "runtime mutation authority is unavailable", http.StatusConflict)
+				return
+			}
+			s.serveOperatorAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/"))
 			return
 		}
 		if r.URL.Path == "/actions/reconcile" {
@@ -188,6 +154,10 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/actions/orchestrator/") {
+			if s.operator == nil {
+				http.Error(w, "runtime mutation authority is unavailable", http.StatusConflict)
+				return
+			}
 			s.serveOrchestratorAction(w, r, strings.TrimPrefix(r.URL.Path, "/actions/orchestrator/"))
 			return
 		}
@@ -263,17 +233,10 @@ func (s *dashboardServer) serveReconcileAction(w http.ResponseWriter, r *http.Re
 		http.Error(w, "invalid reconciliation action", http.StatusBadRequest)
 		return
 	}
-	if s.reconcile == nil {
+	if s.operator == nil || s.reconcile == nil {
 		http.Error(w, "reconciliation is unavailable", http.StatusConflict)
 		return
 	}
-	leave, ok := s.enterOperation(r.Context())
-	if !ok {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
-		return
-	}
-	defer leave()
 	if err := s.reconcile(r.Context()); err != nil {
 		http.Error(w, internalgithub.Redact(err.Error()), http.StatusInternalServerError)
 		return
@@ -362,6 +325,13 @@ func validateDashboardProjectURLs(values []string) ([]string, error) {
 }
 
 func (s *dashboardServer) readStatus() (dashboardStatusSnapshot, error) {
+	if s.operator != nil && s.operator.owner != nil {
+		snapshot, err := s.operator.owner.snapshot(s.ctx)
+		if err != nil {
+			return dashboardStatusSnapshot{}, err
+		}
+		return projectOwnerStatus(snapshot, s.capacity, time.Now())
+	}
 	body, err := readDashboardStatus(filepath.Join(s.stateRoot, "status.json"))
 	if err != nil {
 		return dashboardStatusSnapshot{}, err
@@ -551,6 +521,26 @@ func (s *dashboardServer) serveState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *dashboardServer) readState() (dashboardState, error) {
+	if s.operator != nil {
+		snapshot, err := s.operator.owner.snapshot(s.ctx)
+		if err != nil {
+			return dashboardState{}, err
+		}
+		state := dashboardState{Version: dashboardStateVersion, OwnerRevision: snapshot.State.Revision, Hidden: []dashboardHiddenAttempt{}}
+		for _, tombstone := range snapshot.State.Tombstones {
+			state.Hidden = append(state.Hidden, dashboardHiddenAttempt{Repository: tombstone.Repository, Issue: tombstone.Issue, Attempt: tombstone.Attempt, Reason: tombstone.Action})
+		}
+		slices.SortFunc(state.Hidden, func(a, b dashboardHiddenAttempt) int {
+			if ordered := strings.Compare(a.Repository, b.Repository); ordered != 0 {
+				return ordered
+			}
+			if a.Issue != b.Issue {
+				return a.Issue - b.Issue
+			}
+			return a.Attempt - b.Attempt
+		})
+		return state, nil
+	}
 	state := dashboardState{Version: dashboardStateVersion, Hidden: []dashboardHiddenAttempt{}}
 	body, err := readDashboardFile(filepath.Join(s.stateRoot, "dashboard-state.json"), maxDashboardStateBytes)
 	if errors.Is(err, os.ErrNotExist) {
@@ -570,21 +560,6 @@ func (s *dashboardServer) readState() (dashboardState, error) {
 		}
 	}
 	return state, nil
-}
-
-func (s *dashboardServer) writeState(state dashboardState) error {
-	body, err := json.MarshalIndent(state, "", "  ")
-	if err != nil || len(body) > maxDashboardStateBytes {
-		return errors.New("dashboard state is too large")
-	}
-	return writePrivateStateFile(s.stateRoot, "dashboard-state.json", ".dashboard-state-*", append(body, '\n'), maxDashboardStateBytes)
-}
-
-func (s *dashboardServer) persistState(state dashboardState) error {
-	if s.stateWrite != nil {
-		return s.stateWrite(state)
-	}
-	return s.writeState(state)
 }
 
 func (s *dashboardServer) readRemovalState() (dashboardRemovalState, error) {
@@ -616,366 +591,6 @@ func (s *dashboardServer) readRemovalState() (dashboardRemovalState, error) {
 	return state, nil
 }
 
-func (s *dashboardServer) writeRemovalState(state dashboardRemovalState) error {
-	body, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writePrivateStateFile(s.stateRoot, "removal-state.json", ".removal-state-*", append(body, '\n'), maxDashboardStateBytes)
-}
-
-func (s *dashboardServer) removalIntent(repository string, issue, attempt int) (dashboardRemovalIntent, bool, error) {
-	state, err := s.readRemovalState()
-	if err != nil {
-		return dashboardRemovalIntent{}, false, err
-	}
-	index := slices.IndexFunc(state.Intents, func(intent dashboardRemovalIntent) bool {
-		return intent.Manifest.Repository == repository && intent.Manifest.Issue == issue && intent.Manifest.Attempt == attempt
-	})
-	if index < 0 {
-		return dashboardRemovalIntent{}, false, nil
-	}
-	return state.Intents[index], true, nil
-}
-
-func (s *dashboardServer) writeRemovalIntent(intent dashboardRemovalIntent) error {
-	state, err := s.readRemovalState()
-	if err != nil {
-		return err
-	}
-	if slices.ContainsFunc(state.Intents, func(existing dashboardRemovalIntent) bool {
-		return existing.Manifest.Repository == intent.Manifest.Repository && existing.Manifest.Issue == intent.Manifest.Issue && existing.Manifest.Attempt == intent.Manifest.Attempt
-	}) {
-		return errors.New("permanent removal intent already exists")
-	}
-	state.Intents = append(state.Intents, intent)
-	return s.writeRemovalState(state)
-}
-
-func (s *dashboardServer) markRemovalStarted(repository string, issue, attempt int) error {
-	state, err := s.readRemovalState()
-	if err != nil {
-		return err
-	}
-	index := slices.IndexFunc(state.Intents, func(intent dashboardRemovalIntent) bool {
-		return intent.Manifest.Repository == repository && intent.Manifest.Issue == issue && intent.Manifest.Attempt == attempt
-	})
-	if index < 0 {
-		return errors.New("permanent removal intent is missing")
-	}
-	state.Intents[index].CleanupStarted = true
-	return s.writeRemovalState(state)
-}
-
-func (s *dashboardServer) clearRemovalIntent(repository string, issue, attempt int) error {
-	state, err := s.readRemovalState()
-	if err != nil {
-		return err
-	}
-	state.Intents = slices.DeleteFunc(state.Intents, func(intent dashboardRemovalIntent) bool {
-		return intent.Manifest.Repository == repository && intent.Manifest.Issue == issue && intent.Manifest.Attempt == attempt
-	})
-	return s.writeRemovalState(state)
-}
-
-func writePrivateStateFile(stateRoot, filename, pattern string, body []byte, limit int) error {
-	if len(body) > limit {
-		return errors.New("state file is too large")
-	}
-	path := filepath.Join(stateRoot, filename)
-	root, err := filepath.EvalSymlinks(stateRoot)
-	if err != nil || root != filepath.Clean(stateRoot) {
-		return errors.New("state root is unsafe")
-	}
-	if info, statErr := os.Lstat(path); statErr == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
-		return errors.New("state file is unsafe")
-	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-		return statErr
-	}
-	temporary, err := os.CreateTemp(root, pattern)
-	if err != nil {
-		return err
-	}
-	name := temporary.Name()
-	defer os.Remove(name)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(body); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	return os.Rename(name, path)
-}
-
-func (s *dashboardServer) serveAction(w http.ResponseWriter, r *http.Request, action string) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", "POST")
-		http.Error(w, "action requires POST", http.StatusMethodNotAllowed)
-		return
-	}
-	if !sameDashboardOrigin(r) {
-		http.Error(w, "action requires the dashboard origin", http.StatusForbidden)
-		return
-	}
-	query := r.URL.Query()
-	issue, issueErr := strconv.Atoi(query.Get("issue"))
-	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
-	if issueErr != nil || attemptErr != nil || issue < 1 || attempt < 1 || !s.validProjectQuery(query, "issue", "attempt") || (action != "archive" && action != "abandon" && action != "dismiss" && action != "remove" && action != "recover" && action != "review-plan") {
-		http.Error(w, "invalid action", http.StatusBadRequest)
-		return
-	}
-	if (action == "dismiss" || action == "remove" || action == "review-plan") && (r.ContentLength != 0 || len(r.TransferEncoding) != 0) {
-		http.Error(w, "invalid action body", http.StatusBadRequest)
-		return
-	}
-	leave, ok := s.enterOperation(r.Context())
-	if !ok {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
-		return
-	}
-	defer leave()
-	if action == "remove" {
-		s.serveRemoveAction(w, r, issue, attempt)
-		return
-	}
-	status, err := s.projectedStatus(issue, attempt)
-	if action == "dismiss" {
-		if err != nil || !canDismissClosedAttempt(status) || s.issueClosed == nil {
-			http.Error(w, "attempt is not eligible for dismissal", http.StatusConflict)
-			return
-		}
-		closed, issueErr := s.issueClosed(r.Context(), status.Repository, issue)
-		if issueErr != nil || !closed {
-			http.Error(w, "attempt is not eligible for dismissal", http.StatusConflict)
-			return
-		}
-		if err := s.hideAttempt(status, "dismissed"); err != nil {
-			http.Error(w, "dashboard state could not be updated", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{"ok":true}`)
-		return
-	}
-	if action == "review-plan" {
-		if err != nil || status.State != "active" || s.planReview == nil {
-			http.Error(w, "attempt is not eligible for plan review", http.StatusConflict)
-			return
-		}
-		if err := s.planReview(r.Context(), issue, attempt); err != nil {
-			http.Error(w, internalgithub.Redact(err.Error()), http.StatusConflict)
-			return
-		}
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{"ok":true}`)
-		return
-	}
-	if action == "recover" {
-		if err != nil || !status.Retryable || status.PR > 0 || s.recover == nil {
-			http.Error(w, "attempt is not eligible for recovery", http.StatusConflict)
-			return
-		}
-		if err := s.recover(r.Context(), issue, attempt); err != nil {
-			http.Error(w, internalgithub.Redact(err.Error()), http.StatusConflict)
-			return
-		}
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{"ok":true}`)
-		return
-	}
-	wantState := "completed"
-	if action == "abandon" {
-		wantState = "orphaned"
-	}
-	if err != nil || status.State != wantState {
-		http.Error(w, "attempt is not eligible for this action", http.StatusConflict)
-		return
-	}
-	runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(s.stateRoot), StateRoot: s.stateRoot}
-	manifests, err := runtimeState.Discover()
-	if err != nil {
-		http.Error(w, "local attempt state is unavailable", http.StatusConflict)
-		return
-	}
-	matches := make([]agentruntime.Manifest, 0, 1)
-	for _, manifest := range manifests {
-		if manifest.Repository == status.Repository && manifest.Issue == issue && manifest.Attempt == attempt {
-			matches = append(matches, manifest)
-		}
-	}
-	if len(matches) != 1 || status.Branch != matches[0].Branch || status.Worktree != matches[0].Worktree || status.Session != matches[0].Session {
-		http.Error(w, "local attempt identity does not match the projection", http.StatusConflict)
-		return
-	}
-	if action == "archive" && matches[0].State != "completed" {
-		http.Error(w, "completed projection does not have a completed local attempt", http.StatusConflict)
-		return
-	}
-	if err := s.cleanup(r.Context(), action, matches[0]); err != nil {
-		http.Error(w, "attempt cleanup was refused", http.StatusConflict)
-		return
-	}
-	if action == "abandon" {
-		if err := runtimeState.Forget(matches[0]); err != nil {
-			http.Error(w, "attempt resources were cleaned but its record could not be removed", http.StatusInternalServerError)
-			return
-		}
-	}
-	reason := "archived"
-	if action == "abandon" {
-		reason = "abandoned"
-	}
-	if err := s.hideAttempt(status, reason); err != nil {
-		http.Error(w, "attempt resources were cleaned but dashboard state could not be updated", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = io.WriteString(w, `{"ok":true}`)
-}
-
-func (s *dashboardServer) serveRemoveAction(w http.ResponseWriter, r *http.Request, issue, attempt int) {
-	if s.removalRefresh == nil || s.remove == nil || s.reviewCleanup == nil {
-		http.Error(w, "permanent removal is unavailable", http.StatusConflict)
-		return
-	}
-	if err := s.removalRefresh(r.Context()); err != nil {
-		http.Error(w, "fresh reconciliation required before permanent removal", http.StatusConflict)
-		return
-	}
-	state, err := s.readState()
-	if err != nil {
-		http.Error(w, "dashboard state is unavailable", http.StatusInternalServerError)
-		return
-	}
-	if slices.ContainsFunc(state.Hidden, func(hidden dashboardHiddenAttempt) bool {
-		return hidden.Repository == s.repository && hidden.Issue == issue && hidden.Attempt == attempt && hidden.Reason == "removed"
-	}) {
-		if err := s.clearRemovalIntent(s.repository, issue, attempt); err != nil {
-			http.Error(w, "permanent removal journal could not be finalized", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{"ok":true}`)
-		return
-	}
-	runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(s.stateRoot), StateRoot: s.stateRoot}
-	intent, found, err := s.removalIntent(s.repository, issue, attempt)
-	if err != nil {
-		http.Error(w, "permanent removal journal is unavailable", http.StatusInternalServerError)
-		return
-	}
-	status := orchestrator.RecoveryStatus{Repository: intent.Manifest.Repository, Issue: issue, Attempt: attempt, Branch: intent.Manifest.Branch, Worktree: intent.Manifest.Worktree, Session: intent.Manifest.Session}
-	if !found || !intent.CleanupStarted {
-		status, err = s.projectedStatus(issue, attempt)
-		if err != nil || !s.historicalTerminal(status) {
-			http.Error(w, "attempt is not an eligible historical terminal attempt", http.StatusConflict)
-			return
-		}
-		manifests, discoverErr := runtimeState.Discover()
-		if discoverErr != nil {
-			http.Error(w, "local attempt state is unavailable", http.StatusConflict)
-			return
-		}
-		matches := slices.DeleteFunc(manifests, func(manifest agentruntime.Manifest) bool {
-			return manifest.Repository != status.Repository || manifest.Issue != issue || manifest.Attempt != attempt
-		})
-		if len(matches) != 1 || !removalIdentityMatches(status, matches[0]) {
-			http.Error(w, "local attempt identity or lifecycle does not match the historical projection", http.StatusConflict)
-			return
-		}
-		publishedHead := firstNonempty(status.HeadSHA, matches[0].BaseSHA)
-		if found {
-			if !reflect.DeepEqual(intent.Manifest, matches[0]) || intent.PublishedHead != publishedHead {
-				http.Error(w, "retained attempt no longer matches its pending permanent removal", http.StatusConflict)
-				return
-			}
-		} else {
-			intent = dashboardRemovalIntent{Manifest: matches[0], PublishedHead: publishedHead}
-			if err := s.writeRemovalIntent(intent); err != nil {
-				http.Error(w, "permanent removal intent could not be recorded", http.StatusInternalServerError)
-				return
-			}
-		}
-	}
-	manifest, publishedHead := intent.Manifest, intent.PublishedHead
-	if err := s.remove(r.Context(), "validate-remove", manifest, publishedHead); err != nil {
-		http.Error(w, "permanent removal refused: "+internalgithub.Redact(err.Error()), http.StatusConflict)
-		return
-	}
-	if err := s.reviewCleanup(r.Context(), manifest, false); err != nil {
-		http.Error(w, "permanent removal refused: "+internalgithub.Redact(err.Error()), http.StatusConflict)
-		return
-	}
-	if !intent.CleanupStarted {
-		if err := s.markRemovalStarted(manifest.Repository, issue, attempt); err != nil {
-			http.Error(w, "permanent removal could not record cleanup start", http.StatusInternalServerError)
-			return
-		}
-	}
-	if err := s.reviewCleanup(r.Context(), manifest, true); err != nil {
-		http.Error(w, "permanent removal could not clean reviewer resources: "+internalgithub.Redact(err.Error()), http.StatusConflict)
-		return
-	}
-	if err := s.remove(r.Context(), "remove", manifest, publishedHead); err != nil {
-		http.Error(w, "permanent removal could not clean implementation resources: "+internalgithub.Redact(err.Error()), http.StatusConflict)
-		return
-	}
-	forget := s.forget
-	if forget == nil {
-		forget = runtimeState.Forget
-	}
-	if err := forget(manifest); err != nil {
-		http.Error(w, "attempt resources were cleaned but its retained record could not be removed: "+internalgithub.Redact(err.Error()), http.StatusInternalServerError)
-		return
-	}
-	if err := s.hideAttempt(status, "removed"); err != nil {
-		http.Error(w, "attempt resources were removed but dashboard state could not be updated", http.StatusInternalServerError)
-		return
-	}
-	if err := s.clearRemovalIntent(status.Repository, issue, attempt); err != nil {
-		http.Error(w, "attempt was removed but its durable journal could not be finalized", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = io.WriteString(w, `{"ok":true}`)
-}
-
-func removalIdentityMatches(status orchestrator.RecoveryStatus, manifest agentruntime.Manifest) bool {
-	return status.Repository == manifest.Repository && status.Issue == manifest.Issue && status.Attempt == manifest.Attempt && status.Branch == manifest.Branch && status.Worktree == manifest.Worktree && status.Session == manifest.Session && slices.Contains([]string{"completed", "failed", "cancelled"}, manifest.State) && !slices.Contains([]string{"preparing", "running", "findings-queued"}, manifest.ReviewState)
-}
-
-func (s *dashboardServer) historicalTerminal(selected orchestrator.RecoveryStatus) bool {
-	if selected.Repository == "" || selected.Issue < 1 || selected.Attempt < 1 || !slices.Contains([]string{"failed", "orphaned", "cancelled"}, selected.State) || selected.Retryable {
-		return false
-	}
-	snapshot, err := s.readStatus()
-	return err == nil && slices.ContainsFunc(snapshot.Statuses, func(status orchestrator.RecoveryStatus) bool {
-		return status.Repository == selected.Repository && status.Issue == selected.Issue && status.Attempt > selected.Attempt
-	})
-}
-
 func canDismissClosedAttempt(status orchestrator.RecoveryStatus) bool {
 	return status.Repository != "" && status.Issue > 0 && status.Attempt > 0 && status.IssueClosed && slices.Contains([]string{"completed", "failed", "orphaned", "cancelled"}, status.State)
 }
@@ -1001,41 +616,9 @@ func githubIssueClosed(ctx context.Context, api internalgithub.API, repository s
 	return current.State == "closed", nil
 }
 
-func (s *dashboardServer) hideAttempt(status orchestrator.RecoveryStatus, reason string) error {
-	state, err := s.readState()
-	if err != nil {
-		return err
-	}
-	hidden := dashboardHiddenAttempt{Repository: status.Repository, Issue: status.Issue, Attempt: status.Attempt, Reason: reason}
-	if index := slices.IndexFunc(state.Hidden, func(entry dashboardHiddenAttempt) bool {
-		return entry.Repository == hidden.Repository && entry.Issue == hidden.Issue && entry.Attempt == hidden.Attempt
-	}); index >= 0 {
-		state.Hidden[index] = hidden
-	} else {
-		state.Hidden = append(state.Hidden, hidden)
-	}
-	return s.persistState(state)
-}
-
-func (s *dashboardServer) cleanupAttempt(ctx context.Context, action string, manifest agentruntime.Manifest) error {
-	operation := "cleanup"
-	if action == "abandon" {
-		operation = "abandon"
-	}
-	body, _ := json.Marshal(manifest)
-	_, err := implementationBoundary(s.stateRoot).call(ctx, operation, agentruntime.Command{Stdin: strings.NewReader(string(body))})
-	return err
-}
-
-func (s *dashboardServer) removeAttempt(ctx context.Context, operation string, manifest agentruntime.Manifest, publishedHead string) error {
-	body, _ := json.Marshal(permanentRemovalRequest{Manifest: manifest, PublishedHead: publishedHead})
-	_, err := implementationBoundary(s.stateRoot).call(ctx, operation, agentruntime.Command{Stdin: strings.NewReader(string(body))})
-	return err
-}
-
-func (s *dashboardServer) cleanupAttemptReview(ctx context.Context, manifest agentruntime.Manifest, remove bool) error {
+func cleanupAttemptReviewResources(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool) error {
 	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
-	snapshotRoot := productionSnapshotRoot(s.stateRoot)
+	snapshotRoot := productionSnapshotRoot(stateRoot)
 	if root, err := filepath.EvalSymlinks(snapshotRoot); err == nil {
 		if root != filepath.Clean(snapshotRoot) {
 			return errors.New("review snapshot root is unsafe")
@@ -1080,7 +663,7 @@ func (s *dashboardServer) cleanupAttemptReview(ctx context.Context, manifest age
 	if !remove {
 		return nil
 	}
-	if err := cleanupReviewResources(ctx, reviewBoundary(s.stateRoot), nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot); err != nil {
+	if err := cleanupReviewResources(ctx, boundary, nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot); err != nil {
 		return err
 	}
 	for _, path := range resultPaths {
@@ -1123,14 +706,6 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 		http.Error(w, "invalid orchestrator action", http.StatusBadRequest)
 		return
 	}
-	leave, ok := s.enterOperation(r.Context())
-	if !ok {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "reconciliation is in progress", http.StatusServiceUnavailable)
-		return
-	}
-	defer leave()
-
 	var result orchestratoragent.Status
 	var err error
 	switch action {
@@ -1408,50 +983,82 @@ func (s *dashboardServer) terminalStatus(issue, attempt int) (orchestrator.Recov
 	return s.projectedStatus(issue, attempt)
 }
 
-func startDashboard(ctx context.Context, address, stateRoot string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
-	return startProjectDashboard(ctx, address, stateRoot, "", nil, operationMu, recover, planReview, reconcile, nil, service, allowNet, password, log)
+func startDashboard(ctx context.Context, address, stateRoot string, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
+	return startProjectDashboard(ctx, address, stateRoot, "", nil, nil, service, allowNet, password, log)
 }
 
-func startProjectDashboard(ctx context.Context, address, stateRoot, repository string, peerProjects []string, operationMu *sync.Mutex, recover, planReview func(context.Context, int, int) error, reconcile, removalRefresh func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
+func startProjectDashboard(ctx context.Context, address, stateRoot, repository string, peerProjects []string, reconcile func(context.Context) error, service orchestratoragent.Service, allowNet bool, password string, log io.Writer) (string, error) {
+	project := newProjectDashboardServer(ctx, stateRoot, repository, peerProjects, "tmux", reconcile, service, allowNet, password)
+	url, running, err := startDashboardServerWaitable(address, project, allowNet, password, log)
+	if err != nil {
+		return "", err
+	}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = running.shutdown(shutdown)
+	}()
+	return url, nil
+}
+
+type dashboardServerLifecycle struct {
+	server   *http.Server
+	listener net.Listener
+	control  *controlServerLifecycle
+	done     chan struct{}
+}
+
+func startDashboardServerWaitable(address string, project *dashboardServer, allowNet bool, password string, log io.Writer) (string, *dashboardServerLifecycle, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
-		return "", fmt.Errorf("dashboard address: %w", err)
+		return "", nil, fmt.Errorf("dashboard address: %w", err)
 	}
 	loopback := host == "localhost"
 	if !loopback {
 		ip := net.ParseIP(host)
 		loopback = ip != nil && ip.IsLoopback()
 		if !loopback && !allowNet {
-			return "", errors.New("dashboard address must use localhost or a loopback IP")
+			return "", nil, errors.New("dashboard address must use localhost or a loopback IP")
 		}
 	}
 	if allowNet && password == "" {
-		return "", errors.New("dashboard password is required with --allow-unsafe-dashboard-network")
+		return "", nil, errors.New("dashboard password is required with --allow-unsafe-dashboard-network")
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		return "", fmt.Errorf("listen for dashboard on %s: %w", address, err)
+		return "", nil, fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
-	project := newProjectDashboardServer(ctx, stateRoot, repository, peerProjects, "tmux", operationMu, recover, planReview, reconcile, service, allowNet, password)
-	project.removalRefresh = removalRefresh
-	if err := startControlServer(ctx, project, log); err != nil {
+	control, err := startControlServerWaitable(project, log)
+	if err != nil {
 		_ = listener.Close()
-		return "", err
+		return "", nil, err
 	}
 	server := &http.Server{Handler: project.webHandler(), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
 		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password and session data are exposed in transit, and anyone with the password can use terminals and cleanup controls")
 	}
+	running := &dashboardServerLifecycle{server: server, listener: listener, control: control, done: make(chan struct{})}
 	go func() {
-		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdown)
-	}()
-	go func() {
+		defer close(running.done)
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Fprintln(log, "dashboard: "+err.Error())
 		}
 	}()
-	return "http://" + listener.Addr().String(), nil
+	return "http://" + listener.Addr().String(), running, nil
+}
+
+func (s *dashboardServerLifecycle) shutdown(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	controlErr := s.control.shutdown(ctx)
+	err := s.server.Shutdown(ctx)
+	_ = s.listener.Close()
+	select {
+	case <-s.done:
+	case <-ctx.Done():
+		return errors.Join(controlErr, err, ctx.Err())
+	}
+	return errors.Join(controlErr, err)
 }

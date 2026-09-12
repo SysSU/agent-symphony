@@ -53,6 +53,10 @@ func (m *CycleMetrics) Snapshot() (requests, retries int64) {
 	return m.requests.Load(), m.retries.Load()
 }
 
+func (m *CycleMetrics) Mutated() bool {
+	return m != nil && m.mutated.Load()
+}
+
 func (m *CycleMetrics) Stale() (reads int64, diagnostic string) {
 	if m == nil {
 		return 0, ""

@@ -17,7 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -47,20 +46,24 @@ type controlRequest struct {
 }
 
 type controlResult struct {
-	Version   int             `json:"version"`
-	RequestID string          `json:"request_id"`
-	Action    string          `json:"action"`
-	OK        bool            `json:"ok"`
-	Retryable bool            `json:"retryable,omitempty"`
-	Status    int             `json:"status"`
-	Data      json.RawMessage `json:"data,omitempty"`
-	Error     string          `json:"error,omitempty"`
+	Version       int             `json:"version"`
+	RequestID     string          `json:"request_id"`
+	Action        string          `json:"action"`
+	OK            bool            `json:"ok"`
+	Retryable     bool            `json:"retryable,omitempty"`
+	Status        int             `json:"status"`
+	OwnerRevision uint64          `json:"owner_revision,omitempty"`
+	Data          json.RawMessage `json:"data,omitempty"`
+	Error         string          `json:"error,omitempty"`
 }
 
 type controlReceipt struct {
-	Request controlRequest `json:"request"`
-	State   string         `json:"state"`
-	Result  *controlResult `json:"result,omitempty"`
+	Request    controlRequest `json:"request"`
+	State      string         `json:"state"`
+	Phase      string         `json:"phase,omitempty"`
+	EffectID   string         `json:"effect_id,omitempty"`
+	Diagnostic string         `json:"diagnostic,omitempty"`
+	Result     *controlResult `json:"result,omitempty"`
 }
 
 type controlReceiptState struct {
@@ -84,20 +87,42 @@ func newControlRequestID() (string, error) {
 }
 
 func startControlServer(ctx context.Context, project *dashboardServer, log io.Writer) error {
+	running, err := startControlServerWaitable(project, log)
+	if err != nil {
+		return err
+	}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = running.shutdown(shutdown)
+	}()
+	return nil
+}
+
+type controlServerLifecycle struct {
+	server   *http.Server
+	listener net.Listener
+	path     string
+	socket   os.FileInfo
+	done     chan struct{}
+}
+
+func startControlServerWaitable(project *dashboardServer, log io.Writer) (*controlServerLifecycle, error) {
 	path := controlSocketPath(project.stateRoot)
 	if info, err := os.Lstat(path); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 || !ownedByCurrentUser(info) {
-			return errors.New("running-daemon control path is unsafe")
+			return nil, errors.New("running-daemon control path is unsafe")
 		}
 		if err := os.Remove(path); err != nil {
-			return fmt.Errorf("remove stale running-daemon control socket: %w", err)
+			return nil, fmt.Errorf("remove stale running-daemon control socket: %w", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect running-daemon control socket: %w", err)
+		return nil, fmt.Errorf("inspect running-daemon control socket: %w", err)
 	}
 	listener, err := net.Listen("unix", path)
 	if err != nil {
-		return fmt.Errorf("listen for running-daemon control: %w", err)
+		return nil, fmt.Errorf("listen for running-daemon control: %w", err)
 	}
 	if unix, ok := listener.(*net.UnixListener); ok {
 		unix.SetUnlinkOnClose(false)
@@ -105,28 +130,44 @@ func startControlServer(ctx context.Context, project *dashboardServer, log io.Wr
 	if err := os.Chmod(path, 0o600); err != nil {
 		_ = listener.Close()
 		_ = os.Remove(path)
-		return fmt.Errorf("secure running-daemon control socket: %w", err)
+		return nil, fmt.Errorf("secure running-daemon control socket: %w", err)
 	}
 	socketInfo, err := os.Lstat(path)
 	if err != nil || socketInfo.Mode()&os.ModeSocket == 0 || !ownedByCurrentUser(socketInfo) {
 		_ = listener.Close()
 		_ = os.Remove(path)
-		return errors.New("running-daemon control socket is unsafe")
+		return nil, errors.New("running-daemon control socket is unsafe")
 	}
 	server := &http.Server{Handler: controlHandler(project), ReadHeaderTimeout: 5 * time.Second}
+	running := &controlServerLifecycle{server: server, listener: listener, path: path, socket: socketInfo, done: make(chan struct{})}
 	go func() {
-		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdown)
-		_ = listener.Close()
-	}()
-	go func() {
+		defer close(running.done)
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Fprintln(log, "control: "+internalgithub.Redact(err.Error()))
 		}
 	}()
-	return nil
+	return running, nil
+}
+
+func (s *controlServerLifecycle) shutdown(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	err := s.server.Shutdown(ctx)
+	_ = s.listener.Close()
+	select {
+	case <-s.done:
+	case <-ctx.Done():
+		return errors.Join(err, ctx.Err())
+	}
+	var removeErr error
+	current, inspectErr := os.Lstat(s.path)
+	if inspectErr == nil && os.SameFile(s.socket, current) {
+		removeErr = os.Remove(s.path)
+	} else if inspectErr != nil && !errors.Is(inspectErr, os.ErrNotExist) {
+		removeErr = inspectErr
+	}
+	return errors.Join(err, removeErr)
 }
 
 func controlHandler(project *dashboardServer) http.Handler {
@@ -152,79 +193,34 @@ func controlHandler(project *dashboardServer) http.Handler {
 			writeControlResult(w, controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusBadRequest, Error: "invalid control request deadline"})
 			return
 		}
-		r = r.WithContext(context.WithValue(r.Context(), controlDeadlineContextKey{}, deadline))
+		requestContext := context.WithValue(r.Context(), controlDeadlineContextKey{}, deadline)
+		if project.operator != nil {
+			var cancel context.CancelFunc
+			requestContext, cancel = context.WithDeadline(requestContext, deadline)
+			defer cancel()
+		}
+		r = r.WithContext(requestContext)
 		response := project.performRecordedControl(r.Context(), request)
 		writeControlResult(w, response)
 	})
 }
 
 func (s *dashboardServer) performRecordedControl(ctx context.Context, request controlRequest) controlResult {
-	result := controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action}
-	if !s.controlMu.TryLock() {
-		result.Status, result.Retryable, result.Error = http.StatusServiceUnavailable, true, "another control request is in progress"
-		return result
+	if s.operator == nil {
+		return controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusConflict, Error: "runtime mutation authority is unavailable"}
 	}
-	defer s.controlMu.Unlock()
-	if s.controlHook != nil {
-		s.controlHook(request)
+	if validOperatorRequest(request, s.repository) {
+		return s.operator.perform(ctx, request)
 	}
-	receipts, err := s.readControlReceipts()
-	if err != nil {
-		result.Status, result.Error = http.StatusInternalServerError, "control receipts are unavailable"
-		return result
-	}
-	for _, receipt := range receipts.Receipts {
-		if receipt.Request.RequestID != request.RequestID {
-			continue
-		}
-		if receipt.Request != request {
-			result.Status, result.Error = http.StatusConflict, "control request identity was already used for different input"
-			return result
-		}
-		if receipt.State == "completed" {
-			return *receipt.Result
-		}
-		result.Status, result.Error = http.StatusConflict, "control request outcome is unknown; replay was refused"
-		return result
-	}
-	if len(receipts.Receipts) == maxControlReceipts {
-		completed := slices.IndexFunc(receipts.Receipts, func(receipt controlReceipt) bool { return receipt.State == "completed" })
-		if completed < 0 {
-			result.Status, result.Retryable, result.Error = http.StatusServiceUnavailable, true, "control receipt capacity is unavailable"
-			return result
-		}
-		receipts.Receipts = slices.Delete(receipts.Receipts, completed, completed+1)
-	}
-	if request.Action != "orchestrator-session" {
-		operationMu := s.operationMutex()
-		operationMu.Lock()
-		defer operationMu.Unlock()
-		ctx = context.WithValue(ctx, operationLockContextKey{}, operationMu)
-	}
-	deadline, _ := ctx.Value(controlDeadlineContextKey{}).(time.Time)
-	if ctx.Err() != nil || !deadline.IsZero() && !time.Now().Before(deadline) {
-		result.Status, result.Retryable, result.Error = http.StatusServiceUnavailable, true, "reconciliation is in progress"
-		return result
-	}
-	receipts.Receipts = append(receipts.Receipts, controlReceipt{Request: request, State: "pending"})
-	if err := s.writeControlReceipts(receipts); err != nil {
-		result.Status, result.Error = http.StatusInternalServerError, "control request could not be recorded"
-		return result
-	}
-	result = performDashboardControl(ctx, s, request)
-	result.Version, result.RequestID, result.Action = controlVersion, request.RequestID, request.Action
-	if result.Retryable {
-		receipts.Receipts = receipts.Receipts[:len(receipts.Receipts)-1]
-		if err := s.writeControlReceipts(receipts); err != nil {
-			return controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusInternalServerError, Error: "control retry state could not be recorded; replay was refused"}
+	if request.Action == "reconcile" || strings.HasPrefix(request.Action, "orchestrator-") {
+		result := performDashboardControl(ctx, s, request)
+		result.Version, result.RequestID, result.Action = controlVersion, request.RequestID, request.Action
+		if snapshot, err := s.operator.owner.snapshot(ctx); err == nil {
+			result.OwnerRevision = snapshot.State.Revision
 		}
 		return result
 	}
-	receipts.Receipts[len(receipts.Receipts)-1] = controlReceipt{Request: request, State: "completed", Result: &result}
-	if err := s.writeControlReceipts(receipts); err != nil {
-		return controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusInternalServerError, Error: "control outcome could not be recorded; replay was refused"}
-	}
-	return result
+	return controlResult{Version: controlVersion, RequestID: request.RequestID, Action: request.Action, Status: http.StatusConflict, Error: "control action is unavailable"}
 }
 
 func (s *dashboardServer) readControlReceipts() (controlReceiptState, error) {
@@ -252,7 +248,7 @@ func (s *dashboardServer) readControlReceipts() (controlReceiptState, error) {
 	seen := map[string]bool{}
 	for _, receipt := range state.Receipts {
 		validResult := receipt.Result != nil && validRecordedControlResult(*receipt.Result, receipt.Request)
-		if !validControlRequest(receipt.Request, s.repository) || seen[receipt.Request.RequestID] || receipt.State != "pending" && receipt.State != "completed" || receipt.State == "pending" && receipt.Result != nil || receipt.State == "completed" && !validResult {
+		if !validControlRequest(receipt.Request, s.repository) || seen[receipt.Request.RequestID] || receipt.State != "pending" && receipt.State != "completed" || receipt.State == "pending" && receipt.Result != nil || receipt.State == "completed" && !validResult || !validOperatorReceiptBinding(receipt) {
 			return controlReceiptState{}, errors.New("invalid control receipt")
 		}
 		seen[receipt.Request.RequestID] = true
@@ -265,14 +261,6 @@ func validRecordedControlResult(result controlResult, request controlRequest) bo
 	return result.Version == controlVersion && result.RequestID == request.RequestID && result.Action == request.Action && result.Status >= 100 && result.Status <= 599 && result.OK == ok && result.Retryable == (result.Status == http.StatusServiceUnavailable) && (result.OK || result.Error != "") && (len(result.Data) == 0 || json.Valid(result.Data))
 }
 
-func (s *dashboardServer) writeControlReceipts(state controlReceiptState) error {
-	body, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writePrivateStateFile(s.stateRoot, controlReceiptsFile, ".control-receipts-*", append(body, '\n'), maxDashboardStateBytes)
-}
-
 func validControlRequest(request controlRequest, repository string) bool {
 	if request.Version != controlVersion || request.Repository != repository || !controlRequestIDPattern.MatchString(request.RequestID) {
 		return false
@@ -280,7 +268,7 @@ func validControlRequest(request controlRequest, repository string) bool {
 	switch request.Action {
 	case "reconcile", "orchestrator-recover", "orchestrator-clear", "orchestrator-rebuild", "orchestrator-session":
 		return request.Issue == 0 && request.Attempt == 0 && !request.Confirm
-	case "recover", "review-plan", "dismiss", "orchestrator-investigate":
+	case "recover", "review-plan", "dismiss", "cancel", "orchestrator-investigate":
 		return request.Issue > 0 && request.Attempt > 0 && !request.Confirm
 	case "archive", "abandon", "remove":
 		return request.Issue > 0 && request.Attempt > 0 && request.Confirm

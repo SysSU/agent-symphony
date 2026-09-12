@@ -1,10 +1,17 @@
-export async function postWithReconciliationRetry(url, onRetry = () => new Promise((resolve) => setTimeout(resolve, 1000)), options = {}) {
-  for (let retries = 0; ; retries++) {
-    const response = await fetch(url, { ...options, method: "POST" });
-    if (response.status !== 503 || retries === 9) return response;
-    await response.text();
-    await onRetry();
+export async function postWithReconciliationRetry(url, _onRetry, options = {}) {
+  return fetch(url, { ...options, method: "POST" });
+}
+
+export async function operatorActionNotice(response, verb, finished, issue, attempt) {
+  if (response.status !== 202) return `${finished} issue #${issue}, attempt ${attempt}.`;
+  let phase = "";
+  try {
+    phase = (await response.json())?.data?.phase ?? "";
+  } catch {
+    // Admission is durable even when an older server omits the phase body.
   }
+  const progress = phase ? ` Current phase: ${phase}.` : " Work is in progress.";
+  return `${verb} accepted for issue #${issue}, attempt ${attempt}.${progress}`;
 }
 
 export async function getOrchestratorStatus() {

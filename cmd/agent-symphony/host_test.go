@@ -1169,6 +1169,14 @@ func TestCleanupAttemptRemovesOnlyVerifiedRuntimeResources(t *testing.T) {
 	}
 	t.Cleanup(func() { hostExecRunner = oldExec })
 
+	if err := validateOrCleanupAttempt(t.Context(), body, root, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{manifest.Worktree, resultPath} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("cleanup preflight mutated %s: %v", path, err)
+		}
+	}
 	for range 2 {
 		if err := cleanupAttempt(t.Context(), body, root); err != nil {
 			t.Fatal(err)
@@ -1207,6 +1215,12 @@ func TestAbandonAttemptAcceptsExactFailedWorktreeWithoutWeakeningCleanup(t *test
 		return agentruntime.Result{}, fmt.Errorf("unexpected tmux command %v", command.Args)
 	}
 	t.Cleanup(func() { hostExecRunner = oldExec })
+	if err := validateOrAbandonAttempt(t.Context(), body, root, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manifest.Worktree); err != nil {
+		t.Fatalf("abandon preflight mutated worktree: %v", err)
+	}
 	if err := abandonAttempt(t.Context(), body, root); err != nil {
 		t.Fatal(err)
 	}

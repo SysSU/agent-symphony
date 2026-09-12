@@ -526,6 +526,13 @@ for (const scenario of [
     notice: "Recovery requested for issue #204, attempt 3.",
   },
   {
+    action: "cancel",
+    button: "Cancel issue #206, attempt 5; retain diagnostics",
+    status: { ...statuses[0], issue: 206, attempt: 5, state: "active" },
+    consequence: "retains its worktree, logs, and diagnostics",
+    notice: "Cancel accepted for issue #206, attempt 5. Current phase: stop-pending.",
+  },
+  {
     action: "abandon",
     button: "Abandon attempt",
     status: { ...statuses[0], issue: 205, attempt: 4, state: "orphaned", retryable: false },
@@ -545,15 +552,16 @@ for (const scenario of [
         issue: url.searchParams.get("issue"),
         attempt: url.searchParams.get("attempt"),
       });
-      if (scenario.action === "recover" && requests.length === 1) {
-        await route.fulfill({ status: 503, body: "reconciliation in progress" });
-        return;
-      }
       await actionPending;
       if (scenario.action === "archive" || scenario.action === "abandon") {
         dashboard.hide(scenario.status, scenario.action === "archive" ? "archived" : "abandoned");
       }
-      await route.fulfill({ json: {} });
+      if (scenario.action === "archive" || scenario.action === "cancel") {
+        const phase = scenario.action === "archive" ? "cleanup-pending" : "stop-pending";
+        await route.fulfill({ status: 202, json: { ok: true, status: 202, data: { phase } } });
+      } else {
+        await route.fulfill({ json: {} });
+      }
     });
     await page.goto("/");
 
@@ -573,8 +581,8 @@ for (const scenario of [
     await action.click();
     const actionControl = card.locator(scenario.action === "archive" ? ".secondaryAction" : ".dangerAction");
     await expect(actionControl).toBeDisabled();
-    await expect(actionControl).toHaveText(scenario.action === "recover" ? "Waiting for reconciliation…" : "Working…");
-    const expectedRequests = scenario.action === "recover" ? 2 : 1;
+    await expect(actionControl).toHaveText("Working…");
+    const expectedRequests = 1;
     await expect.poll(() => requests.length).toBe(expectedRequests);
     expect(requests).toEqual(Array.from({ length: expectedRequests }, () => ({
       method: "POST",
@@ -583,12 +591,9 @@ for (const scenario of [
     })));
 
     releaseAction();
-    await expect(page.getByRole("status").filter({ hasText: scenario.notice })).toBeVisible();
+    const notice = scenario.action === "archive" ? "Archive accepted for issue #160, attempt 2. Current phase: cleanup-pending." : scenario.notice;
+    await expect(page.getByRole("status").filter({ hasText: notice })).toBeVisible();
     if (scenario.action === "archive" || scenario.action === "abandon") await expect(card).toBeHidden();
     else await expect(action).toBeEnabled();
-    if (scenario.action === "recover") {
-      expect(browserErrors.get(page)).toEqual(["console: Failed to load resource: the server responded with a status of 503 (Service Unavailable)"]);
-      browserErrors.set(page, []);
-    }
   });
 }
