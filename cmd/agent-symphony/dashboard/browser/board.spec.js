@@ -315,12 +315,14 @@ test("dismisses one closed-issue attempt while retaining diagnostics", async ({ 
   const requests = [];
   await page.route("**/actions/dismiss?*", (route) => {
     const url = new URL(route.request().url());
+    const issue = url.searchParams.get("issue");
     requests.push({
       method: route.request().method(),
       repository: url.searchParams.get("repository"),
-      issue: url.searchParams.get("issue"),
+      issue,
       attempt: url.searchParams.get("attempt"),
     });
+    if (issue === "219") return route.fulfill({ status: 409, json: { ok: false, error: "GitHub issue is open" } });
     dashboard.hide(previous, "dismissed");
     return route.fulfill({ json: { ok: true } });
   });
@@ -331,8 +333,9 @@ test("dismisses one closed-issue attempt while retaining diagnostics", async ({ 
   const dismissPrevious = history.getByRole("button", { name: "Dismiss issue #218, attempt 1; keep diagnostics" });
   await expect(dismissPrevious).toBeVisible();
   await expect(page.getByRole("button", { name: "Dismiss issue #218, attempt 2; keep diagnostics" })).toBeVisible();
-  const openCard = page.locator(".card").filter({ has: page.getByRole("link", { name: "#219 Open issue" }) });
-  await expect(openCard.getByRole("button", { name: /dismiss/i })).toHaveCount(0);
+  const openCard = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: "#219 Open issue" }) });
+  const dismissOpen = openCard.getByRole("button", { name: "Dismiss issue #219, attempt 1; keep diagnostics" });
+  await expect(dismissOpen).toBeVisible();
   await page.screenshot({ path: "test-results/closed-attempt-dismissal-desktop.png", fullPage: true });
 
   let confirmation = "";
@@ -349,6 +352,16 @@ test("dismisses one closed-issue attempt while retaining diagnostics", async ({ 
     log: "agent.log",
     worktree: "diagnostic.txt",
   });
+
+  const rejected = page.waitForResponse((response) => response.url().includes("/actions/dismiss?") && new URL(response.url()).searchParams.get("issue") === "219");
+  page.once("dialog", (dialog) => dialog.accept());
+  await dismissOpen.click();
+  expect((await rejected).status()).toBe(409);
+  await expect(page.getByRole("status").filter({ hasText: "GitHub issue is open" })).toBeVisible();
+  await expect(openCard).toBeVisible();
+  expect(requests.at(-1)).toEqual({ method: "POST", repository: open.repository, issue: "219", attempt: "1" });
+  expect(browserErrors.get(page).filter((message) => !message.includes("409"))).toEqual([]);
+  browserErrors.get(page).length = 0;
 
   await page.reload();
   await expect(page.getByText("attempt one diagnostic", { exact: true })).toHaveCount(0);
