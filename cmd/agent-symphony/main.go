@@ -1969,7 +1969,7 @@ func reviewTarget(mode string, issue internalgithub.RecoveryIssueFact, base, hea
 }
 
 func missingTmuxPaneStatus(result agentruntime.Result) bool {
-	return !result.Exited && result.Code == 0 && strings.TrimSpace(result.Output) == "|||"
+	return !result.Exited && result.Code == 0 && strings.TrimSpace(result.Output) == "||||"
 }
 
 func validReviewTarget(mode, target, repository string, issue int, head string) bool {

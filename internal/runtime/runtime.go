@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	stdruntime "runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -652,7 +653,14 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 		return PaneStatus{}, fmt.Errorf("pane exit status conflicts with recorded status %d", *recordedStatus)
 	}
 	if recordedSignal != nil {
-		return PaneStatus{}, fmt.Errorf("pane exit status conflicts with recorded signal %d", *recordedSignal)
+		if status == 0 {
+			return PaneStatus{}, fmt.Errorf("pane exit status conflicts with recorded signal %d", *recordedSignal)
+		}
+		// The native status belongs to the Go wrapper, which can exit nonzero
+		// instead of re-raising synchronous signals such as SIGSEGV. The pane
+		// option records the child signal before that wrapper exits.
+		pane.Ready, pane.Signal = true, strconv.Itoa(*recordedSignal)
+		return pane, nil
 	}
 	pane.Ready, pane.ExitStatus = true, status
 	return pane, nil
@@ -664,13 +672,24 @@ func nativePaneSignalMatches(native string, recorded int) bool {
 	}
 	known := map[string]syscall.Signal{
 		"hup": syscall.SIGHUP, "int": syscall.SIGINT, "quit": syscall.SIGQUIT,
-		"abrt": syscall.SIGABRT, "kill": syscall.SIGKILL, "pipe": syscall.SIGPIPE,
+		"ill": syscall.SIGILL, "trap": syscall.SIGTRAP, "abrt": syscall.SIGABRT,
+		"iot": syscall.SIGABRT, "bus": syscall.SIGBUS, "fpe": syscall.SIGFPE,
+		"kill": syscall.SIGKILL, "segv": syscall.SIGSEGV, "pipe": syscall.SIGPIPE,
 		"alrm": syscall.SIGALRM, "term": syscall.SIGTERM, "usr1": syscall.SIGUSR1,
 		"usr2": syscall.SIGUSR2, "chld": syscall.SIGCHLD, "cont": syscall.SIGCONT,
 		"stop": syscall.SIGSTOP, "tstp": syscall.SIGTSTP, "ttin": syscall.SIGTTIN,
-		"ttou": syscall.SIGTTOU,
+		"ttou": syscall.SIGTTOU, "sys": syscall.SIGSYS, "urg": syscall.SIGURG,
+		"xcpu": syscall.SIGXCPU, "xfsz": syscall.SIGXFSZ, "vtalrm": syscall.SIGVTALRM,
+		"prof": syscall.SIGPROF, "winch": syscall.SIGWINCH, "io": syscall.SIGIO,
 	}
-	value, ok := known[strings.TrimPrefix(native, "sig")]
+	name := strings.TrimPrefix(native, "sig")
+	value, ok := known[name]
+	if !ok && stdruntime.GOOS == "darwin" {
+		value, ok = map[string]syscall.Signal{"emt": 7, "info": 29}[name]
+	}
+	if !ok && stdruntime.GOOS == "linux" {
+		value, ok = map[string]syscall.Signal{"cld": 17, "poll": 29, "pwr": 30, "stkflt": 16, "unused": 31}[name]
+	}
 	return ok && int(value) == recorded
 }
 

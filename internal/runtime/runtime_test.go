@@ -234,15 +234,19 @@ func TestParsePaneStatus(t *testing.T) {
 		{name: "dead signal", output: "1||term||\n", want: PaneStatus{Dead: true, Ready: true, Signal: "term"}},
 		{name: "dead numeric signal", output: "1||15||\n", want: PaneStatus{Dead: true, Ready: true, Signal: "15"}},
 		{name: "dead matching native signal and recorded", output: "1||term||15\n", want: PaneStatus{Dead: true, Ready: true, Signal: "term"}},
+		{name: "dead matching native segv and recorded", output: "1||segv||11\n", want: PaneStatus{Dead: true, Ready: true, Signal: "segv"}},
 		{name: "dead uppercase signal", output: "1||TERM||\n", want: PaneStatus{Dead: true, Ready: true, Signal: "term"}},
 		{name: "legacy ambiguous", output: "1\n", wantErr: "invalid pane status"},
 		{name: "live with status", output: "0|0|||\n", wantErr: "invalid live pane status"},
 		{name: "dead status and signal", output: "1|17|term||\n", wantErr: "ambiguous dead pane status"},
 		{name: "negative exit", output: "1|-1|||\n", wantErr: "invalid exit status"},
 		{name: "conflicting recorded exit", output: "1|17||42|\n", wantErr: "conflicts"},
-		{name: "conflicting recorded signal and native status", output: "1|143|||15\n", wantErr: "conflicts"},
+		{name: "signaled child with nonzero wrapper status", output: "1|2|||11\n", want: PaneStatus{Dead: true, Ready: true, Signal: "11"}},
+		{name: "signaled child with shell-style wrapper status", output: "1|143|||15\n", want: PaneStatus{Dead: true, Ready: true, Signal: "15"}},
+		{name: "conflicting recorded signal and successful wrapper", output: "1|0|||15\n", wantErr: "conflicts"},
 		{name: "conflicting recorded status and native signal", output: "1||term|143|\n", wantErr: "conflicts"},
 		{name: "conflicting recorded signals", output: "1||term||9\n", wantErr: "conflicts"},
+		{name: "conflicting recorded segv", output: "1||segv||15\n", wantErr: "conflicts"},
 		{name: "conflicting recorded status and signal", output: "1|||143|15\n", wantErr: "conflicting recorded"},
 		{name: "negative recorded exit", output: "1|||-1|\n", wantErr: "invalid recorded pane exit status"},
 		{name: "out of range recorded exit", output: "1|||256|\n", wantErr: "invalid recorded pane exit status"},
@@ -322,7 +326,7 @@ func TestParsePaneStatusFromRealTmux(t *testing.T) {
 		for {
 			pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, PaneStatusFormat))
 			if err != nil {
-				t.Fatalf("tmux %s returned invalid pane status: %v", label, err)
+				t.Fatalf("tmux %s returned invalid pane status: %v; raw=%q pane=%q", label, err, run("display-message", "-p", "-t", target, PaneStatusFormat), run("capture-pane", "-p", "-S", "-", "-t", target))
 			}
 			if pane.Ready {
 				return pane
@@ -343,6 +347,12 @@ func TestParsePaneStatusFromRealTmux(t *testing.T) {
 	}
 	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, "#{pane_dead}||||#{"+PaneExitSignalOption+"}")); err != nil || pane != (PaneStatus{Dead: true, Ready: true, Signal: "15"}) {
 		t.Fatalf("recorded signal fallback: status=%#v err=%v", pane, err)
+	}
+	if pane := awaitPaneDead("signal-segv", append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "kill -SEGV $$"})...)); pane != (PaneStatus{Dead: true, Ready: true, Signal: "segv"}) && pane != (PaneStatus{Dead: true, Ready: true, Signal: "11"}) {
+		t.Fatalf("segfault pane status=%#v", pane)
+	}
+	if pane, err := ParsePaneStatus(run("display-message", "-p", "-t", target, "#{pane_dead}||||#{"+PaneExitSignalOption+"}")); err != nil || pane != (PaneStatus{Dead: true, Ready: true, Signal: "11"}) {
+		t.Fatalf("recorded segfault fallback: status=%#v err=%v", pane, err)
 	}
 	if pane := awaitPaneDead("exit-143", append([]string{"respawn-pane", "-k", "-t", target, "--"}, PaneExitStatusCommand(helper, tmux, []string{"sh", "-c", "exit 143"})...)); pane != (PaneStatus{Dead: true, Ready: true, ExitStatus: 143}) {
 		t.Fatalf("explicit exit 143 status=%#v", pane)
