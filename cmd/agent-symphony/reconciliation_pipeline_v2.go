@@ -935,7 +935,14 @@ func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API
 	if !issueScoped {
 		key, attemptGeneration = ownerAttemptKey(request.Repository, request.Issue, request.Attempt), plan.Identity.AttemptGeneration
 	}
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, attemptGeneration, request.ObservationGeneration)
+	observationGeneration := request.ObservationGeneration
+	if request.GitHubIssueUpdate.Kind == githubIssueRetry {
+		// A retry command changes its own observation before its exact proof is
+		// reread. Owner authorization still checks the captured generation before
+		// posting; destructive owner generations still cancel the running effect.
+		observationGeneration = 0
+	}
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, attemptGeneration, observationGeneration)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}

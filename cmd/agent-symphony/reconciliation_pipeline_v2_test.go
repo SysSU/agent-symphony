@@ -845,6 +845,65 @@ func TestIssueUpdateRevalidationCancelsAfterOwnerInvalidationWithoutMutation(t *
 	}
 }
 
+func TestProvenRetrySurvivesObservationOnlyInvalidation(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "issue-retry").request
+	_, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	request = bindEffectObservation(snapshot, request)
+	issue := issueFact(request.Issue, "title")
+	cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42, CancelCommand: "/cancel", RetryCommand: "/retry"}
+	material := reconciliationIssueUpdateMaterial{Issue: &issue, Config: cfg}
+	request.ExecutionDigest = issueUpdateExecutionDigest(request, material)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedAt := time.Unix(0, request.GitHubIssueUpdate.FailedAtUnixNano)
+	terminal, err := internalgithub.TerminalFailureMarker(request.Issue, request.Attempt, failedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	comment := func(id int, body string, at time.Time) map[string]any {
+		return map[string]any{"id": id, "body": body, "created_at": at, "updated_at": at, "user": map[string]any{"id": 42}}
+	}
+	comments := []map[string]any{comment(1, terminal, failedAt), comment(2, cfg.RetryCommand, failedAt.Add(time.Second))}
+	var reads atomic.Int32
+	proofBlocked, releaseProof := make(chan struct{}), make(chan struct{})
+	api := internalgithub.API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet || r.URL.Path != fmt.Sprintf("/repos/o/r/issues/%d/comments", request.Issue) {
+			return nil, fmt.Errorf("unexpected GitHub request %s", r.URL)
+		}
+		if reads.Add(1) == 3 {
+			close(proofBlocked)
+			<-releaseProof
+		}
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
+		body, _ := json.Marshal(comments)
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: r}, nil
+	})}, Retries: -1}
+	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
+	plan := reconciliationPlannedEffect{Request: request, Identity: ownerReconciliationEffectIdentity(*effect), Material: material}
+	done := make(chan error, 1)
+	go func() {
+		_, err := coordinator.executeOperatorIssueUpdate(api, plan)
+		done <- err
+	}()
+	<-proofBlocked
+	newer := reconciliationEffectObservationInput(request, "title")
+	newer.Issues[0].RecoveryAuthorized, newer.Issues[0].Retry = true, true
+	changed := applyReconciliationInput(t, owner, newer)
+	coordinator.cancelInvalidated(changed)
+	close(releaseProof)
+	if err := <-done; err != nil {
+		t.Fatalf("exact retry proof was lost after observation-only drift: %v", err)
+	}
+	committed := mustOwnerSnapshot(t, owner).State.Effects[effect.ID]
+	if committed.State != "completed" || reads.Load() != 4 {
+		t.Fatalf("retry effect=%#v GitHub reads=%d", committed, reads.Load())
+	}
+}
+
 func TestReconciliationCoordinatorShutdownCancelsAndRejectsWork(t *testing.T) {
 	owner := newReconciliationTestOwner(t)
 	body := "snapshot"

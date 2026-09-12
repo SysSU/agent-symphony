@@ -504,6 +504,48 @@ func TestAttemptInvalidationRevokesIssueScopedDependencyClear(t *testing.T) {
 	}
 }
 
+func TestProvenRetryCompletionStillRejectsDestructiveInvalidation(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "issue-retry").request
+	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
+	issueKey := ownerIssueKey(request.Repository, request.Issue)
+	attemptKey := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	observation := current.Observations[issueKey]
+	observation.Generation++
+	observation.Fact.Retry, observation.Fact.RecoveryAuthorized = true, true
+	current.Observations[issueKey] = observation
+	for _, scenario := range []struct {
+		name   string
+		change func(*runtimeOwnerState)
+	}{
+		{"issue generation", func(state *runtimeOwnerState) { state.IssueGenerations[issueKey]++ }},
+		{"attempt generation", func(state *runtimeOwnerState) { state.AttemptGenerations[attemptKey]++ }},
+		{"tombstone", func(state *runtimeOwnerState) { state.Tombstones[attemptKey] = runtimeTombstone{} }},
+		{"newer attempt", func(state *runtimeOwnerState) {
+			observed := state.Observations[issueKey]
+			observed.Fact.CurrentAttempt = request.Attempt + 1
+			state.Observations[issueKey] = observed
+		}},
+		{"cancelled control", func(state *runtimeOwnerState) {
+			observed := state.Observations[issueKey]
+			observed.Fact.Cancelled = true
+			state.Observations[issueKey] = observed
+		}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			invalid := cloneRuntimeOwnerState(current)
+			scenario.change(&invalid)
+			if err := reconciliationEffectFinishCurrent(owner.stateRoot, invalid, *effect); err == nil {
+				t.Fatal("invalidated retry completion was accepted")
+			}
+		})
+	}
+}
+
 func TestStaleCollectionCannotRestoreInvalidatedDependencyClear(t *testing.T) {
 	request := reconciliationEffectCaseNamed(t, "issue-dependency-clear").request
 	owner, _, request := reconciliationEffectTestOwner(t, request)
