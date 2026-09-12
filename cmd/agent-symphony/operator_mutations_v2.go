@@ -38,16 +38,20 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 	if command.Identity.Epoch != state.Epoch || command.Identity.SourceRevision == 0 || command.Identity.SourceRevision > state.Revision {
 		return nil, errStaleStateResult
 	}
-	manifest := cloneManifest(command.Manifest)
-	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || manifest.Issue != request.Issue || manifest.Attempt != request.Attempt {
-		return nil, errStateConflict
-	}
 	issueKey, attemptKey := ownerIssueKey(request.Repository, request.Issue), ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
 	if command.Identity.IssueGeneration != state.IssueGenerations[issueKey] {
 		return nil, errStaleStateResult
 	}
 	observation, ok := state.Observations[issueKey]
-	if !ok || !observation.Present || command.ObservationGeneration != observation.Generation || command.ObservationCycleID != observation.LastCycleID || command.ObservationBodyDigest != observation.Fact.BodyDigest {
+	if command.RemoteOnly {
+		return applyRemoteOnlyOperatorMutation(attemptRoot, stateRoot, state, command, observation, ok)
+	}
+	manifest := cloneManifest(command.Manifest)
+	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || manifest.Issue != request.Issue || manifest.Attempt != request.Attempt {
+		return nil, errStateConflict
+	}
+	absentOrphan := ok && !observation.Present && (request.Action == "dismiss" && command.IssueClosed || request.Action == "abandon") && observation.ObservationEpoch == state.Epoch
+	if !ok || !observation.Present && !absentOrphan || command.ObservationGeneration != observation.Generation || command.ObservationCycleID != observation.LastCycleID || command.ObservationBodyDigest != observation.Fact.BodyDigest {
 		return nil, errStaleStateResult
 	}
 	tombstone, tombstoned := state.Tombstones[attemptKey]
@@ -83,6 +87,12 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 	status, statuses, err := ownerOperatorStatus(*state, request.Issue, request.Attempt)
 	if err != nil {
 		return nil, errStateConflict
+	}
+	if absentOrphan {
+		if status.State != "orphaned" {
+			return nil, errStateConflict
+		}
+		status.IssueClosed = command.IssueClosed
 	}
 	var effect *runtimeEffectIntent
 	phase := operatorPhaseCompleted
@@ -188,6 +198,26 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		return nil, err
 	}
 	return effect, nil
+}
+
+func applyRemoteOnlyOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwnerState, command beginOperatorMutationCommand, observation reconciliationObservation, observed bool) (*runtimeEffectIntent, error) {
+	request := command.Request
+	issueKey, attemptKey := ownerIssueKey(request.Repository, request.Issue), ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	attempt, accepted := observation.Attempts[attemptKey]
+	if !slices.Contains([]string{"archive", "dismiss"}, request.Action) || request.Action == "dismiss" && !command.IssueClosed || command.IssueClosed != observation.Fact.Closed || !reflect.DeepEqual(command.Manifest, agentruntime.Manifest{}) || command.CleanupValid || command.CleanupDigest != "" || command.CleanupPolicy != (agentruntime.EffectCleanupPolicy{}) || command.Runtime != nil || command.Reconciliation != nil || command.PublishedHead != "" || !observed || !observation.Present || observation.ObservationEpoch != state.Epoch || observation.Fact.CurrentAttempt != request.Attempt || observation.Generation != command.ObservationGeneration || observation.LastCycleID != command.ObservationCycleID || observation.Fact.BodyDigest != command.ObservationBodyDigest || !accepted || !attempt.Present || attempt.ObservationEpoch != state.Epoch || attempt.SourceIssueGeneration != observation.Generation || attempt.OwnerGeneration != command.Identity.AttemptGeneration || attempt.Fact.State != "completed" || attempt.Fact.Repository != request.Repository || attempt.Fact.Issue != request.Issue || attempt.Fact.Attempt != request.Attempt || state.AttemptGenerations[attemptKey] != command.Identity.AttemptGeneration {
+		return nil, errStaleStateResult
+	}
+	if _, exists := state.Attempts[attemptKey]; exists {
+		return nil, errStateConflict
+	}
+	if _, exists := state.Tombstones[attemptKey]; exists {
+		return nil, errStateConflict
+	}
+	if _, err := applyInvalidateAttempt(attemptRoot, stateRoot, state, invalidateAttemptCommand{Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, ExpectedIssueGeneration: state.IssueGenerations[issueKey], ExpectedAttemptGeneration: command.Identity.AttemptGeneration, Action: operatorTombstoneAction(request.Action), CleanupPhase: "completed"}); err != nil {
+		return nil, err
+	}
+	receipt := controlReceipt{Request: request, State: "completed", Phase: operatorPhaseCompleted, Result: successfulOperatorResult(request, 0)}
+	return nil, appendOperatorReceipt(state, receipt)
 }
 
 func applyStartOperatorCleanup(state *runtimeOwnerState, command startOperatorCleanupCommand) error {
@@ -491,7 +521,7 @@ func validTombstoneCleanupPolicy(tombstone runtimeTombstone) bool {
 	if tombstone.Action == "dismissed" {
 		return tombstone.CleanupPolicy == nil && tombstone.PublishedHead == "" && tombstone.CleanupPhase == "completed" && tombstone.EffectID == ""
 	}
-	if bareCompletedRemoval(tombstone) {
+	if bareCompletedRemoval(tombstone) || bareCompletedArchive(tombstone) {
 		return true
 	}
 	if tombstone.CleanupPolicy == nil || tombstone.EffectID == "" {
@@ -499,6 +529,10 @@ func validTombstoneCleanupPolicy(tombstone runtimeTombstone) bool {
 	}
 	want := map[string]string{"archived": "archive", "abandoned": "abandon", "removed": "remove"}[tombstone.Action]
 	return want != "" && tombstone.CleanupPolicy.Action == want && tombstone.CleanupPolicy.PublishedHead == tombstone.PublishedHead && (want == "remove" && preflightObjectID.MatchString(tombstone.PublishedHead) || want != "remove" && tombstone.PublishedHead == "")
+}
+
+func bareCompletedArchive(tombstone runtimeTombstone) bool {
+	return tombstone.Action == "archived" && tombstone.CleanupPhase == "completed" && tombstone.PublishedHead == "" && tombstone.Manifest == nil && tombstone.CleanupPolicy == nil && tombstone.EffectID == ""
 }
 
 func bareCompletedRemoval(tombstone runtimeTombstone) bool {

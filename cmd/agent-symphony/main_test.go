@@ -1269,6 +1269,16 @@ func TestQueuedIssueProjectionIsReadOnlyAndAuthoritative(t *testing.T) {
 	}
 }
 
+func TestCompletedIssueDoesNotProjectUnpublishedNextAttempt(t *testing.T) {
+	// A completed GitHub attempt 1 can already be archived locally. Attempt 2
+	// is merely the collector's next dispatch number, not completed work.
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 161, Attempt: 2, CurrentAttempt: 1, Completed: true, Closed: true}
+	statuses, _ := joinIssueProjection(nil, []internalgithub.RecoveryIssueFact{issue}, 1)
+	if len(statuses) != 0 {
+		t.Fatalf("invented completed attempt: %#v", statuses)
+	}
+}
+
 func TestAttentionProjectionAppliesOnlyToTheCurrentAttempt(t *testing.T) {
 	statuses := []orchestrator.RecoveryStatus{
 		{Repository: "o/r", Issue: 218, Attempt: 1, State: "failed", Blockers: []string{"attempt 1 failed before retry"}},

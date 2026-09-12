@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -151,6 +152,26 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		return operatorResultForReceipt(committed, receipt)
 	}
 
+	if (request.Action == "archive" || request.Action == "dismiss") && !ownerHasAttempt(snapshot.State, request) {
+		fresh, batch, err := s.collectIssue(ctx, request.Issue)
+		if err != nil {
+			return operatorResultForError(request, err)
+		}
+		command, err := remoteOnlyOperatorCommand(fresh, batch, request)
+		if err != nil {
+			return operatorResultForError(request, err)
+		}
+		committed, _, err := s.owner.beginOperatorMutation(ctx, command)
+		if err != nil {
+			return operatorResultForError(request, err)
+		}
+		s.effects.cancelInvalidated(committed)
+		receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
+		if !ok {
+			return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
+		}
+		return operatorResultForReceipt(committed, receipt)
+	}
 	command, work, err := s.prepareAdmission(ctx, snapshot, request)
 	if err != nil {
 		return operatorResultForError(request, err)
@@ -176,6 +197,31 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
 	}
 	return operatorResultForReceipt(committed, receipt)
+}
+
+func ownerHasAttempt(state runtimeOwnerState, request controlRequest) bool {
+	_, ok := state.Attempts[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)]
+	return ok
+}
+
+func remoteOnlyOperatorCommand(snapshot stateOwnerSnapshot, batch reconciliationV2Batch, request controlRequest) (beginOperatorMutationCommand, error) {
+	issueKey, attemptKey := ownerIssueKey(request.Repository, request.Issue), ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	observation, ok := snapshot.State.Observations[issueKey]
+	attempt, accepted := observation.Attempts[attemptKey]
+	issueFound := slices.ContainsFunc(batch.Input.Issues, func(fact internalgithub.RecoveryIssueFact) bool {
+		return fact.Repository == request.Repository && fact.Issue == request.Issue && (request.Action == "archive" || fact.Closed) && fact.CurrentAttempt == request.Attempt
+	})
+	attemptFound := slices.ContainsFunc(batch.Input.Attempts, func(fact internalgithub.RecoveryAttemptFact) bool {
+		reduced, err := reduceAttemptFact(request.Repository, fact)
+		return err == nil && reflect.DeepEqual(reduced, attempt.Fact)
+	})
+	if !issueFound || !attemptFound || !ok || !observation.Present || observation.ObservationEpoch != snapshot.State.Epoch || request.Action == "dismiss" && !observation.Fact.Closed || observation.Fact.CurrentAttempt != request.Attempt || !accepted || !attempt.Present || attempt.ObservationEpoch != snapshot.State.Epoch || attempt.SourceIssueGeneration != observation.Generation || attempt.OwnerGeneration != snapshot.State.AttemptGenerations[attemptKey] || attempt.Fact.State != "completed" || attempt.Fact.Repository != request.Repository || attempt.Fact.Issue != request.Issue || attempt.Fact.Attempt != request.Attempt || ownerHasAttempt(snapshot.State, request) {
+		return beginOperatorMutationCommand{}, errStateConflict
+	}
+	return beginOperatorMutationCommand{Request: request, RemoteOnly: true, IssueClosed: observation.Fact.Closed,
+		ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, ObservationBodyDigest: observation.Fact.BodyDigest,
+		Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[issueKey], AttemptGeneration: snapshot.State.AttemptGenerations[attemptKey]},
+	}, nil
 }
 
 func (s *operatorMutationService) currentReceiptResult(ctx context.Context, request controlRequest) controlResult {
@@ -257,8 +303,7 @@ func (s *operatorMutationService) prepareAdmission(ctx context.Context, snapshot
 		Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], AttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)]},
 	}
 	var work operatorWork
-	switch request.Action {
-	case "dismiss":
+	if request.Action == "dismiss" && !observation.Present {
 		if s.issueClosed == nil {
 			return beginOperatorMutationCommand{}, operatorWork{}, errStateConflict
 		}
@@ -267,9 +312,25 @@ func (s *operatorMutationService) prepareAdmission(ctx context.Context, snapshot
 			return beginOperatorMutationCommand{}, operatorWork{}, err
 		}
 		if !closed {
-			return beginOperatorMutationCommand{}, operatorWork{}, errStateConflict
+			return beginOperatorMutationCommand{}, operatorWork{}, fmt.Errorf("GitHub issue is open: %w", errStateConflict)
 		}
 		command.IssueClosed = true
+	}
+	switch request.Action {
+	case "dismiss":
+		if !command.IssueClosed {
+			if s.issueClosed == nil {
+				return beginOperatorMutationCommand{}, operatorWork{}, errStateConflict
+			}
+			closed, err := s.issueClosed(ctx, request.Repository, request.Issue)
+			if err != nil {
+				return beginOperatorMutationCommand{}, operatorWork{}, err
+			}
+			if !closed {
+				return beginOperatorMutationCommand{}, operatorWork{}, fmt.Errorf("GitHub issue is open: %w", errStateConflict)
+			}
+			command.IssueClosed = true
+		}
 	case "archive", "abandon", "remove":
 		cleanup := agentruntime.EffectRequest{Action: agentruntime.EffectCleanup, Attempt: operatorEffectAttempt(manifest), Manifest: manifest, Cleanup: agentruntime.EffectCleanupPolicy{Action: request.Action}}
 		if request.Action == "remove" {
@@ -359,10 +420,14 @@ func operatorAttempt(snapshot stateOwnerSnapshot, request controlRequest) (agent
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
 	record, ok := snapshot.State.Attempts[key]
 	observation, observed := snapshot.State.Observations[ownerIssueKey(request.Repository, request.Issue)]
-	if !ok || !observed || !observation.Present || record.Generation != snapshot.State.AttemptGenerations[key] || observation.OwnerGeneration != snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)] {
+	absentOrphan := !observation.Present && (request.Action == "dismiss" || request.Action == "abandon") && observation.ObservationEpoch == snapshot.State.Epoch
+	if !ok || !observed || !observation.Present && !absentOrphan || record.Generation != snapshot.State.AttemptGenerations[key] || observation.OwnerGeneration != snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)] {
 		return agentruntime.Manifest{}, orchestrator.RecoveryStatus{}, errStaleStateResult
 	}
 	status, _, err := ownerOperatorStatus(snapshot.State, request.Issue, request.Attempt)
+	if absentOrphan && status.State != "orphaned" {
+		return agentruntime.Manifest{}, orchestrator.RecoveryStatus{}, errStaleStateResult
+	}
 	return cloneManifest(record.Manifest), status, err
 }
 
@@ -676,8 +741,12 @@ func operatorResultForReceipt(snapshot stateOwnerSnapshot, receipt controlReceip
 func operatorResultForError(request controlRequest, err error) controlResult {
 	status := http.StatusInternalServerError
 	message := "operator mutation failed"
-	if errors.Is(err, errStateConflict) || errors.Is(err, errStaleStateResult) || errors.Is(err, errAttemptTombstoned) {
-		status, message = http.StatusConflict, "operator mutation conflicts with current state"
+	if errors.Is(err, errStateConflict) {
+		status, message = http.StatusConflict, internalgithub.Redact(err.Error())
+	} else if errors.Is(err, errStaleStateResult) {
+		status, message = http.StatusConflict, "attempt or issue changed; refresh and retry"
+	} else if errors.Is(err, errAttemptTombstoned) {
+		status, message = http.StatusConflict, "attempt was already invalidated"
 	} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		status, message = http.StatusRequestTimeout, "operator request was cancelled before admission"
 	}

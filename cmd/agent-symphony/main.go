@@ -1380,6 +1380,11 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 		if found {
 			continue
 		}
+		// A completed issue's Attempt is the next dispatch number. Only a
+		// published attempt fact can represent completed work.
+		if issue.Completed {
+			continue
+		}
 		decisionIndex := slices.IndexFunc(decisions, func(d orchestrator.Decision) bool { return d.Repository == issue.Repository && d.Number == issue.Issue })
 		if decisionIndex < 0 {
 			continue
