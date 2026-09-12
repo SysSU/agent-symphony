@@ -1681,6 +1681,69 @@ func TestV2PlanReviewHandlerCommitsExactOwnerEffectWithoutCompatibilityWrite(t *
 	}
 }
 
+func TestV2PlanReviewAdmitsAfterMonitorOnlyTimestampChange(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 335, "active", false)
+	initial := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "body"
+	attempt := expandAttemptFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, owner, input)
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r/issues/335" {
+			t.Errorf("unexpected GitHub read: %s", r.URL.Path)
+		}
+		close(entered)
+		<-release
+		_, _ = io.WriteString(w, `{"number":335,"state":"open","body":"body"}`)
+	}))
+	defer github.Close()
+	defer once.Do(func() { close(release) })
+	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
+	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, executor: agentruntime.EffectExecutor{Runtime: runtimeState}, active: map[string]*activeRuntimeEffect{}, stopped: true}
+	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{API: internalgithub.API{BaseURL: github.URL, HTTP: github.Client()}, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
+	result := make(chan controlResult, 1)
+	go func() {
+		result <- service.perform(t.Context(), operatorRequest("plan-review-monitor-timestamp", "review-plan", manifest, false))
+	}()
+	<-entered // The action has captured its owner snapshot and is waiting on GitHub.
+	before := mustOwnerSnapshot(t, owner).State
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	current := before.Attempts[key].Manifest
+	identity := stateResultIdentity{Epoch: before.Epoch, SourceRevision: before.Revision, IssueGeneration: before.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: before.AttemptGenerations[key]}
+	_, monitor, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectMonitor, Manifest: current, RequestDigest: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := cloneManifest(current)
+	updated.UpdatedAt = updated.UpdatedAt.Add(time.Second)
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*monitor)), Action: agentruntime.EffectMonitor, Manifest: updated}); err != nil {
+		t.Fatal(err)
+	}
+	after := mustOwnerSnapshot(t, owner).State
+	if !reflect.DeepEqual(after.Attempts[key].Manifest, updated) {
+		t.Fatalf("monitor changed more than UpdatedAt: before=%#v after=%#v", current, after.Attempts[key].Manifest)
+	}
+	once.Do(func() { close(release) })
+	if got := <-result; got.Status != http.StatusAccepted || !got.OK {
+		t.Fatalf("monitor-only timestamp change rejected review: %#v", got)
+	}
+	committed := mustOwnerSnapshot(t, owner).State
+	if len(committed.ControlReceipts) != 1 || committed.ControlReceipts[0].Phase != operatorPhaseReviewPending || committed.Effects[committed.ControlReceipts[0].EffectID].Reconciliation == nil {
+		t.Fatalf("review intent not durably admitted after monitor: %#v", committed)
+	}
+	effect := committed.Effects[committed.ControlReceipts[0].EffectID]
+	if err := owner.authorizeReconciliationEffect(t.Context(), authorizeReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: reconciliationReviewer}); err != nil {
+		t.Fatalf("monitor timestamp invalidated the admitted review effect: %v", err)
+	}
+}
+
 func TestV2PlanReviewRejectsBodyChangedDuringPreparationBeforeAdmission(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 334, "active", false)
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
