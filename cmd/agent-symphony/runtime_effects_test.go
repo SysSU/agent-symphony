@@ -722,7 +722,7 @@ func (r *monitorFailureRunner) Run(_ context.Context, command agentruntime.Comma
 		if r.ambiguous {
 			return agentruntime.Result{}, errors.New("observation unavailable")
 		}
-		return agentruntime.Result{Output: "1|9||9\n"}, nil
+		return agentruntime.Result{Output: "1|9||9|\n"}, nil
 	case "capture-pane":
 		return agentruntime.Result{}, errors.New("capture failed")
 	default:
@@ -753,9 +753,9 @@ func (r *monitorSequenceRunner) Run(_ context.Context, command agentruntime.Comm
 	switch command.Args[0] {
 	case "display-message":
 		if r.displays.Add(1) == 1 {
-			return agentruntime.Result{Output: "0|||\n"}, nil
+			return agentruntime.Result{Output: "0||||\n"}, nil
 		}
-		return agentruntime.Result{Output: "1|7||7\n"}, nil
+		return agentruntime.Result{Output: "1|7||7|\n"}, nil
 	case "capture-pane":
 		return agentruntime.Result{Output: "worker failed\n"}, nil
 	default:
@@ -784,7 +784,7 @@ func (r *barrierEffectRunner) Run(ctx context.Context, command agentruntime.Comm
 			return agentruntime.Result{}, ctx.Err()
 		}
 	}
-	return agentruntime.Result{Output: "0|||\n"}, nil
+	return agentruntime.Result{Output: "0||||\n"}, nil
 }
 
 func runtimeEffectTestCoordinator(t *testing.T, issue int) (*runtimeEffectCoordinator, *stateOwner, *barrierEffectRunner, agentruntime.Manifest) {

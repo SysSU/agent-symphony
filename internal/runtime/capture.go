@@ -79,15 +79,15 @@ func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io
 	if len(command) == 0 || command[0] == "" {
 		return 1, 0, errors.New("pane command is missing")
 	}
-	record := func(code int) error {
+	record := func(option string, value int) error {
 		statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		defer cancel()
-		return RecordPaneExitStatus(statusCtx, tmux, code)
+		return recordPaneExitOption(statusCtx, tmux, option, value)
 	}
 	child := exec.CommandContext(ctx, command[0], command[1:]...)
 	child.Stdin, child.Stdout, child.Stderr = stdin, stdout, stderr
 	if err := child.Start(); err != nil {
-		return 1, 0, errors.Join(err, record(1))
+		return 1, 0, errors.Join(err, record(PaneExitStatusOption, 1))
 	}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
@@ -109,7 +109,7 @@ func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io
 		return 1, 0, errors.New("pane command wait status is unavailable")
 	}
 	if status.Signaled() {
-		return 128 + int(status.Signal()), status.Signal(), nil
+		return 128 + int(status.Signal()), status.Signal(), record(PaneExitSignalOption, int(status.Signal()))
 	}
 	code := status.ExitStatus()
 	if code < 0 || code > 255 {
@@ -121,23 +121,27 @@ func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io
 			return code, 0, waitErr
 		}
 	}
-	return code, 0, record(code)
+	return code, 0, record(PaneExitStatusOption, code)
 }
 
 // RecordPaneExitStatus preserves a normal child status when tmux leaves its
 // native pane exit fields unset after a rapid exit.
 func RecordPaneExitStatus(ctx context.Context, tmux string, code int) error {
+	return recordPaneExitOption(ctx, tmux, PaneExitStatusOption, code)
+}
+
+func recordPaneExitOption(ctx context.Context, tmux, option string, value int) error {
 	pane := os.Getenv("TMUX_PANE")
 	if len(pane) < 2 || pane[0] != '%' {
 		return errors.New("tmux pane identity is unavailable")
 	}
-	if _, err := strconv.Atoi(pane[1:]); err != nil || code < 0 || code > 255 {
+	if _, err := strconv.Atoi(pane[1:]); err != nil || value < 0 || value > 255 || option == PaneExitSignalOption && (value == 0 || value > 127) {
 		return errors.New("tmux pane exit status binding is invalid")
 	}
-	set := exec.CommandContext(ctx, tmux, "set-option", "-p", "-t", pane, PaneExitStatusOption, strconv.Itoa(code))
+	set := exec.CommandContext(ctx, tmux, "set-option", "-p", "-t", pane, option, strconv.Itoa(value))
 	set.Dir = "/tmp"
 	if output, err := set.CombinedOutput(); err != nil {
-		return fmt.Errorf("record tmux pane exit status: %w: %s", err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("record tmux pane exit result: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }

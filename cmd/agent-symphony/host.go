@@ -1424,7 +1424,7 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	case "capture-pane":
 		return len(args) == 6 && slices.Equal(args[1:5], []string{"-p", "-S", "-", "-t"}) && validTmuxTarget(args[5], true)
 	case "set-option":
-		return len(args) == 6 && slices.Equal(args[1:3], []string{"-w", "-t"}) && validTmuxTarget(args[3], true) && ((args[4] == "remain-on-exit" && args[5] == "on") || (args[4] == "history-limit" && slices.Contains([]string{"5000", "65536"}, args[5])))
+		return len(args) == 6 && validTmuxTarget(args[3], true) && (slices.Equal(args[1:3], []string{"-w", "-t"}) && ((args[4] == "remain-on-exit" && args[5] == "on") || (args[4] == "history-limit" && slices.Contains([]string{"5000", "65536"}, args[5]))) || slices.Equal(args[1:3], []string{"-p", "-t"}) && args[5] == "" && slices.Contains([]string{agentruntime.PaneExitStatusOption, agentruntime.PaneExitSignalOption}, args[4]))
 	case "respawn-pane":
 		return len(args) > 5 && slices.Equal(args[1:3], []string{"-k", "-t"}) && validTmuxTarget(args[3], true) && args[4] == "--" && args[5] != ""
 	case "split-window":
@@ -1798,8 +1798,10 @@ func acceptHandoff(ctx context.Context, input []byte, root string) (string, erro
 	if err := writeImmutable(launchingPath, []byte(recipient)); err != nil {
 		return "", err
 	}
-	if _, err := runHostTmux(ctx, []string{"set-option", "-p", "-t", pane, agentruntime.PaneExitStatusOption, ""}, nil); err != nil {
-		return "", err
+	for _, option := range []string{agentruntime.PaneExitStatusOption, agentruntime.PaneExitSignalOption} {
+		if _, err := runHostTmux(ctx, []string{"set-option", "-p", "-t", pane, option, ""}, nil); err != nil {
+			return "", err
+		}
 	}
 	tmuxArgs := append(append([]string{"respawn-pane", "-k", "-t", pane, "-c", request.Manifest.Worktree, "--"}, command...), ";", "wait-for", signal)
 	if _, err := runHostTmux(ctx, tmuxArgs, nil); err != nil {
