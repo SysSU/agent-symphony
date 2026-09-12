@@ -991,6 +991,7 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 		checkpoint string
 		marked     bool
 		attached   bool
+		posted     bool
 	}{
 		{name: "terminal-awaiting-single", checkpoint: operatorPhaseTerminalAwait},
 		{name: "terminal-awaiting-attached", checkpoint: operatorPhaseTerminalAwait, attached: true},
@@ -1002,6 +1003,7 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 		{name: "terminal-marker-attached", checkpoint: operatorPhaseTerminal, marked: true, attached: true},
 		{name: "retry-marker-single", checkpoint: operatorPhaseRetryPending, marked: true},
 		{name: "retry-marker-attached", checkpoint: operatorPhaseRetryPending, marked: true, attached: true},
+		{name: "retry-posted-unmarked", checkpoint: operatorPhaseRetryPending, posted: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			owner, manifest := operatorTestOwner(t, 348, "active", false)
@@ -1052,6 +1054,15 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 			if test.checkpoint == operatorPhaseRetryPending {
 				retry := applyAndPlanRecover(t, owner, failedInput, failedInput.Attempts, githubIssueRetry)
 				retryEffect = advanceOperatorRecoverPlan(t, owner, request.RequestID, retry)
+				newAttempt := ownerTestManifest(t, owner.stateRoot, 348, 2, "running")
+				beforeBinding := mustOwnerSnapshot(t, owner)
+				if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: newAttempt, ExpectedIssueGeneration: beforeBinding.State.IssueGenerations[ownerIssueKey("o/r", 348)]}); err == nil {
+					t.Fatal("new attempt bound before pending retry receipt completed")
+				}
+				afterBinding := mustOwnerSnapshot(t, owner)
+				if afterBinding.State.IssueGenerations[ownerIssueKey("o/r", 348)] != beforeBinding.State.IssueGenerations[ownerIssueKey("o/r", 348)] || afterBinding.State.Attempts[ownerAttemptKey("o/r", 348, 2)].Generation != 0 {
+					t.Fatal("rejected new attempt binding changed owner state")
+				}
 			}
 			attachedRequest := operatorRequest("recover-checkpoint-attached", "recover", manifest, false)
 			if test.attached {
@@ -1081,6 +1092,37 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 					}
 				}
 			}
+			var postedComments []map[string]any
+			var priorPosts atomic.Int32
+			if test.posted {
+				failedAt := cancelled.UpdatedAt
+				terminalMarker, err := internalgithub.TerminalFailureMarker(348, 1, failedAt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				postedComments = []map[string]any{{"id": 1, "body": terminalMarker, "created_at": failedAt, "updated_at": failedAt, "user": map[string]any{"id": 42}}}
+				client := &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+					if request.Method != http.MethodPost || !strings.HasSuffix(request.URL.Path, "/issues/348/comments") {
+						return nil, fmt.Errorf("unexpected pre-crash request %s %s", request.Method, request.URL)
+					}
+					var input struct{ Body string }
+					if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+						return nil, err
+					}
+					priorPosts.Add(1)
+					postedComments = append(postedComments, map[string]any{"id": 2, "body": input.Body, "created_at": failedAt.Add(time.Second), "updated_at": failedAt.Add(time.Second), "user": map[string]any{"id": 42}})
+					return &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: request}, nil
+				})}
+				post, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://example.test/repos/o/r/issues/348/comments", strings.NewReader(`{"body":"/agent-symphony retry"}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				response, err := client.Do(post)
+				if err != nil {
+					t.Fatal(err)
+				}
+				response.Body.Close()
+			}
 			before := mustOwnerSnapshot(t, owner)
 			if err := owner.close(t.Context()); err != nil {
 				t.Fatal(err)
@@ -1099,6 +1141,13 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 				inputs = []reconciliationInput{activeInput, failedInput}
 			case operatorPhaseRetryAwait, operatorPhaseTerminal:
 				inputs = []reconciliationInput{failedInput}
+			case operatorPhaseRetryPending:
+				if test.posted {
+					posted := failedInput
+					posted.Issues = slices.Clone(failedInput.Issues)
+					posted.Issues[0].Retry = true
+					inputs = []reconciliationInput{posted}
+				}
 			}
 			var markerFailureAt time.Time
 			stopCollections := 0
@@ -1128,9 +1177,18 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 				inputs = inputs[1:]
 				return reconciliationV2Batch{Input: input}, nil
 			}
+			var githubWrites atomic.Int32
 			service.collector.API = internalgithub.API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.Method != http.MethodGet {
+					githubWrites.Add(1)
+					return nil, fmt.Errorf("unexpected GitHub mutation while replaying receipt: %s", request.URL.String())
+				}
 				if !strings.Contains(request.URL.Path, "/comments") {
 					return nil, fmt.Errorf("unexpected GitHub request %s", request.URL.String())
+				}
+				if test.posted {
+					encoded, _ := json.Marshal(postedComments)
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(encoded)), Request: request}, nil
 				}
 				failedAt := cancelled.UpdatedAt
 				if !markerFailureAt.IsZero() {
@@ -1159,6 +1217,9 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 			}
 			if original.State != "completed" || attachedFound != test.attached || test.attached && (attached.State != "completed" || original.EffectID != attached.EffectID) || len(final.Effects) != wantEffects || remainingInputs != 0 {
 				t.Fatalf("original=%#v attached=%#v effects=%#v remaining_inputs=%d", original, attached, final.Effects, remainingInputs)
+			}
+			if test.posted && (priorPosts.Load() != 1 || githubWrites.Load() != 0) {
+				t.Fatalf("retry posts before crash=%d after restart=%d", priorPosts.Load(), githubWrites.Load())
 			}
 		})
 	}

@@ -935,14 +935,7 @@ func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API
 	if !issueScoped {
 		key, attemptGeneration = ownerAttemptKey(request.Repository, request.Issue, request.Attempt), plan.Identity.AttemptGeneration
 	}
-	observationGeneration := request.ObservationGeneration
-	if request.GitHubIssueUpdate.Kind == githubIssueRetry {
-		// A retry command changes its own observation before its exact proof is
-		// reread. Owner authorization still checks the captured generation before
-		// posting; destructive owner generations still cancel the running effect.
-		observationGeneration = 0
-	}
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, attemptGeneration, observationGeneration)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, attemptGeneration, request.ObservationGeneration)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -966,11 +959,23 @@ func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API
 			err = executeAttemptIssueUpdate(run.ctx, api, request, plan.Material.Config)
 		}
 		if err != nil {
-			return reconciliationEffectResult{}, err
+			if request.GitHubIssueUpdate.Kind != githubIssueRetry {
+				return reconciliationEffectResult{}, err
+			}
+			// The POST may have succeeded just before its context was cancelled.
+			// Only exact external proof can resolve that ambiguous outcome.
+			proved, proofErr := attemptIssueUpdateApplied(c.lifecycle, api, request, plan.Material.Config)
+			if proofErr != nil || !proved {
+				return reconciliationEffectResult{}, errors.Join(err, proofErr)
+			}
 		}
 	}
 	if !issueScoped {
-		applied, err = attemptIssueUpdateApplied(run.ctx, api, request, plan.Material.Config)
+		proofContext := run.ctx
+		if request.GitHubIssueUpdate.Kind == githubIssueRetry {
+			proofContext = c.lifecycle
+		}
+		applied, err = attemptIssueUpdateApplied(proofContext, api, request, plan.Material.Config)
 		if err != nil || !applied {
 			if err == nil {
 				err = errors.New("GitHub issue update was not observable")
