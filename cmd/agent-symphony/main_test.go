@@ -251,7 +251,7 @@ func TestMissingTmuxReviewerPaneIsTheExactPrelaunchStatus(t *testing.T) {
 	if !missingTmuxPaneStatus(agentruntime.Result{Output: "|||\n"}) {
 		t.Fatal("tmux missing-target output was not recognized")
 	}
-	for _, result := range []agentruntime.Result{{Output: "0|||\n"}, {Output: "1|0||\n"}, {Output: "|||\n", Exited: true, Code: 1}} {
+	for _, result := range []agentruntime.Result{{Output: "0||||\n"}, {Output: "1|0|||\n"}, {Output: "||||\n", Exited: true, Code: 1}} {
 		if missingTmuxPaneStatus(result) {
 			t.Fatalf("live, dead, or failed tmux result was treated as missing: %#v", result)
 		}

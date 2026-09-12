@@ -773,8 +773,8 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if _, err := acceptHandoff(t.Context(), request, root); err != nil {
 			t.Fatal(err)
 		}
-		if calls != 5 {
-			t.Fatalf("worker made %d tmux calls, want lookup, buffer load, status clear, launch, and ready binding", calls)
+		if calls != 6 {
+			t.Fatalf("worker made %d tmux calls, want lookup, buffer load, both result clears, launch, and ready binding", calls)
 		}
 		if !slices.Contains(submission.Args, "worker-capture-handoff-ready") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
 			t.Fatalf("handoff did not use the stdin capture helper: %#v", submission.Args)

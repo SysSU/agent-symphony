@@ -2168,6 +2168,11 @@ launch:
 		return independentReviewResult{}, false, err
 	}
 	command = append(slices.Clone(command), prompt)
+	for _, option := range []string{agentruntime.PaneExitStatusOption, agentruntime.PaneExitSignalOption} {
+		if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-p", "-t", agentruntime.PaneTarget(session), option, ""}, Dir: snapshot, Env: env}); err != nil {
+			return independentReviewResult{}, false, err
+		}
+	}
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
