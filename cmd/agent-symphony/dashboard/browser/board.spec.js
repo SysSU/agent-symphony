@@ -293,6 +293,32 @@ test("moves superseded terminal attempts into history", async ({ page }) => {
   await page.screenshot({ path: "test-results/board-attempt-history-mobile.png", fullPage: true });
 });
 
+for (const [reason, olderState] of [["abandoned", "failed"], ["dismissed", "completed"], ["archived", "completed"], ["removed", "cancelled"]]) {
+  test(`keeps earlier ${olderState} attempts in history after ${reason}, then shows a new retry`, async ({ page }) => {
+    const older = { repository: "SysSU/agent-symphony", issue: 191, attempt: 8, title: "Retained issue", state: olderState };
+    const latest = { ...older, attempt: 9, state: "orphaned" };
+    const attempts = [older, latest];
+    const dashboard = await mockDashboard(page, attempts);
+    await page.goto("/");
+    const board = page.getByRole("region", { name: "Issue status board" });
+    await expect(board).toContainText("Attempt 9");
+    await expect(board).not.toContainText("Attempt 8");
+
+    dashboard.hide(latest, reason);
+    attempts.pop(); // owner projection no longer includes the tombstoned attempt
+    await page.reload();
+    await expect(board.getByRole("link", { name: /#191\b/ })).toHaveCount(0);
+    const history = page.locator("details.attemptHistory");
+    await history.locator("summary").click();
+    await expect(history).toContainText("Attempt 8");
+
+    attempts.push({ ...latest, attempt: 10, state: "active" });
+    await page.reload();
+    await expect(board).toContainText("Attempt 10");
+    await expect(board).not.toContainText("Attempt 8");
+  });
+}
+
 test("dismisses one closed-issue attempt while retaining diagnostics", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 });
   const previous = {

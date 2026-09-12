@@ -53,6 +53,20 @@ test("partitions superseded terminal attempts by repository and issue", () => {
   assert.deepEqual(partitioned.current, [statuses[1], statuses[3], statuses[4], statuses[5], statuses[7]]);
 });
 
+test("hidden highest attempts do not promote older terminal attempts", () => {
+  for (const reason of ["abandoned", "dismissed", "archived", "removed"]) {
+    for (const state of ["failed", "orphaned", "cancelled", "completed"]) {
+      const older = { repository: "o/r", issue: 191, attempt: 8, state };
+      const hidden = { repository: "o/r", issue: 191, attempt: 9, reason };
+      const partitioned = partitionAttemptHistory([older], [hidden]);
+      assert.deepEqual(partitioned.current, [], `${reason} after ${state}`);
+      assert.deepEqual(partitioned.historical, [older], `${reason} after ${state}`);
+      const newer = { repository: "o/r", issue: 191, attempt: 10, state: "active" };
+      assert.deepEqual(partitionAttemptHistory([older, newer], [hidden]).current, [newer], `${reason} permits a new retry`);
+    }
+  }
+});
+
 test("orchestrator presentation and investigation eligibility", () => {
   assert.deepEqual(orchestratorPresentation(null, "offline"), { state: "unavailable", label: "Unavailable" });
   assert.deepEqual(orchestratorPresentation({ enabled: false, state: "disabled" }, ""), { state: "disabled", label: "Disabled" });
