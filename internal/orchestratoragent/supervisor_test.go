@@ -30,6 +30,9 @@ type fakeRunner struct {
 	runnerOutput   string
 	auditStarts    atomic.Int32
 	auditGate      chan struct{}
+	auditEntered   chan struct{}
+	tmuxGate       chan struct{}
+	tmuxEntered    chan struct{}
 	attentionInput string
 	sessionAuth    bool
 	auditAuth      bool
@@ -60,7 +63,7 @@ func TestAuditCompletionReservationIsCanceledByLifecycle(t *testing.T) {
 	if err := agent.BindLifecycle(lifecycle); err != nil {
 		t.Fatal(err)
 	}
-	run, generation, ok := agent.claimAuditCompletion(1)
+	run, generation, ok := agent.claimAuditCompletion(1, 0)
 	if !ok || run == nil || generation == 0 {
 		t.Fatalf("run=%v generation=%d ok=%v", run, generation, ok)
 	}
@@ -76,12 +79,162 @@ func TestAuditCompletionReservationIsCanceledByLifecycle(t *testing.T) {
 	}
 }
 
+func TestRecoverPreemptsBackgroundAuditCompletion(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	agent := newTestSupervisor(t, &fakeRunner{}, &now)
+	agent.projectionKnown = true
+	agent.auditGeneration = 1
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		run, generation, ok := agent.claimAuditCompletion(1, 0)
+		if !ok {
+			return
+		}
+		close(started)
+		<-run.Done()
+		agent.release(generation)
+	}()
+	<-started
+	status, err := agent.Recover(t.Context())
+	if err != nil || status.State != "running" {
+		t.Fatalf("Recover while audit completion owns supervisor: status=%#v err=%v", status, err)
+	}
+	<-done
+}
+
+func TestStatusAndAttachRemainAvailableDuringBackgroundCompletion(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	agent := newTestSupervisor(t, &fakeRunner{}, &now)
+	agent.projectionKnown = true
+	if _, err := agent.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	agent.auditGeneration = 1
+	_, generation, ok := agent.claimAuditCompletion(1, agent.contextEpoch)
+	if !ok {
+		t.Fatal("background completion did not acquire token")
+	}
+	defer agent.release(generation)
+	status, err := agent.Status(t.Context())
+	if err != nil || status.State != "running" {
+		t.Fatalf("status during background completion=%#v err=%v", status, err)
+	}
+	target, err := agent.AttachTarget(t.Context())
+	if err != nil || target.Session != status.Session {
+		t.Fatalf("attach during background completion=%#v err=%v", target, err)
+	}
+}
+
+func TestForegroundReservationsFollowSubmissionOrder(t *testing.T) {
+	agent := &Supervisor{}
+	_, background, err := agent.reserve(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	type acquired struct {
+		id  int
+		err error
+	}
+	order := make(chan acquired, 2)
+	firstAdmitted, secondAdmitted := make(chan struct{}), make(chan struct{})
+	releaseFirst, releaseSecond := make(chan struct{}), make(chan struct{})
+	launch := func(id int, admitted chan struct{}, release chan struct{}) {
+		go func() {
+			_, generation, err := agent.reserveForegroundWithAdmission(t.Context(), admitted)
+			order <- acquired{id: id, err: err}
+			if err == nil {
+				<-release
+				agent.release(generation)
+			}
+		}()
+	}
+	launch(1, firstAdmitted, releaseFirst)
+	<-firstAdmitted
+	launch(2, secondAdmitted, releaseSecond)
+	<-secondAdmitted
+	agent.release(background)
+	if got := <-order; got.id != 1 || got.err != nil {
+		t.Fatalf("first foreground grant=%#v", got)
+	}
+	select {
+	case got := <-order:
+		t.Fatalf("second command bypassed first: %#v", got)
+	default:
+	}
+	close(releaseFirst)
+	if got := <-order; got.id != 2 || got.err != nil {
+		t.Fatalf("second foreground grant=%#v", got)
+	}
+	close(releaseSecond)
+	if err := agent.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancelledForegroundReservationDoesNotBlockNextCommand(t *testing.T) {
+	agent := &Supervisor{}
+	_, background, err := agent.reserve(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	admitted := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := agent.reserveForegroundWithAdmission(ctx, admitted)
+		result <- err
+	}()
+	<-admitted
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled foreground command=%v", err)
+	}
+	agent.release(background)
+	_, generation, err := agent.reserveForeground(t.Context())
+	if err != nil {
+		t.Fatalf("canceled waiter blocked the next command: %v", err)
+	}
+	agent.release(generation)
+	if err := agent.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShutdownRejectsQueuedForegroundReservation(t *testing.T) {
+	agent := &Supervisor{}
+	_, background, err := agent.reserve(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := agent.reserveForegroundWithAdmission(t.Context(), admitted)
+		result <- err
+	}()
+	<-admitted
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- agent.Shutdown(t.Context()) }()
+	if err := <-result; !errors.Is(err, ErrSupervisorStopped) {
+		t.Fatalf("queued foreground command after shutdown=%v", err)
+	}
+	agent.release(background)
+	if err := <-shutdown; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if f.honorCtx && ctx.Err() != nil {
 		return agentruntime.Result{}, ctx.Err()
 	}
 	if command.Name != "tmux" {
 		f.auditStarts.Add(1)
+		if f.auditEntered != nil {
+			f.auditEntered <- struct{}{}
+		}
 		if f.auditAuth {
 			token := environmentValue(command.Env, "GH_TOKEN")
 			valid := f.validAuth
@@ -125,6 +278,15 @@ func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (age
 	}
 	switch args[0] {
 	case "display-message":
+		if gate := f.tmuxGate; gate != nil {
+			f.tmuxGate = nil
+			f.tmuxEntered <- struct{}{}
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return agentruntime.Result{}, ctx.Err()
+			}
+		}
 		if !f.live {
 			return agentruntime.Result{Exited: true, Code: 1}, errors.New("missing")
 		}
@@ -158,6 +320,143 @@ func (f *fakeRunner) Run(ctx context.Context, command agentruntime.Command) (age
 		f.live = false
 	}
 	return agentruntime.Result{}, nil
+}
+
+func TestClearPreemptsSlowObservationSubprocess(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	runner := &fakeRunner{}
+	agent := newTestSupervisor(t, runner, &now)
+	agent.projectionKnown = true
+	if _, err := agent.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	runner.honorCtx = true
+	runner.tmuxGate, runner.tmuxEntered = make(chan struct{}), make(chan struct{}, 1)
+	observed := make(chan error, 1)
+	go func() {
+		_, err := agent.Observe(t.Context(), []orchestrator.RecoveryStatus{{Repository: agent.Repository, Issue: 191, Attempt: 1, State: "active"}})
+		observed <- err
+	}()
+	<-runner.tmuxEntered
+	cleared, err := agent.Clear(t.Context())
+	if err != nil || cleared.ContextMode != "clear" {
+		t.Fatalf("Clear waited on slow observation tmux call: status=%#v err=%v", cleared, err)
+	}
+	if err := <-observed; err == nil {
+		t.Fatal("preempted observation continued as if its external inspection succeeded")
+	}
+}
+
+func TestRecoverPreemptsSlowObservationWithoutPersistingFailure(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	runner := &fakeRunner{}
+	agent := newTestSupervisor(t, runner, &now)
+	agent.projectionKnown = true
+	initial, err := agent.Recover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.honorCtx = true
+	runner.tmuxGate, runner.tmuxEntered = make(chan struct{}), make(chan struct{}, 1)
+	observed := make(chan error, 1)
+	go func() {
+		_, err := agent.Observe(t.Context(), []orchestrator.RecoveryStatus{{Repository: agent.Repository, Issue: 191, Attempt: 1, State: "active"}})
+		observed <- err
+	}()
+	<-runner.tmuxEntered
+	recovered, err := agent.Recover(t.Context())
+	if err != nil || recovered.State != "running" || recovered.Generation != initial.Generation {
+		t.Fatalf("Recover after preempting observation: status=%#v err=%v", recovered, err)
+	}
+	if err := <-observed; !errors.Is(err, context.Canceled) {
+		t.Fatalf("preempted observation result=%v", err)
+	}
+	state, err := agent.readOrInitial()
+	if err != nil || state.State != "running" || state.Failures != 0 {
+		t.Fatalf("cancelled observation persisted a false failure: state=%#v err=%v", state, err)
+	}
+}
+
+func TestClearInvalidatesOutstandingAuditResult(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	runner := &fakeRunner{auditGate: make(chan struct{}), auditEntered: make(chan struct{}, 1), auditOutput: "stale audit result"}
+	agent := newTestSupervisor(t, runner, &now)
+	agent.AuditCommand, agent.Launcher = []string{"audit"}, []string{"audit"}
+	projection := []orchestrator.RecoveryStatus{{Repository: agent.Repository, Issue: 191, Attempt: 1, State: "active"}}
+	if _, err := agent.Observe(t.Context(), projection); err != nil {
+		t.Fatal(err)
+	}
+	<-runner.auditEntered
+	cleared, err := agent.Clear(t.Context())
+	if err != nil || cleared.ContextMode != "clear" {
+		t.Fatalf("clear during audit: status=%#v err=%v", cleared, err)
+	}
+	close(runner.auditGate)
+	agent.wg.Wait()
+	reportBody, err := os.ReadFile(filepath.Join(agent.Workspace, HeartbeatReportFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report heartbeatReport
+	if err := json.Unmarshal(reportBody, &report); err != nil || report.State != "failed" || report.Diagnostic != "orchestrator context changed before heartbeat audit completed" || report.Report != "" {
+		t.Fatalf("stale audit result was committed after Clear: report=%s err=%v", reportBody, err)
+	}
+	state, err := agent.readOrInitial()
+	if err != nil || state.ContextMode != "clear" || state.Generation != cleared.Generation {
+		t.Fatalf("cleared context was overwritten: state=%#v err=%v", state, err)
+	}
+}
+
+func TestClearInvalidatesCompletedAuditContext(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	agent := newTestSupervisor(t, &fakeRunner{}, &now)
+	agent.projectionKnown = true
+	if _, err := agent.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.writeHeartbeatReport(heartbeatReport{Version: stateVersion, State: "completed", Report: "old context conclusions"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.Clear(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if previous := agent.previousHeartbeatReport(); previous != "" {
+		t.Fatalf("clear retained old heartbeat context: %q", previous)
+	}
+	body, err := os.ReadFile(filepath.Join(agent.Workspace, HeartbeatReportFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report heartbeatReport
+	if json.Unmarshal(body, &report) != nil || report.State != "failed" || report.Report != "" {
+		t.Fatalf("completed old audit survived context change: %s", body)
+	}
+}
+
+func TestShutdownCancelsOutstandingAudit(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	runner := &fakeRunner{auditGate: make(chan struct{}), auditEntered: make(chan struct{}, 1)}
+	agent := newTestSupervisor(t, runner, &now)
+	agent.AuditCommand, agent.Launcher = []string{"audit"}, []string{"audit"}
+	if err := agent.BindLifecycle(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	projection := []orchestrator.RecoveryStatus{{Repository: agent.Repository, Issue: 191, Attempt: 1, State: "active"}}
+	if _, err := agent.Observe(t.Context(), projection); err != nil {
+		t.Fatal(err)
+	}
+	<-runner.auditEntered
+	if err := agent.Shutdown(t.Context()); err != nil {
+		t.Fatalf("shutdown did not cancel blocked audit: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(agent.Workspace, HeartbeatReportFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report heartbeatReport
+	if json.Unmarshal(body, &report) != nil || report.State != "failed" || report.Report != "" {
+		t.Fatalf("outstanding audit remained active after shutdown: %s", body)
+	}
 }
 
 func environmentValue(environment []string, name string) string {
