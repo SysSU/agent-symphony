@@ -54,6 +54,35 @@ func TestReconciliationCompleteScopeRecordsUnobservedOwnerAbsence(t *testing.T) 
 	}
 }
 
+func TestReconciliationRefreshesUnchangedAbsenceAfterRestart(t *testing.T) {
+	root := resolvedTempDir(t)
+	issueKey := ownerIssueKey("o/r", 193)
+	state := newRuntimeOwnerState("o/r")
+	state.Epoch, state.Revision = 1, 1
+	state.IssueGenerations[issueKey] = 1
+	state.Observations[issueKey] = reconciliationObservation{
+		Generation: 1, OwnerGeneration: 1, ObservationEpoch: 1, LastCycleID: 1,
+		InputDigest: digestText("previous absence"), Attempts: map[string]reconciliationAttemptObservation{},
+	}
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	before, err := owner.snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.State.Epoch != 2 || before.State.Observations[issueKey].ObservationEpoch != 1 {
+		t.Fatalf("fixture is not a stale restarted observation: owner=%d observation=%d", before.State.Epoch, before.State.Observations[issueKey].ObservationEpoch)
+	}
+	after := applyReconciliationInput(t, owner, repositoryInput(true))
+	observation := after.State.Observations[issueKey]
+	if observation.Present || observation.ObservationEpoch != after.State.Epoch || observation.Generation != 1 || observation.OwnerGeneration != 1 {
+		t.Fatalf("unchanged absence was not refreshed without changing identity: epoch=%d observation=%#v", after.State.Epoch, observation)
+	}
+}
+
 func TestReconciliationRepositoryScopeIgnoresHistoricalGenerationOnlyKeys(t *testing.T) {
 	root := resolvedTempDir(t)
 	state := newRuntimeOwnerState("o/r")

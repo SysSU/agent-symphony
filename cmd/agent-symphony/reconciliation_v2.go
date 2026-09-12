@@ -506,7 +506,7 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 			}
 		}
 		next := reconciliationObservation{Generation: generation, OwnerGeneration: state.IssueGenerations[key], ObservationEpoch: identity.Epoch, LastCycleID: identity.CycleID, InputDigest: digest, Attempts: map[string]reconciliationAttemptObservation{}}
-		if exists && reconciliationObservationContentEqual(previous, next) {
+		if exists && previous.ObservationEpoch == identity.Epoch && reconciliationObservationContentEqual(previous, next) {
 			continue
 		}
 		state.Observations[key] = next
