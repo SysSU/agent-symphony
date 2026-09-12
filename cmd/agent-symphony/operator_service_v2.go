@@ -487,7 +487,23 @@ func (s *operatorMutationService) preparePlanReview(ctx context.Context, snapsho
 		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, err
 	}
 	observation := snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
+	var fresh struct {
+		Number      int
+		State       string
+		Body        string
+		PullRequest any `json:"pull_request"`
+	}
+	// Operator admission needs the raw body, but the owner deliberately keeps
+	// only its digest. Read without the reconciliation cache or stale fallback.
+	api := internalgithub.API{BaseURL: s.collector.API.BaseURL, HTTP: s.collector.API.HTTP, Retries: s.collector.API.Retries}
+	if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", manifest.Repository, manifest.Issue), "", &fresh); err != nil {
+		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, err
+	}
+	if fresh.Number != manifest.Issue || fresh.State != "open" || fresh.PullRequest != nil || digestText(fresh.Body) != observation.Fact.BodyDigest {
+		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, errStateConflict
+	}
 	issue := expandIssueFact(observation.Fact)
+	issue.Body = fresh.Body
 	issue.Attempt, issue.BaseSHA = manifest.Attempt, manifest.BaseSHA
 	target := manifest.Repository + "#" + strconv.Itoa(manifest.Issue) + " plan sha256:" + observation.Fact.BodyDigest
 	snapshotPath, session := reviewIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(s.owner.stateRoot))
@@ -904,20 +920,28 @@ func (s *operatorMutationService) resumeUnmarkedReconciliation(ctx context.Conte
 		return errStateConflict
 	}
 	if effect.Reconciliation.Action == reconciliationReviewer {
+		fresh, _, err := s.collectIssue(ctx, receipt.Request.Issue)
+		if err != nil {
+			return err
+		}
+		snapshot = fresh
 		record, ok := snapshot.State.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
 		if !ok {
 			return errStaleStateResult
 		}
 		plan, material, err := s.preparePlanReview(ctx, snapshot, record.Manifest)
-		if err != nil || !reflect.DeepEqual(plan.Request, *effect.Reconciliation) {
-			if err != nil {
-				return err
-			}
-			plan.Request.ObservationCycleID = effect.Reconciliation.ObservationCycleID
-			plan.Request.ExecutionDigest = reviewerExecutionDigest(plan.Request, material)
-			if !reflect.DeepEqual(plan.Request, *effect.Reconciliation) {
-				return errStateConflict
-			}
+		if err != nil {
+			return err
+		}
+		if effect.Reconciliation.Manifest != nil && sameReconciliationManifest(*effect.Reconciliation, record.Manifest, *effect.Reconciliation.Manifest) {
+			// Reuse the admitted immutable request after a monitor-only timestamp
+			// change; the fresh owner/GitHub checks above still gate replay.
+			plan.Request.Manifest = ptrManifest(*effect.Reconciliation.Manifest)
+		}
+		plan.Request.ObservationCycleID = effect.Reconciliation.ObservationCycleID
+		plan.Request.ExecutionDigest = reviewerExecutionDigest(plan.Request, material)
+		if !reflect.DeepEqual(plan.Request, *effect.Reconciliation) {
+			return errStateConflict
 		}
 		plan.Identity = ownerReconciliationEffectIdentity(effect)
 		return s.executeOnce(operatorWork{requestID: receipt.Request.RequestID, plan: &plan, reviewer: &material}, reserved)

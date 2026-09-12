@@ -257,7 +257,7 @@ func applyBeginReconciliationEffect(attemptRoot, stateRoot string, state *runtim
 			return nil, errAttemptTombstoned
 		}
 		record, exists := state.Attempts[attemptKey]
-		if !exists || record.Generation != identity.AttemptGeneration || !reflect.DeepEqual(record.Manifest, manifest) {
+		if !exists || record.Generation != identity.AttemptGeneration || !sameReconciliationManifest(request, record.Manifest, manifest) {
 			return nil, errStaleStateResult
 		}
 		attemptGeneration = identity.AttemptGeneration
@@ -549,6 +549,17 @@ func validReconciliationEffectBindings(request reconciliationEffectRequest) bool
 	}
 }
 
+// Monitor advances UpdatedAt without changing the plan-review target or
+// implementation state. All other manifest fields must still match exactly.
+func sameManifestExceptUpdatedAt(current, planned agentruntime.Manifest) bool {
+	planned.UpdatedAt = current.UpdatedAt
+	return reflect.DeepEqual(current, planned)
+}
+
+func sameReconciliationManifest(request reconciliationEffectRequest, current, planned agentruntime.Manifest) bool {
+	return reflect.DeepEqual(current, planned) || request.Action == reconciliationReviewer && request.Reviewer != nil && request.Reviewer.Mode == agentruntime.ReviewModePlan && sameManifestExceptUpdatedAt(current, planned)
+}
+
 func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwnerState, request reconciliationEffectRequest) bool {
 	if !validReconciliationEffectBindings(request) {
 		return false
@@ -563,7 +574,7 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 	}
 	attemptKey := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
 	record, ok := state.Attempts[attemptKey]
-	if !ok || request.Manifest == nil || !reflect.DeepEqual(record.Manifest, *request.Manifest) {
+	if !ok || request.Manifest == nil || !sameReconciliationManifest(request, record.Manifest, *request.Manifest) {
 		return false
 	}
 	manifest := record.Manifest
