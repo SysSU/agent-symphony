@@ -910,20 +910,28 @@ func (s *operatorMutationService) resumeUnmarkedReconciliation(ctx context.Conte
 		return errStateConflict
 	}
 	if effect.Reconciliation.Action == reconciliationReviewer {
+		fresh, _, err := s.collectIssue(ctx, receipt.Request.Issue)
+		if err != nil {
+			return err
+		}
+		snapshot = fresh
 		record, ok := snapshot.State.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
 		if !ok {
 			return errStaleStateResult
 		}
 		plan, material, err := s.preparePlanReview(ctx, snapshot, record.Manifest)
-		if err != nil || !reflect.DeepEqual(plan.Request, *effect.Reconciliation) {
-			if err != nil {
-				return err
-			}
-			plan.Request.ObservationCycleID = effect.Reconciliation.ObservationCycleID
-			plan.Request.ExecutionDigest = reviewerExecutionDigest(plan.Request, material)
-			if !reflect.DeepEqual(plan.Request, *effect.Reconciliation) {
-				return errStateConflict
-			}
+		if err != nil {
+			return err
+		}
+		if effect.Reconciliation.Manifest != nil && sameReconciliationManifest(*effect.Reconciliation, record.Manifest, *effect.Reconciliation.Manifest) {
+			// Reuse the admitted immutable request after a monitor-only timestamp
+			// change; the fresh owner/GitHub checks above still gate replay.
+			plan.Request.Manifest = ptrManifest(*effect.Reconciliation.Manifest)
+		}
+		plan.Request.ObservationCycleID = effect.Reconciliation.ObservationCycleID
+		plan.Request.ExecutionDigest = reviewerExecutionDigest(plan.Request, material)
+		if !reflect.DeepEqual(plan.Request, *effect.Reconciliation) {
+			return errStateConflict
 		}
 		plan.Identity = ownerReconciliationEffectIdentity(effect)
 		return s.executeOnce(operatorWork{requestID: receipt.Request.RequestID, plan: &plan, reviewer: &material}, reserved)

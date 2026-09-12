@@ -1681,7 +1681,7 @@ func TestV2PlanReviewHandlerCommitsExactOwnerEffectWithoutCompatibilityWrite(t *
 	}
 }
 
-func TestV2PlanReviewAdmitsAfterMonitorOnlyTimestampChange(t *testing.T) {
+func TestV2PlanReviewAdmitsAndResumesAfterMonitorOnlyTimestampChange(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 335, "active", false)
 	initial := mustOwnerSnapshot(t, owner).State
 	issue := expandIssueFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
@@ -1695,11 +1695,12 @@ func TestV2PlanReviewAdmitsAfterMonitorOnlyTimestampChange(t *testing.T) {
 	}
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
+	var enteredOnce sync.Once
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/repos/o/r/issues/335" {
 			t.Errorf("unexpected GitHub read: %s", r.URL.Path)
 		}
-		close(entered)
+		enteredOnce.Do(func() { close(entered) })
 		<-release
 		_, _ = io.WriteString(w, `{"number":335,"state":"open","body":"body"}`)
 	}))
@@ -1742,6 +1743,70 @@ func TestV2PlanReviewAdmitsAfterMonitorOnlyTimestampChange(t *testing.T) {
 	if err := owner.authorizeReconciliationEffect(t.Context(), authorizeReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: reconciliationReviewer}); err != nil {
 		t.Fatalf("monitor timestamp invalidated the admitted review effect: %v", err)
 	}
+	// Crash before the reviewer completion marker, then resume the immutable
+	// admitted effect against the newer monitor timestamp.
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, committed); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, persisted, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: restarted.stateRoot, Runner: operatorOwnedRunner{manifest: updated}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
+	restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
+	boundary := &completedPlanReviewBoundary{}
+	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: service.collector, reviewer: boundary, reviewSource: "source", reviewCommand: []string{"review"}}
+	restartService.collect = func(_ context.Context, _ stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
+		if issue != manifest.Issue {
+			return reconciliationV2Batch{}, fmt.Errorf("unexpected issue %d", issue)
+		}
+		return reconciliationV2Batch{Input: input}, nil
+	}
+	if err := restartService.resumeReceipt(t.Context(), committed.ControlReceipts[0].Request.RequestID); err != nil {
+		t.Fatalf("restart did not resume admitted review: %v", err)
+	}
+	final := mustOwnerSnapshot(t, restarted).State
+	if final.ControlReceipts[0].State != "completed" || final.Effects[effect.ID].State != "completed" || final.Attempts[key].Manifest.ReviewState != "clean" {
+		t.Fatalf("restart lost completed review: receipt=%#v effect=%#v manifest=%#v", final.ControlReceipts[0], final.Effects[effect.ID], final.Attempts[key].Manifest)
+	}
+	if boundary.panes.Load() != 1 || boundary.results.Load() != 1 {
+		t.Fatalf("restart launched or reread reviewer: panes=%d results=%d", boundary.panes.Load(), boundary.results.Load())
+	}
+	marker := filepath.Join(owner.stateRoot, "reconciliation-effects", effect.ID+".done")
+	if _, err := os.Lstat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("review marker %s was not reclaimed", marker)
+	}
+	durable, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil || durable.Effects[effect.ID].State != "completed" || durable.ControlReceipts[0].State != "completed" {
+		t.Fatalf("restart completion was not persisted: receipt=%#v effect=%#v err=%v", durable.ControlReceipts, durable.Effects[effect.ID], err)
+	}
+}
+
+type completedPlanReviewBoundary struct {
+	panes   atomic.Int32
+	results atomic.Int32
+}
+
+func (b *completedPlanReviewBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if operation == "run" && command.Name == "tmux" && slices.Contains(command.Args, "display-message") {
+		b.panes.Add(1)
+		return agentruntime.Result{Output: "1|0||"}, nil
+	}
+	if operation == "review-result" {
+		b.results.Add(1)
+		return agentruntime.Result{Output: `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`}, nil
+	}
+	return agentruntime.Result{}, fmt.Errorf("unexpected review boundary %s %s %v", operation, command.Name, command.Args)
 }
 
 func TestV2PlanReviewRejectsBodyChangedDuringPreparationBeforeAdmission(t *testing.T) {
