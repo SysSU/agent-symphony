@@ -959,11 +959,23 @@ func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API
 			err = executeAttemptIssueUpdate(run.ctx, api, request, plan.Material.Config)
 		}
 		if err != nil {
-			return reconciliationEffectResult{}, err
+			if request.GitHubIssueUpdate.Kind != githubIssueRetry {
+				return reconciliationEffectResult{}, err
+			}
+			// The POST may have succeeded just before its context was cancelled.
+			// Only exact external proof can resolve that ambiguous outcome.
+			proved, proofErr := attemptIssueUpdateApplied(c.lifecycle, api, request, plan.Material.Config)
+			if proofErr != nil || !proved {
+				return reconciliationEffectResult{}, errors.Join(err, proofErr)
+			}
 		}
 	}
 	if !issueScoped {
-		applied, err = attemptIssueUpdateApplied(run.ctx, api, request, plan.Material.Config)
+		proofContext := run.ctx
+		if request.GitHubIssueUpdate.Kind == githubIssueRetry {
+			proofContext = c.lifecycle
+		}
+		applied, err = attemptIssueUpdateApplied(proofContext, api, request, plan.Material.Config)
 		if err != nil || !applied {
 			if err == nil {
 				err = errors.New("GitHub issue update was not observable")

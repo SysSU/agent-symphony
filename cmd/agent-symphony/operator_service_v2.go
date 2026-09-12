@@ -894,6 +894,16 @@ func (s *operatorMutationService) resumeUnmarkedReconciliation(ctx context.Conte
 		if err != nil {
 			return err
 		}
+		if effect.Reconciliation.GitHubIssueUpdate != nil && effect.Reconciliation.GitHubIssueUpdate.Kind == githubIssueRetry {
+			applied, err := attemptIssueUpdateApplied(ctx, s.collector.API, *effect.Reconciliation, s.collector.Config)
+			if err != nil {
+				return err
+			}
+			if applied {
+				result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueRetry, Observed: true}}
+				return s.effects.finishReconciliationMarker(ownerReconciliationEffectIdentity(effect), *effect.Reconciliation, result, true)
+			}
+		}
 		plans, err := planReconciliationAttemptIssueUpdates(fresh, batch, s.collector.Config)
 		if err != nil {
 			return err

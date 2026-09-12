@@ -408,7 +408,7 @@ func reconciliationEffectCurrent(stateRoot string, state runtimeOwnerState, effe
 // a marker from completing invalidated work.
 func reconciliationEffectFinishCurrent(stateRoot string, state runtimeOwnerState, effect runtimeEffectIntent) error {
 	request := effect.Reconciliation
-	if request == nil || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !reconciliationObservationMatches(state, *request) || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
+	if request == nil || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !reconciliationFinishObservationMatches(state, *request) || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
 		return errStaleStateResult
 	}
 	if request.Attempt == 0 {
@@ -422,6 +422,26 @@ func reconciliationEffectFinishCurrent(stateRoot string, state runtimeOwnerState
 		return errAttemptTombstoned
 	}
 	return nil
+}
+
+// A retry command changes its own issue observation. Once its exact GitHub
+// postcondition is proven, only compatible owner state is needed to record
+// completion; the original observation generation is still required before
+// issuing the command.
+func reconciliationFinishObservationMatches(state runtimeOwnerState, request reconciliationEffectRequest) bool {
+	if reconciliationObservationMatches(state, request) {
+		return true
+	}
+	if request.GitHubIssueUpdate == nil || request.GitHubIssueUpdate.Kind != githubIssueRetry {
+		return false
+	}
+	observation, ok := state.Observations[ownerIssueKey(request.Repository, request.Issue)]
+	if !ok || !observation.Present || observation.OwnerGeneration != state.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)] || observation.Fact.BodyDigest != request.BodyDigest {
+		return false
+	}
+	fact := observation.Fact
+	return fact.CurrentAttempt == request.Attempt && !fact.Closed && !fact.Cancelled && !fact.Active &&
+		(fact.RecoveryAuthorized || slices.Equal(fact.Blockers, []string{"control snapshot update is pending"}))
 }
 
 func reconciliationObservationCurrent(state runtimeOwnerState, request reconciliationEffectRequest) bool {

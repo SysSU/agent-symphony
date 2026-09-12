@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -842,6 +843,157 @@ func TestIssueUpdateRevalidationCancelsAfterOwnerInvalidationWithoutMutation(t *
 	coordinator.cancelInvalidated(invalidated)
 	if err := <-done; !errors.Is(err, context.Canceled) || mutations.Load() != 0 {
 		t.Fatalf("execution err=%v mutations=%d", err, mutations.Load())
+	}
+}
+
+func TestProvenRetrySurvivesObservationOnlyInvalidation(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "issue-retry").request
+	_, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	request = bindEffectObservation(snapshot, request)
+	issue := issueFact(request.Issue, "title")
+	cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42, CancelCommand: "/cancel", RetryCommand: "/retry"}
+	material := reconciliationIssueUpdateMaterial{Issue: &issue, Config: cfg}
+	request.ExecutionDigest = issueUpdateExecutionDigest(request, material)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedAt := time.Unix(0, request.GitHubIssueUpdate.FailedAtUnixNano)
+	terminal, err := internalgithub.TerminalFailureMarker(request.Issue, request.Attempt, failedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	comment := func(id int, body string, at time.Time) map[string]any {
+		return map[string]any{"id": id, "body": body, "created_at": at, "updated_at": at, "user": map[string]any{"id": 42}}
+	}
+	comments := []map[string]any{comment(1, terminal, failedAt), comment(2, cfg.RetryCommand, failedAt.Add(time.Second))}
+	var reads atomic.Int32
+	proofBlocked, releaseProof := make(chan struct{}), make(chan struct{})
+	api := internalgithub.API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet || r.URL.Path != fmt.Sprintf("/repos/o/r/issues/%d/comments", request.Issue) {
+			return nil, fmt.Errorf("unexpected GitHub request %s", r.URL)
+		}
+		if reads.Add(1) == 3 {
+			close(proofBlocked)
+			<-releaseProof
+		}
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
+		body, _ := json.Marshal(comments)
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: r}, nil
+	})}, Retries: -1}
+	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
+	plan := reconciliationPlannedEffect{Request: request, Identity: ownerReconciliationEffectIdentity(*effect), Material: material}
+	done := make(chan error, 1)
+	go func() {
+		_, err := coordinator.executeOperatorIssueUpdate(api, plan)
+		done <- err
+	}()
+	<-proofBlocked
+	newer := reconciliationEffectObservationInput(request, "title")
+	newer.Issues[0].RecoveryAuthorized, newer.Issues[0].Retry = true, true
+	changed := applyReconciliationInput(t, owner, newer)
+	coordinator.cancelInvalidated(changed)
+	close(releaseProof)
+	if err := <-done; err != nil {
+		t.Fatalf("exact retry proof was lost after observation-only drift: %v", err)
+	}
+	committed := mustOwnerSnapshot(t, owner).State.Effects[effect.ID]
+	if committed.State != "completed" || reads.Load() != 4 {
+		t.Fatalf("retry effect=%#v GitHub reads=%d", committed, reads.Load())
+	}
+}
+
+func TestRetryObservationInvalidationBeforeAndAfterPost(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*internalgithub.RecoveryIssueFact)
+		posted bool
+	}{
+		{"revoked", func(f *internalgithub.RecoveryIssueFact) { f.RecoveryAuthorized = false }, false},
+		{"closed", func(f *internalgithub.RecoveryIssueFact) { f.Closed = true }, false},
+		{"cancelled", func(f *internalgithub.RecoveryIssueFact) { f.Cancelled = true }, false},
+		{"posted-then-observed", func(f *internalgithub.RecoveryIssueFact) { f.Retry = true }, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := reconciliationEffectCaseNamed(t, "issue-retry").request
+			_, owner, _ := reconciliationEffectPersistentOwner(t, request)
+			authorized := reconciliationEffectObservationInput(request, "title")
+			authorized.Issues[0].RecoveryAuthorized = true
+			snapshot := applyReconciliationInput(t, owner, authorized)
+			request = bindEffectObservation(snapshot, request)
+			issue := issueFact(request.Issue, "title")
+			cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42, CancelCommand: "/cancel", RetryCommand: "/retry"}
+			material := reconciliationIssueUpdateMaterial{Issue: &issue, Config: cfg}
+			request.ExecutionDigest = issueUpdateExecutionDigest(request, material)
+			_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+			if err != nil {
+				t.Fatal(err)
+			}
+			failedAt := time.Unix(0, request.GitHubIssueUpdate.FailedAtUnixNano)
+			terminal, err := internalgithub.TerminalFailureMarker(request.Issue, request.Attempt, failedAt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			active, err := internalgithub.ActiveAttemptMarker(request.Repository, request.Issue, request.Attempt, request.Manifest.BaseSHA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			comment := func(id int, body string, at time.Time) map[string]any {
+				return map[string]any{"id": id, "body": body, "created_at": at, "updated_at": at, "user": map[string]any{"id": 42}}
+			}
+			fixture := &fullSystemGitHub{base: request.Manifest.BaseSHA, historicalIssues: map[int]map[string]any{request.Issue: {"number": request.Issue, "title": "title", "body": issue.Body, "state": "open", "created_at": failedAt.Add(-time.Hour), "updated_at": failedAt, "user": map[string]any{"id": 42}, "labels": []any{}}}, historicalComments: map[int][]map[string]any{request.Issue: {comment(1, active, failedAt.Add(-time.Second)), comment(2, terminal, failedAt)}}}
+			postEntered, releasePost := make(chan struct{}), make(chan struct{})
+			var posts atomic.Int32
+			server := httptest.NewServer(fixture)
+			t.Cleanup(server.Close)
+			client := &http.Client{Transport: reconciliationRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.Method == http.MethodPost && r.URL.Path == fmt.Sprintf("/repos/o/r/issues/%d/comments", request.Issue) {
+					if test.posted {
+						fixture.mu.Lock()
+						fixture.historicalComments[request.Issue] = append(fixture.historicalComments[request.Issue], comment(3, cfg.RetryCommand, failedAt.Add(time.Second)))
+						fixture.mu.Unlock()
+						posts.Add(1)
+					}
+					close(postEntered)
+					<-releasePost
+					if r.Context().Err() != nil {
+						return nil, r.Context().Err()
+					}
+					posts.Add(1)
+					return &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+				}
+				return http.DefaultTransport.RoundTrip(r)
+			})}
+			api := internalgithub.API{BaseURL: server.URL, HTTP: client, Retries: -1}
+			coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
+			plan := reconciliationPlannedEffect{Request: request, Identity: ownerReconciliationEffectIdentity(*effect), Material: material}
+			done := make(chan error, 1)
+			go func() {
+				_, err := coordinator.executeOperatorIssueUpdate(api, plan)
+				done <- err
+			}()
+			select {
+			case <-postEntered:
+			case err := <-done:
+				t.Fatalf("retry failed before POST: %v", err)
+			}
+			changed := reconciliationEffectObservationInput(request, "title")
+			changed.Issues[0].RecoveryAuthorized = true
+			test.change(&changed.Issues[0])
+			invalidated := applyReconciliationInput(t, owner, changed)
+			coordinator.cancelInvalidated(invalidated)
+			close(releasePost)
+			err = <-done
+			if test.posted {
+				if err != nil || posts.Load() != 1 || mustOwnerSnapshot(t, owner).State.Effects[effect.ID].State != "completed" {
+					t.Fatalf("posted retry err=%v writes=%d effect=%#v", err, posts.Load(), mustOwnerSnapshot(t, owner).State.Effects[effect.ID])
+				}
+			} else if err == nil || posts.Load() != 0 {
+				t.Fatalf("retry err=%v writes=%d", err, posts.Load())
+			}
+		})
 	}
 }
 
