@@ -127,3 +127,24 @@ func TestOwnerStatusProjectionMasksTombstonedAttempts(t *testing.T) {
 		}
 	}
 }
+
+func TestOwnerStatusBlocksControlsWhenRemoteAndLocalCompletionDoNotMatch(t *testing.T) {
+	for _, test := range []struct {
+		name, localState, remoteState string
+		owned                         bool
+	}{{"remote-only-failed", "failed", "failed", false}, {"local-running-remote-completed", "running", "completed", true}, {"local-failed-remote-completed", "failed", "completed", true}} {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := ownerTestManifest(t, resolvedTempDir(t), 318, 1, test.localState)
+			state := runtimeEffectInitialState(manifest)
+			addOperatorObservation(&state, manifest, test.remoteState, true)
+			if !test.owned {
+				delete(state.Attempts, ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt))
+			}
+			state.Epoch, state.Revision = 1, 1
+			projected, err := projectOwnerStatus(stateOwnerSnapshot{State: state}, 1, time.Unix(1, 0))
+			if err != nil || len(projected.Statuses) != 1 || !projected.Statuses[0].OperatorBlocked {
+				t.Fatalf("status=%#v err=%v", projected, err)
+			}
+		})
+	}
+}

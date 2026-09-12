@@ -237,6 +237,7 @@ type beginOperatorMutationCommand struct {
 	CleanupDigest         string
 	CleanupPolicy         agentruntime.EffectCleanupPolicy
 	IssueClosed           bool
+	RemoteOnly            bool
 	CleanupValid          bool
 	LivenessFailed        bool
 	Runtime               *beginRuntimeEffectCommand
@@ -1736,7 +1737,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			if !ok || effect.Action != string(agentruntime.EffectCleanup) || effect.Repository != tombstone.Repository || effect.Issue != tombstone.Issue || effect.Attempt != tombstone.Attempt || effect.AttemptGeneration != tombstone.Generation || tombstone.CleanupPhase == "completed" && effect.State != "completed" || tombstone.CleanupPhase != "completed" && effect.State != "pending" {
 				return errors.New("runtime owner tombstone effect is invalid")
 			}
-		} else if tombstone.Action != "dismissed" && !bareCompletedRemoval(tombstone) {
+		} else if tombstone.Action != "dismissed" && !bareCompletedRemoval(tombstone) && !bareCompletedArchive(tombstone) {
 			return errors.New("destructive tombstone lacks its cleanup effect")
 		}
 	}

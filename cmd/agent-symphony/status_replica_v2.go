@@ -145,6 +145,13 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 	for index := range statuses {
 		status := &statuses[index]
 		key := ownerAttemptKey(status.Repository, status.Issue, status.Attempt)
+		issueKey := ownerIssueKey(status.Repository, status.Issue)
+		observation := snapshot.State.Observations[issueKey]
+		record, owned := snapshot.State.Attempts[key]
+		accepted := observation.Attempts[key]
+		status.OperatorBlocked = observation.ObservationEpoch != snapshot.State.Epoch || observation.OwnerGeneration != snapshot.State.IssueGenerations[issueKey] || !observation.Present && !owned ||
+			(!owned || record.Generation != snapshot.State.AttemptGenerations[key]) && (!accepted.Present || accepted.OwnerGeneration != snapshot.State.AttemptGenerations[key] || accepted.ObservationEpoch != snapshot.State.Epoch) ||
+			!owned && accepted.Fact.State != "completed" || owned && status.State == "completed" && record.Manifest.State != "completed"
 		if record, ok := snapshot.State.Attempts[key]; ok && record.Manifest.State == "completed" && (status.State == "failed" || status.State == "cancelled" || status.Retryable) {
 			status.Retryable = false
 			status.Action = "inspect inconsistent completed local attempt before recovery"

@@ -45,19 +45,23 @@ function actionLabel(status, busy, waiting) {
 }
 
 function canPlanReview(status) {
-  return status.state === "active" && !status.sessions?.some((session) => session.role === "reviewer" && ["preparing", "running"].includes(session.state));
+  return !status.operator_blocked && status.state === "active" && !status.sessions?.some((session) => session.role === "reviewer" && ["preparing", "running"].includes(session.state));
 }
 
 function attemptActionAvailable(status, historical) {
-  return !historical && (status.state === "completed" || status.state === "orphaned" || status.retryable);
+  return !status.operator_blocked && !historical && (status.state === "completed" || status.state === "orphaned" || status.retryable);
 }
 
 function canDismiss(status) {
-  return status.issue_closed && dismissibleStates.has(status.state);
+  return !status.operator_blocked && (status.issue_closed || status.state === "orphaned") && dismissibleStates.has(status.state);
+}
+
+function canCancel(status, historical) {
+  return !status.operator_blocked && !historical && ["active", "review-ready"].includes(status.state);
 }
 
 function CancelButton({ status, onAction, busy }) {
-  if (!["active", "review-ready"].includes(status.state)) return null;
+  if (status.operator_blocked || !["active", "review-ready"].includes(status.state)) return null;
   return (
     <button className="dangerAction" type="button" disabled={busy} onClick={() => onAction("cancel", status)} aria-label={`Cancel issue #${status.issue}, attempt ${status.attempt}; retain diagnostics`}>
       {busy ? "Working…" : "Cancel attempt"}
@@ -75,7 +79,7 @@ function DismissButton({ status, onAction, busy }) {
 }
 
 function canPermanentlyRemove(status, historical) {
-  return historical && ["failed", "orphaned", "cancelled"].includes(status.state) && !status.retryable;
+  return !status.operator_blocked && historical && ["failed", "orphaned", "cancelled"].includes(status.state) && !status.retryable;
 }
 
 function PermanentRemoveButton({ status, onAction, busy, historical }) {
@@ -91,7 +95,7 @@ function StatusActions({ status, onAction, onInvestigate, onNotice, investigatio
   const investigationAvailable = investigationEnabled && canInvestigate(status);
   const actionAvailable = attemptActionAvailable(status, historical);
   const planReviewAvailable = canPlanReview(status);
-  const cancelAvailable = !historical && ["active", "review-ready"].includes(status.state);
+  const cancelAvailable = canCancel(status, historical);
   if (readOnly || (!investigationAvailable && !actionAvailable && !canDismiss(status) && !canPermanentlyRemove(status, historical) && !planReviewAvailable && !cancelAvailable)) return null;
   const action = actionFor(status);
   const label = actionLabel(status, busy, waiting);

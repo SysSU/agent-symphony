@@ -428,8 +428,33 @@ func TestOperatorAdmissionAndStatusRejectPreviousEpochObservation(t *testing.T) 
 		t.Fatalf("previous-epoch admission err=%v", err)
 	}
 	status, err := projectOwnerStatus(snapshot, 1, time.Unix(1, 0))
-	if err != nil || len(status.Statuses) != 1 || status.Statuses[0].State != "orphaned" || status.Statuses[0].DispatchAuthorized {
+	if err != nil || len(status.Statuses) != 1 || status.Statuses[0].State != "orphaned" || status.Statuses[0].DispatchAuthorized || !status.Statuses[0].OperatorBlocked {
 		t.Fatalf("status=%#v err=%v", status, err)
+	}
+}
+
+func TestRestartedLocalOrphansHideDestructiveControlsUntilCurrentObservation(t *testing.T) {
+	for _, localState := range []string{"running", "failed"} {
+		t.Run(localState, func(t *testing.T) {
+			owner, manifest := operatorTestOwner(t, 316, "orphaned", false)
+			persisted := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
+			key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+			record := persisted.Attempts[key]
+			record.Manifest.State = localState
+			persisted.Attempts[key] = record
+			if err := owner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := startTestStateOwner(t, owner.stateRoot, persisted, func(runtimeOwnerState) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = restarted.close(context.Background()) })
+			status, err := projectOwnerStatus(mustOwnerSnapshot(t, restarted), 1, time.Unix(1, 0))
+			if err != nil || len(status.Statuses) != 1 || !status.Statuses[0].OperatorBlocked {
+				t.Fatalf("status=%#v err=%v", status, err)
+			}
+		})
 	}
 }
 

@@ -62,8 +62,8 @@ scripts/validate-release.sh "$version"
 Run the compiled deterministic operator journey and the authenticated pilot preflight:
 
 ```sh
-AGENT_SYMPHONY_FULL_SYSTEM_E2E=1 go test ./cmd/agent-symphony -run '^TestFullSystemE2E$' -count=1 -timeout 10m
-AGENT_SYMPHONY_FULL_SYSTEM_E2E=1 AGENT_SYMPHONY_FULL_SYSTEM_RACE=1 go test -race ./cmd/agent-symphony -run '^TestFullSystemE2E$' -count=1 -timeout 10m
+AGENT_SYMPHONY_FULL_SYSTEM_E2E=1 go test ./cmd/agent-symphony -run '^Test(FullSystemE2E|HistoricalAttemptActionsFullSystemE2E)$' -count=1 -timeout 10m
+AGENT_SYMPHONY_FULL_SYSTEM_E2E=1 AGENT_SYMPHONY_FULL_SYSTEM_RACE=1 go test -race ./cmd/agent-symphony -run '^Test(FullSystemE2E|HistoricalAttemptActionsFullSystemE2E)$' -count=1 -timeout 10m
 run_id="live-$version-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID="$run_id" scripts/live-pilot.sh "$run_id.json"
 ```

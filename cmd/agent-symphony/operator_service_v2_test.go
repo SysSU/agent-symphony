@@ -80,6 +80,184 @@ func TestV2DashboardDismissesWhileReconciliationCollectsAndIgnoresStaleFiles(t *
 	}
 }
 
+func TestClosedLocalOrphanOperatorAdmissionAfterIssueFallsOutOfCollector(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 191, "orphaned", true)
+	applyReconciliationInput(t, owner, reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: manifest.Repository}, Complete: true})
+	snapshot := mustOwnerSnapshot(t, owner)
+	if snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Present {
+		t.Fatal("fixture did not reproduce absent issue observation")
+	}
+	for _, action := range []string{"dismiss", "abandon"} {
+		_, _, err := operatorAttempt(snapshot, operatorRequest("orphan-"+action, action, manifest, action == "abandon"))
+		if err != nil {
+			t.Fatalf("%s of exact local orphan rejected: %v", action, err)
+		}
+	}
+}
+
+func TestHistoricalClosedLocalOrphanDashboardActionsCommitTombstones(t *testing.T) {
+	for _, action := range []string{"dismiss", "abandon"} {
+		t.Run(action, func(t *testing.T) {
+			owner, manifest := operatorTestOwner(t, 191, "orphaned", true)
+			applyReconciliationInput(t, owner, reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: manifest.Repository}, Complete: true})
+			if err := os.MkdirAll(productionSnapshotRoot(owner.stateRoot), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+			service.issueClosed = func(context.Context, string, int) (bool, error) { return true, nil }
+			service.effects.stopped = true // Verify admission before external cleanup can run.
+			server := &dashboardServer{ctx: t.Context(), stateRoot: owner.stateRoot, repository: manifest.Repository, operator: service}
+			request := httptest.NewRequest(http.MethodPost, fmt.Sprintf("http://localhost/actions/%s?repository=o%%2Fr&issue=191&attempt=1", action), nil)
+			request.Host = "localhost"
+			request.Header.Set("Origin", "http://localhost")
+			response := httptest.NewRecorder()
+			server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
+			wantStatus := http.StatusOK
+			if action == "abandon" {
+				wantStatus = http.StatusAccepted
+			}
+			if response.Code != wantStatus {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			state := mustOwnerSnapshot(t, owner).State
+			key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+			if _, exists := state.Attempts[key]; exists || state.Tombstones[key].Action != operatorTombstoneAction(action) {
+				t.Fatalf("owner did not durably invalidate orphan: %#v", state)
+			}
+		})
+	}
+}
+
+func TestOpenLocalOrphanDismissRejectsWithoutInvalidatingAndAbandonNeedsNoGitHubRead(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 193, "orphaned", false)
+	applyReconciliationInput(t, owner, reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: manifest.Repository}, Complete: true})
+	if err := os.MkdirAll(productionSnapshotRoot(owner.stateRoot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	service.effects.stopped = true
+	reads := 0
+	service.issueClosed = func(context.Context, string, int) (bool, error) { reads++; return false, nil }
+	before := mustOwnerSnapshot(t, owner).State
+	dismiss := service.perform(t.Context(), operatorRequest("open-orphan-dismiss", "dismiss", manifest, false))
+	if dismiss.Status != http.StatusConflict || !strings.Contains(dismiss.Error, "GitHub issue is open") || reads != 1 {
+		t.Fatalf("dismiss=%#v GitHub reads=%d", dismiss, reads)
+	}
+	after := mustOwnerSnapshot(t, owner).State
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	if after.Revision != before.Revision || after.AttemptGenerations[key] != before.AttemptGenerations[key] || !reflect.DeepEqual(after.Attempts[key], before.Attempts[key]) || len(after.Tombstones) != len(before.Tombstones) {
+		t.Fatalf("rejected dismissal changed owner state: before=%#v after=%#v", before, after)
+	}
+	abandon := service.perform(t.Context(), operatorRequest("open-orphan-abandon", "abandon", manifest, true))
+	if abandon.Status != http.StatusAccepted || !abandon.OK || reads != 1 || mustOwnerSnapshot(t, owner).State.Tombstones[key].Action != "abandoned" {
+		t.Fatalf("abandon=%#v GitHub reads=%d", abandon, reads)
+	}
+}
+
+func TestRemoteOnlyCompletedDashboardActionUsesPublishedAttemptIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name, action string
+		closed       bool
+	}{{"closed-archive", "archive", true}, {"open-archive", "archive", false}, {"closed-dismiss", "dismiss", true}} {
+		t.Run(test.name, func(t *testing.T) {
+			root := resolvedTempDir(t)
+			manifest := ownerTestManifest(t, root, 160, 1, "completed")
+			state := runtimeEffectInitialState(manifest)
+			addOperatorObservation(&state, manifest, "completed", test.closed)
+			delete(state.Attempts, ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt))
+			state.Epoch, state.Revision = 1, 1
+			owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = owner.close(context.Background()) })
+			refreshOperatorObservation(t, owner)
+			service := operatorTestMutationService(t, owner)
+			service.collect = func(_ context.Context, snapshot stateOwnerSnapshot, issueNumber int) (reconciliationV2Batch, error) {
+				observation := snapshot.State.Observations[ownerIssueKey(manifest.Repository, issueNumber)]
+				attempt := observation.Attempts[ownerAttemptKey(manifest.Repository, issueNumber, 1)]
+				return reconciliationV2Batch{Input: reconciliationInput{Scope: reconciliationScope{Kind: reconciliationIssueScope, Repository: manifest.Repository, Issue: issueNumber}, Complete: true, Issues: []internalgithub.RecoveryIssueFact{expandIssueFact(observation.Fact)}, Attempts: []internalgithub.RecoveryAttemptFact{expandAttemptFact(attempt.Fact)}}}, nil
+			}
+			before, err := projectOwnerStatus(mustOwnerSnapshot(t, owner), 1, time.Unix(1, 0))
+			if err != nil || len(before.Statuses) != 1 || before.Statuses[0].Attempt != 1 || before.Statuses[0].State != "completed" {
+				t.Fatalf("before=%#v err=%v", before, err)
+			}
+			result := service.perform(t.Context(), operatorRequest("remote-"+test.name, test.action, manifest, test.action == "archive"))
+			if !result.OK || result.Status != http.StatusOK {
+				t.Fatalf("result=%#v", result)
+			}
+			committed := mustOwnerSnapshot(t, owner)
+			key := ownerAttemptKey(manifest.Repository, manifest.Issue, 1)
+			if tombstone := committed.State.Tombstones[key]; tombstone.Action != operatorTombstoneAction(test.action) || tombstone.Manifest != nil || tombstone.CleanupPhase != "completed" {
+				t.Fatalf("remote-only tombstone=%#v", tombstone)
+			}
+			after, err := projectOwnerStatus(committed, 1, time.Unix(2, 0))
+			if err != nil || len(after.Statuses) != 0 {
+				t.Fatalf("after=%#v err=%v", after, err)
+			}
+		})
+	}
+}
+
+func TestRemoteOnlyTombstoneReplaysAfterReceiptEvictionAndRestart(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 164, 1, "completed")
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "completed", true)
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	delete(state.Attempts, key)
+	state.Epoch, state.Revision = 1, 1
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshOperatorObservation(t, owner)
+	service := operatorTestMutationService(t, owner)
+	service.collect = func(_ context.Context, snapshot stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
+		observation := snapshot.State.Observations[ownerIssueKey(manifest.Repository, issue)]
+		attempt := observation.Attempts[key]
+		return reconciliationV2Batch{Input: reconciliationInput{Scope: reconciliationScope{Kind: reconciliationIssueScope, Repository: manifest.Repository, Issue: issue}, Complete: true, Issues: []internalgithub.RecoveryIssueFact{expandIssueFact(observation.Fact)}, Attempts: []internalgithub.RecoveryAttemptFact{expandAttemptFact(attempt.Fact)}}}, nil
+	}
+	request := operatorRequest("remote-original", "archive", manifest, true)
+	if result := service.perform(t.Context(), request); !result.OK {
+		t.Fatalf("first archive=%#v", result)
+	}
+	persisted := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
+	for index := range maxControlReceipts {
+		dummy := operatorRequest(fmt.Sprintf("evict-%03d", index), "archive", manifest, true)
+		if err := appendOperatorReceipt(&persisted, controlReceipt{Request: dummy, State: "completed", Phase: operatorPhaseCompleted, Result: successfulOperatorResult(dummy, persisted.Revision)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, exists := operatorReceiptByID(persisted, request.RequestID); exists {
+		t.Fatal("fixture did not evict original receipt")
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, root, persisted, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	replayService := operatorTestMutationService(t, restarted)
+	replayService.collect = func(context.Context, stateOwnerSnapshot, int) (reconciliationV2Batch, error) {
+		t.Fatal("replay must not collect GitHub")
+		return reconciliationV2Batch{}, errStateConflict
+	}
+	if result := replayService.perform(t.Context(), request); !result.OK || result.Status != http.StatusOK {
+		t.Fatalf("same-action replay=%#v", result)
+	}
+	other := operatorRequest("remote-opposite", "dismiss", manifest, false)
+	if result := replayService.perform(t.Context(), other); result.Status != http.StatusConflict || result.OK {
+		t.Fatalf("cross-action replay=%#v", result)
+	}
+	final := mustOwnerSnapshot(t, restarted).State
+	if final.Tombstones[key].Action != "archived" || final.AttemptGenerations[key] != 2 || len(final.Attempts) != 0 {
+		t.Fatalf("replay changed tombstone=%#v", final.Tombstones[key])
+	}
+}
+
 func TestV2DashboardCancelRespondsWhileReconciliationCollectsAndRejectsStaleResult(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 327, "active", false)
 	service := operatorTestMutationService(t, owner)

@@ -25,19 +25,22 @@ import (
 )
 
 type fullSystemGitHub struct {
-	mu              sync.Mutex
-	base            string
-	origin          string
-	comments        []map[string]any
-	labels          map[string]bool
-	requests        []string
-	failNext        bool
-	failedRequest   string
-	pr              map[string]any
-	merged          bool
-	closed          bool
-	denyMutations   bool
-	deniedMutations []string
+	mu                 sync.Mutex
+	base               string
+	origin             string
+	comments           []map[string]any
+	labels             map[string]bool
+	requests           []string
+	failNext           bool
+	failedRequest      string
+	pr                 map[string]any
+	merged             bool
+	closed             bool
+	denyMutations      bool
+	deniedMutations    []string
+	historicalIssues   map[int]map[string]any
+	historicalComments map[int][]map[string]any
+	historicalPulls    []map[string]any
 }
 
 type synchronizedBuffer struct {
@@ -87,6 +90,32 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	issue := map[string]any{"number": 73, "node_id": "I_73", "title": "Deterministic full-system journey", "body": body, "state": issueState, "created_at": now, "updated_at": now, "user": map[string]any{"id": 42}, "labels": labels}
 	path := r.URL.Path
+	if f.historicalIssues != nil {
+		if r.Method == http.MethodGet && path == "/repos/o/r/issues" {
+			writeFixtureJSON(w, []any{})
+			return
+		}
+		for number, historical := range f.historicalIssues {
+			prefix := fmt.Sprintf("/repos/o/r/issues/%d", number)
+			if r.Method == http.MethodGet && path == prefix {
+				writeFixtureJSON(w, historical)
+				return
+			}
+			if r.Method == http.MethodGet && path == prefix+"/comments" {
+				writeFixtureJSON(w, f.historicalComments[number])
+				return
+			}
+			if r.Method == http.MethodGet && (path == prefix+"/timeline" || path == prefix+"/events") {
+				writeFixtureJSON(w, []any{})
+				return
+			}
+			prComments := fmt.Sprintf("/repos/o/r/issues/%d/comments", number+800)
+			if r.Method == http.MethodGet && path == prComments {
+				writeFixtureJSON(w, []any{})
+				return
+			}
+		}
+	}
 	switch {
 	case r.Method == http.MethodGet && path == "/user":
 		writeFixtureJSON(w, map[string]any{"id": 42, "login": "coordinator"})
@@ -118,6 +147,9 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	case r.Method == http.MethodGet && path == "/repos/o/r/pulls":
 		pulls := []any{}
+		for _, pull := range f.historicalPulls {
+			pulls = append(pulls, pull)
+		}
 		if f.pr != nil {
 			pulls = append(pulls, f.pr)
 		}
