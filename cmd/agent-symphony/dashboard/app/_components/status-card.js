@@ -49,7 +49,7 @@ function canPlanReview(status) {
 }
 
 function attemptActionAvailable(status, historical) {
-  return !status.operator_blocked && !historical && (status.state === "completed" || status.state === "orphaned" || status.retryable);
+  return !status.operator_blocked && (status.state === "completed" || !historical && (status.state === "orphaned" || status.retryable));
 }
 
 function canDismiss(status) {

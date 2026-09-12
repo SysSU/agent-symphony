@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { canInvestigate, groupStatusesByLane, orchestratorPresentation, overallHealth, partitionAttemptHistory } from "./health.mjs";
+import { canInvestigate, groupStatusesByLane, orchestratorPresentation, overallHealth, ownerVersionAtLeast, partitionAttemptHistory } from "./health.mjs";
 
 const now = new Date("2026-08-13T12:00:00Z").getTime();
 const fresh = { updated_at: "2026-08-13T11:59:30Z" };
@@ -65,6 +65,15 @@ test("hidden highest attempts do not promote older terminal attempts", () => {
       assert.deepEqual(partitionAttemptHistory([older, newer], [hidden]).current, [newer], `${reason} permits a new retry`);
     }
   }
+});
+
+test("owner-backed refreshes never replace a newer committed state", () => {
+  assert.equal(ownerVersionAtLeast({ owner_revision: 9 }, { owner_revision: 10 }), false);
+  assert.equal(ownerVersionAtLeast({ owner_revision: 10 }, { owner_revision: 10 }), true);
+  assert.equal(ownerVersionAtLeast({ owner_epoch: 2, owner_revision: 1 }, { owner_epoch: 1, owner_revision: 10 }), true);
+  assert.equal(ownerVersionAtLeast({ owner_epoch: 1, owner_revision: 20 }, { owner_epoch: 2, owner_revision: 1 }), false);
+  assert.equal(ownerVersionAtLeast({}, { owner_revision: 10 }), false);
+  assert.equal(ownerVersionAtLeast({}, {}), true);
 });
 
 test("orchestrator presentation and investigation eligibility", () => {

@@ -60,7 +60,7 @@ async function mockDashboard(page, attempts, orchestrator = { enabled: true, sta
     hide(status, reason) {
       dashboardState = {
         version: 1,
-        hidden: [{ repository: status.repository, issue: status.issue, attempt: status.attempt, reason }],
+        hidden: [...dashboardState.hidden, { repository: status.repository, issue: status.issue, attempt: status.attempt, reason }],
       };
     },
   };
@@ -311,6 +311,19 @@ for (const [reason, olderState] of [["abandoned", "failed"], ["dismissed", "comp
     const history = page.locator("details.attemptHistory");
     await history.locator("summary").click();
     await expect(history).toContainText("Attempt 8");
+    if (olderState === "completed") {
+      const archive = history.getByRole("button", { name: "Archive" });
+      await expect(archive).toBeVisible();
+      await page.route("**/actions/archive?*", (route) => {
+        expect(new URL(route.request().url()).searchParams.get("attempt")).toBe("8");
+        dashboard.hide(older, "archived");
+        attempts.shift();
+        return route.fulfill({ json: { ok: true } });
+      });
+      page.once("dialog", (dialog) => dialog.accept());
+      await archive.click();
+      await expect(history.getByRole("link", { name: /#191\b/ })).toHaveCount(0);
+    }
 
     attempts.push({ ...latest, attempt: 10, state: "active" });
     await page.reload();
@@ -318,6 +331,52 @@ for (const [reason, olderState] of [["abandoned", "failed"], ["dismissed", "comp
     await expect(board).not.toContainText("Attempt 8");
   });
 }
+
+test("an older periodic refresh cannot undo a newer dismissal", async ({ page }) => {
+  await page.clock.install();
+  const older = { repository: "SysSU/agent-symphony", issue: 191, attempt: 8, title: "Retained issue", state: "failed" };
+  const latest = { ...older, attempt: 9, state: "orphaned" };
+  const attempts = [older, latest];
+  await mockDashboard(page, attempts);
+  await page.goto("/");
+  const board = page.getByRole("region", { name: "Issue status board" });
+  await expect(board.getByRole("link", { name: /#191\b/ })).toBeVisible();
+
+  let capturedOldState;
+  const oldStateCaptured = new Promise((resolve) => { capturedOldState = resolve; });
+  let releaseOldState;
+  const oldStateReleased = new Promise((resolve) => { releaseOldState = resolve; });
+  let stateReads = 0;
+  await page.route("**/dashboard-state.json", async (route) => {
+    stateReads++;
+    if (stateReads === 1) {
+      capturedOldState();
+      await oldStateReleased;
+      return route.fulfill({ json: { version: 1, owner_revision: 1, hidden: [] } });
+    }
+    return route.fulfill({ json: { version: 1, owner_revision: 2, hidden: [{ repository: latest.repository, issue: latest.issue, attempt: latest.attempt, reason: "dismissed" }] } });
+  });
+  let projectReads = 0;
+  await page.route("**/projects.json", (route) => {
+    projectReads++;
+    return route.fulfill({ json: { version: 1, projects: [{ version: 1, repository: "Held refresh completed", local: true }] } });
+  });
+  await page.route("**/actions/dismiss?*", (route) => {
+    attempts.pop();
+    return route.fulfill({ json: { ok: true, owner_revision: 2 } });
+  });
+
+  await page.clock.fastForward(5000);
+  await oldStateCaptured;
+  page.once("dialog", (dialog) => dialog.accept());
+  await board.getByRole("button", { name: "Dismiss issue #191, attempt 9; keep diagnostics" }).click();
+  await expect(board.getByRole("link", { name: /#191\b/ })).toHaveCount(0);
+  releaseOldState();
+  await expect(page.getByRole("heading", { name: "Held refresh completed" })).toBeVisible();
+  expect({ stateReads, projectReads }).toEqual({ stateReads: 2, projectReads: 1 });
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  expect(await board.getByRole("link", { name: /#191\b/ }).count()).toBe(0);
+});
 
 test("dismisses one closed-issue attempt while retaining diagnostics", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 });

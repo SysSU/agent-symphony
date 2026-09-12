@@ -23,6 +23,13 @@ export function attemptKey(status) {
   return `${status.repository}#${status.issue}/${status.attempt}`;
 }
 
+export function ownerVersionAtLeast(next, current) {
+  if (!current?.owner_revision) return true;
+  if (!next?.owner_revision) return false;
+  if (next.owner_epoch && current.owner_epoch && next.owner_epoch !== current.owner_epoch) return next.owner_epoch > current.owner_epoch;
+  return next.owner_revision >= current.owner_revision;
+}
+
 export function partitionAttemptHistory(statuses, hidden = []) {
   const latest = new Map();
   for (const status of [...statuses, ...hidden]) {
