@@ -272,12 +272,12 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 	}
 	if !waitFor(deadline(20*time.Second), func() bool {
 		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
-		return err == nil && ledger.Tombstones[ownerAttemptKey("o/r", 160, 1)].CleanupPhase == "completed" && ledger.Tombstones[ownerAttemptKey("o/r", 162, 1)].Action == "dismissed" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Action == "archived" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Manifest == nil && ledger.Tombstones[ownerAttemptKey("o/r", 191, 9)].CleanupPhase == "completed" && ledger.Tombstones[ownerAttemptKey("o/r", 192, 9)].Action == "dismissed"
+		return err == nil && ledger.Tombstones[ownerAttemptKey("o/r", 160, 1)].CleanupPhase == "completed" && ledger.Tombstones[ownerAttemptKey("o/r", 162, 1)].Action == "dismissed" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Action == "archived" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Manifest == nil && ledger.Tombstones[ownerAttemptKey("o/r", 192, 9)].Action == "dismissed"
 	}) {
 		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 		t.Fatalf("historical mutations did not complete: %s\nserve:\n%s", ledger, output.String())
 	}
-	for _, issue := range []int{160, 191} {
+	for _, issue := range []int{160} {
 		if _, err := os.Lstat(manifests[issue].Worktree); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%d worktree was not cleaned: %v", issue, err)
 		}
@@ -294,9 +294,6 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 		if _, err := os.Stat(manifests[issue].LogPath); err != nil {
 			t.Fatalf("%d log was not retained: %v", issue, err)
 		}
-	}
-	if _, err := os.Lstat(filepath.Dir(manifests[191].LogPath)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("abandoned diagnostics were not removed: %v", err)
 	}
 	if err := server.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
@@ -325,13 +322,13 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 	var freshRevision uint64
 	if !waitFor(deadline(20*time.Second), func() bool {
 		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
-		if err != nil || ledger.Epoch < 3 || ledger.Observations[ownerIssueKey("o/r", 163)].ObservationEpoch != ledger.Epoch || ledger.Observations[ownerIssueKey("o/r", 193)].ObservationEpoch != ledger.Epoch {
+		if err != nil || ledger.Epoch < 3 || ledger.Observations[ownerIssueKey("o/r", 163)].ObservationEpoch != ledger.Epoch {
 			return false
 		}
 		for _, expected := range []struct {
 			issue, attempt int
 			action         string
-		}{{160, 1, "archived"}, {162, 1, "dismissed"}, {163, 1, "archived"}, {191, 9, "abandoned"}, {192, 9, "dismissed"}} {
+		}{{160, 1, "archived"}, {162, 1, "dismissed"}, {163, 1, "archived"}, {192, 9, "dismissed"}} {
 			key := ownerAttemptKey("o/r", expected.issue, expected.attempt)
 			if ledger.Tombstones[key].Action != expected.action || ledger.Attempts[key].Generation != 0 {
 				return false
@@ -349,28 +346,42 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 		if json.NewDecoder(response.Body).Decode(&status) != nil || status.OwnerEpoch != ledger.Epoch || status.OwnerRevision < freshRevision {
 			return false
 		}
-		foundUntouched := false
 		for _, attempt := range status.Statuses {
-			if attempt.Issue == 160 || attempt.Issue == 161 || attempt.Issue == 162 || attempt.Issue == 163 || attempt.Issue == 191 || attempt.Issue == 192 {
+			if attempt.Issue == 160 || attempt.Issue == 161 || attempt.Issue == 162 || attempt.Issue == 163 || attempt.Issue == 192 {
 				return false
 			}
-			if attempt.Issue == 193 && attempt.Attempt == 9 && attempt.State == "orphaned" && !attempt.OperatorBlocked {
-				foundUntouched = true
-			}
 		}
-		return foundUntouched
+		return true
 	}) {
-		t.Fatalf("restart did not refresh untouched orphan or restored hidden cards: %s", output.String())
+		t.Fatalf("restart restored hidden cards: %s", output.String())
 	}
 	runBrowser("post-restart")
 	if !waitFor(deadline(20*time.Second), func() bool {
 		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
-		return err == nil && ledger.Tombstones[ownerAttemptKey("o/r", 193, 9)].Action == "dismissed" && ledger.Attempts[ownerAttemptKey("o/r", 193, 9)].Generation == 0
+		if err != nil {
+			return false
+		}
+		for _, issue := range []int{191, 193} {
+			observation := ledger.Observations[ownerIssueKey("o/r", issue)]
+			if observation.Present || observation.ObservationEpoch != ledger.Epoch || observation.Generation != 1 || ledger.Attempts[ownerAttemptKey("o/r", issue, 9)].Generation != 0 {
+				return false
+			}
+		}
+		return ledger.Tombstones[ownerAttemptKey("o/r", 191, 9)].Action == "abandoned" && ledger.Tombstones[ownerAttemptKey("o/r", 191, 9)].CleanupPhase == "completed" && ledger.Tombstones[ownerAttemptKey("o/r", 193, 9)].Action == "dismissed"
 	}) {
-		t.Fatalf("untouched orphan Dismiss was not durable after restart: %s", output.String())
+		t.Fatalf("post-restart Abandon or Dismiss was not durable: %s", output.String())
+	}
+	if _, err := os.Lstat(manifests[191].Worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("post-restart Abandon did not clean the worktree: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Dir(manifests[191].LogPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("post-restart Abandon did not clean diagnostics: %v", err)
 	}
 	if _, err := os.Stat(manifests[193].Worktree); err != nil {
 		t.Fatalf("post-restart Dismiss lost diagnostics: %v", err)
+	}
+	if _, err := os.Stat(manifests[193].LogPath); err != nil {
+		t.Fatalf("post-restart Dismiss lost log: %v", err)
 	}
 }
 

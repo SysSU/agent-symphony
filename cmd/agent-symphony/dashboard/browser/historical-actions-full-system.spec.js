@@ -21,15 +21,19 @@ test("archive, dismiss, and abandon exact historical attempts through the deploy
   }
 
   if (process.env.AGENT_SYMPHONY_HISTORICAL_E2E_PHASE === "post-restart") {
+    await expect(card(191).getByRole("button", { name: "Abandon attempt" })).toBeVisible();
     await expect(card(193).getByRole("button", { name: "Dismiss issue #193, attempt 9; keep diagnostics" })).toBeVisible();
+    await clickAction("abandon", card(191).getByRole("button", { name: "Abandon attempt" }));
     await clickAction("dismiss", card(193).getByRole("button", { name: "Dismiss issue #193, attempt 9; keep diagnostics" }));
     await expect.poll(async () => {
       const response = await fetch(`${baseURL}/dashboard-state.json`, { cache: "no-store" });
       const state = await response.json();
-      return state.hidden?.some((entry) => entry.issue === 193);
+      return [191, 193].every((issue) => state.hidden?.some((entry) => entry.issue === issue));
     }).toBe(true);
     await page.reload();
-    await expect(page.getByRole("link", { name: /#193\b/ })).toHaveCount(0);
+    for (const issue of [191, 193]) {
+      await expect(page.getByRole("link", { name: new RegExp(`#${issue}\\b`) })).toHaveCount(0);
+    }
     expect(errors).toEqual([]);
     return;
   }
@@ -44,16 +48,15 @@ test("archive, dismiss, and abandon exact historical attempts through the deploy
   await clickAction("archive", card(160).getByRole("button", { name: "Archive" }));
   await clickAction("dismiss", card(162).getByRole("button", { name: "Dismiss issue #162, attempt 1; keep diagnostics" }));
   await clickAction("archive", card(163).getByRole("button", { name: "Archive" }));
-  await clickAction("abandon", card(191).getByRole("button", { name: "Abandon attempt" }));
   await clickAction("dismiss", card(192).getByRole("button", { name: "Dismiss issue #192, attempt 9; keep diagnostics" }));
 
   await expect.poll(async () => {
     const response = await fetch(`${baseURL}/dashboard-state.json`, { cache: "no-store" });
     const state = await response.json();
-    return [160, 162, 163, 191, 192].every((issue) => state.hidden?.some((entry) => entry.issue === issue));
+    return [160, 162, 163, 192].every((issue) => state.hidden?.some((entry) => entry.issue === issue));
   }).toBe(true);
   await page.reload();
-  for (const issue of [160, 161, 162, 163, 191, 192]) {
+  for (const issue of [160, 161, 162, 163, 192]) {
     await expect(page.getByRole("link", { name: new RegExp(`#${issue}\\b`) })).toHaveCount(0);
   }
   expect(errors).toEqual([]);
