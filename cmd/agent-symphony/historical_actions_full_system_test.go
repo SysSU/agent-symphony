@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -84,9 +85,9 @@ func TestHistoricalAttemptActionsFullSystemE2E(t *testing.T) {
 	state := newRuntimeOwnerState("o/r")
 	state.Epoch, state.Revision = 1, 1
 	manifests := map[int]agentruntime.Manifest{}
-	for issue, attempt := range map[int]int{160: 1, 162: 1, 191: 9, 192: 9, 193: 9} {
+	for issue, attempt := range map[int]int{160: 1, 162: 1, 164: 2, 191: 9, 192: 9, 193: 9} {
 		manifest := historicalFullSystemManifest(t, sourceGit, stateRoot, base, issue, attempt)
-		if issue == 160 || issue == 162 {
+		if issue == 160 || issue == 162 || issue == 164 {
 			manifest.State, manifest.ReviewHead = "completed", base
 		} else {
 			manifest.State = "failed"
@@ -101,6 +102,19 @@ func TestHistoricalAttemptActionsFullSystemE2E(t *testing.T) {
 		state.AttemptGenerations[key] = 1
 		state.Attempts[key] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
 	}
+	// The earlier failed attempt must remain in Previous attempts when the
+	// current attempt is abandoned, even though the owner removes the latter
+	// from status projection and retains only its tombstone.
+	for _, issue := range []int{191, 193} {
+		previous := historicalFullSystemManifest(t, sourceGit, stateRoot, base, issue, 8)
+		previousKey := ownerAttemptKey("o/r", issue, 8)
+		state.AttemptGenerations[previousKey] = 1
+		state.Attempts[previousKey] = runtimeAttemptRecord{Generation: 1, Manifest: previous}
+	}
+	previousArchive := historicalFullSystemManifest(t, sourceGit, stateRoot, base, 164, 1)
+	previousArchiveKey := ownerAttemptKey("o/r", 164, 1)
+	state.AttemptGenerations[previousArchiveKey] = 1
+	state.Attempts[previousArchiveKey] = runtimeAttemptRecord{Generation: 1, Manifest: previousArchive}
 	archived := ownerAttemptKey("o/r", 161, 1)
 	state.IssueGenerations[ownerIssueKey("o/r", 161)] = 1
 	state.AttemptGenerations[archived] = 2
@@ -112,16 +126,20 @@ func TestHistoricalAttemptActionsFullSystemE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture := &fullSystemGitHub{base: base, origin: origin, historicalIssues: map[int]map[string]any{}, historicalComments: map[int][]map[string]any{}}
-	for _, issue := range []int{160, 161, 162, 163, 191, 192, 193} {
+	for _, issue := range []int{160, 161, 162, 163, 164, 191, 192, 193} {
 		fixture.historicalIssues[issue] = map[string]any{"number": issue, "node_id": fmt.Sprintf("I_%d", issue), "title": fmt.Sprintf("Historical issue %d", issue), "body": "## Context\nHistorical operator state.\n", "state": "closed", "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "labels": []any{}}
 	}
-	for _, issue := range []int{160, 161, 162, 163} {
-		branch, err := internalgithub.AttemptBranch("o/r", issue, 1)
+	for _, issue := range []int{160, 161, 162, 163, 164} {
+		attempt := 1
+		if issue == 164 {
+			attempt = 2
+		}
+		branch, err := internalgithub.AttemptBranch("o/r", issue, attempt)
 		if err != nil {
 			t.Fatal(err)
 		}
 		pr := issue + 800
-		marker, err := internalgithub.AttemptMarker(issue, 1, branch, base, pr, "review")
+		marker, err := internalgithub.AttemptMarker(issue, attempt, branch, base, pr, "review")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -218,11 +236,11 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 			if attempt.Issue == 161 {
 				return false
 			}
-			if (attempt.Issue == 160 || attempt.Issue == 162 || attempt.Issue == 163 || attempt.Issue == 191 || attempt.Issue == 192 || attempt.Issue == 193) && attempt.OperatorBlocked {
+			if (attempt.Issue == 160 || attempt.Issue == 162 || attempt.Issue == 163 || attempt.Issue == 164 || attempt.Issue == 191 || attempt.Issue == 192 || attempt.Issue == 193) && attempt.OperatorBlocked {
 				return false
 			}
 		}
-		return found[160] == "completed" && found[162] == "completed" && found[163] == "completed" && found[191] == "orphaned" && found[192] == "orphaned" && found[193] == "orphaned"
+		return found[160] == "completed" && found[162] == "completed" && found[163] == "completed" && found[164] == "completed" && found[191] == "orphaned" && found[192] == "orphaned" && found[193] == "orphaned"
 	})
 	if !ready {
 		response, _ := http.Get("http://" + address + "/status.json")
@@ -272,12 +290,12 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 	}
 	if !waitFor(deadline(20*time.Second), func() bool {
 		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
-		return err == nil && ledger.Tombstones[ownerAttemptKey("o/r", 160, 1)].CleanupPhase == "completed" && ledger.Tombstones[ownerAttemptKey("o/r", 162, 1)].Action == "dismissed" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Action == "archived" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Manifest == nil && ledger.Tombstones[ownerAttemptKey("o/r", 192, 9)].Action == "dismissed"
+		return err == nil && ledger.Tombstones[ownerAttemptKey("o/r", 160, 1)].CleanupPhase == "completed" && ledger.Tombstones[ownerAttemptKey("o/r", 162, 1)].Action == "dismissed" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Action == "archived" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Manifest == nil && ledger.Tombstones[ownerAttemptKey("o/r", 164, 2)].Action == "archived" && ledger.Tombstones[ownerAttemptKey("o/r", 192, 9)].Action == "dismissed"
 	}) {
 		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 		t.Fatalf("historical mutations did not complete: %s\nserve:\n%s", ledger, output.String())
 	}
-	for _, issue := range []int{160} {
+	for _, issue := range []int{160, 164} {
 		if _, err := os.Lstat(manifests[issue].Worktree); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%d worktree was not cleaned: %v", issue, err)
 		}
@@ -290,7 +308,7 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 			t.Fatalf("%d dismissed worktree was not retained: %v", issue, err)
 		}
 	}
-	for _, issue := range []int{160, 162, 192} {
+	for _, issue := range []int{160, 162, 164, 192} {
 		if _, err := os.Stat(manifests[issue].LogPath); err != nil {
 			t.Fatalf("%d log was not retained: %v", issue, err)
 		}
@@ -315,9 +333,10 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 	if err != nil {
 		t.Fatal(err)
 	}
+	reconcileBody, _ := io.ReadAll(reconcileResponse.Body)
 	_ = reconcileResponse.Body.Close()
 	if reconcileResponse.StatusCode != http.StatusNoContent {
-		t.Fatalf("post-restart reconciliation barrier returned %d: %s", reconcileResponse.StatusCode, output.String())
+		t.Fatalf("post-restart reconciliation barrier returned %d (%s): %s", reconcileResponse.StatusCode, reconcileBody, output.String())
 	}
 	var freshRevision uint64
 	if !waitFor(deadline(20*time.Second), func() bool {
@@ -328,7 +347,7 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 		for _, expected := range []struct {
 			issue, attempt int
 			action         string
-		}{{160, 1, "archived"}, {162, 1, "dismissed"}, {163, 1, "archived"}, {192, 9, "dismissed"}} {
+		}{{160, 1, "archived"}, {162, 1, "dismissed"}, {163, 1, "archived"}, {164, 2, "archived"}, {192, 9, "dismissed"}} {
 			key := ownerAttemptKey("o/r", expected.issue, expected.attempt)
 			if ledger.Tombstones[key].Action != expected.action || ledger.Attempts[key].Generation != 0 {
 				return false
@@ -347,7 +366,7 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 			return false
 		}
 		for _, attempt := range status.Statuses {
-			if attempt.Issue == 160 || attempt.Issue == 161 || attempt.Issue == 162 || attempt.Issue == 163 || attempt.Issue == 192 {
+			if attempt.Issue == 160 || attempt.Issue == 161 || attempt.Issue == 162 || attempt.Issue == 163 || attempt.Issue == 192 || attempt.Issue == 164 && attempt.Attempt == 2 {
 				return false
 			}
 		}
@@ -383,6 +402,62 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 	if _, err := os.Stat(manifests[193].LogPath); err != nil {
 		t.Fatalf("post-restart Dismiss lost log: %v", err)
 	}
+	beforeReconcile, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcileRequest, err = http.NewRequest(http.MethodPost, "http://"+address+"/actions/reconcile", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcileRequest.Header.Set("Origin", "http://"+address)
+	reconcileResponse, err = http.DefaultClient.Do(reconcileRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = reconcileResponse.Body.Close()
+	if reconcileResponse.StatusCode != http.StatusNoContent || !waitFor(deadline(20*time.Second), func() bool {
+		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+		return err == nil && ledger.CycleOutcomeEpoch == beforeReconcile.Epoch && ledger.CycleOutcomeID > beforeReconcile.CycleOutcomeID
+	}) {
+		t.Fatalf("post-action reconciliation did not complete: status=%d serve=%s", reconcileResponse.StatusCode, output.String())
+	}
+	runBrowser("verification")
+	if err := server.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Wait(); err != nil {
+		t.Fatalf("shutdown after actions: %v\n%s", err, output.String())
+	}
+	stopped = true
+	address = freeAddress(t)
+	server, output = start(address)
+	stopped = false
+	waitHTTP(t, "http://"+address+"/status.json", deadline(20*time.Second), output)
+	if !waitFor(deadline(20*time.Second), func() bool {
+		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+		if err != nil || ledger.Epoch <= beforeReconcile.Epoch || ledger.Observations[ownerIssueKey("o/r", 191)].ObservationEpoch != ledger.Epoch {
+			return false
+		}
+		response, err := http.Get("http://" + address + "/status.json")
+		if err != nil {
+			return false
+		}
+		defer response.Body.Close()
+		var status dashboardStatusSnapshot
+		if json.NewDecoder(response.Body).Decode(&status) != nil || status.OwnerEpoch != ledger.Epoch || status.OwnerRevision < ledger.Revision {
+			return false
+		}
+		for _, attempt := range status.Statuses {
+			if (attempt.Issue == 191 || attempt.Issue == 193) && attempt.Attempt == 9 {
+				return false
+			}
+		}
+		return ledger.Tombstones[ownerAttemptKey("o/r", 191, 9)].Action == "abandoned" && ledger.Tombstones[ownerAttemptKey("o/r", 193, 9)].Action == "dismissed"
+	}) {
+		t.Fatalf("restart after actions did not preserve high-water tombstones: %s", output.String())
+	}
+	runBrowser("verification")
 }
 
 func historicalFullSystemManifest(t *testing.T, sourceGit, stateRoot, base string, issue, number int) agentruntime.Manifest {
