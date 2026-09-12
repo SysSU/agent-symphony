@@ -1630,7 +1630,20 @@ func TestOperatorStartupSweepDispatchesPendingCleanupAndShutdownLeavesItResumabl
 
 func TestV2PlanReviewHandlerCommitsExactOwnerEffectWithoutCompatibilityWrite(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 333, "active", false)
-	refreshOwnerObservation(t, owner, manifest.Issue)
+	before := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(before.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "body"
+	attempt := expandAttemptFact(before.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, owner, input)
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r/issues/333" {
+			t.Errorf("unexpected GitHub read: %s", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"number":333,"state":"open","body":"body"}`)
+	}))
+	defer github.Close()
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1640,7 +1653,11 @@ func TestV2PlanReviewHandlerCommitsExactOwnerEffectWithoutCompatibilityWrite(t *
 	}
 	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
 	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, executor: agentruntime.EffectExecutor{Runtime: runtimeState}, active: map[string]*activeRuntimeEffect{}, stopped: true}
-	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
+	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{API: internalgithub.API{BaseURL: github.URL, HTTP: github.Client()}, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
+	plan, material, err := service.preparePlanReview(t.Context(), mustOwnerSnapshot(t, owner), manifest)
+	if err != nil || material.Issue.Body != "body" || digestText(material.Issue.Body) != plan.Request.BodyDigest {
+		t.Fatalf("plan=%#v material=%#v err=%v", plan, material, err)
+	}
 	server := &dashboardServer{ctx: t.Context(), stateRoot: owner.stateRoot, repository: "o/r", operator: service}
 	request := httptest.NewRequest(http.MethodPost, "http://localhost/actions/review-plan?repository=o%2Fr&issue=333&attempt=1", nil)
 	request.Host = "localhost"
@@ -1661,6 +1678,52 @@ func TestV2PlanReviewHandlerCommitsExactOwnerEffectWithoutCompatibilityWrite(t *
 	afterManifest, err := os.ReadFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"))
 	if err != nil || !bytes.Equal(afterManifest, beforeManifest) {
 		t.Fatalf("compatibility manifest changed err=%v", err)
+	}
+}
+
+func TestV2PlanReviewRejectsBodyChangedDuringPreparationBeforeAdmission(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 334, "active", false)
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	body := ""
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r/issues/334" {
+			t.Errorf("unexpected GitHub read: %s", r.URL.Path)
+		}
+		close(entered)
+		<-release
+		_, _ = fmt.Fprintf(w, `{"number":334,"state":"open","body":%q}`, body)
+	}))
+	defer github.Close()
+	defer once.Do(func() { close(release) })
+	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
+	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, executor: agentruntime.EffectExecutor{Runtime: runtimeState}, active: map[string]*activeRuntimeEffect{}, stopped: true}
+	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{API: internalgithub.API{BaseURL: github.URL, HTTP: github.Client()}, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
+	result := make(chan controlResult, 1)
+	go func() {
+		result <- service.perform(t.Context(), operatorRequest("plan-review-edited", "review-plan", manifest, false))
+	}()
+	<-entered
+	// The owner remains available while the GitHub read is blocked. Its newer
+	// observation must invalidate both the old snapshot and the in-flight body.
+	current := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(current.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "edited"
+	attempt := expandAttemptFact(current.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, owner, input)
+	body = "edited"
+	once.Do(func() { close(release) })
+	if got := <-result; got.Status != http.StatusConflict || got.OK {
+		t.Fatalf("edited issue was admitted: %#v", got)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	if len(state.ControlReceipts) != 0 || len(state.Effects) != 0 {
+		t.Fatalf("stale body committed a pending effect: %#v", state)
 	}
 }
 

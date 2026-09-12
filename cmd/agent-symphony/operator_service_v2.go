@@ -487,7 +487,23 @@ func (s *operatorMutationService) preparePlanReview(ctx context.Context, snapsho
 		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, err
 	}
 	observation := snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
+	var fresh struct {
+		Number      int
+		State       string
+		Body        string
+		PullRequest any `json:"pull_request"`
+	}
+	// Operator admission needs the raw body, but the owner deliberately keeps
+	// only its digest. Read without the reconciliation cache or stale fallback.
+	api := internalgithub.API{BaseURL: s.collector.API.BaseURL, HTTP: s.collector.API.HTTP, Retries: s.collector.API.Retries}
+	if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", manifest.Repository, manifest.Issue), "", &fresh); err != nil {
+		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, err
+	}
+	if fresh.Number != manifest.Issue || fresh.State != "open" || fresh.PullRequest != nil || digestText(fresh.Body) != observation.Fact.BodyDigest {
+		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, errStateConflict
+	}
 	issue := expandIssueFact(observation.Fact)
+	issue.Body = fresh.Body
 	issue.Attempt, issue.BaseSHA = manifest.Attempt, manifest.BaseSHA
 	target := manifest.Repository + "#" + strconv.Itoa(manifest.Issue) + " plan sha256:" + observation.Fact.BodyDigest
 	snapshotPath, session := reviewIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(s.owner.stateRoot))
