@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"slices"
 	"strings"
@@ -373,8 +375,59 @@ func TestOperatorBlockedRecoveryAdvancesThroughDurablePhases(t *testing.T) {
 	retry := applyAndPlanRecover(t, owner, repositoryInput(true, terminalIssue), []internalgithub.RecoveryAttemptFact{failed}, githubIssueRetry)
 	retryEffect := advanceOperatorRecoverPlan(t, owner, request.RequestID, retry)
 	assertOperatorReceiptPhase(t, owner, request.RequestID, operatorPhaseRetryPending, "pending")
+	activeMarker, err := internalgithub.ActiveAttemptMarker("o/r", manifest.Issue, manifest.Attempt, manifest.BaseSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalMarker, err := internalgithub.TerminalFailureMarker(manifest.Issue, manifest.Attempt, cancelled.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	comment := func(id int, body string, created time.Time) map[string]any {
+		return map[string]any{"id": id, "body": body, "created_at": created, "updated_at": created, "user": map[string]any{"id": 42}}
+	}
+	comments := []map[string]any{
+		comment(1, activeMarker, time.Unix(1, 0).UTC()),
+		comment(2, terminalMarker, cancelled.UpdatedAt),
+		comment(3, "/agent-symphony retry", cancelled.UpdatedAt.Add(time.Second)),
+	}
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != fmt.Sprintf("/repos/o/r/issues/%d/comments", manifest.Issue) {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(comments)
+	}))
+	t.Cleanup(github.Close)
+	applied, err := internalgithub.RetryCommandApplied(t.Context(), internalgithub.API{BaseURL: github.URL, HTTP: github.Client(), Retries: -1}, internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42, CancelCommand: "/agent-symphony cancel", RetryCommand: "/agent-symphony retry"}, manifest.Issue, manifest.Attempt, cancelled.UpdatedAt)
+	if err != nil || !applied {
+		t.Fatalf("exact retry proof applied=%v err=%v", applied, err)
+	}
 	retryResult := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueRetry, Observed: true}}
-	completed, err := owner.finishOperatorReconciliationEffect(t.Context(), finishOperatorReconciliationEffectCommand{Finish: finishReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(*retryEffect), Result: retryResult}})
+	// Reconciliation can observe the proven command before the owner commits it.
+	proofReady, releaseFinish := make(chan struct{}), make(chan struct{})
+	type finishResult struct {
+		snapshot stateOwnerSnapshot
+		err      error
+	}
+	finished := make(chan finishResult, 1)
+	go func() {
+		close(proofReady)
+		<-releaseFinish
+		completed, err := owner.finishOperatorReconciliationEffect(t.Context(), finishOperatorReconciliationEffectCommand{Finish: finishReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(*retryEffect), Result: retryResult}})
+		finished <- finishResult{completed, err}
+	}()
+	<-proofReady
+	provisional := terminalIssue
+	provisional.RecoveryAuthorized = false
+	provisional.Blockers = []string{"control snapshot update is pending"}
+	applyReconciliationInput(t, owner, repositoryInput(true, provisional))
+	settled := terminalIssue
+	settled.Attempt, settled.Retry = 2, true
+	applyReconciliationInput(t, owner, repositoryInput(true, settled))
+	close(releaseFinish)
+	finish := <-finished
+	completed, err := finish.snapshot, finish.err
 	if err != nil {
 		t.Fatal(err)
 	}

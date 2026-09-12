@@ -189,9 +189,11 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	if err != nil {
 		return err
 	}
-	if _, err = p.owner.applyReconciliation(ctx, collection); err != nil {
+	applied, err := p.owner.applyReconciliation(ctx, collection)
+	if err != nil {
 		return err
 	}
+	p.effects.cancelInvalidated(applied)
 	if resumed, err := p.resumePendingReconciliation(ctx, api, batch); err != nil || resumed {
 		if err != nil {
 			return err
