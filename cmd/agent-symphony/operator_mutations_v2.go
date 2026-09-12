@@ -203,6 +203,12 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 func applyRemoteOnlyOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwnerState, command beginOperatorMutationCommand, observation reconciliationObservation, observed bool) (*runtimeEffectIntent, error) {
 	request := command.Request
 	issueKey, attemptKey := ownerIssueKey(request.Repository, request.Issue), ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	if tombstone, exists := state.Tombstones[attemptKey]; exists {
+		if !slices.Contains([]string{"archive", "dismiss"}, request.Action) || tombstone.Action != operatorTombstoneAction(request.Action) || tombstone.Manifest != nil || tombstone.CleanupPhase != "completed" || tombstone.EffectID != "" || tombstone.CleanupPolicy != nil || tombstone.PublishedHead != "" || command.Identity.AttemptGeneration != tombstone.Generation || state.AttemptGenerations[attemptKey] != tombstone.Generation || !reflect.DeepEqual(command.Manifest, agentruntime.Manifest{}) {
+			return nil, errStateConflict
+		}
+		return nil, appendOperatorReceipt(state, controlReceipt{Request: request, State: "completed", Phase: operatorPhaseCompleted, Result: successfulOperatorResult(request, 0)})
+	}
 	attempt, accepted := observation.Attempts[attemptKey]
 	if !slices.Contains([]string{"archive", "dismiss"}, request.Action) || request.Action == "dismiss" && !command.IssueClosed || command.IssueClosed != observation.Fact.Closed || !reflect.DeepEqual(command.Manifest, agentruntime.Manifest{}) || command.CleanupValid || command.CleanupDigest != "" || command.CleanupPolicy != (agentruntime.EffectCleanupPolicy{}) || command.Runtime != nil || command.Reconciliation != nil || command.PublishedHead != "" || !observed || !observation.Present || observation.ObservationEpoch != state.Epoch || observation.Fact.CurrentAttempt != request.Attempt || observation.Generation != command.ObservationGeneration || observation.LastCycleID != command.ObservationCycleID || observation.Fact.BodyDigest != command.ObservationBodyDigest || !accepted || !attempt.Present || attempt.ObservationEpoch != state.Epoch || attempt.SourceIssueGeneration != observation.Generation || attempt.OwnerGeneration != command.Identity.AttemptGeneration || attempt.Fact.State != "completed" || attempt.Fact.Repository != request.Repository || attempt.Fact.Issue != request.Issue || attempt.Fact.Attempt != request.Attempt || state.AttemptGenerations[attemptKey] != command.Identity.AttemptGeneration {
 		return nil, errStaleStateResult

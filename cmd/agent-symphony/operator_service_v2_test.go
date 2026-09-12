@@ -199,6 +199,65 @@ func TestRemoteOnlyCompletedDashboardActionUsesPublishedAttemptIdentity(t *testi
 	}
 }
 
+func TestRemoteOnlyTombstoneReplaysAfterReceiptEvictionAndRestart(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 164, 1, "completed")
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "completed", true)
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	delete(state.Attempts, key)
+	state.Epoch, state.Revision = 1, 1
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshOperatorObservation(t, owner)
+	service := operatorTestMutationService(t, owner)
+	service.collect = func(_ context.Context, snapshot stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
+		observation := snapshot.State.Observations[ownerIssueKey(manifest.Repository, issue)]
+		attempt := observation.Attempts[key]
+		return reconciliationV2Batch{Input: reconciliationInput{Scope: reconciliationScope{Kind: reconciliationIssueScope, Repository: manifest.Repository, Issue: issue}, Complete: true, Issues: []internalgithub.RecoveryIssueFact{expandIssueFact(observation.Fact)}, Attempts: []internalgithub.RecoveryAttemptFact{expandAttemptFact(attempt.Fact)}}}, nil
+	}
+	request := operatorRequest("remote-original", "archive", manifest, true)
+	if result := service.perform(t.Context(), request); !result.OK {
+		t.Fatalf("first archive=%#v", result)
+	}
+	persisted := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
+	for index := range maxControlReceipts {
+		dummy := operatorRequest(fmt.Sprintf("evict-%03d", index), "archive", manifest, true)
+		if err := appendOperatorReceipt(&persisted, controlReceipt{Request: dummy, State: "completed", Phase: operatorPhaseCompleted, Result: successfulOperatorResult(dummy, persisted.Revision)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, exists := operatorReceiptByID(persisted, request.RequestID); exists {
+		t.Fatal("fixture did not evict original receipt")
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, root, persisted, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	replayService := operatorTestMutationService(t, restarted)
+	replayService.collect = func(context.Context, stateOwnerSnapshot, int) (reconciliationV2Batch, error) {
+		t.Fatal("replay must not collect GitHub")
+		return reconciliationV2Batch{}, errStateConflict
+	}
+	if result := replayService.perform(t.Context(), request); !result.OK || result.Status != http.StatusOK {
+		t.Fatalf("same-action replay=%#v", result)
+	}
+	other := operatorRequest("remote-opposite", "dismiss", manifest, false)
+	if result := replayService.perform(t.Context(), other); result.Status != http.StatusConflict || result.OK {
+		t.Fatalf("cross-action replay=%#v", result)
+	}
+	final := mustOwnerSnapshot(t, restarted).State
+	if final.Tombstones[key].Action != "archived" || final.AttemptGenerations[key] != 2 || len(final.Attempts) != 0 {
+		t.Fatalf("replay changed tombstone=%#v", final.Tombstones[key])
+	}
+}
+
 func TestV2DashboardCancelRespondsWhileReconciliationCollectsAndRejectsStaleResult(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 327, "active", false)
 	service := operatorTestMutationService(t, owner)

@@ -273,12 +273,18 @@ func (s *operatorMutationService) recoveryAttachCommand(snapshot stateOwnerSnaps
 
 func (s *operatorMutationService) tombstoneReplayCommand(snapshot stateOwnerSnapshot, request controlRequest) (beginOperatorMutationCommand, bool) {
 	tombstone, ok := snapshot.State.Tombstones[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)]
-	if !ok || tombstone.Manifest == nil {
+	if !ok {
 		return beginOperatorMutationCommand{}, false
 	}
 	action := map[string]string{"dismissed": "dismiss", "archived": "archive", "abandoned": "abandon", "removed": "remove"}[tombstone.Action]
 	if request.Action != action {
 		return beginOperatorMutationCommand{Request: request}, true
+	}
+	if tombstone.Manifest == nil {
+		if !slices.Contains([]string{"archive", "dismiss"}, request.Action) || tombstone.CleanupPhase != "completed" || tombstone.EffectID != "" || tombstone.CleanupPolicy != nil {
+			return beginOperatorMutationCommand{Request: request}, true
+		}
+		return beginOperatorMutationCommand{Request: request, RemoteOnly: true, Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], AttemptGeneration: tombstone.Generation}}, true
 	}
 	observation := snapshot.State.Observations[ownerIssueKey(request.Repository, request.Issue)]
 	command := beginOperatorMutationCommand{Request: request, Manifest: cloneManifest(*tombstone.Manifest), PublishedHead: tombstone.PublishedHead, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, ObservationBodyDigest: observation.Fact.BodyDigest, Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], AttemptGeneration: tombstone.Generation}}
