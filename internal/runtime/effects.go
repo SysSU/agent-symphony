@@ -921,6 +921,11 @@ func (r *Runtime) startEffect(ctx context.Context, request EffectRequest) (Manif
 	if r.Helper != "" {
 		command = PaneExitStatusCommand(r.Helper, r.tmux(), command)
 	}
+	for _, option := range []string{PaneExitStatusOption, PaneExitSignalOption} {
+		if _, err := r.run(ctx, r.tmux(), []string{"set-option", "-p", "-t", target, option, ""}, "", []string{}, nil); err != nil {
+			return failedEffectStopping(ctx, r, manifest, "reset pane exit result", err)
+		}
+	}
 	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
 		return failedEffectStopping(ctx, r, manifest, "start agent", err)
 	}

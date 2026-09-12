@@ -81,7 +81,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		return nil, errStaleStateResult
 	}
 	record, ok := state.Attempts[attemptKey]
-	if !ok || record.Generation != command.Identity.AttemptGeneration || !reflect.DeepEqual(record.Manifest, manifest) {
+	if !ok || record.Generation != command.Identity.AttemptGeneration || !reflect.DeepEqual(record.Manifest, manifest) && (request.Action != "review-plan" || !sameManifestExceptUpdatedAt(record.Manifest, manifest)) {
 		return nil, errStaleStateResult
 	}
 	status, statuses, err := ownerOperatorStatus(*state, request.Issue, request.Attempt)

@@ -248,13 +248,37 @@ func TestAuthorizedHumanInstructionsAmendIndependentReviewContractInOrder(t *tes
 }
 
 func TestMissingTmuxReviewerPaneIsTheExactPrelaunchStatus(t *testing.T) {
-	if !missingTmuxPaneStatus(agentruntime.Result{Output: "|||\n"}) {
+	if !missingTmuxPaneStatus(agentruntime.Result{Output: "||||\n"}) {
 		t.Fatal("tmux missing-target output was not recognized")
 	}
-	for _, result := range []agentruntime.Result{{Output: "0|||\n"}, {Output: "1|0||\n"}, {Output: "|||\n", Exited: true, Code: 1}} {
+	for _, result := range []agentruntime.Result{{Output: "0||||\n"}, {Output: "1|0|||\n"}, {Output: "||||\n", Exited: true, Code: 1}, {Output: "|||\n"}} {
 		if missingTmuxPaneStatus(result) {
 			t.Fatalf("live, dead, or failed tmux result was treated as missing: %#v", result)
 		}
+	}
+}
+
+func TestMissingTmuxReviewerPaneFromRealTmux(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socket := fmt.Sprintf("as-missing-reviewer-%d", time.Now().UnixNano())
+	run := func(args ...string) (string, error) {
+		command := exec.Command(tmux, append([]string{"-L", socket, "-f", "/dev/null"}, args...)...)
+		output, err := command.CombinedOutput()
+		return string(output), err
+	}
+	if output, err := run("new-session", "-d", "-s", socket, "sleep", "30"); err != nil {
+		t.Fatalf("start tmux fixture: %v: %s", err, output)
+	}
+	t.Cleanup(func() { _, _ = run("kill-server") })
+	output, err := run("display-message", "-p", "-t", "=missing-reviewer-session:0.0", agentruntime.PaneStatusFormat)
+	if err != nil {
+		t.Fatalf("read missing tmux target: %v: %s", err, output)
+	}
+	if !missingTmuxPaneStatus(agentruntime.Result{Output: output}) {
+		t.Fatalf("real tmux missing target was not recognized: %q", output)
 	}
 }
 

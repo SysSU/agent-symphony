@@ -13,10 +13,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	stdruntime "runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
@@ -33,7 +35,8 @@ const (
 	workerResultSuffix      = ".result.json"
 	WorkerResultEnvironment = "AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
 	PaneExitStatusOption    = "@agent-symphony-exit-status"
-	PaneStatusFormat        = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{@agent-symphony-exit-status}"
+	PaneExitSignalOption    = "@agent-symphony-exit-signal"
+	PaneStatusFormat        = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{@agent-symphony-exit-status}|#{@agent-symphony-exit-signal}"
 )
 
 const (
@@ -474,6 +477,11 @@ func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifes
 	if r.Helper != "" {
 		command = PaneExitStatusCommand(r.Helper, r.tmux(), command)
 	}
+	for _, option := range []string{PaneExitStatusOption, PaneExitSignalOption} {
+		if _, err := r.run(ctx, r.tmux(), []string{"set-option", "-p", "-t", target, option, ""}, "", []string{}, nil); err != nil {
+			return failStop("reset pane exit result", err)
+		}
+	}
 	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
 		return failStop("start agent", err)
 	}
@@ -581,7 +589,7 @@ func TmuxNewSessionArgs(session, dir string, environment []string) []string {
 // has published either its normal exit status or terminating signal.
 func ParsePaneStatus(output string) (PaneStatus, error) {
 	fields := strings.Split(strings.TrimSpace(output), "|")
-	if len(fields) != 4 || (fields[0] != "0" && fields[0] != "1") {
+	if len(fields) != 5 || (fields[0] != "0" && fields[0] != "1") {
 		return PaneStatus{}, fmt.Errorf("invalid pane status %q", strings.TrimSpace(output))
 	}
 	var recordedStatus *int
@@ -591,6 +599,17 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 			return PaneStatus{}, fmt.Errorf("invalid recorded pane exit status %q", fields[3])
 		}
 		recordedStatus = &status
+	}
+	var recordedSignal *int
+	if fields[4] != "" {
+		number, err := strconv.Atoi(fields[4])
+		if err != nil || number < 1 || number > 127 {
+			return PaneStatus{}, fmt.Errorf("invalid recorded pane signal %q", fields[4])
+		}
+		recordedSignal = &number
+	}
+	if recordedStatus != nil && recordedSignal != nil {
+		return PaneStatus{}, fmt.Errorf("conflicting recorded pane exit status and signal")
 	}
 	if fields[0] == "0" {
 		if fields[1] != "" || fields[2] != "" {
@@ -602,6 +621,8 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 	if fields[1] == "" && fields[2] == "" {
 		if recordedStatus != nil {
 			pane.Ready, pane.ExitStatus = true, *recordedStatus
+		} else if recordedSignal != nil {
+			pane.Ready, pane.Signal = true, strconv.Itoa(*recordedSignal)
 		}
 		return pane, nil
 	}
@@ -618,6 +639,9 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 		} else if !signalName.MatchString(signal) {
 			return PaneStatus{}, fmt.Errorf("invalid pane signal %q", fields[2])
 		}
+		if recordedStatus != nil || recordedSignal != nil && !nativePaneSignalMatches(signal, *recordedSignal) {
+			return PaneStatus{}, fmt.Errorf("pane signal conflicts with recorded result")
+		}
 		pane.Ready, pane.Signal = true, signal
 		return pane, nil
 	}
@@ -628,8 +652,45 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 	if recordedStatus != nil && status != *recordedStatus {
 		return PaneStatus{}, fmt.Errorf("pane exit status conflicts with recorded status %d", *recordedStatus)
 	}
+	if recordedSignal != nil {
+		if status == 0 {
+			return PaneStatus{}, fmt.Errorf("pane exit status conflicts with recorded signal %d", *recordedSignal)
+		}
+		// The native status belongs to the Go wrapper, which can exit nonzero
+		// instead of re-raising synchronous signals such as SIGSEGV. The pane
+		// option records the child signal before that wrapper exits.
+		pane.Ready, pane.Signal = true, strconv.Itoa(*recordedSignal)
+		return pane, nil
+	}
 	pane.Ready, pane.ExitStatus = true, status
 	return pane, nil
+}
+
+func nativePaneSignalMatches(native string, recorded int) bool {
+	if native == strconv.Itoa(recorded) {
+		return true
+	}
+	known := map[string]syscall.Signal{
+		"hup": syscall.SIGHUP, "int": syscall.SIGINT, "quit": syscall.SIGQUIT,
+		"ill": syscall.SIGILL, "trap": syscall.SIGTRAP, "abrt": syscall.SIGABRT,
+		"iot": syscall.SIGABRT, "bus": syscall.SIGBUS, "fpe": syscall.SIGFPE,
+		"kill": syscall.SIGKILL, "segv": syscall.SIGSEGV, "pipe": syscall.SIGPIPE,
+		"alrm": syscall.SIGALRM, "term": syscall.SIGTERM, "usr1": syscall.SIGUSR1,
+		"usr2": syscall.SIGUSR2, "chld": syscall.SIGCHLD, "cont": syscall.SIGCONT,
+		"stop": syscall.SIGSTOP, "tstp": syscall.SIGTSTP, "ttin": syscall.SIGTTIN,
+		"ttou": syscall.SIGTTOU, "sys": syscall.SIGSYS, "urg": syscall.SIGURG,
+		"xcpu": syscall.SIGXCPU, "xfsz": syscall.SIGXFSZ, "vtalrm": syscall.SIGVTALRM,
+		"prof": syscall.SIGPROF, "winch": syscall.SIGWINCH, "io": syscall.SIGIO,
+	}
+	name := strings.TrimPrefix(native, "sig")
+	value, ok := known[name]
+	if !ok && stdruntime.GOOS == "darwin" {
+		value, ok = map[string]syscall.Signal{"emt": 7, "info": 29}[name]
+	}
+	if !ok && stdruntime.GOOS == "linux" {
+		value, ok = map[string]syscall.Signal{"cld": 17, "poll": 29, "pwr": 30, "stkflt": 16, "unused": 31}[name]
+	}
+	return ok && int(value) == recorded
 }
 
 // Deliver sends one control-plane-framed handoff through the verified worker

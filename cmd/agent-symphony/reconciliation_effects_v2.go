@@ -257,7 +257,7 @@ func applyBeginReconciliationEffect(attemptRoot, stateRoot string, state *runtim
 			return nil, errAttemptTombstoned
 		}
 		record, exists := state.Attempts[attemptKey]
-		if !exists || record.Generation != identity.AttemptGeneration || !reflect.DeepEqual(record.Manifest, manifest) {
+		if !exists || record.Generation != identity.AttemptGeneration || !sameReconciliationManifest(request, record.Manifest, manifest) {
 			return nil, errStaleStateResult
 		}
 		attemptGeneration = identity.AttemptGeneration
@@ -408,7 +408,7 @@ func reconciliationEffectCurrent(stateRoot string, state runtimeOwnerState, effe
 // a marker from completing invalidated work.
 func reconciliationEffectFinishCurrent(stateRoot string, state runtimeOwnerState, effect runtimeEffectIntent) error {
 	request := effect.Reconciliation
-	if request == nil || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !reconciliationObservationMatches(state, *request) || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
+	if request == nil || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !reconciliationFinishObservationMatches(state, *request) || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
 		return errStaleStateResult
 	}
 	if request.Attempt == 0 {
@@ -422,6 +422,26 @@ func reconciliationEffectFinishCurrent(stateRoot string, state runtimeOwnerState
 		return errAttemptTombstoned
 	}
 	return nil
+}
+
+// A retry command changes its own issue observation. Once its exact GitHub
+// postcondition is proven, only compatible owner state is needed to record
+// completion; the original observation generation is still required before
+// issuing the command.
+func reconciliationFinishObservationMatches(state runtimeOwnerState, request reconciliationEffectRequest) bool {
+	if reconciliationObservationMatches(state, request) {
+		return true
+	}
+	if request.GitHubIssueUpdate == nil || request.GitHubIssueUpdate.Kind != githubIssueRetry {
+		return false
+	}
+	observation, ok := state.Observations[ownerIssueKey(request.Repository, request.Issue)]
+	if !ok || !observation.Present || observation.OwnerGeneration != state.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)] || observation.Fact.BodyDigest != request.BodyDigest {
+		return false
+	}
+	fact := observation.Fact
+	return fact.CurrentAttempt == request.Attempt && !fact.Closed && !fact.Cancelled && !fact.Active &&
+		(fact.RecoveryAuthorized || slices.Equal(fact.Blockers, []string{"control snapshot update is pending"}))
 }
 
 func reconciliationObservationCurrent(state runtimeOwnerState, request reconciliationEffectRequest) bool {
@@ -529,6 +549,17 @@ func validReconciliationEffectBindings(request reconciliationEffectRequest) bool
 	}
 }
 
+// Monitor advances UpdatedAt without changing the plan-review target or
+// implementation state. All other manifest fields must still match exactly.
+func sameManifestExceptUpdatedAt(current, planned agentruntime.Manifest) bool {
+	planned.UpdatedAt = current.UpdatedAt
+	return reflect.DeepEqual(current, planned)
+}
+
+func sameReconciliationManifest(request reconciliationEffectRequest, current, planned agentruntime.Manifest) bool {
+	return reflect.DeepEqual(current, planned) || request.Action == reconciliationReviewer && request.Reviewer != nil && request.Reviewer.Mode == agentruntime.ReviewModePlan && sameManifestExceptUpdatedAt(current, planned)
+}
+
 func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwnerState, request reconciliationEffectRequest) bool {
 	if !validReconciliationEffectBindings(request) {
 		return false
@@ -543,7 +574,7 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 	}
 	attemptKey := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
 	record, ok := state.Attempts[attemptKey]
-	if !ok || request.Manifest == nil || !reflect.DeepEqual(record.Manifest, *request.Manifest) {
+	if !ok || request.Manifest == nil || !sameReconciliationManifest(request, record.Manifest, *request.Manifest) {
 		return false
 	}
 	manifest := record.Manifest

@@ -294,8 +294,25 @@ func TestV2DashboardCancelRespondsWhileReconciliationCollectsAndRejectsStaleResu
 	}
 	state := mustOwnerSnapshot(t, owner).State
 	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
-	if state.AttemptGenerations[key] != 2 || state.Attempts[key].Generation != 2 || len(state.Effects) != 1 || state.ControlReceipts[0].Phase != operatorPhaseStopPending {
+	if state.AttemptGenerations[key] != 2 || state.Attempts[key].Generation != 2 || len(state.Effects) != 1 || len(state.ControlReceipts) != 1 {
 		t.Fatalf("cancel was overwritten: %#v", state)
+	}
+	receipt := state.ControlReceipts[0]
+	effect, exists := state.Effects[receipt.EffectID]
+	if !exists || effect.Action != string(agentruntime.EffectStop) || receipt.Request.Action != "cancel" {
+		t.Fatalf("Cancel receipt lost its exact stop effect: receipt=%#v effect=%#v", receipt, effect)
+	}
+	switch {
+	case receipt.State == "pending" && receipt.Phase == operatorPhaseStopPending:
+		if effect.State != "pending" || receipt.Result != nil {
+			t.Fatalf("pending Cancel was not durable: receipt=%#v effect=%#v", receipt, effect)
+		}
+	case receipt.State == "completed" && receipt.Phase == operatorPhaseCompleted:
+		if effect.State != "completed" || state.Attempts[key].Manifest.State != "cancelled" || receipt.Result == nil || !receipt.Result.OK {
+			t.Fatalf("completed Cancel lost its terminal outcome: receipt=%#v effect=%#v manifest=%#v", receipt, effect, state.Attempts[key].Manifest)
+		}
+	default:
+		t.Fatalf("Cancel reached an invalid phase: receipt=%#v effect=%#v", receipt, effect)
 	}
 }
 
@@ -991,6 +1008,7 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 		checkpoint string
 		marked     bool
 		attached   bool
+		posted     bool
 	}{
 		{name: "terminal-awaiting-single", checkpoint: operatorPhaseTerminalAwait},
 		{name: "terminal-awaiting-attached", checkpoint: operatorPhaseTerminalAwait, attached: true},
@@ -1002,6 +1020,7 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 		{name: "terminal-marker-attached", checkpoint: operatorPhaseTerminal, marked: true, attached: true},
 		{name: "retry-marker-single", checkpoint: operatorPhaseRetryPending, marked: true},
 		{name: "retry-marker-attached", checkpoint: operatorPhaseRetryPending, marked: true, attached: true},
+		{name: "retry-posted-unmarked", checkpoint: operatorPhaseRetryPending, posted: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			owner, manifest := operatorTestOwner(t, 348, "active", false)
@@ -1052,6 +1071,15 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 			if test.checkpoint == operatorPhaseRetryPending {
 				retry := applyAndPlanRecover(t, owner, failedInput, failedInput.Attempts, githubIssueRetry)
 				retryEffect = advanceOperatorRecoverPlan(t, owner, request.RequestID, retry)
+				newAttempt := ownerTestManifest(t, owner.stateRoot, 348, 2, "running")
+				beforeBinding := mustOwnerSnapshot(t, owner)
+				if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: newAttempt, ExpectedIssueGeneration: beforeBinding.State.IssueGenerations[ownerIssueKey("o/r", 348)]}); err == nil {
+					t.Fatal("new attempt bound before pending retry receipt completed")
+				}
+				afterBinding := mustOwnerSnapshot(t, owner)
+				if afterBinding.State.IssueGenerations[ownerIssueKey("o/r", 348)] != beforeBinding.State.IssueGenerations[ownerIssueKey("o/r", 348)] || afterBinding.State.Attempts[ownerAttemptKey("o/r", 348, 2)].Generation != 0 {
+					t.Fatal("rejected new attempt binding changed owner state")
+				}
 			}
 			attachedRequest := operatorRequest("recover-checkpoint-attached", "recover", manifest, false)
 			if test.attached {
@@ -1081,6 +1109,37 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 					}
 				}
 			}
+			var postedComments []map[string]any
+			var priorPosts atomic.Int32
+			if test.posted {
+				failedAt := cancelled.UpdatedAt
+				terminalMarker, err := internalgithub.TerminalFailureMarker(348, 1, failedAt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				postedComments = []map[string]any{{"id": 1, "body": terminalMarker, "created_at": failedAt, "updated_at": failedAt, "user": map[string]any{"id": 42}}}
+				client := &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+					if request.Method != http.MethodPost || !strings.HasSuffix(request.URL.Path, "/issues/348/comments") {
+						return nil, fmt.Errorf("unexpected pre-crash request %s %s", request.Method, request.URL)
+					}
+					var input struct{ Body string }
+					if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+						return nil, err
+					}
+					priorPosts.Add(1)
+					postedComments = append(postedComments, map[string]any{"id": 2, "body": input.Body, "created_at": failedAt.Add(time.Second), "updated_at": failedAt.Add(time.Second), "user": map[string]any{"id": 42}})
+					return &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: request}, nil
+				})}
+				post, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://example.test/repos/o/r/issues/348/comments", strings.NewReader(`{"body":"/agent-symphony retry"}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				response, err := client.Do(post)
+				if err != nil {
+					t.Fatal(err)
+				}
+				response.Body.Close()
+			}
 			before := mustOwnerSnapshot(t, owner)
 			if err := owner.close(t.Context()); err != nil {
 				t.Fatal(err)
@@ -1099,6 +1158,13 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 				inputs = []reconciliationInput{activeInput, failedInput}
 			case operatorPhaseRetryAwait, operatorPhaseTerminal:
 				inputs = []reconciliationInput{failedInput}
+			case operatorPhaseRetryPending:
+				if test.posted {
+					posted := failedInput
+					posted.Issues = slices.Clone(failedInput.Issues)
+					posted.Issues[0].Retry = true
+					inputs = []reconciliationInput{posted}
+				}
 			}
 			var markerFailureAt time.Time
 			stopCollections := 0
@@ -1128,9 +1194,18 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 				inputs = inputs[1:]
 				return reconciliationV2Batch{Input: input}, nil
 			}
+			var githubWrites atomic.Int32
 			service.collector.API = internalgithub.API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.Method != http.MethodGet {
+					githubWrites.Add(1)
+					return nil, fmt.Errorf("unexpected GitHub mutation while replaying receipt: %s", request.URL.String())
+				}
 				if !strings.Contains(request.URL.Path, "/comments") {
 					return nil, fmt.Errorf("unexpected GitHub request %s", request.URL.String())
+				}
+				if test.posted {
+					encoded, _ := json.Marshal(postedComments)
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(encoded)), Request: request}, nil
 				}
 				failedAt := cancelled.UpdatedAt
 				if !markerFailureAt.IsZero() {
@@ -1159,6 +1234,9 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 			}
 			if original.State != "completed" || attachedFound != test.attached || test.attached && (attached.State != "completed" || original.EffectID != attached.EffectID) || len(final.Effects) != wantEffects || remainingInputs != 0 {
 				t.Fatalf("original=%#v attached=%#v effects=%#v remaining_inputs=%d", original, attached, final.Effects, remainingInputs)
+			}
+			if test.posted && (priorPosts.Load() != 1 || githubWrites.Load() != 0) {
+				t.Fatalf("retry posts before crash=%d after restart=%d", priorPosts.Load(), githubWrites.Load())
 			}
 		})
 	}
@@ -1630,7 +1708,20 @@ func TestOperatorStartupSweepDispatchesPendingCleanupAndShutdownLeavesItResumabl
 
 func TestV2PlanReviewHandlerCommitsExactOwnerEffectWithoutCompatibilityWrite(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 333, "active", false)
-	refreshOwnerObservation(t, owner, manifest.Issue)
+	before := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(before.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "body"
+	attempt := expandAttemptFact(before.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, owner, input)
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r/issues/333" {
+			t.Errorf("unexpected GitHub read: %s", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"number":333,"state":"open","body":"body"}`)
+	}))
+	defer github.Close()
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1640,7 +1731,11 @@ func TestV2PlanReviewHandlerCommitsExactOwnerEffectWithoutCompatibilityWrite(t *
 	}
 	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
 	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, executor: agentruntime.EffectExecutor{Runtime: runtimeState}, active: map[string]*activeRuntimeEffect{}, stopped: true}
-	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
+	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{API: internalgithub.API{BaseURL: github.URL, HTTP: github.Client()}, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
+	plan, material, err := service.preparePlanReview(t.Context(), mustOwnerSnapshot(t, owner), manifest)
+	if err != nil || material.Issue.Body != "body" || digestText(material.Issue.Body) != plan.Request.BodyDigest {
+		t.Fatalf("plan=%#v material=%#v err=%v", plan, material, err)
+	}
 	server := &dashboardServer{ctx: t.Context(), stateRoot: owner.stateRoot, repository: "o/r", operator: service}
 	request := httptest.NewRequest(http.MethodPost, "http://localhost/actions/review-plan?repository=o%2Fr&issue=333&attempt=1", nil)
 	request.Host = "localhost"
@@ -1661,6 +1756,180 @@ func TestV2PlanReviewHandlerCommitsExactOwnerEffectWithoutCompatibilityWrite(t *
 	afterManifest, err := os.ReadFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"))
 	if err != nil || !bytes.Equal(afterManifest, beforeManifest) {
 		t.Fatalf("compatibility manifest changed err=%v", err)
+	}
+}
+
+func TestV2PlanReviewAdmitsAndResumesAfterMonitorOnlyTimestampChange(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 335, "active", false)
+	initial := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "body"
+	attempt := expandAttemptFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, owner, input)
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	var enteredOnce sync.Once
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r/issues/335" {
+			t.Errorf("unexpected GitHub read: %s", r.URL.Path)
+		}
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		_, _ = io.WriteString(w, `{"number":335,"state":"open","body":"body"}`)
+	}))
+	defer github.Close()
+	defer once.Do(func() { close(release) })
+	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
+	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, executor: agentruntime.EffectExecutor{Runtime: runtimeState}, active: map[string]*activeRuntimeEffect{}, stopped: true}
+	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{API: internalgithub.API{BaseURL: github.URL, HTTP: github.Client()}, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
+	result := make(chan controlResult, 1)
+	go func() {
+		result <- service.perform(t.Context(), operatorRequest("plan-review-monitor-timestamp", "review-plan", manifest, false))
+	}()
+	<-entered // The action has captured its owner snapshot and is waiting on GitHub.
+	before := mustOwnerSnapshot(t, owner).State
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	current := before.Attempts[key].Manifest
+	identity := stateResultIdentity{Epoch: before.Epoch, SourceRevision: before.Revision, IssueGeneration: before.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: before.AttemptGenerations[key]}
+	_, monitor, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectMonitor, Manifest: current, RequestDigest: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := cloneManifest(current)
+	updated.UpdatedAt = updated.UpdatedAt.Add(time.Second)
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*monitor)), Action: agentruntime.EffectMonitor, Manifest: updated}); err != nil {
+		t.Fatal(err)
+	}
+	after := mustOwnerSnapshot(t, owner).State
+	if !reflect.DeepEqual(after.Attempts[key].Manifest, updated) {
+		t.Fatalf("monitor changed more than UpdatedAt: before=%#v after=%#v", current, after.Attempts[key].Manifest)
+	}
+	once.Do(func() { close(release) })
+	if got := <-result; got.Status != http.StatusAccepted || !got.OK {
+		t.Fatalf("monitor-only timestamp change rejected review: %#v", got)
+	}
+	committed := mustOwnerSnapshot(t, owner).State
+	if len(committed.ControlReceipts) != 1 || committed.ControlReceipts[0].Phase != operatorPhaseReviewPending || committed.Effects[committed.ControlReceipts[0].EffectID].Reconciliation == nil {
+		t.Fatalf("review intent not durably admitted after monitor: %#v", committed)
+	}
+	effect := committed.Effects[committed.ControlReceipts[0].EffectID]
+	if err := owner.authorizeReconciliationEffect(t.Context(), authorizeReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: reconciliationReviewer}); err != nil {
+		t.Fatalf("monitor timestamp invalidated the admitted review effect: %v", err)
+	}
+	// Crash before the reviewer completion marker, then resume the immutable
+	// admitted effect against the newer monitor timestamp.
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, committed); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, persisted, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: restarted.stateRoot, Runner: operatorOwnedRunner{manifest: updated}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
+	restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
+	boundary := &completedPlanReviewBoundary{}
+	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: service.collector, reviewer: boundary, reviewSource: "source", reviewCommand: []string{"review"}}
+	restartService.collect = func(_ context.Context, _ stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
+		if issue != manifest.Issue {
+			return reconciliationV2Batch{}, fmt.Errorf("unexpected issue %d", issue)
+		}
+		return reconciliationV2Batch{Input: input}, nil
+	}
+	if err := restartService.resumeReceipt(t.Context(), committed.ControlReceipts[0].Request.RequestID); err != nil {
+		t.Fatalf("restart did not resume admitted review: %v", err)
+	}
+	final := mustOwnerSnapshot(t, restarted).State
+	if final.ControlReceipts[0].State != "completed" || final.Effects[effect.ID].State != "completed" || final.Attempts[key].Manifest.ReviewState != "clean" {
+		t.Fatalf("restart lost completed review: receipt=%#v effect=%#v manifest=%#v", final.ControlReceipts[0], final.Effects[effect.ID], final.Attempts[key].Manifest)
+	}
+	if boundary.panes.Load() != 1 || boundary.results.Load() != 1 {
+		t.Fatalf("restart launched or reread reviewer: panes=%d results=%d", boundary.panes.Load(), boundary.results.Load())
+	}
+	marker := filepath.Join(owner.stateRoot, "reconciliation-effects", effect.ID+".done")
+	if _, err := os.Lstat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("review marker %s was not reclaimed", marker)
+	}
+	durable, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil || durable.Effects[effect.ID].State != "completed" || durable.ControlReceipts[0].State != "completed" {
+		t.Fatalf("restart completion was not persisted: receipt=%#v effect=%#v err=%v", durable.ControlReceipts, durable.Effects[effect.ID], err)
+	}
+}
+
+type completedPlanReviewBoundary struct {
+	panes   atomic.Int32
+	results atomic.Int32
+}
+
+func (b *completedPlanReviewBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if operation == "run" && command.Name == "tmux" && slices.Contains(command.Args, "display-message") {
+		b.panes.Add(1)
+		return agentruntime.Result{Output: "1|0|||"}, nil
+	}
+	if operation == "review-result" {
+		b.results.Add(1)
+		return agentruntime.Result{Output: `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`}, nil
+	}
+	return agentruntime.Result{}, fmt.Errorf("unexpected review boundary %s %s %v", operation, command.Name, command.Args)
+}
+
+func TestV2PlanReviewRejectsBodyChangedDuringPreparationBeforeAdmission(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 334, "active", false)
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	body := ""
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r/issues/334" {
+			t.Errorf("unexpected GitHub read: %s", r.URL.Path)
+		}
+		close(entered)
+		<-release
+		_, _ = fmt.Fprintf(w, `{"number":334,"state":"open","body":%q}`, body)
+	}))
+	defer github.Close()
+	defer once.Do(func() { close(release) })
+	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
+	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, executor: agentruntime.EffectExecutor{Runtime: runtimeState}, active: map[string]*activeRuntimeEffect{}, stopped: true}
+	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{API: internalgithub.API{BaseURL: github.URL, HTTP: github.Client()}, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
+	result := make(chan controlResult, 1)
+	go func() {
+		result <- service.perform(t.Context(), operatorRequest("plan-review-edited", "review-plan", manifest, false))
+	}()
+	<-entered
+	// The owner remains available while the GitHub read is blocked. Its newer
+	// observation must invalidate both the old snapshot and the in-flight body.
+	current := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(current.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "edited"
+	attempt := expandAttemptFact(current.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, owner, input)
+	body = "edited"
+	once.Do(func() { close(release) })
+	if got := <-result; got.Status != http.StatusConflict || got.OK {
+		t.Fatalf("edited issue was admitted: %#v", got)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	if len(state.ControlReceipts) != 0 || len(state.Effects) != 0 {
+		t.Fatalf("stale body committed a pending effect: %#v", state)
 	}
 }
 

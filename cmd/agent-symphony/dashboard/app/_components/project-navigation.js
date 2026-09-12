@@ -16,8 +16,9 @@ export function projectView(projects, selectedRepository, localSnapshot, localSt
 
 export function projectBoard(view, now) {
   const projected = view.snapshot?.statuses ?? [];
-  const hidden = new Set((view.state.hidden ?? []).map(attemptKey));
-  const partitioned = partitionAttemptHistory(projected);
+  const hiddenAttempts = view.state.hidden ?? [];
+  const hidden = new Set(hiddenAttempts.map(attemptKey));
+  const partitioned = partitionAttemptHistory(projected, hiddenAttempts);
   const statuses = partitioned.current.filter((status) => !hidden.has(attemptKey(status)));
   const historical = partitioned.historical.filter((status) => !hidden.has(attemptKey(status)));
   const counts = Object.entries(statuses.reduce((result, status) => {
