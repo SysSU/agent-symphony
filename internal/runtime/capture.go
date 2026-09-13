@@ -24,7 +24,8 @@ var (
 	// ErrWorkerResultOverflow means the configured command exceeded the capture ceiling.
 	ErrWorkerResultOverflow = errors.New("worker stdout exceeds 64 KiB")
 	// ErrWorkerOutputOpen means an out-of-group process retained the worker output descriptor.
-	ErrWorkerOutputOpen = errors.New("worker stdout remained open after process-group termination")
+	ErrWorkerOutputOpen             = errors.New("worker stdout remained open after process-group termination")
+	errReviewerGroupAbsenceUnproved = errors.New("reviewer process group absence is unproved")
 )
 
 const (
@@ -131,8 +132,8 @@ func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, 
 		if killErr != nil {
 			return killErr
 		}
-		if err := syscall.Kill(-child.Process.Pid, 0); err != nil && !errors.Is(err, syscall.ESRCH) {
-			return fmt.Errorf("reviewer process group did not terminate: %w", err)
+		if err := reviewerGroupAbsenceError(syscall.Kill(-child.Process.Pid, 0)); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -162,6 +163,13 @@ func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, 
 		return 125, 0, finished.err
 	}
 	return finished.code, 0, RecordPaneExitStatus(ctx, tmux, finished.code)
+}
+
+func reviewerGroupAbsenceError(probeErr error) error {
+	if errors.Is(probeErr, syscall.ESRCH) {
+		return nil
+	}
+	return fmt.Errorf("%w: group probe returned %v", errReviewerGroupAbsenceUnproved, probeErr)
 }
 
 func runPaneCommandAfterStart(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, reviewerGroup bool, extraFiles ...*os.File) (int, syscall.Signal, error) {
