@@ -729,38 +729,23 @@ esac`}}
 	})
 
 	t.Run("reviewer-cleanup", func(t *testing.T) {
-		base, head, checkout, exportBoundary := testWorkerExportBoundary(t)
+		base, head := strings.Repeat("a", 40), strings.Repeat("b", 40)
 		owner, _, issue, snapshot := completedWorkerOwner(t, 45, base, head, true)
 		manifest := snapshot.State.Attempts[ownerAttemptKey("o/r", 45, 1)].Manifest
-		implementation := exportBoundary(manifest.Branch)
-		candidate := reviewerExecutionMaterial{Issue: issue, Source: checkout, HeadSHA: head, Env: []string{"REVIEW=1"}, Command: []string{"reviewer"}}
+		candidate := reviewerExecutionMaterial{Issue: issue, HeadSHA: head}
 		plans, _, err := planReconciliationReviewers(snapshot, owner.stateRoot, []reviewerExecutionMaterial{candidate})
-		if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "cleanup" {
-			t.Fatalf("plans=%#v err=%v", plans, err)
-		}
-		coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
-		plan, err := coordinator.beginReconciliation(t.Context(), plans[0])
-		if err != nil {
-			t.Fatal(err)
+		if err != nil || len(plans) != 0 {
+			t.Fatalf("proofless legacy cleanup was planned: plans=%#v err=%v", plans, err)
 		}
 		input := repositoryInput(true, issue)
 		owner = restartOwnerWithInput(t, owner, input)
-		coordinator.owner = owner
-		cfg := config.Default("o/r")
-		cfg.Commands.Reviewer = []string{"reviewer"}
-		reviewer := workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `payload=$(cat)
-case "$payload" in
-  *'has-session'*) printf %s '{"Exited":true,"Code":1}' ;;
-  *'display-message'*) printf %s '{"Output":"||||"}' ;;
-  *) exit 1 ;;
-esac`}}
-		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}}
-		batch := reconciliationV2Batch{Input: input}
-		if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, batch); err != nil || resumed {
-			t.Fatalf("legacy unbound cleanup unexpectedly resumed=%v err=%v", resumed, err)
+		restarted := mustOwnerSnapshot(t, owner)
+		plans, _, err = planReconciliationReviewers(restarted, owner.stateRoot, []reviewerExecutionMaterial{candidate})
+		if err != nil || len(plans) != 0 {
+			t.Fatalf("proofless legacy cleanup was planned after restart: plans=%#v err=%v", plans, err)
 		}
-		if effect := mustOwnerSnapshot(t, owner).State.Effects[plan.Identity.EffectID]; effect.State != "pending" || !strings.Contains(effect.Diagnostic, "certificate") {
-			t.Fatalf("legacy unbound cleanup was not fail-closed: %#v", effect)
+		if current := restarted.State.Attempts[ownerAttemptKey("o/r", 45, 1)].Manifest; current.ReviewSnapshot != manifest.ReviewSnapshot || current.ReviewSession != manifest.ReviewSession || current.ReviewState != "clean" {
+			t.Fatalf("legacy review changed without exact death proof: %#v", current)
 		}
 	})
 }
