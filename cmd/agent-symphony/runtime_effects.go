@@ -348,6 +348,10 @@ func (c *runtimeEffectCoordinator) cancelInvalidated(snapshot stateOwnerSnapshot
 				run.cancel()
 				continue
 			}
+			if effect.ReviewerRevoked {
+				run.cancel()
+				continue
+			}
 			if effect.Reconciliation != nil && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.DigestVersion == 1 && reconciliationEffectFinishCurrent(c.owner.stateRoot, snapshot.State, effect) != nil {
 				run.cancel()
 				continue

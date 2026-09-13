@@ -956,6 +956,56 @@ func TestProductionCycleStopsReceiptBoundPlanReviewerAfterFreshExternalAbsence(t
 	}
 }
 
+func TestUnprovableReviewerDoesNotBlockUnrelatedReconciliation(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 475, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: ownerReconciliationEffectIdentity(*reviewer)}); err != nil {
+		t.Fatal(err)
+	}
+	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||"}}
+	applyReconciliationInput(t, owner, repositoryInput(false, issueFact(476, "unrelated")))
+	checkout := gitRepository(t)
+	runGit(t, checkout, "config", "user.email", "test@example.invalid")
+	runGit(t, checkout, "config", "user.name", "test")
+	runGit(t, checkout, "commit", "--allow-empty", "-m", "base")
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var value any
+		switch request.URL.RequestURI() {
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1", "/repos/o/r/issues?state=open&per_page=100&page=1":
+			value = []any{}
+		case "/repos/o/r":
+			value = map[string]any{"default_branch": "main"}
+		case "/repos/o/r/branches/main":
+			value = map[string]any{"commit": map[string]any{"sha": strings.Repeat("a", 40)}}
+		default:
+			return nil, fmt.Errorf("unexpected read %s", request.URL.String())
+		}
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
+	})}}
+	production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, api: api, config: config.Default("o/r"), stateRoot: owner.stateRoot, attemptRoot: owner.attemptRoot, checkout: checkout, collector: reconciliationV2Collector{API: api, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}, Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: "o/r"}}}
+	cycle, err := owner.reconciliationSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := production.cycleFromSnapshot(t.Context(), cycle); err != nil && !errors.Is(err, errReconciliationRecollect) {
+		t.Fatalf("one ambiguous reviewer blocked the global cycle: %v", err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	other := state.Observations[ownerIssueKey("o/r", 476)]
+	blocked := state.Effects[reviewer.ID]
+	if other.Present || other.Generation < 2 || blocked.State != "pending" || !blocked.ReviewerRevoked || !strings.Contains(blocked.Diagnostic, "stop remains pending") {
+		t.Fatalf("unrelated issue did not advance or ambiguous review falsely completed: other=%#v reviewer=%#v", other, blocked)
+	}
+	if superseded, err := production.supersedeInvalidPendingPlanReviewers(t.Context(), mustOwnerSnapshot(t, owner)); err != nil || superseded {
+		t.Fatalf("repeated ambiguous stop changed outcome: superseded=%v err=%v", superseded, err)
+	}
+	if next := mustOwnerSnapshot(t, owner).State.Revision; next != state.Revision {
+		t.Fatalf("unchanged diagnostic churned owner revision: before=%d after=%d", state.Revision, next)
+	}
+}
+
 func TestStartupMarkerSweepLeavesOperatorEffectsToReceiptRecovery(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 42, "completed", false)
 	snapshot := mustOwnerSnapshot(t, owner)

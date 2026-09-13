@@ -451,7 +451,7 @@ func applySupersedePlanReview(state *runtimeOwnerState, command supersedePlanRev
 	request := *effect.Reconciliation
 	issueKey := ownerIssueKey(effect.Repository, effect.Issue)
 	attemptKey := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
-	invalid := state.IssueGenerations[issueKey] != effect.IssueGeneration || state.AttemptGenerations[attemptKey] != effect.AttemptGeneration
+	invalid := effect.ReviewerRevoked || state.IssueGenerations[issueKey] != effect.IssueGeneration || state.AttemptGenerations[attemptKey] != effect.AttemptGeneration
 	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned {
 		invalid = true
 	}
@@ -517,6 +517,9 @@ func applySupersedePlanReview(state *runtimeOwnerState, command supersedePlanRev
 // Only a fresh owner observation (or an exact generation/tombstone change)
 // may revoke a receipt-bound Plan review that is still running.
 func planReviewInvalidated(state runtimeOwnerState, effect runtimeEffectIntent) bool {
+	if effect.ReviewerRevoked {
+		return true
+	}
 	request := *effect.Reconciliation
 	issueKey := ownerIssueKey(effect.Repository, effect.Issue)
 	attemptKey := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
@@ -610,7 +613,7 @@ func applyDiagnoseReconciliationEffect(state *runtimeOwnerState, command diagnos
 
 func reconciliationEffectCurrent(stateRoot string, state runtimeOwnerState, effect runtimeEffectIntent) error {
 	request := effect.Reconciliation
-	if request == nil || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
+	if request == nil || effect.ReviewerRevoked || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
 		return errStaleStateResult
 	}
 	compatibleV1 := request.Action == reconciliationReviewer && request.Reviewer != nil && request.Reviewer.DigestVersion == 1 && reconciliationFinishObservationMatches(state, *request)
@@ -636,7 +639,7 @@ func reconciliationEffectCurrent(stateRoot string, state runtimeOwnerState, effe
 // a marker from completing invalidated work.
 func reconciliationEffectFinishCurrent(stateRoot string, state runtimeOwnerState, effect runtimeEffectIntent) error {
 	request := effect.Reconciliation
-	if request == nil || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !reconciliationFinishObservationMatches(state, *request) || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
+	if request == nil || effect.ReviewerRevoked || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !reconciliationFinishObservationMatches(state, *request) || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
 		return errStaleStateResult
 	}
 	if request.Attempt == 0 {
@@ -701,7 +704,7 @@ func reconciliationEffectIdentityMatches(effect runtimeEffectIntent, identity st
 
 func validPersistedReconciliationEffect(state runtimeOwnerState, effect runtimeEffectIntent) bool {
 	request := effect.Reconciliation
-	if request == nil || effect.Review != nil || effect.Reason != "" || effect.SupersededReviewerID != "" || !boundedText(effect.Diagnostic, maxReconciliationStringBytes, false) || effect.Action != string(request.Action) || effect.Repository != request.Repository || effect.Issue != request.Issue || effect.Attempt != request.Attempt || effect.RequestDigest != reconciliationEffectDigest(*request) || !validReconciliationEffectRequest(state.Repository, *request) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || effect.ReviewerLaunched != (effect.ReviewerGroupPID > 1) || effect.ReviewerSessionRequested && !effect.ReviewerGateProtocol || (effect.ReviewerLaunched || effect.ReviewerGateProtocol) && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe") {
+	if request == nil || effect.Review != nil || effect.Reason != "" || effect.SupersededReviewerID != "" || !boundedText(effect.Diagnostic, maxReconciliationStringBytes, false) || effect.Action != string(request.Action) || effect.Repository != request.Repository || effect.Issue != request.Issue || effect.Attempt != request.Attempt || effect.RequestDigest != reconciliationEffectDigest(*request) || !validReconciliationEffectRequest(state.Repository, *request) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || effect.ReviewerLaunched != (effect.ReviewerGroupPID > 1) || effect.ReviewerSessionRequested && !effect.ReviewerGateProtocol || (effect.ReviewerLaunched || effect.ReviewerGateProtocol) && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe") || effect.ReviewerRevoked && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Mode != agentruntime.ReviewModePlan || request.Reviewer.Phase != "run-observe") {
 		return false
 	}
 	if effect.State == "pending" {

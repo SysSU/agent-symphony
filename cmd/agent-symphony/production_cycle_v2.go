@@ -295,7 +295,23 @@ func (p *productionReconciliation) supersedeInvalidPendingPlanReviewers(ctx cont
 			continue
 		}
 		p.effects.cancelEffect(effect.ID)
-		return p.operator.supersedeInvalidPlanReview(ctx, effect)
+		superseded, err := p.operator.supersedeInvalidPlanReview(ctx, effect)
+		if err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			diagnostic := "revoked Plan reviewer stop remains pending: " + internalgithub.Redact(err.Error())
+			if len(diagnostic) > maxReconciliationStringBytes {
+				diagnostic = diagnostic[:maxReconciliationStringBytes]
+			}
+			if _, diagnoseErr := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: reconciliationReviewer, Diagnostic: diagnostic}); diagnoseErr != nil && !errors.Is(diagnoseErr, errStaleStateResult) {
+				return false, diagnoseErr
+			}
+			continue
+		}
+		if superseded {
+			return true, nil
+		}
 	}
 	return false, nil
 }

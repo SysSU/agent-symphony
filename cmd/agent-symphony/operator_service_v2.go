@@ -762,7 +762,7 @@ func (s *operatorMutationService) scanPendingPlanReviewers(ctx context.Context, 
 			continue
 		}
 		effect, ok := snapshot.State.Effects[receipt.EffectID]
-		if !ok || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan {
+		if !ok || effect.State != "pending" || effect.ReviewerRevoked || effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan {
 			continue
 		}
 		s.mu.Lock()
@@ -1133,7 +1133,7 @@ func (s *operatorMutationService) validatePendingPlanReviewMarker(ctx context.Co
 	}
 	issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 	observation := fresh.State.Observations[issueKey]
-	current := bodyErr == nil && digestText(body) == request.BodyDigest && observation.ObservationEpoch == fresh.State.Epoch && fresh.State.IssueGenerations[issueKey] == effect.IssueGeneration && fresh.State.AttemptGenerations[attemptKey] == effect.AttemptGeneration && reconciliationFinishObservationMatches(fresh.State, request) && validReconciliationEffectStateBindings(s.owner.stateRoot, fresh.State, request)
+	current := !fresh.State.Effects[effect.ID].ReviewerRevoked && bodyErr == nil && digestText(body) == request.BodyDigest && observation.ObservationEpoch == fresh.State.Epoch && fresh.State.IssueGenerations[issueKey] == effect.IssueGeneration && fresh.State.AttemptGenerations[attemptKey] == effect.AttemptGeneration && reconciliationFinishObservationMatches(fresh.State, request) && validReconciliationEffectStateBindings(s.owner.stateRoot, fresh.State, request)
 	if current {
 		return true, nil
 	}
@@ -1254,9 +1254,14 @@ func (s *operatorMutationService) supersedeInvalidPlanReview(ctx context.Context
 	if err != nil {
 		return false, err
 	}
-	if latest, exists := current.State.Effects[effect.ID]; !exists || latest.State != "pending" {
+	latest, exists := current.State.Effects[effect.ID]
+	if !exists || latest.State != "pending" {
 		return true, nil
 	}
+	if latest.Reconciliation.Reviewer.Mode == agentruntime.ReviewModePlan && !latest.ReviewerRevoked {
+		return false, nil
+	}
+	effect = latest
 	reviewer := effect.Reconciliation.Reviewer
 	launchPath, terminalPath := reviewerLifecyclePaths(reviewer.Snapshot, reviewer.Target)
 	bind := func(pid int) error {

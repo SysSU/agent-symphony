@@ -704,7 +704,7 @@ func startUnboundReviewerForService(t *testing.T, owner *stateOwner, reviewer *r
 }
 
 func TestFreshReconciliationStopsInvalidLivePlanReviewer(t *testing.T) {
-	for _, change := range []string{"body", "closed"} {
+	for _, change := range []string{"body", "closed", "body restored", "partial body"} {
 		t.Run(change, func(t *testing.T) {
 			owner, manifest := operatorTestOwner(t, 366, "active", false)
 			service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
@@ -730,15 +730,51 @@ func TestFreshReconciliationStopsInvalidLivePlanReviewer(t *testing.T) {
 			observation := state.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
 			issue := expandIssueFact(observation.Fact)
 			issue.Body = "body"
-			if change == "body" {
+			if change == "body" || change == "body restored" || change == "partial body" {
 				issue.Body = "changed body"
 			} else {
 				issue.Closed = true
 			}
 			attempt := expandAttemptFact(observation.Attempts[key].Fact)
-			input := repositoryInput(true, issue)
+			input := repositoryInput(change != "partial body", issue)
 			input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
 			applied := applyReconciliationInput(t, owner, input)
+			if change == "body restored" {
+				issue.Body = "body"
+				input = repositoryInput(true, issue)
+				input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+				applied = applyReconciliationInput(t, owner, input)
+				if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, applied.State); err != nil {
+					t.Fatal(err)
+				}
+				loaded, err := readRuntimeOwnerState(owner.stateRoot, applied.State.Repository)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := owner.close(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				restarted, err := startTestStateOwner(t, owner.stateRoot, loaded, func(state runtimeOwnerState) error {
+					return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = restarted.close(context.Background()) })
+				owner, service.owner, service.effects.owner = restarted, restarted, restarted
+				applied = mustOwnerSnapshot(t, owner)
+				stale := applied.State.Effects[reviewer.ID]
+				result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(*stale.Reconciliation)
+				if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(stale), *stale.Reconciliation, result); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := service.effects.verifyPendingOperatorReconciliation(t.Context(), stale); !errors.Is(err, errStaleStateResult) {
+					t.Fatalf("restored body accepted revoked reviewer marker: %v", err)
+				}
+				if current := mustOwnerSnapshot(t, owner).State; current.Effects[reviewer.ID].State != "pending" || current.Attempts[key].Manifest.ReviewState == "clean" {
+					t.Fatalf("stale marker resurrected Plan review: effect=%#v manifest=%#v", current.Effects[reviewer.ID], current.Attempts[key].Manifest)
+				}
+			}
 			superseded, err := pipeline.supersedeInvalidPendingPlanReviewers(t.Context(), applied)
 			if err != nil || !superseded {
 				t.Fatalf("fresh %s observation did not stop review: superseded=%v err=%v", change, superseded, err)
@@ -758,7 +794,71 @@ func TestFreshReconciliationStopsInvalidLivePlanReviewer(t *testing.T) {
 			if err != nil || reloaded.Effects[reviewer.ID].State != "completed" || !reloaded.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, agentruntime.ReviewModePlan, reviewer.Reconciliation.Reviewer.Target)].DeadProved {
 				t.Fatalf("restart lost terminal reviewer proof: err=%v effect=%#v", err, reloaded.Effects[reviewer.ID])
 			}
+			if change == "body restored" {
+				if _, err := service.effects.verifyPendingOperatorReconciliation(t.Context(), reloaded.Effects[reviewer.ID]); err == nil {
+					t.Fatal("stale marker revived a terminal invalidated review")
+				}
+			}
 		})
+	}
+}
+
+func TestPreupgradeInvalidPlanObservationRevokesBeforeRestartEpoch(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 477, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	identity := ownerReconciliationEffectIdentity(*reviewer)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(state.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "changed body"
+	attempt := expandAttemptFact(state.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	invalid := applyReconciliationInput(t, owner, input).State
+	effect := invalid.Effects[reviewer.ID]
+	effect.ReviewerRevoked = false // Simulate a ledger written before this optional field existed.
+	invalid.Effects[reviewer.ID] = effect
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, invalid); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(owner.stateRoot, invalid.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, loaded, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	if started := mustOwnerSnapshot(t, restarted).State; !started.Effects[reviewer.ID].ReviewerRevoked || started.Epoch <= loaded.Epoch {
+		t.Fatalf("restart lost old-epoch invalidity: effect=%#v epoch=%d", started.Effects[reviewer.ID], started.Epoch)
+	}
+	issue.Body = "body"
+	input = repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, restarted, input)
+	stale := mustOwnerSnapshot(t, restarted).State.Effects[reviewer.ID]
+	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(*stale.Reconciliation)
+	if err := writeReconciliationEffectMarker(restarted.stateRoot, identity, *stale.Reconciliation, result); err != nil {
+		t.Fatal(err)
+	}
+	service.owner, service.effects.owner = restarted, restarted
+	if _, err := service.effects.verifyPendingOperatorReconciliation(t.Context(), stale); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("pre-upgrade stale marker completed after body restoration: %v", err)
 	}
 }
 

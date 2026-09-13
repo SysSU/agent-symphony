@@ -130,6 +130,7 @@ type runtimeEffectIntent struct {
 	ReviewerSessionRequested            bool                           `json:"reviewer_session_requested,omitempty"`
 	ReviewerGroupPID                    int                            `json:"reviewer_group_pid,omitempty"`
 	ReviewerStopped                     bool                           `json:"reviewer_stopped,omitempty"`
+	ReviewerRevoked                     bool                           `json:"reviewer_revoked,omitempty"`
 	SupersededReviewerID                string                         `json:"superseded_reviewer_id,omitempty"`
 	SupersededReviewerGroupPID          int                            `json:"superseded_reviewer_group_pid,omitempty"`
 	SupersededReviewerGateProtocol      bool                           `json:"superseded_reviewer_gate_protocol,omitempty"`
@@ -825,6 +826,7 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if candidate.Epoch == ^uint64(0) {
 			return runtimeOwnerState{}, nil, errors.New("runtime epoch overflow")
 		}
+		revokeInvalidPlanReviewers(&candidate) // Upgrade an old pending ledger before its observation epoch changes.
 		candidate.Epoch++
 		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, nil)
 	}
@@ -1405,6 +1407,7 @@ func finishRuntimeOwnerTransition(attemptRoot, stateRoot string, candidate runti
 			candidate.Tombstones[key] = tombstone
 		}
 	}
+	revokeInvalidPlanReviewers(&candidate)
 	if err := validateRuntimeOwnerState(candidate, attemptRoot, stateRoot, true); err != nil {
 		return runtimeOwnerState{}, nil, err
 	}
@@ -2011,7 +2014,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			}
 			continue
 		}
-		if effect.ReconciliationResult != nil {
+		if effect.ReconciliationResult != nil || effect.ReviewerRevoked {
 			return errors.New("runtime owner effect payload is invalid")
 		}
 		if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Attempt < 1 || effect.Action == "" || effect.IssueGeneration == 0 || effect.AttemptGeneration == 0 || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" || !issueCurrent || state.AttemptGenerations[attemptKey] != effect.AttemptGeneration && !receiptBoundCompletion {
