@@ -148,26 +148,23 @@ func guardedReviewerKillSession(ctx context.Context, boundary boundaryCaller, pa
 	}
 	status, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"list-sessions", "-F", reviewerSessionsFormat}, Dir: dir, Env: env})
 	serverErr := syscall.Kill(pane.ServerPID, 0)
-	// The exact guard has run. A successful inventory takes precedence over
-	// original-server death: a visible S2 must not be certified absent. Without
-	// inventory, only death of the captured server proves its S1 gone.
-	if reviewerSessionAbsenceProved(status.Output, err, serverErr, pane, session) {
+	// S1 server death does not prove a same-name S2 is absent. Cleanup needs
+	// a successful inventory from the captured server.
+	if reviewerSessionAbsenceProved(status.Output, err, pane, session) {
 		return nil
 	}
 	return fmt.Errorf("reviewer session absence is unproved after guarded stop (server=%v tmux=%v exited=%t code=%d output=%.256q)", serverErr, err, status.Exited, status.Code, strings.TrimSpace(status.Output))
 }
 
-func reviewerSessionAbsenceProved(inventory string, inventoryErr, serverErr error, pane reviewerPaneIdentity, session string) bool {
-	if inventoryErr == nil {
-		return reviewerSessionAbsentOnServer(inventory, pane, session)
-	}
-	return errors.Is(serverErr, syscall.ESRCH)
+func reviewerSessionAbsenceProved(inventory string, inventoryErr error, pane reviewerPaneIdentity, session string) bool {
+	return inventoryErr == nil && reviewerSessionAbsentOnServer(inventory, pane, session)
 }
 
 func reviewerSessionAbsentOnServer(output string, pane reviewerPaneIdentity, session string) bool {
 	prefix := fmt.Sprintf("%d|%d|", pane.ServerPID, pane.StartTime)
-	for _, row := range strings.Split(strings.TrimSpace(output), "\n") {
-		if !strings.HasPrefix(row, prefix) || strings.TrimPrefix(row, prefix) == "" || strings.TrimPrefix(row, prefix) == session {
+	for _, row := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
+		name, ok := strings.CutPrefix(row, prefix)
+		if !ok || name == "" || name == session || strings.ContainsAny(name, "|\r\n") {
 			return false
 		}
 	}
