@@ -297,6 +297,32 @@ func (p *productionReconciliation) resumePendingReconciliation(ctx context.Conte
 	slices.Sort(ids)
 	for _, id := range ids {
 		effect := snapshot.State.Effects[id]
+		if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Mode == agentruntime.ReviewModeImplementation && effect.Reconciliation.Reviewer.Phase == "run-observe" {
+			stale := reconciliationEffectFinishCurrent(p.owner.stateRoot, snapshot.State, effect) != nil
+			head := ""
+			if !stale {
+				record := snapshot.State.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
+				_, currentHead, _, importErr := importWorkerExport(ctx, p.implementation, record.Manifest)
+				if importErr != nil {
+					return false, importErr
+				}
+				if currentHead != effect.Reconciliation.Reviewer.HeadSHA {
+					head = currentHead
+				}
+			}
+			if stale || head != "" {
+				if p.operator == nil {
+					return false, errors.New("implementation reviewer supersession is unavailable")
+				}
+				p.effects.cancelEffect(effect.ID)
+				if superseded, err := p.operator.supersedeInvalidPlanReview(ctx, effect, head); err != nil {
+					return false, err
+				} else if superseded {
+					return true, nil
+				}
+				continue
+			}
+		}
 		if result, verifyErr := p.effects.verifyPendingReconciliation(ctx, effect); verifyErr != nil {
 			if _, err := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: effect.Reconciliation.Action, Diagnostic: "pending effect marker verification failed: " + internalgithub.Redact(verifyErr.Error())}); err != nil {
 				return false, err

@@ -68,6 +68,7 @@ type reviewerSessionStopBoundary struct {
 	err     error
 	killErr error
 	killed  []string
+	onKill  func() error
 }
 
 type preRespawnReviewerBoundary struct {
@@ -141,10 +142,15 @@ func (b *reviewerSessionStopBoundary) call(_ context.Context, operation string, 
 		return b.status, b.err
 	case "kill-session":
 		b.killed = append(b.killed, command.Args[len(command.Args)-1])
-		b.status = agentruntime.Result{Output: "||||\n"}
+		b.status = agentruntime.Result{Output: "|||||||\n"}
+		if b.onKill != nil {
+			return agentruntime.Result{}, b.onKill()
+		}
 		return agentruntime.Result{}, b.killErr
 	case "wait-for":
 		return agentruntime.Result{}, nil
+	case "has-session":
+		return agentruntime.Result{Exited: true, Code: 1}, errors.New("reviewer session is absent")
 	default:
 		return agentruntime.Result{}, errors.New("unexpected tmux command")
 	}
@@ -212,7 +218,7 @@ func TestUnboundReviewerSessionLossCannotForgeNeverRanProof(t *testing.T) {
 	}
 }
 
-func TestUnboundReviewerKillAcknowledgementWaitsForWrapperDeath(t *testing.T) {
+func TestUnboundReviewerCannotKillBeforeOwnerPIDBinding(t *testing.T) {
 	root := t.TempDir()
 	reviewerID := strings.Repeat("a", 32)
 	digest := strings.Repeat("b", 64)
@@ -245,7 +251,7 @@ func TestUnboundReviewerKillAcknowledgementWaitsForWrapperDeath(t *testing.T) {
 	}
 }
 
-func TestCancelReplaysBoundReviewerAfterKillResponseCrash(t *testing.T) {
+func TestCancelReplaysDiskBoundReviewerAfterKillAck(t *testing.T) {
 	test := reconciliationEffectCaseNamed(t, "reviewer-run-observe")
 	owner, snapshot, review := reconciliationEffectTestOwner(t, test.request)
 	manifest := *review.Manifest
@@ -266,12 +272,33 @@ func TestCancelReplaysBoundReviewerAfterKillResponseCrash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := exec.Command("sleep", "30")
+	admitted := mustOwnerSnapshot(t, owner).State
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, admitted); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durableOwner, err := startTestStateOwner(t, owner.stateRoot, persisted, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command("sh", "-c", "read line")
 	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	input, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := child.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	t.Cleanup(func() { _ = input.Close(); _ = child.Process.Kill(); _ = child.Wait() })
 	launchPath, terminalPath := reviewerLifecyclePaths(review.Reviewer.Snapshot, review.Reviewer.Target)
 	if err := os.MkdirAll(filepath.Dir(launchPath), 0o700); err != nil {
 		t.Fatal(err)
@@ -281,24 +308,40 @@ func TestCancelReplaysBoundReviewerAfterKillResponseCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := "agent-symphony review-pane tmux " + launchPath + " " + terminalPath + " " + reviewerSignal(launch) + " " + launch.RequestDigest
-	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "0|||||$9|" + strconv.Itoa(os.Getpid()) + "|" + start}, killErr: errors.New("tmux response lost after kill")}
-	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
-	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, reviewer: boundary}
-	request, err := service.reconstructRuntimeRequest(mustOwnerSnapshot(t, owner), *stop)
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "0|||||$9|" + strconv.Itoa(os.Getpid()) + "|" + start}}
+	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: durableOwner, active: map[string]*activeRuntimeEffect{}}
+	service := &operatorMutationService{lifecycle: t.Context(), owner: durableOwner, effects: effects, reviewer: boundary}
+	request, err := service.reconstructRuntimeRequest(mustOwnerSnapshot(t, durableOwner), *stop)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := service.stopBoundReviewer(t.Context(), request, reviewer.ID); err == nil || len(boundary.killed) != 1 {
-		t.Fatalf("lost kill response did not leave pending Stop: err=%v killed=%v", err, boundary.killed)
+		t.Fatalf("tmux kill ACK falsely completed Stop while wrapper and child lived: err=%v killed=%v", err, boundary.killed)
 	}
-	bound := mustOwnerSnapshot(t, owner)
+	bound := mustOwnerSnapshot(t, durableOwner)
+	if gone, err := reviewerGroupGone(child.Process.Pid); err != nil || gone {
+		t.Fatalf("ACK test child group was not live: gone=%v err=%v", gone, err)
+	}
 	if effect := bound.State.Effects[stop.ID]; effect.SupersededReviewerGroupPID != child.Process.Pid || effect.ReviewerStopped {
 		t.Fatalf("group was not bound before kill boundary: %#v", effect)
 	}
-	if err := owner.close(t.Context()); err != nil {
+	if receipt, ok := operatorReceiptByID(bound.State, cancelRequest.RequestID); !ok || receipt.State != "pending" {
+		t.Fatalf("tmux ACK falsely completed Cancel receipt: %#v", receipt)
+	}
+	if err := durableOwner.close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	restarted, err := startTestStateOwner(t, owner.stateRoot, bound.State, func(runtimeOwnerState) error { return nil })
+	stored, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofKey := reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, review.Reviewer.Mode, review.Reviewer.Target)
+	if stored.Effects[stop.ID].SupersededReviewerGroupPID != child.Process.Pid || stored.Effects[stop.ID].ReviewerStopped || stored.ReviewerProofs[proofKey].GroupPID != child.Process.Pid || stored.ReviewerProofs[proofKey].DeadProved {
+		t.Fatalf("disk did not preserve pending reviewer group binding: effect=%#v proof=%#v", stored.Effects[stop.ID], stored.ReviewerProofs[proofKey])
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, stored, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,6 +368,16 @@ func TestCancelReplaysBoundReviewerAfterKillResponseCrash(t *testing.T) {
 	receipt, _ := operatorReceiptByID(mustOwnerSnapshot(t, restarted).State, cancelRequest.RequestID)
 	if receipt.State != "completed" {
 		t.Fatalf("Cancel receipt remained pending after exact group death: %#v", receipt)
+	}
+	if err := restarted.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt, ok := operatorReceiptByID(finished, cancelRequest.RequestID); !ok || receipt.State != "completed" || !finished.ReviewerProofs[proofKey].DeadProved {
+		t.Fatalf("disk lost terminal Cancel receipt or group-death proof: receipt=%#v proof=%#v", receipt, finished.ReviewerProofs[proofKey])
 	}
 }
 

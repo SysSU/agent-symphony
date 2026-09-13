@@ -320,6 +320,16 @@ func (c *runtimeEffectCoordinator) cancelOlder(manifest agentruntime.Manifest, g
 	c.mu.Unlock()
 }
 
+func (c *runtimeEffectCoordinator) cancelEffect(effectID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, run := range c.active {
+		if run.effectID == effectID {
+			run.cancel()
+		}
+	}
+}
+
 func (c *runtimeEffectCoordinator) cancelInvalidated(snapshot stateOwnerSnapshot) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -327,6 +337,10 @@ func (c *runtimeEffectCoordinator) cancelInvalidated(snapshot stateOwnerSnapshot
 		if run.effectID != "" {
 			effect, ok := snapshot.State.Effects[run.effectID]
 			if !ok || effect.State != "pending" {
+				run.cancel()
+				continue
+			}
+			if effect.Reconciliation != nil && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.DigestVersion == 1 && reconciliationEffectFinishCurrent(c.owner.stateRoot, snapshot.State, effect) != nil {
 				run.cancel()
 				continue
 			}

@@ -334,6 +334,204 @@ func TestPlanReviewSupersessionRequiresFreshOwnerInvalidation(t *testing.T) {
 	}
 }
 
+func TestImplementationReviewerCompatibleObservationDriftFinishes(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	request.Reviewer.Mode, request.Reviewer.DigestVersion = agentruntime.ReviewModeImplementation, 1
+	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	identity := ownerReconciliationEffectIdentity(*effect)
+	if err := applyMarkReviewerSessionRequested(owner.stateRoot, &state, markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMarkPlanReviewRunning(owner.stateRoot, &state, markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyProveReviewerDead(&state, proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	issueKey := ownerIssueKey(request.Repository, request.Issue)
+	observation := state.Observations[issueKey]
+	observation.Generation++
+	observation.Fact.NeedsAttention = !observation.Fact.NeedsAttention
+	state.Observations[issueKey] = observation
+	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(request)
+	if err := applyFinishReconciliationEffect(owner.stateRoot, &state, finishReconciliationEffectCommand{Identity: identity, Result: result}); err != nil {
+		t.Fatalf("compatible status-only drift stranded implementation review: %v", err)
+	}
+	if state.Effects[effect.ID].State != "completed" {
+		t.Fatal("implementation review remained pending after compatible observation")
+	}
+}
+
+func TestImplementationReviewerInFlightDriftCancelsOnlyChangedTarget(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	request.Reviewer.Mode, request.Reviewer.DigestVersion = agentruntime.ReviewModeImplementation, 1
+	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	issueKey := ownerIssueKey(request.Repository, request.Issue)
+	observation := state.Observations[issueKey]
+	observation.Generation++
+	observation.Fact.NeedsAttention = !observation.Fact.NeedsAttention
+	state.Observations[issueKey] = observation
+	identity := ownerReconciliationEffectIdentity(*effect)
+	if err := applyAuthorizeReconciliationEffect(owner.stateRoot, state, authorizeReconciliationEffectCommand{Identity: identity, Action: reconciliationReviewer}); err != nil {
+		t.Fatalf("compatible drift prevented first reviewer launch: %v", err)
+	}
+	if err := applyMarkReviewerSessionRequested(owner.stateRoot, &state, markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatalf("compatible drift prevented durable launch request: %v", err)
+	}
+	runCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	coordinator := runtimeEffectCoordinator{owner: owner, active: map[string]*activeRuntimeEffect{key: {issueGeneration: effect.IssueGeneration, attemptGeneration: effect.AttemptGeneration, effectID: effect.ID, ctx: runCtx, cancel: cancel}}}
+	coordinator.cancelInvalidated(stateOwnerSnapshot{State: state})
+	if runCtx.Err() != nil {
+		t.Fatal("status-only observation canceled active implementation reviewer")
+	}
+	observation.Fact.BodyDigest = strings.Repeat("e", 64)
+	observation.Generation++
+	state.Observations[issueKey] = observation
+	coordinator.cancelInvalidated(stateOwnerSnapshot{State: state})
+	if runCtx.Err() == nil {
+		t.Fatal("changed reviewer body did not cancel active run")
+	}
+}
+
+func TestImplementationReviewerLocalHeadPrecedesRemotePublication(t *testing.T) {
+	for _, remote := range []string{"active without head", "attempt fact absent", "contradictory head"} {
+		t.Run(remote, func(t *testing.T) {
+			request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+			request.Reviewer.Mode, request.Reviewer.DigestVersion = agentruntime.ReviewModeImplementation, 1
+			owner, snapshot, request := reconciliationEffectTestOwner(t, request)
+			_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := mustOwnerSnapshot(t, owner).State
+			issueKey := ownerIssueKey(request.Repository, request.Issue)
+			observation := state.Observations[issueKey]
+			observation.Generation++
+			observation.Attempts = nil
+			observation.Fact.TerminalAttempts = nil
+			switch remote {
+			case "active without head":
+				observation.Fact.ActiveAttempt = &reconciliationAttemptFact{Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, BaseSHA: request.Reviewer.BaseSHA, State: "active"}
+			case "attempt fact absent":
+				observation.Fact.ActiveAttempt = nil
+			case "contradictory head":
+				observation.Fact.ActiveAttempt = &reconciliationAttemptFact{Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, BaseSHA: request.Reviewer.BaseSHA, HeadSHA: strings.Repeat("f", 40), State: "active"}
+			}
+			state.Observations[issueKey] = observation
+			err = reconciliationEffectFinishCurrent(owner.stateRoot, state, *effect)
+			if remote == "contradictory head" && !errors.Is(err, errStaleStateResult) || remote != "contradictory head" && err != nil {
+				t.Fatalf("remote %s: compatible local export head was rejected or contradictory head accepted: %v", remote, err)
+			}
+		})
+	}
+}
+
+func TestImplementationReviewerChangedBodyRequiresDeadProofBeforeSupersession(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	request.Reviewer.Mode, request.Reviewer.DigestVersion = agentruntime.ReviewModeImplementation, 1
+	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	identity := ownerReconciliationEffectIdentity(*effect)
+	if err := applyMarkReviewerSessionRequested(owner.stateRoot, &state, markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMarkPlanReviewRunning(owner.stateRoot, &state, markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	issueKey := ownerIssueKey(request.Repository, request.Issue)
+	observation := state.Observations[issueKey]
+	observation.Generation++
+	observation.Fact.BodyDigest = digestText("changed body")
+	state.Observations[issueKey] = observation
+	if err := applySupersedePlanReview(&state, supersedePlanReviewCommand{Identity: identity}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("live implementation reviewer superseded without death proof: %v", err)
+	}
+	if err := applyProveReviewerDead(&state, proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applySupersedePlanReview(&state, supersedePlanReviewCommand{Identity: identity}); err != nil {
+		t.Fatalf("proved stopped implementation reviewer stayed pending: %v", err)
+	}
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	if state.Effects[effect.ID].State != "completed" || state.Attempts[key].Manifest.ReviewState != "failed" || !state.Attempts[key].Manifest.ReviewInvalidated {
+		t.Fatalf("implementation supersession did not produce terminal truth: effect=%#v", state.Effects[effect.ID])
+	}
+	// Certified cleanup detaches the old root before the same local head may be reviewed again.
+	record := state.Attempts[key]
+	record.Manifest.ReviewSnapshot, record.Manifest.ReviewSession = "", ""
+	state.Attempts[key] = record
+	issue := issueFact(request.Issue, "title")
+	issue.Attempt, issue.Body = request.Attempt, "changed body"
+	plans, _, err := planReconciliationReviewers(stateOwnerSnapshot{State: state}, owner.stateRoot, []reviewerExecutionMaterial{{Issue: issue, HeadSHA: request.Reviewer.HeadSHA}})
+	if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.HeadSHA != request.Reviewer.HeadSHA {
+		t.Fatalf("same-head review did not replan after certified invalidation cleanup: plans=%#v err=%v", plans, err)
+	}
+}
+
+func TestImplementationReviewerChangedLocalExportHeadSupersedesAfterDeath(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	request.Reviewer.Mode, request.Reviewer.DigestVersion = agentruntime.ReviewModeImplementation, 1
+	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	identity := ownerReconciliationEffectIdentity(*effect)
+	if err := applyMarkReviewerSessionRequested(owner.stateRoot, &state, markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMarkPlanReviewRunning(owner.stateRoot, &state, markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	newHead := strings.Repeat("f", 40)
+	if err := applySupersedePlanReview(&state, supersedePlanReviewCommand{Identity: identity, CurrentHeadSHA: newHead}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("unproved H1 reviewer superseded for H2: %v", err)
+	}
+	if err := applyProveReviewerDead(&state, proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applySupersedePlanReview(&state, supersedePlanReviewCommand{Identity: identity, CurrentHeadSHA: newHead}); err != nil {
+		t.Fatalf("proved H1 reviewer did not supersede for H2: %v", err)
+	}
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	if state.Effects[effect.ID].State != "completed" || !state.Attempts[key].Manifest.ReviewInvalidated {
+		t.Fatal("H1 effect was not terminally invalidated")
+	}
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state); err != nil {
+		t.Fatal(err)
+	}
+	state, err = readRuntimeOwnerState(owner.stateRoot, request.Repository)
+	if err != nil || !state.Attempts[key].Manifest.ReviewInvalidated || !state.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)].DeadProved {
+		t.Fatalf("restart lost exact H1 invalidation/death proof: err=%v", err)
+	}
+	record := state.Attempts[key]
+	record.Manifest.ReviewSnapshot, record.Manifest.ReviewSession = "", ""
+	state.Attempts[key] = record
+	issue := issueFact(request.Issue, "title")
+	issue.Attempt = request.Attempt
+	plans, _, err := planReconciliationReviewers(stateOwnerSnapshot{State: state}, owner.stateRoot, []reviewerExecutionMaterial{{Issue: issue, HeadSHA: newHead}})
+	if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.HeadSHA != newHead {
+		t.Fatalf("H2 did not replan after H1 invalidation cleanup: plans=%#v err=%v", plans, err)
+	}
+}
+
 func TestPrebindingPlanReviewSupersessionRequiresExactStoppedProof(t *testing.T) {
 	for _, test := range []struct {
 		name        string

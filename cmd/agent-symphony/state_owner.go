@@ -264,7 +264,8 @@ type reviewerStopObservation struct {
 }
 
 type supersedePlanReviewCommand struct {
-	Identity stateResultIdentity
+	Identity       stateResultIdentity
+	CurrentHeadSHA string
 }
 
 type finishReconciliationEffectCommand struct {

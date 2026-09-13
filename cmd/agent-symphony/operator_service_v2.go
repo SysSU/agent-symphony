@@ -1243,7 +1243,7 @@ func (s *operatorMutationService) resumeUnmarkedReconciliation(ctx context.Conte
 	return errStateConflict
 }
 
-func (s *operatorMutationService) supersedeInvalidPlanReview(ctx context.Context, effect runtimeEffectIntent) (bool, error) {
+func (s *operatorMutationService) supersedeInvalidPlanReview(ctx context.Context, effect runtimeEffectIntent, currentHead ...string) (bool, error) {
 	key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 	run, err := s.effects.acquireKey(ctx, key, effect.IssueGeneration, effect.AttemptGeneration, 0, effect.ID)
 	if err != nil {
@@ -1270,7 +1270,11 @@ func (s *operatorMutationService) supersedeInvalidPlanReview(ctx context.Context
 	if _, err := s.owner.proveReviewerDead(ctx, proveReviewerDeadCommand{Identity: ownerReconciliationEffectIdentity(effect), GroupPID: observation.GroupPID, NeverRan: observation.NeverRan}); err != nil {
 		return false, err
 	}
-	committed, err := s.owner.supersedePlanReview(ctx, supersedePlanReviewCommand{Identity: ownerReconciliationEffectIdentity(effect)})
+	head := ""
+	if len(currentHead) != 0 {
+		head = currentHead[0]
+	}
+	committed, err := s.owner.supersedePlanReview(ctx, supersedePlanReviewCommand{Identity: ownerReconciliationEffectIdentity(effect), CurrentHeadSHA: head})
 	if errors.Is(err, errStateConflict) {
 		return false, nil
 	}
