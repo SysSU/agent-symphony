@@ -118,12 +118,22 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 				}
 				comments = append(comments, map[string]any{"id": 2, "body": "Attempt failed closed: fixture worker failed\n\n" + terminal, "created_at": manifest.UpdatedAt.Format(time.RFC3339Nano), "updated_at": manifest.UpdatedAt.Format(time.RFC3339Nano), "user": map[string]any{"id": 42}})
 			}
+			var completedComment map[string]any
 			if completedOverlap {
 				marker, err := internalgithub.AttemptMarker(73, 1, manifest.Branch, manifest.ReviewHead, 91, "review")
 				if err != nil {
 					t.Fatal(err)
 				}
-				comments = []map[string]any{{"id": 73, "body": marker, "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}}}
+				completedComment = map[string]any{"id": 73, "body": marker, "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}}
+				comments = []map[string]any{completedComment}
+				if action == "archive-overlap" {
+					// The older remote head keeps startup reconciliation from retiring the local worktree before Archive.
+					older, err := internalgithub.AttemptMarker(73, 1, manifest.Branch, base, 91, "review")
+					if err != nil {
+						t.Fatal(err)
+					}
+					comments = []map[string]any{{"id": 73, "body": older, "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}}}
+				}
 			}
 			if action == "abandon-overlap" {
 				comments = nil
@@ -133,8 +143,13 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 				labels = map[string]bool{}
 			}
 			fixture := &fullSystemGitHub{base: base, origin: origin, labels: labels, comments: comments, closed: completedOverlap}
+			fixture.includeClosedIssue = action == "archive-overlap"
 			if completedOverlap {
-				fixture.pr = map[string]any{"number": 91, "body": comments[0]["body"], "state": "closed", "merged": true, "merged_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "head": map[string]any{"sha": manifest.ReviewHead, "ref": manifest.Branch}, "base": map[string]any{"sha": base}}
+				head := manifest.ReviewHead
+				if action == "archive-overlap" {
+					head = base
+				}
+				fixture.pr = map[string]any{"number": 91, "body": comments[0]["body"], "state": "closed", "merged": true, "merged_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": manifest.Branch}, "base": map[string]any{"sha": base}}
 			}
 			retryEntered, retryRelease := make(chan struct{}, 1), make(chan struct{})
 			var releaseRetry sync.Once
@@ -295,7 +310,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				limit = 90 * time.Second
 			}
 			waitHTTP(t, "http://"+address+"/status.json", limit, output)
-			if controlledCycle {
+			if controlledCycle && action != "archive-overlap" {
 				request, err := http.NewRequest(http.MethodPost, "http://"+address+"/actions/reconcile", nil)
 				if err != nil {
 					t.Fatal(err)
@@ -318,7 +333,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				}
 				if overlap {
 					observation := ledger.Observations[ownerIssueKey("o/r", 73)]
-					if observation.ObservationEpoch != ledger.Epoch || observation.OwnerGeneration != ledger.IssueGenerations[ownerIssueKey("o/r", 73)] || !observation.Present || completedOverlap && (!observation.Attempts[key].Present || observation.Attempts[key].Fact.State != "completed" || observation.Attempts[key].Fact.PR != 91) {
+					if observation.ObservationEpoch != ledger.Epoch || observation.OwnerGeneration != ledger.IssueGenerations[ownerIssueKey("o/r", 73)] || !observation.Present || completedOverlap && (!observation.Attempts[key].Present || observation.Attempts[key].Fact.PR != 91 || observation.Attempts[key].Fact.State != "completed" || action == "archive-overlap" && observation.Attempts[key].Fact.HeadSHA != base) {
 						return false
 					}
 				}
@@ -369,6 +384,11 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				sourceStale = before.StaleReconciliations
 				if completedOverlap {
 					fixture.mu.Lock()
+					if action == "archive-overlap" {
+						fixture.comments = []map[string]any{completedComment}
+						fixture.pr["body"] = completedComment["body"]
+						fixture.pr["head"] = map[string]any{"sha": manifest.ReviewHead, "ref": manifest.Branch}
+					}
 					fixture.includeClosedIssue = true
 					fixture.mu.Unlock()
 					markerExposed.Store(true)
@@ -407,7 +427,16 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				if completedOverlap {
 					heldMarkerObserved = markerObserved.Load()
 					if !heldMarkerObserved {
-						t.Fatal("held reconciliation did not read the completed-attempt marker before Dismiss")
+						t.Fatal("held reconciliation did not read the completed-attempt marker before the browser action")
+					}
+				}
+				if action == "archive-overlap" {
+					ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+					if err != nil || ledger.Attempts[key].Generation != 1 || ledger.Tombstones[key].Generation != 0 {
+						t.Fatalf("Archive lost the owned attempt before browser action: attempt=%#v tombstone=%#v err=%v", ledger.Attempts[key], ledger.Tombstones[key], err)
+					}
+					if _, err := os.Lstat(manifest.Worktree); err != nil {
+						t.Fatalf("Archive worktree was absent before the browser action: %v", err)
 					}
 				}
 			}
@@ -522,6 +551,11 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					t.Fatalf("%s cleanup did not complete after GitHub release: tombstone=%#v receipts=%#v effect=%#v worktree=%v log=%v manifest=%v marker=%v tmux=%t serve=%s", mutation, tombstone, ledger.ControlReceipts, ledger.Effects[tombstone.EffectID], worktreeErr, logErr, manifestErr, markerErr, fullSystemTmuxSessionExists(environment, manifest.Session), output.String())
 				}
 				if mutation == "archive" {
+					ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+					tombstone := ledger.Tombstones[key]
+					if err != nil || tombstone.EffectID == "" || tombstone.Manifest == nil || ledger.Effects[tombstone.EffectID].Action != string(agentruntime.EffectCleanup) || ledger.Effects[tombstone.EffectID].State != "completed" {
+						t.Fatalf("Archive did not complete local cleanup effect: tombstone=%#v effect=%#v err=%v", tombstone, ledger.Effects[tombstone.EffectID], err)
+					}
 					if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
 						t.Fatalf("Archive completed but retained worktree %s: %v", manifest.Worktree, err)
 					}
