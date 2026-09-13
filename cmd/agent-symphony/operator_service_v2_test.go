@@ -808,76 +808,66 @@ func TestFreshReconciliationStopsInvalidLivePlanReviewer(t *testing.T) {
 }
 
 func TestPreupgradeInvalidPlanObservationRevokesBeforeRestartEpoch(t *testing.T) {
-	for _, offEpoch := range []bool{false, true} {
-		t.Run(fmt.Sprintf("off_epoch_%t", offEpoch), func(t *testing.T) {
-			owner, manifest := operatorTestOwner(t, 477, "active", false)
-			service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
-			reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
-			identity := ownerReconciliationEffectIdentity(*reviewer)
-			if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
-				t.Fatal(err)
-			}
-			state := mustOwnerSnapshot(t, owner).State
-			issue := expandIssueFact(state.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
-			issue.Body = "changed body"
-			attempt := expandAttemptFact(state.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
-			input := repositoryInput(true, issue)
-			input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
-			invalid := applyReconciliationInput(t, owner, input).State
-			effect := invalid.Effects[reviewer.ID]
-			effect.ReviewerRevoked = false // Simulate a ledger written before this optional field existed.
-			invalid.Effects[reviewer.ID] = effect
-			if offEpoch {
-				observation := invalid.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
-				if observation.ObservationEpoch != effect.IntentEpoch || observation.LastCycleID <= effect.Reconciliation.ObservationCycleID {
-					t.Fatal("fixture lacks post-admission off-epoch observation evidence")
-				}
-				invalid.Epoch++ // Simulate an old daemon restart after B was accepted.
-			}
-			if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, invalid); err != nil {
-				t.Fatal(err)
-			}
-			if err := owner.close(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-			loaded, err := readRuntimeOwnerState(owner.stateRoot, invalid.Repository)
-			if err != nil {
-				t.Fatal(err)
-			}
-			restarted, err := startTestStateOwner(t, owner.stateRoot, loaded, func(state runtimeOwnerState) error {
-				return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = restarted.close(context.Background()) })
-			if started := mustOwnerSnapshot(t, restarted).State; !started.Effects[reviewer.ID].ReviewerRevoked || started.Epoch <= loaded.Epoch {
-				t.Fatalf("restart lost old-epoch invalidity: effect=%#v epoch=%d", started.Effects[reviewer.ID], started.Epoch)
-			}
-			issue.Body = "body"
-			input = repositoryInput(true, issue)
-			input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
-			applyReconciliationInput(t, restarted, input)
-			stale := mustOwnerSnapshot(t, restarted).State.Effects[reviewer.ID]
-			result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(*stale.Reconciliation)
-			if err := writeReconciliationEffectMarker(restarted.stateRoot, identity, *stale.Reconciliation, result); err != nil {
-				t.Fatal(err)
-			}
-			service.owner, service.effects.owner = restarted, restarted
-			if _, err := service.effects.verifyPendingOperatorReconciliation(t.Context(), stale); !errors.Is(err, errStaleStateResult) {
-				t.Fatalf("pre-upgrade stale marker completed after body restoration: %v", err)
-			}
-		})
+	owner, manifest := operatorTestOwner(t, 477, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	identity := ownerReconciliationEffectIdentity(*reviewer)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(state.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "changed body"
+	attempt := expandAttemptFact(state.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, owner, input)
+	issue.Body = "body"
+	input = repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	legacy := applyReconciliationInput(t, owner, input).State // Old ledger only retains restored A.
+	effect := legacy.Effects[reviewer.ID]
+	effect.ReviewerRevoked = false // Old binary did not track revocation.
+	legacy.Effects[reviewer.ID] = effect
+	legacy.ReviewerRevocationTracked = false
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(owner.stateRoot, legacy.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, loaded, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	if started := mustOwnerSnapshot(t, restarted).State; !started.Effects[reviewer.ID].ReviewerRevoked || !started.ReviewerRevocationTracked || started.Epoch <= loaded.Epoch {
+		t.Fatalf("restart lost old-ledger revocation: effect=%#v epoch=%d", started.Effects[reviewer.ID], started.Epoch)
+	}
+	stale := mustOwnerSnapshot(t, restarted).State.Effects[reviewer.ID]
+	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(*stale.Reconciliation)
+	if err := writeReconciliationEffectMarker(restarted.stateRoot, identity, *stale.Reconciliation, result); err != nil {
+		t.Fatal(err)
+	}
+	service.owner, service.effects.owner = restarted, restarted
+	if _, err := service.effects.verifyPendingOperatorReconciliation(t.Context(), stale); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("pre-upgrade stale marker completed after body restoration: %v", err)
 	}
 }
 
-func TestPreupgradeValidOffEpochPlanObservationDoesNotRevoke(t *testing.T) {
+func TestPreupgradeValidPlanReviewerRevokedOnce(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 478, "active", false)
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
 	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
@@ -887,6 +877,7 @@ func TestPreupgradeValidOffEpochPlanObservationDoesNotRevoke(t *testing.T) {
 		t.Fatal("fixture observation is not the one that admitted the reviewer")
 	}
 	state.Epoch++ // Old daemon restarted without collecting a newer issue fact.
+	state.ReviewerRevocationTracked = false
 	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state); err != nil {
 		t.Fatal(err)
 	}
@@ -904,8 +895,97 @@ func TestPreupgradeValidOffEpochPlanObservationDoesNotRevoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = restarted.close(context.Background()) })
-	if current := mustOwnerSnapshot(t, restarted).State.Effects[reviewer.ID]; current.State != "pending" || current.ReviewerRevoked {
-		t.Fatalf("valid old observation revoked pending reviewer: %#v", current)
+	if current := mustOwnerSnapshot(t, restarted).State; current.Effects[reviewer.ID].State != "pending" || !current.Effects[reviewer.ID].ReviewerRevoked || !current.ReviewerRevocationTracked {
+		t.Fatalf("old pending reviewer was not conservatively revoked: %#v", current.Effects[reviewer.ID])
+	}
+	if err := restarted.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := readRuntimeOwnerState(owner.stateRoot, state.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := startTestStateOwner(t, owner.stateRoot, stored, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.close(context.Background()) })
+	if current := mustOwnerSnapshot(t, second).State; !current.ReviewerRevocationTracked || !current.Effects[reviewer.ID].ReviewerRevoked {
+		t.Fatalf("migration was not durable across second restart: %#v", current.Effects[reviewer.ID])
+	}
+}
+
+func TestTrackedValidPlanReviewerSurvivesRestart(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 479, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, mustOwnerSnapshot(t, owner).State); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for restart := 0; restart < 2; restart++ {
+		stored, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !stored.ReviewerRevocationTracked || stored.Effects[reviewer.ID].ReviewerRevoked {
+			t.Fatalf("valid tracked reviewer changed before restart %d: %#v", restart, stored.Effects[reviewer.ID])
+		}
+		current, err := startTestStateOwner(t, owner.stateRoot, stored, func(next runtimeOwnerState) error {
+			return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, next)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := mustOwnerSnapshot(t, current).State.Effects[reviewer.ID]; got.State != "pending" || got.ReviewerRevoked {
+			t.Fatalf("valid tracked reviewer revoked at restart %d: %#v", restart, got)
+		}
+		if err := current.close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPlanRevocationMigrationPersistenceFailureDoesNotStart(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 480, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	legacy := mustOwnerSnapshot(t, owner).State
+	legacy.ReviewerRevocationTracked = false
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected owner persistence failure")
+	if started, err := startTestStateOwner(t, owner.stateRoot, stored, func(runtimeOwnerState) error { return injected }); !errors.Is(err, injected) || started != nil {
+		t.Fatalf("startup exposed failed migration: owner=%v err=%v", started, err)
+	}
+	unchanged, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Epoch != stored.Epoch || unchanged.ReviewerRevocationTracked || unchanged.Effects[reviewer.ID].ReviewerRevoked {
+		t.Fatalf("failed migration partially persisted: %#v", unchanged.Effects[reviewer.ID])
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, unchanged, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	if current := mustOwnerSnapshot(t, restarted).State; !current.ReviewerRevocationTracked || !current.Effects[reviewer.ID].ReviewerRevoked {
+		t.Fatalf("retry did not commit full migration: %#v", current.Effects[reviewer.ID])
 	}
 }
 

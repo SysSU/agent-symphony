@@ -39,25 +39,26 @@ var (
 )
 
 type runtimeOwnerState struct {
-	Version              int                                  `json:"version"`
-	Repository           string                               `json:"repository"`
-	Epoch                uint64                               `json:"epoch"`
-	Revision             uint64                               `json:"revision"`
-	IssueGenerations     map[string]uint64                    `json:"issue_generations"`
-	AttemptGenerations   map[string]uint64                    `json:"attempt_generations"`
-	Attempts             map[string]runtimeAttemptRecord      `json:"attempts"`
-	Observations         map[string]reconciliationObservation `json:"observations"`
-	Recoveries           map[string]runtimePRRecovery         `json:"recoveries"`
-	Tombstones           map[string]runtimeTombstone          `json:"tombstones"`
-	Effects              map[string]runtimeEffectIntent       `json:"effects"`
-	ReviewerProofs       map[string]reviewerProcessProof      `json:"reviewer_proofs"`
-	ControlReceipts      []controlReceipt                     `json:"control_receipts"`
-	CycleDiagnostic      string                               `json:"cycle_diagnostic,omitempty"`
-	CycleDiagnosticAt    time.Time                            `json:"cycle_diagnostic_at,omitzero"`
-	CycleOutcomeEpoch    uint64                               `json:"cycle_outcome_epoch,omitempty"`
-	CycleOutcomeID       uint64                               `json:"cycle_outcome_id,omitempty"`
-	CycleOutcomeSource   uint64                               `json:"cycle_outcome_source_revision,omitempty"`
-	StaleReconciliations uint64                               `json:"stale_reconciliations,omitempty"`
+	Version                   int                                  `json:"version"`
+	Repository                string                               `json:"repository"`
+	Epoch                     uint64                               `json:"epoch"`
+	Revision                  uint64                               `json:"revision"`
+	IssueGenerations          map[string]uint64                    `json:"issue_generations"`
+	AttemptGenerations        map[string]uint64                    `json:"attempt_generations"`
+	Attempts                  map[string]runtimeAttemptRecord      `json:"attempts"`
+	Observations              map[string]reconciliationObservation `json:"observations"`
+	Recoveries                map[string]runtimePRRecovery         `json:"recoveries"`
+	Tombstones                map[string]runtimeTombstone          `json:"tombstones"`
+	Effects                   map[string]runtimeEffectIntent       `json:"effects"`
+	ReviewerProofs            map[string]reviewerProcessProof      `json:"reviewer_proofs"`
+	ReviewerRevocationTracked bool                                 `json:"reviewer_revocation_tracked,omitempty"`
+	ControlReceipts           []controlReceipt                     `json:"control_receipts"`
+	CycleDiagnostic           string                               `json:"cycle_diagnostic,omitempty"`
+	CycleDiagnosticAt         time.Time                            `json:"cycle_diagnostic_at,omitzero"`
+	CycleOutcomeEpoch         uint64                               `json:"cycle_outcome_epoch,omitempty"`
+	CycleOutcomeID            uint64                               `json:"cycle_outcome_id,omitempty"`
+	CycleOutcomeSource        uint64                               `json:"cycle_outcome_source_revision,omitempty"`
+	StaleReconciliations      uint64                               `json:"stale_reconciliations,omitempty"`
 }
 
 type runtimeAttemptRecord struct {
@@ -826,7 +827,10 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if candidate.Epoch == ^uint64(0) {
 			return runtimeOwnerState{}, nil, errors.New("runtime epoch overflow")
 		}
-		revokeInvalidPlanReviewers(&candidate, true) // Upgrade an old pending ledger before its observation epoch changes.
+		if !candidate.ReviewerRevocationTracked {
+			revokeInvalidPlanReviewers(&candidate, true) // Old ledgers cannot prove an A→B→A observation history.
+			candidate.ReviewerRevocationTracked = true
+		}
 		candidate.Epoch++
 		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, nil)
 	}
@@ -2086,7 +2090,7 @@ func runtimeOwnerAttemptRoot(stateRoot string) string {
 }
 
 func newRuntimeOwnerState(repository string) runtimeOwnerState {
-	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}}
+	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, ReviewerRevocationTracked: true, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}}
 }
 
 func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
