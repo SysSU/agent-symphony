@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -203,7 +204,7 @@ func TestReviewerNormalExitKillsLateWritingDescendant(t *testing.T) {
 	}
 	select {
 	case got := <-finished:
-		if got.signal != 0 || (got.err == nil && got.code != 0) || (got.err != nil && (got.code != 125 || !errors.Is(got.err, errReviewerGroupAbsenceUnproved))) {
+		if got.code != 0 || got.signal != 0 || (got.err != nil && !errors.Is(got.err, errReviewerGroupAbsenceUnproved)) {
 			t.Fatalf("reviewer exit=%d signal=%d err=%v", got.code, got.signal, got.err)
 		}
 		if got.err != nil {
@@ -218,6 +219,39 @@ func TestReviewerNormalExitKillsLateWritingDescendant(t *testing.T) {
 	}
 	if _, err := os.Lstat(late); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("descendant wrote after reviewer completion: %v", err)
+	}
+}
+
+func TestReviewerUnprovedGroupPreservesCommandAndPaneExit(t *testing.T) {
+	root := t.TempDir()
+	tmux := filepath.Join(root, "tmux")
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$AS_TEST_TMUX_ARGS\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(root, "tmux-args")
+	t.Setenv("AS_TEST_TMUX_ARGS", argsPath)
+	t.Setenv("TMUX_PANE", "%123")
+	for _, exitCode := range []int{0, 7} {
+		t.Run(fmt.Sprint(exitCode), func(t *testing.T) {
+			gateReader, gateWriter, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gateReader.Close()
+			defer gateWriter.Close()
+			if _, err := io.WriteString(gateWriter, "go\n"); err != nil {
+				t.Fatal(err)
+			}
+			code, signal, err := runReviewerPaneCommand(t.Context(), tmux, []string{"/bin/sh", "-c", "exit " + fmt.Sprint(exitCode)}, nil, io.Discard, io.Discard, nil, []*os.File{gateReader}, func(int) error { return nil })
+			if code != exitCode || signal != 0 || !errors.Is(err, errReviewerGroupAbsenceUnproved) {
+				t.Fatalf("reviewer command code=%d signal=%d cleanup=%v, want code=%d and typed unproved", code, signal, err, exitCode)
+			}
+			args, err := os.ReadFile(argsPath)
+			want := fmt.Sprintf("set-option\n-p\n-t\n%%123\n%s\n%d\n", PaneExitStatusOption, exitCode)
+			if err != nil || string(args) != want {
+				t.Fatalf("recorded pane exit option = %q, %v; want %q", args, err, want)
+			}
+		})
 	}
 }
 

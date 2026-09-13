@@ -82,7 +82,9 @@ func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io
 
 // RunPaneCommandAfterStart records launch proof only after the child exists.
 func RunPaneCommandAfterStart(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, extraFiles ...*os.File) (int, syscall.Signal, error) {
-	return runReviewerPaneCommand(ctx, tmux, command, stdin, stdout, stderr, afterStart, extraFiles)
+	return runReviewerPaneCommand(ctx, tmux, command, stdin, stdout, stderr, afterStart, extraFiles, func(pid int) error {
+		return syscall.Kill(-pid, 0)
+	})
 }
 
 // The group leader remains alive after the reviewer exits, pinning its PGID
@@ -97,7 +99,7 @@ printf '%d\n' "$code" >&4
 IFS= read -r _ <&5
 exit "$code"`
 
-func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, extraFiles []*os.File) (int, syscall.Signal, error) {
+func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, extraFiles []*os.File, probeGroup func(int) error) (int, syscall.Signal, error) {
 	if len(command) == 0 || command[0] == "" || len(extraFiles) != 1 || extraFiles[0] == nil {
 		return 125, 0, errors.New("reviewer pane command or start gate is missing")
 	}
@@ -132,7 +134,7 @@ func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, 
 		if killErr != nil {
 			return killErr
 		}
-		if err := reviewerGroupAbsenceError(syscall.Kill(-child.Process.Pid, 0)); err != nil {
+		if err := reviewerGroupAbsenceError(probeGroup(child.Process.Pid)); err != nil {
 			return err
 		}
 		return nil
@@ -156,13 +158,15 @@ func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, 
 	case <-ctx.Done():
 		return 125, 0, errors.Join(ctx.Err(), stop())
 	}
-	if err := stop(); err != nil {
-		return 125, 0, err
+	cleanupErr := stop()
+	if cleanupErr != nil && !errors.Is(cleanupErr, errReviewerGroupAbsenceUnproved) {
+		return 125, 0, cleanupErr
 	}
 	if finished.err != nil {
-		return 125, 0, finished.err
+		return 125, 0, errors.Join(finished.err, cleanupErr)
 	}
-	return finished.code, 0, RecordPaneExitStatus(ctx, tmux, finished.code)
+	// Cleanup uncertainty must not replace the command's durable exit result.
+	return finished.code, 0, errors.Join(cleanupErr, RecordPaneExitStatus(ctx, tmux, finished.code))
 }
 
 func reviewerGroupAbsenceError(probeErr error) error {
