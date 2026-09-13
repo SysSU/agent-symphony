@@ -771,7 +771,7 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 		t.Fatal(err)
 	}
 	helper := filepath.Join(t.TempDir(), "review-boundary")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '{\"output\":\"||||\",\"code\":0,\"exited\":false}\\n'\n"), 0o700); err != nil {
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '{\"output\":\"|||||||\",\"code\":0,\"exited\":false}\\n'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", helper)
@@ -808,7 +808,10 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true); err == nil {
 		t.Fatal("unbound reviewer artifacts were cleaned without process-death proof")
 	}
-	proofs := map[string]reviewerProcessProof{targetOne: {Target: targetOne, GroupPID: 99999999, DeadProved: true}, targetTwo: {Target: targetTwo, GroupPID: 99999998, DeadProved: true}}
+	proofs := map[string]reviewerProcessProof{
+		targetOne: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetOne, GroupPID: 99999999, DeadProved: true},
+		targetTwo: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetTwo, GroupPID: 99999998, DeadProved: true},
+	}
 	if err := cleanupAttemptReviewResourcesProved(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true, proofs); err != nil {
 		t.Fatalf("review cleanup: %v", err)
 	}

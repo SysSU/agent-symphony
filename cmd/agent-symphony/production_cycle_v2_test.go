@@ -709,17 +709,21 @@ func TestUnmarkedPublicationAndReviewerReconstructExactWorkerExport(t *testing.T
 		reviewer := workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `payload=$(cat)
 case "$payload" in
   *'"operation":"review-result"'*) printf %s '{"Output":"{\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]}"}' ;;
-  *'display-message'*) printf %s '{"Output":"1|||0|\n"}' ;;
+  *'display-message'*) printf %s '{"Output":"|||||||\n"}' ;;
   *) exit 1 ;;
 esac`}}
 		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}}
 		if _, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{Input: input}); err != nil {
-			t.Fatalf("legacy unbound review resume: %v", err)
+			t.Fatalf("pre-session gated review resume: %v", err)
 		}
 		current := mustOwnerSnapshot(t, owner)
 		manifest = current.State.Attempts[ownerAttemptKey("o/r", issue.Issue, issue.Attempt)].Manifest
-		if effect := current.State.Effects[plan.Identity.EffectID]; effect.State != "pending" || !strings.Contains(effect.Diagnostic, "unbound reviewer pane died") || manifest.ReviewState == "clean" {
-			t.Fatalf("legacy unbound reviewer falsely completed: effect=%#v manifest=%#v", effect, manifest)
+		if effect := current.State.Effects[plan.Identity.EffectID]; effect.State != "completed" || manifest.ReviewState != "failed" || !strings.Contains(manifest.ReviewDiagnostic, "before session creation") {
+			t.Fatalf("pre-session gated reviewer did not terminalize truthful failure: effect=%#v manifest=%#v", effect, manifest)
+		}
+		proof := current.State.ReviewerProofs[reviewerProofKey("o/r", issue.Issue, issue.Attempt, plans[0].Request.Reviewer.Mode, plans[0].Request.Reviewer.Target)]
+		if !proof.NeverRan || !proof.DeadProved || proof.EffectID != plan.Identity.EffectID {
+			t.Fatalf("pre-session gated reviewer lacks exact no-run certificate: %#v", proof)
 		}
 	})
 

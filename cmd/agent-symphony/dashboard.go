@@ -617,16 +617,7 @@ func githubIssueClosed(ctx context.Context, api internalgithub.API, repository s
 }
 
 func cleanupAttemptReviewResources(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool) error {
-	return cleanupAttemptReviewResourcesBound(ctx, stateRoot, boundary, manifest, remove, 0)
-}
-
-func cleanupAttemptReviewResourcesBound(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool, boundGroupPID int) error {
-	proofs := map[string]reviewerProcessProof{}
-	if boundGroupPID > 0 {
-		target := manifestReviewTarget(manifest.ReviewHead, manifest.ReviewTarget)
-		proofs[target] = reviewerProcessProof{Target: target, GroupPID: boundGroupPID, DeadProved: true}
-	}
-	return cleanupAttemptReviewResourcesProved(ctx, stateRoot, boundary, manifest, remove, proofs)
+	return cleanupAttemptReviewResourcesProved(ctx, stateRoot, boundary, manifest, remove, nil)
 }
 
 func cleanupAttemptReviewResourcesProved(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool, proofs map[string]reviewerProcessProof) error {
@@ -706,7 +697,15 @@ func cleanupAttemptReviewResourcesProved(ctx context.Context, stateRoot string, 
 	if (manifest.ReviewSession != "" || manifest.ReviewSnapshot != "" || snapshotExists) && len(proofs) == 0 {
 		return errors.New("unbound reviewer resources cannot be cleaned safely")
 	}
-	if err := cleanupCertifiedReviewResources(ctx, boundary, nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot); err != nil {
+	certificates := make([]reviewerProcessProof, 0, len(proofs))
+	for _, proof := range proofs {
+		certificates = append(certificates, proof)
+	}
+	if len(certificates) == 0 {
+		if err := cleanupReviewResources(ctx, boundary, nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot); err != nil {
+			return err
+		}
+	} else if err := cleanupCertifiedReviewResources(ctx, boundary, nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot, certificates...); err != nil {
 		return err
 	}
 	for _, path := range resultPaths {

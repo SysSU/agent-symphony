@@ -126,10 +126,15 @@ type runtimeEffectIntent struct {
 	Reconciliation                      *reconciliationEffectRequest   `json:"reconciliation,omitempty"`
 	ReconciliationResult                *reconciliationEffectResult    `json:"reconciliation_result,omitempty"`
 	ReviewerLaunched                    bool                           `json:"reviewer_launched,omitempty"`
+	ReviewerGateProtocol                bool                           `json:"reviewer_gate_protocol,omitempty"`
+	ReviewerSessionRequested            bool                           `json:"reviewer_session_requested,omitempty"`
 	ReviewerGroupPID                    int                            `json:"reviewer_group_pid,omitempty"`
 	ReviewerStopped                     bool                           `json:"reviewer_stopped,omitempty"`
 	SupersededReviewerID                string                         `json:"superseded_reviewer_id,omitempty"`
 	SupersededReviewerGroupPID          int                            `json:"superseded_reviewer_group_pid,omitempty"`
+	SupersededReviewerGateProtocol      bool                           `json:"superseded_reviewer_gate_protocol,omitempty"`
+	SupersededReviewerSessionRequested  bool                           `json:"superseded_reviewer_session_requested,omitempty"`
+	SupersededReviewerRequestDigest     string                         `json:"superseded_reviewer_request_digest,omitempty"`
 	SupersededReviewerTarget            string                         `json:"superseded_reviewer_target,omitempty"`
 	SupersededReviewerMode              string                         `json:"superseded_reviewer_mode,omitempty"`
 	SupersededReviewerIssueGeneration   uint64                         `json:"superseded_reviewer_issue_generation,omitempty"`
@@ -192,12 +197,13 @@ type completeEffectCommand struct {
 }
 
 type beginRuntimeEffectCommand struct {
-	Identity      stateResultIdentity
-	Action        agentruntime.EffectAction
-	Manifest      agentruntime.Manifest
-	Reason        string
-	RequestDigest string
-	Review        *agentruntime.ReviewTransition
+	Identity             stateResultIdentity
+	Action               agentruntime.EffectAction
+	Manifest             agentruntime.Manifest
+	Reason               string
+	RequestDigest        string
+	Review               *agentruntime.ReviewTransition
+	SupersededReviewerID string
 }
 
 type finishRuntimeEffectCommand struct {
@@ -232,6 +238,10 @@ type markPlanReviewRunningCommand struct {
 	GroupPID int
 }
 
+type markReviewerSessionRequestedCommand struct {
+	Identity stateResultIdentity
+}
+
 type proveReviewerDeadCommand struct {
 	Identity stateResultIdentity
 	GroupPID int
@@ -241,6 +251,11 @@ type proveReviewerDeadCommand struct {
 type markReviewerStoppedCommand struct {
 	Identity    stateResultIdentity
 	Observation reviewerStopObservation
+}
+
+type bindReviewerStoppingCommand struct {
+	Identity stateResultIdentity
+	GroupPID int
 }
 
 type reviewerStopObservation struct {
@@ -333,8 +348,10 @@ const (
 	stateOwnerBeginReconciliationEffect
 	stateOwnerAuthorizeReconciliationEffect
 	stateOwnerMarkPlanReviewRunning
+	stateOwnerMarkReviewerSessionRequested
 	stateOwnerProveReviewerDead
 	stateOwnerMarkReviewerStopped
+	stateOwnerBindReviewerStopping
 	stateOwnerSupersedePlanReview
 	stateOwnerFinishReconciliationEffect
 	stateOwnerDiagnoseReconciliationEffect
@@ -350,36 +367,38 @@ const (
 )
 
 type stateOwnerCommand struct {
-	kind                    stateOwnerCommandKind
-	issue                   advanceIssueGenerationCommand
-	invalidate              invalidateAttemptCommand
-	record                  recordEffectCommand
-	complete                completeEffectCommand
-	begin                   beginRuntimeEffectCommand
-	finish                  finishRuntimeEffectCommand
-	authorize               authorizeRuntimeEffectCommand
-	diagnoseRuntime         diagnoseRuntimeEffectCommand
-	reconcile               applyReconciliationCommand
-	beginReconciliation     beginReconciliationEffectCommand
-	authorizeReconciliation authorizeReconciliationEffectCommand
-	markPlanReviewRunning   markPlanReviewRunningCommand
-	proveReviewerDead       proveReviewerDeadCommand
-	markReviewerStopped     markReviewerStoppedCommand
-	supersedePlanReview     supersedePlanReviewCommand
-	finishReconciliation    finishReconciliationEffectCommand
-	diagnoseReconciliation  diagnoseReconciliationEffectCommand
-	mutatePRRecovery        mutatePRRecoveryCommand
-	receipt                 recordControlReceiptCommand
-	operatorDiagnostic      recordOperatorDiagnosticCommand
-	beginOperator           beginOperatorMutationCommand
-	startOperatorCleanup    startOperatorCleanupCommand
-	finishOperatorRuntime   finishOperatorRuntimeEffectCommand
-	finishOperatorReconcile finishOperatorReconciliationEffectCommand
-	advanceOperatorRecovery advanceOperatorRecoveryCommand
-	cycleOutcome            recordCycleOutcomeCommand
-	context                 context.Context
-	arbitration             *stateOwnerCommandArbitration
-	reply                   chan stateOwnerResult
+	kind                         stateOwnerCommandKind
+	issue                        advanceIssueGenerationCommand
+	invalidate                   invalidateAttemptCommand
+	record                       recordEffectCommand
+	complete                     completeEffectCommand
+	begin                        beginRuntimeEffectCommand
+	finish                       finishRuntimeEffectCommand
+	authorize                    authorizeRuntimeEffectCommand
+	diagnoseRuntime              diagnoseRuntimeEffectCommand
+	reconcile                    applyReconciliationCommand
+	beginReconciliation          beginReconciliationEffectCommand
+	authorizeReconciliation      authorizeReconciliationEffectCommand
+	markPlanReviewRunning        markPlanReviewRunningCommand
+	markReviewerSessionRequested markReviewerSessionRequestedCommand
+	proveReviewerDead            proveReviewerDeadCommand
+	markReviewerStopped          markReviewerStoppedCommand
+	bindReviewerStopping         bindReviewerStoppingCommand
+	supersedePlanReview          supersedePlanReviewCommand
+	finishReconciliation         finishReconciliationEffectCommand
+	diagnoseReconciliation       diagnoseReconciliationEffectCommand
+	mutatePRRecovery             mutatePRRecoveryCommand
+	receipt                      recordControlReceiptCommand
+	operatorDiagnostic           recordOperatorDiagnosticCommand
+	beginOperator                beginOperatorMutationCommand
+	startOperatorCleanup         startOperatorCleanupCommand
+	finishOperatorRuntime        finishOperatorRuntimeEffectCommand
+	finishOperatorReconcile      finishOperatorReconciliationEffectCommand
+	advanceOperatorRecovery      advanceOperatorRecoveryCommand
+	cycleOutcome                 recordCycleOutcomeCommand
+	context                      context.Context
+	arbitration                  *stateOwnerCommandArbitration
+	reply                        chan stateOwnerResult
 }
 
 type stateOwnerCommandArbitration struct{ state atomic.Uint32 }
@@ -769,6 +788,11 @@ func (o *stateOwner) markPlanReviewRunning(ctx context.Context, command markPlan
 	return result.snapshot, err
 }
 
+func (o *stateOwner) markReviewerSessionRequested(ctx context.Context, command markReviewerSessionRequestedCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerMarkReviewerSessionRequested, markReviewerSessionRequested: command})
+	return result.snapshot, err
+}
+
 func (o *stateOwner) proveReviewerDead(ctx context.Context, command proveReviewerDeadCommand) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerProveReviewerDead, proveReviewerDead: command})
 	return result.snapshot, err
@@ -776,6 +800,11 @@ func (o *stateOwner) proveReviewerDead(ctx context.Context, command proveReviewe
 
 func (o *stateOwner) markReviewerStopped(ctx context.Context, command markReviewerStoppedCommand) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerMarkReviewerStopped, markReviewerStopped: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) bindReviewerStopping(ctx context.Context, command bindReviewerStoppingCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerBindReviewerStopping, bindReviewerStopping: command})
 	return result.snapshot, err
 }
 
@@ -864,12 +893,20 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if err := applyMarkPlanReviewRunning(stateRoot, &candidate, command.markPlanReviewRunning); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
+	case stateOwnerMarkReviewerSessionRequested:
+		if err := applyMarkReviewerSessionRequested(stateRoot, &candidate, command.markReviewerSessionRequested); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
 	case stateOwnerProveReviewerDead:
 		if err := applyProveReviewerDead(&candidate, command.proveReviewerDead); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerMarkReviewerStopped:
 		if err := applyMarkReviewerStopped(&candidate, command.markReviewerStopped); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerBindReviewerStopping:
+		if err := applyBindReviewerStopping(&candidate, command.bindReviewerStopping); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerSupersedePlanReview:
@@ -979,7 +1016,7 @@ func applyAuthorizeRuntimeEffect(state runtimeOwnerState, command authorizeRunti
 
 func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerState, command beginRuntimeEffectCommand) (*runtimeEffectIntent, error) {
 	manifest, identity := cloneManifest(command.Manifest), command.Identity
-	if !validRuntimeEffectInput(command.Action, command.Reason) || !agentruntime.ValidEffectRequestDigest(command.RequestDigest) || command.Action == agentruntime.EffectCleanup || identity.Epoch != state.Epoch || identity.EffectID != "" {
+	if !validRuntimeEffectInput(command.Action, command.Reason) || !agentruntime.ValidEffectRequestDigest(command.RequestDigest) || command.Action == agentruntime.EffectCleanup || command.Action != agentruntime.EffectStop && command.SupersededReviewerID != "" || identity.Epoch != state.Epoch || identity.EffectID != "" {
 		return nil, errStaleStateResult
 	}
 	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil {
@@ -993,7 +1030,7 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 		for _, effect := range state.Effects {
 			record, exists := state.Attempts[attemptKey]
 			if effect.Repository == manifest.Repository && effect.Issue == manifest.Issue && effect.Attempt == manifest.Attempt && effect.State == "pending" && effect.Action == string(agentruntime.EffectStop) {
-				if exists && record.Generation == effect.AttemptGeneration && reflect.DeepEqual(record.Manifest, manifest) && effect.IssueGeneration == state.IssueGenerations[issueKey] && effect.RequestDigest == command.RequestDigest && effect.Reason == command.Reason {
+				if exists && record.Generation == effect.AttemptGeneration && reflect.DeepEqual(record.Manifest, manifest) && effect.IssueGeneration == state.IssueGenerations[issueKey] && effect.RequestDigest == command.RequestDigest && effect.Reason == command.Reason && effect.SupersededReviewerID == command.SupersededReviewerID {
 					return cloneEffect(&effect), nil
 				}
 				return nil, errStateConflict
@@ -1014,6 +1051,7 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 			return nil, errStateConflict
 		}
 	}
+	var supersededReviewer runtimeEffectIntent
 	switch command.Action {
 	case agentruntime.EffectPrepare:
 		if _, exists := state.Attempts[attemptKey]; exists || identity.AttemptGeneration != 0 || hasAttemptEffect(*state, manifest.Repository, manifest.Issue, manifest.Attempt) {
@@ -1029,7 +1067,12 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 		if !exists || !reflect.DeepEqual(record.Manifest, manifest) {
 			return nil, errStateConflict
 		}
-		if err := applyUpsertAttempt(attemptRoot, stateRoot, state, upsertAttemptCommand{Manifest: manifest, ExpectedIssueGeneration: identity.IssueGeneration, ExpectedAttemptGeneration: identity.AttemptGeneration}); err != nil {
+		var reviewerErr error
+		supersededReviewer, reviewerErr = pendingReviewerEffect(*state, manifest.Repository, manifest.Issue, manifest.Attempt)
+		if reviewerErr != nil || supersededReviewer.ID != command.SupersededReviewerID {
+			return nil, errStateConflict
+		}
+		if err := applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot, state, upsertAttemptCommand{Manifest: manifest, ExpectedIssueGeneration: identity.IssueGeneration, ExpectedAttemptGeneration: identity.AttemptGeneration}, supersededReviewer.ID); err != nil {
 			return nil, err
 		}
 		identity.IssueGeneration = state.IssueGenerations[issueKey]
@@ -1041,7 +1084,9 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 		}
 		pruneCompletedAttemptEffects(state, manifest.Repository, manifest.Issue, manifest.Attempt)
 	}
-	return &runtimeEffectIntent{Action: string(command.Action), Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: identity.IssueGeneration, AttemptGeneration: identity.AttemptGeneration, IntentEpoch: state.Epoch, State: "pending", RequestDigest: command.RequestDigest, Reason: command.Reason, Review: cloneReviewTransition(command.Review)}, nil
+	effect := &runtimeEffectIntent{Action: string(command.Action), Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: identity.IssueGeneration, AttemptGeneration: identity.AttemptGeneration, IntentEpoch: state.Epoch, State: "pending", RequestDigest: command.RequestDigest, Reason: command.Reason, Review: cloneReviewTransition(command.Review)}
+	bindSupersededReviewer(effect, supersededReviewer)
+	return effect, nil
 }
 
 func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerState, command finishRuntimeEffectCommand) error {
@@ -1126,7 +1171,7 @@ func applyMarkReviewerStopped(state *runtimeOwnerState, command markReviewerStop
 	}
 	key := reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, effect.SupersededReviewerMode, effect.SupersededReviewerTarget)
 	observed := command.Observation
-	if observed.NeverRan != (observed.GroupPID == 0) || effect.SupersededReviewerGroupPID > 0 && (observed.GroupPID != effect.SupersededReviewerGroupPID || observed.NeverRan) || effect.SupersededReviewerGroupPID == 0 && !observed.NeverRan && observed.GroupPID < 2 {
+	if observed.NeverRan != (observed.GroupPID == 0) || observed.NeverRan && (!effect.SupersededReviewerGateProtocol || effect.SupersededReviewerSessionRequested) || effect.SupersededReviewerGroupPID > 0 && (observed.GroupPID != effect.SupersededReviewerGroupPID || observed.NeverRan) || effect.SupersededReviewerGroupPID == 0 && !observed.NeverRan {
 		return errStateConflict
 	}
 	if effect.SupersededReviewerGroupPID > 0 {
@@ -1143,6 +1188,45 @@ func applyMarkReviewerStopped(state *runtimeOwnerState, command markReviewerStop
 		state.ReviewerProofs[key] = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.SupersededReviewerMode, Target: effect.SupersededReviewerTarget, EffectID: effect.SupersededReviewerID, IssueGeneration: effect.SupersededReviewerIssueGeneration, AttemptGeneration: effect.SupersededReviewerAttemptGeneration, GroupPID: observed.GroupPID, DeadProved: true, NeverRan: observed.NeverRan}
 	}
 	effect.ReviewerStopped = true
+	state.Effects[effect.ID] = effect
+	return nil
+}
+
+// Bind the externally verified live group before signalling it. This is not
+// death proof: a crash after the signal can replay from the durable group ID.
+func applyBindReviewerStopping(state *runtimeOwnerState, command bindReviewerStoppingCommand) error {
+	effect, ok := state.Effects[command.Identity.EffectID]
+	if !ok || effect.State != "pending" || command.GroupPID < 2 || effect.IntentEpoch != command.Identity.Epoch || effect.IntentRevision != command.Identity.SourceRevision || effect.IssueGeneration != command.Identity.IssueGeneration || effect.AttemptGeneration != command.Identity.AttemptGeneration || effect.RequestDigest != command.Identity.RequestDigest {
+		return errStaleStateResult
+	}
+	var proof reviewerProcessProof
+	if effect.Reconciliation != nil && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Mode == agentruntime.ReviewModePlan {
+		if !effect.ReviewerGateProtocol || !effect.ReviewerSessionRequested || effect.ReviewerGroupPID != 0 && effect.ReviewerGroupPID != command.GroupPID {
+			return errStateConflict
+		}
+		proof = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.Reconciliation.Reviewer.Mode, Target: effect.Reconciliation.Reviewer.Target, EffectID: effect.ID, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, GroupPID: command.GroupPID}
+		effect.ReviewerGroupPID = command.GroupPID
+		effect.ReviewerLaunched = true
+	} else if effect.SupersededReviewerID != "" && (effect.Action == string(agentruntime.EffectStop) || effect.Action == string(agentruntime.EffectCleanup)) {
+		if !effect.SupersededReviewerGateProtocol || !effect.SupersededReviewerSessionRequested || effect.SupersededReviewerGroupPID != 0 && effect.SupersededReviewerGroupPID != command.GroupPID {
+			return errStateConflict
+		}
+		proof = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.SupersededReviewerMode, Target: effect.SupersededReviewerTarget, EffectID: effect.SupersededReviewerID, IssueGeneration: effect.SupersededReviewerIssueGeneration, AttemptGeneration: effect.SupersededReviewerAttemptGeneration, GroupPID: command.GroupPID}
+		effect.SupersededReviewerGroupPID = command.GroupPID
+	} else {
+		return errStateConflict
+	}
+	key := reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target)
+	if old, exists := state.ReviewerProofs[key]; exists {
+		if old.EffectID != proof.EffectID || old.GroupPID != proof.GroupPID || old.IssueGeneration != proof.IssueGeneration || old.AttemptGeneration != proof.AttemptGeneration {
+			return errStateConflict
+		}
+		proof = old
+	}
+	if state.ReviewerProofs == nil {
+		state.ReviewerProofs = map[string]reviewerProcessProof{}
+	}
+	state.ReviewerProofs[key] = proof
 	state.Effects[effect.ID] = effect
 	return nil
 }
@@ -1326,6 +1410,10 @@ func finishRuntimeOwnerTransition(attemptRoot, stateRoot string, candidate runti
 }
 
 func applyUpsertAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState, command upsertAttemptCommand) error {
+	return applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot, state, command, "")
+}
+
+func applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot string, state *runtimeOwnerState, command upsertAttemptCommand, supersededReviewerID string) error {
 	manifest := cloneManifest(command.Manifest)
 	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil {
 		return err
@@ -1359,7 +1447,7 @@ func applyUpsertAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState,
 			return errors.New("attempt generation overflow")
 		}
 		for _, effect := range state.Effects {
-			if effect.Repository == manifest.Repository && effect.Issue == manifest.Issue && effect.Attempt == manifest.Attempt && !effectReferencedByReceipt(*state, effect.ID) && pendingReviewerDeathUnproved(*state, effect) {
+			if effect.Repository == manifest.Repository && effect.Issue == manifest.Issue && effect.Attempt == manifest.Attempt && effect.ID != supersededReviewerID && !effectReferencedByReceipt(*state, effect.ID) && pendingReviewerDeathUnproved(*state, effect) {
 				return errStateConflict
 			}
 		}
@@ -1930,7 +2018,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if effect.RequestDigest != "" && (!agentruntime.ValidEffectRequestDigest(effect.RequestDigest) || effect.IntentEpoch == 0 || effect.IntentEpoch > maxEpoch || !validRuntimeEffectInput(agentruntime.EffectAction(effect.Action), effect.Reason) || (effect.Action == string(agentruntime.EffectReview)) != (effect.Review != nil)) {
 			return errors.New("runtime owner typed effect intent is invalid")
 		}
-		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID) || !agentruntime.ValidReviewTarget(effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.Repository, effect.Issue) || effect.SupersededReviewerIssueGeneration == 0 || effect.SupersededReviewerAttemptGeneration == 0) || effect.SupersededReviewerID == "" && (effect.SupersededReviewerTarget != "" || effect.SupersededReviewerMode != "" || effect.SupersededReviewerIssueGeneration != 0 || effect.SupersededReviewerAttemptGeneration != 0 || effect.ReviewerStopped) {
+		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID) || !agentruntime.ValidReviewTarget(effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.Repository, effect.Issue) || effect.SupersededReviewerIssueGeneration == 0 || effect.SupersededReviewerAttemptGeneration == 0 || effect.SupersededReviewerSessionRequested && !effect.SupersededReviewerGateProtocol || effect.SupersededReviewerGateProtocol && !validDigest(effect.SupersededReviewerRequestDigest)) || effect.SupersededReviewerID == "" && (effect.SupersededReviewerTarget != "" || effect.SupersededReviewerMode != "" || effect.SupersededReviewerIssueGeneration != 0 || effect.SupersededReviewerAttemptGeneration != 0 || effect.ReviewerStopped || effect.SupersededReviewerGateProtocol || effect.SupersededReviewerSessionRequested || effect.SupersededReviewerRequestDigest != "") {
 			return errors.New("runtime owner superseded reviewer binding is invalid")
 		}
 		if effect.RequestDigest != "" && effect.Action == string(agentruntime.EffectReview) {

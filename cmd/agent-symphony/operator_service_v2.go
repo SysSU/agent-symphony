@@ -658,14 +658,13 @@ func (s *operatorMutationService) executeReserved(work operatorWork, reserved st
 
 func (s *operatorMutationService) watchPlanReviewer(requestID, effectID string) {
 	watchCtx, cancel := context.WithCancel(s.lifecycle)
-	s.mu.Lock()
-	if s.watchers == nil {
-		s.watchers = map[string]context.CancelFunc{}
-	}
-	s.watchers[effectID] = cancel
-	s.mu.Unlock()
 	released := s.releaseSignal(effectID)
-	if !s.start("review-watch:"+effectID, func() {
+	if !s.startReserved("review-watch:"+effectID, func() {
+		if s.watchers == nil {
+			s.watchers = map[string]context.CancelFunc{}
+		}
+		s.watchers[effectID] = cancel
+	}, func() {
 		defer func() {
 			s.mu.Lock()
 			delete(s.watchers, effectID)
@@ -706,9 +705,6 @@ func (s *operatorMutationService) watchPlanReviewer(requestID, effectID string) 
 		}
 	}) {
 		cancel()
-		s.mu.Lock()
-		delete(s.watchers, effectID)
-		s.mu.Unlock()
 		return
 	}
 	if snapshot, err := s.owner.snapshot(s.lifecycle); err == nil {
@@ -897,6 +893,12 @@ func (s *operatorMutationService) classifyWorkerFailure(requestID string, workEr
 }
 
 func (s *operatorMutationService) start(key string, work func()) bool {
+	return s.startReserved(key, nil, work)
+}
+
+// reserve runs under the same mutex as the active-key check, so duplicate
+// watcher requests cannot replace the cancel function of a live watcher.
+func (s *operatorMutationService) startReserved(key string, reserve, work func()) bool {
 	if key == "" {
 		return false
 	}
@@ -913,6 +915,9 @@ func (s *operatorMutationService) start(key string, work func()) bool {
 	}
 	s.active[key] = true
 	s.released[key] = make(chan struct{})
+	if reserve != nil {
+		reserve()
+	}
 	s.wg.Add(1)
 	s.mu.Unlock()
 	go func() {
@@ -1252,23 +1257,13 @@ func (s *operatorMutationService) supersedeInvalidPlanReview(ctx context.Context
 	if latest, exists := current.State.Effects[effect.ID]; !exists || latest.State != "pending" {
 		return true, nil
 	}
-	probe := cloneRuntimeOwnerState(current.State)
-	if effect.ReviewerLaunched {
-		reviewer := effect.Reconciliation.Reviewer
-		proofKey := reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, reviewer.Mode, reviewer.Target)
-		proof := probe.ReviewerProofs[proofKey]
-		proof.DeadProved = true // Validate invalidation before external stop; the real owner still requires proof.
-		probe.ReviewerProofs[proofKey] = proof
-	}
-	if err := applySupersedePlanReview(&probe, supersedePlanReviewCommand{Identity: ownerReconciliationEffectIdentity(effect)}); err != nil {
-		if errors.Is(err, errStateConflict) {
-			return false, nil
-		}
-		return false, err
-	}
 	reviewer := effect.Reconciliation.Reviewer
 	launchPath, terminalPath := reviewerLifecyclePaths(reviewer.Snapshot, reviewer.Target)
-	observation, err := s.stopReviewerSessionAt(ctx, reviewer.Session, effect.ID, effect.ReviewerGroupPID, launchPath, terminalPath, effect.IssueGeneration, effect.AttemptGeneration)
+	bind := func(pid int) error {
+		_, err := s.owner.bindReviewerStopping(ctx, bindReviewerStoppingCommand{Identity: ownerReconciliationEffectIdentity(effect), GroupPID: pid})
+		return err
+	}
+	observation, err := s.stopReviewerSessionAt(ctx, reviewer.Session, effect.ID, effect.RequestDigest, effect.ReviewerGroupPID, effect.ReviewerGateProtocol, effect.ReviewerSessionRequested, launchPath, terminalPath, effect.IssueGeneration, effect.AttemptGeneration, bind)
 	if err != nil {
 		return false, err
 	}
@@ -1291,11 +1286,11 @@ func (s *operatorMutationService) supersedeInvalidPlanReview(ctx context.Context
 // before signalling, can authorize reviewer cancellation. A lifecycle JSON
 // file or tmux kill-session acknowledgement is not process-death proof.
 func (s *operatorMutationService) stopReviewerSession(ctx context.Context, session, reviewerID string, groupPID int) error {
-	_, err := s.stopReviewerSessionAt(ctx, session, reviewerID, groupPID, "", "", 0, 0)
+	_, err := s.stopReviewerSessionAt(ctx, session, reviewerID, "", groupPID, false, false, "", "", 0, 0)
 	return err
 }
 
-func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, session, reviewerID string, groupPID int, launchPath, terminalPath string, issueGeneration, attemptGeneration uint64) (reviewerStopObservation, error) {
+func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, session, reviewerID, requestDigest string, groupPID int, gateProtocol, sessionRequested bool, launchPath, terminalPath string, issueGeneration, attemptGeneration uint64, beforeKill ...func(int) error) (reviewerStopObservation, error) {
 	s.mu.Lock()
 	cancelWatcher := s.watchers[reviewerID]
 	s.mu.Unlock()
@@ -1307,13 +1302,28 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 	case <-ctx.Done():
 		return reviewerStopObservation{}, ctx.Err()
 	}
-	status, err := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}})
+	status, err := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerPaneIdentityFormat}})
 	if err != nil && !missingTmuxServer(status) {
 		return reviewerStopObservation{}, fmt.Errorf("probe exact reviewer session %s: %w", session, err)
 	}
-	if missingTmuxPaneStatus(status) || missingTmuxServer(status) {
-		if groupPID < 2 {
+	if strings.TrimSpace(status.Output) == "|||||||" || missingTmuxServer(status) {
+		if groupPID < 2 && !gateProtocol {
 			return reviewerStopObservation{}, errors.New("unbound reviewer launch cannot be proved absent after session loss")
+		}
+		if groupPID < 2 {
+			if launchPath == "" || terminalPath == "" {
+				return reviewerStopObservation{}, errors.New("gated reviewer identity is unavailable")
+			}
+			if sessionRequested {
+				return reviewerStopObservation{}, errors.New("requested reviewer session vanished before owner child binding; child death is unproved")
+			}
+			var launch reviewerLaunchIdentity
+			found, readErr := readReviewerRecord(launchPath, &launch)
+			if readErr != nil || found {
+				return reviewerStopObservation{}, errors.New("gated reviewer launch identity is ambiguous after session loss")
+			}
+			s.cancelPlanWatcher(reviewerID)
+			return reviewerStopObservation{NeverRan: true}, nil
 		}
 		gone, proofErr := reviewerGroupGone(groupPID)
 		if proofErr != nil || !gone {
@@ -1322,13 +1332,12 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 		s.cancelPlanWatcher(reviewerID)
 		return reviewerStopObservation{GroupPID: groupPID}, nil
 	}
+	pane, err := parseReviewerPaneIdentity(status.Output)
+	if err != nil {
+		return reviewerStopObservation{}, err
+	}
 	if groupPID < 2 {
-		started, startErr := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_start_command}"}})
-		pidResult, pidErr := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_pid}"}})
-		wrapperPID, parseErr := reviewerPanePID(pidResult.Output)
-		if startErr != nil || pidErr != nil || started.Exited || pidResult.Exited || parseErr != nil {
-			return reviewerStopObservation{}, errors.New("unbound reviewer pane identity is unavailable")
-		}
+		wrapperPID := pane.PID
 		if launchPath == "" || terminalPath == "" {
 			return reviewerStopObservation{}, errors.New("unbound reviewer launch target is unavailable")
 		}
@@ -1338,18 +1347,26 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 			return reviewerStopObservation{}, errors.New("unbound reviewer launch identity is unavailable")
 		}
 		candidate := 0
-		if strings.Contains(started.Output, " review-pane ") {
-			if !found || launch.EffectID != reviewerID || launch.IssueGeneration != issueGeneration || launch.AttemptGeneration != attemptGeneration || !reviewerPaneStartMatches(started.Output, launchPath, terminalPath, launch) {
+		if strings.Contains(pane.Start, " review-pane ") {
+			if !found || launch.EffectID != reviewerID || launch.IssueGeneration != issueGeneration || launch.AttemptGeneration != attemptGeneration || launch.RequestDigest != requestDigest || launch.GateProtocol != gateProtocol || launch.SessionRequested != sessionRequested || !reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, launch) {
 				return reviewerStopObservation{}, errors.New("unbound reviewer launch identity is unavailable")
 			}
 			candidate = launch.ChildPID
-			if err := verifyReviewerChildBinding(ctx, s.reviewer, nil, session, launchPath, terminalPath, launch, candidate); err != nil {
+			if err := verifyReviewerChildAtPane(ctx, pane, launchPath, terminalPath, launch, candidate); err != nil {
 				return reviewerStopObservation{}, err
 			}
-		} else if found {
-			return reviewerStopObservation{}, errors.New("unbound reviewer pane is not the recorded managed wrapper")
+		} else {
+			return reviewerStopObservation{}, errors.New("reviewer session does not contain the exact managed wrapper")
 		}
-		if _, err := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", "=" + session}}); err != nil {
+		if candidate > 1 {
+			if len(beforeKill) == 0 || beforeKill[0] == nil {
+				return reviewerStopObservation{}, errors.New("unbound reviewer group must be owner-bound before stop")
+			}
+			if err := beforeKill[0](candidate); err != nil {
+				return reviewerStopObservation{}, fmt.Errorf("bind exact reviewer group before stop: %w", err)
+			}
+		}
+		if _, err := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", pane.SessionID}}); err != nil {
 			return reviewerStopObservation{}, err
 		}
 		if err := syscall.Kill(wrapperPID, 0); !errors.Is(err, syscall.ESRCH) {
@@ -1364,15 +1381,11 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 		s.cancelPlanWatcher(reviewerID)
 		return reviewerStopObservation{GroupPID: candidate, NeverRan: candidate == 0}, nil
 	}
-	pane, err := agentruntime.ParsePaneStatus(status.Output)
-	if err != nil {
-		return reviewerStopObservation{}, err
-	}
-	if !pane.Dead {
-		if err := verifyReviewerChildBinding(ctx, s.reviewer, nil, session, "", "", reviewerLaunchIdentity{EffectID: reviewerID}, groupPID); err != nil {
+	if !pane.Status.Dead {
+		if err := verifyReviewerChildAtPane(ctx, pane, launchPath, terminalPath, reviewerLaunchIdentity{EffectID: reviewerID, RequestDigest: requestDigest}, groupPID); err != nil {
 			return reviewerStopObservation{}, err
 		}
-		if _, err := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", "=" + session}}); err != nil {
+		if _, err := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", pane.SessionID}}); err != nil {
 			return reviewerStopObservation{}, fmt.Errorf("stop exact reviewer session %s: %w", session, err)
 		}
 		if gone, _ := reviewerGroupGone(groupPID); !gone {
@@ -1424,7 +1437,11 @@ func (s *operatorMutationService) stopBoundReviewer(ctx context.Context, request
 	snapshotRoot := productionSnapshotRoot(s.owner.stateRoot)
 	reviewSnapshot, _ := reviewIdentity(operatorEffectAttempt(manifest), snapshotRoot)
 	launchPath, terminalPath := reviewerLifecyclePaths(reviewSnapshot, effect.SupersededReviewerTarget)
-	observation, err := s.stopReviewerSessionAt(run.ctx, session, reviewerID, effect.SupersededReviewerGroupPID, launchPath, terminalPath, effect.SupersededReviewerIssueGeneration, effect.SupersededReviewerAttemptGeneration)
+	bind := func(pid int) error {
+		_, err := s.owner.bindReviewerStopping(run.ctx, bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), GroupPID: pid})
+		return err
+	}
+	observation, err := s.stopReviewerSessionAt(run.ctx, session, reviewerID, effect.SupersededReviewerRequestDigest, effect.SupersededReviewerGroupPID, effect.SupersededReviewerGateProtocol, effect.SupersededReviewerSessionRequested, launchPath, terminalPath, effect.SupersededReviewerIssueGeneration, effect.SupersededReviewerAttemptGeneration, bind)
 	if err != nil {
 		return err
 	}

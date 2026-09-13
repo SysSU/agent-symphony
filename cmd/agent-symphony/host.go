@@ -1416,11 +1416,22 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	}
 	switch args[0] {
 	case "new-session":
-		return len(args) == 6 && args[1] == "-d" && args[2] == "-s" && args[4] == "-c" && boundedCommandPath(args[5], dir, root)
+		if len(args) == 6 {
+			return args[1] == "-d" && args[2] == "-s" && args[4] == "-c" && boundedCommandPath(args[5], dir, root)
+		}
+		if len(args) < 17 || args[1] != "-d" || args[2] != "-s" || args[4] != "-c" || !boundedCommandPath(args[5], dir, root) || args[6] != "--" || args[8] != "review-pane" || args[9] != "tmux" || args[15] != "--" || args[16] == "" {
+			return false
+		}
+		helper, err := os.Executable()
+		if err != nil || args[7] != helper || filepath.Base(args[10]) != "launch.json" || filepath.Base(args[11]) != "terminal.json" || filepath.Dir(args[10]) != filepath.Dir(args[11]) || !strings.HasPrefix(filepath.Dir(args[10]), args[5]+".result-") {
+			return false
+		}
+		var identity reviewerLaunchIdentity
+		return json.Unmarshal([]byte(args[14]), &identity) == nil && identity.GateProtocol && identity.SessionRequested && identity.EffectID != "" && identity.IssueGeneration > 0 && identity.AttemptGeneration > 0 && validDigest(identity.RequestDigest) && args[12] == reviewerSignal(identity) && args[13] == reviewerStartSignal(identity)
 	case "has-session", "kill-session":
-		return len(args) == 3 && args[1] == "-t" && validTmuxTarget(args[2], false)
+		return len(args) == 3 && args[1] == "-t" && (validTmuxTarget(args[2], false) || args[0] == "kill-session" && validTmuxSessionID(args[2]))
 	case "display-message":
-		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, "#{pane_start_command}", "#{pane_pid}"}, args[4])
+		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, reviewerPaneIdentityFormat, "#{pane_start_command}", "#{pane_pid}"}, args[4])
 	case "wait-for":
 		return len(args) == 3 && (args[1] == "-L" || args[1] == "-U") && validReviewerWaitChannel(args[2])
 	case "capture-pane":
@@ -1488,6 +1499,14 @@ func validTmuxTarget(target string, pane bool) bool {
 		return false
 	}
 	return !pane || strings.HasSuffix(target, ":0.0")
+}
+
+func validTmuxSessionID(target string) bool {
+	if !strings.HasPrefix(target, "$") || len(target) < 2 {
+		return false
+	}
+	_, err := strconv.ParseUint(target[1:], 10, 64)
+	return err == nil
 }
 
 func reservedHostEnvironment(name string) bool {

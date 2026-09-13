@@ -300,7 +300,8 @@ func applyBeginReconciliationEffect(attemptRoot, stateRoot string, state *runtim
 	if err := applyReconciliationBeginTransition(state, request); err != nil {
 		return nil, err
 	}
-	return &runtimeEffectIntent{Action: string(request.Action), Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, IssueGeneration: identity.IssueGeneration, AttemptGeneration: attemptGeneration, IntentEpoch: state.Epoch, State: "pending", RequestDigest: digest, Reconciliation: &request}, nil
+	gateProtocol := request.Action == reconciliationReviewer && request.Reviewer != nil && request.Reviewer.Phase == "run-observe"
+	return &runtimeEffectIntent{Action: string(request.Action), Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, IssueGeneration: identity.IssueGeneration, AttemptGeneration: attemptGeneration, IntentEpoch: state.Epoch, State: "pending", RequestDigest: digest, Reconciliation: &request, ReviewerGateProtocol: gateProtocol}, nil
 }
 
 func samePendingRetryEffect(effect runtimeEffectIntent, request reconciliationEffectRequest, issueGeneration, attemptGeneration uint64) bool {
@@ -348,13 +349,32 @@ func applyAuthorizeReconciliationEffect(stateRoot string, state runtimeOwnerStat
 	return reconciliationEffectCurrent(stateRoot, state, effect)
 }
 
+func applyMarkReviewerSessionRequested(stateRoot string, state *runtimeOwnerState, command markReviewerSessionRequestedCommand) error {
+	effect, ok := state.Effects[command.Identity.EffectID]
+	if !ok || effect.State != "pending" || !effect.ReviewerGateProtocol || effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Phase != "run-observe" || !reconciliationEffectIdentityMatches(effect, command.Identity) {
+		return errStaleStateResult
+	}
+	if effect.ReviewerSessionRequested {
+		return nil
+	}
+	if effect.ReviewerLaunched || effect.ReviewerGroupPID != 0 {
+		return errStateConflict
+	}
+	if err := reconciliationEffectCurrent(stateRoot, *state, effect); err != nil {
+		return err
+	}
+	effect.ReviewerSessionRequested = true
+	state.Effects[effect.ID] = effect
+	return nil
+}
+
 func applyMarkPlanReviewRunning(stateRoot string, state *runtimeOwnerState, command markPlanReviewRunningCommand) error {
 	effect, ok := state.Effects[command.Identity.EffectID]
 	if !ok || effect.State != "pending" || effect.Reconciliation == nil || !reconciliationEffectIdentityMatches(effect, command.Identity) {
 		return errStaleStateResult
 	}
 	request := *effect.Reconciliation
-	if request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe" || request.Manifest == nil || command.GroupPID < 2 {
+	if request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe" || request.Manifest == nil || command.GroupPID < 2 || effect.ReviewerGateProtocol && !effect.ReviewerSessionRequested {
 		return errStateConflict
 	}
 	if err := reconciliationEffectFinishCurrent(stateRoot, *state, effect); err != nil {
@@ -385,7 +405,7 @@ func applyProveReviewerDead(state *runtimeOwnerState, command proveReviewerDeadC
 	if !ok || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || !reconciliationEffectIdentityMatches(effect, command.Identity) {
 		return errStaleStateResult
 	}
-	if command.NeverRan != (command.GroupPID == 0) || effect.ReviewerLaunched && (command.NeverRan || effect.ReviewerGroupPID != command.GroupPID) || !effect.ReviewerLaunched && !command.NeverRan && command.GroupPID < 2 {
+	if command.NeverRan != (command.GroupPID == 0) || command.NeverRan && (!effect.ReviewerGateProtocol || effect.ReviewerSessionRequested) || effect.ReviewerLaunched && (command.NeverRan || effect.ReviewerGroupPID != command.GroupPID) || !effect.ReviewerLaunched && !command.NeverRan && command.GroupPID < 2 {
 		return errStateConflict
 	}
 	key := reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, effect.Reconciliation.Reviewer.Mode, effect.Reconciliation.Reviewer.Target)
@@ -485,6 +505,13 @@ func applyFinishReconciliationEffect(stateRoot string, state *runtimeOwnerState,
 	}
 	if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Phase == "run-observe" && result.Reviewer != nil && result.Reviewer.Status != "failed" && !effect.ReviewerLaunched {
 		return errStateConflict // An old or forged result cannot bypass process binding.
+	}
+	if effect.ReviewerGateProtocol && !effect.ReviewerLaunched && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Phase == "run-observe" {
+		reviewer := effect.Reconciliation.Reviewer
+		proof := state.ReviewerProofs[reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, reviewer.Mode, reviewer.Target)]
+		if proof.EffectID != effect.ID || !proof.DeadProved || !proof.NeverRan || proof.GroupPID != 0 {
+			return errStateConflict
+		}
 	}
 	if effect.ReviewerLaunched && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil {
 		proof, ok := state.ReviewerProofs[reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, effect.Reconciliation.Reviewer.Mode, effect.Reconciliation.Reviewer.Target)]
@@ -610,7 +637,7 @@ func reconciliationEffectIdentityMatches(effect runtimeEffectIntent, identity st
 
 func validPersistedReconciliationEffect(state runtimeOwnerState, effect runtimeEffectIntent) bool {
 	request := effect.Reconciliation
-	if request == nil || effect.Review != nil || effect.Reason != "" || effect.SupersededReviewerID != "" || !boundedText(effect.Diagnostic, maxReconciliationStringBytes, false) || effect.Action != string(request.Action) || effect.Repository != request.Repository || effect.Issue != request.Issue || effect.Attempt != request.Attempt || effect.RequestDigest != reconciliationEffectDigest(*request) || !validReconciliationEffectRequest(state.Repository, *request) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || effect.ReviewerLaunched != (effect.ReviewerGroupPID > 1) || effect.ReviewerLaunched && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe") {
+	if request == nil || effect.Review != nil || effect.Reason != "" || effect.SupersededReviewerID != "" || !boundedText(effect.Diagnostic, maxReconciliationStringBytes, false) || effect.Action != string(request.Action) || effect.Repository != request.Repository || effect.Issue != request.Issue || effect.Attempt != request.Attempt || effect.RequestDigest != reconciliationEffectDigest(*request) || !validReconciliationEffectRequest(state.Repository, *request) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || effect.ReviewerLaunched != (effect.ReviewerGroupPID > 1) || effect.ReviewerSessionRequested && !effect.ReviewerGateProtocol || (effect.ReviewerLaunched || effect.ReviewerGateProtocol) && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe") {
 		return false
 	}
 	if effect.State == "pending" {

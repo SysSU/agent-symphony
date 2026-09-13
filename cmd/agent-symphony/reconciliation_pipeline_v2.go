@@ -491,7 +491,7 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 	if operator && material.Replay && request.Reviewer.Mode == agentruntime.ReviewModePlan {
 		observationGeneration = 0 // Read-only replay; finish still validates body and owner generations.
 	}
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, observationGeneration)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, observationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, false, err
 	}
@@ -511,7 +511,7 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		if !proved || !proof.DeadProved {
 			return reconciliationEffectResult{}, false, errors.New("automatic reviewer cleanup lacks owner process-death certificate")
 		}
-		if err := cleanupCertifiedReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, request.Reviewer.Target, request.Reviewer.Snapshot, request.Reviewer.Session, productionSnapshotRoot(c.owner.stateRoot)); err != nil {
+		if err := cleanupCertifiedReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, request.Reviewer.Target, request.Reviewer.Snapshot, request.Reviewer.Session, productionSnapshotRoot(c.owner.stateRoot), proof); err != nil {
 			return reconciliationEffectResult{}, false, err
 		}
 		session, sessionErr := boundary.call(run.ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + request.Reviewer.Session}, Dir: filepath.Dir(request.Reviewer.Snapshot), Env: material.Env})
@@ -545,6 +545,8 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		}
 		if effect, exists := ownerSnapshot.State.Effects[plan.Identity.EffectID]; exists {
 			value.ChildPID = effect.ReviewerGroupPID
+			value.GateProtocol = effect.ReviewerGateProtocol
+			value.SessionRequested = effect.ReviewerSessionRequested
 		}
 		binding = &value
 	}
@@ -553,11 +555,15 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		if snapshotErr != nil {
 			return reconciliationEffectResult{}, false, snapshotErr
 		}
-		var oldTargets []string
+		oldProofs := map[string]reviewerProcessProof{}
 		for _, proof := range ownerSnapshot.State.ReviewerProofs {
 			if proof.Repository == request.Repository && proof.Issue == request.Issue && proof.Attempt == request.Attempt && proof.DeadProved {
-				oldTargets = append(oldTargets, proof.Target)
+				oldProofs[proof.Target] = proof
 			}
+		}
+		oldTargets := make([]string, 0, len(oldProofs))
+		for target := range oldProofs {
+			oldTargets = append(oldTargets, target)
 		}
 		slices.Sort(oldTargets)
 		root := productionSnapshotRoot(c.owner.stateRoot)
@@ -566,13 +572,30 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		}
 		oldSnapshot, oldSession := reviewIdentity(attempt, root)
 		for _, target := range oldTargets {
-			if err := cleanupCertifiedReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, target, oldSnapshot, oldSession, root); err != nil {
+			if err := cleanupCertifiedReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, target, oldSnapshot, oldSession, root, oldProofs[target]); err != nil {
 				return reconciliationEffectResult{}, false, err
 			}
 		}
 	}
-	review, pending, err := runIndependentReviewV2(run.ctx, attempt, boundary, material.Env, material.Command, material.Issue, executionManifest, material.Source, request.Reviewer.HeadSHA, productionSnapshotRoot(c.owner.stateRoot), request.Reviewer.Mode, binding, material.Replay)
+	beforeSession := func() error {
+		if binding == nil || !binding.GateProtocol {
+			return errStateConflict
+		}
+		if _, err := c.owner.markReviewerSessionRequested(run.ctx, markReviewerSessionRequestedCommand{Identity: plan.Identity}); err != nil {
+			return err
+		}
+		binding.SessionRequested = true
+		return nil
+	}
+	review, pending, err := runIndependentReviewV2(run.ctx, attempt, boundary, material.Env, material.Command, material.Issue, executionManifest, material.Source, request.Reviewer.HeadSHA, productionSnapshotRoot(c.owner.stateRoot), request.Reviewer.Mode, binding, material.Replay, beforeSession)
 	if binding != nil && errors.Is(err, errReviewerTerminal) {
+		if binding.GateProtocol && binding.ChildPID == 0 && !binding.SessionRequested {
+			if _, proofErr := c.owner.proveReviewerDead(run.ctx, proveReviewerDeadCommand{Identity: plan.Identity, NeverRan: true}); proofErr != nil {
+				return reconciliationEffectResult{}, true, proofErr
+			}
+		} else if binding.GateProtocol && binding.ChildPID == 0 {
+			return reconciliationEffectResult{}, true, errors.New("requested reviewer session has no owner-bound child death proof")
+		}
 		review, pending, err = independentReviewResult{Status: "failed", Diagnostic: err.Error()}, false, nil
 	}
 	if binding != nil && material.Replay && pending && err == nil {

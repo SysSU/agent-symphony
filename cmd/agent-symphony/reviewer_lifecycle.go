@@ -25,6 +25,8 @@ type reviewerLaunchIdentity struct {
 	IssueGeneration   uint64 `json:"issue_generation"`
 	AttemptGeneration uint64 `json:"attempt_generation"`
 	RequestDigest     string `json:"request_digest"`
+	GateProtocol      bool   `json:"gate_protocol,omitempty"`
+	SessionRequested  bool   `json:"session_requested,omitempty"`
 	ChildPID          int    `json:"child_pid,omitempty"`
 }
 
@@ -61,6 +63,34 @@ func reviewerGoSignal(identity reviewerLaunchIdentity) string {
 
 func reviewerPaneStartMatches(start, launchPath, terminalPath string, identity reviewerLaunchIdentity) bool {
 	return strings.Contains(start, " review-pane tmux ") && strings.Contains(start, launchPath) && strings.Contains(start, terminalPath) && strings.Contains(start, reviewerSignal(identity)) && strings.Contains(start, identity.RequestDigest)
+}
+
+const reviewerPaneIdentityFormat = agentruntime.PaneStatusFormat + "|#{session_id}|#{pane_pid}|#{pane_start_command}"
+
+type reviewerPaneIdentity struct {
+	Status    agentruntime.PaneStatus
+	SessionID string
+	PID       int
+	Start     string
+}
+
+func parseReviewerPaneIdentity(output string) (reviewerPaneIdentity, error) {
+	fields := strings.SplitN(strings.TrimSpace(output), "|", 8)
+	if len(fields) != 8 || !strings.HasPrefix(fields[5], "$") || len(fields[5]) < 2 {
+		return reviewerPaneIdentity{}, errors.New("exact reviewer pane/session identity is unavailable")
+	}
+	if _, err := strconv.Atoi(strings.TrimPrefix(fields[5], "$")); err != nil {
+		return reviewerPaneIdentity{}, errors.New("exact reviewer session ID is unavailable")
+	}
+	status, err := agentruntime.ParsePaneStatus(strings.Join(fields[:5], "|"))
+	if err != nil {
+		return reviewerPaneIdentity{}, err
+	}
+	pid, err := reviewerPanePID(fields[6])
+	if err != nil {
+		return reviewerPaneIdentity{}, err
+	}
+	return reviewerPaneIdentity{Status: status, SessionID: fields[5], PID: pid, Start: fields[7]}, nil
 }
 
 func reviewerPanePID(output string) (int, error) {
@@ -105,12 +135,26 @@ func verifyReviewerChildBinding(ctx context.Context, boundary boundaryCaller, en
 	if err != nil {
 		return err
 	}
+	return verifyReviewerChildAtPane(ctx, reviewerPaneIdentity{PID: wrapperPID, Start: started.Output}, launchPath, terminalPath, identity, candidate)
+}
+
+func verifyReviewerChildAtPane(ctx context.Context, pane reviewerPaneIdentity, launchPath, terminalPath string, identity reviewerLaunchIdentity, candidate int) error {
+	if candidate < 2 {
+		return errors.New("reviewer child process identity is missing")
+	}
+	matching := reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, identity)
+	if launchPath == "" && terminalPath == "" {
+		matching = strings.Contains(pane.Start, " review-pane tmux ") && strings.Contains(pane.Start, reviewerSignal(identity))
+	}
+	if !matching {
+		return errors.New("exact reviewer wrapper is not live")
+	}
 	parentResult, err := exec.CommandContext(ctx, "ps", "-o", "ppid=", "-p", strconv.Itoa(candidate)).Output()
 	if err != nil {
 		return fmt.Errorf("verify reviewer child parent: %w", err)
 	}
 	parentPID, err := reviewerPanePID(string(parentResult))
-	if err != nil || parentPID != wrapperPID {
+	if err != nil || parentPID != pane.PID {
 		return errors.New("reviewer child is not owned by the exact wrapper")
 	}
 	groupPID, err := syscall.Getpgid(candidate)
