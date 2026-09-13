@@ -78,6 +78,38 @@ func TestEffectiveServeInterval(t *testing.T) {
 	}
 }
 
+func TestDisablePeriodicServeFlagValidation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"accepted by serve", []string{"serve", "--disable-periodic-reconciliation"}, "serve requires --state and --runtime-state"},
+		{"conflicts with explicit interval", []string{"serve", "--state", "unused", "--runtime-state", "unused", "--disable-periodic-reconciliation", "--interval", "60s"}, "--disable-periodic-reconciliation cannot be combined with --interval"},
+		{"not accepted by status", []string{"status", "--disable-periodic-reconciliation"}, "--disable-periodic-reconciliation is available only with serve"},
+		{"explicit false not accepted by status", []string{"status", "--disable-periodic-reconciliation=false"}, "--disable-periodic-reconciliation is available only with serve"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run(test.args, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), test.want) {
+				t.Fatalf("code=%d stderr=%q, want %q", code, stderr.String(), test.want)
+			}
+		})
+	}
+}
+
+func TestServeTickerSelection(t *testing.T) {
+	if ticker := newServeTicker(60*time.Second, true); ticker != nil {
+		ticker.Stop()
+		t.Fatal("disabled periodic reconciliation allocated a ticker")
+	}
+	ticker := newServeTicker(60*time.Second, false)
+	if ticker == nil || ticker.C == nil {
+		t.Fatal("default serve did not allocate its periodic ticker")
+	}
+	ticker.Stop()
+}
+
 func TestRuntimeStateBindsExactlyOneProject(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
 	if err := bindDeployment(root, "owner/first"); err != nil {

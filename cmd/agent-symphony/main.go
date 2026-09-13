@@ -775,6 +775,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	requestID := fs.String("request-id", "", "bounded control request identity")
 	controlTimeout := fs.Duration("timeout", 30*time.Second, "running-daemon control timeout (maximum 2m)")
 	interval := fs.Duration("interval", orchestrator.MaxReconcileInterval, "override configured serve reconciliation interval (maximum 60s)")
+	disablePeriodicReconciliation := fs.Bool("disable-periodic-reconciliation", false, "disable periodic reconciliation in serve (diagnostics/E2E only)")
 	dashboardAddress := fs.String("dashboard-address", "127.0.0.1:8080", "dashboard loopback listen address")
 	var dashboardProjects stringList
 	fs.Var(&dashboardProjects, "dashboard-project", "additional dashboard URL to present read-only (repeatable; serve only)")
@@ -784,6 +785,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	coordinator := fs.String("coordinator", "", "coordinator OS user")
 	if err := fs.Parse(flagArgs); err != nil {
 		return misuse(stderr, wantsJSON, command, err.Error())
+	}
+	disablePeriodicSet, intervalSet := false, false
+	fs.Visit(func(f *flag.Flag) {
+		disablePeriodicSet = disablePeriodicSet || f.Name == "disable-periodic-reconciliation"
+		intervalSet = intervalSet || f.Name == "interval"
+	})
+	if command != "serve" && disablePeriodicSet {
+		return misuse(stderr, wantsJSON, command, "--disable-periodic-reconciliation is available only with serve")
 	}
 	if command != "serve" && len(dashboardProjects) > 0 {
 		return misuse(stderr, wantsJSON, command, "--dashboard-project is available only with serve")
@@ -868,6 +877,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if fs.NArg() != 0 || *statePath == "" || *runtimeState == "" {
 			return misuse(stderr, wantsJSON, command, "serve requires --state and --runtime-state")
 		}
+		if *disablePeriodicReconciliation && intervalSet {
+			return misuse(stderr, wantsJSON, command, "--disable-periodic-reconciliation cannot be combined with --interval")
+		}
 		if *interval <= 0 || *interval > orchestrator.MaxReconcileInterval {
 			return misuse(stderr, wantsJSON, command, "--interval must be greater than zero and no more than 60s")
 		}
@@ -935,11 +947,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
-		ticker := time.NewTicker(*interval)
+		ticker := newServeTicker(*interval, *disablePeriodicReconciliation)
+		var ticks <-chan time.Time
+		if ticker == nil {
+			fmt.Fprintln(stderr, "reconciliation: PERIODIC DISABLED; startup and explicit/event triggers remain active (diagnostics/E2E only)")
+		} else {
+			ticks = ticker.C
+		}
 		for {
 			select {
 			case <-ctx.Done():
-				ticker.Stop()
+				if ticker != nil {
+					ticker.Stop()
+				}
 				shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				dashboardDone, runtimeDone := make(chan error, 1), make(chan error, 1)
 				go func() { dashboardDone <- dashboard.shutdown(shutdown) }()
@@ -950,7 +970,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 					return fail(stderr, *jsonOutput, command, err.Error())
 				}
 				return 0
-			case <-ticker.C:
+			case <-ticks:
 				if err := runtime.trigger.trigger(); err != nil && !errors.Is(err, errStateOwnerStopped) {
 					fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
 				}
@@ -1206,6 +1226,13 @@ func effectiveServeInterval(fs *flag.FlagSet, configuredSeconds int, override ti
 		}
 	})
 	return interval
+}
+
+func newServeTicker(interval time.Duration, disabled bool) *time.Ticker {
+	if disabled {
+		return nil
+	}
+	return time.NewTicker(interval)
 }
 
 func acquireDaemonLock(path string) (*os.File, error) {
@@ -2908,7 +2935,7 @@ commands:
 	init          create .agent-symphony.yaml with project defaults
 	validate      validate configuration
 	config view   print validated configuration
-	serve         reconcile at startup and at most every 60 seconds
+	serve         reconcile at startup and on a configured cadence
 	status        show recovered work
 	list          alias for status
 	inspect       show one issue (--issue number)
@@ -2932,6 +2959,7 @@ options:
 	--request-id id  bounded idempotency identity (control only)
 	--timeout duration  bounded running-daemon request timeout (maximum 2m)
 	--interval duration  override configured serve reconciliation interval (maximum 60s)
+	--disable-periodic-reconciliation  disable serve's periodic reconciliation (diagnostics/E2E only)
 	--dashboard-address address  dashboard listen address (serve only; loopback by default)
 	--dashboard-project URL  additional project dashboard to present read-only (serve only; repeatable)
 	--allow-unsafe-dashboard-network  permit non-loopback dashboard binding (requires password)
