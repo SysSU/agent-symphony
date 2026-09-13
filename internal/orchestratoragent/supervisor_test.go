@@ -704,6 +704,108 @@ func TestFailedDedupMarkerPersistenceDoesNotCancelCurrentAudit(t *testing.T) {
 	}
 }
 
+func TestFailedInvestigationCanBeRetriedForSameTarget(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		name := "same daemon"
+		if restart {
+			name = "after restart"
+		}
+		t.Run(name, func(t *testing.T) {
+			now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+			runner := &fakeRunner{auditAuth: true, auditOutput: "successful retry"}
+			agent := newTestSupervisor(t, runner, &now)
+			projection := []orchestrator.RecoveryStatus{{Repository: agent.Repository, Issue: 191, Attempt: 1, State: "active"}}
+			if _, err := agent.Observe(t.Context(), projection); err != nil {
+				t.Fatal(err)
+			}
+			agent.AuditCommand, agent.Launcher = []string{"audit"}, []string{"audit"}
+			if _, err := agent.Investigate(t.Context(), 191, 1); err != nil {
+				t.Fatal(err)
+			}
+			if report := waitHeartbeatReport(t, agent.Workspace, "failed"); report.Report != "" {
+				t.Fatalf("failed A claimed completed work: %#v", report)
+			}
+			agent.wg.Wait()
+			state, err := agent.readOrInitial()
+			if err != nil || state.LastInvestigation == "" {
+				t.Fatalf("failed A did not retain historical launch marker: state=%#v err=%v", state, err)
+			}
+			runner.auditAuth = false
+			if restart {
+				restarted := newTestSupervisor(t, runner, &now)
+				restarted.Root, restarted.Workspace, restarted.AuditWorkspace = agent.Root, agent.Workspace, agent.AuditWorkspace
+				if _, err := restarted.Observe(t.Context(), projection); err != nil {
+					t.Fatal(err)
+				}
+				restarted.AuditCommand, restarted.Launcher = []string{"audit"}, []string{"audit"}
+				agent = restarted
+			}
+			if status, err := agent.Investigate(t.Context(), 191, 1); err != nil || status.State != "running" {
+				t.Fatalf("same-target retry was not admitted: status=%#v err=%v", status, err)
+			}
+			if report := waitHeartbeatReport(t, agent.Workspace, "completed"); report.Report != "successful retry" || runner.auditStarts.Load() != 2 {
+				t.Fatalf("same-target retry returned without work: report=%#v audits=%d", report, runner.auditStarts.Load())
+			}
+			agent.wg.Wait()
+			if _, err := agent.Investigate(t.Context(), 191, 1); err != nil {
+				t.Fatal(err)
+			}
+			if report := waitHeartbeatReport(t, agent.Workspace, "completed"); report.Report != "successful retry" || runner.auditStarts.Load() != 3 {
+				t.Fatalf("completed target click did not start new work: report=%#v audits=%d", report, runner.auditStarts.Load())
+			}
+			agent.wg.Wait()
+		})
+	}
+}
+
+func TestManualInvestigationSupersedesSameDigestBackgroundAudit(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	initialRunner := &fakeRunner{auditOutput: "old manual result"}
+	initial := newTestSupervisor(t, initialRunner, &now)
+	projection := []orchestrator.RecoveryStatus{{Repository: initial.Repository, Issue: 191, Attempt: 1, State: "active"}}
+	if _, err := initial.Observe(t.Context(), projection); err != nil {
+		t.Fatal(err)
+	}
+	initial.AuditCommand, initial.Launcher = []string{"audit"}, []string{"audit"}
+	if _, err := initial.Investigate(t.Context(), 191, 1); err != nil {
+		t.Fatal(err)
+	}
+	waitHeartbeatReport(t, initial.Workspace, "completed")
+	initial.wg.Wait()
+
+	now = now.Add(heartbeatInterval)
+	runner := &fakeRunner{firstAuditGate: make(chan struct{}), firstAuditEntered: make(chan struct{}), firstAuditOutput: "stale background", auditOutput: "fresh manual"}
+	agent := newTestSupervisor(t, runner, &now)
+	agent.Root, agent.Workspace, agent.AuditWorkspace = initial.Root, initial.Workspace, initial.AuditWorkspace
+	agent.AuditCommand, agent.Launcher = []string{"audit"}, []string{"audit"}
+	released := false
+	defer func() {
+		if !released {
+			close(runner.firstAuditGate)
+		}
+		agent.wg.Wait()
+	}()
+	if _, err := agent.Observe(t.Context(), projection); err != nil {
+		t.Fatal(err)
+	}
+	<-runner.firstAuditEntered
+	if status, err := agent.Investigate(t.Context(), 191, 1); err != nil || status.State != "running" {
+		t.Fatalf("manual click with same historical digest did not supersede background work: status=%#v err=%v", status, err)
+	}
+	if _, _, firstCtx := runner.auditPair(); firstCtx == nil || firstCtx.Err() == nil {
+		t.Fatal("background audit was not canceled")
+	}
+	if report := waitHeartbeatReport(t, agent.Workspace, "completed"); report.Report != "fresh manual" || runner.auditStarts.Load() != 2 {
+		t.Fatalf("manual click returned without new work: report=%#v audits=%d", report, runner.auditStarts.Load())
+	}
+	close(runner.firstAuditGate)
+	released = true
+	agent.wg.Wait()
+	if report := waitHeartbeatReport(t, agent.Workspace, "completed"); report.Report != "fresh manual" {
+		t.Fatalf("stale background audit replaced manual result: %#v", report)
+	}
+}
+
 func TestPreparedAuditFailureReclaimsPrivateWorkspaceAndReport(t *testing.T) {
 	for _, failure := range []string{"state write", "launch"} {
 		t.Run(failure, func(t *testing.T) {
@@ -739,7 +841,7 @@ func TestPreparedAuditFailureReclaimsPrivateWorkspaceAndReport(t *testing.T) {
 				agent.mu.Lock()
 				agent.stopped = true
 				agent.mu.Unlock()
-				err = agent.launchAudit(workspace, now, "digest", "")
+				err = agent.launchAudit(workspace, now, "digest", "", "")
 			}
 			if err == nil || agent.abortPreparedAudit(workspace, err) == nil {
 				t.Fatal("expected failed audit preparation to retain its error")
@@ -1692,8 +1794,14 @@ func TestProjectionIsSanitizedBoundedAndInvestigateIsExact(t *testing.T) {
 	if runner.auditStarts.Load() != 2 {
 		t.Fatalf("investigate audits=%d want=2", runner.auditStarts.Load())
 	}
-	if _, err := agent.Investigate(context.Background(), 5, 1); err != nil || runner.auditStarts.Load() != 2 {
-		t.Fatalf("investigate was not deduplicated: audits=%d err=%v", runner.auditStarts.Load(), err)
+	if _, err := agent.Investigate(context.Background(), 5, 1); err != nil {
+		t.Fatal(err)
+	}
+	waitAuditStarts(t, runner, 3)
+	waitAuditIdle(t, agent)
+	agent.wg.Wait()
+	if report := waitHeartbeatReport(t, agent.Workspace, "completed"); report.Report != runner.auditOutput {
+		t.Fatalf("completed investigation was not repeatable: report=%#v audits=%d", report, runner.auditStarts.Load())
 	}
 	if _, err := agent.Investigate(context.Background(), 5, 2); err == nil {
 		t.Fatal("investigate accepted an absent attempt")

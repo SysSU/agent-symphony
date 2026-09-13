@@ -236,6 +236,7 @@ type Supervisor struct {
 	foreground         []*foregroundReservation
 	auditGeneration    uint64
 	auditCancel        context.CancelFunc
+	auditTargetDigest  string                // nonempty only for the current manual investigation
 	beforeAuditPublish func(context.Context) // deterministic completion barrier in tests
 	beforeMarkerWrite  func()                // deterministic persistence failure in tests
 	contextEpoch       uint64
@@ -255,7 +256,7 @@ type reservationResult struct {
 	err        error
 }
 
-func (s *Supervisor) launchAudit(workspace string, startedAt time.Time, projectionDigest, diagnostic string) error {
+func (s *Supervisor) launchAudit(workspace string, startedAt time.Time, projectionDigest, manualTargetDigest, diagnostic string) error {
 	s.mu.Lock()
 	if s.stopped || s.auditGeneration == ^uint64(0) {
 		s.mu.Unlock()
@@ -270,6 +271,7 @@ func (s *Supervisor) launchAudit(workspace string, startedAt time.Time, projecti
 	}
 	ctx, cancel := context.WithTimeout(lifecycle, auditTimeout)
 	s.auditCancel = cancel
+	s.auditTargetDigest = manualTargetDigest
 	s.wg.Add(1)
 	s.mu.Unlock()
 	go s.runAudit(ctx, cancel, workspace, generation, contextEpoch, startedAt, projectionDigest, diagnostic)
@@ -414,6 +416,12 @@ func (s *Supervisor) auditInFlight() bool {
 	return s.auditRunning
 }
 
+func (s *Supervisor) sameManualAudit(targetDigest string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.auditRunning && s.auditTargetDigest != "" && s.auditTargetDigest == targetDigest
+}
+
 // A foreground investigation supersedes an older audit without waiting for
 // its external process. Its result can only publish for the old generation.
 func (s *Supervisor) supersedeAudit() (bool, error) {
@@ -430,6 +438,7 @@ func (s *Supervisor) supersedeAudit() (bool, error) {
 	s.auditRunning = false
 	cancel := s.auditCancel
 	s.auditCancel = nil
+	s.auditTargetDigest = ""
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -440,6 +449,9 @@ func (s *Supervisor) supersedeAudit() (bool, error) {
 func (s *Supervisor) setAuditRunning(running bool) {
 	s.mu.Lock()
 	s.auditRunning = running
+	if !running {
+		s.auditTargetDigest = ""
+	}
 	s.mu.Unlock()
 }
 
@@ -623,7 +635,7 @@ func (s *Supervisor) ObserveCycle(ctx context.Context, statuses []orchestrator.R
 		}
 	}
 	if launchAudit {
-		if err := s.launchAudit(auditWorkspace, now, digest, diagnostic); err != nil {
+		if err := s.launchAudit(auditWorkspace, now, digest, "", diagnostic); err != nil {
 			err = s.abortPreparedAudit(auditWorkspace, err)
 			state.LastProjection, state.LastHeartbeatAt = previousProjection, previousHeartbeat
 			err = errors.Join(err, s.writeState(state))
@@ -730,7 +742,7 @@ func (s *Supervisor) Investigate(ctx context.Context, issue, attemptNumber int) 
 	}
 	item := s.projection[index]
 	digest := digest([]sanitizedStatus{item})
-	if digest == state.LastInvestigation {
+	if s.sameManualAudit(digest) {
 		return statusOf(state, len(attention(s.projection))), nil
 	}
 	if len(s.AuditCommand) == 0 {
@@ -769,7 +781,7 @@ func (s *Supervisor) Investigate(ctx context.Context, issue, attemptNumber int) 
 		err = s.abortPreparedAudit(auditWorkspace, err)
 		return statusOf(state, len(attention(s.projection))), err
 	}
-	if err := s.launchAudit(auditWorkspace, now, digest, ""); err != nil {
+	if err := s.launchAudit(auditWorkspace, now, digest, digest, ""); err != nil {
 		err = s.abortPreparedAudit(auditWorkspace, err)
 		state.LastInvestigation, state.LastHeartbeatAt = previousInvestigation, previousHeartbeat
 		err = errors.Join(err, s.writeState(state))
@@ -1015,6 +1027,7 @@ func (s *Supervisor) start(ctx context.Context, state persisted) (persisted, err
 		s.auditGeneration++
 		s.auditRunning = false
 		s.auditCancel = nil
+		s.auditTargetDigest = ""
 	}
 	s.mu.Unlock()
 	if oldAuditCancel != nil {
@@ -1204,6 +1217,7 @@ func (s *Supervisor) runAudit(ctx context.Context, cancel context.CancelFunc, wo
 		if generation == s.auditGeneration {
 			s.auditRunning = false
 			s.auditCancel = nil
+			s.auditTargetDigest = ""
 		}
 		s.mu.Unlock()
 		if completion != 0 {
