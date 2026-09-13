@@ -40,6 +40,7 @@ type operatorMutationService struct {
 	active            map[string]bool
 	released          map[string]chan struct{}
 	watchers          map[string]context.CancelFunc
+	stopping          chan struct{}
 	stopped           bool
 }
 
@@ -99,6 +100,12 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 	}
 	if err := ctx.Err(); err != nil {
 		return operatorErrorResult(request, http.StatusRequestTimeout, "operator request was cancelled before admission")
+	}
+	if request.Action == "review-plan" {
+		if err := s.reservePlanAdmission(ctx, request.RequestID); err != nil {
+			return operatorResultForError(request, err)
+		}
+		defer s.release("request:" + request.RequestID)
 	}
 	snapshot, err := s.owner.snapshot(ctx)
 	if err != nil {
@@ -766,7 +773,7 @@ func (s *operatorMutationService) scanPendingPlanReviewers(ctx context.Context, 
 			continue
 		}
 		s.mu.Lock()
-		launching := s.active[effect.ID]
+		launching := s.active[effect.ID] || s.active["request:"+receipt.Request.RequestID]
 		s.mu.Unlock()
 		if launching {
 			continue
@@ -950,6 +957,35 @@ func (s *operatorMutationService) reserve(key string) bool {
 	return true
 }
 
+func (s *operatorMutationService) reservePlanAdmission(ctx context.Context, requestID string) error {
+	key := "request:" + requestID
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if s.reserve(key) {
+			return nil
+		}
+		s.mu.Lock()
+		if s.stopping == nil {
+			s.stopping = make(chan struct{})
+		}
+		stopped := s.stopped
+		stopping := s.stopping
+		s.mu.Unlock()
+		if stopped {
+			return fmt.Errorf("operator service stopped: %w", context.Canceled)
+		}
+		select {
+		case <-s.releaseSignal(key):
+		case <-stopping:
+			return fmt.Errorf("operator service stopped: %w", context.Canceled)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 func (s *operatorMutationService) release(key string) {
 	s.mu.Lock()
 	delete(s.active, key)
@@ -976,7 +1012,12 @@ func (s *operatorMutationService) shutdown(ctx context.Context) error {
 		return nil
 	}
 	s.mu.Lock()
-	s.stopped = true
+	if !s.stopped {
+		s.stopped = true
+		if s.stopping != nil {
+			close(s.stopping)
+		}
+	}
 	s.mu.Unlock()
 	done := make(chan struct{})
 	go func() {
