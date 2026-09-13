@@ -78,6 +78,8 @@ type tmuxReviewerGuardBoundary struct {
 	binary      string
 	socket      string
 	beforeGuard func() error
+	afterGuard  func() error
+	maskMissing bool
 }
 
 func (b *tmuxReviewerGuardBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
@@ -95,6 +97,15 @@ func (b *tmuxReviewerGuardBoundary) call(ctx context.Context, operation string, 
 	result := agentruntime.Result{Output: string(output), Exited: true}
 	if exit, ok := err.(*exec.ExitError); ok {
 		result.Code = exit.ExitCode()
+	}
+	if len(command.Args) > 0 && command.Args[0] == "if-shell" && err == nil && b.afterGuard != nil {
+		if hookErr := b.afterGuard(); hookErr != nil {
+			return agentruntime.Result{}, hookErr
+		}
+		b.afterGuard = nil
+	}
+	if len(command.Args) > 0 && command.Args[0] == "has-session" && err != nil && b.maskMissing {
+		result.Output = "server exited unexpectedly"
 	}
 	return result, err
 }
@@ -202,6 +213,9 @@ func TestGuardedReviewerKillDoesNotTouchReplacementTmuxSession(t *testing.T) {
 
 func TestGuardedReviewerKillStopsExactTmuxSession(t *testing.T) {
 	boundary, run := reviewerGuardTmux(t)
+	// WSL2 reports this instead of the usual missing-server text after the
+	// real last-pane shutdown. The boundary still executes the real tmux call.
+	boundary.maskMissing = true
 	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 298, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -223,8 +237,67 @@ func TestGuardedReviewerKillStopsExactTmuxSession(t *testing.T) {
 	if err := guardedReviewerKillSession(t.Context(), boundary, pane, session, "", nil); err != nil {
 		t.Fatal(err)
 	}
+	if err := syscall.Kill(pane.ServerPID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("original tmux server still exists or cannot be proved gone: %v", err)
+	}
 	if output, err := run("has-session", "-t", "="+session); err == nil {
 		t.Fatalf("exact reviewer session remains: %s", output)
+	}
+}
+
+func TestGuardedReviewerKillRejectsUnlinkedLiveServerAndReplacement(t *testing.T) {
+	for _, replacement := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replacement_%t", replacement), func(t *testing.T) {
+			boundary, run := reviewerGuardTmux(t)
+			session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 315, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"anchor", session} {
+				if output, err := run("new-session", "-d", "-s", name); err != nil {
+					t.Fatalf("create %s: %v: %s", name, err, output)
+				}
+			}
+			output, err := run("display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerPaneIdentityFormat)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pane, err := parseReviewerPaneIdentity(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldSocket := boundary.socket + ".old"
+			boundary.afterGuard = func() error {
+				if err := os.Rename(boundary.socket, oldSocket); err != nil {
+					return err
+				}
+				if err := syscall.Kill(pane.ServerPID, 0); err != nil {
+					return fmt.Errorf("original server must remain live: %w", err)
+				}
+				if replacement {
+					if output, err := run("new-session", "-d", "-s", session); err != nil {
+						return fmt.Errorf("create foreign S2: %w: %s", err, output)
+					}
+				}
+				return nil
+			}
+			t.Cleanup(func() {
+				if output, err := exec.Command(boundary.binary, "-S", oldSocket, "-f", "/dev/null", "kill-server").CombinedOutput(); err != nil {
+					t.Errorf("stop exact original fixture server: %v: %s", err, output)
+				}
+			})
+			if err := guardedReviewerKillSession(t.Context(), boundary, pane, session, "", nil); err == nil {
+				t.Fatal("live original server was certified absent")
+			}
+			if err := syscall.Kill(pane.ServerPID, 0); err != nil {
+				t.Fatalf("original server no longer live: %v", err)
+			}
+			if replacement {
+				if output, err := run("has-session", "-t", "="+session); err != nil {
+					t.Fatalf("foreign S2 was killed: %v: %s", err, output)
+				}
+			}
+		})
 	}
 }
 

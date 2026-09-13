@@ -149,7 +149,10 @@ func guardedReviewerKillSession(ctx context.Context, boundary boundaryCaller, pa
 	if err == nil {
 		return errors.New("reviewer session remains after guarded stop")
 	}
-	if missingTmuxServer(status) || status.Exited && status.Code == 1 && strings.TrimSpace(status.Output) == "can't find session: "+session {
+	// The exact guard has run. If its original server is gone, its session is
+	// gone too; a tmux error string or missing socket alone is not that proof.
+	// A live, inaccessible, or reused PID remains ambiguous.
+	if errors.Is(syscall.Kill(pane.ServerPID, 0), syscall.ESRCH) {
 		return nil
 	}
 	return fmt.Errorf("reviewer session absence is unproved after guarded stop: %w (exited=%t code=%d output=%.256q)", err, status.Exited, status.Code, strings.TrimSpace(status.Output))
