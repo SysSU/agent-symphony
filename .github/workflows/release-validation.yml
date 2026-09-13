@@ -36,6 +36,7 @@ jobs:
         run: brew install tmux
       - name: Run deterministic full-system gate
         run: |
+          tmux -V
           AGENT_SYMPHONY_FULL_SYSTEM_E2E=1 go test ./cmd/agent-symphony -run '^Test(FullSystemE2E|HistoricalAttemptActionsFullSystemE2E|DashboardLifecycleFullSystemE2E|DashboardOrchestratorFullSystemE2E)$' -count=1 -timeout 10m
           AGENT_SYMPHONY_FULL_SYSTEM_E2E=1 AGENT_SYMPHONY_FULL_SYSTEM_RACE=1 go test -race ./cmd/agent-symphony -run '^Test(FullSystemE2E|HistoricalAttemptActionsFullSystemE2E|DashboardLifecycleFullSystemE2E|DashboardOrchestratorFullSystemE2E)$' -count=1 -timeout 10m
       - run: npm --prefix cmd/agent-symphony/dashboard run test:browser

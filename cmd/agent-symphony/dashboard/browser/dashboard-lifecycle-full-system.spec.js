@@ -34,7 +34,8 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
     page.once("dialog", (dialog) => dialog.accept());
     await archive.click();
     const response = await responsePromise;
-    expect([200, 202], await response.text()).toContain(response.status());
+    expect([200, 202]).toContain(response.status());
+    await expect(page.getByRole("status").filter({ hasText: /Archived issue #73, attempt 1|Archive accepted for issue #73, attempt 1/ })).toBeVisible();
     await expect.poll(async () => {
       const state = await fetch(`${baseURL}/dashboard-state.json`, { cache: "no-store" }).then((result) => result.json());
       return state.hidden?.some((entry) => entry.issue === 73 && entry.attempt === 1 && entry.reason === "archived");
@@ -132,7 +133,15 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       await page.reload();
       const canceledCard = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#73\b/ }) }).first();
       await expect(canceledCard).toContainText("failed");
-      await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toBeVisible();
+      try {
+        await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toBeVisible();
+      } catch (error) {
+        const [status, comments] = await Promise.all([
+          page.request.get(`${baseURL}/status.json`).then((response) => response.json()),
+          page.request.get(`${fakeGitHubURL}/repos/o/r/issues/73/comments`).then((response) => response.json()),
+        ]);
+        throw new Error(`Recover is unavailable after Cancel: status=${JSON.stringify(status)} comments=${JSON.stringify(comments)}`, { cause: error });
+      }
       await expect(canceledCard.getByRole("button", { name: "Open reviewer terminal" })).toHaveCount(0);
       expect(errors).toEqual([]);
       return;

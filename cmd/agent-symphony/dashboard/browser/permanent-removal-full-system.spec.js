@@ -6,7 +6,7 @@ const phase = process.env.AGENT_SYMPHONY_REMOVAL_E2E_PHASE;
 
 test.skip(!baseURL || !fakeGitHubURL, "run through the compiled permanent-removal harness");
 
-test("permanently removes one real historical attempt", async ({ page }) => {
+test("removes a historical attempt and archives a generated attempt", async ({ page }) => {
   const outbound = [];
   await page.context().route("https://github.com/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
