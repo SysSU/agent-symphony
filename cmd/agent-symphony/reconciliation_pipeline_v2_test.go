@@ -377,6 +377,63 @@ func TestReviewerPlannerUsesVerifiedCompletedHeadAndFullEnvironmentDigest(t *tes
 	}
 }
 
+func TestCompletedWorkerCleansPriorReviewBeforeStartingNewImplementationReview(t *testing.T) {
+	for _, mode := range []string{agentruntime.ReviewModePlan, agentruntime.ReviewModeImplementation} {
+		t.Run(mode, func(t *testing.T) {
+			test := reconciliationEffectCaseNamed(t, "reviewer-cleanup")
+			test.request.Reviewer.Mode = mode
+			root, owner, before := reconciliationEffectPersistentOwner(t, test.request)
+			if err := owner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			state := cloneRuntimeOwnerState(before.State)
+			key := ownerAttemptKey(test.request.Repository, test.request.Issue, test.request.Attempt)
+			record := state.Attempts[key]
+			record.Manifest.State = "completed"
+			state.Attempts[key] = record
+			owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = owner.close(context.Background()) })
+			current := refreshOwnerObservation(t, owner, test.request.Issue)
+			issue := issueFact(test.request.Issue, "title")
+			issue.Attempt = test.request.Attempt
+			newHead := strings.Repeat("c", 40)
+			candidate := reviewerExecutionMaterial{Issue: issue, Source: "/source", HeadSHA: newHead, Command: []string{"reviewer"}}
+			plans, _, err := planReconciliationReviewers(current, root, []reviewerExecutionMaterial{candidate})
+			if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "cleanup" || plans[0].Request.Reviewer.Mode != mode {
+				t.Fatalf("attached review must be cleaned before new reviewer: plans=%#v err=%v", plans, err)
+			}
+			_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request})
+			if err != nil {
+				t.Fatalf("owner rejected certified cleanup after worker completion: %v", err)
+			}
+			finished, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(*effect), Result: test.result(plans[0].Request)})
+			if err != nil {
+				t.Fatalf("owner rejected certified cleanup completion: %v", err)
+			}
+			manifest := finished.State.Attempts[key].Manifest
+			if manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" || manifest.ReviewState != "clean" || manifest.ReviewMode != mode {
+				t.Fatalf("cleanup did not detach only prior resources: %#v", manifest)
+			}
+			candidate.HeadSHA = manifest.ReviewHead
+			plans, _, err = planReconciliationReviewers(finished, root, []reviewerExecutionMaterial{candidate})
+			if err != nil || len(plans) != 0 {
+				t.Fatalf("same reviewed head was scheduled again: plans=%#v err=%v", plans, err)
+			}
+			candidate.HeadSHA = newHead
+			plans, _, err = planReconciliationReviewers(finished, root, []reviewerExecutionMaterial{candidate})
+			if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "run-observe" || plans[0].Request.Reviewer.Mode != agentruntime.ReviewModeImplementation || plans[0].Request.Reviewer.HeadSHA != newHead {
+				t.Fatalf("new worker head did not require implementation review: plans=%#v err=%v", plans, err)
+			}
+			if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request}); err != nil {
+				t.Fatalf("owner rejected implementation review after certified cleanup: %v", err)
+			}
+		})
+	}
+}
+
 func TestFailedImplementationReviewPersistsDiagnosticWithoutAutomaticRetry(t *testing.T) {
 	test := reconciliationEffectCaseNamed(t, "reviewer-run-observe")
 	test.request.Reviewer.Mode = agentruntime.ReviewModeImplementation
@@ -409,8 +466,330 @@ func TestFailedImplementationReviewPersistsDiagnosticWithoutAutomaticRetry(t *te
 	issue.Attempt = request.Attempt
 	candidate := reviewerExecutionMaterial{Issue: issue, Source: "/source", HeadSHA: request.Reviewer.HeadSHA, Env: []string{"GH_TOKEN=one"}, Command: []string{"reviewer"}}
 	plans, _, err := planReconciliationReviewers(finished, owner.stateRoot, []reviewerExecutionMaterial{candidate})
+	if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "cleanup" || plans[0].Request.Reviewer.HeadSHA != candidate.HeadSHA {
+		t.Fatalf("failed reviewer resources were not scheduled for exact cleanup: plans=%#v err=%v", plans, err)
+	}
+	_, cleanup, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request})
+	if err != nil {
+		t.Fatalf("owner rejected certified failed-review cleanup: %v", err)
+	}
+	cleaned, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(*cleanup), Result: reconciliationEffectCaseNamed(t, "reviewer-cleanup").result(plans[0].Request)})
+	if err != nil {
+		t.Fatalf("owner rejected failed-review cleanup completion: %v", err)
+	}
+	if manifest := cleaned.State.Attempts[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)].Manifest; manifest.ReviewState != "failed" || manifest.ReviewDiagnostic != result.Reviewer.Diagnostic || manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" {
+		t.Fatalf("failed review cleanup lost its durable diagnostic or retained resources: %#v", manifest)
+	}
+	plans, _, err = planReconciliationReviewers(cleaned, owner.stateRoot, []reviewerExecutionMaterial{candidate})
 	if err != nil || len(plans) != 0 {
-		t.Fatalf("failed implementation review retried without a new authorized head: plans=%#v err=%v", plans, err)
+		t.Fatalf("failed implementation review retried the same head: plans=%#v err=%v", plans, err)
+	}
+	candidate.HeadSHA = strings.Repeat("c", 40)
+	plans, _, err = planReconciliationReviewers(cleaned, owner.stateRoot, []reviewerExecutionMaterial{candidate})
+	if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "run-observe" || plans[0].Request.Reviewer.HeadSHA != candidate.HeadSHA {
+		t.Fatalf("new head did not authorize fresh implementation review: plans=%#v err=%v", plans, err)
+	}
+	sameHead := cloneReconciliationRequest(plans[0].Request)
+	sameHead.Reviewer.HeadSHA = request.Reviewer.HeadSHA
+	sameHead.Reviewer.Target = sameHead.Reviewer.BaseSHA + ".." + sameHead.Reviewer.HeadSHA
+	oldCandidate := candidate
+	oldCandidate.HeadSHA = sameHead.Reviewer.HeadSHA
+	sameHead.ExecutionDigest = reviewerExecutionDigest(sameHead, oldCandidate)
+	if !validReconciliationEffectRequest(cleaned.State.Repository, sameHead) {
+		t.Fatal("same-head probe was not a valid request")
+	}
+	if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: sameHead}); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("owner allowed same failed implementation head to retry: %v", err)
+	}
+	if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request}); err != nil {
+		t.Fatalf("owner rejected new-head review after failed-review cleanup: %v", err)
+	}
+}
+
+func TestInvalidatedImplementationSameHeadRequiresCertifiedCleanup(t *testing.T) {
+	test := reconciliationEffectCaseNamed(t, "reviewer-run-observe")
+	test.request.Reviewer.Mode, test.request.Reviewer.DigestVersion = agentruntime.ReviewModeImplementation, 1
+	oldOwner, snapshot, request := reconciliationEffectTestOwner(t, test.request)
+	root := oldOwner.stateRoot
+	_, pending, err := oldOwner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := mustOwnerSnapshot(t, oldOwner).State
+	identity := ownerReconciliationEffectIdentity(*pending)
+	if err := applyMarkReviewerSessionRequested(root, &state, markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMarkPlanReviewRunning(root, &state, markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	issueKey := ownerIssueKey(request.Repository, request.Issue)
+	observation := state.Observations[issueKey]
+	observation.Generation++
+	observation.Fact.BodyDigest = digestText("changed body")
+	for key, attempt := range observation.Attempts {
+		attempt.SourceIssueGeneration = observation.Generation
+		observation.Attempts[key] = attempt
+	}
+	state.Observations[issueKey] = observation
+	if err := applySupersedePlanReview(&state, supersedePlanReviewCommand{Identity: identity}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("live H1 reviewer superseded without death proof: %v", err)
+	}
+	if err := applyProveReviewerDead(&state, proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applySupersedePlanReview(&state, supersedePlanReviewCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldOwner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	if manifest := state.Attempts[key].Manifest; manifest.ReviewState != "failed" || !manifest.ReviewInvalidated || manifest.ReviewSnapshot == "" || manifest.ReviewSession == "" {
+		t.Fatalf("superseded H1 review did not retain exact failed resources: %#v", manifest)
+	}
+	persist := func(value runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), value)
+	}
+	owner, err := startTestStateOwner(t, root, state, persist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	current := refreshOwnerObservation(t, owner, request.Issue)
+	issue := issueFact(request.Issue, "title")
+	issue.Attempt, issue.Body = request.Attempt, "changed body"
+	candidate := reviewerExecutionMaterial{Issue: issue, Source: "/source", HeadSHA: request.Reviewer.HeadSHA, Command: []string{"reviewer"}}
+	plans, _, err := planReconciliationReviewers(current, root, []reviewerExecutionMaterial{candidate})
+	if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "cleanup" {
+		t.Fatalf("invalidated reviewer resources must be cleaned first: plans=%#v err=%v", plans, err)
+	}
+	_, cleanup, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := plans[0].Request.Reviewer
+	resultRoot := filepath.Dir(reviewResultPath(old.Snapshot, old.Target))
+	for _, path := range []string{old.Snapshot, resultRoot} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	proof := current.State.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, old.Mode, old.Target)]
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||\n"}}
+	attempt := agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt, BaseSHA: old.BaseSHA}
+	if err := cleanupCertifiedReviewResources(t.Context(), boundary, nil, attempt, old.HeadSHA, old.Target, old.Snapshot, old.Session, productionSnapshotRoot(root), proof); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{old.Snapshot, resultRoot} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("certified cleanup left old reviewer resource %s: %v", path, err)
+		}
+	}
+	cleaned, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(*cleanup), Result: reconciliationEffectCaseNamed(t, "reviewer-cleanup").result(plans[0].Request)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := cleaned.State.Attempts[key].Manifest
+	if manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" || !manifest.ReviewInvalidated {
+		t.Fatalf("cleanup lost invalidation or retained old resources: %#v", manifest)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(root, request.Repository)
+	if err != nil || !loaded.Attempts[key].Manifest.ReviewInvalidated || loaded.Attempts[key].Manifest.ReviewSnapshot != "" {
+		t.Fatalf("restart lost invalidation or cleanup: err=%v manifest=%#v", err, loaded.Attempts[key].Manifest)
+	}
+	owner, err = startTestStateOwner(t, root, loaded, persist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans, _, err = planReconciliationReviewers(refreshOwnerObservation(t, owner, request.Issue), root, []reviewerExecutionMaterial{candidate})
+	if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "run-observe" || plans[0].Request.Reviewer.HeadSHA != manifest.ReviewHead {
+		t.Fatalf("certified invalidation did not admit same-head review: plans=%#v err=%v", plans, err)
+	}
+	_, review, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request})
+	if err != nil {
+		t.Fatalf("owner rejected same-head review after certified cleanup: %v", err)
+	}
+	identity = ownerReconciliationEffectIdentity(*review)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999998}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: 99999998}); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(plans[0].Request)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest := finished.State.Attempts[key].Manifest; manifest.ReviewState != "clean" || manifest.ReviewInvalidated {
+		t.Fatalf("completed same-head review retained invalidation: %#v", manifest)
+	}
+}
+
+func TestProoflessLegacyTerminalReviewerDoesNotPoisonReconciliation(t *testing.T) {
+	for _, testCase := range []struct {
+		state, diagnostic string
+	}{
+		{state: "clean"},
+		{state: "findings-queued"},
+		{state: "failed", diagnostic: "legacy reviewer failed"},
+	} {
+		t.Run(testCase.state, func(t *testing.T) {
+			test := reconciliationEffectCaseNamed(t, "reviewer-cleanup")
+			test.request.Reviewer.Mode = agentruntime.ReviewModeImplementation
+			root, oldOwner, before := reconciliationEffectPersistentOwner(t, test.request)
+			if err := oldOwner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			state := cloneRuntimeOwnerState(before.State)
+			key := ownerAttemptKey(test.request.Repository, test.request.Issue, test.request.Attempt)
+			record := state.Attempts[key]
+			record.Manifest.ReviewState, record.Manifest.ReviewDiagnostic = testCase.state, testCase.diagnostic
+			if testCase.state == "findings-queued" {
+				record.Manifest.ReviewFindings = []string{"legacy finding"}
+			}
+			state.Attempts[key] = record
+			proofKey := reviewerProofKey(test.request.Repository, test.request.Issue, test.request.Attempt, record.Manifest.ReviewMode, record.Manifest.ReviewTarget)
+			proof := state.ReviewerProofs[proofKey]
+			delete(state.ReviewerProofs, proofKey)
+			owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = owner.close(context.Background()) })
+			current := refreshOwnerObservation(t, owner, test.request.Issue)
+			issue := issueFact(test.request.Issue, "title")
+			issue.Attempt = test.request.Attempt
+			candidate := reviewerExecutionMaterial{Issue: issue, Source: "/source", HeadSHA: strings.Repeat("c", 40), Command: []string{"reviewer"}}
+			plans, _, err := planReconciliationReviewers(current, root, []reviewerExecutionMaterial{candidate})
+			if err != nil || len(plans) != 0 {
+				t.Fatalf("proofless legacy cleanup was planned: plans=%#v err=%v", plans, err)
+			}
+			withProof := current
+			withProof.State = cloneRuntimeOwnerState(current.State)
+			withProof.State.ReviewerProofs[proofKey] = proof
+			plans, _, err = planReconciliationReviewers(withProof, root, []reviewerExecutionMaterial{candidate})
+			if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "cleanup" {
+				t.Fatalf("certified control plan was unavailable: plans=%#v err=%v", plans, err)
+			}
+			if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request}); !errors.Is(err, errStaleStateResult) {
+				t.Fatalf("owner admitted proofless legacy cleanup: %v", err)
+			}
+			runner := reconciliationRunner{owner: owner, collect: func(context.Context, stateOwnerSnapshot) (reconciliationInput, error) {
+				return reconciliationInput{Scope: issueScope(200), Complete: true, Issues: []internalgithub.RecoveryIssueFact{issueFact(200, "unrelated")}}, nil
+			}}
+			trigger, err := newReconciliationTriggerRunner(t.Context(), runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = trigger.shutdown(context.Background()) }()
+			project, err := newProjectDashboardServerV2(t.Context(), root, "o/r", nil, "tmux", operatorTestMutationService(t, owner), 1, false, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			project.reconcile = trigger.triggerAndWait
+			request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/reconcile", nil)
+			request.Header.Set("Origin", "http://127.0.0.1")
+			response := httptest.NewRecorder()
+			project.webHandler().ServeHTTP(response, request)
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("unrelated manual Reconcile HTTP %d: %s", response.Code, response.Body.String())
+			}
+			after := mustOwnerSnapshot(t, owner)
+			manifest := after.State.Attempts[key].Manifest
+			if manifest.ReviewState != testCase.state || manifest.ReviewDiagnostic != testCase.diagnostic || manifest.ReviewSnapshot == "" || manifest.ReviewSession == "" {
+				t.Fatalf("proofless legacy reviewer was changed or hidden: %#v", manifest)
+			}
+			for _, effect := range after.State.Effects {
+				if effect.State == "pending" && effect.Reconciliation != nil && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer.Phase == "cleanup" {
+					t.Fatalf("unfinishable cleanup intent was persisted: %#v", effect)
+				}
+			}
+		})
+	}
+}
+
+func TestPartialLegacyReviewerBindingDoesNotPoisonSameIssueManualReconcile(t *testing.T) {
+	for _, missing := range []string{"snapshot", "session"} {
+		t.Run(missing, func(t *testing.T) {
+			test := reconciliationEffectCaseNamed(t, "reviewer-cleanup")
+			root, oldOwner, before := reconciliationEffectPersistentOwner(t, test.request)
+			if err := oldOwner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			state := cloneRuntimeOwnerState(before.State)
+			key := ownerAttemptKey(test.request.Repository, test.request.Issue, test.request.Attempt)
+			record := state.Attempts[key]
+			if missing == "snapshot" {
+				record.Manifest.ReviewSnapshot = ""
+			} else {
+				record.Manifest.ReviewSession = ""
+			}
+			state.Attempts[key] = record
+			proof := state.ReviewerProofs[reviewerProofKey(test.request.Repository, test.request.Issue, test.request.Attempt, record.Manifest.ReviewMode, record.Manifest.ReviewTarget)]
+			if !proof.DeadProved {
+				t.Fatal("fixture lacks exact reviewer death proof")
+			}
+			owner, err := startTestStateOwner(t, root, state, func(value runtimeOwnerState) error {
+				return writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), value)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = owner.close(context.Background()) })
+			refreshOwnerObservation(t, owner, test.request.Issue)
+			if err := owner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := readRuntimeOwnerState(root, test.request.Repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner, err = startTestStateOwner(t, root, loaded, func(value runtimeOwnerState) error {
+				return writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), value)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			issue := issueFact(test.request.Issue, "title")
+			issue.Attempt = test.request.Attempt
+			candidate := reviewerExecutionMaterial{Issue: issue, HeadSHA: strings.Repeat("c", 40), Command: []string{"reviewer"}}
+			production := &productionReconciliation{owner: owner, effects: &runtimeEffectCoordinator{owner: owner}, stateRoot: root}
+			trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(ctx context.Context) error {
+				return production.runReviewerPhase(ctx, []reviewerExecutionMaterial{candidate})
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = trigger.shutdown(context.Background()) })
+			project, err := newProjectDashboardServerV2(t.Context(), root, "o/r", nil, "tmux", operatorTestMutationService(t, owner), 1, false, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			project.reconcile = trigger.triggerAndWait
+			request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/reconcile", nil)
+			request.Header.Set("Origin", "http://127.0.0.1")
+			response := httptest.NewRecorder()
+			project.webHandler().ServeHTTP(response, request)
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("same-issue manual Reconcile HTTP %d: %s", response.Code, response.Body.String())
+			}
+			after := mustOwnerSnapshot(t, owner)
+			if !reflect.DeepEqual(after.State.Attempts[key].Manifest, record.Manifest) {
+				t.Fatalf("partial legacy reviewer binding changed: %#v", after.State.Attempts[key].Manifest)
+			}
+			for _, effect := range after.State.Effects {
+				if effect.State == "pending" && effect.Reconciliation != nil && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer.Phase == "cleanup" {
+					t.Fatalf("unfinishable cleanup intent persisted: %#v", effect)
+				}
+			}
+		})
 	}
 }
 

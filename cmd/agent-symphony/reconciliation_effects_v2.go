@@ -851,6 +851,9 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 		if reviewer.Snapshot != expectedSnapshot || reviewer.Session != expectedSession {
 			return false
 		}
+		if reviewer.Phase == "cleanup" {
+			return (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued" || manifest.ReviewState == "failed") && reviewManifestMatches(manifest, reviewer) && reviewerCleanupProved(state, request.Repository, request.Issue, request.Attempt, reviewer.Mode, reviewer.Target)
+		}
 		if reviewer.Mode == agentruntime.ReviewModePlan {
 			if manifest.State != "running" || !observation.Fact.DispatchAuthorized || reviewer.Target != fmt.Sprintf("%s#%d plan sha256:%s", request.Repository, request.Issue, request.BodyDigest) || reviewer.BaseSHA != manifest.BaseSHA || reviewer.HeadSHA != manifest.BaseSHA || !remotelyObserved || fact.BaseSHA != manifest.BaseSHA || fact.State != "active" && fact.State != "review-ready" {
 				return false
@@ -858,13 +861,21 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 		} else if manifest.State != "completed" || reviewer.Target != reviewer.BaseSHA+".."+reviewer.HeadSHA || reviewer.BaseSHA != observation.Fact.BaseSHA {
 			return false
 		}
-		if reviewer.Phase == "cleanup" {
-			return (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued") && reviewManifestMatches(manifest, reviewer)
+		detached := manifest.ReviewSnapshot == "" && manifest.ReviewSession == ""
+		switch manifest.ReviewState {
+		case "":
+			return true
+		case "failed":
+			return detached && (reviewer.Mode == agentruntime.ReviewModePlan || reviewer.Mode == agentruntime.ReviewModeImplementation && (manifest.ReviewHead != reviewer.HeadSHA || manifest.ReviewInvalidated && manifest.ReviewMode == agentruntime.ReviewModeImplementation))
+		case "preparing", "running":
+			return reviewManifestMatches(manifest, reviewer)
+		case "findings-queued":
+			return manifest.ReviewHandoffAck && detached && manifest.ReviewHead != reviewer.HeadSHA
+		case "clean":
+			return detached && reviewer.Mode == agentruntime.ReviewModeImplementation && (manifest.ReviewMode == agentruntime.ReviewModePlan || manifest.ReviewMode == agentruntime.ReviewModeImplementation) && manifest.ReviewHead != reviewer.HeadSHA && reviewer.HeadSHA != manifest.BaseSHA
+		default:
+			return false
 		}
-		// A fresh review may replace a previous failed review with a new
-		// target. The outer exact manifest binding pins that failed projection;
-		// running/completion still bind to this pending effect's own target.
-		return manifest.ReviewState == "" || manifest.ReviewState == "failed" && request.Manifest != nil && sameReconciliationManifest(request, manifest, *request.Manifest) || (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") && reviewManifestMatches(manifest, reviewer) || manifest.ReviewState == "findings-queued" && manifest.ReviewHandoffAck && manifest.ReviewSnapshot == "" && manifest.ReviewSession == "" && manifest.ReviewHead != reviewer.HeadSHA
 	case reconciliationMonitoringCheckIn:
 		return manifest.State == "running" && observation.Fact.DispatchAuthorized && observation.Fact.NeedsAttention && remotelyObserved && (fact.State == "active" || fact.State == "review-ready") && fact.BaseSHA == manifest.BaseSHA
 	case reconciliationHandoffDeliver:
@@ -907,6 +918,11 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 
 func reviewManifestMatches(manifest agentruntime.Manifest, request *reviewerEffectRequest) bool {
 	return request != nil && manifest.ReviewMode == request.Mode && manifest.ReviewTarget == request.Target && manifest.ReviewBase == request.BaseSHA && manifest.ReviewHead == request.HeadSHA && manifest.ReviewSnapshot == request.Snapshot && manifest.ReviewSession == request.Session
+}
+
+func reviewerCleanupProved(state runtimeOwnerState, repository string, issue, attempt int, mode, target string) bool {
+	proof, ok := state.ReviewerProofs[reviewerProofKey(repository, issue, attempt, mode, target)]
+	return ok && proof.DeadProved && proof.IssueGeneration == state.IssueGenerations[ownerIssueKey(repository, issue)] && proof.AttemptGeneration == state.AttemptGenerations[ownerAttemptKey(repository, issue, attempt)]
 }
 
 func currentPRRecovery(state runtimeOwnerState, request reconciliationEffectRequest) (runtimePRRecovery, bool) {
