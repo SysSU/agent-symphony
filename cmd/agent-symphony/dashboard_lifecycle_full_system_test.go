@@ -40,9 +40,10 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	tracing := os.Getenv("AGENT_SYMPHONY_FULL_SYSTEM_RACE") == "1"
-	for _, action := range []string{"cancel", "recover", "review-plan", "review-plan-cancel", "review-plan-archive", "dismiss-overlap", "abandon-overlap"} {
+	for _, action := range []string{"cancel", "recover", "review-plan", "review-plan-cancel", "review-plan-archive", "dismiss-overlap", "abandon-overlap", "archive-overlap"} {
 		t.Run(action, func(t *testing.T) {
 			overlap := strings.HasSuffix(action, "-overlap")
+			completedOverlap := action == "dismiss-overlap" || action == "archive-overlap"
 			controlledCycle := overlap
 			root, err := os.MkdirTemp("/tmp", "as-lifecycle-")
 			if err != nil {
@@ -78,7 +79,7 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 			runExternal(t, repository, "git", "push", "-q", "runtime-fixture", "main")
 			manifest := historicalFullSystemManifest(t, sourceGit, stateRoot, base, 73, 1)
 			manifest.State = "running"
-			if action == "dismiss-overlap" {
+			if completedOverlap {
 				if err := os.WriteFile(filepath.Join(manifest.Worktree, "completed.txt"), []byte("published attempt\n"), 0o600); err != nil {
 					t.Fatal(err)
 				}
@@ -117,7 +118,7 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 				}
 				comments = append(comments, map[string]any{"id": 2, "body": "Attempt failed closed: fixture worker failed\n\n" + terminal, "created_at": manifest.UpdatedAt.Format(time.RFC3339Nano), "updated_at": manifest.UpdatedAt.Format(time.RFC3339Nano), "user": map[string]any{"id": 42}})
 			}
-			if action == "dismiss-overlap" {
+			if completedOverlap {
 				marker, err := internalgithub.AttemptMarker(73, 1, manifest.Branch, manifest.ReviewHead, 91, "review")
 				if err != nil {
 					t.Fatal(err)
@@ -131,8 +132,8 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 			if action == "abandon-overlap" {
 				labels = map[string]bool{}
 			}
-			fixture := &fullSystemGitHub{base: base, origin: origin, labels: labels, comments: comments, closed: action == "dismiss-overlap"}
-			if action == "dismiss-overlap" {
+			fixture := &fullSystemGitHub{base: base, origin: origin, labels: labels, comments: comments, closed: completedOverlap}
+			if completedOverlap {
 				fixture.pr = map[string]any{"number": 91, "body": comments[0]["body"], "state": "closed", "merged": true, "merged_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "head": map[string]any{"sha": manifest.ReviewHead, "ref": manifest.Branch}, "base": map[string]any{"sha": base}}
 			}
 			retryEntered, retryRelease := make(chan struct{}, 1), make(chan struct{})
@@ -317,7 +318,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				}
 				if overlap {
 					observation := ledger.Observations[ownerIssueKey("o/r", 73)]
-					if observation.ObservationEpoch != ledger.Epoch || observation.OwnerGeneration != ledger.IssueGenerations[ownerIssueKey("o/r", 73)] || !observation.Present || action == "dismiss-overlap" && (!observation.Attempts[key].Present || observation.Attempts[key].Fact.State != "completed" || observation.Attempts[key].Fact.PR != 91) {
+					if observation.ObservationEpoch != ledger.Epoch || observation.OwnerGeneration != ledger.IssueGenerations[ownerIssueKey("o/r", 73)] || !observation.Present || completedOverlap && (!observation.Attempts[key].Present || observation.Attempts[key].Fact.State != "completed" || observation.Attempts[key].Fact.PR != 91) {
 						return false
 					}
 				}
@@ -341,7 +342,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				}
 				for _, status := range snapshot.Statuses {
 					if status.Issue == 73 && status.Attempt == 1 {
-						return action == "recover" && status.Retryable || action == "dismiss-overlap" && status.State == "completed" && status.IssueClosed && !status.OperatorBlocked || action == "abandon-overlap" && status.State == "orphaned" && !status.OperatorBlocked || action != "recover" && !overlap && status.State == "active"
+						return action == "recover" && status.Retryable || completedOverlap && status.State == "completed" && status.IssueClosed && !status.OperatorBlocked || action == "abandon-overlap" && status.State == "orphaned" && !status.OperatorBlocked || action != "recover" && !overlap && status.State == "active"
 					}
 				}
 				return false
@@ -366,7 +367,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				}
 				sourceCycle = before.CycleOutcomeID
 				sourceStale = before.StaleReconciliations
-				if action == "dismiss-overlap" {
+				if completedOverlap {
 					fixture.mu.Lock()
 					fixture.includeClosedIssue = true
 					fixture.mu.Unlock()
@@ -403,7 +404,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				case <-time.After(limit):
 					t.Fatal("reconciliation did not enter blocked fake-GitHub read")
 				}
-				if action == "dismiss-overlap" {
+				if completedOverlap {
 					heldMarkerObserved = markerObserved.Load()
 					if !heldMarkerObserved {
 						t.Fatal("held reconciliation did not read the completed-attempt marker before Dismiss")
@@ -432,7 +433,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 			}
 			if overlap {
 				mutation := strings.TrimSuffix(action, "-overlap")
-				terminalAction := map[string]string{"dismiss": "dismissed", "abandon": "abandoned"}[mutation]
+				terminalAction := map[string]string{"dismiss": "dismissed", "abandon": "abandoned", "archive": "archived"}[mutation]
 				verifyAbsent := func(address, stage string) {
 					verify := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, stage+"-playwright"))
 					verify.Dir = source
@@ -448,7 +449,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 						return false
 					}
 					for _, receipt := range ledger.ControlReceipts {
-						if receipt.Request.Action == mutation && receipt.Request.Issue == 73 && receipt.Request.Attempt == 1 && (mutation == "abandon" && receipt.State == "pending" && receipt.EffectID == tombstone.EffectID || receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK) {
+						if receipt.Request.Action == mutation && receipt.Request.Issue == 73 && receipt.Request.Attempt == 1 && ((mutation == "abandon" || mutation == "archive") && receipt.State == "pending" && receipt.EffectID == tombstone.EffectID || receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK) {
 							return true
 						}
 					}
@@ -486,7 +487,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				case <-time.After(limit):
 					t.Fatalf("stale reconciliation did not finish after %s", mutation)
 				}
-				if !heldIssueListObserved.Load() || mutation == "dismiss" && !heldMarkerObserved || mutation == "abandon" && !markerObserved.Load() {
+				if !heldIssueListObserved.Load() || (mutation == "dismiss" || mutation == "archive") && !heldMarkerObserved || mutation == "abandon" && !markerObserved.Load() {
 					fixture.mu.Lock()
 					requests := append([]string(nil), fixture.requests...)
 					fixture.mu.Unlock()

@@ -17,6 +17,13 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
   await page.goto(baseURL);
   const card = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#73\b/ }) }).first();
   const exactAttempt = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#73\b/ }) }).filter({ hasText: /Attempt 1(?!\d)/ });
+  const historicalAttempt = async () => {
+    const history = page.locator("details.attemptHistory");
+    await expect(history).toBeVisible();
+    if (await history.getAttribute("open") === null) await history.locator("summary").click();
+    await expect(history).toHaveAttribute("open", "");
+    return history.getByRole("listitem").filter({ hasText: /Attempt 1(?!\d)/ });
+  };
   if (action.endsWith("-overlap-verify")) {
     await expect.poll(async () => {
       const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
@@ -61,6 +68,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
     "review-plan": card.getByRole("button", { name: "Start plan review" }),
     "review-plan-archive": card.getByRole("button", { name: "Start plan review" }),
     "review-plan-cancel": card.getByRole("button", { name: "Start plan review" }),
+    "archive-overlap": card.getByRole("button", { name: "Archive" }),
     "dismiss-overlap": card.getByRole("button", { name: "Dismiss issue #73, attempt 1; keep diagnostics" }),
     "abandon-overlap": card.getByRole("button", { name: "Abandon attempt" }),
   }[action];
@@ -79,7 +87,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
   await expect(page.getByRole("status").filter({ hasText: requestAction === "review-plan" ? "Started plan review for issue #73, attempt 1." : "issue #73, attempt 1" })).toBeVisible({ timeout: 15_000 });
 
   if (action.endsWith("-overlap")) {
-    const reason = requestAction === "dismiss" ? "dismissed" : "abandoned";
+    const reason = { archive: "archived", dismiss: "dismissed", abandon: "abandoned" }[requestAction];
     await expect.poll(async () => {
       const state = await fetch(`${baseURL}/dashboard-state.json`, { cache: "no-store" }).then((result) => result.json());
       return state.hidden?.some((entry) => entry.issue === 73 && entry.attempt === 1 && entry.reason === reason);
@@ -96,7 +104,18 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       return status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.state;
     }, { timeout: 20_000 }).toMatch(/^(cancelled|failed)$/);
     await page.reload();
-    await expect(page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#73\b/ }) }).first()).toContainText(/cancelled|failed/);
+    const current = await page.request.get(`${baseURL}/status.json`).then((result) => result.json());
+    const old = current.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1);
+    const next = current.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
+    if (next && !/Attempt 2(?!\d)/.test(await card.innerText())) await page.reload();
+    const canceledCard = /Attempt 2(?!\d)/.test(await card.innerText()) ? await historicalAttempt() : exactAttempt;
+    await expect(canceledCard).toContainText(/cancelled|failed/);
+    if (next) {
+      expect(next.session).toBeTruthy();
+      expect(next.session).not.toBe(old?.session);
+      await expect(card).toContainText(/Attempt 2(?!\d)/);
+      await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toHaveCount(0);
+    }
   }
   if (requestAction === "review-plan") {
     let reviewer;
@@ -132,18 +151,11 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       }, { timeout: 20_000 }).toBe("failed");
       await page.reload();
       await expect(card).toBeVisible();
-      const history = page.locator("details.attemptHistory");
-      const historicalCard = async () => {
-        await expect(history).toBeVisible();
-        if (await history.getAttribute("open") === null) await history.locator("summary").click();
-        await expect(history).toHaveAttribute("open", "");
-        return history.getByRole("listitem").filter({ hasText: /Attempt 1(?!\d)/ });
-      };
-      let canceledCard = /Attempt 2(?!\d)/.test(await card.innerText()) ? await historicalCard() : exactAttempt;
+      let canceledCard = /Attempt 2(?!\d)/.test(await card.innerText()) ? await historicalAttempt() : exactAttempt;
       try {
         await expect(canceledCard).toContainText("failed");
       } catch {
-        canceledCard = await historicalCard();
+        canceledCard = await historicalAttempt();
         await expect(canceledCard).toContainText("failed");
       }
       const status = await page.request.get(`${baseURL}/status.json`).then((response) => response.json());
