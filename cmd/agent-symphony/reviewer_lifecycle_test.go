@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -117,6 +119,26 @@ func reviewerGuardTmux(t *testing.T) (*tmuxReviewerGuardBoundary, func(...string
 	return boundary, run
 }
 
+func waitReviewerTmuxSocketDisconnected(socket string) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		connection, err := net.DialTimeout("unix", socket, 100*time.Millisecond)
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
+			return nil
+		}
+		if err != nil && !os.IsTimeout(err) {
+			return err
+		}
+		if connection != nil {
+			_ = connection.Close()
+		}
+		if time.Now().After(deadline) {
+			return errors.New("old tmux server still accepts connections after kill-server")
+		}
+		runtime.Gosched()
+	}
+}
+
 func TestGuardedReviewerKillDoesNotTouchReplacementTmuxSession(t *testing.T) {
 	for _, replaceServer := range []bool{false, true} {
 		t.Run(fmt.Sprintf("server_restart_%t", replaceServer), func(t *testing.T) {
@@ -145,6 +167,9 @@ func TestGuardedReviewerKillDoesNotTouchReplacementTmuxSession(t *testing.T) {
 				if replaceServer {
 					if output, err := run("kill-server"); err != nil {
 						return fmt.Errorf("replace S1 server: %w: %s", err, output)
+					}
+					if err := waitReviewerTmuxSocketDisconnected(boundary.socket); err != nil {
+						return err
 					}
 				} else if output, err := run("kill-session", "-t", "="+session); err != nil {
 					return fmt.Errorf("replace S1 session: %w: %s", err, output)
@@ -333,6 +358,9 @@ func TestCertifiedReviewerCleanupGuardsDeadPaneAcrossServerReplacement(t *testin
 				boundary.beforeGuard = func() error {
 					if output, err := run("kill-server"); err != nil {
 						return fmt.Errorf("replace reviewer server: %w: %s", err, output)
+					}
+					if err := waitReviewerTmuxSocketDisconnected(boundary.socket); err != nil {
+						return err
 					}
 					if output, err := run("new-session", "-d", "-s", session); err != nil {
 						return fmt.Errorf("create foreign reviewer S2: %w: %s", err, output)
