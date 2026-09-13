@@ -140,12 +140,30 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 		reviewer := effect.Reconciliation.Reviewer
 		for index := range statuses {
 			status := &statuses[index]
-			if status.Repository != effect.Repository || status.Issue != effect.Issue || status.Attempt != effect.Attempt || slices.ContainsFunc(status.Sessions, func(session orchestrator.AttemptSession) bool {
-				return session.Role == agentruntime.SessionRoleReviewer
-			}) {
+			if status.Repository != effect.Repository || status.Issue != effect.Issue || status.Attempt != effect.Attempt {
 				continue
 			}
-			status.Sessions = append(status.Sessions, orchestrator.AttemptSession{Role: agentruntime.SessionRoleReviewer, Name: reviewer.Session, State: "preparing", Mode: reviewer.Mode, Target: reviewer.Target, Current: true})
+			phase := "preparing"
+			if effect.ReviewerLaunched {
+				phase = "running"
+			}
+			session := orchestrator.AttemptSession{Role: agentruntime.SessionRoleReviewer, Name: reviewer.Session, State: phase, Mode: reviewer.Mode, Target: reviewer.Target, Current: true}
+			replaced := false
+			for i := range status.Sessions {
+				status.Sessions[i].Current = false
+				if status.Sessions[i].Role == agentruntime.SessionRoleReviewer {
+					status.Sessions[i] = session
+					replaced = true
+				}
+			}
+			if !replaced {
+				status.Sessions = append(status.Sessions, session)
+			}
+			status.CurrentPhase = "review"
+			status.Diagnostic = ""
+			if len(status.Blockers) == 0 && (status.State == "active" || status.State == "review-ready") {
+				status.Action = "monitor the independent reviewer session"
+			}
 		}
 	}
 	for index := range statuses {

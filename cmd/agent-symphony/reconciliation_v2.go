@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
 const (
@@ -440,6 +441,7 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 		}
 	}
 	if !collection.Complete {
+		revokeInvalidPlanReviewers(state, false)
 		return nil
 	}
 	keys := make([]string, 0, len(state.Observations)+1)
@@ -511,7 +513,21 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 		}
 		state.Observations[key] = next
 	}
+	revokeInvalidPlanReviewers(state, false)
 	return nil
+}
+
+func revokeInvalidPlanReviewers(state *runtimeOwnerState, untracked bool) {
+	for id, effect := range state.Effects {
+		if effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan || effect.Reconciliation.Reviewer.Phase != "run-observe" {
+			continue
+		}
+		if !untracked && !planReviewInvalidated(*state, effect) {
+			continue
+		}
+		effect.ReviewerRevoked = true
+		state.Effects[id] = effect
+	}
 }
 
 func countStaleReconciliation(state *runtimeOwnerState) error {

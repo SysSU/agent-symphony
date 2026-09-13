@@ -33,6 +33,37 @@ func TestRuntimeEffectSupersededBeforeExecutionPerformsNoIO(t *testing.T) {
 	}
 }
 
+func TestOlderOwnerSnapshotCannotCancelNewerAdmittedRun(t *testing.T) {
+	owner := newReconciliationTestOwner(t)
+	stale := applyReconciliationInput(t, owner, repositoryInput(true, issueFact(471, "first")))
+	applyReconciliationInput(t, owner, repositoryInput(true, issueFact(471, "first"), issueFact(472, "second")))
+	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
+	captured, release, canceled := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		close(captured) // Caller A has captured S1, but has not examined active runs.
+		<-release
+		coordinator.cancelInvalidated(stale)
+		close(canceled)
+	}()
+	<-captured
+	key := ownerAttemptKey("o/r", 472, 1)
+	run, err := coordinator.acquireKey(t.Context(), key, 1, 1, 0, "new-effect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coordinator.releaseKey(key, run)
+	close(release)
+	<-canceled
+	if run.ctx.Err() != nil {
+		t.Fatal("delayed old commit canceled a newer admitted effect")
+	}
+	current := mustOwnerSnapshot(t, owner)
+	coordinator.cancelInvalidated(current)
+	if run.ctx.Err() == nil {
+		t.Fatal("current invalidation failed to cancel a missing effect")
+	}
+}
+
 func TestRuntimeEffectDispatchRegistersBeforeSpawnAndShutdownJoins(t *testing.T) {
 	coordinator, owner, _, manifest := runtimeEffectTestCoordinator(t, 72)
 	request := beginRuntimeTestEffect(t, coordinator, owner, agentruntime.EffectMonitor, manifest, "")

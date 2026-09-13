@@ -112,7 +112,7 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	cycle := &productionReconciliation{
 		owner: owner, effects: effects, collector: collector, config: cfg, api: api,
 		stateRoot: stateRoot, attemptRoot: attemptRoot, checkout: checkout,
-		implementation: implementation, reviewer: reviewer, reviewEnv: reviewEnvironment,
+		implementation: implementation, reviewer: reviewer, operator: operator, reviewEnv: reviewEnvironment,
 		supervisor: agent, capacity: cfg.Concurrency, log: log,
 	}
 	runtime.cycle = cycle

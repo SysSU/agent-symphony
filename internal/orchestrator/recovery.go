@@ -250,6 +250,9 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 }
 
 func projectAttemptLifecycle(status *RecoveryStatus, manifest agentruntime.Manifest) {
+	if manifest.ReviewState == "failed" && manifest.ReviewDiagnostic != "" {
+		status.Diagnostic = manifest.ReviewDiagnostic
+	}
 	add := func(role, name, state, mode, target string, created time.Time) {
 		want, err := agentruntime.AttemptSessionName(role, manifest.Repository, manifest.Issue, manifest.Attempt)
 		if err == nil && name == want && state != "" {
@@ -272,6 +275,8 @@ func projectAttemptLifecycle(status *RecoveryStatus, manifest agentruntime.Manif
 	switch {
 	case manifest.State == "failed" || manifest.State == "cancelled":
 		status.CurrentPhase = manifest.State
+	case manifest.ReviewMode == agentruntime.ReviewModePlan && (manifest.ReviewState == "preparing" || manifest.ReviewState == "running"):
+		status.CurrentPhase = "review"
 	case manifest.State == "preparing" || manifest.State == "running":
 		if manifest.ReviewState == "findings-queued" {
 			status.CurrentPhase = "findings-handoff"

@@ -256,7 +256,7 @@ func TestLocalAgentHostLaunchesImplementationAndReviewSessions(t *testing.T) {
 				t.Fatalf("launch: %v: %s", err, result.Output)
 			}
 			output := filepath.Join(root, "environment")
-			script := `printf '%s\n' "$GIT_CONFIG_COUNT" "$GIT_CONFIG_KEY_0" "$GIT_CONFIG_VALUE_0" > "$1"`
+			script := `printf '%s\n' "$GIT_CONFIG_COUNT" "$GIT_CONFIG_KEY_0" "$GIT_CONFIG_VALUE_0" > "$1.tmp" && mv "$1.tmp" "$1"`
 			if _, err := boundary.Run(t.Context(), agentruntime.Command{Name: "tmux", Args: []string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--", "sh", "-c", script, "agent-host-test", output}, Dir: root, Env: env}); err != nil {
 				t.Fatal(err)
 			}
@@ -417,6 +417,30 @@ func TestWorkerBoundaryAllowsOnlyExactAncestryCheck(t *testing.T) {
 				t.Fatal("broader ancestry command accepted")
 			}
 		})
+	}
+}
+
+func TestReviewerBoundaryWaitForOnlyExactEffectChannels(t *testing.T) {
+	root := t.TempDir()
+	effect := strings.Repeat("a", 32)
+	for _, channel := range []string{"review-" + effect, "review-" + effect + "-start"} {
+		for _, action := range []string{"-L", "-U"} {
+			if err := validateBoundaryCommand(boundaryCommand{Name: "tmux", Args: []string{"wait-for", action, channel}}, root); err != nil {
+				t.Fatalf("exact reviewer wait %q rejected: %v", channel, err)
+			}
+		}
+	}
+	for _, args := range [][]string{
+		{"wait-for", "-S", "review-" + effect},
+		{"wait-for", "-L", "review-" + effect + "; kill-server"},
+		{"wait-for", "-U", "review-" + strings.Repeat("A", 32)},
+		{"wait-for", "-L", "review-" + effect[:31]},
+		{"wait-for", "-L", "other-" + effect},
+		{"set-hook", "-p", "-t", "=pane:0.0", "pane-died", "wait-for -U review-" + effect},
+	} {
+		if err := validateBoundaryCommand(boundaryCommand{Name: "tmux", Args: args}, root); err == nil {
+			t.Fatalf("forged reviewer wait accepted: %q", args)
+		}
 	}
 }
 

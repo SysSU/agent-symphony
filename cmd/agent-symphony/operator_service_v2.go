@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
@@ -36,14 +38,17 @@ type operatorMutationService struct {
 	mu                sync.Mutex
 	wg                sync.WaitGroup
 	active            map[string]bool
+	released          map[string]chan struct{}
+	watchers          map[string]context.CancelFunc
 	stopped           bool
 }
 
 type operatorWork struct {
-	requestID string
-	runtime   *agentruntime.EffectRequest
-	plan      *reconciliationPlannedEffect
-	reviewer  *reviewerExecutionMaterial
+	requestID      string
+	runtime        *agentruntime.EffectRequest
+	plan           *reconciliationPlannedEffect
+	reviewer       *reviewerExecutionMaterial
+	stopReviewerID string
 }
 
 type operatorReceiptStatus struct {
@@ -61,12 +66,13 @@ func newOperatorMutationService(lifecycle context.Context, owner *stateOwner, ef
 		return nil, errors.New("operator mutation service repository does not match owner")
 	}
 	cleanup.runtime = effects.executor.Runtime
+	cleanup.owner = owner
 	effects.executor.Cleanup = cleanup.execute
 	effects.executor.VerifyCleanup = cleanup.verify
 	service := &operatorMutationService{
 		lifecycle: lifecycle, owner: owner, effects: effects, cleanup: cleanup, collector: collector, reviewer: reviewer,
 		reviewSource: reviewSource, reviewEnvironment: slices.Clone(reviewEnvironment), reviewCommand: slices.Clone(reviewCommand), issueClosed: currentGitHubIssueClosed,
-		active: map[string]bool{},
+		active: map[string]bool{}, released: map[string]chan struct{}{}, watchers: map[string]context.CancelFunc{},
 	}
 	service.collect = func(ctx context.Context, snapshot stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
 		bound := collector
@@ -181,9 +187,11 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		return operatorResultForError(request, err)
 	}
 	s.effects.cancelInvalidated(committed)
+	s.cancelSupersededPlanWatchers(snapshot, committed)
 	if effect != nil {
 		work.requestID = request.RequestID
 		bindOperatorWorkIdentity(&work, *effect)
+		work.stopReviewerID = effect.SupersededReviewerID
 		if synchronous {
 			if err := s.executeOnce(work, ""); err != nil {
 				return operatorResultForError(request, err)
@@ -458,6 +466,7 @@ func (s *operatorMutationService) collectIssue(ctx context.Context, issue int) (
 		return stateOwnerSnapshot{}, reconciliationV2Batch{}, err
 	}
 	s.effects.cancelInvalidated(committed)
+	s.cancelSupersededPlanWatchers(snapshot, committed)
 	return committed, batch, nil
 }
 
@@ -487,23 +496,15 @@ func (s *operatorMutationService) preparePlanReview(ctx context.Context, snapsho
 		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, err
 	}
 	observation := snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
-	var fresh struct {
-		Number      int
-		State       string
-		Body        string
-		PullRequest any `json:"pull_request"`
-	}
-	// Operator admission needs the raw body, but the owner deliberately keeps
-	// only its digest. Read without the reconciliation cache or stale fallback.
-	api := internalgithub.API{BaseURL: s.collector.API.BaseURL, HTTP: s.collector.API.HTTP, Retries: s.collector.API.Retries}
-	if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", manifest.Repository, manifest.Issue), "", &fresh); err != nil {
+	body, err := s.freshPlanReviewBody(ctx, manifest.Repository, manifest.Issue)
+	if err != nil {
 		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, err
 	}
-	if fresh.Number != manifest.Issue || fresh.State != "open" || fresh.PullRequest != nil || digestText(fresh.Body) != observation.Fact.BodyDigest {
+	if digestText(body) != observation.Fact.BodyDigest {
 		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, errStateConflict
 	}
 	issue := expandIssueFact(observation.Fact)
-	issue.Body = fresh.Body
+	issue.Body = body
 	issue.Attempt, issue.BaseSHA = manifest.Attempt, manifest.BaseSHA
 	target := manifest.Repository + "#" + strconv.Itoa(manifest.Issue) + " plan sha256:" + observation.Fact.BodyDigest
 	snapshotPath, session := reviewIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(s.owner.stateRoot))
@@ -514,6 +515,25 @@ func (s *operatorMutationService) preparePlanReview(ctx context.Context, snapsho
 		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, errStateConflict
 	}
 	return reconciliationPlannedEffect{Identity: ownerReconciliationBeginIdentity(snapshot, request), Request: request}, material, nil
+}
+
+func (s *operatorMutationService) freshPlanReviewBody(ctx context.Context, repository string, issue int) (string, error) {
+	var fresh struct {
+		Number      int
+		State       string
+		Body        string
+		PullRequest any `json:"pull_request"`
+	}
+	// Operator admission needs the raw body, but the owner deliberately keeps
+	// only its digest. Read without the reconciliation cache or stale fallback.
+	api := internalgithub.API{BaseURL: s.collector.API.BaseURL, HTTP: s.collector.API.HTTP, Retries: s.collector.API.Retries}
+	if _, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", repository, issue), "", &fresh); err != nil {
+		return "", err
+	}
+	if fresh.Number != issue || fresh.State != "open" || fresh.PullRequest != nil {
+		return "", errStateConflict
+	}
+	return fresh.Body, nil
 }
 
 func bindOperatorWorkIdentity(work *operatorWork, effect runtimeEffectIntent) {
@@ -591,7 +611,11 @@ func (s *operatorMutationService) reserveSuccessor(current, next string) bool {
 	if !s.active[current] || s.active[next] {
 		return false
 	}
+	if s.released == nil {
+		s.released = map[string]chan struct{}{}
+	}
 	s.active[next] = true
+	s.released[next] = make(chan struct{})
 	return true
 }
 
@@ -601,6 +625,11 @@ func (s *operatorMutationService) execute(work operatorWork) error {
 
 func (s *operatorMutationService) executeReserved(work operatorWork, reserved string) error {
 	if work.runtime != nil {
+		if work.stopReviewerID != "" {
+			if err := s.stopBoundReviewer(s.lifecycle, *work.runtime, work.stopReviewerID); err != nil {
+				return err
+			}
+		}
 		result, err := s.effects.executeOperator(*work.runtime)
 		if result.Disposition == agentruntime.EffectResultReady && work.requestID != "" {
 			err = errors.Join(err, s.resumeReceiptReserved(s.lifecycle, work.requestID, reserved))
@@ -612,6 +641,9 @@ func (s *operatorMutationService) executeReserved(work operatorWork, reserved st
 	}
 	if work.reviewer != nil {
 		result, pending, err := s.effects.executeOperatorReviewer(s.reviewer, *work.plan, *work.reviewer)
+		if pending && work.requestID != "" && work.plan.Request.Reviewer != nil && work.plan.Request.Reviewer.Mode == agentruntime.ReviewModePlan {
+			s.watchPlanReviewer(work.requestID, work.plan.Identity.EffectID)
+		}
 		if !pending && result.Action != "" && work.requestID != "" {
 			err = errors.Join(err, s.resumeReceiptReserved(s.lifecycle, work.requestID, reserved))
 		}
@@ -622,6 +654,164 @@ func (s *operatorMutationService) executeReserved(work operatorWork, reserved st
 		err = errors.Join(err, s.resumeReceiptReserved(s.lifecycle, work.requestID, reserved))
 	}
 	return err
+}
+
+func (s *operatorMutationService) watchPlanReviewer(requestID, effectID string) {
+	watchCtx, cancel := context.WithCancel(s.lifecycle)
+	released := s.releaseSignal(effectID)
+	if !s.startReserved("review-watch:"+effectID, func() {
+		if s.watchers == nil {
+			s.watchers = map[string]context.CancelFunc{}
+		}
+		s.watchers[effectID] = cancel
+	}, func() {
+		defer func() {
+			s.mu.Lock()
+			delete(s.watchers, effectID)
+			s.mu.Unlock()
+			cancel()
+		}()
+		select {
+		case <-released:
+		case <-watchCtx.Done():
+			return
+		}
+		identity := reviewerLaunchIdentity{EffectID: effectID}
+		for _, channel := range []string{reviewerStartSignal(identity), reviewerSignal(identity)} {
+			if _, err := s.reviewer.call(watchCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-L", channel}}); err != nil {
+				if watchCtx.Err() != nil {
+					return
+				}
+				s.classifyWorkerFailure(requestID, err)
+				return
+			}
+			unlockCtx, unlockCancel := context.WithTimeout(context.WithoutCancel(watchCtx), 5*time.Second)
+			_, _ = s.reviewer.call(unlockCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-U", channel}})
+			unlockCancel()
+			if watchCtx.Err() != nil {
+				return
+			}
+			if err := s.resumeReceiptReserved(watchCtx, requestID, ""); err != nil {
+				s.classifyWorkerFailure(requestID, err)
+				return
+			}
+			snapshot, err := s.owner.snapshot(watchCtx)
+			if err != nil {
+				return
+			}
+			if receipt, ok := operatorReceiptByID(snapshot.State, requestID); !ok || receipt.State == "completed" {
+				return
+			}
+		}
+	}) {
+		cancel()
+		return
+	}
+	if snapshot, err := s.owner.snapshot(s.lifecycle); err == nil {
+		if effect, ok := snapshot.State.Effects[effectID]; !ok || effect.State != "pending" {
+			s.cancelPlanWatcher(effectID)
+		}
+	}
+}
+
+func (s *operatorMutationService) cancelPlanWatcher(effectID string) {
+	s.mu.Lock()
+	cancel := s.watchers[effectID]
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	// tmux wait-for locks outlive a canceled client. Release only the exact
+	// effect channels, outside the owner and dashboard request path.
+	s.start("review-unlock:"+effectID, func() {
+		identity := reviewerLaunchIdentity{EffectID: effectID}
+		for _, channel := range []string{reviewerStartSignal(identity), reviewerSignal(identity)} {
+			unlockCtx, done := context.WithTimeout(context.WithoutCancel(s.lifecycle), 2*time.Second)
+			_, _ = s.reviewer.call(unlockCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-U", channel}})
+			done()
+		}
+	})
+}
+
+func (s *operatorMutationService) cancelSupersededPlanWatchers(before, after stateOwnerSnapshot) {
+	ids := map[string]bool{}
+	for id, effect := range before.State.Effects {
+		if effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan {
+			continue
+		}
+		ids[id] = true
+	}
+	s.mu.Lock()
+	for id := range s.watchers {
+		ids[id] = true
+	}
+	s.mu.Unlock()
+	for id := range ids {
+		current, exists := after.State.Effects[id]
+		if !exists || current.State != "pending" {
+			s.cancelPlanWatcher(id)
+		}
+	}
+}
+
+// A cycle probes only abnormal or already-terminal reviewers. It does not
+// depend on pane-died hooks, which can be missed across tmux versions/restart.
+func (s *operatorMutationService) scanPendingPlanReviewers(ctx context.Context, snapshot stateOwnerSnapshot) {
+	for _, receipt := range snapshot.State.ControlReceipts {
+		if receipt.State != "pending" || receipt.Phase != operatorPhaseReviewPending {
+			continue
+		}
+		effect, ok := snapshot.State.Effects[receipt.EffectID]
+		if !ok || effect.State != "pending" || effect.ReviewerRevoked || effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan {
+			continue
+		}
+		s.mu.Lock()
+		launching := s.active[effect.ID]
+		s.mu.Unlock()
+		if launching {
+			continue
+		}
+		if !effect.ReviewerLaunched {
+			s.dispatchResume(receipt.Request.RequestID)
+			continue
+		}
+		request := effect.Reconciliation.Reviewer
+		_, terminalPath := reviewerLifecyclePaths(request.Snapshot, request.Target)
+		var terminal reviewerTerminalRecord
+		terminalExists, terminalErr := readReviewerRecord(terminalPath, &terminal)
+		if terminalExists || terminalErr != nil {
+			s.dispatchResume(receipt.Request.RequestID)
+			continue
+		}
+		status, err := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(request.Session), agentruntime.PaneStatusFormat}})
+		if err != nil {
+			diagnostic := "reviewer pane probe unavailable: " + internalgithub.Redact(err.Error())
+			if len(diagnostic) > maxReconciliationStringBytes {
+				diagnostic = diagnostic[:maxReconciliationStringBytes]
+			}
+			_, _ = s.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: reconciliationReviewer, Diagnostic: diagnostic})
+			continue
+		}
+		dead := missingTmuxPaneStatus(status)
+		if !dead {
+			pane, parseErr := agentruntime.ParsePaneStatus(status.Output)
+			if parseErr != nil {
+				_, _ = s.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: reconciliationReviewer, Diagnostic: "reviewer pane probe returned invalid status"})
+				continue
+			}
+			dead = pane.Dead
+		}
+		if !dead {
+			continue
+		}
+		identity := reviewerIdentity(ownerReconciliationEffectIdentity(effect))
+		for _, channel := range []string{reviewerStartSignal(identity), reviewerSignal(identity)} {
+			unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			_, _ = s.reviewer.call(unlockCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-U", channel}})
+			cancel()
+		}
+		s.dispatchResume(receipt.Request.RequestID)
+	}
 }
 
 func (s *operatorMutationService) dispatchResume(requestID string) {
@@ -659,6 +849,23 @@ func (s *operatorMutationService) classifyWorkerFailure(requestID string, workEr
 	}
 	diagnostic := "operator worker stopped with pending durable intent: " + internalgithub.Redact(workErr.Error())
 	if effect.Reconciliation != nil {
+		if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Mode == agentruntime.ReviewModePlan {
+			// A marker is only local execution proof. The normal receipt path
+			// checks fresh GitHub eligibility before the owner can commit it.
+			if marker, markerErr := readReconciliationEffectMarker(s.owner.stateRoot, ownerReconciliationEffectIdentity(effect), *effect.Reconciliation); markerErr != nil {
+				diagnostic += "; marker verification failed: " + internalgithub.Redact(markerErr.Error())
+			} else if marker != nil {
+				current, validationErr := s.validatePendingPlanReviewMarker(s.lifecycle, effect)
+				if validationErr != nil {
+					diagnostic += "; fresh issue validation failed: " + internalgithub.Redact(validationErr.Error())
+					_, _ = s.owner.diagnoseReconciliationEffect(s.lifecycle, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: effect.Reconciliation.Action, Diagnostic: diagnostic})
+					return
+				}
+				if !current {
+					return
+				}
+			}
+		}
 		result, verifyErr := s.effects.verifyPendingOperatorReconciliation(s.lifecycle, effect)
 		if result != nil || verifyErr == nil {
 			if result != nil {
@@ -686,6 +893,12 @@ func (s *operatorMutationService) classifyWorkerFailure(requestID string, workEr
 }
 
 func (s *operatorMutationService) start(key string, work func()) bool {
+	return s.startReserved(key, nil, work)
+}
+
+// reserve runs under the same mutex as the active-key check, so duplicate
+// watcher requests cannot replace the cancel function of a live watcher.
+func (s *operatorMutationService) startReserved(key string, reserve, work func()) bool {
 	if key == "" {
 		return false
 	}
@@ -697,7 +910,14 @@ func (s *operatorMutationService) start(key string, work func()) bool {
 	if s.active == nil {
 		s.active = map[string]bool{}
 	}
+	if s.released == nil {
+		s.released = map[string]chan struct{}{}
+	}
 	s.active[key] = true
+	s.released[key] = make(chan struct{})
+	if reserve != nil {
+		reserve()
+	}
 	s.wg.Add(1)
 	s.mu.Unlock()
 	go func() {
@@ -722,14 +942,33 @@ func (s *operatorMutationService) reserve(key string) bool {
 	if s.active == nil {
 		s.active = map[string]bool{}
 	}
+	if s.released == nil {
+		s.released = map[string]chan struct{}{}
+	}
 	s.active[key] = true
+	s.released[key] = make(chan struct{})
 	return true
 }
 
 func (s *operatorMutationService) release(key string) {
 	s.mu.Lock()
 	delete(s.active, key)
+	if done := s.released[key]; done != nil {
+		close(done)
+		delete(s.released, key)
+	}
 	s.mu.Unlock()
+}
+
+func (s *operatorMutationService) releaseSignal(key string) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if done := s.released[key]; done != nil {
+		return done
+	}
+	closed := make(chan struct{})
+	close(closed)
+	return closed
 }
 
 func (s *operatorMutationService) shutdown(ctx context.Context) error {
@@ -821,7 +1060,24 @@ func (s *operatorMutationService) resumeReceiptReserved(ctx context.Context, req
 	if !ok || effect.State != "pending" {
 		return errStateConflict
 	}
+	if effect.ReviewerRevoked {
+		s.effects.cancelEffect(effect.ID)
+		_, err := s.supersedeInvalidPlanReview(ctx, effect)
+		return err
+	}
 	if effect.Reconciliation != nil {
+		if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Mode == agentruntime.ReviewModePlan {
+			marker, markerErr := readReconciliationEffectMarker(s.owner.stateRoot, ownerReconciliationEffectIdentity(effect), *effect.Reconciliation)
+			if markerErr != nil {
+				return markerErr
+			}
+			if marker != nil {
+				current, validationErr := s.validatePendingPlanReviewMarker(ctx, effect)
+				if validationErr != nil || !current {
+					return validationErr
+				}
+			}
+		}
 		verified, err := s.effects.verifyPendingOperatorReconciliation(ctx, effect)
 		if err != nil {
 			return err
@@ -839,6 +1095,11 @@ func (s *operatorMutationService) resumeReceiptReserved(ctx context.Context, req
 	request, err := s.reconstructRuntimeRequest(snapshot, effect)
 	if err != nil {
 		return err
+	}
+	if effect.SupersededReviewerID != "" {
+		if err := s.stopBoundReviewer(ctx, request, effect.SupersededReviewerID); err != nil {
+			return err
+		}
 	}
 	verification, err := s.effects.verifyPendingOperator(ctx, snapshot, effect, request)
 	if err != nil {
@@ -860,6 +1121,31 @@ func (s *operatorMutationService) resumeReceiptReserved(ctx context.Context, req
 		return errStateConflict
 	}
 	return s.executeOnce(operatorWork{requestID: requestID, runtime: &bound}, reserved)
+}
+
+// A local completion marker proves the reviewer finished, but not that the
+// GitHub issue is still eligible after a daemon restart. Refresh external
+// evidence before the owner is asked to commit the marked result.
+func (s *operatorMutationService) validatePendingPlanReviewMarker(ctx context.Context, effect runtimeEffectIntent) (bool, error) {
+	request := *effect.Reconciliation
+	body, bodyErr := s.freshPlanReviewBody(ctx, request.Repository, request.Issue)
+	if bodyErr != nil && !errors.Is(bodyErr, errStateConflict) {
+		return false, bodyErr
+	}
+	fresh, _, err := s.collectIssue(ctx, request.Issue)
+	if err != nil {
+		return false, err
+	}
+	issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+	observation := fresh.State.Observations[issueKey]
+	current := !fresh.State.Effects[effect.ID].ReviewerRevoked && bodyErr == nil && digestText(body) == request.BodyDigest && observation.ObservationEpoch == fresh.State.Epoch && fresh.State.IssueGenerations[issueKey] == effect.IssueGeneration && fresh.State.AttemptGenerations[attemptKey] == effect.AttemptGeneration && reconciliationFinishObservationMatches(fresh.State, request) && validReconciliationEffectStateBindings(s.owner.stateRoot, fresh.State, request)
+	if current {
+		return true, nil
+	}
+	if superseded, supersedeErr := s.supersedeInvalidPlanReview(ctx, effect); superseded || supersedeErr != nil {
+		return false, supersedeErr
+	}
+	return false, errStaleStateResult
 }
 
 func (s *operatorMutationService) recordAwaitingDiagnostic(receipt controlReceipt, cause error) error {
@@ -925,28 +1211,267 @@ func (s *operatorMutationService) resumeUnmarkedReconciliation(ctx context.Conte
 			return err
 		}
 		snapshot = fresh
-		record, ok := snapshot.State.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
+		if latest, exists := snapshot.State.Effects[effect.ID]; exists && latest.ReviewerRevoked {
+			s.effects.cancelEffect(latest.ID)
+			_, err := s.supersedeInvalidPlanReview(ctx, latest)
+			return err
+		}
+		request := *effect.Reconciliation
+		key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+		if snapshot.State.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || snapshot.State.AttemptGenerations[key] != effect.AttemptGeneration || !reconciliationFinishObservationMatches(snapshot.State, request) || !validReconciliationEffectStateBindings(s.owner.stateRoot, snapshot.State, request) {
+			if superseded, supersedeErr := s.supersedeInvalidPlanReview(ctx, effect); superseded || supersedeErr != nil {
+				return supersedeErr
+			}
+			return errStaleStateResult
+		}
+		record, ok := snapshot.State.Attempts[key]
 		if !ok {
 			return errStaleStateResult
 		}
 		plan, material, err := s.preparePlanReview(ctx, snapshot, record.Manifest)
 		if err != nil {
+			if superseded, supersedeErr := s.supersedeInvalidPlanReview(ctx, effect); superseded || supersedeErr != nil {
+				return supersedeErr
+			}
 			return err
 		}
-		if effect.Reconciliation.Manifest != nil && sameReconciliationManifest(*effect.Reconciliation, record.Manifest, *effect.Reconciliation.Manifest) {
+		if effect.Reconciliation.Manifest != nil && sameReconciliationManifest(request, record.Manifest, *request.Manifest) {
 			// Reuse the admitted immutable request after a monitor-only timestamp
 			// change; the fresh owner/GitHub checks above still gate replay.
 			plan.Request.Manifest = ptrManifest(*effect.Reconciliation.Manifest)
 		}
 		plan.Request.ObservationCycleID = effect.Reconciliation.ObservationCycleID
+		plan.Request.ObservationGeneration = effect.Reconciliation.ObservationGeneration
 		plan.Request.ExecutionDigest = reviewerExecutionDigest(plan.Request, material)
 		if !reflect.DeepEqual(plan.Request, *effect.Reconciliation) {
 			return errStateConflict
 		}
 		plan.Identity = ownerReconciliationEffectIdentity(effect)
+		material.Replay = true
 		return s.executeOnce(operatorWork{requestID: receipt.Request.RequestID, plan: &plan, reviewer: &material}, reserved)
 	}
 	return errStateConflict
+}
+
+func (s *operatorMutationService) supersedeInvalidPlanReview(ctx context.Context, effect runtimeEffectIntent, currentHead ...string) (bool, error) {
+	key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+	run, err := s.effects.acquireKey(ctx, key, effect.IssueGeneration, effect.AttemptGeneration, 0, effect.ID)
+	if err != nil {
+		return false, err
+	}
+	defer s.effects.releaseKey(key, run)
+	current, err := s.owner.snapshot(ctx)
+	if err != nil {
+		return false, err
+	}
+	latest, exists := current.State.Effects[effect.ID]
+	if !exists || latest.State != "pending" {
+		return true, nil
+	}
+	if latest.Reconciliation.Reviewer.Mode == agentruntime.ReviewModePlan && !latest.ReviewerRevoked {
+		return false, nil
+	}
+	effect = latest
+	reviewer := effect.Reconciliation.Reviewer
+	launchPath, terminalPath := reviewerLifecyclePaths(reviewer.Snapshot, reviewer.Target)
+	bind := func(pid int) error {
+		_, err := s.owner.bindReviewerStopping(ctx, bindReviewerStoppingCommand{Identity: ownerReconciliationEffectIdentity(effect), GroupPID: pid})
+		return err
+	}
+	observation, err := s.stopReviewerSessionAt(ctx, reviewer.Session, effect.ID, effect.RequestDigest, effect.ReviewerGroupPID, effect.ReviewerGateProtocol, effect.ReviewerSessionRequested, launchPath, terminalPath, effect.IssueGeneration, effect.AttemptGeneration, bind)
+	if err != nil {
+		return false, err
+	}
+	if _, err := s.owner.proveReviewerDead(ctx, proveReviewerDeadCommand{Identity: ownerReconciliationEffectIdentity(effect), GroupPID: observation.GroupPID, NeverRan: observation.NeverRan}); err != nil {
+		return false, err
+	}
+	head := ""
+	if len(currentHead) != 0 {
+		head = currentHead[0]
+	}
+	committed, err := s.owner.supersedePlanReview(ctx, supersedePlanReviewCommand{Identity: ownerReconciliationEffectIdentity(effect), CurrentHeadSHA: head})
+	if errors.Is(err, errStateConflict) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	s.effects.cancelInvalidated(committed)
+	s.cancelPlanWatcher(effect.ID)
+	return true, nil
+}
+
+// Only an owner-bound process group, revalidated against a live exact wrapper
+// before signalling, can authorize reviewer cancellation. A lifecycle JSON
+// file or tmux kill-session acknowledgement is not process-death proof.
+func (s *operatorMutationService) stopReviewerSession(ctx context.Context, session, reviewerID string, groupPID int) error {
+	_, err := s.stopReviewerSessionAt(ctx, session, reviewerID, "", groupPID, false, false, "", "", 0, 0)
+	return err
+}
+
+func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, session, reviewerID, requestDigest string, groupPID int, gateProtocol, sessionRequested bool, launchPath, terminalPath string, issueGeneration, attemptGeneration uint64, beforeKill ...func(int) error) (reviewerStopObservation, error) {
+	s.mu.Lock()
+	cancelWatcher := s.watchers[reviewerID]
+	s.mu.Unlock()
+	if cancelWatcher != nil {
+		cancelWatcher()
+	}
+	select {
+	case <-s.releaseSignal("review-watch:" + reviewerID):
+	case <-ctx.Done():
+		return reviewerStopObservation{}, ctx.Err()
+	}
+	status, err := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerPaneIdentityFormat}})
+	if err != nil && !missingTmuxServer(status) {
+		return reviewerStopObservation{}, fmt.Errorf("probe exact reviewer session %s: %w", session, err)
+	}
+	if reviewerPaneAbsent(status.Output) || missingTmuxServer(status) {
+		if groupPID < 2 && !gateProtocol {
+			return reviewerStopObservation{}, errors.New("unbound reviewer launch cannot be proved absent after session loss")
+		}
+		if groupPID < 2 {
+			if launchPath == "" || terminalPath == "" {
+				return reviewerStopObservation{}, errors.New("gated reviewer identity is unavailable")
+			}
+			if sessionRequested {
+				return reviewerStopObservation{}, errors.New("requested reviewer session vanished before owner child binding; child death is unproved")
+			}
+			var launch reviewerLaunchIdentity
+			found, readErr := readReviewerRecord(launchPath, &launch)
+			if readErr != nil || found {
+				return reviewerStopObservation{}, errors.New("gated reviewer launch identity is ambiguous after session loss")
+			}
+			s.cancelPlanWatcher(reviewerID)
+			return reviewerStopObservation{NeverRan: true}, nil
+		}
+		gone, proofErr := reviewerGroupGone(groupPID)
+		if proofErr != nil || !gone {
+			return reviewerStopObservation{}, fmt.Errorf("reviewer group death is unproved after session loss: %w", proofErr)
+		}
+		s.cancelPlanWatcher(reviewerID)
+		return reviewerStopObservation{GroupPID: groupPID}, nil
+	}
+	pane, err := parseReviewerPaneIdentity(status.Output)
+	if err != nil {
+		return reviewerStopObservation{}, err
+	}
+	if pane.Name != session {
+		return reviewerStopObservation{}, errors.New("reviewer pane name does not match exact session")
+	}
+	if groupPID < 2 {
+		wrapperPID := pane.PID
+		if launchPath == "" || terminalPath == "" {
+			return reviewerStopObservation{}, errors.New("unbound reviewer launch target is unavailable")
+		}
+		var launch reviewerLaunchIdentity
+		found, readErr := readReviewerRecord(launchPath, &launch)
+		if readErr != nil {
+			return reviewerStopObservation{}, errors.New("unbound reviewer launch identity is unavailable")
+		}
+		candidate := 0
+		if strings.Contains(pane.Start, " review-pane ") {
+			if !found || launch.EffectID != reviewerID || launch.IssueGeneration != issueGeneration || launch.AttemptGeneration != attemptGeneration || launch.RequestDigest != requestDigest || launch.GateProtocol != gateProtocol || launch.SessionRequested != sessionRequested || !reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, launch) {
+				return reviewerStopObservation{}, errors.New("unbound reviewer launch identity is unavailable")
+			}
+			candidate = launch.ChildPID
+			if err := verifyReviewerChildAtPane(ctx, pane, launchPath, terminalPath, launch, candidate); err != nil {
+				return reviewerStopObservation{}, err
+			}
+		} else {
+			return reviewerStopObservation{}, errors.New("reviewer session does not contain the exact managed wrapper")
+		}
+		if candidate > 1 {
+			if len(beforeKill) == 0 || beforeKill[0] == nil {
+				return reviewerStopObservation{}, errors.New("unbound reviewer group must be owner-bound before stop")
+			}
+			if err := beforeKill[0](candidate); err != nil {
+				return reviewerStopObservation{}, fmt.Errorf("bind exact reviewer group before stop: %w", err)
+			}
+		}
+		if err := guardedReviewerKillSession(ctx, s.reviewer, pane, session, "", nil); err != nil {
+			return reviewerStopObservation{}, err
+		}
+		if err := syscall.Kill(wrapperPID, 0); !errors.Is(err, syscall.ESRCH) {
+			return reviewerStopObservation{}, errors.New("unbound reviewer wrapper death is unproved")
+		}
+		if candidate > 1 {
+			gone, proofErr := reviewerGroupGone(candidate)
+			if proofErr != nil || !gone {
+				return reviewerStopObservation{}, errors.New("unbound reviewer child group death is unproved")
+			}
+		}
+		s.cancelPlanWatcher(reviewerID)
+		return reviewerStopObservation{GroupPID: candidate, NeverRan: candidate == 0}, nil
+	}
+	if !pane.Status.Dead {
+		if err := verifyReviewerChildAtPane(ctx, pane, launchPath, terminalPath, reviewerLaunchIdentity{EffectID: reviewerID, RequestDigest: requestDigest}, groupPID); err != nil {
+			return reviewerStopObservation{}, err
+		}
+		if err := guardedReviewerKillSession(ctx, s.reviewer, pane, session, "", nil); err != nil {
+			return reviewerStopObservation{}, fmt.Errorf("stop exact reviewer session %s: %w", session, err)
+		}
+		if gone, _ := reviewerGroupGone(groupPID); !gone {
+			waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			channel := reviewerSignal(reviewerLaunchIdentity{EffectID: reviewerID})
+			if _, err := s.reviewer.call(waitCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-L", channel}}); err != nil {
+				return reviewerStopObservation{}, fmt.Errorf("wait for reviewer termination: %w", err)
+			}
+			unlockCtx, unlockCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_, _ = s.reviewer.call(unlockCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-U", channel}})
+			unlockCancel()
+		}
+	}
+	gone, proofErr := reviewerGroupGone(groupPID)
+	if proofErr != nil || !gone {
+		return reviewerStopObservation{}, fmt.Errorf("reviewer process group remains live or unknown: %w", proofErr)
+	}
+	s.cancelPlanWatcher(reviewerID)
+	return reviewerStopObservation{GroupPID: groupPID}, nil
+}
+
+func (s *operatorMutationService) stopBoundReviewer(ctx context.Context, request agentruntime.EffectRequest, reviewerID string) error {
+	if reviewerID == "" {
+		return nil
+	}
+	if s.reviewer == nil || request.Action != agentruntime.EffectStop && request.Action != agentruntime.EffectCleanup {
+		return errStateConflict
+	}
+	manifest := request.Manifest
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	run, err := s.effects.acquireKey(ctx, key, request.Identity.IssueGeneration, request.Identity.AttemptGeneration, 0, request.Identity.EffectID)
+	if err != nil {
+		return err
+	}
+	defer s.effects.releaseKey(key, run)
+	snapshot, err := s.owner.snapshot(run.ctx)
+	if err != nil {
+		return err
+	}
+	effect, current := snapshot.State.Effects[request.Identity.EffectID]
+	if !current || effect.State != "pending" || effect.SupersededReviewerID != reviewerID || effect.Action != string(request.Action) || effect.IssueGeneration != request.Identity.IssueGeneration || effect.AttemptGeneration != request.Identity.AttemptGeneration {
+		return errStaleStateResult
+	}
+	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
+	if err != nil {
+		return err
+	}
+	snapshotRoot := productionSnapshotRoot(s.owner.stateRoot)
+	reviewSnapshot, _ := reviewIdentity(operatorEffectAttempt(manifest), snapshotRoot)
+	launchPath, terminalPath := reviewerLifecyclePaths(reviewSnapshot, effect.SupersededReviewerTarget)
+	bind := func(pid int) error {
+		_, err := s.owner.bindReviewerStopping(run.ctx, bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), GroupPID: pid})
+		return err
+	}
+	observation, err := s.stopReviewerSessionAt(run.ctx, session, reviewerID, effect.SupersededReviewerRequestDigest, effect.SupersededReviewerGroupPID, effect.SupersededReviewerGateProtocol, effect.SupersededReviewerSessionRequested, launchPath, terminalPath, effect.SupersededReviewerIssueGeneration, effect.SupersededReviewerAttemptGeneration, bind)
+	if err != nil {
+		return err
+	}
+	if _, err := s.owner.markReviewerStopped(run.ctx, markReviewerStoppedCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), Observation: observation}); err != nil {
+		return err
+	}
+	s.cancelPlanWatcher(reviewerID)
+	return nil
 }
 
 func (s *operatorMutationService) resumePending(ctx context.Context) error {
@@ -982,6 +1507,12 @@ func (s *operatorMutationService) resumePending(ctx context.Context) error {
 			return errStateConflict
 		}
 		if effect.Reconciliation != nil {
+			if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Mode == agentruntime.ReviewModePlan {
+				// The reserved receipt path stops a revoked reviewer before any
+				// marker verification, collection, or generic replay.
+				s.dispatchResume(requestID)
+				continue
+			}
 			result, verifyErr := s.effects.verifyPendingOperatorReconciliation(ctx, effect)
 			if verifyErr != nil {
 				return verifyErr

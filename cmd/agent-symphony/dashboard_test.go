@@ -771,7 +771,7 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 		t.Fatal(err)
 	}
 	helper := filepath.Join(t.TempDir(), "review-boundary")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '{\"output\":\"\",\"code\":0,\"exited\":false}\\n'\n"), 0o700); err != nil {
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '{\"output\":\"||||||||||\",\"code\":0,\"exited\":false}\\n'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", helper)
@@ -784,7 +784,9 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	if err := os.Mkdir(snapshot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	resultOne, resultTwo := snapshot+".result-0123456789abcdef", snapshot+".result-fedcba9876543210"
+	targetOne := "o/r#31 plan sha256:" + strings.Repeat("a", 64)
+	targetTwo := "o/r#31 plan sha256:" + strings.Repeat("b", 64)
+	resultOne, resultTwo := filepath.Dir(reviewResultPath(snapshot, targetOne)), filepath.Dir(reviewResultPath(snapshot, targetTwo))
 	for _, path := range []string{resultOne, resultTwo} {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
@@ -794,7 +796,7 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	if err := os.Mkdir(sibling, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, ReviewHead: strings.Repeat("b", 40), ReviewSnapshot: snapshot, ReviewSession: session}
+	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, ReviewHead: strings.Repeat("b", 40), ReviewTarget: targetTwo, ReviewSnapshot: snapshot, ReviewSession: session}
 	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, false); err != nil {
 		t.Fatalf("review preflight: %v", err)
 	}
@@ -803,7 +805,14 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 			t.Fatalf("preflight removed %s: %v", path, err)
 		}
 	}
-	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true); err != nil {
+	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true); err == nil {
+		t.Fatal("unbound reviewer artifacts were cleaned without process-death proof")
+	}
+	proofs := map[string]reviewerProcessProof{
+		targetOne: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetOne, GroupPID: 99999999, DeadProved: true},
+		targetTwo: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetTwo, GroupPID: 99999998, DeadProved: true},
+	}
+	if err := cleanupAttemptReviewResourcesProved(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true, proofs); err != nil {
 		t.Fatalf("review cleanup: %v", err)
 	}
 	for _, path := range []string{snapshot, resultOne, resultTwo} {
@@ -933,7 +942,10 @@ printf 'implementation-ready\r\n'
 IFS= read -r input
 printf 'implementation-received:%s\r\n' "$input"
 printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"direct input received","documentation":"none"}' >"$AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
-sleep 1
+IFS= read -r finish || exit 1
+test "$finish" = finish || exit 1
+tmux set-option -p -t "$TMUX_PANE" @agent-symphony-exit-status 0 || exit 1
+printf 'implementation-finished\r\n'
 `
 	if err := os.WriteFile(agent, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
@@ -970,6 +982,16 @@ sleep 1
 		}
 		output.Write(message)
 	}
+	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("finish\n")); err != nil {
+		t.Fatal(err)
+	}
+	for !strings.Contains(output.String(), "implementation-finished") {
+		kind, message, err := connection.Read(deadline)
+		if err != nil || kind != websocket.MessageBinary {
+			t.Fatalf("terminal completion output=%q kind=%v err=%v", output.String(), kind, err)
+		}
+		output.Write(message)
+	}
 	connection.CloseNow()
 	var monitored agentruntime.Manifest
 	monitorDeadline := time.Now().Add(5 * time.Second)
@@ -981,7 +1003,8 @@ sleep 1
 		time.Sleep(25 * time.Millisecond)
 	}
 	if err != nil || monitored.State != "completed" {
-		t.Fatalf("monitored manifest=%#v err=%v", monitored, err)
+		pane, probeErr := exec.Command(tmux, "display-message", "-p", "-t", agentruntime.PaneTarget(manifest.Session), agentruntime.PaneStatusFormat).CombinedOutput()
+		t.Fatalf("monitored manifest=%#v err=%v pane=%q probeErr=%v", monitored, err, pane, probeErr)
 	}
 	result, err := readWorkerResult(agentruntime.ResultPath(manifest.Worktree))
 	if err != nil || result.Validation != "direct input received" {
