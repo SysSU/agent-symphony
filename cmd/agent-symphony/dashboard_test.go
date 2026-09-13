@@ -771,7 +771,7 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 		t.Fatal(err)
 	}
 	helper := filepath.Join(t.TempDir(), "review-boundary")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '{\"output\":\"|||||||\",\"code\":0,\"exited\":false}\\n'\n"), 0o700); err != nil {
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '{\"output\":\"||||||||||\",\"code\":0,\"exited\":false}\\n'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", helper)
@@ -944,6 +944,7 @@ printf 'implementation-received:%s\r\n' "$input"
 printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"direct input received","documentation":"none"}' >"$AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
 IFS= read -r finish || exit 1
 test "$finish" = finish || exit 1
+tmux set-option -p -t "$TMUX_PANE" @agent-symphony-exit-status 0 || exit 1
 printf 'implementation-finished\r\n'
 `
 	if err := os.WriteFile(agent, []byte(script), 0o700); err != nil {
@@ -1002,7 +1003,8 @@ printf 'implementation-finished\r\n'
 		time.Sleep(25 * time.Millisecond)
 	}
 	if err != nil || monitored.State != "completed" {
-		t.Fatalf("monitored manifest=%#v err=%v", monitored, err)
+		pane, probeErr := exec.Command(tmux, "display-message", "-p", "-t", agentruntime.PaneTarget(manifest.Session), agentruntime.PaneStatusFormat).CombinedOutput()
+		t.Fatalf("monitored manifest=%#v err=%v pane=%q probeErr=%v", monitored, err, pane, probeErr)
 	}
 	result, err := readWorkerResult(agentruntime.ResultPath(manifest.Worktree))
 	if err != nil || result.Validation != "direct input received" {

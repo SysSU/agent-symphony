@@ -710,7 +710,7 @@ func TestUnmarkedPublicationAndReviewerReconstructExactWorkerExport(t *testing.T
 		reviewer := workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `payload=$(cat)
 case "$payload" in
   *'"operation":"review-result"'*) printf %s '{"Output":"{\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]}"}' ;;
-  *'display-message'*) printf %s '{"Output":"|||||||\n"}' ;;
+  *'display-message'*) printf %s '{"Output":"||||||||||\n"}' ;;
   *) exit 1 ;;
 esac`}}
 		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}}
@@ -964,7 +964,7 @@ func TestUnprovableReviewerDoesNotBlockUnrelatedReconciliation(t *testing.T) {
 	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: ownerReconciliationEffectIdentity(*reviewer)}); err != nil {
 		t.Fatal(err)
 	}
-	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||"}}
+	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
 	applyReconciliationInput(t, owner, repositoryInput(false, issueFact(476, "unrelated")))
 	checkout := gitRepository(t)
 	runGit(t, checkout, "config", "user.email", "test@example.invalid")
@@ -1031,7 +1031,7 @@ func TestImplementationReviewerFailureDoesNotBlockOtherEffect(t *testing.T) {
 				applyReconciliationInput(t, owner, input)
 			}
 			service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: request.Manifest.Worktree})
-			service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||"}}
+			service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
 			production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, implementation: workerBoundaryRunner{}, stateRoot: owner.stateRoot}
 			if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{}); err != nil || resumed {
 				t.Fatalf("ambiguous issue A aborted or falsely completed: resumed=%v err=%v", resumed, err)
@@ -1150,7 +1150,7 @@ func TestChangedExportHeadRejectsOlderReviewerMarker(t *testing.T) {
 		t.Fatal("H1 marker lacked an otherwise finishable owner death certificate")
 	}
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
-	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||"}}
+	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
 	production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, implementation: exportBoundary(manifest.Branch), stateRoot: owner.stateRoot}
 	resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{})
 	if err != nil || !resumed {

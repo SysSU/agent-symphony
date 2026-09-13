@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -1430,6 +1431,8 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 		return json.Unmarshal([]byte(args[14]), &identity) == nil && identity.GateProtocol && identity.SessionRequested && identity.EffectID != "" && identity.IssueGeneration > 0 && identity.AttemptGeneration > 0 && validDigest(identity.RequestDigest) && args[12] == reviewerSignal(identity) && args[13] == reviewerStartSignal(identity)
 	case "has-session", "kill-session":
 		return len(args) == 3 && args[1] == "-t" && (validTmuxTarget(args[2], false) || args[0] == "kill-session" && validTmuxSessionID(args[2]))
+	case "if-shell":
+		return validReviewerGuardedKillArgs(args)
 	case "display-message":
 		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, reviewerPaneIdentityFormat, "#{pane_start_command}", "#{pane_pid}"}, args[4])
 	case "wait-for":
@@ -1453,6 +1456,25 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	default:
 		return false
 	}
+}
+
+var reviewerGuardFormatPattern = regexp.MustCompile(`^#\{&&:#\{==:#\{pid\},([1-9][0-9]*)\},#\{&&:#\{==:#\{start_time\},([1-9][0-9]*)\},#\{&&:#\{==:#\{session_name\},(as-r-[0-9a-f]{16}-[1-9][0-9]*-[1-9][0-9]*)\},#\{&&:#\{==:#\{session_id\},(\$[0-9]+)\},#\{==:#\{pane_pid\},([1-9][0-9]*)\}\}\}\}\}$`)
+
+func validReviewerGuardedKillArgs(args []string) bool {
+	if len(args) != 7 || args[1] != "-F" || args[2] != "-t" || args[6] != "display-message -p "+reviewerGuardMismatch {
+		return false
+	}
+	fields := reviewerGuardFormatPattern.FindStringSubmatch(args[4])
+	if fields == nil || args[3] != "="+fields[3]+":0.0" || args[5] != "kill-session -t "+fields[4] {
+		return false
+	}
+	serverPID, err1 := strconv.Atoi(fields[1])
+	startTime, err2 := strconv.ParseUint(fields[2], 10, 64)
+	panePID, err3 := strconv.Atoi(fields[5])
+	if err1 != nil || err2 != nil || err3 != nil || serverPID < 2 || startTime == 0 || panePID < 2 {
+		return false
+	}
+	return args[4] == reviewerGuardCondition(reviewerPaneIdentity{ServerPID: serverPID, StartTime: startTime, Name: fields[3], SessionID: fields[4], PID: panePID})
 }
 
 func validReviewerWaitChannel(channel string) bool {

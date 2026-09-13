@@ -65,18 +65,22 @@ func reviewerPaneStartMatches(start, launchPath, terminalPath string, identity r
 	return strings.Contains(start, " review-pane tmux ") && strings.Contains(start, launchPath) && strings.Contains(start, terminalPath) && strings.Contains(start, reviewerSignal(identity)) && strings.Contains(start, identity.RequestDigest)
 }
 
-const reviewerPaneIdentityFormat = agentruntime.PaneStatusFormat + "|#{session_id}|#{pane_pid}|#{pane_start_command}"
+const reviewerPaneIdentityFormat = agentruntime.PaneStatusFormat + "|#{session_id}|#{pane_pid}|#{pid}|#{start_time}|#{session_name}|#{pane_start_command}"
+const reviewerGuardMismatch = "reviewer-guard-mismatch"
 
 type reviewerPaneIdentity struct {
 	Status    agentruntime.PaneStatus
 	SessionID string
 	PID       int
+	ServerPID int
+	StartTime uint64
+	Name      string
 	Start     string
 }
 
 func parseReviewerPaneIdentity(output string) (reviewerPaneIdentity, error) {
-	fields := strings.SplitN(strings.TrimSpace(output), "|", 8)
-	if len(fields) != 8 || !strings.HasPrefix(fields[5], "$") || len(fields[5]) < 2 {
+	fields := strings.SplitN(strings.TrimSpace(output), "|", 11)
+	if len(fields) != 11 || !strings.HasPrefix(fields[5], "$") || len(fields[5]) < 2 {
 		return reviewerPaneIdentity{}, errors.New("exact reviewer pane/session identity is unavailable")
 	}
 	if _, err := strconv.Atoi(strings.TrimPrefix(fields[5], "$")); err != nil {
@@ -90,7 +94,65 @@ func parseReviewerPaneIdentity(output string) (reviewerPaneIdentity, error) {
 	if err != nil {
 		return reviewerPaneIdentity{}, err
 	}
-	return reviewerPaneIdentity{Status: status, SessionID: fields[5], PID: pid, Start: fields[7]}, nil
+	serverPID, err := reviewerPanePID(fields[7])
+	if err != nil {
+		return reviewerPaneIdentity{}, err
+	}
+	startTime, err := strconv.ParseUint(fields[8], 10, 64)
+	if err != nil || startTime == 0 || fields[9] == "" {
+		return reviewerPaneIdentity{}, errors.New("exact reviewer server/session identity is unavailable")
+	}
+	return reviewerPaneIdentity{Status: status, SessionID: fields[5], PID: pid, ServerPID: serverPID, StartTime: startTime, Name: fields[9], Start: fields[10]}, nil
+}
+
+// A missing pane can still expose server-global format fields on a live tmux
+// server. Require every pane/session field to be empty before treating it as
+// absent; malformed or partially populated identities remain ambiguous.
+func reviewerPaneAbsent(output string) bool {
+	fields := strings.SplitN(strings.TrimSpace(output), "|", 11)
+	if len(fields) != 11 {
+		return false
+	}
+	for _, index := range []int{0, 1, 2, 3, 4, 5, 6, 9, 10} {
+		if fields[index] != "" {
+			return false
+		}
+	}
+	if fields[7] == "" && fields[8] == "" {
+		return true
+	}
+	serverPID, err := reviewerPanePID(fields[7])
+	if err != nil || serverPID < 2 {
+		return false
+	}
+	startTime, err := strconv.ParseUint(fields[8], 10, 64)
+	return err == nil && startTime > 0
+}
+
+func reviewerGuardCondition(pane reviewerPaneIdentity) string {
+	return fmt.Sprintf("#{&&:#{==:#{pid},%d},#{&&:#{==:#{start_time},%d},#{&&:#{==:#{session_name},%s},#{&&:#{==:#{session_id},%s},#{==:#{pane_pid},%d}}}}}", pane.ServerPID, pane.StartTime, pane.Name, pane.SessionID, pane.PID)
+}
+
+func guardedReviewerKillSession(ctx context.Context, boundary boundaryCaller, pane reviewerPaneIdentity, session, dir string, env []string) error {
+	if pane.Name != session || pane.ServerPID < 2 || pane.StartTime == 0 || pane.PID < 2 {
+		return errors.New("reviewer session identity changed before guarded stop")
+	}
+	args := []string{"if-shell", "-F", "-t", agentruntime.PaneTarget(session), reviewerGuardCondition(pane), "kill-session -t " + pane.SessionID, "display-message -p " + reviewerGuardMismatch}
+	result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: args, Dir: dir, Env: env})
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(result.Output) != "" {
+		return errors.New("reviewer session changed before guarded stop")
+	}
+	status, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + session}, Dir: dir, Env: env})
+	if err == nil {
+		return errors.New("reviewer session remains after guarded stop")
+	}
+	if missingTmuxServer(status) || status.Exited && status.Code == 1 && strings.TrimSpace(status.Output) == "can't find session: "+session {
+		return nil
+	}
+	return fmt.Errorf("reviewer session absence is unproved after guarded stop: %w", err)
 }
 
 func reviewerPanePID(output string) (int, error) {

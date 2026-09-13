@@ -631,7 +631,7 @@ func bindLiveReviewerForService(t *testing.T, owner *stateOwner, reviewer *runti
 		t.Fatal(err)
 	}
 	start := "agent-symphony review-pane tmux " + launchPath + " " + terminalPath + " " + reviewerSignal(launch) + " " + launch.RequestDigest
-	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "0|||||$9|" + strconv.Itoa(os.Getpid()) + "|" + start}}
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: reviewerPaneTestOutput("0||||", reviewer.Reconciliation.Reviewer.Session, "$9", os.Getpid(), start)}}
 	boundary.onKill = func() error {
 		if err := syscall.Kill(-child.Process.Pid, syscall.SIGKILL); err != nil {
 			return err
@@ -693,7 +693,7 @@ func startUnboundReviewerForService(t *testing.T, owner *stateOwner, reviewer *r
 		t.Fatal(err)
 	}
 	start := "agent-symphony review-pane tmux " + launchPath + " " + terminalPath + " " + reviewerSignal(launch) + " " + launch.RequestDigest
-	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "0|||||$9|" + strconv.Itoa(wrapper.Process.Pid) + "|" + start}}
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: reviewerPaneTestOutput("0||||", reviewer.Reconciliation.Reviewer.Session, "$9", wrapper.Process.Pid, start)}}
 	boundary.onKill = func() error {
 		if _, err := input.Write([]byte{'x'}); err != nil {
 			return err
@@ -2581,7 +2581,7 @@ func TestV2PlanReviewMarkerReplayRejectsChangedGitHubBodyAfterRestart(t *testing
 			changedInput.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
 			restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: restarted.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
 			restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
-			restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: service.collector, reviewer: &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||\n"}}, reviewSource: "source", reviewCommand: []string{"review"}}
+			restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: service.collector, reviewer: &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||\n"}}, reviewSource: "source", reviewCommand: []string{"review"}}
 			restartService.collect = func(context.Context, stateOwnerSnapshot, int) (reconciliationV2Batch, error) {
 				return reconciliationV2Batch{Input: changedInput}, nil
 			}
@@ -2676,7 +2676,7 @@ func TestCancelPreservesExactReviewerStopBindingAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = restarted.close(context.Background()) })
-	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||\n"}}
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||\n"}}
 	restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: restarted.stateRoot, Runner: &barrierEffectRunner{}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
 	restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
 	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, reviewer: boundary, active: map[string]bool{}, released: map[string]chan struct{}{}}
@@ -2698,7 +2698,7 @@ func (b *completedPlanReviewBoundary) call(_ context.Context, operation string, 
 	if operation == "run" && command.Name == "tmux" && slices.Contains(command.Args, "display-message") {
 		b.panes.Add(1)
 		if command.Args[len(command.Args)-1] == reviewerPaneIdentityFormat {
-			return agentruntime.Result{Output: "|||||||"}, nil
+			return agentruntime.Result{Output: "||||||||||"}, nil
 		}
 		return agentruntime.Result{Output: "1|0|||"}, nil
 	}
@@ -3244,7 +3244,7 @@ func (r *operatorBoundaryRecorder) call(_ context.Context, operation string, com
 			if r.sessionLive {
 				return agentruntime.Result{Output: "0||||||\n"}, nil
 			}
-			return agentruntime.Result{Output: "|||||||\n"}, nil
+			return agentruntime.Result{Output: "||||||||||\n"}, nil
 		}
 		if r.sessionLive {
 			return agentruntime.Result{Output: "0||||\n"}, nil

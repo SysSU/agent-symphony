@@ -1325,7 +1325,7 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 	if err != nil && !missingTmuxServer(status) {
 		return reviewerStopObservation{}, fmt.Errorf("probe exact reviewer session %s: %w", session, err)
 	}
-	if strings.TrimSpace(status.Output) == "|||||||" || missingTmuxServer(status) {
+	if reviewerPaneAbsent(status.Output) || missingTmuxServer(status) {
 		if groupPID < 2 && !gateProtocol {
 			return reviewerStopObservation{}, errors.New("unbound reviewer launch cannot be proved absent after session loss")
 		}
@@ -1354,6 +1354,9 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 	pane, err := parseReviewerPaneIdentity(status.Output)
 	if err != nil {
 		return reviewerStopObservation{}, err
+	}
+	if pane.Name != session {
+		return reviewerStopObservation{}, errors.New("reviewer pane name does not match exact session")
 	}
 	if groupPID < 2 {
 		wrapperPID := pane.PID
@@ -1385,7 +1388,7 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 				return reviewerStopObservation{}, fmt.Errorf("bind exact reviewer group before stop: %w", err)
 			}
 		}
-		if _, err := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", pane.SessionID}}); err != nil {
+		if err := guardedReviewerKillSession(ctx, s.reviewer, pane, session, "", nil); err != nil {
 			return reviewerStopObservation{}, err
 		}
 		if err := syscall.Kill(wrapperPID, 0); !errors.Is(err, syscall.ESRCH) {
@@ -1404,7 +1407,7 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 		if err := verifyReviewerChildAtPane(ctx, pane, launchPath, terminalPath, reviewerLaunchIdentity{EffectID: reviewerID, RequestDigest: requestDigest}, groupPID); err != nil {
 			return reviewerStopObservation{}, err
 		}
-		if _, err := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", pane.SessionID}}); err != nil {
+		if err := guardedReviewerKillSession(ctx, s.reviewer, pane, session, "", nil); err != nil {
 			return reviewerStopObservation{}, fmt.Errorf("stop exact reviewer session %s: %w", session, err)
 		}
 		if gone, _ := reviewerGroupGone(groupPID); !gone {

@@ -1959,10 +1959,13 @@ func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCalle
 		if err != nil && !missingTmuxServer(status) {
 			return err
 		}
-		if strings.TrimSpace(status.Output) != "|||||||" && !missingTmuxServer(status) {
+		if !reviewerPaneAbsent(status.Output) && !missingTmuxServer(status) {
 			pane, err := parseReviewerPaneIdentity(status.Output)
 			if err != nil {
 				return err
+			}
+			if pane.Name != session {
+				return errors.New("reviewer pane name does not match exact session")
 			}
 			if !certified || !pane.Status.Dead {
 				return errors.New("reviewer pane remains; cleanup requires exact stopped-child proof and ownership")
@@ -1980,7 +1983,7 @@ func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCalle
 			if !matched {
 				return errors.New("reviewer pane does not match an owner-certified lifecycle")
 			}
-			if _, err := boundary.call(cleanupCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", pane.SessionID}, Dir: filepath.Dir(snapshot), Env: env}); err != nil {
+			if err := guardedReviewerKillSession(cleanupCtx, boundary, pane, session, filepath.Dir(snapshot), env); err != nil {
 				return err
 			}
 		}
