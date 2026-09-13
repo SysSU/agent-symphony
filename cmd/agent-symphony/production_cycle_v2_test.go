@@ -1127,9 +1127,23 @@ func TestChangedExportHeadRejectsOlderReviewerMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	identity := ownerReconciliationEffectIdentity(*old)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	const stoppedGroup = 99999999
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: stoppedGroup}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: stoppedGroup}); err != nil {
+		t.Fatal(err)
+	}
 	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(*old.Reconciliation)
 	if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*old), *old.Reconciliation, result); err != nil {
 		t.Fatal(err)
+	}
+	if current := mustOwnerSnapshot(t, owner).State; reconciliationEffectFinishCurrent(owner.stateRoot, current, current.Effects[old.ID]) != nil || !current.ReviewerProofs[reviewerProofKey(old.Repository, old.Issue, old.Attempt, old.Reconciliation.Reviewer.Mode, old.Reconciliation.Reviewer.Target)].DeadProved {
+		t.Fatal("H1 marker lacked an otherwise finishable owner death certificate")
 	}
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
 	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||"}}
@@ -1141,6 +1155,87 @@ func TestChangedExportHeadRejectsOlderReviewerMarker(t *testing.T) {
 	final := mustOwnerSnapshot(t, owner).State
 	if effect := final.Effects[old.ID]; effect.State != "completed" || effect.ReconciliationResult != nil && effect.ReconciliationResult.Reviewer != nil && effect.ReconciliationResult.Reviewer.Status == "clean" || !final.Attempts[ownerAttemptKey("o/r", issue.Issue, issue.Attempt)].Manifest.ReviewInvalidated {
 		t.Fatalf("old clean marker was applied despite newer export: effect=%#v manifest=%#v", effect, final.Attempts[ownerAttemptKey("o/r", issue.Issue, issue.Attempt)].Manifest)
+	}
+}
+
+func TestHealthyPendingReviewerReplayLetsOtherEffectFinish(t *testing.T) {
+	base, head, checkout, exportBoundary := testWorkerExportBoundary(t)
+	owner, manifest, issue, snapshot := completedWorkerOwner(t, 194, base, head, false)
+	plans, _, err := planReconciliationReviewers(snapshot, owner.stateRoot, []reviewerExecutionMaterial{{Issue: issue, Source: checkout, HeadSHA: head, Command: []string{"reviewer"}}})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("admit reviewer: plans=%#v err=%v", plans, err)
+	}
+	_, reviewer, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := startUnboundReviewerForService(t, owner, reviewer)
+	parts := strings.SplitN(live.status.Output, "|", 8)
+	if len(parts) != 8 {
+		t.Fatal("fixture has no exact live wrapper identity")
+	}
+	encode := func(output string) string {
+		body, err := json.Marshal(agentruntime.Result{Output: output})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	replayBoundary := workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `payload=$(cat)
+case "$payload" in
+  *'#{pane_start_command}'*) printf %s "$REPLAY_START" ;;
+  *'#{pane_pid}'*) printf %s "$REPLAY_PID" ;;
+  *'#{pane_dead}'*) printf %s "$REPLAY_PANE" ;;
+  *'"wait-for"'*) printf %s "$REPLAY_OK" ;;
+  *) exit 1 ;;
+esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode(parts[6]), "REPLAY_PANE=" + encode("0||||"), "REPLAY_OK=" + encode("")}}
+	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
+	cfg := config.Default("o/r")
+	cfg.Commands.Reviewer = []string{"reviewer"}
+	production := &productionReconciliation{owner: owner, effects: coordinator, implementation: exportBoundary(manifest.Branch), reviewer: replayBoundary, config: cfg, stateRoot: owner.stateRoot}
+	batch := reconciliationV2Batch{Input: reconciliationInput{Issues: []internalgithub.RecoveryIssueFact{issue}}}
+	if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, batch); err != nil || resumed {
+		t.Fatalf("healthy live reviewer forced immediate recollection: resumed=%v err=%v", resumed, err)
+	}
+	if current := mustOwnerSnapshot(t, owner).State.Effects[reviewer.ID]; current.State != "pending" || current.ReviewerGroupPID < 2 {
+		t.Fatalf("healthy reviewer did not remain owner-bound and pending: %#v", current)
+	}
+	other := ownerTestManifest(t, owner.stateRoot, 195, 1, "running")
+	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: other}); err != nil {
+		t.Fatal(err)
+	}
+	otherIssue := issueFact(195, "other")
+	otherIssue.Attempt, otherIssue.CurrentAttempt = 1, 1
+	otherIssue.NeedsAttention, otherIssue.DispatchAuthorized = true, true
+	otherAttempt := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 195, Attempt: 1, BaseSHA: other.BaseSHA, State: "active", Checks: []string{}}
+	otherIssue.Active, otherIssue.ActiveAttempt = true, &otherAttempt
+	input := repositoryInput(true, otherIssue)
+	input.Scope = issueScope(195)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{otherAttempt}
+	applyReconciliationInput(t, owner, input)
+	checkIn := reconciliationEffectCaseNamed(t, "monitoring-check-in")
+	otherRequest := checkIn.request
+	otherRequest.Issue, otherRequest.CheckIn.Session = 195, other.Session
+	otherSnapshot := mustOwnerSnapshot(t, owner)
+	other = otherSnapshot.State.Attempts[ownerAttemptKey("o/r", 195, 1)].Manifest
+	otherRequest.Manifest = &other
+	otherRequest = bindEffectObservation(otherSnapshot, otherRequest)
+	_, ready, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(otherSnapshot, otherRequest), Request: otherRequest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*ready), *ready.Reconciliation, checkIn.result(*ready.Reconciliation)); err != nil {
+		t.Fatal(err)
+	}
+	if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, batch); err != nil || !resumed {
+		t.Fatalf("healthy pending reviewer blocked other marked effect: resumed=%v err=%v", resumed, err)
+	}
+	final := mustOwnerSnapshot(t, owner).State
+	if final.Effects[reviewer.ID].State != "pending" || final.Effects[ready.ID].State != "completed" {
+		t.Fatalf("reviewer or other effect changed incorrectly: reviewer=%#v other=%#v", final.Effects[reviewer.ID], final.Effects[ready.ID])
+	}
+	if err := live.onKill(); err != nil {
+		t.Fatal(err)
 	}
 }
 
