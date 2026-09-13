@@ -235,6 +235,9 @@ func TestAmbiguousReviewerPaneProbeKeepsPendingIntentWithDiagnostic(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: ownerReconciliationEffectIdentity(*effect)}); err != nil {
+		t.Fatal(err)
+	}
 	current := mustOwnerSnapshot(t, owner)
 	current.State.ControlReceipts = append(current.State.ControlReceipts, controlReceipt{Request: operatorRequest("probe-reviewer", "review-plan", *request.Manifest, false), State: "pending", Phase: operatorPhaseReviewPending, EffectID: effect.ID})
 	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Exited: true, Code: 1, Output: "permission denied"}, err: errors.New("tmux socket unavailable")}
