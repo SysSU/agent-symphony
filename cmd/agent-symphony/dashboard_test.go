@@ -803,7 +803,10 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 			t.Fatalf("preflight removed %s: %v", path, err)
 		}
 	}
-	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true); err != nil {
+	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true); err == nil {
+		t.Fatal("unbound reviewer artifacts were cleaned without process-death proof")
+	}
+	if err := cleanupAttemptReviewResourcesBound(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true, 99999999); err != nil {
 		t.Fatalf("review cleanup: %v", err)
 	}
 	for _, path := range []string{snapshot, resultOne, resultTwo} {

@@ -68,12 +68,12 @@ func TestPlanReviewRunningTransitionRequiresExactPendingEffect(t *testing.T) {
 	}
 	identity := ownerReconciliationEffectIdentity(*effect)
 	beforeManifest := snapshot.State.Attempts[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)].Manifest
-	running, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity})
+	running, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999})
 	if err != nil {
 		t.Fatal(err)
 	}
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	if got := running.State.Attempts[key].Manifest; !reflect.DeepEqual(got, beforeManifest) || !running.State.Effects[effect.ID].ReviewerLaunched {
+	if got := running.State.Attempts[key].Manifest; !reflect.DeepEqual(got, beforeManifest) || !running.State.Effects[effect.ID].ReviewerLaunched || running.State.Effects[effect.ID].ReviewerGroupPID != 99999999 {
 		t.Fatalf("launch changed committed manifest or was not recorded on effect: manifest=%#v effect=%#v", got, running.State.Effects[effect.ID])
 	}
 	projected, err := projectOwnerStatus(running, 1, time.Unix(1, 0))
@@ -82,9 +82,12 @@ func TestPlanReviewRunningTransitionRequiresExactPendingEffect(t *testing.T) {
 	}) {
 		t.Fatalf("launched effect was not projected as current reviewer: status=%#v err=%v", projected.Statuses, err)
 	}
-	again, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity})
+	again, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999})
 	if err != nil || again.State.Revision != running.State.Revision {
 		t.Fatalf("idempotent running transition revision=%d want=%d err=%v", again.State.Revision, running.State.Revision, err)
+	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999998}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("different process group replaced committed reviewer binding: %v", err)
 	}
 	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(request)
 	if _, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: result}); err != nil {
@@ -214,7 +217,7 @@ func TestPlanReviewSupersessionRequiresFreshOwnerInvalidation(t *testing.T) {
 			if err := applySupersedePlanReview(&state, supersedePlanReviewCommand{Identity: identity}); !errors.Is(err, errStateConflict) {
 				t.Fatalf("valid current review was superseded: %v", err)
 			}
-			if err := applyMarkPlanReviewRunning(owner.stateRoot, &state, markPlanReviewRunningCommand{Identity: identity}); err != nil {
+			if err := applyMarkPlanReviewRunning(owner.stateRoot, &state, markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
 				t.Fatal(err)
 			}
 			issueKey := ownerIssueKey(request.Repository, request.Issue)

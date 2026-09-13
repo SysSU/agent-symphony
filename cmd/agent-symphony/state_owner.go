@@ -89,24 +89,26 @@ type runtimeTombstone struct {
 }
 
 type runtimeEffectIntent struct {
-	ID                   string                         `json:"id"`
-	Action               string                         `json:"action"`
-	Repository           string                         `json:"repository"`
-	Issue                int                            `json:"issue"`
-	Attempt              int                            `json:"attempt"`
-	IssueGeneration      uint64                         `json:"issue_generation"`
-	AttemptGeneration    uint64                         `json:"attempt_generation"`
-	IntentEpoch          uint64                         `json:"intent_epoch,omitempty"`
-	IntentRevision       uint64                         `json:"intent_revision"`
-	State                string                         `json:"state"`
-	RequestDigest        string                         `json:"request_digest"`
-	Reason               string                         `json:"reason,omitempty"`
-	Review               *agentruntime.ReviewTransition `json:"review,omitempty"`
-	Reconciliation       *reconciliationEffectRequest   `json:"reconciliation,omitempty"`
-	ReconciliationResult *reconciliationEffectResult    `json:"reconciliation_result,omitempty"`
-	ReviewerLaunched     bool                           `json:"reviewer_launched,omitempty"`
-	SupersededReviewerID string                         `json:"superseded_reviewer_id,omitempty"`
-	Diagnostic           string                         `json:"diagnostic,omitempty"`
+	ID                         string                         `json:"id"`
+	Action                     string                         `json:"action"`
+	Repository                 string                         `json:"repository"`
+	Issue                      int                            `json:"issue"`
+	Attempt                    int                            `json:"attempt"`
+	IssueGeneration            uint64                         `json:"issue_generation"`
+	AttemptGeneration          uint64                         `json:"attempt_generation"`
+	IntentEpoch                uint64                         `json:"intent_epoch,omitempty"`
+	IntentRevision             uint64                         `json:"intent_revision"`
+	State                      string                         `json:"state"`
+	RequestDigest              string                         `json:"request_digest"`
+	Reason                     string                         `json:"reason,omitempty"`
+	Review                     *agentruntime.ReviewTransition `json:"review,omitempty"`
+	Reconciliation             *reconciliationEffectRequest   `json:"reconciliation,omitempty"`
+	ReconciliationResult       *reconciliationEffectResult    `json:"reconciliation_result,omitempty"`
+	ReviewerLaunched           bool                           `json:"reviewer_launched,omitempty"`
+	ReviewerGroupPID           int                            `json:"reviewer_group_pid,omitempty"`
+	SupersededReviewerID       string                         `json:"superseded_reviewer_id,omitempty"`
+	SupersededReviewerGroupPID int                            `json:"superseded_reviewer_group_pid,omitempty"`
+	Diagnostic                 string                         `json:"diagnostic,omitempty"`
 }
 
 type stateResultIdentity struct {
@@ -201,6 +203,7 @@ type authorizeReconciliationEffectCommand struct {
 
 type markPlanReviewRunningCommand struct {
 	Identity stateResultIdentity
+	GroupPID int
 }
 
 type supersedePlanReviewCommand struct {
@@ -1803,7 +1806,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if effect.RequestDigest != "" && (!agentruntime.ValidEffectRequestDigest(effect.RequestDigest) || effect.IntentEpoch == 0 || effect.IntentEpoch > maxEpoch || !validRuntimeEffectInput(agentruntime.EffectAction(effect.Action), effect.Reason) || (effect.Action == string(agentruntime.EffectReview)) != (effect.Review != nil)) {
 			return errors.New("runtime owner typed effect intent is invalid")
 		}
-		if effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID)) {
+		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID)) {
 			return errors.New("runtime owner superseded reviewer binding is invalid")
 		}
 		if effect.RequestDigest != "" && effect.Action == string(agentruntime.EffectReview) {

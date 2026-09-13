@@ -17,6 +17,7 @@ import (
 // the owner has durably tombstoned the attempt.
 type operatorCleanupExecutor struct {
 	stateRoot      string
+	owner          *stateOwner
 	implementation boundaryCaller
 	reviewer       boundaryCaller
 	runtime        *agentruntime.Runtime
@@ -58,7 +59,19 @@ func (e operatorCleanupExecutor) execute(ctx context.Context, request agentrunti
 	if e.reviewer == nil {
 		return errors.New("review cleanup boundary is missing")
 	}
-	if err := cleanupAttemptReviewResources(ctx, e.stateRoot, e.reviewer, request.Manifest, true); err != nil {
+	groupPID := 0
+	if e.owner != nil {
+		snapshot, err := e.owner.snapshot(ctx)
+		if err != nil {
+			return err
+		}
+		effect, ok := snapshot.State.Effects[request.Identity.EffectID]
+		if !ok || effect.State != "pending" || effect.Action != string(agentruntime.EffectCleanup) || effect.RequestDigest != request.Identity.RequestDigest || effect.IssueGeneration != request.Identity.IssueGeneration || effect.AttemptGeneration != request.Identity.AttemptGeneration || effect.Repository != request.Identity.Repository || effect.Issue != request.Identity.Issue || effect.Attempt != request.Identity.Attempt {
+			return errStaleStateResult
+		}
+		groupPID = effect.SupersededReviewerGroupPID
+	}
+	if err := cleanupAttemptReviewResourcesBound(ctx, e.stateRoot, e.reviewer, request.Manifest, true, groupPID); err != nil {
 		return err
 	}
 	operation, body, err := cleanupBoundaryInput(request, false)

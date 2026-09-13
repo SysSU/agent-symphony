@@ -617,6 +617,10 @@ func githubIssueClosed(ctx context.Context, api internalgithub.API, repository s
 }
 
 func cleanupAttemptReviewResources(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool) error {
+	return cleanupAttemptReviewResourcesBound(ctx, stateRoot, boundary, manifest, remove, 0)
+}
+
+func cleanupAttemptReviewResourcesBound(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool, boundGroupPID int) error {
 	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
 	snapshotRoot := productionSnapshotRoot(stateRoot)
 	if root, err := filepath.EvalSymlinks(snapshotRoot); err == nil {
@@ -634,7 +638,9 @@ func cleanupAttemptReviewResources(ctx context.Context, stateRoot string, bounda
 	if manifest.ReviewSnapshot != "" && manifest.ReviewSnapshot != expectedSnapshot || manifest.ReviewSession != "" && manifest.ReviewSession != expectedSession || !belowRoot(expectedSnapshot, snapshotRoot) {
 		return errors.New("persisted reviewer cleanup identity mismatch")
 	}
+	snapshotExists := false
 	if info, err := os.Lstat(expectedSnapshot); err == nil {
+		snapshotExists = true
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return errors.New("review snapshot cleanup path is invalid")
 		}
@@ -663,7 +669,10 @@ func cleanupAttemptReviewResources(ctx context.Context, stateRoot string, bounda
 	if !remove {
 		return nil
 	}
-	if err := cleanupReviewResources(ctx, boundary, nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot); err != nil {
+	if boundGroupPID == 0 && (manifest.ReviewSession != "" || manifest.ReviewState != "" || snapshotExists || len(resultPaths) > 0) {
+		return errors.New("unbound reviewer resources cannot be cleaned safely")
+	}
+	if err := cleanupReviewResourcesBound(ctx, boundary, nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot, boundGroupPID); err != nil {
 		return err
 	}
 	for _, path := range resultPaths {
