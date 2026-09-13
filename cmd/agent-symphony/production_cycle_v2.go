@@ -334,6 +334,20 @@ func (p *productionReconciliation) resumePendingReconciliation(ctx context.Conte
 		}
 	}
 	slices.Sort(ids)
+	diagnose := func(effect runtimeEffectIntent, prefix string, cause error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		diagnostic := prefix + internalgithub.Redact(cause.Error())
+		if len(diagnostic) > maxReconciliationStringBytes {
+			diagnostic = diagnostic[:maxReconciliationStringBytes]
+		}
+		_, err := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: effect.Reconciliation.Action, Diagnostic: diagnostic})
+		if errors.Is(err, errStaleStateResult) {
+			return nil
+		}
+		return err
+	}
 	for _, id := range ids {
 		effect := snapshot.State.Effects[id]
 		if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Mode == agentruntime.ReviewModeImplementation && effect.Reconciliation.Reviewer.Phase == "run-observe" {
@@ -343,7 +357,10 @@ func (p *productionReconciliation) resumePendingReconciliation(ctx context.Conte
 				record := snapshot.State.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
 				_, currentHead, _, importErr := importWorkerExport(ctx, p.implementation, record.Manifest)
 				if importErr != nil {
-					return false, importErr
+					if err := diagnose(effect, "pending reviewer export import failed: ", importErr); err != nil {
+						return false, err
+					}
+					continue
 				}
 				if currentHead != effect.Reconciliation.Reviewer.HeadSHA {
 					head = currentHead
@@ -355,7 +372,10 @@ func (p *productionReconciliation) resumePendingReconciliation(ctx context.Conte
 				}
 				p.effects.cancelEffect(effect.ID)
 				if superseded, err := p.operator.supersedeInvalidPlanReview(ctx, effect, head); err != nil {
-					return false, err
+					if diagnoseErr := diagnose(effect, "pending reviewer stop remains pending: ", err); diagnoseErr != nil {
+						return false, diagnoseErr
+					}
+					continue
 				} else if superseded {
 					return true, nil
 				}
@@ -363,7 +383,7 @@ func (p *productionReconciliation) resumePendingReconciliation(ctx context.Conte
 			}
 		}
 		if result, verifyErr := p.effects.verifyPendingReconciliation(ctx, effect); verifyErr != nil {
-			if _, err := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: effect.Reconciliation.Action, Diagnostic: "pending effect marker verification failed: " + internalgithub.Redact(verifyErr.Error())}); err != nil {
+			if err := diagnose(effect, "pending effect marker verification failed: ", verifyErr); err != nil {
 				return false, err
 			}
 			continue
@@ -372,7 +392,7 @@ func (p *productionReconciliation) resumePendingReconciliation(ctx context.Conte
 		}
 		resumed, resumeErr := p.resumeUnmarkedReconciliation(ctx, api, batch, snapshot, effect)
 		if resumeErr != nil {
-			if _, err := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: effect.Reconciliation.Action, Diagnostic: "pending effect reconstruction failed: " + internalgithub.Redact(resumeErr.Error())}); err != nil {
+			if err := diagnose(effect, "pending effect reconstruction failed: ", resumeErr); err != nil {
 				return false, err
 			}
 			continue
@@ -471,8 +491,8 @@ func (p *productionReconciliation) resumeUnmarkedReconciliation(ctx context.Cont
 		if reviewerExecutionDigest(request, material) != request.ExecutionDigest || digestText(issue.Body) != request.BodyDigest {
 			return false, errStateConflict
 		}
-		_, _, err = p.effects.executeReviewer(ctx, p.reviewer, plan, material)
-		return err == nil, err
+		_, pending, err := p.effects.executeReviewer(ctx, p.reviewer, plan, material)
+		return err == nil && !pending, err
 	case reconciliationHandoffDeliver:
 		if request.Handoff.Outcome != nil {
 			path := filepath.Join(p.stateRoot, "handoff-outcomes", request.Handoff.Key+".json")
@@ -703,7 +723,17 @@ func (p *productionReconciliation) executionCandidates(ctx context.Context, snap
 		}
 		result, head, root, err := importWorkerExport(ctx, p.implementation, record.Manifest)
 		if err != nil {
-			return nil, nil, fmt.Errorf("import worker export for %s: %w", key, err)
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			if p.log != nil {
+				diagnostic := internalgithub.Redact(err.Error())
+				if len(diagnostic) > maxReconciliationStringBytes {
+					diagnostic = diagnostic[:maxReconciliationStringBytes]
+				}
+				_, _ = fmt.Fprintf(p.log, "attempt #%d/%d export import remains unavailable: %s\n", record.Manifest.Issue, record.Manifest.Attempt, diagnostic)
+			}
+			continue
 		}
 		issue.Attempt = record.Manifest.Attempt
 		reviewers = append(reviewers, reviewerExecutionMaterial{Issue: issue, Source: root, HeadSHA: head, Env: slices.Clone(p.reviewEnv), Command: slices.Clone(p.config.Commands.Reviewer)})

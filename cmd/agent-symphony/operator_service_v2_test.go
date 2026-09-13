@@ -774,8 +774,17 @@ func TestFreshReconciliationStopsInvalidLivePlanReviewer(t *testing.T) {
 				if current := mustOwnerSnapshot(t, owner).State; current.Effects[reviewer.ID].State != "pending" || current.Attempts[key].Manifest.ReviewState == "clean" {
 					t.Fatalf("stale marker resurrected Plan review: effect=%#v manifest=%#v", current.Effects[reviewer.ID], current.Attempts[key].Manifest)
 				}
+				if err := os.Remove(filepath.Join(owner.stateRoot, "reconciliation-effects", reviewer.ID+".done")); err != nil {
+					t.Fatal(err)
+				}
 			}
-			superseded, err := pipeline.supersedeInvalidPendingPlanReviewers(t.Context(), applied)
+			var superseded bool
+			if change == "body restored" {
+				err = service.resumeReceipt(t.Context(), fmt.Sprintf("pending-plan-%d", manifest.Issue))
+				superseded = err == nil
+			} else {
+				superseded, err = pipeline.supersedeInvalidPendingPlanReviewers(t.Context(), applied)
+			}
 			if err != nil || !superseded {
 				t.Fatalf("fresh %s observation did not stop review: superseded=%v err=%v", change, superseded, err)
 			}
@@ -793,11 +802,6 @@ func TestFreshReconciliationStopsInvalidLivePlanReviewer(t *testing.T) {
 			reloaded, err := readRuntimeOwnerState(owner.stateRoot, final.Repository)
 			if err != nil || reloaded.Effects[reviewer.ID].State != "completed" || !reloaded.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, agentruntime.ReviewModePlan, reviewer.Reconciliation.Reviewer.Target)].DeadProved {
 				t.Fatalf("restart lost terminal reviewer proof: err=%v effect=%#v", err, reloaded.Effects[reviewer.ID])
-			}
-			if change == "body restored" {
-				if _, err := service.effects.verifyPendingOperatorReconciliation(t.Context(), reloaded.Effects[reviewer.ID]); err == nil {
-					t.Fatal("stale marker revived a terminal invalidated review")
-				}
 			}
 		})
 	}

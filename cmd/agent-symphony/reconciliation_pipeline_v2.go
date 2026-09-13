@@ -499,6 +499,16 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		return reconciliationEffectResult{}, false, err
 	}
 	defer c.releaseKey(key, run)
+	if operator && material.Replay && request.Reviewer.Mode == agentruntime.ReviewModePlan {
+		current, err := c.owner.snapshot(run.ctx)
+		if err != nil {
+			return reconciliationEffectResult{}, false, err
+		}
+		effect, exists := current.State.Effects[plan.Identity.EffectID]
+		if !exists || effect.State != "pending" || effect.ReviewerRevoked || !reconciliationEffectIdentityMatches(effect, plan.Identity) {
+			return reconciliationEffectResult{}, false, errStaleStateResult
+		}
+	}
 	if !material.Replay || request.Reviewer.DigestVersion != 1 && (!operator || request.Reviewer.Mode != agentruntime.ReviewModePlan) {
 		if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
 			return reconciliationEffectResult{}, false, err

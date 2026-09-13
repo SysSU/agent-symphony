@@ -1060,6 +1060,11 @@ func (s *operatorMutationService) resumeReceiptReserved(ctx context.Context, req
 	if !ok || effect.State != "pending" {
 		return errStateConflict
 	}
+	if effect.ReviewerRevoked {
+		s.effects.cancelEffect(effect.ID)
+		_, err := s.supersedeInvalidPlanReview(ctx, effect)
+		return err
+	}
 	if effect.Reconciliation != nil {
 		if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Mode == agentruntime.ReviewModePlan {
 			marker, markerErr := readReconciliationEffectMarker(s.owner.stateRoot, ownerReconciliationEffectIdentity(effect), *effect.Reconciliation)
@@ -1206,6 +1211,11 @@ func (s *operatorMutationService) resumeUnmarkedReconciliation(ctx context.Conte
 			return err
 		}
 		snapshot = fresh
+		if latest, exists := snapshot.State.Effects[effect.ID]; exists && latest.ReviewerRevoked {
+			s.effects.cancelEffect(latest.ID)
+			_, err := s.supersedeInvalidPlanReview(ctx, latest)
+			return err
+		}
 		request := *effect.Reconciliation
 		key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 		if snapshot.State.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || snapshot.State.AttemptGenerations[key] != effect.AttemptGeneration || !reconciliationFinishObservationMatches(snapshot.State, request) || !validReconciliationEffectStateBindings(s.owner.stateRoot, snapshot.State, request) {
@@ -1495,8 +1505,8 @@ func (s *operatorMutationService) resumePending(ctx context.Context) error {
 		}
 		if effect.Reconciliation != nil {
 			if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Mode == agentruntime.ReviewModePlan {
-				// Do not verify a durable Plan marker here: resumeReceiptReserved
-				// must refresh GitHub eligibility before applying it.
+				// The reserved receipt path stops a revoked reviewer before any
+				// marker verification, collection, or generic replay.
 				s.dispatchResume(requestID)
 				continue
 			}
