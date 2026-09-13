@@ -5,11 +5,43 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestEffectExecutorMonitorNoopAndTerminalResult(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r}
+	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "a")
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "b")
+	started, err := executor.Execute(t.Context(), start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest = started.Manifest
+	request := effectTestRequest(t, executor, EffectRequest{Action: EffectMonitor, Attempt: attempt, Manifest: manifest, Eligible: true}, "c")
+	live, err := executor.Execute(t.Context(), request)
+	if err != nil || live.Disposition != EffectResultReady || !reflect.DeepEqual(live.Manifest, manifest) {
+		t.Fatalf("alive Monitor changed the manifest: result=%#v err=%v", live, err)
+	}
+	fake.sessions[manifest.Session].dead = true
+	terminal := effectTestRequest(t, executor, EffectRequest{Action: EffectMonitor, Attempt: attempt, Manifest: manifest, Eligible: true}, "d")
+	finished, err := executor.Execute(t.Context(), terminal)
+	if err != nil || finished.Disposition != EffectResultReady || finished.Manifest.State != "completed" || !finished.Manifest.UpdatedAt.After(manifest.UpdatedAt) {
+		t.Fatalf("terminal Monitor did not commit a timestamped outcome: result=%#v err=%v", finished, err)
+	}
+}
 
 func TestEffectExecutorPrepareAndStartNeverWritesManifest(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
