@@ -639,7 +639,7 @@ func (s *operatorMutationService) executeReserved(work operatorWork, reserved st
 	}
 	if work.reviewer != nil {
 		result, pending, err := s.effects.executeOperatorReviewer(s.reviewer, *work.plan, *work.reviewer)
-		if pending && err == nil && work.requestID != "" && work.plan.Request.Reviewer != nil && work.plan.Request.Reviewer.Mode == agentruntime.ReviewModePlan {
+		if pending && work.requestID != "" && work.plan.Request.Reviewer != nil && work.plan.Request.Reviewer.Mode == agentruntime.ReviewModePlan {
 			s.watchPlanReviewer(work.requestID, work.plan.Identity.EffectID)
 		}
 		if !pending && result.Action != "" && work.requestID != "" {
@@ -771,6 +771,10 @@ func (s *operatorMutationService) scanPendingPlanReviewers(ctx context.Context, 
 		launching := s.active[effect.ID]
 		s.mu.Unlock()
 		if launching {
+			continue
+		}
+		if !effect.ReviewerLaunched {
+			s.dispatchResume(receipt.Request.RequestID)
 			continue
 		}
 		request := effect.Reconciliation.Reviewer

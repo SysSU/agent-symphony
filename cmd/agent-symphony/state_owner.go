@@ -1225,10 +1225,12 @@ func applyUpsertAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState,
 			return errors.New("issue generation overflow")
 		}
 		issueGeneration++
+		if err := pruneSupersededIssueEffects(state, manifest.Repository, manifest.Issue, issueGeneration); err != nil {
+			return err
+		}
 		state.IssueGenerations[issueKey] = issueGeneration
 		delete(state.Observations, issueKey)
 		deleteIssueRecoveries(state, manifest.Repository, manifest.Issue)
-		deleteIssueScopedEffects(state, manifest.Repository, manifest.Issue)
 		generation = 1
 	} else {
 		if generation == ^uint64(0) {
@@ -2015,6 +2017,22 @@ func deleteAttemptEffects(state *runtimeOwnerState, repository string, issue, at
 			delete(state.Effects, id)
 		}
 	}
+}
+
+func pruneSupersededIssueEffects(state *runtimeOwnerState, repository string, issue int, nextGeneration uint64) error {
+	for id, effect := range state.Effects {
+		if effect.Repository != repository || effect.Issue != issue || effect.IssueGeneration >= nextGeneration || effectAuthorizedByTombstone(*state, effect) {
+			continue
+		}
+		if effectReferencedByReceipt(*state, id) {
+			if effect.State == "pending" {
+				return errStateConflict
+			}
+			continue
+		}
+		delete(state.Effects, id)
+	}
+	return nil
 }
 
 func effectAuthorizedByTombstone(state runtimeOwnerState, effect runtimeEffectIntent) bool {

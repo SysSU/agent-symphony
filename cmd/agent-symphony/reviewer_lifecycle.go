@@ -49,6 +49,10 @@ func reviewerStartSignal(identity reviewerLaunchIdentity) string {
 	return reviewerSignal(identity) + "-start"
 }
 
+func reviewerPaneStartMatches(start, launchPath, terminalPath string, identity reviewerLaunchIdentity) bool {
+	return strings.Contains(start, " review-pane tmux ") && strings.Contains(start, launchPath) && strings.Contains(start, terminalPath) && strings.Contains(start, reviewerSignal(identity)) && strings.Contains(start, identity.RequestDigest)
+}
+
 func readReviewerRecord(path string, value any) (bool, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {

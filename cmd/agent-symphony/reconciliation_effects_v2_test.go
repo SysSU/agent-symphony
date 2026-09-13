@@ -483,6 +483,33 @@ func TestFirstAttemptReservationInvalidatesIssueScopedEffect(t *testing.T) {
 	}
 }
 
+func TestNewAttemptPrunesCompletedUnboundRetryFromOldIssueGeneration(t *testing.T) {
+	caseData := reconciliationEffectCaseNamed(t, "issue-retry")
+	owner, snapshot, request := reconciliationEffectTestOwner(t, caseData.request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := caseData.result(request)
+	identity := ownerReconciliationEffectIdentity(*effect)
+	if _, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: result}); err != nil {
+		t.Fatal(err)
+	}
+	before := mustOwnerSnapshot(t, owner)
+	issueKey := ownerIssueKey(request.Repository, request.Issue)
+	manifest := ownerTestManifest(t, owner.stateRoot, request.Issue, request.Attempt+1, "preparing")
+	created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest, ExpectedIssueGeneration: before.State.IssueGenerations[issueKey]})
+	if err != nil {
+		t.Fatalf("new attempt was blocked by completed old retry: %v", err)
+	}
+	if _, exists := created.State.Effects[effect.ID]; exists {
+		t.Fatal("old unbound retry survived issue-generation advance")
+	}
+	if _, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: result}); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("old retry result could reapply after new attempt: %v", err)
+	}
+}
+
 func TestRuntimePRRecoveryClonesLoadsAndRejectsInvalidState(t *testing.T) {
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, 191, 1, "running")
