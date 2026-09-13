@@ -84,7 +84,7 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 	github := httptest.NewServer(githubFixture)
 	defer github.Close()
 	peerRoot := filepath.Join(root, "peer")
-	if err := writeDashboardStatusSnapshot(peerRoot, dashboardStatusSnapshot{UpdatedAt: time.Now().UTC(), Statuses: []orchestrator.RecoveryStatus{{Repository: "peer/project", Issue: 27, Attempt: 1, Title: "Read-only peer fixture", State: "failed"}}}); err != nil {
+	if err := writeDashboardStatusSnapshot(peerRoot, dashboardStatusSnapshot{UpdatedAt: time.Now().UTC(), Statuses: []orchestrator.RecoveryStatus{{Repository: "peer/project", Issue: 27, Attempt: 1, Title: "Action-eligible peer fixture", State: "completed", IssueClosed: true}}}); err != nil {
 		t.Fatal(err)
 	}
 	peer := httptest.NewServer(newProjectDashboardServer(t.Context(), peerRoot, "peer/project", nil, "tmux", nil, nil, false, "").webHandler())
@@ -128,7 +128,7 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 	if err := eventsFile.Close(); err != nil {
 		t.Fatal(err)
 	}
-	holdAudit, releaseAudit := fixtureEvents+"-hold", fixtureEvents+"-release"
+	holdAudit, releaseAudit, failAudit := fixtureEvents+"-hold", fixtureEvents+"-release", fixtureEvents+"-fail"
 	if err := syscall.Mkfifo(releaseAudit, 0o666); err != nil {
 		t.Fatal(err)
 	}
@@ -144,8 +144,13 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 		_, err = pipe.Write([]byte("release\n"))
 		return err
 	}
-	t.Cleanup(func() { _ = releaseHeldAudit(); _ = os.Remove(holdAudit); _ = os.Remove(releaseAudit) })
-	writeExecutable(t, filepath.Join(binDir, "codex"), strings.NewReplacer("@EVENTS@", fixtureEvents, "@HOLD@", holdAudit, "@RELEASE@", releaseAudit).Replace(`#!/bin/sh
+	t.Cleanup(func() {
+		_ = releaseHeldAudit()
+		_ = os.Remove(holdAudit)
+		_ = os.Remove(releaseAudit)
+		_ = os.Remove(failAudit)
+	})
+	writeExecutable(t, filepath.Join(binDir, "codex"), strings.NewReplacer("@EVENTS@", fixtureEvents, "@HOLD@", holdAudit, "@RELEASE@", releaseAudit, "@FAIL@", failAudit).Replace(`#!/bin/sh
 if [ "$1" = audit ]; then
   audit_context=$(cat)
   case "$audit_context" in
@@ -155,6 +160,11 @@ if [ "$1" = audit ]; then
   if [ -f "@HOLD@" ]; then
     printf 'audit:blocked\n' >> "@EVENTS@"
     IFS= read -r release < "@RELEASE@"
+  fi
+  if [ -f "@FAIL@" ]; then
+    printf 'audit:failed\n' >> "@EVENTS@"
+    printf 'fixture audit failed\n' >&2
+    exit 17
   fi
   printf 'fixture audit complete\n'
   exit 0
@@ -446,5 +456,58 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 	}) {
 		body, _ := os.ReadFile(reportPath)
 		t.Fatalf("controlled audit did not complete after Recover and explicit release: %s serve=%s", body, output.String())
+	}
+	if err := os.WriteFile(failAudit, []byte("fail next audit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeFailureEvents, err := os.ReadFile(fixtureEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runBrowser("fail-manual")
+	var failed struct {
+		StartedAt        time.Time `json:"started_at"`
+		ProjectionDigest string    `json:"projection_digest"`
+		State            string    `json:"state"`
+	}
+	if !waitFor(deadline, func() bool {
+		body, readErr := os.ReadFile(reportPath)
+		return readErr == nil && json.Unmarshal(body, &failed) == nil && failed.StartedAt.After(held.StartedAt) && failed.State == "failed" && failed.ProjectionDigest == persisted.LastInvestigation
+	}) {
+		body, _ := os.ReadFile(reportPath)
+		t.Fatalf("nonzero audit did not produce a failed target-bound report: %s serve=%s", body, output.String())
+	}
+	events, err = os.ReadFile(fixtureEvents)
+	if err != nil || len(events) < len(beforeFailureEvents) || !strings.Contains(string(events[len(beforeFailureEvents):]), "audit:191:9\naudit:failed\n") {
+		t.Fatalf("failed audit subprocess was not observed: err=%v prior=%q current=%q", err, beforeFailureEvents, events)
+	}
+	stateBody, err = os.ReadFile(filepath.Join(stateRoot, "orchestrator-agent.json"))
+	var failedState struct {
+		LastInvestigation string `json:"last_investigation_digest"`
+	}
+	if err != nil || json.Unmarshal(stateBody, &failedState) != nil || failedState.LastInvestigation != persisted.LastInvestigation {
+		t.Fatalf("failed audit did not retain the historical launch marker under test: %v %s", err, stateBody)
+	}
+	if err := os.Remove(failAudit); err != nil {
+		t.Fatal(err)
+	}
+	beforeRetryEvents := len(events)
+	runBrowser("retry-manual")
+	if !waitFor(deadline, func() bool {
+		body, readErr := os.ReadFile(reportPath)
+		var report struct {
+			StartedAt        time.Time `json:"started_at"`
+			ProjectionDigest string    `json:"projection_digest"`
+			State            string    `json:"state"`
+			Report           string    `json:"report"`
+		}
+		return readErr == nil && json.Unmarshal(body, &report) == nil && report.StartedAt.After(failed.StartedAt) && report.ProjectionDigest == failed.ProjectionDigest && report.State == "completed" && strings.Contains(report.Report, "fixture audit complete")
+	}) {
+		body, _ := os.ReadFile(reportPath)
+		t.Fatalf("same visible Investigate click did not retry failed audit: %s serve=%s", body, output.String())
+	}
+	events, err = os.ReadFile(fixtureEvents)
+	if err != nil || len(events) < beforeRetryEvents || !strings.Contains(string(events[beforeRetryEvents:]), "audit:191:9\n") || strings.Contains(string(events[beforeRetryEvents:]), "audit:failed\n") {
+		t.Fatalf("same-target retry did not launch a fresh successful subprocess: err=%v events=%q", err, events)
 	}
 }

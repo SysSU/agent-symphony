@@ -6,20 +6,28 @@ test.setTimeout(process.env.AGENT_SYMPHONY_FULL_SYSTEM_RACE === "true" ? 180_000
 
 test("operator controls the real supervised orchestrator and manual reconciliation", async ({ page }) => {
   const errors = [];
+  const peerPosts = [];
   page.on("pageerror", (error) => errors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().startsWith(`${process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_PEER}/actions/`)) peerPosts.push(request.url());
+  });
   await page.goto(baseURL);
   const projects = page.getByRole("navigation", { name: "Project deployments" });
   await projects.getByRole("button", { name: "peer/project" }).click();
   await expect(page.getByRole("heading", { name: "peer/project" })).toBeVisible();
-  await expect(page.getByRole("link", { name: /#27\b/ })).toBeVisible();
+  const projectedPeer = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#27\b/ }) });
+  await expect(projectedPeer).toContainText("completed");
   await expect(page.getByRole("link", { name: "Open project dashboard" })).toHaveAttribute("href", process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_PEER);
-  await expect(page.getByRole("button", { name: /Dismiss issue #27/ })).toHaveCount(0);
+  await expect(projectedPeer.getByRole("button", { name: /Dismiss issue #27/ })).toHaveCount(0);
+  await expect(projectedPeer.getByRole("button", { name: "Archive" })).toHaveCount(0);
   await page.getByRole("link", { name: "Open project dashboard" }).click();
   await expect(page).toHaveURL(process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_PEER + "/");
   await expect(page.getByRole("heading", { name: "peer/project" })).toBeVisible();
-  await expect(page.getByRole("link", { name: /#27\b/ })).toBeVisible();
-  await expect(page.getByRole("button", { name: /Dismiss issue #27/ })).toHaveCount(0);
+  const linkedPeer = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#27\b/ }) });
+  await expect(linkedPeer.getByRole("button", { name: /Dismiss issue #27/ })).toBeVisible();
+  await expect(linkedPeer.getByRole("button", { name: "Archive" })).toBeVisible();
+  expect(peerPosts).toEqual([]);
   await page.goBack();
   await projects.getByRole("button", { name: "o/r" }).click();
   await expect(page.getByRole("heading", { name: "o/r" })).toBeVisible();
@@ -43,7 +51,7 @@ test("operator controls the real supervised orchestrator and manual reconciliati
     return;
   }
 
-  if (phase === "post-restart" || phase === "start-held") {
+  if (["post-restart", "start-held", "fail-manual", "retry-manual"].includes(phase)) {
     await expect(orchestrator).toContainText(`Generation ${initialGeneration + 2} · rebuild`);
     const issue = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#191\b/ }) });
     const investigate = page.waitForResponse((response) => response.url().includes("/actions/orchestrator/investigate?") && response.request().method() === "POST");
