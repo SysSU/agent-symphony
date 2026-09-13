@@ -358,6 +358,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 			}
 			var blockedCycle <-chan error
 			var sourceCycle, sourceStale uint64
+			var heldMarkerObserved bool
 			if overlap {
 				before, err := readRuntimeOwnerState(stateRoot, "o/r")
 				if err != nil {
@@ -366,6 +367,9 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				sourceCycle = before.CycleOutcomeID
 				sourceStale = before.StaleReconciliations
 				if action == "dismiss-overlap" {
+					fixture.mu.Lock()
+					fixture.includeClosedIssue = true
+					fixture.mu.Unlock()
 					markerExposed.Store(true)
 				}
 				holdReconcile.Store(true)
@@ -398,6 +402,12 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					t.Fatalf("reconciliation finished before GitHub read was blocked: %v", err)
 				case <-time.After(limit):
 					t.Fatal("reconciliation did not enter blocked fake-GitHub read")
+				}
+				if action == "dismiss-overlap" {
+					heldMarkerObserved = markerObserved.Load()
+					if !heldMarkerObserved {
+						t.Fatal("held reconciliation did not read the completed-attempt marker before Dismiss")
+					}
 				}
 			}
 			playwright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "playwright"))
@@ -453,7 +463,9 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				default:
 				}
 				fixture.mu.Lock()
-				fixture.closed = false
+				if mutation == "abandon" {
+					fixture.closed = false
+				}
 				fixture.comments = []map[string]any{{"id": 73, "body": active, "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}}}
 				markerExposed.Store(true)
 				fixture.mu.Unlock()
@@ -461,8 +473,10 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				if err != nil || len(parsed.Facts) != 1 || parsed.Facts[0].Issue != 73 || parsed.Facts[0].ActiveAttempt == nil || parsed.Facts[0].ActiveAttempt.Attempt != 1 || parsed.Facts[0].ActiveAttempt.BaseSHA != base || parsed.Facts[0].ActiveAttempt.State != "active" {
 					t.Fatalf("fake GitHub did not parse an active attempt-1 fact after %s: facts=%#v err=%v", mutation, parsed.Facts, err)
 				}
-				// The mutation or fixture probe may have read the marker; require the held cycle to do so itself.
-				markerObserved.Store(false)
+				// For Abandon, the marker is introduced after mutation; ignore the fixture probe.
+				if mutation == "abandon" {
+					markerObserved.Store(false)
+				}
 				releaseReconcile.Do(func() { close(reconcileRelease) })
 				select {
 				case err := <-blockedCycle:
@@ -472,8 +486,11 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				case <-time.After(limit):
 					t.Fatalf("stale reconciliation did not finish after %s", mutation)
 				}
-				if !heldIssueListObserved.Load() || mutation == "abandon" && !markerObserved.Load() {
-					t.Fatalf("held reconciliation did not consume the expected fake-GitHub response: issue_list=%t attempt_marker=%t", heldIssueListObserved.Load(), markerObserved.Load())
+				if !heldIssueListObserved.Load() || mutation == "dismiss" && !heldMarkerObserved || mutation == "abandon" && !markerObserved.Load() {
+					fixture.mu.Lock()
+					requests := append([]string(nil), fixture.requests...)
+					fixture.mu.Unlock()
+					t.Fatalf("held reconciliation did not consume the expected fake-GitHub response: issue_list=%t attempt_marker=%t requests=%q", heldIssueListObserved.Load(), markerObserved.Load(), requests)
 				}
 				if !waitFor(limit, func() bool {
 					ledger, err := readRuntimeOwnerState(stateRoot, "o/r")

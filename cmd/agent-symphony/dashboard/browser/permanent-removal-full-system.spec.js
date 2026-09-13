@@ -21,8 +21,35 @@ test("permanently removes one real historical attempt", async ({ page }) => {
     await route.fulfill({ response });
   });
   await page.goto(baseURL);
+  const issueCards = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#73 Deterministic full-system journey/ }) });
+  if (phase === "archive-generated-click") {
+    const generated = issueCards.filter({ hasText: /Attempt 2\b/ }).first();
+    const archive = generated.getByRole("button", { name: "Archive" });
+    await expect(archive).toBeVisible();
+    const responsePromise = page.waitForResponse((response) => response.url().includes("/actions/archive?") && response.request().method() === "POST");
+    page.once("dialog", (dialog) => dialog.accept());
+    await archive.click();
+    const response = await responsePromise;
+    expect([200, 202]).toContain(response.status());
+    await expect(page.getByRole("status").filter({ hasText: /(Archived|Archive accepted) issue #73, attempt 2/ })).toBeVisible();
+    await expect.poll(async () => {
+      const state = await fetch(`${baseURL}/dashboard-state.json`, { cache: "no-store" }).then((result) => result.json());
+      return state.hidden?.some((attempt) => attempt.repository === "o/r" && attempt.issue === 73 && attempt.attempt === 2 && attempt.reason === "archived");
+    }).toBe(true);
+    await page.reload();
+    await expect(issueCards.filter({ hasText: /Attempt 2\b/ })).toHaveCount(0);
+    return;
+  }
+  if (phase === "post-archive-restart") {
+    await expect(issueCards.filter({ hasText: /Attempt [12]\b/ })).toHaveCount(0);
+    const state = await fetch(`${baseURL}/dashboard-state.json`, { cache: "no-store" }).then((response) => response.json());
+    expect(state.hidden).toEqual(expect.arrayContaining([
+      { repository: "o/r", issue: 73, attempt: 1, reason: "removed" },
+      { repository: "o/r", issue: 73, attempt: 2, reason: "archived" },
+    ]));
+    return;
+  }
   if (phase === "post-restart") {
-    const issueCards = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#73 Deterministic full-system journey/ }) });
     await expect(issueCards.filter({ hasText: /Attempt 1\b/ })).toHaveCount(0);
     await expect(issueCards.filter({ hasText: /Attempt 2\b/ }).first()).toBeVisible();
     await expect(page.getByRole("button", { name: "Permanently remove issue #73, attempt 1" })).toHaveCount(0);

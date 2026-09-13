@@ -37,6 +37,7 @@ type fullSystemGitHub struct {
 	pr                 map[string]any
 	merged             bool
 	closed             bool
+	includeClosedIssue bool
 	denyMutations      bool
 	deniedMutations    []string
 	historicalIssues   map[int]map[string]any
@@ -130,7 +131,7 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == "/repos/o/r/branches/main":
 		writeFixtureJSON(w, map[string]any{"name": "main", "commit": map[string]string{"sha": f.base}, "protected": false})
 	case r.Method == http.MethodGet && path == "/repos/o/r/issues":
-		if f.closed {
+		if f.closed && !f.includeClosedIssue {
 			writeFixtureJSON(w, []any{})
 		} else {
 			writeFixtureJSON(w, []any{issue})
@@ -705,18 +706,21 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 		t.Fatalf("real permanent-removal Playwright: %v\n%s\nledger=%s\nserve:\n%s", removalErr, removalOutput, ledger, restartOutput.String())
 	}
-	removeCLI := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "remove", "--issue", "73", "--attempt", "1", "--confirm", "--request-id", "full-system-removal-retry", "--timeout", controlTimeout, "--json")
-	removeOutput, err := removeCLI.CombinedOutput()
-	if err != nil || !strings.Contains(string(removeOutput), `"ok":true`) {
-		t.Fatalf("idempotent permanent-removal CLI: %v output=%s serve=%s", err, removeOutput, restartOutput.String())
-	}
 	var removedState runtimeOwnerState
 	var tombstone runtimeTombstone
 	if !waitFor(deadline(15*time.Second), func() bool {
 		var readErr error
 		removedState, readErr = readRuntimeOwnerState(stateRoot, "o/r")
 		tombstone = removedState.Tombstones[removedKey]
-		return readErr == nil && tombstone.Action == "removed" && tombstone.CleanupPhase == "completed"
+		if readErr != nil || tombstone.Action != "removed" || tombstone.CleanupPhase != "completed" {
+			return false
+		}
+		for _, receipt := range removedState.ControlReceipts {
+			if receipt.Request.Action == "remove" && receipt.Request.Issue == 73 && receipt.Request.Attempt == 1 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK && receipt.EffectID != "" && removedState.Effects[receipt.EffectID].State == "completed" {
+				return true
+			}
+		}
+		return false
 	}) {
 		roots, _ := os.ReadDir(productionSnapshotRoot(stateRoot))
 		t.Fatalf("permanent removal was not durably completed: tombstone=%#v effect=%#v proofs=%#v roots=%#v serve=%s", tombstone, removedState.Effects[tombstone.EffectID], removedState.ReviewerProofs, roots, restartOutput.String())
@@ -743,6 +747,11 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		if !fullSystemTmuxSessionExists(tmuxEnvironment, session) {
 			t.Fatalf("unrelated tmux session changed during permanent removal: %s", session)
 		}
+	}
+	removeCLI := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "remove", "--issue", "73", "--attempt", "1", "--confirm", "--request-id", "full-system-removal-retry", "--timeout", controlTimeout, "--json")
+	removeOutput, err := removeCLI.CombinedOutput()
+	if err != nil || !strings.Contains(string(removeOutput), `"ok":true`) {
+		t.Fatalf("idempotent permanent-removal CLI after dashboard cleanup: %v output=%s serve=%s", err, removeOutput, restartOutput.String())
 	}
 	fixture.mu.Lock()
 	deniedMutations := append([]string(nil), fixture.deniedMutations...)
@@ -854,6 +863,42 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	if len(deniedMutations) != 0 {
 		t.Fatalf("restart/reconcile attempted GitHub mutations during removal proof: %q", deniedMutations)
 	}
+	generatedKey := ownerAttemptKey("o/r", 73, 2)
+	generated := implementationAttempt
+	if generated.Generation == 0 || generated.Manifest.Session == "" || generated.Manifest.Worktree == "" || !afterRemovalCycle.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey].Present {
+		t.Fatalf("real daemon-generated attempt is unavailable in owner observation for Archive: origin=%#v current=%#v", generated, afterRemovalCycle.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey])
+	}
+	archiveBrowser := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "generated-archive-playwright"))
+	archiveBrowser.Dir = source
+	archiveBrowser.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+removalRestartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_REMOVAL_E2E_PHASE=archive-generated-click")
+	if browserOutput, browserErr := archiveBrowser.CombinedOutput(); browserErr != nil {
+		ledger, _ := readRuntimeOwnerState(stateRoot, "o/r")
+		fixture.mu.Lock()
+		archiveRequests := append([]string(nil), fixture.requests...)
+		fixture.mu.Unlock()
+		t.Fatalf("real generated-attempt Archive browser: %v\n%s\nowner_attempt=%#v observation=%#v tombstone=%#v receipts=%#v cycle=%q requests=%q serve=%s", browserErr, browserOutput, ledger.Attempts[generatedKey], ledger.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey], ledger.Tombstones[generatedKey], ledger.ControlReceipts, ledger.CycleDiagnostic, archiveRequests, removalRestartOutput.String())
+	}
+	if !waitFor(deadline(15*time.Second), func() bool {
+		current, readErr := readRuntimeOwnerState(stateRoot, "o/r")
+		if readErr != nil || current.Tombstones[generatedKey].Action != "archived" || current.Tombstones[generatedKey].CleanupPhase != "completed" || current.Attempts[generatedKey].Generation != 0 {
+			return false
+		}
+		for _, receipt := range current.ControlReceipts {
+			if receipt.Request.Action == "archive" && receipt.Request.Issue == 73 && receipt.Request.Attempt == 2 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK && receipt.EffectID == "" && current.Tombstones[generatedKey].EffectID == "" {
+				return true
+			}
+		}
+		return false
+	}) {
+		current, _ := readRuntimeOwnerState(stateRoot, "o/r")
+		t.Fatalf("generated-attempt Archive did not commit: tombstone=%#v receipts=%#v effects=%s serve=%s", current.Tombstones[generatedKey], current.ControlReceipts, fullSystemEffectSummary(current), removalRestartOutput.String())
+	}
+	if _, err := os.Lstat(generated.Manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Archive retained generated worktree %s: %v", generated.Manifest.Worktree, err)
+	}
+	if fullSystemTmuxSessionExists(tmuxEnvironment, generated.Manifest.Session) {
+		t.Fatalf("Archive retained generated session %s", generated.Manifest.Session)
+	}
 	if err := removalRestarted.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
 	}
@@ -861,6 +906,57 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatalf("post-removal serve shutdown: %v output=%s", err, removalRestartOutput.String())
 	}
 	removalRestartStopped = true
+	staleFacts, err = internalgithub.FetchAttemptFacts(t.Context(), internalgithub.API{BaseURL: github.URL, HTTP: github.Client(), Retries: -1}, "o/r", 42)
+	if err != nil || !slices.ContainsFunc(staleFacts, func(fact internalgithub.RecoveryAttemptFact) bool {
+		return fact.Repository == "o/r" && fact.Issue == 73 && fact.Attempt == 2 && fact.PR == 91
+	}) {
+		t.Fatalf("fake GitHub did not expose a parser-accepted archived attempt: facts=%#v err=%v", staleFacts, err)
+	}
+	beforeArchiveRestart, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveRestartAddress := freeAddress(t)
+	archiveRestarted := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", archiveRestartAddress, "--interval", "30s")
+	archiveRestarted.Dir, archiveRestarted.Env = repository, server.Env
+	var archiveRestartOutput synchronizedBuffer
+	archiveRestarted.Stdout, archiveRestarted.Stderr = &archiveRestartOutput, &archiveRestartOutput
+	if err := archiveRestarted.Start(); err != nil {
+		t.Fatal(err)
+	}
+	archiveRestartStopped := false
+	t.Cleanup(func() {
+		if !archiveRestartStopped {
+			_ = archiveRestarted.Process.Kill()
+			_ = archiveRestarted.Wait()
+		}
+	})
+	waitHTTP(t, "http://"+archiveRestartAddress+"/status.json", deadline(15*time.Second), &archiveRestartOutput)
+	archiveReconcile := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "reconcile", "--request-id", "full-system-after-generated-archive", "--timeout", controlTimeout, "--json")
+	archiveReconcileOutput, err := archiveReconcile.CombinedOutput()
+	if err != nil || !strings.Contains(string(archiveReconcileOutput), `"ok":true`) {
+		t.Fatalf("post-Archive restart reconcile: %v output=%s serve=%s", err, archiveReconcileOutput, archiveRestartOutput.String())
+	}
+	afterArchiveRestart, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil || !fullSystemNewCycleAfter(afterArchiveRestart, beforeArchiveRestart) || afterArchiveRestart.CycleDiagnostic != "" || afterArchiveRestart.Tombstones[generatedKey].Action != "archived" || afterArchiveRestart.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey].Present {
+		t.Fatalf("stale fake-GitHub data restored archived generated attempt: err=%v before=%d/%d after=%d/%d tombstone=%#v observation=%#v diagnostic=%q", err, beforeArchiveRestart.CycleOutcomeEpoch, beforeArchiveRestart.CycleOutcomeID, afterArchiveRestart.CycleOutcomeEpoch, afterArchiveRestart.CycleOutcomeID, afterArchiveRestart.Tombstones[generatedKey], afterArchiveRestart.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey], afterArchiveRestart.CycleDiagnostic)
+	}
+	if _, exists := afterArchiveRestart.Attempts[generatedKey]; exists {
+		t.Fatal("restart/reconcile recreated archived generated owner attempt")
+	}
+	archiveRestartBrowser := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "generated-archive-restart-playwright"))
+	archiveRestartBrowser.Dir = source
+	archiveRestartBrowser.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+archiveRestartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_REMOVAL_E2E_PHASE=post-archive-restart")
+	if browserOutput, browserErr := archiveRestartBrowser.CombinedOutput(); browserErr != nil {
+		t.Fatalf("archived generated attempt reappeared after restart: %v\n%s\nserve=%s", browserErr, browserOutput, archiveRestartOutput.String())
+	}
+	if err := archiveRestarted.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := archiveRestarted.Wait(); err != nil {
+		t.Fatalf("post-Archive serve shutdown: %v output=%s", err, archiveRestartOutput.String())
+	}
+	archiveRestartStopped = true
 	if err := stopFullSystemTmux(server.Env, currentSession); err != nil {
 		t.Fatal(err)
 	}
