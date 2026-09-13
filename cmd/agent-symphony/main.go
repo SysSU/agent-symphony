@@ -2098,8 +2098,18 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 				}
 				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer wrapper never started"))
 			}
-			if _, parseErr := agentruntime.ParsePaneStatus(paneStatus.Output); parseErr != nil {
+			pane, parseErr := agentruntime.ParsePaneStatus(paneStatus.Output)
+			if parseErr != nil {
 				return independentReviewResult{}, true, fmt.Errorf("probe unmarked reviewer pane: %w", parseErr)
+			}
+			if pane.Dead {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot)
+				cancel()
+				if cleanupErr != nil {
+					return independentReviewResult{}, true, fmt.Errorf("clean dead unmarked reviewer pane: %w", cleanupErr)
+				}
+				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer exited before launch identity was recorded"))
 			}
 			started, probeErr := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_start_command}"}, Dir: snapshot, Env: env})
 			if probeErr != nil || started.Exited {
@@ -2256,7 +2266,13 @@ launch:
 	}
 	args := agentruntime.TmuxNewSessionArgs(session, snapshot, env)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: args, Dir: snapshot, Env: env}); err != nil {
-		return independentReviewResult{}, false, err
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot)
+		cancel()
+		if cleanupErr != nil {
+			return independentReviewResult{}, true, errors.Join(err, cleanupErr)
+		}
+		return independentReviewResult{}, false, reviewerLifecycleError(err)
 	}
 	failBeforeRespawn := func(cause error) (independentReviewResult, bool, error) {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)

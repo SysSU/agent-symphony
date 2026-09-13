@@ -22,8 +22,10 @@ func (b *forbiddenReviewerBoundary) call(context.Context, string, agentruntime.C
 }
 
 type prelaunchFailureBoundary struct {
-	created bool
-	killed  bool
+	created         bool
+	killed          bool
+	newSessionError bool
+	beforeCreate    bool
 }
 
 type ambiguousRespawnBoundary struct {
@@ -32,6 +34,7 @@ type ambiguousRespawnBoundary struct {
 	terminal string
 	after    bool
 	marker   bool
+	dead     bool
 	created  bool
 	killed   bool
 	probes   int
@@ -56,6 +59,9 @@ func (b *ambiguousRespawnBoundary) call(_ context.Context, operation string, com
 			return agentruntime.Result{Output: "/bin/zsh"}, nil
 		}
 		if b.created && !b.killed {
+			if b.dead {
+				return agentruntime.Result{Output: "1|||0|"}, nil
+			}
 			return agentruntime.Result{Output: "0||||"}, nil
 		}
 		return agentruntime.Result{Output: "||||"}, nil
@@ -88,7 +94,12 @@ func (b *prelaunchFailureBoundary) call(_ context.Context, operation string, com
 		return agentruntime.Result{Output: "||||"}, nil
 	case "set-option":
 		if len(command.Args) > 5 && command.Args[4] == ";" && command.Args[5] == "new-session" {
-			b.created = true
+			if !b.beforeCreate {
+				b.created = true
+			}
+			if b.newSessionError {
+				return agentruntime.Result{}, errors.New("tmux new-session response failed")
+			}
 			return agentruntime.Result{}, nil
 		}
 		return agentruntime.Result{}, errors.New("tmux set-option denied")
@@ -343,15 +354,41 @@ func TestPlanReviewerSetupFailureKillsDefaultShellAndTerminalizes(t *testing.T) 
 	}
 }
 
+func TestPlanReviewerNewSessionErrorCleansExactShellBeforeTerminal(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		beforeCreate bool
+	}{
+		{name: "error before session creation", beforeCreate: true},
+		{name: "error after session creation"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base, _, source, _ := testWorkerExportBoundary(t)
+			root := t.TempDir()
+			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 77, Number: 1, BaseSHA: base}
+			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, Body: "plan"}
+			manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "running"}
+			identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64)}
+			boundary := &prelaunchFailureBoundary{newSessionError: true, beforeCreate: test.beforeCreate}
+			_, pending, err := runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, source, base, root, agentruntime.ReviewModePlan, &identity, false)
+			if pending || !errors.Is(err, errReviewerTerminal) || boundary.killed == test.beforeCreate {
+				t.Fatalf("new-session ambiguity left shell/receipt pending: pending=%v err=%v boundary=%#v", pending, err, boundary)
+			}
+		})
+	}
+}
+
 func TestPlanReviewerAmbiguousRespawnProbesExactPaneBeforeTerminalizing(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		after  bool
 		marker bool
+		dead   bool
 	}{
 		{name: "before spawn"},
 		{name: "after spawn with marker", after: true, marker: true},
 		{name: "after spawn before marker", after: true},
+		{name: "after spawn crashes before marker", after: true, dead: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			base, _, source, _ := testWorkerExportBoundary(t)
@@ -366,7 +403,7 @@ func TestPlanReviewerAmbiguousRespawnProbesExactPaneBeforeTerminalizing(t *testi
 			}
 			snapshot, session := reviewIdentity(attempt, root)
 			launch, terminal := reviewerLifecyclePaths(snapshot, target)
-			boundary := &ambiguousRespawnBoundary{identity: identity, launch: launch, terminal: terminal, after: test.after, marker: test.marker}
+			boundary := &ambiguousRespawnBoundary{identity: identity, launch: launch, terminal: terminal, after: test.after, marker: test.marker, dead: test.dead}
 			_, pending, err := runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, source, base, root, agentruntime.ReviewModePlan, &identity, false)
 			if !test.after {
 				if pending || !errors.Is(err, errReviewerTerminal) || !boundary.killed || boundary.probes != 2 {
@@ -379,6 +416,12 @@ func TestPlanReviewerAmbiguousRespawnProbesExactPaneBeforeTerminalizing(t *testi
 			}
 			if !test.marker {
 				_, pending, err = runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, source, base, root, agentruntime.ReviewModePlan, &identity, true)
+				if test.dead {
+					if pending || !errors.Is(err, errReviewerTerminal) || !boundary.killed {
+						t.Fatalf("dead unmarked reviewer did not terminalize: pending=%v err=%v boundary=%#v", pending, err, boundary)
+					}
+					return
+				}
 				if !pending || err != nil || boundary.killed {
 					t.Fatalf("restart before launch marker lost live reviewer: pending=%v err=%v boundary=%#v", pending, err, boundary)
 				}
