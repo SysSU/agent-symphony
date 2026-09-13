@@ -7,7 +7,7 @@ import AttemptHistory from "./_components/attempt-history";
 import ProjectNavigation, { ProjectAgentConsole, ProjectHeader, ProjectHealthControl, projectBoard, projectView } from "./_components/project-navigation";
 import { getOrchestratorStatus, getRelease, operatorActionNotice, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
-import { attemptKey } from "./health.mjs";
+import { attemptKey, ownerVersionAtLeast } from "./health.mjs";
 
 const actionDetails = {
   abandon: ["Abandon", "This stops its tmux session and permanently deletes its local worktree, log, and retained attempt record.", "Abandoned"],
@@ -35,6 +35,8 @@ export default function Dashboard() {
   const [projects, setProjects] = useState([]);
   const [selectedRepository, setSelectedRepository] = useState("");
   const closeTerminal = useCallback(() => setTerminal(null), []);
+  const acceptSnapshot = useCallback((next) => setSnapshot((current) => ownerVersionAtLeast(next, current) ? next : current), []);
+  const acceptDashboardState = useCallback((next) => setDashboardState((current) => ownerVersionAtLeast(next, current) ? next : current), []);
 
   useEffect(() => {
     let active = true;
@@ -42,19 +44,20 @@ export default function Dashboard() {
       getRelease().then((value) => { if (active) setRelease(value); });
       try {
         const orchestratorRequest = getOrchestratorStatus();
-        const [response, stateResponse, projectsResponse, orchestratorResult] = await Promise.all([
+        const projectsRequest = fetch("/projects.json", { cache: "no-store" });
+        const [response, orchestratorResult] = await Promise.all([
           fetch("/status.json", { cache: "no-store" }),
-          fetch("/dashboard-state.json", { cache: "no-store" }),
-          fetch("/projects.json", { cache: "no-store" }),
           orchestratorRequest,
         ]);
         if (!response.ok) throw new Error(response.status === 404 ? "Waiting for the first reconciliation" : `Status request failed (${response.status})`);
+        const stateResponse = await fetch("/dashboard-state.json", { cache: "no-store" });
+        const projectsResponse = await projectsRequest;
         if (!stateResponse.ok) throw new Error(`Dashboard state request failed (${stateResponse.status})`);
         if (!projectsResponse.ok) throw new Error(`Project request failed (${projectsResponse.status})`);
         const [next, nextState, nextProjects] = await Promise.all([response.json(), stateResponse.json(), projectsResponse.json()]);
         if (active) {
-          setSnapshot(next);
-          setDashboardState(nextState);
+          acceptSnapshot(next);
+          acceptDashboardState(nextState);
           setProjects(nextProjects.projects ?? []);
           setOrchestratorStatus(orchestratorResult.status);
           setOrchestratorError(orchestratorResult.error);
@@ -71,7 +74,7 @@ export default function Dashboard() {
       active = false;
       clearInterval(timer);
     };
-  }, []);
+  }, [acceptSnapshot, acceptDashboardState]);
 
   const performAction = useCallback(async (action, status) => {
     const [verb, consequence, finished] = actionDetails[action] ?? actionDetails.abandon;
@@ -90,7 +93,7 @@ export default function Dashboard() {
       const notice = await operatorActionNotice(response, verb, finished, status.issue, status.attempt);
       const stateResponse = await fetch("/dashboard-state.json", { cache: "no-store" });
       if (!stateResponse.ok) throw new Error(`${verb} was accepted, but dashboard state could not be refreshed.`);
-      setDashboardState(await stateResponse.json());
+      acceptDashboardState(await stateResponse.json());
       setActionNotice(notice);
     } catch (reason) {
       setActionNotice(reason instanceof Error ? reason.message : `${verb} failed.`);
@@ -98,7 +101,7 @@ export default function Dashboard() {
       setBusy("");
       setWaiting(false);
     }
-  }, []);
+  }, [acceptDashboardState]);
 
   const performOrchestratorAction = useCallback(async (action, status) => {
     const confirmations = {
@@ -161,7 +164,7 @@ export default function Dashboard() {
           <h2>{health.title}</h2>
           <p>{health.detail}</p>
         </div>
-        <ProjectHealthControl remote={remoteProject} onNotice={setActionNotice} onSnapshot={setSnapshot} />
+        <ProjectHealthControl remote={remoteProject} onNotice={setActionNotice} onSnapshot={acceptSnapshot} />
       </section>
 
       <ProjectAgentConsole

@@ -709,7 +709,7 @@ func TestUnmarkedPublicationAndReviewerReconstructExactWorkerExport(t *testing.T
 		reviewer := workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `payload=$(cat)
 case "$payload" in
   *'"operation":"review-result"'*) printf %s '{"Output":"{\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]}"}' ;;
-  *'display-message'*) printf %s '{"Output":"1|||0\n"}' ;;
+  *'display-message'*) printf %s '{"Output":"1|||0|\n"}' ;;
   *) exit 1 ;;
 esac`}}
 		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}}

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { canInvestigate, groupStatusesByLane, orchestratorPresentation, overallHealth, partitionAttemptHistory } from "./health.mjs";
+import { canInvestigate, groupStatusesByLane, orchestratorPresentation, overallHealth, ownerVersionAtLeast, partitionAttemptHistory } from "./health.mjs";
 
 const now = new Date("2026-08-13T12:00:00Z").getTime();
 const fresh = { updated_at: "2026-08-13T11:59:30Z" };
@@ -51,6 +51,29 @@ test("partitions superseded terminal attempts by repository and issue", () => {
   const partitioned = partitionAttemptHistory(statuses);
   assert.deepEqual(partitioned.historical, [statuses[0], statuses[2], statuses[6]]);
   assert.deepEqual(partitioned.current, [statuses[1], statuses[3], statuses[4], statuses[5], statuses[7]]);
+});
+
+test("hidden highest attempts do not promote older terminal attempts", () => {
+  for (const reason of ["abandoned", "dismissed", "archived", "removed"]) {
+    for (const state of ["failed", "orphaned", "cancelled", "completed"]) {
+      const older = { repository: "o/r", issue: 191, attempt: 8, state };
+      const hidden = { repository: "o/r", issue: 191, attempt: 9, reason };
+      const partitioned = partitionAttemptHistory([older], [hidden]);
+      assert.deepEqual(partitioned.current, [], `${reason} after ${state}`);
+      assert.deepEqual(partitioned.historical, [older], `${reason} after ${state}`);
+      const newer = { repository: "o/r", issue: 191, attempt: 10, state: "active" };
+      assert.deepEqual(partitionAttemptHistory([older, newer], [hidden]).current, [newer], `${reason} permits a new retry`);
+    }
+  }
+});
+
+test("owner-backed refreshes never replace a newer committed state", () => {
+  assert.equal(ownerVersionAtLeast({ owner_revision: 9 }, { owner_revision: 10 }), false);
+  assert.equal(ownerVersionAtLeast({ owner_revision: 10 }, { owner_revision: 10 }), true);
+  assert.equal(ownerVersionAtLeast({ owner_epoch: 2, owner_revision: 1 }, { owner_epoch: 1, owner_revision: 10 }), true);
+  assert.equal(ownerVersionAtLeast({ owner_epoch: 1, owner_revision: 20 }, { owner_epoch: 2, owner_revision: 1 }), false);
+  assert.equal(ownerVersionAtLeast({}, { owner_revision: 10 }), false);
+  assert.equal(ownerVersionAtLeast({}, {}), true);
 });
 
 test("orchestrator presentation and investigation eligibility", () => {
