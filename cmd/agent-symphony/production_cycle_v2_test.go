@@ -1057,15 +1057,19 @@ func TestImplementationReviewerFailureDoesNotBlockOtherEffect(t *testing.T) {
 			input.Attempts = []internalgithub.RecoveryAttemptFact{otherAttempt}
 			applyReconciliationInput(t, owner, input)
 			checkIn := reconciliationEffectCaseNamed(t, "monitoring-check-in")
-			otherRequest := checkIn.request
-			otherRequest.Issue, otherRequest.CheckIn.Session = 191, other.Session
 			otherSnapshot := mustOwnerSnapshot(t, owner)
-			other = otherSnapshot.State.Attempts[ownerAttemptKey("o/r", 191, 1)].Manifest
-			otherRequest.Manifest = &other
-			otherRequest = bindEffectObservation(otherSnapshot, otherRequest)
+			planned, err := planMonitoringCheckIn(otherSnapshot, orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 191, Attempt: 1, Action: orchestratoragent.ProposalActionCheckIn, Binding: strings.Repeat("a", 64)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			otherRequest := planned.Request
+			otherRequest = checkInAfterEffectID(t, otherSnapshot, otherRequest, blocked.ID)
 			_, ready, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(otherSnapshot, otherRequest), Request: otherRequest})
 			if err != nil {
 				t.Fatal(err)
+			}
+			if blocked.ID >= ready.ID {
+				t.Fatalf("fixture did not visit blocked reviewer before marked B: A=%s B=%s", blocked.ID, ready.ID)
 			}
 			if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*ready), *ready.Reconciliation, checkIn.result(*ready.Reconciliation)); err != nil {
 				t.Fatal(err)
@@ -1214,15 +1218,19 @@ esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode
 	input.Attempts = []internalgithub.RecoveryAttemptFact{otherAttempt}
 	applyReconciliationInput(t, owner, input)
 	checkIn := reconciliationEffectCaseNamed(t, "monitoring-check-in")
-	otherRequest := checkIn.request
-	otherRequest.Issue, otherRequest.CheckIn.Session = 195, other.Session
 	otherSnapshot := mustOwnerSnapshot(t, owner)
-	other = otherSnapshot.State.Attempts[ownerAttemptKey("o/r", 195, 1)].Manifest
-	otherRequest.Manifest = &other
-	otherRequest = bindEffectObservation(otherSnapshot, otherRequest)
+	planned, err := planMonitoringCheckIn(otherSnapshot, orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 195, Attempt: 1, Action: orchestratoragent.ProposalActionCheckIn, Binding: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRequest := planned.Request
+	otherRequest = checkInAfterEffectID(t, otherSnapshot, otherRequest, reviewer.ID)
 	_, ready, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(otherSnapshot, otherRequest), Request: otherRequest})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if reviewer.ID >= ready.ID {
+		t.Fatalf("fixture did not visit healthy reviewer before marked B: A=%s B=%s", reviewer.ID, ready.ID)
 	}
 	if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*ready), *ready.Reconciliation, checkIn.result(*ready.Reconciliation)); err != nil {
 		t.Fatal(err)
@@ -1237,6 +1245,27 @@ esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode
 	if err := live.onKill(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func checkInAfterEffectID(t *testing.T, snapshot stateOwnerSnapshot, request reconciliationEffectRequest, after string) reconciliationEffectRequest {
+	t.Helper()
+	for candidate := 1; candidate < 256; candidate++ {
+		// Binding is a legitimate check-in proposal input; keep the derived
+		// execution digest valid while choosing a deterministic owner ID order.
+		request.CheckIn.Binding = fmt.Sprintf("%064x", candidate)
+		request.ExecutionDigest = monitoringCheckInExecutionDigest(request)
+		preview := runtimeEffectIntent{
+			Action: string(request.Action), Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt,
+			IssueGeneration:   snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)],
+			AttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)],
+			IntentEpoch:       snapshot.State.Epoch, IntentRevision: snapshot.State.Revision + 1, RequestDigest: reconciliationEffectDigest(request),
+		}
+		if runtimeEffectID(preview) > after {
+			return request
+		}
+	}
+	t.Fatal("could not order marked B after reviewer A")
+	return reconciliationEffectRequest{}
 }
 
 func TestStartupMarkerSweepLeavesOperatorEffectsToReceiptRecovery(t *testing.T) {

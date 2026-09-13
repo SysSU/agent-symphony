@@ -826,7 +826,7 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if candidate.Epoch == ^uint64(0) {
 			return runtimeOwnerState{}, nil, errors.New("runtime epoch overflow")
 		}
-		revokeInvalidPlanReviewers(&candidate) // Upgrade an old pending ledger before its observation epoch changes.
+		revokeInvalidPlanReviewers(&candidate, true) // Upgrade an old pending ledger before its observation epoch changes.
 		candidate.Epoch++
 		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, nil)
 	}
@@ -1407,7 +1407,7 @@ func finishRuntimeOwnerTransition(attemptRoot, stateRoot string, candidate runti
 			candidate.Tombstones[key] = tombstone
 		}
 	}
-	revokeInvalidPlanReviewers(&candidate)
+	revokeInvalidPlanReviewers(&candidate, false)
 	if err := validateRuntimeOwnerState(candidate, attemptRoot, stateRoot, true); err != nil {
 		return runtimeOwnerState{}, nil, err
 	}

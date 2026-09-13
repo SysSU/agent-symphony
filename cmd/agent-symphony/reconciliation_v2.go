@@ -441,7 +441,7 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 		}
 	}
 	if !collection.Complete {
-		revokeInvalidPlanReviewers(state)
+		revokeInvalidPlanReviewers(state, false)
 		return nil
 	}
 	keys := make([]string, 0, len(state.Observations)+1)
@@ -513,13 +513,28 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 		}
 		state.Observations[key] = next
 	}
-	revokeInvalidPlanReviewers(state)
+	revokeInvalidPlanReviewers(state, false)
 	return nil
 }
 
-func revokeInvalidPlanReviewers(state *runtimeOwnerState) {
+func revokeInvalidPlanReviewers(state *runtimeOwnerState, startup bool) {
 	for id, effect := range state.Effects {
-		if effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan || effect.Reconciliation.Reviewer.Phase != "run-observe" || !planReviewInvalidated(*state, effect) {
+		if effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan || effect.Reconciliation.Reviewer.Phase != "run-observe" {
+			continue
+		}
+		invalid := planReviewInvalidated(*state, effect)
+		if startup && !invalid {
+			observation := state.Observations[ownerIssueKey(effect.Repository, effect.Issue)]
+			// Only an observation accepted after this exact effect's admission
+			// can revoke an old-epoch Plan review during ledger migration.
+			later := observation.ObservationEpoch > effect.IntentEpoch || observation.ObservationEpoch == effect.IntentEpoch && observation.LastCycleID > effect.Reconciliation.ObservationCycleID
+			if later {
+				atObservationEpoch := *state
+				atObservationEpoch.Epoch = observation.ObservationEpoch
+				invalid = planReviewInvalidated(atObservationEpoch, effect)
+			}
+		}
+		if !invalid {
 			continue
 		}
 		effect.ReviewerRevoked = true
