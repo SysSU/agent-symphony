@@ -15,19 +15,41 @@ test("operator controls the real supervised orchestrator and manual reconciliati
   await expect(page.getByRole("link", { name: /#27\b/ })).toBeVisible();
   await expect(page.getByRole("link", { name: "Open project dashboard" })).toHaveAttribute("href", process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_PEER);
   await expect(page.getByRole("button", { name: /Dismiss issue #27/ })).toHaveCount(0);
+  await page.getByRole("link", { name: "Open project dashboard" }).click();
+  await expect(page).toHaveURL(process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_PEER + "/");
+  await expect(page.getByRole("heading", { name: "peer/project" })).toBeVisible();
+  await expect(page.getByRole("link", { name: /#27\b/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Dismiss issue #27/ })).toHaveCount(0);
+  await page.goBack();
   await projects.getByRole("button", { name: "o/r" }).click();
   await expect(page.getByRole("heading", { name: "o/r" })).toBeVisible();
   const orchestrator = page.getByRole("region", { name: "Orchestrator" });
   await expect(orchestrator.getByRole("status", { name: "" })).toHaveText("Running");
   const initialGeneration = Number(process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_GENERATION);
   const session = process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_SESSION;
+  const phase = process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_PHASE;
 
-  if (process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_PHASE === "post-restart") {
+  if (phase === "recover-held") {
+    const responsePromise = page.waitForResponse((response) => response.url().endsWith("/actions/orchestrator/recover") && response.request().method() === "POST");
+    page.once("dialog", (dialog) => dialog.accept());
+    await orchestrator.getByRole("button", { name: "Recover/restart" }).click();
+    const response = await responsePromise;
+    const result = await response.json();
+    expect(response.status(), JSON.stringify(result)).toBe(200);
+    expect(result.status.generation).toBe(initialGeneration + 2);
+    expect(result.status.context_mode).toBe("rebuild");
+    await expect(orchestrator).toContainText(`Generation ${initialGeneration + 2} · rebuild`);
+    expect(errors).toEqual([]);
+    return;
+  }
+
+  if (phase === "post-restart" || phase === "start-held") {
     await expect(orchestrator).toContainText(`Generation ${initialGeneration + 2} · rebuild`);
     const issue = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#191\b/ }) });
     const investigate = page.waitForResponse((response) => response.url().includes("/actions/orchestrator/investigate?") && response.request().method() === "POST");
     await issue.getByRole("button", { name: "Ask orchestrator to investigate" }).click();
-    expect((await investigate).status()).toBe(200);
+    const response = await investigate;
+    expect(response.status(), await response.text()).toBe(200);
     await expect(page.getByRole("status").filter({ hasText: "Asked the orchestrator to investigate issue #191, attempt 9." })).toBeVisible();
     expect(errors).toEqual([]);
     return;
@@ -39,6 +61,10 @@ test("operator controls the real supervised orchestrator and manual reconciliati
   await expect(terminal.locator(".xterm-rows")).toContainText("orchestrator-ready");
   await terminal.getByRole("button", { name: "Close" }).click();
   await expect(terminal).toBeHidden();
+  await orchestrator.getByRole("button", { name: session }).click();
+  await expect(terminal.getByRole("status")).toHaveText("Connected");
+  await expect(terminal.locator(".xterm-rows")).toContainText("orchestrator-ready");
+  await terminal.getByRole("button", { name: "Close" }).click();
 
   async function action(name, path, expectedGeneration, expectedMode) {
     const button = orchestrator.getByRole("button", { name });
@@ -52,8 +78,8 @@ test("operator controls the real supervised orchestrator and manual reconciliati
     page.once("dialog", (dialog) => dialog.accept());
     await button.click();
     const response = await responsePromise;
-    expect(response.status()).toBe(200);
     const result = await response.json();
+    expect(response.status(), JSON.stringify(result)).toBe(200);
     expect(result.ok).toBe(true);
     expect(result.status.generation).toBe(expectedGeneration);
     expect(result.status.context_mode).toBe(expectedMode);
@@ -66,8 +92,19 @@ test("operator controls the real supervised orchestrator and manual reconciliati
   const mode = process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_MODE;
   const recovered = await action("Recover/restart", "/actions/orchestrator/recover", initialGeneration, mode);
   expect(recovered.last_healthy_at).not.toBe(process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_LAST_HEALTHY);
+  await orchestrator.getByRole("button", { name: "Open terminal" }).click();
+  await expect(terminal.getByRole("status")).toHaveText("Connected");
+  await terminal.locator(".terminal textarea").pressSequentially("conversation-before-clear");
+  await page.keyboard.press("Enter");
+  await terminal.getByRole("button", { name: "Close" }).click();
   await action("Clear context", "/actions/orchestrator/clear", initialGeneration + 1, "clear");
+  await orchestrator.getByRole("button", { name: "Open terminal" }).click();
+  await expect(terminal.locator(".xterm-rows")).toContainText("orchestrator-projection-absent");
+  await terminal.getByRole("button", { name: "Close" }).click();
   await action("Rebuild context", "/actions/orchestrator/rebuild", initialGeneration + 2, "rebuild");
+  await orchestrator.getByRole("button", { name: "Open terminal" }).click();
+  await expect(terminal.locator(".xterm-rows")).toContainText("orchestrator-projection-present");
+  await terminal.getByRole("button", { name: "Close" }).click();
 
   const reconcile = page.waitForResponse((response) => response.url().endsWith("/actions/reconcile") && response.request().method() === "POST");
   await page.getByRole("button", { name: "Check now" }).click();

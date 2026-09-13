@@ -10,10 +10,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/SysSU/agent-symphony/internal/config"
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
@@ -75,22 +78,16 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 	if err := writeRuntimeOwnerState(stateRoot, productionAttemptRoot(stateRoot), state); err != nil {
 		t.Fatal(err)
 	}
-	githubFixture := &fullSystemGitHub{base: base, origin: origin, historicalIssues: map[int]map[string]any{191: {
-		"number": 191, "node_id": "I_191", "title": "Orchestrator control fixture", "body": "## Context\nClosed fixture.\n", "state": "closed", "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "labels": []any{},
-	}}, historicalComments: map[int][]map[string]any{}}
+	githubFixture := &fullSystemGitHub{base: base, origin: origin, historicalIssues: map[int]map[string]any{
+		191: {"number": 191, "node_id": "I_191", "title": "Orchestrator control fixture", "body": "## Context\nClosed fixture.\n", "state": "closed", "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "labels": []any{}},
+	}, historicalComments: map[int][]map[string]any{}}
 	github := httptest.NewServer(githubFixture)
 	defer github.Close()
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/project.json" {
-			http.NotFound(w, r)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"version": 1, "repository": "peer/project",
-			"snapshot": map[string]any{"updated_at": time.Now().UTC(), "statuses": []map[string]any{{"repository": "peer/project", "issue": 27, "attempt": 1, "title": "Read-only peer fixture", "state": "failed"}}},
-			"state":    map[string]any{"version": 1, "hidden": []any{}},
-		})
-	}))
+	peerRoot := filepath.Join(root, "peer")
+	if err := writeDashboardStatusSnapshot(peerRoot, dashboardStatusSnapshot{UpdatedAt: time.Now().UTC(), Statuses: []orchestrator.RecoveryStatus{{Repository: "peer/project", Issue: 27, Attempt: 1, Title: "Read-only peer fixture", State: "failed"}}}); err != nil {
+		t.Fatal(err)
+	}
+	peer := httptest.NewServer(newProjectDashboardServer(t.Context(), peerRoot, "peer/project", nil, "tmux", nil, nil, false, "").webHandler())
 	defer peer.Close()
 	binDir := filepath.Join(root, "bin")
 	if err := os.Mkdir(binDir, 0o700); err != nil {
@@ -119,11 +116,54 @@ test "$endpoint" = graphql && endpoint=/graphql
 if [ "$input" -eq 1 ]; then exec curl -sS -i -X "$method" --data-binary @- "$FAKE_GITHUB_URL$endpoint"; fi
 exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 `)
-	writeExecutable(t, filepath.Join(binDir, "codex"), `#!/bin/sh
-if [ "$1" = audit ]; then printf 'fixture audit complete\n'; exit 0; fi
+	eventsFile, err := os.CreateTemp("/tmp", "agent-symphony-orchestrator-events-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureEvents := eventsFile.Name()
+	t.Cleanup(func() { _ = os.Remove(fixtureEvents) })
+	if err := eventsFile.Chmod(0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := eventsFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	holdAudit, releaseAudit := fixtureEvents+"-hold", fixtureEvents+"-release"
+	if err := syscall.Mkfifo(releaseAudit, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(releaseAudit, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	releaseHeldAudit := func() error {
+		pipe, err := os.OpenFile(releaseAudit, os.O_RDWR|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return err
+		}
+		defer pipe.Close()
+		_, err = pipe.Write([]byte("release\n"))
+		return err
+	}
+	t.Cleanup(func() { _ = releaseHeldAudit(); _ = os.Remove(holdAudit); _ = os.Remove(releaseAudit) })
+	writeExecutable(t, filepath.Join(binDir, "codex"), strings.NewReplacer("@EVENTS@", fixtureEvents, "@HOLD@", holdAudit, "@RELEASE@", releaseAudit).Replace(`#!/bin/sh
+if [ "$1" = audit ]; then
+  audit_context=$(cat)
+  case "$audit_context" in
+    *'"issue":191,"attempt":9'*) printf 'audit:191:9\n' >> "@EVENTS@" ;;
+    *) printf 'audit:other\n' >> "@EVENTS@" ;;
+  esac
+  if [ -f "@HOLD@" ]; then
+    printf 'audit:blocked\n' >> "@EVENTS@"
+    IFS= read -r release < "@RELEASE@"
+  fi
+  printf 'fixture audit complete\n'
+  exit 0
+fi
 printf 'orchestrator-ready\n'
-while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; done
-`)
+case "$2" in *"## Sanitized current projection"*) printf 'orchestrator-projection-present\n'; printf 'start:projection-present\n' >> "@EVENTS@" ;; *) printf 'orchestrator-projection-absent\n'; printf 'start:projection-absent\n' >> "@EVENTS@" ;; esac
+case "$2" in *conversation-before-clear*) printf 'start:stale-conversation\n' >> "@EVENTS@" ;; esac
+while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 'received:%s\n' "$line" >> "@EVENTS@"; done
+`))
 	cfg := config.Default("o/r")
 	cfg.Commands.Orchestrator = []string{"codex", "orchestrate"}
 	cfg.Commands.OrchestratorAudit = []string{"codex", "audit"}
@@ -162,6 +202,7 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; done
 	}
 	baseURL := "http://" + address
 	waitHTTP(t, baseURL+"/status.json", deadline, output)
+	reportPath := filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-"+internalgithub.RepositoryIdentifier("o/r"), orchestratoragent.HeartbeatReportFile)
 	readOrchestrator := func() (orchestratoragent.Status, error) {
 		response, err := http.Get(baseURL + "/orchestrator.json")
 		if err != nil {
@@ -192,7 +233,13 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; done
 		return len(snapshot.Statuses) == 0
 	})
 	if !ready {
-		t.Fatalf("orchestrator dashboard was not ready: %s", output.String())
+		response, _ := http.Get(baseURL + "/status.json")
+		var snapshot dashboardStatusSnapshot
+		if response != nil {
+			_ = json.NewDecoder(response.Body).Decode(&snapshot)
+			response.Body.Close()
+		}
+		t.Fatalf("orchestrator dashboard was not ready: statuses=%+v serve=%s", snapshot.Statuses, output.String())
 	}
 	initial, err := readOrchestrator()
 	if err != nil {
@@ -216,10 +263,31 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; done
 		browser.Dir = source
 		browser.Env = append(os.Environ(), "AGENT_SYMPHONY_ORCHESTRATOR_E2E_URL="+baseURL, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_PEER="+peer.URL, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_PHASE="+phase, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_GENERATION="+strconv.Itoa(initial.Generation), "AGENT_SYMPHONY_ORCHESTRATOR_E2E_SESSION="+initial.Session, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_MODE="+initial.ContextMode, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_LAST_HEALTHY="+initial.LastHealthyAt.Format(time.RFC3339Nano), "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(raceMode))
 		if browserOutput, err := browser.CombinedOutput(); err != nil {
-			t.Fatalf("orchestrator browser phase %s: %v\n%s\nserve:\n%s", phase, err, browserOutput, output.String())
+			pane := exec.Command("tmux", "display-message", "-p", "-t", agentruntime.PaneTarget(initial.Session), "#{pane_dead} #{pane_pid} #{pane_current_command}")
+			pane.Env = environment
+			paneOutput, paneErr := pane.CombinedOutput()
+			capture := exec.Command("tmux", "capture-pane", "-p", "-S", "-100", "-t", agentruntime.PaneTarget(initial.Session))
+			capture.Env = environment
+			captured, _ := capture.CombinedOutput()
+			status, statusErr := readOrchestrator()
+			t.Fatalf("orchestrator browser phase %s: %v\n%s\nstatus=%+v statusErr=%v pane=%s paneErr=%v capture=%s\nserve:\n%s", phase, err, browserOutput, status, statusErr, paneOutput, paneErr, captured, output.String())
 		}
 	}
 	runBrowser("initial")
+	if !waitFor(deadline, func() bool {
+		body, err := os.ReadFile(fixtureEvents)
+		if err != nil {
+			return false
+		}
+		events := string(body)
+		received := strings.Index(events, "received:conversation-before-clear\n")
+		cleared := strings.Index(events, "start:projection-absent\n")
+		rebuilt := strings.LastIndex(events, "start:projection-present\n")
+		return received >= 0 && cleared > received && rebuilt > cleared && !strings.Contains(events, "start:stale-conversation\n")
+	}) {
+		body, _ := os.ReadFile(fixtureEvents)
+		t.Fatalf("Clear/Rebuild did not restart with empty then projected context after the previous conversation: %s", body)
+	}
 	finalBody, err := os.ReadFile(filepath.Join(stateRoot, "orchestrator-agent.json"))
 	var final orchestratoragent.Status
 	if err == nil {
@@ -267,8 +335,17 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; done
 		if err != nil || status.State != "running" || status.Generation != final.Generation || status.ContextMode != "rebuild" || status.Session != final.Session {
 			return false
 		}
-		heartbeat, err := os.ReadFile(filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-"+strings.TrimPrefix(final.Session, "as-o-"), orchestratoragent.HeartbeatReportFile))
+		heartbeat, err := os.ReadFile(reportPath)
 		if err != nil || !strings.Contains(string(heartbeat), `"state": "completed"`) {
+			return false
+		}
+		var persisted struct {
+			Handoff *struct {
+				State string `json:"state"`
+			} `json:"attention_handoff"`
+		}
+		persistedBody, err := os.ReadFile(filepath.Join(stateRoot, "orchestrator-agent.json"))
+		if err != nil || json.Unmarshal(persistedBody, &persisted) != nil || persisted.Handoff == nil || (persisted.Handoff.State != "waiting" && persisted.Handoff.State != "human-attention") {
 			return false
 		}
 		response, err := http.Get(baseURL + "/status.json")
@@ -289,6 +366,18 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; done
 	}) {
 		t.Fatalf("orchestrator context did not survive restart: %s", output.String())
 	}
+	var priorReport struct {
+		StartedAt time.Time `json:"started_at"`
+		State     string    `json:"state"`
+	}
+	priorBody, err := os.ReadFile(reportPath)
+	if err != nil || json.Unmarshal(priorBody, &priorReport) != nil || priorReport.State != "completed" {
+		t.Fatalf("startup audit did not complete before Investigate: %v %s", err, priorBody)
+	}
+	priorEvents, err := os.ReadFile(fixtureEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
 	runBrowser("post-restart")
 	stateBody, err := os.ReadFile(filepath.Join(stateRoot, "orchestrator-agent.json"))
 	var persisted struct {
@@ -296,5 +385,66 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; done
 	}
 	if err != nil || json.Unmarshal(stateBody, &persisted) != nil || len(persisted.LastInvestigation) != 64 {
 		t.Fatalf("Investigate did not persist its exact projection digest: %v %s", err, stateBody)
+	}
+	var investigation struct {
+		StartedAt        time.Time `json:"started_at"`
+		CompletedAt      time.Time `json:"completed_at"`
+		ProjectionDigest string    `json:"projection_digest"`
+		State            string    `json:"state"`
+		Report           string    `json:"report"`
+	}
+	if !waitFor(deadline, func() bool {
+		body, readErr := os.ReadFile(reportPath)
+		return readErr == nil && json.Unmarshal(body, &investigation) == nil && investigation.StartedAt.After(priorReport.StartedAt) && !investigation.CompletedAt.IsZero() && investigation.State == "completed" && investigation.ProjectionDigest == persisted.LastInvestigation && strings.Contains(investigation.Report, "fixture audit complete")
+	}) {
+		body, _ := os.ReadFile(reportPath)
+		t.Fatalf("exact Investigate audit did not complete: prior=%s current=%s serve=%s", priorBody, body, output.String())
+	}
+	events, err := os.ReadFile(fixtureEvents)
+	if err != nil || len(events) < len(priorEvents) || !strings.Contains(string(events[len(priorEvents):]), "audit:191:9\n") {
+		t.Fatalf("new Investigate subprocess did not receive issue #191 attempt 9: err=%v prior=%q current=%q", err, priorEvents, events)
+	}
+	if err := os.WriteFile(holdAudit, []byte("hold next audit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	priorHeldEvents := len(events)
+	runBrowser("start-held")
+	if !waitFor(deadline, func() bool {
+		body, readErr := os.ReadFile(fixtureEvents)
+		return readErr == nil && len(body) >= priorHeldEvents && strings.Contains(string(body[priorHeldEvents:]), "audit:blocked\n")
+	}) {
+		body, _ := os.ReadFile(fixtureEvents)
+		t.Fatalf("new Investigate subprocess did not enter controlled blocker: events=%q serve=%s", body, output.String())
+	}
+	if err := os.Remove(holdAudit); err != nil {
+		t.Fatal(err)
+	}
+	var held struct {
+		StartedAt time.Time `json:"started_at"`
+		State     string    `json:"state"`
+	}
+	body, err := os.ReadFile(reportPath)
+	if err != nil || json.Unmarshal(body, &held) != nil || held.State != "running" || !held.StartedAt.After(investigation.StartedAt) {
+		t.Fatalf("controlled audit was not active before Recover: %v %s", err, body)
+	}
+	runBrowser("recover-held")
+	body, err = os.ReadFile(reportPath)
+	if err != nil || json.Unmarshal(body, &held) != nil || held.State != "running" {
+		t.Fatalf("Recover did not return while controlled audit remained active: %v %s", err, body)
+	}
+	if err := releaseHeldAudit(); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(deadline, func() bool {
+		body, readErr := os.ReadFile(reportPath)
+		var report struct {
+			StartedAt time.Time `json:"started_at"`
+			State     string    `json:"state"`
+			Report    string    `json:"report"`
+		}
+		return readErr == nil && json.Unmarshal(body, &report) == nil && report.StartedAt.Equal(held.StartedAt) && report.State == "completed" && strings.Contains(report.Report, "fixture audit complete")
+	}) {
+		body, _ := os.ReadFile(reportPath)
+		t.Fatalf("controlled audit did not complete after Recover and explicit release: %s serve=%s", body, output.String())
 	}
 }
