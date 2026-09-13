@@ -256,7 +256,7 @@ func TestLocalAgentHostLaunchesImplementationAndReviewSessions(t *testing.T) {
 				t.Fatalf("launch: %v: %s", err, result.Output)
 			}
 			output := filepath.Join(root, "environment")
-			script := `printf '%s\n' "$GIT_CONFIG_COUNT" "$GIT_CONFIG_KEY_0" "$GIT_CONFIG_VALUE_0" > "$1"`
+			script := `printf '%s\n' "$GIT_CONFIG_COUNT" "$GIT_CONFIG_KEY_0" "$GIT_CONFIG_VALUE_0" > "$1.tmp" && mv "$1.tmp" "$1"`
 			if _, err := boundary.Run(t.Context(), agentruntime.Command{Name: "tmux", Args: []string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--", "sh", "-c", script, "agent-host-test", output}, Dir: root, Env: env}); err != nil {
 				t.Fatal(err)
 			}
@@ -1469,6 +1469,7 @@ func TestResumeHandoffFetchesThroughAgentHostBoundary(t *testing.T) {
 	if out, err := exec.Command("git", "clone", "--no-local", "--no-checkout", bundle, manifest.Worktree).CombinedOutput(); err != nil {
 		t.Fatalf("clone attempt: %v: %s", err, out)
 	}
+	runGit(t, manifest.Worktree, "config", "maintenance.auto", "false")
 	runGit(t, manifest.Worktree, "checkout", "--detach", base)
 	runGit(t, manifest.Worktree, "switch", "-c", manifest.Branch)
 	runGit(t, manifest.Worktree, "remote", "remove", "origin")

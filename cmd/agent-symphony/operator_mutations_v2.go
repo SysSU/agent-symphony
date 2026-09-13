@@ -120,6 +120,10 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		} else if command.PublishedHead != "" {
 			return nil, errStateConflict
 		}
+		reviewer, reviewerErr := pendingReviewerEffect(*state, request.Repository, request.Issue, request.Attempt)
+		if reviewerErr != nil {
+			return nil, reviewerErr
+		}
 		supersedePendingOperatorWorkflows(state, request.Repository, request.Issue, request.Attempt, request.Action)
 		policy := command.CleanupPolicy
 		effect, err = applyInvalidateAttempt(attemptRoot, stateRoot, state, invalidateAttemptCommand{
@@ -128,6 +132,9 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 			Action: operatorTombstoneAction(request.Action), CleanupPhase: "pending", PublishedHead: publishedHead, Manifest: &manifest, CleanupPolicy: &policy,
 			EffectAction: string(agentruntime.EffectCleanup), EffectRequestDigest: command.CleanupDigest,
 		})
+		if effect != nil {
+			bindSupersededReviewer(effect, reviewer)
+		}
 		phase = operatorPhaseCleanupPending
 	case "cancel":
 		if command.Runtime == nil || command.Reconciliation != nil || command.CleanupDigest != "" || command.PublishedHead != "" || command.Runtime.Action != agentruntime.EffectStop || !reflect.DeepEqual(command.Runtime.Manifest, manifest) {
@@ -137,15 +144,15 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		if !sameOperatorBeginIdentity(begin.Identity, command.Identity) {
 			return nil, errStaleStateResult
 		}
-		reviewerID, reviewerErr := pendingPlanReviewerEffectID(*state, request.Repository, request.Issue, request.Attempt)
+		reviewer, reviewerErr := pendingReviewerEffect(*state, request.Repository, request.Issue, request.Attempt)
 		if reviewerErr != nil {
 			return nil, reviewerErr
 		}
-		supersedePendingOperatorWorkflows(state, request.Repository, request.Issue, request.Attempt, request.Action)
 		begin.Identity.SourceRevision = state.Revision
+		begin.SupersededReviewerID = reviewer.ID
 		effect, err = applyBeginRuntimeEffect(attemptRoot, stateRoot, state, begin)
-		if effect != nil {
-			effect.SupersededReviewerID = reviewerID
+		if err == nil {
+			supersedePendingOperatorWorkflows(state, request.Repository, request.Issue, request.Attempt, request.Action)
 		}
 		phase = operatorPhaseStopPending
 	case "recover":
@@ -161,8 +168,16 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 			if !sameOperatorBeginIdentity(begin.Identity, command.Identity) {
 				return nil, errStaleStateResult
 			}
+			reviewer, reviewerErr := pendingReviewerEffect(*state, request.Repository, request.Issue, request.Attempt)
+			if reviewerErr != nil {
+				return nil, reviewerErr
+			}
 			begin.Identity.SourceRevision = state.Revision
+			begin.SupersededReviewerID = reviewer.ID
 			effect, err = applyBeginRuntimeEffect(attemptRoot, stateRoot, state, begin)
+			if err == nil {
+				supersedePendingOperatorWorkflows(state, request.Repository, request.Issue, request.Attempt, request.Action)
+			}
 			phase = operatorPhaseStopPending
 		} else {
 			if command.LivenessFailed || !status.Retryable || status.PR > 0 || !slices.Contains([]string{"failed", "cancelled"}, manifest.State) || command.Reconciliation == nil || command.Reconciliation.Request.Action != reconciliationGitHubIssueUpdate || command.Reconciliation.Request.GitHubIssueUpdate == nil || command.Reconciliation.Request.GitHubIssueUpdate.Kind != githubIssueRetry {
@@ -380,20 +395,35 @@ func supersedePendingOperatorWorkflows(state *runtimeOwnerState, repository stri
 	}
 }
 
-func pendingPlanReviewerEffectID(state runtimeOwnerState, repository string, issue, attempt int) (string, error) {
+func pendingReviewerEffect(state runtimeOwnerState, repository string, issue, attempt int) (runtimeEffectIntent, error) {
 	issueGeneration := state.IssueGenerations[ownerIssueKey(repository, issue)]
 	attemptGeneration := state.AttemptGenerations[ownerAttemptKey(repository, issue, attempt)]
-	var selected string
+	var selected runtimeEffectIntent
 	for _, effect := range state.Effects {
-		if effect.Repository != repository || effect.Issue != issue || effect.Attempt != attempt || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan {
+		if effect.Repository != repository || effect.Issue != issue || effect.Attempt != attempt || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Phase != "run-observe" {
 			continue
 		}
-		if selected != "" || effect.IssueGeneration != issueGeneration || effect.AttemptGeneration != attemptGeneration {
-			return "", errStateConflict
+		if selected.ID != "" || effect.IssueGeneration != issueGeneration || effect.AttemptGeneration != attemptGeneration {
+			return runtimeEffectIntent{}, errStateConflict
 		}
-		selected = effect.ID
+		selected = effect
 	}
 	return selected, nil
+}
+
+func bindSupersededReviewer(effect *runtimeEffectIntent, reviewer runtimeEffectIntent) {
+	if reviewer.ID == "" {
+		return
+	}
+	effect.SupersededReviewerID = reviewer.ID
+	effect.SupersededReviewerGroupPID = reviewer.ReviewerGroupPID
+	effect.SupersededReviewerGateProtocol = reviewer.ReviewerGateProtocol
+	effect.SupersededReviewerSessionRequested = reviewer.ReviewerSessionRequested
+	effect.SupersededReviewerRequestDigest = reviewer.RequestDigest
+	effect.SupersededReviewerMode = reviewer.Reconciliation.Reviewer.Mode
+	effect.SupersededReviewerTarget = reviewer.Reconciliation.Reviewer.Target
+	effect.SupersededReviewerIssueGeneration = reviewer.IssueGeneration
+	effect.SupersededReviewerAttemptGeneration = reviewer.AttemptGeneration
 }
 
 func bindOperatorReceipt(state *runtimeOwnerState, requestID string, effect *runtimeEffectIntent, revision uint64) {

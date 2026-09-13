@@ -683,14 +683,14 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	removedSnapshot, removedReviewSession := reviewIdentity(removedAttempt, snapshotRoot)
 	unrelatedSnapshot := filepath.Join(snapshotRoot, "unrelated-snapshot")
 	removedReviewResult := removedSnapshot + ".result-0123456789abcdef"
-	for _, path := range []string{removedSnapshot, removedReviewResult, unrelatedSnapshot} {
+	for _, path := range []string{unrelatedSnapshot} {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 	tmuxEnvironment := append(os.Environ(), "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
 	unrelatedSession := "as-unrelated-permanent-removal"
-	for _, session := range []string{removedManifest.Session, removedReviewSession, unrelatedSession} {
+	for _, session := range []string{removedManifest.Session, unrelatedSession} {
 		ensureFullSystemTmuxSession(t, tmuxEnvironment, session, repository)
 	}
 	fixture.mu.Lock()
@@ -716,7 +716,8 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		tombstone = removedState.Tombstones[removedKey]
 		return readErr == nil && tombstone.Action == "removed" && tombstone.CleanupPhase == "completed"
 	}) {
-		t.Fatalf("permanent removal was not durably completed: tombstone=%#v", tombstone)
+		roots, _ := os.ReadDir(productionSnapshotRoot(stateRoot))
+		t.Fatalf("permanent removal was not durably completed: tombstone=%#v effect=%#v proofs=%#v roots=%#v serve=%s", tombstone, removedState.Effects[tombstone.EffectID], removedState.ReviewerProofs, roots, restartOutput.String())
 	}
 	if _, exists := removedState.Attempts[removedKey]; exists {
 		t.Fatal("permanently removed attempt remains authoritative")

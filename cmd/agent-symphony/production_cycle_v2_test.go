@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -709,16 +710,21 @@ func TestUnmarkedPublicationAndReviewerReconstructExactWorkerExport(t *testing.T
 		reviewer := workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `payload=$(cat)
 case "$payload" in
   *'"operation":"review-result"'*) printf %s '{"Output":"{\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]}"}' ;;
-  *'display-message'*) printf %s '{"Output":"1|||0|\n"}' ;;
+  *'display-message'*) printf %s '{"Output":"||||||||||\n"}' ;;
   *) exit 1 ;;
 esac`}}
 		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}}
-		if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{Input: input}); err != nil || !resumed {
-			t.Fatalf("resume=%v err=%v effect=%#v", resumed, err, mustOwnerSnapshot(t, owner).State.Effects[plan.Identity.EffectID])
+		if _, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{Input: input}); err != nil {
+			t.Fatalf("pre-session gated review resume: %v", err)
 		}
 		current := mustOwnerSnapshot(t, owner)
-		if current.State.Effects[plan.Identity.EffectID].State != "completed" || current.State.Attempts[ownerAttemptKey("o/r", issue.Issue, issue.Attempt)].Manifest.ReviewState != "clean" {
-			t.Fatalf("reviewer result was not committed: %#v", current.State.Effects[plan.Identity.EffectID])
+		manifest = current.State.Attempts[ownerAttemptKey("o/r", issue.Issue, issue.Attempt)].Manifest
+		if effect := current.State.Effects[plan.Identity.EffectID]; effect.State != "completed" || manifest.ReviewState != "failed" || !strings.Contains(manifest.ReviewDiagnostic, "before session creation") {
+			t.Fatalf("pre-session gated reviewer did not terminalize truthful failure: effect=%#v manifest=%#v", effect, manifest)
+		}
+		proof := current.State.ReviewerProofs[reviewerProofKey("o/r", issue.Issue, issue.Attempt, plans[0].Request.Reviewer.Mode, plans[0].Request.Reviewer.Target)]
+		if !proof.NeverRan || !proof.DeadProved || proof.EffectID != plan.Identity.EffectID {
+			t.Fatalf("pre-session gated reviewer lacks exact no-run certificate: %#v", proof)
 		}
 	})
 
@@ -750,11 +756,11 @@ case "$payload" in
 esac`}}
 		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}}
 		batch := reconciliationV2Batch{Input: input}
-		if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, batch); err != nil || !resumed {
-			t.Fatalf("resume=%v err=%v effect=%#v", resumed, err, mustOwnerSnapshot(t, owner).State.Effects[plan.Identity.EffectID])
+		if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, batch); err != nil || resumed {
+			t.Fatalf("legacy unbound cleanup unexpectedly resumed=%v err=%v", resumed, err)
 		}
-		if mustOwnerSnapshot(t, owner).State.Effects[plan.Identity.EffectID].State != "completed" {
-			t.Fatal("reviewer cleanup intent remained pending")
+		if effect := mustOwnerSnapshot(t, owner).State.Effects[plan.Identity.EffectID]; effect.State != "pending" || !strings.Contains(effect.Diagnostic, "certificate") {
+			t.Fatalf("legacy unbound cleanup was not fail-closed: %#v", effect)
 		}
 	})
 }
@@ -906,6 +912,360 @@ func TestProductionCycleCollectsAppliesAndPlansWithoutLegacyWriters(t *testing.T
 	if files, err := filepath.Glob(filepath.Join(owner.attemptRoot, "*.source.bundle")); err != nil || len(files) != 1 {
 		t.Fatalf("immutable sources=%v err=%v", files, err)
 	}
+}
+
+func TestProductionCycleStopsReceiptBoundPlanReviewerAfterFreshExternalAbsence(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 473, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	boundary := bindLiveReviewerForService(t, owner, reviewer)
+	service.reviewer = boundary
+	reads := 0
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet {
+			return nil, fmt.Errorf("unexpected mutation %s", request.URL.String())
+		}
+		reads++
+		var value any
+		switch request.URL.RequestURI() {
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1", "/repos/o/r/issues?state=open&per_page=100&page=1":
+			value = []any{}
+		case "/repos/o/r":
+			value = map[string]any{"default_branch": "main"}
+		case "/repos/o/r/branches/main":
+			value = map[string]any{"commit": map[string]any{"sha": strings.Repeat("a", 40)}}
+		default:
+			return nil, fmt.Errorf("unexpected read %s", request.URL.String())
+		}
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
+	})}}
+	production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, api: api, collector: reconciliationV2Collector{API: api, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}, Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: "o/r"}}}
+	cycle, err := owner.reconciliationSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := production.cycleFromSnapshot(t.Context(), cycle); !errors.Is(err, errReconciliationRecollect) {
+		t.Fatalf("fresh collector cycle did not preempt reviewer: %v", err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	receipt, ok := operatorReceiptByID(state, fmt.Sprintf("pending-plan-%d", manifest.Issue))
+	proof := state.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, agentruntime.ReviewModePlan, reviewer.Reconciliation.Reviewer.Target)]
+	gone, groupErr := reviewerGroupGone(proof.GroupPID)
+	if reads == 0 || !ok || receipt.State != "completed" || receipt.Result == nil || receipt.Result.Status != http.StatusConflict || !proof.DeadProved || !gone || groupErr != nil || len(boundary.killed) != 1 {
+		t.Fatalf("cycle failed to stop live review: reads=%d receipt=%#v proof=%#v gone=%v groupErr=%v killed=%v", reads, receipt, proof, gone, groupErr, boundary.killed)
+	}
+}
+
+func TestUnprovableReviewerDoesNotBlockUnrelatedReconciliation(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 475, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: ownerReconciliationEffectIdentity(*reviewer)}); err != nil {
+		t.Fatal(err)
+	}
+	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
+	applyReconciliationInput(t, owner, repositoryInput(false, issueFact(476, "unrelated")))
+	checkout := gitRepository(t)
+	runGit(t, checkout, "config", "user.email", "test@example.invalid")
+	runGit(t, checkout, "config", "user.name", "test")
+	runGit(t, checkout, "commit", "--allow-empty", "-m", "base")
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var value any
+		switch request.URL.RequestURI() {
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1", "/repos/o/r/issues?state=open&per_page=100&page=1":
+			value = []any{}
+		case "/repos/o/r":
+			value = map[string]any{"default_branch": "main"}
+		case "/repos/o/r/branches/main":
+			value = map[string]any{"commit": map[string]any{"sha": strings.Repeat("a", 40)}}
+		default:
+			return nil, fmt.Errorf("unexpected read %s", request.URL.String())
+		}
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
+	})}}
+	production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, api: api, config: config.Default("o/r"), stateRoot: owner.stateRoot, attemptRoot: owner.attemptRoot, checkout: checkout, collector: reconciliationV2Collector{API: api, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}, Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: "o/r"}}}
+	cycle, err := owner.reconciliationSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := production.cycleFromSnapshot(t.Context(), cycle); err != nil && !errors.Is(err, errReconciliationRecollect) {
+		t.Fatalf("one ambiguous reviewer blocked the global cycle: %v", err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	other := state.Observations[ownerIssueKey("o/r", 476)]
+	blocked := state.Effects[reviewer.ID]
+	if other.Present || other.Generation < 2 || blocked.State != "pending" || !blocked.ReviewerRevoked || !strings.Contains(blocked.Diagnostic, "stop remains pending") {
+		t.Fatalf("unrelated issue did not advance or ambiguous review falsely completed: other=%#v reviewer=%#v", other, blocked)
+	}
+	if superseded, err := production.supersedeInvalidPendingPlanReviewers(t.Context(), mustOwnerSnapshot(t, owner)); err != nil || superseded {
+		t.Fatalf("repeated ambiguous stop changed outcome: superseded=%v err=%v", superseded, err)
+	}
+	if next := mustOwnerSnapshot(t, owner).State.Revision; next != state.Revision {
+		t.Fatalf("unchanged diagnostic churned owner revision: before=%d after=%d", state.Revision, next)
+	}
+}
+
+func TestImplementationReviewerFailureDoesNotBlockOtherEffect(t *testing.T) {
+	for _, failure := range []string{"unprovable stop", "unreadable export"} {
+		t.Run(failure, func(t *testing.T) {
+			request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+			request.Reviewer.Mode, request.Reviewer.DigestVersion = agentruntime.ReviewModeImplementation, 1
+			owner, admitted, request := reconciliationEffectTestOwner(t, request)
+			_, blocked, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(admitted, request), Request: request})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: ownerReconciliationEffectIdentity(*blocked)}); err != nil {
+				t.Fatal(err)
+			}
+			if failure == "unprovable stop" {
+				state := mustOwnerSnapshot(t, owner).State
+				changed := expandIssueFact(state.Observations[ownerIssueKey("o/r", request.Issue)].Fact)
+				changed.Body = "changed body"
+				attempt := expandAttemptFact(state.Observations[ownerIssueKey("o/r", request.Issue)].Attempts[ownerAttemptKey("o/r", request.Issue, request.Attempt)].Fact)
+				input := repositoryInput(true, changed)
+				input.Scope = issueScope(request.Issue)
+				input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+				applyReconciliationInput(t, owner, input)
+			}
+			service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: request.Manifest.Worktree})
+			service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
+			production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, implementation: workerBoundaryRunner{}, stateRoot: owner.stateRoot}
+			if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{}); err != nil || resumed {
+				t.Fatalf("ambiguous issue A aborted or falsely completed: resumed=%v err=%v", resumed, err)
+			}
+			wantDiagnostic := "stop remains pending"
+			if failure == "unreadable export" {
+				wantDiagnostic = "export import failed"
+			}
+			if current := mustOwnerSnapshot(t, owner).State; current.Effects[blocked.ID].State != "pending" || !strings.Contains(current.Effects[blocked.ID].Diagnostic, wantDiagnostic) {
+				t.Fatalf("ambiguous issue A lost its durable pending diagnostic: %#v", current.Effects[blocked.ID])
+			}
+			other := ownerTestManifest(t, owner.stateRoot, 191, 1, "running")
+			if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: other}); err != nil {
+				t.Fatal(err)
+			}
+			otherIssue := issueFact(191, "other")
+			otherIssue.Attempt, otherIssue.CurrentAttempt = 1, 1
+			otherIssue.NeedsAttention, otherIssue.DispatchAuthorized = true, true
+			otherAttempt := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 191, Attempt: 1, BaseSHA: other.BaseSHA, State: "active", Checks: []string{}}
+			otherIssue.Active, otherIssue.ActiveAttempt = true, &otherAttempt
+			input := repositoryInput(true, otherIssue)
+			input.Scope = issueScope(191)
+			input.Attempts = []internalgithub.RecoveryAttemptFact{otherAttempt}
+			applyReconciliationInput(t, owner, input)
+			checkIn := reconciliationEffectCaseNamed(t, "monitoring-check-in")
+			otherSnapshot := mustOwnerSnapshot(t, owner)
+			planned, err := planMonitoringCheckIn(otherSnapshot, orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 191, Attempt: 1, Action: orchestratoragent.ProposalActionCheckIn, Binding: strings.Repeat("a", 64)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			otherRequest := planned.Request
+			otherRequest = checkInAfterEffectID(t, otherSnapshot, otherRequest, blocked.ID)
+			_, ready, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(otherSnapshot, otherRequest), Request: otherRequest})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if blocked.ID >= ready.ID {
+				t.Fatalf("fixture did not visit blocked reviewer before marked B: A=%s B=%s", blocked.ID, ready.ID)
+			}
+			if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*ready), *ready.Reconciliation, checkIn.result(*ready.Reconciliation)); err != nil {
+				t.Fatal(err)
+			}
+			resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{})
+			if err != nil || !resumed {
+				t.Fatalf("ambiguous issue A blocked marked issue B: resumed=%v err=%v", resumed, err)
+			}
+			final := mustOwnerSnapshot(t, owner).State
+			if final.Effects[blocked.ID].State != "pending" || !strings.Contains(final.Effects[blocked.ID].Diagnostic, wantDiagnostic) || final.Effects[ready.ID].State != "completed" {
+				t.Fatalf("issue A was falsely certified or issue B did not complete: A=%#v B=%#v", final.Effects[blocked.ID], final.Effects[ready.ID])
+			}
+		})
+	}
+}
+
+func TestBadCompletedExportDoesNotBlockOtherCandidate(t *testing.T) {
+	base, head, _, exportBoundary := testWorkerExportBoundary(t)
+	owner, bad, badIssue, _ := completedWorkerOwner(t, 190, base, head, false)
+	good := ownerTestManifest(t, owner.stateRoot, 191, 1, "completed")
+	good.BaseSHA = base
+	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: good}); err != nil {
+		t.Fatal(err)
+	}
+	goodIssue := issueFact(191, "good export")
+	goodIssue.Attempt, goodIssue.CurrentAttempt, goodIssue.BaseBranch, goodIssue.BaseSHA = 1, 1, "main", base
+	input := repositoryInput(true, goodIssue)
+	input.Scope = issueScope(191)
+	snapshot := applyReconciliationInput(t, owner, input)
+	var log bytes.Buffer
+	production := &productionReconciliation{owner: owner, implementation: exportBoundary(good.Branch), log: &log}
+	batch := reconciliationV2Batch{Input: reconciliationInput{Issues: []internalgithub.RecoveryIssueFact{badIssue, goodIssue}}}
+	reviewers, publications, err := production.executionCandidates(t.Context(), snapshot, batch)
+	if err != nil || len(reviewers) != 1 || len(publications) != 1 || reviewers[0].Issue.Issue != good.Issue || publications[0].Issue.Issue != good.Issue {
+		t.Fatalf("bad issue blocked good candidate: reviewers=%#v publications=%#v err=%v", reviewers, publications, err)
+	}
+	plans, _, err := planReconciliationReviewers(snapshot, owner.stateRoot, reviewers)
+	if err != nil || len(plans) != 1 || plans[0].Request.Issue != good.Issue {
+		t.Fatalf("good issue did not reach reviewer admission: plans=%#v err=%v", plans, err)
+	}
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request})
+	if err != nil || effect == nil || effect.State != "pending" || effect.Issue != good.Issue {
+		t.Fatalf("bad export prevented good issue's durable reviewer intent: effect=%#v err=%v", effect, err)
+	}
+	if !strings.Contains(log.String(), fmt.Sprintf("attempt #%d/%d", bad.Issue, bad.Attempt)) || !strings.Contains(log.String(), "export import remains unavailable") {
+		t.Fatalf("bad attempt lost its bounded operator diagnostic: %q", log.String())
+	}
+}
+
+func TestChangedExportHeadRejectsOlderReviewerMarker(t *testing.T) {
+	base, head, checkout, exportBoundary := testWorkerExportBoundary(t)
+	owner, manifest, issue, snapshot := completedWorkerOwner(t, 193, base, head, false)
+	oldHead := strings.Repeat("c", 40)
+	plans, _, err := planReconciliationReviewers(snapshot, owner.stateRoot, []reviewerExecutionMaterial{{Issue: issue, Source: checkout, HeadSHA: oldHead, Command: []string{"reviewer"}}})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("admit older reviewer: plans=%#v err=%v", plans, err)
+	}
+	_, old, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := ownerReconciliationEffectIdentity(*old)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	const stoppedGroup = 99999999
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: stoppedGroup}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: stoppedGroup}); err != nil {
+		t.Fatal(err)
+	}
+	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(*old.Reconciliation)
+	if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*old), *old.Reconciliation, result); err != nil {
+		t.Fatal(err)
+	}
+	if current := mustOwnerSnapshot(t, owner).State; reconciliationEffectFinishCurrent(owner.stateRoot, current, current.Effects[old.ID]) != nil || !current.ReviewerProofs[reviewerProofKey(old.Repository, old.Issue, old.Attempt, old.Reconciliation.Reviewer.Mode, old.Reconciliation.Reviewer.Target)].DeadProved {
+		t.Fatal("H1 marker lacked an otherwise finishable owner death certificate")
+	}
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
+	production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, implementation: exportBoundary(manifest.Branch), stateRoot: owner.stateRoot}
+	resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{})
+	if err != nil || !resumed {
+		t.Fatalf("new exported head did not invalidate marked old review: resumed=%v err=%v", resumed, err)
+	}
+	final := mustOwnerSnapshot(t, owner).State
+	if effect := final.Effects[old.ID]; effect.State != "completed" || effect.ReconciliationResult != nil && effect.ReconciliationResult.Reviewer != nil && effect.ReconciliationResult.Reviewer.Status == "clean" || !final.Attempts[ownerAttemptKey("o/r", issue.Issue, issue.Attempt)].Manifest.ReviewInvalidated {
+		t.Fatalf("old clean marker was applied despite newer export: effect=%#v manifest=%#v", effect, final.Attempts[ownerAttemptKey("o/r", issue.Issue, issue.Attempt)].Manifest)
+	}
+}
+
+func TestHealthyPendingReviewerReplayLetsOtherEffectFinish(t *testing.T) {
+	base, head, checkout, exportBoundary := testWorkerExportBoundary(t)
+	owner, manifest, issue, snapshot := completedWorkerOwner(t, 194, base, head, false)
+	plans, _, err := planReconciliationReviewers(snapshot, owner.stateRoot, []reviewerExecutionMaterial{{Issue: issue, Source: checkout, HeadSHA: head, Command: []string{"reviewer"}}})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("admit reviewer: plans=%#v err=%v", plans, err)
+	}
+	_, reviewer, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := startUnboundReviewerForService(t, owner, reviewer)
+	parts := strings.SplitN(live.status.Output, "|", 8)
+	if len(parts) != 8 {
+		t.Fatal("fixture has no exact live wrapper identity")
+	}
+	encode := func(output string) string {
+		body, err := json.Marshal(agentruntime.Result{Output: output})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	replayBoundary := workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `payload=$(cat)
+case "$payload" in
+  *'#{pane_start_command}'*) printf %s "$REPLAY_START" ;;
+  *'#{pane_pid}'*) printf %s "$REPLAY_PID" ;;
+  *'#{pane_dead}'*) printf %s "$REPLAY_PANE" ;;
+  *'"wait-for"'*) printf %s "$REPLAY_OK" ;;
+  *) exit 1 ;;
+esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode(parts[6]), "REPLAY_PANE=" + encode("0||||"), "REPLAY_OK=" + encode("")}}
+	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
+	cfg := config.Default("o/r")
+	cfg.Commands.Reviewer = []string{"reviewer"}
+	production := &productionReconciliation{owner: owner, effects: coordinator, implementation: exportBoundary(manifest.Branch), reviewer: replayBoundary, config: cfg, stateRoot: owner.stateRoot}
+	batch := reconciliationV2Batch{Input: reconciliationInput{Issues: []internalgithub.RecoveryIssueFact{issue}}}
+	if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, batch); err != nil || resumed {
+		t.Fatalf("healthy live reviewer forced immediate recollection: resumed=%v err=%v", resumed, err)
+	}
+	if current := mustOwnerSnapshot(t, owner).State.Effects[reviewer.ID]; current.State != "pending" || current.ReviewerGroupPID < 2 {
+		t.Fatalf("healthy reviewer did not remain owner-bound and pending: %#v", current)
+	}
+	other := ownerTestManifest(t, owner.stateRoot, 195, 1, "running")
+	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: other}); err != nil {
+		t.Fatal(err)
+	}
+	otherIssue := issueFact(195, "other")
+	otherIssue.Attempt, otherIssue.CurrentAttempt = 1, 1
+	otherIssue.NeedsAttention, otherIssue.DispatchAuthorized = true, true
+	otherAttempt := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 195, Attempt: 1, BaseSHA: other.BaseSHA, State: "active", Checks: []string{}}
+	otherIssue.Active, otherIssue.ActiveAttempt = true, &otherAttempt
+	input := repositoryInput(true, otherIssue)
+	input.Scope = issueScope(195)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{otherAttempt}
+	applyReconciliationInput(t, owner, input)
+	checkIn := reconciliationEffectCaseNamed(t, "monitoring-check-in")
+	otherSnapshot := mustOwnerSnapshot(t, owner)
+	planned, err := planMonitoringCheckIn(otherSnapshot, orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 195, Attempt: 1, Action: orchestratoragent.ProposalActionCheckIn, Binding: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRequest := planned.Request
+	otherRequest = checkInAfterEffectID(t, otherSnapshot, otherRequest, reviewer.ID)
+	_, ready, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(otherSnapshot, otherRequest), Request: otherRequest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reviewer.ID >= ready.ID {
+		t.Fatalf("fixture did not visit healthy reviewer before marked B: A=%s B=%s", reviewer.ID, ready.ID)
+	}
+	if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*ready), *ready.Reconciliation, checkIn.result(*ready.Reconciliation)); err != nil {
+		t.Fatal(err)
+	}
+	if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, batch); err != nil || !resumed {
+		t.Fatalf("healthy pending reviewer blocked other marked effect: resumed=%v err=%v", resumed, err)
+	}
+	final := mustOwnerSnapshot(t, owner).State
+	if final.Effects[reviewer.ID].State != "pending" || final.Effects[ready.ID].State != "completed" {
+		t.Fatalf("reviewer or other effect changed incorrectly: reviewer=%#v other=%#v", final.Effects[reviewer.ID], final.Effects[ready.ID])
+	}
+	if err := live.onKill(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkInAfterEffectID(t *testing.T, snapshot stateOwnerSnapshot, request reconciliationEffectRequest, after string) reconciliationEffectRequest {
+	t.Helper()
+	for candidate := 1; candidate < 256; candidate++ {
+		// Binding is a legitimate check-in proposal input; keep the derived
+		// execution digest valid while choosing a deterministic owner ID order.
+		request.CheckIn.Binding = fmt.Sprintf("%064x", candidate)
+		request.ExecutionDigest = monitoringCheckInExecutionDigest(request)
+		preview := runtimeEffectIntent{
+			Action: string(request.Action), Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt,
+			IssueGeneration:   snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)],
+			AttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)],
+			IntentEpoch:       snapshot.State.Epoch, IntentRevision: snapshot.State.Revision + 1, RequestDigest: reconciliationEffectDigest(request),
+		}
+		if runtimeEffectID(preview) > after {
+			return request
+		}
+	}
+	t.Fatal("could not order marked B after reviewer A")
+	return reconciliationEffectRequest{}
 }
 
 func TestStartupMarkerSweepLeavesOperatorEffectsToReceiptRecovery(t *testing.T) {

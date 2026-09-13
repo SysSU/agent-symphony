@@ -76,11 +76,95 @@ func CaptureWorkerReplacingResultAfterStart(ctx context.Context, tmux, buffer, r
 // RunPaneCommand preserves normal exit status while leaving signaled exits for
 // the caller to re-raise, so tmux retains the signal identity.
 func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer) (int, syscall.Signal, error) {
-	return RunPaneCommandAfterStart(ctx, tmux, command, stdin, stdout, stderr, nil)
+	return runPaneCommandAfterStart(ctx, tmux, command, stdin, stdout, stderr, nil, false)
 }
 
 // RunPaneCommandAfterStart records launch proof only after the child exists.
-func RunPaneCommandAfterStart(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func() error) (int, syscall.Signal, error) {
+func RunPaneCommandAfterStart(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, extraFiles ...*os.File) (int, syscall.Signal, error) {
+	return runReviewerPaneCommand(ctx, tmux, command, stdin, stdout, stderr, afterStart, extraFiles)
+}
+
+// The group leader remains alive after the reviewer exits, pinning its PGID
+// until the wrapper has killed every remaining descendant. FD3 is the owner
+// start gate, FD4 reports the reviewer exit, and FD5 holds the leader.
+const reviewerWrapper = `set +m
+IFS= read -r ready <&3 || exit 125
+[ "$ready" = go ] || exit 125
+"$@" 3>&- 4>&- 5>&-
+code=$?
+printf '%d\n' "$code" >&4
+IFS= read -r _ <&5
+exit "$code"`
+
+func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, extraFiles []*os.File) (int, syscall.Signal, error) {
+	if len(command) == 0 || command[0] == "" || len(extraFiles) != 1 || extraFiles[0] == nil {
+		return 125, 0, errors.New("reviewer pane command or start gate is missing")
+	}
+	statusReader, statusWriter, err := os.Pipe()
+	if err != nil {
+		return 125, 0, err
+	}
+	defer statusReader.Close()
+	defer statusWriter.Close()
+	holdReader, holdWriter, err := os.Pipe()
+	if err != nil {
+		return 125, 0, err
+	}
+	defer holdReader.Close()
+	defer holdWriter.Close()
+	child := exec.CommandContext(ctx, "/bin/sh", append([]string{"-c", reviewerWrapper, "reviewer-wrapper"}, command...)...)
+	child.Stdin, child.Stdout, child.Stderr = stdin, stdout, stderr
+	child.ExtraFiles = []*os.File{extraFiles[0], statusWriter, holdReader}
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(signals)
+	if err := child.Start(); err != nil {
+		return 125, 0, err
+	}
+	_ = statusWriter.Close()
+	_ = holdReader.Close()
+	stop := func() error {
+		killErr := killProcessGroup(child)
+		_ = holdWriter.Close()
+		_ = child.Wait()
+		if killErr != nil {
+			return killErr
+		}
+		if err := syscall.Kill(-child.Process.Pid, 0); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("reviewer process group did not terminate: %w", err)
+		}
+		return nil
+	}
+	if afterStart != nil {
+		if err := afterStart(child.Process.Pid); err != nil {
+			return 125, 0, errors.Join(err, stop())
+		}
+	}
+	type completion struct {
+		code int
+		err  error
+	}
+	done := make(chan completion, 1)
+	go func() { code, err := readWorkerStatus(statusReader); done <- completion{code, err} }()
+	var finished completion
+	select {
+	case finished = <-done:
+	case <-signals:
+		return 137, syscall.SIGKILL, stop()
+	case <-ctx.Done():
+		return 125, 0, errors.Join(ctx.Err(), stop())
+	}
+	if err := stop(); err != nil {
+		return 125, 0, err
+	}
+	if finished.err != nil {
+		return 125, 0, finished.err
+	}
+	return finished.code, 0, RecordPaneExitStatus(ctx, tmux, finished.code)
+}
+
+func runPaneCommandAfterStart(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, reviewerGroup bool, extraFiles ...*os.File) (int, syscall.Signal, error) {
 	if len(command) == 0 || command[0] == "" {
 		return 1, 0, errors.New("pane command is missing")
 	}
@@ -91,19 +175,30 @@ func RunPaneCommandAfterStart(ctx context.Context, tmux string, command []string
 	}
 	child := exec.CommandContext(ctx, command[0], command[1:]...)
 	child.Stdin, child.Stdout, child.Stderr = stdin, stdout, stderr
-	if err := child.Start(); err != nil {
-		return 1, 0, errors.Join(err, record(PaneExitStatusOption, 1))
-	}
-	if afterStart != nil {
-		if err := afterStart(); err != nil {
-			_ = child.Process.Kill()
-			_ = child.Wait()
-			return 1, 0, errors.Join(err, record(PaneExitStatusOption, 1))
-		}
+	child.ExtraFiles = extraFiles
+	if reviewerGroup {
+		child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(signals)
+	if err := child.Start(); err != nil {
+		return 1, 0, errors.Join(err, record(PaneExitStatusOption, 1))
+	}
+	stopChild := func() {
+		if reviewerGroup {
+			_ = syscall.Kill(-child.Process.Pid, syscall.SIGKILL)
+		} else {
+			_ = child.Process.Kill()
+		}
+	}
+	if afterStart != nil {
+		if err := afterStart(child.Process.Pid); err != nil {
+			stopChild()
+			_ = child.Wait()
+			return 1, 0, errors.Join(err, record(PaneExitStatusOption, 1))
+		}
+	}
 	waited := make(chan error, 1)
 	go func() { waited <- child.Wait() }()
 	var waitErr error
@@ -113,8 +208,17 @@ func RunPaneCommandAfterStart(ctx context.Context, tmux string, command []string
 		case waitErr = <-waited:
 			finished = true
 		case received := <-signals:
-			_ = child.Process.Signal(received)
+			if reviewerGroup {
+				stopChild()
+			} else {
+				_ = child.Process.Signal(received)
+			}
 		}
+	}
+	if reviewerGroup {
+		// The direct reviewer may fork an external writer and exit first.
+		// Terminate any remaining members before reporting a terminal result.
+		_ = syscall.Kill(-child.Process.Pid, syscall.SIGKILL)
 	}
 	status, ok := child.ProcessState.Sys().(syscall.WaitStatus)
 	if !ok {

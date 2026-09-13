@@ -197,6 +197,12 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	p.effects.cancelInvalidated(applied)
 	if p.operator != nil {
 		p.operator.cancelSupersededPlanWatchers(cycleSnapshot, applied)
+		if superseded, err := p.supersedeInvalidPendingPlanReviewers(ctx, applied); err != nil || superseded {
+			if err != nil {
+				return err
+			}
+			return errReconciliationRecollect
+		}
 		p.operator.scanPendingPlanReviewers(ctx, applied)
 	}
 	if resumed, err := p.resumePendingReconciliation(ctx, api, batch); err != nil || resumed {
@@ -277,6 +283,39 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	return p.runRetirementPhase(ctx)
 }
 
+// Receipt-bound Plan reviews are excluded from generic reconciliation replay.
+// A fresh observation must revoke them here, including while their pane lives.
+func (p *productionReconciliation) supersedeInvalidPendingPlanReviewers(ctx context.Context, snapshot stateOwnerSnapshot) (bool, error) {
+	for _, receipt := range snapshot.State.ControlReceipts {
+		if receipt.State != "pending" || receipt.Request.Action != "review-plan" {
+			continue
+		}
+		effect, ok := snapshot.State.Effects[receipt.EffectID]
+		if !ok || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan || !planReviewInvalidated(snapshot.State, effect) {
+			continue
+		}
+		p.effects.cancelEffect(effect.ID)
+		superseded, err := p.operator.supersedeInvalidPlanReview(ctx, effect)
+		if err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			diagnostic := "revoked Plan reviewer stop remains pending: " + internalgithub.Redact(err.Error())
+			if len(diagnostic) > maxReconciliationStringBytes {
+				diagnostic = diagnostic[:maxReconciliationStringBytes]
+			}
+			if _, diagnoseErr := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: reconciliationReviewer, Diagnostic: diagnostic}); diagnoseErr != nil && !errors.Is(diagnoseErr, errStaleStateResult) {
+				return false, diagnoseErr
+			}
+			continue
+		}
+		if superseded {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (p *productionReconciliation) resumePendingReconciliation(ctx context.Context, api internalgithub.API, batch reconciliationV2Batch) (bool, error) {
 	snapshot, err := p.owner.snapshot(ctx)
 	if err != nil {
@@ -295,10 +334,56 @@ func (p *productionReconciliation) resumePendingReconciliation(ctx context.Conte
 		}
 	}
 	slices.Sort(ids)
+	diagnose := func(effect runtimeEffectIntent, prefix string, cause error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		diagnostic := prefix + internalgithub.Redact(cause.Error())
+		if len(diagnostic) > maxReconciliationStringBytes {
+			diagnostic = diagnostic[:maxReconciliationStringBytes]
+		}
+		_, err := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: effect.Reconciliation.Action, Diagnostic: diagnostic})
+		if errors.Is(err, errStaleStateResult) {
+			return nil
+		}
+		return err
+	}
 	for _, id := range ids {
 		effect := snapshot.State.Effects[id]
+		if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Mode == agentruntime.ReviewModeImplementation && effect.Reconciliation.Reviewer.Phase == "run-observe" {
+			stale := reconciliationEffectFinishCurrent(p.owner.stateRoot, snapshot.State, effect) != nil
+			head := ""
+			if !stale {
+				record := snapshot.State.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
+				_, currentHead, _, importErr := importWorkerExport(ctx, p.implementation, record.Manifest)
+				if importErr != nil {
+					if err := diagnose(effect, "pending reviewer export import failed: ", importErr); err != nil {
+						return false, err
+					}
+					continue
+				}
+				if currentHead != effect.Reconciliation.Reviewer.HeadSHA {
+					head = currentHead
+				}
+			}
+			if stale || head != "" {
+				if p.operator == nil {
+					return false, errors.New("implementation reviewer supersession is unavailable")
+				}
+				p.effects.cancelEffect(effect.ID)
+				if superseded, err := p.operator.supersedeInvalidPlanReview(ctx, effect, head); err != nil {
+					if diagnoseErr := diagnose(effect, "pending reviewer stop remains pending: ", err); diagnoseErr != nil {
+						return false, diagnoseErr
+					}
+					continue
+				} else if superseded {
+					return true, nil
+				}
+				continue
+			}
+		}
 		if result, verifyErr := p.effects.verifyPendingReconciliation(ctx, effect); verifyErr != nil {
-			if _, err := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: effect.Reconciliation.Action, Diagnostic: "pending effect marker verification failed: " + internalgithub.Redact(verifyErr.Error())}); err != nil {
+			if err := diagnose(effect, "pending effect marker verification failed: ", verifyErr); err != nil {
 				return false, err
 			}
 			continue
@@ -307,7 +392,7 @@ func (p *productionReconciliation) resumePendingReconciliation(ctx context.Conte
 		}
 		resumed, resumeErr := p.resumeUnmarkedReconciliation(ctx, api, batch, snapshot, effect)
 		if resumeErr != nil {
-			if _, err := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: effect.Reconciliation.Action, Diagnostic: "pending effect reconstruction failed: " + internalgithub.Redact(resumeErr.Error())}); err != nil {
+			if err := diagnose(effect, "pending effect reconstruction failed: ", resumeErr); err != nil {
 				return false, err
 			}
 			continue
@@ -402,12 +487,12 @@ func (p *productionReconciliation) resumeUnmarkedReconciliation(ctx context.Cont
 			return false, err
 		}
 		issue.Attempt = record.Manifest.Attempt
-		material := reviewerExecutionMaterial{Issue: issue, Source: source, HeadSHA: head, Env: slices.Clone(p.reviewEnv), Command: slices.Clone(p.config.Commands.Reviewer)}
+		material := reviewerExecutionMaterial{Issue: issue, Source: source, HeadSHA: head, Env: slices.Clone(p.reviewEnv), Command: slices.Clone(p.config.Commands.Reviewer), Replay: true}
 		if reviewerExecutionDigest(request, material) != request.ExecutionDigest || digestText(issue.Body) != request.BodyDigest {
 			return false, errStateConflict
 		}
-		_, _, err = p.effects.executeReviewer(ctx, p.reviewer, plan, material)
-		return err == nil, err
+		_, pending, err := p.effects.executeReviewer(ctx, p.reviewer, plan, material)
+		return err == nil && !pending, err
 	case reconciliationHandoffDeliver:
 		if request.Handoff.Outcome != nil {
 			path := filepath.Join(p.stateRoot, "handoff-outcomes", request.Handoff.Key+".json")
@@ -638,7 +723,17 @@ func (p *productionReconciliation) executionCandidates(ctx context.Context, snap
 		}
 		result, head, root, err := importWorkerExport(ctx, p.implementation, record.Manifest)
 		if err != nil {
-			return nil, nil, fmt.Errorf("import worker export for %s: %w", key, err)
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			if p.log != nil {
+				diagnostic := internalgithub.Redact(err.Error())
+				if len(diagnostic) > maxReconciliationStringBytes {
+					diagnostic = diagnostic[:maxReconciliationStringBytes]
+				}
+				_, _ = fmt.Fprintf(p.log, "attempt #%d/%d export import remains unavailable: %s\n", record.Manifest.Issue, record.Manifest.Attempt, diagnostic)
+			}
+			continue
 		}
 		issue.Attempt = record.Manifest.Attempt
 		reviewers = append(reviewers, reviewerExecutionMaterial{Issue: issue, Source: root, HeadSHA: head, Env: slices.Clone(p.reviewEnv), Command: slices.Clone(p.config.Commands.Reviewer)})

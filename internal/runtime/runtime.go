@@ -159,6 +159,7 @@ type Manifest struct {
 	ReviewAgent         string    `json:"review_agent,omitempty"`
 	ReviewState         string    `json:"review_state,omitempty"`
 	ReviewDiagnostic    string    `json:"review_diagnostic,omitempty"`
+	ReviewInvalidated   bool      `json:"review_invalidated,omitempty"`
 	ReviewMode          string    `json:"review_mode,omitempty"`
 	ReviewTarget        string    `json:"review_target,omitempty"`
 	ReviewBase          string    `json:"review_base,omitempty"`
@@ -1060,14 +1061,17 @@ func validateManifestIdentity(want, manifest Manifest) error {
 		if !legacy && !ValidReviewBinding(manifest.ReviewMode, manifest.ReviewTarget, manifest.Repository, manifest.Issue, manifest.ReviewBase, manifest.ReviewHead, manifest.BaseSHA) {
 			return errors.New("review target does not match persisted identity")
 		}
-		if manifest.ReviewState == "failed" && (manifest.ReviewMode != ReviewModePlan || manifest.ReviewDiagnostic == "" || len(manifest.ReviewDiagnostic) > 4096) {
-			return errors.New("failed plan review requires a bounded diagnostic")
+		if manifest.ReviewState == "failed" && (manifest.ReviewDiagnostic == "" || len(manifest.ReviewDiagnostic) > 4096) {
+			return errors.New("failed review requires a bounded diagnostic")
 		}
 	default:
 		return fmt.Errorf("invalid review state %q", manifest.ReviewState)
 	}
 	if manifest.ReviewState != "failed" && manifest.ReviewDiagnostic != "" {
 		return errors.New("review diagnostic requires failed state")
+	}
+	if manifest.ReviewInvalidated && manifest.ReviewState != "failed" {
+		return errors.New("invalidated review requires failed state")
 	}
 	if manifest.ReviewBase != "" && !commitID.MatchString(manifest.ReviewBase) {
 		return errors.New("review base is invalid")

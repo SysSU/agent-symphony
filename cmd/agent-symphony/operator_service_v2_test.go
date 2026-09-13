@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -18,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -77,6 +79,73 @@ func TestV2DashboardDismissesWhileReconciliationCollectsAndIgnoresStaleFiles(t *
 	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
 	if _, exists := committed.Attempts[key]; exists || committed.Tombstones[key].Action != "dismissed" {
 		t.Fatalf("stale reconciliation restored the attempt: %#v", committed)
+	}
+}
+
+func TestV2DashboardDismissSurvivesAliveMonitorDuringGitHubPreflight(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 350, 1, "running")
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "orphaned", true)
+	state.Epoch, state.Revision = 1, 1
+	owner, err := startTestStateOwner(t, root, state, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, productionAttemptRoot(root), next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
+	service := operatorTestMutationService(t, owner)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	service.issueClosed = func(ctx context.Context, repository string, issue int) (bool, error) {
+		if repository != manifest.Repository || issue != manifest.Issue {
+			return false, fmt.Errorf("unexpected GitHub issue %s#%d", repository, issue)
+		}
+		close(entered)
+		select {
+		case <-release:
+			return true, nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	monitor, err := service.effects.begin(t.Context(), mustOwnerSnapshot(t, owner), runtimeTestRequest(agentruntime.EffectMonitor, manifest, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &dashboardServer{ctx: t.Context(), stateRoot: owner.stateRoot, repository: manifest.Repository, operator: service}
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/actions/dismiss?repository=o%2Fr&issue=350&attempt=1", nil)
+	request.Host = "localhost"
+	request.Header.Set("Origin", "http://localhost")
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		server.handler(http.NotFoundHandler()).ServeHTTP(recorder, request)
+		response <- recorder
+	}()
+	<-entered
+	if _, err := service.effects.execute(t.Context(), monitor); err != nil {
+		t.Fatal(err)
+	}
+	afterMonitor := mustOwnerSnapshot(t, owner).State
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	once.Do(func() { close(release) })
+	result := <-response
+	if result.Code != http.StatusOK {
+		t.Fatalf("alive Monitor made Dismiss fail: HTTP %d body=%s", result.Code, result.Body.String())
+	}
+	if !reflect.DeepEqual(afterMonitor.Attempts[key].Manifest, manifest) || afterMonitor.Effects[monitor.Identity.EffectID].State != "completed" {
+		t.Fatalf("alive Monitor changed manifest or did not finish: manifest=%#v effect=%#v", afterMonitor.Attempts[key].Manifest, afterMonitor.Effects[monitor.Identity.EffectID])
+	}
+	persisted, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil || persisted.Tombstones[key].Action != "dismissed" {
+		t.Fatalf("Dismiss did not durably invalidate attempt: tombstone=%#v err=%v", persisted.Tombstones[key], err)
+	}
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(monitor.Identity), Action: agentruntime.EffectMonitor, Manifest: manifest}); err == nil {
+		t.Fatal("old Monitor result could finish after Dismiss invalidated the attempt")
 	}
 }
 
@@ -473,6 +542,8 @@ func TestOperatorBlockedRecoverSelfAdvancesToRetryCompletion(t *testing.T) {
 	refreshOperatorObservation(t, owner)
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	service := operatorTestMutationService(t, owner)
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	service.reviewer = bindLiveReviewerForService(t, owner, reviewer)
 	service.collector.Config.ActorID = 42
 	service.collector.Config.RetryCommand = "/agent-symphony retry"
 	var collections atomic.Int32
@@ -514,11 +585,498 @@ func TestOperatorBlockedRecoverSelfAdvancesToRetryCompletion(t *testing.T) {
 	if !result.OK || result.Status != http.StatusAccepted {
 		t.Fatalf("result=%#v", result)
 	}
-	<-completed
+	select {
+	case <-completed:
+	case <-time.After(5 * time.Second):
+		current := mustOwnerSnapshot(t, owner).State
+		receipt, _ := operatorReceiptByID(current, "recover-self-advance")
+		t.Fatalf("Recover did not reach a terminal receipt: receipt=%#v effects=%#v", receipt, current.Effects)
+	}
 	final := mustOwnerSnapshot(t, owner).State
 	receipt, ok := operatorReceiptByID(final, "recover-self-advance")
 	if !ok || receipt.State != "completed" || receipt.Phase != operatorPhaseCompleted || receipt.Result == nil || receipt.Result.Status != http.StatusOK || collections.Load() != 2 {
 		t.Fatalf("receipt=%#v collections=%d effects=%#v", receipt, collections.Load(), final.Effects)
+	}
+	proof := final.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, reviewer.Reconciliation.Reviewer.Mode, reviewer.Reconciliation.Reviewer.Target)]
+	if !proof.DeadProved || proof.NeverRan || proof.GroupPID < 2 || final.Effects[reviewer.ID].State == "pending" {
+		t.Fatalf("Recover completed without stopped reviewer proof: proof=%#v reviewer=%#v", proof, final.Effects[reviewer.ID])
+	}
+}
+
+func bindLiveReviewerForService(t *testing.T, owner *stateOwner, reviewer *runtimeEffectIntent) *reviewerSessionStopBoundary {
+	t.Helper()
+	child := exec.Command("sh", "-c", "read line")
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	input, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = input.Close(); _ = child.Process.Kill(); _ = child.Wait() })
+	identity := ownerReconciliationEffectIdentity(*reviewer)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: child.Process.Pid}); err != nil {
+		t.Fatal(err)
+	}
+	launchPath, terminalPath := reviewerLifecyclePaths(reviewer.Reconciliation.Reviewer.Snapshot, reviewer.Reconciliation.Reviewer.Target)
+	if err := os.MkdirAll(filepath.Dir(launchPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	launch := reviewerLaunchIdentity{EffectID: reviewer.ID, IssueGeneration: reviewer.IssueGeneration, AttemptGeneration: reviewer.AttemptGeneration, RequestDigest: reviewer.RequestDigest, GateProtocol: true, SessionRequested: true, ChildPID: child.Process.Pid}
+	if err := writeReviewerRecord(launchPath, launch); err != nil {
+		t.Fatal(err)
+	}
+	start := "agent-symphony review-pane tmux " + launchPath + " " + terminalPath + " " + reviewerSignal(launch) + " " + launch.RequestDigest
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: reviewerPaneTestOutput("0||||", reviewer.Reconciliation.Reviewer.Session, "$9", os.Getpid(), start)}}
+	boundary.onKill = func() error {
+		if err := syscall.Kill(-child.Process.Pid, syscall.SIGKILL); err != nil {
+			return err
+		}
+		_ = child.Wait()
+		return nil
+	}
+	return boundary
+}
+
+func TestUnboundReviewerWrapperProcess(t *testing.T) {
+	if os.Getenv("AGENT_SYMPHONY_TEST_REVIEWER_WRAPPER") != "1" {
+		return
+	}
+	child := exec.Command("sh", "-c", "read line")
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	input, err := child.StdinPipe()
+	if err != nil || child.Start() != nil {
+		os.Exit(2)
+	}
+	_, _ = fmt.Fprintln(os.Stdout, child.Process.Pid)
+	var release [1]byte
+	_, _ = os.Stdin.Read(release[:])
+	_ = syscall.Kill(-child.Process.Pid, syscall.SIGKILL)
+	_ = child.Wait()
+	_ = input.Close()
+}
+
+func startUnboundReviewerForService(t *testing.T, owner *stateOwner, reviewer *runtimeEffectIntent) *reviewerSessionStopBoundary {
+	t.Helper()
+	wrapper := exec.Command(os.Args[0], "-test.run=^TestUnboundReviewerWrapperProcess$")
+	wrapper.Env = append(os.Environ(), "AGENT_SYMPHONY_TEST_REVIEWER_WRAPPER=1")
+	input, err := wrapper.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := wrapper.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wrapper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = input.Close(); _ = wrapper.Process.Kill(); _ = wrapper.Wait() })
+	var childPID int
+	if _, err := fmt.Fscan(output, &childPID); err != nil {
+		t.Fatal(err)
+	}
+	identity := ownerReconciliationEffectIdentity(*reviewer)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	launchPath, terminalPath := reviewerLifecyclePaths(reviewer.Reconciliation.Reviewer.Snapshot, reviewer.Reconciliation.Reviewer.Target)
+	if err := os.MkdirAll(filepath.Dir(launchPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	launch := reviewerLaunchIdentity{EffectID: reviewer.ID, IssueGeneration: reviewer.IssueGeneration, AttemptGeneration: reviewer.AttemptGeneration, RequestDigest: reviewer.RequestDigest, GateProtocol: true, SessionRequested: true, ChildPID: childPID}
+	if err := writeReviewerRecord(launchPath, launch); err != nil {
+		t.Fatal(err)
+	}
+	start := "agent-symphony review-pane tmux " + launchPath + " " + terminalPath + " " + reviewerSignal(launch) + " " + launch.RequestDigest
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: reviewerPaneTestOutput("0||||", reviewer.Reconciliation.Reviewer.Session, "$9", wrapper.Process.Pid, start)}}
+	boundary.onKill = func() error {
+		if _, err := input.Write([]byte{'x'}); err != nil {
+			return err
+		}
+		return wrapper.Wait()
+	}
+	return boundary
+}
+
+func TestFreshReconciliationStopsInvalidLivePlanReviewer(t *testing.T) {
+	for _, change := range []string{"body", "closed", "body restored", "partial body"} {
+		t.Run(change, func(t *testing.T) {
+			owner, manifest := operatorTestOwner(t, 366, "active", false)
+			service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+			reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+			boundary := bindLiveReviewerForService(t, owner, reviewer)
+			service.reviewer = boundary
+			key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+			run, err := service.effects.acquireKey(t.Context(), key, reviewer.IssueGeneration, reviewer.AttemptGeneration, 0, reviewer.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			released := make(chan struct{})
+			go func() {
+				<-run.ctx.Done()
+				service.effects.releaseKey(key, run)
+				close(released)
+			}()
+			pipeline := productionReconciliation{owner: owner, effects: service.effects, operator: service}
+			if superseded, err := pipeline.supersedeInvalidPendingPlanReviewers(t.Context(), mustOwnerSnapshot(t, owner)); err != nil || superseded || run.ctx.Err() != nil {
+				t.Fatalf("compatible live review was stopped: superseded=%v err=%v", superseded, err)
+			}
+			state := mustOwnerSnapshot(t, owner).State
+			observation := state.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
+			issue := expandIssueFact(observation.Fact)
+			issue.Body = "body"
+			if change == "body" || change == "body restored" || change == "partial body" {
+				issue.Body = "changed body"
+			} else {
+				issue.Closed = true
+			}
+			attempt := expandAttemptFact(observation.Attempts[key].Fact)
+			input := repositoryInput(change != "partial body", issue)
+			input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+			applied := applyReconciliationInput(t, owner, input)
+			if change == "body restored" {
+				issue.Body = "body"
+				input = repositoryInput(true, issue)
+				input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+				applied = applyReconciliationInput(t, owner, input)
+				if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, applied.State); err != nil {
+					t.Fatal(err)
+				}
+				loaded, err := readRuntimeOwnerState(owner.stateRoot, applied.State.Repository)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := owner.close(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				restarted, err := startTestStateOwner(t, owner.stateRoot, loaded, func(state runtimeOwnerState) error {
+					return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = restarted.close(context.Background()) })
+				owner, service.owner, service.effects.owner = restarted, restarted, restarted
+				applied = mustOwnerSnapshot(t, owner)
+				stale := applied.State.Effects[reviewer.ID]
+				result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(*stale.Reconciliation)
+				if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(stale), *stale.Reconciliation, result); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := service.effects.verifyPendingOperatorReconciliation(t.Context(), stale); !errors.Is(err, errStaleStateResult) {
+					t.Fatalf("restored body accepted revoked reviewer marker: %v", err)
+				}
+				if current := mustOwnerSnapshot(t, owner).State; current.Effects[reviewer.ID].State != "pending" || current.Attempts[key].Manifest.ReviewState == "clean" {
+					t.Fatalf("stale marker resurrected Plan review: effect=%#v manifest=%#v", current.Effects[reviewer.ID], current.Attempts[key].Manifest)
+				}
+				if err := os.Remove(filepath.Join(owner.stateRoot, "reconciliation-effects", reviewer.ID+".done")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var superseded bool
+			if change == "body restored" {
+				err = service.resumeReceipt(t.Context(), fmt.Sprintf("pending-plan-%d", manifest.Issue))
+				superseded = err == nil
+			} else {
+				superseded, err = pipeline.supersedeInvalidPendingPlanReviewers(t.Context(), applied)
+			}
+			if err != nil || !superseded {
+				t.Fatalf("fresh %s observation did not stop review: superseded=%v err=%v", change, superseded, err)
+			}
+			<-released
+			final := mustOwnerSnapshot(t, owner).State
+			receipt, ok := operatorReceiptByID(final, fmt.Sprintf("pending-plan-%d", manifest.Issue))
+			proof := final.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, agentruntime.ReviewModePlan, reviewer.Reconciliation.Reviewer.Target)]
+			gone, groupErr := reviewerGroupGone(proof.GroupPID)
+			if !ok || receipt.State != "completed" || receipt.Result == nil || receipt.Result.Status != http.StatusConflict || final.Effects[reviewer.ID].State != "completed" || !proof.DeadProved || !gone || groupErr != nil || len(boundary.killed) != 1 {
+				t.Fatalf("invalidated review remained executable: receipt=%#v proof=%#v gone=%v groupErr=%v killed=%v", receipt, proof, gone, groupErr, boundary.killed)
+			}
+			if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, final); err != nil {
+				t.Fatal(err)
+			}
+			reloaded, err := readRuntimeOwnerState(owner.stateRoot, final.Repository)
+			if err != nil || reloaded.Effects[reviewer.ID].State != "completed" || !reloaded.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, agentruntime.ReviewModePlan, reviewer.Reconciliation.Reviewer.Target)].DeadProved {
+				t.Fatalf("restart lost terminal reviewer proof: err=%v effect=%#v", err, reloaded.Effects[reviewer.ID])
+			}
+		})
+	}
+}
+
+func TestPreupgradeInvalidPlanObservationRevokesBeforeRestartEpoch(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 477, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	identity := ownerReconciliationEffectIdentity(*reviewer)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(state.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "changed body"
+	attempt := expandAttemptFact(state.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, owner, input)
+	issue.Body = "body"
+	input = repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	legacy := applyReconciliationInput(t, owner, input).State // Old ledger only retains restored A.
+	effect := legacy.Effects[reviewer.ID]
+	effect.ReviewerRevoked = false // Old binary did not track revocation.
+	legacy.Effects[reviewer.ID] = effect
+	legacy.ReviewerRevocationTracked = false
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(owner.stateRoot, legacy.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, loaded, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	if started := mustOwnerSnapshot(t, restarted).State; !started.Effects[reviewer.ID].ReviewerRevoked || !started.ReviewerRevocationTracked || started.Epoch <= loaded.Epoch {
+		t.Fatalf("restart lost old-ledger revocation: effect=%#v epoch=%d", started.Effects[reviewer.ID], started.Epoch)
+	}
+	stale := mustOwnerSnapshot(t, restarted).State.Effects[reviewer.ID]
+	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(*stale.Reconciliation)
+	if err := writeReconciliationEffectMarker(restarted.stateRoot, identity, *stale.Reconciliation, result); err != nil {
+		t.Fatal(err)
+	}
+	service.owner, service.effects.owner = restarted, restarted
+	if _, err := service.effects.verifyPendingOperatorReconciliation(t.Context(), stale); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("pre-upgrade stale marker completed after body restoration: %v", err)
+	}
+}
+
+func TestPreupgradeValidPlanReviewerRevokedOnce(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 478, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	state := mustOwnerSnapshot(t, owner).State
+	observation := state.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
+	if observation.ObservationEpoch != reviewer.IntentEpoch || observation.LastCycleID != reviewer.Reconciliation.ObservationCycleID {
+		t.Fatal("fixture observation is not the one that admitted the reviewer")
+	}
+	state.Epoch++ // Old daemon restarted without collecting a newer issue fact.
+	state.ReviewerRevocationTracked = false
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(owner.stateRoot, state.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, loaded, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	if current := mustOwnerSnapshot(t, restarted).State; current.Effects[reviewer.ID].State != "pending" || !current.Effects[reviewer.ID].ReviewerRevoked || !current.ReviewerRevocationTracked {
+		t.Fatalf("old pending reviewer was not conservatively revoked: %#v", current.Effects[reviewer.ID])
+	}
+	if err := restarted.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := readRuntimeOwnerState(owner.stateRoot, state.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := startTestStateOwner(t, owner.stateRoot, stored, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.close(context.Background()) })
+	if current := mustOwnerSnapshot(t, second).State; !current.ReviewerRevocationTracked || !current.Effects[reviewer.ID].ReviewerRevoked {
+		t.Fatalf("migration was not durable across second restart: %#v", current.Effects[reviewer.ID])
+	}
+}
+
+func TestTrackedValidPlanReviewerSurvivesRestart(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 479, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, mustOwnerSnapshot(t, owner).State); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for restart := 0; restart < 2; restart++ {
+		stored, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !stored.ReviewerRevocationTracked || stored.Effects[reviewer.ID].ReviewerRevoked {
+			t.Fatalf("valid tracked reviewer changed before restart %d: %#v", restart, stored.Effects[reviewer.ID])
+		}
+		current, err := startTestStateOwner(t, owner.stateRoot, stored, func(next runtimeOwnerState) error {
+			return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, next)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := mustOwnerSnapshot(t, current).State.Effects[reviewer.ID]; got.State != "pending" || got.ReviewerRevoked {
+			t.Fatalf("valid tracked reviewer revoked at restart %d: %#v", restart, got)
+		}
+		if err := current.close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPlanRevocationMigrationPersistenceFailureDoesNotStart(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 480, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	legacy := mustOwnerSnapshot(t, owner).State
+	legacy.ReviewerRevocationTracked = false
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected owner persistence failure")
+	if started, err := startTestStateOwner(t, owner.stateRoot, stored, func(runtimeOwnerState) error { return injected }); !errors.Is(err, injected) || started != nil {
+		t.Fatalf("startup exposed failed migration: owner=%v err=%v", started, err)
+	}
+	unchanged, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Epoch != stored.Epoch || unchanged.ReviewerRevocationTracked || unchanged.Effects[reviewer.ID].ReviewerRevoked {
+		t.Fatalf("failed migration partially persisted: %#v", unchanged.Effects[reviewer.ID])
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, unchanged, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	if current := mustOwnerSnapshot(t, restarted).State; !current.ReviewerRevocationTracked || !current.Effects[reviewer.ID].ReviewerRevoked {
+		t.Fatalf("retry did not commit full migration: %#v", current.Effects[reviewer.ID])
+	}
+}
+
+func TestImplementationSupersessionBindsUnboundLiveReviewerBeforeKill(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	request.Reviewer.Mode, request.Reviewer.DigestVersion = agentruntime.ReviewModeImplementation, 1
+	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
+	_, reviewer, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary := startUnboundReviewerForService(t, owner, reviewer)
+	launchPath, terminalPath := reviewerLifecyclePaths(request.Reviewer.Snapshot, request.Reviewer.Target)
+	var launch reviewerLaunchIdentity
+	found, launchErr := readReviewerRecord(launchPath, &launch)
+	if !found || launchErr != nil || !reviewerPaneStartMatches(strings.SplitN(boundary.status.Output, "|", 8)[7], launchPath, terminalPath, launch) {
+		t.Fatalf("fixture launch: found=%v err=%v launch=%#v pane=%q", found, launchErr, launch, boundary.status.Output)
+	}
+	service := operatorTestMutationService(t, owner)
+	service.reviewer = boundary
+	input := reconciliationEffectObservationInput(request, "changed")
+	input.Issues[0].Body = "changed body"
+	applyReconciliationInput(t, owner, input)
+	current := mustOwnerSnapshot(t, owner).State.Effects[reviewer.ID]
+	superseded, err := service.supersedeInvalidPlanReview(t.Context(), current)
+	if err != nil || !superseded {
+		t.Fatalf("unbound implementation reviewer did not stop after drift: superseded=%v err=%v", superseded, err)
+	}
+	final := mustOwnerSnapshot(t, owner).State
+	effect := final.Effects[reviewer.ID]
+	proof := final.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)]
+	gone, groupErr := reviewerGroupGone(proof.GroupPID)
+	if effect.State != "completed" || effect.ReviewerGroupPID < 2 || !proof.DeadProved || proof.EffectID != reviewer.ID || !gone || groupErr != nil || len(boundary.killed) != 1 {
+		t.Fatalf("implementation reviewer was not durably bound and stopped: effect=%#v proof=%#v gone=%v groupErr=%v killed=%v", effect, proof, gone, groupErr, boundary.killed)
+	}
+}
+
+func admitPendingGatedPlanReviewer(t *testing.T, owner *stateOwner, service *operatorMutationService, manifest agentruntime.Manifest) *runtimeEffectIntent {
+	t.Helper()
+	initial := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "body"
+	attempt := expandAttemptFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, owner, input)
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"number":%d,"state":"open","body":"body"}`, manifest.Issue))
+	}))
+	t.Cleanup(github.Close)
+	service.collector.API = internalgithub.API{BaseURL: github.URL, HTTP: github.Client()}
+	service.reviewSource, service.reviewCommand = "source", []string{"review"}
+	runtimeState := service.effects.executor.Runtime
+	priorRunner, priorTmux, priorGit := runtimeState.Runner, runtimeState.Tmux, runtimeState.Git
+	runtimeState.Runner, runtimeState.Tmux, runtimeState.Git = operatorOwnedRunner{manifest: manifest}, "tmux", "git"
+	command, _, err := service.prepareAdmission(t.Context(), mustOwnerSnapshot(t, owner), operatorRequest(fmt.Sprintf("pending-plan-%d", manifest.Issue), "review-plan", manifest, false))
+	runtimeState.Runner, runtimeState.Tmux, runtimeState.Git = priorRunner, priorTmux, priorGit
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, reviewer, err := owner.beginOperatorMutation(t.Context(), command)
+	if err != nil || reviewer == nil || !reviewer.ReviewerGateProtocol || reviewer.ReviewerSessionRequested {
+		t.Fatalf("pending gated reviewer admission: reviewer=%#v err=%v", reviewer, err)
+	}
+	return reviewer
+}
+
+func TestAbandonAcceptsAndStopsLiveBoundReviewerThroughService(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 339, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree, additionalPath: filepath.Dir(manifest.LogPath)})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	boundary := bindLiveReviewerForService(t, owner, reviewer)
+	service.reviewer, service.cleanup.reviewer, service.cleanup.owner = boundary, boundary, owner
+	service.effects.executor.Cleanup, service.effects.executor.VerifyCleanup = service.cleanup.execute, service.cleanup.verify
+	applyReconciliationInput(t, owner, reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: manifest.Repository}, Complete: true})
+	result := service.performSynchronously(t.Context(), operatorRequest("abandon-live-reviewer", "abandon", manifest, true))
+	if !result.OK || result.Status != http.StatusOK {
+		current := mustOwnerSnapshot(t, owner).State
+		pending, _ := operatorReceiptByID(current, "abandon-live-reviewer")
+		t.Fatalf("Abandon did not complete after live reviewer stop: result=%#v receipt=%#v effect=%#v", result, pending, current.Effects[pending.EffectID])
+	}
+	final := mustOwnerSnapshot(t, owner).State
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	receipt, ok := operatorReceiptByID(final, "abandon-live-reviewer")
+	effect := final.Effects[receipt.EffectID]
+	groupGone, groupErr := reviewerGroupGone(effect.SupersededReviewerGroupPID)
+	if !ok || receipt.State != "completed" || final.Tombstones[key].Action != "abandoned" || !effect.ReviewerStopped || effect.SupersededReviewerGroupPID < 2 || !groupGone || groupErr != nil || len(boundary.killed) != 1 {
+		t.Fatalf("Abandon did not prove exact reviewer death before completion: receipt=%#v effect=%#v tombstone=%#v groupGone=%v groupErr=%v killed=%v", receipt, effect, final.Tombstones[key], groupGone, groupErr, boundary.killed)
 	}
 }
 
@@ -1451,18 +2009,16 @@ func TestOperatorCleanupExecutesExactArchiveAbandonAndRemovePolicies(t *testing.
 		t.Run(action, func(t *testing.T) {
 			owner, manifest := operatorTestOwner(t, 330, "completed", false)
 			if manifest.ReviewSession != "" || manifest.ReviewSnapshot != "" || manifest.ReviewTarget != "" {
-				t.Fatal("cleanup fixture must exercise an in-flight effect absent from Manifest")
+				t.Fatal("cleanup fixture must have no reviewer resources")
 			}
 			snapshotRoot := productionSnapshotRoot(owner.stateRoot)
+			if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
 			expectedSnapshot, _ := reviewIdentity(operatorEffectAttempt(manifest), snapshotRoot)
 			resultRoot := expectedSnapshot + ".result-0123456789abcdef"
-			for _, path := range []string{expectedSnapshot, resultRoot} {
-				if err := os.MkdirAll(path, 0o700); err != nil {
-					t.Fatal(err)
-				}
-			}
 			implementation := &operatorBoundaryRecorder{}
-			reviewer := &operatorBoundaryRecorder{sessionLive: true}
+			reviewer := &operatorBoundaryRecorder{}
 			runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: &barrierEffectRunner{}, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
 			executor := operatorCleanupExecutor{stateRoot: owner.stateRoot, implementation: implementation, reviewer: reviewer, runtime: runtimeState}
 			request := agentruntime.EffectRequest{Action: agentruntime.EffectCleanup, Attempt: operatorEffectAttempt(manifest), Manifest: manifest, Cleanup: agentruntime.EffectCleanupPolicy{Action: action}}
@@ -1503,10 +2059,10 @@ func TestOperatorCleanupExecutesExactArchiveAbandonAndRemovePolicies(t *testing.
 				t.Fatalf("%s retained compatibility state: %v", action, err)
 			}
 			wantOperation := map[string]string{"archive": "cleanup", "abandon": "abandon", "remove": "remove"}[action]
-			if !slices.Equal(implementation.operations(), []string{"validate-" + wantOperation, wantOperation}) || !slices.Equal(reviewer.operations(), []string{"run", "run", "run"}) {
+			if !slices.Equal(implementation.operations(), []string{"validate-" + wantOperation, wantOperation}) || !slices.Equal(reviewer.operations(), []string{"run", "run"}) {
 				t.Fatalf("implementation=%v reviewer=%v", implementation.operations(), reviewer.operations())
 			}
-			if want := productionSnapshotRoot(owner.stateRoot); !slices.Equal(reviewer.directories(), []string{want, want, want}) {
+			if want := productionSnapshotRoot(owner.stateRoot); !slices.Equal(reviewer.directories(), []string{want, want}) {
 				t.Fatalf("reviewer directories=%v want=%q", reviewer.directories(), want)
 			}
 		})
@@ -1876,11 +2432,21 @@ func TestV2PlanReviewAdmitsAndResumesAfterMonitorOnlyTimestampChange(t *testing.
 	if err := owner.authorizeReconciliationEffect(t.Context(), authorizeReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: reconciliationReviewer}); err != nil {
 		t.Fatalf("monitor timestamp invalidated the admitted review effect: %v", err)
 	}
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: ownerReconciliationEffectIdentity(effect)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: ownerReconciliationEffectIdentity(effect), GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	committed = mustOwnerSnapshot(t, owner).State
 	launchPath, terminalPath := reviewerLifecyclePaths(effect.Reconciliation.Reviewer.Snapshot, effect.Reconciliation.Reviewer.Target)
 	if err := os.MkdirAll(filepath.Dir(launchPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	launch := reviewerIdentity(ownerReconciliationEffectIdentity(effect))
+	launch.GateProtocol = effect.ReviewerGateProtocol
+	launch.SessionRequested = true
+	launch.ChildPID = 99999999
 	if err := writeReviewerRecord(launchPath, launch); err != nil {
 		t.Fatal(err)
 	}
@@ -1923,8 +2489,8 @@ func TestV2PlanReviewAdmitsAndResumesAfterMonitorOnlyTimestampChange(t *testing.
 	if final.ControlReceipts[0].State != "completed" || final.Effects[effect.ID].State != "completed" || final.Attempts[key].Manifest.ReviewState != "clean" {
 		t.Fatalf("restart lost completed review: receipt=%#v effect=%#v manifest=%#v", final.ControlReceipts[0], final.Effects[effect.ID], final.Attempts[key].Manifest)
 	}
-	if boundary.panes.Load() != 0 || boundary.results.Load() != 1 {
-		t.Fatalf("restart launched or reread reviewer: panes=%d results=%d", boundary.panes.Load(), boundary.results.Load())
+	if boundary.panes.Load() == 0 || boundary.results.Load() != 1 {
+		t.Fatalf("restart did not verify dead pane and exact artifact: panes=%d results=%d", boundary.panes.Load(), boundary.results.Load())
 	}
 	marker := filepath.Join(owner.stateRoot, "reconciliation-effects", effect.ID+".done")
 	if _, err := os.Lstat(marker); !errors.Is(err, os.ErrNotExist) {
@@ -1937,90 +2503,104 @@ func TestV2PlanReviewAdmitsAndResumesAfterMonitorOnlyTimestampChange(t *testing.
 }
 
 func TestV2PlanReviewMarkerReplayRejectsChangedGitHubBodyAfterRestart(t *testing.T) {
-	owner, manifest := operatorTestOwner(t, 336, "active", false)
-	initial := mustOwnerSnapshot(t, owner).State
-	issue := expandIssueFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
-	issue.Body = "body"
-	attempt := expandAttemptFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
-	input := repositoryInput(true, issue)
-	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
-	applyReconciliationInput(t, owner, input)
-	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	var body atomic.Value
-	body.Store("body")
-	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/o/r/issues/336" {
-			t.Errorf("unexpected GitHub read: %s", r.URL.Path)
-		}
-		_, _ = fmt.Fprintf(w, `{"number":336,"state":"open","body":%q}`, body.Load().(string))
-	}))
-	defer github.Close()
-	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
-	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, executor: agentruntime.EffectExecutor{Runtime: runtimeState}, active: map[string]*activeRuntimeEffect{}, stopped: true}
-	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{API: internalgithub.API{BaseURL: github.URL, HTTP: github.Client()}, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
-	request := operatorRequest("review-marker-body-drift", "review-plan", manifest, false)
-	command, _, err := service.prepareAdmission(t.Context(), mustOwnerSnapshot(t, owner), request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, effect, err := owner.beginOperatorMutation(t.Context(), command)
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity := ownerReconciliationEffectIdentity(*effect)
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity}); err != nil {
-		t.Fatal(err)
-	}
-	reviewer := effect.Reconciliation.Reviewer
-	result := reconciliationEffectResult{Action: reconciliationReviewer, Reviewer: &reviewerEffectResult{Phase: reviewer.Phase, Status: "clean", Mode: reviewer.Mode, Target: reviewer.Target, BaseSHA: reviewer.BaseSHA, HeadSHA: reviewer.HeadSHA, Snapshot: reviewer.Snapshot, Session: reviewer.Session}}
-	if err := writeReconciliationEffectMarker(owner.stateRoot, identity, *effect.Reconciliation, result); err != nil {
-		t.Fatal(err)
-	}
-	_, terminalPath := reviewerLifecyclePaths(reviewer.Snapshot, reviewer.Target)
-	if err := os.MkdirAll(filepath.Dir(terminalPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeReviewerRecord(terminalPath, reviewerTerminalRecord{Identity: reviewerIdentity(identity)}); err != nil {
-		t.Fatal(err)
-	}
-	crashState := mustOwnerSnapshot(t, owner).State
-	if err := owner.close(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, crashState); err != nil {
-		t.Fatal(err)
-	}
-	persisted, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
-	if err != nil {
-		t.Fatal(err)
-	}
-	restarted, err := startTestStateOwner(t, owner.stateRoot, persisted, func(state runtimeOwnerState) error {
-		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = restarted.close(context.Background()) })
-	body.Store("changed while daemon was down")
-	changed := issue
-	changed.Body = body.Load().(string)
-	changedInput := repositoryInput(true, changed)
-	changedInput.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
-	restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: restarted.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
-	restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
-	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: service.collector, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
-	restartService.collect = func(context.Context, stateOwnerSnapshot, int) (reconciliationV2Batch, error) {
-		return reconciliationV2Batch{Input: changedInput}, nil
-	}
-	if err := restartService.resumeReceipt(t.Context(), request.RequestID); err != nil {
-		t.Fatal(err)
-	}
-	final := mustOwnerSnapshot(t, restarted).State
-	receipt := final.ControlReceipts[0]
-	if receipt.State != "completed" || receipt.Result == nil || receipt.Result.Status != http.StatusConflict || final.Effects[effect.ID].ReconciliationResult == nil || final.Effects[effect.ID].ReconciliationResult.Reviewer.Status != "failed" || final.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Manifest.ReviewState == "clean" {
-		t.Fatalf("stale marker committed review: receipt=%#v effect=%#v", receipt, final.Effects[effect.ID])
+	for _, entry := range []string{"startup resume", "worker failure classification"} {
+		t.Run(entry, func(t *testing.T) {
+			owner, manifest := operatorTestOwner(t, 336, "active", false)
+			initial := mustOwnerSnapshot(t, owner).State
+			issue := expandIssueFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+			issue.Body = "body"
+			attempt := expandAttemptFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+			input := repositoryInput(true, issue)
+			input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+			applyReconciliationInput(t, owner, input)
+			if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			var body atomic.Value
+			body.Store("body")
+			github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/repos/o/r/issues/336" {
+					t.Errorf("unexpected GitHub read: %s", r.URL.Path)
+				}
+				_, _ = fmt.Fprintf(w, `{"number":336,"state":"open","body":%q}`, body.Load().(string))
+			}))
+			defer github.Close()
+			runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
+			effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, executor: agentruntime.EffectExecutor{Runtime: runtimeState}, active: map[string]*activeRuntimeEffect{}, stopped: true}
+			service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{API: internalgithub.API{BaseURL: github.URL, HTTP: github.Client()}, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
+			request := operatorRequest("review-marker-body-drift", "review-plan", manifest, false)
+			command, _, err := service.prepareAdmission(t.Context(), mustOwnerSnapshot(t, owner), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, effect, err := owner.beginOperatorMutation(t.Context(), command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			identity := ownerReconciliationEffectIdentity(*effect)
+			if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+				t.Fatal(err)
+			}
+			reviewer := effect.Reconciliation.Reviewer
+			result := reconciliationEffectResult{Action: reconciliationReviewer, Reviewer: &reviewerEffectResult{Phase: reviewer.Phase, Status: "clean", Mode: reviewer.Mode, Target: reviewer.Target, BaseSHA: reviewer.BaseSHA, HeadSHA: reviewer.HeadSHA, Snapshot: reviewer.Snapshot, Session: reviewer.Session}}
+			if err := writeReconciliationEffectMarker(owner.stateRoot, identity, *effect.Reconciliation, result); err != nil {
+				t.Fatal(err)
+			}
+			_, terminalPath := reviewerLifecyclePaths(reviewer.Snapshot, reviewer.Target)
+			if err := os.MkdirAll(filepath.Dir(terminalPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeReviewerRecord(terminalPath, reviewerTerminalRecord{Identity: reviewerIdentity(identity)}); err != nil {
+				t.Fatal(err)
+			}
+			crashState := mustOwnerSnapshot(t, owner).State
+			if err := owner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, crashState); err != nil {
+				t.Fatal(err)
+			}
+			persisted, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := startTestStateOwner(t, owner.stateRoot, persisted, func(state runtimeOwnerState) error {
+				return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = restarted.close(context.Background()) })
+			body.Store("changed while daemon was down")
+			changed := issue
+			changed.Body = body.Load().(string)
+			changedInput := repositoryInput(true, changed)
+			changedInput.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+			restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: restarted.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
+			restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
+			restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: service.collector, reviewer: &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||\n"}}, reviewSource: "source", reviewCommand: []string{"review"}}
+			restartService.collect = func(context.Context, stateOwnerSnapshot, int) (reconciliationV2Batch, error) {
+				return reconciliationV2Batch{Input: changedInput}, nil
+			}
+			if entry == "startup resume" {
+				if err := restartService.resumePending(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if err := restartService.shutdown(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				restartService.classifyWorkerFailure(request.RequestID, errors.New("worker stopped after writing marker"))
+			}
+			final := mustOwnerSnapshot(t, restarted).State
+			receipt := final.ControlReceipts[0]
+			if receipt.State != "completed" || receipt.Result == nil || receipt.Result.Status != http.StatusConflict || final.Effects[effect.ID].ReconciliationResult == nil || final.Effects[effect.ID].ReconciliationResult.Reviewer.Status != "failed" || final.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Manifest.ReviewState == "clean" {
+				t.Fatalf("stale marker committed review: receipt=%#v effect=%#v", receipt, final.Effects[effect.ID])
+			}
+		})
 	}
 }
 
@@ -2051,7 +2631,10 @@ func TestCancelPreservesExactReviewerStopBindingAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: ownerReconciliationEffectIdentity(*reviewer)}); err != nil {
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: ownerReconciliationEffectIdentity(*reviewer)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: ownerReconciliationEffectIdentity(*reviewer), GroupPID: 99999999}); err != nil {
 		t.Fatal(err)
 	}
 	beforeCancel := mustOwnerSnapshot(t, owner)
@@ -2070,7 +2653,7 @@ func TestCancelPreservesExactReviewerStopBindingAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Cancel overlapped launched review: %v", err)
 	}
-	if stop == nil || stop.SupersededReviewerID != reviewer.ID || committed.State.Effects[reviewer.ID].State == "pending" {
+	if stop == nil || stop.SupersededReviewerID != reviewer.ID || stop.SupersededReviewerRequestDigest != reviewer.RequestDigest || !stop.SupersededReviewerGateProtocol || !stop.SupersededReviewerSessionRequested || stop.SupersededReviewerGroupPID != 99999999 || committed.State.Effects[reviewer.ID].State == "pending" {
 		t.Fatalf("Cancel lost reviewer stop binding: stop=%#v reviewer=%#v", stop, committed.State.Effects[reviewer.ID])
 	}
 	if err := owner.close(t.Context()); err != nil {
@@ -2083,6 +2666,9 @@ func TestCancelPreservesExactReviewerStopBindingAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if stored := persisted.Effects[stop.ID]; stored.SupersededReviewerID != reviewer.ID || stored.SupersededReviewerRequestDigest != reviewer.RequestDigest || !stored.SupersededReviewerSessionRequested || stored.SupersededReviewerGroupPID != 99999999 {
+		t.Fatalf("restart lost exact reviewer stop binding: %#v", stored)
+	}
 	restarted, err := startTestStateOwner(t, owner.stateRoot, persisted, func(state runtimeOwnerState) error {
 		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state)
 	})
@@ -2090,7 +2676,7 @@ func TestCancelPreservesExactReviewerStopBindingAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = restarted.close(context.Background()) })
-	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "0||||\n"}}
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||\n"}}
 	restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: restarted.stateRoot, Runner: &barrierEffectRunner{}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
 	restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
 	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, reviewer: boundary, active: map[string]bool{}, released: map[string]chan struct{}{}}
@@ -2098,8 +2684,8 @@ func TestCancelPreservesExactReviewerStopBindingAcrossRestart(t *testing.T) {
 		t.Fatalf("restart could not resume Cancel after reviewer stop: %v", err)
 	}
 	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
-	if err != nil || len(boundary.killed) != 1 || boundary.killed[0] != "="+session {
-		t.Fatalf("restart failed to stop exact reviewer before continuing Cancel: killed=%v err=%v", boundary.killed, err)
+	if err != nil || len(boundary.killed) != 0 {
+		t.Fatalf("restart failed to prove already-stopped reviewer before continuing Cancel: session=%s killed=%v err=%v", session, boundary.killed, err)
 	}
 }
 
@@ -2111,6 +2697,9 @@ type completedPlanReviewBoundary struct {
 func (b *completedPlanReviewBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
 	if operation == "run" && command.Name == "tmux" && slices.Contains(command.Args, "display-message") {
 		b.panes.Add(1)
+		if command.Args[len(command.Args)-1] == reviewerPaneIdentityFormat {
+			return agentruntime.Result{Output: "||||||||||"}, nil
+		}
 		return agentruntime.Result{Output: "1|0|||"}, nil
 	}
 	if operation == "review-result" {
@@ -2599,6 +3188,7 @@ func operatorServiceWithCleanup(t *testing.T, owner *stateOwner, lifecycle conte
 
 type operatorCleanupBoundary struct {
 	path            string
+	additionalPath  string
 	entered, exited chan struct{}
 	enterOnce       sync.Once
 	calls           atomic.Int32
@@ -2624,7 +3214,13 @@ func (b *operatorCleanupBoundary) call(ctx context.Context, operation string, co
 		}
 		return agentruntime.Result{}, ctx.Err()
 	}
-	return agentruntime.Result{}, os.RemoveAll(b.path)
+	if err := os.RemoveAll(b.path); err != nil {
+		return agentruntime.Result{}, err
+	}
+	if b.additionalPath != "" {
+		return agentruntime.Result{}, os.RemoveAll(b.additionalPath)
+	}
+	return agentruntime.Result{}, nil
 }
 
 type operatorBoundaryRecorder struct {
@@ -2644,6 +3240,12 @@ func (r *operatorBoundaryRecorder) call(_ context.Context, operation string, com
 	}
 	switch command.Args[0] {
 	case "display-message":
+		if command.Args[len(command.Args)-1] == reviewerPaneIdentityFormat {
+			if r.sessionLive {
+				return agentruntime.Result{Output: "0||||||\n"}, nil
+			}
+			return agentruntime.Result{Output: "||||||||||\n"}, nil
+		}
 		if r.sessionLive {
 			return agentruntime.Result{Output: "0||||\n"}, nil
 		}
