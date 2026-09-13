@@ -127,6 +127,12 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 	// failed liveness check.
 	committedLiveness := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
 	statuses, _ := projectRecoveryStatuses(context.Background(), facts, issues, manifests, capacity, committedLiveness)
+	// Issue-level scheduling can synthesize a status from a stale scalar Attempt
+	// even after its active binding and local/remote facts were removed.
+	statuses = slices.DeleteFunc(statuses, func(status orchestrator.RecoveryStatus) bool {
+		_, tombstoned := snapshot.State.Tombstones[ownerAttemptKey(status.Repository, status.Issue, status.Attempt)]
+		return tombstoned
+	})
 	for _, effect := range snapshot.State.Effects {
 		if effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Phase != "run-observe" {
 			continue
