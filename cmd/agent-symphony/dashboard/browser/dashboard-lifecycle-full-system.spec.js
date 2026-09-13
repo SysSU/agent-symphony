@@ -164,7 +164,10 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       if (next) {
         expect(next.session).toBeTruthy();
         expect(next.session).not.toBe(old?.session);
+        await page.reload();
         await expect(card).toContainText(/Attempt 2(?!\d)/);
+        canceledCard = await historicalAttempt();
+        await expect(canceledCard).toContainText("failed");
         await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toHaveCount(0);
       } else if (old?.retryable && !old.operator_blocked) {
         await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toBeVisible();
