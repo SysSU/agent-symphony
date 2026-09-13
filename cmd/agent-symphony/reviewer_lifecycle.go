@@ -66,6 +66,7 @@ func reviewerPaneStartMatches(start, launchPath, terminalPath string, identity r
 }
 
 const reviewerPaneIdentityFormat = agentruntime.PaneStatusFormat + "|#{session_id}|#{pane_pid}|#{pid}|#{start_time}|#{session_name}|#{pane_start_command}"
+const reviewerSessionsFormat = "#{pid}|#{start_time}|#{session_name}"
 const reviewerGuardMismatch = "reviewer-guard-mismatch"
 
 type reviewerPaneIdentity struct {
@@ -145,17 +146,29 @@ func guardedReviewerKillSession(ctx context.Context, boundary boundaryCaller, pa
 	if strings.TrimSpace(result.Output) != "" {
 		return errors.New("reviewer session changed before guarded stop")
 	}
-	status, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + session}, Dir: dir, Env: env})
+	status, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"list-sessions", "-F", reviewerSessionsFormat}, Dir: dir, Env: env})
+	serverErr := syscall.Kill(pane.ServerPID, 0)
+	// The exact guard has run. A successful inventory takes precedence over
+	// original-server death: a visible S2 must not be certified absent. Without
+	// inventory, only death of the captured server proves its S1 gone.
 	if err == nil {
-		return errors.New("reviewer session remains after guarded stop")
-	}
-	// The exact guard has run. If its original server is gone, its session is
-	// gone too; a tmux error string or missing socket alone is not that proof.
-	// A live, inaccessible, or reused PID remains ambiguous.
-	if errors.Is(syscall.Kill(pane.ServerPID, 0), syscall.ESRCH) {
+		if (serverErr == nil || errors.Is(serverErr, syscall.ESRCH)) && reviewerSessionAbsentOnServer(status.Output, pane, session) {
+			return nil
+		}
+	} else if errors.Is(serverErr, syscall.ESRCH) {
 		return nil
 	}
-	return fmt.Errorf("reviewer session absence is unproved after guarded stop: %w (exited=%t code=%d output=%.256q)", err, status.Exited, status.Code, strings.TrimSpace(status.Output))
+	return fmt.Errorf("reviewer session absence is unproved after guarded stop (server=%v tmux=%v exited=%t code=%d output=%.256q)", serverErr, err, status.Exited, status.Code, strings.TrimSpace(status.Output))
+}
+
+func reviewerSessionAbsentOnServer(output string, pane reviewerPaneIdentity, session string) bool {
+	prefix := fmt.Sprintf("%d|%d|", pane.ServerPID, pane.StartTime)
+	for _, row := range strings.Split(strings.TrimSpace(output), "\n") {
+		if !strings.HasPrefix(row, prefix) || strings.TrimPrefix(row, prefix) == "" || strings.TrimPrefix(row, prefix) == session {
+			return false
+		}
+	}
+	return true
 }
 
 func reviewerPanePID(output string) (int, error) {
