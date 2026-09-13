@@ -1431,6 +1431,8 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 		return json.Unmarshal([]byte(args[14]), &identity) == nil && identity.GateProtocol && identity.SessionRequested && identity.EffectID != "" && identity.IssueGeneration > 0 && identity.AttemptGeneration > 0 && validDigest(identity.RequestDigest) && args[12] == reviewerSignal(identity) && args[13] == reviewerStartSignal(identity)
 	case "has-session", "kill-session":
 		return len(args) == 3 && args[1] == "-t" && (validTmuxTarget(args[2], false) || args[0] == "kill-session" && validTmuxSessionID(args[2]))
+	case "list-sessions":
+		return len(args) == 3 && args[1] == "-F" && args[2] == reviewerSessionsFormat
 	case "if-shell":
 		return validReviewerGuardedKillArgs(args)
 	case "display-message":
