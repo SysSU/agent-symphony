@@ -88,6 +88,7 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 	var heldIssueList chan struct{}
 	var enteredIssueList chan struct{}
 	var checkNowBaseline uint64
+	var checkNowReads int
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/fixture/check-now/hold":
@@ -102,7 +103,7 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 				http.Error(w, "issue-list read is already held", http.StatusConflict)
 				return
 			}
-			heldIssueList, enteredIssueList, checkNowBaseline = make(chan struct{}), make(chan struct{}), ledger.CycleOutcomeID
+			heldIssueList, enteredIssueList, checkNowBaseline, checkNowReads = make(chan struct{}), make(chan struct{}), ledger.CycleOutcomeID, 2
 			checkNowMu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -134,12 +135,16 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 				http.Error(w, "issue-list read has not entered", http.StatusConflict)
 				return
 			}
-			githubFixture.mu.Lock()
-			githubFixture.listedIssues = []map[string]any{checkNowIssue}
-			githubFixture.mu.Unlock()
 			close(heldIssueList)
-			heldIssueList = nil
-			enteredIssueList = nil
+			checkNowReads--
+			if checkNowReads == 0 {
+				githubFixture.mu.Lock()
+				githubFixture.listedIssues = []map[string]any{checkNowIssue}
+				githubFixture.mu.Unlock()
+				heldIssueList, enteredIssueList = nil, nil
+			} else {
+				heldIssueList, enteredIssueList = make(chan struct{}), make(chan struct{})
+			}
 			checkNowMu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 			return

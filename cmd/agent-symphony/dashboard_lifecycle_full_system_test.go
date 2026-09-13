@@ -1040,7 +1040,12 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					}
 					return failed && reviewerGone && retryable
 				}) {
-					t.Fatal("restart did not preserve cancelled attempt as failed without its reviewer, or show a valid recovery/active next attempt")
+					latest, latestErr := readRuntimeOwnerState(stateRoot, "o/r")
+					serve := restartOutput.String()
+					if len(serve) > 8192 {
+						serve = serve[len(serve)-8192:]
+					}
+					t.Fatalf("restart did not preserve cancelled attempt as failed without its reviewer, or show a valid recovery/active next attempt: owner_read=%v effects=%s receipts=%s\n%s\nserve=%s", latestErr, internalgithub.Redact(fullSystemEffectSummary(latest)), internalgithub.Redact(fmt.Sprintf("%#v", latest.ControlReceipts)), internalgithub.Redact(fullSystemLifecycleDiagnostic(restartAddress, stateRoot, fixture)), internalgithub.Redact(serve))
 				}
 			}
 		})
