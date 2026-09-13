@@ -66,6 +66,7 @@ func reviewerPaneStartMatches(start, launchPath, terminalPath string, identity r
 }
 
 const reviewerPaneIdentityFormat = agentruntime.PaneStatusFormat + "|#{session_id}|#{pane_pid}|#{pid}|#{start_time}|#{session_name}|#{pane_start_command}"
+const reviewerSessionsFormat = "#{pid}|#{start_time}|#{session_name}"
 const reviewerGuardMismatch = "reviewer-guard-mismatch"
 
 type reviewerPaneIdentity struct {
@@ -145,14 +146,29 @@ func guardedReviewerKillSession(ctx context.Context, boundary boundaryCaller, pa
 	if strings.TrimSpace(result.Output) != "" {
 		return errors.New("reviewer session changed before guarded stop")
 	}
-	status, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + session}, Dir: dir, Env: env})
-	if err == nil {
-		return errors.New("reviewer session remains after guarded stop")
-	}
-	if missingTmuxServer(status) || status.Exited && status.Code == 1 && strings.TrimSpace(status.Output) == "can't find session: "+session {
+	status, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"list-sessions", "-F", reviewerSessionsFormat}, Dir: dir, Env: env})
+	serverErr := syscall.Kill(pane.ServerPID, 0)
+	// S1 server death does not prove a same-name S2 is absent. Cleanup needs
+	// a successful inventory from the captured server.
+	if reviewerSessionAbsenceProved(status.Output, err, pane, session) {
 		return nil
 	}
-	return fmt.Errorf("reviewer session absence is unproved after guarded stop: %w (exited=%t code=%d output=%.256q)", err, status.Exited, status.Code, strings.TrimSpace(status.Output))
+	return fmt.Errorf("reviewer session absence is unproved after guarded stop (server=%v tmux=%v exited=%t code=%d output=%.256q)", serverErr, err, status.Exited, status.Code, strings.TrimSpace(status.Output))
+}
+
+func reviewerSessionAbsenceProved(inventory string, inventoryErr error, pane reviewerPaneIdentity, session string) bool {
+	return inventoryErr == nil && reviewerSessionAbsentOnServer(inventory, pane, session)
+}
+
+func reviewerSessionAbsentOnServer(output string, pane reviewerPaneIdentity, session string) bool {
+	prefix := fmt.Sprintf("%d|%d|", pane.ServerPID, pane.StartTime)
+	for _, row := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
+		name, ok := strings.CutPrefix(row, prefix)
+		if !ok || name == "" || name == session || strings.ContainsAny(name, "|\r\n") {
+			return false
+		}
+	}
+	return true
 }
 
 func reviewerPanePID(output string) (int, error) {

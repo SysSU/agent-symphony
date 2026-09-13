@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -67,17 +68,22 @@ func (b *directReviewerSessionBoundary) call(_ context.Context, operation string
 }
 
 type reviewerSessionStopBoundary struct {
-	status  agentruntime.Result
-	err     error
-	killErr error
-	killed  []string
-	onKill  func() error
+	status    agentruntime.Result
+	err       error
+	killErr   error
+	killed    []string
+	onKill    func() error
+	inventory string
 }
 
 type tmuxReviewerGuardBoundary struct {
-	binary      string
-	socket      string
-	beforeGuard func() error
+	binary         string
+	socket         string
+	beforeGuard    func() error
+	afterGuard     func() error
+	maskMissing    bool
+	inventoryError error
+	lastInventory  string
 }
 
 func (b *tmuxReviewerGuardBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
@@ -90,11 +96,27 @@ func (b *tmuxReviewerGuardBoundary) call(ctx context.Context, operation string, 
 		}
 		b.beforeGuard = nil
 	}
+	if len(command.Args) > 0 && command.Args[0] == "list-sessions" && b.inventoryError != nil {
+		b.lastInventory = ""
+		return agentruntime.Result{Exited: true, Code: 1, Output: "server exited unexpectedly"}, b.inventoryError
+	}
 	cmd := exec.CommandContext(ctx, b.binary, append([]string{"-S", b.socket, "-f", "/dev/null"}, command.Args...)...)
 	output, err := cmd.CombinedOutput()
 	result := agentruntime.Result{Output: string(output), Exited: true}
 	if exit, ok := err.(*exec.ExitError); ok {
 		result.Code = exit.ExitCode()
+	}
+	if len(command.Args) > 0 && command.Args[0] == "if-shell" && err == nil && b.afterGuard != nil {
+		if hookErr := b.afterGuard(); hookErr != nil {
+			return agentruntime.Result{}, hookErr
+		}
+		b.afterGuard = nil
+	}
+	if len(command.Args) > 0 && command.Args[0] == "list-sessions" && err != nil && b.maskMissing {
+		result.Output = "server exited unexpectedly"
+	}
+	if len(command.Args) > 0 && command.Args[0] == "list-sessions" {
+		b.lastInventory = result.Output
 	}
 	return result, err
 }
@@ -202,6 +224,9 @@ func TestGuardedReviewerKillDoesNotTouchReplacementTmuxSession(t *testing.T) {
 
 func TestGuardedReviewerKillStopsExactTmuxSession(t *testing.T) {
 	boundary, run := reviewerGuardTmux(t)
+	// WSL2 reports this instead of the usual missing-server text after the
+	// real last-pane shutdown. The boundary still executes the real tmux call.
+	boundary.maskMissing = true
 	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 298, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -220,11 +245,262 @@ func TestGuardedReviewerKillStopsExactTmuxSession(t *testing.T) {
 	if !validReviewerGuardedKillArgs([]string{"if-shell", "-F", "-t", agentruntime.PaneTarget(session), reviewerGuardCondition(pane), "kill-session -t " + pane.SessionID, "display-message -p " + reviewerGuardMismatch}) {
 		t.Fatal("host rejected the exact guarded reviewer stop")
 	}
-	if err := guardedReviewerKillSession(t.Context(), boundary, pane, session, "", nil); err != nil {
-		t.Fatal(err)
+	if err := guardedReviewerKillSession(t.Context(), boundary, pane, session, "", nil); err == nil {
+		if !reviewerSessionAbsentOnServer(boundary.lastInventory, pane, session) {
+			t.Fatalf("last-pane stop lacked exact-server inventory proof: %q", boundary.lastInventory)
+		}
+	} else if !strings.Contains(err.Error(), "absence is unproved") {
+		t.Fatalf("last-pane stop did not fail closed: %v", err)
 	}
 	if output, err := run("has-session", "-t", "="+session); err == nil {
 		t.Fatalf("exact reviewer session remains: %s", output)
+	}
+}
+
+func TestGuardedReviewerKillStopsExactTmuxSessionWithAnchor(t *testing.T) {
+	boundary, run := reviewerGuardTmux(t)
+	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 315, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"anchor", session} {
+		if output, err := run("new-session", "-d", "-s", name); err != nil {
+			t.Fatalf("create %s: %v: %s", name, err, output)
+		}
+	}
+	output, err := run("display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerPaneIdentityFormat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := parseReviewerPaneIdentity(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := guardedReviewerKillSession(t.Context(), boundary, pane, session, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(pane.ServerPID, 0); err != nil {
+		t.Fatalf("anchor server stopped: %v", err)
+	}
+	if output, err := run("has-session", "-t", "=anchor"); err != nil {
+		t.Fatalf("anchor was killed: %v: %s", err, output)
+	}
+	if output, err := run("has-session", "-t", "="+session); err == nil {
+		t.Fatalf("exact reviewer session remains: %s", output)
+	}
+}
+
+func TestGuardedReviewerKillRejectsSameServerS2AfterGuard(t *testing.T) {
+	boundary, run := reviewerGuardTmux(t)
+	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 315, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"anchor", session} {
+		if output, err := run("new-session", "-d", "-s", name); err != nil {
+			t.Fatalf("create %s: %v: %s", name, err, output)
+		}
+	}
+	output, err := run("display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerPaneIdentityFormat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := parseReviewerPaneIdentity(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary.afterGuard = func() error {
+		if output, err := run("new-session", "-d", "-s", session); err != nil {
+			return fmt.Errorf("create same-server foreign S2: %w: %s", err, output)
+		}
+		return nil
+	}
+	if err := guardedReviewerKillSession(t.Context(), boundary, pane, session, "", nil); err == nil {
+		t.Fatal("same-server foreign S2 was certified absent")
+	}
+	if output, err := run("has-session", "-t", "="+session); err != nil {
+		t.Fatalf("same-server foreign S2 was killed: %v: %s", err, output)
+	}
+}
+
+func TestGuardedReviewerKillRejectsS2AfterLastServerExit(t *testing.T) {
+	for _, failInventory := range []bool{false, true} {
+		t.Run(fmt.Sprintf("inventory_failure_%t", failInventory), func(t *testing.T) {
+			testGuardedReviewerKillRejectsS2AfterLastServerExit(t, failInventory)
+		})
+	}
+}
+
+func testGuardedReviewerKillRejectsS2AfterLastServerExit(t *testing.T, failInventory bool) {
+	boundary, run := reviewerGuardTmux(t)
+	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 315, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := exec.CommandContext(t.Context(), boundary.binary, "-D", "-S", boundary.socket, "-f", "/dev/null")
+	var serverOutput bytes.Buffer
+	server.Stderr = &serverOutput
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- server.Wait() }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		connection, connectErr := net.DialTimeout("unix", boundary.socket, 100*time.Millisecond)
+		if connectErr == nil {
+			_ = connection.Close()
+			break
+		}
+		select {
+		case serverErr := <-serverDone:
+			t.Fatalf("foreground S1 server exited before startup: %v: %s", serverErr, serverOutput.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("foreground S1 server did not start: %v", connectErr)
+		}
+		runtime.Gosched()
+	}
+	if output, err := run("new-session", "-d", "-s", session); err != nil {
+		t.Fatalf("create S1: %v: %s", err, output)
+	}
+	if output, err := run("set-option", "-g", "exit-empty", "on"); err != nil {
+		t.Fatalf("restore last-pane server exit: %v: %s", err, output)
+	}
+	output, err := run("display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerPaneIdentityFormat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := parseReviewerPaneIdentity(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pane.ServerPID != server.Process.Pid {
+		t.Fatalf("foreground S1 server PID differs from captured identity: started=%d captured=%d", server.Process.Pid, pane.ServerPID)
+	}
+	gate := filepath.Join(filepath.Dir(boundary.socket), "s2-gate")
+	if err := syscall.Mkfifo(gate, 0600); err != nil {
+		t.Fatal(err)
+	}
+	boundary.afterGuard = func() error {
+		<-serverDone // The exact last-pane guarded kill naturally exited S1.
+		if err := syscall.Kill(pane.ServerPID, 0); !errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("S1 server death is unproved: %v", err)
+		}
+		if err := waitReviewerTmuxSocketDisconnected(boundary.socket); err != nil {
+			return err
+		}
+		if err := os.Remove(boundary.socket); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove disconnected S1 socket: %w", err)
+		}
+		if output, err := run("new-session", "-d", "-s", "anchor", "/bin/cat "+gate); err != nil {
+			return fmt.Errorf("create S2 server anchor: %w: %s", err, output)
+		}
+		if output, err := run("set-option", "-gw", "remain-on-exit", "on"); err != nil {
+			return fmt.Errorf("keep S2 fixture pane after exit: %w: %s", err, output)
+		}
+		if output, err := run("new-session", "-d", "-s", session, "/bin/cat "+gate); err != nil {
+			return fmt.Errorf("create foreign S2: %w: %s", err, output)
+		}
+		if output, err := run("list-sessions", "-F", reviewerSessionsFormat); err != nil || !strings.Contains(output, "|"+session+"\n") {
+			return fmt.Errorf("S2 inventory unavailable: %v: %s", err, output)
+		}
+		if failInventory {
+			boundary.inventoryError = errors.New("injected inventory failure")
+		}
+		return nil
+	}
+	guardErr := guardedReviewerKillSession(t.Context(), boundary, pane, session, "", nil)
+	if guardErr == nil {
+		t.Fatal("foreign S2 was certified absent after original server death")
+	}
+	if !failInventory && !strings.Contains(boundary.lastInventory, "|"+session+"\n") || failInventory && !strings.Contains(guardErr.Error(), "inventory failure") {
+		t.Fatalf("post-guard inventory did not observe foreign S2: %q (guard: %v)", boundary.lastInventory, guardErr)
+	}
+	if output, err := run("has-session", "-t", "="+session); err != nil {
+		t.Fatalf("foreign S2 was killed: %v: %s", err, output)
+	}
+}
+
+func TestReviewerSessionAbsentOnServerRequiresValidatedRow(t *testing.T) {
+	pane := reviewerPaneIdentity{ServerPID: 123, StartTime: 456}
+	for _, output := range []string{"", "124|456|anchor", "123|457|anchor", "123|456|reviewer", "123|456|anchor\n124|456|other", "123|456|", "123|456|anchor|extra", "123|456|anchor\n\n"} {
+		if reviewerSessionAbsentOnServer(output, pane, "reviewer") {
+			t.Fatalf("uncertain server inventory was accepted: %q", output)
+		}
+	}
+	if !reviewerSessionAbsentOnServer("123|456|anchor", pane, "reviewer") {
+		t.Fatal("matching live server with only anchor was rejected")
+	}
+}
+
+func TestReviewerSessionAbsenceProofRequiresExactInventory(t *testing.T) {
+	pane := reviewerPaneIdentity{ServerPID: 123, StartTime: 456}
+	if !reviewerSessionAbsenceProved("123|456|anchor\n", nil, pane, "reviewer") {
+		t.Fatal("exact same-server inventory was rejected")
+	}
+	if reviewerSessionAbsenceProved("123|456|anchor\n123|456|reviewer\n", nil, pane, "reviewer") {
+		t.Fatal("positive same-name S2 inventory was certified absent")
+	}
+	if reviewerSessionAbsenceProved("", errors.New("tmux unavailable"), pane, "reviewer") || reviewerSessionAbsenceProved("123|456|anchor\n", errors.New("tmux failed"), pane, "reviewer") {
+		t.Fatal("failed inventory was certified absent")
+	}
+}
+
+func TestGuardedReviewerKillRejectsUnlinkedLiveServerAndReplacement(t *testing.T) {
+	for _, replacement := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replacement_%t", replacement), func(t *testing.T) {
+			boundary, run := reviewerGuardTmux(t)
+			session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 315, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"anchor", session} {
+				if output, err := run("new-session", "-d", "-s", name); err != nil {
+					t.Fatalf("create %s: %v: %s", name, err, output)
+				}
+			}
+			output, err := run("display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerPaneIdentityFormat)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pane, err := parseReviewerPaneIdentity(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldSocket := boundary.socket + ".old"
+			boundary.afterGuard = func() error {
+				if err := os.Rename(boundary.socket, oldSocket); err != nil {
+					return err
+				}
+				if err := syscall.Kill(pane.ServerPID, 0); err != nil {
+					return fmt.Errorf("original server must remain live: %w", err)
+				}
+				if replacement {
+					if output, err := run("new-session", "-d", "-s", session); err != nil {
+						return fmt.Errorf("create foreign S2: %w: %s", err, output)
+					}
+				}
+				return nil
+			}
+			t.Cleanup(func() {
+				if output, err := exec.Command(boundary.binary, "-S", oldSocket, "-f", "/dev/null", "kill-server").CombinedOutput(); err != nil {
+					t.Errorf("stop exact original fixture server: %v: %s", err, output)
+				}
+			})
+			if err := guardedReviewerKillSession(t.Context(), boundary, pane, session, "", nil); err == nil {
+				t.Fatal("live original server was certified absent")
+			}
+			if err := syscall.Kill(pane.ServerPID, 0); err != nil {
+				t.Fatalf("original server no longer live: %v", err)
+			}
+			if replacement {
+				if output, err := run("has-session", "-t", "="+session); err != nil {
+					t.Fatalf("foreign S2 was killed: %v: %s", err, output)
+				}
+			}
+		})
 	}
 }
 
@@ -237,6 +513,9 @@ func TestHostAllowsOnlyExactReviewerGuardedKill(t *testing.T) {
 	args := []string{"if-shell", "-F", "-t", agentruntime.PaneTarget(session), reviewerGuardCondition(pane), "kill-session -t " + pane.SessionID, "display-message -p " + reviewerGuardMismatch}
 	if !validTmuxBoundaryArgs(args, nil, "", "") {
 		t.Fatal("host denied exact server-side reviewer guard")
+	}
+	if !validTmuxBoundaryArgs([]string{"list-sessions", "-F", reviewerSessionsFormat}, nil, "", "") || validTmuxBoundaryArgs([]string{"list-sessions", "-F", "#{session_name}"}, nil, "", "") {
+		t.Fatal("host did not allow only exact reviewer server inventory")
 	}
 	for _, change := range []func([]string){
 		func(args []string) { args[3] = "=foreign:0.0" },
@@ -302,8 +581,8 @@ func TestReviewerMissingSessionWithLiveTmuxServerNeedsGroupDeath(t *testing.T) {
 }
 
 func TestCertifiedReviewerCleanupGuardsDeadPaneAcrossServerReplacement(t *testing.T) {
-	for _, replace := range []bool{false, true} {
-		t.Run(fmt.Sprintf("replace_%t", replace), func(t *testing.T) {
+	for _, mode := range []string{"exact", "replaced_before_guard", "replaced_after_guard_inventory_failed"} {
+		t.Run(mode, func(t *testing.T) {
 			boundary, run := reviewerGuardTmux(t)
 			root := t.TempDir()
 			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 299, Number: 1, BaseSHA: strings.Repeat("a", 40)}
@@ -323,6 +602,11 @@ func TestCertifiedReviewerCleanupGuardsDeadPaneAcrossServerReplacement(t *testin
 			proof := reviewerProcessProof{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: target, Mode: agentruntime.ReviewModePlan, EffectID: identity.EffectID, IssueGeneration: 1, AttemptGeneration: 1, GroupPID: identity.ChildPID, DeadProved: true}
 			if output, err := run("new-session", "-d", "-s", session); err != nil {
 				t.Fatalf("create reviewer S1: %v: %s", err, output)
+			}
+			if mode != "replaced_before_guard" {
+				if output, err := run("new-session", "-d", "-s", "anchor"); err != nil {
+					t.Fatalf("create S1 anchor: %v: %s", err, output)
+				}
 			}
 			if output, err := run("set-option", "-w", "-t", agentruntime.PaneTarget(session), "remain-on-exit", "on"); err != nil {
 				t.Fatalf("retain reviewer pane: %v: %s", err, output)
@@ -354,7 +638,7 @@ func TestCertifiedReviewerCleanupGuardsDeadPaneAcrossServerReplacement(t *testin
 					t.Fatal("reviewer pane did not exit")
 				}
 			}
-			if replace {
+			if mode == "replaced_before_guard" {
 				boundary.beforeGuard = func() error {
 					if output, err := run("kill-server"); err != nil {
 						return fmt.Errorf("replace reviewer server: %w: %s", err, output)
@@ -375,10 +659,27 @@ func TestCertifiedReviewerCleanupGuardsDeadPaneAcrossServerReplacement(t *testin
 					}
 					return nil
 				}
+			} else if mode == "replaced_after_guard_inventory_failed" {
+				boundary.afterGuard = func() error {
+					if output, err := run("kill-server"); err != nil {
+						return fmt.Errorf("stop original server after guard: %w: %s", err, output)
+					}
+					if err := waitReviewerTmuxSocketDisconnected(boundary.socket); err != nil {
+						return err
+					}
+					if err := os.Remove(boundary.socket); err != nil && !errors.Is(err, os.ErrNotExist) {
+						return err
+					}
+					if output, err := run("new-session", "-d", "-s", session); err != nil {
+						return fmt.Errorf("create foreign reviewer S2: %w: %s", err, output)
+					}
+					boundary.inventoryError = errors.New("injected inventory failure")
+					return nil
+				}
 			}
 			err := cleanupCertifiedReviewResources(t.Context(), boundary, nil, attempt, attempt.BaseSHA, target, snapshot, session, root, proof)
-			if replace {
-				if err == nil || !strings.Contains(err.Error(), "changed before guarded stop") {
+			if mode != "exact" {
+				if err == nil || mode == "replaced_before_guard" && !strings.Contains(err.Error(), "changed before guarded stop") || mode == "replaced_after_guard_inventory_failed" && !strings.Contains(err.Error(), "absence is unproved") {
 					t.Fatalf("certified cleanup killed foreign S2 or guard did not report false branch: %v", err)
 				}
 				if output, err := run("has-session", "-t", "="+session); err != nil {
@@ -477,6 +778,9 @@ func (b *reviewerSessionStopBoundary) call(_ context.Context, operation string, 
 		return b.status, b.err
 	case "if-shell":
 		b.killed = append(b.killed, strings.TrimPrefix(command.Args[5], "kill-session -t "))
+		if pane, err := parseReviewerPaneIdentity(b.status.Output); err == nil {
+			b.inventory = fmt.Sprintf("%d|%d|anchor\n", pane.ServerPID, pane.StartTime)
+		}
 		b.status = agentruntime.Result{Output: "||||||||||\n"}
 		if b.onKill != nil {
 			return agentruntime.Result{}, b.onKill()
@@ -484,6 +788,8 @@ func (b *reviewerSessionStopBoundary) call(_ context.Context, operation string, 
 		return agentruntime.Result{}, b.killErr
 	case "wait-for":
 		return agentruntime.Result{}, nil
+	case "list-sessions":
+		return agentruntime.Result{Output: b.inventory}, nil
 	case "has-session":
 		name := strings.TrimPrefix(command.Args[2], "=")
 		return agentruntime.Result{Exited: true, Code: 1, Output: "can't find session: " + name}, errors.New("reviewer session is absent")
