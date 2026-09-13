@@ -717,7 +717,11 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 		result, err = s.orchestrator.Rebuild(r.Context())
 	case "investigate":
 		orchestratorStatus, statusErr := s.orchestrator.Status(r.Context())
-		if statusErr != nil || !orchestratorStatus.Enabled || orchestratorStatus.State != "running" {
+		if statusErr != nil {
+			http.Error(w, "orchestrator status is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if !orchestratorStatus.Enabled || orchestratorStatus.State != "running" {
 			http.Error(w, "orchestrator is not running", http.StatusConflict)
 			return
 		}
@@ -729,7 +733,14 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 		result, err = s.orchestrator.Investigate(r.Context(), status.Issue, status.Attempt)
 	}
 	if err != nil {
-		http.Error(w, "orchestrator action was refused", http.StatusConflict)
+		switch {
+		case errors.Is(err, orchestratoragent.ErrPrecondition):
+			http.Error(w, internalgithub.Redact(err.Error()), http.StatusConflict)
+		case errors.Is(err, orchestratoragent.ErrSupervisorStopped), errors.Is(err, orchestratoragent.ErrSupervisorBusy), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			http.Error(w, "orchestrator is temporarily unavailable", http.StatusServiceUnavailable)
+		default:
+			http.Error(w, "orchestrator action failed", http.StatusInternalServerError)
+		}
 		return
 	}
 	result.Diagnostic = internalgithub.Redact(result.Diagnostic)

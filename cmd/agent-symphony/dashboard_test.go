@@ -586,6 +586,33 @@ func TestDashboardOrchestratorClearAndRebuildAreBodylessPOSTsWithContextTransiti
 	}
 }
 
+func TestDashboardOrchestratorActionErrorsAreClassified(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code int
+		body string
+	}{
+		{"precondition", fmt.Errorf("%w: audit is already running", orchestratoragent.ErrPrecondition), http.StatusConflict, "audit is already running"},
+		{"stopped", orchestratoragent.ErrSupervisorStopped, http.StatusServiceUnavailable, "temporarily unavailable"},
+		{"cancelled", context.Canceled, http.StatusServiceUnavailable, "temporarily unavailable"},
+		{"failure", errors.New("tmux failed"), http.StatusInternalServerError, "orchestrator action failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeDashboardOrchestrator{status: orchestratoragent.Status{Version: 1, Enabled: true, State: "running"}, err: test.err}
+			handler := dashboardOrchestratorHandler(t.Context(), t.TempDir(), "tmux", service, false, "")
+			request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/orchestrator/recover", nil)
+			request.Header.Set("Origin", "http://127.0.0.1")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.code || !strings.Contains(response.Body.String(), test.body) {
+				t.Fatalf("status=%d body=%q want status=%d containing %q", response.Code, response.Body.String(), test.code, test.body)
+			}
+		})
+	}
+}
+
 func TestDashboardOrchestratorTerminalIsExactAndLoopbackOnly(t *testing.T) {
 	root := t.TempDir()
 	session := "as-o-test-repository"
