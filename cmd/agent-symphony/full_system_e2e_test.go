@@ -698,7 +698,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	fixture.mu.Unlock()
 	removalPlaywright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "removal-playwright"))
 	removalPlaywright.Dir = source
-	removalPlaywright.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+restartAddress)
+	removalPlaywright.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+restartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL)
 	if removalOutput, removalErr := removalPlaywright.CombinedOutput(); removalErr != nil {
 		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 		t.Fatalf("real permanent-removal Playwright: %v\n%s\nledger=%s\nserve:\n%s", removalErr, removalOutput, ledger, restartOutput.String())
@@ -785,6 +785,12 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	_ = response.Body.Close()
 	if decodeErr != nil || !slices.Contains(removalState.Hidden, dashboardHiddenAttempt{Repository: "o/r", Issue: 73, Attempt: 1, Reason: "removed"}) {
 		t.Fatalf("removed attempt did not persist after restart/reconcile: state=%#v err=%v", removalState, decodeErr)
+	}
+	removalRestartBrowser := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "removal-restart-playwright"))
+	removalRestartBrowser.Dir = source
+	removalRestartBrowser.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+removalRestartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_REMOVAL_E2E_PHASE=post-restart")
+	if browserOutput, browserErr := removalRestartBrowser.CombinedOutput(); browserErr != nil {
+		t.Fatalf("removed attempt reappeared in browser after restart/reconcile: %v\n%s\nserve=%s", browserErr, browserOutput, removalRestartOutput.String())
 	}
 	fixture.mu.Lock()
 	deniedMutations = append([]string(nil), fixture.deniedMutations...)

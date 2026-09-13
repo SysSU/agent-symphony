@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -36,8 +40,10 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	tracing := os.Getenv("AGENT_SYMPHONY_FULL_SYSTEM_RACE") == "1"
-	for _, action := range []string{"cancel", "recover", "review-plan", "review-plan-cancel"} {
+	for _, action := range []string{"cancel", "recover", "review-plan", "review-plan-cancel", "review-plan-archive", "dismiss-overlap", "abandon-overlap"} {
 		t.Run(action, func(t *testing.T) {
+			overlap := strings.HasSuffix(action, "-overlap")
+			controlledCycle := overlap
 			root, err := os.MkdirTemp("/tmp", "as-lifecycle-")
 			if err != nil {
 				t.Fatal(err)
@@ -72,7 +78,17 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 			runExternal(t, repository, "git", "push", "-q", "runtime-fixture", "main")
 			manifest := historicalFullSystemManifest(t, sourceGit, stateRoot, base, 73, 1)
 			manifest.State = "running"
-			if action == "recover" {
+			if action == "dismiss-overlap" {
+				if err := os.WriteFile(filepath.Join(manifest.Worktree, "completed.txt"), []byte("published attempt\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				runExternal(t, manifest.Worktree, "git", "-c", "user.name=Lifecycle fixture", "-c", "user.email=fixture@example.invalid", "add", "completed.txt")
+				runExternal(t, manifest.Worktree, "git", "-c", "user.name=Lifecycle fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "completed attempt")
+				manifest.State, manifest.ReviewHead = "completed", strings.TrimSpace(runExternal(t, manifest.Worktree, "git", "rev-parse", "HEAD"))
+				if err := os.WriteFile(agentruntime.ResultPath(manifest.Worktree), []byte(`{"type":"agent-symphony-result-v1","validation":"completed fixture passed","documentation":"none"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if action == "recover" || overlap {
 				manifest.State = "failed"
 				manifest.Diagnostic = "fixture worker failed"
 			}
@@ -101,9 +117,71 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 				}
 				comments = append(comments, map[string]any{"id": 2, "body": "Attempt failed closed: fixture worker failed\n\n" + terminal, "created_at": manifest.UpdatedAt.Format(time.RFC3339Nano), "updated_at": manifest.UpdatedAt.Format(time.RFC3339Nano), "user": map[string]any{"id": 42}})
 			}
-			fixture := &fullSystemGitHub{base: base, origin: origin, labels: map[string]bool{"agent-ready": true, "priority:P1": true, "autonomous-merge": true}, comments: comments}
-			github := httptest.NewServer(fixture)
+			if action == "dismiss-overlap" {
+				marker, err := internalgithub.AttemptMarker(73, 1, manifest.Branch, manifest.ReviewHead, 91, "review")
+				if err != nil {
+					t.Fatal(err)
+				}
+				comments = []map[string]any{{"id": 73, "body": marker, "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}}}
+			}
+			if action == "abandon-overlap" {
+				comments = nil
+			}
+			labels := map[string]bool{"agent-ready": true, "priority:P1": true, "autonomous-merge": true}
+			if action == "abandon-overlap" {
+				labels = map[string]bool{}
+			}
+			fixture := &fullSystemGitHub{base: base, origin: origin, labels: labels, comments: comments, closed: action == "dismiss-overlap"}
+			if action == "dismiss-overlap" {
+				fixture.pr = map[string]any{"number": 91, "body": comments[0]["body"], "state": "closed", "merged": true, "merged_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "head": map[string]any{"sha": manifest.ReviewHead, "ref": manifest.Branch}, "base": map[string]any{"sha": base}}
+			}
+			retryEntered, retryRelease := make(chan struct{}, 1), make(chan struct{})
+			var releaseRetry sync.Once
+			var holdReconcile atomic.Bool
+			var markerExposed, markerObserved atomic.Bool
+			reconcileEntered, reconcileRelease := make(chan struct{}), make(chan struct{})
+			var releaseReconcile sync.Once
+			github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if overlap && r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/73/comments" && markerExposed.Load() {
+					markerObserved.Store(true)
+				}
+				if overlap && r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues" && holdReconcile.CompareAndSwap(true, false) {
+					close(reconcileEntered)
+					select {
+					case <-reconcileRelease:
+					case <-r.Context().Done():
+						return
+					}
+				}
+				if action == "recover" && r.Method == http.MethodPost && r.URL.Path == "/fixture/release-retry" {
+					releaseRetry.Do(func() { close(retryRelease) })
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				if action == "recover" && r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/73/comments" {
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					r.Body = io.NopCloser(bytes.NewReader(body))
+					if bytes.Contains(body, []byte("/agent-symphony retry")) {
+						select {
+						case retryEntered <- struct{}{}:
+						default:
+						}
+						select {
+						case <-retryRelease:
+						case <-r.Context().Done():
+							return
+						}
+					}
+				}
+				fixture.ServeHTTP(w, r)
+			}))
 			defer github.Close()
+			defer releaseRetry.Do(func() { close(retryRelease) })
+			defer releaseReconcile.Do(func() { close(reconcileRelease) })
 			binDir := filepath.Join(root, "bin")
 			if err := os.Mkdir(binDir, 0o700); err != nil {
 				t.Fatal(err)
@@ -149,6 +227,7 @@ printf '%%s\n' "$result"
 `, reviewGate)
 				if action == "review-plan-cancel" {
 					codex = fmt.Sprintf(`#!/bin/sh
+trap '' TERM HUP
 printf '%%s\n' "$$" > %q || exit 1
 IFS= read -r release < %q || exit 1
 test "$release" = release || exit 1
@@ -162,6 +241,11 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 			cfg := config.Default("o/r")
 			cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
 			cfg.ReconciliationIntervalSeconds = 1
+			serveInterval := "200ms"
+			if controlledCycle {
+				cfg.ReconciliationIntervalSeconds = 60
+				serveInterval = "60s"
+			}
 			configPath := filepath.Join(repository, config.DefaultPath)
 			if err := config.Write(configPath, cfg); err != nil {
 				t.Fatal(err)
@@ -172,10 +256,10 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 			}
 			address := freeAddress(t)
 			environment := append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_GITHUB_URL="+github.URL, "CODEX_HOME="+filepath.Join(root, "codex-home"), "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
-			if action != "recover" {
+			if action != "recover" && !overlap {
 				ensureFullSystemTmuxSession(t, environment, manifest.Session, repository)
 			}
-			server := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", "200ms")
+			server := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", serveInterval)
 			server.Dir, server.Env = repository, environment
 			output := &synchronizedBuffer{}
 			server.Stdout, server.Stderr = output, output
@@ -196,10 +280,32 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				limit = 90 * time.Second
 			}
 			waitHTTP(t, "http://"+address+"/status.json", limit, output)
+			if controlledCycle {
+				request, err := http.NewRequest(http.MethodPost, "http://"+address+"/actions/reconcile", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.Header.Set("Origin", "http://"+address)
+				response, err := http.DefaultClient.Do(request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, readErr := io.ReadAll(response.Body)
+				_ = response.Body.Close()
+				if readErr != nil || response.StatusCode != http.StatusNoContent {
+					t.Fatalf("initial closed-issue reconciliation: HTTP %d, read=%v, body=%s", response.StatusCode, readErr, body)
+				}
+			}
 			if !waitFor(limit, func() bool {
 				ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
 				if err != nil || len(ledger.Observations[ownerIssueKey("o/r", 73)].IssueUpdates) != 0 {
 					return false
+				}
+				if overlap {
+					observation := ledger.Observations[ownerIssueKey("o/r", 73)]
+					if observation.ObservationEpoch != ledger.Epoch || observation.OwnerGeneration != ledger.IssueGenerations[ownerIssueKey("o/r", 73)] || !observation.Present || action == "dismiss-overlap" && (!observation.Attempts[key].Present || observation.Attempts[key].Fact.State != "completed" || observation.Attempts[key].Fact.PR != 91) {
+						return false
+					}
 				}
 				controlsSettled := false
 				for _, effect := range ledger.Effects {
@@ -207,7 +313,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 						controlsSettled = true
 					}
 				}
-				if !controlsSettled {
+				if !overlap && !controlsSettled {
 					return false
 				}
 				response, err := http.Get("http://" + address + "/status.json")
@@ -221,7 +327,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				}
 				for _, status := range snapshot.Statuses {
 					if status.Issue == 73 && status.Attempt == 1 {
-						return action == "recover" && status.Retryable || action != "recover" && status.State == "active"
+						return action == "recover" && status.Retryable || action == "dismiss-overlap" && status.State == "completed" && status.IssueClosed && !status.OperatorBlocked || action == "abandon-overlap" && status.State == "orphaned" && !status.OperatorBlocked || action != "recover" && !overlap && status.State == "active"
 					}
 				}
 				return false
@@ -229,9 +335,60 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 				t.Fatalf("%s button never became available: ledger=%s serve=%s", action, ledger, output.String())
 			}
+			if action == "recover" {
+				select {
+				case <-retryEntered:
+				case <-time.After(limit):
+					t.Fatal("automatic retry never reached the fake-GitHub barrier")
+				}
+			}
+			var blockedCycle <-chan error
+			var sourceCycle, sourceStale uint64
+			if overlap {
+				before, err := readRuntimeOwnerState(stateRoot, "o/r")
+				if err != nil {
+					t.Fatal(err)
+				}
+				sourceCycle = before.CycleOutcomeID
+				sourceStale = before.StaleReconciliations
+				if action == "dismiss-overlap" {
+					markerExposed.Store(true)
+				}
+				holdReconcile.Store(true)
+				request, err := http.NewRequest(http.MethodPost, "http://"+address+"/actions/reconcile", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.Header.Set("Origin", "http://"+address)
+				done := make(chan error, 1)
+				blockedCycle = done
+				go func() {
+					response, err := http.DefaultClient.Do(request)
+					if err != nil {
+						done <- err
+						return
+					}
+					body, readErr := io.ReadAll(response.Body)
+					_ = response.Body.Close()
+					if readErr != nil {
+						done <- readErr
+					} else if response.StatusCode != http.StatusNoContent {
+						done <- fmt.Errorf("reconciliation returned HTTP %d: %s", response.StatusCode, body)
+					} else {
+						done <- nil
+					}
+				}()
+				select {
+				case <-reconcileEntered:
+				case err := <-blockedCycle:
+					t.Fatalf("reconciliation finished before GitHub read was blocked: %v", err)
+				case <-time.After(limit):
+					t.Fatal("reconciliation did not enter blocked fake-GitHub read")
+				}
+			}
 			playwright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "playwright"))
 			playwright.Dir = source
-			playwright.Env = append(os.Environ(), "AGENT_SYMPHONY_LIFECYCLE_E2E_URL=http://"+address, "AGENT_SYMPHONY_LIFECYCLE_E2E_ACTION="+action, "AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEW_GATE="+reviewGate, "AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEWER_PID="+reviewerPID, "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(tracing))
+			playwright.Env = append(os.Environ(), "AGENT_SYMPHONY_LIFECYCLE_E2E_URL=http://"+address, "AGENT_SYMPHONY_LIFECYCLE_E2E_ACTION="+action, "AGENT_SYMPHONY_LIFECYCLE_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEW_GATE="+reviewGate, "AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEWER_PID="+reviewerPID, "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(tracing))
 			if browserOutput, err := playwright.CombinedOutput(); err != nil {
 				ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 				reviewerArtifact := ""
@@ -249,9 +406,151 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				}
 				t.Fatalf("%s browser: %v\n%s\nreviewer artifact=%s\nledger=%s\nserve=%s", action, err, browserOutput, reviewerArtifact, ledger, output.String())
 			}
+			if overlap {
+				mutation := strings.TrimSuffix(action, "-overlap")
+				terminalAction := map[string]string{"dismiss": "dismissed", "abandon": "abandoned"}[mutation]
+				verifyAbsent := func(address, stage string) {
+					verify := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, stage+"-playwright"))
+					verify.Dir = source
+					verify.Env = append(os.Environ(), "AGENT_SYMPHONY_LIFECYCLE_E2E_URL=http://"+address, "AGENT_SYMPHONY_LIFECYCLE_E2E_ACTION="+action+"-verify", "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(tracing))
+					if browserOutput, err := verify.CombinedOutput(); err != nil {
+						t.Fatalf("%s after %s: %v\n%s", mutation, stage, err, browserOutput)
+					}
+				}
+				if !waitFor(limit, func() bool {
+					ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+					tombstone := ledger.Tombstones[key]
+					if err != nil || tombstone.Action != terminalAction || tombstone.InvalidatedGeneration != 1 || tombstone.Generation <= tombstone.InvalidatedGeneration || ledger.Attempts[key].Generation != 0 || mutation == "dismiss" && tombstone.CleanupPhase != "completed" {
+						return false
+					}
+					for _, receipt := range ledger.ControlReceipts {
+						if receipt.Request.Action == mutation && receipt.Request.Issue == 73 && receipt.Request.Attempt == 1 && (mutation == "abandon" && receipt.State == "pending" && receipt.EffectID == tombstone.EffectID || receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK) {
+							return true
+						}
+					}
+					return false
+				}) {
+					ledger, _ := readRuntimeOwnerState(stateRoot, "o/r")
+					t.Fatalf("%s did not commit receipt/tombstone while GitHub was blocked: tombstone=%#v receipts=%#v", mutation, ledger.Tombstones[key], ledger.ControlReceipts)
+				}
+				select {
+				case err := <-blockedCycle:
+					t.Fatalf("%s only finished after blocked reconciliation escaped early: %v", mutation, err)
+				default:
+				}
+				if mutation == "abandon" {
+					fixture.mu.Lock()
+					fixture.comments = []map[string]any{{"id": 73, "body": active, "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}}}
+					markerExposed.Store(true)
+					fixture.mu.Unlock()
+					parsed, err := internalgithub.CollectIssueFactsV2(t.Context(), internalgithub.API{BaseURL: github.URL, HTTP: github.Client(), Retries: -1}, githubPRConfig(cfg, 42), nil)
+					if err != nil || len(parsed.Facts) != 1 || parsed.Facts[0].Issue != 73 || parsed.Facts[0].ActiveAttempt == nil || parsed.Facts[0].ActiveAttempt.Attempt != 1 || parsed.Facts[0].ActiveAttempt.BaseSHA != base || parsed.Facts[0].ActiveAttempt.State != "active" {
+						t.Fatalf("fake GitHub did not parse an active attempt-1 fact: facts=%#v err=%v", parsed.Facts, err)
+					}
+					markerObserved.Store(false)
+				}
+				releaseReconcile.Do(func() { close(reconcileRelease) })
+				select {
+				case err := <-blockedCycle:
+					if err != nil {
+						t.Fatalf("stale reconciliation after %s: %v", mutation, err)
+					}
+				case <-time.After(limit):
+					t.Fatalf("stale reconciliation did not finish after %s", mutation)
+				}
+				if !markerObserved.Load() {
+					t.Fatal("held reconciliation did not read the fake-GitHub attempt marker")
+				}
+				if !waitFor(limit, func() bool {
+					ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+					return err == nil && ledger.CycleOutcomeID > sourceCycle && (mutation != "abandon" || ledger.StaleReconciliations > sourceStale) && ledger.Tombstones[key].Action == terminalAction && ledger.Attempts[key].Generation == 0 && !ledger.Observations[ownerIssueKey("o/r", 73)].Attempts[key].Present
+				}) {
+					ledger, _ := readRuntimeOwnerState(stateRoot, "o/r")
+					t.Fatalf("stale reconciliation restored %s attempt or was not rejected: stale=%d source=%d observation=%#v", mutation, ledger.StaleReconciliations, sourceStale, ledger.Observations[ownerIssueKey("o/r", 73)].Attempts[key])
+				}
+				verifyAbsent(address, "post-cycle")
+				if !waitFor(limit, func() bool {
+					ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+					if err != nil || ledger.Tombstones[key].CleanupPhase != "completed" {
+						return false
+					}
+					for _, receipt := range ledger.ControlReceipts {
+						if receipt.Request.Action == mutation && receipt.Request.Issue == 73 && receipt.Request.Attempt == 1 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK {
+							return true
+						}
+					}
+					return false
+				}) {
+					ledger, _ := readRuntimeOwnerState(stateRoot, "o/r")
+					tombstone := ledger.Tombstones[key]
+					_, worktreeErr := os.Lstat(manifest.Worktree)
+					_, logErr := os.Lstat(manifest.LogPath)
+					_, manifestErr := os.Lstat(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"))
+					_, markerErr := os.Lstat(filepath.Join(stateRoot, "runtime-effects", tombstone.EffectID+".done"))
+					t.Fatalf("%s cleanup did not complete after GitHub release: tombstone=%#v receipts=%#v effect=%#v worktree=%v log=%v manifest=%v marker=%v tmux=%t serve=%s", mutation, tombstone, ledger.ControlReceipts, ledger.Effects[tombstone.EffectID], worktreeErr, logErr, manifestErr, markerErr, fullSystemTmuxSessionExists(environment, manifest.Session), output.String())
+				}
+				if err := server.Process.Signal(os.Interrupt); err != nil {
+					t.Fatal(err)
+				}
+				if err := server.Wait(); err != nil {
+					t.Fatalf("%s shutdown: %v", mutation, err)
+				}
+				stopped = true
+				restarted := freeAddress(t)
+				restart := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", restarted, "--interval", serveInterval)
+				restart.Dir, restart.Env = repository, environment
+				restartOutput := &synchronizedBuffer{}
+				restart.Stdout, restart.Stderr = restartOutput, restartOutput
+				if err := restart.Start(); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = restart.Process.Kill(); _ = restart.Wait() })
+				waitHTTP(t, "http://"+restarted+"/status.json", limit, restartOutput)
+				reconcileRequest, err := http.NewRequest(http.MethodPost, "http://"+restarted+"/actions/reconcile", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				reconcileRequest.Header.Set("Origin", "http://"+restarted)
+				reconcileResponse, err := http.DefaultClient.Do(reconcileRequest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				reconcileBody, readErr := io.ReadAll(reconcileResponse.Body)
+				_ = reconcileResponse.Body.Close()
+				if readErr != nil || reconcileResponse.StatusCode != http.StatusNoContent {
+					t.Fatalf("post-restart reconciliation: HTTP %d, read=%v, body=%s", reconcileResponse.StatusCode, readErr, reconcileBody)
+				}
+				if !waitFor(limit, func() bool {
+					ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+					if err != nil || ledger.Tombstones[key].Action != terminalAction || ledger.Attempts[key].Generation != 0 {
+						return false
+					}
+					response, err := http.Get("http://" + restarted + "/status.json")
+					if err != nil {
+						return false
+					}
+					defer response.Body.Close()
+					var snapshot dashboardStatusSnapshot
+					if json.NewDecoder(response.Body).Decode(&snapshot) != nil {
+						return false
+					}
+					for _, status := range snapshot.Statuses {
+						if status.Issue == 73 && status.Attempt == 1 {
+							return false
+						}
+					}
+					return true
+				}) {
+					t.Fatalf("restart restored %s attempt: %s", mutation, restartOutput.String())
+				}
+				verifyAbsent(restarted, "restart")
+				return
+			}
 			terminalAction := action
 			if action == "review-plan-cancel" {
 				terminalAction = "cancel"
+			} else if action == "review-plan-archive" {
+				terminalAction = "review-plan"
 			}
 			var completed controlReceipt
 			if !waitFor(limit, func() bool {
@@ -270,6 +569,20 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 				t.Fatalf("%s did not commit durable completion: %s\nserve=%s", action, ledger, output.String())
 			}
+			if action == "recover" {
+				second, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 73, 2)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !waitFor(limit, func() bool {
+					current, err := readRuntimeOwnerState(stateRoot, "o/r")
+					recovered, ok := current.Attempts[ownerAttemptKey("o/r", 73, 2)]
+					return err == nil && ok && recovered.Manifest.State == "running" && recovered.Manifest.Session == second && fullSystemTmuxSessionExists(environment, second)
+				}) {
+					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
+					t.Fatalf("recover did not start usable attempt 2: %#v\nserve=%s", current.Attempts[ownerAttemptKey("o/r", 73, 2)], output.String())
+				}
+			}
 			if action == "review-plan-cancel" {
 				reviewerSession, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 73, 1)
 				if err != nil {
@@ -286,8 +599,8 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				if err != nil || pid < 2 {
 					t.Fatalf("invalid reviewer PID %q: %v", pidBody, err)
 				}
-				if !waitFor(limit, func() bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) }) {
-					t.Fatalf("cancel left reviewer process %d alive", pid)
+				if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+					t.Fatalf("cancel completed while TERM/HUP-ignoring reviewer process %d was still alive: %v", pid, err)
 				}
 				gate, err := os.OpenFile(reviewGate, os.O_RDWR|syscall.O_NONBLOCK, 0)
 				if err != nil {
@@ -307,6 +620,179 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
 					t.Errorf("no reconciliation cycle completed after cancel: outcome source=%d cancel revision=%d diagnostic=%q", current.CycleOutcomeSource, completed.Result.OwnerRevision, current.CycleDiagnostic)
 				}
+			}
+			if action == "review-plan-archive" {
+				if ledger, err := readRuntimeOwnerState(stateRoot, "o/r"); err != nil || ledger.Attempts[key].Manifest.ReviewState != "clean" {
+					t.Fatalf("archive fixture never completed owner-bound plan review: attempt=%#v err=%v", ledger.Attempts[key], err)
+				}
+				if err := os.WriteFile(filepath.Join(manifest.Worktree, "reviewed.txt"), []byte("reviewed implementation\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				runExternal(t, manifest.Worktree, "git", "-c", "user.name=Lifecycle fixture", "-c", "user.email=fixture@example.invalid", "add", "reviewed.txt")
+				runExternal(t, manifest.Worktree, "git", "-c", "user.name=Lifecycle fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "reviewed implementation")
+				if err := os.WriteFile(agentruntime.ResultPath(manifest.Worktree), []byte(`{"type":"agent-symphony-result-v1","validation":"reviewed fixture passed","documentation":"none"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				target := agentruntime.PaneTarget(manifest.Session)
+				for _, args := range [][]string{{"set-option", "-w", "-t", target, "remain-on-exit", "on"}, {"respawn-pane", "-k", "-t", target, "--", binary, "pane-exit-status", "tmux", "--", "true"}} {
+					command := exec.Command("tmux", args...)
+					command.Env = environment
+					if result, err := command.CombinedOutput(); err != nil {
+						t.Fatalf("complete reviewed implementation pane: %v: %s", err, result)
+					}
+				}
+				if !waitFor(limit, func() bool {
+					current, err := readRuntimeOwnerState(stateRoot, "o/r")
+					return err == nil && current.Attempts[key].Manifest.State == "completed"
+				}) {
+					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
+					t.Fatalf("reviewed implementation did not complete: attempt=%#v serve=%s", current.Attempts[key], output.String())
+				}
+				if !waitFor(limit, func() bool {
+					current, err := readRuntimeOwnerState(stateRoot, "o/r")
+					attempt := current.Attempts[key].Manifest
+					return err == nil && attempt.ReviewState == "running" && attempt.ReviewMode == agentruntime.ReviewModeImplementation && attempt.ReviewSnapshot != "" && attempt.ReviewSession != ""
+				}) {
+					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
+					t.Fatalf("Plan cleanup did not yield an implementation reviewer: attempt=%#v effects=%s serve=%s", current.Attempts[key], fullSystemEffectSummary(current), output.String())
+				}
+				gate, err := os.OpenFile(reviewGate, os.O_RDWR|syscall.O_NONBLOCK, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := gate.WriteString("release\n"); err != nil {
+					t.Fatal(err)
+				}
+				if !waitFor(limit, func() bool {
+					current, err := readRuntimeOwnerState(stateRoot, "o/r")
+					attempt := current.Attempts[key].Manifest
+					return err == nil && attempt.ReviewState == "clean" && attempt.ReviewMode == agentruntime.ReviewModeImplementation
+				}) {
+					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
+					t.Fatalf("implementation reviewer did not finish clean: attempt=%#v effects=%s serve=%s", current.Attempts[key], fullSystemEffectSummary(current), output.String())
+				}
+				if err := gate.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if !waitFor(limit, func() bool {
+					current, err := readRuntimeOwnerState(stateRoot, "o/r")
+					if err != nil {
+						return false
+					}
+					for _, effect := range current.Effects {
+						if effect.Action == string(reconciliationGitHubPublish) && effect.Issue == 73 && effect.Attempt == 1 && effect.State == "completed" {
+							return true
+						}
+					}
+					return false
+				}) {
+					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
+					t.Fatalf("reviewed implementation was not published by an owner effect: effects=%s serve=%s", fullSystemEffectSummary(current), output.String())
+				}
+				if !waitFor(limit, func() bool {
+					fixture.mu.Lock()
+					defer fixture.mu.Unlock()
+					return fixture.merged && fixture.closed
+				}) {
+					fixture.mu.Lock()
+					pr := fixture.pr
+					fixture.mu.Unlock()
+					t.Fatalf("published reviewed PR was not merged and closed: pr=%#v serve=%s", pr, output.String())
+				}
+				if !waitFor(limit, func() bool {
+					response, err := http.Get("http://" + address + "/status.json")
+					if err != nil {
+						return false
+					}
+					defer response.Body.Close()
+					var snapshot dashboardStatusSnapshot
+					if json.NewDecoder(response.Body).Decode(&snapshot) != nil {
+						return false
+					}
+					for _, status := range snapshot.Statuses {
+						if status.Issue == 73 && status.Attempt == 1 {
+							return status.State == "completed" && !status.OperatorBlocked
+						}
+					}
+					return false
+				}) {
+					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
+					t.Fatalf("reviewed attempt never became Archive-eligible: observation=%#v cycle=%q serve=%s", current.Observations[ownerIssueKey("o/r", 73)], current.CycleDiagnostic, output.String())
+				}
+				archive := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "archive-playwright"))
+				archive.Dir = source
+				archive.Env = append(os.Environ(), "AGENT_SYMPHONY_LIFECYCLE_E2E_URL=http://"+address, "AGENT_SYMPHONY_LIFECYCLE_E2E_ACTION=review-plan-archive-click", "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(tracing))
+				if browserOutput, err := archive.CombinedOutput(); err != nil {
+					t.Fatalf("reviewed Archive browser: %v\n%s\nserve=%s", err, browserOutput, output.String())
+				}
+				if !waitFor(limit, func() bool {
+					current, err := readRuntimeOwnerState(stateRoot, "o/r")
+					if err != nil || current.Tombstones[key].Action != "archived" || current.Tombstones[key].CleanupPhase != "completed" || current.Attempts[key].Generation != 0 {
+						return false
+					}
+					for _, receipt := range current.ControlReceipts {
+						if receipt.Request.Action == "archive" && receipt.Request.Issue == 73 && receipt.Request.Attempt == 1 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK && receipt.EffectID != "" && current.Effects[receipt.EffectID].State == "completed" {
+							return true
+						}
+					}
+					return false
+				}) {
+					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
+					t.Fatalf("reviewed Archive did not commit: tombstone=%#v receipts=%#v effects=%#v serve=%s", current.Tombstones[key], current.ControlReceipts, current.Effects, output.String())
+				}
+				snapshotPath, _ := reviewIdentity(agentruntime.Attempt{Repository: "o/r", Issue: 73, Number: 1}, productionSnapshotRoot(stateRoot))
+				current, err := readRuntimeOwnerState(stateRoot, "o/r")
+				if err != nil || current.Effects[completed.EffectID].Reconciliation == nil || current.Effects[completed.EffectID].Reconciliation.Reviewer == nil {
+					t.Fatalf("reviewer effect identity lost after Archive: effect=%#v err=%v", current.Effects[completed.EffectID], err)
+				}
+				reviewer := current.Effects[completed.EffectID].Reconciliation.Reviewer
+				for _, path := range []string{manifest.Worktree, snapshotPath, reviewResultPath(snapshotPath, reviewer.Target)} {
+					if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("Archive retained runtime resource %s: %v", path, err)
+					}
+				}
+				if err := server.Process.Signal(os.Interrupt); err != nil {
+					t.Fatal(err)
+				}
+				if err := server.Wait(); err != nil {
+					t.Fatalf("reviewed Archive shutdown: %v\n%s", err, output.String())
+				}
+				stopped = true
+				restarted := freeAddress(t)
+				restart := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", restarted, "--interval", serveInterval)
+				restart.Dir, restart.Env = repository, environment
+				restartOutput := &synchronizedBuffer{}
+				restart.Stdout, restart.Stderr = restartOutput, restartOutput
+				if err := restart.Start(); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = restart.Process.Kill(); _ = restart.Wait() })
+				waitHTTP(t, "http://"+restarted+"/status.json", limit, restartOutput)
+				reconcileRequest, err := http.NewRequest(http.MethodPost, "http://"+restarted+"/actions/reconcile", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				reconcileRequest.Header.Set("Origin", "http://"+restarted)
+				reconcileResponse, err := http.DefaultClient.Do(reconcileRequest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				reconcileBody, readErr := io.ReadAll(reconcileResponse.Body)
+				_ = reconcileResponse.Body.Close()
+				if readErr != nil || reconcileResponse.StatusCode != http.StatusNoContent {
+					t.Fatalf("reviewed Archive restart reconciliation: HTTP %d read=%v body=%s", reconcileResponse.StatusCode, readErr, reconcileBody)
+				}
+				persisted, err := readRuntimeOwnerState(stateRoot, "o/r")
+				if err != nil || persisted.Tombstones[key].Action != "archived" || persisted.Tombstones[key].CleanupPhase != "completed" || persisted.Attempts[key].Generation != 0 {
+					t.Fatalf("reviewed Archive did not survive restart: tombstone=%#v attempt=%#v err=%v", persisted.Tombstones[key], persisted.Attempts[key], err)
+				}
+				verify := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "archive-restart-playwright"))
+				verify.Dir = source
+				verify.Env = append(os.Environ(), "AGENT_SYMPHONY_LIFECYCLE_E2E_URL=http://"+restarted, "AGENT_SYMPHONY_LIFECYCLE_E2E_ACTION=review-plan-archive-verify", "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(tracing))
+				if browserOutput, err := verify.CombinedOutput(); err != nil {
+					t.Fatalf("reviewed Archive restart browser: %v\n%s", err, browserOutput)
+				}
+				return
 			}
 			if err := server.Process.Signal(os.Interrupt); err != nil {
 				t.Fatal(err)
@@ -359,8 +845,14 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				fixture.mu.Lock()
 				comments := append([]map[string]any(nil), fixture.comments...)
 				fixture.mu.Unlock()
-				if len(comments) < 3 || !strings.Contains(fmt.Sprint(comments[len(comments)-1]["body"]), "retry") {
-					t.Fatalf("recover did not durably authorize a retry on GitHub: %#v", comments)
+				retries := 0
+				for _, comment := range comments {
+					if fmt.Sprint(comment["body"]) == "/agent-symphony retry" {
+						retries++
+					}
+				}
+				if retries != 1 {
+					t.Fatalf("recover expected one durable GitHub retry authorization, got %d: %#v", retries, comments)
 				}
 			case "review-plan":
 				effect := ledger.Effects[completed.EffectID]
@@ -394,6 +886,32 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 			}
 			if action == "review-plan" && persisted.Attempts[key].Manifest.ReviewState != "clean" {
 				t.Fatalf("clean reviewer outcome did not survive restart: %#v", persisted.Attempts[key])
+			}
+			if action == "recover" {
+				second, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 73, 2)
+				recovered, ok := persisted.Attempts[ownerAttemptKey("o/r", 73, 2)]
+				if !ok || recovered.Manifest.State != "running" || recovered.Manifest.Session != second || !fullSystemTmuxSessionExists(environment, second) {
+					t.Fatalf("recovered attempt 2 was not live after restart: %#v", recovered)
+				}
+				if !waitFor(limit, func() bool {
+					response, err := http.Get("http://" + restartAddress + "/status.json")
+					if err != nil {
+						return false
+					}
+					defer response.Body.Close()
+					var snapshot dashboardStatusSnapshot
+					if json.NewDecoder(response.Body).Decode(&snapshot) != nil {
+						return false
+					}
+					for _, status := range snapshot.Statuses {
+						if status.Issue == 73 && status.Attempt == 2 {
+							return status.State == "active" && status.Session == second
+						}
+					}
+					return false
+				}) {
+					t.Fatal("restart did not project recovered attempt 2 as active with the owned live session")
+				}
 			}
 			if (action == "cancel" || action == "review-plan-cancel") && persisted.Attempts[key].Manifest.State != "cancelled" {
 				t.Fatalf("cancelled attempt did not survive restart: %#v", persisted.Attempts[key])
