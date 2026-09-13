@@ -445,6 +445,9 @@ func applySupersedePlanReview(state *runtimeOwnerState, command supersedePlanRev
 	if !ok || proof.EffectID != effect.ID || proof.GroupPID != effect.ReviewerGroupPID || !proof.DeadProved || proof.NeverRan == effect.ReviewerLaunched {
 		return errStateConflict
 	}
+	if reviewer.Mode == agentruntime.ReviewModePlan && !planReviewInvalidated(*state, effect) {
+		return errStateConflict
+	}
 	request := *effect.Reconciliation
 	issueKey := ownerIssueKey(effect.Repository, effect.Issue)
 	attemptKey := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
@@ -509,6 +512,27 @@ func applySupersedePlanReview(state *runtimeOwnerState, command supersedePlanRev
 	effect.State, effect.ReconciliationResult, effect.Diagnostic = "completed", &result, ""
 	state.Effects[effect.ID] = effect
 	return nil
+}
+
+// Only a fresh owner observation (or an exact generation/tombstone change)
+// may revoke a receipt-bound Plan review that is still running.
+func planReviewInvalidated(state runtimeOwnerState, effect runtimeEffectIntent) bool {
+	request := *effect.Reconciliation
+	issueKey := ownerIssueKey(effect.Repository, effect.Issue)
+	attemptKey := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+	if state.IssueGenerations[issueKey] != effect.IssueGeneration || state.AttemptGenerations[attemptKey] != effect.AttemptGeneration {
+		return true
+	}
+	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned {
+		return true
+	}
+	observation, ok := state.Observations[issueKey]
+	if !ok || observation.ObservationEpoch != state.Epoch {
+		return false
+	}
+	attempt, present := observedReconciliationAttempt(observation, request.Attempt)
+	record, exists := state.Attempts[attemptKey]
+	return !reconciliationFinishObservationMatches(state, request) || !exists || request.Manifest == nil || !sameReconciliationManifest(request, record.Manifest, *request.Manifest) || !observation.Fact.DispatchAuthorized || !present || attempt.State != "active" && attempt.State != "review-ready"
 }
 
 func applyFinishReconciliationEffect(stateRoot string, state *runtimeOwnerState, command finishReconciliationEffectCommand) error {

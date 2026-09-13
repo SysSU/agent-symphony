@@ -913,6 +913,49 @@ func TestProductionCycleCollectsAppliesAndPlansWithoutLegacyWriters(t *testing.T
 	}
 }
 
+func TestProductionCycleStopsReceiptBoundPlanReviewerAfterFreshExternalAbsence(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 473, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	boundary := bindLiveReviewerForService(t, owner, reviewer)
+	service.reviewer = boundary
+	reads := 0
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet {
+			return nil, fmt.Errorf("unexpected mutation %s", request.URL.String())
+		}
+		reads++
+		var value any
+		switch request.URL.RequestURI() {
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1", "/repos/o/r/issues?state=open&per_page=100&page=1":
+			value = []any{}
+		case "/repos/o/r":
+			value = map[string]any{"default_branch": "main"}
+		case "/repos/o/r/branches/main":
+			value = map[string]any{"commit": map[string]any{"sha": strings.Repeat("a", 40)}}
+		default:
+			return nil, fmt.Errorf("unexpected read %s", request.URL.String())
+		}
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
+	})}}
+	production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, api: api, collector: reconciliationV2Collector{API: api, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}, Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: "o/r"}}}
+	cycle, err := owner.reconciliationSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := production.cycleFromSnapshot(t.Context(), cycle); !errors.Is(err, errReconciliationRecollect) {
+		t.Fatalf("fresh collector cycle did not preempt reviewer: %v", err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	receipt, ok := operatorReceiptByID(state, fmt.Sprintf("pending-plan-%d", manifest.Issue))
+	proof := state.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, agentruntime.ReviewModePlan, reviewer.Reconciliation.Reviewer.Target)]
+	gone, groupErr := reviewerGroupGone(proof.GroupPID)
+	if reads == 0 || !ok || receipt.State != "completed" || receipt.Result == nil || receipt.Result.Status != http.StatusConflict || !proof.DeadProved || !gone || groupErr != nil || len(boundary.killed) != 1 {
+		t.Fatalf("cycle failed to stop live review: reads=%d receipt=%#v proof=%#v gone=%v groupErr=%v killed=%v", reads, receipt, proof, gone, groupErr, boundary.killed)
+	}
+}
+
 func TestStartupMarkerSweepLeavesOperatorEffectsToReceiptRecovery(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 42, "completed", false)
 	snapshot := mustOwnerSnapshot(t, owner)

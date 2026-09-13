@@ -197,6 +197,12 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	p.effects.cancelInvalidated(applied)
 	if p.operator != nil {
 		p.operator.cancelSupersededPlanWatchers(cycleSnapshot, applied)
+		if superseded, err := p.supersedeInvalidPendingPlanReviewers(ctx, applied); err != nil || superseded {
+			if err != nil {
+				return err
+			}
+			return errReconciliationRecollect
+		}
 		p.operator.scanPendingPlanReviewers(ctx, applied)
 	}
 	if resumed, err := p.resumePendingReconciliation(ctx, api, batch); err != nil || resumed {
@@ -275,6 +281,23 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 		return errReconciliationRecollect
 	}
 	return p.runRetirementPhase(ctx)
+}
+
+// Receipt-bound Plan reviews are excluded from generic reconciliation replay.
+// A fresh observation must revoke them here, including while their pane lives.
+func (p *productionReconciliation) supersedeInvalidPendingPlanReviewers(ctx context.Context, snapshot stateOwnerSnapshot) (bool, error) {
+	for _, receipt := range snapshot.State.ControlReceipts {
+		if receipt.State != "pending" || receipt.Request.Action != "review-plan" {
+			continue
+		}
+		effect, ok := snapshot.State.Effects[receipt.EffectID]
+		if !ok || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan || !planReviewInvalidated(snapshot.State, effect) {
+			continue
+		}
+		p.effects.cancelEffect(effect.ID)
+		return p.operator.supersedeInvalidPlanReview(ctx, effect)
+	}
+	return false, nil
 }
 
 func (p *productionReconciliation) resumePendingReconciliation(ctx context.Context, api internalgithub.API, batch reconciliationV2Batch) (bool, error) {

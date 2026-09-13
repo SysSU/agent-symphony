@@ -24,6 +24,7 @@ type runtimeEffectCoordinator struct {
 
 type activeRuntimeEffect struct {
 	issueGeneration, attemptGeneration, observationGeneration uint64
+	admittedRevision                                          uint64
 	effectID                                                  string
 	ctx                                                       context.Context
 	cancel                                                    context.CancelFunc
@@ -245,6 +246,10 @@ func (c *runtimeEffectCoordinator) acquire(ctx context.Context, request agentrun
 
 func (c *runtimeEffectCoordinator) acquireKey(ctx context.Context, key string, issueGeneration, attemptGeneration, observationGeneration uint64, effectID ...string) (*activeRuntimeEffect, error) {
 	for {
+		admitted, err := c.owner.snapshot(ctx)
+		if err != nil {
+			return nil, err
+		}
 		c.mu.Lock()
 		if c.stopped {
 			c.mu.Unlock()
@@ -257,7 +262,7 @@ func (c *runtimeEffectCoordinator) acquireKey(ctx context.Context, key string, i
 		previous := c.active[key]
 		if previous == nil {
 			runCtx, cancel := context.WithCancel(c.lifecycle)
-			run := &activeRuntimeEffect{issueGeneration: issueGeneration, attemptGeneration: attemptGeneration, observationGeneration: observationGeneration, ctx: runCtx, cancel: cancel, done: make(chan struct{})}
+			run := &activeRuntimeEffect{issueGeneration: issueGeneration, attemptGeneration: attemptGeneration, observationGeneration: observationGeneration, admittedRevision: admitted.State.Revision, ctx: runCtx, cancel: cancel, done: make(chan struct{})}
 			if len(effectID) != 0 {
 				run.effectID = effectID[0]
 			}
@@ -334,6 +339,9 @@ func (c *runtimeEffectCoordinator) cancelInvalidated(snapshot stateOwnerSnapshot
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for key, run := range c.active {
+		if snapshot.State.Revision < run.admittedRevision {
+			continue // An older commit cannot revoke a later admission.
+		}
 		if run.effectID != "" {
 			effect, ok := snapshot.State.Effects[run.effectID]
 			if !ok || effect.State != "pending" {

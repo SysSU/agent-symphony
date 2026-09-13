@@ -1201,7 +1201,7 @@ func applyBindReviewerStopping(state *runtimeOwnerState, command bindReviewerSto
 		return errStaleStateResult
 	}
 	var proof reviewerProcessProof
-	if effect.Reconciliation != nil && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Mode == agentruntime.ReviewModePlan {
+	if effect.Reconciliation != nil && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Phase == "run-observe" {
 		if !effect.ReviewerGateProtocol || !effect.ReviewerSessionRequested || effect.ReviewerGroupPID != 0 && effect.ReviewerGroupPID != command.GroupPID {
 			return errStateConflict
 		}

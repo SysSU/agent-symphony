@@ -756,14 +756,19 @@ func TestBindReviewerStoppingReplacesOnlyPriorDeadSameTargetProof(t *testing.T) 
 	const oldID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const newID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	const stopID = "cccccccccccccccccccccccccccccccc"
-	for _, action := range []string{string(agentruntime.EffectStop), string(agentruntime.EffectCleanup), string(reconciliationReviewer)} {
+	for _, action := range []string{string(agentruntime.EffectStop), string(agentruntime.EffectCleanup), string(reconciliationReviewer), "implementation run-observe"} {
 		t.Run(action, func(t *testing.T) {
+			review := review
+			if action == "implementation run-observe" {
+				review.Reviewer.Mode = agentruntime.ReviewModeImplementation
+			}
 			state := newRuntimeOwnerState(review.Repository)
 			key := reviewerProofKey(review.Repository, review.Issue, review.Attempt, review.Reviewer.Mode, review.Reviewer.Target)
 			old := reviewerProcessProof{Repository: review.Repository, Issue: review.Issue, Attempt: review.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, EffectID: oldID, IssueGeneration: 1, AttemptGeneration: 1, GroupPID: 11111, DeadProved: true}
 			state.ReviewerProofs[key] = old
 			effect := runtimeEffectIntent{ID: stopID, Action: action, Repository: review.Repository, Issue: review.Issue, Attempt: review.Attempt, IssueGeneration: 2, AttemptGeneration: 2, IntentEpoch: 1, IntentRevision: 3, State: "pending", RequestDigest: strings.Repeat("d", 64), ReviewerGateProtocol: true, ReviewerSessionRequested: true}
-			if action == string(reconciliationReviewer) {
+			if action == string(reconciliationReviewer) || action == "implementation run-observe" {
+				effect.Action = string(reconciliationReviewer)
 				effect.ID = newID
 				effect.Reconciliation = &review
 			} else {
