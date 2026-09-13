@@ -114,9 +114,37 @@ test("operator controls the real supervised orchestrator and manual reconciliati
   await expect(terminal.locator(".xterm-rows")).toContainText("orchestrator-projection-present");
   await terminal.getByRole("button", { name: "Close" }).click();
 
-  const reconcile = page.waitForResponse((response) => response.url().endsWith("/actions/reconcile") && response.request().method() === "POST");
-  await page.getByRole("button", { name: "Check now" }).click();
-  expect((await reconcile).status()).toBe(204);
+  const discovered = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#192\b/ }) });
+  await expect(discovered).toHaveCount(0);
+  const fixture = process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_FAKE_GITHUB_URL;
+  expect((await fetch(`${fixture}/fixture/check-now/hold`, { method: "POST" })).status).toBe(204);
+  let released = false;
+  try {
+    const requested = page.waitForRequest((request) => request.url().endsWith("/actions/reconcile") && request.method() === "POST");
+    let responseSettled = false;
+    const reconciled = page.waitForResponse((response) => response.url().endsWith("/actions/reconcile") && response.request().method() === "POST").then((response) => {
+      responseSettled = true;
+      return response;
+    });
+    const entered = fetch(`${fixture}/fixture/check-now/entered`);
+    const clicked = page.getByRole("button", { name: "Check now" }).click();
+    await requested;
+    const first = await Promise.race([
+      entered.then((response) => ({ source: "GitHub", response })),
+      reconciled.then((response) => ({ source: "button", response })),
+    ]);
+    expect(first.source, "Check now must reach GitHub before returning").toBe("GitHub");
+    expect(first.response.status).toBe(204);
+    expect(responseSettled, "manual reconciliation must await the held GitHub read").toBe(false);
+    await expect(discovered).toHaveCount(0);
+    expect((await fetch(`${fixture}/fixture/check-now/release`, { method: "POST" })).status).toBe(204);
+    released = true;
+    await clicked;
+    expect((await reconciled).status()).toBe(204);
+  } finally {
+    if (!released) await fetch(`${fixture}/fixture/check-now/release`, { method: "POST" });
+  }
   await expect(page.getByRole("status").filter({ hasText: "Reconciliation completed." })).toBeVisible();
+  await expect(discovered).toContainText("Check now discovered this issue");
   expect(errors).toEqual([]);
 });
