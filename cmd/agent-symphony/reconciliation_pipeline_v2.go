@@ -423,13 +423,15 @@ func planReconciliationReviewers(snapshot stateOwnerSnapshot, stateRoot string, 
 		}
 		phase, mode, target, base, head := "run-observe", manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead
 		snapshotPath, session := reviewIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(stateRoot))
-		if manifest.State == "completed" && validOptionalObjectID(candidate.HeadSHA) && candidate.HeadSHA != "" && candidate.HeadSHA != manifest.BaseSHA && (candidate.HeadSHA != manifest.ReviewHead || manifest.ReviewInvalidated && manifest.ReviewSnapshot == "" && manifest.ReviewSession == "") {
-			mode, base, head, target = agentruntime.ReviewModeImplementation, manifest.BaseSHA, candidate.HeadSHA, manifest.BaseSHA+".."+candidate.HeadSHA
-		} else if manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued" {
-			if manifest.ReviewSnapshot == "" && manifest.ReviewSession == "" {
+		if (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued" || manifest.ReviewState == "failed") && (manifest.ReviewSnapshot != "" || manifest.ReviewSession != "") {
+			if !reviewerCleanupProved(snapshot.State, manifest.Repository, manifest.Issue, manifest.Attempt, manifest.ReviewMode, manifest.ReviewTarget) {
 				continue
 			}
 			phase, mode, target, base, head, snapshotPath, session = "cleanup", manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession
+		} else if manifest.State == "completed" && validOptionalObjectID(candidate.HeadSHA) && candidate.HeadSHA != "" && candidate.HeadSHA != manifest.BaseSHA && (candidate.HeadSHA != manifest.ReviewHead || manifest.ReviewInvalidated) && (manifest.ReviewState != "findings-queued" || manifest.ReviewHandoffAck) {
+			mode, base, head, target = agentruntime.ReviewModeImplementation, manifest.BaseSHA, candidate.HeadSHA, manifest.BaseSHA+".."+candidate.HeadSHA
+		} else if manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued" {
+			continue
 		} else if manifest.ReviewState == "preparing" || manifest.ReviewState == "running" {
 			expected := reviewerEffectRequest{Mode: mode, Target: target, BaseSHA: base, HeadSHA: head, Snapshot: snapshotPath, Session: session}
 			if !reviewManifestMatches(manifest, &expected) {
