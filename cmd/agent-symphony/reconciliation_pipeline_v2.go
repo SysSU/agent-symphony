@@ -424,7 +424,7 @@ func planReconciliationReviewers(snapshot stateOwnerSnapshot, stateRoot string, 
 		phase, mode, target, base, head := "run-observe", manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead
 		snapshotPath, session := reviewIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(stateRoot))
 		if (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued" || manifest.ReviewState == "failed") && (manifest.ReviewSnapshot != "" || manifest.ReviewSession != "") {
-			if !reviewerCleanupProved(snapshot.State, manifest.Repository, manifest.Issue, manifest.Attempt, manifest.ReviewMode, manifest.ReviewTarget) {
+			if manifest.ReviewSnapshot != snapshotPath || manifest.ReviewSession != session || !reviewerCleanupProved(snapshot.State, manifest.Repository, manifest.Issue, manifest.Attempt, manifest.ReviewMode, manifest.ReviewTarget) {
 				continue
 			}
 			phase, mode, target, base, head, snapshotPath, session = "cleanup", manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession

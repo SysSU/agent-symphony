@@ -715,6 +715,84 @@ func TestProoflessLegacyTerminalReviewerDoesNotPoisonReconciliation(t *testing.T
 	}
 }
 
+func TestPartialLegacyReviewerBindingDoesNotPoisonSameIssueManualReconcile(t *testing.T) {
+	for _, missing := range []string{"snapshot", "session"} {
+		t.Run(missing, func(t *testing.T) {
+			test := reconciliationEffectCaseNamed(t, "reviewer-cleanup")
+			root, oldOwner, before := reconciliationEffectPersistentOwner(t, test.request)
+			if err := oldOwner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			state := cloneRuntimeOwnerState(before.State)
+			key := ownerAttemptKey(test.request.Repository, test.request.Issue, test.request.Attempt)
+			record := state.Attempts[key]
+			if missing == "snapshot" {
+				record.Manifest.ReviewSnapshot = ""
+			} else {
+				record.Manifest.ReviewSession = ""
+			}
+			state.Attempts[key] = record
+			proof := state.ReviewerProofs[reviewerProofKey(test.request.Repository, test.request.Issue, test.request.Attempt, record.Manifest.ReviewMode, record.Manifest.ReviewTarget)]
+			if !proof.DeadProved {
+				t.Fatal("fixture lacks exact reviewer death proof")
+			}
+			owner, err := startTestStateOwner(t, root, state, func(value runtimeOwnerState) error {
+				return writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), value)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = owner.close(context.Background()) })
+			refreshOwnerObservation(t, owner, test.request.Issue)
+			if err := owner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := readRuntimeOwnerState(root, test.request.Repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner, err = startTestStateOwner(t, root, loaded, func(value runtimeOwnerState) error {
+				return writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), value)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			issue := issueFact(test.request.Issue, "title")
+			issue.Attempt = test.request.Attempt
+			candidate := reviewerExecutionMaterial{Issue: issue, HeadSHA: strings.Repeat("c", 40), Command: []string{"reviewer"}}
+			production := &productionReconciliation{owner: owner, effects: &runtimeEffectCoordinator{owner: owner}, stateRoot: root}
+			trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(ctx context.Context) error {
+				return production.runReviewerPhase(ctx, []reviewerExecutionMaterial{candidate})
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = trigger.shutdown(context.Background()) })
+			project, err := newProjectDashboardServerV2(t.Context(), root, "o/r", nil, "tmux", operatorTestMutationService(t, owner), 1, false, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			project.reconcile = trigger.triggerAndWait
+			request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/actions/reconcile", nil)
+			request.Header.Set("Origin", "http://127.0.0.1")
+			response := httptest.NewRecorder()
+			project.webHandler().ServeHTTP(response, request)
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("same-issue manual Reconcile HTTP %d: %s", response.Code, response.Body.String())
+			}
+			after := mustOwnerSnapshot(t, owner)
+			if !reflect.DeepEqual(after.State.Attempts[key].Manifest, record.Manifest) {
+				t.Fatalf("partial legacy reviewer binding changed: %#v", after.State.Attempts[key].Manifest)
+			}
+			for _, effect := range after.State.Effects {
+				if effect.State == "pending" && effect.Reconciliation != nil && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer.Phase == "cleanup" {
+					t.Fatalf("unfinishable cleanup intent persisted: %#v", effect)
+				}
+			}
+		})
+	}
+}
+
 type reviewerSessionStillPresentBoundary struct{}
 
 func (reviewerSessionStillPresentBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
