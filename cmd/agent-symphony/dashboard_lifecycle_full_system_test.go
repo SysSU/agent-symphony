@@ -521,6 +521,16 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					_, markerErr := os.Lstat(filepath.Join(stateRoot, "runtime-effects", tombstone.EffectID+".done"))
 					t.Fatalf("%s cleanup did not complete after GitHub release: tombstone=%#v receipts=%#v effect=%#v worktree=%v log=%v manifest=%v marker=%v tmux=%t serve=%s", mutation, tombstone, ledger.ControlReceipts, ledger.Effects[tombstone.EffectID], worktreeErr, logErr, manifestErr, markerErr, fullSystemTmuxSessionExists(environment, manifest.Session), output.String())
 				}
+				if mutation == "archive" {
+					if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("Archive completed but retained worktree %s: %v", manifest.Worktree, err)
+					}
+					for _, path := range []string{manifest.LogPath, filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")} {
+						if _, err := os.Lstat(path); err != nil {
+							t.Fatalf("Archive did not retain diagnostic %s: %v", path, err)
+						}
+					}
+				}
 				if err := server.Process.Signal(os.Interrupt); err != nil {
 					t.Fatal(err)
 				}
