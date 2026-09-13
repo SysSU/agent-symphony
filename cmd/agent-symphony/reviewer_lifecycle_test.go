@@ -410,6 +410,19 @@ func TestReviewerSessionAbsentOnServerRequiresValidatedRow(t *testing.T) {
 	}
 }
 
+func TestReviewerSessionAbsenceProofDoesNotRequireSignalPermissionAfterExactInventory(t *testing.T) {
+	pane := reviewerPaneIdentity{ServerPID: 123, StartTime: 456}
+	if !reviewerSessionAbsenceProved("123|456|anchor\n", nil, syscall.EPERM, pane, "reviewer") {
+		t.Fatal("exact same-server inventory was rejected solely because coordinator cannot signal server")
+	}
+	if reviewerSessionAbsenceProved("123|456|anchor\n123|456|reviewer\n", nil, syscall.ESRCH, pane, "reviewer") {
+		t.Fatal("positive same-name S2 inventory was overridden by original PID death")
+	}
+	if reviewerSessionAbsenceProved("", errors.New("tmux unavailable"), syscall.EPERM, pane, "reviewer") {
+		t.Fatal("unavailable inventory and inaccessible PID were certified")
+	}
+}
+
 func TestGuardedReviewerKillRejectsUnlinkedLiveServerAndReplacement(t *testing.T) {
 	for _, replacement := range []bool{false, true} {
 		t.Run(fmt.Sprintf("replacement_%t", replacement), func(t *testing.T) {

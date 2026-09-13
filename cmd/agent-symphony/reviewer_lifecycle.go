@@ -151,14 +151,17 @@ func guardedReviewerKillSession(ctx context.Context, boundary boundaryCaller, pa
 	// The exact guard has run. A successful inventory takes precedence over
 	// original-server death: a visible S2 must not be certified absent. Without
 	// inventory, only death of the captured server proves its S1 gone.
-	if err == nil {
-		if (serverErr == nil || errors.Is(serverErr, syscall.ESRCH)) && reviewerSessionAbsentOnServer(status.Output, pane, session) {
-			return nil
-		}
-	} else if errors.Is(serverErr, syscall.ESRCH) {
+	if reviewerSessionAbsenceProved(status.Output, err, serverErr, pane, session) {
 		return nil
 	}
 	return fmt.Errorf("reviewer session absence is unproved after guarded stop (server=%v tmux=%v exited=%t code=%d output=%.256q)", serverErr, err, status.Exited, status.Code, strings.TrimSpace(status.Output))
+}
+
+func reviewerSessionAbsenceProved(inventory string, inventoryErr, serverErr error, pane reviewerPaneIdentity, session string) bool {
+	if inventoryErr == nil {
+		return reviewerSessionAbsentOnServer(inventory, pane, session)
+	}
+	return errors.Is(serverErr, syscall.ESRCH)
 }
 
 func reviewerSessionAbsentOnServer(output string, pane reviewerPaneIdentity, session string) bool {
