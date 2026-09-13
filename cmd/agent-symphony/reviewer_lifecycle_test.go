@@ -178,6 +178,24 @@ func TestInvalidatedReviewerWatcherExitsWithoutPaneSignal(t *testing.T) {
 	<-boundary.exited
 }
 
+func TestAmbiguousReviewerPaneProbeKeepsPendingIntentWithDiagnostic(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := mustOwnerSnapshot(t, owner)
+	current.State.ControlReceipts = append(current.State.ControlReceipts, controlReceipt{Request: operatorRequest("probe-reviewer", "review-plan", *request.Manifest, false), State: "pending", Phase: operatorPhaseReviewPending, EffectID: effect.ID})
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Exited: true, Code: 1, Output: "permission denied"}, err: errors.New("tmux socket unavailable")}
+	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, reviewer: boundary}
+	service.scanPendingPlanReviewers(t.Context(), current)
+	after := mustOwnerSnapshot(t, owner).State.Effects[effect.ID]
+	if after.State != "pending" || !strings.Contains(after.Diagnostic, "reviewer pane probe unavailable") || boundary.killed != nil {
+		t.Fatalf("ambiguous probe falsely terminalized reviewer: %#v boundary=%#v", after, boundary)
+	}
+}
+
 type invalidReviewArtifactBoundary struct{ calls int }
 
 func (b *invalidReviewArtifactBoundary) call(_ context.Context, operation string, _ agentruntime.Command) (agentruntime.Result, error) {

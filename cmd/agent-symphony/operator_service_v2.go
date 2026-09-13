@@ -782,10 +782,22 @@ func (s *operatorMutationService) scanPendingPlanReviewers(ctx context.Context, 
 			continue
 		}
 		status, err := s.reviewer.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(request.Session), agentruntime.PaneStatusFormat}})
-		dead := err == nil && missingTmuxPaneStatus(status)
-		if !dead && err == nil {
+		if err != nil {
+			diagnostic := "reviewer pane probe unavailable: " + internalgithub.Redact(err.Error())
+			if len(diagnostic) > maxReconciliationStringBytes {
+				diagnostic = diagnostic[:maxReconciliationStringBytes]
+			}
+			_, _ = s.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: reconciliationReviewer, Diagnostic: diagnostic})
+			continue
+		}
+		dead := missingTmuxPaneStatus(status)
+		if !dead {
 			pane, parseErr := agentruntime.ParsePaneStatus(status.Output)
-			dead = parseErr == nil && pane.Dead
+			if parseErr != nil {
+				_, _ = s.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Action: reconciliationReviewer, Diagnostic: "reviewer pane probe returned invalid status"})
+				continue
+			}
+			dead = pane.Dead
 		}
 		if !dead {
 			continue

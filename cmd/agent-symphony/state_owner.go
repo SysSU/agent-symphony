@@ -1788,7 +1788,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			issueScoped := reconciliationEffectIssueScoped(*effect.Reconciliation)
 			attemptCurrent := issueScoped && effect.Attempt == 0 && effect.AttemptGeneration == 0 || !issueScoped && effect.Attempt > 0 && effect.AttemptGeneration > 0 && (state.AttemptGenerations[attemptKey] == effect.AttemptGeneration || receiptBoundCompletion)
 			if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Action == "" || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" || !issueCurrent || !attemptCurrent || !validPersistedReconciliationEffect(state, effect) {
-				return errors.New("runtime owner reconciliation effect intent is invalid")
+				return fmt.Errorf("runtime owner reconciliation effect intent %s (%s) is invalid: identity=%t issue_current=%t attempt_current=%t payload=%t", effect.ID, effect.Action, key == effect.ID && effect.ID == runtimeEffectID(effect), issueCurrent, attemptCurrent, validPersistedReconciliationEffect(state, effect))
 			}
 			continue
 		}
