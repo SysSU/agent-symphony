@@ -373,6 +373,12 @@ func TestGuardedReviewerKillRejectsS2AfterLastServerExit(t *testing.T) {
 		if err := syscall.Kill(pane.ServerPID, 0); !errors.Is(err, syscall.ESRCH) {
 			return fmt.Errorf("S1 server death is unproved: %v", err)
 		}
+		if err := waitReviewerTmuxSocketDisconnected(boundary.socket); err != nil {
+			return err
+		}
+		if err := os.Remove(boundary.socket); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove disconnected S1 socket: %w", err)
+		}
 		if output, err := run("new-session", "-d", "-s", "anchor", "/bin/cat "+gate); err != nil {
 			return fmt.Errorf("create S2 server anchor: %w: %s", err, output)
 		}
