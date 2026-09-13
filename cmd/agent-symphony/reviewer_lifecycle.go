@@ -152,7 +152,7 @@ func guardedReviewerKillSession(ctx context.Context, boundary boundaryCaller, pa
 	if missingTmuxServer(status) || status.Exited && status.Code == 1 && strings.TrimSpace(status.Output) == "can't find session: "+session {
 		return nil
 	}
-	return fmt.Errorf("reviewer session absence is unproved after guarded stop: %w", err)
+	return fmt.Errorf("reviewer session absence is unproved after guarded stop: %w (exited=%t code=%d output=%.256q)", err, status.Exited, status.Code, strings.TrimSpace(status.Output))
 }
 
 func reviewerPanePID(output string) (int, error) {
