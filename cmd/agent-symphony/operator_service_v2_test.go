@@ -1056,6 +1056,290 @@ func admitPendingGatedPlanReviewer(t *testing.T, owner *stateOwner, service *ope
 	return reviewer
 }
 
+func TestPlanReviewScannerHonorsAdmissionReservation(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 349, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	service.reviewer = absentSessionBoundary{}
+	requestID := fmt.Sprintf("pending-plan-%d", manifest.Issue)
+	requestKey := "request:" + requestID
+	if !service.reserve(requestKey) {
+		t.Fatal("could not reserve plan review before owner admission")
+	}
+	defer service.release(requestKey)
+	effect := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	service.effects.mu.Lock()
+	defer service.effects.mu.Unlock()
+	snapshot := mustOwnerSnapshot(t, owner)
+	service.scanPendingPlanReviewers(t.Context(), snapshot)
+	service.mu.Lock()
+	replayStarted := service.active[effect.ID]
+	service.mu.Unlock()
+	if replayStarted {
+		t.Fatal("same-daemon scan reserved replay before the original admission dispatched")
+	}
+	current := mustOwnerSnapshot(t, owner).State
+	receipt, ok := operatorReceiptByID(current, requestID)
+	if !ok || receipt.State != "pending" || receipt.Phase != operatorPhaseReviewPending || current.Effects[effect.ID].ReviewerLaunched {
+		t.Fatalf("scanner altered unlaunched admission: receipt=%#v effect=%#v", receipt, current.Effects[effect.ID])
+	}
+}
+
+func TestPlanReviewAdmissionReservesBeforeEffectDispatch(t *testing.T) {
+	root := resolvedTempDir(t)
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(productionSnapshotRoot(root), func(path string, entry os.DirEntry, err error) error {
+			if err == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+	source := filepath.Join(root, "source")
+	runExternal(t, "", "git", "init", "-q", "-b", "main", source)
+	runExternal(t, source, "git", "config", "user.name", "Review fixture")
+	runExternal(t, source, "git", "config", "user.email", "fixture@example.invalid")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("plan review\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runExternal(t, source, "git", "add", "README.md")
+	runExternal(t, source, "git", "commit", "-qm", "base")
+	manifest := ownerTestManifest(t, root, 348, 1, "running")
+	manifest.BaseSHA = strings.TrimSpace(runExternal(t, source, "git", "rev-parse", "HEAD"))
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "active", false)
+	state.Epoch, state.Revision = 1, 1
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
+	initial := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "body"
+	attempt := expandAttemptFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, owner, input)
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"number":%d,"state":"open","body":"body"}`, manifest.Issue)
+	}))
+	t.Cleanup(github.Close)
+	lifecycle, stop := context.WithCancel(t.Context())
+	defer stop()
+	service := operatorServiceWithCleanup(t, owner, lifecycle, &operatorCleanupBoundary{path: manifest.Worktree})
+	service.collector.API = internalgithub.API{BaseURL: github.URL, HTTP: github.Client()}
+	service.reviewSource, service.reviewCommand = source, []string{"review"}
+	launch := &admissionReviewerBoundary{entered: make(chan struct{})}
+	service.reviewer = launch
+	service.effects.executor.Runtime.Runner = operatorOwnedRunner{manifest: manifest}
+	service.effects.executor.Runtime.Tmux, service.effects.executor.Runtime.Git = "tmux", "git"
+	request := operatorRequest("plan-admission-before-dispatch", "review-plan", manifest, false)
+	service.effects.mu.Lock() // Hold only effect cancellation, after owner admission and before dispatch.
+	locked := true
+	defer func() {
+		if locked {
+			service.effects.mu.Unlock()
+		}
+	}()
+	result := make(chan controlResult, 1)
+	go func() { result <- service.perform(t.Context(), request) }()
+	var committed stateOwnerSnapshot
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case committed = <-owner.commits:
+			if receipt, ok := operatorReceiptByID(committed.State, request.RequestID); ok && receipt.State == "pending" {
+				goto admitted
+			}
+		case got := <-result:
+			t.Fatalf("plan review returned before owner admission: %#v", got)
+		case <-deadline:
+			t.Fatal("plan review did not commit before effect dispatch barrier")
+		}
+	}
+admitted:
+	receipt, _ := operatorReceiptByID(committed.State, request.RequestID)
+	service.scanPendingPlanReviewers(t.Context(), committed)
+	service.mu.Lock()
+	replayStarted := service.active[receipt.EffectID]
+	service.mu.Unlock()
+	if replayStarted || committed.State.Effects[receipt.EffectID].ReviewerLaunched {
+		t.Fatalf("same-daemon scan stole freshly admitted reviewer: replay=%t effect=%#v", replayStarted, committed.State.Effects[receipt.EffectID])
+	}
+	duplicate := make(chan controlResult, 1)
+	go func() { duplicate <- service.perform(t.Context(), request) }()
+	service.effects.mu.Unlock()
+	locked = false
+	select {
+	case got := <-result:
+		if !got.OK || got.Status != http.StatusAccepted {
+			t.Fatalf("original reviewer admission=%#v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("original reviewer admission did not dispatch after barrier")
+	}
+	select {
+	case <-launch.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("original reviewer did not reach tmux new-session after handoff")
+	}
+	select {
+	case got := <-duplicate:
+		var status operatorReceiptStatus
+		if !got.OK || got.Status != http.StatusAccepted || json.Unmarshal(got.Data, &status) != nil || status.EffectID != receipt.EffectID {
+			t.Fatalf("duplicate RequestID did not reuse original receipt: %#v status=%#v", got, status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("duplicate RequestID did not resolve after admission handoff")
+	}
+	stop()
+	if err := service.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type admissionReviewerBoundary struct{ entered chan struct{} }
+
+func (b *admissionReviewerBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if operation != "run" || command.Name != "tmux" {
+		return agentruntime.Result{}, fmt.Errorf("unexpected reviewer command %s %s", operation, command.Name)
+	}
+	if slices.Contains(command.Args, "new-session") {
+		close(b.entered)
+		<-ctx.Done()
+		return agentruntime.Result{}, ctx.Err()
+	}
+	if slices.Contains(command.Args, "display-message") {
+		return agentruntime.Result{Output: "||||||||||"}, nil
+	}
+	if slices.Contains(command.Args, "has-session") {
+		return agentruntime.Result{Exited: true, Code: 1}, errors.New("session not found")
+	}
+	if slices.Contains(command.Args, "wait-for") || slices.Contains(command.Args, "set-option") {
+		return agentruntime.Result{}, nil
+	}
+	return agentruntime.Result{}, fmt.Errorf("unexpected reviewer command %v", command.Args)
+}
+
+func TestPlanReviewCommittedBeforeDispatchReplaysAfterRestart(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 347, "active", false)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	effect := admitPendingGatedPlanReviewer(t, owner, service, manifest)
+	committed := mustOwnerSnapshot(t, owner).State
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, committed); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, persisted, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	replayed := operatorServiceWithCleanup(t, restarted, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	replayed.collect = func(context.Context, stateOwnerSnapshot, int) (reconciliationV2Batch, error) {
+		close(entered)
+		<-release
+		return reconciliationV2Batch{}, errors.New("controlled recovery stop before external launch")
+	}
+	if err := replayed.resumePending(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("committed unstarted review was not replayed after restart")
+	}
+	state := mustOwnerSnapshot(t, restarted).State
+	receipt, ok := operatorReceiptByID(state, fmt.Sprintf("pending-plan-%d", manifest.Issue))
+	if !ok || receipt.State != "pending" || state.Effects[effect.ID].ReviewerLaunched || state.Effects[effect.ID].ReviewerRevoked {
+		t.Fatalf("restart replay altered unstarted intent before external work: receipt=%#v effect=%#v", receipt, state.Effects[effect.ID])
+	}
+	once.Do(func() { close(release) })
+	select {
+	case <-replayed.releaseSignal(effect.ID):
+	case <-time.After(5 * time.Second):
+		t.Fatal("controlled restart replay did not stop")
+	}
+}
+
+func TestPlanReviewReservationWaitHonorsCancellationAndShutdown(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 346, "active", false)
+	service := operatorTestMutationService(t, owner)
+	if err := service.reservePlanAdmission(t.Context(), "same-request"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := service.reservePlanAdmission(ctx, "same-request"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled duplicate reservation = %v", err)
+	}
+	service.release("request:same-request")
+	if err := service.reservePlanAdmission(t.Context(), "same-request"); err != nil {
+		t.Fatalf("cancelled waiter poisoned reservation: %v", err)
+	}
+	service.release("request:same-request")
+	if err := service.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.reservePlanAdmission(t.Context(), "after-shutdown"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown admitted a new reservation: %v", err)
+	}
+}
+
+type reservationWaitContext struct {
+	context.Context
+	waiting chan struct{}
+	once    sync.Once
+}
+
+func (c *reservationWaitContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
+
+func TestPlanReviewBlockedDuplicateWakesOnShutdown(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 345, "active", false)
+	service := operatorTestMutationService(t, owner)
+	if err := service.reservePlanAdmission(t.Context(), "shutdown-wait"); err != nil {
+		t.Fatal(err)
+	}
+	defer service.release("request:shutdown-wait")
+	ctx := &reservationWaitContext{Context: t.Context(), waiting: make(chan struct{})}
+	finished := make(chan error, 1)
+	go func() { finished <- service.reservePlanAdmission(ctx, "shutdown-wait") }()
+	select {
+	case <-ctx.waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("duplicate did not reach reservation wait")
+	}
+	if err := service.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("shutdown waiter result = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown left an already-waiting duplicate blocked")
+	}
+}
+
 func TestAbandonAcceptsAndStopsLiveBoundReviewerThroughService(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 339, "active", false)
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree, additionalPath: filepath.Dir(manifest.LogPath)})
