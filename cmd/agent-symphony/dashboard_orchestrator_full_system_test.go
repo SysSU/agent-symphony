@@ -88,7 +88,7 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 	var heldIssueList chan struct{}
 	var enteredIssueList chan struct{}
 	var checkNowBaseline uint64
-	var checkNowReads int
+	var startupCycleID uint64
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/fixture/check-now/hold":
@@ -97,13 +97,27 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			if ledger.CycleOutcomeEpoch != ledger.Epoch || ledger.CycleOutcomeID == 0 || ledger.CycleDiagnostic != "" || len(ledger.Attempts) != 0 || len(ledger.Effects) != 0 || len(ledger.Observations) != 0 || len(ledger.ControlReceipts) != 0 {
+				http.Error(w, "startup reconciliation or owner effects are not settled", http.StatusConflict)
+				return
+			}
+			proposal, proposalErr := os.ReadFile(filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-"+internalgithub.RepositoryIdentifier("o/r"), orchestratoragent.MessageProposalFile))
+			if proposalErr != nil || len(proposal) != 0 {
+				http.Error(w, "orchestrator proposal is not empty", http.StatusConflict)
+				return
+			}
 			checkNowMu.Lock()
+			if ledger.CycleOutcomeID != startupCycleID {
+				checkNowMu.Unlock()
+				http.Error(w, "another reconciliation ran after startup", http.StatusConflict)
+				return
+			}
 			if heldIssueList != nil {
 				checkNowMu.Unlock()
 				http.Error(w, "issue-list read is already held", http.StatusConflict)
 				return
 			}
-			heldIssueList, enteredIssueList, checkNowBaseline, checkNowReads = make(chan struct{}), make(chan struct{}), ledger.CycleOutcomeID, 2
+			heldIssueList, enteredIssueList, checkNowBaseline = make(chan struct{}), make(chan struct{}), ledger.CycleOutcomeID
 			checkNowMu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -135,16 +149,11 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 				http.Error(w, "issue-list read has not entered", http.StatusConflict)
 				return
 			}
+			githubFixture.mu.Lock()
+			githubFixture.listedIssues = []map[string]any{checkNowIssue}
+			githubFixture.mu.Unlock()
 			close(heldIssueList)
-			checkNowReads--
-			if checkNowReads == 0 {
-				githubFixture.mu.Lock()
-				githubFixture.listedIssues = []map[string]any{checkNowIssue}
-				githubFixture.mu.Unlock()
-				heldIssueList, enteredIssueList = nil, nil
-			} else {
-				heldIssueList, enteredIssueList = make(chan struct{}), make(chan struct{})
-			}
+			heldIssueList, enteredIssueList = nil, nil
 			checkNowMu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -290,7 +299,7 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 	environment := append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_GITHUB_URL="+github.URL, "CODEX_HOME="+filepath.Join(root, "codex-home"), "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
 	address := freeAddress(t)
 	start := func() (*exec.Cmd, *synchronizedBuffer) {
-		command := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--dashboard-project", peer.URL, "--interval", "60s")
+		command := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--dashboard-project", peer.URL, "--disable-periodic-reconciliation")
 		command.Dir, command.Env = repository, environment
 		output := &synchronizedBuffer{}
 		command.Stdout, command.Stderr = output, output
@@ -352,6 +361,20 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 		}
 		t.Fatalf("orchestrator dashboard was not ready: statuses=%+v serve=%s", snapshot.Statuses, output.String())
 	}
+	if !waitFor(deadline, func() bool {
+		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+		return err == nil && ledger.CycleOutcomeEpoch == ledger.Epoch && ledger.CycleOutcomeID > 0 && ledger.CycleDiagnostic == "" && len(ledger.Attempts) == 0 && len(ledger.Effects) == 0 && len(ledger.Observations) == 0 && len(ledger.ControlReceipts) == 0
+	}) {
+		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+		t.Fatalf("startup cycle or owner work did not settle before Check now: owner=%+v err=%v serve=%s", ledger, err, output.String())
+	}
+	startupLedger, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNowMu.Lock()
+	startupCycleID = startupLedger.CycleOutcomeID
+	checkNowMu.Unlock()
 	initial, err := readOrchestrator()
 	if err != nil {
 		t.Fatal(err)
@@ -412,7 +435,7 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 	if !waitFor(deadline, func() bool {
 		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
 		observation := ledger.Observations[ownerIssueKey("o/r", 192)]
-		return err == nil && ledger.CycleOutcomeID > baseline && observation.Present && observation.Fact.Title == "Check now discovered this issue"
+		return err == nil && ledger.CycleOutcomeEpoch == ledger.Epoch && ledger.CycleOutcomeID == baseline+1 && observation.Present && observation.Fact.Title == "Check now discovered this issue"
 	}) {
 		t.Fatal("Check now did not commit a new cycle with the changed fake-GitHub issue")
 	}
