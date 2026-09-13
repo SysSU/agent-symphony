@@ -114,9 +114,24 @@ test("operator controls the real supervised orchestrator and manual reconciliati
   await expect(terminal.locator(".xterm-rows")).toContainText("orchestrator-projection-present");
   await terminal.getByRole("button", { name: "Close" }).click();
 
-  const reconcile = page.waitForResponse((response) => response.url().endsWith("/actions/reconcile") && response.request().method() === "POST");
-  await page.getByRole("button", { name: "Check now" }).click();
-  expect((await reconcile).status()).toBe(204);
+  const discovered = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#192\b/ }) });
+  await expect(discovered).toHaveCount(0);
+  const fixture = process.env.AGENT_SYMPHONY_ORCHESTRATOR_E2E_FAKE_GITHUB_URL;
+  expect((await fetch(`${fixture}/fixture/check-now/hold`, { method: "POST" })).status).toBe(204);
+  let released = false;
+  try {
+    const requested = page.waitForRequest((request) => request.url().endsWith("/actions/reconcile") && request.method() === "POST");
+    const reconciled = page.waitForResponse((response) => response.url().endsWith("/actions/reconcile") && response.request().method() === "POST");
+    const clicked = page.getByRole("button", { name: "Check now" }).click();
+    await requested;
+    expect((await fetch(`${fixture}/fixture/check-now/release`, { method: "POST" })).status).toBe(204);
+    released = true;
+    await clicked;
+    expect((await reconciled).status()).toBe(204);
+  } finally {
+    if (!released) await fetch(`${fixture}/fixture/check-now/release`, { method: "POST" });
+  }
   await expect(page.getByRole("status").filter({ hasText: "Reconciliation completed." })).toBeVisible();
+  await expect(discovered).toContainText("Check now discovered this issue");
   expect(errors).toEqual([]);
 });

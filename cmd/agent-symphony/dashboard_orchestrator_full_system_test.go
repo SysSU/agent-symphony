@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -78,11 +79,69 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 	if err := writeRuntimeOwnerState(stateRoot, productionAttemptRoot(stateRoot), state); err != nil {
 		t.Fatal(err)
 	}
+	checkNowIssue := map[string]any{"number": 192, "node_id": "I_192", "title": "Check now discovered this issue", "body": "## Context\nCheck now must refresh the board.\n", "state": "open", "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "labels": []any{}}
 	githubFixture := &fullSystemGitHub{base: base, origin: origin, historicalIssues: map[int]map[string]any{
 		191: {"number": 191, "node_id": "I_191", "title": "Orchestrator control fixture", "body": "## Context\nClosed fixture.\n", "state": "closed", "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "labels": []any{}},
+		192: checkNowIssue,
 	}, historicalComments: map[int][]map[string]any{}}
-	github := httptest.NewServer(githubFixture)
-	defer github.Close()
+	var checkNowMu sync.Mutex
+	var heldIssueList chan struct{}
+	var checkNowBaseline uint64
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/fixture/check-now/hold":
+			ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			checkNowMu.Lock()
+			if heldIssueList != nil {
+				checkNowMu.Unlock()
+				http.Error(w, "issue-list read is already held", http.StatusConflict)
+				return
+			}
+			heldIssueList, checkNowBaseline = make(chan struct{}), ledger.CycleOutcomeID
+			checkNowMu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/fixture/check-now/release":
+			checkNowMu.Lock()
+			if heldIssueList == nil {
+				checkNowMu.Unlock()
+				http.Error(w, "issue-list read is not held", http.StatusConflict)
+				return
+			}
+			githubFixture.mu.Lock()
+			githubFixture.listedIssues = []map[string]any{checkNowIssue}
+			githubFixture.mu.Unlock()
+			close(heldIssueList)
+			heldIssueList = nil
+			checkNowMu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues":
+			checkNowMu.Lock()
+			held := heldIssueList
+			checkNowMu.Unlock()
+			if held != nil {
+				select {
+				case <-held:
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}
+		githubFixture.ServeHTTP(w, r)
+	}))
+	defer func() {
+		checkNowMu.Lock()
+		if heldIssueList != nil {
+			close(heldIssueList)
+		}
+		checkNowMu.Unlock()
+		github.Close()
+	}()
 	peerRoot := filepath.Join(root, "peer")
 	if err := writeDashboardStatusSnapshot(peerRoot, dashboardStatusSnapshot{UpdatedAt: time.Now().UTC(), Statuses: []orchestrator.RecoveryStatus{{Repository: "peer/project", Issue: 27, Attempt: 1, Title: "Action-eligible peer fixture", State: "completed", IssueClosed: true}}}); err != nil {
 		t.Fatal(err)
@@ -264,14 +323,10 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 		captured, _ := capture.CombinedOutput()
 		t.Fatalf("orchestrator pane is not live: %v %s\n%s\nserve=%s", liveErr, liveOutput, captured, output.String())
 	}
-	ledgerBefore, err := readRuntimeOwnerState(stateRoot, "o/r")
-	if err != nil {
-		t.Fatal(err)
-	}
 	runBrowser := func(phase string) {
 		browser := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/orchestrator-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "playwright"))
 		browser.Dir = source
-		browser.Env = append(os.Environ(), "AGENT_SYMPHONY_ORCHESTRATOR_E2E_URL="+baseURL, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_PEER="+peer.URL, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_PHASE="+phase, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_GENERATION="+strconv.Itoa(initial.Generation), "AGENT_SYMPHONY_ORCHESTRATOR_E2E_SESSION="+initial.Session, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_MODE="+initial.ContextMode, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_LAST_HEALTHY="+initial.LastHealthyAt.Format(time.RFC3339Nano), "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(raceMode))
+		browser.Env = append(os.Environ(), "AGENT_SYMPHONY_ORCHESTRATOR_E2E_URL="+baseURL, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_PEER="+peer.URL, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_PHASE="+phase, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_GENERATION="+strconv.Itoa(initial.Generation), "AGENT_SYMPHONY_ORCHESTRATOR_E2E_SESSION="+initial.Session, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_MODE="+initial.ContextMode, "AGENT_SYMPHONY_ORCHESTRATOR_E2E_LAST_HEALTHY="+initial.LastHealthyAt.Format(time.RFC3339Nano), "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(raceMode))
 		if browserOutput, err := browser.CombinedOutput(); err != nil {
 			pane := exec.Command("tmux", "display-message", "-p", "-t", agentruntime.PaneTarget(initial.Session), "#{pane_dead} #{pane_pid} #{pane_current_command}")
 			pane.Env = environment
@@ -309,11 +364,15 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 	if !fullSystemTmuxSessionExists(environment, final.Session) {
 		t.Fatal("orchestrator exact tmux session is not live after controls")
 	}
+	checkNowMu.Lock()
+	baseline := checkNowBaseline
+	checkNowMu.Unlock()
 	if !waitFor(deadline, func() bool {
 		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
-		return err == nil && ledger.CycleOutcomeID > ledgerBefore.CycleOutcomeID
+		observation := ledger.Observations[ownerIssueKey("o/r", 192)]
+		return err == nil && ledger.CycleOutcomeID > baseline && observation.Present && observation.Fact.Title == "Check now discovered this issue"
 	}) {
-		t.Fatal("Check now did not commit a reconciliation cycle")
+		t.Fatal("Check now did not commit a new cycle with the changed fake-GitHub issue")
 	}
 	if err := server.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
