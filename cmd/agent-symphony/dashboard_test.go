@@ -944,6 +944,7 @@ printf 'implementation-received:%s\r\n' "$input"
 printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"direct input received","documentation":"none"}' >"$AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
 IFS= read -r finish
 test "$finish" = finish
+printf 'implementation-finished\r\n'
 `
 	if err := os.WriteFile(agent, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
@@ -982,6 +983,13 @@ test "$finish" = finish
 	}
 	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("finish\n")); err != nil {
 		t.Fatal(err)
+	}
+	for !strings.Contains(output.String(), "implementation-finished") {
+		kind, message, err := connection.Read(deadline)
+		if err != nil || kind != websocket.MessageBinary {
+			t.Fatalf("terminal completion output=%q kind=%v err=%v", output.String(), kind, err)
+		}
+		output.Write(message)
 	}
 	connection.CloseNow()
 	var monitored agentruntime.Manifest
