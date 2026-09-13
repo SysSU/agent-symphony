@@ -221,24 +221,27 @@ type Supervisor struct {
 	Runner                agentruntime.Runner
 	Now                   func() time.Time
 
-	mu               sync.Mutex
-	projection       []sanitizedStatus
-	projectionKnown  bool
-	auditRunning     bool
-	auditChecked     bool
-	proposalRunning  bool
-	lifecycle        context.Context
-	cancel           context.CancelFunc
-	activeCancel     context.CancelFunc
-	activeGeneration uint64
-	activeDone       chan struct{}
-	activeBackground bool
-	foreground       []*foregroundReservation
-	auditGeneration  uint64
-	contextEpoch     uint64
-	active           bool
-	stopped          bool
-	wg               sync.WaitGroup
+	mu                 sync.Mutex
+	projection         []sanitizedStatus
+	projectionKnown    bool
+	auditRunning       bool
+	auditChecked       bool
+	proposalRunning    bool
+	lifecycle          context.Context
+	cancel             context.CancelFunc
+	activeCancel       context.CancelFunc
+	activeGeneration   uint64
+	activeDone         chan struct{}
+	activeBackground   bool
+	foreground         []*foregroundReservation
+	auditGeneration    uint64
+	auditCancel        context.CancelFunc
+	beforeAuditPublish func(context.Context) // deterministic completion barrier in tests
+	beforeMarkerWrite  func()                // deterministic persistence failure in tests
+	contextEpoch       uint64
+	active             bool
+	stopped            bool
+	wg                 sync.WaitGroup
 }
 
 type foregroundReservation struct {
@@ -252,7 +255,7 @@ type reservationResult struct {
 	err        error
 }
 
-func (s *Supervisor) launchAudit(startedAt time.Time, projectionDigest, diagnostic string) error {
+func (s *Supervisor) launchAudit(workspace string, startedAt time.Time, projectionDigest, diagnostic string) error {
 	s.mu.Lock()
 	if s.stopped || s.auditGeneration == ^uint64(0) {
 		s.mu.Unlock()
@@ -261,9 +264,15 @@ func (s *Supervisor) launchAudit(startedAt time.Time, projectionDigest, diagnost
 	s.auditGeneration++
 	generation := s.auditGeneration
 	contextEpoch := s.contextEpoch
+	lifecycle := s.lifecycle
+	if lifecycle == nil {
+		lifecycle = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(lifecycle, auditTimeout)
+	s.auditCancel = cancel
 	s.wg.Add(1)
 	s.mu.Unlock()
-	go s.runAudit(generation, contextEpoch, startedAt, projectionDigest, diagnostic)
+	go s.runAudit(ctx, cancel, workspace, generation, contextEpoch, startedAt, projectionDigest, diagnostic)
 	return nil
 }
 
@@ -405,10 +414,38 @@ func (s *Supervisor) auditInFlight() bool {
 	return s.auditRunning
 }
 
+// A foreground investigation supersedes an older audit without waiting for
+// its external process. Its result can only publish for the old generation.
+func (s *Supervisor) supersedeAudit() (bool, error) {
+	s.mu.Lock()
+	if !s.auditRunning {
+		s.mu.Unlock()
+		return false, nil
+	}
+	if s.auditGeneration == ^uint64(0) {
+		s.mu.Unlock()
+		return false, errors.New("orchestrator audit generation is exhausted")
+	}
+	s.auditGeneration++
+	s.auditRunning = false
+	cancel := s.auditCancel
+	s.auditCancel = nil
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return true, s.invalidateAuditReport("heartbeat audit was superseded by manual investigation", false)
+}
+
 func (s *Supervisor) setAuditRunning(running bool) {
 	s.mu.Lock()
 	s.auditRunning = running
 	s.mu.Unlock()
+}
+
+func (s *Supervisor) abortPreparedAudit(workspace string, cause error) error {
+	s.setAuditRunning(false)
+	return errors.Join(cause, os.RemoveAll(workspace), s.invalidateAuditReport("heartbeat audit did not launch", false))
 }
 
 func (s *Supervisor) claimAuditCompletion(generation, contextEpoch uint64) (context.Context, uint64, bool) {
@@ -460,6 +497,7 @@ func (s *Supervisor) Shutdown(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	s.stopped = true
+	activeDone := s.activeDone
 	for _, waiter := range s.foreground {
 		waiter.ready <- reservationResult{err: ErrSupervisorStopped}
 	}
@@ -467,10 +505,23 @@ func (s *Supervisor) Shutdown(ctx context.Context) error {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	if s.auditCancel != nil {
+		s.auditCancel()
+	}
 	if s.activeCancel != nil {
 		s.activeCancel()
 	}
 	s.mu.Unlock()
+	if activeDone != nil {
+		select {
+		case <-activeDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if err := s.invalidateAuditReport("coordinator shut down before heartbeat audit completed", false); err != nil {
+		return err
+	}
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); close(done) }()
 	select {
@@ -517,6 +568,7 @@ func (s *Supervisor) ObserveCycle(ctx context.Context, statuses []orchestrator.R
 	}
 	items := s.projection
 	digest := digest(items)
+	previousProjection, previousHeartbeat := state.LastProjection, state.LastHeartbeatAt
 	state.PendingAttention = len(attention(items))
 	diagnostic := ""
 	if cycleErr != nil {
@@ -527,6 +579,7 @@ func (s *Supervisor) ObserveCycle(ctx context.Context, statuses []orchestrator.R
 	attentionChanged := s.reconcileAttention(&state, items, now)
 	write := attentionChanged
 	launchAudit := false
+	auditWorkspace := ""
 	changed := digest != state.LastProjection && (len(items) > 0 || state.LastProjection != "")
 	if changed && len(s.AuditCommand) == 0 {
 		state.LastProjection = digest
@@ -539,7 +592,7 @@ func (s *Supervisor) ObserveCycle(ctx context.Context, statuses []orchestrator.R
 		}
 		prompt, auditErr := auditPrompt(items, state.LastHeartbeatAt, diagnostic, s.previousHeartbeatReport())
 		if auditErr == nil {
-			auditErr = s.prepareAudit(prompt, now, digest, diagnostic)
+			auditWorkspace, auditErr = s.prepareAudit(prompt, now, digest, diagnostic)
 		}
 		state.LastHeartbeatAt = now
 		if auditErr != nil {
@@ -554,19 +607,26 @@ func (s *Supervisor) ObserveCycle(ctx context.Context, statuses []orchestrator.R
 		state.UpdatedAt = now
 		if writeErr := s.writeState(state); writeErr != nil {
 			if launchAudit {
-				s.setAuditRunning(false)
+				writeErr = s.abortPreparedAudit(auditWorkspace, writeErr)
 			}
 			return statusOf(state, len(attention(items))), errors.Join(scheduleErr, writeErr)
 		}
 		if attentionChanged {
 			if handoffErr := s.writeAttentionHandoff(state.AttentionHandoff); handoffErr != nil {
+				if launchAudit {
+					handoffErr = s.abortPreparedAudit(auditWorkspace, handoffErr)
+					state.LastProjection, state.LastHeartbeatAt = previousProjection, previousHeartbeat
+					handoffErr = errors.Join(handoffErr, s.writeState(state))
+				}
 				return statusOf(state, len(attention(items))), errors.Join(scheduleErr, handoffErr)
 			}
 		}
 	}
 	if launchAudit {
-		if err := s.launchAudit(now, digest, diagnostic); err != nil {
-			s.setAuditRunning(false)
+		if err := s.launchAudit(auditWorkspace, now, digest, diagnostic); err != nil {
+			err = s.abortPreparedAudit(auditWorkspace, err)
+			state.LastProjection, state.LastHeartbeatAt = previousProjection, previousHeartbeat
+			err = errors.Join(err, s.writeState(state))
 			return statusOf(state, len(attention(items))), errors.Join(scheduleErr, err)
 		}
 	} else if !s.auditInFlight() && (len(s.AuditCommand) == 0 || state.LastProjection == digest) {
@@ -677,12 +737,28 @@ func (s *Supervisor) Investigate(ctx context.Context, issue, attemptNumber int) 
 		return statusOf(state, len(attention(s.projection))), fmt.Errorf("%w: audit command is not configured", ErrPrecondition)
 	}
 	if s.auditInFlight() {
-		return statusOf(state, len(attention(s.projection))), fmt.Errorf("%w: audit is already running", ErrPrecondition)
+		// Clear the launch-time dedup marker before cancelling the older audit.
+		// A failed write leaves that audit running and retry semantics unchanged.
+		cleared := state
+		cleared.LastInvestigation, cleared.LastHeartbeatAt, cleared.UpdatedAt = "", time.Time{}, s.now()
+		if s.beforeMarkerWrite != nil {
+			s.beforeMarkerWrite()
+		}
+		if err := s.writeState(cleared); err != nil {
+			return statusOf(state, len(attention(s.projection))), err
+		}
+		state = cleared
+	}
+	previousInvestigation, previousHeartbeat := state.LastInvestigation, state.LastHeartbeatAt
+	_, err = s.supersedeAudit()
+	if err != nil {
+		return statusOf(state, len(attention(s.projection))), err
 	}
 	now := s.now()
 	prompt, err := auditPrompt([]sanitizedStatus{item}, state.LastHeartbeatAt, "", s.previousHeartbeatReport())
+	auditWorkspace := ""
 	if err == nil {
-		err = s.prepareAudit(prompt, now, digest, "")
+		auditWorkspace, err = s.prepareAudit(prompt, now, digest, "")
 	}
 	if err != nil {
 		return statusOf(state, len(attention(s.projection))), err
@@ -690,11 +766,13 @@ func (s *Supervisor) Investigate(ctx context.Context, issue, attemptNumber int) 
 	s.setAuditRunning(true)
 	state.LastInvestigation, state.LastHeartbeatAt, state.UpdatedAt = digest, now, now
 	if err := s.writeState(state); err != nil {
-		s.setAuditRunning(false)
+		err = s.abortPreparedAudit(auditWorkspace, err)
 		return statusOf(state, len(attention(s.projection))), err
 	}
-	if err := s.launchAudit(now, digest, ""); err != nil {
-		s.setAuditRunning(false)
+	if err := s.launchAudit(auditWorkspace, now, digest, ""); err != nil {
+		err = s.abortPreparedAudit(auditWorkspace, err)
+		state.LastInvestigation, state.LastHeartbeatAt = previousInvestigation, previousHeartbeat
+		err = errors.Join(err, s.writeState(state))
 		return statusOf(state, len(attention(s.projection))), err
 	}
 	return statusOf(state, len(attention(s.projection))), nil
@@ -927,8 +1005,21 @@ func (s *Supervisor) start(ctx context.Context, state persisted) (persisted, err
 		s.mu.Unlock()
 		return s.failed(state, errors.New("orchestrator context epoch is exhausted"))
 	}
+	if s.auditRunning && s.auditGeneration == ^uint64(0) {
+		s.mu.Unlock()
+		return s.failed(state, errors.New("orchestrator audit generation is exhausted"))
+	}
 	s.contextEpoch++
+	oldAuditCancel := s.auditCancel
+	if s.auditRunning {
+		s.auditGeneration++
+		s.auditRunning = false
+		s.auditCancel = nil
+	}
 	s.mu.Unlock()
+	if oldAuditCancel != nil {
+		oldAuditCancel()
+	}
 	if err := s.invalidateAuditReport("orchestrator context changed before heartbeat audit completed", true); err != nil {
 		return state, err
 	}
@@ -1040,23 +1131,43 @@ func (s *Supervisor) stop(ctx context.Context, session string) error {
 	return nil
 }
 
-func (s *Supervisor) prepareAudit(prompt string, startedAt time.Time, projectionDigest, diagnostic string) error {
+func (s *Supervisor) prepareAudit(prompt string, startedAt time.Time, projectionDigest, diagnostic string) (string, error) {
 	if s.AuditWorkspace == "" || !filepath.IsAbs(s.AuditWorkspace) || len(s.AuditCommand) == 0 || strings.TrimSpace(s.AuditCommand[0]) == "" || len(s.Launcher) == 0 || strings.TrimSpace(s.Launcher[0]) == "" {
-		return errors.New("invalid orchestrator audit configuration")
+		return "", errors.New("invalid orchestrator audit configuration")
 	}
 	if err := os.MkdirAll(s.AuditWorkspace, 0o750); err != nil {
-		return err
+		return "", err
 	}
-	resultPath := filepath.Join(s.AuditWorkspace, auditResultFile)
-	usesResultFile := slices.ContainsFunc(s.AuditCommand, func(arg string) bool { return strings.Contains(arg, auditResultPlaceholder) })
-	if usesResultFile {
-		if err := os.Remove(resultPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove stale orchestrator audit result: %w", err)
-		}
+	parent, err := os.Lstat(s.AuditWorkspace)
+	if err != nil || !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("orchestrator audit workspace is unsafe")
 	}
-	command, err := config.ExpandManagedWorkspace(s.AuditCommand, s.AuditWorkspace)
+	workspace, err := os.MkdirTemp(s.AuditWorkspace, "orchestrator-audit-")
 	if err != nil {
-		return err
+		return "", err
+	}
+	prepared := false
+	defer func() {
+		if !prepared {
+			_ = os.RemoveAll(workspace)
+		}
+	}()
+	if err := os.Chmod(workspace, os.ModeSetgid|0o750); err != nil {
+		return "", err
+	}
+	child, err := os.Lstat(workspace)
+	if err != nil {
+		return "", err
+	}
+	parentStat, parentOK := parent.Sys().(*syscall.Stat_t)
+	childStat, childOK := child.Sys().(*syscall.Stat_t)
+	if !child.IsDir() || child.Mode()&os.ModeSymlink != 0 || child.Mode()&(os.ModePerm|os.ModeSetgid) != os.ModeSetgid|0o750 || !parentOK || !childOK || parentStat.Gid != childStat.Gid {
+		return "", errors.New("orchestrator audit workspace ownership or mode is unsafe")
+	}
+	resultPath := filepath.Join(workspace, auditResultFile)
+	command, err := config.ExpandManagedWorkspace(s.AuditCommand, workspace)
+	if err != nil {
+		return "", err
 	}
 	for index := range command {
 		command[index] = strings.ReplaceAll(command[index], auditResultPlaceholder, resultPath)
@@ -1069,45 +1180,45 @@ func (s *Supervisor) prepareAudit(prompt string, startedAt time.Time, projection
 		Timeout int      `json:"timeout_seconds"`
 	}{stateVersion, command, prompt, true, int(auditProcessTimeout / time.Second)}, "", "  ")
 	if err != nil {
-		return err
+		return "", err
 	}
-	if err := writeAtomic(filepath.Join(s.AuditWorkspace, "orchestrator-launch.json"), append(launch, '\n'), 0o440); err != nil {
-		return err
+	if err := writeAtomic(filepath.Join(workspace, "orchestrator-launch.json"), append(launch, '\n'), 0o440); err != nil {
+		return "", err
 	}
-	return s.writeHeartbeatReport(heartbeatReport{Version: stateVersion, StartedAt: startedAt, ProjectionDigest: projectionDigest, State: "running", ReconciliationDiagnostic: diagnostic})
+	if err := s.writeHeartbeatReport(heartbeatReport{Version: stateVersion, StartedAt: startedAt, ProjectionDigest: projectionDigest, State: "running", ReconciliationDiagnostic: diagnostic}); err != nil {
+		return "", err
+	}
+	prepared = true
+	return workspace, nil
 }
 
-func (s *Supervisor) runAudit(generation, contextEpoch uint64, startedAt time.Time, projectionDigest, diagnostic string) {
+func (s *Supervisor) runAudit(ctx context.Context, cancel context.CancelFunc, workspace string, generation, contextEpoch uint64, startedAt time.Time, projectionDigest, diagnostic string) {
 	defer s.wg.Done()
+	defer cancel()
+	defer os.RemoveAll(workspace)
 	var completion uint64
-	committed := false
+	reportPublished := false
 	defer func() {
-		if !committed {
-			_ = s.invalidateAuditReport("heartbeat audit completion was superseded by operator action", false)
-		}
 		s.mu.Lock()
+		current := generation == s.auditGeneration && contextEpoch == s.contextEpoch && !s.stopped
 		if generation == s.auditGeneration {
 			s.auditRunning = false
+			s.auditCancel = nil
 		}
 		s.mu.Unlock()
 		if completion != 0 {
+			if current && !reportPublished {
+				_ = s.invalidateAuditReport("heartbeat audit completion was interrupted", false)
+			}
 			s.release(completion)
 		}
 	}()
-	s.mu.Lock()
-	lifecycle := s.lifecycle
-	s.mu.Unlock()
-	if lifecycle == nil {
-		lifecycle = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(lifecycle, auditTimeout)
-	defer cancel()
 	runner := s.Runner
 	if runner == nil {
 		runner = agentruntime.ExecRunner{}
 	}
-	result, runErr := runner.Run(ctx, agentruntime.Command{Name: s.Launcher[0], Args: slices.Clone(s.Launcher[1:]), Dir: s.AuditWorkspace, Env: s.Env, MaxOutputBytes: maxAuditReportBytes})
-	resultPath := filepath.Join(s.AuditWorkspace, auditResultFile)
+	result, runErr := runner.Run(ctx, agentruntime.Command{Name: s.Launcher[0], Args: slices.Clone(s.Launcher[1:]), Dir: workspace, Env: s.Env, MaxOutputBytes: maxAuditReportBytes})
+	resultPath := filepath.Join(workspace, auditResultFile)
 	if slices.ContainsFunc(s.AuditCommand, func(arg string) bool { return strings.Contains(arg, auditResultPlaceholder) }) {
 		if runErr == nil {
 			result.Output, runErr = readAuditResult(resultPath)
@@ -1124,12 +1235,15 @@ func (s *Supervisor) runAudit(generation, contextEpoch uint64, startedAt time.Ti
 		return
 	}
 	completion = token
+	if s.beforeAuditPublish != nil {
+		s.beforeAuditPublish(completionCtx)
+	}
 	if completionCtx.Err() != nil {
 		return
 	}
 	items := slices.Clone(s.projection)
 	writeErr := s.writeHeartbeatReport(report)
-	committed = writeErr == nil
+	reportPublished = writeErr == nil
 	state, stateErr := s.readOrInitial()
 	if writeErr != nil && stateErr == nil {
 		state.Diagnostic = bounded("write heartbeat audit report: " + writeErr.Error())
