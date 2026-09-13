@@ -120,7 +120,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		} else if command.PublishedHead != "" {
 			return nil, errStateConflict
 		}
-		reviewerID, reviewerGroupPID, reviewerErr := pendingPlanReviewerEffectID(*state, request.Repository, request.Issue, request.Attempt)
+		reviewerID, reviewerGroupPID, reviewerMode, reviewerTarget, reviewerErr := pendingReviewerEffectID(*state, request.Repository, request.Issue, request.Attempt)
 		if reviewerErr != nil {
 			return nil, reviewerErr
 		}
@@ -135,6 +135,12 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		if effect != nil {
 			effect.SupersededReviewerID = reviewerID
 			effect.SupersededReviewerGroupPID = reviewerGroupPID
+			effect.SupersededReviewerMode = reviewerMode
+			effect.SupersededReviewerTarget = reviewerTarget
+			if reviewerID != "" {
+				effect.SupersededReviewerIssueGeneration = command.Identity.IssueGeneration
+				effect.SupersededReviewerAttemptGeneration = command.Identity.AttemptGeneration
+			}
 		}
 		phase = operatorPhaseCleanupPending
 	case "cancel":
@@ -145,7 +151,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		if !sameOperatorBeginIdentity(begin.Identity, command.Identity) {
 			return nil, errStaleStateResult
 		}
-		reviewerID, reviewerGroupPID, reviewerErr := pendingPlanReviewerEffectID(*state, request.Repository, request.Issue, request.Attempt)
+		reviewerID, reviewerGroupPID, reviewerMode, reviewerTarget, reviewerErr := pendingReviewerEffectID(*state, request.Repository, request.Issue, request.Attempt)
 		if reviewerErr != nil {
 			return nil, reviewerErr
 		}
@@ -155,6 +161,12 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		if effect != nil {
 			effect.SupersededReviewerID = reviewerID
 			effect.SupersededReviewerGroupPID = reviewerGroupPID
+			effect.SupersededReviewerMode = reviewerMode
+			effect.SupersededReviewerTarget = reviewerTarget
+			if reviewerID != "" {
+				effect.SupersededReviewerIssueGeneration = command.Identity.IssueGeneration
+				effect.SupersededReviewerAttemptGeneration = command.Identity.AttemptGeneration
+			}
 		}
 		phase = operatorPhaseStopPending
 	case "recover":
@@ -389,22 +401,26 @@ func supersedePendingOperatorWorkflows(state *runtimeOwnerState, repository stri
 	}
 }
 
-func pendingPlanReviewerEffectID(state runtimeOwnerState, repository string, issue, attempt int) (string, int, error) {
+func pendingReviewerEffectID(state runtimeOwnerState, repository string, issue, attempt int) (string, int, string, string, error) {
 	issueGeneration := state.IssueGenerations[ownerIssueKey(repository, issue)]
 	attemptGeneration := state.AttemptGenerations[ownerAttemptKey(repository, issue, attempt)]
 	var selected string
 	var groupPID int
+	var target string
+	var mode string
 	for _, effect := range state.Effects {
-		if effect.Repository != repository || effect.Issue != issue || effect.Attempt != attempt || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan {
+		if effect.Repository != repository || effect.Issue != issue || effect.Attempt != attempt || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Phase != "run-observe" {
 			continue
 		}
 		if selected != "" || effect.IssueGeneration != issueGeneration || effect.AttemptGeneration != attemptGeneration {
-			return "", 0, errStateConflict
+			return "", 0, "", "", errStateConflict
 		}
 		selected = effect.ID
 		groupPID = effect.ReviewerGroupPID
+		target = effect.Reconciliation.Reviewer.Target
+		mode = effect.Reconciliation.Reviewer.Mode
 	}
-	return selected, groupPID, nil
+	return selected, groupPID, mode, target, nil
 }
 
 func bindOperatorReceipt(state *runtimeOwnerState, requestID string, effect *runtimeEffectIntent, revision uint64) {

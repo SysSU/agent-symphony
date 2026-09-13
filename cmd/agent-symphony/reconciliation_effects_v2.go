@@ -354,7 +354,7 @@ func applyMarkPlanReviewRunning(stateRoot string, state *runtimeOwnerState, comm
 		return errStaleStateResult
 	}
 	request := *effect.Reconciliation
-	if request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Mode != agentruntime.ReviewModePlan || request.Reviewer.Phase != "run-observe" || request.Manifest == nil || command.GroupPID < 2 {
+	if request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe" || request.Manifest == nil || command.GroupPID < 2 {
 		return errStateConflict
 	}
 	if err := reconciliationEffectFinishCurrent(stateRoot, *state, effect); err != nil {
@@ -366,9 +366,42 @@ func applyMarkPlanReviewRunning(stateRoot string, state *runtimeOwnerState, comm
 		}
 		return nil
 	}
+	if state.ReviewerProofs == nil {
+		state.ReviewerProofs = map[string]reviewerProcessProof{}
+	}
+	key := reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, request.Reviewer.Mode, request.Reviewer.Target)
+	if old, exists := state.ReviewerProofs[key]; exists && !old.DeadProved && old.EffectID != effect.ID {
+		return errStateConflict
+	}
+	state.ReviewerProofs[key] = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, EffectID: effect.ID, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, GroupPID: command.GroupPID}
 	effect.ReviewerLaunched = true
 	effect.ReviewerGroupPID = command.GroupPID
 	state.Effects[effect.ID] = effect
+	return nil
+}
+
+func applyProveReviewerDead(state *runtimeOwnerState, command proveReviewerDeadCommand) error {
+	effect, ok := state.Effects[command.Identity.EffectID]
+	if !ok || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || !reconciliationEffectIdentityMatches(effect, command.Identity) {
+		return errStaleStateResult
+	}
+	if command.NeverRan != (command.GroupPID == 0) || effect.ReviewerLaunched && (command.NeverRan || effect.ReviewerGroupPID != command.GroupPID) || !effect.ReviewerLaunched && !command.NeverRan && command.GroupPID < 2 {
+		return errStateConflict
+	}
+	key := reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, effect.Reconciliation.Reviewer.Mode, effect.Reconciliation.Reviewer.Target)
+	proof, ok := state.ReviewerProofs[key]
+	if ok && (proof.EffectID != effect.ID || proof.GroupPID != command.GroupPID || proof.IssueGeneration != effect.IssueGeneration || proof.AttemptGeneration != effect.AttemptGeneration) || !ok && effect.ReviewerLaunched {
+		return errStateConflict
+	}
+	if !ok {
+		proof = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.Reconciliation.Reviewer.Mode, Target: effect.Reconciliation.Reviewer.Target, EffectID: effect.ID, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, GroupPID: command.GroupPID, NeverRan: command.NeverRan}
+	}
+	proof.DeadProved = true
+	state.ReviewerProofs[key] = proof
+	if !effect.ReviewerLaunched && command.GroupPID > 1 {
+		effect.ReviewerLaunched, effect.ReviewerGroupPID = true, command.GroupPID
+		state.Effects[effect.ID] = effect
+	}
 	return nil
 }
 
@@ -382,6 +415,11 @@ func applySupersedePlanReview(state *runtimeOwnerState, command supersedePlanRev
 	}
 	if effect.State == "completed" {
 		return nil // A terminal receipt is immutable.
+	}
+	reviewer := effect.Reconciliation.Reviewer
+	proof, ok := state.ReviewerProofs[reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, reviewer.Mode, reviewer.Target)]
+	if !ok || proof.EffectID != effect.ID || proof.GroupPID != effect.ReviewerGroupPID || !proof.DeadProved || proof.NeverRan == effect.ReviewerLaunched {
+		return errStateConflict
 	}
 	request := *effect.Reconciliation
 	issueKey := ownerIssueKey(effect.Repository, effect.Issue)
@@ -416,7 +454,6 @@ func applySupersedePlanReview(state *runtimeOwnerState, command supersedePlanRev
 	if !receiptFound {
 		return errStateConflict
 	}
-	reviewer := request.Reviewer
 	result := reconciliationEffectResult{Action: reconciliationReviewer, Reviewer: &reviewerEffectResult{Phase: reviewer.Phase, Status: "failed", Mode: reviewer.Mode, Target: reviewer.Target, BaseSHA: reviewer.BaseSHA, HeadSHA: reviewer.HeadSHA, Snapshot: reviewer.Snapshot, Session: reviewer.Session, Diagnostic: "plan review was invalidated by current issue state"}}
 	if record, present := state.Attempts[attemptKey]; present && request.Manifest != nil && sameReconciliationManifest(request, record.Manifest, *request.Manifest) {
 		if err := applyReconciliationEffectOutcome(state, request, result); err != nil {
@@ -446,8 +483,25 @@ func applyFinishReconciliationEffect(stateRoot string, state *runtimeOwnerState,
 	if err := reconciliationEffectFinishCurrent(stateRoot, *state, effect); err != nil {
 		return err
 	}
+	if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Phase == "run-observe" && result.Reviewer != nil && result.Reviewer.Status != "failed" && !effect.ReviewerLaunched {
+		return errStateConflict // An old or forged result cannot bypass process binding.
+	}
+	if effect.ReviewerLaunched && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil {
+		proof, ok := state.ReviewerProofs[reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, effect.Reconciliation.Reviewer.Mode, effect.Reconciliation.Reviewer.Target)]
+		if !ok || proof.EffectID != effect.ID || proof.GroupPID != effect.ReviewerGroupPID || !proof.DeadProved {
+			return errStateConflict
+		}
+	}
 	if err := applyReconciliationEffectOutcome(state, *effect.Reconciliation, result); err != nil {
 		return err
+	}
+	if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Phase == "cleanup" {
+		key := reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, effect.Reconciliation.Reviewer.Mode, effect.Reconciliation.Reviewer.Target)
+		proof, ok := state.ReviewerProofs[key]
+		if !ok || !proof.DeadProved {
+			return errStateConflict
+		}
+		delete(state.ReviewerProofs, key)
 	}
 	effect.State, effect.ReconciliationResult, effect.Diagnostic = "completed", &result, ""
 	state.Effects[effect.ID] = effect
@@ -556,7 +610,7 @@ func reconciliationEffectIdentityMatches(effect runtimeEffectIntent, identity st
 
 func validPersistedReconciliationEffect(state runtimeOwnerState, effect runtimeEffectIntent) bool {
 	request := effect.Reconciliation
-	if request == nil || effect.Review != nil || effect.Reason != "" || effect.SupersededReviewerID != "" || !boundedText(effect.Diagnostic, maxReconciliationStringBytes, false) || effect.Action != string(request.Action) || effect.Repository != request.Repository || effect.Issue != request.Issue || effect.Attempt != request.Attempt || effect.RequestDigest != reconciliationEffectDigest(*request) || !validReconciliationEffectRequest(state.Repository, *request) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || effect.ReviewerLaunched != (effect.ReviewerGroupPID > 1) || effect.ReviewerLaunched && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Mode != agentruntime.ReviewModePlan || request.Reviewer.Phase != "run-observe") {
+	if request == nil || effect.Review != nil || effect.Reason != "" || effect.SupersededReviewerID != "" || !boundedText(effect.Diagnostic, maxReconciliationStringBytes, false) || effect.Action != string(request.Action) || effect.Repository != request.Repository || effect.Issue != request.Issue || effect.Attempt != request.Attempt || effect.RequestDigest != reconciliationEffectDigest(*request) || !validReconciliationEffectRequest(state.Repository, *request) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || effect.ReviewerLaunched != (effect.ReviewerGroupPID > 1) || effect.ReviewerLaunched && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe") {
 		return false
 	}
 	if effect.State == "pending" {
@@ -713,10 +767,10 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 		if reviewer.Phase == "cleanup" {
 			return (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued") && reviewManifestMatches(manifest, reviewer)
 		}
-		// A fresh Plan review may replace a previous failed review with a new
+		// A fresh review may replace a previous failed review with a new
 		// target. The outer exact manifest binding pins that failed projection;
 		// running/completion still bind to this pending effect's own target.
-		return manifest.ReviewState == "" || reviewer.Mode == agentruntime.ReviewModePlan && manifest.ReviewState == "failed" && request.Manifest != nil && sameReconciliationManifest(request, manifest, *request.Manifest) || (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") && reviewManifestMatches(manifest, reviewer) || manifest.ReviewState == "findings-queued" && manifest.ReviewHandoffAck && manifest.ReviewSnapshot == "" && manifest.ReviewSession == "" && manifest.ReviewHead != reviewer.HeadSHA
+		return manifest.ReviewState == "" || manifest.ReviewState == "failed" && request.Manifest != nil && sameReconciliationManifest(request, manifest, *request.Manifest) || (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") && reviewManifestMatches(manifest, reviewer) || manifest.ReviewState == "findings-queued" && manifest.ReviewHandoffAck && manifest.ReviewSnapshot == "" && manifest.ReviewSession == "" && manifest.ReviewHead != reviewer.HeadSHA
 	case reconciliationMonitoringCheckIn:
 		return manifest.State == "running" && observation.Fact.DispatchAuthorized && observation.Fact.NeedsAttention && remotelyObserved && (fact.State == "active" || fact.State == "review-ready") && fact.BaseSHA == manifest.BaseSHA
 	case reconciliationHandoffDeliver:
@@ -1078,7 +1132,7 @@ func validReviewerResult(request reviewerEffectRequest, result reviewerEffectRes
 		return result.Status == "cleaned" && len(result.Findings) == 0 && result.Diagnostic == ""
 	}
 	if result.Status == "failed" {
-		return request.Mode == agentruntime.ReviewModePlan && len(result.Findings) == 0 && boundedText(result.Diagnostic, 4096, true)
+		return len(result.Findings) == 0 && boundedText(result.Diagnostic, 4096, true)
 	}
 	if result.Diagnostic != "" {
 		return false

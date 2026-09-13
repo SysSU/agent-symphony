@@ -1911,23 +1911,27 @@ func reviewResultPath(snapshot, target string) string {
 }
 
 func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string) error {
-	return cleanupReviewResourcesWithProof(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot, 0, false)
+	return cleanupReviewResourcesWithProof(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot, 0, false, false)
 }
 
 // A tmux kill-session acknowledgement is not evidence that a reviewer child
 // stopped: the child may have survived as an orphan. Destructive cleanup only
 // uses the owner-bound group after Stop has independently proved it absent.
 func cleanupReviewResourcesBound(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string, boundGroupPID int) error {
-	return cleanupReviewResourcesWithProof(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot, boundGroupPID, false)
+	return cleanupReviewResourcesWithProof(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot, boundGroupPID, false, false)
+}
+
+func cleanupCertifiedReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string) error {
+	return cleanupReviewResourcesWithProof(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot, 0, false, true)
 }
 
 // Only the launch path, before respawn-pane (or after proving it never ran),
 // may remove tmux's default shell without a reviewer process-group binding.
 func cleanupUnlaunchedReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string) error {
-	return cleanupReviewResourcesWithProof(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot, 0, true)
+	return cleanupReviewResourcesWithProof(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot, 0, true, false)
 }
 
-func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string, boundGroupPID int, unlaunched bool) error {
+func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string, boundGroupPID int, unlaunched, certified bool) error {
 	expectedSnapshot, expectedSession := reviewIdentity(attempt, snapshotRoot)
 	if (snapshot != "" && snapshot != expectedSnapshot) || (session != "" && session != expectedSession) {
 		return errors.New("persisted reviewer cleanup identity mismatch")
@@ -1949,6 +1953,15 @@ func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCalle
 	}
 	resultPath := reviewResultPath(expectedSnapshot, manifestReviewTarget(head, target))
 	resultRoot := filepath.Dir(resultPath)
+	if !unlaunched && !certified && boundGroupPID == 0 {
+		for _, path := range []string{snapshot, resultRoot} {
+			if _, err := os.Lstat(path); err == nil {
+				return errors.New("unbound reviewer resources cannot be cleaned safely")
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
 	if unlaunched {
 		if _, err := os.Lstat(filepath.Join(resultRoot, "launch.json")); err == nil {
 			return errors.New("reviewer launch exists; default-shell cleanup is unsafe")
@@ -1960,15 +1973,15 @@ func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCalle
 		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		status, err := boundary.call(cleanupCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: filepath.Dir(snapshot), Env: env})
-		if err != nil {
+		if err != nil && !missingTmuxServer(status) {
 			return err
 		}
-		if !missingTmuxPaneStatus(status) {
+		if !missingTmuxPaneStatus(status) && !missingTmuxServer(status) {
 			pane, err := agentruntime.ParsePaneStatus(status.Output)
 			if err != nil {
 				return err
 			}
-			if !unlaunched && (boundGroupPID == 0 || !pane.Dead) {
+			if !unlaunched && (!pane.Dead || boundGroupPID == 0 && !certified) {
 				return errors.New("reviewer pane remains; cleanup requires exact stopped-child proof")
 			}
 			if _, err := boundary.call(cleanupCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", "=" + session}, Dir: filepath.Dir(snapshot), Env: env}); err != nil {
@@ -1976,7 +1989,7 @@ func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCalle
 			}
 		}
 	}
-	if boundGroupPID == 0 {
+	if boundGroupPID == 0 && !certified {
 		if _, err := os.Lstat(filepath.Join(resultRoot, "launch.json")); err == nil {
 			return errors.New("unbound reviewer launch cannot be cleaned safely")
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -2089,9 +2102,6 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if issue.Attempt == 0 {
 		issue.Attempt = attempt.Number
 	}
-	if binding != nil && mode != agentruntime.ReviewModePlan {
-		return independentReviewResult{}, false, errStateConflict
-	}
 	env = append(slices.Clone(env), "GH_REPO="+issue.Repository)
 	reviewBase := attempt.BaseSHA
 	if preflightObjectID.MatchString(issue.BaseSHA) {
@@ -2121,6 +2131,18 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 		launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
 		var launch reviewerLaunchIdentity
 		found, launchErr := readReviewerRecord(launchPath, &launch)
+		if launchErr != nil || !found || !sameReviewerIdentity(launch, *binding) {
+			if binding.ChildPID > 1 {
+				gone, proofErr := reviewerGroupGone(binding.ChildPID)
+				if proofErr != nil || !gone {
+					return independentReviewResult{}, true, fmt.Errorf("owner-bound reviewer group remains live with invalid launch record: %w", proofErr)
+				}
+				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("owner-bound reviewer launch record is invalid"))
+			}
+			if launchErr != nil || found {
+				return independentReviewResult{}, true, errors.New("unbound reviewer launch record is invalid")
+			}
+		}
 		if launchErr != nil {
 			return independentReviewResult{}, false, reviewerLifecycleError(launchErr)
 		}
@@ -2130,26 +2152,14 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 				return independentReviewResult{}, true, fmt.Errorf("probe unmarked reviewer pane: %w", statusErr)
 			}
 			if missingTmuxPaneStatus(paneStatus) {
-				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot)
-				cancel()
-				if cleanupErr != nil {
-					return independentReviewResult{}, true, fmt.Errorf("clean missing reviewer pane: %w", cleanupErr)
-				}
-				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer wrapper never started"))
+				return independentReviewResult{}, true, errors.New("unbound reviewer pane is missing; execution cannot be proved absent")
 			}
 			pane, parseErr := agentruntime.ParsePaneStatus(paneStatus.Output)
 			if parseErr != nil {
 				return independentReviewResult{}, true, fmt.Errorf("probe unmarked reviewer pane: %w", parseErr)
 			}
 			if pane.Dead {
-				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot)
-				cancel()
-				if cleanupErr != nil {
-					return independentReviewResult{}, true, fmt.Errorf("clean dead unmarked reviewer pane: %w", cleanupErr)
-				}
-				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer exited before launch identity was recorded"))
+				return independentReviewResult{}, true, errors.New("unbound reviewer pane died before launch identity was recorded")
 			}
 			started, probeErr := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_start_command}"}, Dir: snapshot, Env: env})
 			if probeErr != nil || started.Exited {

@@ -713,12 +713,13 @@ case "$payload" in
   *) exit 1 ;;
 esac`}}
 		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}}
-		if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{Input: input}); err != nil || !resumed {
-			t.Fatalf("resume=%v err=%v effect=%#v", resumed, err, mustOwnerSnapshot(t, owner).State.Effects[plan.Identity.EffectID])
+		if _, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{Input: input}); err != nil {
+			t.Fatalf("legacy unbound review resume: %v", err)
 		}
 		current := mustOwnerSnapshot(t, owner)
-		if current.State.Effects[plan.Identity.EffectID].State != "completed" || current.State.Attempts[ownerAttemptKey("o/r", issue.Issue, issue.Attempt)].Manifest.ReviewState != "clean" {
-			t.Fatalf("reviewer result was not committed: %#v", current.State.Effects[plan.Identity.EffectID])
+		manifest = current.State.Attempts[ownerAttemptKey("o/r", issue.Issue, issue.Attempt)].Manifest
+		if effect := current.State.Effects[plan.Identity.EffectID]; effect.State != "pending" || !strings.Contains(effect.Diagnostic, "unbound reviewer pane died") || manifest.ReviewState == "clean" {
+			t.Fatalf("legacy unbound reviewer falsely completed: effect=%#v manifest=%#v", effect, manifest)
 		}
 	})
 
@@ -750,11 +751,11 @@ case "$payload" in
 esac`}}
 		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}}
 		batch := reconciliationV2Batch{Input: input}
-		if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, batch); err != nil || !resumed {
-			t.Fatalf("resume=%v err=%v effect=%#v", resumed, err, mustOwnerSnapshot(t, owner).State.Effects[plan.Identity.EffectID])
+		if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, batch); err != nil || resumed {
+			t.Fatalf("legacy unbound cleanup unexpectedly resumed=%v err=%v", resumed, err)
 		}
-		if mustOwnerSnapshot(t, owner).State.Effects[plan.Identity.EffectID].State != "completed" {
-			t.Fatal("reviewer cleanup intent remained pending")
+		if effect := mustOwnerSnapshot(t, owner).State.Effects[plan.Identity.EffectID]; effect.State != "pending" || !strings.Contains(effect.Diagnostic, "certificate") {
+			t.Fatalf("legacy unbound cleanup was not fail-closed: %#v", effect)
 		}
 	})
 }

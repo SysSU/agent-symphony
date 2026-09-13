@@ -50,6 +50,7 @@ type runtimeOwnerState struct {
 	Recoveries           map[string]runtimePRRecovery         `json:"recoveries"`
 	Tombstones           map[string]runtimeTombstone          `json:"tombstones"`
 	Effects              map[string]runtimeEffectIntent       `json:"effects"`
+	ReviewerProofs       map[string]reviewerProcessProof      `json:"reviewer_proofs"`
 	ControlReceipts      []controlReceipt                     `json:"control_receipts"`
 	CycleDiagnostic      string                               `json:"cycle_diagnostic,omitempty"`
 	CycleDiagnosticAt    time.Time                            `json:"cycle_diagnostic_at,omitzero"`
@@ -64,6 +65,26 @@ type runtimeAttemptRecord struct {
 	ObservationEpoch uint64                `json:"observation_epoch,omitempty"`
 	LastCycleID      uint64                `json:"last_cycle_id,omitempty"`
 	Manifest         agentruntime.Manifest `json:"manifest"`
+}
+
+// A completed review's filesystem root outlives bounded operator receipts.
+// This owner-held certificate is retained until destructive cleanup commits.
+type reviewerProcessProof struct {
+	Repository        string `json:"repository"`
+	Issue             int    `json:"issue"`
+	Attempt           int    `json:"attempt"`
+	Target            string `json:"target"`
+	Mode              string `json:"mode"`
+	EffectID          string `json:"effect_id"`
+	IssueGeneration   uint64 `json:"issue_generation"`
+	AttemptGeneration uint64 `json:"attempt_generation"`
+	GroupPID          int    `json:"group_pid"`
+	DeadProved        bool   `json:"dead_proved,omitempty"`
+	NeverRan          bool   `json:"never_ran,omitempty"`
+}
+
+func reviewerProofKey(repository string, issue, attempt int, mode, target string) string {
+	return ownerAttemptKey(repository, issue, attempt) + "\x00" + mode + "\x00" + target
 }
 
 type runtimePRRecovery struct {
@@ -89,26 +110,31 @@ type runtimeTombstone struct {
 }
 
 type runtimeEffectIntent struct {
-	ID                         string                         `json:"id"`
-	Action                     string                         `json:"action"`
-	Repository                 string                         `json:"repository"`
-	Issue                      int                            `json:"issue"`
-	Attempt                    int                            `json:"attempt"`
-	IssueGeneration            uint64                         `json:"issue_generation"`
-	AttemptGeneration          uint64                         `json:"attempt_generation"`
-	IntentEpoch                uint64                         `json:"intent_epoch,omitempty"`
-	IntentRevision             uint64                         `json:"intent_revision"`
-	State                      string                         `json:"state"`
-	RequestDigest              string                         `json:"request_digest"`
-	Reason                     string                         `json:"reason,omitempty"`
-	Review                     *agentruntime.ReviewTransition `json:"review,omitempty"`
-	Reconciliation             *reconciliationEffectRequest   `json:"reconciliation,omitempty"`
-	ReconciliationResult       *reconciliationEffectResult    `json:"reconciliation_result,omitempty"`
-	ReviewerLaunched           bool                           `json:"reviewer_launched,omitempty"`
-	ReviewerGroupPID           int                            `json:"reviewer_group_pid,omitempty"`
-	SupersededReviewerID       string                         `json:"superseded_reviewer_id,omitempty"`
-	SupersededReviewerGroupPID int                            `json:"superseded_reviewer_group_pid,omitempty"`
-	Diagnostic                 string                         `json:"diagnostic,omitempty"`
+	ID                                  string                         `json:"id"`
+	Action                              string                         `json:"action"`
+	Repository                          string                         `json:"repository"`
+	Issue                               int                            `json:"issue"`
+	Attempt                             int                            `json:"attempt"`
+	IssueGeneration                     uint64                         `json:"issue_generation"`
+	AttemptGeneration                   uint64                         `json:"attempt_generation"`
+	IntentEpoch                         uint64                         `json:"intent_epoch,omitempty"`
+	IntentRevision                      uint64                         `json:"intent_revision"`
+	State                               string                         `json:"state"`
+	RequestDigest                       string                         `json:"request_digest"`
+	Reason                              string                         `json:"reason,omitempty"`
+	Review                              *agentruntime.ReviewTransition `json:"review,omitempty"`
+	Reconciliation                      *reconciliationEffectRequest   `json:"reconciliation,omitempty"`
+	ReconciliationResult                *reconciliationEffectResult    `json:"reconciliation_result,omitempty"`
+	ReviewerLaunched                    bool                           `json:"reviewer_launched,omitempty"`
+	ReviewerGroupPID                    int                            `json:"reviewer_group_pid,omitempty"`
+	ReviewerStopped                     bool                           `json:"reviewer_stopped,omitempty"`
+	SupersededReviewerID                string                         `json:"superseded_reviewer_id,omitempty"`
+	SupersededReviewerGroupPID          int                            `json:"superseded_reviewer_group_pid,omitempty"`
+	SupersededReviewerTarget            string                         `json:"superseded_reviewer_target,omitempty"`
+	SupersededReviewerMode              string                         `json:"superseded_reviewer_mode,omitempty"`
+	SupersededReviewerIssueGeneration   uint64                         `json:"superseded_reviewer_issue_generation,omitempty"`
+	SupersededReviewerAttemptGeneration uint64                         `json:"superseded_reviewer_attempt_generation,omitempty"`
+	Diagnostic                          string                         `json:"diagnostic,omitempty"`
 }
 
 type stateResultIdentity struct {
@@ -206,6 +232,22 @@ type markPlanReviewRunningCommand struct {
 	GroupPID int
 }
 
+type proveReviewerDeadCommand struct {
+	Identity stateResultIdentity
+	GroupPID int
+	NeverRan bool
+}
+
+type markReviewerStoppedCommand struct {
+	Identity    stateResultIdentity
+	Observation reviewerStopObservation
+}
+
+type reviewerStopObservation struct {
+	GroupPID int
+	NeverRan bool
+}
+
 type supersedePlanReviewCommand struct {
 	Identity stateResultIdentity
 }
@@ -291,6 +333,8 @@ const (
 	stateOwnerBeginReconciliationEffect
 	stateOwnerAuthorizeReconciliationEffect
 	stateOwnerMarkPlanReviewRunning
+	stateOwnerProveReviewerDead
+	stateOwnerMarkReviewerStopped
 	stateOwnerSupersedePlanReview
 	stateOwnerFinishReconciliationEffect
 	stateOwnerDiagnoseReconciliationEffect
@@ -319,6 +363,8 @@ type stateOwnerCommand struct {
 	beginReconciliation     beginReconciliationEffectCommand
 	authorizeReconciliation authorizeReconciliationEffectCommand
 	markPlanReviewRunning   markPlanReviewRunningCommand
+	proveReviewerDead       proveReviewerDeadCommand
+	markReviewerStopped     markReviewerStoppedCommand
 	supersedePlanReview     supersedePlanReviewCommand
 	finishReconciliation    finishReconciliationEffectCommand
 	diagnoseReconciliation  diagnoseReconciliationEffectCommand
@@ -723,6 +769,16 @@ func (o *stateOwner) markPlanReviewRunning(ctx context.Context, command markPlan
 	return result.snapshot, err
 }
 
+func (o *stateOwner) proveReviewerDead(ctx context.Context, command proveReviewerDeadCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerProveReviewerDead, proveReviewerDead: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) markReviewerStopped(ctx context.Context, command markReviewerStoppedCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerMarkReviewerStopped, markReviewerStopped: command})
+	return result.snapshot, err
+}
+
 func (o *stateOwner) supersedePlanReview(ctx context.Context, command supersedePlanReviewCommand) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerSupersedePlanReview, supersedePlanReview: command})
 	return result.snapshot, err
@@ -806,6 +862,14 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		}
 	case stateOwnerMarkPlanReviewRunning:
 		if err := applyMarkPlanReviewRunning(stateRoot, &candidate, command.markPlanReviewRunning); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerProveReviewerDead:
+		if err := applyProveReviewerDead(&candidate, command.proveReviewerDead); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerMarkReviewerStopped:
+		if err := applyMarkReviewerStopped(&candidate, command.markReviewerStopped); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerSupersedePlanReview:
@@ -989,6 +1053,9 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 	if !ok || effect.Action != string(command.Action) || effect.IntentEpoch != identity.Epoch || effect.IntentRevision != identity.SourceRevision || effect.IssueGeneration != identity.IssueGeneration || effect.AttemptGeneration != identity.AttemptGeneration || effect.RequestDigest != identity.RequestDigest {
 		return errStaleStateResult
 	}
+	if effect.SupersededReviewerID != "" && !effect.ReviewerStopped {
+		return errStateConflict
+	}
 	issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 	if state.IssueGenerations[issueKey] != identity.IssueGeneration && !effectAuthorizedByTombstone(*state, effect) || state.AttemptGenerations[attemptKey] != identity.AttemptGeneration {
 		return errStaleStateResult
@@ -1035,10 +1102,48 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 	}
 	effect.State, effect.Diagnostic = "completed", manifest.Diagnostic
 	state.Effects[effect.ID] = effect
+	if command.Action == agentruntime.EffectCleanup {
+		for key, proof := range state.ReviewerProofs {
+			if proof.Repository == effect.Repository && proof.Issue == effect.Issue && proof.Attempt == effect.Attempt {
+				delete(state.ReviewerProofs, key)
+			}
+		}
+	}
 	if tombstone, ok := state.Tombstones[attemptKey]; ok && tombstone.EffectID == effect.ID {
 		tombstone.CleanupPhase = "completed"
 		state.Tombstones[attemptKey] = tombstone
 	}
+	return nil
+}
+
+func applyMarkReviewerStopped(state *runtimeOwnerState, command markReviewerStoppedCommand) error {
+	effect, ok := state.Effects[command.Identity.EffectID]
+	if !ok || effect.State != "pending" || effect.SupersededReviewerID == "" || effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || effect.IntentEpoch != command.Identity.Epoch || effect.IntentRevision != command.Identity.SourceRevision || effect.IssueGeneration != command.Identity.IssueGeneration || effect.AttemptGeneration != command.Identity.AttemptGeneration || effect.RequestDigest != command.Identity.RequestDigest {
+		return errStaleStateResult
+	}
+	if effect.ReviewerStopped {
+		return nil
+	}
+	key := reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, effect.SupersededReviewerMode, effect.SupersededReviewerTarget)
+	observed := command.Observation
+	if observed.NeverRan != (observed.GroupPID == 0) || effect.SupersededReviewerGroupPID > 0 && (observed.GroupPID != effect.SupersededReviewerGroupPID || observed.NeverRan) || effect.SupersededReviewerGroupPID == 0 && !observed.NeverRan && observed.GroupPID < 2 {
+		return errStateConflict
+	}
+	if effect.SupersededReviewerGroupPID > 0 {
+		proof, exists := state.ReviewerProofs[key]
+		if !exists || proof.EffectID != effect.SupersededReviewerID || proof.GroupPID != effect.SupersededReviewerGroupPID || proof.IssueGeneration != effect.SupersededReviewerIssueGeneration || proof.AttemptGeneration != effect.SupersededReviewerAttemptGeneration {
+			return errStateConflict
+		}
+		proof.DeadProved = true
+		state.ReviewerProofs[key] = proof
+	} else {
+		if state.ReviewerProofs == nil {
+			state.ReviewerProofs = map[string]reviewerProcessProof{}
+		}
+		state.ReviewerProofs[key] = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.SupersededReviewerMode, Target: effect.SupersededReviewerTarget, EffectID: effect.SupersededReviewerID, IssueGeneration: effect.SupersededReviewerIssueGeneration, AttemptGeneration: effect.SupersededReviewerAttemptGeneration, GroupPID: observed.GroupPID, DeadProved: true, NeverRan: observed.NeverRan}
+	}
+	effect.ReviewerStopped = true
+	state.Effects[effect.ID] = effect
 	return nil
 }
 
@@ -1153,6 +1258,15 @@ func pruneCompletedAttemptEffects(state *runtimeOwnerState, repository string, i
 	}
 }
 
+func pendingReviewerDeathUnproved(state runtimeOwnerState, effect runtimeEffectIntent) bool {
+	if effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Phase != "run-observe" {
+		return false
+	}
+	reviewer := effect.Reconciliation.Reviewer
+	proof, ok := state.ReviewerProofs[reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, reviewer.Mode, reviewer.Target)]
+	return !ok || proof.EffectID != effect.ID || !proof.DeadProved
+}
+
 func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueGenerationCommand) error {
 	if command.Repository != state.Repository || command.Issue < 1 {
 		return errStateConflict
@@ -1164,6 +1278,11 @@ func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueG
 	}
 	if generation == ^uint64(0) {
 		return errors.New("issue generation overflow")
+	}
+	for _, effect := range state.Effects {
+		if effect.Repository == command.Repository && effect.Issue == command.Issue && !effectAuthorizedByTombstone(*state, effect) && pendingReviewerDeathUnproved(*state, effect) {
+			return errStateConflict
+		}
 	}
 	state.IssueGenerations[key] = generation + 1
 	delete(state.Observations, key)
@@ -1238,6 +1357,11 @@ func applyUpsertAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState,
 	} else {
 		if generation == ^uint64(0) {
 			return errors.New("attempt generation overflow")
+		}
+		for _, effect := range state.Effects {
+			if effect.Repository == manifest.Repository && effect.Issue == manifest.Issue && effect.Attempt == manifest.Attempt && !effectReferencedByReceipt(*state, effect.ID) && pendingReviewerDeathUnproved(*state, effect) {
+				return errStateConflict
+			}
 		}
 		generation++
 		deleteAttemptEffects(state, manifest.Repository, manifest.Issue, manifest.Attempt)
@@ -1806,7 +1930,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if effect.RequestDigest != "" && (!agentruntime.ValidEffectRequestDigest(effect.RequestDigest) || effect.IntentEpoch == 0 || effect.IntentEpoch > maxEpoch || !validRuntimeEffectInput(agentruntime.EffectAction(effect.Action), effect.Reason) || (effect.Action == string(agentruntime.EffectReview)) != (effect.Review != nil)) {
 			return errors.New("runtime owner typed effect intent is invalid")
 		}
-		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID)) {
+		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID) || !agentruntime.ValidReviewTarget(effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.Repository, effect.Issue) || effect.SupersededReviewerIssueGeneration == 0 || effect.SupersededReviewerAttemptGeneration == 0) || effect.SupersededReviewerID == "" && (effect.SupersededReviewerTarget != "" || effect.SupersededReviewerMode != "" || effect.SupersededReviewerIssueGeneration != 0 || effect.SupersededReviewerAttemptGeneration != 0 || effect.ReviewerStopped) {
 			return errors.New("runtime owner superseded reviewer binding is invalid")
 		}
 		if effect.RequestDigest != "" && effect.Action == string(agentruntime.EffectReview) {
@@ -1817,6 +1941,11 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			if _, err := agentruntime.ReviewEffectResult(attemptRoot, stateRoot, record.Manifest, *effect.Review); err != nil {
 				return errors.New("runtime owner review effect transition is invalid")
 			}
+		}
+	}
+	for key, proof := range state.ReviewerProofs {
+		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || (proof.GroupPID < 2 && !(proof.NeverRan && proof.GroupPID == 0 && proof.DeadProved)) || proof.NeverRan && proof.GroupPID != 0 || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] {
+			return errors.New("runtime owner reviewer process proof is invalid")
 		}
 	}
 	if len(state.ControlReceipts) > maxControlReceipts {
@@ -1864,7 +1993,7 @@ func runtimeOwnerAttemptRoot(stateRoot string) string {
 }
 
 func newRuntimeOwnerState(repository string) runtimeOwnerState {
-	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ControlReceipts: []controlReceipt{}}
+	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}}
 }
 
 func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
@@ -1900,6 +2029,10 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 		effect.Reconciliation = cloneReconciliationEffectRequest(effect.Reconciliation)
 		effect.ReconciliationResult = cloneReconciliationEffectResult(effect.ReconciliationResult)
 		clone.Effects[key] = effect
+	}
+	clone.ReviewerProofs = make(map[string]reviewerProcessProof, len(state.ReviewerProofs))
+	for key, proof := range state.ReviewerProofs {
+		clone.ReviewerProofs[key] = proof
 	}
 	clone.ControlReceipts = make([]controlReceipt, len(state.ControlReceipts))
 	for index, receipt := range state.ControlReceipts {
@@ -1997,7 +2130,7 @@ func validCleanupPhase(phase string) bool {
 func runtimeEffectID(effect runtimeEffectIntent) string {
 	material := fmt.Sprintf("%s\x00%s\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%s\x00%s", effect.Action, effect.Repository, effect.Issue, effect.Attempt, effect.IssueGeneration, effect.AttemptGeneration, effect.IntentRevision, effect.IntentEpoch, effect.RequestDigest, effect.Reason)
 	if effect.SupersededReviewerID != "" {
-		material += "\x00" + effect.SupersededReviewerID
+		material += fmt.Sprintf("\x00%s\x00%s\x00%s\x00%d\x00%d", effect.SupersededReviewerID, effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.SupersededReviewerIssueGeneration, effect.SupersededReviewerAttemptGeneration)
 	}
 	digest := sha256.Sum256([]byte(material))
 	return hex.EncodeToString(digest[:16])
@@ -2032,6 +2165,9 @@ func pruneSupersededIssueEffects(state *runtimeOwnerState, repository string, is
 				return errStateConflict
 			}
 			continue
+		}
+		if pendingReviewerDeathUnproved(*state, effect) {
+			return errStateConflict
 		}
 		delete(state.Effects, id)
 	}

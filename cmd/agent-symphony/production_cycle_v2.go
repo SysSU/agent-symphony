@@ -402,7 +402,7 @@ func (p *productionReconciliation) resumeUnmarkedReconciliation(ctx context.Cont
 			return false, err
 		}
 		issue.Attempt = record.Manifest.Attempt
-		material := reviewerExecutionMaterial{Issue: issue, Source: source, HeadSHA: head, Env: slices.Clone(p.reviewEnv), Command: slices.Clone(p.config.Commands.Reviewer)}
+		material := reviewerExecutionMaterial{Issue: issue, Source: source, HeadSHA: head, Env: slices.Clone(p.reviewEnv), Command: slices.Clone(p.config.Commands.Reviewer), Replay: true}
 		if reviewerExecutionDigest(request, material) != request.ExecutionDigest || digestText(issue.Body) != request.BodyDigest {
 			return false, errStateConflict
 		}

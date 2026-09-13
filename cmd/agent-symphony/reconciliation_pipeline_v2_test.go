@@ -377,6 +377,40 @@ func TestReviewerPlannerUsesVerifiedCompletedHeadAndFullEnvironmentDigest(t *tes
 	}
 }
 
+func TestFailedImplementationReviewPersistsDiagnosticWithoutAutomaticRetry(t *testing.T) {
+	test := reconciliationEffectCaseNamed(t, "reviewer-run-observe")
+	test.request.Reviewer.Mode = agentruntime.ReviewModeImplementation
+	owner, snapshot, request := reconciliationEffectTestOwner(t, test.request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := ownerReconciliationEffectIdentity(*effect)
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	result := test.result(request)
+	result.Reviewer.Status, result.Reviewer.Diagnostic = "failed", "reviewer exited without a valid result"
+	finished, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: result})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := finished.State.Attempts[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)].Manifest
+	if manifest.ReviewState != "failed" || manifest.ReviewDiagnostic != result.Reviewer.Diagnostic {
+		t.Fatalf("failed implementation review was not durable: %#v", manifest)
+	}
+	issue := issueFact(request.Issue, "title")
+	issue.Attempt = request.Attempt
+	candidate := reviewerExecutionMaterial{Issue: issue, Source: "/source", HeadSHA: request.Reviewer.HeadSHA, Env: []string{"GH_TOKEN=one"}, Command: []string{"reviewer"}}
+	plans, _, err := planReconciliationReviewers(finished, owner.stateRoot, []reviewerExecutionMaterial{candidate})
+	if err != nil || len(plans) != 0 {
+		t.Fatalf("failed implementation review retried without a new authorized head: plans=%#v err=%v", plans, err)
+	}
+}
+
 type reviewerSessionStillPresentBoundary struct{}
 
 func (reviewerSessionStillPresentBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {

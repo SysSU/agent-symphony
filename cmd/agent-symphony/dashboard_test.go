@@ -784,7 +784,9 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	if err := os.Mkdir(snapshot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	resultOne, resultTwo := snapshot+".result-0123456789abcdef", snapshot+".result-fedcba9876543210"
+	targetOne := "o/r#31 plan sha256:" + strings.Repeat("a", 64)
+	targetTwo := "o/r#31 plan sha256:" + strings.Repeat("b", 64)
+	resultOne, resultTwo := filepath.Dir(reviewResultPath(snapshot, targetOne)), filepath.Dir(reviewResultPath(snapshot, targetTwo))
 	for _, path := range []string{resultOne, resultTwo} {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
@@ -794,7 +796,7 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	if err := os.Mkdir(sibling, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, ReviewHead: strings.Repeat("b", 40), ReviewSnapshot: snapshot, ReviewSession: session}
+	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, ReviewHead: strings.Repeat("b", 40), ReviewTarget: targetTwo, ReviewSnapshot: snapshot, ReviewSession: session}
 	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, false); err != nil {
 		t.Fatalf("review preflight: %v", err)
 	}
@@ -806,7 +808,8 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true); err == nil {
 		t.Fatal("unbound reviewer artifacts were cleaned without process-death proof")
 	}
-	if err := cleanupAttemptReviewResourcesBound(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true, 99999999); err != nil {
+	proofs := map[string]reviewerProcessProof{targetOne: {Target: targetOne, GroupPID: 99999999, DeadProved: true}, targetTwo: {Target: targetTwo, GroupPID: 99999998, DeadProved: true}}
+	if err := cleanupAttemptReviewResourcesProved(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true, proofs); err != nil {
 		t.Fatalf("review cleanup: %v", err)
 	}
 	for _, path := range []string{snapshot, resultOne, resultTwo} {

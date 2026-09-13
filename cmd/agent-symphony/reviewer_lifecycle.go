@@ -79,6 +79,11 @@ func reviewerGroupGone(pid int) (bool, error) {
 	return false, err
 }
 
+func missingTmuxServer(result agentruntime.Result) bool {
+	message := strings.TrimSpace(result.Output)
+	return result.Exited && result.Code == 1 && (strings.HasPrefix(message, "error connecting to ") && strings.HasSuffix(message, " (No such file or directory)") || strings.HasPrefix(message, "no server running on /"))
+}
+
 func verifyReviewerChildBinding(ctx context.Context, boundary boundaryCaller, env []string, session, launchPath, terminalPath string, identity reviewerLaunchIdentity, candidate int) error {
 	if candidate < 2 {
 		return errors.New("reviewer child process identity is missing")

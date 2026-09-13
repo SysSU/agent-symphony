@@ -621,8 +621,25 @@ func cleanupAttemptReviewResources(ctx context.Context, stateRoot string, bounda
 }
 
 func cleanupAttemptReviewResourcesBound(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool, boundGroupPID int) error {
+	proofs := map[string]reviewerProcessProof{}
+	if boundGroupPID > 0 {
+		target := manifestReviewTarget(manifest.ReviewHead, manifest.ReviewTarget)
+		proofs[target] = reviewerProcessProof{Target: target, GroupPID: boundGroupPID, DeadProved: true}
+	}
+	return cleanupAttemptReviewResourcesProved(ctx, stateRoot, boundary, manifest, remove, proofs)
+}
+
+func cleanupAttemptReviewResourcesProved(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool, proofs map[string]reviewerProcessProof) error {
 	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
 	snapshotRoot := productionSnapshotRoot(stateRoot)
+	if _, err := os.Lstat(snapshotRoot); errors.Is(err, os.ErrNotExist) && manifest.ReviewSession == "" && manifest.ReviewSnapshot == "" && len(proofs) == 0 {
+		if !remove {
+			return nil // No reviewer resources exist to preflight.
+		}
+		if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
+			return err
+		}
+	}
 	if root, err := filepath.EvalSymlinks(snapshotRoot); err == nil {
 		if root != filepath.Clean(snapshotRoot) {
 			return errors.New("review snapshot root is unsafe")
@@ -669,10 +686,27 @@ func cleanupAttemptReviewResourcesBound(ctx context.Context, stateRoot string, b
 	if !remove {
 		return nil
 	}
-	if boundGroupPID == 0 && (manifest.ReviewSession != "" || manifest.ReviewState != "" || snapshotExists || len(resultPaths) > 0) {
+	for _, proof := range proofs {
+		if !proof.DeadProved {
+			return errors.New("reviewer process-death certificate is missing")
+		}
+	}
+	for _, path := range resultPaths {
+		proved := false
+		for target, proof := range proofs {
+			if filepath.Dir(reviewResultPath(expectedSnapshot, target)) == path && proof.DeadProved {
+				proved = true
+				break
+			}
+		}
+		if !proved {
+			return errors.New("review result root has no owner process-death certificate")
+		}
+	}
+	if (manifest.ReviewSession != "" || manifest.ReviewSnapshot != "" || snapshotExists) && len(proofs) == 0 {
 		return errors.New("unbound reviewer resources cannot be cleaned safely")
 	}
-	if err := cleanupReviewResourcesBound(ctx, boundary, nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot, boundGroupPID); err != nil {
+	if err := cleanupCertifiedReviewResources(ctx, boundary, nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot); err != nil {
 		return err
 	}
 	for _, path := range resultPaths {

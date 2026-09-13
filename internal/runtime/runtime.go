@@ -1060,8 +1060,8 @@ func validateManifestIdentity(want, manifest Manifest) error {
 		if !legacy && !ValidReviewBinding(manifest.ReviewMode, manifest.ReviewTarget, manifest.Repository, manifest.Issue, manifest.ReviewBase, manifest.ReviewHead, manifest.BaseSHA) {
 			return errors.New("review target does not match persisted identity")
 		}
-		if manifest.ReviewState == "failed" && (manifest.ReviewMode != ReviewModePlan || manifest.ReviewDiagnostic == "" || len(manifest.ReviewDiagnostic) > 4096) {
-			return errors.New("failed plan review requires a bounded diagnostic")
+		if manifest.ReviewState == "failed" && (manifest.ReviewDiagnostic == "" || len(manifest.ReviewDiagnostic) > 4096) {
+			return errors.New("failed review requires a bounded diagnostic")
 		}
 	default:
 		return fmt.Errorf("invalid review state %q", manifest.ReviewState)

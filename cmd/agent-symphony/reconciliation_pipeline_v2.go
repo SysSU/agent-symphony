@@ -503,7 +503,15 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 	}
 	attempt := agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt, BaseSHA: request.Manifest.BaseSHA}
 	if request.Reviewer.Phase == "cleanup" {
-		if err := cleanupReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, request.Reviewer.Target, request.Reviewer.Snapshot, request.Reviewer.Session, productionSnapshotRoot(c.owner.stateRoot)); err != nil {
+		ownerSnapshot, snapshotErr := c.owner.snapshot(run.ctx)
+		if snapshotErr != nil {
+			return reconciliationEffectResult{}, false, snapshotErr
+		}
+		proof, proved := ownerSnapshot.State.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)]
+		if !proved || !proof.DeadProved {
+			return reconciliationEffectResult{}, false, errors.New("automatic reviewer cleanup lacks owner process-death certificate")
+		}
+		if err := cleanupCertifiedReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, request.Reviewer.Target, request.Reviewer.Snapshot, request.Reviewer.Session, productionSnapshotRoot(c.owner.stateRoot)); err != nil {
 			return reconciliationEffectResult{}, false, err
 		}
 		session, sessionErr := boundary.call(run.ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + request.Reviewer.Session}, Dir: filepath.Dir(request.Reviewer.Snapshot), Env: material.Env})
@@ -529,7 +537,7 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 	executionManifest.ReviewBase, executionManifest.ReviewHead = request.Reviewer.BaseSHA, request.Reviewer.HeadSHA
 	executionManifest.ReviewSnapshot, executionManifest.ReviewSession = request.Reviewer.Snapshot, request.Reviewer.Session
 	var binding *reviewerLaunchIdentity
-	if operator && request.Reviewer.Mode == agentruntime.ReviewModePlan {
+	if request.Reviewer.Phase == "run-observe" {
 		value := reviewerIdentity(plan.Identity)
 		ownerSnapshot, snapshotErr := c.owner.snapshot(run.ctx)
 		if snapshotErr != nil {
@@ -539,6 +547,29 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 			value.ChildPID = effect.ReviewerGroupPID
 		}
 		binding = &value
+	}
+	if binding != nil && !material.Replay {
+		ownerSnapshot, snapshotErr := c.owner.snapshot(run.ctx)
+		if snapshotErr != nil {
+			return reconciliationEffectResult{}, false, snapshotErr
+		}
+		var oldTargets []string
+		for _, proof := range ownerSnapshot.State.ReviewerProofs {
+			if proof.Repository == request.Repository && proof.Issue == request.Issue && proof.Attempt == request.Attempt && proof.DeadProved {
+				oldTargets = append(oldTargets, proof.Target)
+			}
+		}
+		slices.Sort(oldTargets)
+		root := productionSnapshotRoot(c.owner.stateRoot)
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			return reconciliationEffectResult{}, false, err
+		}
+		oldSnapshot, oldSession := reviewIdentity(attempt, root)
+		for _, target := range oldTargets {
+			if err := cleanupCertifiedReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, target, oldSnapshot, oldSession, root); err != nil {
+				return reconciliationEffectResult{}, false, err
+			}
+		}
 	}
 	review, pending, err := runIndependentReviewV2(run.ctx, attempt, boundary, material.Env, material.Command, material.Issue, executionManifest, material.Source, request.Reviewer.HeadSHA, productionSnapshotRoot(c.owner.stateRoot), request.Reviewer.Mode, binding, material.Replay)
 	if binding != nil && errors.Is(err, errReviewerTerminal) {
@@ -562,6 +593,25 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 	}
 	if err != nil || pending {
 		return reconciliationEffectResult{}, pending, err
+	}
+	if binding != nil && binding.ChildPID > 1 {
+		status, probeErr := boundary.call(run.ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(request.Reviewer.Session), agentruntime.PaneStatusFormat}, Env: material.Env})
+		if probeErr != nil {
+			return reconciliationEffectResult{}, true, probeErr
+		}
+		if !missingTmuxPaneStatus(status) {
+			pane, parseErr := agentruntime.ParsePaneStatus(status.Output)
+			if parseErr != nil || !pane.Dead {
+				return reconciliationEffectResult{}, true, errors.New("reviewer terminal pane death is unproved")
+			}
+		}
+		gone, proofErr := reviewerGroupGone(binding.ChildPID)
+		if proofErr != nil || !gone {
+			return reconciliationEffectResult{}, true, errors.New("reviewer process-group death is unproved")
+		}
+		if _, proofErr := c.owner.proveReviewerDead(run.ctx, proveReviewerDeadCommand{Identity: plan.Identity, GroupPID: binding.ChildPID}); proofErr != nil {
+			return reconciliationEffectResult{}, false, proofErr
+		}
 	}
 	result := reconciliationEffectResult{Action: request.Action, Reviewer: &reviewerEffectResult{Phase: request.Reviewer.Phase, Status: review.Status, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, BaseSHA: request.Reviewer.BaseSHA, HeadSHA: request.Reviewer.HeadSHA, Snapshot: request.Reviewer.Snapshot, Session: request.Reviewer.Session, Findings: slices.Clone(review.Findings), Diagnostic: review.Diagnostic}}
 	if err := c.finishReconciliationMarker(plan.Identity, request, result, operator); err != nil {
