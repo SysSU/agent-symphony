@@ -80,6 +80,73 @@ func TestV2DashboardDismissesWhileReconciliationCollectsAndIgnoresStaleFiles(t *
 	}
 }
 
+func TestV2DashboardDismissSurvivesAliveMonitorDuringGitHubPreflight(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 350, 1, "running")
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "orphaned", true)
+	state.Epoch, state.Revision = 1, 1
+	owner, err := startTestStateOwner(t, root, state, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, productionAttemptRoot(root), next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
+	service := operatorTestMutationService(t, owner)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	service.issueClosed = func(ctx context.Context, repository string, issue int) (bool, error) {
+		if repository != manifest.Repository || issue != manifest.Issue {
+			return false, fmt.Errorf("unexpected GitHub issue %s#%d", repository, issue)
+		}
+		close(entered)
+		select {
+		case <-release:
+			return true, nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	monitor, err := service.effects.begin(t.Context(), mustOwnerSnapshot(t, owner), runtimeTestRequest(agentruntime.EffectMonitor, manifest, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &dashboardServer{ctx: t.Context(), stateRoot: owner.stateRoot, repository: manifest.Repository, operator: service}
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/actions/dismiss?repository=o%2Fr&issue=350&attempt=1", nil)
+	request.Host = "localhost"
+	request.Header.Set("Origin", "http://localhost")
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		server.handler(http.NotFoundHandler()).ServeHTTP(recorder, request)
+		response <- recorder
+	}()
+	<-entered
+	if _, err := service.effects.execute(t.Context(), monitor); err != nil {
+		t.Fatal(err)
+	}
+	afterMonitor := mustOwnerSnapshot(t, owner).State
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	once.Do(func() { close(release) })
+	result := <-response
+	if result.Code != http.StatusOK {
+		t.Fatalf("alive Monitor made Dismiss fail: HTTP %d body=%s", result.Code, result.Body.String())
+	}
+	if !reflect.DeepEqual(afterMonitor.Attempts[key].Manifest, manifest) || afterMonitor.Effects[monitor.Identity.EffectID].State != "completed" {
+		t.Fatalf("alive Monitor changed manifest or did not finish: manifest=%#v effect=%#v", afterMonitor.Attempts[key].Manifest, afterMonitor.Effects[monitor.Identity.EffectID])
+	}
+	persisted, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil || persisted.Tombstones[key].Action != "dismissed" {
+		t.Fatalf("Dismiss did not durably invalidate attempt: tombstone=%#v err=%v", persisted.Tombstones[key], err)
+	}
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(monitor.Identity), Action: agentruntime.EffectMonitor, Manifest: manifest}); err == nil {
+		t.Fatal("old Monitor result could finish after Dismiss invalidated the attempt")
+	}
+}
+
 func TestClosedLocalOrphanOperatorAdmissionAfterIssueFallsOutOfCollector(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 191, "orphaned", true)
 	applyReconciliationInput(t, owner, reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: manifest.Repository}, Complete: true})
@@ -1937,6 +2004,8 @@ func TestV2PlanReviewAdmitsAndResumesAfterMonitorOnlyTimestampChange(t *testing.
 }
 
 func TestV2PlanReviewMarkerReplayRejectsChangedGitHubBodyAfterRestart(t *testing.T) {
+	for _, entry := range []string{"startup resume", "worker failure classification"} {
+		t.Run(entry, func(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 336, "active", false)
 	initial := mustOwnerSnapshot(t, owner).State
 	issue := expandIssueFact(initial.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
@@ -1970,7 +2039,7 @@ func TestV2PlanReviewMarkerReplayRejectsChangedGitHubBodyAfterRestart(t *testing
 		t.Fatal(err)
 	}
 	identity := ownerReconciliationEffectIdentity(*effect)
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity}); err != nil {
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
 		t.Fatal(err)
 	}
 	reviewer := effect.Reconciliation.Reviewer
@@ -2010,17 +2079,26 @@ func TestV2PlanReviewMarkerReplayRejectsChangedGitHubBodyAfterRestart(t *testing
 	changedInput.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
 	restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: restarted.stateRoot, Runner: operatorOwnedRunner{manifest: manifest}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
 	restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
-	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: service.collector, reviewer: absentSessionBoundary{}, reviewSource: "source", reviewCommand: []string{"review"}}
+	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: service.collector, reviewer: &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||\n"}}, reviewSource: "source", reviewCommand: []string{"review"}}
 	restartService.collect = func(context.Context, stateOwnerSnapshot, int) (reconciliationV2Batch, error) {
 		return reconciliationV2Batch{Input: changedInput}, nil
 	}
-	if err := restartService.resumeReceipt(t.Context(), request.RequestID); err != nil {
-		t.Fatal(err)
+	if entry == "startup resume" {
+		if err := restartService.resumePending(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := restartService.shutdown(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		restartService.classifyWorkerFailure(request.RequestID, errors.New("worker stopped after writing marker"))
 	}
 	final := mustOwnerSnapshot(t, restarted).State
 	receipt := final.ControlReceipts[0]
 	if receipt.State != "completed" || receipt.Result == nil || receipt.Result.Status != http.StatusConflict || final.Effects[effect.ID].ReconciliationResult == nil || final.Effects[effect.ID].ReconciliationResult.Reviewer.Status != "failed" || final.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Manifest.ReviewState == "clean" {
 		t.Fatalf("stale marker committed review: receipt=%#v effect=%#v", receipt, final.Effects[effect.ID])
+	}
+		})
 	}
 }
 
@@ -2051,7 +2129,7 @@ func TestCancelPreservesExactReviewerStopBindingAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: ownerReconciliationEffectIdentity(*reviewer)}); err != nil {
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: ownerReconciliationEffectIdentity(*reviewer), GroupPID: 99999999}); err != nil {
 		t.Fatal(err)
 	}
 	beforeCancel := mustOwnerSnapshot(t, owner)

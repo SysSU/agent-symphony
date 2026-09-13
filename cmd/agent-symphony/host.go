@@ -1420,7 +1420,7 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	case "has-session", "kill-session":
 		return len(args) == 3 && args[1] == "-t" && validTmuxTarget(args[2], false)
 	case "display-message":
-		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, "#{pane_start_command}"}, args[4])
+		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, "#{pane_start_command}", "#{pane_pid}"}, args[4])
 	case "wait-for":
 		return len(args) == 3 && (args[1] == "-L" || args[1] == "-U") && validReviewerWaitChannel(args[2])
 	case "capture-pane":
@@ -1450,6 +1450,7 @@ func validReviewerWaitChannel(channel string) bool {
 	}
 	identity := strings.TrimPrefix(channel, "review-")
 	identity = strings.TrimSuffix(identity, "-start")
+	identity = strings.TrimSuffix(identity, "-go")
 	if len(identity) != 32 {
 		return false
 	}

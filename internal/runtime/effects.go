@@ -953,7 +953,6 @@ func (r *Runtime) monitorEffect(ctx context.Context, request EffectRequest) (Man
 		return manifest, fmt.Errorf("observe tmux session: %w", err)
 	}
 	if !pane.Dead || !pane.Ready {
-		manifest.UpdatedAt = time.Now().UTC()
 		return manifest, nil
 	}
 	env := effectEnvironment(request)

@@ -531,6 +531,13 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 	var binding *reviewerLaunchIdentity
 	if operator && request.Reviewer.Mode == agentruntime.ReviewModePlan {
 		value := reviewerIdentity(plan.Identity)
+		ownerSnapshot, snapshotErr := c.owner.snapshot(run.ctx)
+		if snapshotErr != nil {
+			return reconciliationEffectResult{}, false, snapshotErr
+		}
+		if effect, exists := ownerSnapshot.State.Effects[plan.Identity.EffectID]; exists {
+			value.ChildPID = effect.ReviewerGroupPID
+		}
 		binding = &value
 	}
 	review, pending, err := runIndependentReviewV2(run.ctx, attempt, boundary, material.Env, material.Command, material.Issue, executionManifest, material.Source, request.Reviewer.HeadSHA, productionSnapshotRoot(c.owner.stateRoot), request.Reviewer.Mode, binding, material.Replay)
@@ -538,8 +545,19 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		review, pending, err = independentReviewResult{Status: "failed", Diagnostic: err.Error()}, false, nil
 	}
 	if binding != nil && material.Replay && pending && err == nil {
-		if _, markErr := c.owner.markPlanReviewRunning(run.ctx, markPlanReviewRunningCommand{Identity: plan.Identity}); markErr != nil {
+		launchPath, terminalPath := reviewerLifecyclePaths(review.Snapshot, request.Reviewer.Target)
+		var launch reviewerLaunchIdentity
+		if exists, readErr := readReviewerRecord(launchPath, &launch); readErr != nil || !exists || !sameReviewerIdentity(launch, *binding) {
+			return reconciliationEffectResult{}, true, errors.New("reviewer launch proof is unavailable")
+		}
+		if verifyErr := verifyReviewerChildBinding(run.ctx, boundary, material.Env, review.Session, launchPath, terminalPath, *binding, launch.ChildPID); verifyErr != nil {
+			return reconciliationEffectResult{}, true, verifyErr
+		}
+		if _, markErr := c.owner.markPlanReviewRunning(run.ctx, markPlanReviewRunningCommand{Identity: plan.Identity, GroupPID: launch.ChildPID}); markErr != nil {
 			return reconciliationEffectResult{}, false, markErr
+		}
+		if _, unlockErr := boundary.call(run.ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-U", reviewerGoSignal(*binding)}, Env: material.Env}); unlockErr != nil {
+			return reconciliationEffectResult{}, true, unlockErr
 		}
 	}
 	if err != nil || pending {

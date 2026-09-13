@@ -354,16 +354,20 @@ func applyMarkPlanReviewRunning(stateRoot string, state *runtimeOwnerState, comm
 		return errStaleStateResult
 	}
 	request := *effect.Reconciliation
-	if request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Mode != agentruntime.ReviewModePlan || request.Reviewer.Phase != "run-observe" || request.Manifest == nil {
+	if request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Mode != agentruntime.ReviewModePlan || request.Reviewer.Phase != "run-observe" || request.Manifest == nil || command.GroupPID < 2 {
 		return errStateConflict
 	}
 	if err := reconciliationEffectFinishCurrent(stateRoot, *state, effect); err != nil {
 		return err
 	}
 	if effect.ReviewerLaunched {
+		if effect.ReviewerGroupPID != command.GroupPID {
+			return errStateConflict
+		}
 		return nil
 	}
 	effect.ReviewerLaunched = true
+	effect.ReviewerGroupPID = command.GroupPID
 	state.Effects[effect.ID] = effect
 	return nil
 }
@@ -552,7 +556,7 @@ func reconciliationEffectIdentityMatches(effect runtimeEffectIntent, identity st
 
 func validPersistedReconciliationEffect(state runtimeOwnerState, effect runtimeEffectIntent) bool {
 	request := effect.Reconciliation
-	if request == nil || effect.Review != nil || effect.Reason != "" || effect.SupersededReviewerID != "" || !boundedText(effect.Diagnostic, maxReconciliationStringBytes, false) || effect.Action != string(request.Action) || effect.Repository != request.Repository || effect.Issue != request.Issue || effect.Attempt != request.Attempt || effect.RequestDigest != reconciliationEffectDigest(*request) || !validReconciliationEffectRequest(state.Repository, *request) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || effect.ReviewerLaunched && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Mode != agentruntime.ReviewModePlan || request.Reviewer.Phase != "run-observe") {
+	if request == nil || effect.Review != nil || effect.Reason != "" || effect.SupersededReviewerID != "" || !boundedText(effect.Diagnostic, maxReconciliationStringBytes, false) || effect.Action != string(request.Action) || effect.Repository != request.Repository || effect.Issue != request.Issue || effect.Attempt != request.Attempt || effect.RequestDigest != reconciliationEffectDigest(*request) || !validReconciliationEffectRequest(state.Repository, *request) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || effect.ReviewerLaunched != (effect.ReviewerGroupPID > 1) || effect.ReviewerLaunched && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Mode != agentruntime.ReviewModePlan || request.Reviewer.Phase != "run-observe") {
 		return false
 	}
 	if effect.State == "pending" {

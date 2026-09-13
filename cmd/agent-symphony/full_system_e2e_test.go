@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/SysSU/agent-symphony/internal/config"
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
@@ -698,7 +699,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	fixture.mu.Unlock()
 	removalPlaywright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "removal-playwright"))
 	removalPlaywright.Dir = source
-	removalPlaywright.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+restartAddress)
+	removalPlaywright.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+restartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL)
 	if removalOutput, removalErr := removalPlaywright.CombinedOutput(); removalErr != nil {
 		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 		t.Fatalf("real permanent-removal Playwright: %v\n%s\nledger=%s\nserve:\n%s", removalErr, removalOutput, ledger, restartOutput.String())
@@ -754,6 +755,24 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatalf("restarted serve shutdown: %v output=%s", err, restartOutput.String())
 	}
 	restartedStopped = true
+	staleBranch, err := internalgithub.AttemptBranch("o/r", 73, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleMarker, err := internalgithub.AttemptMarker(73, 1, staleBranch, base, 90, "review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.mu.Lock()
+	fixture.historicalPulls = append(fixture.historicalPulls, map[string]any{"number": 90, "body": staleMarker, "state": "closed", "merged_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "head": map[string]any{"sha": base, "ref": staleBranch}, "base": map[string]any{"sha": base}})
+	fixture.comments = append(fixture.comments, map[string]any{"id": 90, "body": staleMarker, "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}})
+	fixture.mu.Unlock()
+	staleFacts, err := internalgithub.FetchAttemptFacts(t.Context(), internalgithub.API{BaseURL: github.URL, HTTP: github.Client(), Retries: -1}, "o/r", 42)
+	if err != nil || !slices.ContainsFunc(staleFacts, func(fact internalgithub.RecoveryAttemptFact) bool {
+		return fact.Repository == "o/r" && fact.Issue == 73 && fact.Attempt == 1 && fact.PR == 90 && fact.HeadSHA == base
+	}) {
+		t.Fatalf("fake GitHub did not expose a parser-accepted stale removed attempt: facts=%#v err=%v", staleFacts, err)
+	}
 
 	removalRestartAddress := freeAddress(t)
 	removalRestarted := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", removalRestartAddress, "--interval", "30s")
@@ -771,10 +790,42 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		}
 	})
 	waitHTTP(t, "http://"+removalRestartAddress+"/status.json", deadline(15*time.Second), &removalRestartOutput)
+	beforeRemovalCycle, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.mu.Lock()
+	if !slices.ContainsFunc(fixture.historicalPulls, func(pull map[string]any) bool {
+		return pull["body"] == staleMarker
+	}) || !slices.ContainsFunc(fixture.comments, func(comment map[string]any) bool {
+		return comment["body"] == staleMarker
+	}) {
+		fixture.mu.Unlock()
+		t.Fatal("fake GitHub lost the exact removed-attempt marker before post-removal reconciliation")
+	}
+	requestsBeforeRemovalCycle := len(fixture.requests)
+	fixture.mu.Unlock()
 	reconcileAfterRemoval := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "reconcile", "--request-id", "full-system-after-removal", "--timeout", controlTimeout, "--json")
 	reconcileOutput, err := reconcileAfterRemoval.CombinedOutput()
 	if err != nil || !strings.Contains(string(reconcileOutput), `"ok":true`) {
 		t.Fatalf("post-removal restart reconcile: %v output=%s serve=%s", err, reconcileOutput, removalRestartOutput.String())
+	}
+	afterRemovalCycle, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil || !fullSystemNewCycleAfter(afterRemovalCycle, beforeRemovalCycle) || afterRemovalCycle.CycleDiagnostic != "" {
+		t.Fatalf("post-removal fake-GitHub cycle did not commit cleanly: err=%v before=%d/%d after=%d/%d diagnostic=%q", err, beforeRemovalCycle.CycleOutcomeEpoch, beforeRemovalCycle.CycleOutcomeID, afterRemovalCycle.CycleOutcomeEpoch, afterRemovalCycle.CycleOutcomeID, afterRemovalCycle.CycleDiagnostic)
+	}
+	if _, exists := afterRemovalCycle.Attempts[removedKey]; exists {
+		t.Fatal("fake-GitHub reconciliation recreated permanently removed owner attempt")
+	}
+	fixture.mu.Lock()
+	removalCycleRequests := append([]string(nil), fixture.requests[requestsBeforeRemovalCycle:]...)
+	fixture.mu.Unlock()
+	if !slices.ContainsFunc(removalCycleRequests, func(request string) bool {
+		return request == "GET /repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1"
+	}) || !slices.ContainsFunc(removalCycleRequests, func(request string) bool {
+		return strings.HasPrefix(request, "GET /repos/o/r/issues/73/comments")
+	}) {
+		t.Fatalf("post-removal cycle did not consume fake-GitHub removed-attempt PR and comments: %q", removalCycleRequests)
 	}
 	response, err = http.Get("http://" + removalRestartAddress + "/dashboard-state.json")
 	if err != nil {
@@ -785,6 +836,12 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	_ = response.Body.Close()
 	if decodeErr != nil || !slices.Contains(removalState.Hidden, dashboardHiddenAttempt{Repository: "o/r", Issue: 73, Attempt: 1, Reason: "removed"}) {
 		t.Fatalf("removed attempt did not persist after restart/reconcile: state=%#v err=%v", removalState, decodeErr)
+	}
+	removalRestartBrowser := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "removal-restart-playwright"))
+	removalRestartBrowser.Dir = source
+	removalRestartBrowser.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+removalRestartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_REMOVAL_E2E_PHASE=post-restart")
+	if browserOutput, browserErr := removalRestartBrowser.CombinedOutput(); browserErr != nil {
+		t.Fatalf("removed attempt reappeared in browser after restart/reconcile: %v\n%s\nserve=%s", browserErr, browserOutput, removalRestartOutput.String())
 	}
 	fixture.mu.Lock()
 	deniedMutations = append([]string(nil), fixture.deniedMutations...)

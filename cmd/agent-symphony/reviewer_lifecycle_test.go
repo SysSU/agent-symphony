@@ -5,10 +5,14 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
@@ -22,8 +26,64 @@ func (b *forbiddenReviewerBoundary) call(context.Context, string, agentruntime.C
 }
 
 type prelaunchFailureBoundary struct {
-	created bool
-	killed  bool
+	created         bool
+	killed          bool
+	newSessionError bool
+	beforeCreate    bool
+}
+
+type ambiguousRespawnBoundary struct {
+	identity reviewerLaunchIdentity
+	launch   string
+	terminal string
+	after    bool
+	marker   bool
+	dead     bool
+	created  bool
+	killed   bool
+	probes   int
+}
+
+func (b *ambiguousRespawnBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if operation != "run" || command.Name != "tmux" || len(command.Args) == 0 {
+		return agentruntime.Result{}, errors.New("unexpected reviewer boundary command")
+	}
+	switch command.Args[0] {
+	case "set-option":
+		if len(command.Args) > 5 && command.Args[4] == ";" && command.Args[5] == "new-session" {
+			b.created = true
+		}
+		return agentruntime.Result{}, nil
+	case "display-message":
+		if command.Args[len(command.Args)-1] == "#{pane_start_command}" {
+			b.probes++
+			if b.after && b.probes > 1 {
+				return agentruntime.Result{Output: "agent-symphony review-pane tmux " + b.launch + " " + b.terminal + " " + reviewerSignal(b.identity) + " " + b.identity.RequestDigest}, nil
+			}
+			return agentruntime.Result{Output: ""}, nil // tmux reports an empty start command for its default shell.
+		}
+		if b.created && !b.killed {
+			if b.dead {
+				return agentruntime.Result{Output: "1|||0|"}, nil
+			}
+			return agentruntime.Result{Output: "0||||"}, nil
+		}
+		return agentruntime.Result{Output: "||||"}, nil
+	case "respawn-pane":
+		if b.after && b.marker {
+			if err := writeReviewerRecord(b.launch, b.identity); err != nil {
+				return agentruntime.Result{}, err
+			}
+		}
+		return agentruntime.Result{}, errors.New("respawn boundary response lost")
+	case "kill-session":
+		b.killed = true
+		return agentruntime.Result{}, nil
+	case "wait-for":
+		return agentruntime.Result{}, nil
+	default:
+		return agentruntime.Result{}, errors.New("unexpected reviewer boundary command")
+	}
 }
 
 func (b *prelaunchFailureBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
@@ -38,7 +98,12 @@ func (b *prelaunchFailureBoundary) call(_ context.Context, operation string, com
 		return agentruntime.Result{Output: "||||"}, nil
 	case "set-option":
 		if len(command.Args) > 5 && command.Args[4] == ";" && command.Args[5] == "new-session" {
-			b.created = true
+			if !b.beforeCreate {
+				b.created = true
+			}
+			if b.newSessionError {
+				return agentruntime.Result{}, errors.New("tmux new-session response failed")
+			}
 			return agentruntime.Result{}, nil
 		}
 		return agentruntime.Result{}, errors.New("tmux set-option denied")
@@ -87,13 +152,13 @@ func TestReviewerSessionStopRequiresExactPaneEvidence(t *testing.T) {
 		wantError bool
 	}{
 		{name: "exact missing pane", status: agentruntime.Result{Output: "||||\n"}},
-		{name: "live exact pane", status: agentruntime.Result{Output: "0||||\n"}, wantKill: true},
+		{name: "unverified live pane", status: agentruntime.Result{Output: "0||||\n"}, wantError: true},
 		{name: "ambiguous tmux exit one", status: agentruntime.Result{Exited: true, Code: 1, Output: "permission denied"}, err: errors.New("tmux failed"), wantError: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			boundary := &reviewerSessionStopBoundary{status: test.status, err: test.err}
-			service := &operatorMutationService{reviewer: boundary}
-			err := service.stopReviewerSession(t.Context(), session, nil)
+			service := &operatorMutationService{reviewer: boundary, lifecycle: t.Context()}
+			err := service.stopReviewerSession(t.Context(), session, strings.Repeat("a", 32), 99999999)
 			if (err != nil) != test.wantError || (len(boundary.killed) != 0) != test.wantKill {
 				t.Fatalf("err=%v killed=%v", err, boundary.killed)
 			}
@@ -101,6 +166,132 @@ func TestReviewerSessionStopRequiresExactPaneEvidence(t *testing.T) {
 				t.Fatalf("killed wrong session: %v", boundary.killed)
 			}
 		})
+	}
+}
+
+type forgedTerminalStopBoundary struct {
+	parentPID int
+	reviewerID string
+	kills      int
+}
+
+func (b *forgedTerminalStopBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if operation != "run" || command.Name != "tmux" || len(command.Args) == 0 {
+		return agentruntime.Result{}, errors.New("unexpected reviewer boundary call")
+	}
+	switch command.Args[0] {
+	case "display-message":
+		switch command.Args[4] {
+		case agentruntime.PaneStatusFormat:
+			return agentruntime.Result{Output: "0||||\n"}, nil
+		case "#{pane_start_command}":
+			return agentruntime.Result{Output: "agent-symphony review-pane tmux /tmp/launch /tmp/terminal review-" + b.reviewerID}, nil
+		case "#{pane_pid}":
+			return agentruntime.Result{Output: strconv.Itoa(b.parentPID)}, nil
+		}
+	case "kill-session":
+		b.kills++ // The fake tmux ACK deliberately does not terminate the child.
+		return agentruntime.Result{}, nil
+	case "wait-for":
+		return agentruntime.Result{}, nil
+	}
+	return agentruntime.Result{}, errors.New("unexpected reviewer tmux command")
+}
+
+func TestReviewerStopDoesNotTrustTmuxKillAck(t *testing.T) {
+	root := t.TempDir()
+	reviewerID := strings.Repeat("a", 32)
+	identity := reviewerLaunchIdentity{EffectID: reviewerID, IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64)}
+	terminal := filepath.Join(root, "terminal.json")
+	if err := writeReviewerRecord(terminal, reviewerTerminalRecord{Identity: identity, ExitCode: 0}); err != nil {
+		t.Fatal(err)
+	}
+	readyReader, readyWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readyReader.Close()
+	defer readyWriter.Close()
+	holdReader, holdWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holdReader.Close()
+	defer holdWriter.Close()
+	child := exec.Command("/bin/sh", "-c", `printf ready >&3; IFS= read -r _`)
+	child.Stdin = holdReader
+	child.ExtraFiles = []*os.File{readyWriter}
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syscall.Kill(-child.Process.Pid, syscall.SIGKILL); _ = child.Wait() }()
+	ready := make(chan string, 1)
+	go func() {
+		buffer := make([]byte, 5)
+		n, _ := readyReader.Read(buffer)
+		ready <- string(buffer[:n])
+	}()
+	select {
+	case value := <-ready:
+		if value != "ready" {
+			t.Fatalf("child readiness = %q", value)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("child did not start")
+	}
+	boundary := &forgedTerminalStopBoundary{parentPID: os.Getpid(), reviewerID: reviewerID}
+	service := &operatorMutationService{lifecycle: t.Context(), reviewer: boundary}
+	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 73, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.stopReviewerSession(t.Context(), session, reviewerID, child.Process.Pid); err == nil || boundary.kills != 1 {
+		t.Fatalf("forged terminal or kill ACK completed cancellation: err=%v kills=%d", err, boundary.kills)
+	}
+	if err := syscall.Kill(-child.Process.Pid, 0); err != nil {
+		t.Fatalf("fake did not preserve live reviewer group: %v", err)
+	}
+	if content, err := os.ReadFile(terminal); err != nil || !strings.Contains(string(content), reviewerID) {
+		t.Fatalf("forged terminal fixture missing: %q %v", content, err)
+	}
+}
+
+type liveReviewerArtifactBoundary struct{ artifactCalls int }
+
+func (b *liveReviewerArtifactBoundary) call(_ context.Context, operation string, _ agentruntime.Command) (agentruntime.Result, error) {
+	if operation == "run" {
+		return agentruntime.Result{Output: "0||||\n"}, nil
+	}
+	if operation == "review-result" {
+		b.artifactCalls++
+		return agentruntime.Result{Exited: true, Code: reviewResultInvalidCode}, errors.New("forged clean result")
+	}
+	return agentruntime.Result{}, errors.New("unexpected reviewer boundary call")
+}
+
+func TestPlanReviewerForgedTerminalCannotFinishLivePane(t *testing.T) {
+	root := t.TempDir()
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 73, Number: 1, BaseSHA: strings.Repeat("a", 40)}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, Body: "plan"}
+	target := "o/r#73 plan sha256:" + digestText(issue.Body)
+	snapshot, session := reviewIdentity(attempt, root)
+	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "running", ReviewState: "running", ReviewMode: agentruntime.ReviewModePlan, ReviewTarget: target, ReviewBase: attempt.BaseSHA, ReviewHead: attempt.BaseSHA, ReviewSnapshot: snapshot, ReviewSession: session}
+	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64)}
+	launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
+	if err := os.MkdirAll(filepath.Dir(launchPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReviewerRecord(launchPath, identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReviewerRecord(terminalPath, reviewerTerminalRecord{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	boundary := &liveReviewerArtifactBoundary{}
+	_, pending, err := runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, "", attempt.BaseSHA, root, agentruntime.ReviewModePlan, &identity, true)
+	if !pending || err != nil || boundary.artifactCalls != 0 {
+		t.Fatalf("forged terminal overrode live reviewer: pending=%v err=%v artifact_calls=%d", pending, err, boundary.artifactCalls)
 	}
 }
 
@@ -185,6 +376,9 @@ func TestAmbiguousReviewerPaneProbeKeepsPendingIntentWithDiagnostic(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: ownerReconciliationEffectIdentity(*effect), GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
 	current := mustOwnerSnapshot(t, owner)
 	current.State.ControlReceipts = append(current.State.ControlReceipts, controlReceipt{Request: operatorRequest("probe-reviewer", "review-plan", *request.Manifest, false), State: "pending", Phase: operatorPhaseReviewPending, EffectID: effect.ID})
 	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Exited: true, Code: 1, Output: "permission denied"}, err: errors.New("tmux socket unavailable")}
@@ -199,8 +393,11 @@ func TestAmbiguousReviewerPaneProbeKeepsPendingIntentWithDiagnostic(t *testing.T
 type invalidReviewArtifactBoundary struct{ calls int }
 
 func (b *invalidReviewArtifactBoundary) call(_ context.Context, operation string, _ agentruntime.Command) (agentruntime.Result, error) {
-	b.calls++
+	if operation == "run" {
+		return agentruntime.Result{Output: "1|0|||\n"}, nil
+	}
 	if operation == "review-result" {
+		b.calls++
 		return agentruntime.Result{Exited: true, Code: reviewResultInvalidCode}, errors.New("invalid reviewer result")
 	}
 	return agentruntime.Result{}, errors.New("unexpected reviewer boundary call")
@@ -240,10 +437,10 @@ func TestPlanReviewerReplayFailsClosedWithoutExactLaunch(t *testing.T) {
 	snapshot, session := reviewIdentity(attempt, root)
 	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "running", ReviewState: "running", ReviewMode: agentruntime.ReviewModePlan, ReviewTarget: target, ReviewBase: attempt.BaseSHA, ReviewHead: attempt.BaseSHA, ReviewSnapshot: snapshot, ReviewSession: session}
 	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64)}
-	boundary := &forbiddenReviewerBoundary{}
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||"}}
 	_, pending, err := runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, "", attempt.BaseSHA, root, agentruntime.ReviewModePlan, &identity, true)
-	if pending || !errors.Is(err, errReviewerTerminal) || boundary.calls != 0 {
-		t.Fatalf("missing launch replay pending=%v err=%v boundary_calls=%d", pending, err, boundary.calls)
+	if pending || !errors.Is(err, errReviewerTerminal) || len(boundary.killed) != 0 {
+		t.Fatalf("missing launch replay pending=%v err=%v boundary=%#v", pending, err, boundary)
 	}
 	launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
 	if err := os.MkdirAll(filepath.Dir(launchPath), 0o700); err != nil {
@@ -258,8 +455,8 @@ func TestPlanReviewerReplayFailsClosedWithoutExactLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, pending, err = runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, "", attempt.BaseSHA, root, agentruntime.ReviewModePlan, &identity, true)
-	if pending || !errors.Is(err, errReviewerTerminal) || boundary.calls != 0 {
-		t.Fatalf("mismatched launch replay pending=%v err=%v boundary_calls=%d", pending, err, boundary.calls)
+	if pending || !errors.Is(err, errReviewerTerminal) || len(boundary.killed) != 0 {
+		t.Fatalf("mismatched launch replay pending=%v err=%v boundary=%#v", pending, err, boundary)
 	}
 }
 
@@ -290,6 +487,85 @@ func TestPlanReviewerSetupFailureKillsDefaultShellAndTerminalizes(t *testing.T) 
 	}
 }
 
+func TestPlanReviewerNewSessionErrorCleansExactShellBeforeTerminal(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		beforeCreate bool
+	}{
+		{name: "error before session creation", beforeCreate: true},
+		{name: "error after session creation"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base, _, source, _ := testWorkerExportBoundary(t)
+			root := t.TempDir()
+			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 77, Number: 1, BaseSHA: base}
+			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, Body: "plan"}
+			manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "running"}
+			identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64)}
+			boundary := &prelaunchFailureBoundary{newSessionError: true, beforeCreate: test.beforeCreate}
+			_, pending, err := runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, source, base, root, agentruntime.ReviewModePlan, &identity, false)
+			if pending || !errors.Is(err, errReviewerTerminal) || boundary.killed == test.beforeCreate {
+				t.Fatalf("new-session ambiguity left shell/receipt pending: pending=%v err=%v boundary=%#v", pending, err, boundary)
+			}
+		})
+	}
+}
+
+func TestPlanReviewerAmbiguousRespawnProbesExactPaneBeforeTerminalizing(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		after  bool
+		marker bool
+		dead   bool
+	}{
+		{name: "before spawn"},
+		{name: "after spawn with marker", after: true, marker: true},
+		{name: "after spawn before marker", after: true},
+		{name: "after spawn crashes before marker", after: true, dead: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base, _, source, _ := testWorkerExportBoundary(t)
+			root := t.TempDir()
+			attempt := agentruntime.Attempt{Repository: "o/r", Issue: 76, Number: 1, BaseSHA: base}
+			issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, Body: "plan"}
+			manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "running"}
+			identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64)}
+			target, err := reviewTarget(agentruntime.ReviewModePlan, issue, base, base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, session := reviewIdentity(attempt, root)
+			launch, terminal := reviewerLifecyclePaths(snapshot, target)
+			boundary := &ambiguousRespawnBoundary{identity: identity, launch: launch, terminal: terminal, after: test.after, marker: test.marker, dead: test.dead}
+			_, pending, err := runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, source, base, root, agentruntime.ReviewModePlan, &identity, false)
+			if !test.after {
+				if pending || !errors.Is(err, errReviewerTerminal) || !boundary.killed || boundary.probes != 2 {
+					t.Fatalf("unstarted reviewer not terminalized: pending=%v err=%v boundary=%#v", pending, err, boundary)
+				}
+				return
+			}
+			if !pending || err == nil || boundary.killed {
+				t.Fatalf("possibly started reviewer was terminalized: pending=%v err=%v boundary=%#v", pending, err, boundary)
+			}
+			if !test.marker {
+				_, pending, err = runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, source, base, root, agentruntime.ReviewModePlan, &identity, true)
+				if test.dead {
+					if pending || !errors.Is(err, errReviewerTerminal) || !boundary.killed {
+						t.Fatalf("dead unmarked reviewer did not terminalize: pending=%v err=%v boundary=%#v", pending, err, boundary)
+					}
+					return
+				}
+				if !pending || err != nil || boundary.killed {
+					t.Fatalf("restart before launch marker lost live reviewer: pending=%v err=%v boundary=%#v", pending, err, boundary)
+				}
+			}
+			if err := cleanupReviewResources(t.Context(), boundary, nil, attempt, base, target, snapshot, session, root); err != nil {
+				t.Fatalf("test reviewer cleanup: %v", err)
+			}
+		})
+	}
+}
+
 func TestPlanReviewerInvalidArtifactIsTerminalFailure(t *testing.T) {
 	root := t.TempDir()
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 73, Number: 1, BaseSHA: strings.Repeat("a", 40)}
@@ -297,7 +573,7 @@ func TestPlanReviewerInvalidArtifactIsTerminalFailure(t *testing.T) {
 	target := "o/r#73 plan sha256:" + digestText(issue.Body)
 	snapshot, session := reviewIdentity(attempt, root)
 	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "running", ReviewState: "running", ReviewMode: agentruntime.ReviewModePlan, ReviewTarget: target, ReviewBase: attempt.BaseSHA, ReviewHead: attempt.BaseSHA, ReviewSnapshot: snapshot, ReviewSession: session}
-	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64)}
+	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64), ChildPID: 99999999}
 	launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
 	if err := os.MkdirAll(filepath.Dir(launchPath), 0o700); err != nil {
 		t.Fatal(err)

@@ -25,6 +25,7 @@ type reviewerLaunchIdentity struct {
 	IssueGeneration   uint64 `json:"issue_generation"`
 	AttemptGeneration uint64 `json:"attempt_generation"`
 	RequestDigest     string `json:"request_digest"`
+	ChildPID          int    `json:"child_pid,omitempty"`
 }
 
 type reviewerTerminalRecord struct {
@@ -36,7 +37,13 @@ type reviewerTerminalRecord struct {
 var errReviewerTerminal = errors.New("reviewer terminal failure")
 
 func reviewerIdentity(identity stateResultIdentity) reviewerLaunchIdentity {
-	return reviewerLaunchIdentity{identity.EffectID, identity.IssueGeneration, identity.AttemptGeneration, identity.RequestDigest}
+	return reviewerLaunchIdentity{EffectID: identity.EffectID, IssueGeneration: identity.IssueGeneration, AttemptGeneration: identity.AttemptGeneration, RequestDigest: identity.RequestDigest}
+}
+
+func sameReviewerIdentity(actual, expected reviewerLaunchIdentity) bool {
+	actual.ChildPID = 0
+	expected.ChildPID = 0
+	return reflect.DeepEqual(actual, expected)
 }
 
 func reviewerLifecyclePaths(snapshot, target string) (string, string) {
@@ -47,6 +54,65 @@ func reviewerLifecyclePaths(snapshot, target string) (string, string) {
 func reviewerSignal(identity reviewerLaunchIdentity) string { return "review-" + identity.EffectID }
 func reviewerStartSignal(identity reviewerLaunchIdentity) string {
 	return reviewerSignal(identity) + "-start"
+}
+func reviewerGoSignal(identity reviewerLaunchIdentity) string {
+	return reviewerSignal(identity) + "-go"
+}
+
+func reviewerPaneStartMatches(start, launchPath, terminalPath string, identity reviewerLaunchIdentity) bool {
+	return strings.Contains(start, " review-pane tmux ") && strings.Contains(start, launchPath) && strings.Contains(start, terminalPath) && strings.Contains(start, reviewerSignal(identity)) && strings.Contains(start, identity.RequestDigest)
+}
+
+func reviewerPanePID(output string) (int, error) {
+	pid, err := strconv.Atoi(strings.TrimSpace(output))
+	if err != nil || pid < 2 {
+		return 0, errors.New("exact reviewer pane PID is unavailable")
+	}
+	return pid, nil
+}
+
+func reviewerGroupGone(pid int) (bool, error) {
+	err := syscall.Kill(-pid, 0)
+	if errors.Is(err, syscall.ESRCH) {
+		return true, nil
+	}
+	return false, err
+}
+
+func verifyReviewerChildBinding(ctx context.Context, boundary boundaryCaller, env []string, session, launchPath, terminalPath string, identity reviewerLaunchIdentity, candidate int) error {
+	if candidate < 2 {
+		return errors.New("reviewer child process identity is missing")
+	}
+	pane := agentruntime.PaneTarget(session)
+	started, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", pane, "#{pane_start_command}"}, Env: env})
+	matching := reviewerPaneStartMatches(started.Output, launchPath, terminalPath, identity)
+	if launchPath == "" && terminalPath == "" {
+		matching = strings.Contains(started.Output, " review-pane tmux ") && strings.Contains(started.Output, reviewerSignal(identity))
+	}
+	if err != nil || started.Exited || !matching {
+		return errors.New("exact reviewer wrapper is not live")
+	}
+	pidResult, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", pane, "#{pane_pid}"}, Env: env})
+	if err != nil || pidResult.Exited {
+		return errors.New("exact reviewer wrapper PID is unavailable")
+	}
+	wrapperPID, err := reviewerPanePID(pidResult.Output)
+	if err != nil {
+		return err
+	}
+	parentResult, err := exec.CommandContext(ctx, "ps", "-o", "ppid=", "-p", strconv.Itoa(candidate)).Output()
+	if err != nil {
+		return fmt.Errorf("verify reviewer child parent: %w", err)
+	}
+	parentPID, err := reviewerPanePID(string(parentResult))
+	if err != nil || parentPID != wrapperPID {
+		return errors.New("reviewer child is not owned by the exact wrapper")
+	}
+	groupPID, err := syscall.Getpgid(candidate)
+	if err != nil || groupPID != candidate {
+		return errors.New("reviewer child is not its process-group leader")
+	}
+	return nil
 }
 
 func readReviewerRecord(path string, value any) (bool, error) {
@@ -141,14 +207,44 @@ func runReviewerPane(args []string, stdout, stderr io.Writer) (int, syscall.Sign
 		unlockStart.Dir = "/tmp"
 		_ = unlockStart.Run()
 	}()
-	code, childSignal, err := agentruntime.RunPaneCommandAfterStart(context.Background(), args[0], args[7:], os.Stdin, stdout, stderr, func() error {
-		if err := writeReviewerRecord(launchPath, identity); err != nil {
+	lock := exec.Command(args[0], "wait-for", "-L", reviewerGoSignal(identity))
+	lock.Dir = "/tmp"
+	if err := lock.Run(); err != nil {
+		return 125, 0, fmt.Errorf("lock reviewer start gate: %w", err)
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return 125, 0, err
+	}
+	defer reader.Close()
+	defer writer.Close()
+	gateCtx, cancelGate := context.WithCancel(context.Background())
+	defer cancelGate()
+	code, childSignal, err := agentruntime.RunPaneCommandAfterStart(context.Background(), args[0], args[7:], os.Stdin, stdout, stderr, func(pid int) error {
+		launch := identity
+		launch.ChildPID = pid
+		if err := writeReviewerRecord(launchPath, launch); err != nil {
 			return err
 		}
+		_ = reader.Close()
 		unlock := exec.Command("tmux", "wait-for", "-U", args[4])
 		unlock.Dir = "/tmp"
-		return unlock.Run()
-	})
+		if err := unlock.Run(); err != nil {
+			return err
+		}
+		go func() {
+			wait := exec.CommandContext(gateCtx, args[0], "wait-for", "-L", reviewerGoSignal(identity))
+			wait.Dir = "/tmp"
+			if wait.Run() == nil {
+				_, _ = io.WriteString(writer, "go\n")
+				unlock := exec.Command(args[0], "wait-for", "-U", reviewerGoSignal(identity))
+				unlock.Dir = "/tmp"
+				_ = unlock.Run()
+			}
+			_ = writer.Close()
+		}()
+		return nil
+	}, reader)
 	record := reviewerTerminalRecord{Identity: identity, ExitCode: code, Signal: int(childSignal)}
 	if writeErr := writeReviewerRecord(terminalPath, record); writeErr != nil {
 		return 126, 0, errors.Join(err, fmt.Errorf("record reviewer terminal result: %w", writeErr))
@@ -158,7 +254,7 @@ func runReviewerPane(args []string, stdout, stderr io.Writer) (int, syscall.Sign
 
 func readReviewerTerminal(launchPath, terminalPath string, identity reviewerLaunchIdentity) (*reviewerTerminalRecord, error) {
 	var launch reviewerLaunchIdentity
-	if exists, err := readReviewerRecord(launchPath, &launch); err != nil || !exists || !reflect.DeepEqual(launch, identity) {
+	if exists, err := readReviewerRecord(launchPath, &launch); err != nil || !exists || !sameReviewerIdentity(launch, identity) {
 		if err != nil {
 			return nil, err
 		}
@@ -169,7 +265,7 @@ func readReviewerTerminal(launchPath, terminalPath string, identity reviewerLaun
 	if err != nil || !exists {
 		return nil, err
 	}
-	if !reflect.DeepEqual(terminal.Identity, identity) || terminal.ExitCode < 0 || terminal.ExitCode > 255 || terminal.Signal < 0 || terminal.Signal > 127 || terminal.Signal != 0 && terminal.ExitCode != 128+terminal.Signal {
+	if !sameReviewerIdentity(terminal.Identity, identity) || terminal.ExitCode < 0 || terminal.ExitCode > 255 || terminal.Signal < 0 || terminal.Signal > 127 || terminal.Signal != 0 && terminal.ExitCode != 128+terminal.Signal {
 		return nil, errors.New("reviewer terminal identity or exit result is invalid")
 	}
 	return &terminal, nil

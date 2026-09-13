@@ -105,7 +105,9 @@ type runtimeEffectIntent struct {
 	Reconciliation       *reconciliationEffectRequest   `json:"reconciliation,omitempty"`
 	ReconciliationResult *reconciliationEffectResult    `json:"reconciliation_result,omitempty"`
 	ReviewerLaunched     bool                           `json:"reviewer_launched,omitempty"`
+	ReviewerGroupPID     int                            `json:"reviewer_group_pid,omitempty"`
 	SupersededReviewerID string                         `json:"superseded_reviewer_id,omitempty"`
+	SupersededReviewerGroupPID int                      `json:"superseded_reviewer_group_pid,omitempty"`
 	Diagnostic           string                         `json:"diagnostic,omitempty"`
 }
 
@@ -201,6 +203,7 @@ type authorizeReconciliationEffectCommand struct {
 
 type markPlanReviewRunningCommand struct {
 	Identity stateResultIdentity
+	GroupPID int
 }
 
 type supersedePlanReviewCommand struct {
@@ -1225,10 +1228,12 @@ func applyUpsertAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState,
 			return errors.New("issue generation overflow")
 		}
 		issueGeneration++
+		if err := pruneSupersededIssueEffects(state, manifest.Repository, manifest.Issue, issueGeneration); err != nil {
+			return err
+		}
 		state.IssueGenerations[issueKey] = issueGeneration
 		delete(state.Observations, issueKey)
 		deleteIssueRecoveries(state, manifest.Repository, manifest.Issue)
-		deleteIssueScopedEffects(state, manifest.Repository, manifest.Issue)
 		generation = 1
 	} else {
 		if generation == ^uint64(0) {
@@ -1801,7 +1806,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if effect.RequestDigest != "" && (!agentruntime.ValidEffectRequestDigest(effect.RequestDigest) || effect.IntentEpoch == 0 || effect.IntentEpoch > maxEpoch || !validRuntimeEffectInput(agentruntime.EffectAction(effect.Action), effect.Reason) || (effect.Action == string(agentruntime.EffectReview)) != (effect.Review != nil)) {
 			return errors.New("runtime owner typed effect intent is invalid")
 		}
-		if effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID)) {
+		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID)) {
 			return errors.New("runtime owner superseded reviewer binding is invalid")
 		}
 		if effect.RequestDigest != "" && effect.Action == string(agentruntime.EffectReview) {
@@ -2015,6 +2020,22 @@ func deleteAttemptEffects(state *runtimeOwnerState, repository string, issue, at
 			delete(state.Effects, id)
 		}
 	}
+}
+
+func pruneSupersededIssueEffects(state *runtimeOwnerState, repository string, issue int, nextGeneration uint64) error {
+	for id, effect := range state.Effects {
+		if effect.Repository != repository || effect.Issue != issue || effect.IssueGeneration >= nextGeneration || effectAuthorizedByTombstone(*state, effect) {
+			continue
+		}
+		if effectReferencedByReceipt(*state, id) {
+			if effect.State == "pending" {
+				return errStateConflict
+			}
+			continue
+		}
+		delete(state.Effects, id)
+	}
+	return nil
 }
 
 func effectAuthorizedByTombstone(state runtimeOwnerState, effect runtimeEffectIntent) bool {

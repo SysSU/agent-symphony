@@ -2078,11 +2078,88 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	}
 	if binding != nil && replay {
 		launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
+		var launch reviewerLaunchIdentity
+		found, launchErr := readReviewerRecord(launchPath, &launch)
+		if launchErr != nil {
+			return independentReviewResult{}, false, reviewerLifecycleError(launchErr)
+		}
+		if !found {
+			paneStatus, statusErr := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
+			if statusErr != nil {
+				return independentReviewResult{}, true, fmt.Errorf("probe unmarked reviewer pane: %w", statusErr)
+			}
+			if missingTmuxPaneStatus(paneStatus) {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot)
+				cancel()
+				if cleanupErr != nil {
+					return independentReviewResult{}, true, fmt.Errorf("clean missing reviewer pane: %w", cleanupErr)
+				}
+				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer wrapper never started"))
+			}
+			pane, parseErr := agentruntime.ParsePaneStatus(paneStatus.Output)
+			if parseErr != nil {
+				return independentReviewResult{}, true, fmt.Errorf("probe unmarked reviewer pane: %w", parseErr)
+			}
+			if pane.Dead {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot)
+				cancel()
+				if cleanupErr != nil {
+					return independentReviewResult{}, true, fmt.Errorf("clean dead unmarked reviewer pane: %w", cleanupErr)
+				}
+				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer exited before launch identity was recorded"))
+			}
+			started, probeErr := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_start_command}"}, Dir: snapshot, Env: env})
+			if probeErr != nil || started.Exited {
+				return independentReviewResult{}, true, fmt.Errorf("probe unmarked reviewer pane: %w", errors.Join(probeErr, errors.New("tmux pane identity is unavailable")))
+			}
+			if reviewerPaneStartMatches(started.Output, launchPath, terminalPath, *binding) {
+				return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
+			}
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot)
+			cancel()
+			if cleanupErr != nil {
+				return independentReviewResult{}, true, fmt.Errorf("stop unmarked reviewer pane: %w", cleanupErr)
+			}
+			return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer wrapper never started"))
+		}
+		if !sameReviewerIdentity(launch, *binding) {
+			return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer launch identity mismatched"))
+		}
+		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
+		if err != nil {
+			return independentReviewResult{}, true, fmt.Errorf("observe launched reviewer: %w", err)
+		}
+		if missingTmuxPaneStatus(result) {
+			return independentReviewResult{}, true, errors.New("launched reviewer pane identity is unavailable")
+		}
+		pane, err := agentruntime.ParsePaneStatus(result.Output)
+		if err != nil {
+			return independentReviewResult{}, true, err
+		}
+		if !pane.Dead {
+			return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
+		}
+		if !pane.Ready {
+			return independentReviewResult{}, true, errors.New("reviewer pane exit is not yet recorded")
+		}
+		if binding.ChildPID < 2 || launch.ChildPID != binding.ChildPID {
+			return independentReviewResult{}, true, errors.New("owner-bound reviewer process group is unavailable")
+		}
+		gone, err := reviewerGroupGone(binding.ChildPID)
+		if err != nil || !gone {
+			return independentReviewResult{}, true, fmt.Errorf("reviewer process group remains live or unknown: %w", err)
+		}
 		terminal, terminalErr := readReviewerTerminal(launchPath, terminalPath, *binding)
 		if terminalErr != nil {
 			return independentReviewResult{}, false, reviewerLifecycleError(terminalErr)
 		}
 		if terminal != nil {
+			if terminal.ExitCode == 0 && (pane.Signal != "" || pane.ExitStatus != 0) {
+				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer terminal record conflicts with tmux pane exit"))
+			}
 			if terminal.ExitCode != 0 || terminal.Signal != 0 {
 				return independentReviewResult{}, false, reviewerLifecycleError(errors.New(reviewerTerminalDiagnostic(*terminal)))
 			}
@@ -2100,21 +2177,7 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 			}
 			return parsed, false, nil
 		}
-		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
-		if err != nil {
-			return independentReviewResult{}, true, fmt.Errorf("observe launched reviewer: %w", err)
-		}
-		if missingTmuxPaneStatus(result) {
-			return independentReviewResult{}, false, reviewerLifecycleError(errors.New("launched reviewer pane is missing"))
-		}
-		pane, err := agentruntime.ParsePaneStatus(result.Output)
-		if err != nil {
-			return independentReviewResult{}, true, err
-		}
-		if pane.Dead {
-			return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer exited without terminal record"))
-		}
-		return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
+		return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer exited without terminal record"))
 	}
 	if binding == nil && manifest.ReviewState == "running" && manifestMode == mode && manifestTarget == target && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
 		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
@@ -2215,7 +2278,13 @@ launch:
 	}
 	args := agentruntime.TmuxNewSessionArgs(session, snapshot, env)
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: args, Dir: snapshot, Env: env}); err != nil {
-		return independentReviewResult{}, false, err
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot)
+		cancel()
+		if cleanupErr != nil {
+			return independentReviewResult{}, true, errors.Join(err, cleanupErr)
+		}
+		return independentReviewResult{}, false, reviewerLifecycleError(err)
 	}
 	failBeforeRespawn := func(cause error) (independentReviewResult, bool, error) {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -2272,8 +2341,26 @@ launch:
 		encoded, _ := json.Marshal(binding)
 		command = append([]string{help, "review-pane", "tmux", launchPath, terminalPath, reviewerSignal(*binding), reviewerStartSignal(*binding), string(encoded), "--"}, command...)
 	}
+	baseline, baselineErr := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_start_command}"}, Dir: snapshot, Env: env})
+	if baselineErr != nil || baseline.Exited {
+		return failBeforeRespawn(errors.Join(baselineErr, errors.New("cannot establish reviewer pane launch identity")))
+	}
 	respawnRequested = true // A failed boundary response cannot prove the wrapper did not start.
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
+		if binding != nil {
+			launchPath, _ := reviewerLifecyclePaths(snapshot, target)
+			var launch reviewerLaunchIdentity
+			found, readErr := readReviewerRecord(launchPath, &launch)
+			if readErr == nil && !found {
+				current, probeErr := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_start_command}"}, Dir: snapshot, Env: env})
+				if probeErr == nil && !current.Exited && current.Output == baseline.Output {
+					respawnRequested = false // The original shell still owns the pane.
+					return failBeforeRespawn(err)
+				}
+			}
+			armed = false // The wrapper may own the latches; keep the exact intent pending.
+			return independentReviewResult{Snapshot: snapshot, Session: session}, true, fmt.Errorf("reviewer respawn outcome is uncertain: %w", err)
+		}
 		return independentReviewResult{}, false, err
 	}
 	armed = false // The reviewer wrapper owns both latches after respawn succeeds.
