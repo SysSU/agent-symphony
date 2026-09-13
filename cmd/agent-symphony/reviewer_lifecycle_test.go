@@ -21,6 +21,35 @@ func (b *forbiddenReviewerBoundary) call(context.Context, string, agentruntime.C
 	return agentruntime.Result{}, errors.New("replayed reviewer attempted boundary work")
 }
 
+type prelaunchFailureBoundary struct {
+	created bool
+	killed  bool
+}
+
+func (b *prelaunchFailureBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
+	if operation != "run" || command.Name != "tmux" || len(command.Args) == 0 {
+		return agentruntime.Result{}, errors.New("unexpected reviewer boundary command")
+	}
+	switch command.Args[0] {
+	case "display-message":
+		if b.created && !b.killed {
+			return agentruntime.Result{Output: "0||||"}, nil
+		}
+		return agentruntime.Result{Output: "||||"}, nil
+	case "set-option":
+		if len(command.Args) > 5 && command.Args[4] == ";" && command.Args[5] == "new-session" {
+			b.created = true
+			return agentruntime.Result{}, nil
+		}
+		return agentruntime.Result{}, errors.New("tmux set-option denied")
+	case "kill-session":
+		b.killed = true
+		return agentruntime.Result{}, nil
+	default:
+		return agentruntime.Result{}, errors.New("unexpected reviewer boundary command")
+	}
+}
+
 type reviewerSessionStopBoundary struct {
 	status agentruntime.Result
 	err    error
@@ -226,6 +255,20 @@ func TestPlanReviewerCleanupFailureDoesNotWaitForAnUnlaunchedPane(t *testing.T) 
 	_, pending, err := runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, "", attempt.BaseSHA, root, agentruntime.ReviewModePlan, &identity, false)
 	if pending || !errors.Is(err, errReviewerTerminal) || boundary.calls != 1 {
 		t.Fatalf("failed prelaunch cleanup may not leave a pending reviewer: pending=%v err=%v calls=%d", pending, err, boundary.calls)
+	}
+}
+
+func TestPlanReviewerSetupFailureKillsDefaultShellAndTerminalizes(t *testing.T) {
+	base, _, source, _ := testWorkerExportBoundary(t)
+	root := t.TempDir()
+	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 75, Number: 1, BaseSHA: base}
+	issue := internalgithub.RecoveryIssueFact{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, Body: "plan"}
+	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: base, State: "running"}
+	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64)}
+	boundary := &prelaunchFailureBoundary{}
+	_, pending, err := runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, source, base, root, agentruntime.ReviewModePlan, &identity, false)
+	if pending || !errors.Is(err, errReviewerTerminal) || !boundary.created || !boundary.killed {
+		t.Fatalf("setup failure left default reviewer shell or pending intent: pending=%v err=%v boundary=%#v", pending, err, boundary)
 	}
 }
 

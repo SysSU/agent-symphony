@@ -2026,7 +2026,13 @@ func runIndependentReviewV2(ctx context.Context, attempt agentruntime.Attempt, b
 	return runIndependentReviewCore(ctx, attempt, boundary, env, command, issue, manifest, source, head, snapshotRoot, mode, binding, replay)
 }
 
-func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot, mode string, binding *reviewerLaunchIdentity, replay bool) (independentReviewResult, bool, error) {
+func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot, mode string, binding *reviewerLaunchIdentity, replay bool) (review independentReviewResult, pending bool, err error) {
+	respawnRequested := false
+	defer func() {
+		if binding != nil && !respawnRequested && err != nil && !pending && !errors.Is(err, errReviewerTerminal) {
+			err = reviewerLifecycleError(err)
+		}
+	}()
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
 	}
@@ -2211,12 +2217,18 @@ launch:
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: args, Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
+	failBeforeRespawn := func(cause error) (independentReviewResult, bool, error) {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot)
+		return independentReviewResult{}, false, reviewerLifecycleError(errors.Join(cause, cleanupErr))
+	}
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-w", "-t", agentruntime.PaneTarget(session), "remain-on-exit", "on"}, Dir: snapshot, Env: env}); err != nil {
-		return independentReviewResult{}, false, err
+		return failBeforeRespawn(err)
 	}
 	prompt, err := reviewPrompt(mode, target, issue)
 	if err != nil {
-		return independentReviewResult{}, false, err
+		return failBeforeRespawn(err)
 	}
 	prompt += "\n\nBefore exiting, atomically write the final JSON object to the path in AGENT_SYMPHONY_REVIEW_RESULT. The result file is the lifecycle authority; terminal text is only operator-visible conversation."
 	legacy := []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-"}
@@ -2227,21 +2239,16 @@ launch:
 	}
 	command, err = config.ExpandManagedWorkspace(command, snapshot)
 	if err != nil {
-		return independentReviewResult{}, false, err
+		return failBeforeRespawn(err)
 	}
 	command = append(slices.Clone(command), prompt)
 	for _, option := range []string{agentruntime.PaneExitStatusOption, agentruntime.PaneExitSignalOption} {
 		if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-p", "-t", agentruntime.PaneTarget(session), option, ""}, Dir: snapshot, Env: env}); err != nil {
-			return independentReviewResult{}, false, err
+			return failBeforeRespawn(err)
 		}
 	}
 	armed := false
 	if binding != nil {
-		for _, channel := range []string{reviewerSignal(*binding), reviewerStartSignal(*binding)} {
-			if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-L", channel}, Dir: snapshot, Env: env}); err != nil {
-				return independentReviewResult{}, false, err
-			}
-		}
 		armed = true
 		defer func() {
 			if armed {
@@ -2252,14 +2259,20 @@ launch:
 				}
 			}
 		}()
+		for _, channel := range []string{reviewerSignal(*binding), reviewerStartSignal(*binding)} {
+			if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-L", channel}, Dir: snapshot, Env: env}); err != nil {
+				return failBeforeRespawn(err)
+			}
+		}
 		help, err := os.Executable()
 		if err != nil {
-			return independentReviewResult{}, false, err
+			return failBeforeRespawn(err)
 		}
 		launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
 		encoded, _ := json.Marshal(binding)
 		command = append([]string{help, "review-pane", "tmux", launchPath, terminalPath, reviewerSignal(*binding), reviewerStartSignal(*binding), string(encoded), "--"}, command...)
 	}
+	respawnRequested = true // A failed boundary response cannot prove the wrapper did not start.
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
