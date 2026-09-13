@@ -942,8 +942,8 @@ printf 'implementation-ready\r\n'
 IFS= read -r input
 printf 'implementation-received:%s\r\n' "$input"
 printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"direct input received","documentation":"none"}' >"$AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
-IFS= read -r finish
-test "$finish" = finish
+IFS= read -r finish || exit 1
+test "$finish" = finish || exit 1
 printf 'implementation-finished\r\n'
 `
 	if err := os.WriteFile(agent, []byte(script), 0o700); err != nil {
