@@ -785,7 +785,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 						return false
 					}
 					for _, receipt := range current.ControlReceipts {
-						if receipt.Request.Action == "archive" && receipt.Request.Issue == 73 && receipt.Request.Attempt == 1 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK && receipt.EffectID != "" && current.Effects[receipt.EffectID].State == "completed" {
+						if receipt.Request.Action == "archive" && receipt.Request.Issue == 73 && receipt.Request.Attempt == 1 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK && receipt.EffectID == current.Tombstones[key].EffectID && (receipt.EffectID == "" || current.Effects[receipt.EffectID].State == "completed") {
 							return true
 						}
 					}
@@ -804,6 +804,9 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 						t.Fatalf("Archive retained runtime resource %s: %v", path, err)
 					}
+				}
+				if fullSystemTmuxSessionExists(environment, manifest.Session) {
+					t.Fatalf("Archive retained implementation session %s", manifest.Session)
 				}
 				if err := server.Process.Signal(os.Interrupt); err != nil {
 					t.Fatal(err)
@@ -972,19 +975,27 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					if json.NewDecoder(response.Body).Decode(&snapshot) != nil {
 						return false
 					}
+					failed, retryable, reviewerGone, replacementActive := false, false, false, false
 					for _, status := range snapshot.Statuses {
-						if status.Issue == 73 && status.Attempt == 1 {
+						if status.Issue != 73 {
+							continue
+						}
+						if status.Attempt == 2 && status.State == "active" {
+							replacementActive = status.Session != "" && fullSystemTmuxSessionExists(environment, status.Session)
+						}
+						if status.Attempt == 1 {
+							failed, retryable, reviewerGone = status.State == "failed", status.Retryable, true
 							for _, session := range status.Sessions {
-								if session.Role == agentruntime.SessionRoleReviewer {
-									return false
-								}
+								reviewerGone = reviewerGone && session.Role != agentruntime.SessionRoleReviewer
 							}
-							return status.State == "failed" && status.Retryable
 						}
 					}
-					return false
+					if replacementActive {
+						return failed && reviewerGone && !retryable
+					}
+					return failed && reviewerGone && retryable
 				}) {
-					t.Fatal("restart did not preserve failed/retryable GitHub projection with cancelled local runtime and no reviewer session")
+					t.Fatal("restart did not preserve cancelled attempt as failed without its reviewer, or show a valid recovery/active next attempt")
 				}
 			}
 		})

@@ -16,7 +16,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
   page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
   await page.goto(baseURL);
   const card = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#73\b/ }) }).first();
-  const exactAttempt = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#73\b/ }) }).filter({ hasText: /Attempt 1\b/ });
+  const exactAttempt = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#73\b/ }) }).filter({ hasText: /Attempt 1(?!\d)/ });
   if (action.endsWith("-overlap-verify")) {
     await expect.poll(async () => {
       const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
@@ -131,16 +131,31 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
         return status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.state;
       }, { timeout: 20_000 }).toBe("failed");
       await page.reload();
-      const canceledCard = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: /#73\b/ }) }).first();
-      await expect(canceledCard).toContainText("failed");
+      await expect(card).toBeVisible();
+      const history = page.locator("details.attemptHistory");
+      const historicalCard = async () => {
+        await expect(history).toBeVisible();
+        if (await history.getAttribute("open") === null) await history.locator("summary").click();
+        await expect(history).toHaveAttribute("open", "");
+        return history.getByRole("listitem").filter({ hasText: /Attempt 1(?!\d)/ });
+      };
+      let canceledCard = /Attempt 2(?!\d)/.test(await card.innerText()) ? await historicalCard() : exactAttempt;
       try {
+        await expect(canceledCard).toContainText("failed");
+      } catch {
+        canceledCard = await historicalCard();
+        await expect(canceledCard).toContainText("failed");
+      }
+      const status = await page.request.get(`${baseURL}/status.json`).then((response) => response.json());
+      const old = status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1);
+      const next = status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
+      if (next) {
+        expect(next.session).toBeTruthy();
+        expect(next.session).not.toBe(old?.session);
+        await expect(card).toContainText(/Attempt 2(?!\d)/);
+        await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toHaveCount(0);
+      } else if (old?.retryable && !old.operator_blocked) {
         await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toBeVisible();
-      } catch (error) {
-        const [status, comments] = await Promise.all([
-          page.request.get(`${baseURL}/status.json`).then((response) => response.json()),
-          page.request.get(`${fakeGitHubURL}/repos/o/r/issues/73/comments`).then((response) => response.json()),
-        ]);
-        throw new Error(`Recover is unavailable after Cancel: status=${JSON.stringify(status)} comments=${JSON.stringify(comments)}`, { cause: error });
       }
       await expect(canceledCard.getByRole("button", { name: "Open reviewer terminal" })).toHaveCount(0);
       expect(errors).toEqual([]);

@@ -31,7 +31,7 @@ test("removes a historical attempt and archives a generated attempt", async ({ p
     await archive.click();
     const response = await responsePromise;
     expect([200, 202]).toContain(response.status());
-    await expect(page.getByRole("status").filter({ hasText: /(Archived|Archive accepted) issue #73, attempt 2/ })).toBeVisible();
+    await expect(page.getByRole("status").filter({ hasText: /Archived issue #73, attempt 2|Archive accepted for issue #73, attempt 2/ })).toBeVisible();
     await expect.poll(async () => {
       const state = await fetch(`${baseURL}/dashboard-state.json`, { cache: "no-store" }).then((result) => result.json());
       return state.hidden?.some((attempt) => attempt.repository === "o/r" && attempt.issue === 73 && attempt.attempt === 2 && attempt.reason === "archived");
