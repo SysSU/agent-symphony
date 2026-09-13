@@ -24,7 +24,8 @@ var (
 	// ErrWorkerResultOverflow means the configured command exceeded the capture ceiling.
 	ErrWorkerResultOverflow = errors.New("worker stdout exceeds 64 KiB")
 	// ErrWorkerOutputOpen means an out-of-group process retained the worker output descriptor.
-	ErrWorkerOutputOpen = errors.New("worker stdout remained open after process-group termination")
+	ErrWorkerOutputOpen             = errors.New("worker stdout remained open after process-group termination")
+	errReviewerGroupAbsenceUnproved = errors.New("reviewer process group absence is unproved")
 )
 
 const (
@@ -81,7 +82,9 @@ func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io
 
 // RunPaneCommandAfterStart records launch proof only after the child exists.
 func RunPaneCommandAfterStart(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, extraFiles ...*os.File) (int, syscall.Signal, error) {
-	return runReviewerPaneCommand(ctx, tmux, command, stdin, stdout, stderr, afterStart, extraFiles)
+	return runReviewerPaneCommand(ctx, tmux, command, stdin, stdout, stderr, afterStart, extraFiles, func(pid int) error {
+		return syscall.Kill(-pid, 0)
+	})
 }
 
 // The group leader remains alive after the reviewer exits, pinning its PGID
@@ -96,7 +99,7 @@ printf '%d\n' "$code" >&4
 IFS= read -r _ <&5
 exit "$code"`
 
-func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, extraFiles []*os.File) (int, syscall.Signal, error) {
+func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, extraFiles []*os.File, probeGroup func(int) error) (int, syscall.Signal, error) {
 	if len(command) == 0 || command[0] == "" || len(extraFiles) != 1 || extraFiles[0] == nil {
 		return 125, 0, errors.New("reviewer pane command or start gate is missing")
 	}
@@ -131,8 +134,8 @@ func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, 
 		if killErr != nil {
 			return killErr
 		}
-		if err := syscall.Kill(-child.Process.Pid, 0); err != nil && !errors.Is(err, syscall.ESRCH) {
-			return fmt.Errorf("reviewer process group did not terminate: %w", err)
+		if err := reviewerGroupAbsenceError(probeGroup(child.Process.Pid)); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -155,13 +158,22 @@ func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, 
 	case <-ctx.Done():
 		return 125, 0, errors.Join(ctx.Err(), stop())
 	}
-	if err := stop(); err != nil {
-		return 125, 0, err
+	cleanupErr := stop()
+	if cleanupErr != nil && !errors.Is(cleanupErr, errReviewerGroupAbsenceUnproved) {
+		return 125, 0, cleanupErr
 	}
 	if finished.err != nil {
-		return 125, 0, finished.err
+		return 125, 0, errors.Join(finished.err, cleanupErr)
 	}
-	return finished.code, 0, RecordPaneExitStatus(ctx, tmux, finished.code)
+	// Cleanup uncertainty must not replace the command's durable exit result.
+	return finished.code, 0, errors.Join(cleanupErr, RecordPaneExitStatus(ctx, tmux, finished.code))
+}
+
+func reviewerGroupAbsenceError(probeErr error) error {
+	if errors.Is(probeErr, syscall.ESRCH) {
+		return nil
+	}
+	return fmt.Errorf("%w: group probe returned %v", errReviewerGroupAbsenceUnproved, probeErr)
 }
 
 func runPaneCommandAfterStart(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, reviewerGroup bool, extraFiles ...*os.File) (int, syscall.Signal, error) {
