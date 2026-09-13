@@ -598,19 +598,28 @@ func TestCancelBindsObservedReviewerGroupBeforeStopAndSurvivesRestart(t *testing
 		t.Fatal(err)
 	}
 	identity := ownerEffectIdentity(effectRequestIdentity(*stop))
-	if _, err := owner.markReviewerStopped(t.Context(), markReviewerStoppedCommand{Identity: identity, Observation: reviewerStopObservation{GroupPID: 12345}}); !errors.Is(err, errStateConflict) {
-		t.Fatalf("stop completed before durable group bind: %v", err)
+	proofKey := reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, review.Reviewer.Mode, review.Reviewer.Target)
+	prior := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
+	prior.ReviewerProofs[proofKey] = reviewerProcessProof{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, EffectID: strings.Repeat("f", 32), IssueGeneration: reviewer.IssueGeneration, AttemptGeneration: reviewer.AttemptGeneration, GroupPID: 7777, DeadProved: true}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
 	}
-	bound, err := owner.bindReviewerStopping(t.Context(), bindReviewerStoppingCommand{Identity: identity, GroupPID: 12345})
+	bindingOwner, err := startTestStateOwner(t, owner.stateRoot, prior, func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	proofKey := reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, review.Reviewer.Mode, review.Reviewer.Target)
+	if _, err := bindingOwner.markReviewerStopped(t.Context(), markReviewerStoppedCommand{Identity: identity, Observation: reviewerStopObservation{GroupPID: 12345}}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("stop completed before durable group bind: %v", err)
+	}
+	bound, err := bindingOwner.bindReviewerStopping(t.Context(), bindReviewerStoppingCommand{Identity: identity, GroupPID: 12345})
+	if err != nil {
+		t.Fatal(err)
+	}
 	proof := bound.State.ReviewerProofs[proofKey]
 	if bound.State.Effects[stop.ID].SupersededReviewerGroupPID != 12345 || proof.GroupPID != 12345 || proof.DeadProved || proof.EffectID != reviewer.ID {
 		t.Fatalf("pre-kill owner binding=%#v proof=%#v", bound.State.Effects[stop.ID], proof)
 	}
-	if err := owner.close(t.Context()); err != nil {
+	if err := bindingOwner.close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	restarted, err := startTestStateOwner(t, owner.stateRoot, bound.State, func(runtimeOwnerState) error { return nil })
@@ -721,6 +730,66 @@ func TestAbandonCapturesPendingReviewerIdentityBeforeTombstone(t *testing.T) {
 	}
 	if committed.State.Tombstones[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].EffectID != cleanup.ID {
 		t.Fatalf("Abandon did not bind pending cleanup to tombstone: %#v", committed.State.Tombstones)
+	}
+	proofKey := reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, review.Reviewer.Mode, review.Reviewer.Target)
+	prior := cloneRuntimeOwnerState(committed.State)
+	prior.ReviewerProofs[proofKey] = reviewerProcessProof{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, EffectID: strings.Repeat("f", 32), IssueGeneration: reviewer.IssueGeneration, AttemptGeneration: reviewer.AttemptGeneration, GroupPID: 7777, DeadProved: true}
+	if err := restarted.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	bindingOwner, err := startTestStateOwner(t, restarted.stateRoot, prior, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bindingOwner.close(context.Background()) })
+	bound, err := bindingOwner.bindReviewerStopping(t.Context(), bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*cleanup)), GroupPID: 12345})
+	if err != nil {
+		t.Fatalf("Abandon cleanup could not replace prior certified proof: %v", err)
+	}
+	if proof := bound.State.ReviewerProofs[proofKey]; proof.EffectID != reviewer.ID || proof.GroupPID != 12345 || proof.DeadProved {
+		t.Fatalf("Abandon cleanup kept stale proof after new live bind: %#v", proof)
+	}
+}
+
+func TestBindReviewerStoppingReplacesOnlyPriorDeadSameTargetProof(t *testing.T) {
+	review := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	const oldID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const newID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const stopID = "cccccccccccccccccccccccccccccccc"
+	for _, action := range []string{string(agentruntime.EffectStop), string(agentruntime.EffectCleanup), string(reconciliationReviewer)} {
+		t.Run(action, func(t *testing.T) {
+			state := newRuntimeOwnerState(review.Repository)
+			key := reviewerProofKey(review.Repository, review.Issue, review.Attempt, review.Reviewer.Mode, review.Reviewer.Target)
+			old := reviewerProcessProof{Repository: review.Repository, Issue: review.Issue, Attempt: review.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, EffectID: oldID, IssueGeneration: 1, AttemptGeneration: 1, GroupPID: 11111, DeadProved: true}
+			state.ReviewerProofs[key] = old
+			effect := runtimeEffectIntent{ID: stopID, Action: action, Repository: review.Repository, Issue: review.Issue, Attempt: review.Attempt, IssueGeneration: 2, AttemptGeneration: 2, IntentEpoch: 1, IntentRevision: 3, State: "pending", RequestDigest: strings.Repeat("d", 64), ReviewerGateProtocol: true, ReviewerSessionRequested: true}
+			if action == string(reconciliationReviewer) {
+				effect.ID = newID
+				effect.Reconciliation = &review
+			} else {
+				effect.SupersededReviewerID = newID
+				effect.SupersededReviewerGateProtocol = true
+				effect.SupersededReviewerSessionRequested = true
+				effect.SupersededReviewerMode = review.Reviewer.Mode
+				effect.SupersededReviewerTarget = review.Reviewer.Target
+				effect.SupersededReviewerIssueGeneration = 2
+				effect.SupersededReviewerAttemptGeneration = 2
+			}
+			state.Effects[effect.ID] = effect
+			command := bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), GroupPID: 22222}
+			if err := applyBindReviewerStopping(&state, command); err != nil {
+				t.Fatalf("prior dead same-target review blocked new reviewer binding: %v", err)
+			}
+			proof := state.ReviewerProofs[key]
+			if proof.EffectID != newID || proof.GroupPID != 22222 || proof.IssueGeneration != 2 || proof.AttemptGeneration != 2 || proof.DeadProved {
+				t.Fatalf("new live reviewer proof was not bound exactly: %#v", proof)
+			}
+			old.DeadProved = false
+			state.ReviewerProofs[key] = old
+			if err := applyBindReviewerStopping(&state, command); !errors.Is(err, errStateConflict) {
+				t.Fatalf("live prior reviewer proof was overwritten: %v", err)
+			}
+		})
 	}
 }
 

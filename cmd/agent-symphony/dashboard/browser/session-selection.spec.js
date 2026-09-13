@@ -101,7 +101,7 @@ test("opens and chats with both exact review modes", async ({ page }) => {
   await page.keyboard.type("implementation input");
   await expect.poll(() => sockets[2]?.messages.some((message) => typeof message !== "string")).toBe(true);
   const target = new URL(sockets[2].url);
-  await expect(page.getByText("agent: acknowledged", { exact: false })).toBeVisible();
+  await expect(page.getByRole("dialog", { name: attempt.sessions[0].name }).getByRole("listitem").filter({ hasText: "agent: acknowledged" })).toBeVisible();
   expect(target.pathname).toBe("/terminal");
   expect(Object.fromEntries(target.searchParams)).toEqual({ repository: attempt.repository, issue: "163", attempt: "1" });
   expect(Buffer.concat(sockets[2].messages.filter((message) => typeof message !== "string").map((message) => Buffer.from(message))).toString()).toContain("implementation input");

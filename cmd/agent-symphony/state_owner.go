@@ -1218,10 +1218,11 @@ func applyBindReviewerStopping(state *runtimeOwnerState, command bindReviewerSto
 	}
 	key := reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target)
 	if old, exists := state.ReviewerProofs[key]; exists {
-		if old.EffectID != proof.EffectID || old.GroupPID != proof.GroupPID || old.IssueGeneration != proof.IssueGeneration || old.AttemptGeneration != proof.AttemptGeneration {
+		if old.EffectID == proof.EffectID && old.GroupPID == proof.GroupPID && old.IssueGeneration == proof.IssueGeneration && old.AttemptGeneration == proof.AttemptGeneration {
+			proof = old
+		} else if !old.DeadProved || old.EffectID == proof.EffectID || old.Repository != proof.Repository || old.Issue != proof.Issue || old.Attempt != proof.Attempt || old.Mode != proof.Mode || old.Target != proof.Target || old.IssueGeneration > proof.IssueGeneration || old.AttemptGeneration > proof.AttemptGeneration {
 			return errStateConflict
 		}
-		proof = old
 	}
 	if state.ReviewerProofs == nil {
 		state.ReviewerProofs = map[string]reviewerProcessProof{}
