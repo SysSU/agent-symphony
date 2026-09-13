@@ -133,6 +133,7 @@ type productionReconciliation struct {
 	checkout       string
 	implementation workerBoundaryRunner
 	reviewer       workerBoundaryRunner
+	operator       *operatorMutationService
 	reviewEnv      []string
 	wake           func() error
 	supervisor     *orchestratoragent.Supervisor
@@ -194,6 +195,10 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 		return err
 	}
 	p.effects.cancelInvalidated(applied)
+	if p.operator != nil {
+		p.operator.cancelSupersededPlanWatchers(cycleSnapshot, applied)
+		p.operator.scanPendingPlanReviewers(ctx, applied)
+	}
 	if resumed, err := p.resumePendingReconciliation(ctx, api, batch); err != nil || resumed {
 		if err != nil {
 			return err

@@ -205,6 +205,13 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 			m.ReviewBase, m.ReviewHead = "aaaaaaa", "bbbbbbb"
 			return m
 		}(), "review", "reviewer", 2, "reviewer session"},
+		{"plan review running alongside implementation", func() agentruntime.Manifest {
+			m := base
+			m.State, m.ReviewState, m.ReviewSession = "running", "running", reviewer
+			m.ReviewMode, m.ReviewTarget = agentruntime.ReviewModePlan, "o/r#4 plan sha256:"+strings.Repeat("b", 64)
+			m.ReviewBase, m.ReviewHead = fact.BaseSHA, fact.BaseSHA
+			return m
+		}(), "review", "reviewer", 2, "reviewer session"},
 		{"review session missing", func() agentruntime.Manifest { m := base; m.ReviewState = "running"; return m }(), "review", "", 1, "restore"},
 		{"findings handoff", func() agentruntime.Manifest {
 			m := base
@@ -239,6 +246,15 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 				t.Fatalf("current role = %q, want %q: %#v", current, test.currentRole, got[0].Sessions)
 			}
 		})
+	}
+}
+
+func TestFailedPlanReviewProjectsActionableDiagnostic(t *testing.T) {
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "running", ReviewState: "failed", ReviewMode: agentruntime.ReviewModePlan, ReviewDiagnostic: "reviewer exited 17"}
+	status := RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "active"}
+	projectAttemptLifecycle(&status, manifest)
+	if status.Diagnostic != manifest.ReviewDiagnostic {
+		t.Fatalf("failed review diagnostic not visible: %#v", status)
 	}
 }
 

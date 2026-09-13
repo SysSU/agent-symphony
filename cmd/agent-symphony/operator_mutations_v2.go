@@ -137,9 +137,16 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		if !sameOperatorBeginIdentity(begin.Identity, command.Identity) {
 			return nil, errStaleStateResult
 		}
+		reviewerID, reviewerErr := pendingPlanReviewerEffectID(*state, request.Repository, request.Issue, request.Attempt)
+		if reviewerErr != nil {
+			return nil, reviewerErr
+		}
 		supersedePendingOperatorWorkflows(state, request.Repository, request.Issue, request.Attempt, request.Action)
 		begin.Identity.SourceRevision = state.Revision
 		effect, err = applyBeginRuntimeEffect(attemptRoot, stateRoot, state, begin)
+		if effect != nil {
+			effect.SupersededReviewerID = reviewerID
+		}
 		phase = operatorPhaseStopPending
 	case "recover":
 		if command.CleanupDigest != "" || command.PublishedHead != "" {
@@ -342,6 +349,18 @@ func completeOperatorReceipts(state *runtimeOwnerState, effectID string) {
 	}
 }
 
+func failOperatorReceipts(state *runtimeOwnerState, effectID, diagnostic string) {
+	for index := range state.ControlReceipts {
+		receipt := &state.ControlReceipts[index]
+		if receipt.EffectID != effectID || receipt.State != "pending" {
+			continue
+		}
+		receipt.State, receipt.Phase = "completed", operatorPhaseCompleted
+		receipt.Diagnostic = ""
+		receipt.Result = &controlResult{Version: controlVersion, RequestID: receipt.Request.RequestID, Action: receipt.Request.Action, Status: http.StatusInternalServerError, Error: diagnostic, OwnerRevision: state.Revision + 1}
+	}
+}
+
 func supersedePendingOperatorWorkflows(state *runtimeOwnerState, repository string, issue, attempt int, action string) {
 	remove := map[string]bool{}
 	for index := range state.ControlReceipts {
@@ -359,6 +378,22 @@ func supersedePendingOperatorWorkflows(state *runtimeOwnerState, repository stri
 			delete(state.Effects, effectID)
 		}
 	}
+}
+
+func pendingPlanReviewerEffectID(state runtimeOwnerState, repository string, issue, attempt int) (string, error) {
+	issueGeneration := state.IssueGenerations[ownerIssueKey(repository, issue)]
+	attemptGeneration := state.AttemptGenerations[ownerAttemptKey(repository, issue, attempt)]
+	var selected string
+	for _, effect := range state.Effects {
+		if effect.Repository != repository || effect.Issue != issue || effect.Attempt != attempt || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan {
+			continue
+		}
+		if selected != "" || effect.IssueGeneration != issueGeneration || effect.AttemptGeneration != attemptGeneration {
+			return "", errStateConflict
+		}
+		selected = effect.ID
+	}
+	return selected, nil
 }
 
 func bindOperatorReceipt(state *runtimeOwnerState, requestID string, effect *runtimeEffectIntent, revision uint64) {

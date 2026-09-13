@@ -76,6 +76,11 @@ func CaptureWorkerReplacingResultAfterStart(ctx context.Context, tmux, buffer, r
 // RunPaneCommand preserves normal exit status while leaving signaled exits for
 // the caller to re-raise, so tmux retains the signal identity.
 func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer) (int, syscall.Signal, error) {
+	return RunPaneCommandAfterStart(ctx, tmux, command, stdin, stdout, stderr, nil)
+}
+
+// RunPaneCommandAfterStart records launch proof only after the child exists.
+func RunPaneCommandAfterStart(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func() error) (int, syscall.Signal, error) {
 	if len(command) == 0 || command[0] == "" {
 		return 1, 0, errors.New("pane command is missing")
 	}
@@ -88,6 +93,13 @@ func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io
 	child.Stdin, child.Stdout, child.Stderr = stdin, stdout, stderr
 	if err := child.Start(); err != nil {
 		return 1, 0, errors.Join(err, record(PaneExitStatusOption, 1))
+	}
+	if afterStart != nil {
+		if err := afterStart(); err != nil {
+			_ = child.Process.Kill()
+			_ = child.Wait()
+			return 1, 0, errors.Join(err, record(PaneExitStatusOption, 1))
+		}
 	}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)

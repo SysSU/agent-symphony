@@ -24,6 +24,7 @@ type runtimeEffectCoordinator struct {
 
 type activeRuntimeEffect struct {
 	issueGeneration, attemptGeneration, observationGeneration uint64
+	effectID                                                  string
 	ctx                                                       context.Context
 	cancel                                                    context.CancelFunc
 	done                                                      chan struct{}
@@ -239,10 +240,10 @@ func (c *runtimeEffectCoordinator) verifyPendingMode(ctx context.Context, snapsh
 
 func (c *runtimeEffectCoordinator) acquire(ctx context.Context, request agentruntime.EffectRequest) (*activeRuntimeEffect, error) {
 	key := ownerAttemptKey(request.Manifest.Repository, request.Manifest.Issue, request.Manifest.Attempt)
-	return c.acquireKey(ctx, key, request.Identity.IssueGeneration, request.Identity.AttemptGeneration, 0)
+	return c.acquireKey(ctx, key, request.Identity.IssueGeneration, request.Identity.AttemptGeneration, 0, request.Identity.EffectID)
 }
 
-func (c *runtimeEffectCoordinator) acquireKey(ctx context.Context, key string, issueGeneration, attemptGeneration, observationGeneration uint64) (*activeRuntimeEffect, error) {
+func (c *runtimeEffectCoordinator) acquireKey(ctx context.Context, key string, issueGeneration, attemptGeneration, observationGeneration uint64, effectID ...string) (*activeRuntimeEffect, error) {
 	for {
 		c.mu.Lock()
 		if c.stopped {
@@ -257,6 +258,9 @@ func (c *runtimeEffectCoordinator) acquireKey(ctx context.Context, key string, i
 		if previous == nil {
 			runCtx, cancel := context.WithCancel(c.lifecycle)
 			run := &activeRuntimeEffect{issueGeneration: issueGeneration, attemptGeneration: attemptGeneration, observationGeneration: observationGeneration, ctx: runCtx, cancel: cancel, done: make(chan struct{})}
+			if len(effectID) != 0 {
+				run.effectID = effectID[0]
+			}
 			c.active[key] = run
 			c.mu.Unlock()
 			return run, nil
@@ -320,6 +324,13 @@ func (c *runtimeEffectCoordinator) cancelInvalidated(snapshot stateOwnerSnapshot
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for key, run := range c.active {
+		if run.effectID != "" {
+			effect, ok := snapshot.State.Effects[run.effectID]
+			if !ok || effect.State != "pending" {
+				run.cancel()
+				continue
+			}
+		}
 		repository, rest, ok := strings.Cut(key, "#")
 		if !ok {
 			run.cancel()

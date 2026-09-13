@@ -55,6 +55,7 @@ type reviewerExecutionMaterial struct {
 	HeadSHA string
 	Env     []string
 	Command []string
+	Replay  bool
 }
 
 type handoffExecutionMaterial struct{ Command []string }
@@ -456,6 +457,10 @@ func digestText(value string) string {
 
 func reviewerExecutionDigest(request reconciliationEffectRequest, material reviewerExecutionMaterial) string {
 	request.ExecutionDigest = ""
+	if request.Reviewer != nil && request.Reviewer.Mode == agentruntime.ReviewModePlan {
+		// Status comments and labels do not change the plan-review prompt.
+		material.Issue = internalgithub.RecoveryIssueFact{Repository: material.Issue.Repository, Issue: material.Issue.Issue, Attempt: material.Issue.Attempt, BaseSHA: material.Issue.BaseSHA, Body: material.Issue.Body}
+	}
 	body, _ := json.Marshal(struct {
 		Request reconciliationEffectRequest
 		Issue   internalgithub.RecoveryIssueFact
@@ -482,13 +487,19 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		return reconciliationEffectResult{}, false, errStateConflict
 	}
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	observationGeneration := request.ObservationGeneration
+	if operator && material.Replay && request.Reviewer.Mode == agentruntime.ReviewModePlan {
+		observationGeneration = 0 // Read-only replay; finish still validates body and owner generations.
+	}
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, observationGeneration)
 	if err != nil {
 		return reconciliationEffectResult{}, false, err
 	}
 	defer c.releaseKey(key, run)
-	if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
-		return reconciliationEffectResult{}, false, err
+	if !operator || !material.Replay || request.Reviewer.Mode != agentruntime.ReviewModePlan {
+		if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
+			return reconciliationEffectResult{}, false, err
+		}
 	}
 	attempt := agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt, BaseSHA: request.Manifest.BaseSHA}
 	if request.Reviewer.Phase == "cleanup" {
@@ -517,11 +528,24 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 	executionManifest.ReviewState, executionManifest.ReviewMode, executionManifest.ReviewTarget = "running", request.Reviewer.Mode, request.Reviewer.Target
 	executionManifest.ReviewBase, executionManifest.ReviewHead = request.Reviewer.BaseSHA, request.Reviewer.HeadSHA
 	executionManifest.ReviewSnapshot, executionManifest.ReviewSession = request.Reviewer.Snapshot, request.Reviewer.Session
-	review, pending, err := runIndependentReviewV2(run.ctx, attempt, boundary, material.Env, material.Command, material.Issue, executionManifest, material.Source, request.Reviewer.HeadSHA, productionSnapshotRoot(c.owner.stateRoot), request.Reviewer.Mode)
+	var binding *reviewerLaunchIdentity
+	if operator && request.Reviewer.Mode == agentruntime.ReviewModePlan {
+		value := reviewerIdentity(plan.Identity)
+		binding = &value
+	}
+	review, pending, err := runIndependentReviewV2(run.ctx, attempt, boundary, material.Env, material.Command, material.Issue, executionManifest, material.Source, request.Reviewer.HeadSHA, productionSnapshotRoot(c.owner.stateRoot), request.Reviewer.Mode, binding, material.Replay)
+	if binding != nil && errors.Is(err, errReviewerTerminal) {
+		review, pending, err = independentReviewResult{Status: "failed", Diagnostic: err.Error()}, false, nil
+	}
+	if binding != nil && material.Replay && pending && err == nil {
+		if _, markErr := c.owner.markPlanReviewRunning(run.ctx, markPlanReviewRunningCommand{Identity: plan.Identity}); markErr != nil {
+			return reconciliationEffectResult{}, false, markErr
+		}
+	}
 	if err != nil || pending {
 		return reconciliationEffectResult{}, pending, err
 	}
-	result := reconciliationEffectResult{Action: request.Action, Reviewer: &reviewerEffectResult{Phase: request.Reviewer.Phase, Status: review.Status, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, BaseSHA: request.Reviewer.BaseSHA, HeadSHA: request.Reviewer.HeadSHA, Snapshot: request.Reviewer.Snapshot, Session: request.Reviewer.Session, Findings: slices.Clone(review.Findings)}}
+	result := reconciliationEffectResult{Action: request.Action, Reviewer: &reviewerEffectResult{Phase: request.Reviewer.Phase, Status: review.Status, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, BaseSHA: request.Reviewer.BaseSHA, HeadSHA: request.Reviewer.HeadSHA, Snapshot: request.Reviewer.Snapshot, Session: request.Reviewer.Session, Findings: slices.Clone(review.Findings), Diagnostic: review.Diagnostic}}
 	if err := c.finishReconciliationMarker(plan.Identity, request, result, operator); err != nil {
 		return reconciliationEffectResult{}, false, err
 	}

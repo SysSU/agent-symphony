@@ -420,6 +420,30 @@ func TestWorkerBoundaryAllowsOnlyExactAncestryCheck(t *testing.T) {
 	}
 }
 
+func TestReviewerBoundaryWaitForOnlyExactEffectChannels(t *testing.T) {
+	root := t.TempDir()
+	effect := strings.Repeat("a", 32)
+	for _, channel := range []string{"review-" + effect, "review-" + effect + "-start"} {
+		for _, action := range []string{"-L", "-U"} {
+			if err := validateBoundaryCommand(boundaryCommand{Name: "tmux", Args: []string{"wait-for", action, channel}}, root); err != nil {
+				t.Fatalf("exact reviewer wait %q rejected: %v", channel, err)
+			}
+		}
+	}
+	for _, args := range [][]string{
+		{"wait-for", "-S", "review-" + effect},
+		{"wait-for", "-L", "review-" + effect + "; kill-server"},
+		{"wait-for", "-U", "review-" + strings.Repeat("A", 32)},
+		{"wait-for", "-L", "review-" + effect[:31]},
+		{"wait-for", "-L", "other-" + effect},
+		{"set-hook", "-p", "-t", "=pane:0.0", "pane-died", "wait-for -U review-" + effect},
+	} {
+		if err := validateBoundaryCommand(boundaryCommand{Name: "tmux", Args: args}, root); err == nil {
+			t.Fatalf("forged reviewer wait accepted: %q", args)
+		}
+	}
+}
+
 func TestReviewerBoundaryAllowsOnlyExactOrchestratorTmuxLaunch(t *testing.T) {
 	fakeHostIdentity(t, 1234, 5678)
 	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner

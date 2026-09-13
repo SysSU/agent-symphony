@@ -744,7 +744,7 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 		t.Fatal(err)
 	}
 	helper := filepath.Join(t.TempDir(), "review-boundary")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '{\"output\":\"\",\"code\":0,\"exited\":false}\\n'\n"), 0o700); err != nil {
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '{\"output\":\"||||\",\"code\":0,\"exited\":false}\\n'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", helper)

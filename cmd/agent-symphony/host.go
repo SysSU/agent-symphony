@@ -1421,6 +1421,8 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 		return len(args) == 3 && args[1] == "-t" && validTmuxTarget(args[2], false)
 	case "display-message":
 		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, "#{pane_start_command}"}, args[4])
+	case "wait-for":
+		return len(args) == 3 && (args[1] == "-L" || args[1] == "-U") && validReviewerWaitChannel(args[2])
 	case "capture-pane":
 		return len(args) == 6 && slices.Equal(args[1:5], []string{"-p", "-S", "-", "-t"}) && validTmuxTarget(args[5], true)
 	case "set-option":
@@ -1440,6 +1442,23 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	default:
 		return false
 	}
+}
+
+func validReviewerWaitChannel(channel string) bool {
+	if !strings.HasPrefix(channel, "review-") {
+		return false
+	}
+	identity := strings.TrimPrefix(channel, "review-")
+	identity = strings.TrimSuffix(identity, "-start")
+	if len(identity) != 32 {
+		return false
+	}
+	for _, c := range identity {
+		if c < '0' || c > '9' && c < 'a' || c > 'f' {
+			return false
+		}
+	}
+	return true
 }
 
 func tmuxNewSessionOffset(args []string) int {

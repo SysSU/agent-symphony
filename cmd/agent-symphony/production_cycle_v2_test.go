@@ -742,7 +742,13 @@ esac`}}
 		coordinator.owner = owner
 		cfg := config.Default("o/r")
 		cfg.Commands.Reviewer = []string{"reviewer"}
-		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: workerBoundaryResultValue(t, agentruntime.Result{Exited: true, Code: 1}), config: cfg, reviewEnv: []string{"REVIEW=1"}}
+		reviewer := workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `payload=$(cat)
+case "$payload" in
+  *'has-session'*) printf %s '{"Exited":true,"Code":1}' ;;
+  *'display-message'*) printf %s '{"Output":"||||"}' ;;
+  *) exit 1 ;;
+esac`}}
+		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}}
 		batch := reconciliationV2Batch{Input: input}
 		if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, batch); err != nil || !resumed {
 			t.Fatalf("resume=%v err=%v effect=%#v", resumed, err, mustOwnerSnapshot(t, owner).State.Effects[plan.Identity.EffectID])

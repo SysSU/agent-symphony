@@ -663,6 +663,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	command := args[0]
+	if command == "review-pane" {
+		code, childSignal, err := runReviewerPane(args[1:], stdout, stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "error: "+err.Error())
+		}
+		if childSignal != 0 {
+			signal.Reset(childSignal)
+			if killErr := syscall.Kill(os.Getpid(), childSignal); killErr == nil {
+				select {}
+			}
+		}
+		return code
+	}
 	if command == "pane-exit-status" {
 		if len(args) < 4 || args[2] != "--" {
 			return misuse(stderr, false, command, "invalid internal pane command invocation")
@@ -1914,9 +1927,17 @@ func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []
 	if session != "" {
 		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		result, err := boundary.call(cleanupCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", "=" + session}, Dir: filepath.Dir(snapshot), Env: env})
-		if err != nil && !(result.Exited && result.Code == 1) {
+		status, err := boundary.call(cleanupCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: filepath.Dir(snapshot), Env: env})
+		if err != nil {
 			return err
+		}
+		if !missingTmuxPaneStatus(status) {
+			if _, err := agentruntime.ParsePaneStatus(status.Output); err != nil {
+				return err
+			}
+			if _, err := boundary.call(cleanupCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", "=" + session}, Dir: filepath.Dir(snapshot), Env: env}); err != nil {
+				return err
+			}
 		}
 	}
 	resultPath := reviewResultPath(expectedSnapshot, manifestReviewTarget(head, target))
@@ -1943,11 +1964,12 @@ func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []
 }
 
 type independentReviewResult struct {
-	Type     string   `json:"type"`
-	Status   string   `json:"status"`
-	Findings []string `json:"findings"`
-	Snapshot string   `json:"-"`
-	Session  string   `json:"-"`
+	Type       string   `json:"type"`
+	Status     string   `json:"status"`
+	Findings   []string `json:"findings"`
+	Snapshot   string   `json:"-"`
+	Session    string   `json:"-"`
+	Diagnostic string   `json:"-"`
 }
 
 func reviewTarget(mode string, issue internalgithub.RecoveryIssueFact, base, head string) (string, error) {
@@ -2000,11 +2022,11 @@ func reviewPrompt(mode, target string, issue internalgithub.RecoveryIssueFact) (
 	return fmt.Sprintf("Review mode: %s. %s Use the installed gh CLI to post direct status on the bound issue or pull request as one unedited `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON` comment; pair it with adding or removing the bound issue's `needs-attention` label. A nonempty reason and a fresh re-read of both comment and label are required before reporting the status changed. Authentication, authorization, or partial-update errors are failures, never success. Make the entire final response exactly one bounded JSON object on stdout: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings. Do not wrap it in Markdown, emit prose, or emit another object.\n\n%s", mode, task, issue.Body), nil
 }
 
-func runIndependentReviewV2(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot, mode string) (independentReviewResult, bool, error) {
-	return runIndependentReviewCore(ctx, attempt, boundary, env, command, issue, manifest, source, head, snapshotRoot, mode)
+func runIndependentReviewV2(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot, mode string, binding *reviewerLaunchIdentity, replay bool) (independentReviewResult, bool, error) {
+	return runIndependentReviewCore(ctx, attempt, boundary, env, command, issue, manifest, source, head, snapshotRoot, mode, binding, replay)
 }
 
-func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot string, selectedMode ...string) (independentReviewResult, bool, error) {
+func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot, mode string, binding *reviewerLaunchIdentity, replay bool) (independentReviewResult, bool, error) {
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
 	}
@@ -2020,11 +2042,8 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if issue.Attempt == 0 {
 		issue.Attempt = attempt.Number
 	}
-	mode := agentruntime.ReviewModeImplementation
-	if len(selectedMode) == 1 {
-		mode = selectedMode[0]
-	} else if len(selectedMode) > 1 {
-		return independentReviewResult{}, false, errors.New("exactly one review mode is required")
+	if binding != nil && mode != agentruntime.ReviewModePlan {
+		return independentReviewResult{}, false, errStateConflict
 	}
 	env = append(slices.Clone(env), "GH_REPO="+issue.Repository)
 	reviewBase := attempt.BaseSHA
@@ -2051,7 +2070,47 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if manifestMode == "" && manifestTarget == "" {
 		manifestMode, manifestTarget = agentruntime.ReviewModeImplementation, target
 	}
-	if manifest.ReviewState == "running" && manifestMode == mode && manifestTarget == target && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
+	if binding != nil && replay {
+		launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
+		terminal, terminalErr := readReviewerTerminal(launchPath, terminalPath, *binding)
+		if terminalErr != nil {
+			return independentReviewResult{}, false, reviewerLifecycleError(terminalErr)
+		}
+		if terminal != nil {
+			if terminal.ExitCode != 0 || terminal.Signal != 0 {
+				return independentReviewResult{}, false, reviewerLifecycleError(errors.New(reviewerTerminalDiagnostic(*terminal)))
+			}
+			request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, Head: head})
+			artifact, err := boundary.call(ctx, "review-result", agentruntime.Command{Stdin: bytes.NewReader(request)})
+			if err != nil {
+				if artifact.Exited && artifact.Code == reviewResultInvalidCode {
+					return independentReviewResult{}, false, reviewerLifecycleError(err)
+				}
+				return independentReviewResult{}, true, err
+			}
+			parsed, err := parseIndependentReview(artifact.Output)
+			if err != nil {
+				return independentReviewResult{}, false, reviewerLifecycleError(err)
+			}
+			return parsed, false, nil
+		}
+		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
+		if err != nil {
+			return independentReviewResult{}, true, fmt.Errorf("observe launched reviewer: %w", err)
+		}
+		if missingTmuxPaneStatus(result) {
+			return independentReviewResult{}, false, reviewerLifecycleError(errors.New("launched reviewer pane is missing"))
+		}
+		pane, err := agentruntime.ParsePaneStatus(result.Output)
+		if err != nil {
+			return independentReviewResult{}, true, err
+		}
+		if pane.Dead {
+			return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer exited without terminal record"))
+		}
+		return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
+	}
+	if binding == nil && manifest.ReviewState == "running" && manifestMode == mode && manifestTarget == target && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
 		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
 		if err == nil {
 			// tmux reports a missing exact target as success with empty format
@@ -2094,7 +2153,10 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 
 launch:
 	if err := cleanupReviewResources(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot); err != nil {
-		return independentReviewResult{}, true, nil
+		if binding != nil {
+			return independentReviewResult{}, false, reviewerLifecycleError(fmt.Errorf("clean previous reviewer resources: %w", err))
+		}
+		return independentReviewResult{}, false, fmt.Errorf("clean previous reviewer resources: %w", err)
 	}
 	if out, err := exec.CommandContext(ctx, "git", "clone", "--no-local", "--no-checkout", source, snapshot).CombinedOutput(); err != nil {
 		return independentReviewResult{}, false, fmt.Errorf("create snapshot: %w: %s", err, strings.TrimSpace(string(out)))
@@ -2173,9 +2235,35 @@ launch:
 			return independentReviewResult{}, false, err
 		}
 	}
+	armed := false
+	if binding != nil {
+		for _, channel := range []string{reviewerSignal(*binding), reviewerStartSignal(*binding)} {
+			if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-L", channel}, Dir: snapshot, Env: env}); err != nil {
+				return independentReviewResult{}, false, err
+			}
+		}
+		armed = true
+		defer func() {
+			if armed {
+				for _, channel := range []string{reviewerSignal(*binding), reviewerStartSignal(*binding)} {
+					unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+					_, _ = boundary.call(unlockCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-U", channel}, Dir: snapshot, Env: env})
+					cancel()
+				}
+			}
+		}()
+		help, err := os.Executable()
+		if err != nil {
+			return independentReviewResult{}, false, err
+		}
+		launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
+		encoded, _ := json.Marshal(binding)
+		command = append([]string{help, "review-pane", "tmux", launchPath, terminalPath, reviewerSignal(*binding), reviewerStartSignal(*binding), string(encoded), "--"}, command...)
+	}
 	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
 		return independentReviewResult{}, false, err
 	}
+	armed = false // The reviewer wrapper owns both latches after respawn succeeds.
 	return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
 }
 

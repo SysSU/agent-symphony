@@ -104,6 +104,8 @@ type runtimeEffectIntent struct {
 	Review               *agentruntime.ReviewTransition `json:"review,omitempty"`
 	Reconciliation       *reconciliationEffectRequest   `json:"reconciliation,omitempty"`
 	ReconciliationResult *reconciliationEffectResult    `json:"reconciliation_result,omitempty"`
+	ReviewerLaunched     bool                           `json:"reviewer_launched,omitempty"`
+	SupersededReviewerID string                         `json:"superseded_reviewer_id,omitempty"`
 	Diagnostic           string                         `json:"diagnostic,omitempty"`
 }
 
@@ -197,6 +199,14 @@ type authorizeReconciliationEffectCommand struct {
 	Action   reconciliationEffectAction
 }
 
+type markPlanReviewRunningCommand struct {
+	Identity stateResultIdentity
+}
+
+type supersedePlanReviewCommand struct {
+	Identity stateResultIdentity
+}
+
 type finishReconciliationEffectCommand struct {
 	Identity stateResultIdentity
 	Result   reconciliationEffectResult
@@ -277,6 +287,8 @@ const (
 	stateOwnerApplyReconciliation
 	stateOwnerBeginReconciliationEffect
 	stateOwnerAuthorizeReconciliationEffect
+	stateOwnerMarkPlanReviewRunning
+	stateOwnerSupersedePlanReview
 	stateOwnerFinishReconciliationEffect
 	stateOwnerDiagnoseReconciliationEffect
 	stateOwnerMutatePRRecovery
@@ -303,6 +315,8 @@ type stateOwnerCommand struct {
 	reconcile               applyReconciliationCommand
 	beginReconciliation     beginReconciliationEffectCommand
 	authorizeReconciliation authorizeReconciliationEffectCommand
+	markPlanReviewRunning   markPlanReviewRunningCommand
+	supersedePlanReview     supersedePlanReviewCommand
 	finishReconciliation    finishReconciliationEffectCommand
 	diagnoseReconciliation  diagnoseReconciliationEffectCommand
 	mutatePRRecovery        mutatePRRecoveryCommand
@@ -701,6 +715,16 @@ func (o *stateOwner) finishOperatorReconciliationEffect(ctx context.Context, com
 	return result.snapshot, err
 }
 
+func (o *stateOwner) markPlanReviewRunning(ctx context.Context, command markPlanReviewRunningCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerMarkPlanReviewRunning, markPlanReviewRunning: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) supersedePlanReview(ctx context.Context, command supersedePlanReviewCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerSupersedePlanReview, supersedePlanReview: command})
+	return result.snapshot, err
+}
+
 func (o *stateOwner) advanceOperatorRecovery(ctx context.Context, command advanceOperatorRecoveryCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerAdvanceOperatorRecovery, advanceOperatorRecovery: command})
 	return result.snapshot, result.effect, err
@@ -775,6 +799,14 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect)
 	case stateOwnerAuthorizeReconciliationEffect:
 		if err := applyAuthorizeReconciliationEffect(stateRoot, candidate, command.authorizeReconciliation); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerMarkPlanReviewRunning:
+		if err := applyMarkPlanReviewRunning(stateRoot, &candidate, command.markPlanReviewRunning); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerSupersedePlanReview:
+		if err := applySupersedePlanReview(&candidate, command.supersedePlanReview); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerFinishReconciliationEffect:
@@ -1053,6 +1085,7 @@ func sameRuntimeEffectManifestBase(current, result agentruntime.Manifest, review
 	copy.State, copy.Diagnostic, copy.UpdatedAt = current.State, current.Diagnostic, current.UpdatedAt
 	if review {
 		copy.ReviewState, copy.ReviewMode, copy.ReviewTarget = current.ReviewState, current.ReviewMode, current.ReviewTarget
+		copy.ReviewDiagnostic = current.ReviewDiagnostic
 		copy.ReviewBase, copy.ReviewHead, copy.ReviewSnapshot, copy.ReviewSession = current.ReviewBase, current.ReviewHead, current.ReviewSnapshot, current.ReviewSession
 		copy.ReviewFindings = slices.Clone(current.ReviewFindings)
 		copy.ReviewHandoffQueued, copy.ReviewHandoffAck = current.ReviewHandoffQueued, current.ReviewHandoffAck
@@ -1070,7 +1103,7 @@ func reviewTransitionMatches(review agentruntime.ReviewTransition, current, resu
 	if review.State != "findings-queued" {
 		wantFindings, wantQueued, wantAcknowledged = nil, false, false
 	}
-	return result.State == wantState && result.Diagnostic == wantDiagnostic && result.ReviewState == review.State && result.ReviewMode == review.Mode && result.ReviewTarget == review.Target && result.ReviewBase == review.Base && result.ReviewHead == review.Head && result.ReviewSnapshot == review.Snapshot && result.ReviewSession == review.Session && slices.Equal(result.ReviewFindings, wantFindings) && result.ReviewHandoffQueued == wantQueued && result.ReviewHandoffAck == wantAcknowledged
+	return result.State == wantState && result.Diagnostic == wantDiagnostic && result.ReviewState == review.State && result.ReviewDiagnostic == current.ReviewDiagnostic && result.ReviewMode == review.Mode && result.ReviewTarget == review.Target && result.ReviewBase == review.Base && result.ReviewHead == review.Head && result.ReviewSnapshot == review.Snapshot && result.ReviewSession == review.Session && slices.Equal(result.ReviewFindings, wantFindings) && result.ReviewHandoffQueued == wantQueued && result.ReviewHandoffAck == wantAcknowledged
 }
 
 func validRuntimeEffectAction(action agentruntime.EffectAction) bool {
@@ -1768,6 +1801,9 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if effect.RequestDigest != "" && (!agentruntime.ValidEffectRequestDigest(effect.RequestDigest) || effect.IntentEpoch == 0 || effect.IntentEpoch > maxEpoch || !validRuntimeEffectInput(agentruntime.EffectAction(effect.Action), effect.Reason) || (effect.Action == string(agentruntime.EffectReview)) != (effect.Review != nil)) {
 			return errors.New("runtime owner typed effect intent is invalid")
 		}
+		if effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID)) {
+			return errors.New("runtime owner superseded reviewer binding is invalid")
+		}
 		if effect.RequestDigest != "" && effect.Action == string(agentruntime.EffectReview) {
 			record, ok := state.Attempts[attemptKey]
 			if !ok {
@@ -1955,6 +1991,9 @@ func validCleanupPhase(phase string) bool {
 
 func runtimeEffectID(effect runtimeEffectIntent) string {
 	material := fmt.Sprintf("%s\x00%s\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%s\x00%s", effect.Action, effect.Repository, effect.Issue, effect.Attempt, effect.IssueGeneration, effect.AttemptGeneration, effect.IntentRevision, effect.IntentEpoch, effect.RequestDigest, effect.Reason)
+	if effect.SupersededReviewerID != "" {
+		material += "\x00" + effect.SupersededReviewerID
+	}
 	digest := sha256.Sum256([]byte(material))
 	return hex.EncodeToString(digest[:16])
 }
