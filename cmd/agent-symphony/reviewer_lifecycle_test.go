@@ -387,11 +387,12 @@ func TestGuardedReviewerKillRejectsS2AfterLastServerExit(t *testing.T) {
 		}
 		return nil
 	}
-	if err := guardedReviewerKillSession(t.Context(), boundary, pane, session, "", nil); err == nil {
+	guardErr := guardedReviewerKillSession(t.Context(), boundary, pane, session, "", nil)
+	if guardErr == nil {
 		t.Fatal("foreign S2 was certified absent after original server death")
 	}
 	if !strings.Contains(boundary.lastInventory, "|"+session+"\n") {
-		t.Fatalf("post-guard inventory did not observe foreign S2: %q", boundary.lastInventory)
+		t.Fatalf("post-guard inventory did not observe foreign S2: %q (guard: %v)", boundary.lastInventory, guardErr)
 	}
 	if output, err := run("has-session", "-t", "="+session); err != nil {
 		t.Fatalf("foreign S2 was killed: %v: %s", err, output)
