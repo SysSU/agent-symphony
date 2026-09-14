@@ -128,10 +128,11 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
     const reviewerButton = card.getByRole("button", { name: "Open reviewer terminal" });
     await expect(reviewerButton).toBeVisible();
     await reviewerButton.click();
-    const terminal = page.getByRole("dialog", { name: reviewer.name });
-    await expect(terminal).toBeVisible();
-    await expect(terminal.getByRole("status")).toHaveText("Connected");
-    await terminal.getByRole("button", { name: "Close" }).click();
+    await expect(page.getByRole("status").filter({ hasText: "Reviewer terminal is unavailable until session identity can be verified safely." })).toBeVisible();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    const terminal = await page.request.get(`${baseURL}/reviewer/terminal?repository=o%2Fr&issue=73&attempt=1`, { headers: { Origin: baseURL } });
+    expect(terminal.status()).toBe(409);
+    expect(await terminal.text()).toContain("session identity can be verified safely");
     if (action === "review-plan-cancel") {
       await expect.poll(async () => {
         try { return Number((await readFile(reviewerPID, "utf8")).trim()) > 1; }
