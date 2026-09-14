@@ -66,7 +66,49 @@ func reviewerPaneStartMatches(start, launchPath, terminalPath string, identity r
 }
 
 const reviewerPaneIdentityFormat = agentruntime.PaneStatusFormat + "|#{session_id}|#{pane_pid}|#{pid}|#{start_time}|#{session_name}|#{pane_start_command}"
+const reviewerTerminalIdentityFormat = agentruntime.PaneStatusFormat + "|#{session_id}|#{pane_pid}|#{pid}|#{start_time}|#{session_name}|#{pane_id}|#{pane_start_command}"
 const reviewerGuardMismatch = "reviewer-guard-mismatch"
+
+// This is committed by the owner only after the exact reviewer wrapper and
+// child are verified. A status projection or a fresh tmux name is not proof.
+type reviewerTerminalIdentity struct {
+	ServerPID int    `json:"server_pid"`
+	StartTime uint64 `json:"start_time"`
+	SessionID string `json:"session_id"`
+	Name      string `json:"name"`
+	PaneID    string `json:"pane_id"`
+	PanePID   int    `json:"pane_pid"`
+}
+
+func validTmuxPaneID(value string) bool {
+	if !strings.HasPrefix(value, "%") || len(value) < 2 {
+		return false
+	}
+	_, err := strconv.ParseUint(value[1:], 10, 64)
+	return err == nil
+}
+
+func validReviewerTerminalIdentity(identity reviewerTerminalIdentity, repository string, issue, attempt int) bool {
+	want, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, repository, issue, attempt)
+	return err == nil && identity.Name == want && identity.ServerPID >= 2 && identity.StartTime > 0 && identity.PanePID >= 2 && validTmuxSessionID(identity.SessionID) && validTmuxPaneID(identity.PaneID)
+}
+
+func observeReviewerTerminalIdentity(ctx context.Context, boundary boundaryCaller, env []string, session, launchPath, terminalPath string, launch reviewerLaunchIdentity) (reviewerTerminalIdentity, error) {
+	result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerTerminalIdentityFormat}, Env: env})
+	if err != nil || result.Exited {
+		return reviewerTerminalIdentity{}, errors.New("exact reviewer terminal pane is unavailable")
+	}
+	fields := strings.SplitN(strings.TrimSpace(result.Output), "|", 12)
+	if len(fields) != 12 || !validTmuxPaneID(fields[10]) {
+		return reviewerTerminalIdentity{}, errors.New("exact reviewer terminal pane identity is invalid")
+	}
+	paneFields := append(fields[:10:10], fields[11])
+	pane, err := parseReviewerPaneIdentity(strings.Join(paneFields, "|"))
+	if err != nil || pane.Status.Dead || pane.Name != session || verifyReviewerChildAtPane(ctx, pane, launchPath, terminalPath, launch, launch.ChildPID) != nil {
+		return reviewerTerminalIdentity{}, errors.New("exact reviewer wrapper and child are not live")
+	}
+	return reviewerTerminalIdentity{ServerPID: pane.ServerPID, StartTime: pane.StartTime, SessionID: pane.SessionID, Name: pane.Name, PaneID: fields[10], PanePID: pane.PID}, nil
+}
 
 type reviewerPaneIdentity struct {
 	Status    agentruntime.PaneStatus
@@ -174,30 +216,6 @@ func reviewerGroupGone(pid int) (bool, error) {
 func missingTmuxServer(result agentruntime.Result) bool {
 	message := strings.TrimSpace(result.Output)
 	return result.Exited && result.Code == 1 && (strings.HasPrefix(message, "error connecting to ") && strings.HasSuffix(message, " (No such file or directory)") || strings.HasPrefix(message, "no server running on /"))
-}
-
-func verifyReviewerChildBinding(ctx context.Context, boundary boundaryCaller, env []string, session, launchPath, terminalPath string, identity reviewerLaunchIdentity, candidate int) error {
-	if candidate < 2 {
-		return errors.New("reviewer child process identity is missing")
-	}
-	pane := agentruntime.PaneTarget(session)
-	started, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", pane, "#{pane_start_command}"}, Env: env})
-	matching := reviewerPaneStartMatches(started.Output, launchPath, terminalPath, identity)
-	if launchPath == "" && terminalPath == "" {
-		matching = strings.Contains(started.Output, " review-pane tmux ") && strings.Contains(started.Output, reviewerSignal(identity))
-	}
-	if err != nil || started.Exited || !matching {
-		return errors.New("exact reviewer wrapper is not live")
-	}
-	pidResult, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", pane, "#{pane_pid}"}, Env: env})
-	if err != nil || pidResult.Exited {
-		return errors.New("exact reviewer wrapper PID is unavailable")
-	}
-	wrapperPID, err := reviewerPanePID(pidResult.Output)
-	if err != nil {
-		return err
-	}
-	return verifyReviewerChildAtPane(ctx, reviewerPaneIdentity{PID: wrapperPID, Start: started.Output}, launchPath, terminalPath, identity, candidate)
 }
 
 func verifyReviewerChildAtPane(ctx context.Context, pane reviewerPaneIdentity, launchPath, terminalPath string, identity reviewerLaunchIdentity, candidate int) error {

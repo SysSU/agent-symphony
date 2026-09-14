@@ -1159,8 +1159,8 @@ func TestHealthyPendingReviewerReplayLetsOtherEffectFinish(t *testing.T) {
 		t.Fatal(err)
 	}
 	live := startUnboundReviewerForService(t, owner, reviewer)
-	parts := strings.SplitN(live.status.Output, "|", 8)
-	if len(parts) != 8 {
+	parts := strings.SplitN(live.status.Output, "|", 11)
+	if len(parts) != 11 {
 		t.Fatal("fixture has no exact live wrapper identity")
 	}
 	encode := func(output string) string {
@@ -1172,12 +1172,13 @@ func TestHealthyPendingReviewerReplayLetsOtherEffectFinish(t *testing.T) {
 	}
 	replayBoundary := workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `payload=$(cat)
 case "$payload" in
+  *'#{pane_id}|#{pane_start_command}'*) printf %s "$REPLAY_TERMINAL" ;;
   *'#{pane_start_command}'*) printf %s "$REPLAY_START" ;;
   *'#{pane_pid}'*) printf %s "$REPLAY_PID" ;;
   *'#{pane_dead}'*) printf %s "$REPLAY_PANE" ;;
   *'"wait-for"'*) printf %s "$REPLAY_OK" ;;
   *) exit 1 ;;
-esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode(parts[6]), "REPLAY_PANE=" + encode("0||||"), "REPLAY_OK=" + encode("")}}
+esac`}, Env: []string{"REPLAY_TERMINAL=" + encode(strings.Join(parts[:10], "|")+"|%7|"+parts[10]), "REPLAY_START=" + encode(parts[10]), "REPLAY_PID=" + encode(parts[6]), "REPLAY_PANE=" + encode("0||||"), "REPLAY_OK=" + encode("")}}
 	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
 	cfg := config.Default("o/r")
 	cfg.Commands.Reviewer = []string{"reviewer"}

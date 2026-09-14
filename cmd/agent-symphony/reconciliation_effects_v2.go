@@ -375,7 +375,7 @@ func applyMarkPlanReviewRunning(stateRoot string, state *runtimeOwnerState, comm
 		return errStaleStateResult
 	}
 	request := *effect.Reconciliation
-	if request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe" || request.Manifest == nil || command.GroupPID < 2 || effect.ReviewerGateProtocol && !effect.ReviewerSessionRequested {
+	if request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe" || request.Manifest == nil || command.GroupPID < 2 || effect.ReviewerGateProtocol && !effect.ReviewerSessionRequested || command.Terminal != (reviewerTerminalIdentity{}) && !validReviewerTerminalIdentity(command.Terminal, effect.Repository, effect.Issue, effect.Attempt) {
 		return errStateConflict
 	}
 	if err := reconciliationEffectFinishCurrent(stateRoot, *state, effect); err != nil {
@@ -385,6 +385,11 @@ func applyMarkPlanReviewRunning(stateRoot string, state *runtimeOwnerState, comm
 		if effect.ReviewerGroupPID != command.GroupPID {
 			return errStateConflict
 		}
+		proof, ok := state.ReviewerProofs[reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, request.Reviewer.Mode, request.Reviewer.Target)]
+		if !ok || proof.EffectID != effect.ID || proof.GroupPID != command.GroupPID || proof.Terminal != (reviewerTerminalIdentity{}) && proof.Terminal != command.Terminal {
+			return errStateConflict
+		}
+		// A legacy launch cannot acquire a terminal certificate on replay.
 		return nil
 	}
 	if state.ReviewerProofs == nil {
@@ -394,7 +399,7 @@ func applyMarkPlanReviewRunning(stateRoot string, state *runtimeOwnerState, comm
 	if old, exists := state.ReviewerProofs[key]; exists && !old.DeadProved && old.EffectID != effect.ID {
 		return errStateConflict
 	}
-	state.ReviewerProofs[key] = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, EffectID: effect.ID, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, GroupPID: command.GroupPID}
+	state.ReviewerProofs[key] = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, EffectID: effect.ID, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, GroupPID: command.GroupPID, Terminal: command.Terminal}
 	effect.ReviewerLaunched = true
 	effect.ReviewerGroupPID = command.GroupPID
 	state.Effects[effect.ID] = effect

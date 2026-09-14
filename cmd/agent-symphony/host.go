@@ -1434,7 +1434,7 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	case "if-shell":
 		return validReviewerGuardedKillArgs(args)
 	case "display-message":
-		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, reviewerPaneIdentityFormat, "#{pane_start_command}", "#{pane_pid}"}, args[4])
+		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, reviewerPaneIdentityFormat, reviewerTerminalIdentityFormat, "#{pane_start_command}", "#{pane_pid}"}, args[4])
 	case "wait-for":
 		return len(args) == 3 && (args[1] == "-L" || args[1] == "-U") && validReviewerWaitChannel(args[2])
 	case "capture-pane":

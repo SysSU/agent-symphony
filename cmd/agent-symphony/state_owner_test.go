@@ -404,12 +404,18 @@ func TestStateOwnerPersistenceFailureKeepsCommittedSnapshotAndDispatchesNothing(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	commitSignal := owner.commitNotification()
 	result := make(chan error, 1)
 	go func() {
 		_, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 43, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: 1, Action: "abandoned", CleanupPhase: "pending", Manifest: &manifest, CleanupPolicy: &agentruntime.EffectCleanupPolicy{Action: "abandon"}, EffectAction: "cleanup", EffectRequestDigest: strings.Repeat("a", 64)})
 		result <- err
 	}()
 	<-entered
+	select {
+	case <-commitSignal:
+		t.Fatal("unpersisted invalidation notified terminal watchers")
+	default:
+	}
 	snapshot, err := owner.snapshot(t.Context())
 	if err != nil || snapshot.State.Revision != 1 || len(snapshot.State.Tombstones) != 0 || len(snapshot.State.Effects) != 0 || len(snapshot.State.Attempts) != 1 {
 		t.Fatalf("visible snapshot=%#v err=%v manifest=%#v", snapshot, err, manifest)
@@ -417,6 +423,11 @@ func TestStateOwnerPersistenceFailureKeepsCommittedSnapshotAndDispatchesNothing(
 	unblock()
 	if err := <-result; err == nil || !strings.Contains(err.Error(), "injected persistence failure") {
 		t.Fatalf("err=%v", err)
+	}
+	select {
+	case <-commitSignal:
+		t.Fatal("failed persistence notified terminal watchers")
+	default:
 	}
 	snapshot, err = owner.snapshot(t.Context())
 	if err != nil || snapshot.State.Revision != 1 || len(snapshot.State.Tombstones) != 0 || len(snapshot.State.Effects) != 0 || len(snapshot.State.Attempts) != 1 {
@@ -441,6 +452,7 @@ func TestStateOwnerCancellationAfterPersistenceDispatchStillCommits(t *testing.T
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	<-owner.commits
+	commitSignal := owner.commitNotification()
 	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
 	go func() {
@@ -448,6 +460,11 @@ func TestStateOwnerCancellationAfterPersistenceDispatchStillCommits(t *testing.T
 		result <- err
 	}()
 	<-entered
+	select {
+	case <-commitSignal:
+		t.Fatal("terminal watchers notified before durable commit")
+	default:
+	}
 	cancel()
 	select {
 	case err := <-result:
@@ -457,6 +474,11 @@ func TestStateOwnerCancellationAfterPersistenceDispatchStillCommits(t *testing.T
 	close(release)
 	if err := <-result; err != nil {
 		t.Fatalf("caller result=%v", err)
+	}
+	select {
+	case <-commitSignal:
+	default:
+		t.Fatal("durable commit did not notify terminal watchers")
 	}
 	committed := <-owner.commits
 	if receipt, ok := operatorReceiptByID(committed.State, "admitted"); !ok || receipt.State != "pending" {

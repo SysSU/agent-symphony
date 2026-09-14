@@ -628,10 +628,11 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		if exists, readErr := readReviewerRecord(launchPath, &launch); readErr != nil || !exists || !sameReviewerIdentity(launch, *binding) {
 			return reconciliationEffectResult{}, true, errors.New("reviewer launch proof is unavailable")
 		}
-		if verifyErr := verifyReviewerChildBinding(run.ctx, boundary, material.Env, review.Session, launchPath, terminalPath, *binding, launch.ChildPID); verifyErr != nil {
+		terminal, verifyErr := observeReviewerTerminalIdentity(run.ctx, boundary, material.Env, review.Session, launchPath, terminalPath, launch)
+		if verifyErr != nil {
 			return reconciliationEffectResult{}, true, verifyErr
 		}
-		if _, markErr := c.owner.markPlanReviewRunning(run.ctx, markPlanReviewRunningCommand{Identity: plan.Identity, GroupPID: launch.ChildPID}); markErr != nil {
+		if _, markErr := c.owner.markPlanReviewRunning(run.ctx, markPlanReviewRunningCommand{Identity: plan.Identity, GroupPID: launch.ChildPID, Terminal: terminal}); markErr != nil {
 			return reconciliationEffectResult{}, false, markErr
 		}
 		if _, unlockErr := boundary.call(run.ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-U", reviewerGoSignal(*binding)}, Env: material.Env}); unlockErr != nil {

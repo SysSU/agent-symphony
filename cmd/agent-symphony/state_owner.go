@@ -71,17 +71,18 @@ type runtimeAttemptRecord struct {
 // A completed review's filesystem root outlives bounded operator receipts.
 // This owner-held certificate is retained until destructive cleanup commits.
 type reviewerProcessProof struct {
-	Repository        string `json:"repository"`
-	Issue             int    `json:"issue"`
-	Attempt           int    `json:"attempt"`
-	Target            string `json:"target"`
-	Mode              string `json:"mode"`
-	EffectID          string `json:"effect_id"`
-	IssueGeneration   uint64 `json:"issue_generation"`
-	AttemptGeneration uint64 `json:"attempt_generation"`
-	GroupPID          int    `json:"group_pid"`
-	DeadProved        bool   `json:"dead_proved,omitempty"`
-	NeverRan          bool   `json:"never_ran,omitempty"`
+	Repository        string                   `json:"repository"`
+	Issue             int                      `json:"issue"`
+	Attempt           int                      `json:"attempt"`
+	Target            string                   `json:"target"`
+	Mode              string                   `json:"mode"`
+	EffectID          string                   `json:"effect_id"`
+	IssueGeneration   uint64                   `json:"issue_generation"`
+	AttemptGeneration uint64                   `json:"attempt_generation"`
+	GroupPID          int                      `json:"group_pid"`
+	DeadProved        bool                     `json:"dead_proved,omitempty"`
+	NeverRan          bool                     `json:"never_ran,omitempty"`
+	Terminal          reviewerTerminalIdentity `json:"terminal,omitzero"`
 }
 
 func reviewerProofKey(repository string, issue, attempt int, mode, target string) string {
@@ -238,6 +239,7 @@ type authorizeReconciliationEffectCommand struct {
 type markPlanReviewRunningCommand struct {
 	Identity stateResultIdentity
 	GroupPID int
+	Terminal reviewerTerminalIdentity
 }
 
 type markReviewerSessionRequestedCommand struct {
@@ -451,14 +453,16 @@ type appliedReconciliationCycle struct {
 
 // stateOwner is the sole in-process commit authority for the runtime ledger.
 type stateOwner struct {
-	stateRoot   string
-	attemptRoot string
-	commands    chan stateOwnerCommand
-	snapshots   chan stateOwnerSnapshotRequest
-	stop        chan struct{}
-	stopOnce    sync.Once
-	done        chan struct{}
-	commits     chan stateOwnerSnapshot
+	stateRoot    string
+	attemptRoot  string
+	commands     chan stateOwnerCommand
+	snapshots    chan stateOwnerSnapshotRequest
+	stop         chan struct{}
+	stopOnce     sync.Once
+	done         chan struct{}
+	commits      chan stateOwnerSnapshot
+	commitMu     sync.Mutex
+	commitSignal chan struct{}
 }
 
 func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial runtimeOwnerState, persist func(runtimeOwnerState) error) (*stateOwner, error) {
@@ -477,13 +481,14 @@ func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial
 		return nil, err
 	}
 	owner := &stateOwner{
-		stateRoot:   root,
-		attemptRoot: attempts,
-		commands:    make(chan stateOwnerCommand),
-		snapshots:   make(chan stateOwnerSnapshotRequest),
-		stop:        make(chan struct{}),
-		done:        make(chan struct{}),
-		commits:     make(chan stateOwnerSnapshot, 1),
+		stateRoot:    root,
+		attemptRoot:  attempts,
+		commands:     make(chan stateOwnerCommand),
+		snapshots:    make(chan stateOwnerSnapshotRequest),
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
+		commits:      make(chan stateOwnerSnapshot, 1),
+		commitSignal: make(chan struct{}),
 	}
 	persistRequests := make(chan statePersistenceRequest, 1)
 	persistDone := make(chan struct{})
@@ -506,6 +511,7 @@ func runStatePersistence(requests <-chan statePersistenceRequest, done chan<- st
 func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersistenceRequest, persistenceDone <-chan struct{}) {
 	defer close(o.done)
 	defer close(o.commits)
+	defer o.closeCommitSignal()
 	committed := cloneRuntimeOwnerState(initial)
 	var queue []stateOwnerCommand
 	var inFlight *pendingStateCommit
@@ -612,6 +618,7 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 		case err := <-persistenceResult:
 			if err == nil {
 				committed = inFlight.candidate
+				o.notifyCommit()
 				publish()
 				recordAppliedReconciliationCycles(appliedCycles, inFlight.command, committed, true)
 				inFlight.command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(inFlight.effect)}
@@ -654,6 +661,25 @@ func (o *stateOwner) close(ctx context.Context) error {
 
 func (o *stateOwner) snapshot(ctx context.Context) (stateOwnerSnapshot, error) {
 	return o.requestSnapshot(ctx, false)
+}
+
+func (o *stateOwner) commitNotification() <-chan struct{} {
+	o.commitMu.Lock()
+	defer o.commitMu.Unlock()
+	return o.commitSignal
+}
+
+func (o *stateOwner) notifyCommit() {
+	o.commitMu.Lock()
+	close(o.commitSignal)
+	o.commitSignal = make(chan struct{})
+	o.commitMu.Unlock()
+}
+
+func (o *stateOwner) closeCommitSignal() {
+	o.commitMu.Lock()
+	close(o.commitSignal)
+	o.commitMu.Unlock()
 }
 
 func (o *stateOwner) reconciliationSnapshot(ctx context.Context) (stateOwnerSnapshot, error) {
@@ -2041,7 +2067,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		}
 	}
 	for key, proof := range state.ReviewerProofs {
-		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || (proof.GroupPID < 2 && !(proof.NeverRan && proof.GroupPID == 0 && proof.DeadProved)) || proof.NeverRan && proof.GroupPID != 0 || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] {
+		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || (proof.GroupPID < 2 && !(proof.NeverRan && proof.GroupPID == 0 && proof.DeadProved)) || proof.NeverRan && proof.GroupPID != 0 || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] || proof.Terminal != (reviewerTerminalIdentity{}) && (!validReviewerTerminalIdentity(proof.Terminal, proof.Repository, proof.Issue, proof.Attempt) || proof.NeverRan || proof.GroupPID < 2) {
 			return errors.New("runtime owner reviewer process proof is invalid")
 		}
 	}

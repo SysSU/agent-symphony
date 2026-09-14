@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -864,12 +865,218 @@ func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request, 
 	query := r.URL.Query()
 	issue, issueErr := strconv.Atoi(query.Get("issue"))
 	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
+	if role == agentruntime.SessionRoleReviewer {
+		if issueErr != nil || attemptErr != nil || !s.validProjectQuery(query, "issue", "attempt") {
+			http.Error(w, "terminal session is not available", http.StatusNotFound)
+			return
+		}
+		proof, err := s.reviewerTerminalProof(r.Context(), query.Get("repository"), issue, attempt)
+		if err != nil {
+			http.Error(w, "terminal session is not available", http.StatusNotFound)
+			return
+		}
+		s.serveReviewerTerminal(w, r, proof)
+		return
+	}
 	session, err := s.projectedSession(issue, attempt, role)
 	if issueErr != nil || attemptErr != nil || err != nil || !s.validProjectQuery(query, "issue", "attempt") {
 		http.Error(w, "terminal session is not available", http.StatusNotFound)
 		return
 	}
 	s.serveTerminalSession(w, r, session.Name)
+}
+
+func (s *dashboardServer) reviewerTerminalProof(ctx context.Context, repository string, issue, attempt int) (reviewerProcessProof, error) {
+	if s.operator == nil || s.operator.owner == nil || repository == "" || issue < 1 || attempt < 1 {
+		return reviewerProcessProof{}, errors.New("reviewer owner is unavailable")
+	}
+	snapshot, err := s.operator.owner.snapshot(ctx)
+	if err != nil || repository != snapshot.State.Repository {
+		return reviewerProcessProof{}, errors.New("reviewer owner is unavailable")
+	}
+	statusSnapshot, err := projectOwnerStatus(snapshot, s.capacity, time.Now().UTC())
+	if err != nil {
+		return reviewerProcessProof{}, err
+	}
+	status, err := projectedStatusFromSnapshot(statusSnapshot, issue, attempt)
+	if err != nil || status.Repository != repository {
+		return reviewerProcessProof{}, errors.New("reviewer attempt is not current")
+	}
+	session, err := projectedSessionFromStatus(status, issue, attempt, agentruntime.SessionRoleReviewer)
+	if err != nil {
+		return reviewerProcessProof{}, err
+	}
+	var matched *reviewerProcessProof
+	for _, proof := range snapshot.State.ReviewerProofs {
+		if proof.Repository != repository || proof.Issue != issue || proof.Attempt != attempt || proof.Mode != session.Mode || proof.Target != session.Target || proof.Terminal.Name != session.Name || !reviewerTerminalProofCurrent(snapshot.State, proof) {
+			continue
+		}
+		if matched != nil {
+			return reviewerProcessProof{}, errors.New("reviewer terminal has ambiguous owner certificates")
+		}
+		copy := proof
+		matched = &copy
+	}
+	if matched == nil {
+		return reviewerProcessProof{}, errors.New("reviewer terminal has no current owner certificate")
+	}
+	return *matched, nil
+}
+
+func reviewerTerminalProofCurrent(state runtimeOwnerState, proof reviewerProcessProof) bool {
+	key := ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)
+	if state.Repository != proof.Repository || proof.DeadProved || proof.NeverRan || proof.Terminal == (reviewerTerminalIdentity{}) || !validReviewerTerminalIdentity(proof.Terminal, proof.Repository, proof.Issue, proof.Attempt) || state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] != proof.IssueGeneration || state.AttemptGenerations[key] != proof.AttemptGeneration {
+		return false
+	}
+	if _, tombstoned := state.Tombstones[key]; tombstoned {
+		return false
+	}
+	record, exists := state.Attempts[key]
+	if !exists || record.Generation != proof.AttemptGeneration {
+		return false
+	}
+	effect, exists := state.Effects[proof.EffectID]
+	if !exists || effect.State != "pending" || effect.ReviewerRevoked || !effect.ReviewerLaunched || effect.ReviewerGroupPID != proof.GroupPID || effect.IssueGeneration != proof.IssueGeneration || effect.AttemptGeneration != proof.AttemptGeneration || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Phase != "run-observe" {
+		return false
+	}
+	reviewer := effect.Reconciliation.Reviewer
+	return reviewer.Mode == proof.Mode && reviewer.Target == proof.Target && reviewer.Session == proof.Terminal.Name && state.ReviewerProofs[reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target)] == proof
+}
+
+const reviewerTerminalDenied = "agent-symphony-reviewer-terminal-denied"
+const reviewerTerminalClientFormat = "#{client_pid}|#{pid}|#{start_time}|#{session_id}|#{session_name}|#{pane_id}"
+
+func reviewerTerminalGuardCondition(proof reviewerProcessProof) string {
+	pane := proof.Terminal
+	checks := []string{
+		fmt.Sprintf("#{==:#{pid},%d}", pane.ServerPID),
+		fmt.Sprintf("#{==:#{start_time},%d}", pane.StartTime),
+		fmt.Sprintf("#{==:#{session_id},%s}", pane.SessionID),
+		fmt.Sprintf("#{==:#{session_name},%s}", pane.Name),
+		fmt.Sprintf("#{==:#{pane_id},%s}", pane.PaneID),
+		fmt.Sprintf("#{==:#{pane_pid},%d}", pane.PanePID),
+		"#{==:#{pane_dead},0}",
+		"#{m:*review-" + proof.EffectID + "*,#{pane_start_command}}",
+	}
+	condition := checks[0]
+	for _, check := range checks[1:] {
+		condition = "#{&&:" + condition + "," + check + "}"
+	}
+	return condition
+}
+
+func (s *dashboardServer) reviewerTerminalStillCurrent(ctx context.Context, proof reviewerProcessProof) bool {
+	snapshot, err := s.operator.owner.snapshot(ctx)
+	return err == nil && reviewerTerminalProofCurrent(snapshot.State, proof)
+}
+
+func (s *dashboardServer) reviewerTerminalClientAttached(ctx context.Context, proof reviewerProcessProof, clientPID int) (bool, error) {
+	command := exec.CommandContext(ctx, s.tmux, "list-clients", "-F", reviewerTerminalClientFormat)
+	command.Dir = "/tmp"
+	output, err := command.Output()
+	if err != nil || len(output) > maxTerminalInputBytes {
+		return false, errors.New("reviewer terminal client inventory is unavailable")
+	}
+	if len(output) == 0 {
+		return false, nil
+	}
+	attached := false
+	for _, line := range strings.Split(strings.TrimSuffix(string(output), "\n"), "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) != 6 {
+			return false, errors.New("reviewer terminal client inventory is malformed")
+		}
+		pid, parseErr := strconv.Atoi(fields[0])
+		serverPID, serverErr := strconv.Atoi(fields[1])
+		startTime, startErr := strconv.ParseUint(fields[2], 10, 64)
+		if parseErr != nil || pid < 2 || serverErr != nil || serverPID < 2 || startErr != nil || startTime == 0 || !validTmuxSessionID(fields[3]) || !validTmuxPaneID(fields[5]) {
+			return false, errors.New("reviewer terminal client inventory is malformed")
+		}
+		if pid != clientPID {
+			continue
+		}
+		if attached || serverPID != proof.Terminal.ServerPID || startTime != proof.Terminal.StartTime || fields[3] != proof.Terminal.SessionID || fields[4] != proof.Terminal.Name || fields[5] != proof.Terminal.PaneID {
+			return false, errors.New("reviewer terminal client attached to another pane")
+		}
+		attached = true
+	}
+	return attached, nil
+}
+
+func (s *dashboardServer) serveReviewerTerminal(w http.ResponseWriter, r *http.Request, proof reviewerProcessProof) {
+	ctx, cancel := context.WithCancel(s.ctx)
+	defer cancel()
+	go func() {
+		for {
+			changed := s.operator.owner.commitNotification()
+			if !s.reviewerTerminalStillCurrent(ctx, proof) {
+				cancel()
+				return
+			}
+			select {
+			case <-changed:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	command := exec.CommandContext(ctx, s.tmux, "if-shell", "-F", "-t", proof.Terminal.PaneID, reviewerTerminalGuardCondition(proof),
+		"attach-session -t "+proof.Terminal.SessionID,
+		"display-message -p "+reviewerTerminalDenied)
+	command.Dir = "/tmp"
+	command.Env = append(os.Environ(), "TERM=xterm-256color")
+	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 24, Cols: 80})
+	if err != nil {
+		http.Error(w, "cannot attach reviewer terminal", http.StatusConflict)
+		return
+	}
+	stopOnCancel := context.AfterFunc(ctx, func() { _ = terminal.Close() })
+	defer stopOnCancel()
+	defer func() {
+		cancel()
+		_ = terminal.Close()
+		_ = command.Wait()
+	}()
+	reader := bufio.NewReader(terminal)
+	stopOnDisconnect := context.AfterFunc(r.Context(), cancel)
+	stopOnTimeout := time.AfterFunc(5*time.Second, func() { _ = terminal.Close() })
+	handshakeCtx, cancelHandshake := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancelHandshake()
+	buffered := make([]byte, 0, 4096)
+	attached := false
+	chunk := make([]byte, 4096)
+	for len(buffered) < maxTerminalInputBytes {
+		n, readErr := reader.Read(chunk)
+		if n == 0 || readErr != nil || len(buffered)+n > maxTerminalInputBytes {
+			break
+		}
+		buffered = append(buffered, chunk[:n]...)
+		attached, err = s.reviewerTerminalClientAttached(handshakeCtx, proof, command.Process.Pid)
+		if err != nil || attached {
+			break
+		}
+	}
+	readyInTime := stopOnTimeout.Stop()
+	stopOnDisconnect()
+	if !attached || err != nil || !readyInTime || !s.reviewerTerminalStillCurrent(ctx, proof) {
+		http.Error(w, "reviewer terminal identity changed", http.StatusConflict)
+		return
+	}
+	attached, err = s.reviewerTerminalClientAttached(handshakeCtx, proof, command.Process.Pid)
+	if err != nil || !attached || !s.reviewerTerminalStillCurrent(ctx, proof) {
+		http.Error(w, "reviewer terminal identity changed", http.StatusConflict)
+		return
+	}
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow()
+	if !s.reviewerTerminalStillCurrent(ctx, proof) {
+		_ = conn.Close(websocket.StatusPolicyViolation, "Reviewer session ended.")
+		return
+	}
+	s.relayTerminalSession(ctx, cancel, conn, terminal, reader, buffered, func() bool { return s.reviewerTerminalStillCurrent(ctx, proof) })
 }
 
 func (s *dashboardServer) serveOrchestratorTerminal(w http.ResponseWriter, r *http.Request) {
@@ -907,7 +1114,6 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 		_ = conn.Close(websocket.StatusNormalClosure, "Session ended.")
 		return
 	}
-	conn.SetReadLimit(maxTerminalInputBytes)
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
 	command := exec.CommandContext(ctx, s.tmux, "attach-session", "-t", "="+session)
@@ -919,14 +1125,27 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer terminal.Close()
+	s.relayTerminalSession(ctx, cancel, conn, terminal, terminal, nil, nil)
+	_ = command.Wait()
+}
+
+func (s *dashboardServer) relayTerminalSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn, terminal *os.File, output io.Reader, buffered []byte, current func() bool) {
+	conn.SetReadLimit(maxTerminalInputBytes)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		defer cancel()
 		defer conn.CloseNow()
+		if len(buffered) > 0 && (current != nil && !current() || conn.Write(ctx, websocket.MessageBinary, buffered) != nil) {
+			return
+		}
 		buffer := make([]byte, 32<<10)
 		for {
-			n, readErr := terminal.Read(buffer)
+			n, readErr := output.Read(buffer)
+			if current != nil && !current() {
+				_ = conn.Close(websocket.StatusPolicyViolation, "Reviewer session ended.")
+				return
+			}
 			if n > 0 && conn.Write(ctx, websocket.MessageBinary, buffer[:n]) != nil {
 				return
 			}
@@ -939,6 +1158,10 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 	for {
 		kind, message, readErr := conn.Read(ctx)
 		if readErr != nil {
+			break
+		}
+		if current != nil && !current() {
+			_ = conn.Close(websocket.StatusPolicyViolation, "Reviewer session ended.")
 			break
 		}
 		if kind == websocket.MessageBinary {
@@ -964,7 +1187,6 @@ func (s *dashboardServer) serveTerminalSession(w http.ResponseWriter, r *http.Re
 	cancel()
 	_ = terminal.Close()
 	<-done
-	_ = command.Wait()
 }
 
 func tmuxPaneLive(ctx context.Context, tmux, session string) bool {
@@ -975,12 +1197,16 @@ func tmuxPaneLive(ctx context.Context, tmux, session string) bool {
 }
 
 func (s *dashboardServer) projectedStatus(issue, attempt int) (orchestrator.RecoveryStatus, error) {
-	if issue < 1 || attempt < 1 {
-		return orchestrator.RecoveryStatus{}, errors.New("invalid attempt")
-	}
 	snapshot, err := s.readStatus()
 	if err != nil {
 		return orchestrator.RecoveryStatus{}, err
+	}
+	return projectedStatusFromSnapshot(snapshot, issue, attempt)
+}
+
+func projectedStatusFromSnapshot(snapshot dashboardStatusSnapshot, issue, attempt int) (orchestrator.RecoveryStatus, error) {
+	if issue < 1 || attempt < 1 {
+		return orchestrator.RecoveryStatus{}, errors.New("invalid attempt")
 	}
 	var found *orchestrator.RecoveryStatus
 	for i := range snapshot.Statuses {
@@ -1018,6 +1244,10 @@ func (s *dashboardServer) projectedSession(issue, attempt int, role string) (orc
 	if err != nil {
 		return orchestrator.AttemptSession{}, err
 	}
+	return projectedSessionFromStatus(status, issue, attempt, role)
+}
+
+func projectedSessionFromStatus(status orchestrator.RecoveryStatus, issue, attempt int, role string) (orchestrator.AttemptSession, error) {
 	want, err := agentruntime.AttemptSessionName(role, status.Repository, issue, attempt)
 	if err != nil {
 		return orchestrator.AttemptSession{}, err
