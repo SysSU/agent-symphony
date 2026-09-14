@@ -861,6 +861,10 @@ func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "terminal requires the dashboard origin", http.StatusForbidden)
 		return
 	}
+	if role == agentruntime.SessionRoleReviewer {
+		http.Error(w, "Reviewer terminal is unavailable until session identity can be verified safely.", http.StatusConflict)
+		return
+	}
 	query := r.URL.Query()
 	issue, issueErr := strconv.Atoi(query.Get("issue"))
 	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))

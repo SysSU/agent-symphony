@@ -1159,13 +1159,13 @@ func TestAttemptSessionRoutingNeedsNoOrchestrator(t *testing.T) {
 	}
 }
 
-func TestDashboardRoutesOperatorInputDirectlyToReviewerWithoutOrchestrator(t *testing.T) {
+func TestDashboardRejectsReviewerTerminalWithoutBlockingImplementation(t *testing.T) {
 	root := t.TempDir()
 	repository, issue, attempt := "o/r", 23, 2
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, repository, issue, attempt)
 	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, repository, issue, attempt)
 	status := orchestrator.RecoveryStatus{Repository: repository, Issue: issue, Attempt: attempt, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{
-		{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "completed"},
+		{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "running", Current: true},
 		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModePlan, Target: "o/r#23 plan sha256:" + strings.Repeat("a", 64), Current: true},
 	}}
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
@@ -1179,7 +1179,7 @@ func TestDashboardRoutesOperatorInputDirectlyToReviewerWithoutOrchestrator(t *te
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("EXPECTED_SESSION", reviewer)
+	t.Setenv("EXPECTED_SESSION", implementation)
 	server := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), root, repository, nil, script, nil, false, ""))
 	defer server.Close()
 	dial := func(path, extraQuery string) (*websocket.Conn, *http.Response, error) {
@@ -1196,8 +1196,20 @@ func TestDashboardRoutesOperatorInputDirectlyToReviewerWithoutOrchestrator(t *te
 		t.Fatalf("unknown role response=%v err=%v", response, err)
 	}
 	connection, response, err := dial("/reviewer/terminal", "")
+	if connection != nil {
+		connection.CloseNow()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusConflict {
+		t.Fatalf("reviewer terminal response=%v err=%v", response, err)
+	}
+	message, readErr := io.ReadAll(response.Body)
+	response.Body.Close()
+	if readErr != nil || !strings.Contains(string(message), "session identity can be verified safely") {
+		t.Fatalf("reviewer terminal reason=%q err=%v", message, readErr)
+	}
+	connection, response, err = dial("/terminal", "")
 	if err != nil {
-		t.Fatalf("review terminal dial response=%v err=%v", response, err)
+		t.Fatalf("implementation terminal dial response=%v err=%v", response, err)
 	}
 	defer connection.CloseNow()
 	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("review the dependency edge\n")); err != nil {
@@ -1207,7 +1219,7 @@ func TestDashboardRoutesOperatorInputDirectlyToReviewerWithoutOrchestrator(t *te
 	for {
 		kind, message, readErr := connection.Read(t.Context())
 		if readErr != nil {
-			t.Fatalf("reviewer terminal output=%q err=%v", output.String(), readErr)
+			t.Fatalf("implementation terminal output=%q err=%v", output.String(), readErr)
 		}
 		if kind == websocket.MessageBinary {
 			output.Write(message)
@@ -1291,7 +1303,7 @@ func TestDashboardTerminalRejectsTamperedIdentityAndInvalidMessages(t *testing.T
 	}
 }
 
-func TestDashboardMissingReviewerSessionClosesWithExplicitReason(t *testing.T) {
+func TestDashboardMissingReviewerSessionCannotAttach(t *testing.T) {
 	root := t.TempDir()
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 8, 1)
 	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 8, 1)
@@ -1301,7 +1313,7 @@ func TestDashboardMissingReviewerSessionClosesWithExplicitReason(t *testing.T) {
 	}
 	script := filepath.Join(t.TempDir(), "tmux")
 	attached := filepath.Join(t.TempDir(), "attached")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nif test \"$1\" = display-message; then exit 1; fi\ntouch \"$ATTACHED\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch \"$ATTACHED\"\nif test \"$1\" = display-message; then exit 1; fi\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("ATTACHED", attached)
@@ -1309,17 +1321,14 @@ func TestDashboardMissingReviewerSessionClosesWithExplicitReason(t *testing.T) {
 	defer server.Close()
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/reviewer/terminal?issue=8&attempt=1"
 	connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
-	if err != nil {
-		t.Fatalf("missing session dial response=%v err=%v", response, err)
+	if connection != nil {
+		connection.CloseNow()
 	}
-	defer connection.CloseNow()
-	_, _, err = connection.Read(t.Context())
-	var closeErr websocket.CloseError
-	if !errors.As(err, &closeErr) || closeErr.Code != websocket.StatusNormalClosure || closeErr.Reason != "Session ended." {
-		t.Fatalf("missing session close=%#v err=%v", closeErr, err)
+	if err == nil || response == nil || response.StatusCode != http.StatusConflict {
+		t.Fatalf("missing reviewer session response=%v err=%v", response, err)
 	}
 	if _, err := os.Stat(attached); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("missing session reached attachment: %v", err)
+		t.Fatalf("rejected reviewer terminal invoked tmux: %v", err)
 	}
 }
 
