@@ -1118,7 +1118,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					if len(serve) > 8192 {
 						serve = serve[len(serve)-8192:]
 					}
-					t.Fatalf("restart did not preserve cancelled attempt as failed without its reviewer, or show a valid recovery/active next attempt: owner_read=%v effects=%s receipts=%s\n%s\nserve=%s", latestErr, internalgithub.Redact(fullSystemEffectSummary(latest)), internalgithub.Redact(fmt.Sprintf("%#v", latest.ControlReceipts)), internalgithub.Redact(fullSystemLifecycleDiagnostic(restartAddress, stateRoot, fixture)), internalgithub.Redact(serve))
+					t.Fatalf("restart did not preserve cancelled attempt as failed without its reviewer, or show a valid recovery/active next attempt: owner_read=%v effects=%s pending_start=%s receipts=%s\n%s\nserve=%s", latestErr, internalgithub.Redact(fullSystemEffectSummary(latest)), fullSystemPendingStartDiagnostic(latest, stateRoot, environment), internalgithub.Redact(fmt.Sprintf("%#v", latest.ControlReceipts)), internalgithub.Redact(fullSystemLifecycleDiagnostic(restartAddress, stateRoot, fixture)), internalgithub.Redact(serve))
 				}
 			}
 		})
@@ -1237,4 +1237,55 @@ func fullSystemEffectSummary(state runtimeOwnerState) string {
 		rows = append(rows, fmt.Sprintf("id=%s id_valid=%t action=%s state=%s issue=%d attempt=%d issue_gen=%d/%d attempt_gen=%d/%d epoch=%d revision=%d request=%s result=%s digest_valid=%t payload_valid=%t launched=%t superseded=%s", id, id == runtimeEffectID(effect), effect.Action, effect.State, effect.Issue, effect.Attempt, effect.IssueGeneration, state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)], effect.AttemptGeneration, state.AttemptGenerations[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)], effect.IntentEpoch, effect.IntentRevision, requestAction, resultAction, agentruntime.ValidEffectRequestDigest(effect.RequestDigest), valid, effect.ReviewerLaunched, effect.SupersededReviewerID))
 	}
 	return strings.Join(rows, "; ")
+}
+
+func fullSystemPendingStartDiagnostic(state runtimeOwnerState, stateRoot string, environment []string) string {
+	var rows []string
+	for id, effect := range state.Effects {
+		if effect.Repository != "o/r" || effect.Issue != 73 || effect.Attempt != 2 || effect.Action != string(agentruntime.EffectStart) || effect.State != "pending" {
+			continue
+		}
+		marker := "missing"
+		if _, err := os.Lstat(filepath.Join(stateRoot, "runtime-effects", id+".done")); err == nil {
+			marker = "present"
+		} else if !errors.Is(err, os.ErrNotExist) {
+			marker = "error: " + fmt.Sprintf("%.256s", err)
+		}
+		session := state.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)].Manifest.Session
+		pane := "no session"
+		if session != "" {
+			command := exec.Command("tmux", "display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{session_name}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_current_command}")
+			command.Env = environment
+			output, err := command.CombinedOutput()
+			pane = fmt.Sprintf("output=%.512q error=%.256s", internalgithub.Redact(string(output)), fmt.Sprint(err))
+		}
+		rows = append(rows, fmt.Sprintf("id=%.64s diagnostic=%.256q marker=%s session=%.128q pane=%s", id, internalgithub.Redact(effect.Diagnostic), marker, session, pane))
+		if len(rows) == 3 {
+			break
+		}
+	}
+	return strings.Join(rows, "; ")
+}
+
+func TestFullSystemPendingStartDiagnostic(t *testing.T) {
+	root := t.TempDir()
+	id := strings.Repeat("a", 32)
+	state := newRuntimeOwnerState("o/r")
+	state.Effects[id] = runtimeEffectIntent{Repository: "o/r", Issue: 73, Attempt: 2, Action: string(agentruntime.EffectStart), State: "pending", Diagnostic: "external completion remains ambiguous"}
+	marker := filepath.Join(root, "runtime-effects", id+".done")
+	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte("proof"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := fullSystemPendingStartDiagnostic(state, root, nil); !strings.Contains(got, "marker=present") || !strings.Contains(got, `diagnostic="external completion remains ambiguous"`) {
+		t.Fatalf("pending Start failure omitted its marker or diagnostic: %s", got)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if got := fullSystemPendingStartDiagnostic(state, root, nil); !strings.Contains(got, "marker=missing") {
+		t.Fatalf("pending Start failure reported a missing marker as present: %s", got)
+	}
 }
