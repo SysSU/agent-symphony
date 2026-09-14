@@ -435,6 +435,50 @@ func TestLocalTombstoneReplayIgnoresLaterMissingObservation(t *testing.T) {
 	}
 }
 
+func TestLocalTombstoneReplayAdmitsCapturedCommandAfterObservationChanges(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 375, "completed", true)
+	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	service.issueClosed = func(context.Context, string, int) (bool, error) { return true, nil }
+	first := service.perform(t.Context(), operatorRequest("dismiss-before-body-change", "dismiss", manifest, false))
+	if !first.OK || first.Status != http.StatusOK {
+		t.Fatalf("first dismissal=%#v", first)
+	}
+	before := mustOwnerSnapshot(t, owner)
+	request := operatorRequest("dismiss-captured-before-body-change", "dismiss", manifest, false)
+	command, ok := service.tombstoneReplayCommand(before, request)
+	if !ok {
+		t.Fatal("service did not prepare tombstone replay")
+	}
+	issueKey := ownerIssueKey(manifest.Repository, manifest.Issue)
+	issue := expandIssueFact(before.State.Observations[issueKey].Fact)
+	issue.Body = "changed GitHub issue body"
+	input := repositoryInput(true, issue)
+	for _, attempt := range before.State.Observations[issueKey].Attempts {
+		if attempt.Present {
+			input.Attempts = append(input.Attempts, expandAttemptFact(attempt.Fact))
+		}
+	}
+	changed := applyReconciliationInput(t, owner, input)
+	if !changed.State.Observations[issueKey].Present || changed.State.Observations[issueKey].Fact.BodyDigest == before.State.Observations[issueKey].Fact.BodyDigest || changed.State.IssueGenerations[issueKey] != before.State.IssueGenerations[issueKey] {
+		t.Fatalf("fixture did not change only the observation: before=%#v after=%#v", before.State.Observations[issueKey], changed.State.Observations[issueKey])
+	}
+	committed, effect, err := owner.beginOperatorMutation(t.Context(), command)
+	if err != nil {
+		t.Fatalf("captured replay rejected after GitHub body changed: %v", err)
+	}
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	if effect != nil || !reflect.DeepEqual(committed.State.Tombstones[key], before.State.Tombstones[key]) || committed.State.Attempts[key].Generation != 0 {
+		t.Fatalf("replay changed invalidated attempt: effect=%#v state=%#v", effect, committed.State)
+	}
+	if receipt, ok := operatorReceiptByID(committed.State, request.RequestID); !ok || receipt.State != "completed" || receipt.Result == nil || !receipt.Result.OK {
+		t.Fatalf("captured replay receipt=%#v exists=%t", receipt, ok)
+	}
+	fresh := service.perform(t.Context(), operatorRequest("dismiss-after-body-change", "dismiss", manifest, false))
+	if !fresh.OK || fresh.Status != http.StatusOK {
+		t.Fatalf("fresh request after changed body=%#v", fresh)
+	}
+}
+
 func TestV2DashboardCancelRespondsWhileReconciliationCollectsAndRejectsStaleResult(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 327, "active", false)
 	service := operatorTestMutationService(t, owner)

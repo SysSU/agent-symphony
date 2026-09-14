@@ -711,7 +711,8 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					t.Fatalf("invalid reviewer PID %q: %v", pidBody, err)
 				}
 				if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-					t.Fatalf("cancel completed while TERM/HUP-ignoring reviewer process %d was still alive: %v", pid, err)
+					process, psErr := exec.Command("ps", "-o", "pid,ppid,pgid,sid,stat", "-p", strconv.Itoa(pid)).CombinedOutput()
+					t.Fatalf("cancel completed while TERM/HUP-ignoring reviewer process %d was still alive: %v; ps=%q ps_err=%v", pid, err, process, psErr)
 				}
 				gate, err := os.OpenFile(reviewGate, os.O_RDWR|syscall.O_NONBLOCK, 0)
 				if err != nil {
