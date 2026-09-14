@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1240,6 +1241,7 @@ func fullSystemEffectSummary(state runtimeOwnerState) string {
 }
 
 func fullSystemPendingStartDiagnostic(state runtimeOwnerState, stateRoot string, environment []string) string {
+	redact := func(value string) string { return internalgithub.RedactEnvironment(value, environment) }
 	var rows []string
 	for id, effect := range state.Effects {
 		if effect.Repository != "o/r" || effect.Issue != 73 || effect.Attempt != 2 || effect.Action != string(agentruntime.EffectStart) || effect.State != "pending" {
@@ -1249,29 +1251,44 @@ func fullSystemPendingStartDiagnostic(state runtimeOwnerState, stateRoot string,
 		if _, err := os.Lstat(filepath.Join(stateRoot, "runtime-effects", id+".done")); err == nil {
 			marker = "present"
 		} else if !errors.Is(err, os.ErrNotExist) {
-			marker = "error: " + fmt.Sprintf("%.256s", err)
+			marker = "error: " + fmt.Sprintf("%.256s", redact(err.Error()))
 		}
 		session := state.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)].Manifest.Session
 		pane := "no session"
 		if session != "" {
-			command := exec.Command("tmux", "display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{session_name}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_current_command}")
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			command := exec.CommandContext(ctx, "tmux", "display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{session_name}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_current_command}")
 			command.Env = environment
+			command.WaitDelay = time.Second
 			output, err := command.CombinedOutput()
-			pane = fmt.Sprintf("output=%.512q error=%.256s", internalgithub.Redact(string(output)), fmt.Sprint(err))
+			cancel()
+			pane = fmt.Sprintf("output=%.512q error=%.256s", redact(string(output)), redact(fmt.Sprint(err)))
 		}
-		rows = append(rows, fmt.Sprintf("id=%.64s diagnostic=%.256q marker=%s session=%.128q pane=%s", id, internalgithub.Redact(effect.Diagnostic), marker, session, pane))
+		rows = append(rows, fmt.Sprintf("id=%.64s diagnostic=%.256q marker=%s session=%.128q pane=%s", redact(id), redact(effect.Diagnostic), marker, redact(session), pane))
 		if len(rows) == 3 {
 			break
 		}
 	}
-	return strings.Join(rows, "; ")
+	result := redact(strings.Join(rows, "; "))
+	if len(result) > 2048 {
+		result = result[:2048]
+	}
+	return result
 }
 
 func TestFullSystemPendingStartDiagnostic(t *testing.T) {
 	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(bin, "tmux"), "#!/bin/sh\nprintf 'pane-probe canary-private-token %s\\n' \"$*\"\n")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	id := strings.Repeat("a", 32)
 	state := newRuntimeOwnerState("o/r")
-	state.Effects[id] = runtimeEffectIntent{Repository: "o/r", Issue: 73, Attempt: 2, Action: string(agentruntime.EffectStart), State: "pending", Diagnostic: "external completion remains ambiguous"}
+	state.Effects[id] = runtimeEffectIntent{Repository: "o/r", Issue: 73, Attempt: 2, Action: string(agentruntime.EffectStart), State: "pending", Diagnostic: "external completion remains ambiguous canary-private-token " + strings.Repeat("x", 5000)}
+	state.Attempts[ownerAttemptKey("o/r", 73, 2)] = runtimeAttemptRecord{Manifest: agentruntime.Manifest{Session: "test-session"}}
+	environment := []string{"PATH=" + bin, "GH_TOKEN=canary-private-token"}
 	marker := filepath.Join(root, "runtime-effects", id+".done")
 	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
 		t.Fatal(err)
@@ -1279,13 +1296,13 @@ func TestFullSystemPendingStartDiagnostic(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("proof"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := fullSystemPendingStartDiagnostic(state, root, nil); !strings.Contains(got, "marker=present") || !strings.Contains(got, `diagnostic="external completion remains ambiguous"`) {
-		t.Fatalf("pending Start failure omitted its marker or diagnostic: %s", got)
+	if got := fullSystemPendingStartDiagnostic(state, root, environment); !strings.Contains(got, "marker=present") || !strings.Contains(got, `diagnostic="external completion remains ambiguous [REDACTED]`) || !strings.Contains(got, "pane-probe [REDACTED] display-message -p -t =test-session:0.0") || strings.Contains(got, "canary-private-token") || len(got) > 2048 {
+		t.Fatalf("pending Start failure omitted bounded redacted marker, diagnostic, or pane identity: %s", got)
 	}
 	if err := os.Remove(marker); err != nil {
 		t.Fatal(err)
 	}
-	if got := fullSystemPendingStartDiagnostic(state, root, nil); !strings.Contains(got, "marker=missing") {
+	if got := fullSystemPendingStartDiagnostic(state, root, environment); !strings.Contains(got, "marker=missing") {
 		t.Fatalf("pending Start failure reported a missing marker as present: %s", got)
 	}
 }
