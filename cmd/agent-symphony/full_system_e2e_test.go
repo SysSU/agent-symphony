@@ -1029,12 +1029,27 @@ func waitHTTP(t *testing.T, target string, timeout time.Duration, output fmt.Str
 	t.Fatalf("server did not become ready: %s", output.String())
 }
 
+func TestWaitForKeepsFirstSuccessfulSample(t *testing.T) {
+	calls := 0
+	if !waitFor(time.Second, func() bool {
+		calls++
+		return calls == 1
+	}) || calls != 1 {
+		t.Fatalf("successful sample was lost or evaluated twice: calls=%d", calls)
+	}
+}
+
 func waitFor(timeout time.Duration, ready func() bool) bool {
 	deadline := time.Now().Add(timeout)
-	for !ready() && time.Now().Before(deadline) {
+	for {
+		if ready() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	return ready()
 }
 
 func fullSystemAttemptDiagnostics(address, stateRoot, implementationSession string, environment []string) string {
