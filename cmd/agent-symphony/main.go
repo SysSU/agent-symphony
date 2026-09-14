@@ -120,11 +120,13 @@ type handoffReceipt struct {
 }
 
 type handoffRequest struct {
-	Manifest     agentruntime.Manifest `json:"manifest"`
-	Handoff      json.RawMessage       `json:"handoff"`
-	OutcomePath  string                `json:"outcome_path"`
-	OutcomeToken string                `json:"outcome_token"`
-	Command      []string              `json:"command"`
+	Manifest             agentruntime.Manifest `json:"manifest"`
+	Handoff              json.RawMessage       `json:"handoff"`
+	OutcomePath          string                `json:"outcome_path"`
+	OutcomeToken         string                `json:"outcome_token"`
+	Command              []string              `json:"command"`
+	CandidateLaunchToken string                `json:"candidate_launch_token,omitempty"`
+	CandidateLaunchID    string                `json:"candidate_launch_id,omitempty"`
 }
 
 func (b workerBoundaryRunner) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
@@ -653,6 +655,29 @@ func chatExactSession(stateRoot, repository, role string, issue, attempt int, ti
 	return nil
 }
 
+func signalHandoffLaunch(tmux, channel string) error {
+	command := exec.CommandContext(context.Background(), tmux, "wait-for", "-S", channel)
+	command.Dir = "/tmp"
+	return command.Run()
+}
+
+func recordHandoffLaunch(path, recipient, channel, tmux string) error {
+	if err := writeImmutable(path, []byte(recipient)); err != nil {
+		return err
+	}
+	if err := signalHandoffLaunch(tmux, channel); err != nil {
+		signalErr := fmt.Errorf("launch signal: %w", err)
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return errors.Join(signalErr, fmt.Errorf("roll back launch marker: %w", removeErr))
+		}
+		if syncErr := immutableDirSync(filepath.Dir(path)); syncErr != nil {
+			return errors.Join(signalErr, fmt.Errorf("sync launch marker rollback: %w", syncErr))
+		}
+		return signalErr
+	}
+	return nil
+}
+
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == "--version" {
 		fmt.Fprintln(stdout, releaseVersion())
@@ -665,6 +690,38 @@ func run(args []string, stdout, stderr io.Writer) int {
 	command := args[0]
 	if command == "review-pane" {
 		code, childSignal, err := runReviewerPane(args[1:], stdout, stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "error: "+err.Error())
+		}
+		if childSignal != 0 {
+			signal.Reset(childSignal)
+			if killErr := syscall.Kill(os.Getpid(), childSignal); killErr == nil {
+				select {}
+			}
+		}
+		return code
+	}
+	if command == "implementation-gate" {
+		if len(args) < 9 || args[7] != "--" {
+			return misuse(stderr, false, command, "invalid implementation gate invocation")
+		}
+		manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, LogPath: args[2], Worktree: args[3], Session: args[4], LaunchToken: args[5], LaunchID: args[6]}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer stop()
+		if err := agentruntime.RunImplementationGate(ctx, manifest, args[1], args[8:]); err != nil {
+			fmt.Fprintln(stderr, "error: "+err.Error())
+			return 125
+		}
+		return 0
+	}
+	if command == "pane-exit-status-bound" {
+		if len(args) < 9 || args[7] != "--" {
+			return misuse(stderr, false, command, "invalid bound pane command invocation")
+		}
+		manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, LogPath: args[2], Worktree: args[3], Session: args[4], LaunchToken: args[5], LaunchID: args[6], Interactive: true}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer stop()
+		code, childSignal, err := agentruntime.RunBoundPaneCommand(ctx, manifest, args[1], args[8:], os.Stdin, stdout, stderr)
 		if err != nil {
 			fmt.Fprintln(stderr, "error: "+err.Error())
 		}
@@ -694,6 +751,40 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return code
 	}
+	if command == "worker-capture-bound" || command == "worker-capture-handoff-ready-bound" {
+		handoff := command == "worker-capture-handoff-ready-bound"
+		identityAt, separator := 4, 9
+		if handoff {
+			identityAt, separator = 7, 12
+		}
+		if len(args) < separator+2 || args[separator] != "--" {
+			return misuse(stderr, false, command, "invalid bound worker capture invocation")
+		}
+		manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, LogPath: args[identityAt], Worktree: args[identityAt+1], Session: args[identityAt+2], LaunchToken: args[identityAt+3], LaunchID: args[identityAt+4]}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer stop()
+		var afterStart func() error
+		if handoff {
+			afterStart = func() error {
+				return recordHandoffLaunch(args[4], args[5], args[6], args[1])
+			}
+		}
+		code, err := agentruntime.CaptureBoundWorker(ctx, manifest, args[1], args[2], args[3], args[separator+1:], stdout, stderr, handoff, afterStart)
+		if err != nil {
+			if handoff {
+				_ = signalHandoffLaunch(args[1], args[6])
+			}
+			fmt.Fprintln(stderr, "error: "+err.Error())
+			code = 1
+		}
+		statusCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if statusErr := agentruntime.RecordPaneExitStatus(statusCtx, args[1], code); statusErr != nil {
+			fmt.Fprintln(stderr, "error: "+statusErr.Error())
+			return 1
+		}
+		return code
+	}
 	if command == "worker-capture" || command == "worker-capture-replace" || command == "worker-capture-handoff" || command == "worker-capture-handoff-ready" {
 		if command == "worker-capture-handoff" || command == "worker-capture-handoff-ready" {
 			if len(args) < 9 || args[7] != "--" {
@@ -701,30 +792,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			}
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 			defer stop()
-			signalLaunch := func() error {
-				command := exec.CommandContext(context.Background(), args[1], "wait-for", "-S", args[6])
-				command.Dir = "/tmp"
-				return command.Run()
-			}
 			code, err := agentruntime.CaptureWorkerReplacingResultAfterStart(ctx, args[1], args[2], args[3], args[8:], stdout, stderr, func() error {
-				if err := writeImmutable(args[4], []byte(args[5])); err != nil {
-					return err
-				}
-				if err := signalLaunch(); err != nil {
-					signalErr := fmt.Errorf("launch signal: %w", err)
-					if removeErr := os.Remove(args[4]); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-						return errors.Join(signalErr, fmt.Errorf("roll back launch marker: %w", removeErr))
-					}
-					if syncErr := immutableDirSync(filepath.Dir(args[4])); syncErr != nil {
-						return errors.Join(signalErr, fmt.Errorf("sync launch marker rollback: %w", syncErr))
-					}
-					return signalErr
-				}
-				return nil
+				return recordHandoffLaunch(args[4], args[5], args[6], args[1])
 			})
 			if err != nil {
 				if command == "worker-capture-handoff-ready" {
-					_ = signalLaunch()
+					_ = signalHandoffLaunch(args[1], args[6])
 				}
 				fmt.Fprintln(stderr, "error: "+err.Error())
 			}
@@ -733,7 +806,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if len(args) < 6 || args[4] != "--" {
 			return misuse(stderr, false, command, "invalid internal worker capture invocation")
 		}
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 		defer stop()
 		capture := agentruntime.CaptureWorker
 		if command == "worker-capture-replace" {

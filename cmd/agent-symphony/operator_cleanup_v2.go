@@ -69,6 +69,9 @@ func (e operatorCleanupExecutor) execute(ctx context.Context, request agentrunti
 		if !ok || effect.State != "pending" || effect.Action != string(agentruntime.EffectCleanup) || effect.RequestDigest != request.Identity.RequestDigest || effect.IssueGeneration != request.Identity.IssueGeneration || effect.AttemptGeneration != request.Identity.AttemptGeneration || effect.Repository != request.Identity.Repository || effect.Issue != request.Identity.Issue || effect.Attempt != request.Identity.Attempt {
 			return errStaleStateResult
 		}
+		if tombstone := snapshot.State.Tombstones[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]; tombstone.InvalidatedStart != nil {
+			return fmt.Errorf("start candidate cleanup remains unproved: %w", agentruntime.ErrRuntimeResourcesRemain)
+		}
 		for _, proof := range snapshot.State.ReviewerProofs {
 			if proof.Repository == request.Identity.Repository && proof.Issue == request.Identity.Issue && proof.Attempt == request.Identity.Attempt && proof.DeadProved {
 				proofs[proof.Target] = proof
@@ -94,6 +97,15 @@ func (e operatorCleanupExecutor) execute(ctx context.Context, request agentrunti
 func (e operatorCleanupExecutor) verify(ctx context.Context, request agentruntime.EffectRequest) (bool, error) {
 	if e.reviewer == nil || e.runtime == nil {
 		return false, errors.New("operator cleanup verifier is invalid")
+	}
+	if e.owner != nil {
+		snapshot, err := e.owner.snapshot(ctx)
+		if err != nil {
+			return false, err
+		}
+		if tombstone := snapshot.State.Tombstones[ownerAttemptKey(request.Identity.Repository, request.Identity.Issue, request.Identity.Attempt)]; tombstone.InvalidatedStart != nil {
+			return false, nil
+		}
 	}
 	if err := freshRuntime(e.runtime, e.runtime.Source).VerifyResourcesGone(ctx, request.Manifest); err != nil {
 		if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
