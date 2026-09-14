@@ -641,26 +641,30 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 	if err != nil || pending {
 		return reconciliationEffectResult{}, pending, err
 	}
+	var sealedPane reviewerPaneIdentity
+	var sealedTerminal reviewerTerminalRecord
 	if binding != nil && binding.ChildPID > 1 {
-		status, probeErr := boundary.call(run.ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(request.Reviewer.Session), agentruntime.PaneStatusFormat}, Env: material.Env})
+		status, probeErr := boundary.call(run.ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(request.Reviewer.Session), reviewerPaneIdentityFormat}, Env: material.Env})
 		if probeErr != nil {
 			return reconciliationEffectResult{}, true, probeErr
 		}
-		if !missingTmuxPaneStatus(status) {
-			pane, parseErr := agentruntime.ParsePaneStatus(status.Output)
-			if parseErr != nil || !pane.Dead {
-				return reconciliationEffectResult{}, true, errors.New("reviewer terminal pane death is unproved")
-			}
+		pane, parseErr := parseReviewerPaneIdentity(status.Output)
+		launchPath, terminalPath := reviewerLifecyclePaths(request.Reviewer.Snapshot, request.Reviewer.Target)
+		if parseErr != nil || !pane.Status.Dead || pane.Name != request.Reviewer.Session || !reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, *binding) {
+			return reconciliationEffectResult{}, true, errors.New("reviewer terminal pane death is unproved")
 		}
-		gone, proofErr := reviewerGroupGone(binding.ChildPID)
-		if proofErr != nil || !gone {
-			return reconciliationEffectResult{}, true, errors.New("reviewer process-group death is unproved")
+		terminal, terminalErr := readReviewerTerminal(launchPath, terminalPath, *binding)
+		if terminalErr != nil || terminal == nil {
+			return reconciliationEffectResult{}, true, errors.New("reviewer terminal identity is unavailable")
 		}
-		if _, proofErr := c.owner.proveReviewerDead(run.ctx, proveReviewerDeadCommand{Identity: plan.Identity, GroupPID: binding.ChildPID}); proofErr != nil {
-			return reconciliationEffectResult{}, false, proofErr
-		}
+		sealedPane, sealedTerminal = pane, *terminal
 	}
 	result := reconciliationEffectResult{Action: request.Action, Reviewer: &reviewerEffectResult{Phase: request.Reviewer.Phase, Status: review.Status, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, BaseSHA: request.Reviewer.BaseSHA, HeadSHA: request.Reviewer.HeadSHA, Snapshot: request.Reviewer.Snapshot, Session: request.Reviewer.Session, Findings: slices.Clone(review.Findings), Diagnostic: review.Diagnostic}}
+	if binding != nil && binding.ChildPID > 1 {
+		if _, sealErr := c.owner.sealReviewerResult(run.ctx, sealReviewerResultCommand{Identity: plan.Identity, Result: result, Pane: sealedPane, Terminal: sealedTerminal}); sealErr != nil {
+			return reconciliationEffectResult{}, false, sealErr
+		}
+	}
 	if err := c.finishReconciliationMarker(plan.Identity, request, result, operator); err != nil {
 		return reconciliationEffectResult{}, false, err
 	}

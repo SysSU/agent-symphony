@@ -1951,7 +1951,7 @@ func cleanupCertifiedReviewResources(ctx context.Context, boundary boundaryCalle
 func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string, proofs []reviewerProcessProof) error {
 	certified := len(proofs) > 0
 	for _, proof := range proofs {
-		if !proof.DeadProved || proof.Repository != attempt.Repository || proof.Issue != attempt.Issue || proof.Attempt != attempt.Number || target != "" && len(proofs) == 1 && proof.Target != target {
+		if !proof.DeadProved || !proof.NeverRan || proof.Repository != attempt.Repository || proof.Issue != attempt.Issue || proof.Attempt != attempt.Number || target != "" && len(proofs) == 1 && proof.Target != target {
 			return errors.New("reviewer cleanup certificate does not match the attempt and target")
 		}
 	}
@@ -2223,36 +2223,29 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 		if !sameReviewerIdentity(launch, *binding) {
 			return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer launch identity mismatched"))
 		}
-		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
+		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerPaneIdentityFormat}, Dir: snapshot, Env: env})
 		if err != nil {
 			return independentReviewResult{}, true, fmt.Errorf("observe launched reviewer: %w", err)
 		}
-		if missingTmuxPaneStatus(result) {
+		pane, err := parseReviewerPaneIdentity(result.Output)
+		if err != nil || pane.Name != session || !reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, *binding) {
 			return independentReviewResult{}, true, errors.New("launched reviewer pane identity is unavailable")
 		}
-		pane, err := agentruntime.ParsePaneStatus(result.Output)
-		if err != nil {
-			return independentReviewResult{}, true, err
-		}
-		if !pane.Dead {
+		if !pane.Status.Dead {
 			return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
 		}
-		if !pane.Ready {
+		if !pane.Status.Ready {
 			return independentReviewResult{}, true, errors.New("reviewer pane exit is not yet recorded")
 		}
 		if binding.ChildPID < 2 || launch.ChildPID != binding.ChildPID {
 			return independentReviewResult{}, true, errors.New("owner-bound reviewer process group is unavailable")
-		}
-		gone, err := reviewerGroupGone(binding.ChildPID)
-		if err != nil || !gone {
-			return independentReviewResult{}, true, fmt.Errorf("reviewer process group remains live or unknown: %w", err)
 		}
 		terminal, terminalErr := readReviewerTerminal(launchPath, terminalPath, *binding)
 		if terminalErr != nil {
 			return independentReviewResult{}, false, reviewerLifecycleError(terminalErr)
 		}
 		if terminal != nil {
-			if terminal.ExitCode == 0 && (pane.Signal != "" || pane.ExitStatus != 0) {
+			if terminal.ExitCode == 0 && (pane.Status.Signal != "" || pane.Status.ExitStatus != 0) {
 				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer terminal record conflicts with tmux pane exit"))
 			}
 			if terminal.ExitCode != 0 || terminal.Signal != 0 {

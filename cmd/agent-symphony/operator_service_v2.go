@@ -1034,7 +1034,12 @@ func (s *operatorMutationService) shutdown(ctx context.Context) error {
 
 func operatorResultForReceipt(snapshot stateOwnerSnapshot, receipt controlReceipt) controlResult {
 	if receipt.State == "completed" {
-		return *receipt.Result
+		result := *receipt.Result
+		if diagnostic := legacyReviewerDiagnostic(snapshot.State, receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt); diagnostic != "" {
+			result.Status = http.StatusAccepted
+			result.Data, _ = json.Marshal(operatorReceiptStatus{Phase: "physical-unverified", Diagnostic: diagnostic})
+		}
+		return result
 	}
 	body, _ := json.Marshal(operatorReceiptStatus{Phase: receipt.Phase, EffectID: receipt.EffectID, Diagnostic: receipt.Diagnostic})
 	return controlResult{Version: controlVersion, RequestID: receipt.Request.RequestID, Action: receipt.Request.Action, OK: true, Status: http.StatusAccepted, OwnerRevision: snapshot.State.Revision, Data: body}

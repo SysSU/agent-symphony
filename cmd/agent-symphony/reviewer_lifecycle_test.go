@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -577,6 +582,322 @@ func TestReviewerMissingSessionWithLiveTmuxServerNeedsGroupDeath(t *testing.T) {
 		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("certified cleanup retained %s: %v", path, err)
 		}
+	}
+}
+
+func TestDetachedReviewerChildProcessHelper(t *testing.T) {
+	switch os.Getenv("AGENT_SYMPHONY_DETACHED_REVIEWER_HELPER") {
+	case "reviewer":
+		child := exec.Command(os.Args[0], "-test.run=^TestDetachedReviewerChildProcessHelper$")
+		child.Env = append(os.Environ(), "AGENT_SYMPHONY_DETACHED_REVIEWER_HELPER=child")
+		child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		child.Stdout, child.Stderr = io.Discard, io.Discard
+		if child.Start() != nil {
+			os.Exit(125)
+		}
+		_, _ = fmt.Fprintln(os.Stdout, child.Process.Pid)
+		_ = child.Wait()
+	case "child":
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		<-signals
+	}
+}
+
+func TestReviewerCleanupRejectsEscapedChild(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := ownerReconciliationEffectIdentity(*effect)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	reviewer := exec.Command(os.Args[0], "-test.run=^TestDetachedReviewerChildProcessHelper$")
+	reviewer.Env = append(os.Environ(), "AGENT_SYMPHONY_DETACHED_REVIEWER_HELPER=reviewer")
+	reviewer.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	output, err := reviewer.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reviewer.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	t.Cleanup(func() {
+		_ = reviewer.Process.Kill()
+		if !waited {
+			_ = reviewer.Wait()
+		}
+	})
+	line, err := bufio.NewReader(output).ReadString('\n')
+	if err != nil {
+		t.Fatalf("reviewer did not report detached child: %v", err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil || childPID < 2 {
+		t.Fatalf("invalid detached reviewer PID %q: %v", line, err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	groupPID := reviewer.Process.Pid
+	if childGroup, err := syscall.Getpgid(childPID); err != nil || childGroup == groupPID {
+		t.Fatalf("reviewer child did not escape original group: child=%d group=%d err=%v", childGroup, groupPID, err)
+	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: groupPID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(-groupPID, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	_ = reviewer.Wait()
+	waited = true
+	if gone, err := reviewerGroupGone(groupPID); err != nil || !gone {
+		t.Fatalf("original reviewer group remains: gone=%t err=%v", gone, err)
+	}
+	if err := syscall.Kill(childPID, 0); err != nil {
+		t.Fatalf("detached reviewer child is not live: %v", err)
+	}
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
+	service := &operatorMutationService{lifecycle: t.Context(), reviewer: boundary}
+	stopped, stopErr := service.stopReviewerSessionAt(t.Context(), request.Reviewer.Session, effect.ID, effect.RequestDigest, groupPID, true, true, "", "", effect.IssueGeneration, effect.AttemptGeneration)
+	if stopErr == nil && stopped.GroupPID == groupPID {
+		_, _ = owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: groupPID})
+	}
+	proof := mustOwnerSnapshot(t, owner).State.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)]
+	if proof.DeadProved {
+		snapshotRoot := productionSnapshotRoot(owner.stateRoot)
+		if err := os.MkdirAll(request.Reviewer.Snapshot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := cleanupCertifiedReviewResources(t.Context(), boundary, nil, agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, request.Reviewer.HeadSHA, request.Reviewer.Target, request.Reviewer.Snapshot, request.Reviewer.Session, snapshotRoot, proof); err != nil {
+			t.Fatalf("false death certificate did not reach cleanup: %v", err)
+		}
+		if err := syscall.Kill(childPID, 0); err != nil {
+			t.Fatalf("detached reviewer child died before cleanup was checked: %v", err)
+		}
+		t.Fatal("reviewer cleanup deleted snapshot with detached child still live")
+	}
+}
+
+func TestDismissWithPendingReviewerDoesNotCompletePhysicalCleanup(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	request.Reviewer.Mode = agentruntime.ReviewModeImplementation
+	root, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	request = bindEffectObservation(snapshot, request)
+	_, reviewer, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := ownerReconciliationEffectIdentity(*reviewer)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	liveReviewer := exec.Command(os.Args[0], "-test.run=^TestDetachedReviewerChildProcessHelper$")
+	liveReviewer.Env = append(os.Environ(), "AGENT_SYMPHONY_DETACHED_REVIEWER_HELPER=child")
+	liveReviewer.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := liveReviewer.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = liveReviewer.Process.Kill()
+		_ = liveReviewer.Wait()
+	})
+	if group, err := syscall.Getpgid(liveReviewer.Process.Pid); err != nil || group != liveReviewer.Process.Pid {
+		t.Fatalf("fixture reviewer is not its process-group leader: group=%d err=%v", group, err)
+	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: liveReviewer.Process.Pid}); err != nil {
+		t.Fatal(err)
+	}
+	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(request)
+	sealTestReviewerResult(t, owner, *reviewer, result)
+	if err := os.MkdirAll(request.Reviewer.Snapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	input := reconciliationEffectObservationInput(request, "title")
+	input.Issues[0].Closed = true
+	input.Issues[0].ActiveAttempt = nil
+	input.Issues[0].TerminalAttempts = nil
+	input.Issues[0].Active = false
+	input.Issues[0].DispatchAuthorized = false
+	applyReconciliationInput(t, owner, input)
+	before := mustOwnerSnapshot(t, owner)
+	status, _, err := ownerOperatorStatus(before.State, request.Issue, request.Attempt)
+	if err != nil || !canDismissClosedAttempt(status) {
+		t.Fatalf("pending reviewer cannot reach Dismiss: status=%#v err=%v", status, err)
+	}
+	service := operatorTestMutationService(t, owner)
+	service.issueClosed = func(context.Context, string, int) (bool, error) { return true, nil }
+	server := &dashboardServer{ctx: t.Context(), stateRoot: owner.stateRoot, repository: request.Repository, operator: service}
+	httpRequest := httptest.NewRequest(http.MethodPost, fmt.Sprintf("http://localhost/actions/dismiss?repository=o%%2Fr&issue=%d&attempt=%d", request.Issue, request.Attempt), nil)
+	httpRequest.Host = "localhost"
+	httpRequest.Header.Set("Origin", "http://localhost")
+	response := httptest.NewRecorder()
+	server.handler(http.NotFoundHandler()).ServeHTTP(response, httpRequest)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("reachable Dismiss failed: status=%d body=%s", response.Code, response.Body.String())
+	}
+	committed := mustOwnerSnapshot(t, owner)
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	proofKey := reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)
+	proof := committed.State.ReviewerProofs[proofKey]
+	if err := syscall.Kill(liveReviewer.Process.Pid, 0); err != nil {
+		t.Fatalf("pending reviewer did not remain live: %v", err)
+	}
+	if _, err := os.Lstat(request.Reviewer.Snapshot); err != nil {
+		t.Fatalf("pending reviewer snapshot was removed: %v", err)
+	}
+	if _, exists := committed.State.Attempts[key]; exists || committed.State.Tombstones[key].Action != "dismissed" || committed.State.Tombstones[key].ReviewerLeaseID != reviewer.ID || proof.EffectID != reviewer.ID || proof.DeadProved {
+		t.Fatalf("Dismiss lost logical invalidation or exact pending reviewer proof: tombstone=%#v proof=%#v", committed.State.Tombstones[key], proof)
+	}
+	if _, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: result}); err == nil {
+		t.Fatal("stale reviewer result resurrected dismissed attempt")
+	}
+	if _, err := owner.sealReviewerResult(t.Context(), sealReviewerResultCommand{Identity: identity, Result: result}); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("dismissed reviewer accepted a stale business-result seal: %v", err)
+	}
+	if committed.State.Tombstones[key].CleanupPhase == "completed" {
+		t.Fatal("Dismiss falsely completed cleanup with unresolved reviewer lease")
+	}
+	replay := httptest.NewRecorder()
+	server.handler(http.NotFoundHandler()).ServeHTTP(replay, httpRequest.Clone(t.Context()))
+	if replay.Code != http.StatusAccepted {
+		t.Fatalf("duplicate Dismiss lost physical-pending response: status=%d body=%s", replay.Code, replay.Body.String())
+	}
+	blocked := cloneRuntimeOwnerState(committed.State)
+	if err := applyAdvanceIssueGeneration(&blocked, advanceIssueGenerationCommand{Repository: request.Repository, Issue: request.Issue, ExpectedGeneration: blocked.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)]}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("unproved reviewer allowed same-issue generation advance: %v", err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(root, request.Repository)
+	if err != nil || loaded.Tombstones[key].CleanupPhase == "completed" || loaded.ReviewerProofs[proofKey].EffectID != reviewer.ID {
+		t.Fatalf("restart lost pending reviewer quarantine: tombstone=%#v proof=%#v err=%v", loaded.Tombstones[key], loaded.ReviewerProofs[proofKey], err)
+	}
+	restarted, err := startTestStateOwner(t, root, loaded, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, owner.attemptRoot, state)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	replayResult := operatorTestMutationService(t, restarted).perform(t.Context(), controlRequest{Version: controlVersion, RequestID: "dismiss-after-restart", Repository: request.Repository, Action: "dismiss", Issue: request.Issue, Attempt: request.Attempt})
+	if replayResult.Status != http.StatusAccepted || !replayResult.OK {
+		t.Fatalf("restart rejected idempotent pending Dismiss: %#v", replayResult)
+	}
+}
+
+func TestRestartDemotesLegacyReviewerGroupDeathCertificate(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	root, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	request = bindEffectObservation(snapshot, request)
+	state := cloneRuntimeOwnerState(snapshot.State)
+	proof := reviewerProcessProof{Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, EffectID: strings.Repeat("a", 32), IssueGeneration: state.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], AttemptGeneration: state.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)], GroupPID: 99999999, DeadProved: true}
+	state.ReviewerSafetyMigrated = false // A pre-upgrade ledger has no migration marker.
+	key := reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)
+	state.ReviewerProofs[key] = proof
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRuntimeOwnerState(root, owner.attemptRoot, state); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, root, state, func(value runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, owner.attemptRoot, value)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	current := mustOwnerSnapshot(t, restarted).State
+	if current.ReviewerProofs[key].DeadProved {
+		t.Fatal("legacy group-only certificate survived restart as descendant-death proof")
+	}
+	if err := applyAdvanceIssueGeneration(&current, advanceIssueGenerationCommand{Repository: request.Repository, Issue: request.Issue, ExpectedGeneration: current.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)]}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("legacy reviewer lease allowed conflicting dispatch: %v", err)
+	}
+}
+
+func TestLegacyCompletedCleanupWithoutReviewerIdentityQuarantinesOnlyItsIssue(t *testing.T) {
+	for _, action := range []string{"dismissed", "archived", "abandoned", "removed"} {
+		t.Run(action, func(t *testing.T) {
+			request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+			root, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+			state := cloneRuntimeOwnerState(snapshot.State)
+			if err := owner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			publishedHead := ""
+			if action == "removed" {
+				publishedHead = strings.Repeat("a", 40)
+			}
+			if err := migrateLegacyTombstone(&state, request.Repository, request.Issue, request.Attempt, action, "completed", publishedHead, nil); err != nil {
+				t.Fatal(err)
+			}
+			delete(state.Observations, ownerIssueKey(request.Repository, request.Issue))
+			key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+			tombstone := state.Tombstones[key]
+			tombstone.Revision = state.Revision
+			state.Tombstones[key] = tombstone
+			operatorAction := map[string]string{"dismissed": "dismiss", "archived": "archive", "abandoned": "abandon", "removed": "remove"}[action]
+			legacyRequest := controlRequest{Version: controlVersion, RequestID: "legacy-" + operatorAction + "-receipt", Repository: request.Repository, Action: operatorAction, Issue: request.Issue, Attempt: request.Attempt, Confirm: operatorAction != "dismiss"}
+			legacyReceipt := controlReceipt{Request: legacyRequest, State: "completed", Phase: operatorPhaseCompleted, EffectID: tombstone.EffectID, Result: successfulOperatorResult(legacyRequest, state.Revision)}
+			state.ControlReceipts = append(state.ControlReceipts, legacyReceipt)
+			state.ReviewerSafetyMigrated = false
+			state.ReviewerProofs = map[string]reviewerProcessProof{} // Old cleanup discarded the only group certificate.
+			before := cloneRuntimeOwnerState(state)
+			if err := writeRuntimeOwnerState(root, owner.attemptRoot, state); err != nil {
+				t.Fatal(err)
+			}
+			for restart := 0; restart < 2; restart++ {
+				restarted, err := startTestStateOwner(t, root, state, func(value runtimeOwnerState) error {
+					return writeRuntimeOwnerState(root, owner.attemptRoot, value)
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				state = mustOwnerSnapshot(t, restarted).State
+				if err := restarted.close(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !reflect.DeepEqual(state.Tombstones[key], before.Tombstones[key]) {
+				t.Fatal("migration rewrote a completed destructive tombstone")
+			}
+			for id, effect := range before.Effects {
+				if state.Effects[id].State != effect.State || state.Effects[id].ID != effect.ID {
+					t.Fatal("migration rewrote a completed effect")
+				}
+			}
+			if !reflect.DeepEqual(state.ControlReceipts, before.ControlReceipts) {
+				t.Fatal("migration rewrote a completed operator receipt")
+			}
+			warning := operatorResultForReceipt(stateOwnerSnapshot{State: state}, state.ControlReceipts[len(state.ControlReceipts)-1])
+			if warning.Status != http.StatusAccepted || !strings.Contains(string(warning.Data), "physical-unverified") {
+				t.Fatalf("duplicate historical action lacked quarantine warning: %#v", warning)
+			}
+			if state.LegacyReviewerQuarantines[ownerIssueKey(request.Repository, request.Issue)] == "" {
+				t.Fatal("missing reviewer identity was silently considered clean")
+			}
+			if err := applyAdvanceIssueGeneration(&state, advanceIssueGenerationCommand{Repository: request.Repository, Issue: request.Issue, ExpectedGeneration: state.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)]}); !errors.Is(err, errStateConflict) {
+				t.Fatalf("quarantined issue admitted new work: %v", err)
+			}
+			status, err := projectOwnerStatus(stateOwnerSnapshot{State: state}, maxReconciliationAttemptCount, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			visible := false
+			for _, entry := range status.Statuses {
+				if entry.Issue == request.Issue && entry.Attempt == request.Attempt && entry.NeedsAttention && entry.CurrentPhase == "physical-unverified" && entry.Diagnostic != "" {
+					visible = true
+				}
+			}
+			if !visible {
+				t.Fatal("quarantined historical attempt is absent from dashboard status")
+			}
+		})
 	}
 }
 

@@ -180,6 +180,54 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 			status.Retryable = false
 			status.Action = "inspect inconsistent completed local attempt before recovery"
 		}
+		if attemptHasUnprovedReviewer(snapshot.State, status.Repository, status.Issue, status.Attempt) {
+			status.NeedsAttention = true
+			status.DispatchAuthorized = false
+			status.Retryable = false
+			status.Diagnostic = "reviewer descendant absence is unproved; physical cleanup remains pending"
+			status.Action = "archive, abandon, remove, or dismiss can hide the attempt while physical cleanup remains pending"
+		}
+		if diagnostic := snapshot.State.LegacyReviewerQuarantines[issueKey]; diagnostic != "" {
+			status.NeedsAttention = true
+			status.OperatorBlocked = true
+			status.DispatchAuthorized = false
+			status.Retryable = false
+			status.CurrentPhase = "physical-unverified"
+			status.Diagnostic = diagnostic
+			status.Action = "inspect legacy reviewer descendants before reusing this issue"
+		}
+		if record.StopEffectID != "" {
+			status.State = "blocked"
+			status.CurrentPhase = "stop-pending"
+			status.NeedsAttention = true
+			status.OperatorBlocked = true
+			status.Retryable = false
+			status.DispatchAuthorized = false
+			status.Blockers = append(status.Blockers, "physical stop remains pending")
+			status.Diagnostic = "stop requested; reviewer descendant absence is unproved"
+			status.Action = "wait for verified physical cleanup before retrying or dispatching"
+		}
+	}
+	// A historical cleanup may have removed the attempt from ordinary recovery
+	// projection. Keep its unresolved physical safety lease visible anyway.
+	for _, tombstone := range snapshot.State.Tombstones {
+		diagnostic := legacyReviewerDiagnostic(snapshot.State, tombstone.Repository, tombstone.Issue, tombstone.Attempt)
+		if diagnostic == "" {
+			continue
+		}
+		found := false
+		for index := range statuses {
+			if statuses[index].Repository == tombstone.Repository && statuses[index].Issue == tombstone.Issue && statuses[index].Attempt == tombstone.Attempt {
+				statuses[index].NeedsAttention = true
+				statuses[index].OperatorBlocked = true
+				statuses[index].DispatchAuthorized = false
+				statuses[index].Diagnostic = diagnostic
+				found = true
+			}
+		}
+		if !found {
+			statuses = append(statuses, orchestrator.RecoveryStatus{Repository: tombstone.Repository, Issue: tombstone.Issue, Attempt: tombstone.Attempt, State: "blocked", CurrentPhase: "physical-unverified", NeedsAttention: true, OperatorBlocked: true, Diagnostic: diagnostic, Action: "inspect legacy reviewer descendants before reusing this issue"})
+		}
 	}
 	slices.SortFunc(statuses, func(a, b orchestrator.RecoveryStatus) int {
 		if ordered := cmp.Compare(a.Repository, b.Repository); ordered != 0 {
@@ -191,6 +239,18 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 		return cmp.Compare(a.Attempt, b.Attempt)
 	})
 	return dashboardStatusSnapshot{UpdatedAt: now.UTC(), OwnerEpoch: snapshot.State.Epoch, OwnerRevision: snapshot.State.Revision, Statuses: statuses, ReconciliationError: snapshot.State.CycleDiagnostic, ReconciliationErrorAt: snapshot.State.CycleDiagnosticAt}, nil
+}
+
+func legacyReviewerDiagnostic(state runtimeOwnerState, repository string, issue, attempt int) string {
+	if diagnostic := state.LegacyReviewerQuarantines[ownerIssueKey(repository, issue)]; diagnostic != "" {
+		return diagnostic
+	}
+	for _, proof := range state.ReviewerProofs {
+		if proof.Repository == repository && proof.Issue == issue && proof.Attempt == attempt && proof.LegacyUnverified {
+			return "legacy reviewer descendant absence is unverified; physical cleanup cannot be certified"
+		}
+	}
+	return ""
 }
 
 func expandIssueFact(fact reconciliationIssueFact) internalgithub.RecoveryIssueFact {
