@@ -175,12 +175,18 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
         try {
           await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toBeVisible();
         } catch (error) {
-          const fresh = await page.request.get(`${baseURL}/status.json`).then((response) => response.json()).catch((readError) => ({ error: String(readError) }));
-          const freshOld = fresh.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1);
-          const freshNext = fresh.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
-          const currentAttempt2 = /Attempt 2(?!\d)/.test(await card.innerText().catch(() => ""));
-          const recoverButtons = await canceledCard.getByRole("button", { name: "Recover attempt" }).count().catch(() => -1);
-          throw new Error(`Recover button missing: historical=${canceledHistorical} current_attempt_2=${currentAttempt2} original_old=${JSON.stringify({ state: old.state, retryable: old.retryable, operator_blocked: old.operator_blocked })} original_next=${next?.state ?? "none"} fresh_old=${JSON.stringify({ state: freshOld?.state, retryable: freshOld?.retryable, operator_blocked: freshOld?.operator_blocked })} fresh_next=${freshNext?.state ?? "none"} buttons=${recoverButtons} read_error=${fresh.error ?? "none"}\n${error.message}`);
+          let detail = `historical=${canceledHistorical} original_old=${JSON.stringify({ state: old.state, retryable: old.retryable, operator_blocked: old.operator_blocked })} original_next=${next?.state ?? "none"}`;
+          try {
+            const fresh = await page.request.get(`${baseURL}/status.json`, { timeout: 1_000 }).then((response) => response.json());
+            const freshOld = fresh.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1);
+            const freshNext = fresh.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
+            const currentAttempt2 = /Attempt 2(?!\d)/.test(await card.innerText({ timeout: 1_000 }));
+            detail += ` current_attempt_2=${currentAttempt2} fresh_old=${JSON.stringify({ state: freshOld?.state, retryable: freshOld?.retryable, operator_blocked: freshOld?.operator_blocked })} fresh_next=${freshNext?.state ?? "none"}`;
+          } catch (diagnosticError) {
+            detail += ` diagnostic_error=${String(diagnosticError)}`;
+          }
+          error.message += `\nRecover button diagnostic: ${detail}`;
+          throw error;
         }
       }
       await expect(canceledCard.getByRole("button", { name: "Open reviewer terminal" })).toHaveCount(0);
