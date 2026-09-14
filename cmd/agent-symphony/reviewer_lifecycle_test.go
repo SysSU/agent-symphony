@@ -789,6 +789,41 @@ func TestDismissWithPendingReviewerDoesNotCompletePhysicalCleanup(t *testing.T) 
 	}
 }
 
+func TestDismissBeforeReviewerSessionRequestProvesNeverRan(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	_, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	request = bindEffectObservation(snapshot, request)
+	_, reviewer, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
+	publication := bindEffectObservation(stateOwnerSnapshot{State: state}, reconciliationEffectCaseNamed(t, "github-publish").request)
+	if _, err := applyBeginReconciliationEffect(owner.attemptRoot, owner.stateRoot, &state, beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(stateOwnerSnapshot{State: state}, publication), Request: publication}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("publication overlapped unlaunched reviewer gate: %v", err)
+	}
+	leaseID, err := retainReviewerLease(&state, request.Repository, request.Issue, request.Attempt, *reviewer)
+	if err != nil || leaseID != "" {
+		t.Fatalf("never-requested reviewer retained an unresolved lease: lease=%q err=%v", leaseID, err)
+	}
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	manifest := cloneManifest(state.Attempts[key].Manifest)
+	if _, err := applyInvalidateAttempt(owner.attemptRoot, owner.stateRoot, &state, invalidateAttemptCommand{Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, ExpectedIssueGeneration: reviewer.IssueGeneration, ExpectedAttemptGeneration: reviewer.AttemptGeneration, Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest}); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err = finishRuntimeOwnerTransition(owner.attemptRoot, owner.stateRoot, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := state.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)]
+	if state.Tombstones[key].CleanupPhase != "completed" || state.Tombstones[key].ReviewerLeaseID != "" || !proof.NeverRan || !proof.DeadProved {
+		t.Fatalf("dismissed no-launch reviewer lacks exact no-run evidence: tombstone=%#v proof=%#v", state.Tombstones[key], proof)
+	}
+	if err := applyMarkReviewerSessionRequested(owner.stateRoot, &state, markReviewerSessionRequestedCommand{Identity: ownerReconciliationEffectIdentity(*reviewer)}); err == nil {
+		t.Fatal("reviewer session started after durable Dismiss")
+	}
+}
+
 func TestRestartDemotesLegacyReviewerGroupDeathCertificate(t *testing.T) {
 	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
 	root, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
@@ -896,6 +931,109 @@ func TestLegacyCompletedCleanupWithoutReviewerIdentityQuarantinesOnlyItsIssue(t 
 			}
 			if !visible {
 				t.Fatal("quarantined historical attempt is absent from dashboard status")
+			}
+		})
+	}
+}
+
+func TestLegacyCleanManifestWithoutReviewerHistoryBlocksPublication(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	root, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	state := cloneRuntimeOwnerState(snapshot.State)
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	record := state.Attempts[key]
+	record.Manifest.ReviewState = "clean"
+	state.Attempts[key] = record
+	state.ReviewerSafetyMigrated = false
+	if err := writeRuntimeOwnerState(root, owner.attemptRoot, state); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, root, state, func(value runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, owner.attemptRoot, value)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	current := mustOwnerSnapshot(t, restarted).State
+	if current.LegacyReviewerQuarantines[ownerIssueKey(request.Repository, request.Issue)] == "" || !issueHasUnprovedReviewer(current, request.Repository, request.Issue) {
+		t.Fatal("old clean manifest without retained reviewer history was considered physically safe")
+	}
+	if err := applyAdvanceIssueGeneration(&current, advanceIssueGenerationCommand{Repository: request.Repository, Issue: request.Issue, ExpectedGeneration: current.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)]}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("old clean manifest allowed issue reuse: %v", err)
+	}
+	status, err := projectOwnerStatus(stateOwnerSnapshot{State: current}, maxReconciliationAttemptCount, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	visible := false
+	for _, entry := range status.Statuses {
+		if entry.Issue == request.Issue && entry.Attempt == request.Attempt && entry.NeedsAttention && !entry.DispatchAuthorized && entry.Diagnostic != "" {
+			visible = true
+		}
+	}
+	if !visible {
+		t.Fatal("old clean manifest quarantine is not visible to the dashboard")
+	}
+}
+
+func TestEscapedReviewerChildBlocksGitHubPublicationAndGovernance(t *testing.T) {
+	reviewer := exec.Command(os.Args[0], "-test.run=^TestDetachedReviewerChildProcessHelper$")
+	reviewer.Env = append(os.Environ(), "AGENT_SYMPHONY_DETACHED_REVIEWER_HELPER=reviewer")
+	reviewer.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	output, err := reviewer.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reviewer.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	t.Cleanup(func() {
+		_ = reviewer.Process.Kill()
+		if !waited {
+			_ = reviewer.Wait()
+		}
+	})
+	line, err := bufio.NewReader(output).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil || childPID < 2 {
+		t.Fatalf("invalid escaped child PID: %q", line)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	if group, err := syscall.Getpgid(childPID); err != nil || group == reviewer.Process.Pid {
+		t.Fatalf("fixture child did not escape reviewer group: group=%d err=%v", group, err)
+	}
+	if err := syscall.Kill(-reviewer.Process.Pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	_ = reviewer.Wait()
+	waited = true
+	if gone, err := reviewerGroupGone(reviewer.Process.Pid); err != nil || !gone {
+		t.Fatalf("old reviewer group still exists: gone=%t err=%v", gone, err)
+	}
+	if err := syscall.Kill(childPID, 0); err != nil {
+		t.Fatalf("escaped child died before publication authorization: %v", err)
+	}
+	for _, name := range []string{"github-publish", "github-pr-governance", "issue-evidence"} {
+		t.Run(name, func(t *testing.T) {
+			request := reconciliationEffectCaseNamed(t, name).request
+			owner, snapshot, request := reconciliationEffectTestOwner(t, request)
+			t.Cleanup(func() { _ = owner.close(context.Background()) })
+			state := cloneRuntimeOwnerState(snapshot.State)
+			key := reviewerProofKey(request.Repository, request.Issue, request.Attempt, agentruntime.ReviewModeImplementation, strings.Repeat("a", 40)+".."+strings.Repeat("b", 40))
+			state.ReviewerProofs[key] = reviewerProcessProof{Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, Mode: agentruntime.ReviewModeImplementation, Target: strings.Repeat("a", 40) + ".." + strings.Repeat("b", 40), EffectID: strings.Repeat("c", 32), IssueGeneration: state.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], AttemptGeneration: state.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)], GroupPID: reviewer.Process.Pid, LegacyUnverified: true}
+			if _, err := applyBeginReconciliationEffect(owner.attemptRoot, owner.stateRoot, &state, beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request}); !errors.Is(err, errStateConflict) {
+				t.Fatalf("escaped reviewer child permitted %s: %v", name, err)
+			}
+			if err := syscall.Kill(childPID, 0); err != nil {
+				t.Fatalf("escaped child died during blocked %s: %v", name, err)
 			}
 		})
 	}

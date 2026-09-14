@@ -1496,6 +1496,22 @@ func migrateLegacyReviewerSafety(state *runtimeOwnerState) {
 		}
 		state.ReviewerProofs[key] = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: reviewer.Mode, Target: reviewer.Target, EffectID: effect.ID, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, GroupPID: effect.ReviewerGroupPID, LegacyUnverified: true}
 	}
+	for _, record := range state.Attempts {
+		manifest := record.Manifest
+		if manifest.ReviewState == "" {
+			continue
+		}
+		found := false
+		for _, proof := range state.ReviewerProofs {
+			if proof.Repository == manifest.Repository && proof.Issue == manifest.Issue && proof.Attempt == manifest.Attempt && !proof.NeverRan {
+				found = true
+				break
+			}
+		}
+		if !found {
+			state.LegacyReviewerQuarantines[ownerIssueKey(manifest.Repository, manifest.Issue)] = "legacy reviewer history is incomplete; physical cleanup cannot be certified"
+		}
+	}
 	for _, tombstone := range state.Tombstones {
 		bound := false
 		for _, proof := range state.ReviewerProofs {

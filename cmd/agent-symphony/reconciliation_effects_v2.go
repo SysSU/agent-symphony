@@ -243,8 +243,18 @@ func applyBeginReconciliationEffect(attemptRoot, stateRoot string, state *runtim
 	if state.IssueGenerations[issueKey] != identity.IssueGeneration {
 		return nil, errStaleStateResult
 	}
+	if reconciliationMutatesGitHub(request.Action) && (issueHasUnprovedReviewer(*state, request.Repository, request.Issue) || issueHasPendingReviewer(*state, request.Repository, request.Issue)) {
+		return nil, errStateConflict
+	}
 	if issueHasUnprovedReviewer(*state, request.Repository, request.Issue) && request.Action == reconciliationReviewer {
 		return nil, errStateConflict
+	}
+	if request.Action == reconciliationReviewer {
+		for _, effect := range state.Effects {
+			if effect.Repository == request.Repository && effect.Issue == request.Issue && effect.State == "pending" && effect.Reconciliation != nil && reconciliationMutatesGitHub(effect.Reconciliation.Action) {
+				return nil, errStateConflict
+			}
+		}
 	}
 	if !reconciliationObservationCurrent(*state, request) || state.Observations[issueKey].LastCycleID != request.ObservationCycleID || !validReconciliationEffectStateBindings(stateRoot, *state, request) {
 		return nil, errStaleStateResult
@@ -659,6 +669,9 @@ func applyDiagnoseReconciliationEffect(state *runtimeOwnerState, command diagnos
 
 func reconciliationEffectCurrent(stateRoot string, state runtimeOwnerState, effect runtimeEffectIntent) error {
 	request := effect.Reconciliation
+	if request != nil && reconciliationMutatesGitHub(request.Action) && (issueHasUnprovedReviewer(state, effect.Repository, effect.Issue) || issueHasPendingReviewer(state, effect.Repository, effect.Issue)) {
+		return errStateConflict
+	}
 	if request == nil || effect.ReviewerRevoked || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
 		return errStaleStateResult
 	}
@@ -685,6 +698,9 @@ func reconciliationEffectCurrent(stateRoot string, state runtimeOwnerState, effe
 // a marker from completing invalidated work.
 func reconciliationEffectFinishCurrent(stateRoot string, state runtimeOwnerState, effect runtimeEffectIntent) error {
 	request := effect.Reconciliation
+	if request != nil && reconciliationMutatesGitHub(request.Action) && (issueHasUnprovedReviewer(state, effect.Repository, effect.Issue) || issueHasPendingReviewer(state, effect.Repository, effect.Issue)) {
+		return errStateConflict
+	}
 	if request == nil || effect.ReviewerRevoked || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !reconciliationFinishObservationMatches(state, *request) || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
 		return errStaleStateResult
 	}
@@ -699,6 +715,19 @@ func reconciliationEffectFinishCurrent(stateRoot string, state runtimeOwnerState
 		return errAttemptTombstoned
 	}
 	return nil
+}
+
+func reconciliationMutatesGitHub(action reconciliationEffectAction) bool {
+	return action == reconciliationGitHubBind || action == reconciliationGitHubPublish || action == reconciliationGitHubIssueUpdate || action == reconciliationGitHubPRGovernance
+}
+
+func issueHasPendingReviewer(state runtimeOwnerState, repository string, issue int) bool {
+	for _, effect := range state.Effects {
+		if effect.Repository == repository && effect.Issue == issue && effect.State == "pending" && effect.Reconciliation != nil && effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Phase == "run-observe" {
+			return true
+		}
+	}
+	return false
 }
 
 // A retry command changes its own issue observation. Once its exact GitHub
