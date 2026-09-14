@@ -1261,8 +1261,9 @@ func fullSystemPendingStartDiagnostic(state runtimeOwnerState, stateRoot string,
 			command.Env = environment
 			command.WaitDelay = time.Second
 			output, err := command.CombinedOutput()
+			probeErr := ctx.Err()
 			cancel()
-			pane = fmt.Sprintf("output=%.512q error=%.256s", redact(string(output)), redact(fmt.Sprint(err)))
+			pane = fmt.Sprintf("output=%.512q error=%.256s context=%.128s", redact(string(output)), redact(fmt.Sprint(err)), redact(fmt.Sprint(probeErr)))
 		}
 		rows = append(rows, fmt.Sprintf("id=%.64s diagnostic=%.256q marker=%s session=%.128q pane=%s", redact(id), redact(effect.Diagnostic), marker, redact(session), pane))
 		if len(rows) == 3 {
@@ -1282,7 +1283,8 @@ func TestFullSystemPendingStartDiagnostic(t *testing.T) {
 	if err := os.Mkdir(bin, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeExecutable(t, filepath.Join(bin, "tmux"), "#!/bin/sh\nprintf 'pane-probe canary-private-token %s\\n' \"$*\"\n")
+	tmux := filepath.Join(bin, "tmux")
+	writeExecutable(t, tmux, fmt.Sprintf("#!/bin/sh\nprintf 'pane-probe canary-private-token %%s %s\\n' \"$*\"\n", strings.Repeat("p", 800)))
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	id := strings.Repeat("a", 32)
 	state := newRuntimeOwnerState("o/r")
@@ -1304,5 +1306,22 @@ func TestFullSystemPendingStartDiagnostic(t *testing.T) {
 	}
 	if got := fullSystemPendingStartDiagnostic(state, root, environment); !strings.Contains(got, "marker=missing") {
 		t.Fatalf("pending Start failure reported a missing marker as present: %s", got)
+	}
+	for _, next := range []string{strings.Repeat("b", 32), strings.Repeat("c", 32)} {
+		state.Effects[next] = runtimeEffectIntent{Repository: "o/r", Issue: 73, Attempt: 2, Action: string(agentruntime.EffectStart), State: "pending", Diagnostic: strings.Repeat("x", 5000)}
+	}
+	if got := fullSystemPendingStartDiagnostic(state, root, environment); len(got) != 2048 || strings.Contains(got, "canary-private-token") {
+		t.Fatalf("three pending Starts did not exercise bounded redacted aggregate output: length=%d diagnostic=%s", len(got), got)
+	}
+	gate := filepath.Join(root, "tmux-gate.fifo")
+	if err := syscall.Mkfifo(gate, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, tmux, "#!/bin/sh\nIFS= read -r release < \"$FAKE_TMUX_GATE\"\n")
+	state.Effects = map[string]runtimeEffectIntent{id: state.Effects[id]}
+	started := time.Now()
+	got := fullSystemPendingStartDiagnostic(state, root, append(environment, "FAKE_TMUX_GATE="+gate))
+	if !strings.Contains(got, "context=context deadline exceeded") || time.Since(started) > 5*time.Second {
+		t.Fatalf("blocked tmux diagnostic did not return on context deadline: elapsed=%s diagnostic=%s", time.Since(started), got)
 	}
 }
