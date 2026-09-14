@@ -712,7 +712,31 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				}
 				if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
 					process, psErr := exec.Command("ps", "-o", "pid,ppid,pgid,stat", "-p", strconv.Itoa(pid)).CombinedOutput()
-					t.Fatalf("cancel completed while TERM/HUP-ignoring reviewer process %d was still alive: %v; ps=%q ps_err=%v", pid, err, process, psErr)
+					groupPID, groupErr := syscall.Getpgid(pid)
+					ledger, ledgerErr := readRuntimeOwnerState(stateRoot, "o/r")
+					stop := ledger.Effects[completed.EffectID]
+					reviewer, reviewerFound := ledger.Effects[stop.SupersededReviewerID]
+					var reviewerEffects []string
+					for id, effect := range ledger.Effects {
+						if effect.Repository == "o/r" && effect.Issue == 73 && effect.Attempt == 1 && effect.Action == string(reconciliationReviewer) {
+							phase := ""
+							if effect.Reconciliation != nil && effect.Reconciliation.Reviewer != nil {
+								phase = effect.Reconciliation.Reviewer.Phase
+							}
+							reviewerEffects = append(reviewerEffects, fmt.Sprintf("id=%s state=%s group=%d phase=%s launched=%t session_requested=%t gate=%t revoked=%t issue_gen=%d attempt_gen=%d", id, effect.State, effect.ReviewerGroupPID, phase, effect.ReviewerLaunched, effect.ReviewerSessionRequested, effect.ReviewerGateProtocol, effect.ReviewerRevoked, effect.IssueGeneration, effect.AttemptGeneration))
+						}
+					}
+					var proofs []string
+					for _, proof := range ledger.ReviewerProofs {
+						if proof.Repository == "o/r" && proof.Issue == 73 && proof.Attempt == 1 {
+							proofs = append(proofs, fmt.Sprintf("effect=%s group=%d issue_gen=%d attempt_gen=%d dead=%t never_ran=%t", proof.EffectID, proof.GroupPID, proof.IssueGeneration, proof.AttemptGeneration, proof.DeadProved, proof.NeverRan))
+						}
+					}
+					reviewSnapshot, _ := reviewIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot))
+					launchPath, _ := reviewerLifecyclePaths(reviewSnapshot, stop.SupersededReviewerTarget)
+					var launch reviewerLaunchIdentity
+					launchFound, launchErr := readReviewerRecord(launchPath, &launch)
+					t.Fatalf("cancel completed while TERM/HUP-ignoring reviewer process %d was still alive: %v; ps=%q ps_err=%v getpgid=%d getpgid_err=%v owner_err=%v stop={id:%s state:%s superseded:%s group:%d stopped:%t issue_gen:%d attempt_gen:%d} reviewer={found:%t state:%s group:%d launched:%t session_requested:%t gate:%t revoked:%t issue_gen:%d attempt_gen:%d} reviewer_effects=%q owner_gens=%d/%d proofs=%q launch={found:%t err:%v effect:%s child:%d issue_gen:%d attempt_gen:%d gate:%t session_requested:%t}", pid, err, process, psErr, groupPID, groupErr, ledgerErr, completed.EffectID, stop.State, stop.SupersededReviewerID, stop.SupersededReviewerGroupPID, stop.ReviewerStopped, stop.IssueGeneration, stop.AttemptGeneration, reviewerFound, reviewer.State, reviewer.ReviewerGroupPID, reviewer.ReviewerLaunched, reviewer.ReviewerSessionRequested, reviewer.ReviewerGateProtocol, reviewer.ReviewerRevoked, reviewer.IssueGeneration, reviewer.AttemptGeneration, reviewerEffects, ledger.IssueGenerations[ownerIssueKey("o/r", 73)], ledger.AttemptGenerations[key], proofs, launchFound, launchErr, launch.EffectID, launch.ChildPID, launch.IssueGeneration, launch.AttemptGeneration, launch.GateProtocol, launch.SessionRequested)
 				}
 				gate, err := os.OpenFile(reviewGate, os.O_RDWR|syscall.O_NONBLOCK, 0)
 				if err != nil {

@@ -151,10 +151,12 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       }, { timeout: 20_000 }).toBe("failed");
       await page.reload();
       await expect(card).toBeVisible();
-      let canceledCard = /Attempt 2(?!\d)/.test(await card.innerText()) ? await historicalAttempt() : exactAttempt;
+      let canceledHistorical = /Attempt 2(?!\d)/.test(await card.innerText());
+      let canceledCard = canceledHistorical ? await historicalAttempt() : exactAttempt;
       try {
         await expect(canceledCard).toContainText("failed");
       } catch {
+        canceledHistorical = true;
         canceledCard = await historicalAttempt();
         await expect(canceledCard).toContainText("failed");
       }
@@ -170,7 +172,16 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
         await expect(canceledCard).toContainText("failed");
         await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toHaveCount(0);
       } else if (old?.retryable && !old.operator_blocked) {
-        await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toBeVisible();
+        try {
+          await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toBeVisible();
+        } catch (error) {
+          const fresh = await page.request.get(`${baseURL}/status.json`).then((response) => response.json()).catch((readError) => ({ error: String(readError) }));
+          const freshOld = fresh.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1);
+          const freshNext = fresh.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
+          const currentAttempt2 = /Attempt 2(?!\d)/.test(await card.innerText().catch(() => ""));
+          const recoverButtons = await canceledCard.getByRole("button", { name: "Recover attempt" }).count().catch(() => -1);
+          throw new Error(`Recover button missing: historical=${canceledHistorical} current_attempt_2=${currentAttempt2} original_old=${JSON.stringify({ state: old.state, retryable: old.retryable, operator_blocked: old.operator_blocked })} original_next=${next?.state ?? "none"} fresh_old=${JSON.stringify({ state: freshOld?.state, retryable: freshOld?.retryable, operator_blocked: freshOld?.operator_blocked })} fresh_next=${freshNext?.state ?? "none"} buttons=${recoverButtons} read_error=${fresh.error ?? "none"}\n${error.message}`);
+        }
       }
       await expect(canceledCard.getByRole("button", { name: "Open reviewer terminal" })).toHaveCount(0);
       expect(errors).toEqual([]);
