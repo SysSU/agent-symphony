@@ -1741,6 +1741,13 @@ func TestCleanupInvalidatesBlockedGitHubBindBeforeMutation(t *testing.T) {
 		return nil, request.Context().Err()
 	})}, Retries: -1}
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := service.shutdown(ctx); err != nil {
+			t.Errorf("join Abandon cleanup before owner teardown: %v", err)
+		}
+	})
 	effects := service.effects
 	plan, err := effects.beginReconciliation(t.Context(), plans[0])
 	if err != nil {
@@ -1762,8 +1769,18 @@ func TestCleanupInvalidatesBlockedGitHubBindBeforeMutation(t *testing.T) {
 	if requests.Load() != 1 {
 		t.Fatalf("GitHub bind performed %d requests after invalidation", requests.Load())
 	}
-	if tombstone := mustOwnerSnapshot(t, owner).State.Tombstones[ownerAttemptKey("o/r", manifest.Issue, 1)]; tombstone.Action != "abandoned" {
-		t.Fatalf("tombstone=%#v", tombstone)
+	if err := service.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	final := mustOwnerSnapshot(t, owner).State
+	key := ownerAttemptKey("o/r", manifest.Issue, 1)
+	tombstone := final.Tombstones[key]
+	receipt, ok := operatorReceiptByID(final, "abandon-blocked-bind")
+	if tombstone.Action != "abandoned" || tombstone.CleanupPhase != "completed" || final.Effects[tombstone.EffectID].State != "completed" || !ok || receipt.State != "completed" || receipt.Result == nil || !receipt.Result.OK {
+		t.Fatalf("Abandon did not complete after blocked GitHub bind: tombstone=%#v receipt=%#v found=%t effect=%#v", tombstone, receipt, ok, final.Effects[tombstone.EffectID])
+	}
+	if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Abandon left worktree after completed cleanup: %v", err)
 	}
 }
 
