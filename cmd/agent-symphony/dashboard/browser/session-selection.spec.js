@@ -82,7 +82,7 @@ test("shows both review modes but rejects reviewer terminal while implementation
   await expect(page.getByText("ui-review", { exact: true })).toHaveCount(0);
   await page.screenshot({ path: "test-results/session-selection-card.png", fullPage: true });
   for (const [index] of [attempt, implementationReview].entries()) {
-    await page.getByRole("button", { name: "Open reviewer terminal" }).nth(index).click();
+    await page.getByRole("button", { name: "Reviewer terminal unavailable; show why" }).nth(index).click();
     await expect(page.getByRole("status").filter({ hasText: "Reviewer terminal is unavailable until session identity can be verified safely." })).toBeVisible();
     await expect(page.getByRole("dialog")).toHaveCount(0);
     expect(sockets).toHaveLength(0);
@@ -134,8 +134,8 @@ test("keeps reviewer terminal warning usable on a mobile viewport", async ({ pag
   await mockDashboard(page);
   await page.goto("/");
 
-  await expect(page.getByRole("button", { name: "Open reviewer terminal" }).first()).toBeVisible();
-  await page.getByRole("button", { name: "Open reviewer terminal" }).first().click();
+  await expect(page.getByRole("button", { name: "Reviewer terminal unavailable; show why" }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Reviewer terminal unavailable; show why" }).first().click();
   const box = await page.getByRole("status").filter({ hasText: "Reviewer terminal is unavailable" }).boundingBox();
   expect(box).not.toBeNull();
   expect(box.x).toBeGreaterThanOrEqual(0);

@@ -125,7 +125,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       return reviewer?.state;
     }, { timeout: 20_000 }).toBe("running");
     expect(reviewer.name).toMatch(/^as-/);
-    const reviewerButton = card.getByRole("button", { name: "Open reviewer terminal" });
+    const reviewerButton = card.getByRole("button", { name: "Reviewer terminal unavailable; show why" });
     await expect(reviewerButton).toBeVisible();
     await reviewerButton.click();
     await expect(page.getByRole("status").filter({ hasText: "Reviewer terminal is unavailable until session identity can be verified safely." })).toBeVisible();
@@ -173,7 +173,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       } else if (old?.retryable && !old.operator_blocked) {
         await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toBeVisible();
       }
-      await expect(canceledCard.getByRole("button", { name: "Open reviewer terminal" })).toHaveCount(0);
+      await expect(canceledCard.getByRole("button", { name: "Reviewer terminal unavailable; show why" })).toHaveCount(0);
       expect(errors).toEqual([]);
       return;
     }

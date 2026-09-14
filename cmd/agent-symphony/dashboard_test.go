@@ -1313,7 +1313,7 @@ func TestDashboardMissingReviewerSessionCannotAttach(t *testing.T) {
 	}
 	script := filepath.Join(t.TempDir(), "tmux")
 	attached := filepath.Join(t.TempDir(), "attached")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nif test \"$1\" = display-message; then exit 1; fi\ntouch \"$ATTACHED\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch \"$ATTACHED\"\nif test \"$1\" = display-message; then exit 1; fi\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("ATTACHED", attached)
@@ -1328,7 +1328,7 @@ func TestDashboardMissingReviewerSessionCannotAttach(t *testing.T) {
 		t.Fatalf("missing reviewer session response=%v err=%v", response, err)
 	}
 	if _, err := os.Stat(attached); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("missing session reached attachment: %v", err)
+		t.Fatalf("rejected reviewer terminal invoked tmux: %v", err)
 	}
 }
 
