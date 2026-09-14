@@ -664,7 +664,7 @@ func TestInteractiveLifecycleKeepsAgentOnTmuxAndRequiresResult(t *testing.T) {
 				}
 			}
 			fake.sessions[manifest.Session].dead = true
-			got, err := r.Monitor(t.Context(), Attempt{Repository: attempt.Repository, Issue: attempt.Issue, Number: attempt.Number, BaseSHA: attempt.BaseSHA})
+			got, err := monitorFixture(t, r, t.Context(), Attempt{Repository: attempt.Repository, Issue: attempt.Issue, Number: attempt.Number, BaseSHA: attempt.BaseSHA})
 			if err != nil || got.State != test.wantState || !strings.Contains(got.Diagnostic, test.wantReason) {
 				t.Fatalf("monitored manifest=%#v err=%v", got, err)
 			}
@@ -686,7 +686,7 @@ func TestResumeHandoffRefreshesTrustedSourceRefs(t *testing.T) {
 	want := gitOutput(t, primary, "rev-parse", "HEAD")
 	branch := gitOutput(t, primary, "branch", "--show-current")
 	fake.sessions[manifest.Session].dead = true
-	if _, err := r.Monitor(t.Context(), attempt); err != nil {
+	if _, err := monitorFixture(t, r, t.Context(), attempt); err != nil {
 		t.Fatal(err)
 	}
 	resumed, err := resumeHandoffFixture(t, r, t.Context(), attempt)
@@ -708,7 +708,7 @@ func TestResumeHandoffRecreatesMissingSessionBeforeStateTransition(t *testing.T)
 		t.Fatal(err)
 	}
 	fake.sessions[manifest.Session].dead = true
-	if manifest, err = r.Monitor(t.Context(), attempt); err != nil || manifest.State != "completed" {
+	if manifest, err = monitorFixture(t, r, t.Context(), attempt); err != nil || manifest.State != "completed" {
 		t.Fatalf("completed manifest=%#v err=%v", manifest, err)
 	}
 	delete(fake.sessions, manifest.Session)
@@ -730,7 +730,7 @@ func TestPersistedParkedBoundGateReleasesOnlyExactCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake.sessions[manifest.Session].dead = true
-	if manifest, err = r.Monitor(t.Context(), attempt); err != nil || manifest.State != "completed" {
+	if manifest, err = monitorFixture(t, r, t.Context(), attempt); err != nil || manifest.State != "completed" {
 		t.Fatalf("completed manifest=%#v err=%v", manifest, err)
 	}
 	delete(fake.sessions, manifest.Session)
@@ -915,7 +915,7 @@ func TestAgentFailureCancelAndIneligibility(t *testing.T) {
 	fake.sessions[manifest.Session].status = 7
 	fake.sessions[manifest.Session].output = "useful failure output\n"
 	recovered := Attempt{Repository: attempt.Repository, Issue: attempt.Issue, Number: attempt.Number, BaseSHA: attempt.BaseSHA}
-	manifest, err = r.Monitor(context.Background(), recovered)
+	manifest, err = monitorFixture(t, r, context.Background(), recovered)
 	if err != nil || manifest.State != "failed" || !strings.Contains(manifest.Diagnostic, "status 7") {
 		t.Fatalf("monitor = %#v, %v", manifest, err)
 	}
@@ -952,7 +952,7 @@ func TestMonitorStopsAttemptThatBecomesIneligible(t *testing.T) {
 	}
 	session := manifest.Session
 	eligible = false
-	manifest, err = r.Monitor(context.Background(), attempt)
+	manifest, err = monitorFixture(t, r, context.Background(), attempt)
 	if err == nil || !strings.Contains(err.Error(), "generation-invalidating stop") {
 		t.Fatalf("ineligible monitor should defer to owner Stop: %#v, %v", manifest, err)
 	}
@@ -1915,7 +1915,7 @@ func TestBoundImplementationRejectsSamePaneRespawn(t *testing.T) {
 	if err := r.stop(t.Context(), manifest); err == nil {
 		t.Fatal("stop accepted a same-pane replacement")
 	}
-	if _, err := r.Monitor(t.Context(), attempt); err == nil {
+	if _, err := monitorFixture(t, r, t.Context(), attempt); err == nil {
 		t.Fatal("monitor accepted a same-pane replacement")
 	}
 	if err := r.Deliver(t.Context(), manifest, []byte("handoff")); err == nil {
@@ -2230,7 +2230,7 @@ func TestCredentialedPaneOutputIsRedactedBeforeLogPersistence(t *testing.T) {
 	}
 	fake.sessions[manifest.Session].dead = true
 	fake.sessions[manifest.Session].output = "agent failure " + canary
-	if _, err := r.Monitor(t.Context(), attempt); err != nil {
+	if _, err := monitorFixture(t, r, t.Context(), attempt); err != nil {
 		t.Fatal(err)
 	}
 	log, err := os.ReadFile(manifest.LogPath)
@@ -2347,7 +2347,7 @@ func TestExactTargetsExitCodesAndHistory(t *testing.T) {
 	}
 	fake.sessions[manifest.Session].dead = true
 	fake.sessions[manifest.Session].status = 127
-	manifest, err = r.Monitor(context.Background(), attempt)
+	manifest, err = monitorFixture(t, r, context.Background(), attempt)
 	if err != nil || manifest.State != "failed" || !strings.Contains(manifest.Diagnostic, "status 127") {
 		t.Fatalf("large exit status = %#v, %v", manifest, err)
 	}
@@ -2406,7 +2406,7 @@ func TestResumeHandoffEligibilityOwnsStateTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake.sessions[manifest.Session].dead = true
-	if manifest, err = r.Monitor(t.Context(), attempt); err != nil || manifest.State != "completed" {
+	if manifest, err = monitorFixture(t, r, t.Context(), attempt); err != nil || manifest.State != "completed" {
 		t.Fatalf("completed manifest=%#v err=%v", manifest, err)
 	}
 	eligibilityChecked := false
@@ -2451,7 +2451,7 @@ func TestLaunchConfiguresEmptySessionBeforeAgentAndRetainsFastExit(t *testing.T)
 	if !(newIndex >= 0 && newIndex < releaseIndex) {
 		t.Fatalf("launch order new=%d release=%d", newIndex, releaseIndex)
 	}
-	got, err := r.Monitor(context.Background(), attempt)
+	got, err := monitorFixture(t, r, context.Background(), attempt)
 	if err != nil || got.State != "failed" || !strings.Contains(got.Diagnostic, "status 42") || !fake.sessions[manifest.Session].dead {
 		t.Fatalf("fast exit = %#v, %v", got, err)
 	}
@@ -2465,12 +2465,12 @@ func TestMonitorWaitsForPaneStatusThenReportsSignal(t *testing.T) {
 	}
 	session := fake.sessions[manifest.Session]
 	session.dead, session.pending = true, true
-	pending, err := r.Monitor(t.Context(), attempt)
+	pending, err := monitorFixture(t, r, t.Context(), attempt)
 	if err != nil || pending.State != "running" || !pending.UpdatedAt.Equal(manifest.UpdatedAt) {
 		t.Fatalf("pending pane status changed progress: manifest=%#v err=%v", pending, err)
 	}
 	session.pending, session.signal, session.output = false, "15", "terminated output\n"
-	failed, err := r.Monitor(t.Context(), attempt)
+	failed, err := monitorFixture(t, r, t.Context(), attempt)
 	if err != nil || failed.State != "failed" || !strings.Contains(failed.Diagnostic, "signal 15") {
 		t.Fatalf("signaled pane status=%#v err=%v", failed, err)
 	}
@@ -2525,7 +2525,7 @@ func TestStateContainmentRejectsEscapes(t *testing.T) {
 		if err := os.Symlink(outside, r.manifestPath(attempt)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := r.Monitor(context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "symlink") {
+		if _, err := monitorFixture(t, r, context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "symlink") {
 			t.Fatalf("read escape = %v", err)
 		}
 	})
@@ -2538,7 +2538,7 @@ func TestProbeAndCancellationErrorsPreserveState(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake.failCode["display-message"] = 23
-	if got, err := r.Monitor(context.Background(), attempt); err == nil || got.State != "running" {
+	if got, err := monitorFixture(t, r, context.Background(), attempt); err == nil || got.State != "running" {
 		t.Fatalf("observation error = %#v, %v", got, err)
 	}
 	delete(fake.failCode, "display-message")
@@ -2594,7 +2594,7 @@ func TestCancelValidatesManifestAndWinsConcurrentMonitor(t *testing.T) {
 	}
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = r2.Monitor(context.Background(), attempt2) }()
+	go func() { defer wg.Done(); _, _ = monitorFixture(t, r2, context.Background(), attempt2) }()
 	go func() { defer wg.Done(); _, _ = r2.Cancel(context.Background(), attempt2, "stop") }()
 	wg.Wait()
 	stored, err := readManifest(r2.manifestPath(attempt2))
@@ -2642,7 +2642,7 @@ func TestCaptureAndLogErrorsAreHonest(t *testing.T) {
 			if err := test.breakOutput(fake, manifest); err != nil {
 				t.Fatal(err)
 			}
-			got, err := r.Monitor(context.Background(), attempt)
+			got, err := monitorFixture(t, r, context.Background(), attempt)
 			if err == nil || got.State != "failed" || !strings.Contains(got.Diagnostic, "not preserved") || strings.Contains(got.Diagnostic, "output preserved in") {
 				t.Fatalf("output failure = %#v, %v", got, err)
 			}
@@ -2769,6 +2769,45 @@ func prepareAndStartFixture(t *testing.T, r *Runtime, ctx context.Context, attem
 		return started.Manifest, errors.Join(err, writeErr)
 	}
 	return started.Manifest, err
+}
+
+func monitorFixture(t *testing.T, r *Runtime, ctx context.Context, attempt Attempt) (Manifest, error) {
+	t.Helper()
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if manifest.Version != boundManifestVersion {
+		return r.Monitor(ctx, attempt)
+	}
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		return Manifest{}, err
+	}
+	eligible := attempt.Eligible == nil || attempt.Eligible()
+	effectAttempt := attempt
+	effectAttempt.Eligible = nil
+	executor := EffectExecutor{Runtime: r}
+	request, err := executor.BindRequest(EffectRequest{Action: EffectMonitor, Attempt: effectAttempt, Manifest: manifest, Eligible: eligible})
+	if err != nil {
+		return manifest, err
+	}
+	id, err := newLaunchToken()
+	if err != nil {
+		return manifest, err
+	}
+	request.Identity = EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: id}
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		return manifest, err
+	}
+	result, effectErr := executor.Execute(ctx, request)
+	if result.Manifest.Repository == "" {
+		return manifest, effectErr
+	}
+	if writeErr := r.writeManifest(attempt, result.Manifest); writeErr != nil {
+		return result.Manifest, errors.Join(effectErr, writeErr)
+	}
+	return result.Manifest, effectErr
 }
 
 func resumeHandoffFixture(t *testing.T, r *Runtime, ctx context.Context, attempt Attempt) (Manifest, error) {

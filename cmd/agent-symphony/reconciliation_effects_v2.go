@@ -246,6 +246,9 @@ func applyBeginReconciliationEffect(attemptRoot, stateRoot string, state *runtim
 	if state.IssueGenerations[issueKey] != identity.IssueGeneration {
 		return nil, errStaleStateResult
 	}
+	if implementationLeaseBlocksGitHub(*state, request.Action, request.Repository, request.Issue) {
+		return nil, errStateConflict
+	}
 	if !reconciliationObservationCurrent(*state, request) || state.Observations[issueKey].LastCycleID != request.ObservationCycleID || !validReconciliationEffectStateBindings(stateRoot, *state, request) {
 		return nil, errStaleStateResult
 	}
@@ -622,6 +625,9 @@ func reconciliationEffectCurrent(stateRoot string, state runtimeOwnerState, effe
 	if request == nil || effect.ReviewerRevoked || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
 		return errStaleStateResult
 	}
+	if implementationLeaseBlocksGitHub(state, request.Action, effect.Repository, effect.Issue) {
+		return errStateConflict
+	}
 	compatibleV1 := request.Action == reconciliationReviewer && request.Reviewer != nil && request.Reviewer.DigestVersion == 1 && reconciliationFinishObservationMatches(state, *request)
 	if request.Action == reconciliationReviewer && request.Reviewer != nil && request.Reviewer.DigestVersion == 1 && !compatibleV1 || !reconciliationObservationCurrent(state, *request) && !compatibleV1 || compatibleV1 && state.Observations[ownerIssueKey(effect.Repository, effect.Issue)].ObservationEpoch != state.Epoch {
 		return errStaleStateResult
@@ -639,6 +645,44 @@ func reconciliationEffectCurrent(stateRoot string, state runtimeOwnerState, effe
 	return nil
 }
 
+// A launched implementation can leave a child outside its original process
+// group. Until there is positive descendant containment, no GitHub mutation
+// may consume that potentially live worker result or its issue authority.
+func implementationLeaseBlocksGitHub(state runtimeOwnerState, action reconciliationEffectAction, repository string, issue int) bool {
+	switch action {
+	case reconciliationGitHubBind, reconciliationGitHubPublish, reconciliationGitHubIssueUpdate, reconciliationGitHubPRGovernance:
+	default:
+		return false
+	}
+	for _, record := range state.Attempts {
+		manifest := record.Manifest
+		if manifest.Repository == repository && manifest.Issue == issue && manifest.Version == agentruntime.ManifestVersion2 && manifest.LaunchID != "" {
+			return true
+		}
+	}
+	for _, effect := range state.Effects {
+		if effect.Repository == repository && effect.Issue == issue && effect.Action == string(agentruntime.EffectStart) && effect.StartMayRun {
+			return true
+		}
+	}
+	for _, tombstone := range state.Tombstones {
+		if tombstone.Repository != repository || tombstone.Issue != issue {
+			continue
+		}
+		if tombstone.Manifest != nil && tombstone.Manifest.Version == agentruntime.ManifestVersion2 && tombstone.Manifest.LaunchID != "" || tombstone.InvalidatedHandoff != nil {
+			return true
+		}
+		if tombstone.InvalidatedStart != nil {
+			for _, candidate := range tombstone.InvalidatedStart.Candidates {
+				if candidate.MayRun {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // reconciliationEffectFinishCurrent intentionally does not require a current
 // observation epoch. An immutable completion marker proves that the external
 // effect finished before restart; generations and state bindings still prevent
@@ -647,6 +691,9 @@ func reconciliationEffectFinishCurrent(stateRoot string, state runtimeOwnerState
 	request := effect.Reconciliation
 	if request == nil || effect.ReviewerRevoked || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !reconciliationFinishObservationMatches(state, *request) || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
 		return errStaleStateResult
+	}
+	if implementationLeaseBlocksGitHub(state, request.Action, effect.Repository, effect.Issue) {
+		return errStateConflict
 	}
 	if request.Attempt == 0 {
 		return nil
