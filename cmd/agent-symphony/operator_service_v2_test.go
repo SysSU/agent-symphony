@@ -327,6 +327,114 @@ func TestRemoteOnlyTombstoneReplaysAfterReceiptEvictionAndRestart(t *testing.T) 
 	}
 }
 
+func TestLocalTombstoneReplayIgnoresLaterMissingObservation(t *testing.T) {
+	for index, action := range []string{"dismiss", "archive", "abandon", "remove"} {
+		t.Run(action, func(t *testing.T) {
+			var owner *stateOwner
+			var manifest agentruntime.Manifest
+			if action == "dismiss" {
+				owner, manifest = operatorTestOwner(t, 370+index, "completed", true)
+			} else {
+				owner, manifest = operatorCleanupRestartOwner(t, 370+index, action)
+				if err := os.MkdirAll(productionSnapshotRoot(owner.stateRoot), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+			service.issueClosed = func(context.Context, string, int) (bool, error) { return true, nil }
+			service.stopped = true // Keep cleanup pending so replay can prove it does not create another effect.
+			confirm := action != "dismiss"
+			first := service.perform(t.Context(), operatorRequest(action+"-first", action, manifest, confirm))
+			want := http.StatusAccepted
+			if action == "dismiss" {
+				want = http.StatusOK
+			}
+			if !first.OK || first.Status != want {
+				t.Fatalf("first action=%#v", first)
+			}
+			before := mustOwnerSnapshot(t, owner).State
+			key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+			if before.Tombstones[key].Action != operatorTombstoneAction(action) {
+				t.Fatalf("first action did not tombstone attempt: %#v", before.Tombstones[key])
+			}
+			applyReconciliationInput(t, owner, reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: manifest.Repository}, Complete: true})
+			if mustOwnerSnapshot(t, owner).State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Present {
+				t.Fatal("fixture did not remove the prior issue observation")
+			}
+			replay := service.perform(t.Context(), operatorRequest(action+"-replay", action, manifest, confirm))
+			if !replay.OK || replay.Status != want {
+				t.Fatalf("same-action replay after observation loss=%#v", replay)
+			}
+			cross := service.perform(t.Context(), operatorRequest(action+"-cross", "cancel", manifest, false))
+			if cross.OK || cross.Status != http.StatusConflict {
+				t.Fatalf("cross-action replay=%#v", cross)
+			}
+			after := mustOwnerSnapshot(t, owner).State
+			if !reflect.DeepEqual(after.Tombstones[key], before.Tombstones[key]) || after.AttemptGenerations[key] != before.AttemptGenerations[key] || !reflect.DeepEqual(after.Effects, before.Effects) || !reflect.DeepEqual(after.Attempts, before.Attempts) {
+				t.Fatalf("replay changed durable invalidation: before=%#v after=%#v", before, after)
+			}
+			if receipt, ok := operatorReceiptByID(after, action+"-replay"); !ok || receipt.EffectID != before.Tombstones[key].EffectID || receipt.State != map[bool]string{true: "completed", false: "pending"}[action == "dismiss"] {
+				t.Fatalf("replay receipt=%#v exists=%t", receipt, ok)
+			}
+			command, ok := service.tombstoneReplayCommand(stateOwnerSnapshot{State: after}, operatorRequest(action+"-invalid", action, manifest, confirm))
+			if !ok {
+				t.Fatal("tombstone replay command missing")
+			}
+			for name, corrupt := range map[string]func(*beginOperatorMutationCommand){
+				"epoch":              func(c *beginOperatorMutationCommand) { c.Identity.Epoch++ },
+				"source revision":    func(c *beginOperatorMutationCommand) { c.Identity.SourceRevision = after.Revision + 1 },
+				"issue generation":   func(c *beginOperatorMutationCommand) { c.Identity.IssueGeneration++ },
+				"attempt generation": func(c *beginOperatorMutationCommand) { c.Identity.AttemptGeneration++ },
+				"manifest":           func(c *beginOperatorMutationCommand) { c.Manifest.BaseSHA = strings.Repeat("f", 40) },
+				"published head":     func(c *beginOperatorMutationCommand) { c.PublishedHead = strings.Repeat("f", 40) },
+				"cleanup digest":     func(c *beginOperatorMutationCommand) { c.CleanupDigest = strings.Repeat("f", 64) },
+				"policy": func(c *beginOperatorMutationCommand) {
+					c.CleanupPolicy.Action = "dismiss"
+				},
+			} {
+				t.Run(name, func(t *testing.T) {
+					invalid := command
+					corrupt(&invalid)
+					if _, _, err := owner.beginOperatorMutation(t.Context(), invalid); !errors.Is(err, errStaleStateResult) && !errors.Is(err, errStateConflict) {
+						t.Fatalf("invalid replay error=%v", err)
+					}
+					unchanged := mustOwnerSnapshot(t, owner).State
+					if unchanged.Revision != after.Revision || !reflect.DeepEqual(unchanged.Tombstones, after.Tombstones) || !reflect.DeepEqual(unchanged.Effects, after.Effects) || !reflect.DeepEqual(unchanged.ControlReceipts, after.ControlReceipts) {
+						t.Fatal("invalid replay committed owner state")
+					}
+				})
+			}
+			if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, after); err != nil {
+				t.Fatal(err)
+			}
+			if err := owner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			persisted, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := startTestStateOwner(t, owner.stateRoot, persisted, func(next runtimeOwnerState) error {
+				return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, next)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = restarted.close(context.Background()) })
+			replayService := operatorServiceWithCleanup(t, restarted, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+			replayService.stopped = true
+			restartedReplay := replayService.perform(t.Context(), operatorRequest(action+"-restarted", action, manifest, confirm))
+			if !restartedReplay.OK || restartedReplay.Status != want {
+				t.Fatalf("restart replay=%#v", restartedReplay)
+			}
+			durable, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+			if err != nil || !reflect.DeepEqual(durable.Tombstones[key], before.Tombstones[key]) || !reflect.DeepEqual(durable.Effects, before.Effects) {
+				t.Fatalf("restart changed durable invalidation: err=%v state=%#v", err, durable)
+			}
+		})
+	}
+}
+
 func TestV2DashboardCancelRespondsWhileReconciliationCollectsAndRejectsStaleResult(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 327, "active", false)
 	service := operatorTestMutationService(t, owner)

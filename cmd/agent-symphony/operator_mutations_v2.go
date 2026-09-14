@@ -50,24 +50,21 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || manifest.Issue != request.Issue || manifest.Attempt != request.Attempt {
 		return nil, errStateConflict
 	}
-	absentOrphan := ok && !observation.Present && (request.Action == "dismiss" && command.IssueClosed || request.Action == "abandon") && observation.ObservationEpoch == state.Epoch
-	if !ok || !observation.Present && !absentOrphan || command.ObservationGeneration != observation.Generation || command.ObservationCycleID != observation.LastCycleID || command.ObservationBodyDigest != observation.Fact.BodyDigest {
-		return nil, errStaleStateResult
-	}
 	tombstone, tombstoned := state.Tombstones[attemptKey]
-	if observation.ObservationEpoch != state.Epoch && (!tombstoned || tombstone.CleanupPhase != "completed") {
+	if tombstoned {
+		if command.Identity.AttemptGeneration != tombstone.InvalidatedGeneration && command.Identity.AttemptGeneration != tombstone.Generation {
+			return nil, errStaleStateResult
+		}
+		return replayOperatorTombstone(state, request, manifest, command.PublishedHead, command.CleanupDigest, command.CleanupPolicy, tombstone)
+	}
+	absentOrphan := ok && !observation.Present && (request.Action == "dismiss" && command.IssueClosed || request.Action == "abandon") && observation.ObservationEpoch == state.Epoch
+	if !ok || !observation.Present && !absentOrphan || command.ObservationGeneration != observation.Generation || command.ObservationCycleID != observation.LastCycleID || command.ObservationBodyDigest != observation.Fact.BodyDigest || observation.ObservationEpoch != state.Epoch {
 		return nil, errStaleStateResult
 	}
 	if request.Action == "recover" {
 		if effect, attached, err := attachOperatorRecovery(state, command, manifest); attached || err != nil {
 			return effect, err
 		}
-	}
-	if tombstoned {
-		if command.Identity.AttemptGeneration != tombstone.InvalidatedGeneration && command.Identity.AttemptGeneration != tombstone.Generation {
-			return nil, errStaleStateResult
-		}
-		return replayOperatorTombstone(state, request, manifest, command.PublishedHead, command.CleanupDigest, command.CleanupPolicy, tombstone)
 	}
 	if request.Action == "cancel" || request.Action == "recover" {
 		if effect := matchingPendingOperatorStop(*state, command); effect != nil {

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -565,6 +566,11 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 						}
 					}
 				}
+				// Model the issue disappearing from the next GitHub list before restart.
+				// Replay must use the tombstone, not that now-missing observation.
+				fixture.mu.Lock()
+				fixture.closed, fixture.includeClosedIssue = true, false
+				fixture.mu.Unlock()
 				if err := server.Process.Signal(os.Interrupt); err != nil {
 					t.Fatal(err)
 				}
@@ -607,6 +613,48 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					t.Fatalf("restart did not finish a fresh GitHub-backed cycle without restoring %s attempt: %s\n%s", mutation, restartOutput.String(), fullSystemLifecycleDiagnostic(restarted, stateRoot, fixture))
 				}
 				verifyAbsent(restarted, "restart")
+				beforeReplay, err := readRuntimeOwnerState(stateRoot, "o/r")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if beforeReplay.Observations[ownerIssueKey("o/r", 73)].Present {
+					t.Fatal("replay fixture did not lose its GitHub issue observation")
+				}
+				cleanupCount := func(state runtimeOwnerState) int {
+					count := 0
+					for _, effect := range state.Effects {
+						if effect.Action == string(agentruntime.EffectCleanup) && effect.Repository == "o/r" && effect.Issue == 73 && effect.Attempt == 1 {
+							count++
+						}
+					}
+					return count
+				}
+				replayRequest, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/actions/%s?repository=o%%2Fr&issue=73&attempt=1", restarted, mutation), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				replayRequest.Header.Set("Origin", "http://"+restarted)
+				replayResponse, err := http.DefaultClient.Do(replayRequest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var replay controlResult
+				decodeErr := json.NewDecoder(replayResponse.Body).Decode(&replay)
+				_ = replayResponse.Body.Close()
+				if decodeErr != nil || replayResponse.StatusCode != http.StatusOK || !replay.OK || replay.RequestID == "" {
+					t.Fatalf("%s fresh-ID replay after restart: HTTP %d result=%#v decode=%v", mutation, replayResponse.StatusCode, replay, decodeErr)
+				}
+				afterReplay, err := readRuntimeOwnerState(stateRoot, "o/r")
+				if err != nil || !reflect.DeepEqual(afterReplay.Tombstones[key], beforeReplay.Tombstones[key]) || afterReplay.AttemptGenerations[key] != beforeReplay.AttemptGenerations[key] || afterReplay.Attempts[key].Generation != 0 || cleanupCount(afterReplay) != cleanupCount(beforeReplay) {
+					t.Fatalf("%s replay changed durable invalidation: err=%v before=%#v after=%#v", mutation, err, beforeReplay, afterReplay)
+				}
+				if effectID := beforeReplay.Tombstones[key].EffectID; effectID != "" && !reflect.DeepEqual(afterReplay.Effects[effectID], beforeReplay.Effects[effectID]) {
+					t.Fatalf("%s replay changed the original cleanup effect: before=%#v after=%#v", mutation, beforeReplay.Effects[effectID], afterReplay.Effects[effectID])
+				}
+				if receipt, ok := operatorReceiptByID(afterReplay, replay.RequestID); !ok || receipt.State != "completed" || receipt.Result == nil || !receipt.Result.OK {
+					t.Fatalf("%s replay did not commit completed receipt: %#v exists=%t", mutation, receipt, ok)
+				}
+				verifyAbsent(restarted, "replay")
 				return
 			}
 			terminalAction := action
