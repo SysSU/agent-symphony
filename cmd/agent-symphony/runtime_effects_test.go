@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -87,8 +89,22 @@ func TestRuntimeEffectDispatchRegistersBeforeSpawnAndShutdownJoins(t *testing.T)
 	}
 }
 
+func TestOwnerRejectsDormantRuntimeHandoffAdmission(t *testing.T) {
+	coordinator, owner, _, manifest := runtimeEffectTestCoordinator(t, 310, true)
+	coordinator.executor.Runtime.Helper = "bound-helper"
+	before := mustOwnerSnapshot(t, owner)
+	_, err := coordinator.begin(t.Context(), before, runtimeTestRequest(agentruntime.EffectHandoff, manifest, ""))
+	if !errors.Is(err, errStateConflict) {
+		t.Fatalf("owner admitted runtime Handoff with no recovery producer: %v", err)
+	}
+	after := mustOwnerSnapshot(t, owner)
+	if after.State.Revision != before.State.Revision || len(after.State.Effects) != len(before.State.Effects) {
+		t.Fatalf("rejected handoff changed owner state: before=%#v after=%#v", before.State.Effects, after.State.Effects)
+	}
+}
+
 func TestRuntimeEffectStopCancelsAuthorizedBlockedMonitor(t *testing.T) {
-	coordinator, owner, runner, manifest := runtimeEffectTestCoordinator(t, 72)
+	coordinator, owner, runner, manifest := runtimeEffectTestCoordinator(t, 72, true)
 	monitor := beginRuntimeTestEffect(t, coordinator, owner, agentruntime.EffectMonitor, manifest, "")
 	done := make(chan error, 1)
 	go func() {
@@ -103,8 +119,8 @@ func TestRuntimeEffectStopCancelsAuthorizedBlockedMonitor(t *testing.T) {
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("monitor err=%v", err)
 	}
-	if got := runner.calls.Load(); got != 1 {
-		t.Fatalf("monitor I/O calls=%d", got)
+	if got := runner.blocked.Load(); got != 1 {
+		t.Fatalf("blocked monitor I/O calls=%d", got)
 	}
 }
 
@@ -182,7 +198,7 @@ func TestRuntimeEffectConcurrentSameSnapshotStopCommitsOnce(t *testing.T) {
 }
 
 func TestRuntimeEffectDaemonShutdownCancelsOutstandingIO(t *testing.T) {
-	coordinator, owner, runner, manifest := runtimeEffectTestCoordinator(t, 82)
+	coordinator, owner, runner, manifest := runtimeEffectTestCoordinator(t, 82, true)
 	lifecycle, cancel := context.WithCancel(t.Context())
 	coordinator.lifecycle = lifecycle
 	request := beginRuntimeTestEffect(t, coordinator, owner, agentruntime.EffectMonitor, manifest, "")
@@ -209,6 +225,7 @@ func TestRuntimeEffectCancelledStartCleanupRemainsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := ownerTestManifest(t, root, 88, 1, "preparing")
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
 	owner, err := startTestStateOwner(t, root, runtimeEffectInitialState(manifest), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -767,7 +784,10 @@ func (r *cancelledStartRunner) Run(ctx context.Context, command agentruntime.Com
 	if err := ctx.Err(); err != nil {
 		return agentruntime.Result{}, err
 	}
-	if len(command.Args) > 0 && command.Args[0] == "respawn-pane" {
+	if len(command.Args) > 0 && command.Args[0] == "has-session" {
+		return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
+	}
+	if slices.Contains(command.Args, "new-session") {
 		close(r.entered)
 		<-ctx.Done()
 		return agentruntime.Result{}, ctx.Err()
@@ -798,13 +818,23 @@ type barrierEffectRunner struct {
 	entered chan struct{}
 	release chan struct{}
 	calls   atomic.Int32
+	blocked atomic.Int32
+	pane    *agentruntime.ImplementationPane
 }
 
 func (r *barrierEffectRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	r.calls.Add(1)
+	if r.pane != nil && len(command.Args) > 0 && command.Args[0] == "display-message" && command.Args[len(command.Args)-1] == agentruntime.ImplementationPaneFormat {
+		pane := r.pane
+		return agentruntime.Result{Output: fmt.Sprintf("%s|%s|%s|%d|%d|%d|%s|%s|%s\n", pane.SessionName, pane.SessionID, pane.PaneID, pane.PanePID, pane.ServerPID, pane.ServerStart, pane.StartPath, pane.Token, pane.Command)}, nil
+	}
+	if r.pane != nil && len(command.Args) > 0 && command.Args[0] == "list-panes" {
+		return agentruntime.Result{Output: fmt.Sprintf("%d|%d|%%999\n", r.pane.ServerPID, r.pane.ServerStart)}, nil
+	}
 	if len(command.Args) > 0 && command.Args[0] == "has-session" {
 		return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
 	}
+	r.blocked.Add(1)
 	if r.entered != nil {
 		r.entered <- struct{}{}
 	}
@@ -818,7 +848,7 @@ func (r *barrierEffectRunner) Run(ctx context.Context, command agentruntime.Comm
 	return agentruntime.Result{Output: "0||||\n"}, nil
 }
 
-func runtimeEffectTestCoordinator(t *testing.T, issue int) (*runtimeEffectCoordinator, *stateOwner, *barrierEffectRunner, agentruntime.Manifest) {
+func runtimeEffectTestCoordinator(t *testing.T, issue int, bound ...bool) (*runtimeEffectCoordinator, *stateOwner, *barrierEffectRunner, agentruntime.Manifest) {
 	t.Helper()
 	root := resolvedTempDir(t)
 	attemptRoot := productionAttemptRoot(root)
@@ -826,19 +856,50 @@ func runtimeEffectTestCoordinator(t *testing.T, issue int) (*runtimeEffectCoordi
 		t.Fatal(err)
 	}
 	manifest := ownerTestManifest(t, root, issue, 1, "running")
+	var pane *agentruntime.ImplementationPane
+	if len(bound) != 0 && bound[0] {
+		manifest, pane = boundRuntimeEffectTestManifest(t, manifest)
+	}
 	state := runtimeEffectInitialState(manifest)
 	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
-	runner := &barrierEffectRunner{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	runner := &barrierEffectRunner{entered: make(chan struct{}, 1), release: make(chan struct{}), pane: pane}
 	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Runner: runner, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
 	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState, Cleanup: func(context.Context, agentruntime.EffectRequest) error { return nil }, VerifyCleanup: func(context.Context, agentruntime.EffectRequest) (bool, error) { return true, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return coordinator, owner, runner, manifest
+}
+
+func boundRuntimeEffectTestManifest(t *testing.T, manifest agentruntime.Manifest) (agentruntime.Manifest, *agentruntime.ImplementationPane) {
+	t.Helper()
+	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
+	pane := boundRuntimeEffectTestPane(t, manifest)
+	body, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return manifest, pane
+}
+
+func boundRuntimeEffectTestPane(t *testing.T, manifest agentruntime.Manifest) *agentruntime.ImplementationPane {
+	t.Helper()
+	pane := &agentruntime.ImplementationPane{SessionName: manifest.Session, SessionID: "$1", PaneID: "%1", PanePID: 1234, ServerPID: 2345, ServerStart: 1, StartPath: manifest.Worktree, Token: manifest.LaunchToken, Command: "bound-test-worker"}
+	binding, err := agentruntime.BindImplementationPane(manifest, manifest.LaunchID, "capture", *pane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agentruntime.WriteImplementationBinding(manifest, binding); err != nil {
+		t.Fatal(err)
+	}
+	return pane
 }
 
 func runtimeEffectInitialState(manifest agentruntime.Manifest) runtimeOwnerState {

@@ -242,9 +242,11 @@ func TestReconciliationRejectsStaleEpochAndDiscardsStaleGeneration(t *testing.T)
 	}
 	t.Cleanup(func() { _ = attemptOwner.close(context.Background()) })
 	manifest := ownerTestManifest(t, root, 176, 1, "running")
-	if _, err := attemptOwner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
+	created, err := attemptOwner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	if err != nil {
 		t.Fatal(err)
 	}
+	manifest = created.State.Attempts[ownerAttemptKey("o/r", 176, 1)].Manifest
 	attemptSnapshot, _ := attemptOwner.reconciliationSnapshot(t.Context())
 	attemptInput := repositoryInput(true, issueFact(176, "issue"))
 	attemptInput.Attempts = []internalgithub.RecoveryAttemptFact{attemptFact(176, 1, "stale")}
@@ -336,9 +338,11 @@ func TestReconciliationGenerationAdvanceMasksNestedAttemptFacts(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = owner.close(context.Background()) })
 			manifest := ownerTestManifest(t, root, 177, 1, "running")
-			if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
+			created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+			if err != nil {
 				t.Fatal(err)
 			}
+			manifest = created.State.Attempts[ownerAttemptKey("o/r", 177, 1)].Manifest
 			snapshot, _ := owner.reconciliationSnapshot(t.Context())
 			remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 177, Attempt: 1, PR: 9, BaseSHA: manifest.BaseSHA, HeadSHA: strings.Repeat("b", 40), State: "completed"}
 			issue := issueFact(177, "stale")

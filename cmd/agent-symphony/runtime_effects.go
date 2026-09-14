@@ -48,6 +48,13 @@ func (c *runtimeEffectCoordinator) beginWithSource(ctx context.Context, snapshot
 	if snapshot.CycleID != 0 || snapshot.State.Epoch == 0 || snapshot.State.Revision == 0 {
 		return agentruntime.EffectRequest{}, errStaleStateResult
 	}
+	if request.Action == agentruntime.EffectHandoff && request.Manifest.Version == 2 {
+		var err error
+		request.CandidateLaunchToken, err = agentruntime.NewLaunchToken()
+		if err != nil {
+			return agentruntime.EffectRequest{}, err
+		}
+	}
 	request, executor, err := c.bindWithSource(request, source)
 	if err != nil {
 		return agentruntime.EffectRequest{}, err
@@ -72,11 +79,14 @@ func (c *runtimeEffectCoordinator) beginWithSource(ctx context.Context, snapshot
 	if request.Action == agentruntime.EffectReview {
 		review = cloneReviewTransition(&request.Review)
 	}
-	_, effect, err := c.owner.beginRuntimeEffect(ctx, beginRuntimeEffectCommand{Identity: identity, Action: request.Action, Manifest: manifest, Reason: request.Reason, RequestDigest: digest, Review: review})
+	_, effect, err := c.owner.beginRuntimeEffect(ctx, beginRuntimeEffectCommand{Identity: identity, Action: request.Action, Manifest: manifest, Reason: request.Reason, RequestDigest: digest, Review: review, CandidateLaunchToken: request.CandidateLaunchToken})
 	if err != nil {
 		return agentruntime.EffectRequest{}, err
 	}
 	request.Identity = effectRequestIdentity(*effect)
+	if request.Action == agentruntime.EffectStart {
+		request.GateNonce = effect.StartGateNonce
+	}
 	if request.Action == agentruntime.EffectStop {
 		c.cancelOlder(manifest, effect.AttemptGeneration)
 	}
@@ -127,13 +137,19 @@ func (c *runtimeEffectCoordinator) execute(_ context.Context, request agentrunti
 
 func (c *runtimeEffectCoordinator) executeWithRun(request agentruntime.EffectRequest, run *activeRuntimeEffect) (agentruntime.EffectResult, error) {
 	defer c.release(request, run)
-	if err := c.owner.authorizeRuntimeEffect(c.lifecycle, authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: request.Action}); err != nil {
-		return agentruntime.EffectResult{}, err
+	if request.Action != agentruntime.EffectStart {
+		if err := c.owner.authorizeRuntimeEffect(c.lifecycle, authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: request.Action}); err != nil {
+			return agentruntime.EffectResult{}, err
+		}
 	}
 	if err := run.ctx.Err(); err != nil {
 		return agentruntime.EffectResult{}, err
 	}
-	result, err := c.executor.Execute(run.ctx, request)
+	executor := c.executor
+	executor.AuthorizeLaunch = func(ctx context.Context, request agentruntime.EffectRequest) error {
+		return c.owner.authorizeRuntimeEffect(ctx, authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: request.Action, GateNonce: request.GateNonce})
+	}
+	result, err := executor.Execute(run.ctx, request)
 	if result.Disposition != agentruntime.EffectResultReady {
 		return result, err
 	}
@@ -171,6 +187,19 @@ func (c *runtimeEffectCoordinator) executeOperator(request agentruntime.EffectRe
 	}
 	defer c.release(request, run)
 	identity := ownerEffectIdentity(request.Identity)
+	if request.Action == agentruntime.EffectStop {
+		snapshot, err := c.owner.snapshot(c.lifecycle)
+		if err != nil {
+			return agentruntime.EffectResult{}, err
+		}
+		effect, ok := snapshot.State.Effects[identity.EffectID]
+		if !ok || effect.State != "pending" || effect.Action != string(agentruntime.EffectStop) {
+			return agentruntime.EffectResult{}, errStaleStateResult
+		}
+		if effect.InvalidatedStart != nil {
+			return agentruntime.EffectResult{Disposition: agentruntime.EffectResultAmbiguous}, agentruntime.ErrRuntimeResourcesRemain
+		}
+	}
 	if request.Action == agentruntime.EffectCleanup {
 		if _, err := c.owner.startOperatorCleanup(c.lifecycle, startOperatorCleanupCommand{Identity: identity}); err != nil {
 			return agentruntime.EffectResult{}, err
@@ -181,7 +210,11 @@ func (c *runtimeEffectCoordinator) executeOperator(request agentruntime.EffectRe
 	if err := run.ctx.Err(); err != nil {
 		return agentruntime.EffectResult{}, err
 	}
-	result, err := c.executor.Execute(run.ctx, request)
+	executor := c.executor
+	executor.AuthorizeLaunch = func(ctx context.Context, request agentruntime.EffectRequest) error {
+		return c.owner.authorizeRuntimeEffect(ctx, authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: request.Action})
+	}
+	result, err := executor.Execute(run.ctx, request)
 	if result.Disposition != agentruntime.EffectResultReady {
 		return result, err
 	}
@@ -211,6 +244,9 @@ func (c *runtimeEffectCoordinator) verifyPendingMode(ctx context.Context, snapsh
 	action := agentruntime.EffectAction(effect.Action)
 	if !validRuntimeEffectAction(action) {
 		return agentruntime.EffectVerification{}, errStateConflict
+	}
+	if action == agentruntime.EffectStop && effect.InvalidatedStart != nil {
+		return agentruntime.EffectVerification{Disposition: agentruntime.EffectPending}, nil
 	}
 	request.Action = action
 	request.Identity = effectRequestIdentity(effect)

@@ -110,6 +110,7 @@ type handoffEffectRequest struct {
 	Recovery                    *internalgithub.RecoveryHandoff
 	Outcome                     *internalgithub.HandoffOutcome
 	OutcomePath, OutcomeToken   string
+	CandidateLaunchToken        string `json:",omitempty"`
 }
 
 type retireCompletedEffectRequest struct {
@@ -155,6 +156,8 @@ type reviewerEffectResult struct {
 type handoffEffectResult struct {
 	Kind, Key, OutcomePath, OutcomeToken string
 	Observed                             bool
+	LaunchToken                          string `json:",omitempty"`
+	LaunchID                             string `json:",omitempty"`
 }
 type retireCompletedEffectResult struct{ ResourcesGone bool }
 type monitoringCheckInEffectResult struct {
@@ -547,6 +550,9 @@ func applyFinishReconciliationEffect(stateRoot string, state *runtimeOwnerState,
 	if !validReconciliationEffectResult(*effect.Reconciliation, result) {
 		return errStateConflict
 	}
+	if effect.Action == string(reconciliationHandoffDeliver) && effect.Reconciliation.Manifest.Version == agentruntime.ManifestVersion2 && result.Handoff.LaunchID != effect.ID {
+		return errStateConflict
+	}
 	if effect.State == "completed" {
 		if reflect.DeepEqual(effect.ReconciliationResult, &result) {
 			return nil
@@ -770,6 +776,13 @@ func validReconciliationEffectBindings(request reconciliationEffectRequest) bool
 		return request.Manifest != nil && agentruntime.ValidReviewTarget(request.Reviewer.Mode, request.Reviewer.Target, request.Repository, request.Issue)
 	case reconciliationHandoffDeliver:
 		if request.Manifest == nil || request.Handoff.OutcomePath != handoffReceiptPath(request.Manifest.Worktree, request.Handoff.Key) {
+			return false
+		}
+		if request.Manifest.Version == agentruntime.ManifestVersion2 {
+			if !agentruntime.ValidLaunchToken(request.Handoff.CandidateLaunchToken) || request.Handoff.CandidateLaunchToken == request.Manifest.LaunchToken {
+				return false
+			}
+		} else if request.Handoff.CandidateLaunchToken != "" {
 			return false
 		}
 		if request.Handoff.Kind == "recovery" {
@@ -1098,6 +1111,11 @@ func validReconciliationEffectResult(request reconciliationEffectRequest, result
 		valid = result.Reviewer != nil && validReviewerResult(*request.Reviewer, *result.Reviewer)
 	case reconciliationHandoffDeliver:
 		valid = result.Handoff != nil && result.Handoff.Kind == request.Handoff.Kind && result.Handoff.Key == request.Handoff.Key && result.Handoff.OutcomePath == request.Handoff.OutcomePath && result.Handoff.OutcomeToken == request.Handoff.OutcomeToken && result.Handoff.Observed
+		if valid && request.Manifest.Version == agentruntime.ManifestVersion2 {
+			valid = result.Handoff.LaunchToken == request.Handoff.CandidateLaunchToken && result.Handoff.LaunchID != ""
+		} else if valid {
+			valid = result.Handoff.LaunchToken == "" && result.Handoff.LaunchID == ""
+		}
 	case reconciliationRetireCompleted:
 		valid = result.Retire != nil && result.Retire.ResourcesGone
 	case reconciliationMonitoringCheckIn:
@@ -1151,6 +1169,9 @@ func applyReconciliationEffectOutcome(state *runtimeOwnerState, request reconcil
 		}
 		state.Attempts[key] = record
 	case reconciliationHandoffDeliver:
+		if request.Manifest.Version == agentruntime.ManifestVersion2 {
+			record.Manifest.LaunchToken, record.Manifest.LaunchID = result.Handoff.LaunchToken, result.Handoff.LaunchID
+		}
 		if request.Handoff.Kind == "review-findings" {
 			record.Manifest.ReviewHandoffQueued, record.Manifest.ReviewHandoffAck = true, true
 			if record.Manifest.State == "completed" {
@@ -1173,6 +1194,7 @@ func applyReconciliationEffectOutcome(state *runtimeOwnerState, request reconcil
 			return errStateConflict
 		}
 		state.Recoveries[key] = recovery
+		state.Attempts[key] = record
 	case reconciliationRetireCompleted:
 		delete(state.Attempts, key)
 		delete(state.Recoveries, key)
