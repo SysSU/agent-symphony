@@ -50,7 +50,11 @@ func TestHistoricalAttemptActionsFullSystemE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	t.Cleanup(func() {
+		if err := removeFullSystemFixtureRoot(root); err != nil {
+			t.Errorf("remove historical full-system root: %v", err)
+		}
+	})
 	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +182,8 @@ test "$endpoint" = graphql && endpoint=/graphql
 if [ "$input" -eq 1 ]; then exec curl -sS -i -X "$method" --data-binary @- "$FAKE_GITHUB_URL$endpoint"; fi
 exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 `)
-	writeExecutable(t, filepath.Join(binDir, "codex"), `#!/bin/sh
+	codexPath := filepath.Join(binDir, "codex")
+	buildNativeCodexFixture(t, codexPath, `#!/bin/sh
 if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
 if [ "$1" = sandbox ]; then
   while [ "$1" != -- ]; do shift; done
@@ -189,7 +194,35 @@ fi
 exit 0
 `)
 	cfg := config.Default("o/r")
+	cfg.Commands.Implementation[0], cfg.Commands.Reviewer[0] = codexPath, codexPath
 	cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
+	profileDigest, err := config.PinWorkerExecutable(t.Context(), stateRoot, &cfg.Commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, record := range state.Attempts {
+		manifest := record.Manifest
+		manifest.Version = agentruntime.ManifestVersion2
+		manifest.LaunchToken = digestText("historical launch token " + key)[:32]
+		manifest.LaunchID = digestText("historical launch id " + key)[:32]
+		manifest.WorkerGeneration = record.Generation
+		manifest.WorkerProfileDigest = profileDigest
+		record.Manifest = manifest
+		state.Attempts[key] = record
+		if current, ok := manifests[manifest.Issue]; ok && current.Attempt == manifest.Attempt {
+			manifests[manifest.Issue] = manifest
+		}
+		body, marshalErr := json.Marshal(manifest)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeRuntimeOwnerState(stateRoot, attemptRoot, state); err != nil {
+		t.Fatal(err)
+	}
 	cfg.ReconciliationIntervalSeconds = 1
 	configPath := filepath.Join(repository, config.DefaultPath)
 	if err := config.Write(configPath, cfg); err != nil {
@@ -211,6 +244,29 @@ exit 0
 		}
 		return command, output
 	}
+	// Attempt 164 exercises cleanup after the exact bound implementation pane
+	// has already disappeared. Preserve its immutable launch binding while
+	// removing only the pane, so the archive can prove the absence rather than
+	// failing closed on an unbound V2 manifest.
+	ensureFullSystemParkedImplementation(t, environment, binary, manifests[164])
+	if err := stopFullSystemTmux(environment, manifests[164].Session); err != nil {
+		t.Fatal(err)
+	}
+	if fullSystemTmuxSessionExists(environment, manifests[164].Session) {
+		t.Fatalf("historical absent implementation session remained: %s", manifests[164].Session)
+	}
+	// The post-restart Abandon case has the same exact-bound, already-absent
+	// implementation shape.
+	ensureFullSystemParkedImplementation(t, environment, binary, manifests[191])
+	if err := stopFullSystemTmux(environment, manifests[191].Session); err != nil {
+		t.Fatal(err)
+	}
+	if fullSystemTmuxSessionExists(environment, manifests[191].Session) {
+		t.Fatalf("historical abandoned implementation session remained: %s", manifests[191].Session)
+	}
+	// stopFullSystemTmux tears down the fixture's isolated tmux server, so start
+	// the live attempt only after establishing attempt 164's absent-pane proof.
+	ensureFullSystemParkedImplementation(t, environment, binary, manifests[160])
 	server, output := start(address)
 	stopped := false
 	t.Cleanup(func() {
@@ -313,7 +369,7 @@ exit 0
 	}
 	if !waitFor(deadline(20*time.Second), func() bool {
 		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
-		return err == nil && ledger.Tombstones[ownerAttemptKey("o/r", 160, 1)].CleanupPhase == "completed" && ledger.Tombstones[ownerAttemptKey("o/r", 162, 1)].Action == "dismissed" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Action == "archived" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Manifest == nil && ledger.Tombstones[ownerAttemptKey("o/r", 164, 2)].Action == "archived" && ledger.Tombstones[ownerAttemptKey("o/r", 192, 9)].Action == "dismissed"
+		return err == nil && ledger.Tombstones[ownerAttemptKey("o/r", 160, 1)].CleanupPhase == "completed" && ledger.Tombstones[ownerAttemptKey("o/r", 162, 1)].Action == "dismissed" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Action == "archived" && ledger.Tombstones[ownerAttemptKey("o/r", 163, 1)].Manifest == nil && ledger.Tombstones[ownerAttemptKey("o/r", 164, 2)].Action == "archived" && ledger.Tombstones[ownerAttemptKey("o/r", 164, 2)].CleanupPhase == "completed" && ledger.Tombstones[ownerAttemptKey("o/r", 192, 9)].Action == "dismissed"
 	}) {
 		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 		t.Fatalf("historical mutations did not complete: %s\nserve:\n%s", ledger, output.String())
