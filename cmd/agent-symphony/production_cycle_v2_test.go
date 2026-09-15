@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +27,20 @@ import (
 	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
+
+type fixedGovernanceSource struct{ state internalgithub.PRState }
+
+func (s fixedGovernanceSource) OpenPullRequests(context.Context) ([]int, error) {
+	return []int{s.state.Number}, nil
+}
+
+func (s fixedGovernanceSource) FreshPullRequest(context.Context, int) (internalgithub.PRState, error) {
+	return s.state, nil
+}
+
+func (fixedGovernanceSource) FreshFeedback(context.Context, internalgithub.PRState, internalgithub.Feedback) (internalgithub.Feedback, error) {
+	return internalgithub.Feedback{}, errors.New("unexpected feedback read")
+}
 
 func TestSuccessfulCheckDoesNotCacheCancellation(t *testing.T) {
 	var check successfulCheck
@@ -112,6 +127,120 @@ func TestInvalidatedAdmittedMergeStaysUnresolvedAfterUnmergedRead(t *testing.T) 
 	final := mustOwnerSnapshot(t, owner).State
 	if final.Effects[effect.ID].State != "invalidated" || len(final.Tombstones[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)].ExternalOutcomes) != 0 {
 		t.Fatalf("response-lost merge was not retained for convergence: effect=%#v tombstone=%#v", final.Effects[effect.ID], final.Tombstones[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)])
+	}
+}
+
+func TestInvalidatedMergeConvergesAfterBlockedResponseLostPUTLands(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "github-pr-governance").request
+	request.Issue, request.Manifest.Issue = 73, 73
+	request.Manifest.Branch = "agent/73-1"
+	request.GitHubPRGovernance.HeadSHA = strings.Repeat("b", 40)
+	request.GitHubPRGovernance.Policy.ActorID = 42
+	_, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	request = bindEffectObservation(snapshot, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request = *effect.Reconciliation
+	recovery := ownerAttemptRecovery{owner: owner, identity: ownerReconciliationEffectIdentity(*effect)}
+	state, err := recovery.PullRequestState(t.Context(), request.Repository, request.GitHubPRGovernance.PR, request.Issue, request.Attempt, request.GitHubPRGovernance.HeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := state.HeadSHA
+	state.CheckHead, state.PolicyStatus, state.MergeAttemptSHA, state.MergePhase = head, "success", head, "prepared"
+	state.Facts = internalgithub.PRFacts{IssueOpen: true, IssueEligible: true, AutonomousMerge: true, PRIsOpen: true, Mergeable: true, HeadSHA: head, ValidationSHA: head, DocumentationSHA: head, Approved: true, RequiredChecksPass: true, PolicyCheckRequired: true, MergePermission: true, BranchProtectionAllows: true}
+	marker, err := internalgithub.AttemptMarker(request.Issue, request.Attempt, request.Manifest.Branch, head, request.GitHubPRGovernance.PR, "review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &fullSystemGitHub{
+		base: request.Manifest.BaseSHA, labels: map[string]bool{}, includeClosedIssue: true,
+		comments: []map[string]any{{"id": 1, "body": marker, "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}}},
+		pr:       map[string]any{"number": request.GitHubPRGovernance.PR, "body": marker, "state": "open", "merged": false, "mergeable": true, "mergeable_state": "clean", "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": request.Manifest.Branch}, "base": map[string]any{"sha": request.Manifest.BaseSHA, "ref": "main"}, "labels": []any{}},
+	}
+	putEntered, releasePUT := make(chan struct{}), make(chan struct{})
+	var enterOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Path == fmt.Sprintf("/repos/o/r/pulls/%d/merge", request.GitHubPRGovernance.PR) {
+			enterOnce.Do(func() { close(putEntered) })
+			select {
+			case <-releasePUT:
+			case <-r.Context().Done():
+				return
+			}
+			fixture.mu.Lock()
+			fixture.merged, fixture.closed = true, true
+			fixture.pr["state"], fixture.pr["merged"], fixture.pr["merged_at"] = "closed", true, "2026-09-09T12:00:01Z"
+			fixture.mu.Unlock()
+			http.Error(w, `{"message":"response lost after acceptance"}`, http.StatusInternalServerError)
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == fmt.Sprintf("/repos/o/r/pulls/%d/merge", request.GitHubPRGovernance.PR) {
+			fixture.mu.Lock()
+			merged := fixture.merged
+			fixture.mu.Unlock()
+			if merged {
+				w.WriteHeader(http.StatusNoContent)
+			} else {
+				http.Error(w, `{"message":"not merged"}`, http.StatusNotFound)
+			}
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == fmt.Sprintf("/repos/o/r/pulls/%d", request.GitHubPRGovernance.PR) {
+			fixture.mu.Lock()
+			defer fixture.mu.Unlock()
+			writeFixtureJSON(w, fixture.pr)
+			return
+		}
+		if r.Method == http.MethodGet && (r.URL.Path == fmt.Sprintf("/repos/o/r/issues/%d/comments", request.GitHubPRGovernance.PR) || r.URL.Path == fmt.Sprintf("/repos/o/r/pulls/%d/comments", request.GitHubPRGovernance.PR) || r.URL.Path == fmt.Sprintf("/repos/o/r/pulls/%d/reviews", request.GitHubPRGovernance.PR)) {
+			writeFixtureJSON(w, []any{})
+			return
+		}
+		fixture.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	api := internalgithub.API{BaseURL: server.URL, HTTP: server.Client(), Retries: -1}
+	coordinator := internalgithub.PRCoordinator{API: api, Source: fixedGovernanceSource{state: state}, Signals: internalgithub.RecoverySignals{Recovery: recovery}, Phases: recovery, Attempts: map[int]internalgithub.RecoveryAttemptFact{request.GitHubPRGovernance.PR: {Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, PR: request.GitHubPRGovernance.PR}}, MergeMethod: "squash"}
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Reconcile(t.Context()) }()
+	select {
+	case <-putEntered:
+	case err := <-done:
+		t.Fatalf("governance did not reach merge PUT: %v", err)
+	case <-t.Context().Done():
+		t.Fatal(t.Context().Err())
+	}
+	current := mustOwnerSnapshot(t, owner)
+	admitted := current.State.Effects[effect.ID]
+	if !slices.ContainsFunc(admitted.GovernancePhases, func(phase internalgithub.GovernancePhase) bool {
+		return phase.Kind == "merge" && phase.State == "admitted"
+	}) {
+		t.Fatalf("merge PUT started without durable admission: %#v", admitted.GovernancePhases)
+	}
+	manifest := *request.Manifest
+	if _, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, ExpectedIssueGeneration: current.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], ExpectedAttemptGeneration: current.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)], Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest}); err != nil {
+		t.Fatal(err)
+	}
+	production := &productionReconciliation{owner: owner, effects: &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}, collector: reconciliationV2Collector{Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}}}
+	invalidated := mustOwnerSnapshot(t, owner).State.Effects[effect.ID]
+	if changed, err := production.resolveOneInvalidatedGitHubEffect(t.Context(), api, invalidated); err != nil || changed {
+		t.Fatalf("blocked response-lost merge resolved before remote acceptance: changed=%v err=%v", changed, err)
+	}
+	close(releasePUT)
+	if err := <-done; err == nil {
+		t.Fatal("response-lost merge unexpectedly returned success")
+	}
+	invalidated = mustOwnerSnapshot(t, owner).State.Effects[effect.ID]
+	if changed, err := production.resolveOneInvalidatedGitHubEffect(t.Context(), api, invalidated); err != nil || !changed {
+		facts, factsErr := internalgithub.FetchAttemptFacts(t.Context(), api, request.Repository, 42)
+		t.Fatalf("late exact merge did not converge: changed=%v err=%v request=%#v observed=%v facts=%#v facts_err=%v", changed, err, request.GitHubPRGovernance, exactGovernanceMergeObserved(request, facts), facts, factsErr)
+	}
+	final := mustOwnerSnapshot(t, owner).State
+	outcome := final.Tombstones[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)].ExternalOutcomes[effect.ID]
+	if !outcome.Observed || !outcome.Merged || outcome.Superseded || outcome.HeadSHA != head {
+		t.Fatalf("late merge outcome=%#v", outcome)
 	}
 }
 

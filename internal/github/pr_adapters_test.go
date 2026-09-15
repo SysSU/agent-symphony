@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,35 +16,6 @@ import (
 	"testing"
 	"time"
 )
-
-func TestFileRecoveryDurablyRecordsGovernancePhases(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "recovery.json")
-	recovery := &FileRecovery{Path: path}
-	head := strings.Repeat("a", 40)
-	state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: head, Facts: PRFacts{HeadSHA: head}}
-	if err := recovery.write([]PRState{state}); err != nil {
-		t.Fatal(err)
-	}
-	phase, err := NewGovernancePhase(state, "merge", "squash")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := recovery.AdmitGovernancePhase(t.Context(), phase); err != nil {
-		t.Fatal(err)
-	}
-	loaded, err := recovery.read()
-	if err != nil || len(loaded) != 1 || len(loaded[0].GovernancePhases) != 1 || loaded[0].GovernancePhases[0].State != "admitted" {
-		t.Fatalf("admitted phase was not durable: states=%#v err=%v", loaded, err)
-	}
-	restarted := &FileRecovery{Path: path}
-	if err := restarted.CompleteGovernancePhase(t.Context(), phase); err != nil {
-		t.Fatal(err)
-	}
-	loaded, err = restarted.read()
-	if err != nil || loaded[0].GovernancePhases[0].State != "completed" {
-		t.Fatalf("completed phase was not durable across restart: states=%#v err=%v", loaded, err)
-	}
-}
 
 func TestFileRecoveryDurablyClaimsAndCompletesRuntimeHandoffs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "recovery.json")
@@ -530,7 +502,25 @@ func TestPullRequestMergedFieldIsRequired(t *testing.T) {
 	}
 }
 
-func TestRunPRReconciliationConstructsAndExecutes(t *testing.T) {
+func TestRunPRReconciliationIsRetiredWithoutSideEffects(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	const original = "operator-owned state\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		called = true
+		return nil, errors.New("unexpected GitHub request")
+	})}}
+	err := RunPRReconciliation(t.Context(), api, productionPRConfig(), path)
+	body, readErr := os.ReadFile(path)
+	if err == nil || !strings.Contains(err.Error(), "retired") || called || readErr != nil || string(body) != original {
+		t.Fatalf("err=%v called=%v body=%q read_err=%v", err, called, body, readErr)
+	}
+}
+
+func obsoleteRunPRReconciliationConstructsAndExecutes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	api := fixtureAPI(t, map[string]any{"/repos/o/r": map[string]any{"full_name": "o/r", "permissions": map[string]any{"pull": true}}, "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1": []any{}, "/repos/o/r/pulls?state=open&per_page=100&page=1": []any{}})
 	cfg := productionPRConfig()
@@ -559,7 +549,7 @@ func TestRunPRReconciliationConstructsAndExecutes(t *testing.T) {
 	}
 }
 
-func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t *testing.T) {
+func obsoleteRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t *testing.T) {
 	for _, precreate := range []bool{false, true} {
 		name := "absent state"
 		if precreate {
@@ -715,7 +705,7 @@ func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t 
 	}
 }
 
-func TestRunPRReconciliationSerializesWholeRun(t *testing.T) {
+func obsoleteRunPRReconciliationSerializesWholeRun(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	var mu sync.Mutex
 	inFlight, overlap, pulls := 0, false, 0
@@ -751,7 +741,7 @@ func TestRunPRReconciliationSerializesWholeRun(t *testing.T) {
 	}
 }
 
-func TestRunPRReconciliationIgnoresUnverifiedDurableState(t *testing.T) {
+func obsoleteRunPRReconciliationIgnoresUnverifiedDurableState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	state := []PRState{{Repository: "o/r", Number: 3, Issue: 10, Attempt: 1}}
 	b, _ := json.Marshal(state)
@@ -1307,16 +1297,13 @@ func TestFileRecoveryRejectsSymlinkLocks(t *testing.T) {
 	if err := os.WriteFile(target, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, suffix := range []string{".lock", ".governance.lock"} {
+	for _, suffix := range []string{".lock"} {
 		if err := os.Symlink(target, path+suffix); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := (&FileRecovery{Path: path}).update(func([]PRState) error { return nil }); err == nil {
 		t.Fatal("symlink recovery lock accepted")
-	}
-	if err := RunPRReconciliation(context.Background(), API{}, PRAdapterConfig{}, path); err == nil {
-		t.Fatal("symlink governance lock accepted")
 	}
 }
 
