@@ -64,6 +64,8 @@ grep -qF 'native_root="$prefix/lib/node_modules/@openai/codex/node_modules/@open
 grep -qF 'native="$native_root/vendor/$target/bin/codex"' .github/workflows/release-validation.yml
 grep -qF 'sudo chown -R 0:0 "$prefix"' .github/workflows/release-validation.yml
 grep -qF 'sudo chmod -R go-w "$prefix"' .github/workflows/release-validation.yml
+grep -qF 'test -f "$native" && test ! -L "$native" && test -x "$native"' .github/workflows/release-validation.yml
+grep -qF 'find "$native_root" ! -type d ! -type f -print -quit' .github/workflows/release-validation.yml
 grep -qF 'find "$native_root" \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \)' .github/workflows/release-validation.yml
 grep -qF 'printf '\''CODEX_NATIVE=%s\n'\'' "$native" >> "$GITHUB_ENV"' .github/workflows/release-validation.yml
 grep -qF 'dirname "$native" >> "$GITHUB_PATH"' .github/workflows/release-validation.yml
@@ -92,6 +94,8 @@ grep -qF "\$codexVersion = '0.153.0'" .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install pinned Codex CLI in WSL'" .github/workflows/release-validation.yml
 grep -qF '$codexRoot = "/usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-${codexPlatform}"' .github/workflows/release-validation.yml
 grep -qF '$codexNative = "/usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-${codexPlatform}/vendor/${codexTarget}/bin/codex"' .github/workflows/release-validation.yml
+grep -qF "test -f '\${codexNative}' && test ! -L '\${codexNative}' && test -x '\${codexNative}'" .github/workflows/release-validation.yml
+grep -qF "find '\${codexRoot}' ! -type d ! -type f -print -quit" .github/workflows/release-validation.yml
 grep -qF 'find '\''${codexRoot}'\'' \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \)' .github/workflows/release-validation.yml
 grep -qF "throw 'Pinned WSL Codex installation is unsafe or invalid'" .github/workflows/release-validation.yml
 grep -qF "throw 'WSL rootless Codex confinement proof failed'" .github/workflows/release-validation.yml
