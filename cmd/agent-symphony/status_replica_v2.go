@@ -172,6 +172,7 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 		issueKey := ownerIssueKey(status.Repository, status.Issue)
 		status.IssueGeneration = snapshot.State.IssueGenerations[issueKey]
 		status.AttemptGeneration = snapshot.State.AttemptGenerations[key]
+		status.MachineStatusSequence = snapshot.State.MachineStatuses[issueKey].Sequence
 		observation := snapshot.State.Observations[issueKey]
 		record, owned := snapshot.State.Attempts[key]
 		accepted := observation.Attempts[key]
@@ -290,7 +291,7 @@ func expandIssueFact(fact reconciliationIssueFact) internalgithub.RecoveryIssueF
 	if fact.CreatedAtUnixNano != 0 {
 		createdAt = time.Unix(0, fact.CreatedAtUnixNano)
 	}
-	result := internalgithub.RecoveryIssueFact{Repository: fact.Repository, Title: fact.Title, BaseSHA: fact.BaseSHA, BaseBranch: fact.BaseBranch, Issue: fact.Issue, Attempt: fact.Attempt, CurrentAttempt: fact.CurrentAttempt, Priority: fact.Priority, CreatedAt: createdAt, Dependencies: slices.Clone(fact.Dependencies), SatisfiedDependencies: slices.Clone(fact.SatisfiedDependencies), Paths: slices.Clone(fact.Paths), Blockers: slices.Clone(fact.Blockers), Eligible: fact.Eligible, Active: fact.Active, Completed: fact.Completed, Retry: fact.Retry, Cancelled: fact.Cancelled, Closed: fact.Closed, DispatchAuthorized: fact.DispatchAuthorized, RecoveryAuthorized: fact.RecoveryAuthorized, RecoveryAttempt: fact.RecoveryAttempt, NeedsAttention: fact.NeedsAttention}
+	result := internalgithub.RecoveryIssueFact{Repository: fact.Repository, Title: fact.Title, BaseSHA: fact.BaseSHA, BaseBranch: fact.BaseBranch, Issue: fact.Issue, Attempt: fact.Attempt, CurrentAttempt: fact.CurrentAttempt, Priority: fact.Priority, CreatedAt: createdAt, Dependencies: slices.Clone(fact.Dependencies), SatisfiedDependencies: slices.Clone(fact.SatisfiedDependencies), Paths: slices.Clone(fact.Paths), Blockers: slices.Clone(fact.Blockers), Eligible: fact.Eligible, Active: fact.Active, Completed: fact.Completed, Retry: fact.Retry, Cancelled: fact.Cancelled, Closed: fact.Closed, DispatchAuthorized: fact.DispatchAuthorized, RecoveryAuthorized: fact.RecoveryAuthorized, RecoveryAttempt: fact.RecoveryAttempt, NeedsAttention: fact.NeedsAttention, MachineStatusProtocol: fact.MachineStatusProtocol, MachineStatusAttempt: fact.MachineStatusAttempt, MachineStatusSequence: fact.MachineStatusSequence, MachineStatusNeedsAttention: fact.MachineStatusNeedsAttention, MachineStatusReason: fact.MachineStatusReason}
 	if fact.ActiveAttempt != nil {
 		active := expandAttemptFact(*fact.ActiveAttempt)
 		result.ActiveAttempt = &active

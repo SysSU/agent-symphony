@@ -672,6 +672,28 @@ func TestRuntimeEffectOwnerRejectsInvalidResultTransitions(t *testing.T) {
 	}
 }
 
+func TestOldWorkerStatusCannotOverwriteNewOwnerClear(t *testing.T) {
+	coordinator, owner, _, manifest := runtimeEffectTestCoordinator(t, 333)
+	request := beginRuntimeTestEffect(t, coordinator, owner, agentruntime.EffectMonitor, manifest, "")
+	issueKey, attemptKey := ownerIssueKey(manifest.Repository, manifest.Issue), ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	started := mustOwnerSnapshot(t, owner)
+	if got := started.State.Effects[request.Identity.EffectID].MachineStatusSequence; got != 0 {
+		t.Fatalf("captured status sequence=%d", got)
+	}
+	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, ExpectedIssueGeneration: started.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: started.State.AttemptGenerations[attemptKey], ExpectedStatusSequence: 0, Source: "orchestrator", SourceID: "new-clear", Status: "clear", Reason: "monitoring: recovered"}); err != nil {
+		t.Fatal(err)
+	}
+	result := manifest
+	result.WorkerStatus, result.WorkerStatusReason, result.WorkerStatusSeq = "needs-attention", "monitoring: stale worker", 1
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: agentruntime.EffectMonitor, Manifest: result}); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("stale worker result err=%v", err)
+	}
+	status := mustOwnerSnapshot(t, owner).State.MachineStatuses[issueKey]
+	if status.Status != "clear" || status.SourceID != "new-clear" || status.Sequence != 1 {
+		t.Fatalf("stale worker overwrote status: %#v", status)
+	}
+}
+
 func TestRuntimeEffectOwnerRejectsPrepareSuccessDiagnostic(t *testing.T) {
 	root := resolvedTempDir(t)
 	attemptRoot := productionAttemptRoot(root)

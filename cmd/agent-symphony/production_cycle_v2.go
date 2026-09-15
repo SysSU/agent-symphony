@@ -362,12 +362,13 @@ func (p *productionReconciliation) admitDependencyStatuses(ctx context.Context, 
 				continue
 			}
 			attemptGeneration := snapshot.State.AttemptGenerations[ownerAttemptKey(proposal.Repository, proposal.Issue, proposal.AttributionAttempt)]
+			statusSequence := snapshot.State.MachineStatuses[issueKey].Sequence
 			var err error
 			snapshot, err = p.owner.admitMachineStatus(ctx, admitMachineStatusCommand{
 				Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.AttributionAttempt,
 				ExpectedIssueGeneration: observation.OwnerGeneration, ExpectedAttemptGeneration: attemptGeneration,
-				ExpectedObservationGeneration: observation.Generation, Dependency: proposal.Dependency, PullRequest: proposal.PullRequest,
-				Source: "dependency", SourceSequence: observation.Generation, Status: "clear", Reason: fmt.Sprintf("monitoring: dependency #%d is complete", proposal.Dependency),
+				ExpectedObservationGeneration: observation.Generation, ExpectedStatusSequence: statusSequence, Dependency: proposal.Dependency, PullRequest: proposal.PullRequest,
+				Source: "dependency", SourceID: fmt.Sprintf("%d:%d:%d", observation.Generation, proposal.Dependency, proposal.PullRequest), Status: "clear", Reason: fmt.Sprintf("monitoring: dependency #%d is complete", proposal.Dependency),
 			})
 			if err != nil {
 				return stateOwnerSnapshot{}, err

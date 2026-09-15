@@ -42,7 +42,7 @@ func testBlockedMachineStatusConvergence(t *testing.T, desired, action string) {
 	service.collector.Config.ActorID = 42
 	snapshot := mustOwnerSnapshot(t, owner)
 	issueKey, attemptKey := ownerIssueKey("o/r", 333), ownerAttemptKey("o/r", 333, 1)
-	snapshot, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], Source: "orchestrator", SourceSequence: 1, Status: desired, Reason: "monitoring: blocked write"})
+	snapshot, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], Source: "orchestrator", SourceID: "blocked-write", Status: desired, Reason: "monitoring: blocked write"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,13 +230,13 @@ func TestWorkerStatusOutcomeCannotApplyOutOfOrderOrAfterInvalidation(t *testing.
 	state := newRuntimeOwnerState("o/r")
 	state.IssueGenerations[issueKey], state.AttemptGenerations[key] = 1, 1
 	state.Attempts[key] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
-	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 2, Source: "worker", SourceSequence: 7, Status: "needs-attention", Reason: "operator decision required"}
-	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 329, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueMachineStatus, AttributionAttempt: 1, Status: "needs-attention", StatusReason: "operator decision required", StatusSequence: 2, StatusSource: "worker", StatusSourceSequence: 7}}
+	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 2, Source: "worker", SourceID: "worker-7", SourceSequence: 2, Status: "needs-attention", Reason: "operator decision required"}
+	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 329, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueMachineStatus, AttributionAttempt: 1, Status: "needs-attention", StatusReason: "operator decision required", StatusSequence: 2, StatusSource: "worker", StatusSourceSequence: 2}}
 	result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueMachineStatus, Observed: true}}
 	if err := applyReconciliationEffectOutcome(&state, request, result); err != nil || state.MachineStatuses[issueKey].AppliedSequence != 2 || state.Attempts[key].Manifest.WorkerStatusApplied != 7 {
 		t.Fatalf("current status outcome failed: status=%#v err=%v", state.MachineStatuses[issueKey], err)
 	}
-	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 3, AppliedSequence: 2, Source: "orchestrator", SourceSequence: 9, Status: "clear", Reason: "monitoring: recovered"}
+	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 3, AppliedSequence: 2, Source: "orchestrator", SourceID: "proposal-9", SourceSequence: 3, Status: "clear", Reason: "monitoring: recovered"}
 	if err := applyReconciliationEffectOutcome(&state, request, result); !errors.Is(err, errStaleStateResult) {
 		t.Fatalf("out-of-order status outcome err=%v", err)
 	}
@@ -251,10 +251,42 @@ func TestMachineStatusPlannerRepairsStaleExternalObservationAfterRestart(t *test
 	observation := state.Observations[issueKey]
 	observation.Fact.NeedsAttention = true
 	state.Observations[issueKey] = observation
-	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 334, Attempt: 1, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: 1, Sequence: 2, AppliedSequence: 2, Source: "destructive", SourceSequence: 2, Status: "clear", Reason: "attempt invalidated"}
+	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 334, Attempt: 1, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: 1, Sequence: 2, AppliedSequence: 2, Source: "destructive", SourceID: "dismissed-2", SourceSequence: 2, Status: "clear", Reason: "attempt invalidated"}
 	plans, err := planMachineStatusUpdates(stateOwnerSnapshot{State: state}, internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42})
 	if err != nil || len(plans) != 1 || plans[0].Request.GitHubIssueUpdate.StatusSequence != 2 || plans[0].Request.GitHubIssueUpdate.Status != "clear" {
 		t.Fatalf("repair plans=%#v err=%v", plans, err)
+	}
+}
+
+func TestMachineStatusPlannerRequiresExactOwnerMarker(t *testing.T) {
+	manifest := ownerTestManifest(t, t.TempDir(), 335, 1, "running")
+	base := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&base, manifest, "active", false)
+	issueKey := ownerIssueKey("o/r", 335)
+	base.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 335, Attempt: 1, IssueGeneration: base.IssueGenerations[issueKey], AttemptGeneration: 1, Sequence: 2, AppliedSequence: 2, Source: "orchestrator", SourceID: "current", SourceSequence: 2, Status: "clear", Reason: "monitoring: recovered"}
+	for _, test := range []struct {
+		name string
+		edit func(*reconciliationIssueFact)
+		want int
+	}{
+		{"missing", func(*reconciliationIssueFact) {}, 1},
+		{"edited", func(f *reconciliationIssueFact) {
+			f.MachineStatusProtocol, f.MachineStatusAttempt, f.MachineStatusSequence, f.MachineStatusReason = 2, 1, 2, "edited"
+		}, 1},
+		{"current", func(f *reconciliationIssueFact) {
+			f.MachineStatusProtocol, f.MachineStatusAttempt, f.MachineStatusSequence, f.MachineStatusReason = 2, 1, 2, "monitoring: recovered"
+		}, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := cloneRuntimeOwnerState(base)
+			observation := state.Observations[issueKey]
+			test.edit(&observation.Fact)
+			state.Observations[issueKey] = observation
+			plans, err := planMachineStatusUpdates(stateOwnerSnapshot{State: state}, internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42})
+			if err != nil || len(plans) != test.want {
+				t.Fatalf("plans=%d want=%d err=%v", len(plans), test.want, err)
+			}
+		})
 	}
 }
 

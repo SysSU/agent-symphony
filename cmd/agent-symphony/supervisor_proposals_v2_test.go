@@ -103,6 +103,66 @@ func TestSupervisorStatusProposalCannotRebindAfterDismiss(t *testing.T) {
 	}
 }
 
+func TestSupervisorStatusProposalCannotOverwriteNewerStatus(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 334, "active", false)
+	before := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey("o/r", 334), ownerAttemptKey("o/r", 334, 1)
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 334, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-334-1", Detail: "monitoring: stale heartbeat", IssueGeneration: before.State.IssueGenerations[issueKey], AttemptGeneration: before.State.AttemptGenerations[attemptKey], MachineStatusSequence: 0}
+	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 334, Attempt: 1, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, ExpectedStatusSequence: 0, Source: "worker", SourceID: "new-clear", Status: "clear", Reason: "monitoring: recovered"}); err != nil {
+		t.Fatal(err)
+	}
+	agent := proposalTestSupervisor(t)
+	writeProposalV2(t, agent, proposal)
+	operator := operatorTestMutationService(t, owner)
+	trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
+	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
+	if err := service.process(t.Context()); err == nil {
+		t.Fatal("stale supervisor proposal unexpectedly succeeded")
+	}
+	if status := readProposalStatusV2(t, agent); status.Resolution != "refused" {
+		t.Fatalf("proposal status=%#v", status)
+	}
+	committed := mustOwnerSnapshot(t, owner).State.MachineStatuses[issueKey]
+	if committed.Status != "clear" || committed.SourceID != "new-clear" || committed.Sequence != 1 || committed.Attempt != manifest.Attempt {
+		t.Fatalf("stale supervisor changed status: %#v", committed)
+	}
+}
+
+func TestSupervisorStatusAdmissionRemainsAcceptedWithoutObservation(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 336, 1, "running")
+	state := runtimeEffectInitialState(manifest)
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	snapshot := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey("o/r", 336), ownerAttemptKey("o/r", 336, 1)
+	agent := proposalTestSupervisor(t)
+	writeProposalV2(t, agent, orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 336, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-336-1", Detail: "monitoring: awaiting observation", IssueGeneration: snapshot.State.IssueGenerations[issueKey], AttemptGeneration: snapshot.State.AttemptGenerations[attemptKey]})
+	operator := operatorTestMutationService(t, owner)
+	trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
+	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
+	if err := service.process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if status := readProposalStatusV2(t, agent); status.Resolution != "running" {
+		t.Fatalf("durably admitted proposal was not pending: %#v", status)
+	}
+	if status := mustOwnerSnapshot(t, owner).State.MachineStatuses[issueKey]; status.Status != "needs-attention" || status.Sequence != 1 {
+		t.Fatalf("owner status=%#v", status)
+	}
+}
+
 func TestSupervisorRecoverWaitsForDurableReceipt(t *testing.T) {
 	owner, manifest := operatorNeverLaunchedOwner(t, 373, "failed", "failed", func(runtimeOwnerState) error { return nil })
 	snapshot, err := owner.reconciliationSnapshot(t.Context())
