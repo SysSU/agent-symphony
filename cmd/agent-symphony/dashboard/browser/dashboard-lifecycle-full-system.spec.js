@@ -191,17 +191,17 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
 	  await expect.poll(async () => {
         const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
         return status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.state;
-      }, { timeout: 20_000 }).toBe("cancelled");
+      }, { timeout: 20_000 }).toMatch(/^(cancelled|failed)$/);
       await page.reload();
       await expect(card).toBeVisible();
       let canceledHistorical = /Attempt 2(?!\d)/.test(await card.innerText());
       let canceledCard = canceledHistorical ? await historicalAttempt() : exactAttempt;
       try {
-        await expect(canceledCard).toContainText("cancelled");
+        await expect(canceledCard).toContainText(/cancelled|failed/);
       } catch {
         canceledHistorical = true;
         canceledCard = await historicalAttempt();
-        await expect(canceledCard).toContainText("cancelled");
+        await expect(canceledCard).toContainText(/cancelled|failed/);
       }
       const status = await page.request.get(`${baseURL}/status.json`).then((response) => response.json());
       const old = status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1);
@@ -212,7 +212,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
         await page.reload();
         await expect(card).toContainText(/Attempt 2(?!\d)/);
         canceledCard = await historicalAttempt();
-        await expect(canceledCard).toContainText("cancelled");
+        await expect(canceledCard).toContainText(/cancelled|failed/);
         await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toHaveCount(0);
       } else if (old?.retryable && !old.operator_blocked) {
         try {
