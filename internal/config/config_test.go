@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -114,6 +115,10 @@ func TestPinWorkerExecutableReusesOnlyValidatedArtifactOnRestart(t *testing.T) {
 	if info, err := os.Stat(filepath.Dir(first.Implementation[0])); err != nil || info.Mode().Perm() != 0o500 {
 		t.Fatalf("published pin directory=%v err=%v", info, err)
 	}
+	marker := filepath.Dir(first.Implementation[0]) + ".ready"
+	if info, err := os.Stat(marker); err != nil || info.Mode().Perm() != 0o400 {
+		t.Fatalf("atomic pin publication marker=%v err=%v", info, err)
+	}
 	if err := os.Chmod(first.Implementation[0], 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -128,6 +133,41 @@ func TestPinWorkerExecutableReusesOnlyValidatedArtifactOnRestart(t *testing.T) {
 	commands.Implementation[0], commands.Reviewer[0] = source, source
 	if _, err := PinWorkerExecutable(t.Context(), stateRoot, &commands); err == nil || !strings.Contains(err.Error(), "digest does not match") {
 		t.Fatalf("digest-path substitution was reused: %v", err)
+	}
+}
+
+func TestPinWorkerExecutableRecoversUnmarkedWritableCrashResidue(t *testing.T) {
+	stateRoot, source := pinnedTestRoot(t), filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(source, []byte("#!/bin/sh\nprintf 'codex-cli 0.153.4\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(source)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = source, source
+	if _, err := PinWorkerExecutable(t.Context(), stateRoot, &commands); err != nil {
+		t.Fatal(err)
+	}
+	target, marker := filepath.Dir(commands.Implementation[0]), filepath.Dir(commands.Implementation[0])+".ready"
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(target, "unpublished-residue")
+	if err := os.WriteFile(sentinel, []byte("must not be reused\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted := Default("o/r").Commands
+	restarted.Implementation[0], restarted.Reviewer[0] = source, source
+	if _, err := PinWorkerExecutable(t.Context(), stateRoot, &restarted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(sentinel); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unmarked writable residue was reused: %v", err)
+	}
+	if info, err := os.Stat(marker); err != nil || info.Mode().Perm() != 0o400 {
+		t.Fatalf("recovered marker=%v err=%v", info, err)
 	}
 }
 

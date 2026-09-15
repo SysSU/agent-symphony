@@ -133,7 +133,9 @@ func BindWorkerExecutable(ctx context.Context, commands *Commands) (string, erro
 
 // PinWorkerExecutable copies the verified Codex installation into the private
 // runtime root. Workers execute only this read-only artifact, so replacing the
-// configured path after startup cannot change what they run.
+// configured path after startup cannot change what they run. The production
+// caller holds the deployment daemon lock, which serializes publication and
+// recovery of an incomplete artifact.
 func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Commands) (string, error) {
 	if commands == nil || len(commands.Implementation) == 0 || len(commands.Reviewer) == 0 {
 		return "", errors.New("worker commands are unavailable")
@@ -201,18 +203,27 @@ func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Comman
 	}
 	single := root == source
 	target := filepath.Join(pinRoot, treeDigest)
-	installed := false
-	if err := os.Rename(stage, target); err != nil {
-		if _, validationErr := os.Lstat(target); validationErr != nil {
-			return "", err
+	marker := target + ".ready"
+	if err := validatePinnedMarker(marker, treeDigest); errors.Is(err, os.ErrNotExist) {
+		if err := os.Rename(stage, target); err != nil {
+			if discardErr := discardUnpublishedPinnedTarget(target); discardErr != nil {
+				return "", errors.Join(errors.New("pinned worker executable has an unsafe unpublished artifact"), err, discardErr)
+			}
+			if err := os.Rename(stage, target); err != nil {
+				return "", err
+			}
 		}
-	} else {
-		installed = true
-	}
-	if installed {
 		if err := os.Chmod(target, 0o500); err != nil {
 			return "", err
 		}
+		if err := validatePinnedTree(ctx, target, treeDigest, single); err != nil {
+			return "", err
+		}
+		if err := publishPinnedMarker(pinRoot, marker, treeDigest); err != nil {
+			return "", err
+		}
+	} else if err != nil {
+		return "", err
 	}
 	if err := validatePinnedTree(ctx, target, treeDigest, single); err != nil {
 		return "", err
@@ -227,6 +238,86 @@ func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Comman
 		commands.OrchestratorAudit[0] = commands.Implementation[0]
 	}
 	return digest, nil
+}
+
+func publishPinnedMarker(root, path, digest string) error {
+	file, err := os.CreateTemp(root, ".ready-")
+	if err != nil {
+		return err
+	}
+	name := file.Name()
+	defer os.Remove(name)
+	if _, err = io.WriteString(file, digest+"\n"); err == nil {
+		err = file.Sync()
+	}
+	if err == nil {
+		err = file.Chmod(0o400)
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(name, path)
+	}
+	if err == nil {
+		directory, openErr := os.Open(root)
+		if openErr == nil {
+			openErr = directory.Sync()
+			if closeErr := directory.Close(); openErr == nil {
+				openErr = closeErr
+			}
+		}
+		err = openErr
+	}
+	return err
+}
+
+func discardUnpublishedPinnedTarget(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !safeExecutableOwner(info) {
+		return errors.New("unpublished pinned worker target is unsafe")
+	}
+	err = filepath.WalkDir(path, func(candidate string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := os.Lstat(candidate)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !safeExecutableOwner(info) || !entry.IsDir() && !info.Mode().IsRegular() {
+			return errors.New("unpublished pinned worker target contains an unsafe entry")
+		}
+		if entry.IsDir() {
+			return os.Chmod(candidate, 0o700)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(path)
+}
+
+func validatePinnedMarker(path, digest string) error {
+	listed, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !listed.Mode().IsRegular() || listed.Mode().Perm() != 0o400 || !safeExecutableOwner(listed) {
+		return errors.New("pinned worker executable marker is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	opened, statErr := file.Stat()
+	body, readErr := io.ReadAll(io.LimitReader(file, 66))
+	closeErr := file.Close()
+	if statErr != nil || !os.SameFile(listed, opened) || readErr != nil || closeErr != nil || string(body) != digest+"\n" {
+		return errors.New("pinned worker executable marker is invalid")
+	}
+	return nil
 }
 
 func resolveNativeCodex(path string) (string, error) {
