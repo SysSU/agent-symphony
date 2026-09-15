@@ -137,6 +137,14 @@ func (c *runtimeEffectCoordinator) execute(_ context.Context, request agentrunti
 
 func (c *runtimeEffectCoordinator) executeWithRun(request agentruntime.EffectRequest, run *activeRuntimeEffect) (agentruntime.EffectResult, error) {
 	defer c.release(request, run)
+	snapshot, err := c.owner.snapshot(c.lifecycle)
+	if err != nil {
+		return agentruntime.EffectResult{}, err
+	}
+	effect, ok := snapshot.State.Effects[request.Identity.EffectID]
+	if !ok || effect.State != "pending" || effect.Action != string(request.Action) || !reconciliationEffectIdentityMatches(effect, ownerEffectIdentity(request.Identity)) {
+		return agentruntime.EffectResult{}, errStaleStateResult
+	}
 	if request.Action != agentruntime.EffectStart {
 		if err := c.owner.authorizeRuntimeEffect(c.lifecycle, authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: request.Action}); err != nil {
 			return agentruntime.EffectResult{}, err
