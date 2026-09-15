@@ -204,7 +204,7 @@ func reconcileOperatorAdmissions(state *runtimeOwnerState, collection reconcilia
 		if receipt.Admission.ObservationGeneration == observation.Generation && receipt.Admission.ObservationCycleID == observation.LastCycleID && receipt.Admission.ObservationBodyDigest == observation.Fact.BodyDigest {
 			continue
 		}
-		if receipt.Admission.RemoteOnly && !remoteOnlyOperatorAdmissionEligible(*state, *receipt, observation) || !receipt.Admission.RemoteOnly && (!observation.Present || receipt.Request.Action == "dismiss" && !observation.Fact.Closed) {
+		if receipt.Admission.RemoteOnly && !remoteOnlyOperatorAdmissionEligible(*state, *receipt, observation) || !receipt.Admission.RemoteOnly && (receipt.Request.Action == "recover" && !observation.Present || receipt.Request.Action == "dismiss" && observation.Present && !observation.Fact.Closed) {
 			result := operatorErrorResult(receipt.Request, http.StatusConflict, "attempt or issue changed; refresh and retry")
 			result.OwnerRevision = state.Revision + 1
 			receipt.State, receipt.Phase, receipt.Admission, receipt.Result = "completed", operatorPhaseCompleted, nil, &result

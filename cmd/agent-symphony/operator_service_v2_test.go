@@ -2418,6 +2418,63 @@ func TestDismissDoesNotOverrideNewerOpenObservationDuringCleanupPreflight(t *tes
 	}
 }
 
+func TestDismissRetriesAfterNewerAbsentObservationDuringCloseCheck(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 468, "completed", true)
+	firstAbsent, err := owner.reconciliationSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.applyReconciliation(t.Context(), mustCollection(t, firstAbsent, reconciliationInput{Scope: issueScope(manifest.Issue), Complete: true})); err != nil {
+		t.Fatal(err)
+	}
+	issueKey := ownerIssueKey(manifest.Repository, manifest.Issue)
+	if mustOwnerSnapshot(t, owner).State.Observations[issueKey].Present {
+		t.Fatal("test requires a local orphan with an absent issue observation")
+	}
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	service := operatorTestMutationService(t, owner)
+	service.issueClosed = func(context.Context, string, int) (bool, error) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return true, nil
+	}
+	service.stopped = true
+	request := operatorRequest("dismiss-absent-cycle", "dismiss", manifest, false)
+	result := make(chan controlResult, 1)
+	go func() { result <- service.perform(t.Context(), request) }()
+	<-entered
+	reserved, ok := operatorReceiptByID(mustOwnerSnapshot(t, owner).State, request.RequestID)
+	if !ok || reserved.Phase != operatorPhaseAdmissionPending || reserved.Admission == nil || reserved.Admission.RemoteOnly {
+		close(release)
+		t.Fatalf("local orphan Dismiss was not reserved before close check: %#v", reserved)
+	}
+	secondAbsent, err := owner.reconciliationSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.applyReconciliation(t.Context(), mustCollection(t, secondAbsent, reconciliationInput{Scope: issueScope(manifest.Issue), Complete: true})); err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	close(release)
+	first := <-result
+	state := mustOwnerSnapshot(t, owner).State
+	receipt, ok := operatorReceiptByID(state, request.RequestID)
+	if !first.OK || first.Status != http.StatusAccepted || !ok || receipt.Phase != operatorPhaseAdmissionPending || receipt.Admission == nil || len(state.Tombstones) != 0 || calls.Load() != 1 {
+		t.Fatalf("newer absent observation rejected or committed stale Dismiss: result=%#v receipt=%#v tombstones=%#v calls=%d", first, receipt, state.Tombstones, calls.Load())
+	}
+
+	second := service.perform(t.Context(), request)
+	state = mustOwnerSnapshot(t, owner).State
+	if !second.OK || second.Status != http.StatusAccepted || state.Tombstones[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Action != "dismissed" || calls.Load() != 2 {
+		t.Fatalf("fresh Dismiss did not commit after absent reconciliation: result=%#v tombstones=%#v calls=%d", second, state.Tombstones, calls.Load())
+	}
+}
+
 func TestCollectIssueIgnoresStaleDispositionFromDifferentIssue(t *testing.T) {
 	root := resolvedTempDir(t)
 	first := ownerTestManifest(t, root, 469, 1, "running")
