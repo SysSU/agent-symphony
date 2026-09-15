@@ -79,6 +79,10 @@ grep -qF 'sed "s#\"codex\"#\"$codex_native\"#g" "$config" > "$config.native"' sc
 grep -qF 'kernel.unprivileged_userns_clone=1' .github/workflows/release-validation.yml
 grep -qF 'kernel.apparmor_restrict_unprivileged_userns=0' .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to enable WSL unprivileged user namespaces'" .github/workflows/release-validation.yml
+grep -qF "\$validationUser = 'agent-symphony-ci'" .github/workflows/release-validation.yml
+grep -qF 'wsl -d $distribution --user root -- useradd --create-home --user-group --shell /bin/bash $validationUser' .github/workflows/release-validation.yml
+grep -qF "throw 'Failed to provision the WSL validation user'" .github/workflows/release-validation.yml
+grep -qF 'wsl -d $distribution --user $validationUser -- tar -xf - -C "/home/$validationUser/agent-symphony-ci"' .github/workflows/release-validation.yml
 grep -qF "\$goArchiveVersion = '1.26.0'" .github/workflows/release-validation.yml
 grep -qF 'https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz' .github/workflows/release-validation.yml
 grep -qF "sha256sum -c -" .github/workflows/release-validation.yml
@@ -99,11 +103,12 @@ grep -qF "find '\${codexRoot}' ! -type d ! -type f -print -quit" .github/workflo
 grep -qF 'find '\''${codexRoot}'\'' \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \)' .github/workflows/release-validation.yml
 grep -qF "throw 'Pinned WSL Codex installation is unsafe or invalid'" .github/workflows/release-validation.yml
 grep -qF "throw 'WSL rootless Codex confinement proof failed'" .github/workflows/release-validation.yml
-grep -qF -- "--cd '~' -- bash agent-symphony-ci/scripts/wsl-release-validation.sh proof \"\$codexNative\"" .github/workflows/release-validation.yml
-grep -qF -- "--cd '~' -- bash agent-symphony-ci/scripts/wsl-release-validation.sh release \"\$codexNative\"" .github/workflows/release-validation.yml
+grep -qF -- '--user $validationUser --cd "/home/$validationUser" -- bash agent-symphony-ci/scripts/wsl-release-validation.sh proof "$codexNative"' .github/workflows/release-validation.yml
+grep -qF -- '--user $validationUser --cd "/home/$validationUser" -- bash agent-symphony-ci/scripts/wsl-release-validation.sh release "$codexNative"' .github/workflows/release-validation.yml
 ! grep -F 'bash -lc' .github/workflows/release-validation.yml | grep -qF 'wsl-release-validation.sh'
 grep -qF 'codex_native=${2:-}' scripts/wsl-release-validation.sh
 grep -qF 'test -f "$codex_native" && test ! -L "$codex_native" && test -x "$codex_native"' scripts/wsl-release-validation.sh
+grep -qF 'test "$(id -u)" -ne 0' scripts/wsl-release-validation.sh
 grep -qF 'test "$(command -v codex)" = "$codex_native"' scripts/wsl-release-validation.sh
 grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl' scripts/wsl-release-validation.sh
 grep -qF "throw 'WSL release validation failed'" .github/workflows/release-validation.yml

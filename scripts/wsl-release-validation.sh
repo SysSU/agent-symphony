@@ -9,7 +9,8 @@ case "$codex_native" in
 esac
 test -f "$codex_native" && test ! -L "$codex_native" && test -x "$codex_native"
 export PATH="$(dirname "$codex_native"):/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-cd "$HOME/agent-symphony-ci"
+root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+cd "$root"
 
 case "$mode" in
 proof)
