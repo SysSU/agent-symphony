@@ -233,7 +233,7 @@ func TestWorkerStatusOutcomeCannotApplyOutOfOrderOrAfterInvalidation(t *testing.
 	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 2, Source: "worker", SourceID: "worker-7", SourceSequence: 2, Status: "needs-attention", Reason: "operator decision required"}
 	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 329, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueMachineStatus, AttributionAttempt: 1, Status: "needs-attention", StatusReason: "operator decision required", StatusSequence: 2, StatusSource: "worker", StatusSourceSequence: 2}}
 	result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueMachineStatus, Observed: true}}
-	if err := applyReconciliationEffectOutcome(&state, request, result); err != nil || state.MachineStatuses[issueKey].AppliedSequence != 2 || state.Attempts[key].Manifest.WorkerStatusApplied != 7 {
+	if err := applyReconciliationEffectOutcome(&state, request, result); err != nil || state.MachineStatuses[issueKey].AppliedSequence != 2 || state.Attempts[key].Manifest.WorkerStatusApplied != 2 {
 		t.Fatalf("current status outcome failed: status=%#v err=%v", state.MachineStatuses[issueKey], err)
 	}
 	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 3, AppliedSequence: 2, Source: "orchestrator", SourceID: "proposal-9", SourceSequence: 3, Status: "clear", Reason: "monitoring: recovered"}
