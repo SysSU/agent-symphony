@@ -1595,7 +1595,7 @@ func TestQueuedReviewHandoffTransitionsAreDurableAndImmutable(t *testing.T) {
 		queued, acknowledged bool
 		state                string
 	}{{false, false, "completed"}, {true, false, "completed"}, {true, true, "running"}} {
-		if _, err := r.RecordReviewFindings(attempt, "abcdef1", findings, transition.queued, transition.acknowledged); err != nil {
+		if _, err := reviewFindingsFixture(t, r, attempt, "abcdef1", findings, transition.queued, transition.acknowledged); err != nil {
 			t.Fatal(err)
 		}
 		restarted := &Runtime{StateRoot: r.StateRoot}
@@ -1604,7 +1604,7 @@ func TestQueuedReviewHandoffTransitionsAreDurableAndImmutable(t *testing.T) {
 			t.Fatalf("transition %#v was not durable: %#v err=%v", transition, stored, err)
 		}
 	}
-	if _, err := r.RecordReviewFindings(attempt, "abcdef1", []string{"different"}, true, true); err == nil {
+	if _, err := reviewFindingsFixture(t, r, attempt, "abcdef1", []string{"different"}, true, true); err == nil {
 		t.Fatal("queued handoff was mutable")
 	}
 }
@@ -1617,7 +1617,7 @@ func TestReviewModeAndTargetAreDurableAndValidated(t *testing.T) {
 	}
 	target := attempt.BaseSHA + ".." + strings.Repeat("b", 40)
 	reviewer, _ := AttemptSessionName(SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
-	stored, err := r.RecordReview(attempt, "running", ReviewModeImplementation, target, attempt.BaseSHA, strings.Repeat("b", 40), "/review/snapshot", reviewer)
+	stored, err := reviewFixture(t, r, attempt, ReviewTransition{State: "running", Mode: ReviewModeImplementation, Target: target, Base: attempt.BaseSHA, Head: strings.Repeat("b", 40), Snapshot: "/review/snapshot", Session: reviewer})
 	if err != nil || stored.ReviewMode != ReviewModeImplementation || stored.ReviewTarget != target {
 		t.Fatalf("review metadata was not persisted: %#v err=%v", stored, err)
 	}
@@ -2131,27 +2131,28 @@ func TestGuardedObservationRejectsReplacementBetweenProbeAndRead(t *testing.T) {
 }
 
 func TestForgetRemovesOnlyCleanedAttemptRecord(t *testing.T) {
-	r, _, attempt, _ := testRuntime(t)
+	r, fake, attempt, _ := testRuntime(t)
 	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Forget(manifest); err == nil || !strings.Contains(err.Error(), "resource still exists") {
+	if err := forgetFixture(t, r, manifest); err == nil || !strings.Contains(err.Error(), "resources remain") {
 		t.Fatalf("forgot live resources: %v", err)
 	}
 	if err := os.RemoveAll(manifest.Worktree); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Forget(manifest); err != nil {
+	delete(fake.sessions, manifest.Session)
+	if err := forgetFixture(t, r, manifest); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Forget(manifest); err != nil {
+	if err := forgetFixture(t, r, manifest); err != nil {
 		t.Fatalf("idempotent forget after restart-style retry: %v", err)
 	}
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Forget(manifest); err == nil || !strings.Contains(err.Error(), "resource still exists") {
+	if err := forgetFixture(t, r, manifest); err == nil || !strings.Contains(err.Error(), "resources remain") {
 		t.Fatalf("missing record accepted a reappeared worker resource: %v", err)
 	}
 	if err := os.RemoveAll(manifest.Worktree); err != nil {
@@ -2848,6 +2849,82 @@ func cancelFixture(t *testing.T, r *Runtime, ctx context.Context, attempt Attemp
 		}
 	}
 	return result.Manifest, effectErr
+}
+
+func reviewFixture(t *testing.T, r *Runtime, attempt Attempt, review ReviewTransition) (Manifest, error) {
+	t.Helper()
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if manifest.Version != boundManifestVersion {
+		return r.RecordReview(attempt, review.State, review.Mode, review.Target, review.Base, review.Head, review.Snapshot, review.Session)
+	}
+	executor := EffectExecutor{Runtime: r}
+	request, err := executor.BindRequest(EffectRequest{Action: EffectReview, Attempt: attempt, Manifest: manifest, Review: review})
+	if err != nil {
+		return manifest, err
+	}
+	id, err := newLaunchToken()
+	if err != nil {
+		return manifest, err
+	}
+	request.Identity = EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: id}
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		return manifest, err
+	}
+	result, effectErr := executor.Execute(t.Context(), request)
+	if effectErr != nil {
+		return manifest, effectErr
+	}
+	return result.Manifest, r.writeManifest(attempt, result.Manifest)
+}
+
+func reviewFindingsFixture(t *testing.T, r *Runtime, attempt Attempt, head string, findings []string, queued, acknowledged bool) (Manifest, error) {
+	t.Helper()
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if manifest.Version != boundManifestVersion {
+		return r.RecordReviewFindings(attempt, head, findings, queued, acknowledged)
+	}
+	return reviewFixture(t, r, attempt, ReviewTransition{State: "findings-queued", Mode: manifest.ReviewMode, Target: manifest.ReviewTarget, Base: manifest.ReviewBase, Head: head, Snapshot: manifest.ReviewSnapshot, Session: manifest.ReviewSession, Findings: slices.Clone(findings), HandoffQueued: queued, HandoffAcknowledged: acknowledged})
+}
+
+func forgetFixture(t *testing.T, r *Runtime, manifest Manifest) error {
+	t.Helper()
+	if manifest.Version != boundManifestVersion {
+		return r.Forget(manifest)
+	}
+	executor := EffectExecutor{
+		Runtime: r,
+		Cleanup: func(ctx context.Context, request EffectRequest) error {
+			if err := r.VerifyResourcesGone(ctx, request.Manifest); err != nil {
+				return err
+			}
+			return r.ForgetCompatibility(request.Manifest)
+		},
+		VerifyCleanup: func(ctx context.Context, request EffectRequest) (bool, error) {
+			return r.VerifyResourcesGone(ctx, request.Manifest) == nil, nil
+		},
+	}
+	request, err := executor.BindRequest(EffectRequest{Action: EffectCleanup, Attempt: Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}, Manifest: manifest, Cleanup: EffectCleanupPolicy{Action: "abandon"}})
+	if err != nil {
+		return err
+	}
+	id, err := newLaunchToken()
+	if err != nil {
+		return err
+	}
+	request.Identity = EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: id}
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		return err
+	}
+	_, err = executor.Execute(t.Context(), request)
+	return err
 }
 
 func resumeHandoffFixture(t *testing.T, r *Runtime, ctx context.Context, attempt Attempt) (Manifest, error) {

@@ -595,6 +595,30 @@ func TestEffectExecutorRetainsAmbiguousStartUntilExactGateProof(t *testing.T) {
 	}
 }
 
+func TestInteractiveStartReusesSafeReservedResultAfterCandidateRotation(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	attempt.Interactive = true
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(7, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "3")
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultPath := ResultPath(prepared.Manifest.Worktree)
+	if err := os.WriteFile(resultPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "4")
+	started, err := executor.Execute(t.Context(), start)
+	if err != nil || started.Manifest.State != "running" {
+		t.Fatalf("rotated Start rejected safe reserved result: result=%#v err=%v", started, err)
+	}
+}
+
 func TestEffectExecuteUsesBoundRuntimeSnapshot(t *testing.T) {
 	t.Setenv("TEST_EFFECT_BOUND", "first")
 	r, _, attempt, _ := testRuntime(t)
@@ -693,7 +717,7 @@ func TestEffectVerificationRejectsChangedInputAndDoesNotInferFromLiveness(t *tes
 	}
 }
 
-func TestEffectVerificationReconstructsStopFromDurableReason(t *testing.T) {
+func TestEffectVerificationDoesNotReconstructLegacyStopFromMissingName(t *testing.T) {
 	r, _, attempt, _ := testRuntime(t)
 	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(3, 0))
 	if err != nil {
@@ -703,7 +727,7 @@ func TestEffectVerificationReconstructsStopFromDurableReason(t *testing.T) {
 	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
 	request := effectTestRequest(t, executor, EffectRequest{Action: EffectStop, Attempt: attempt, Manifest: manifest, Reason: "issue closed"}, "e")
 	verification, err := executor.VerifyPending(t.Context(), request)
-	if err != nil || verification.Disposition != EffectVerified || verification.Result == nil || verification.Result.Manifest.State != "cancelled" || verification.Result.Manifest.Diagnostic != "issue closed" {
+	if err != nil || verification.Disposition != EffectPending || verification.Result != nil {
 		t.Fatalf("verification=%#v err=%v", verification, err)
 	}
 }

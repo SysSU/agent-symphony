@@ -292,6 +292,21 @@ func (e EffectExecutor) VerifyPending(ctx context.Context, request EffectRequest
 			return EffectVerification{}, err
 		}
 		if !live {
+			if request.Manifest.Version != boundManifestVersion {
+				return EffectVerification{Disposition: EffectPending}, nil
+			}
+			binding, err := ReadImplementationBinding(request.Manifest)
+			if err != nil {
+				return EffectVerification{Disposition: EffectPending}, nil
+			}
+			absent, err := r.boundPaneAbsent(ctx, binding)
+			if err != nil || !absent {
+				return EffectVerification{Disposition: EffectPending}, nil
+			}
+			gone, err := ImplementationWorkerGone(request.Manifest, binding)
+			if err != nil || !gone {
+				return EffectVerification{Disposition: EffectPending}, nil
+			}
 			return verified(cancelledEffect(request.Manifest, request.Reason)), nil
 		}
 		return retry, nil
@@ -981,7 +996,7 @@ func (r *Runtime) startEffect(ctx context.Context, request EffectRequest, author
 	if manifest.Interactive {
 		result, err := os.OpenFile(ResultPath(manifest.Worktree), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
-			if !live || !errors.Is(err, os.ErrExist) {
+			if !errors.Is(err, os.ErrExist) {
 				return failedEffect(manifest, "prepare worker result", err)
 			}
 			info, statErr := os.Lstat(ResultPath(manifest.Worktree))
