@@ -331,9 +331,9 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 				t.Fatal(err)
 			}
 			binary := filepath.Join(binDir, "agent-symphony")
-			args := []string{"build", "-o", binary, "."}
+			args := []string{"build", "-tags", "agent_symphony_test", "-o", binary, "."}
 			if tracing {
-				args = []string{"build", "-race", "-o", binary, "."}
+				args = []string{"build", "-race", "-tags", "agent_symphony_test", "-o", binary, "."}
 			}
 			runExternal(t, source, "go", args...)
 			writeExecutable(t, filepath.Join(binDir, "gh"), `#!/bin/sh

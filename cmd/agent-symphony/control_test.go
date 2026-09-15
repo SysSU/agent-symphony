@@ -56,6 +56,7 @@ func TestControlServeHelper(t *testing.T) {
 	if json.Unmarshal([]byte(os.Getenv("AGENT_SYMPHONY_CONTROL_ARGS")), &args) != nil {
 		os.Exit(2)
 	}
+	testRuntimeStateRootAllowed = func(string) bool { return true }
 	os.Exit(run(args, io.Discard, io.Discard))
 }
 
@@ -152,7 +153,7 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 	runGit(t, root, "commit", "-m", "initial")
 	base := runGit(t, root, "rev-parse", "HEAD")
 	runGit(t, root, "update-ref", "refs/remotes/origin/main", base)
-	stateRoot := filepath.Join(root, "runtime")
+	stateRoot := filepath.Join(privateDiagnosticRoot(t), "runtime")
 	cleanupControlSocket(t, stateRoot)
 	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -225,8 +226,8 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 		"AGENT_SYMPHONY_CONTROL_ARGS="+string(encodedArgs),
 		"CODEX_HOME="+t.TempDir(),
 	)
-	var childOutput bytes.Buffer
-	command.Stdout, command.Stderr = &childOutput, &childOutput
+	childOutput := &synchronizedBuffer{}
+	command.Stdout, command.Stderr = childOutput, childOutput
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}

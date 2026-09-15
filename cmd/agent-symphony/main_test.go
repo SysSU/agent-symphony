@@ -1313,9 +1313,6 @@ func mustOutput(t *testing.T, cmd *exec.Cmd) []byte {
 }
 
 func TestProductionStateRootRejectsSharedTemporaryStorageWithoutCreatingIt(t *testing.T) {
-	previous := allowSharedTempRuntimeStateForTest
-	allowSharedTempRuntimeStateForTest = false
-	t.Cleanup(func() { allowSharedTempRuntimeStateForTest = previous })
 	for _, shared := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
 		if _, err := os.Stat(shared); err != nil {
 			continue
@@ -1334,9 +1331,6 @@ func TestProductionStateRootRejectsSharedTemporaryStorageWithoutCreatingIt(t *te
 }
 
 func TestServeRejectsSharedTemporaryStateBeforeNetworkOrFilesystemMutation(t *testing.T) {
-	previous := allowSharedTempRuntimeStateForTest
-	allowSharedTempRuntimeStateForTest = false
-	t.Cleanup(func() { allowSharedTempRuntimeStateForTest = previous })
 	repository := t.TempDir()
 	runGit(t, repository, "init")
 	configuration := config.Default("o/r")

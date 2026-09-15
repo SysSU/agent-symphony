@@ -375,10 +375,12 @@ func configureProjectRuntimeState(stateRoot string) error {
 	return nil
 }
 
-var allowSharedTempRuntimeStateForTest = strings.HasSuffix(os.Args[0], ".test")
+// testRuntimeStateRootAllowed is assigned only by test-only source. A shipped
+// binary cannot enable the shared-temporary-state seam through argv or env.
+var testRuntimeStateRootAllowed func(string) bool
 
 func validateProductionStateRoot(stateRoot string) error {
-	if allowSharedTempRuntimeStateForTest {
+	if testRuntimeStateRootAllowed != nil && testRuntimeStateRootAllowed(stateRoot) {
 		return nil
 	}
 	return validatePrivateStateRoot(stateRoot)

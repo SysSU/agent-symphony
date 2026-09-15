@@ -204,10 +204,10 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(binDir, "agent-symphony")
-	build := []string{"build", "-o", binary, "."}
+	build := []string{"build", "-tags", "agent_symphony_test", "-o", binary, "."}
 	raceMode := os.Getenv("AGENT_SYMPHONY_FULL_SYSTEM_RACE") == "1"
 	if raceMode {
-		build = []string{"build", "-race", "-o", binary, "."}
+		build = []string{"build", "-race", "-tags", "agent_symphony_test", "-o", binary, "."}
 	}
 	runExternal(t, source, "go", build...)
 	writeExecutable(t, filepath.Join(binDir, "gh"), `#!/bin/sh
