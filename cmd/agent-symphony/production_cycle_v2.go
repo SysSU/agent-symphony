@@ -555,13 +555,25 @@ func (p *productionReconciliation) resumePendingRuntime(ctx context.Context, bat
 		}
 		key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 		record, ok := snapshot.State.Attempts[key]
+		if action == agentruntime.EffectStart && ok && record.Manifest.Version != agentruntime.ManifestVersion2 {
+			const diagnostic = "legacy launch identity unproved; manual migration required"
+			if effect.Diagnostic != diagnostic {
+				if _, err := p.owner.diagnoseRuntimeEffect(ctx, diagnoseRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), Action: action, Diagnostic: diagnostic}); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		observation := snapshot.State.Observations[ownerIssueKey(effect.Repository, effect.Issue)]
 		issue, supplied := raw[ownerIssueKey(effect.Repository, effect.Issue)]
 		if !ok || record.Generation != effect.AttemptGeneration || !supplied || !currentReconciliationObservation(snapshot.State, ownerIssueKey(effect.Repository, effect.Issue), observation) || digestText(issue.Body) != observation.Fact.BodyDigest {
 			continue
 		}
 		manifest := cloneManifest(record.Manifest)
-		request := agentruntime.EffectRequest{Identity: effectRequestIdentity(effect), Action: action, Manifest: manifest, Eligible: true}
+		if p.effects.effectActive(manifest, effect.ID) {
+			continue
+		}
+		request := agentruntime.EffectRequest{Identity: effectRequestIdentity(effect), Action: action, Manifest: manifest, Eligible: true, CandidateLaunchToken: effect.CandidateLaunchToken, GateNonce: effect.StartGateNonce}
 		if action == agentruntime.EffectPrepare || action == agentruntime.EffectStart {
 			accepted := expandIssueFact(observation.Fact)
 			accepted.Body, accepted.Attempt, accepted.BaseSHA = issue.Body, manifest.Attempt, manifest.BaseSHA
@@ -580,6 +592,14 @@ func (p *productionReconciliation) resumePendingRuntime(ctx context.Context, bat
 		if digestErr != nil || digest != effect.RequestDigest {
 			_, err = p.owner.diagnoseRuntimeEffect(ctx, diagnoseRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: action, Diagnostic: "fresh input does not reproduce the durable request"})
 			if err != nil {
+				return err
+			}
+			continue
+		}
+		if action == agentruntime.EffectMonitor && manifest.Version != agentruntime.ManifestVersion2 {
+			// A legacy session has no durable pane identity. Retire an old
+			// pending monitor without inferring process state or redispatching it.
+			if _, err := p.owner.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: action, Manifest: manifest}); err != nil {
 				return err
 			}
 			continue
@@ -608,8 +628,42 @@ func (p *productionReconciliation) resumePendingRuntime(ctx context.Context, bat
 			}); err != nil {
 				return err
 			}
+		case agentruntime.EffectRotate:
+			if action == agentruntime.EffectStart && effect.StartMayRun {
+				// A permitted candidate may already have executed. Its missing
+				// session is not proof of death, so never rotate or redispatch it.
+				if effect.Diagnostic != "" {
+					continue
+				}
+				if _, err := p.owner.diagnoseRuntimeEffect(ctx, diagnoseRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: action, Diagnostic: "pending Start launch identity or worker absence is unproved"}); err != nil {
+					return err
+				}
+				continue
+			}
+			if action != agentruntime.EffectStart || bound.GateNonce == "" {
+				return errStateConflict
+			}
+			_, rotated, err := p.owner.rotateStartGate(ctx, rotateStartGateCommand{Identity: ownerEffectIdentity(bound.Identity), OldNonce: bound.GateNonce})
+			if err != nil {
+				return err
+			}
+			bound.GateNonce = rotated.StartGateNonce
+			if err := p.effects.dispatch(bound, func() {
+				if p.wake != nil {
+					_ = p.wake()
+				}
+			}); err != nil {
+				return err
+			}
 		case agentruntime.EffectPending:
-			_, err = p.owner.diagnoseRuntimeEffect(ctx, diagnoseRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: action, Diagnostic: "external completion remains ambiguous"})
+			if effect.Diagnostic != "" {
+				continue
+			}
+			diagnostic := "external completion remains ambiguous"
+			if action == agentruntime.EffectStart {
+				diagnostic = "pending Start launch identity or worker absence is unproved"
+			}
+			_, err = p.owner.diagnoseRuntimeEffect(ctx, diagnoseRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: action, Diagnostic: diagnostic})
 			if err != nil {
 				return err
 			}
@@ -976,6 +1030,10 @@ func planRuntimeLifecycle(snapshot stateOwnerSnapshot, batch reconciliationV2Bat
 		attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
 		switch manifest.State {
 		case "preparing":
+			if manifest.Version != agentruntime.ManifestVersion2 {
+				// A historical pending Start cannot be relaunched by session name.
+				continue
+			}
 			remote, bound := observedReconciliationAttempt(observation, manifest.Attempt)
 			if !bound || remote.BaseSHA != manifest.BaseSHA || remote.State != "active" && remote.State != "review-ready" {
 				continue
@@ -988,6 +1046,11 @@ func planRuntimeLifecycle(snapshot stateOwnerSnapshot, batch reconciliationV2Bat
 			}
 			plans = append(plans, runtimeLifecyclePlan{Snapshot: snapshot, Request: agentruntime.EffectRequest{Action: agentruntime.EffectStart, Attempt: attempt, Manifest: manifest, Eligible: true}})
 		case "running":
+			if manifest.Version != agentruntime.ManifestVersion2 {
+				// Name alone cannot identify a legacy process. Leave its
+				// process state unknown, without a recurring monitor wake.
+				continue
+			}
 			plans = append(plans, runtimeLifecyclePlan{Snapshot: snapshot, Request: agentruntime.EffectRequest{Action: agentruntime.EffectMonitor, Attempt: attempt, Manifest: manifest, Eligible: true}})
 		}
 	}
