@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"debug/elf"
+	"debug/macho"
+	"debug/pe"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -167,6 +170,9 @@ func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Comman
 		if err != nil || statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 || !safeExecutableOwner(info) {
 			return "", errors.New("codex worker executable is unsafe")
 		}
+		if err := validateNativeExecutable(path); err != nil {
+			return "", err
+		}
 		if source != "" && source != path {
 			return "", errors.New("implementation and reviewer must use the same Codex executable")
 		}
@@ -219,6 +225,9 @@ func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Comman
 		if err := validatePinnedTree(ctx, target, treeDigest, single); err != nil {
 			return "", err
 		}
+		if err := validateNativeExecutable(filepath.Join(target, relative)); err != nil {
+			return "", err
+		}
 		if err := publishPinnedMarker(pinRoot, marker, treeDigest); err != nil {
 			return "", err
 		}
@@ -229,6 +238,9 @@ func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Comman
 		return "", err
 	}
 	pinned := filepath.Join(target, relative)
+	if err := validateNativeExecutable(pinned); err != nil {
+		return "", err
+	}
 	commands.Implementation[0], commands.Reviewer[0] = pinned, pinned
 	digest, err := BindWorkerExecutable(ctx, commands)
 	if err != nil {
@@ -338,6 +350,30 @@ func resolveNativeCodex(path string) (string, error) {
 		return "", errors.New("codex npm wrapper has no exact native worker executable")
 	}
 	return filepath.EvalSymlinks(matches[0])
+}
+
+func validateNativeExecutable(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	switch runtime.GOOS {
+	case "linux":
+		_, err = elf.NewFile(file)
+	case "darwin":
+		if _, err = macho.NewFile(file); err != nil {
+			_, err = macho.NewFatFile(file)
+		}
+	case "windows":
+		_, err = pe.NewFile(file)
+	default:
+		err = fmt.Errorf("unsupported platform %s", runtime.GOOS)
+	}
+	if err != nil {
+		return fmt.Errorf("codex worker executable is not a native %s executable: %w", runtime.GOOS, err)
+	}
+	return nil
 }
 
 func copyPinnedTree(ctx context.Context, root, executable, destination string) (string, string, error) {
