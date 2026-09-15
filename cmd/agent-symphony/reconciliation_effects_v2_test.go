@@ -331,6 +331,28 @@ func TestDestructiveInvalidationDurablySupersedesPendingControlSnapshot(t *testi
 	}
 }
 
+func TestControlSnapshotRepairDoesNotWaitForUnrelatedAmbiguousGitHubEffect(t *testing.T) {
+	state := newRuntimeOwnerState("o/r")
+	key := ownerIssueKey("o/r", 330)
+	body := internalgithub.SnapshotComment(internalgithub.Snapshot{Version: 2, OwnerGeneration: 2})
+	state.ControlGenerations[key] = 2
+	state.ControlRepairs[key] = controlSnapshotRepair{Generation: 2, Body: body}
+	publish := reconciliationEffectRequest{Action: reconciliationGitHubPublish, Repository: "o/r", Issue: 330, Attempt: 1, GitHubPublish: &githubPublishEffectRequest{}}
+	state.Effects["ambiguous-publish"] = runtimeEffectIntent{Repository: "o/r", Issue: 330, Attempt: 1, State: "invalidated", Dispatched: true, Reconciliation: &publish}
+	repair := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 330, ControlGeneration: 2, ControlRepair: true, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueControlSnapshot, ControlSnapshotBody: body}}
+	result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueControlSnapshot, Observed: true}}
+
+	if err := applyReconciliationEffectOutcome(&state, repair, result); err != nil {
+		t.Fatalf("unrelated ambiguous publication blocked control repair: %v", err)
+	}
+	if _, ok := state.ControlRepairs[key]; ok {
+		t.Fatal("completed control repair was retained")
+	}
+	if effect := state.Effects["ambiguous-publish"]; effect.State != "invalidated" {
+		t.Fatalf("ambiguous publication was not retained: %#v", effect)
+	}
+}
+
 func TestDispatchedGitHubEffectSurvivesDestructiveInvalidationAndRestart(t *testing.T) {
 	request := reconciliationEffectCaseNamed(t, "github-bind").request
 	root, owner, snapshot := reconciliationEffectPersistentOwner(t, request)

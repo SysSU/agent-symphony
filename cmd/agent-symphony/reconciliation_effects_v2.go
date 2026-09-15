@@ -1456,7 +1456,7 @@ func applyReconciliationEffectOutcome(state *runtimeOwnerState, request reconcil
 				return errStaleStateResult
 			}
 			for _, effect := range state.Effects {
-				if effect.Repository == request.Repository && effect.Issue == request.Issue && effect.State == "invalidated" {
+				if invalidatedEffectBlocksControlRepair(effect, request.Repository, request.Issue) {
 					return errStateConflict
 				}
 			}
@@ -1544,6 +1544,11 @@ func applyReconciliationEffectOutcome(state *runtimeOwnerState, request reconcil
 		delete(state.Recoveries, key)
 	}
 	return nil
+}
+
+func invalidatedEffectBlocksControlRepair(effect runtimeEffectIntent, repository string, issue int) bool {
+	request := effect.Reconciliation
+	return effect.Repository == repository && effect.Issue == issue && effect.State == "invalidated" && request != nil && request.Action == reconciliationGitHubIssueUpdate && request.GitHubIssueUpdate != nil && request.GitHubIssueUpdate.Kind == githubIssueControlSnapshot
 }
 
 func validGitHubBind(request githubBindEffectRequest) bool {
