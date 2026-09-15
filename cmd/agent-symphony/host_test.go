@@ -2154,10 +2154,20 @@ func TestRootlessCodexConfinementFailsClosedWithoutSupportedSandbox(t *testing.T
 	}
 }
 
-func TestSandboxedWorkerExportCannotRunGitConfigWithOwnerAuthority(t *testing.T) {
+func testWorkerExecutable(t *testing.T) string {
+	t.Helper()
 	if _, err := exec.LookPath("codex"); err != nil {
 		t.Skip("codex CLI is unavailable")
 	}
+	commands := config.Default("o/r").Commands
+	if _, err := config.BindWorkerExecutable(t.Context(), &commands); err != nil {
+		t.Fatal(err)
+	}
+	return commands.Implementation[0]
+}
+
+func TestSandboxedWorkerExportCannotRunGitConfigWithOwnerAuthority(t *testing.T) {
+	codexExecutable := testWorkerExecutable(t)
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
@@ -2207,7 +2217,7 @@ func TestSandboxedWorkerExportCannotRunGitConfigWithOwnerAuthority(t *testing.T)
 	}
 	manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, Repository: "o/r", Issue: 329, Attempt: 1, Branch: runGit(t, workspace, "branch", "--show-current"), Worktree: workspace, BaseSHA: baseSHA, State: "completed", WorkerGeneration: 1, WorkerProfileDigest: config.WorkerProfileDigest()}
 	input, _ := json.Marshal(manifest)
-	command := exec.CommandContext(t.Context(), "codex", config.WorkerSandboxArgs(workspace, binary, "export-attempt", attemptRoot)...)
+	command := exec.CommandContext(t.Context(), codexExecutable, config.WorkerSandboxArgsForExecutable(workspace, codexExecutable, binary, "export-attempt", attemptRoot)...)
 	command.Dir = workspace
 	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(workspace, ".agent-symphony")}
 	command.Stdin = bytes.NewReader(input)
@@ -2218,9 +2228,7 @@ func TestSandboxedWorkerExportCannotRunGitConfigWithOwnerAuthority(t *testing.T)
 }
 
 func TestDismissCommitsWhileConfinedDetachedChildLivesAndRejectsItsStaleResult(t *testing.T) {
-	if _, err := exec.LookPath("codex"); err != nil {
-		t.Skip("codex CLI is unavailable")
-	}
+	codexExecutable := testWorkerExecutable(t)
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
@@ -2288,8 +2296,8 @@ func TestDismissCommitsWhileConfinedDetachedChildLivesAndRejectsItsStaleResult(t
 	}
 	defer releaseFile.Close()
 	proof := filepath.Join(workspace, "proof")
-	args := config.WorkerSandboxArgs(workspace, binary, "sandbox-probe", proof, siblingCanary, stateCanary, authCanary, tcpListener.Addr().String(), unixPath, sharedTempPath, ready, release)
-	command := exec.CommandContext(t.Context(), "codex", args...)
+	args := config.WorkerSandboxArgsForExecutable(workspace, codexExecutable, binary, "sandbox-probe", proof, siblingCanary, stateCanary, authCanary, tcpListener.Addr().String(), unixPath, sharedTempPath, ready, release)
+	command := exec.CommandContext(t.Context(), codexExecutable, args...)
 	privateTemp := filepath.Join(workspace, ".agent-symphony", "tmp")
 	if err := os.Mkdir(privateTemp, 0o700); err != nil {
 		t.Fatal(err)

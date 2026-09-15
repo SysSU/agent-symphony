@@ -2603,6 +2603,103 @@ func TestOperatorCleanupExecutesExactArchiveAbandonAndRemovePolicies(t *testing.
 	}
 }
 
+func TestMachineStatusAdmissionRecollectsAfterDestructiveAction(t *testing.T) {
+	for _, action := range []string{"archive", "abandon", "dismiss", "remove"} {
+		t.Run(action, func(t *testing.T) {
+			var owner *stateOwner
+			var manifest agentruntime.Manifest
+			if action == "dismiss" {
+				owner, manifest = operatorTestOwner(t, 410, "completed", true)
+			} else {
+				owner, manifest = operatorCleanupRestartOwner(t, 410, action)
+			}
+			service := operatorTestMutationService(t, owner)
+			cleanup := service.cleanup
+			cleanup.implementation = &operatorBoundaryRecorder{}
+			service.cleanup = cleanup
+			service.effects.executor.Cleanup, service.effects.executor.VerifyCleanup = cleanup.execute, cleanup.verify
+			service.issueClosed = func(context.Context, string, int) (bool, error) { return true, nil }
+			snapshot := mustOwnerSnapshot(t, owner)
+			issueKey := ownerIssueKey(manifest.Repository, manifest.Issue)
+			attemptKey := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+			var err error
+			snapshot, err = owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{
+				Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt,
+				ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey],
+				ExpectedStatusSequence: snapshot.State.MachineStatuses[issueKey].Sequence, ExpectedCausalityToken: ownerAttemptCausalityToken(snapshot.State, manifest.Repository, manifest.Issue, manifest.Attempt),
+				Source: "orchestrator", SourceID: "stale-after-" + action, Status: "needs-attention", Reason: "monitoring: stale plan",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			plans, err := planMachineStatusUpdates(snapshot, service.collector.Config)
+			if err != nil || len(plans) != 1 {
+				t.Fatalf("plans=%#v err=%v", plans, err)
+			}
+			result := service.performSynchronously(t.Context(), operatorRequest("stale-status-"+action, action, manifest, action != "dismiss"))
+			if !result.OK || result.Status != http.StatusOK {
+				t.Fatalf("destructive result=%#v", result)
+			}
+			githubCalls := 0
+			api := internalgithub.API{HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				githubCalls++
+				return nil, errors.New("stale admission reached GitHub")
+			})}}
+			production := productionReconciliation{effects: service.effects}
+			changed, phaseErr := production.runMachineStatusPlan(t.Context(), api, plans[0])
+			if changed || !errors.Is(phaseErr, errStaleStateResult) || githubCalls != 0 {
+				t.Fatalf("stale admission changed=%t calls=%d err=%v", changed, githubCalls, phaseErr)
+			}
+			if err := reconciliationCycleDisposition(fmt.Errorf("run machine-status phase: %w", phaseErr), nil); !errors.Is(err, errReconciliationRecollect) {
+				t.Fatalf("stale admission disposition=%v", err)
+			}
+			current := mustOwnerSnapshot(t, owner).State
+			if status := current.MachineStatuses[issueKey]; status.Status != "clear" || status.Sequence <= plans[0].Request.GitHubIssueUpdate.StatusSequence {
+				t.Fatalf("stale plan replaced destructive status: %#v", status)
+			}
+			freshPlans, err := planMachineStatusUpdates(stateOwnerSnapshot{State: current}, service.collector.Config)
+			if err != nil || len(freshPlans) != 1 || freshPlans[0].Request.GitHubIssueUpdate.Status != "clear" || freshPlans[0].Request.GitHubIssueUpdate.StatusSequence <= plans[0].Request.GitHubIssueUpdate.StatusSequence {
+				t.Fatalf("fresh plans=%#v err=%v", freshPlans, err)
+			}
+			for _, effect := range current.Effects {
+				if effect.State == "pending" && effect.Reconciliation != nil && effect.Reconciliation.ExecutionDigest == plans[0].Request.ExecutionDigest {
+					t.Fatalf("stale machine-status effect was persisted: %#v", effect)
+				}
+			}
+		})
+	}
+}
+
+func TestReconciliationCycleErrorDisposition(t *testing.T) {
+	conflict := fmt.Errorf("admission: %w", errStateConflict)
+	arbitrary := errors.New("GitHub unavailable")
+	canceled := context.Canceled
+	persistence := errors.New("persist cycle outcome")
+	for _, test := range []struct {
+		name                 string
+		phaseErr, outcomeErr error
+		want                 error
+	}{
+		{name: "success"},
+		{name: "machine-status stale", phaseErr: fmt.Errorf("run machine-status phase: %w", errStaleStateResult), want: errReconciliationRecollect},
+		{name: "issue-scoped stale", phaseErr: fmt.Errorf("run issue-update phase: %w", errStaleStateResult), want: errReconciliationRecollect},
+		{name: "attempt-scoped stale", phaseErr: fmt.Errorf("run monitor phase: %w", errStaleStateResult), want: errReconciliationRecollect},
+		{name: "recollect", phaseErr: errReconciliationRecollect, want: errReconciliationRecollect},
+		{name: "conflict", phaseErr: conflict, want: conflict},
+		{name: "arbitrary", phaseErr: arbitrary, want: arbitrary},
+		{name: "canceled", phaseErr: canceled, want: canceled},
+		{name: "persistence beats recollect", phaseErr: errReconciliationRecollect, outcomeErr: persistence, want: persistence},
+		{name: "conflict beats stale", phaseErr: errStaleStateResult, outcomeErr: conflict, want: conflict},
+		{name: "cancellation beats stale", phaseErr: errStaleStateResult, outcomeErr: canceled, want: canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := reconciliationCycleDisposition(test.phaseErr, test.outcomeErr); got != test.want {
+				t.Fatalf("disposition=%v want=%v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestOperatorCleanupVerifyRequiresExactReviewerProofAndResourcesGone(t *testing.T) {
 	for _, test := range []struct {
 		name         string

@@ -1282,7 +1282,7 @@ func main() {
 
 func removeFullSystemFixtureRoot(root string) error {
 	base := filepath.Base(root)
-	if !strings.HasPrefix(base, ".as-lifecycle-") && !strings.HasPrefix(base, ".agent-symphony-full-system-") && !strings.HasPrefix(base, ".agent-symphony-orchestrator-e2e-") && !strings.HasPrefix(base, ".agent-symphony-historical-actions-") {
+	if !strings.HasPrefix(base, ".as-test-") && !strings.HasPrefix(base, ".as-lifecycle-") && !strings.HasPrefix(base, ".agent-symphony-full-system-") && !strings.HasPrefix(base, ".agent-symphony-orchestrator-e2e-") && !strings.HasPrefix(base, ".agent-symphony-historical-actions-") {
 		return fmt.Errorf("refusing to remove unexpected fixture root %q", root)
 	}
 	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {

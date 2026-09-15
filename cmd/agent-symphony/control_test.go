@@ -32,7 +32,20 @@ func cleanupControlSocket(t *testing.T, root string) {
 
 func resolvedTempDir(t *testing.T) string {
 	t.Helper()
-	root, err := filepath.EvalSymlinks(t.TempDir())
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(home, ".as-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := removeFullSystemFixtureRoot(root); err != nil {
+			t.Errorf("remove private test root: %v", err)
+		}
+	})
+	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,9 +244,20 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 	}
 	args := []string{"serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", dashboardAddress, "--interval", "200ms"}
 	encodedArgs, _ := json.Marshal(args)
+	binDir := t.TempDir()
+	buildNativeCodexFixture(t, filepath.Join(binDir, "codex"), `#!/bin/sh
+if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
+if [ "$1" = sandbox ]; then
+  while [ "$1" != -- ]; do shift; done
+  shift
+  if [ "$2" = sandbox-probe ]; then printf '%s\n' '{"confined":true,"shared_temp_read":true,"shared_temp_write":true}' > "$3"; exit 0; fi
+fi
+exit 0
+`)
 	command := exec.Command(os.Args[0], "-test.run=^TestControlServeHelper$")
 	command.Dir = root
 	command.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"AGENT_SYMPHONY_CONTROL_SERVE_HELPER=1",
 		"AGENT_SYMPHONY_CONTROL_GITHUB_URL="+github.URL,
 		"AGENT_SYMPHONY_CONTROL_ARGS="+string(encodedArgs),
