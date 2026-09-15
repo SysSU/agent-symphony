@@ -16,6 +16,35 @@ import (
 	"time"
 )
 
+func TestFileRecoveryDurablyRecordsGovernancePhases(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery.json")
+	recovery := &FileRecovery{Path: path}
+	head := strings.Repeat("a", 40)
+	state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: head, Facts: PRFacts{HeadSHA: head}}
+	if err := recovery.write([]PRState{state}); err != nil {
+		t.Fatal(err)
+	}
+	phase, err := NewGovernancePhase(state, "merge", "squash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.AdmitGovernancePhase(t.Context(), phase); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := recovery.read()
+	if err != nil || len(loaded) != 1 || len(loaded[0].GovernancePhases) != 1 || loaded[0].GovernancePhases[0].State != "admitted" {
+		t.Fatalf("admitted phase was not durable: states=%#v err=%v", loaded, err)
+	}
+	restarted := &FileRecovery{Path: path}
+	if err := restarted.CompleteGovernancePhase(t.Context(), phase); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = restarted.read()
+	if err != nil || loaded[0].GovernancePhases[0].State != "completed" {
+		t.Fatalf("completed phase was not durable across restart: states=%#v err=%v", loaded, err)
+	}
+}
+
 func TestFileRecoveryDurablyClaimsAndCompletesRuntimeHandoffs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "recovery.json")
 	recovery := &FileRecovery{Path: path}

@@ -65,6 +65,56 @@ func TestGovernanceMergeObservationRequiresExactIdentityAndHead(t *testing.T) {
 	}
 }
 
+func TestInvalidatedAdmittedMergeStaysUnresolvedAfterUnmergedRead(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "github-pr-governance").request
+	_, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	request = bindEffectObservation(snapshot, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := ownerAttemptRecovery{owner: owner, identity: ownerReconciliationEffectIdentity(*effect)}
+	state, err := recovery.PullRequestState(t.Context(), request.Repository, request.GitHubPRGovernance.PR, request.Issue, request.Attempt, request.GitHubPRGovernance.HeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Facts.HeadSHA = state.HeadSHA
+	phase, err := internalgithub.NewGovernancePhase(state, "merge", "squash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.AdmitGovernancePhase(t.Context(), phase); err != nil {
+		t.Fatal(err)
+	}
+	current := mustOwnerSnapshot(t, owner)
+	manifest := *request.Manifest
+	if _, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{
+		Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt,
+		ExpectedIssueGeneration:   current.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)],
+		ExpectedAttemptGeneration: current.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)],
+		Action:                    "dismissed", CleanupPhase: "completed", Manifest: &manifest,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet || r.URL.Path != fmt.Sprintf("/repos/o/r/pulls/%d/merge", request.GitHubPRGovernance.PR) {
+			return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+		return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+	})}}
+	production := &productionReconciliation{owner: owner, effects: &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}, collector: reconciliationV2Collector{Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}}}
+	invalidated := mustOwnerSnapshot(t, owner).State.Effects[effect.ID]
+	changed, err := production.resolveOneInvalidatedGitHubEffect(t.Context(), api, invalidated)
+	if err != nil || changed {
+		t.Fatalf("single unmerged read resolved response-lost merge: changed=%v err=%v", changed, err)
+	}
+	final := mustOwnerSnapshot(t, owner).State
+	if final.Effects[effect.ID].State != "invalidated" || len(final.Tombstones[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)].ExternalOutcomes) != 0 {
+		t.Fatalf("response-lost merge was not retained for convergence: effect=%#v tombstone=%#v", final.Effects[effect.ID], final.Tombstones[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)])
+	}
+}
+
 func restartOwnerWithInput(t *testing.T, owner *stateOwner, input reconciliationInput) *stateOwner {
 	t.Helper()
 	before := mustOwnerSnapshot(t, owner)

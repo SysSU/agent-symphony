@@ -471,8 +471,14 @@ func (p *productionReconciliation) resolveOneInvalidatedGitHubEffect(ctx context
 		mergeAdmitted := len(effect.GovernancePhases) == 0 || slices.ContainsFunc(effect.GovernancePhases, func(phase internalgithub.GovernancePhase) bool { return phase.Kind == "merge" })
 		if mergeAdmitted {
 			outcome.Merged, err = api.PullRequestMerged(run.ctx, request.Repository, request.GitHubPRGovernance.PR)
+			if err == nil && !outcome.Merged {
+				// A 404 is only a point-in-time observation. An already accepted
+				// exact-head merge can become visible later, so it cannot certify
+				// that the invalidated effect was superseded.
+				return false, nil
+			}
 		}
-		if err == nil && outcome.Merged {
+		if err == nil && mergeAdmitted {
 			var facts []internalgithub.RecoveryAttemptFact
 			facts, err = internalgithub.FetchAttemptFacts(run.ctx, api, request.Repository, request.GitHubPRGovernance.Policy.ActorID)
 			outcome.Observed = exactGovernanceMergeObserved(request, facts)

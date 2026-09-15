@@ -79,6 +79,7 @@ type PRState struct {
 	ConfirmedDispositions                                                                    []Feedback           `json:"-"`
 	HandoffReceipts                                                                          map[string]bool      `json:"handoff_receipts,omitempty"`
 	PreparedPublication                                                                      *PreparedPublication `json:"prepared_publication,omitempty"`
+	GovernancePhases                                                                         []GovernancePhase    `json:"governance_phases,omitempty"`
 }
 
 type Decision struct {
@@ -173,8 +174,8 @@ func (p GovernancePhase) Valid() bool {
 }
 
 func (c PRCoordinator) governanceMutation(ctx context.Context, state PRState, kind, payload string, mutate func() error) error {
-	if c.Phases == nil { // Offline/legacy reconciler compatibility; RunPRGovernance always supplies the owner recorder.
-		return mutate()
+	if c.Phases == nil {
+		return errors.New("pull request governance mutation requires durable phase recording")
 	}
 	phase, err := NewGovernancePhase(state, kind, payload)
 	if err != nil {

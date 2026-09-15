@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -321,23 +322,71 @@ func (s *prSignalsStub) DelegateFeedback(context.Context, PRState, Feedback) err
 type phaseRecorderStub struct {
 	admitted, completed atomic.Bool
 	admission           chan struct{}
+	admissionOnce       sync.Once
+}
+
+type phaseRecorderBarrier struct {
+	mu            sync.Mutex
+	phases        map[string]string
+	mergeAdmitted chan struct{}
+}
+
+func (r *phaseRecorderBarrier) AdmitGovernancePhase(_ context.Context, phase GovernancePhase) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.phases == nil {
+		r.phases = map[string]string{}
+	}
+	r.phases[phase.Kind] = "admitted"
+	if phase.Kind == "merge" {
+		close(r.mergeAdmitted)
+	}
+	return nil
+}
+
+func (r *phaseRecorderBarrier) CompleteGovernancePhase(_ context.Context, phase GovernancePhase) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.phases[phase.Kind] = "completed"
+	return nil
+}
+
+func (r *phaseRecorderBarrier) state(kind string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.phases[kind]
 }
 
 func (r *phaseRecorderStub) AdmitGovernancePhase(_ context.Context, phase GovernancePhase) error {
-	if !phase.Valid() {
-		return errors.New("invalid phase")
-	}
 	r.admitted.Store(true)
-	close(r.admission)
+	if r.admission != nil {
+		r.admissionOnce.Do(func() { close(r.admission) })
+	}
 	return nil
 }
 
 func (r *phaseRecorderStub) CompleteGovernancePhase(_ context.Context, phase GovernancePhase) error {
-	if !r.admitted.Load() || !phase.Valid() {
+	if !r.admitted.Load() {
 		return errors.New("phase completed before admission")
 	}
 	r.completed.Store(true)
 	return nil
+}
+
+func TestPRCoordinatorRefusesMutationWithoutDurablePhaseRecorder(t *testing.T) {
+	facts := eligiblePR()
+	facts.AutonomousMerge = false
+	state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: "abcdef0", Facts: facts}
+	state.Facts.HeadSHA, state.Facts.ValidationSHA, state.Facts.DocumentationSHA = state.HeadSHA, state.HeadSHA, state.HeadSHA
+	mutated := false
+	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		mutated = true
+		return httpResponse(http.StatusCreated, `{}`, nil), nil
+	})}}
+	err := (PRCoordinator{API: api, Source: &prSourceStub{state: state}, Signals: &prSignalsStub{}}).Reconcile(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "durable phase recording") || mutated {
+		t.Fatalf("err=%v mutated=%v", err, mutated)
+	}
 }
 
 func TestPRGovernanceCommitsPhaseBeforeSlowGitHubMutation(t *testing.T) {
@@ -388,6 +437,36 @@ func TestPRGovernanceResponseLostLeavesPhaseAdmitted(t *testing.T) {
 	}
 }
 
+func TestPRGovernanceResponseLostMergePUTRemainsAdmitted(t *testing.T) {
+	facts := eligiblePR()
+	head := "abcdef0"
+	facts.HeadSHA, facts.ValidationSHA, facts.DocumentationSHA = head, head, head
+	state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: head, CheckHead: head, PolicyStatus: "success", MergeAttemptSHA: head, MergePhase: "prepared", Facts: facts}
+	recorder := &phaseRecorderBarrier{mergeAdmitted: make(chan struct{})}
+	putEntered, releasePUT := make(chan struct{}), make(chan struct{})
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/merge") {
+			close(putEntered)
+			<-releasePUT
+			return nil, errors.New("merge response lost")
+		}
+		return httpResponse(http.StatusCreated, `{}`, nil), nil
+	})}}
+	done := make(chan error, 1)
+	go func() {
+		done <- (PRCoordinator{API: api, Source: &prSourceStub{state: state}, Signals: &prSignalsStub{}, Phases: recorder, MergeMethod: "squash"}).Reconcile(t.Context())
+	}()
+	<-recorder.mergeAdmitted
+	<-putEntered
+	if got := recorder.state("merge"); got != "admitted" {
+		t.Fatalf("merge PUT started without durable admission: %q", got)
+	}
+	close(releasePUT)
+	if err := <-done; err == nil || recorder.state("merge") != "admitted" {
+		t.Fatalf("response-lost merge err=%v phase=%q", err, recorder.state("merge"))
+	}
+}
+
 func TestGovernanceResponseLostNeedsExactRemotePostcondition(t *testing.T) {
 	state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: "abcdef0", Facts: PRFacts{HeadSHA: "abcdef0"}}
 	body, _ := AttributedBody(state.Issue, state.Attempt, "durable decision")
@@ -426,7 +505,7 @@ func TestPRCoordinatorDoesNotMergeHeadChangedAfterPolicy(t *testing.T) {
 		paths = append(paths, r.URL.Path)
 		return httpResponse(http.StatusOK, `{}`, nil), nil
 	})}}
-	if err := (PRCoordinator{API: api, Source: source, Signals: signals, MergeMethod: "squash"}).Reconcile(context.Background()); err != nil {
+	if err := (PRCoordinator{API: api, Source: source, Signals: signals, Phases: &phaseRecorderStub{}, MergeMethod: "squash"}).Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(paths) != 1 || paths[0] != "/repos/o/r/statuses/abc" {
@@ -443,7 +522,7 @@ func TestPRCoordinatorHonorsRecoveredFeedbackClaim(t *testing.T) {
 	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return httpResponse(http.StatusCreated, `{}`, nil), nil
 	})}}
-	if err := (PRCoordinator{API: api, Source: source, Signals: signals}).Reconcile(context.Background()); err != nil {
+	if err := (PRCoordinator{API: api, Source: source, Signals: signals, Phases: &phaseRecorderStub{}}).Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if signals.feedback != 0 {
@@ -480,7 +559,7 @@ func TestPRCoordinatorCommentsOnUnresolvedPolicyOnce(t *testing.T) {
 			return nil, nil
 		}
 	})}}
-	coordinator := PRCoordinator{API: api, Source: &prSourceStub{state: state}, Signals: &prSignalsStub{}, ActorID: 42}
+	coordinator := PRCoordinator{API: api, Source: &prSourceStub{state: state}, Signals: &prSignalsStub{}, Phases: &phaseRecorderStub{}, ActorID: 42}
 	for range 2 {
 		if err := coordinator.Reconcile(t.Context()); err != nil {
 			t.Fatal(err)
@@ -504,7 +583,7 @@ func TestPRCoordinatorPublishesLocalDispositionButWaitsForGitHub(t *testing.T) {
 		bodies = append(bodies, string(body))
 		return httpResponse(http.StatusCreated, `{}`, nil), nil
 	})}}
-	if err := (PRCoordinator{API: api, Source: source, Signals: &prSignalsStub{}}).Reconcile(context.Background()); err != nil {
+	if err := (PRCoordinator{API: api, Source: source, Signals: &prSignalsStub{}, Phases: &phaseRecorderStub{}}).Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	want, _ := FeedbackDispositionBody(10, 2, feedback, "")
@@ -523,7 +602,7 @@ func TestProductionReconcilerRunsRecoveredIssuesThenPullRequests(t *testing.T) {
 		return httpResponse(http.StatusCreated, `{}`, nil), nil
 	})}}
 	issuesRead := false
-	coordinator := &PRCoordinator{API: api, Source: source, Signals: signals, ActorID: 42}
+	coordinator := &PRCoordinator{API: api, Source: source, Signals: signals, Phases: &phaseRecorderStub{}, ActorID: 42}
 	if err := (Reconciler{FullRead: func() error { issuesRead = true; return nil }, PullRequests: coordinator}).RunOnce(); err != nil {
 		t.Fatal(err)
 	}
@@ -558,7 +637,7 @@ func TestPRCoordinatorReconstructsLifecycleAndCreatesCheckForNewHead(t *testing.
 		}{r.Method, r.URL.Path, body})
 		return httpResponse(http.StatusCreated, `{}`, nil), nil
 	})}}
-	err := (PRCoordinator{API: api, Source: source, Signals: signals, ReviewLabel: "needs-human-review", MergeMethod: "squash"}).Reconcile(context.Background())
+	err := (PRCoordinator{API: api, Source: source, Signals: signals, Phases: &phaseRecorderStub{}, ReviewLabel: "needs-human-review", MergeMethod: "squash"}).Reconcile(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -645,7 +724,7 @@ func TestPRCoordinatorSerializesAttemptsForOneIssueAcrossMutation(t *testing.T) 
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- (PRCoordinator{API: api, Source: source, Signals: &prSignalsStub{}, Attempts: map[int]RecoveryAttemptFact{
+		done <- (PRCoordinator{API: api, Source: source, Signals: &prSignalsStub{}, Phases: &phaseRecorderStub{}, Attempts: map[int]RecoveryAttemptFact{
 			11: {Issue: 7, Attempt: 1, PR: 11},
 			12: {Issue: 7, Attempt: 2, PR: 12},
 		}, MergeMethod: "squash"}).Reconcile(ctx)
@@ -679,7 +758,7 @@ func TestPRCoordinatorIsolatesAndAggregatesPRErrors(t *testing.T) {
 	state := PRState{Repository: "o/r", Number: 2, Issue: 10, Attempt: 1, HeadSHA: "abc", Facts: facts}
 	source := &multiPRSource{prSourceStub: prSourceStub{state: state}}
 	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return httpResponse(http.StatusCreated, `{}`, nil), nil })}}
-	err := (PRCoordinator{API: api, Source: source, Signals: &prSignalsStub{}}).Reconcile(context.Background())
+	err := (PRCoordinator{API: api, Source: source, Signals: &prSignalsStub{}, Phases: &phaseRecorderStub{}}).Reconcile(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "pull request 1") || source.reads != 2 {
 		t.Fatalf("err=%v later reads=%d", err, source.reads)
 	}
@@ -739,7 +818,7 @@ func TestPRCoordinatorRecoveredDispatchedMergeUsesDedicatedStatus(t *testing.T) 
 				}
 				return httpResponse(http.StatusCreated, `{}`, nil), nil
 			})}}
-			err := (PRCoordinator{API: api, Source: &prSourceStub{state: state}, Signals: &prSignalsStub{}, MergeMethod: "squash"}).Reconcile(context.Background())
+			err := (PRCoordinator{API: api, Source: &prSourceStub{state: state}, Signals: &prSignalsStub{}, Phases: &phaseRecorderStub{}, MergeMethod: "squash"}).Reconcile(context.Background())
 			if (err != nil) != test.wantError || gets != 1 || puts != 0 || (comments == 1) != test.wantComment {
 				t.Fatalf("err=%v gets=%d puts=%d comments=%d", err, gets, puts, comments)
 			}
@@ -762,7 +841,7 @@ func TestPRCoordinatorRecoveredPreparedMergeDispatchesOnce(t *testing.T) {
 		}
 		return httpResponse(http.StatusCreated, `{}`, nil), nil
 	})}}
-	if err := (PRCoordinator{API: api, Source: source, Signals: &prSignalsStub{}, MergeMethod: "squash"}).Reconcile(context.Background()); err != nil {
+	if err := (PRCoordinator{API: api, Source: source, Signals: &prSignalsStub{}, Phases: &phaseRecorderStub{}, MergeMethod: "squash"}).Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if comments != 1 || merges != 1 {
@@ -795,7 +874,7 @@ func TestMergeSuppressionOnlyForAmbiguousOutcome(t *testing.T) {
 				}
 				return httpResponse(http.StatusCreated, `{}`, nil), nil
 			})}}
-			err := (PRCoordinator{API: api, Source: source, Signals: &prSignalsStub{}, MergeMethod: "squash"}).Reconcile(context.Background())
+			err := (PRCoordinator{API: api, Source: source, Signals: &prSignalsStub{}, Phases: &phaseRecorderStub{}, MergeMethod: "squash"}).Reconcile(context.Background())
 			if err == nil || comments != test.comments {
 				t.Fatalf("err=%v comments=%d", err, comments)
 			}

@@ -519,6 +519,7 @@ func advancePublicationHead(state *PRState, head string) {
 	state.Facts.BranchModifiedOutsideAttempt = false
 	state.PendingDispositions, state.ConfirmedDispositions = nil, nil
 	state.PreparedPublication = nil
+	state.GovernancePhases = nil
 }
 
 func recoveryWorkInFlight(state PRState) bool {
@@ -647,6 +648,65 @@ func (r *FileRecovery) QueueValidation(_ context.Context, state PRState) error {
 		return errors.New("recovered pull request attempt not found")
 	})
 }
+
+func (r *FileRecovery) AdmitGovernancePhase(_ context.Context, phase GovernancePhase) error {
+	if !phase.Valid() || phase.State != "" {
+		return errors.New("governance phase is invalid")
+	}
+	return r.update(func(states []PRState) error {
+		for i := range states {
+			state := &states[i]
+			if state.Repository != phase.Repository || state.Number != phase.PR || state.Issue != phase.Issue || state.Attempt != phase.Attempt || state.HeadSHA != phase.HeadSHA {
+				continue
+			}
+			for _, current := range state.GovernancePhases {
+				if current.ID != phase.ID {
+					continue
+				}
+				expected := phase
+				expected.State = current.State
+				if current == expected {
+					return nil
+				}
+				return errors.New("governance phase identity changed")
+			}
+			phase.State = "admitted"
+			state.GovernancePhases = append(state.GovernancePhases, phase)
+			return nil
+		}
+		return errors.New("recovered pull request attempt not found or head changed")
+	})
+}
+
+func (r *FileRecovery) CompleteGovernancePhase(_ context.Context, phase GovernancePhase) error {
+	if !phase.Valid() || phase.State != "" {
+		return errors.New("governance phase is invalid")
+	}
+	return r.update(func(states []PRState) error {
+		for i := range states {
+			state := &states[i]
+			if state.Repository != phase.Repository || state.Number != phase.PR || state.Issue != phase.Issue || state.Attempt != phase.Attempt || state.HeadSHA != phase.HeadSHA {
+				continue
+			}
+			for j, current := range state.GovernancePhases {
+				if current.ID != phase.ID {
+					continue
+				}
+				expected := phase
+				expected.State = current.State
+				if current != expected {
+					return errors.New("governance phase identity changed")
+				}
+				state.GovernancePhases[j].State = "completed"
+				return nil
+			}
+			return errors.New("governance phase was not admitted")
+		}
+		return errors.New("recovered pull request attempt not found or head changed")
+	})
+}
+
+var _ GovernancePhaseRecorder = (*FileRecovery)(nil)
 
 func sameAttempt(a, b PRState) bool {
 	return a.Repository == b.Repository && a.Number == b.Number && a.Issue == b.Issue && a.Attempt == b.Attempt
