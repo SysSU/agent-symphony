@@ -51,6 +51,8 @@ type synchronizedBuffer struct {
 	buffer bytes.Buffer
 }
 
+const fullSystemIssueBody = "## Context\nProtect the full operator journey.\n\n## Acceptance criteria\n- The change is visible.\n\n## Checklist\n- [ ] Implement and review.\n\n## Validation\nRun the deterministic full-system test.\n\n## Dependencies\n#72"
+
 func (b *synchronizedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -80,7 +82,7 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := "2026-09-09T12:00:00Z"
-	body := "## Context\nProtect the full operator journey.\n\n## Acceptance criteria\n- The change is visible.\n\n## Checklist\n- [ ] Implement and review.\n\n## Validation\nRun the deterministic full-system test.\n\n## Dependencies\n#72"
+	body := fullSystemIssueBody
 	labels := make([]map[string]string, 0, len(f.labels))
 	for label, present := range f.labels {
 		if present {
@@ -143,11 +145,33 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == "/repos/o/r/issues/73/comments":
 		writeFixtureJSON(w, f.comments)
 	case r.Method == http.MethodGet && path == "/repos/o/r/issues/73/timeline":
-		writeFixtureJSON(w, []any{
-			map[string]any{"id": 731, "event": "labeled", "label": map[string]string{"name": "agent-ready"}, "created_at": now, "actor": map[string]any{"id": 42}},
-			map[string]any{"id": 732, "event": "labeled", "label": map[string]string{"name": "priority:P1"}, "created_at": now, "actor": map[string]any{"id": 42}},
-			map[string]any{"id": 733, "event": "labeled", "label": map[string]string{"name": "autonomous-merge"}, "created_at": now, "actor": map[string]any{"id": 42}},
-		})
+		events := []any{}
+		for _, item := range []struct {
+			id    int
+			label string
+		}{{731, "agent-ready"}, {732, "priority:P1"}, {733, "autonomous-merge"}} {
+			id, label := item.id, item.label
+			if f.labels[label] {
+				events = append(events, map[string]any{"id": id, "event": "labeled", "label": map[string]string{"name": label}, "created_at": now, "actor": map[string]any{"id": 42}})
+			}
+		}
+		if f.closed {
+			events = append(events, map[string]any{"id": 734, "event": "closed", "created_at": now, "actor": map[string]any{"id": 42}})
+		}
+		writeFixtureJSON(w, events)
+	case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/o/r/issues/comments/"):
+		id, _ := strconv.ParseInt(strings.TrimPrefix(path, "/repos/o/r/issues/comments/"), 10, 64)
+		for _, comment := range f.comments {
+			if commentID, ok := comment["id"].(int64); ok && commentID == id {
+				writeFixtureJSON(w, comment)
+				return
+			}
+			if commentID, ok := comment["id"].(int); ok && int64(commentID) == id {
+				writeFixtureJSON(w, comment)
+				return
+			}
+		}
+		http.Error(w, `{"message":"comment not found"}`, http.StatusNotFound)
 	case r.Method == http.MethodGet && path == "/repos/o/r/pulls":
 		pulls := []any{}
 		for _, pull := range f.historicalPulls {
