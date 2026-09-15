@@ -1,11 +1,11 @@
 #!/bin/sh
-set -eu
+set -eux
 
 mode=${1:-}
 codex_native=${2:-}
 case "$codex_native" in
 /usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex) ;;
-*) exit 2 ;;
+*) echo "invalid native Codex path: $codex_native" >&2; exit 2 ;;
 esac
 test -f "$codex_native" && test ! -L "$codex_native" && test -x "$codex_native"
 export PATH="$(dirname "$codex_native"):/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
