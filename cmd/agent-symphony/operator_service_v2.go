@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -118,6 +119,9 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		if receipt.State == "pending" {
 			if synchronous {
 				if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+					if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
+						return s.currentReceiptResult(ctx, request)
+					}
 					return operatorResultForError(request, err)
 				}
 				return s.currentReceiptResult(ctx, request)
@@ -134,6 +138,9 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		if effect != nil && effect.State == "pending" {
 			if synchronous {
 				if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+					if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
+						return s.currentReceiptResult(ctx, request)
+					}
 					return operatorResultForError(request, err)
 				}
 				return s.currentReceiptResult(ctx, request)
@@ -143,6 +150,9 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		receipt, found := operatorReceiptByID(committed.State, request.RequestID)
 		if !found {
 			return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
+		}
+		if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup {
+			s.dispatchResume(request.RequestID)
 		}
 		return operatorResultForReceipt(committed, receipt)
 	}
@@ -201,6 +211,9 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		work.stopReviewerID = effect.SupersededReviewerID
 		if synchronous {
 			if err := s.executeOnce(work, ""); err != nil {
+				if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
+					return s.currentReceiptResult(ctx, request)
+				}
 				return operatorResultForError(request, err)
 			}
 			return s.currentReceiptResult(ctx, request)
@@ -210,6 +223,9 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 	receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
 	if !ok {
 		return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
+	}
+	if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup {
+		s.dispatchResume(request.RequestID)
 	}
 	return operatorResultForReceipt(committed, receipt)
 }
@@ -499,7 +515,14 @@ func (s *operatorMutationService) prepareRecoveryAdmission(snapshot stateOwnerSn
 }
 
 func (s *operatorMutationService) preparePlanReview(ctx context.Context, snapshot stateOwnerSnapshot, manifest agentruntime.Manifest) (reconciliationPlannedEffect, reviewerExecutionMaterial, error) {
-	if err := freshRuntime(s.effects.executor.Runtime, s.effects.executor.Runtime.Source).VerifyOwned(ctx, manifest); err != nil {
+	runtime := freshRuntime(s.effects.executor.Runtime, s.effects.executor.Runtime.Source)
+	var err error
+	if manifest.Version == agentruntime.ManifestVersion2 {
+		err = runtime.VerifyOwned(ctx, manifest)
+	} else {
+		err = runtime.VerifyWorkspace(ctx, manifest)
+	}
+	if err != nil {
 		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, err
 	}
 	observation := snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
@@ -632,6 +655,9 @@ func (s *operatorMutationService) execute(work operatorWork) error {
 
 func (s *operatorMutationService) executeReserved(work operatorWork, reserved string) error {
 	if work.runtime != nil {
+		if err := s.compensateWorkHandoff(s.lifecycle, *work.runtime); err != nil {
+			return err
+		}
 		if work.stopReviewerID != "" {
 			if err := s.stopBoundReviewer(s.lifecycle, *work.runtime, work.stopReviewerID); err != nil {
 				return err
@@ -819,6 +845,47 @@ func (s *operatorMutationService) scanPendingPlanReviewers(ctx context.Context, 
 		}
 		s.dispatchResume(receipt.Request.RequestID)
 	}
+}
+
+func (s *operatorMutationService) compensateHandoff(ctx context.Context, candidate handoffCandidateInvalidation, preserveOld bool) (handoffCompensationProof, error) {
+	if s.cleanup.implementation == nil {
+		return handoffCompensationProof{}, errors.New("implementation compensation boundary is unavailable")
+	}
+	request := handoffCompensationRequest{Candidate: candidate, PreserveOld: preserveOld}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return handoffCompensationProof{}, err
+	}
+	result, err := s.cleanup.implementation.call(ctx, "compensate-handoff", agentruntime.Command{Stdin: bytes.NewReader(body)})
+	if err != nil {
+		return handoffCompensationProof{}, err
+	}
+	old, err := agentruntime.ReadImplementationBinding(candidate.Manifest)
+	if err != nil {
+		return handoffCompensationProof{}, err
+	}
+	var proof handoffCompensationProof
+	if json.Unmarshal([]byte(result.Output), &proof) != nil || !validHandoffCompensationProof(proof, request, old) {
+		return handoffCompensationProof{}, errors.New("bound handoff compensation proof is invalid")
+	}
+	return proof, nil
+}
+
+func (s *operatorMutationService) compensateWorkHandoff(ctx context.Context, request agentruntime.EffectRequest) error {
+	snapshot, err := s.owner.snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	key := ownerAttemptKey(request.Manifest.Repository, request.Manifest.Issue, request.Manifest.Attempt)
+	if tombstone, ok := snapshot.State.Tombstones[key]; ok && tombstone.InvalidatedHandoff != nil {
+		_, err := s.compensateHandoff(ctx, *tombstone.InvalidatedHandoff, false)
+		return err
+	}
+	if effect, ok := snapshot.State.Effects[request.Identity.EffectID]; ok && effect.InvalidatedHandoff != nil {
+		_, err := s.compensateHandoff(ctx, *effect.InvalidatedHandoff, false)
+		return err
+	}
+	return nil
 }
 
 func (s *operatorMutationService) dispatchResume(requestID string) {
@@ -1080,6 +1147,23 @@ func (s *operatorMutationService) resumeReceiptReserved(ctx context.Context, req
 	if !ok || receipt.State == "completed" {
 		return nil
 	}
+	if receipt.Phase == operatorPhaseHandoffCleanup {
+		tombstone, ok := snapshot.State.Tombstones[ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)]
+		if !ok || tombstone.InvalidatedHandoff == nil || tombstone.Action != "dismissed" {
+			return errStateConflict
+		}
+		proof, err := s.compensateHandoff(ctx, *tombstone.InvalidatedHandoff, true)
+		if err != nil {
+			return errors.Join(err, s.recordAwaitingDiagnostic(receipt, err))
+		}
+		_, err = s.owner.completeHandoffCompensation(ctx, completeHandoffCompensationCommand{RequestID: requestID, Proof: proof})
+		return err
+	}
+	if receipt.Phase == operatorPhaseStartCleanup {
+		// The invalidated Start still has a physical candidate obligation.
+		// Do not claim cleanup from a tmux name or a process-group guess.
+		return nil
+	}
 	if receipt.Phase == operatorPhaseTerminalAwait || receipt.Phase == operatorPhaseRetryAwait {
 		kind := githubIssueTerminalFailure
 		if receipt.Phase == operatorPhaseRetryAwait {
@@ -1195,7 +1279,11 @@ func (s *operatorMutationService) validatePendingPlanReviewMarker(ctx context.Co
 }
 
 func (s *operatorMutationService) recordAwaitingDiagnostic(receipt controlReceipt, cause error) error {
-	diagnostic := strings.ToValidUTF8("recovery admission remains pending: "+internalgithub.Redact(cause.Error()), "?")
+	prefix := "recovery admission remains pending: "
+	if receipt.Phase == operatorPhaseHandoffCleanup {
+		prefix = "handoff compensation remains pending: "
+	}
+	diagnostic := strings.ToValidUTF8(prefix+internalgithub.Redact(cause.Error()), "?")
 	if len(diagnostic) > maxReconciliationStringBytes {
 		diagnostic = diagnostic[:maxReconciliationStringBytes]
 	}
@@ -1546,6 +1634,13 @@ func (s *operatorMutationService) resumePending(ctx context.Context) error {
 				continue
 			}
 			s.dispatchResume(requestID)
+			continue
+		}
+		if receipt.Phase == operatorPhaseHandoffCleanup {
+			s.dispatchResume(requestID)
+			continue
+		}
+		if receipt.Phase == operatorPhaseStartCleanup {
 			continue
 		}
 		effect, ok := snapshot.State.Effects[receipt.EffectID]

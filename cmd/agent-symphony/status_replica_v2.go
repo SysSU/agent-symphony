@@ -180,6 +180,18 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 			status.Retryable = false
 			status.Action = "inspect inconsistent completed local attempt before recovery"
 		}
+		for id, effect := range snapshot.State.Effects {
+			if id == effect.ID && effect.State == "pending" && effect.Action == string(agentruntime.EffectStart) && effect.Repository == status.Repository && effect.Issue == status.Issue && effect.Attempt == status.Attempt && effect.IssueGeneration == snapshot.State.IssueGenerations[issueKey] && effect.AttemptGeneration == snapshot.State.AttemptGenerations[key] && owned && record.Generation == effect.AttemptGeneration && (effect.Diagnostic == "legacy launch identity unproved; manual migration required" || effect.Diagnostic == "pending Start launch identity or worker absence is unproved") {
+				status.Diagnostic = effect.Diagnostic
+				if effect.Diagnostic == "legacy launch identity unproved; manual migration required" {
+					status.Action = "manually migrate the legacy implementation launch identity"
+				} else {
+					status.Action = "inspect the unproved implementation launch before retry"
+				}
+				status.NeedsAttention = true
+				break
+			}
+		}
 		if attemptHasUnprovedReviewer(snapshot.State, status.Repository, status.Issue, status.Attempt) {
 			status.NeedsAttention = true
 			status.DispatchAuthorized = false
@@ -212,6 +224,23 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 	// projection. Keep its unresolved physical safety lease visible anyway.
 	for _, tombstone := range snapshot.State.Tombstones {
 		diagnostic := legacyReviewerDiagnostic(snapshot.State, tombstone.Repository, tombstone.Issue, tombstone.Attempt)
+		if tombstone.ReviewerLeaseID != "" || attemptHasUnprovedReviewer(snapshot.State, tombstone.Repository, tombstone.Issue, tombstone.Attempt) {
+			if diagnostic == "" {
+				diagnostic = "reviewer descendant absence is unproved; physical cleanup remains pending"
+			}
+		}
+		if tombstone.InvalidatedStart != nil {
+			if diagnostic != "" {
+				diagnostic += "; "
+			}
+			diagnostic += "implementation start candidate absence is unproved; physical cleanup remains pending"
+		}
+		if tombstone.InvalidatedHandoff != nil && !tombstone.HandoffCompensated {
+			if diagnostic != "" {
+				diagnostic += "; "
+			}
+			diagnostic += "implementation handoff compensation remains pending"
+		}
 		if diagnostic == "" {
 			continue
 		}
@@ -221,6 +250,7 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 				statuses[index].NeedsAttention = true
 				statuses[index].OperatorBlocked = true
 				statuses[index].DispatchAuthorized = false
+				statuses[index].CurrentPhase = "physical-unverified"
 				statuses[index].Diagnostic = diagnostic
 				found = true
 			}

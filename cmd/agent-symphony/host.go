@@ -1061,6 +1061,21 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return errors.New("review boundary cannot accept implementation handoffs")
 		}
 		result.Output, err = acceptHandoff(ctx, request.Command.Input, root)
+	case "prepare-handoff":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot prepare implementation handoffs")
+		}
+		result.Output, err = prepareHandoffV2(ctx, request.Command.Input, root)
+	case "release-handoff":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot release implementation handoffs")
+		}
+		result.Output, err = releaseHandoffV2(ctx, request.Command.Input, root)
+	case "compensate-handoff":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot compensate implementation handoffs")
+		}
+		result.Output, err = compensateHandoffV2(ctx, request.Command.Input, root)
 	case "verify-handoff":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot verify implementation handoffs")
@@ -1129,7 +1144,7 @@ func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.M
 	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
 	want, err := agentruntime.AttemptIdentity(root, attempt)
 	validState := manifest.State == "preparing" || manifest.State == "running" || manifest.State == "completed" || manifest.State == "failed" || manifest.State == "cancelled"
-	if err != nil || manifest.Version != want.Version || !validState || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session ||
+	if err != nil || !agentruntime.ValidManifestVersion(manifest) || !validState || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session ||
 		(completed && (manifest.State != "completed" || !preflightObjectID.MatchString(manifest.ReviewHead))) ||
 		(publishedHead != "" && !preflightObjectID.MatchString(publishedHead)) {
 		return errors.New("invalid attempt manifest")
@@ -1187,7 +1202,7 @@ func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.M
 	if !remove {
 		return nil
 	}
-	if err := stopAttemptSession(ctx, want.Session); err != nil {
+	if err := stopAttemptSession(ctx, manifest); err != nil {
 		return err
 	}
 	if worktreeErr == nil {
@@ -1203,7 +1218,15 @@ func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.M
 	return nil
 }
 
-func stopAttemptSession(ctx context.Context, session string) error {
+func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) error {
+	if manifest.Version != agentruntime.ManifestVersion2 {
+		return errors.New("legacy implementation session has no durable launch identity")
+	}
+	binding, err := agentruntime.ReadImplementationBinding(manifest)
+	if err != nil {
+		return err
+	}
+	session := manifest.Session
 	probe := func() (bool, error) {
 		result, err := runHostTmux(ctx, []string{"has-session", "-t", "=" + session}, nil)
 		if err == nil {
@@ -1215,22 +1238,63 @@ func stopAttemptSession(ctx context.Context, session string) error {
 		return false, err
 	}
 	live, err := probe()
-	if err != nil || !live {
-		return err
-	}
-	if _, err := runHostTmux(ctx, []string{"kill-session", "-t", "=" + session}, nil); err != nil {
-		if live, probeErr := probe(); probeErr != nil || live {
-			return errors.Join(err, probeErr)
-		}
-	}
-	live, err = probe()
 	if err != nil {
 		return err
 	}
-	if live {
-		return errors.New("tmux session remained after cleanup")
+	if !live {
+		absent, probeErr := hostBoundImplementationPaneAbsent(ctx, binding)
+		if probeErr == nil && absent {
+			gone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding)
+			if groupErr == nil && gone {
+				return nil
+			}
+			return errors.Join(groupErr, errors.New("implementation worker group termination is unconfirmed"))
+		}
+		return errors.Join(probeErr, errors.New("bound implementation pane may still exist"))
+	}
+	observed, err := runHostTmux(ctx, []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.ImplementationPaneFormat}, nil)
+	if err != nil {
+		return err
+	}
+	pane, err := agentruntime.ParseImplementationPane(observed.Output)
+	if err != nil || !binding.Matches(manifest, pane) {
+		return errors.New("implementation pane no longer matches durable launch identity")
+	}
+	args, err := agentruntime.GuardedImplementationArgs(binding, pane, "kill-pane -t "+pane.PaneID)
+	if err != nil {
+		return err
+	}
+	result, err := runHostTmux(ctx, args, nil)
+	if err != nil || strings.TrimSpace(result.Output) != "" {
+		return errors.Join(err, errors.New("implementation pane changed before guarded cleanup"))
+	}
+	absent, inventoryErr := hostBoundImplementationPaneAbsent(ctx, binding)
+	if inventoryErr != nil {
+		return inventoryErr
+	}
+	if !absent {
+		return errors.New("bound implementation pane remained after guarded cleanup")
+	}
+	workerGone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding)
+	if groupErr != nil || !workerGone {
+		return errors.Join(groupErr, errors.New("implementation worker group termination is unconfirmed"))
 	}
 	return nil
+}
+
+func hostBoundImplementationPaneAbsent(ctx context.Context, binding agentruntime.ImplementationLaunchBinding) (bool, error) {
+	result, err := runHostTmux(ctx, []string{"list-panes", "-a", "-F", agentruntime.ImplementationInventoryFormat}, nil)
+	if err != nil {
+		if agentruntime.ImplementationOriginalServerGone(binding) {
+			return true, nil
+		}
+		return false, err
+	}
+	absent, err := agentruntime.ImplementationPaneAbsentFromInventory(result.Output, binding)
+	if err != nil && agentruntime.ImplementationOriginalServerGone(binding) {
+		return true, nil
+	}
+	return absent, err
 }
 
 func verifyHostAccess(root, mode string, deny []string, snapshot string) error {
@@ -1409,36 +1473,57 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		return false
 	}
+	gate := ""
+	if len(args) >= 4 && slices.Equal(args[:2], []string{"wait-for", "-L"}) && args[3] == ";" {
+		gate, args = args[2], args[4:]
+		if !validImplementationGateChannel(gate) {
+			return false
+		}
+	}
+	if len(args) == 0 {
+		return false
+	}
 	if offset := tmuxNewSessionOffset(args); offset >= 0 {
 		if offset == 0 || !slices.Equal(strings.Fields(args[3]), environmentNames(environment)) {
 			return false
 		}
 		args = args[offset:]
 	}
+	if gate != "" && args[0] != "new-session" {
+		return false
+	}
 	switch args[0] {
 	case "new-session":
 		if len(args) == 6 {
 			return args[1] == "-d" && args[2] == "-s" && args[4] == "-c" && boundedCommandPath(args[5], dir, root)
 		}
-		if len(args) < 17 || args[1] != "-d" || args[2] != "-s" || args[4] != "-c" || !boundedCommandPath(args[5], dir, root) || args[6] != "--" || args[8] != "review-pane" || args[9] != "tmux" || args[15] != "--" || args[16] == "" {
-			return false
+		if gate != "" {
+			return validBoundImplementationNewSession(args, gate, dir, root)
 		}
-		helper, err := os.Executable()
-		if err != nil || args[7] != helper || filepath.Base(args[10]) != "launch.json" || filepath.Base(args[11]) != "terminal.json" || filepath.Dir(args[10]) != filepath.Dir(args[11]) || !strings.HasPrefix(filepath.Dir(args[10]), args[5]+".result-") {
-			return false
+		if len(args) >= 17 && args[8] == "review-pane" {
+			if args[1] != "-d" || args[2] != "-s" || args[4] != "-c" || !boundedCommandPath(args[5], dir, root) || args[6] != "--" || args[9] != "tmux" || args[15] != "--" || args[16] == "" {
+				return false
+			}
+			helper, err := os.Executable()
+			if err != nil || args[7] != helper || filepath.Base(args[10]) != "launch.json" || filepath.Base(args[11]) != "terminal.json" || filepath.Dir(args[10]) != filepath.Dir(args[11]) || !strings.HasPrefix(filepath.Dir(args[10]), args[5]+".result-") {
+				return false
+			}
+			var identity reviewerLaunchIdentity
+			return json.Unmarshal([]byte(args[14]), &identity) == nil && identity.GateProtocol && identity.SessionRequested && identity.EffectID != "" && identity.IssueGeneration > 0 && identity.AttemptGeneration > 0 && validDigest(identity.RequestDigest) && args[12] == reviewerSignal(identity) && args[13] == reviewerStartSignal(identity)
 		}
-		var identity reviewerLaunchIdentity
-		return json.Unmarshal([]byte(args[14]), &identity) == nil && identity.GateProtocol && identity.SessionRequested && identity.EffectID != "" && identity.IssueGeneration > 0 && identity.AttemptGeneration > 0 && validDigest(identity.RequestDigest) && args[12] == reviewerSignal(identity) && args[13] == reviewerStartSignal(identity)
+		return validBoundImplementationNewSession(args, "", dir, root)
 	case "has-session", "kill-session":
 		return len(args) == 3 && args[1] == "-t" && (validTmuxTarget(args[2], false) || args[0] == "kill-session" && validTmuxSessionID(args[2]))
 	case "list-sessions":
 		return len(args) == 3 && args[1] == "-F" && args[2] == reviewerSessionsFormat
 	case "if-shell":
-		return validReviewerGuardedKillArgs(args)
+		return validReviewerGuardedKillArgs(args) || validImplementationGuardedArgs(args)
 	case "display-message":
-		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, reviewerPaneIdentityFormat, "#{pane_start_command}", "#{pane_pid}"}, args[4])
+		return len(args) == 5 && args[1] == "-p" && args[2] == "-t" && validTmuxTarget(args[3], true) && slices.Contains([]string{"#{pane_dead}", agentruntime.PaneStatusFormat, reviewerPaneIdentityFormat, agentruntime.ImplementationPaneFormat, "#{pane_start_command}", "#{pane_pid}"}, args[4])
+	case "list-panes":
+		return len(args) == 4 && slices.Equal(args[1:3], []string{"-a", "-F"}) && args[3] == agentruntime.ImplementationInventoryFormat
 	case "wait-for":
-		return len(args) == 3 && (args[1] == "-L" || args[1] == "-U") && validReviewerWaitChannel(args[2])
+		return len(args) == 3 && (args[1] == "-L" || args[1] == "-U") && (validReviewerWaitChannel(args[2]) || validImplementationGateChannel(args[2]))
 	case "capture-pane":
 		return len(args) == 6 && slices.Equal(args[1:5], []string{"-p", "-S", "-", "-t"}) && validTmuxTarget(args[5], true)
 	case "set-option":
@@ -1495,6 +1580,124 @@ func validReviewerWaitChannel(channel string) bool {
 		}
 	}
 	return true
+}
+
+func validImplementationGateChannel(channel string) bool {
+	return strings.HasPrefix(channel, "implementation-") && agentruntime.ValidLaunchToken(strings.TrimPrefix(channel, "implementation-"))
+}
+
+func validBoundImplementationNewSession(args []string, gate, dir, root string) bool {
+	if len(args) < 45 || !slices.Equal(args[1:4], []string{"-d", "-P", "-F"}) || args[4] != agentruntime.ImplementationPaneFormat || args[5] != "-s" || !validTmuxTarget("="+args[6], false) || args[7] != "-c" || !boundedCommandPath(args[8], dir, root) {
+		return false
+	}
+	target, suffix := agentruntime.PaneTarget(args[6]), args[len(args)-35:]
+	token := suffix[6]
+	if !agentruntime.ValidLaunchToken(token) || !slices.Equal(suffix, []string{
+		";", "set-option", "-p", "-t", target, "@agent-symphony-launch-token", token,
+		";", "set-option", "-w", "-t", target, "remain-on-exit", "on",
+		";", "set-option", "-w", "-t", target, "history-limit", "5000",
+		";", "set-option", "-p", "-t", target, agentruntime.PaneExitStatusOption, "",
+		";", "set-option", "-p", "-t", target, agentruntime.PaneExitSignalOption, "",
+	}) {
+		return false
+	}
+	launch := args[9 : len(args)-35]
+	if gate == "" {
+		return slices.Equal(launch, []string{"/bin/sh"})
+	}
+	helper, err := os.Executable()
+	if err != nil || len(launch) < 10 || launch[0] != helper || launch[1] != "implementation-gate" || launch[2] != "tmux" || !boundedCommandPath(launch[3], dir, root) || launch[4] != args[8] || launch[5] != args[6] || launch[6] != token || launch[7] != strings.TrimPrefix(gate, "implementation-") || launch[8] != "--" || launch[9] == "" {
+		return false
+	}
+	return !slices.Contains(launch, ";")
+}
+
+var implementationGuardPattern = regexp.MustCompile(`^#\{&&:#\{==:#\{pid\},([1-9][0-9]*)\},#\{&&:#\{==:#\{start_time\},([1-9][0-9]*)\},#\{&&:#\{==:#\{session_name\},(as-[0-9a-f]{16}-[1-9][0-9]*-[1-9][0-9]*)\},#\{&&:#\{==:#\{session_id\},(\$[0-9]+)\},#\{&&:#\{==:#\{pane_id\},(%[0-9]+)\},#\{&&:#\{==:#\{pane_pid\},([1-9][0-9]*)\},#\{==:#\{@agent-symphony-launch-token\},([0-9a-f]{32})\}\}\}\}\}\}\}$`)
+
+func validImplementationGuardedArgs(args []string) bool {
+	if len(args) != 7 || args[1] != "-F" || args[2] != "-t" || args[6] != "display-message -p "+agentruntime.ImplementationGuardMismatch {
+		return false
+	}
+	fields := implementationGuardPattern.FindStringSubmatch(args[4])
+	if fields == nil || args[3] != fields[5] {
+		return false
+	}
+	serverPID, err1 := strconv.Atoi(fields[1])
+	serverStart, err2 := strconv.ParseUint(fields[2], 10, 64)
+	panePID, err3 := strconv.Atoi(fields[6])
+	if err1 != nil || err2 != nil || err3 != nil || serverPID < 2 || serverStart == 0 || panePID < 2 {
+		return false
+	}
+	binding := agentruntime.ImplementationLaunchBinding{ServerPID: serverPID, ServerStart: serverStart, SessionName: fields[3], SessionID: fields[4], PaneID: fields[5], PanePID: panePID, Token: fields[7], Command: "validated by host boundary"}
+	pane := agentruntime.ImplementationPane{ServerPID: serverPID, ServerStart: serverStart, SessionName: fields[3], SessionID: fields[4], PaneID: fields[5], PanePID: panePID, Token: fields[7], Command: binding.Command}
+	condition, err := agentruntime.ImplementationGuardCondition(binding, pane)
+	if err != nil || condition != args[4] {
+		return false
+	}
+	if args[5] == "send-keys -t "+pane.PaneID+" C-c" || args[5] == "kill-pane -t "+pane.PaneID || strings.HasPrefix(args[5], "wait-for -U ") && validImplementationGateChannel(strings.TrimPrefix(args[5], "wait-for -U ")) {
+		return true
+	}
+	nested, ok := parseCanonicalTmuxWords(args[5])
+	if !ok || len(nested) == 0 {
+		return false
+	}
+	switch nested[0] {
+	case "set-option":
+		return len(nested) == 6 && slices.Equal(nested[1:4], []string{"-p", "-t", pane.PaneID}) && nested[5] == "" && slices.Contains([]string{agentruntime.PaneExitStatusOption, agentruntime.PaneExitSignalOption}, nested[4])
+	case "respawn-pane":
+		return len(nested) > 5 && slices.Equal(nested[1:4], []string{"-k", "-t", pane.PaneID}) && nested[4] == "--" && nested[5] != ""
+	case "display-message":
+		return len(nested) == 5 && slices.Equal(nested[1:4], []string{"-p", "-t", pane.PaneID}) && slices.Contains([]string{agentruntime.PaneStatusFormat, "#{pane_dead}"}, nested[4])
+	case "capture-pane":
+		return len(nested) == 6 && slices.Equal(nested[1:5], []string{"-p", "-S", "-", "-t"}) && nested[5] == pane.PaneID
+	case "load-buffer":
+		return len(nested) == 4 && nested[1] == "-b" && nested[2] != "" && nested[3] == "-"
+	case "paste-buffer":
+		return len(nested) == 6 && slices.Equal(nested[1:3], []string{"-d", "-b"}) && nested[3] != "" && nested[4] == "-t" && nested[5] == pane.PaneID
+	case "send-keys":
+		return len(nested) == 4 && nested[1] == "-t" && nested[2] == pane.PaneID && nested[3] == "Enter"
+	default:
+		return false
+	}
+}
+
+// parseCanonicalTmuxWords accepts only the single-quoted argv encoding emitted
+// by runtime.TmuxCommandString, not arbitrary shell syntax.
+func parseCanonicalTmuxWords(command string) ([]string, bool) {
+	original := command
+	var words []string
+	for len(command) > 0 {
+		if command[0] != '\'' {
+			return nil, false
+		}
+		command = command[1:]
+		var word strings.Builder
+		for {
+			index := strings.IndexByte(command, '\'')
+			if index < 0 {
+				return nil, false
+			}
+			word.WriteString(command[:index])
+			command = command[index:]
+			if strings.HasPrefix(command, "'\\''") {
+				word.WriteByte('\'')
+				command = command[4:]
+				continue
+			}
+			command = command[1:]
+			break
+		}
+		words = append(words, word.String())
+		if command == "" {
+			break
+		}
+		if command[0] != ' ' {
+			return nil, false
+		}
+		command = command[1:]
+	}
+	canonical, err := agentruntime.TmuxCommandString(words)
+	return words, err == nil && canonical == original
 }
 
 func tmuxNewSessionOffset(args []string) int {
@@ -1565,7 +1768,7 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 		return "", errors.New("invalid export manifest")
 	}
 	want, identityErr := agentruntime.AttemptIdentity(root, agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA})
-	if identityErr != nil || manifest.Version != want.Version || manifest.State != "completed" || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session {
+	if identityErr != nil || !agentruntime.ValidManifestVersion(manifest) || manifest.State != "completed" || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session {
 		return "", errors.New("invalid export manifest")
 	}
 	run := func(args ...string) (string, error) {
@@ -1732,6 +1935,14 @@ func decodeHandoffRequest(input []byte, root string) (handoffRequest, struct{ Ty
 	if request.OutcomePath != handoffReceiptPath(request.Manifest.Worktree, h.Key) || !belowRoot(request.OutcomePath, request.Manifest.Worktree) {
 		return request, h, errors.New("invalid handoff receipt path")
 	}
+	if request.Manifest.Version == agentruntime.ManifestVersion2 {
+		decodedID, idErr := hex.DecodeString(request.CandidateLaunchID)
+		if !agentruntime.ValidManifestVersion(request.Manifest) || !agentruntime.ValidLaunchToken(request.CandidateLaunchToken) || request.CandidateLaunchToken == request.Manifest.LaunchToken || idErr != nil || len(decodedID) != 16 {
+			return request, h, errors.New("invalid handoff candidate identity")
+		}
+	} else if request.CandidateLaunchToken != "" || request.CandidateLaunchID != "" {
+		return request, h, errors.New("unexpected handoff candidate identity")
+	}
 	return request, h, nil
 }
 
@@ -1742,7 +1953,9 @@ func handoffBinding(request handoffRequest) ([]byte, string) {
 		Handoff                    json.RawMessage
 		OutcomePath, OutcomeToken  string
 		Command                    []string
-	}{"pending", request.Manifest.Worktree, request.Manifest.Session, request.Manifest.LogPath, request.Handoff, request.OutcomePath, request.OutcomeToken, request.Command})
+		CandidateLaunchToken       string `json:",omitempty"`
+		CandidateLaunchID          string `json:",omitempty"`
+	}{"pending", request.Manifest.Worktree, request.Manifest.Session, request.Manifest.LogPath, request.Handoff, request.OutcomePath, request.OutcomeToken, request.Command, request.CandidateLaunchToken, request.CandidateLaunchID})
 	return binding, fmt.Sprintf("%x", sha256.Sum256(binding))
 }
 
@@ -1751,136 +1964,51 @@ func verifyHandoff(ctx context.Context, input []byte, root string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	binding, recipient := handoffBinding(request)
-	persisted, err := immutableMarkerMatches(filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs", h.Key+".json"), binding)
+	handoffProof, recipient := handoffBinding(request)
+	persisted, err := immutableMarkerMatches(filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs", h.Key+".json"), handoffProof)
 	if err != nil {
 		return "", fmt.Errorf("verify handoff binding: %w", err)
 	}
 	if !persisted {
 		return "", nil
 	}
-	option := "@agent-symphony-handoff-" + recipient[:16]
-	observed, err := runHostTmux(ctx, []string{"show-options", "-pqv", "-t", agentruntime.PaneTarget(request.Manifest.Session), option}, nil)
-	if err != nil {
-		return "", fmt.Errorf("verify handoff launch identity: %w", err)
+	if request.Manifest.Version != agentruntime.ManifestVersion2 {
+		return "", errors.New("legacy implementation pane has no durable handoff identity")
 	}
-	if strings.TrimSpace(observed.Output) != recipient {
+	option := "@agent-symphony-handoff-" + recipient[:16]
+	binding, pane, err := handoffCandidateBinding(ctx, request)
+	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
+	if err != nil {
+		return "", err
+	}
+	read, _ := agentruntime.TmuxCommandString([]string{"show-options", "-pqv", "-t", pane.PaneID, option})
+	args, err := agentruntime.GuardedImplementationArgs(binding, pane, read)
+	if err != nil {
+		return "", err
+	}
+	observed, err := runHostTmux(ctx, args, nil)
+	if err != nil || strings.TrimSpace(observed.Output) != recipient {
+		return "", err
+	}
 	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", h.Key, request.OutcomePath, request.OutcomeToken})
+	matches, err := immutableMarkerMatches(request.OutcomePath, ack)
+	if err != nil || !matches {
+		return "", err
+	}
 	return string(ack), nil
 }
 
-func acceptHandoff(ctx context.Context, input []byte, root string) (string, error) {
-	request, h, err := decodeHandoffRequest(input, root)
+func acceptHandoff(_ context.Context, input []byte, root string) (string, error) {
+	request, _, err := decodeHandoffRequest(input, root)
 	if err != nil {
 		return "", err
 	}
-	inbox := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs")
-	if err := os.MkdirAll(inbox, 0o700); err != nil {
-		return "", err
+	if request.Manifest.Version == agentruntime.ManifestVersion2 {
+		return "", errors.New("bound handoff requires prepare and release phases")
 	}
-	binding, recipient := handoffBinding(request)
-	if err := writeImmutable(filepath.Join(inbox, h.Key+".json"), binding); err != nil {
-		return "", err
-	}
-	ack, _ := json.Marshal(handoffReceipt{"agent-symphony-handoff-executed-v1", h.Key, request.OutcomePath, request.OutcomeToken})
-	if body, err := os.ReadFile(request.OutcomePath); err == nil && bytes.Equal(body, ack) {
-		return string(ack), nil
-	} else if err == nil || !errors.Is(err, os.ErrNotExist) {
-		return "", errors.New("handoff receipt binding mismatch")
-	}
-	buffer := "as-handoff-" + fmt.Sprintf("%x", sha256.Sum256(request.Handoff))[:16]
-	pane := agentruntime.PaneTarget(request.Manifest.Session)
-	option := "@agent-symphony-handoff-" + recipient[:16]
-	observed, err := runHostTmux(ctx, []string{"show-options", "-pqv", "-t", pane, option}, nil)
-	if err == nil && strings.TrimSpace(observed.Output) == recipient {
-		if err := writeImmutable(request.OutcomePath, ack); err != nil {
-			return "", err
-		}
-		return string(ack), nil
-	}
-	resultPath := agentruntime.ResultPath(request.Manifest.Worktree)
-	if !belowRoot(resultPath, root) {
-		return "", errors.New("handoff result path escapes provisioned root")
-	}
-	if info, err := os.Lstat(resultPath); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
-		return "", errors.New("handoff result is not a regular non-symlink file")
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", err
-	}
-	helper, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	launchingPath := filepath.Join(inbox, h.Key+".launching")
-	launchedPath := filepath.Join(inbox, h.Key+".launched")
-	launched, err := immutableMarkerMatches(launchedPath, []byte(recipient))
-	if err != nil {
-		return "", err
-	}
-	if launched {
-		if err := writeImmutable(request.OutcomePath, ack); err != nil {
-			return "", err
-		}
-		return string(ack), nil
-	}
-	launching, err := immutableMarkerMatches(launchingPath, []byte(recipient))
-	if err != nil {
-		return "", err
-	}
-	if launching {
-		state, stateErr := runHostTmux(ctx, []string{"display-message", "-p", "-t", pane, "#{pane_dead}"}, nil)
-		if stateErr == nil && strings.TrimSpace(state.Output) == "0" {
-			started, startErr := runHostTmux(ctx, []string{"display-message", "-p", "-t", pane, "#{pane_start_command}"}, nil)
-			if startErr != nil {
-				return "", errors.New("cannot reconcile in-flight handoff launch")
-			}
-			if strings.Contains(started.Output, " worker-capture-handoff-ready ") && strings.Contains(started.Output, launchedPath) && strings.Contains(started.Output, recipient) {
-				return "", errors.New("handoff launch remains in flight")
-			}
-		}
-		if stateErr != nil || strings.TrimSpace(state.Output) != "1" {
-			if stateErr != nil || strings.TrimSpace(state.Output) != "0" {
-				return "", errors.New("cannot reconcile in-flight handoff launch")
-			}
-		}
-		if err := os.Remove(launchingPath); err != nil {
-			return "", err
-		}
-		if err := immutableDirSync(inbox); err != nil {
-			return "", err
-		}
-	}
-	signal := buffer + "-launched"
-	command := agentruntime.PaneExitStatusCommand(helper, "tmux", agentruntime.HandoffPromptCommand(helper, "tmux", buffer, resultPath, launchedPath, recipient, signal, request.Command))
-	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony handoff in the current worktree. It may contain review feedback or confirmed human instructions. %s Current source refs are available under refs/remotes/agent-symphony/. Do not push; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", humanInstructionPrecedence, request.Handoff)
-	if _, err := runHostTmux(ctx, []string{"load-buffer", "-b", buffer, "-"}, bytes.NewReader(prompt)); err != nil {
-		return "", err
-	}
-	if err := writeImmutable(launchingPath, []byte(recipient)); err != nil {
-		return "", err
-	}
-	for _, option := range []string{agentruntime.PaneExitStatusOption, agentruntime.PaneExitSignalOption} {
-		if _, err := runHostTmux(ctx, []string{"set-option", "-p", "-t", pane, option, ""}, nil); err != nil {
-			return "", err
-		}
-	}
-	tmuxArgs := append(append([]string{"respawn-pane", "-k", "-t", pane, "-c", request.Manifest.Worktree, "--"}, command...), ";", "wait-for", signal)
-	if _, err := runHostTmux(ctx, tmuxArgs, nil); err != nil {
-		return "", err
-	}
-	launched, err = immutableMarkerMatches(launchedPath, []byte(recipient))
-	if err != nil || !launched {
-		return "", errors.New("replacement worker did not produce startup output")
-	}
-	if _, err := runHostTmux(ctx, []string{"set-option", "-p", "-t", pane, option, recipient}, nil); err != nil {
-		return "", err
-	}
-	if err := writeImmutable(request.OutcomePath, ack); err != nil {
-		return "", err
-	}
-	return string(ack), nil
+	return "", errors.New("legacy implementation pane has no durable handoff identity")
 }
 
 func immutableMarkerMatches(path string, want []byte) (bool, error) {

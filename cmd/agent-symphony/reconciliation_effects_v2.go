@@ -110,6 +110,7 @@ type handoffEffectRequest struct {
 	Recovery                    *internalgithub.RecoveryHandoff
 	Outcome                     *internalgithub.HandoffOutcome
 	OutcomePath, OutcomeToken   string
+	CandidateLaunchToken        string `json:",omitempty"`
 }
 
 type retireCompletedEffectRequest struct {
@@ -155,6 +156,8 @@ type reviewerEffectResult struct {
 type handoffEffectResult struct {
 	Kind, Key, OutcomePath, OutcomeToken string
 	Observed                             bool
+	LaunchToken                          string `json:",omitempty"`
+	LaunchID                             string `json:",omitempty"`
 }
 type retireCompletedEffectResult struct{ ResourcesGone bool }
 type monitoringCheckInEffectResult struct {
@@ -243,7 +246,7 @@ func applyBeginReconciliationEffect(attemptRoot, stateRoot string, state *runtim
 	if state.IssueGenerations[issueKey] != identity.IssueGeneration {
 		return nil, errStaleStateResult
 	}
-	if reconciliationMutatesGitHub(request.Action) && (issueHasUnprovedReviewer(*state, request.Repository, request.Issue) || issueHasPendingReviewer(*state, request.Repository, request.Issue)) {
+	if implementationLeaseBlocksGitHub(*state, request.Action, request.Repository, request.Issue) || reconciliationMutatesGitHub(request.Action) && (issueHasUnprovedReviewer(*state, request.Repository, request.Issue) || issueHasPendingReviewer(*state, request.Repository, request.Issue)) {
 		return nil, errStateConflict
 	}
 	if issueHasUnprovedReviewer(*state, request.Repository, request.Issue) && request.Action == reconciliationReviewer {
@@ -603,6 +606,9 @@ func applyFinishReconciliationEffect(stateRoot string, state *runtimeOwnerState,
 	if !validReconciliationEffectResult(*effect.Reconciliation, result) {
 		return errStateConflict
 	}
+	if effect.Action == string(reconciliationHandoffDeliver) && effect.Reconciliation.Manifest.Version == agentruntime.ManifestVersion2 && result.Handoff.LaunchID != effect.ID {
+		return errStateConflict
+	}
 	if effect.State == "completed" {
 		if reflect.DeepEqual(effect.ReconciliationResult, &result) {
 			return nil
@@ -675,6 +681,9 @@ func reconciliationEffectCurrent(stateRoot string, state runtimeOwnerState, effe
 	if request == nil || effect.ReviewerRevoked || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
 		return errStaleStateResult
 	}
+	if implementationLeaseBlocksGitHub(state, request.Action, effect.Repository, effect.Issue) {
+		return errStateConflict
+	}
 	compatibleV1 := request.Action == reconciliationReviewer && request.Reviewer != nil && request.Reviewer.DigestVersion == 1 && reconciliationFinishObservationMatches(state, *request)
 	if request.Action == reconciliationReviewer && request.Reviewer != nil && request.Reviewer.DigestVersion == 1 && !compatibleV1 || !reconciliationObservationCurrent(state, *request) && !compatibleV1 || compatibleV1 && state.Observations[ownerIssueKey(effect.Repository, effect.Issue)].ObservationEpoch != state.Epoch {
 		return errStaleStateResult
@@ -692,6 +701,44 @@ func reconciliationEffectCurrent(stateRoot string, state runtimeOwnerState, effe
 	return nil
 }
 
+// A launched implementation can leave a child outside its original process
+// group. Until there is positive descendant containment, no GitHub mutation
+// may consume that potentially live worker result or its issue authority.
+func implementationLeaseBlocksGitHub(state runtimeOwnerState, action reconciliationEffectAction, repository string, issue int) bool {
+	switch action {
+	case reconciliationGitHubBind, reconciliationGitHubPublish, reconciliationGitHubIssueUpdate, reconciliationGitHubPRGovernance:
+	default:
+		return false
+	}
+	for _, record := range state.Attempts {
+		manifest := record.Manifest
+		if manifest.Repository == repository && manifest.Issue == issue && manifest.Version == agentruntime.ManifestVersion2 && manifest.LaunchID != "" {
+			return true
+		}
+	}
+	for _, effect := range state.Effects {
+		if effect.Repository == repository && effect.Issue == issue && effect.Action == string(agentruntime.EffectStart) && effect.StartMayRun {
+			return true
+		}
+	}
+	for _, tombstone := range state.Tombstones {
+		if tombstone.Repository != repository || tombstone.Issue != issue {
+			continue
+		}
+		if tombstone.Manifest != nil && tombstone.Manifest.Version == agentruntime.ManifestVersion2 && tombstone.Manifest.LaunchID != "" || tombstone.InvalidatedHandoff != nil {
+			return true
+		}
+		if tombstone.InvalidatedStart != nil {
+			for _, candidate := range tombstone.InvalidatedStart.Candidates {
+				if candidate.MayRun {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // reconciliationEffectFinishCurrent intentionally does not require a current
 // observation epoch. An immutable completion marker proves that the external
 // effect finished before restart; generations and state bindings still prevent
@@ -703,6 +750,9 @@ func reconciliationEffectFinishCurrent(stateRoot string, state runtimeOwnerState
 	}
 	if request == nil || effect.ReviewerRevoked || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != effect.IssueGeneration || !reconciliationFinishObservationMatches(state, *request) || !validReconciliationEffectStateBindings(stateRoot, state, *request) {
 		return errStaleStateResult
+	}
+	if implementationLeaseBlocksGitHub(state, request.Action, effect.Repository, effect.Issue) {
+		return errStateConflict
 	}
 	if request.Attempt == 0 {
 		return nil
@@ -845,6 +895,13 @@ func validReconciliationEffectBindings(request reconciliationEffectRequest) bool
 		return request.Manifest != nil && agentruntime.ValidReviewTarget(request.Reviewer.Mode, request.Reviewer.Target, request.Repository, request.Issue)
 	case reconciliationHandoffDeliver:
 		if request.Manifest == nil || request.Handoff.OutcomePath != handoffReceiptPath(request.Manifest.Worktree, request.Handoff.Key) {
+			return false
+		}
+		if request.Manifest.Version == agentruntime.ManifestVersion2 {
+			if !agentruntime.ValidLaunchToken(request.Handoff.CandidateLaunchToken) || request.Handoff.CandidateLaunchToken == request.Manifest.LaunchToken {
+				return false
+			}
+		} else if request.Handoff.CandidateLaunchToken != "" {
 			return false
 		}
 		if request.Handoff.Kind == "recovery" {
@@ -1173,6 +1230,11 @@ func validReconciliationEffectResult(request reconciliationEffectRequest, result
 		valid = result.Reviewer != nil && validReviewerResult(*request.Reviewer, *result.Reviewer)
 	case reconciliationHandoffDeliver:
 		valid = result.Handoff != nil && result.Handoff.Kind == request.Handoff.Kind && result.Handoff.Key == request.Handoff.Key && result.Handoff.OutcomePath == request.Handoff.OutcomePath && result.Handoff.OutcomeToken == request.Handoff.OutcomeToken && result.Handoff.Observed
+		if valid && request.Manifest.Version == agentruntime.ManifestVersion2 {
+			valid = result.Handoff.LaunchToken == request.Handoff.CandidateLaunchToken && result.Handoff.LaunchID != ""
+		} else if valid {
+			valid = result.Handoff.LaunchToken == "" && result.Handoff.LaunchID == ""
+		}
 	case reconciliationRetireCompleted:
 		valid = result.Retire != nil && result.Retire.ResourcesGone
 	case reconciliationMonitoringCheckIn:
@@ -1226,6 +1288,9 @@ func applyReconciliationEffectOutcome(state *runtimeOwnerState, request reconcil
 		}
 		state.Attempts[key] = record
 	case reconciliationHandoffDeliver:
+		if request.Manifest.Version == agentruntime.ManifestVersion2 {
+			record.Manifest.LaunchToken, record.Manifest.LaunchID = result.Handoff.LaunchToken, result.Handoff.LaunchID
+		}
 		if request.Handoff.Kind == "review-findings" {
 			record.Manifest.ReviewHandoffQueued, record.Manifest.ReviewHandoffAck = true, true
 			if record.Manifest.State == "completed" {
@@ -1248,6 +1313,7 @@ func applyReconciliationEffectOutcome(state *runtimeOwnerState, request reconcil
 			return errStateConflict
 		}
 		state.Recoveries[key] = recovery
+		state.Attempts[key] = record
 	case reconciliationRetireCompleted:
 		delete(state.Attempts, key)
 		delete(state.Recoveries, key)

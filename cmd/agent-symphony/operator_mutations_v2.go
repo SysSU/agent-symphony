@@ -22,6 +22,8 @@ const (
 	operatorPhaseRetryAwait     = "retry-awaiting"
 	operatorPhaseRetryPending   = "retry-pending"
 	operatorPhaseReviewPending  = "review-pending"
+	operatorPhaseHandoffCleanup = "handoff-cleanup-pending"
+	operatorPhaseStartCleanup   = "start-cleanup-pending"
 	operatorPhaseCompleted      = "completed"
 )
 
@@ -51,24 +53,26 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || manifest.Issue != request.Issue || manifest.Attempt != request.Attempt {
 		return nil, errStateConflict
 	}
+	tombstone, tombstoned := state.Tombstones[attemptKey]
+	if tombstoned {
+		// A same-action replay is bound to the durable tombstone, not a
+		// later GitHub observation that may already have disappeared.
+		if command.Identity.AttemptGeneration != tombstone.InvalidatedGeneration && command.Identity.AttemptGeneration != tombstone.Generation {
+			return nil, errStaleStateResult
+		}
+		return replayOperatorTombstone(state, request, manifest, command.PublishedHead, command.CleanupDigest, command.CleanupPolicy, tombstone)
+	}
 	absentOrphan := ok && !observation.Present && (request.Action == "dismiss" && command.IssueClosed || request.Action == "abandon") && observation.ObservationEpoch == state.Epoch
 	if !ok || !observation.Present && !absentOrphan || command.ObservationGeneration != observation.Generation || command.ObservationCycleID != observation.LastCycleID || command.ObservationBodyDigest != observation.Fact.BodyDigest {
 		return nil, errStaleStateResult
 	}
-	tombstone, tombstoned := state.Tombstones[attemptKey]
-	if observation.ObservationEpoch != state.Epoch && !tombstoned {
+	if observation.ObservationEpoch != state.Epoch {
 		return nil, errStaleStateResult
 	}
 	if request.Action == "recover" {
 		if effect, attached, err := attachOperatorRecovery(state, command, manifest); attached || err != nil {
 			return effect, err
 		}
-	}
-	if tombstoned {
-		if command.Identity.AttemptGeneration != tombstone.InvalidatedGeneration && command.Identity.AttemptGeneration != tombstone.Generation {
-			return nil, errStaleStateResult
-		}
-		return replayOperatorTombstone(state, request, manifest, command.PublishedHead, command.CleanupDigest, command.CleanupPolicy, tombstone)
 	}
 	if request.Action == "cancel" || request.Action == "recover" {
 		if effect := matchingPendingOperatorStop(*state, command); effect != nil {
@@ -120,11 +124,18 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 			ExpectedIssueGeneration: command.Identity.IssueGeneration, ExpectedAttemptGeneration: command.Identity.AttemptGeneration,
 			Action: "dismissed", CleanupPhase: cleanupPhase, Manifest: &manifest,
 		})
-		if err == nil && leaseID != "" {
+		if err == nil {
 			tombstone := state.Tombstones[attemptKey]
-			tombstone.ReviewerLeaseID = leaseID
-			tombstone.Diagnostic = "reviewer descendant absence is unproved; physical cleanup remains pending"
-			state.Tombstones[attemptKey] = tombstone
+			if leaseID != "" {
+				tombstone.ReviewerLeaseID = leaseID
+				tombstone.Diagnostic = "reviewer descendant absence is unproved; physical cleanup remains pending"
+				state.Tombstones[attemptKey] = tombstone
+			}
+			if tombstone.InvalidatedStart != nil {
+				phase = operatorPhaseStartCleanup
+			} else if tombstone.InvalidatedHandoff != nil {
+				phase = operatorPhaseHandoffCleanup
+			}
 		}
 	case "archive", "abandon", "remove":
 		if !command.CleanupValid || !validDestructiveOperatorStatus(request.Action, status, statuses) || !agentruntime.ValidEffectRequestDigest(command.CleanupDigest) || command.CleanupPolicy.Action != request.Action || command.CleanupPolicy.PublishedHead != command.PublishedHead || command.Runtime != nil || command.Reconciliation != nil || request.Action == "archive" && manifest.State != "completed" {
@@ -278,7 +289,7 @@ func applyStartOperatorCleanup(state *runtimeOwnerState, command startOperatorCl
 	if !ok || effect.Action != string(agentruntime.EffectCleanup) || effect.State != "pending" {
 		return errStaleStateResult
 	}
-	if err := applyAuthorizeRuntimeEffect(*state, authorizeRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectCleanup}); err != nil {
+	if err := applyAuthorizeRuntimeEffect(state, authorizeRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectCleanup}); err != nil {
 		return err
 	}
 	key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
@@ -504,6 +515,18 @@ func replayOperatorTombstone(state *runtimeOwnerState, request controlRequest, m
 		if cleanupDigest != "" || cleanupPolicy != (agentruntime.EffectCleanupPolicy{}) || tombstone.EffectID != "" || tombstone.CleanupPolicy != nil {
 			return nil, errStateConflict
 		}
+		if tombstone.InvalidatedStart != nil {
+			if err := appendOperatorReceipt(state, controlReceipt{Request: request, State: "pending", Phase: operatorPhaseStartCleanup}); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+		if tombstone.InvalidatedHandoff != nil && !tombstone.HandoffCompensated {
+			if err := appendOperatorReceipt(state, controlReceipt{Request: request, State: "pending", Phase: operatorPhaseHandoffCleanup}); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
 		result := successfulOperatorResult(request, 0)
 		if tombstone.ReviewerLeaseID != "" {
 			result = pendingReviewerResult(request, 0, tombstone.Diagnostic)
@@ -565,7 +588,7 @@ func attachOperatorRecovery(state *runtimeOwnerState, command beginOperatorMutat
 	}
 	key := ownerAttemptKey(command.Request.Repository, command.Request.Issue, command.Request.Attempt)
 	record, ok := state.Attempts[key]
-	if !ok || !sameRuntimeEffectManifestBase(record.Manifest, manifest, false) {
+	if !ok || !sameRuntimeEffectManifestBase(record.Manifest, manifest, "") {
 		return nil, false, nil
 	}
 	for _, receipt := range state.ControlReceipts {
@@ -585,7 +608,7 @@ func attachOperatorRecovery(state *runtimeOwnerState, command beginOperatorMutat
 	}
 	if effect := currentRetryEffect(*state, command.Request.Repository, command.Request.Issue, command.Request.Attempt); effect != nil {
 		if command.Identity.IssueGeneration != effect.IssueGeneration || command.Identity.AttemptGeneration != effect.AttemptGeneration ||
-			effect.Reconciliation.Manifest == nil || !sameRuntimeEffectManifestBase(*effect.Reconciliation.Manifest, manifest, false) {
+			effect.Reconciliation.Manifest == nil || !sameRuntimeEffectManifestBase(*effect.Reconciliation.Manifest, manifest, "") {
 			return nil, true, errStateConflict
 		}
 		receipt := controlReceipt{Request: command.Request, State: "pending", Phase: operatorPhaseRetryPending, EffectID: effect.ID}
@@ -715,11 +738,14 @@ func validOperatorReceiptBinding(receipt controlReceipt) bool {
 	if receipt.Phase == "" {
 		return receipt.EffectID == "" && receipt.Diagnostic == ""
 	}
-	if !slices.Contains([]string{operatorPhaseCleanupPending, operatorPhaseCleanupStarted, operatorPhaseStopPending, operatorPhaseTerminalAwait, operatorPhaseTerminal, operatorPhaseRetryAwait, operatorPhaseRetryPending, operatorPhaseReviewPending, operatorPhaseCompleted}, receipt.Phase) {
+	if !slices.Contains([]string{operatorPhaseCleanupPending, operatorPhaseCleanupStarted, operatorPhaseStopPending, operatorPhaseTerminalAwait, operatorPhaseTerminal, operatorPhaseRetryAwait, operatorPhaseRetryPending, operatorPhaseReviewPending, operatorPhaseHandoffCleanup, operatorPhaseStartCleanup, operatorPhaseCompleted}, receipt.Phase) {
 		return false
 	}
 	if receipt.State == "completed" {
 		return receipt.Phase == operatorPhaseCompleted && receipt.Result != nil && receipt.Diagnostic == ""
+	}
+	if receipt.Request.Action == "dismiss" && (receipt.Phase == operatorPhaseHandoffCleanup || receipt.Phase == operatorPhaseStartCleanup) {
+		return receipt.State == "pending" && receipt.EffectID == "" && receipt.Result == nil && boundedText(receipt.Diagnostic, maxReconciliationStringBytes, false)
 	}
 	return receipt.State == "pending" && receipt.Phase != operatorPhaseCompleted && receipt.EffectID != "" && receipt.Result == nil && boundedText(receipt.Diagnostic, maxReconciliationStringBytes, false)
 }

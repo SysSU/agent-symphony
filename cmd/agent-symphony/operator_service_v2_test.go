@@ -524,6 +524,7 @@ func TestOperatorStopDigestBindsExactAttemptIdentity(t *testing.T) {
 func TestOperatorBlockedRecoverSelfAdvancesToRetryCompletion(t *testing.T) {
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, 329, 1, "running")
+	manifest, pane := boundRuntimeEffectTestManifest(t, manifest)
 	state := runtimeEffectInitialState(manifest)
 	addOperatorObservation(&state, manifest, "active", false)
 	state.Epoch, state.Revision = 1, 1
@@ -542,6 +543,7 @@ func TestOperatorBlockedRecoverSelfAdvancesToRetryCompletion(t *testing.T) {
 	refreshOperatorObservation(t, owner)
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	service := operatorTestMutationService(t, owner)
+	service.effects.executor.Runtime.Runner = &barrierEffectRunner{pane: pane}
 	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
 	service.reviewer = bindLiveReviewerForService(t, owner, reviewer)
 	service.collector.Config.ActorID = 42
@@ -1867,8 +1869,9 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 		{name: "retry-posted-unmarked", checkpoint: operatorPhaseRetryPending, posted: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			owner, manifest := operatorTestOwner(t, 348, "active", false)
+			owner, manifest := operatorTestOwner(t, 348, "active", false, true)
 			service := operatorTestMutationService(t, owner)
+			service.effects.executor.Runtime.Runner = &barrierEffectRunner{pane: boundRuntimeEffectTestPane(t, manifest)}
 			request := operatorRequest("recover-checkpoint", "recover", manifest, false)
 			command := operatorCommand(mustOwnerSnapshot(t, owner), request, manifest)
 			stopRequest, err := service.prepareStop(manifest, "dashboard recovery: runtime liveness mismatch")
@@ -3350,6 +3353,7 @@ func TestOperatorPersistenceFailureBeforeDispatchCommitsNothing(t *testing.T) {
 func TestOperatorMarkerSurvivesFinishPersistenceFailureAndFinalizesAfterRestart(t *testing.T) {
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, 341, 1, "running")
+	manifest, pane := boundRuntimeEffectTestManifest(t, manifest)
 	state := runtimeEffectInitialState(manifest)
 	addOperatorObservation(&state, manifest, "active", false)
 	state.Epoch, state.Revision = 1, 1
@@ -3367,7 +3371,7 @@ func TestOperatorMarkerSurvivesFinishPersistenceFailureAndFinalizesAfterRestart(
 		t.Fatal(err)
 	}
 	refreshOperatorObservation(t, owner)
-	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: root, Runner: &barrierEffectRunner{}, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
+	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: root, Runner: &barrierEffectRunner{pane: pane}, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
 	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, executor: agentruntime.EffectExecutor{Runtime: runtimeState}, active: map[string]*activeRuntimeEffect{}}
 	service := &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}}
 	request, err := service.prepareStop(manifest, "operator cancelled attempt")
@@ -3405,7 +3409,7 @@ func TestOperatorMarkerSurvivesFinishPersistenceFailureAndFinalizesAfterRestart(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = restarted.close(context.Background()) })
-	restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: root, Runner: &barrierEffectRunner{}, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
+	restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: root, Runner: &barrierEffectRunner{pane: pane}, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
 	restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
 	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: reconciliationV2Collector{Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}}
 	if err := restartService.resumePending(t.Context()); err != nil {
@@ -3426,6 +3430,12 @@ type operatorOwnedRunner struct{ manifest agentruntime.Manifest }
 func (r operatorOwnedRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if command.Name == "git" && slices.Contains(command.Args, "--show-current") {
 		return agentruntime.Result{Output: r.manifest.Branch + "\n"}, nil
+	}
+	if r.manifest.Version == agentruntime.ManifestVersion2 && command.Name == "tmux" && slices.Contains(command.Args, agentruntime.ImplementationPaneFormat) {
+		return agentruntime.Result{Output: fmt.Sprintf("%s|$1|%%1|1234|2345|1|%s|%s|bound-test-worker\n", r.manifest.Session, r.manifest.Worktree, r.manifest.LaunchToken)}, nil
+	}
+	if r.manifest.Version == agentruntime.ManifestVersion2 && command.Name == "tmux" && len(command.Args) > 0 && command.Args[0] == "if-shell" {
+		return agentruntime.Result{Output: "0"}, nil
 	}
 	if command.Name == "tmux" && slices.Contains(command.Args, "has-session") {
 		return agentruntime.Result{}, nil

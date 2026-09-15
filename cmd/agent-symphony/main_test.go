@@ -16,7 +16,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -312,15 +314,6 @@ func TestMissingTmuxReviewerPaneFromRealTmux(t *testing.T) {
 	if !missingTmuxPaneStatus(agentruntime.Result{Output: output}) {
 		t.Fatalf("real tmux missing target was not recognized: %q", output)
 	}
-}
-
-func acknowledgeHandoffLaunch(command agentruntime.Command) (string, error) {
-	index := slices.Index(command.Args, "worker-capture-handoff-ready")
-	if index < 0 || index+5 >= len(command.Args) {
-		return "", nil
-	}
-	recipient := command.Args[index+5]
-	return recipient, writeImmutable(command.Args[index+4], []byte(recipient))
 }
 
 func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
@@ -654,6 +647,199 @@ func TestWorkerCaptureInternalCLIAndHandoffPreStartRecovery(t *testing.T) {
 	}
 	if got, err := os.ReadFile(signalPath); err != nil || string(got) != "signal-name" {
 		t.Fatalf("launch signal=%q err=%v", got, err)
+	}
+}
+
+func TestWorkerCaptureSIGHUPTerminatesExactChildGroup(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-capture-hup-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	if output, err := exec.Command(tmux, "new-session", "-d", "-s", "control").CombinedOutput(); err != nil {
+		t.Fatalf("start tmux control session: %v: %s", err, output)
+	}
+	buffer := exec.Command(tmux, "load-buffer", "-b", "capture-prompt", "-")
+	buffer.Stdin = strings.NewReader("prompt")
+	if output, err := buffer.CombinedOutput(); err != nil {
+		t.Fatalf("load worker prompt: %v: %s", err, output)
+	}
+	const readyChannel = "capture-hup-ready"
+	if output, err := exec.Command(tmux, "wait-for", "-L", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("lock readiness channel: %v: %s", err, output)
+	}
+	helper := filepath.Join(t.TempDir(), "agent-symphony")
+	if output, err := exec.Command("go", "build", "-o", helper, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build capture helper: %v: %s", err, output)
+	}
+	root := t.TempDir()
+	pidPath, fifoPath := filepath.Join(root, "child.pid"), filepath.Join(root, "hold.fifo")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	worker := exec.Command(helper, "pane-exit-status", tmux, "--", helper, "worker-capture", tmux, "capture-prompt", filepath.Join(root, "result.json"), "--", "/bin/sh", "-c", `printf '%d\n' "$$" > "$1"; tmux wait-for -U "$2"; exec cat "$3"`, "worker", pidPath, readyChannel, fifoPath)
+	if err := worker.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = worker.Process.Kill() })
+	readyCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if output, err := exec.CommandContext(readyCtx, tmux, "wait-for", "-L", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("worker did not signal readiness: %v: %s", err, output)
+	}
+	if output, err := exec.Command(tmux, "wait-for", "-U", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("unlock readiness channel: %v: %s", err, output)
+	}
+	pidBody, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidBody)))
+	if err != nil || childPID < 2 {
+		t.Fatalf("worker PID is invalid: %q, %v", pidBody, err)
+	}
+	groupID, err := syscall.Getpgid(childPID)
+	if err != nil || groupID < 2 {
+		t.Fatalf("worker group is invalid: %d, %v", groupID, err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-groupID, syscall.SIGKILL) })
+	if err := worker.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- worker.Wait() }()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("capture parent did not exit after SIGHUP")
+	}
+	state, err := exec.Command("ps", "-p", strconv.Itoa(childPID), "-o", "state=").CombinedOutput()
+	if err == nil && strings.TrimSpace(string(state)) != "" && !strings.HasPrefix(strings.TrimSpace(string(state)), "Z") {
+		t.Fatalf("worker child survived capture SIGHUP: PID=%d group=%d state=%s", childPID, groupID, state)
+	}
+}
+
+func TestInteractivePaneSIGHUPTerminatesForkedWorker(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-interactive-hup-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	if output, err := exec.Command(tmux, "new-session", "-d", "-s", "control").CombinedOutput(); err != nil {
+		t.Fatalf("start tmux control session: %v: %s", err, output)
+	}
+	const readyChannel = "interactive-hup-ready"
+	if output, err := exec.Command(tmux, "wait-for", "-L", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("lock readiness channel: %v: %s", err, output)
+	}
+	helper := filepath.Join(t.TempDir(), "agent-symphony")
+	if output, err := exec.Command("go", "build", "-o", helper, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build interactive helper: %v: %s", err, output)
+	}
+	root := t.TempDir()
+	manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, Session: "bound-interactive", Worktree: root, LogPath: filepath.Join(t.TempDir(), "agent.log"), LaunchToken: strings.Repeat("a", 32), LaunchID: strings.Repeat("b", 32), Interactive: true}
+	pidPath, fifoPath := filepath.Join(root, "child.pid"), filepath.Join(root, "hold.fifo")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gate := agentruntime.ImplementationGateChannel(manifest.LaunchID)
+	launch := exec.Command(tmux, "wait-for", "-L", gate, ";", "new-session", "-d", "-P", "-F", agentruntime.ImplementationPaneFormat, "-s", manifest.Session, "-c", root, "--", "/bin/sh", "-c", `"$1" wait-for -L "$2" && "$1" wait-for -U "$2" && shift 2 && exec "$@"`, "agent-symphony-gate", tmux, gate, helper, "pane-exit-status-bound", tmux, manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, manifest.LaunchID, "--", "/bin/sh", "-c", `sleep 30 & printf '%d\n' "$!" > "$1"; tmux wait-for -U "$2"; exec cat "$3"`, "worker", pidPath, readyChannel, fifoPath)
+	if output, err := launch.CombinedOutput(); err != nil {
+		t.Fatalf("start parked bound pane: %v: %s", err, output)
+	}
+	if output, err := exec.Command(tmux, "set-option", "-p", "-t", agentruntime.PaneTarget(manifest.Session), "@agent-symphony-launch-token", manifest.LaunchToken).CombinedOutput(); err != nil {
+		t.Fatalf("tag bound pane: %v: %s", err, output)
+	}
+	if output, err := exec.Command(tmux, "set-option", "-w", "-t", agentruntime.PaneTarget(manifest.Session), "remain-on-exit", "on").CombinedOutput(); err != nil {
+		t.Fatalf("retain bound pane: %v: %s", err, output)
+	}
+	observed, err := exec.Command(tmux, "display-message", "-p", "-t", agentruntime.PaneTarget(manifest.Session), agentruntime.ImplementationPaneFormat).CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := agentruntime.ParseImplementationPane(string(observed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := agentruntime.BindImplementationPane(manifest, manifest.LaunchID, "interactive", pane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agentruntime.WriteImplementationBinding(manifest, binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker ran before bound pane release: %v", err)
+	}
+	if err := agentruntime.WriteImplementationRelease(manifest, binding); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(tmux, "wait-for", "-U", gate).CombinedOutput(); err != nil {
+		paneStatus, _ := exec.Command(tmux, "display-message", "-p", "-t", binding.PaneID, agentruntime.PaneStatusFormat).CombinedOutput()
+		paneOutput, _ := exec.Command(tmux, "capture-pane", "-p", "-S", "-", "-t", binding.PaneID).CombinedOutput()
+		t.Fatalf("release bound pane: %v: %s; pane=%q output=%q", err, output, paneStatus, paneOutput)
+	}
+	readyCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if output, err := exec.CommandContext(readyCtx, tmux, "wait-for", "-L", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("worker did not signal readiness: %v: %s", err, output)
+	}
+	if output, err := exec.Command(tmux, "wait-for", "-U", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("unlock readiness channel: %v: %s", err, output)
+	}
+	pidBody, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidBody)))
+	if err != nil || childPID < 2 {
+		t.Fatalf("worker PID is invalid: %q, %v", pidBody, err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	if _, err := os.Stat(agentruntime.ImplementationBindingPath(manifest, manifest.LaunchID) + ".interactive.start"); err != nil {
+		t.Fatalf("worker ran without durable group start: %v", err)
+	}
+	if output, err := exec.Command(tmux, "kill-pane", "-t", binding.PaneID).CombinedOutput(); err != nil {
+		t.Fatalf("kill exact bound pane: %v: %s", err, output)
+	}
+	for {
+		state, psErr := exec.Command("ps", "-p", strconv.Itoa(childPID), "-o", "state=").CombinedOutput()
+		if psErr != nil || strings.TrimSpace(string(state)) == "" || strings.HasPrefix(strings.TrimSpace(string(state)), "Z") {
+			break
+		}
+		if readyCtx.Err() != nil {
+			t.Fatalf("forked interactive worker survived pane SIGHUP: PID=%d state=%s", childPID, state)
+		}
+	}
+	for {
+		gone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding)
+		if groupErr == nil && gone {
+			break
+		}
+		if readyCtx.Err() != nil {
+			t.Fatalf("bound interactive worker death was unproved: %v", groupErr)
+		}
+	}
+	for {
+		state, psErr := exec.Command("ps", "-p", strconv.Itoa(binding.PanePID), "-o", "state=").CombinedOutput()
+		if psErr != nil || strings.TrimSpace(string(state)) == "" || strings.HasPrefix(strings.TrimSpace(string(state)), "Z") {
+			break
+		}
+		if readyCtx.Err() != nil {
+			t.Fatalf("bound pane helper did not exit after HUP: PID=%d state=%s", binding.PanePID, state)
+		}
 	}
 }
 
