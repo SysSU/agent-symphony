@@ -39,6 +39,20 @@ func TestOperatorDismissCommitsCompletedTombstoneReceiptWithoutCleanup(t *testin
 	}
 }
 
+func TestOperatorWithoutTombstoneStillRejectsMissingObservation(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 371, "completed", false)
+	before := mustOwnerSnapshot(t, owner)
+	command := operatorCommand(before, operatorRequest("archive-stale-observation", "archive", manifest, true), manifest)
+	applyReconciliationInput(t, owner, reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: manifest.Repository}, Complete: true})
+	if _, _, err := owner.beginOperatorMutation(t.Context(), command); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("missing observation without tombstone err=%v", err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	if _, exists := state.Tombstones[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]; exists {
+		t.Fatal("stale request created tombstone")
+	}
+}
+
 func TestDismissPendingStartKeepsPhysicalCleanupPendingAcrossRestart(t *testing.T) {
 	owner, manifest := operatorOwnerWithPendingStart(t, 397, "completed", true)
 	request := operatorRequest("dismiss-start-candidate", "dismiss", manifest, false)
