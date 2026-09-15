@@ -89,6 +89,26 @@ func TestRuntimeEffectDispatchRegistersBeforeSpawnAndShutdownJoins(t *testing.T)
 	}
 }
 
+func TestRuntimeEffectDispatchPersistsAsynchronousFailureDiagnostic(t *testing.T) {
+	coordinator, owner, _, manifest := runtimeEffectTestCoordinator(t, 472, true)
+	binding, err := agentruntime.ReadImplementationBinding(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane := &agentruntime.ImplementationPane{SessionName: binding.SessionName, SessionID: binding.SessionID, PaneID: binding.PaneID, PanePID: binding.PanePID, ServerPID: binding.ServerPID, ServerStart: binding.ServerStart, StartPath: binding.StartPath, Token: binding.Token, Command: binding.Command}
+	coordinator.executor.Runtime.Runner = &monitorFailureRunner{ambiguous: true, pane: pane}
+	request := beginRuntimeTestEffect(t, coordinator, owner, agentruntime.EffectMonitor, manifest, "")
+	finished := make(chan struct{})
+	if err := coordinator.dispatch(request, func() { close(finished) }); err != nil {
+		t.Fatal(err)
+	}
+	<-finished
+	effect := mustOwnerSnapshot(t, owner).State.Effects[request.Identity.EffectID]
+	if effect.State != "pending" || !strings.Contains(effect.Diagnostic, "runtime effect failed: observe tmux session") {
+		t.Fatalf("asynchronous failure was not durably diagnosed: %#v", effect)
+	}
+}
+
 func TestOwnerRejectsDormantRuntimeHandoffAdmission(t *testing.T) {
 	coordinator, owner, _, manifest := runtimeEffectTestCoordinator(t, 310, true)
 	coordinator.executor.Runtime.Helper = "bound-helper"
@@ -233,7 +253,7 @@ func TestRuntimeEffectCancelledStartCleanupRemainsPending(t *testing.T) {
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	lifecycle, cancel := context.WithCancel(t.Context())
 	runner := &cancelledStartRunner{entered: make(chan struct{})}
-	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Runner: runner, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Runner: runner, Tmux: "tmux", Helper: "helper", VerifyWorker: func(context.Context) error { return nil }}
 	coordinator, err := newRuntimeEffectCoordinator(lifecycle, owner, agentruntime.EffectExecutor{Runtime: runtimeState})
 	if err != nil {
 		t.Fatal(err)
@@ -369,7 +389,7 @@ func TestRuntimeEffectPrepareAllocatesFirstGenerationsAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
-	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Source: filepath.Join(root, "source"), VerifyWorker: func(context.Context) error { return nil }}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Source: filepath.Join(root, "source"), Helper: "helper", VerifyWorker: func(context.Context) error { return nil }}
 	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
 	if err != nil {
 		t.Fatal(err)
@@ -402,7 +422,7 @@ func TestRuntimeMonitorRetriesDifferentObservationAfterFinalizationFailure(t *te
 	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := ownerTestManifest(t, root, 76, 1, "running")
+	manifest, pane := boundRuntimeEffectTestManifest(t, ownerTestManifest(t, root, 76, 1, "running"))
 	state := newRuntimeOwnerState("o/r")
 	state.IssueGenerations[ownerIssueKey("o/r", 76)] = 1
 	state.AttemptGenerations[ownerAttemptKey("o/r", 76, 1)] = 1
@@ -419,7 +439,7 @@ func TestRuntimeMonitorRetriesDifferentObservationAfterFinalizationFailure(t *te
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
-	runner := &monitorSequenceRunner{}
+	runner := &monitorSequenceRunner{pane: pane}
 	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Runner: runner, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
 	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
 	if err != nil {
@@ -465,7 +485,7 @@ func TestRuntimeEffectCommitsDefinitiveFailureButLeavesAmbiguousWorkPending(t *t
 			if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			manifest := ownerTestManifest(t, root, 77, 1, "running")
+			manifest, pane := boundRuntimeEffectTestManifest(t, ownerTestManifest(t, root, 77, 1, "running"))
 			state := runtimeEffectInitialState(manifest)
 			writes := 0
 			owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error {
@@ -479,7 +499,7 @@ func TestRuntimeEffectCommitsDefinitiveFailureButLeavesAmbiguousWorkPending(t *t
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = owner.close(context.Background()) })
-			runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Runner: &monitorFailureRunner{ambiguous: test.ambiguous}, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
+			runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Runner: &monitorFailureRunner{ambiguous: test.ambiguous, pane: pane}, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
 			coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
 			if err != nil {
 				t.Fatal(err)
@@ -578,6 +598,7 @@ func TestRuntimeEffectPersistsDigestsWithoutRawSecretInputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := ownerTestManifest(t, root, 84, 1, "preparing")
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
 	owner, err := startTestStateOwner(t, root, runtimeEffectInitialState(manifest), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -595,6 +616,10 @@ func TestRuntimeEffectPersistsDigestsWithoutRawSecretInputs(t *testing.T) {
 	request := runtimeTestRequest(agentruntime.EffectStart, manifest, "")
 	request.Attempt.Context = contextCanary
 	request = beginRuntimeTestEffectRequest(t, coordinator, owner, request)
+	runner.pane = &agentruntime.ImplementationPane{SessionName: manifest.Session, SessionID: "$1", PaneID: "%1", PanePID: 1234, ServerPID: 2345, ServerStart: 1, StartPath: manifest.Worktree, Token: manifest.LaunchToken, Command: "bound-test-worker"}
+	coordinator.executor.AuthorizeLaunch = func(ctx context.Context, candidate agentruntime.EffectRequest) error {
+		return owner.authorizeRuntimeEffect(ctx, authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(candidate.Identity), Action: candidate.Action, GateNonce: candidate.GateNonce})
+	}
 	ledger, err := json.Marshal(mustOwnerSnapshot(t, owner).State)
 	if err != nil {
 		t.Fatal(err)
@@ -658,7 +683,7 @@ func TestRuntimeEffectOwnerRejectsPrepareSuccessDiagnostic(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
-	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Source: filepath.Join(root, "source"), VerifyWorker: func(context.Context) error { return nil }}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Source: filepath.Join(root, "source"), Helper: "helper", VerifyWorker: func(context.Context) error { return nil }}
 	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
 	if err != nil {
 		t.Fatal(err)
@@ -801,7 +826,10 @@ func TestRuntimeOwnerLoadRejectsMalformedReviewEffectTransition(t *testing.T) {
 	}
 }
 
-type monitorFailureRunner struct{ ambiguous bool }
+type monitorFailureRunner struct {
+	ambiguous bool
+	pane      *agentruntime.ImplementationPane
+}
 
 func (r *monitorFailureRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if len(command.Args) == 0 {
@@ -809,15 +837,25 @@ func (r *monitorFailureRunner) Run(_ context.Context, command agentruntime.Comma
 	}
 	switch command.Args[0] {
 	case "display-message":
-		if r.ambiguous {
-			return agentruntime.Result{}, errors.New("observation unavailable")
+		if command.Args[len(command.Args)-1] == agentruntime.ImplementationPaneFormat {
+			return agentruntime.Result{Output: formatRuntimeEffectPane(r.pane)}, nil
 		}
-		return agentruntime.Result{Output: "1|9||9|\n"}, nil
-	case "capture-pane":
-		return agentruntime.Result{}, errors.New("capture failed")
-	default:
+	case "if-shell":
+		if strings.Contains(command.Args[5], agentruntime.PaneStatusFormat) {
+			if r.ambiguous {
+				return agentruntime.Result{}, errors.New("observation unavailable")
+			}
+			return agentruntime.Result{Output: "1|9||9|\n"}, nil
+		}
+		if strings.Contains(command.Args[5], "capture-pane") {
+			return agentruntime.Result{}, errors.New("capture failed")
+		}
 		return agentruntime.Result{}, nil
 	}
+	if r.ambiguous {
+		return agentruntime.Result{}, errors.New("observation unavailable")
+	}
+	return agentruntime.Result{}, nil
 }
 
 type cancelledStartRunner struct{ entered chan struct{} }
@@ -837,7 +875,10 @@ func (r *cancelledStartRunner) Run(ctx context.Context, command agentruntime.Com
 	return agentruntime.Result{}, nil
 }
 
-type monitorSequenceRunner struct{ displays atomic.Int32 }
+type monitorSequenceRunner struct {
+	displays atomic.Int32
+	pane     *agentruntime.ImplementationPane
+}
 
 func (r *monitorSequenceRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if len(command.Args) == 0 {
@@ -845,15 +886,26 @@ func (r *monitorSequenceRunner) Run(_ context.Context, command agentruntime.Comm
 	}
 	switch command.Args[0] {
 	case "display-message":
-		if r.displays.Add(1) == 1 {
-			return agentruntime.Result{Output: "0||||\n"}, nil
+		if command.Args[len(command.Args)-1] == agentruntime.ImplementationPaneFormat {
+			return agentruntime.Result{Output: formatRuntimeEffectPane(r.pane)}, nil
 		}
-		return agentruntime.Result{Output: "1|7||7|\n"}, nil
-	case "capture-pane":
-		return agentruntime.Result{Output: "worker failed\n"}, nil
-	default:
+	case "if-shell":
+		if strings.Contains(command.Args[5], agentruntime.PaneStatusFormat) {
+			if r.displays.Add(1) == 1 {
+				return agentruntime.Result{Output: "0||||\n"}, nil
+			}
+			return agentruntime.Result{Output: "1|7||7|\n"}, nil
+		}
+		if strings.Contains(command.Args[5], "capture-pane") {
+			return agentruntime.Result{Output: "worker failed\n"}, nil
+		}
 		return agentruntime.Result{}, nil
 	}
+	return agentruntime.Result{}, nil
+}
+
+func formatRuntimeEffectPane(pane *agentruntime.ImplementationPane) string {
+	return fmt.Sprintf("%s|%s|%s|%d|%d|%d|%s|%s|%s\n", pane.SessionName, pane.SessionID, pane.PaneID, pane.PanePID, pane.ServerPID, pane.ServerStart, pane.StartPath, pane.Token, pane.Command)
 }
 
 type barrierEffectRunner struct {
@@ -868,8 +920,12 @@ type barrierEffectRunner struct {
 func (r *barrierEffectRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	r.calls.Add(1)
 	if r.pane != nil && len(command.Args) > 0 && command.Args[0] == "display-message" && command.Args[len(command.Args)-1] == agentruntime.ImplementationPaneFormat {
-		pane := r.pane
-		return agentruntime.Result{Output: fmt.Sprintf("%s|%s|%s|%d|%d|%d|%s|%s|%s\n", pane.SessionName, pane.SessionID, pane.PaneID, pane.PanePID, pane.ServerPID, pane.ServerStart, pane.StartPath, pane.Token, pane.Command)}, nil
+		return agentruntime.Result{Output: formatRuntimeEffectPane(r.pane)}, nil
+	}
+	if r.pane != nil && slices.Contains(command.Args, "new-session") {
+		initial := *r.pane
+		initial.Token = ""
+		return agentruntime.Result{Output: formatRuntimeEffectPane(&initial)}, nil
 	}
 	if r.pane != nil && len(command.Args) > 0 && command.Args[0] == "list-panes" {
 		return agentruntime.Result{Output: fmt.Sprintf("%d|%d|%%999\n", r.pane.ServerPID, r.pane.ServerStart)}, nil
