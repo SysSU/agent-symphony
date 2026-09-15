@@ -92,17 +92,18 @@ type AttachTarget struct {
 // MessageProposal is the orchestrator's fixed control proposal. Binding is a
 // control-plane digest over its exact fields.
 type MessageProposal struct {
-	Version           int    `json:"version"`
-	Repository        string `json:"repository"`
-	Issue             int    `json:"issue"`
-	Attempt           int    `json:"attempt"`
-	Action            string `json:"action,omitempty"`
-	RequestID         string `json:"request_id,omitempty"`
-	HandoffID         string `json:"handoff_id,omitempty"`
-	Detail            string `json:"detail,omitempty"`
-	Binding           string `json:"binding,omitempty"`
-	IssueGeneration   uint64 `json:"issue_generation,omitempty"`
-	AttemptGeneration uint64 `json:"attempt_generation,omitempty"`
+	Version               int    `json:"version"`
+	Repository            string `json:"repository"`
+	Issue                 int    `json:"issue"`
+	Attempt               int    `json:"attempt"`
+	Action                string `json:"action,omitempty"`
+	RequestID             string `json:"request_id,omitempty"`
+	HandoffID             string `json:"handoff_id,omitempty"`
+	Detail                string `json:"detail,omitempty"`
+	Binding               string `json:"binding,omitempty"`
+	IssueGeneration       uint64 `json:"issue_generation,omitempty"`
+	AttemptGeneration     uint64 `json:"attempt_generation,omitempty"`
+	MachineStatusSequence uint64 `json:"machine_status_sequence,omitempty"`
 }
 
 // MessageProposalStatus is the control plane's last live observation of the
@@ -158,22 +159,23 @@ type persisted struct {
 }
 
 type sanitizedStatus struct {
-	Repository         string             `json:"repository"`
-	Issue              int                `json:"issue"`
-	Attempt            int                `json:"attempt"`
-	State              string             `json:"state"`
-	CurrentPhase       string             `json:"current_phase,omitempty"`
-	PR                 int                `json:"pr,omitempty"`
-	HeadSHA            string             `json:"head_sha,omitempty"`
-	Sessions           []sanitizedSession `json:"sessions,omitempty"`
-	Blockers           string             `json:"blockers,omitempty"`
-	Diagnostic         string             `json:"diagnostic,omitempty"`
-	NextAction         string             `json:"next_action,omitempty"`
-	Retryable          bool               `json:"retryable,omitempty"`
-	DispatchAuthorized bool               `json:"dispatch_authorized,omitempty"`
-	NeedsAttention     bool               `json:"needs_attention,omitempty"`
-	IssueGeneration    uint64             `json:"issue_generation,omitempty"`
-	AttemptGeneration  uint64             `json:"attempt_generation,omitempty"`
+	Repository            string             `json:"repository"`
+	Issue                 int                `json:"issue"`
+	Attempt               int                `json:"attempt"`
+	State                 string             `json:"state"`
+	CurrentPhase          string             `json:"current_phase,omitempty"`
+	PR                    int                `json:"pr,omitempty"`
+	HeadSHA               string             `json:"head_sha,omitempty"`
+	Sessions              []sanitizedSession `json:"sessions,omitempty"`
+	Blockers              string             `json:"blockers,omitempty"`
+	Diagnostic            string             `json:"diagnostic,omitempty"`
+	NextAction            string             `json:"next_action,omitempty"`
+	Retryable             bool               `json:"retryable,omitempty"`
+	DispatchAuthorized    bool               `json:"dispatch_authorized,omitempty"`
+	NeedsAttention        bool               `json:"needs_attention,omitempty"`
+	IssueGeneration       uint64             `json:"issue_generation,omitempty"`
+	AttemptGeneration     uint64             `json:"attempt_generation,omitempty"`
+	MachineStatusSequence uint64             `json:"machine_status_sequence,omitempty"`
 }
 
 type sanitizedSession struct {
@@ -1371,7 +1373,7 @@ func (s *Supervisor) context(mode string) ([]byte, error) {
 	controlCommands, _ := json.Marshal(CoordinatorCLICommands(s.Repository, s.Root))
 	body.WriteString("Use no browser automation for coordinator recovery, lifecycle, or terminal actions. The complete allowed Agent Symphony argv values are ")
 	body.Write(controlCommands)
-	body.WriteString(". Replace `<request-id>` with one new bounded identity per logical control operation and reuse that same identity after a timeout. Replace only `<issue>` and `<attempt>` with the exact positive decimal identity from the current projection; every action and role is already fixed with all required flags. To set or clear machine attention, submit one `status_needs_attention` or `status_clear` proposal through the proposal command with the exact positive `issue_generation` and `attempt_generation` from that same projection and a concise `detail` prefixed `monitoring: `. A busy JSON result is retryable only when it says so; never retry forever. Re-read the authoritative projection after success.\n\nFor an exact active attempt already marked needs-attention, an automatic attention wake may submit `{")
+	body.WriteString(". Replace `<request-id>` with one new bounded identity per logical control operation and reuse that same identity after a timeout. Replace only `<issue>` and `<attempt>` with the exact positive decimal identity from the current projection; every action and role is already fixed with all required flags. To set or clear machine attention, submit one `status_needs_attention` or `status_clear` proposal through the proposal command with the exact positive `issue_generation`, `attempt_generation`, and `machine_status_sequence` from that same projection and a concise `detail` prefixed `monitoring: `. A busy JSON result is retryable only when it says so; never retry forever. Re-read the authoritative projection after success.\n\nFor an exact active attempt already marked needs-attention, an automatic attention wake may submit `{")
 	body.WriteString("\"version\":1,\"repository\":\"")
 	body.WriteString(s.Repository)
 	body.WriteString("\",\"issue\":123,\"attempt\":1,\"action\":\"check_in_attempt\",\"request_id\":\"unique-1\",\"handoff_id\":\"<64-hex-character-id>\"}` on standard input to ")
@@ -1432,23 +1434,24 @@ func decodeMessageProposal(body []byte, repository string) (MessageProposal, err
 		return MessageProposal{}, errors.New("orchestrator message proposal is oversized")
 	}
 	var submitted struct {
-		Version           int    `json:"version"`
-		Repository        string `json:"repository"`
-		Issue             int    `json:"issue"`
-		Attempt           int    `json:"attempt"`
-		Action            string `json:"action,omitempty"`
-		RequestID         string `json:"request_id,omitempty"`
-		HandoffID         string `json:"handoff_id,omitempty"`
-		Detail            string `json:"detail,omitempty"`
-		IssueGeneration   uint64 `json:"issue_generation,omitempty"`
-		AttemptGeneration uint64 `json:"attempt_generation,omitempty"`
+		Version               int    `json:"version"`
+		Repository            string `json:"repository"`
+		Issue                 int    `json:"issue"`
+		Attempt               int    `json:"attempt"`
+		Action                string `json:"action,omitempty"`
+		RequestID             string `json:"request_id,omitempty"`
+		HandoffID             string `json:"handoff_id,omitempty"`
+		Detail                string `json:"detail,omitempty"`
+		IssueGeneration       uint64 `json:"issue_generation,omitempty"`
+		AttemptGeneration     uint64 `json:"attempt_generation,omitempty"`
+		MachineStatusSequence uint64 `json:"machine_status_sequence,omitempty"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&submitted) != nil || decoder.Decode(&struct{}{}) != io.EOF || submitted.Version != 1 || submitted.Repository != repository {
 		return MessageProposal{}, errors.New("orchestrator message proposal is invalid")
 	}
-	proposal := MessageProposal{Version: submitted.Version, Repository: submitted.Repository, Issue: submitted.Issue, Attempt: submitted.Attempt, Action: submitted.Action, RequestID: submitted.RequestID, HandoffID: submitted.HandoffID, Detail: submitted.Detail, IssueGeneration: submitted.IssueGeneration, AttemptGeneration: submitted.AttemptGeneration}
+	proposal := MessageProposal{Version: submitted.Version, Repository: submitted.Repository, Issue: submitted.Issue, Attempt: submitted.Attempt, Action: submitted.Action, RequestID: submitted.RequestID, HandoffID: submitted.HandoffID, Detail: submitted.Detail, IssueGeneration: submitted.IssueGeneration, AttemptGeneration: submitted.AttemptGeneration, MachineStatusSequence: submitted.MachineStatusSequence}
 	if err := ValidateMessageProposal(proposal); err != nil {
 		return MessageProposal{}, err
 	}
@@ -1634,22 +1637,22 @@ func (s *Supervisor) writeMessageProposalStatus(pending string, state persisted)
 func ValidateMessageProposal(proposal MessageProposal) error {
 	switch proposal.Action {
 	case ProposalActionCheckIn:
-		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) {
+		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) {
 			return errors.New("orchestrator monitoring check-in proposal is invalid")
 		}
 		return nil
 	case ProposalActionRetry:
-		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || !validProposalRequestID(proposal.RequestID) || proposal.HandoffID != "" && !validHandoffID(proposal.HandoffID) {
+		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || !validProposalRequestID(proposal.RequestID) || proposal.HandoffID != "" && !validHandoffID(proposal.HandoffID) {
 			return errors.New("orchestrator transition retry proposal is invalid")
 		}
 		return nil
 	case ProposalActionRecover:
-		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) {
+		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) {
 			return errors.New("orchestrator attempt recovery proposal is invalid")
 		}
 		return nil
 	case ProposalActionAttention:
-		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) || strings.TrimSpace(proposal.Detail) == "" || len(proposal.Detail) > maxAttentionDetailBytes {
+		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) || strings.TrimSpace(proposal.Detail) == "" || len(proposal.Detail) > maxAttentionDetailBytes {
 			return errors.New("orchestrator human-attention proposal is invalid")
 		}
 		return nil
@@ -1733,7 +1736,7 @@ func sanitizeProjection(repository string, statuses []orchestrator.RecoveryStatu
 		if pr < 1 {
 			pr = 0
 		}
-		result = append(result, sanitizedStatus{Repository: repository, Issue: status.Issue, Attempt: status.Attempt, State: clean(status.State, 64), CurrentPhase: clean(status.CurrentPhase, 64), PR: pr, HeadSHA: clean(status.HeadSHA, 64), Sessions: sessions, Blockers: clean(internalgithub.Redact(strings.Join(status.Blockers, "; ")), 512), Diagnostic: clean(internalgithub.Redact(status.Diagnostic), 512), NextAction: clean(status.Action, 512), Retryable: status.Retryable, DispatchAuthorized: status.DispatchAuthorized, NeedsAttention: status.NeedsAttention, IssueGeneration: status.IssueGeneration, AttemptGeneration: status.AttemptGeneration})
+		result = append(result, sanitizedStatus{Repository: repository, Issue: status.Issue, Attempt: status.Attempt, State: clean(status.State, 64), CurrentPhase: clean(status.CurrentPhase, 64), PR: pr, HeadSHA: clean(status.HeadSHA, 64), Sessions: sessions, Blockers: clean(internalgithub.Redact(strings.Join(status.Blockers, "; ")), 512), Diagnostic: clean(internalgithub.Redact(status.Diagnostic), 512), NextAction: clean(status.Action, 512), Retryable: status.Retryable, DispatchAuthorized: status.DispatchAuthorized, NeedsAttention: status.NeedsAttention, IssueGeneration: status.IssueGeneration, AttemptGeneration: status.AttemptGeneration, MachineStatusSequence: status.MachineStatusSequence})
 	}
 	slices.SortFunc(result, func(a, b sanitizedStatus) int {
 		if a.Issue != b.Issue {

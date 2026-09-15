@@ -42,7 +42,8 @@ func TestDirectStatusRequiresTheSmallVocabularyAndReason(t *testing.T) {
 
 func TestEnsureOwnerStatusAppliesExactCommentAndLabelIdempotently(t *testing.T) {
 	now := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
-	var comments []map[string]any
+	legacy, _ := AttributedBody(9, 3, "/agent-symphony status clear: historic status\n\n<!-- agent-symphony:status:v1:sequence:100 -->")
+	comments := []map[string]any{{"id": 100, "body": legacy, "created_at": now, "updated_at": now, "user": map[string]any{"id": 42}}}
 	label := false
 	posts, labels := 0, 0
 	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -120,6 +121,30 @@ func TestOwnerStatusSequenceWinsWhenStaleSetArrivesLast(t *testing.T) {
 	status, err := (&GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}).directStatus(t.Context(), 9, 0)
 	if err != nil || status.NeedsAttention || status.statusSequence != 2 || status.Reason != "attempt invalidated" {
 		t.Fatalf("status=%#v err=%v", status, err)
+	}
+}
+
+func TestGlobalOwnerStatusStartsFreshAfterLegacyOrdering(t *testing.T) {
+	now := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
+	legacyOld, _ := AttributedBody(9, 1, "/agent-symphony status needs-attention: legacy one\n\n<!-- agent-symphony:status:v1:sequence:100 -->")
+	legacyNew, _ := AttributedBody(9, 2, "/agent-symphony status clear: legacy two\n\n<!-- agent-symphony:status:v1:sequence:1 -->")
+	global, _ := AttributedBody(9, 1, "/agent-symphony status clear: owner clear\n\n<!-- agent-symphony:status:v2:sequence:1 -->")
+	comments := []any{
+		map[string]any{"id": 1, "body": legacyOld, "created_at": now, "updated_at": now, "user": map[string]any{"id": 42}},
+		map[string]any{"id": 2, "body": legacyNew, "created_at": now.Add(time.Second), "updated_at": now.Add(time.Second), "user": map[string]any{"id": 42}},
+	}
+	api := fixtureAPI(t, map[string]any{"/repos/o/r/issues/9/comments?per_page=100&page=1": comments, "/repos/o/r/issues/9": map[string]any{"labels": []any{}}})
+	source := &GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
+	status, err := source.directStatus(t.Context(), 9, 0)
+	if err != nil || status.attributionAttempt != 2 || status.statusSequence != 1 || status.statusProtocol != 1 {
+		t.Fatalf("legacy ordering status=%#v err=%v", status, err)
+	}
+	comments = append(comments, map[string]any{"id": 3, "body": global, "created_at": now.Add(2 * time.Second), "updated_at": now.Add(2 * time.Second), "user": map[string]any{"id": 42}})
+	api = fixtureAPI(t, map[string]any{"/repos/o/r/issues/9/comments?per_page=100&page=1": comments, "/repos/o/r/issues/9": map[string]any{"labels": []any{}}})
+	source = &GitHubPRSource{API: api, Config: PRAdapterConfig{Repository: "o/r", ActorID: 42}}
+	status, err = source.directStatus(t.Context(), 9, 0)
+	if err != nil || status.attributionAttempt != 1 || status.statusSequence != 1 || status.statusProtocol != 2 || status.Reason != "owner clear" {
+		t.Fatalf("global ordering status=%#v err=%v", status, err)
 	}
 }
 

@@ -169,6 +169,11 @@ type RecoveryIssueFact struct {
 	RecoveryAuthorized                            bool
 	RecoveryAttempt                               int
 	NeedsAttention                                bool
+	MachineStatusProtocol                         int
+	MachineStatusAttempt                          int
+	MachineStatusSequence                         uint64
+	MachineStatusNeedsAttention                   bool
+	MachineStatusReason                           string
 	ActiveAttempt                                 *RecoveryAttemptFact
 	TerminalAttempts                              []RecoveryAttemptFact
 }
@@ -319,6 +324,7 @@ type directStatus struct {
 	attributionIssue     int
 	attributionAttempt   int
 	statusSequence       uint64
+	statusProtocol       int
 }
 
 func monitoringDependencyStatus(reason string, needsAttention bool) int {
@@ -354,16 +360,21 @@ func parseDirectStatus(body string) (directStatus, bool) {
 	var issue, attempt int
 	marker := strings.TrimSpace(rest)
 	var sequence uint64
-	if _, err := fmt.Sscanf(marker, "<!-- agent-symphony:status:v1:sequence:%d -->\n\n<!-- agent-symphony:issue:%d:attempt:%d -->", &sequence, &issue, &attempt); err == nil && marker == fmt.Sprintf("<!-- agent-symphony:status:v1:sequence:%d -->\n\n<!-- agent-symphony:issue:%d:attempt:%d -->", sequence, issue, attempt) && sequence > 0 && issue > 0 && attempt > 0 {
-		status.attributionAttempt = attempt
-		status.attributionIssue = issue
-		status.statusSequence = sequence
+	for protocol := 2; protocol >= 1; protocol-- {
+		format := fmt.Sprintf("<!-- agent-symphony:status:v%d:sequence:%%d -->\n\n<!-- agent-symphony:issue:%%d:attempt:%%d -->", protocol)
+		if _, err := fmt.Sscanf(marker, format, &sequence, &issue, &attempt); err == nil && marker == fmt.Sprintf(format, sequence, issue, attempt) && sequence > 0 && issue > 0 && attempt > 0 {
+			status.attributionAttempt = attempt
+			status.attributionIssue = issue
+			status.statusSequence = sequence
+			status.statusProtocol = protocol
+			break
+		}
 	}
 	return status, true
 }
 
 func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest int) (directStatus, error) {
-	var latestMarked, latestUnmarked directStatus
+	var latestGlobal, latestLegacy, latestUnmarked directStatus
 	for _, number := range []int{issue, pullRequest} {
 		if number == 0 {
 			continue
@@ -386,21 +397,31 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 			}
 			status.requestedReason = status.Reason
 			status.createdAt, status.commentID = comment.CreatedAt, comment.ID
-			if status.attributionAttempt > 0 {
+			if status.statusProtocol == 2 {
 				if status.attributionIssue != issue {
 					continue
 				}
-				if latestMarked.commentID == 0 || status.statusSequence > latestMarked.statusSequence || status.statusSequence == latestMarked.statusSequence && newerDirectStatus(status, latestMarked) {
-					latestMarked = status
+				if latestGlobal.commentID == 0 || status.statusSequence > latestGlobal.statusSequence || status.statusSequence == latestGlobal.statusSequence && newerDirectStatus(status, latestGlobal) {
+					latestGlobal = status
+				}
+			} else if status.attributionAttempt > 0 {
+				if status.attributionIssue != issue {
+					continue
+				}
+				if latestLegacy.commentID == 0 || status.attributionAttempt > latestLegacy.attributionAttempt || status.attributionAttempt == latestLegacy.attributionAttempt && (status.statusSequence > latestLegacy.statusSequence || status.statusSequence == latestLegacy.statusSequence && newerDirectStatus(status, latestLegacy)) {
+					latestLegacy = status
 				}
 			} else if latestUnmarked.commentID == 0 || newerDirectStatus(status, latestUnmarked) {
 				latestUnmarked = status
 			}
 		}
 	}
-	latest := latestMarked
+	latest := latestGlobal
 	if latest.commentID == 0 {
-		latest = latestUnmarked
+		latest = latestLegacy
+		if latest.commentID == 0 || latestUnmarked.commentID != 0 && newerDirectStatus(latestUnmarked, latest) {
+			latest = latestUnmarked
+		}
 	}
 	var current struct{ Labels []struct{ Name string } }
 	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", s.Config.Repository, issue), "", &current); err != nil {
@@ -439,7 +460,7 @@ func (a API) OwnerStatusApplied(ctx context.Context, repository string, issue, a
 	}
 	source := GitHubPRSource{API: a, Config: PRAdapterConfig{Repository: repository, ActorID: actorID}}
 	status, err := source.directStatus(ctx, issue, 0)
-	return err == nil && status.commentID > 0 && !status.incomplete && status.attributionIssue == issue && status.attributionAttempt == attempt && status.statusSequence == sequence && status.NeedsAttention == needsAttention && status.Reason == reason, err
+	return err == nil && status.commentID > 0 && !status.incomplete && status.statusProtocol == 2 && status.attributionIssue == issue && status.attributionAttempt == attempt && status.statusSequence == sequence && status.NeedsAttention == needsAttention && status.Reason == reason, err
 }
 
 // EnsureOwnerStatus applies an untrusted worker request through owner credentials.
@@ -454,15 +475,15 @@ func (a API) EnsureOwnerStatus(ctx context.Context, repository string, issue, at
 	if err != nil {
 		return err
 	}
-	if status.attributionIssue == issue && (status.statusSequence > sequence || status.statusSequence == sequence && (status.attributionAttempt != attempt || status.requestedAttention != needsAttention || status.requestedReason != reason)) {
+	if status.statusProtocol == 2 && status.attributionIssue == issue && (status.statusSequence > sequence || status.statusSequence == sequence && (status.attributionAttempt != attempt || status.requestedAttention != needsAttention || status.requestedReason != reason)) {
 		return errors.New("owner status sequence is stale or conflicting")
 	}
-	if status.commentID == 0 || status.attributionAttempt != attempt || status.statusSequence != sequence || status.requestedAttention != needsAttention || status.requestedReason != reason {
+	if status.commentID == 0 || status.statusProtocol != 2 || status.attributionAttempt != attempt || status.statusSequence != sequence || status.requestedAttention != needsAttention || status.requestedReason != reason {
 		name := "clear"
 		if needsAttention {
 			name = "needs-attention"
 		}
-		body, err := AttributedBody(issue, attempt, directStatusPrefix+name+": "+reason+fmt.Sprintf("\n\n<!-- agent-symphony:status:v1:sequence:%d -->", sequence))
+		body, err := AttributedBody(issue, attempt, directStatusPrefix+name+": "+reason+fmt.Sprintf("\n\n<!-- agent-symphony:status:v2:sequence:%d -->", sequence))
 		if err != nil {
 			return err
 		}
@@ -761,7 +782,7 @@ func fetchRecoveryIssueFact(ctx context.Context, api API, cfg PRAdapterConfig, s
 		if status.NeedsAttention {
 			blockers = append(blockers, "needs attention: "+status.Reason)
 		}
-		return RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: baseSHA, BaseBranch: baseBranch, CreatedAt: issue.CreatedAt, Blockers: blockers, Active: active[issue.Number] || binding.Attempt > 0 || bindingConflicts.Any, Completed: completed[issue.Number], Closed: issue.State == "closed", NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts}, proposals, nil
+		return RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: baseSHA, BaseBranch: baseBranch, CreatedAt: issue.CreatedAt, Blockers: blockers, Active: active[issue.Number] || binding.Attempt > 0 || bindingConflicts.Any, Completed: completed[issue.Number], Closed: issue.State == "closed", NeedsAttention: status.NeedsAttention, MachineStatusProtocol: status.statusProtocol, MachineStatusAttempt: status.attributionAttempt, MachineStatusSequence: status.statusSequence, MachineStatusNeedsAttention: status.requestedAttention, MachineStatusReason: status.requestedReason, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts}, proposals, nil
 	}
 	blockers := []string{}
 	var satisfiedDependencies []int
@@ -823,7 +844,7 @@ func fetchRecoveryIssueFact(ctx context.Context, api API, cfg PRAdapterConfig, s
 	if status.NeedsAttention {
 		blockers = append(blockers, "needs attention: "+status.Reason)
 	}
-	return RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: baseSHA, BaseBranch: baseBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, SatisfiedDependencies: satisfiedDependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, Closed: issue.State == "closed", DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, NeedsAttention: status.NeedsAttention, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts}, proposals, nil
+	return RecoveryIssueFact{Repository: cfg.Repository, Issue: issue.Number, Attempt: attempt, CurrentAttempt: currentAttempt, Title: issue.Title, Body: issue.Body, BaseSHA: baseSHA, BaseBranch: baseBranch, CreatedAt: issue.CreatedAt, Priority: controls.Priority, Dependencies: controls.Dependencies, SatisfiedDependencies: satisfiedDependencies, Paths: IssuePaths(issue.Body), Blockers: blockers, Eligible: eligible, Active: isActive, Completed: completed[issue.Number], Retry: controls.Retry, Cancelled: controls.Cancelled, Closed: issue.State == "closed", DispatchAuthorized: authorized, RecoveryAuthorized: recoveryAuthorized, RecoveryAttempt: recoveryAttempt, NeedsAttention: status.NeedsAttention, MachineStatusProtocol: status.statusProtocol, MachineStatusAttempt: status.attributionAttempt, MachineStatusSequence: status.statusSequence, MachineStatusNeedsAttention: status.requestedAttention, MachineStatusReason: status.requestedReason, ActiveAttempt: activeAttempt, TerminalAttempts: terminalAttempts}, proposals, nil
 }
 
 func fetchActiveAttempts(ctx context.Context, api API, cfg PRAdapterConfig, issue int) ([]activeMarkerPayload, markerConflicts, error) {

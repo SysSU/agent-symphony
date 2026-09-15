@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
@@ -99,26 +98,16 @@ func (s *supervisorProposalServiceV2) process(ctx context.Context) error {
 			checkIn, err = planMonitoringCheckIn(snapshot, proposal)
 		}
 	case orchestratoragent.ProposalActionStatusSet, orchestratoragent.ProposalActionStatusClear:
-		sequence, parseErr := strconv.ParseUint(proposal.Binding[:16], 16, 64)
-		if parseErr != nil {
-			err = errors.New("orchestrator status binding is invalid")
-			break
-		}
-		if sequence == 0 {
-			sequence = 1
-		}
 		status := "clear"
 		if proposal.Action == orchestratoragent.ProposalActionStatusSet {
 			status = "needs-attention"
 		}
 		var admitted stateOwnerSnapshot
-		admitted, err = s.owner.admitMachineStatus(ctx, admitMachineStatusCommand{Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, Source: "orchestrator", SourceSequence: sequence, Status: status, Reason: proposal.Detail})
+		admitted, err = s.owner.admitMachineStatus(ctx, admitMachineStatusCommand{Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, ExpectedStatusSequence: proposal.MachineStatusSequence, Source: "orchestrator", SourceID: proposal.Binding, Status: status, Reason: proposal.Detail})
 		if err == nil {
 			plans, planErr := planMachineStatusUpdates(admitted, s.operator.collector.Config)
 			err = planErr
-			if err == nil && len(plans) == 0 {
-				err = errors.New("owner status intent has no current external observation")
-			} else if err == nil {
+			if err == nil && len(plans) != 0 {
 				machineStatus = plans[0]
 			}
 		}
@@ -150,12 +139,18 @@ func (s *supervisorProposalServiceV2) process(ctx context.Context) error {
 		}
 		succeeded = "the generation-bound monitoring check-in was delivered and durably recorded"
 	case orchestratoragent.ProposalActionStatusSet, orchestratoragent.ProposalActionStatusClear:
+		if machineStatus.Request.Action == "" {
+			return nil
+		}
 		if machineStatus, err = s.effects.beginReconciliation(ctx, machineStatus); err == nil {
 			_, err = s.effects.executeIssueUpdate(ctx, s.operator.collector.API, machineStatus)
 		}
 		succeeded = "the owner-issued machine status was observed on GitHub"
 	}
 	if err != nil {
+		if proposal.Action == orchestratoragent.ProposalActionStatusSet || proposal.Action == orchestratoragent.ProposalActionStatusClear {
+			return err
+		}
 		return errors.Join(err, s.resolve(ctx, proposal.Binding, "failed", err))
 	}
 	return s.agent.ResolveMessageProposal(ctx, proposal.Binding, "succeeded", succeeded)

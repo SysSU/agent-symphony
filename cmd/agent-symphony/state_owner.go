@@ -71,8 +71,9 @@ type runtimeOwnerState struct {
 }
 
 // machineStatusRecord is the single owner-issued ordering domain for every
-// Agent Symphony status producer. SourceSequence is producer-local; Sequence
-// is the durable per-issue order used at the GitHub boundary.
+// Agent Symphony status producer. Sequence is the durable per-issue order used
+// both for optimistic admission and at the GitHub boundary. SourceID makes a
+// producer proposal idempotent; SourceSequence is allocated by the owner.
 type machineStatusRecord struct {
 	Repository        string `json:"repository"`
 	Issue             int    `json:"issue"`
@@ -82,6 +83,7 @@ type machineStatusRecord struct {
 	Sequence          uint64 `json:"sequence"`
 	AppliedSequence   uint64 `json:"applied_sequence,omitempty"`
 	Source            string `json:"source"`
+	SourceID          string `json:"source_id"`
 	SourceSequence    uint64 `json:"source_sequence"`
 	Status            string `json:"status"`
 	Reason            string `json:"reason"`
@@ -223,6 +225,7 @@ type runtimeEffectIntent struct {
 	State                               string                         `json:"state"`
 	Dispatched                          bool                           `json:"dispatched,omitempty"`
 	RequestDigest                       string                         `json:"request_digest"`
+	MachineStatusSequence               uint64                         `json:"machine_status_sequence,omitempty"`
 	CandidateLaunchToken                string                         `json:"candidate_launch_token,omitempty"`
 	StartGateNonce                      string                         `json:"start_gate_nonce,omitempty"`
 	StartMayRun                         bool                           `json:"start_may_run,omitempty"`
@@ -365,9 +368,10 @@ type admitMachineStatusCommand struct {
 	ExpectedIssueGeneration       uint64
 	ExpectedAttemptGeneration     uint64
 	ExpectedObservationGeneration uint64
+	ExpectedStatusSequence        uint64
 	Dependency, PullRequest       int
 	Source                        string
-	SourceSequence                uint64
+	SourceID                      string
 	Status, Reason                string
 }
 
@@ -1404,6 +1408,9 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 		pruneCompletedAttemptEffects(state, manifest.Repository, manifest.Issue, manifest.Attempt)
 	}
 	effect := &runtimeEffectIntent{Action: string(command.Action), Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: identity.IssueGeneration, AttemptGeneration: identity.AttemptGeneration, IntentEpoch: state.Epoch, State: "pending", RequestDigest: command.RequestDigest, Reason: command.Reason, Review: cloneReviewTransition(command.Review), CandidateLaunchToken: command.CandidateLaunchToken, InvalidatedHandoff: invalidatedHandoff, InvalidatedStart: invalidatedStart}
+	if command.Action == agentruntime.EffectMonitor {
+		effect.MachineStatusSequence = state.MachineStatuses[issueKey].Sequence
+	}
 	if command.Action == agentruntime.EffectStart {
 		effect.StartGateNonce = command.StartGateNonce
 		effect.StartCandidates = []startGateCandidate{{Nonce: command.StartGateNonce}}
@@ -1476,7 +1483,8 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 			if err := applyAdmitMachineStatus(state, admitMachineStatusCommand{
 				Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt,
 				ExpectedIssueGeneration: identity.IssueGeneration, ExpectedAttemptGeneration: identity.AttemptGeneration,
-				Source: "worker", SourceSequence: manifest.WorkerStatusSeq, Status: manifest.WorkerStatus, Reason: manifest.WorkerStatusReason,
+				ExpectedStatusSequence: effect.MachineStatusSequence,
+				Source:                 "worker", SourceID: fmt.Sprintf("%d:%d", identity.AttemptGeneration, manifest.WorkerStatusSeq), Status: manifest.WorkerStatus, Reason: manifest.WorkerStatusReason,
 			}); err != nil {
 				return err
 			}
@@ -1756,10 +1764,7 @@ func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueG
 	}
 	state.IssueGenerations[key] = generation + 1
 	if current, exists := state.MachineStatuses[key]; exists {
-		if current.SourceSequence == ^uint64(0) {
-			return errors.New("machine status source sequence overflow")
-		}
-		if err := applyAdmitMachineStatus(state, admitMachineStatusCommand{Repository: command.Repository, Issue: command.Issue, Attempt: current.Attempt, ExpectedIssueGeneration: generation + 1, ExpectedAttemptGeneration: state.AttemptGenerations[ownerAttemptKey(command.Repository, command.Issue, current.Attempt)], Source: "destructive", SourceSequence: current.SourceSequence + 1, Status: "clear", Reason: "issue generation invalidated"}); err != nil {
+		if err := applyAdmitMachineStatus(state, admitMachineStatusCommand{Repository: command.Repository, Issue: command.Issue, Attempt: current.Attempt, ExpectedIssueGeneration: generation + 1, ExpectedAttemptGeneration: state.AttemptGenerations[ownerAttemptKey(command.Repository, command.Issue, current.Attempt)], ExpectedStatusSequence: current.Sequence, Source: "destructive", SourceID: fmt.Sprintf("issue:%d", generation+1), Status: "clear", Reason: "issue generation invalidated"}); err != nil {
 			return err
 		}
 	}
@@ -1944,10 +1949,7 @@ func applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot string, state *ru
 		generation = 1
 		state.AttemptGenerations[attemptKey] = generation
 		if current, exists := state.MachineStatuses[issueKey]; exists {
-			if current.SourceSequence == ^uint64(0) {
-				return errors.New("machine status source sequence overflow")
-			}
-			if err := applyAdmitMachineStatus(state, admitMachineStatusCommand{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, ExpectedIssueGeneration: issueGeneration, ExpectedAttemptGeneration: generation, Source: "destructive", SourceSequence: current.SourceSequence + 1, Status: "clear", Reason: "attempt superseded"}); err != nil {
+			if err := applyAdmitMachineStatus(state, admitMachineStatusCommand{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, ExpectedIssueGeneration: issueGeneration, ExpectedAttemptGeneration: generation, ExpectedStatusSequence: current.Sequence, Source: "destructive", SourceID: fmt.Sprintf("attempt:%d", generation), Status: "clear", Reason: "attempt superseded"}); err != nil {
 				return err
 			}
 		}
@@ -2129,7 +2131,8 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 	if err := applyAdmitMachineStatus(state, admitMachineStatusCommand{
 		Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt,
 		ExpectedIssueGeneration: command.ExpectedIssueGeneration, ExpectedAttemptGeneration: generation,
-		Source: "destructive", SourceSequence: generation, Status: "clear", Reason: "attempt invalidated",
+		ExpectedStatusSequence: state.MachineStatuses[issueKey].Sequence,
+		Source:                 "destructive", SourceID: fmt.Sprintf("%s:%d", command.Action, generation), Status: "clear", Reason: "attempt invalidated",
 	}); err != nil {
 		return nil, err
 	}
@@ -2169,7 +2172,7 @@ func applyAdmitMachineStatus(state *runtimeOwnerState, command admitMachineStatu
 	if command.Repository != state.Repository || command.Issue < 1 || command.Attempt < 1 ||
 		state.IssueGenerations[issueKey] != command.ExpectedIssueGeneration || command.ExpectedIssueGeneration == 0 ||
 		!slices.Contains([]string{"worker", "dependency", "orchestrator", "destructive"}, command.Source) ||
-		command.SourceSequence == 0 || !slices.Contains([]string{"needs-attention", "clear"}, command.Status) ||
+		!boundedText(command.SourceID, 128, true) || !slices.Contains([]string{"needs-attention", "clear"}, command.Status) ||
 		!boundedText(command.Reason, 1024, true) {
 		return errStaleStateResult
 	}
@@ -2191,13 +2194,11 @@ func applyAdmitMachineStatus(state *runtimeOwnerState, command admitMachineStatu
 		return errStaleStateResult
 	}
 	current := state.MachineStatuses[issueKey]
-	if current.Repository != "" && current.Source == command.Source && current.Attempt == command.Attempt && current.AttemptGeneration == command.ExpectedAttemptGeneration {
-		if command.SourceSequence <= current.SourceSequence {
-			if command.SourceSequence == current.SourceSequence && current.Status == command.Status && current.Reason == command.Reason {
-				return nil
-			}
-			return errStaleStateResult
-		}
+	if current.Repository != "" && current.Source == command.Source && current.SourceID == command.SourceID && current.Attempt == command.Attempt && current.AttemptGeneration == command.ExpectedAttemptGeneration && current.Status == command.Status && current.Reason == command.Reason {
+		return nil
+	}
+	if current.Sequence != command.ExpectedStatusSequence {
+		return errStaleStateResult
 	}
 	if current.Sequence == ^uint64(0) {
 		return errors.New("machine status sequence overflow")
@@ -2222,7 +2223,7 @@ func applyAdmitMachineStatus(state *runtimeOwnerState, command admitMachineStatu
 		Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt,
 		IssueGeneration: command.ExpectedIssueGeneration, AttemptGeneration: command.ExpectedAttemptGeneration,
 		Sequence: sequence, AppliedSequence: current.AppliedSequence, Source: command.Source,
-		SourceSequence: command.SourceSequence, Status: command.Status, Reason: strings.TrimSpace(command.Reason),
+		SourceID: command.SourceID, SourceSequence: sequence, Status: command.Status, Reason: strings.TrimSpace(command.Reason),
 	}
 	return nil
 }
@@ -2421,6 +2422,13 @@ func readRuntimeOwnerState(stateRoot, repository string) (runtimeOwnerState, err
 // canonical owner marker.
 func migrateLegacyMachineStatuses(state *runtimeOwnerState) {
 	if state.MachineStatuses != nil {
+		for key, status := range state.MachineStatuses {
+			if status.SourceID == "" {
+				status.SourceID = fmt.Sprintf("legacy:%s:%d", status.Source, status.SourceSequence)
+			}
+			status.SourceSequence = status.Sequence
+			state.MachineStatuses[key] = status
+		}
 		return
 	}
 	state.MachineStatuses = map[string]machineStatusRecord{}
@@ -2434,7 +2442,7 @@ func migrateLegacyMachineStatuses(state *runtimeOwnerState) {
 		if current.Repository != "" && current.Attempt >= manifest.Attempt {
 			continue
 		}
-		state.MachineStatuses[issueKey] = machineStatusRecord{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: state.AttemptGenerations[key], Sequence: 1, Source: "worker", SourceSequence: manifest.WorkerStatusSeq, Status: manifest.WorkerStatus, Reason: strings.TrimSpace(manifest.WorkerStatusReason)}
+		state.MachineStatuses[issueKey] = machineStatusRecord{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: state.AttemptGenerations[key], Sequence: 1, Source: "worker", SourceID: fmt.Sprintf("legacy:worker:%d", manifest.WorkerStatusSeq), SourceSequence: 1, Status: manifest.WorkerStatus, Reason: strings.TrimSpace(manifest.WorkerStatusReason)}
 	}
 	for id, effect := range state.Effects {
 		if effect.Reconciliation != nil && effect.Reconciliation.GitHubIssueUpdate != nil && effect.Reconciliation.GitHubIssueUpdate.Kind == githubIssueMachineStatus && effect.Attempt > 0 {
@@ -2442,7 +2450,7 @@ func migrateLegacyMachineStatuses(state *runtimeOwnerState) {
 			if _, current := state.MachineStatuses[issueKey]; !current {
 				attemptGeneration := state.AttemptGenerations[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
 				if state.IssueGenerations[issueKey] > 0 && attemptGeneration > 0 {
-					state.MachineStatuses[issueKey] = machineStatusRecord{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: attemptGeneration, Sequence: 1, Source: "destructive", SourceSequence: attemptGeneration, Status: "clear", Reason: "legacy status intent invalidated"}
+					state.MachineStatuses[issueKey] = machineStatusRecord{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: attemptGeneration, Sequence: 1, Source: "destructive", SourceID: fmt.Sprintf("legacy:destructive:%d", attemptGeneration), SourceSequence: 1, Status: "clear", Reason: "legacy status intent invalidated"}
 				}
 			}
 			delete(state.Effects, id)
@@ -2767,7 +2775,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		attemptBound := (status.Source == "dependency" || status.Source == "destructive") && status.AttemptGeneration == 0 || status.AttemptGeneration > 0 && status.AttemptGeneration == state.AttemptGenerations[attemptKey]
 		if key != ownerIssueKey(status.Repository, status.Issue) || status.Repository != state.Repository || status.Issue < 1 || status.Attempt < 1 ||
 			status.IssueGeneration == 0 || status.IssueGeneration != state.IssueGenerations[key] || !attemptBound ||
-			status.Sequence == 0 || status.AppliedSequence > status.Sequence || status.SourceSequence == 0 ||
+			status.Sequence == 0 || status.AppliedSequence > status.Sequence || status.SourceSequence == 0 || !boundedText(status.SourceID, 128, true) ||
 			!slices.Contains([]string{"worker", "dependency", "orchestrator", "destructive"}, status.Source) ||
 			!slices.Contains([]string{"needs-attention", "clear"}, status.Status) || !boundedText(status.Reason, 1024, true) {
 			return errors.New("runtime owner machine status is invalid")

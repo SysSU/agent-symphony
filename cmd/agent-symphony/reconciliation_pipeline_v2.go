@@ -994,7 +994,10 @@ func planMachineStatusUpdates(snapshot stateOwnerSnapshot, cfg internalgithub.PR
 			continue
 		}
 		needsAttention := status.Status == "needs-attention"
-		remoteCurrent := observation.Fact.NeedsAttention == needsAttention
+		remoteCurrent := observation.Fact.NeedsAttention == needsAttention &&
+			observation.Fact.MachineStatusProtocol == 2 && observation.Fact.MachineStatusAttempt == status.Attempt &&
+			observation.Fact.MachineStatusSequence == status.Sequence && observation.Fact.MachineStatusNeedsAttention == needsAttention &&
+			observation.Fact.MachineStatusReason == status.Reason
 		if status.AppliedSequence == status.Sequence && remoteCurrent {
 			continue
 		}
