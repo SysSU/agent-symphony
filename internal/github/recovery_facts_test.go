@@ -97,6 +97,15 @@ func TestEnsureOwnerStatusAppliesExactCommentAndLabelIdempotently(t *testing.T) 
 	if applied, err := api.OwnerStatusApplied(t.Context(), "o/r", 9, 2, 2, false, "operator decision supplied", 42); err != nil || applied {
 		t.Fatalf("old attempt falsely proved the current status: applied=%t err=%v", applied, err)
 	}
+	lateOld, _ := AttributedBody(9, 3, directStatusPrefix+"needs-attention: stale worker\n\n<!-- agent-symphony:status:v1:sequence:1 -->")
+	wrongIssue, _ := AttributedBody(8, 3, directStatusPrefix+"needs-attention: misplaced worker\n\n<!-- agent-symphony:status:v1:sequence:3 -->")
+	for index, body := range []string{lateOld, wrongIssue} {
+		created := now.Add(time.Duration(10+index) * time.Second)
+		comments = append(comments, map[string]any{"id": 10 + index, "body": body, "created_at": created, "updated_at": created, "user": map[string]any{"id": 42}})
+	}
+	if applied, err := api.OwnerStatusApplied(t.Context(), "o/r", 9, 3, 2, false, "operator decision supplied", 42); err != nil || !applied {
+		t.Fatalf("late old or cross-issue status displaced canonical clear: applied=%t err=%v", applied, err)
+	}
 }
 
 func TestDirectStatusUsesNewestAuthenticatedIssueOrPullRequestComment(t *testing.T) {
@@ -372,6 +381,43 @@ func TestEnsureRetryCommandIsAuthorizedExactAndIdempotent(t *testing.T) {
 	}
 	if posts != 1 {
 		t.Fatalf("retry posts=%d", posts)
+	}
+}
+
+func TestEnsureRetrySuppressedSurvivesLostAcceptedResponseAndRestart(t *testing.T) {
+	failedAt := time.Unix(10, 0).UTC()
+	active, _ := ActiveAttemptMarker("o/r", 4, 2, "abcdef0")
+	terminal, _ := TerminalFailureMarker(4, 2, failedAt)
+	comments := []map[string]any{
+		{"id": 1, "body": active, "created_at": failedAt.Add(-time.Minute), "updated_at": failedAt.Add(-time.Minute), "user": map[string]any{"id": 42}},
+		{"id": 2, "body": terminal, "created_at": failedAt, "updated_at": failedAt, "user": map[string]any{"id": 42}},
+		{"id": 3, "body": "/retry", "created_at": failedAt.Add(time.Minute), "updated_at": failedAt.Add(time.Minute), "user": map[string]any{"id": 42}},
+	}
+	posts := 0
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r/issues/4/comments?per_page=100&page=1" {
+			body, _ := json.Marshal(comments)
+			return httpResponse(http.StatusOK, string(body), nil), nil
+		}
+		if r.Method == http.MethodPost && r.URL.RequestURI() == "/repos/o/r/issues/4/comments" {
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil || payload.Body != "/cancel" {
+				t.Fatalf("suppression body=%q", payload.Body)
+			}
+			posts++
+			createdAt := failedAt.Add(2 * time.Minute)
+			comments = append(comments, map[string]any{"id": 4, "body": payload.Body, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
+			return nil, io.ErrUnexpectedEOF
+		}
+		t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		return nil, nil
+	})}}
+	cfg := PRAdapterConfig{Repository: "o/r", ActorID: 42, CancelCommand: "/cancel", RetryCommand: "/retry"}
+	if applied, err := EnsureRetrySuppressed(t.Context(), api, cfg, 4, 2, failedAt); err != nil || !applied {
+		t.Fatalf("lost accepted response was not converged: applied=%v err=%v", applied, err)
+	}
+	if applied, err := EnsureRetrySuppressed(t.Context(), api, cfg, 4, 2, failedAt); err != nil || !applied || posts != 1 {
+		t.Fatalf("restart suppression applied=%v posts=%d err=%v", applied, posts, err)
 	}
 }
 

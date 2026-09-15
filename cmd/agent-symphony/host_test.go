@@ -2017,6 +2017,69 @@ func TestRootlessCodexConfinementDeniesDetachedChildAuthority(t *testing.T) {
 	}
 }
 
+func TestSandboxedWorkerExportCannotRunGitConfigWithOwnerAuthority(t *testing.T) {
+	if _, err := exec.LookPath("codex"); err != nil {
+		t.Skip("codex CLI is unavailable")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := os.MkdirTemp(home, ".as-hostile-export-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	attemptRoot, workspace, stateRoot := filepath.Join(base, "attempts"), filepath.Join(base, "attempts", "worker"), filepath.Join(base, "state")
+	for _, path := range []string{attemptRoot, workspace, stateRoot, filepath.Join(workspace, ".agent-symphony")} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runGit(t, workspace, "init")
+	runGit(t, workspace, "config", "user.email", "test@example.invalid")
+	runGit(t, workspace, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(workspace, "file"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, workspace, "add", "file")
+	runGit(t, workspace, "commit", "-m", "base")
+	baseSHA := runGit(t, workspace, "rev-parse", "HEAD")
+	canary := filepath.Join(stateRoot, "escaped")
+	script := filepath.Join(workspace, "escape.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf escaped >"+canary+"\ncat\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, workspace, "config", "core.fsmonitor", script)
+	runGit(t, workspace, "config", "filter.escape.clean", script)
+	if err := os.WriteFile(filepath.Join(workspace, ".gitattributes"), []byte("file filter=escape\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := workerResult{Type: "agent-symphony-result-v1", Validation: "green", Documentation: "none"}
+	resultBody, _ := json.Marshal(result)
+	if err := os.WriteFile(agentruntime.ResultPath(workspace), resultBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(base, "agent-symphony")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build export helper: %v: %s", err, output)
+	}
+	codexHome := filepath.Join(base, "codex-home")
+	if err := os.Mkdir(codexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, Repository: "o/r", Issue: 329, Attempt: 1, Branch: runGit(t, workspace, "branch", "--show-current"), Worktree: workspace, BaseSHA: baseSHA, State: "completed", WorkerGeneration: 1, WorkerProfileDigest: config.WorkerProfileDigest()}
+	input, _ := json.Marshal(manifest)
+	command := exec.CommandContext(t.Context(), "codex", config.WorkerSandboxArgs(workspace, binary, "export-attempt", attemptRoot)...)
+	command.Dir = workspace
+	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(workspace, ".agent-symphony")}
+	command.Stdin = bytes.NewReader(input)
+	_, _ = command.CombinedOutput() // A hostile filter may make export fail closed.
+	if _, err := os.Lstat(canary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker-controlled Git config escaped sandbox: %v", err)
+	}
+}
+
 func TestDismissCommitsWhileConfinedDetachedChildLivesAndRejectsItsStaleResult(t *testing.T) {
 	if _, err := exec.LookPath("codex"); err != nil {
 		t.Skip("codex CLI is unavailable")

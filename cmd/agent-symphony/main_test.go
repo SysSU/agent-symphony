@@ -1303,6 +1303,37 @@ func TestProductionStateRootRejectsSharedTemporaryStorageWithoutCreatingIt(t *te
 	}
 }
 
+func TestServeRejectsSharedTemporaryStateBeforeNetworkOrFilesystemMutation(t *testing.T) {
+	previous := allowSharedTempRuntimeStateForTest
+	allowSharedTempRuntimeStateForTest = false
+	t.Cleanup(func() { allowSharedTempRuntimeStateForTest = previous })
+	repository := t.TempDir()
+	runGit(t, repository, "init")
+	configuration := config.Default("o/r")
+	path := filepath.Join(repository, config.DefaultPath)
+	if err := config.Write(path, configuration); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(os.TempDir(), fmt.Sprintf("agent-symphony-serve-rejected-%d", os.Getpid()))
+	stateRoot := filepath.Join(parent, "runtime")
+	var stdout, stderr bytes.Buffer
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repository); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	code := run([]string{"serve", "--config", path, "--state", filepath.Join(repository, "legacy.json"), "--runtime-state", stateRoot}, &stdout, &stderr)
+	if code == 0 || !strings.Contains(stderr.String(), "shared temporary storage") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if _, err := os.Lstat(parent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected serve created runtime state: %v", err)
+	}
+}
+
 func TestWorkerExportRejectsMaliciousOrOversizedBundleBeforeImport(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "boundary")
