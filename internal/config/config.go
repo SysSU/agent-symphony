@@ -199,11 +199,23 @@ func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Comman
 	if err != nil {
 		return "", err
 	}
+	single := root == source
 	target := filepath.Join(pinRoot, treeDigest)
+	installed := false
 	if err := os.Rename(stage, target); err != nil {
-		if validationErr := validatePinnedDirectory(target, 0o500); validationErr != nil {
+		if _, validationErr := os.Lstat(target); validationErr != nil {
 			return "", err
 		}
+	} else {
+		installed = true
+	}
+	if installed {
+		if err := os.Chmod(target, 0o500); err != nil {
+			return "", err
+		}
+	}
+	if err := validatePinnedTree(ctx, target, treeDigest, single); err != nil {
+		return "", err
 	}
 	pinned := filepath.Join(target, relative)
 	commands.Implementation[0], commands.Reviewer[0] = pinned, pinned
@@ -323,6 +335,57 @@ func validatePinnedDirectory(path string, mode os.FileMode) error {
 	info, err := os.Lstat(path)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != mode || !safeExecutableOwner(info) {
 		return errors.New("pinned worker executable directory is unsafe")
+	}
+	return nil
+}
+
+func validatePinnedTree(ctx context.Context, root, expected string, single bool) error {
+	hash := sha256.New()
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return errors.New("pinned worker executable escaped its root")
+		}
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !safeExecutableOwner(info) {
+			return errors.New("pinned worker executable is unsafe")
+		}
+		if entry.IsDir() {
+			if info.Mode().Perm() != 0o500 {
+				return errors.New("pinned worker executable directory is writable")
+			}
+			if !(single && rel == ".") {
+				_, _ = io.WriteString(hash, rel+"\x00")
+			}
+			return nil
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o400 && info.Mode().Perm() != 0o500 {
+			return errors.New("pinned worker executable contains an unsafe file")
+		}
+		_, _ = io.WriteString(hash, rel+"\x00")
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		opened, statErr := file.Stat()
+		if statErr != nil || !os.SameFile(info, opened) {
+			_ = file.Close()
+			return errors.New("pinned worker executable changed while opening")
+		}
+		_, copyErr := io.Copy(hash, file)
+		return errors.Join(copyErr, file.Close())
+	})
+	if err != nil {
+		return err
+	}
+	if fmt.Sprintf("%x", hash.Sum(nil)) != expected {
+		return errors.New("pinned worker executable digest does not match its path")
 	}
 	return nil
 }

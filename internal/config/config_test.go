@@ -58,7 +58,7 @@ func TestBindWorkerExecutableRejectsFakeCodexBasename(t *testing.T) {
 }
 
 func TestPinWorkerExecutableSurvivesConfiguredPathSwap(t *testing.T) {
-	root := t.TempDir()
+	root := pinnedTestRoot(t)
 	source := filepath.Join(t.TempDir(), "codex")
 	write := func(path, marker string, mode os.FileMode) {
 		t.Helper()
@@ -89,6 +89,48 @@ func TestPinWorkerExecutableSurvivesConfiguredPathSwap(t *testing.T) {
 	}
 }
 
+func TestPinWorkerExecutableReusesOnlyValidatedArtifactOnRestart(t *testing.T) {
+	stateRoot, source := pinnedTestRoot(t), filepath.Join(t.TempDir(), "codex")
+	original := []byte("#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.153.4\\n'; else printf 'original\\n'; fi\n")
+	if err := os.WriteFile(source, original, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(source)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	pin := func() (string, Commands) {
+		t.Helper()
+		commands := Default("o/r").Commands
+		commands.Implementation[0], commands.Reviewer[0] = source, source
+		digest, err := PinWorkerExecutable(t.Context(), stateRoot, &commands)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return digest, commands
+	}
+	firstDigest, first := pin()
+	secondDigest, second := pin()
+	if firstDigest != secondDigest || first.Implementation[0] != second.Implementation[0] {
+		t.Fatalf("restart changed pinned identity: first=%q/%q second=%q/%q", firstDigest, first.Implementation[0], secondDigest, second.Implementation[0])
+	}
+	if info, err := os.Stat(filepath.Dir(first.Implementation[0])); err != nil || info.Mode().Perm() != 0o500 {
+		t.Fatalf("published pin directory=%v err=%v", info, err)
+	}
+	if err := os.Chmod(first.Implementation[0], 0o700); err != nil {
+		t.Fatal(err)
+	}
+	substitute := []byte("#!/bin/sh\nprintf 'codex-cli 0.153.4\\n'\n# substituted artifact\n")
+	if err := os.WriteFile(first.Implementation[0], substitute, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(first.Implementation[0], 0o500); err != nil {
+		t.Fatal(err)
+	}
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = source, source
+	if _, err := PinWorkerExecutable(t.Context(), stateRoot, &commands); err == nil || !strings.Contains(err.Error(), "digest does not match") {
+		t.Fatalf("digest-path substitution was reused: %v", err)
+	}
+}
+
 func TestBindWorkerExecutableRejectsWritableArtifact(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "codex")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'codex-cli 0.153.4\\n'\n"), 0o722); err != nil {
@@ -113,7 +155,7 @@ func TestPinWorkerExecutableRejectsDifferentAuditorBinary(t *testing.T) {
 	}
 	commands := Default("o/r").Commands
 	commands.Implementation[0], commands.Reviewer[0], commands.OrchestratorAudit[0] = worker, worker, auditor
-	if _, err := PinWorkerExecutable(t.Context(), t.TempDir(), &commands); err == nil || !strings.Contains(err.Error(), "same Codex executable") {
+	if _, err := PinWorkerExecutable(t.Context(), pinnedTestRoot(t), &commands); err == nil || !strings.Contains(err.Error(), "same Codex executable") {
 		t.Fatalf("different auditor binary was accepted: %v", err)
 	}
 }
@@ -142,13 +184,27 @@ func TestPinWorkerExecutableReplacesNPMNodeWrapperWithNativeBinary(t *testing.T)
 	}
 	commands := Default("o/r").Commands
 	commands.Implementation[0], commands.Reviewer[0], commands.OrchestratorAudit[0] = wrapper, wrapper, wrapper
-	if _, err := PinWorkerExecutable(t.Context(), t.TempDir(), &commands); err != nil {
+	if _, err := PinWorkerExecutable(t.Context(), pinnedTestRoot(t), &commands); err != nil {
 		t.Fatal(err)
 	}
 	output, err := exec.Command(commands.Implementation[0]).Output()
 	if err != nil || strings.TrimSpace(string(output)) != "native" || commands.OrchestratorAudit[0] != commands.Implementation[0] || strings.Contains(commands.Implementation[0], "codex.js") {
 		t.Fatalf("npm wrapper remained executable: implementation=%q audit=%q output=%q err=%v", commands.Implementation[0], commands.OrchestratorAudit[0], output, err)
 	}
+}
+
+func pinnedTestRoot(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+			if err == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+	return root
 }
 
 func TestLoadAndValidate(t *testing.T) {
