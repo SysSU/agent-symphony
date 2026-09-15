@@ -33,8 +33,10 @@ jobs:
         run: |
           set -euo pipefail
           prefix=/usr/local/agent-symphony-codex
+          cache="$RUNNER_TEMP/agent-symphony-codex-npm-cache"
           sudo rm -rf "$prefix"
-          sudo -H env "PATH=$PATH" npm install --global --prefix "$prefix" "@openai/codex@$CODEX_VERSION"
+          sudo rm -rf "$cache"
+          sudo -H env "PATH=$PATH" npm install --global --prefix "$prefix" --cache "$cache" "@openai/codex@$CODEX_VERSION"
           case "$(uname -s)/$(uname -m)" in
             Darwin/x86_64) package=codex-darwin-x64; target=x86_64-apple-darwin ;;
             Darwin/arm64) package=codex-darwin-arm64; target=aarch64-apple-darwin ;;
@@ -42,12 +44,12 @@ jobs:
             Linux/aarch64) package=codex-linux-arm64; target=aarch64-unknown-linux-musl ;;
             *) echo "unsupported Codex platform: $(uname -s)/$(uname -m)" >&2; exit 1 ;;
           esac
-          native="$prefix/lib/node_modules/@openai/codex/node_modules/@openai/$package/vendor/$target/bin/codex"
-          sudo rm -f "$prefix/bin/codex"
+          native_root="$prefix/lib/node_modules/@openai/codex/node_modules/@openai/$package"
+          native="$native_root/vendor/$target/bin/codex"
           sudo chown -R 0:0 "$prefix"
           sudo chmod -R go-w "$prefix"
-          test -x "$native"
-          test -z "$(find "$prefix" \( ! -user root -o -perm -020 -o -perm -002 \) -print -quit)"
+          test -f "$native" && test -x "$native"
+          test -z "$(find "$native_root" \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \) -print -quit)"
           test "$("$native" --version)" = "codex-cli $CODEX_VERSION"
           printf 'CODEX_NATIVE=%s\n' "$native" >> "$GITHUB_ENV"
           dirname "$native" >> "$GITHUB_PATH"
@@ -134,12 +136,13 @@ jobs:
           $codexVersion = '0.153.0'
           wsl -d $distribution -- bash -lc "set -e; sudo rm -rf /usr/local/codex; sudo env PATH=/usr/local/node/bin:/usr/bin:/bin /usr/local/node/bin/npm install --global --prefix /usr/local/codex '@openai/codex@${codexVersion}'"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install pinned Codex CLI in WSL' }
+          $codexRoot = "/usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-${codexPlatform}"
           $codexNative = "/usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-${codexPlatform}/vendor/${codexTarget}/bin/codex"
-          wsl -d $distribution -- bash -lc "set -e; sudo rm -f /usr/local/codex/bin/codex; sudo chown -R 0:0 /usr/local/codex; sudo chmod -R go-w /usr/local/codex; test -x '${codexNative}'; ! find /usr/local/codex \( ! -user root -o -perm -020 -o -perm -002 \) -print -quit | grep -q .; '${codexNative}' --version | grep -qx 'codex-cli ${codexVersion}'"
+          wsl -d $distribution -- bash -lc "set -e; sudo chown -R 0:0 /usr/local/codex; sudo chmod -R go-w /usr/local/codex; test -f '${codexNative}' && test -x '${codexNative}'; ! find '${codexRoot}' \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \) -print -quit | grep -q .; '${codexNative}' --version | grep -qx 'codex-cli ${codexVersion}'"
           if ($LASTEXITCODE -ne 0) { throw 'Pinned WSL Codex installation is unsafe or invalid' }
-          wsl -d $distribution -- bash -lc 'set -euo pipefail; set -- /usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex; test "$#" -eq 1; CODEX_NATIVE=$1; cd ~/agent-symphony-ci; export PATH="$(dirname "$CODEX_NATIVE"):/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; test "$(id -u)" -ne 0; test "$(command -v node)" = /usr/local/node/bin/node; test "$(command -v codex)" = "$CODEX_NATIVE"; test "$(/usr/local/node/bin/node --version)" = v22.15.1; test "$("$CODEX_NATIVE" --version)" = "codex-cli 0.153.0"; go run ./cmd/agent-symphony init --config .agent-symphony-ci.yaml; sed -i "s#\"codex\"#\"$CODEX_NATIVE\"#g" .agent-symphony-ci.yaml; go run ./cmd/agent-symphony validate --config .agent-symphony-ci.yaml; go run ./cmd/agent-symphony doctor --offline --config .agent-symphony-ci.yaml --runtime-state "$HOME/.local/state/agent-symphony-doctor"'
+          wsl -d $distribution -- bash -lc 'set -euo pipefail; CODEX_NATIVE=$1; cd ~/agent-symphony-ci; export PATH="$(dirname "$CODEX_NATIVE"):/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; test "$(id -u)" -ne 0; test "$(command -v node)" = /usr/local/node/bin/node; test "$(command -v codex)" = "$CODEX_NATIVE"; test "$(/usr/local/node/bin/node --version)" = v22.15.1; test "$("$CODEX_NATIVE" --version)" = "codex-cli 0.153.0"; go run ./cmd/agent-symphony init --config .agent-symphony-ci.yaml; sed -i "s#\"codex\"#\"$CODEX_NATIVE\"#g" .agent-symphony-ci.yaml; go run ./cmd/agent-symphony validate --config .agent-symphony-ci.yaml; go run ./cmd/agent-symphony doctor --offline --config .agent-symphony-ci.yaml --runtime-state "$HOME/.local/state/agent-symphony-doctor"' agent-symphony "$codexNative"
           if ($LASTEXITCODE -ne 0) { throw 'WSL rootless Codex confinement proof failed' }
-          wsl -d $distribution -- bash -lc 'set -e; set -- /usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex; test "$#" -eq 1; CODEX_NATIVE=$1; cd ~/agent-symphony-ci && PATH="$(dirname "$CODEX_NATIVE"):/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl'
+          wsl -d $distribution -- bash -lc 'set -e; CODEX_NATIVE=$1; cd ~/agent-symphony-ci && PATH="$(dirname "$CODEX_NATIVE"):/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl' agent-symphony "$codexNative"
           if ($LASTEXITCODE -ne 0) { throw 'WSL release validation failed' }
 
   artifacts:

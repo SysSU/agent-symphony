@@ -54,16 +54,17 @@ git -C "$tmp/tag-binding" tag -fam moved v0.0.0
 grep -qF 'wsl --install --distribution $distribution --web-download --no-launch' .github/workflows/release-validation.yml
 grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap build-essential ca-certificates curl git ruby tmux xz-utils' .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install WSL validation prerequisites'" .github/workflows/release-validation.yml
-grep -qF 'sudo -H env "PATH=$PATH" npm install --global --prefix "$prefix" "@openai/codex@$CODEX_VERSION"' .github/workflows/release-validation.yml
+grep -qF 'cache="$RUNNER_TEMP/agent-symphony-codex-npm-cache"' .github/workflows/release-validation.yml
+grep -qF 'sudo -H env "PATH=$PATH" npm install --global --prefix "$prefix" --cache "$cache" "@openai/codex@$CODEX_VERSION"' .github/workflows/release-validation.yml
 grep -qF 'Darwin/x86_64) package=codex-darwin-x64; target=x86_64-apple-darwin' .github/workflows/release-validation.yml
 grep -qF 'Darwin/arm64) package=codex-darwin-arm64; target=aarch64-apple-darwin' .github/workflows/release-validation.yml
 grep -qF 'Linux/x86_64) package=codex-linux-x64; target=x86_64-unknown-linux-musl' .github/workflows/release-validation.yml
 grep -qF 'Linux/aarch64) package=codex-linux-arm64; target=aarch64-unknown-linux-musl' .github/workflows/release-validation.yml
-grep -qF 'native="$prefix/lib/node_modules/@openai/codex/node_modules/@openai/$package/vendor/$target/bin/codex"' .github/workflows/release-validation.yml
-grep -qF 'sudo rm -f "$prefix/bin/codex"' .github/workflows/release-validation.yml
+grep -qF 'native_root="$prefix/lib/node_modules/@openai/codex/node_modules/@openai/$package"' .github/workflows/release-validation.yml
+grep -qF 'native="$native_root/vendor/$target/bin/codex"' .github/workflows/release-validation.yml
 grep -qF 'sudo chown -R 0:0 "$prefix"' .github/workflows/release-validation.yml
 grep -qF 'sudo chmod -R go-w "$prefix"' .github/workflows/release-validation.yml
-grep -qF 'find "$prefix" \( ! -user root -o -perm -020 -o -perm -002 \)' .github/workflows/release-validation.yml
+grep -qF 'find "$native_root" \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \)' .github/workflows/release-validation.yml
 grep -qF 'printf '\''CODEX_NATIVE=%s\n'\'' "$native" >> "$GITHUB_ENV"' .github/workflows/release-validation.yml
 grep -qF 'dirname "$native" >> "$GITHUB_PATH"' .github/workflows/release-validation.yml
 grep -qF 'sed "s#\"codex\"#\"$CODEX_NATIVE\"#g" "$config" > "$config.native"' .github/workflows/release-validation.yml
@@ -89,11 +90,13 @@ grep -qF "throw 'Failed to install pinned Node.js toolchain in WSL'" .github/wor
 grep -qF "CODEX_VERSION: '0.153.0'" .github/workflows/release-validation.yml
 grep -qF "\$codexVersion = '0.153.0'" .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install pinned Codex CLI in WSL'" .github/workflows/release-validation.yml
+grep -qF '$codexRoot = "/usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-${codexPlatform}"' .github/workflows/release-validation.yml
 grep -qF '$codexNative = "/usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-${codexPlatform}/vendor/${codexTarget}/bin/codex"' .github/workflows/release-validation.yml
-grep -qF 'sudo rm -f /usr/local/codex/bin/codex; sudo chown -R 0:0 /usr/local/codex; sudo chmod -R go-w /usr/local/codex' .github/workflows/release-validation.yml
+grep -qF 'find '\''${codexRoot}'\'' \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \)' .github/workflows/release-validation.yml
 grep -qF "throw 'Pinned WSL Codex installation is unsafe or invalid'" .github/workflows/release-validation.yml
 grep -qF "throw 'WSL rootless Codex confinement proof failed'" .github/workflows/release-validation.yml
-test "$(grep -cF 'set -- /usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex; test "$#" -eq 1; CODEX_NATIVE=$1' .github/workflows/release-validation.yml)" -eq 2
+test "$(grep -cF 'CODEX_NATIVE=$1' .github/workflows/release-validation.yml)" -eq 2
+test "$(grep -cF 'agent-symphony "$codexNative"' .github/workflows/release-validation.yml)" -eq 2
 grep -qF 'PATH="$(dirname "$CODEX_NATIVE"):/usr/local/node/bin:/usr/local/go/bin:' .github/workflows/release-validation.yml
 grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl' .github/workflows/release-validation.yml
 grep -qF "throw 'WSL release validation failed'" .github/workflows/release-validation.yml
