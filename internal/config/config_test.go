@@ -14,7 +14,7 @@ func TestLoadAndValidate(t *testing.T) {
 	if c.ReconciliationIntervalSeconds != 60 {
 		t.Fatalf("default reconciliation interval = %d", c.ReconciliationIntervalSeconds)
 	}
-	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "-c", `projects={"{managed_workspace}"={trust_level="trusted"}}`, "--dangerously-bypass-approvals-and-sandbox", "-"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "-c", `projects={"{managed_workspace}"={trust_level="trusted"}}`, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
+	if !slices.Equal(c.Commands.Implementation, defaultWorkerCommand(false)) || !slices.Equal(c.Commands.Reviewer, defaultWorkerCommand(true)) {
 		t.Fatalf("unexpected default commands: %#v", c.Commands)
 	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
@@ -25,7 +25,6 @@ func TestLoadAndValidate(t *testing.T) {
 	if !slices.Equal(c.Commands.OrchestratorAudit, wantAudit) {
 		t.Fatalf("unexpected default orchestrator audit: %#v", c.Commands.OrchestratorAudit)
 	}
-	c.Commands.Implementation = []string{"custom-agent", "--flag"}
 	path := filepath.Join(t.TempDir(), DefaultPath)
 	if err := Write(path, c); err != nil {
 		t.Fatal(err)
@@ -34,8 +33,12 @@ func TestLoadAndValidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Repository != "owner/repo" || c.Concurrency != 1 || c.ReconciliationIntervalSeconds != 60 || c.CompletionPolicies.Default != "human-review" || !slices.Equal(c.Commands.Implementation, []string{"custom-agent", "--flag"}) {
+	if c.Repository != "owner/repo" || c.Concurrency != 1 || c.ReconciliationIntervalSeconds != 60 || c.CompletionPolicies.Default != "human-review" || !slices.Equal(c.Commands.Implementation, defaultWorkerCommand(false)) {
 		t.Fatalf("unexpected defaults: %#v", c)
+	}
+	c.Commands.Implementation = []string{"custom-agent", "--flag"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "managed rootless Codex worker profile") {
+		t.Fatalf("custom worker command accepted: %v", err)
 	}
 }
 
@@ -180,7 +183,7 @@ func TestExpandManagedWorkspaceUsesOneExactEscapedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoded, _ := json.Marshal(workspace)
-	want := `projects={` + string(encoded) + `={trust_level="trusted"}}`
+	want := `projects={` + string(encoded) + `={trust_level="untrusted"}}`
 	if !slices.Equal(expanded, []string{"codex", "-c", want, "--no-alt-screen"}) {
 		t.Fatalf("expanded command=%q, want exact workspace %q", expanded, want)
 	}
@@ -264,8 +267,8 @@ func TestValidateRejectsUnsafePathsAndPolicy(t *testing.T) {
 	}
 	c := Default("owner/repo")
 	c.Commands.Environment = []string{"GITHUB_TOKEN"}
-	if err := c.Validate(); err != nil {
-		t.Fatalf("GitHub CLI authentication environment rejected: %v", err)
+	if err := c.Validate(); err == nil {
+		t.Fatal("worker GitHub authentication environment accepted")
 	}
 }
 

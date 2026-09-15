@@ -69,7 +69,7 @@ func (e operatorCleanupExecutor) execute(ctx context.Context, request agentrunti
 		if !ok || effect.State != "pending" || effect.Action != string(agentruntime.EffectCleanup) || effect.RequestDigest != request.Identity.RequestDigest || effect.IssueGeneration != request.Identity.IssueGeneration || effect.AttemptGeneration != request.Identity.AttemptGeneration || effect.Repository != request.Identity.Repository || effect.Issue != request.Identity.Issue || effect.Attempt != request.Identity.Attempt {
 			return errStaleStateResult
 		}
-		if tombstone := snapshot.State.Tombstones[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]; tombstone.InvalidatedStart != nil {
+		if tombstone := snapshot.State.Tombstones[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]; tombstone.InvalidatedStart != nil && !agentruntime.WorkerConfinementBound(tombstone.InvalidatedStart.Manifest, tombstone.InvalidatedGeneration, e.runtime.WorkerProfileDigest) {
 			return fmt.Errorf("start candidate cleanup remains unproved: %w", agentruntime.ErrRuntimeResourcesRemain)
 		}
 		for _, proof := range snapshot.State.ReviewerProofs {
@@ -103,7 +103,7 @@ func (e operatorCleanupExecutor) verify(ctx context.Context, request agentruntim
 		if err != nil {
 			return false, err
 		}
-		if tombstone := snapshot.State.Tombstones[ownerAttemptKey(request.Identity.Repository, request.Identity.Issue, request.Identity.Attempt)]; tombstone.InvalidatedStart != nil {
+		if tombstone := snapshot.State.Tombstones[ownerAttemptKey(request.Identity.Repository, request.Identity.Issue, request.Identity.Attempt)]; tombstone.InvalidatedStart != nil && !agentruntime.WorkerConfinementBound(tombstone.InvalidatedStart.Manifest, tombstone.InvalidatedGeneration, e.runtime.WorkerProfileDigest) {
 			return false, nil
 		}
 	}

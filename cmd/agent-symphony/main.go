@@ -196,10 +196,7 @@ func implementationBoundary(stateRoot string) workerBoundaryRunner {
 		return workerBoundaryRunner{Command: command}
 	}
 	binary, _ := os.Executable()
-	if !hostIsolationInstalled() {
-		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "implementation"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localAttemptRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot)}}
-	}
-	return workerBoundaryRunner{Command: "sudo", Args: []string{"-n", "-u", workerUser, "-g", attemptGroup, binary, "agent-host", "implementation"}}
+	return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "implementation"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localAttemptRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot), "CODEX_HOME=" + workerCodexHome(stateRoot)}}
 }
 
 func reviewBoundary(stateRoot string) workerBoundaryRunner {
@@ -207,10 +204,7 @@ func reviewBoundary(stateRoot string) workerBoundaryRunner {
 		return workerBoundaryRunner{Command: command}
 	}
 	binary, _ := os.Executable()
-	if !hostIsolationInstalled() {
-		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "review"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localSnapshotRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot)}}
-	}
-	return workerBoundaryRunner{Command: "sudo", Args: []string{"-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "review"}}
+	return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "review"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localSnapshotRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot), "CODEX_HOME=" + workerCodexHome(stateRoot)}}
 }
 
 // productionAttemptRoot and productionSnapshotRoot are the single source of
@@ -221,28 +215,14 @@ func productionAttemptRoot(stateRoot string) string {
 	if reviewSnapshotRoot != "" {
 		return filepath.Join(filepath.Dir(reviewSnapshotRoot), "attempts")
 	}
-	if !hostIsolationInstalled() {
-		return localAttemptRoot(stateRoot)
-	}
-	root := "/var/lib/agent-symphony/attempts"
-	if runtime.GOOS == "darwin" {
-		root = "/var/db/agent-symphony/attempts"
-	}
-	return root
+	return localAttemptRoot(stateRoot)
 }
 
 func productionSnapshotRoot(stateRoot string) string {
 	if reviewSnapshotRoot != "" {
 		return reviewSnapshotRoot
 	}
-	if !hostIsolationInstalled() {
-		return localSnapshotRoot(stateRoot)
-	}
-	root := "/var/lib/agent-symphony/snapshots"
-	if runtime.GOOS == "darwin" {
-		root = "/var/db/agent-symphony/snapshots"
-	}
-	return root
+	return localSnapshotRoot(stateRoot)
 }
 
 func projectTmuxRoot(stateRoot string) string { return filepath.Join(stateRoot, "tmux") }
@@ -386,10 +366,11 @@ func configureProjectRuntimeState(stateRoot string) error {
 	if err := configureProjectTmux(stateRoot); err != nil {
 		return err
 	}
-	if !hostIsolationInstalled() {
-		if err := configureAgentCodexHome(stateRoot); err != nil {
-			return err
-		}
+	if err := configureAgentCodexHome(stateRoot); err != nil {
+		return err
+	}
+	if err := configureWorkerCodexHome(stateRoot); err != nil {
+		return err
 	}
 	return nil
 }
@@ -412,6 +393,9 @@ func prepareProductionDeploymentLocked(stateRoot, repository string) error {
 }
 
 var agentCodexAssets = []string{"auth.json", "config.toml", "AGENTS.md", "rules", "skills", "plugins", "cache", "installation_id"}
+var workerCodexAssets = []string{"auth.json", "installation_id"}
+
+func workerCodexHome(stateRoot string) string { return filepath.Join(stateRoot, "worker-codex-home") }
 
 func configureAgentCodexHome(stateRoot string) error {
 	source := strings.TrimSpace(os.Getenv("CODEX_HOME"))
@@ -454,6 +438,49 @@ func configureAgentCodexHome(stateRoot string) error {
 	}
 	if err := os.Setenv("CODEX_HOME", target); err != nil {
 		return fmt.Errorf("configure agent Codex home: %w", err)
+	}
+	return nil
+}
+
+func configureWorkerCodexHome(stateRoot string) error {
+	source := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if source == "" {
+		return errors.New("CODEX_HOME is required for rootless workers")
+	}
+	source, err := filepath.Abs(source)
+	if err != nil {
+		return fmt.Errorf("resolve Codex home: %w", err)
+	}
+	target, err := filepath.Abs(workerCodexHome(stateRoot))
+	if err != nil {
+		return fmt.Errorf("resolve worker Codex home: %w", err)
+	}
+	if filepath.Clean(source) == filepath.Clean(target) {
+		return errors.New("worker CODEX_HOME must be isolated from the coordinator")
+	}
+	if err := ensureLocalRoot(target); err != nil {
+		return fmt.Errorf("prepare worker Codex home: %w", err)
+	}
+	for _, forbidden := range []string{"config.toml", "AGENTS.md", "rules", "skills", "plugins", "cache", "hooks.json"} {
+		if _, err := os.Lstat(filepath.Join(target, forbidden)); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("worker Codex home contains forbidden capability %s", forbidden)
+		}
+	}
+	for _, name := range workerCodexAssets {
+		from, to := filepath.Join(source, name), filepath.Join(target, name)
+		if _, err := os.Lstat(from); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return fmt.Errorf("inspect Codex authentication asset %s: %w", name, err)
+		}
+		if destination, err := os.Readlink(to); err == nil && destination == from {
+			continue
+		} else if err == nil || !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("worker Codex authentication asset %s conflicts with managed link", name)
+		}
+		if err := os.Symlink(from, to); err != nil {
+			return fmt.Errorf("link worker Codex authentication asset %s: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -688,6 +715,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	command := args[0]
+	if command == "sandbox-probe" || command == "sandbox-probe-child" {
+		if err := runSandboxProbe(args[1:], command == "sandbox-probe-child"); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
+	}
 	if command == "review-pane" {
 		code, childSignal, err := runReviewerPane(args[1:], stdout, stderr)
 		if err != nil {
@@ -1555,11 +1589,7 @@ func seedImmutableAttemptSource(ctx context.Context, checkout, repositoryName, a
 }
 
 func seedAttemptSourceMode(ctx context.Context, checkout, repositoryName, attemptRoot, baseBranch, baseSHA string, immutable bool) (string, error) {
-	mode := os.FileMode(0o770)
-	if !hostIsolationInstalled() {
-		mode = 0o700
-	}
-	if err := os.MkdirAll(attemptRoot, mode); err != nil {
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
 		return "", fmt.Errorf("open provisioned attempt root: %w", err)
 	}
 	if baseBranch != "" || baseSHA != "" {
@@ -1668,7 +1698,7 @@ func implementationPrompt(issue internalgithub.RecoveryIssueFact, identity agent
 	if interactive {
 		completion = "Before exiting, write exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence to the existing private file named by " + agentruntime.WorkerResultEnvironment + ". Write the file in place without replacing it. Terminal output is operator-visible conversation, not the result artifact."
 	}
-	return fmt.Sprintf("Project: %s\nIssue: #%d\nAttempt: %d\nBase branch: %s\nBranch: %s\nWorktree: %s\nSession: %s\n\n%s\n\nDirect status: use the installed gh CLI to post one unedited comment on issue #%d or its pull request: `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON`. A nonempty reason is required. Pair the comment with the `needs-attention` label on the bound issue: add it when setting status and remove it when clearing. Re-read both the comment and label before reporting the status changed; authentication, authorization, or partial-update errors are failures, never success. Other issue-authorized comments, labels, and Markdown links may also be updated directly with gh.\n\nCompletion contract: %s\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.BaseBranch, identity.Branch, identity.Worktree, identity.Session, issue.Body, issue.Issue, completion)
+	return fmt.Sprintf("Project: %s\nIssue: #%d\nAttempt: %d\nBase branch: %s\nBranch: %s\nWorktree: %s\nSession: %s\n\n%s\n\nGitHub and runtime-state mutations are owner-only. Do not use gh, GitHub credentials, coordinator control sockets, or paths outside this disposable workspace. To request needs-attention or clear it while running, atomically write one private JSON object to the path in %s: {\"type\":\"agent-symphony-status-v1\",\"generation\":<decimal from %s>,\"launch_id\":\"<exact %s>\",\"sequence\":<increasing positive integer>,\"status\":\"needs-attention|clear\",\"reason\":\"specific nonempty reason\"}. The owner validates and applies the request.\n\nCompletion contract: %s\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.BaseBranch, identity.Branch, identity.Worktree, identity.Session, issue.Body, agentruntime.WorkerStatusEnvironment, agentruntime.WorkerGenerationEnv, agentruntime.WorkerLaunchIDEnv, completion)
 }
 
 type workerResult struct {
@@ -1690,7 +1720,24 @@ type workerExport struct {
 	Bundle       string       `json:"bundle"`
 }
 
-func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, manifest agentruntime.Manifest) (workerResult, string, string, error) {
+type workerSeal struct {
+	Version       int    `json:"version"`
+	Repository    string `json:"repository"`
+	Issue         int    `json:"issue"`
+	Attempt       int    `json:"attempt"`
+	Generation    uint64 `json:"generation"`
+	BaseSHA       string `json:"base_sha"`
+	HeadSHA       string `json:"head_sha"`
+	BundleSHA256  string `json:"bundle_sha256"`
+	ProfileDigest string `json:"profile_digest"`
+}
+
+var workerSealBeforeRename = func() {}
+
+func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, stateRoot string, generation uint64, manifest agentruntime.Manifest) (workerResult, string, string, error) {
+	if !filepath.IsAbs(stateRoot) || filepath.Clean(stateRoot) != stateRoot || generation == 0 {
+		return workerResult{}, "", "", errors.New("worker seal requires canonical owner state and generation")
+	}
 	request, _ := json.Marshal(manifest)
 	response, err := boundary.call(ctx, "export", agentruntime.Command{Stdin: bytes.NewReader(request)})
 	if err != nil {
@@ -1706,19 +1753,25 @@ func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, mani
 	if err != nil || len(bundle) == 0 || len(bundle) > 16<<20 || fmt.Sprintf("%x", sha256.Sum256(bundle)) != exported.BundleSHA256 {
 		return workerResult{}, "", "", errors.New("worker boundary returned invalid or oversized bundle")
 	}
-	temp, err := os.MkdirTemp("", "agent-symphony-import-")
+	root, err := config.GitRoot()
 	if err != nil {
 		return workerResult{}, "", "", err
 	}
-	defer os.RemoveAll(temp)
-	bundlePath := filepath.Join(temp, "attempt.bundle")
-	if err := os.WriteFile(bundlePath, bundle, 0o600); err != nil {
+	sealedPath := workerSealPath(stateRoot, generation, manifest, exported.HeadSHA)
+	if validWorkerSeal(sealedPath, generation, manifest, exported) {
+		if err := validateWorkerSeal(ctx, sealedPath, generation, manifest, exported); err != nil {
+			return workerResult{}, "", "", errors.New("existing worker seal is corrupt")
+		}
+		return exported.Result, exported.HeadSHA, sealedPath, nil
+	}
+	importedRepo, bundlePath, cleanup, err := prepareWorkerSeal(ctx, stateRoot, generation, manifest, exported, bundle, root)
+	if err != nil {
+		if validateWorkerSeal(ctx, sealedPath, generation, manifest, exported) == nil {
+			return exported.Result, exported.HeadSHA, sealedPath, nil
+		}
 		return workerResult{}, "", "", err
 	}
-	importedRepo := filepath.Join(temp, "repository.git")
-	if err := scanGit(ctx, temp, nil, []string{"init", "--bare", importedRepo}, nil); err != nil {
-		return workerResult{}, "", "", fmt.Errorf("create temporary import repository: %w", err)
-	}
+	defer cleanup()
 	if err := scanGit(ctx, importedRepo, nil, []string{"bundle", "verify", bundlePath}, nil); err != nil {
 		return workerResult{}, "", "", errors.New("worker bundle verification failed")
 	}
@@ -1752,14 +1805,106 @@ func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, mani
 	if err := validateWorkerTree(ctx, importedRepo, head); err != nil {
 		return workerResult{}, "", "", errors.New("worker bundle contains a symlink or result marker")
 	}
-	root, err := config.GitRoot()
+	sealed, err := installWorkerSeal(ctx, importedRepo, stateRoot, generation, manifest, exported)
 	if err != nil {
 		return workerResult{}, "", "", err
 	}
-	if err := scanGit(ctx, root, nil, []string{"fetch", "--no-tags", importedRepo, head}, nil); err != nil {
-		return workerResult{}, "", "", fmt.Errorf("import verified worker head: %w", err)
+	return exported.Result, head, sealed, nil
+}
+
+func workerSealPath(stateRoot string, generation uint64, manifest agentruntime.Manifest, head string) string {
+	return filepath.Join(stateRoot, "seals", internalgithub.RepositoryIdentifier(manifest.Repository), fmt.Sprintf("%d-%d-%d", manifest.Issue, manifest.Attempt, generation), head+".git")
+}
+
+func prepareWorkerSeal(ctx context.Context, stateRoot string, generation uint64, manifest agentruntime.Manifest, exported workerExport, bundle []byte, ownerRoot string) (string, string, func(), error) {
+	final := workerSealPath(stateRoot, generation, manifest, exported.HeadSHA)
+	parent := filepath.Dir(final)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", "", func() {}, err
 	}
-	return exported.Result, head, root, nil
+	if _, err := os.Lstat(final); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return "", "", func() {}, errors.New("existing worker seal conflicts with attested export")
+		}
+		return "", "", func() {}, err
+	}
+	temp, err := os.MkdirTemp(parent, ".seal-")
+	if err != nil {
+		return "", "", func() {}, err
+	}
+	cleanup := func() { _ = os.RemoveAll(temp) }
+	bundleFile, err := os.CreateTemp(parent, ".bundle-")
+	if err != nil {
+		cleanup()
+		return "", "", func() {}, err
+	}
+	bundlePath := bundleFile.Name()
+	cleanup = func() { _ = os.RemoveAll(temp); _ = os.Remove(bundlePath) }
+	if bundleFile.Chmod(0o600) != nil || func() error { _, err := bundleFile.Write(bundle); return err }() != nil || bundleFile.Sync() != nil || bundleFile.Close() != nil {
+		cleanup()
+		return "", "", func() {}, errors.New("write owner-private worker bundle")
+	}
+	if err := scanGit(ctx, parent, nil, []string{"init", "--bare", temp}, nil); err != nil {
+		cleanup()
+		return "", "", func() {}, fmt.Errorf("create owner-private seal: %w", err)
+	}
+	remote, err := gitSingleLine(ctx, ownerRoot, "remote", "get-url", "origin")
+	if err != nil || strings.TrimSpace(remote) == "" {
+		cleanup()
+		return "", "", func() {}, errors.New("owner publication remote is unavailable")
+	}
+	if err := scanGit(ctx, temp, nil, []string{"remote", "add", "origin", remote}, nil); err != nil {
+		cleanup()
+		return "", "", func() {}, err
+	}
+	return temp, bundlePath, cleanup, nil
+}
+
+func installWorkerSeal(ctx context.Context, temp, stateRoot string, generation uint64, manifest agentruntime.Manifest, exported workerExport) (string, error) {
+	final := workerSealPath(stateRoot, generation, manifest, exported.HeadSHA)
+	seal := workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, config.WorkerProfileDigest()}
+	body, _ := json.Marshal(seal)
+	if err := os.WriteFile(filepath.Join(temp, "agent-symphony-seal.json"), body, 0o600); err != nil {
+		return "", err
+	}
+	workerSealBeforeRename()
+	if err := os.Rename(temp, final); err != nil {
+		// POSIX platforms report concurrent directory installs differently
+		// (EEXIST or ENOTEMPTY). Accept only the complete expected object graph,
+		// never metadata alone.
+		if validationErr := validateWorkerSeal(ctx, final, generation, manifest, exported); validationErr != nil {
+			return "", errors.Join(errors.New("install owner-private worker seal"), err, validationErr)
+		}
+	}
+	if err := validateWorkerSeal(ctx, final, generation, manifest, exported); err != nil {
+		return "", errors.New("installed worker seal failed validation")
+	}
+	return final, nil
+}
+
+func validateWorkerSeal(ctx context.Context, path string, generation uint64, manifest agentruntime.Manifest, exported workerExport) error {
+	if !validWorkerSeal(path, generation, manifest, exported) {
+		return errors.New("worker seal metadata changed")
+	}
+	head, err := gitSingleLine(ctx, path, "rev-parse", exported.HeadSHA+"^{commit}")
+	if err != nil || head != exported.HeadSHA {
+		return errors.New("worker seal commit changed or is unavailable")
+	}
+	if err := validateWorkerTree(ctx, path, head); err != nil {
+		return errors.New("worker seal tree is invalid")
+	}
+	return nil
+}
+
+func validWorkerSeal(path string, generation uint64, manifest agentruntime.Manifest, exported workerExport) bool {
+	body, err := os.ReadFile(filepath.Join(path, "agent-symphony-seal.json"))
+	if err != nil {
+		return false
+	}
+	var seal workerSeal
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(&seal) == nil && decoder.Decode(&struct{}{}) == io.EOF && seal == (workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, config.WorkerProfileDigest()})
 }
 
 const (
@@ -2007,7 +2152,7 @@ func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, 
 
 func reviewResultPath(snapshot, target string) string {
 	sum := sha256.Sum256([]byte(target))
-	return filepath.Join(fmt.Sprintf("%s.result-%x", snapshot, sum[:8]), "result.json")
+	return filepath.Join(snapshot, fmt.Sprintf(".agent-symphony-review-%x", sum[:8]), "result.json")
 }
 
 func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string) error {
@@ -2172,7 +2317,7 @@ func reviewPrompt(mode, target string, issue internalgithub.RecoveryIssueFact) (
 	default:
 		return "", fmt.Errorf("invalid review mode %q", mode)
 	}
-	return fmt.Sprintf("Review mode: %s. %s Use the installed gh CLI to post direct status on the bound issue or pull request as one unedited `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON` comment; pair it with adding or removing the bound issue's `needs-attention` label. A nonempty reason and a fresh re-read of both comment and label are required before reporting the status changed. Authentication, authorization, or partial-update errors are failures, never success. Make the entire final response exactly one bounded JSON object on stdout: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings. Do not wrap it in Markdown, emit prose, or emit another object.\n\n%s", mode, task, issue.Body), nil
+	return fmt.Sprintf("Review mode: %s. %s GitHub and runtime-state mutations are owner-only. Do not use gh, GitHub credentials, coordinator control sockets, or paths outside this disposable snapshot. Report blockers as findings for the owner to validate and apply. Make the entire final response exactly one bounded JSON object on stdout: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings. Do not wrap it in Markdown, emit prose, or emit another object.\n\n%s", mode, task, issue.Body), nil
 }
 
 func runIndependentReviewV2(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot, mode string, binding *reviewerLaunchIdentity, replay bool, beforeSession ...func() error) (independentReviewResult, bool, error) {
@@ -2206,7 +2351,7 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if issue.Attempt == 0 {
 		issue.Attempt = attempt.Number
 	}
-	env = append(slices.Clone(env), "GH_REPO="+issue.Repository)
+	env = slices.Clone(env)
 	reviewBase := attempt.BaseSHA
 	if preflightObjectID.MatchString(issue.BaseSHA) {
 		reviewBase = issue.BaseSHA
@@ -2415,16 +2560,17 @@ launch:
 	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "update-ref", "-d", "refs/agent-symphony/attested-review").Run()
 	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "config", "--local", "credential.helper", "").Run()
 	reviewGID := -1
-	if reviewSnapshotRoot == "" && hostIsolationInstalled() {
-		group, err := user.LookupGroup(snapshotGroup)
-		if err != nil {
-			return independentReviewResult{}, false, err
-		}
-		reviewGID, _ = strconv.Atoi(group.Gid)
+	resultPath := reviewResultPath(snapshot, target)
+	resultRoot := filepath.Dir(resultPath)
+	if err := os.Mkdir(resultRoot, 0o700); err != nil {
+		return independentReviewResult{}, false, errors.New("prepare review result artifact")
 	}
 	if err := filepath.WalkDir(snapshot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
+		}
+		if path == resultRoot {
+			return filepath.SkipDir
 		}
 		if reviewGID >= 0 {
 			if err := os.Chown(path, -1, reviewGID); err != nil {
@@ -2438,10 +2584,12 @@ launch:
 	}); err != nil {
 		return independentReviewResult{}, false, err
 	}
-	resultPath := reviewResultPath(snapshot, target)
+	env, err = privateWorkerEnvironment(env, resultRoot)
+	if err != nil {
+		return independentReviewResult{}, false, err
+	}
 	env = append(env, "AGENT_SYMPHONY_REVIEW_RESULT="+resultPath)
-	resultRoot := filepath.Dir(resultPath)
-	if err := os.Mkdir(resultRoot, 0o770); err != nil || reviewGID >= 0 && os.Chown(resultRoot, -1, reviewGID) != nil || os.Chmod(resultRoot, 0o770) != nil {
+	if reviewGID >= 0 && os.Chown(resultRoot, -1, reviewGID) != nil || os.Chmod(resultRoot, 0o700) != nil {
 		_ = os.RemoveAll(resultRoot)
 		return independentReviewResult{}, false, errors.New("prepare review result artifact")
 	}
@@ -2518,6 +2666,36 @@ launch:
 
 func configuredAgentEnvironment(allow []string) ([]string, error) {
 	return internalgithub.AgentEnvironmentWith(os.Environ(), allow...)
+}
+
+func configuredWorkerEnvironment(allow []string, stateRoot string) ([]string, error) {
+	environment := append(os.Environ(), "CODEX_HOME="+workerCodexHome(stateRoot))
+	return internalgithub.WorkerEnvironmentWith(environment, allow...)
+}
+
+func privateWorkerEnvironment(environment []string, root string) ([]string, error) {
+	paths := map[string]string{
+		"TMPDIR":           filepath.Join(root, "tmp"),
+		"XDG_CACHE_HOME":   filepath.Join(root, "cache"),
+		"GOCACHE":          filepath.Join(root, "go-cache"),
+		"npm_config_cache": filepath.Join(root, "npm-cache"),
+	}
+	for _, path := range paths {
+		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("prepare worker-private cache: %w", err)
+		}
+	}
+	filtered := environment[:0]
+	for _, entry := range environment {
+		name, _, _ := strings.Cut(entry, "=")
+		if _, managed := paths[name]; !managed {
+			filtered = append(filtered, entry)
+		}
+	}
+	for name, path := range paths {
+		filtered = append(filtered, name+"="+path)
+	}
+	return filtered, nil
 }
 
 func parseIndependentReview(output string) (independentReviewResult, error) {

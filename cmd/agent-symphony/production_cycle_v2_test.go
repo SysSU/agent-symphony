@@ -27,6 +27,22 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
+func TestSuccessfulCheckDoesNotCacheCancellation(t *testing.T) {
+	var check successfulCheck
+	calls := 0
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := check.Do(func() error { calls++; return cancelled.Err() }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled preflight error=%v", err)
+	}
+	if err := check.Do(func() error { calls++; return nil }); err != nil {
+		t.Fatalf("retry after cancellation: %v", err)
+	}
+	if err := check.Do(func() error { calls++; return errors.New("must not run") }); err != nil || calls != 2 {
+		t.Fatalf("successful preflight was not cached: calls=%d err=%v", calls, err)
+	}
+}
+
 func restartOwnerWithInput(t *testing.T, owner *stateOwner, input reconciliationInput) *stateOwner {
 	t.Helper()
 	before := mustOwnerSnapshot(t, owner)

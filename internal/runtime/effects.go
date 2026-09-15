@@ -88,12 +88,13 @@ type EffectCleanupPolicy struct {
 // EffectRuntime is the process configuration and environment snapshot used by
 // one immutable request. It is hashed into the intent but never persisted.
 type EffectRuntime struct {
-	Source      string
-	Git         string
-	Tmux        string
-	Helper      string
-	StopWait    time.Duration
-	Environment []string
+	Source              string
+	Git                 string
+	Tmux                string
+	Helper              string
+	StopWait            time.Duration
+	Environment         []string
+	WorkerProfileDigest string
 }
 
 // EffectResult carries the unchanged authorization identity back to the owner.
@@ -287,6 +288,9 @@ func (e EffectExecutor) VerifyPending(ctx context.Context, request EffectRequest
 		}
 		return retry, nil
 	case EffectStop:
+		if request.Manifest.LaunchID == "" && WorkerConfinementBound(request.Manifest, request.Identity.AttemptGeneration, r.WorkerProfileDigest) {
+			return verified(cancelledEffect(request.Manifest, request.Reason)), nil
+		}
 		live, err := r.session(ctx, request.Manifest.Session)
 		if err != nil {
 			return EffectVerification{}, err
@@ -302,6 +306,9 @@ func (e EffectExecutor) VerifyPending(ctx context.Context, request EffectRequest
 			absent, err := r.boundPaneAbsent(ctx, binding)
 			if err != nil || !absent {
 				return EffectVerification{Disposition: EffectPending}, nil
+			}
+			if WorkerConfinementMatches(request.Manifest, request.Identity.AttemptGeneration, r.WorkerProfileDigest) {
+				return verified(cancelledEffect(request.Manifest, request.Reason)), nil
 			}
 			gone, err := ImplementationWorkerGone(request.Manifest, binding)
 			if err != nil || !gone {
@@ -815,6 +822,9 @@ func cloneEffectRequest(request EffectRequest) EffectRequest {
 
 func effectRuntimeSnapshot(r *Runtime, request EffectRequest) (EffectRuntime, error) {
 	var config EffectRuntime
+	if slices.Contains([]EffectAction{EffectPrepare, EffectStart, EffectMonitor, EffectStop, EffectHandoff, EffectCleanup}, request.Action) {
+		config.WorkerProfileDigest = r.WorkerProfileDigest
+	}
 	switch request.Action {
 	case EffectPrepare:
 		config.Source, config.Git, config.Tmux, config.Helper = r.Source, r.git(), r.tmux(), r.Helper
@@ -856,13 +866,17 @@ func (e EffectExecutor) runtimeFor(config EffectRuntime) *Runtime {
 	return &Runtime{
 		Root: e.Runtime.Root, StateRoot: e.Runtime.StateRoot,
 		Source: config.Source, Git: config.Git, Tmux: config.Tmux, Helper: config.Helper, StopWait: config.StopWait,
-		Runner: e.Runtime.Runner, VerifyWorker: e.Runtime.VerifyWorker,
+		Runner: e.Runtime.Runner, VerifyWorker: e.Runtime.VerifyWorker, WorkerProfileDigest: config.WorkerProfileDigest,
 	}
 }
 
 func validEffectRuntime(request EffectRequest) bool {
 	action, config := request.Action, request.Runtime
 	environment := len(config.Environment) > 0
+	profile := config.WorkerProfileDigest == "" || ValidEffectRequestDigest(config.WorkerProfileDigest)
+	if !profile {
+		return false
+	}
 	switch action {
 	case EffectPrepare:
 		return config.Source != "" && config.Git != "" && config.Tmux != "" && environment && config.StopWait == 0
@@ -974,11 +988,19 @@ func (r *Runtime) startEffect(ctx context.Context, request EffectRequest, author
 	if err := r.verifyEffectWorker(ctx); err != nil {
 		return manifest, err
 	}
-	env := effectEnvironment(request)
+	if manifest.WorkerProfileDigest != "" && !WorkerConfinementMatches(Manifest{
+		Version: manifest.Version, LaunchID: request.GateNonce, WorkerGeneration: manifest.WorkerGeneration, WorkerProfileDigest: manifest.WorkerProfileDigest,
+	}, request.Identity.AttemptGeneration, r.WorkerProfileDigest) {
+		return manifest, errors.New("implementation confinement binding does not match the authorized launch")
+	}
 	candidate := manifest
 	candidate.LaunchID = request.GateNonce
 	if candidate.LaunchID == "" {
 		candidate.LaunchID = request.Identity.EffectID // Old intents remain quarantined by the owner.
+	}
+	env, err := workspaceEnvironment(effectEnvironment(request), candidate, request.Identity.AttemptGeneration)
+	if err != nil {
+		return failedEffect(manifest, "prepare worker-private paths", err)
 	}
 	live, err := r.session(ctx, manifest.Session)
 	if err != nil {
@@ -1075,6 +1097,11 @@ func (r *Runtime) monitorEffect(ctx context.Context, request EffectRequest) (Man
 	if err := r.verifyEffectWorker(ctx); err != nil {
 		return manifest, err
 	}
+	var err error
+	manifest, err = observeWorkerStatus(manifest, request.Identity.AttemptGeneration)
+	if err != nil {
+		return manifest, err
+	}
 	var result Result
 	var runErr error
 	result, runErr = r.observeBoundCommand(ctx, manifest, func(pane ImplementationPane) []string {
@@ -1135,7 +1162,10 @@ func (r *Runtime) stopEffect(ctx context.Context, request EffectRequest) (Manife
 	if err := r.verifyEffectWorker(ctx); err != nil {
 		return manifest, err
 	}
-	if err := r.stop(ctx, manifest); err != nil {
+	if manifest.LaunchID == "" && WorkerConfinementBound(manifest, request.Identity.AttemptGeneration, r.WorkerProfileDigest) {
+		return cancelledEffect(manifest, request.Reason), nil
+	}
+	if err := r.stopGeneration(ctx, manifest, request.Identity.AttemptGeneration); err != nil {
 		return manifest, err
 	}
 	return cancelledEffect(manifest, request.Reason), nil

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
@@ -93,6 +94,82 @@ func TestEscapedImplementationChildBlocksGitHubPublication(t *testing.T) {
 	}
 	if _, err := applyBeginReconciliationEffect(owner.attemptRoot, owner.stateRoot, &state, beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request}); !errors.Is(err, errStateConflict) {
 		t.Fatalf("owner admitted GitHub publication while escaped child may live: %v", err)
+	}
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = record.Generation, config.WorkerProfileDigest()
+	record.Manifest = manifest
+	state.Attempts[key] = record
+	request.Manifest = &manifest
+	for _, action := range []reconciliationEffectAction{reconciliationGitHubBind, reconciliationGitHubPublish, reconciliationGitHubIssueUpdate, reconciliationGitHubPRGovernance} {
+		if implementationLeaseBlocksGitHub(state, action, request.Repository, request.Issue) {
+			t.Fatalf("%s retained revoked authority for confined escaped child", action)
+		}
+	}
+}
+
+func TestWorkerStatusOutcomeCannotApplyOutOfOrderOrAfterInvalidation(t *testing.T) {
+	root := t.TempDir()
+	manifest := ownerTestManifest(t, root, 329, 1, "running")
+	manifest.WorkerStatus, manifest.WorkerStatusReason, manifest.WorkerStatusSeq = "needs-attention", "operator decision required", 2
+	key, issueKey := ownerAttemptKey("o/r", 329, 1), ownerIssueKey("o/r", 329)
+	state := newRuntimeOwnerState("o/r")
+	state.IssueGenerations[issueKey], state.AttemptGenerations[key] = 1, 1
+	state.Attempts[key] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
+	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 329, Attempt: 1, Manifest: ptrManifest(manifest), GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueWorkerStatus, Status: manifest.WorkerStatus, StatusReason: manifest.WorkerStatusReason, StatusSequence: 2}}
+	result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueWorkerStatus, Observed: true}}
+	if err := applyReconciliationEffectOutcome(&state, request, result); err != nil || state.Attempts[key].Manifest.WorkerStatusApplied != 2 {
+		t.Fatalf("current status outcome failed: state=%#v err=%v", state.Attempts[key].Manifest, err)
+	}
+	if err := applyReconciliationEffectOutcome(&state, request, result); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("duplicate status outcome err=%v", err)
+	}
+	record := state.Attempts[key]
+	record.Manifest.WorkerStatus, record.Manifest.WorkerStatusReason, record.Manifest.WorkerStatusSeq = "clear", "decision supplied", 3
+	state.Attempts[key] = record
+	if err := applyReconciliationEffectOutcome(&state, request, result); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("out-of-order status outcome err=%v", err)
+	}
+	delete(state.Attempts, key)
+	state.Tombstones[key] = runtimeTombstone{Repository: "o/r", Issue: 329, Attempt: 1, Generation: 2, InvalidatedGeneration: 1, Action: "dismissed", CleanupPhase: "pending"}
+	if err := applyReconciliationEffectOutcome(&state, request, result); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("invalidated status outcome err=%v", err)
+	}
+}
+
+func TestDestructiveInvalidationDurablySupersedesPendingControlSnapshot(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 329, "completed", true)
+	state := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
+	issueKey, attemptKey := ownerIssueKey(manifest.Repository, manifest.Issue), ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	body := internalgithub.SnapshotComment(internalgithub.Snapshot{Version: 2})
+	proposal := reconciliationIssueUpdateProposal{Repository: manifest.Repository, Issue: manifest.Issue, Kind: githubIssueControlSnapshot, ControlSnapshotDigest: digestText(body)}
+	observation := state.Observations[issueKey]
+	observation.IssueUpdates = append(observation.IssueUpdates, proposal)
+	state.Observations[issueKey] = observation
+	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: manifest.Repository, Issue: manifest.Issue, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, ExecutionDigest: strings.Repeat("a", 64), ControlGeneration: 1, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueControlSnapshot, ControlSnapshotDigest: digestText(body), ControlSnapshotBody: body}}
+	effect := runtimeEffectIntent{Action: string(request.Action), Repository: request.Repository, Issue: request.Issue, IssueGeneration: state.IssueGenerations[issueKey], IntentEpoch: state.Epoch, IntentRevision: state.Revision, State: "pending", RequestDigest: reconciliationEffectDigest(request), Reconciliation: &request}
+	effect.ID = runtimeEffectID(effect)
+	state.Effects[effect.ID] = effect
+	if _, err := applyInvalidateAttempt(owner.attemptRoot, owner.stateRoot, &state, invalidateAttemptCommand{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, ExpectedIssueGeneration: state.IssueGenerations[issueKey], ExpectedAttemptGeneration: state.AttemptGenerations[attemptKey], Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest}); err != nil {
+		t.Fatal(err)
+	}
+	repair := state.ControlRepairs[issueKey]
+	parsed, parseErr := internalgithub.ParseSnapshotComment(repair.Body, 1, 1)
+	if retained := state.Effects[effect.ID]; retained.State != "invalidated" || repair.Generation != 2 || parsed.OwnerGeneration != 2 || parseErr != nil {
+		t.Fatalf("stale control effect was not superseded: repair=%#v parsed=%#v err=%v", repair, parsed, parseErr)
+	}
+	state.Revision++
+	tombstone := state.Tombstones[attemptKey]
+	tombstone.Revision = state.Revision
+	state.Tombstones[attemptKey] = tombstone
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil || loaded.ControlRepairs[issueKey] != repair {
+		t.Fatalf("restart lost control repair: repair=%#v err=%v", loaded.ControlRepairs[issueKey], err)
+	}
+	plans, err := planControlSnapshotRepairs(stateOwnerSnapshot{State: loaded}, internalgithub.PRAdapterConfig{Repository: manifest.Repository, ActorID: 42})
+	if err != nil || len(plans) != 1 || !plans[0].Request.ControlRepair || plans[0].Request.ControlGeneration != 2 {
+		t.Fatalf("restart repair plans=%#v err=%v", plans, err)
 	}
 }
 

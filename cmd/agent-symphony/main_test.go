@@ -511,7 +511,7 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 	identity := agentruntime.Manifest{Branch: "agent-symphony/owner-repo/56-3", Worktree: "/attempts/owner-repo-56-3", Session: "as-owner-repo-56-3"}
 	for _, interactive := range []bool{false, true} {
 		prompt := implementationPrompt(issue, identity, interactive)
-		for _, want := range []string{"Project: owner/repo", "Issue: #56", "Attempt: 3", "Base branch: main", "Branch: " + identity.Branch, "Worktree: " + identity.Worktree, "Session: " + identity.Session, issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "installed gh CLI", "/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "Re-read both the comment and label", "updated directly with gh", "partial-update errors are failures, never success"} {
+		for _, want := range []string{"Project: owner/repo", "Issue: #56", "Attempt: 3", "Base branch: main", "Branch: " + identity.Branch, "Worktree: " + identity.Worktree, "Session: " + identity.Session, issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "GitHub and runtime-state mutations are owner-only", "Do not use gh", agentruntime.WorkerStatusEnvironment, agentruntime.WorkerGenerationEnv, agentruntime.WorkerLaunchIDEnv, "agent-symphony-status-v1"} {
 			if !strings.Contains(prompt, want) {
 				t.Fatalf("interactive=%v prompt omitted %q: %s", interactive, want, prompt)
 			}
@@ -533,12 +533,12 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 	}
 }
 
-func TestReviewPromptExposesTheSameDirectStatusContract(t *testing.T) {
+func TestReviewPromptKeepsMutationsOwnerOnly(t *testing.T) {
 	prompt, err := reviewPrompt(agentruntime.ReviewModeImplementation, strings.Repeat("a", 40)+".."+strings.Repeat("b", 40), internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 56, Attempt: 3, Body: "review contract"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "nonempty reason", "fresh re-read", "partial-update errors are failures, never success"} {
+	for _, want := range []string{"GitHub and runtime-state mutations are owner-only", "Do not use gh", "findings for the owner"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("review prompt omitted %q: %s", want, prompt)
 		}
@@ -890,6 +890,38 @@ func TestConfigureAgentCodexHomeLinksCapabilitiesAndIsolatesRuntimeState(t *test
 	}
 }
 
+func TestConfigureWorkerCodexHomeLinksOnlyAuthentication(t *testing.T) {
+	source, stateRoot := t.TempDir(), t.TempDir()
+	for _, name := range agentCodexAssets {
+		path := filepath.Join(source, name)
+		if slices.Contains([]string{"skills", "plugins", "cache", "rules"}, name) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := os.WriteFile(path, []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("CODEX_HOME", source)
+	if err := configureWorkerCodexHome(stateRoot); err != nil {
+		t.Fatal(err)
+	}
+	target := workerCodexHome(stateRoot)
+	for _, name := range workerCodexAssets {
+		if got, err := os.Readlink(filepath.Join(target, name)); err != nil || got != filepath.Join(source, name) {
+			t.Fatalf("authentication %s link=%q err=%v", name, got, err)
+		}
+	}
+	for _, name := range []string{"config.toml", "AGENTS.md", "rules", "skills", "plugins", "cache", "hooks.json"} {
+		if _, err := os.Lstat(filepath.Join(target, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("worker loaded ambient capability %s: %v", name, err)
+		}
+	}
+	if info, err := os.Lstat(target); err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("worker Codex home is unsafe: %#v %v", info, err)
+	}
+}
+
 func TestWorkerBoundaryCarriesGitHubCredentialsOnlyInBoundedInput(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "boundary")
@@ -1053,7 +1085,7 @@ func TestReviewModesBindExactTargetsAndStatusPermissions(t *testing.T) {
 	}
 	for _, test := range []struct{ mode, target string }{{agentruntime.ReviewModePlan, plan}, {agentruntime.ReviewModeImplementation, implementation}} {
 		prompt, err := reviewPrompt(test.mode, test.target, issue)
-		if err != nil || !strings.Contains(prompt, "Review mode: "+test.mode) || !strings.Contains(prompt, test.target) || !strings.Contains(prompt, "Use the installed gh CLI") || !strings.Contains(prompt, "/agent-symphony status needs-attention: REASON") || !strings.Contains(prompt, "needs-attention` label") || strings.Contains(prompt, "ui-review") {
+		if err != nil || !strings.Contains(prompt, "Review mode: "+test.mode) || !strings.Contains(prompt, test.target) || !strings.Contains(prompt, "mutations are owner-only") || !strings.Contains(prompt, "Do not use gh") || strings.Contains(prompt, "ui-review") {
 			t.Fatalf("%s prompt did not preserve its exact target and permissions: %q err=%v", test.mode, prompt, err)
 		}
 	}
@@ -1069,8 +1101,16 @@ func TestDefaultReviewerProductionShapeUsesExactDiffAndRejectsProse(t *testing.T
 	dir := t.TempDir()
 	codex := filepath.Join(dir, "codex")
 	const script = `#!/bin/sh
-test "$#" -eq 5 && test "$1" = -c && test "$2" = "projects={$FAKE_REVIEW_WORKSPACE={trust_level=\"trusted\"}}" && test "$3" = --dangerously-bypass-approvals-and-sandbox && test "$4" = --no-alt-screen || exit 20
-prompt=$5
+safe=0
+never=0
+previous=
+for argument do
+  test "$argument" != "projects={$FAKE_REVIEW_WORKSPACE={trust_level=\"untrusted\"}}" || safe=1
+  if test "$previous" = --ask-for-approval && test "$argument" = never; then never=1; fi
+  previous=$argument
+  prompt=$argument
+done
+test "$safe" -eq 1 && test "$never" -eq 1 || exit 20
 printf '%s' "$prompt" | grep -F "$FAKE_REVIEW_BASE..$FAKE_REVIEW_HEAD" >/dev/null || exit 22
 diff=$(git -C "$FAKE_REVIEW_REPO" diff --no-ext-diff "$FAKE_REVIEW_BASE" HEAD) || exit 23
 printf '%s' "$diff" | grep -F '+first implementation commit' >/dev/null || exit 24
@@ -1162,16 +1202,18 @@ test "$CODEX_HOME" = "$EXPECTED_CODEX_HOME" || exit 10
 trusted=0
 bypass=0
 never=0
+profile=0
 previous=
 for argument do
   test "$argument" != "$EXPECTED_TRUST" || trusted=1
   test "$argument" != --dangerously-bypass-approvals-and-sandbox || bypass=1
+  test "$argument" != 'default_permissions="agent-symphony-worker"' || profile=1
   if test "$previous" = --ask-for-approval && test "$argument" = never; then never=1; fi
   previous=$argument
 done
 test "$trusted" -eq 1 || { printf 'Do you trust the contents of this directory?'; exit 20; }
 case "$ROLE" in
-implementation|review) test "$bypass" -eq 1 || exit 21;;
+implementation|review) test "$bypass" -eq 0 && test "$never" -eq 1 && test "$profile" -eq 1 || exit 21;;
 orchestrator|heartbeat) test "$never" -eq 1 || exit 22;;
 *) exit 23;;
 esac
@@ -1216,9 +1258,13 @@ printf started`
 				command = append(command, "task")
 			}
 			encoded, _ := json.Marshal(role.workspace)
+			trust := `projects={` + string(encoded) + `={trust_level="trusted"}}`
+			if role.name == "implementation" || role.name == "review" {
+				trust = `projects={` + string(encoded) + `={trust_level="untrusted"}}`
+			}
 			process := exec.Command(command[0], command[1:]...)
 			process.Dir = role.workspace
-			process.Env = []string{"CODEX_HOME=" + freshHome, "EXPECTED_CODEX_HOME=" + freshHome, "EXPECTED_TRUST=projects={" + string(encoded) + `={trust_level="trusted"}}`, "ROLE=" + role.name}
+			process.Env = []string{"CODEX_HOME=" + freshHome, "EXPECTED_CODEX_HOME=" + freshHome, "EXPECTED_TRUST=" + trust, "ROLE=" + role.name}
 			process.Stdin = strings.NewReader("task")
 			if output, err := process.CombinedOutput(); err != nil || string(output) != "started" {
 				t.Fatalf("managed %s startup output=%q err=%v command=%q", role.name, output, err, command)
@@ -1245,7 +1291,7 @@ func TestWorkerExportRejectsMaliciousOrOversizedBundleBeforeImport(t *testing.T)
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' '"+string(result)+"'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, err := importWorkerExport(context.Background(), workerBoundaryRunner{Command: script}, agentruntime.Manifest{Repository: "o/r", Branch: "issue-4", BaseSHA: "abcdef1"})
+	_, _, _, err := importWorkerExport(context.Background(), workerBoundaryRunner{Command: script}, dir, 1, agentruntime.Manifest{Repository: "o/r", Branch: "issue-4", BaseSHA: "abcdef1"})
 	if err == nil || !strings.Contains(err.Error(), "invalid or oversized bundle") {
 		t.Fatalf("err=%v", err)
 	}
@@ -1258,6 +1304,7 @@ func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
 		runGit(t, repo, "config", "user.email", "test@example.invalid")
 		runGit(t, repo, "config", "user.name", "test")
 	}
+	runGit(t, coordinator, "remote", "add", "origin", "https://example.invalid/o/r.git")
 	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("base"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1298,7 +1345,7 @@ func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
 		if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' '"+string(boundaryJSON)+"'\n"), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		return importWorkerExport(t.Context(), workerBoundaryRunner{Command: script}, manifest)
+		return importWorkerExport(t.Context(), workerBoundaryRunner{Command: script}, filepath.Join(coordinator, "state"), 1, manifest)
 	}
 
 	if _, _, _, err := importBundle(head, "HEAD", "^"+base); err == nil || !strings.Contains(err.Error(), "worker bundle verification failed") {
@@ -1318,12 +1365,75 @@ func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
 		t.Fatalf("unchanged worker head err=%v", err)
 	}
 	result, importedHead, root, err := importBundle(head, "HEAD")
-	resolvedCoordinator, resolveErr := filepath.EvalSymlinks(coordinator)
-	if err != nil || resolveErr != nil || result.Validation != "ok" || importedHead != head || root != resolvedCoordinator {
+	if err != nil || result.Validation != "ok" || importedHead != head || root != workerSealPath(filepath.Join(coordinator, "state"), 1, manifest, head) {
 		t.Fatalf("result=%#v head=%q root=%q err=%v", result, importedHead, root, err)
 	}
-	if err := exec.Command("git", "-C", coordinator, "cat-file", "-e", head).Run(); err != nil {
-		t.Fatalf("verified head was not imported: %v", err)
+	if err := exec.Command("git", "-C", root, "cat-file", "-e", head).Run(); err != nil {
+		t.Fatalf("verified head was not sealed: %v", err)
+	}
+	if err := exec.Command("git", "-C", coordinator, "cat-file", "-e", head).Run(); err == nil {
+		t.Fatal("verified head leaked into the mutable coordinator checkout")
+	}
+}
+
+func TestConcurrentWorkerSealInstallValidatesCompleteExistingSeal(t *testing.T) {
+	root, source := t.TempDir(), t.TempDir()
+	runGit(t, source, "init")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "file")
+	runGit(t, source, "commit", "-m", "base")
+	base := runGit(t, source, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("head"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "commit", "-am", "head")
+	head := runGit(t, source, "rev-parse", "HEAD")
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 329, Attempt: 1, BaseSHA: base}
+	exported := workerExport{HeadSHA: head, BundleSHA256: strings.Repeat("b", 64)}
+	final := workerSealPath(root, 7, manifest, head)
+	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	temps := []string{filepath.Join(filepath.Dir(final), "seal-a.git"), filepath.Join(filepath.Dir(final), "seal-b.git")}
+	for _, temp := range temps {
+		runGit(t, "", "clone", "--bare", source, temp)
+	}
+	entered, release := make(chan struct{}, 2), make(chan struct{})
+	oldHook := workerSealBeforeRename
+	workerSealBeforeRename = func() { entered <- struct{}{}; <-release }
+	t.Cleanup(func() { workerSealBeforeRename = oldHook })
+	errorsByInstall := make(chan error, 2)
+	for _, temp := range temps {
+		go func(path string) {
+			_, err := installWorkerSeal(t.Context(), path, root, 7, manifest, exported)
+			errorsByInstall <- err
+		}(temp)
+	}
+	<-entered
+	<-entered
+	close(release)
+	for range temps {
+		if err := <-errorsByInstall; err != nil {
+			t.Fatalf("identical concurrent seal install: %v", err)
+		}
+	}
+	if err := validateWorkerSeal(t.Context(), final, 7, manifest, exported); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, final, "update-ref", "refs/heads/mutated", base)
+	if err := validateWorkerSeal(t.Context(), final, 7, manifest, exported); err != nil {
+		t.Fatalf("unrelated ref mutation changed content-addressed seal: %v", err)
+	}
+	object := filepath.Join(final, "objects", head[:2], head[2:])
+	if err := os.Remove(object); err != nil {
+		t.Fatalf("remove sealed commit fixture: %v", err)
+	}
+	if err := validateWorkerSeal(t.Context(), final, 7, manifest, exported); err == nil {
+		t.Fatal("seal with deleted source object remained valid")
 	}
 }
 

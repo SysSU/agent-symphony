@@ -355,7 +355,7 @@ func (p *productionReconciliation) resumePendingReconciliation(ctx context.Conte
 			head := ""
 			if !stale {
 				record := snapshot.State.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
-				_, currentHead, _, importErr := importWorkerExport(ctx, p.implementation, record.Manifest)
+				_, currentHead, _, importErr := importWorkerExport(ctx, p.implementation, p.stateRoot, effect.AttemptGeneration, record.Manifest)
 				if importErr != nil {
 					if err := diagnose(effect, "pending reviewer export import failed: ", importErr); err != nil {
 						return false, err
@@ -430,7 +430,7 @@ func (p *productionReconciliation) resumeUnmarkedReconciliation(ctx context.Cont
 		if !ok || !supplied {
 			return false, errStaleStateResult
 		}
-		result, head, root, err := importWorkerExport(ctx, p.implementation, record.Manifest)
+		result, head, root, err := importWorkerExport(ctx, p.implementation, p.stateRoot, effect.AttemptGeneration, record.Manifest)
 		if err != nil {
 			return false, err
 		}
@@ -482,7 +482,7 @@ func (p *productionReconciliation) resumeUnmarkedReconciliation(ctx context.Cont
 		if !ok || !supplied {
 			return false, errStaleStateResult
 		}
-		_, head, source, err := importWorkerExport(ctx, p.implementation, record.Manifest)
+		_, head, source, err := importWorkerExport(ctx, p.implementation, p.stateRoot, effect.AttemptGeneration, record.Manifest)
 		if err != nil {
 			return false, err
 		}
@@ -712,7 +712,10 @@ func (p *productionReconciliation) runIssueUpdatePhase(ctx context.Context, api 
 	if attempts {
 		plans, err = planReconciliationAttemptIssueUpdates(snapshot, batch, p.collector.Config)
 	} else {
-		plans, err = planReconciliationIssueUpdates(snapshot, batch)
+		plans, err = planControlSnapshotRepairs(snapshot, p.collector.Config)
+		if err == nil && len(plans) == 0 {
+			plans, err = planReconciliationIssueUpdates(snapshot, batch)
+		}
 	}
 	if err != nil || len(plans) == 0 {
 		return false, err
@@ -766,7 +769,7 @@ func (p *productionReconciliation) executionCandidates(ctx context.Context, snap
 		if !ok || !currentReconciliationObservation(snapshot.State, ownerIssueKey(record.Manifest.Repository, record.Manifest.Issue), observation) || digestText(issue.Body) != observation.Fact.BodyDigest {
 			continue
 		}
-		result, head, root, err := importWorkerExport(ctx, p.implementation, record.Manifest)
+		result, head, root, err := importWorkerExport(ctx, p.implementation, p.stateRoot, record.Generation, record.Manifest)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, nil, ctx.Err()

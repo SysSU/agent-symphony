@@ -55,6 +55,17 @@ func (c *runtimeEffectCoordinator) beginWithSource(ctx context.Context, snapshot
 			return agentruntime.EffectRequest{}, err
 		}
 	}
+	manifest := request.Manifest
+	issueGeneration := snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)]
+	attemptGeneration := snapshot.State.AttemptGenerations[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]
+	if request.Action == agentruntime.EffectPrepare && c.executor.Runtime.WorkerProfileDigest != "" {
+		var err error
+		request.Manifest, err = agentruntime.BindWorkerConfinement(request.Manifest, attemptGeneration+1, c.executor.Runtime.WorkerProfileDigest)
+		if err != nil {
+			return agentruntime.EffectRequest{}, err
+		}
+		manifest = request.Manifest
+	}
 	request, executor, err := c.bindWithSource(request, source)
 	if err != nil {
 		return agentruntime.EffectRequest{}, err
@@ -62,9 +73,6 @@ func (c *runtimeEffectCoordinator) beginWithSource(ctx context.Context, snapshot
 	if err := executor.ValidateRequest(request); err != nil {
 		return agentruntime.EffectRequest{}, err
 	}
-	manifest := request.Manifest
-	issueGeneration := snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)]
-	attemptGeneration := snapshot.State.AttemptGenerations[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]
 	identity := stateResultIdentity{
 		Epoch:             snapshot.State.Epoch,
 		SourceRevision:    snapshot.State.Revision,
@@ -103,7 +111,7 @@ func (c *runtimeEffectCoordinator) bindWithSource(request agentruntime.EffectReq
 func freshRuntime(runtime *agentruntime.Runtime, source string) *agentruntime.Runtime {
 	return &agentruntime.Runtime{
 		Root: runtime.Root, StateRoot: runtime.StateRoot, Source: source, Git: runtime.Git, Tmux: runtime.Tmux,
-		Helper: runtime.Helper, Runner: runtime.Runner, AllowEnv: slices.Clone(runtime.AllowEnv), StopWait: runtime.StopWait, VerifyWorker: runtime.VerifyWorker,
+		Helper: runtime.Helper, Runner: runtime.Runner, AllowEnv: slices.Clone(runtime.AllowEnv), StopWait: runtime.StopWait, VerifyWorker: runtime.VerifyWorker, WorkerHome: runtime.WorkerHome, WorkerProfileDigest: runtime.WorkerProfileDigest,
 	}
 }
 
@@ -204,7 +212,7 @@ func (c *runtimeEffectCoordinator) executeOperator(request agentruntime.EffectRe
 		if !ok || effect.State != "pending" || effect.Action != string(agentruntime.EffectStop) {
 			return agentruntime.EffectResult{}, errStaleStateResult
 		}
-		if effect.InvalidatedStart != nil {
+		if effect.InvalidatedStart != nil && !agentruntime.WorkerConfinementBound(effect.InvalidatedStart.Manifest, effect.AttemptGeneration, c.executor.Runtime.WorkerProfileDigest) {
 			return agentruntime.EffectResult{Disposition: agentruntime.EffectResultAmbiguous}, agentruntime.ErrRuntimeResourcesRemain
 		}
 	}
@@ -253,7 +261,7 @@ func (c *runtimeEffectCoordinator) verifyPendingMode(ctx context.Context, snapsh
 	if !validRuntimeEffectAction(action) {
 		return agentruntime.EffectVerification{}, errStateConflict
 	}
-	if action == agentruntime.EffectStop && effect.InvalidatedStart != nil {
+	if action == agentruntime.EffectStop && effect.InvalidatedStart != nil && !agentruntime.WorkerConfinementBound(effect.InvalidatedStart.Manifest, effect.AttemptGeneration, c.executor.Runtime.WorkerProfileDigest) {
 		return agentruntime.EffectVerification{Disposition: agentruntime.EffectPending}, nil
 	}
 	request.Action = action

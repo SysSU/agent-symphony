@@ -732,6 +732,41 @@ func TestEffectVerificationDoesNotReconstructLegacyStopFromMissingName(t *testin
 	}
 }
 
+func TestEffectVerificationSettlesGenerationBoundConfinedStopAfterRestart(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	profile := strings.Repeat("a", 64)
+	r.WorkerProfileDigest = profile
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(3, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err = BindWorkerConfinement(manifest, 7, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r}
+	request := effectTestRequest(t, executor, EffectRequest{Action: EffectStop, Attempt: attempt, Manifest: manifest, Reason: "operator cancelled"}, "f")
+	request.Identity.AttemptGeneration = 7
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := executor.VerifyPending(t.Context(), request)
+	if err != nil || verification.Disposition != EffectVerified || verification.Result == nil || verification.Result.Manifest.State != "cancelled" {
+		t.Fatalf("confined restart verification=%#v err=%v", verification, err)
+	}
+
+	wrongProfile := request
+	wrongProfile.Runtime.WorkerProfileDigest = strings.Repeat("b", 64)
+	wrongProfile.Identity.RequestDigest, err = EffectRequestDigest(wrongProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = executor.VerifyPending(t.Context(), wrongProfile); err == nil {
+		t.Fatal("mismatched profile escaped confinement validation")
+	}
+}
+
 func TestEffectCleanupPolicyIsClosedAndDigestBound(t *testing.T) {
 	r, _, attempt, _ := testRuntime(t)
 	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(4, 0))

@@ -40,6 +40,62 @@ func TestDirectStatusRequiresTheSmallVocabularyAndReason(t *testing.T) {
 	}
 }
 
+func TestEnsureOwnerStatusAppliesExactCommentAndLabelIdempotently(t *testing.T) {
+	now := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
+	var comments []map[string]any
+	label := false
+	posts, labels := 0, 0
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		respond := func(value any) *http.Response {
+			body, _ := json.Marshal(value)
+			return httpResponse(http.StatusOK, string(body), nil)
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/9/comments":
+			return respond(comments), nil
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/9":
+			var issueLabels []map[string]string
+			if label {
+				issueLabels = append(issueLabels, map[string]string{"name": NeedsAttentionLabel})
+			}
+			return respond(map[string]any{"labels": issueLabels}), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/9/comments":
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil {
+				t.Fatal("invalid comment")
+			}
+			posts++
+			comments = append(comments, map[string]any{"id": posts, "body": payload.Body, "created_at": now.Add(time.Duration(posts) * time.Second), "updated_at": now.Add(time.Duration(posts) * time.Second), "user": map[string]any{"id": 42}})
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/9/labels":
+			label, labels = true, labels+1
+			return httpResponse(http.StatusOK, `{}`, nil), nil
+		case r.Method == http.MethodDelete && r.URL.Path == "/repos/o/r/issues/9/labels/needs-attention":
+			label, labels = false, labels+1
+			return httpResponse(http.StatusNoContent, ``, nil), nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			return nil, nil
+		}
+	})}}
+	for range 2 {
+		if err := api.EnsureOwnerStatus(t.Context(), "o/r", 9, 3, true, "operator decision required", 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if posts != 1 || labels != 1 || !label {
+		t.Fatalf("needs-attention posts=%d labels=%d label=%v", posts, labels, label)
+	}
+	for range 2 {
+		if err := api.EnsureOwnerStatus(t.Context(), "o/r", 9, 3, false, "operator decision supplied", 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if posts != 2 || labels != 2 || label {
+		t.Fatalf("clear posts=%d labels=%d label=%v", posts, labels, label)
+	}
+}
+
 func TestDirectStatusUsesNewestAuthenticatedIssueOrPullRequestComment(t *testing.T) {
 	now := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
 	labelPresent := true

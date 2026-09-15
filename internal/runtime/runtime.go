@@ -38,8 +38,13 @@ const (
 	maxResourceName         = 64
 	maxPathLength           = 4096
 	historyLimit            = "5000"
-	workerResultSuffix      = ".result.json"
+	workerPrivateDir        = ".agent-symphony"
+	workerResultName        = "result.json"
+	workerStatusName        = "status.json"
 	WorkerResultEnvironment = "AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
+	WorkerStatusEnvironment = "AGENT_SYMPHONY_STATUS_REQUEST"
+	WorkerGenerationEnv     = "AGENT_SYMPHONY_WORKER_GENERATION"
+	WorkerLaunchIDEnv       = "AGENT_SYMPHONY_WORKER_LAUNCH_ID"
 	PaneExitStatusOption    = "@agent-symphony-exit-status"
 	PaneExitSignalOption    = "@agent-symphony-exit-signal"
 	PaneStatusFormat        = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{@agent-symphony-exit-status}|#{@agent-symphony-exit-signal}"
@@ -177,8 +182,56 @@ type Manifest struct {
 	ReviewFindings      []string  `json:"review_findings,omitempty"`
 	ReviewHandoffQueued bool      `json:"review_handoff_queued,omitempty"`
 	ReviewHandoffAck    bool      `json:"review_handoff_ack,omitempty"`
+	WorkerStatus        string    `json:"worker_status,omitempty"`
+	WorkerStatusReason  string    `json:"worker_status_reason,omitempty"`
+	WorkerStatusSeq     uint64    `json:"worker_status_sequence,omitempty"`
+	WorkerStatusApplied uint64    `json:"worker_status_applied_sequence,omitempty"`
+	WorkerGeneration    uint64    `json:"worker_generation,omitempty"`
+	WorkerProfileDigest string    `json:"worker_profile_digest,omitempty"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+}
+
+type workerStatusRequest struct {
+	Type       string `json:"type"`
+	Generation uint64 `json:"generation"`
+	LaunchID   string `json:"launch_id"`
+	Sequence   uint64 `json:"sequence"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason"`
+}
+
+func observeWorkerStatus(manifest Manifest, generation uint64) (Manifest, error) {
+	path := StatusPath(manifest.Worktree)
+	listed, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return manifest, nil
+	}
+	if err != nil || !listed.Mode().IsRegular() || listed.Mode()&os.ModeSymlink != 0 || listed.Mode().Perm()&0o077 != 0 || listed.Size() < 1 || listed.Size() > WorkerResultMaxBytes {
+		return manifest, errors.New("worker status request is not a bounded private regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return manifest, errors.New("worker status request is unavailable")
+	}
+	opened, statErr := file.Stat()
+	body, readErr := io.ReadAll(io.LimitReader(file, WorkerResultMaxBytes+1))
+	closeErr := file.Close()
+	current, finalErr := os.Lstat(path)
+	if statErr != nil || readErr != nil || closeErr != nil || finalErr != nil || len(body) > WorkerResultMaxBytes || !os.SameFile(listed, opened) || !os.SameFile(opened, current) || opened.Size() != current.Size() || !opened.ModTime().Equal(current.ModTime()) {
+		return manifest, errors.New("worker status request changed while reading")
+	}
+	var request workerStatusRequest
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&request) != nil || decoder.Decode(&struct{}{}) != io.EOF || request.Type != "agent-symphony-status-v1" || request.Generation != generation || request.LaunchID != manifest.LaunchID || request.Sequence == 0 || request.Sequence > 1<<53 || !slices.Contains([]string{"needs-attention", "clear"}, request.Status) || strings.TrimSpace(request.Reason) == "" || len(request.Reason) > 1024 || strings.ContainsRune(request.Reason, 0) {
+		return manifest, errors.New("worker status request is invalid or stale")
+	}
+	if request.Sequence <= manifest.WorkerStatusSeq {
+		return manifest, nil
+	}
+	manifest.WorkerStatus, manifest.WorkerStatusReason, manifest.WorkerStatusSeq = request.Status, strings.TrimSpace(request.Reason), request.Sequence
+	return manifest, nil
 }
 
 func (r *Runtime) RecordReview(attempt Attempt, state, mode, target, base, head, snapshot, session string) (Manifest, error) {
@@ -232,15 +285,20 @@ func (r *Runtime) ResumeHandoff(context.Context, Attempt) (Manifest, error) {
 }
 
 type Runtime struct {
-	Root      string
-	StateRoot string
-	Source    string
-	Git       string
-	Tmux      string
-	Helper    string
-	Runner    Runner
-	AllowEnv  []string
-	StopWait  time.Duration
+	Root       string
+	StateRoot  string
+	Source     string
+	Git        string
+	Tmux       string
+	Helper     string
+	Runner     Runner
+	AllowEnv   []string
+	WorkerHome string
+	// WorkerProfileDigest binds a launched worker to the owner-approved
+	// confinement configuration. An empty value preserves fail-closed legacy
+	// behavior for manifests created before confinement was enforced.
+	WorkerProfileDigest string
+	StopWait            time.Duration
 	// VerifyWorker verifies execution through the provisioned agent-host identity.
 	// agent-host supplies the target account HOME; the coordinator never does.
 	VerifyWorker func(context.Context) error
@@ -311,7 +369,15 @@ func AttemptSessionName(role, repository string, issue, attempt int) (string, er
 	return name, nil
 }
 
-func ResultPath(worktree string) string { return worktree + workerResultSuffix }
+func ResultPath(worktree string) string {
+	return filepath.Join(worktree, workerPrivateDir, workerResultName)
+}
+
+func StatusPath(worktree string) string {
+	return filepath.Join(worktree, workerPrivateDir, workerStatusName)
+}
+
+func PrivatePath(worktree string) string { return filepath.Join(worktree, workerPrivateDir) }
 
 // PromptCommand runs command through the descriptor-owning capture helper.
 func PromptCommand(helper, tmux, buffer, resultPath string, command []string) []string {
@@ -441,7 +507,53 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 	return manifest, r.writeManifest(attempt, manifest)
 }
 func (r *Runtime) agentEnvironment(repository string, extra ...string) ([]string, error) {
-	return internalgithub.AgentEnvironmentWith(append(append(os.Environ(), extra...), "GH_REPO="+repository), r.AllowEnv...)
+	environment := append(os.Environ(), extra...)
+	if r.WorkerHome != "" {
+		environment = append(environment, "CODEX_HOME="+r.WorkerHome)
+	}
+	return internalgithub.WorkerEnvironmentWith(environment, r.AllowEnv...)
+}
+
+func workspaceEnvironment(environment []string, manifest Manifest, generation uint64) ([]string, error) {
+	private := PrivatePath(manifest.Worktree)
+	if err := os.Mkdir(private, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, fmt.Errorf("prepare worker-private directory: %w", err)
+	}
+	info, err := os.Lstat(private)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return nil, errors.New("worker-private directory is unsafe")
+	}
+	paths := map[string]string{
+		"TMPDIR":           filepath.Join(private, "tmp"),
+		"XDG_CACHE_HOME":   filepath.Join(private, "cache"),
+		"GOCACHE":          filepath.Join(private, "go-cache"),
+		"npm_config_cache": filepath.Join(private, "npm-cache"),
+	}
+	for _, path := range paths {
+		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("prepare worker-private cache: %w", err)
+		}
+	}
+	managed := map[string]bool{}
+	for name := range paths {
+		managed[name] = true
+	}
+	managed[WorkerStatusEnvironment], managed[WorkerGenerationEnv], managed[WorkerLaunchIDEnv] = true, true, true
+	filtered := environment[:0]
+	for _, entry := range environment {
+		name, _, _ := strings.Cut(entry, "=")
+		if !managed[name] && !internalgithub.GitHubCLIEnvironmentVariable(name) {
+			filtered = append(filtered, entry)
+		}
+	}
+	for name, path := range paths {
+		filtered = append(filtered, name+"="+path)
+	}
+	return append(filtered,
+		WorkerStatusEnvironment+"="+StatusPath(manifest.Worktree),
+		WorkerGenerationEnv+"="+strconv.FormatUint(generation, 10),
+		WorkerLaunchIDEnv+"="+manifest.LaunchID,
+	), nil
 }
 
 func (r *Runtime) startSession(ctx context.Context, manifest Manifest, env []string, effectID string, command []string) error {
@@ -1075,6 +1187,9 @@ func validateManifestIdentity(want, manifest Manifest) error {
 		manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session || manifest.BaseSHA != want.BaseSHA || manifest.LogPath != want.LogPath {
 		return fmt.Errorf("manifest does not match deterministic attempt resources")
 	}
+	if (manifest.WorkerGeneration == 0) != (manifest.WorkerProfileDigest == "") || manifest.WorkerProfileDigest != "" && !ValidEffectRequestDigest(manifest.WorkerProfileDigest) {
+		return errors.New("worker confinement proof is invalid")
+	}
 	switch manifest.ReviewState {
 	case "":
 		if manifest.ReviewMode != "" || manifest.ReviewTarget != "" || manifest.ReviewSession != "" {
@@ -1118,6 +1233,30 @@ func validateManifestIdentity(want, manifest Manifest) error {
 	default:
 		return fmt.Errorf("invalid manifest state %q", manifest.State)
 	}
+}
+
+// BindWorkerConfinement records the exact generation and profile the owner
+// authorizes before any implementation process may be released.
+func BindWorkerConfinement(manifest Manifest, generation uint64, profileDigest string) (Manifest, error) {
+	if generation == 0 || !ValidEffectRequestDigest(profileDigest) || manifest.WorkerGeneration != 0 || manifest.WorkerProfileDigest != "" {
+		return Manifest{}, errors.New("worker confinement binding is invalid")
+	}
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = generation, profileDigest
+	return manifest, nil
+}
+
+// WorkerConfinementMatches proves that a launched worker was admitted under
+// the current rootless profile for this exact attempt generation.
+func WorkerConfinementMatches(manifest Manifest, generation uint64, profileDigest string) bool {
+	return WorkerConfinementBound(manifest, generation, profileDigest) && manifest.LaunchID != ""
+}
+
+// WorkerConfinementBound validates the durable owner authorization even when
+// a generation-invalidating action raced a Start before its LaunchID result
+// could be committed.
+func WorkerConfinementBound(manifest Manifest, generation uint64, profileDigest string) bool {
+	return manifest.Version == boundManifestVersion && generation != 0 && manifest.WorkerGeneration == generation &&
+		manifest.WorkerProfileDigest == profileDigest && ValidEffectRequestDigest(profileDigest)
 }
 
 // ValidateManifest verifies a persisted manifest against deterministic
@@ -1315,9 +1454,14 @@ func (r *Runtime) session(ctx context.Context, session string) (bool, error) {
 }
 
 func (r *Runtime) stop(ctx context.Context, manifest Manifest) error {
+	return r.stopGeneration(ctx, manifest, 0)
+}
+
+func (r *Runtime) stopGeneration(ctx context.Context, manifest Manifest, generation uint64) error {
 	if manifest.Version != boundManifestVersion {
 		return errors.New("legacy implementation session has no durable launch identity")
 	}
+	confined := WorkerConfinementMatches(manifest, generation, r.WorkerProfileDigest)
 	binding, err := ReadImplementationBinding(manifest)
 	if err != nil {
 		return err
@@ -1331,6 +1475,9 @@ func (r *Runtime) stop(ctx context.Context, manifest Manifest) error {
 		// alive. The inventory must come from the exact original server.
 		absent, probeErr := r.boundPaneAbsent(ctx, binding)
 		if probeErr == nil && absent {
+			if confined {
+				return nil
+			}
 			gone, groupErr := ImplementationWorkerGone(manifest, binding)
 			if groupErr == nil && gone {
 				return nil
@@ -1339,7 +1486,7 @@ func (r *Runtime) stop(ctx context.Context, manifest Manifest) error {
 		}
 		return errors.Join(probeErr, errors.New("bound implementation pane may still exist"))
 	}
-	return r.stopBound(ctx, manifest)
+	return r.stopBound(ctx, manifest, confined)
 }
 
 func (r *Runtime) boundPaneAbsent(ctx context.Context, binding ImplementationLaunchBinding) (bool, error) {
@@ -1411,7 +1558,7 @@ func (r *Runtime) observeBoundCommand(ctx context.Context, manifest Manifest, bu
 	return r.guardedBoundResult(ctx, binding, pane, nested, nil)
 }
 
-func (r *Runtime) stopBound(ctx context.Context, manifest Manifest) error {
+func (r *Runtime) stopBound(ctx context.Context, manifest Manifest, confined bool) error {
 	binding, pane, err := r.observeBound(ctx, manifest)
 	if err != nil {
 		return err
@@ -1453,6 +1600,9 @@ func (r *Runtime) stopBound(ctx context.Context, manifest Manifest) error {
 	}
 	if !absent {
 		return errors.New("bound implementation pane remained after guarded stop")
+	}
+	if confined {
+		return nil
 	}
 	workerGone, groupErr := ImplementationWorkerGone(manifest, binding)
 	if groupErr != nil || !workerGone {

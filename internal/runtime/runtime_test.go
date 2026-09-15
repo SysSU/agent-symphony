@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +35,54 @@ type fakeRunner struct {
 	ignoreInterrupt bool
 	keepAfterKill   bool
 	seen            []Command
+}
+
+func TestWorkerStatusRequestIsGenerationAndLaunchBound(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.Mkdir(PrivatePath(workspace), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{Worktree: workspace, LaunchID: strings.Repeat("a", 32)}
+	write := func(generation, sequence uint64, status, reason string) {
+		t.Helper()
+		body, _ := json.Marshal(workerStatusRequest{Type: "agent-symphony-status-v1", Generation: generation, LaunchID: manifest.LaunchID, Sequence: sequence, Status: status, Reason: reason})
+		if err := os.WriteFile(StatusPath(workspace), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(7, 1, "needs-attention", "operator decision required")
+	observed, err := observeWorkerStatus(manifest, 7)
+	if err != nil || observed.WorkerStatus != "needs-attention" || observed.WorkerStatusReason != "operator decision required" || observed.WorkerStatusSeq != 1 {
+		t.Fatalf("observed=%#v err=%v", observed, err)
+	}
+	write(6, 2, "clear", "stale worker")
+	if _, err := observeWorkerStatus(observed, 7); err == nil {
+		t.Fatal("stale generation status was accepted")
+	}
+	write(7, 1, "clear", "out of order")
+	unchanged, err := observeWorkerStatus(observed, 7)
+	if err != nil || unchanged.WorkerStatus != observed.WorkerStatus || unchanged.WorkerStatusSeq != observed.WorkerStatusSeq {
+		t.Fatalf("out-of-order request changed status: %#v err=%v", unchanged, err)
+	}
+}
+
+func TestWorkerEnvironmentUsesOnlyAttemptPrivateTempAndStatusPaths(t *testing.T) {
+	workspace := t.TempDir()
+	manifest := Manifest{Worktree: workspace, LaunchID: strings.Repeat("b", 32)}
+	environment, err := workspaceEnvironment([]string{"PATH=/bin", "TMPDIR=/host/tmp", "GOCACHE=/host/cache", "GH_TOKEN=secret"}, manifest, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range environment {
+		if strings.Contains(entry, "/host/") || strings.HasPrefix(entry, "GH_TOKEN=") {
+			t.Fatalf("host path or GitHub credential survived: %q", entry)
+		}
+	}
+	for _, want := range []string{WorkerStatusEnvironment + "=" + StatusPath(workspace), WorkerGenerationEnv + "=9", WorkerLaunchIDEnv + "=" + manifest.LaunchID, "TMPDIR=" + filepath.Join(PrivatePath(workspace), "tmp")} {
+		if !slices.Contains(environment, want) {
+			t.Fatalf("missing managed worker environment %q in %#v", want, environment)
+		}
+	}
 }
 
 type inheritedEnvironmentRunner struct{}

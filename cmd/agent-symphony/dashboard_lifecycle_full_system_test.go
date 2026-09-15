@@ -79,6 +79,7 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 			runExternal(t, repository, "git", "push", "-q", "runtime-fixture", "main")
 			manifest := historicalFullSystemManifest(t, sourceGit, stateRoot, base, 73, 1)
 			manifest.State = "running"
+			manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, config.WorkerProfileDigest()
 			if completedOverlap {
 				if err := os.WriteFile(filepath.Join(manifest.Worktree, "completed.txt"), []byte("published attempt\n"), 0o600); err != nil {
 					t.Fatal(err)

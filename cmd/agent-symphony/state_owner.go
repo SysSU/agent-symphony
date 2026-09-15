@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
@@ -53,12 +54,19 @@ type runtimeOwnerState struct {
 	ReviewerProofs            map[string]reviewerProcessProof      `json:"reviewer_proofs"`
 	ReviewerRevocationTracked bool                                 `json:"reviewer_revocation_tracked,omitempty"`
 	ControlReceipts           []controlReceipt                     `json:"control_receipts"`
+	ControlGenerations        map[string]uint64                    `json:"control_generations,omitempty"`
+	ControlRepairs            map[string]controlSnapshotRepair     `json:"control_repairs,omitempty"`
 	CycleDiagnostic           string                               `json:"cycle_diagnostic,omitempty"`
 	CycleDiagnosticAt         time.Time                            `json:"cycle_diagnostic_at,omitzero"`
 	CycleOutcomeEpoch         uint64                               `json:"cycle_outcome_epoch,omitempty"`
 	CycleOutcomeID            uint64                               `json:"cycle_outcome_id,omitempty"`
 	CycleOutcomeSource        uint64                               `json:"cycle_outcome_source_revision,omitempty"`
 	StaleReconciliations      uint64                               `json:"stale_reconciliations,omitempty"`
+}
+
+type controlSnapshotRepair struct {
+	Generation uint64 `json:"generation"`
+	Body       string `json:"body"`
 }
 
 type runtimeAttemptRecord struct {
@@ -1474,7 +1482,16 @@ func sameRuntimeEffectManifestBase(current, result agentruntime.Manifest, action
 		copy.ReviewFindings = slices.Clone(current.ReviewFindings)
 		copy.ReviewHandoffQueued, copy.ReviewHandoffAck = current.ReviewHandoffQueued, current.ReviewHandoffAck
 	}
-	return reflect.DeepEqual(copy, current)
+	if action == agentruntime.EffectMonitor {
+		copy.WorkerStatus, copy.WorkerStatusReason, copy.WorkerStatusSeq, copy.WorkerStatusApplied = current.WorkerStatus, current.WorkerStatusReason, current.WorkerStatusSeq, current.WorkerStatusApplied
+	}
+	if !reflect.DeepEqual(copy, current) {
+		return false
+	}
+	if action != agentruntime.EffectMonitor {
+		return result.WorkerStatus == current.WorkerStatus && result.WorkerStatusReason == current.WorkerStatusReason && result.WorkerStatusSeq == current.WorkerStatusSeq && result.WorkerStatusApplied == current.WorkerStatusApplied
+	}
+	return result.WorkerStatusApplied == current.WorkerStatusApplied && result.WorkerStatusSeq >= current.WorkerStatusSeq && (result.WorkerStatusSeq == current.WorkerStatusSeq && result.WorkerStatus == current.WorkerStatus && result.WorkerStatusReason == current.WorkerStatusReason || result.WorkerStatusSeq > current.WorkerStatusSeq && slices.Contains([]string{"needs-attention", "clear"}, result.WorkerStatus) && strings.TrimSpace(result.WorkerStatusReason) != "" && len(result.WorkerStatusReason) <= 1024)
 }
 
 func reviewTransitionMatches(review agentruntime.ReviewTransition, current, result agentruntime.Manifest) bool {
@@ -1693,6 +1710,45 @@ func pendingStartCandidate(state runtimeOwnerState, manifest agentruntime.Manife
 	return candidate, nil
 }
 
+func controlGeneration(state runtimeOwnerState, issueKey string) uint64 {
+	if generation := state.ControlGenerations[issueKey]; generation > 0 {
+		return generation
+	}
+	return 1
+}
+
+func invalidateControlSnapshot(state *runtimeOwnerState, issueKey string) {
+	generation := controlGeneration(*state, issueKey) + 1
+	if state.ControlGenerations == nil {
+		state.ControlGenerations = map[string]uint64{}
+	}
+	if state.ControlRepairs == nil {
+		state.ControlRepairs = map[string]controlSnapshotRepair{}
+	}
+	state.ControlGenerations[issueKey] = generation
+	body := state.ControlRepairs[issueKey].Body
+	for id, effect := range state.Effects {
+		request := effect.Reconciliation
+		if effect.State != "pending" || request == nil || ownerIssueKey(effect.Repository, effect.Issue) != issueKey || request.Action != reconciliationGitHubIssueUpdate || request.GitHubIssueUpdate == nil || request.GitHubIssueUpdate.Kind != githubIssueControlSnapshot {
+			continue
+		}
+		if request.GitHubIssueUpdate.ControlSnapshotBody != "" {
+			body = request.GitHubIssueUpdate.ControlSnapshotBody
+		}
+		effect.State = "invalidated"
+		state.Effects[id] = effect
+	}
+	if body == "" {
+		return
+	}
+	snapshot, err := internalgithub.ParseSnapshotComment(body, 1, 1)
+	if err != nil {
+		return
+	}
+	snapshot.OwnerGeneration = generation
+	state.ControlRepairs[issueKey] = controlSnapshotRepair{Generation: generation, Body: internalgithub.SnapshotComment(snapshot)}
+}
+
 func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState, command invalidateAttemptCommand) (*runtimeEffectIntent, error) {
 	if command.Repository != state.Repository || command.Issue < 1 || command.Attempt < 1 || !validTombstoneAction(command.Action) || !validCleanupPhase(command.CleanupPhase) {
 		return nil, errStateConflict
@@ -1724,6 +1780,7 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 		}
 		command.Manifest = &manifest
 	}
+	invalidateControlSnapshot(state, issueKey)
 	invalidatedHandoff, err := pendingHandoffCandidate(*state, command.Repository, command.Issue, command.Attempt)
 	if err != nil {
 		return nil, err
@@ -1733,6 +1790,12 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 		invalidatedStart, err = pendingStartCandidate(*state, *command.Manifest)
 		if err != nil {
 			return nil, err
+		}
+		if invalidatedStart != nil && agentruntime.WorkerConfinementBound(invalidatedStart.Manifest, command.ExpectedAttemptGeneration, config.WorkerProfileDigest()) {
+			// The generation change revokes all owner authority held by this
+			// rootless candidate. Its physically escaped descendants have no
+			// network, credentials, state, socket, or sibling-workspace access.
+			invalidatedStart = nil
 		}
 	}
 	invalidated := command.ExpectedAttemptGeneration
@@ -2217,6 +2280,17 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 	if (state.CycleOutcomeEpoch == 0) != (state.CycleOutcomeID == 0) || (state.CycleOutcomeEpoch == 0) != (state.CycleOutcomeSource == 0) || state.CycleOutcomeEpoch > state.Epoch || state.CycleOutcomeSource > state.Revision {
 		return errors.New("runtime owner cycle outcome identity is invalid")
 	}
+	for key, generation := range state.ControlGenerations {
+		if generation < 2 || issueFromOwnerKey(key) < 1 || key != ownerIssueKey(state.Repository, issueFromOwnerKey(key)) {
+			return errors.New("runtime owner control generation is invalid")
+		}
+	}
+	for key, repair := range state.ControlRepairs {
+		snapshot, err := internalgithub.ParseSnapshotComment(repair.Body, 1, 1)
+		if err != nil || repair.Generation != controlGeneration(state, key) || snapshot.OwnerGeneration != repair.Generation {
+			return errors.New("runtime owner control repair is invalid")
+		}
+	}
 	for key, generation := range state.IssueGenerations {
 		issue := issueFromOwnerKey(key)
 		if generation == 0 || issue < 1 || key != ownerIssueKey(state.Repository, issue) {
@@ -2236,6 +2310,9 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, record.Manifest); err != nil {
 			return err
 		}
+		if record.Manifest.WorkerProfileDigest != "" && record.Manifest.WorkerGeneration != record.Generation {
+			return errors.New("runtime owner worker confinement generation is invalid")
+		}
 	}
 	if err := validateReconciliationObservations(state); err != nil {
 		return err
@@ -2253,6 +2330,9 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if tombstone.Manifest != nil {
 			if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, *tombstone.Manifest); err != nil || tombstone.Manifest.Issue != tombstone.Issue || tombstone.Manifest.Attempt != tombstone.Attempt {
 				return errors.New("runtime owner tombstone manifest is invalid")
+			}
+			if tombstone.Manifest.WorkerProfileDigest != "" && tombstone.Manifest.WorkerGeneration != tombstone.InvalidatedGeneration {
+				return errors.New("runtime owner tombstone confinement generation is invalid")
 			}
 		}
 		if tombstone.InvalidatedHandoff != nil && (tombstone.Manifest == nil || !validHandoffCandidateInvalidation(*tombstone.InvalidatedHandoff, *tombstone.Manifest)) {
@@ -2295,7 +2375,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if effect.Reconciliation != nil {
 			issueScoped := reconciliationEffectIssueScoped(*effect.Reconciliation)
 			attemptCurrent := issueScoped && effect.Attempt == 0 && effect.AttemptGeneration == 0 || !issueScoped && effect.Attempt > 0 && effect.AttemptGeneration > 0 && (state.AttemptGenerations[attemptKey] == effect.AttemptGeneration || receiptBoundCompletion)
-			if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Action == "" || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" || !issueCurrent || !attemptCurrent || !validPersistedReconciliationEffect(state, effect) {
+			if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Action == "" || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" && effect.State != "invalidated" || !issueCurrent || !attemptCurrent || !validPersistedReconciliationEffect(state, effect) {
 				return fmt.Errorf("runtime owner reconciliation effect intent %s (%s) is invalid: identity=%t issue_current=%t attempt_current=%t payload=%t", effect.ID, effect.Action, key == effect.ID && effect.ID == runtimeEffectID(effect), issueCurrent, attemptCurrent, validPersistedReconciliationEffect(state, effect))
 			}
 			continue
@@ -2403,13 +2483,18 @@ func runtimeOwnerAttemptRoot(stateRoot string) string {
 }
 
 func newRuntimeOwnerState(repository string) runtimeOwnerState {
-	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, ReviewerRevocationTracked: true, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}}
+	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, ReviewerRevocationTracked: true, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}, ControlGenerations: map[string]uint64{}, ControlRepairs: map[string]controlSnapshotRepair{}}
 }
 
 func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 	clone := state
 	clone.IssueGenerations = cloneMap(state.IssueGenerations)
 	clone.AttemptGenerations = cloneMap(state.AttemptGenerations)
+	clone.ControlGenerations = cloneMap(state.ControlGenerations)
+	clone.ControlRepairs = make(map[string]controlSnapshotRepair, len(state.ControlRepairs))
+	for key, repair := range state.ControlRepairs {
+		clone.ControlRepairs[key] = repair
+	}
 	clone.Attempts = make(map[string]runtimeAttemptRecord, len(state.Attempts))
 	for key, record := range state.Attempts {
 		record.Manifest = cloneManifest(record.Manifest)

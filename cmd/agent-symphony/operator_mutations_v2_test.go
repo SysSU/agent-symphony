@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
@@ -66,6 +67,33 @@ func TestDismissPendingStartKeepsPhysicalCleanupPendingAcrossRestart(t *testing.
 	}
 	if _, exists := loaded.Attempts[key]; exists || loaded.Tombstones[key].InvalidatedStart == nil {
 		t.Fatalf("restart resurrected dismissed attempt or lost candidate: %#v", loaded)
+	}
+}
+
+func TestDismissConfinedPendingStartSettlesAndRemainsRevokedAfterRestart(t *testing.T) {
+	owner, manifest := operatorOwnerWithConfinedPendingStart(t, 329, "completed", true)
+	request := operatorRequest("dismiss-confined-start", "dismiss", manifest, false)
+	committed, effect, err := owner.beginOperatorMutation(t.Context(), operatorCommand(mustOwnerSnapshot(t, owner), request, manifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
+	if effect != nil || !ok || receipt.State != "completed" || receipt.Phase != operatorPhaseCompleted || committed.State.Tombstones[key].InvalidatedStart != nil {
+		t.Fatalf("confined dismissal did not settle: effect=%#v receipt=%#v tombstone=%#v", effect, receipt, committed.State.Tombstones[key])
+	}
+	if implementationLeaseBlocksGitHub(committed.State, reconciliationGitHubIssueUpdate, manifest.Repository, manifest.Issue) {
+		t.Fatal("revoked confined Start retained GitHub authority")
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := loaded.Attempts[key]; exists || loaded.Tombstones[key].InvalidatedStart != nil || implementationLeaseBlocksGitHub(loaded, reconciliationGitHubIssueUpdate, manifest.Repository, manifest.Issue) {
+		t.Fatalf("restart restored confined worker authority: %#v", loaded)
 	}
 }
 
@@ -150,6 +178,30 @@ func operatorOwnerWithPendingStart(t *testing.T, issue int, status string, close
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	refreshOperatorObservation(t, owner)
 	return owner, manifest
+}
+
+func operatorOwnerWithConfinedPendingStart(t *testing.T, issue int, status string, closed bool) (*stateOwner, agentruntime.Manifest) {
+	t.Helper()
+	owner, manifest := operatorOwnerWithPendingStart(t, issue, status, closed)
+	state := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	generation := state.AttemptGenerations[key]
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = generation, config.WorkerProfileDigest()
+	record := state.Attempts[key]
+	record.Manifest = manifest
+	state.Attempts[key] = record
+	restarted, err := startTestStateOwner(t, owner.stateRoot, state, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, productionAttemptRoot(owner.stateRoot), next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	refreshOperatorObservation(t, restarted)
+	return restarted, manifest
 }
 
 func TestOperatorSameSnapshotDismissAndCleanupRequestsConverge(t *testing.T) {

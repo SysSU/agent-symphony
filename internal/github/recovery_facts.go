@@ -248,6 +248,30 @@ func ExecuteIssueUpdateProposal(ctx context.Context, api API, cfg PRAdapterConfi
 	return errors.Join(err, verifyErr, errors.New("issue update postcondition was not observed"))
 }
 
+// EnsureControlSnapshotRepair posts a generation-unique owner snapshot even
+// when an older, semantically equivalent snapshot is already present.
+func EnsureControlSnapshotRepair(ctx context.Context, api API, cfg PRAdapterConfig, repository string, issue int, body string) error {
+	if repository != cfg.Repository || issue < 1 {
+		return errors.New("control snapshot repair identity is invalid")
+	}
+	snapshot, err := ParseSnapshotComment(body, cfg.ActorID, cfg.ActorID)
+	if err != nil || snapshot.OwnerGeneration == 0 {
+		return errors.New("control snapshot repair body is invalid")
+	}
+	if err := api.createControlSnapshot(ctx, repository, issue, body); err != nil {
+		return err
+	}
+	applied, err := issueUpdateApplied(ctx, api, cfg, IssueUpdateProposal{Kind: IssueUpdateControlSnapshot, Repository: repository, Issue: issue, ControlSnapshotBody: body})
+	if err != nil || !applied {
+		return errors.Join(err, errors.New("control snapshot repair was not observed"))
+	}
+	return nil
+}
+
+func ControlSnapshotRepairApplied(ctx context.Context, api API, cfg PRAdapterConfig, repository string, issue int, body string) (bool, error) {
+	return issueUpdateApplied(ctx, api, cfg, IssueUpdateProposal{Kind: IssueUpdateControlSnapshot, Repository: repository, Issue: issue, ControlSnapshotBody: body})
+}
+
 func issueUpdateApplied(ctx context.Context, api API, cfg PRAdapterConfig, proposal IssueUpdateProposal) (bool, error) {
 	if proposal.Repository != cfg.Repository || proposal.Issue < 1 {
 		return false, errors.New("issue update proposal identity is invalid")
@@ -289,6 +313,7 @@ type directStatus struct {
 	incomplete           bool
 	createdAt            time.Time
 	commentID            int64
+	requestedReason      string
 }
 
 func monitoringDependencyStatus(reason string, needsAttention bool) int {
@@ -304,7 +329,8 @@ func monitoringDependencyStatus(reason string, needsAttention bool) int {
 }
 
 func parseDirectStatus(body string) (directStatus, bool) {
-	command, reason, found := strings.Cut(strings.TrimSpace(body), ":")
+	line, _, _ := strings.Cut(strings.TrimSpace(body), "\n")
+	command, reason, found := strings.Cut(strings.TrimSpace(line), ":")
 	reason = strings.TrimSpace(reason)
 	if !found || reason == "" || len(reason) > 1024 || strings.ContainsRune(reason, 0) {
 		return directStatus{}, false
@@ -345,6 +371,7 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 				status = directStatus{NeedsAttention: true, Reason: "direct status intent is incomplete: use needs-attention or clear with a nonempty reason", incomplete: true}
 			}
 			if latest.commentID == 0 || comment.CreatedAt.After(latest.createdAt) || comment.CreatedAt.Equal(latest.createdAt) && comment.ID > latest.commentID {
+				status.requestedReason = status.Reason
 				status.createdAt, status.commentID = comment.CreatedAt, comment.ID
 				latest = status
 			}
@@ -373,6 +400,60 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 		latest.NeedsAttention = true
 	}
 	return latest, nil
+}
+
+// OwnerStatusApplied verifies the exact owner-authored status comment and label pair.
+func (a API) OwnerStatusApplied(ctx context.Context, repository string, issue, attempt int, needsAttention bool, reason string, actorID int) (bool, error) {
+	reason = strings.TrimSpace(reason)
+	if repository == "" || issue < 1 || attempt < 1 || actorID < 1 || reason == "" || len(reason) > 1024 || strings.ContainsRune(reason, 0) {
+		return false, errors.New("owner status requires a bound attempt and reason")
+	}
+	source := GitHubPRSource{API: a, Config: PRAdapterConfig{Repository: repository, ActorID: actorID}}
+	status, err := source.directStatus(ctx, issue, 0)
+	return err == nil && status.commentID > 0 && !status.incomplete && status.NeedsAttention == needsAttention && status.Reason == reason, err
+}
+
+// EnsureOwnerStatus applies an untrusted worker request through owner credentials.
+func (a API) EnsureOwnerStatus(ctx context.Context, repository string, issue, attempt int, needsAttention bool, reason string, actorID int) error {
+	reason = strings.TrimSpace(reason)
+	applied, err := a.OwnerStatusApplied(ctx, repository, issue, attempt, needsAttention, reason, actorID)
+	if err != nil || applied {
+		return err
+	}
+	source := GitHubPRSource{API: a, Config: PRAdapterConfig{Repository: repository, ActorID: actorID}}
+	status, err := source.directStatus(ctx, issue, 0)
+	if err != nil {
+		return err
+	}
+	if status.commentID == 0 || status.requestedAttention != needsAttention || status.requestedReason != reason {
+		name := "clear"
+		if needsAttention {
+			name = "needs-attention"
+		}
+		body, err := AttributedBody(issue, attempt, directStatusPrefix+name+": "+reason)
+		if err != nil {
+			return err
+		}
+		if err := a.CreateIssueComment(ctx, repository, issue, body, Mutation{Issue: issue, Attempt: attempt}); err != nil {
+			return err
+		}
+	}
+	var current struct{ Labels []struct{ Name string } }
+	if _, _, err := a.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", repository, issue), "", &current); err != nil {
+		return err
+	}
+	hasLabel := slices.ContainsFunc(current.Labels, func(label struct{ Name string }) bool { return strings.EqualFold(label.Name, NeedsAttentionLabel) })
+	if err := a.SyncReviewLabel(ctx, repository, issue, NeedsAttentionLabel, hasLabel, needsAttention, Mutation{Issue: issue, Attempt: attempt}); err != nil {
+		return err
+	}
+	applied, err = a.OwnerStatusApplied(ctx, repository, issue, attempt, needsAttention, reason, actorID)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return errors.New("owner status did not match after apply")
+	}
+	return nil
 }
 
 func (s *GitHubPRSource) clearResolvedMonitoringDependencyStatus(ctx context.Context, issue, pullRequest, attempt int, status directStatus) (directStatus, error) {
