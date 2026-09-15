@@ -399,11 +399,20 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	stopped := false
 	currentSession := "as-o-r-964584196b5c-73-1"
 	t.Cleanup(func() {
-		_ = stopFullSystemTmux(server.Env, currentSession)
-		_ = stopFullSystemProcesses(root)
 		if !stopped {
-			_ = server.Process.Kill()
-			_ = server.Wait()
+			if err := stopFullSystemDaemon(server); err != nil {
+				t.Errorf("join full-system daemon before resource cleanup: %v", err)
+			}
+			stopped = true
+		}
+		if err := stopFullSystemTmux(server.Env, currentSession); err != nil {
+			t.Errorf("stop full-system tmux: %v", err)
+		}
+		if fullSystemTmuxSessionExists(server.Env, currentSession) {
+			t.Errorf("full-system tmux session remained after cleanup: %s", currentSession)
+		}
+		if err := stopFullSystemProcesses(root); err != nil {
+			t.Errorf("stop full-system child processes: %v", err)
 		}
 	})
 	waitHTTP(t, "http://"+address+"/status.json", deadline(15*time.Second), output)
@@ -1119,11 +1128,52 @@ func stopFullSystemTmux(environment []string, session string) error {
 	return nil
 }
 
+func stopFullSystemDaemon(command *exec.Cmd) error {
+	if command == nil || command.Process == nil || command.ProcessState != nil {
+		return nil
+	}
+	killErr := command.Process.Kill()
+	waitErr := command.Wait()
+	if errors.Is(killErr, os.ErrProcessDone) {
+		killErr = nil
+	}
+	var exit *exec.ExitError
+	if killErr == nil && errors.As(waitErr, &exit) {
+		waitErr = nil
+	}
+	return errors.Join(killErr, waitErr)
+}
+
 func stopFullSystemProcesses(root string) error {
-	listed, err := exec.Command("ps", "-axo", "pid=,command=").Output()
+	pids, err := fullSystemProcessIDs(root)
 	if err != nil {
 		return err
 	}
+	for _, pid := range pids {
+		process, err := os.FindProcess(pid)
+		if err != nil {
+			return err
+		}
+		if err := process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return err
+		}
+	}
+	remaining, err := fullSystemProcessIDs(root)
+	if err != nil {
+		return err
+	}
+	if len(remaining) != 0 {
+		return fmt.Errorf("isolated processes remained after cleanup: %v", remaining)
+	}
+	return nil
+}
+
+func fullSystemProcessIDs(root string) ([]int, error) {
+	listed, err := exec.Command("ps", "-axo", "pid=,command=").Output()
+	if err != nil {
+		return nil, err
+	}
+	var pids []int
 	for _, line := range strings.Split(string(listed), "\n") {
 		if !strings.Contains(line, root) {
 			continue
@@ -1134,13 +1184,9 @@ func stopFullSystemProcesses(root string) error {
 		}
 		pid, err := strconv.Atoi(fields[0])
 		if err != nil || pid <= 1 {
-			return fmt.Errorf("invalid isolated process identity %q", line)
+			return nil, fmt.Errorf("invalid isolated process identity %q", line)
 		}
-		process, err := os.FindProcess(pid)
-		if err != nil {
-			return err
-		}
-		_ = process.Kill()
+		pids = append(pids, pid)
 	}
-	return nil
+	return pids, nil
 }
