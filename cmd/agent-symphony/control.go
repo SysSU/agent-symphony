@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -73,7 +74,38 @@ type controlReceiptState struct {
 type controlDeadlineContextKey struct{}
 
 func controlSocketPath(stateRoot string) string {
-	return filepath.Join(filepath.Clean(stateRoot), "control.sock")
+	stateRoot = filepath.Clean(stateRoot)
+	direct := filepath.Join(stateRoot, "control.sock")
+	if len(direct) <= 90 { // Portable below Darwin's 104-byte sockaddr_un limit.
+		return direct
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return direct
+	}
+	digest := sha256.Sum256([]byte(stateRoot))
+	return filepath.Join(home, ".agent-symphony-control", hex.EncodeToString(digest[:8])+".sock")
+}
+
+func validateControlSocketParent(path, stateRoot string, create bool) error {
+	parent := filepath.Dir(path)
+	if parent == filepath.Clean(stateRoot) {
+		return nil
+	}
+	canonical, err := canonicalPathWithMissingLeaf(parent)
+	if err != nil || canonical != parent || pathInSharedTemporaryStorage(canonical) {
+		return errors.New("running-daemon control directory is unsafe")
+	}
+	if create {
+		if err := os.Mkdir(parent, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+	}
+	info, err := os.Lstat(parent)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
+		return errors.New("running-daemon control directory is unsafe")
+	}
+	return nil
 }
 
 func newControlRequestID() (string, error) {
@@ -99,15 +131,19 @@ func startControlServer(ctx context.Context, project *dashboardServer, log io.Wr
 }
 
 type controlServerLifecycle struct {
-	server   *http.Server
-	listener net.Listener
-	path     string
-	socket   os.FileInfo
-	done     chan struct{}
+	server     *http.Server
+	listener   net.Listener
+	path       string
+	cleanupDir string
+	socket     os.FileInfo
+	done       chan struct{}
 }
 
 func startControlServerWaitable(project *dashboardServer, log io.Writer) (*controlServerLifecycle, error) {
 	path := controlSocketPath(project.stateRoot)
+	if err := validateControlSocketParent(path, project.stateRoot, true); err != nil {
+		return nil, err
+	}
 	if info, err := os.Lstat(path); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 || !ownedByCurrentUser(info) {
 			return nil, errors.New("running-daemon control path is unsafe")
@@ -137,7 +173,11 @@ func startControlServerWaitable(project *dashboardServer, log io.Writer) (*contr
 		return nil, errors.New("running-daemon control socket is unsafe")
 	}
 	server := &http.Server{Handler: controlHandler(project), ReadHeaderTimeout: 5 * time.Second}
-	running := &controlServerLifecycle{server: server, listener: listener, path: path, socket: socketInfo, done: make(chan struct{})}
+	cleanupDir := ""
+	if parent := filepath.Dir(path); parent != filepath.Clean(project.stateRoot) {
+		cleanupDir = parent
+	}
+	running := &controlServerLifecycle{server: server, listener: listener, path: path, cleanupDir: cleanupDir, socket: socketInfo, done: make(chan struct{})}
 	go func() {
 		defer close(running.done)
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -164,6 +204,9 @@ func (s *controlServerLifecycle) shutdown(ctx context.Context) error {
 		removeErr = os.Remove(s.path)
 	} else if inspectErr != nil && !errors.Is(inspectErr, os.ErrNotExist) {
 		removeErr = inspectErr
+	}
+	if s.cleanupDir != "" {
+		_ = os.Remove(s.cleanupDir)
 	}
 	return errors.Join(err, removeErr)
 }
@@ -346,6 +389,9 @@ func callRunningDaemon(ctx context.Context, stateRoot string, request controlReq
 		return controlResult{}, fmt.Errorf("runtime state is bound to project %s, not %s", identity.Repository, request.Repository)
 	}
 	path := controlSocketPath(stateRoot)
+	if err := validateControlSocketParent(path, stateRoot, false); err != nil {
+		return controlResult{}, err
+	}
 	info, err := os.Lstat(path)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(info) {
 		return controlResult{}, errors.New("running-daemon control socket is unavailable or unsafe")

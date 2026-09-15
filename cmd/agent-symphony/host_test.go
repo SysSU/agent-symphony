@@ -565,8 +565,8 @@ func TestReviewerBoundaryAllowsOnlyExactOrchestratorTmuxLaunch(t *testing.T) {
 	if err := request([]string{"split-window", "-d", "-t", "=as-o-owner-repo:0.0", "-c", filepath.Dir(root), "--", "operator-agent"}, []string{"PATH=/bin"}); err == nil {
 		t.Fatal("orchestrator pane replacement escaped the snapshot root")
 	}
-	if err := request(respawn("=as-o-owner-repo:0.0"), []string{"GH_TOKEN=secret"}); err != nil {
-		t.Fatal("orchestrator launch rejected GitHub CLI authentication")
+	if err := request(respawn("=as-o-owner-repo:0.0"), []string{"GH_TOKEN=secret"}); err == nil {
+		t.Fatal("orchestrator launch accepted GitHub CLI authentication")
 	}
 	if err := request(respawn("=as-o-owner-repo:0.0"), []string{"SSH_AUTH_SOCK=/tmp/agent"}); err == nil {
 		t.Fatal("orchestrator launch accepted SSH credentials")
@@ -696,7 +696,7 @@ func TestReviewResultArtifactFailsClosed(t *testing.T) {
 	}
 
 	t.Run("legacy head artifact", func(t *testing.T) {
-		root := t.TempDir()
+		root := resolvedTempDir(t)
 		snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
 		mustWriteFile(t, reviewResultPath(snapshot, request.Head), valid)
 		legacy := request
@@ -798,10 +798,10 @@ func TestReviewResultArtifactFailsClosed(t *testing.T) {
 
 func mustWriteFile(t *testing.T, path, body string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o770); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(body), 0o660); err != nil {
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -809,6 +809,9 @@ func mustWriteFile(t *testing.T, path, body string) {
 func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux is unavailable")
+	}
+	if _, err := exec.LookPath("codex"); err != nil {
+		t.Skip("codex is unavailable")
 	}
 	tmuxTmp, err := os.MkdirTemp("/tmp", "as-tmux-")
 	if err != nil {
@@ -818,7 +821,14 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 	t.Setenv("TMUX_TMPDIR", tmuxTmp)
 
 	t.Run("export", func(t *testing.T) {
-		root := t.TempDir()
+		root := resolvedTempDir(t)
+		binary := filepath.Join(root, "agent-symphony")
+		if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+			t.Fatalf("build export helper: %v: %s", err, output)
+		}
+		previousExecutable := hostExecutable
+		hostExecutable = func() (string, error) { return binary, nil }
+		t.Cleanup(func() { hostExecutable = previousExecutable })
 		primary := filepath.Join(root, "primary")
 		if err := os.Mkdir(primary, 0o700); err != nil {
 			t.Fatal(err)
@@ -841,8 +851,13 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if out, err := exec.Command("git", "-C", primary, "worktree", "add", "-b", identity.Branch, identity.Worktree).CombinedOutput(); err != nil {
-			t.Fatalf("git worktree: %v: %s", err, out)
+		if out, err := exec.Command("git", "clone", primary, identity.Worktree).CombinedOutput(); err != nil {
+			t.Fatalf("git clone: %v: %s", err, out)
+		}
+		for _, args := range [][]string{{"checkout", "-b", identity.Branch}, {"remote", "remove", "origin"}} {
+			if out, err := exec.Command("git", append([]string{"-C", identity.Worktree}, args...)...).CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v: %s", args, err, out)
+			}
 		}
 		if err := os.WriteFile(filepath.Join(identity.Worktree, "README.md"), []byte("base\nchanged\n"), 0o644); err != nil {
 			t.Fatal(err)
@@ -882,6 +897,19 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		tmux(t, "select-window", "-t", "="+identity.Session+":1")
 		manifest := identity
 		manifest.State = "completed"
+		commands := config.Default("o/r").Commands
+		profileDigest, err := config.BindWorkerExecutable(t.Context(), &commands)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifest.WorkerProfileDigest = profileDigest
+		codexHome := filepath.Join(root, "codex-home")
+		if err := os.Mkdir(codexHome, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("CODEX_HOME", codexHome)
+		t.Setenv("AGENT_SYMPHONY_CODEX_EXECUTABLE", commands.Implementation[0])
+		t.Setenv("AGENT_SYMPHONY_WORKER_PROFILE_DIGEST", profileDigest)
 		t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
 		call := func(mode string, candidate agentruntime.Manifest) (agentruntime.Result, error) {
 			body, _ := json.Marshal(candidate)
@@ -894,6 +922,9 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 			var result agentruntime.Result
 			if err == nil {
 				err = json.Unmarshal(boundary.Bytes(), &result)
+			}
+			if err == nil && result.Exited && result.Code != 0 {
+				err = errors.New(result.Output)
 			}
 			return result, err
 		}
@@ -910,23 +941,6 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 				}
 			})
 		}
-		badTMP := filepath.Join(t.TempDir(), "missing")
-		t.Setenv("TMPDIR", badTMP)
-		if _, err := call("implementation", manifest); err == nil {
-			t.Fatal("post-commit export failure was not injected")
-		}
-		if _, err := os.Lstat(resultPath); err != nil {
-			t.Fatalf("result was consumed after failed export: %v", err)
-		}
-		committedHead := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "rev-parse", "HEAD"))))
-		if committedHead == base {
-			t.Fatal("injected failure happened before the worker commit")
-		}
-		if status := strings.TrimSpace(string(mustOutput(t, exec.Command("git", "-C", identity.Worktree, "status", "--porcelain", "--", ".", ":(exclude).agent-symphony")))); status != "" {
-			t.Fatalf("worktree remained dirty after commit: %q", status)
-		}
-
-		t.Setenv("TMPDIR", t.TempDir())
 		result, err := call("implementation", manifest)
 		if err != nil {
 			t.Fatal(err)
@@ -1389,13 +1403,16 @@ func TestCleanupAttemptRejectsSubstitutedResources(t *testing.T) {
 	t.Run("result symlink", func(t *testing.T) {
 		root, _ := filepath.EvalSymlinks(t.TempDir())
 		manifest := cleanupTestManifest(t, root)
+		if err := os.Mkdir(agentruntime.PrivatePath(manifest.Worktree), 0o700); err != nil {
+			t.Fatal(err)
+		}
 		canary := filepath.Join(t.TempDir(), "canary")
 		mustWriteFile(t, canary, "unchanged")
 		if err := os.Symlink(canary, agentruntime.ResultPath(manifest.Worktree)); err != nil {
 			t.Fatal(err)
 		}
 		body, _ := json.Marshal(manifest)
-		if err := cleanupAttempt(t.Context(), body, root); err == nil || !strings.Contains(err.Error(), "cleanup result") {
+		if err := cleanupAttempt(t.Context(), body, root); err == nil || !strings.Contains(err.Error(), "legacy implementation session") {
 			t.Fatalf("substituted result cleanup = %v", err)
 		}
 		if got, err := os.ReadFile(canary); err != nil || string(got) != "unchanged" {

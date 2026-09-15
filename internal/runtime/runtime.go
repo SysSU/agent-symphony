@@ -515,6 +515,12 @@ func (r *Runtime) agentEnvironment(repository string, extra ...string) ([]string
 }
 
 func workspaceEnvironment(environment []string, manifest Manifest, generation uint64) ([]string, error) {
+	for _, name := range []string{".agents", ".codex"} {
+		path := filepath.Join(manifest.Worktree, name)
+		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("prepare denied worker configuration path: %w", err)
+		}
+	}
 	private := PrivatePath(manifest.Worktree)
 	if err := os.Mkdir(private, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("prepare worker-private directory: %w", err)

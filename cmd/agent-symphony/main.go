@@ -385,17 +385,24 @@ func validateProductionStateRoot(stateRoot string) error {
 	if err != nil {
 		return fmt.Errorf("resolve runtime state root: %w", err)
 	}
+	if pathInSharedTemporaryStorage(root) {
+		return errors.New("runtime state root must not be inside shared temporary storage")
+	}
+	return nil
+}
+
+func pathInSharedTemporaryStorage(path string) bool {
 	for _, shared := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
-		shared, err = filepath.EvalSymlinks(shared)
+		shared, err := filepath.EvalSymlinks(shared)
 		if err != nil {
 			continue
 		}
-		relative, relErr := filepath.Rel(shared, root)
+		relative, relErr := filepath.Rel(shared, path)
 		if relErr == nil && (relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
-			return errors.New("runtime state root must not be inside shared temporary storage")
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 func canonicalPathWithMissingLeaf(path string) (string, error) {
