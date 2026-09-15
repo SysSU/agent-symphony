@@ -59,6 +59,8 @@ type RecoveryStatus struct {
 	NeedsAttention      bool             `json:"needs_attention,omitempty"`
 	IssueClosed         bool             `json:"issue_closed,omitempty"`
 	OperatorBlocked     bool             `json:"operator_blocked,omitempty"`
+	IssueGeneration     uint64           `json:"issue_generation,omitempty"`
+	AttemptGeneration   uint64           `json:"attempt_generation,omitempty"`
 }
 
 type AttemptSession struct {

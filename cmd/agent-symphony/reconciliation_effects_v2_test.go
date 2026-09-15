@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -24,6 +27,119 @@ import (
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
+
+func TestBlockedMachineStatusConvergesAfterDestructiveActionsAndRetry(t *testing.T) {
+	for _, status := range []string{"needs-attention", "clear"} {
+		for _, action := range []string{"dismiss", "abandon", "remove", "retry"} {
+			t.Run(status+"/"+action, func(t *testing.T) { testBlockedMachineStatusConvergence(t, status, action) })
+		}
+	}
+}
+
+func testBlockedMachineStatusConvergence(t *testing.T, desired, action string) {
+	owner, manifest := operatorTestOwner(t, 333, "active", false)
+	service := operatorTestMutationService(t, owner)
+	service.collector.Config.ActorID = 42
+	snapshot := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey("o/r", 333), ownerAttemptKey("o/r", 333, 1)
+	snapshot, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], Source: "orchestrator", SourceSequence: 1, Status: desired, Reason: "monitoring: blocked write"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans, err := planMachineStatusUpdates(snapshot, service.collector.Config)
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%#v err=%v", plans, err)
+	}
+	plan, err := service.effects.beginReconciliation(t.Context(), plans[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	var comments []map[string]any
+	label := desired == "clear"
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		respond := func(status int, value any) *http.Response {
+			body, _ := json.Marshal(value)
+			return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: request}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case request.Method == http.MethodGet && strings.Contains(request.URL.Path, "/comments"):
+			return respond(http.StatusOK, comments), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/o/r/issues/333":
+			labels := []map[string]string{}
+			if label {
+				labels = append(labels, map[string]string{"name": internalgithub.NeedsAttentionLabel})
+			}
+			return respond(http.StatusOK, map[string]any{"labels": labels}), nil
+		case request.Method == http.MethodPost && strings.Contains(request.URL.Path, "/comments"):
+			var payload struct{ Body string }
+			if json.NewDecoder(request.Body).Decode(&payload) != nil {
+				t.Fatal("invalid comment payload")
+			}
+			if len(comments) == 0 {
+				close(entered)
+				mu.Unlock()
+				<-release
+				mu.Lock()
+			}
+			now := time.Unix(int64(len(comments)+1), 0).UTC()
+			comments = append(comments, map[string]any{"id": len(comments) + 1, "body": payload.Body, "created_at": now, "updated_at": now, "user": map[string]any{"id": 42}})
+			return respond(http.StatusCreated, map[string]any{}), nil
+		case request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/labels"):
+			label = true
+			return respond(http.StatusOK, []any{}), nil
+		case request.Method == http.MethodDelete && strings.HasSuffix(request.URL.Path, "/labels/needs-attention"):
+			label = false
+			return respond(http.StatusNoContent, nil), nil
+		default:
+			return nil, fmt.Errorf("unexpected request %s %s", request.Method, request.URL.String())
+		}
+	})}}
+	done := make(chan error, 1)
+	go func() {
+		_, executeErr := service.effects.executeIssueUpdate(t.Context(), api, plan)
+		done <- executeErr
+	}()
+	<-entered
+	before := mustOwnerSnapshot(t, owner)
+	var after stateOwnerSnapshot
+	switch action {
+	case "dismiss":
+		after, _, err = owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: before.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: before.State.AttemptGenerations[attemptKey], Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest})
+	case "abandon", "remove":
+		published := ""
+		tombstoneAction := "abandoned"
+		if action == "remove" {
+			published = manifest.BaseSHA
+			tombstoneAction = "removed"
+		}
+		policy := agentruntime.EffectCleanupPolicy{Action: action, PublishedHead: published}
+		after, _, err = owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: before.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: before.State.AttemptGenerations[attemptKey], Action: tombstoneAction, CleanupPhase: "pending", PublishedHead: published, Manifest: &manifest, CleanupPolicy: &policy, EffectAction: string(agentruntime.EffectCleanup), EffectRequestDigest: strings.Repeat("f", 64)})
+	case "retry":
+		after, err = owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: ownerTestManifest(t, owner.stateRoot, 333, 2, "running")})
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.effects.cancelInvalidated(after)
+	close(release)
+	if err := <-done; err == nil {
+		t.Fatal("stale status write completed as current")
+	}
+	production := productionReconciliation{owner: owner, effects: service.effects, collector: service.collector}
+	if changed, err := production.resolveInvalidatedGitHubEffect(t.Context(), api); err != nil || !changed {
+		t.Fatalf("compensation changed=%t err=%v", changed, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	status := mustOwnerSnapshot(t, owner).State.MachineStatuses[issueKey]
+	if label || status.Status != "clear" || status.AppliedSequence != status.Sequence || len(comments) != 2 {
+		t.Fatalf("label=%t comments=%#v status=%#v", label, comments, status)
+	}
+}
 
 func TestEscapedImplementationChildBlocksGitHubPublication(t *testing.T) {
 	if os.Getenv("AGENT_SYMPHONY_ESCAPED_IMPLEMENTATION_HELPER") == "1" {
@@ -109,29 +225,36 @@ func TestEscapedImplementationChildBlocksGitHubPublication(t *testing.T) {
 func TestWorkerStatusOutcomeCannotApplyOutOfOrderOrAfterInvalidation(t *testing.T) {
 	root := t.TempDir()
 	manifest := ownerTestManifest(t, root, 329, 1, "running")
-	manifest.WorkerStatus, manifest.WorkerStatusReason, manifest.WorkerStatusSeq = "needs-attention", "operator decision required", 2
+	manifest.WorkerStatus, manifest.WorkerStatusReason, manifest.WorkerStatusSeq = "needs-attention", "operator decision required", 7
 	key, issueKey := ownerAttemptKey("o/r", 329, 1), ownerIssueKey("o/r", 329)
 	state := newRuntimeOwnerState("o/r")
 	state.IssueGenerations[issueKey], state.AttemptGenerations[key] = 1, 1
 	state.Attempts[key] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
-	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 329, Attempt: 1, Manifest: ptrManifest(manifest), GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueWorkerStatus, Status: manifest.WorkerStatus, StatusReason: manifest.WorkerStatusReason, StatusSequence: 2}}
-	result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueWorkerStatus, Observed: true}}
-	if err := applyReconciliationEffectOutcome(&state, request, result); err != nil || state.Attempts[key].Manifest.WorkerStatusApplied != 2 {
-		t.Fatalf("current status outcome failed: state=%#v err=%v", state.Attempts[key].Manifest, err)
+	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 2, Source: "worker", SourceSequence: 7, Status: "needs-attention", Reason: "operator decision required"}
+	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 329, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueMachineStatus, AttributionAttempt: 1, Status: "needs-attention", StatusReason: "operator decision required", StatusSequence: 2, StatusSource: "worker", StatusSourceSequence: 7}}
+	result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueMachineStatus, Observed: true}}
+	if err := applyReconciliationEffectOutcome(&state, request, result); err != nil || state.MachineStatuses[issueKey].AppliedSequence != 2 || state.Attempts[key].Manifest.WorkerStatusApplied != 7 {
+		t.Fatalf("current status outcome failed: status=%#v err=%v", state.MachineStatuses[issueKey], err)
 	}
-	if err := applyReconciliationEffectOutcome(&state, request, result); !errors.Is(err, errStaleStateResult) {
-		t.Fatalf("duplicate status outcome err=%v", err)
-	}
-	record := state.Attempts[key]
-	record.Manifest.WorkerStatus, record.Manifest.WorkerStatusReason, record.Manifest.WorkerStatusSeq = "clear", "decision supplied", 3
-	state.Attempts[key] = record
+	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 3, AppliedSequence: 2, Source: "orchestrator", SourceSequence: 9, Status: "clear", Reason: "monitoring: recovered"}
 	if err := applyReconciliationEffectOutcome(&state, request, result); !errors.Is(err, errStaleStateResult) {
 		t.Fatalf("out-of-order status outcome err=%v", err)
 	}
-	delete(state.Attempts, key)
-	state.Tombstones[key] = runtimeTombstone{Repository: "o/r", Issue: 329, Attempt: 1, Generation: 2, InvalidatedGeneration: 1, Action: "dismissed", CleanupPhase: "pending"}
-	if err := applyReconciliationEffectOutcome(&state, request, result); !errors.Is(err, errStaleStateResult) {
-		t.Fatalf("invalidated status outcome err=%v", err)
+}
+
+func TestMachineStatusPlannerRepairsStaleExternalObservationAfterRestart(t *testing.T) {
+	root := t.TempDir()
+	manifest := ownerTestManifest(t, root, 334, 1, "running")
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "active", false)
+	issueKey := ownerIssueKey("o/r", 334)
+	observation := state.Observations[issueKey]
+	observation.Fact.NeedsAttention = true
+	state.Observations[issueKey] = observation
+	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 334, Attempt: 1, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: 1, Sequence: 2, AppliedSequence: 2, Source: "destructive", SourceSequence: 2, Status: "clear", Reason: "attempt invalidated"}
+	plans, err := planMachineStatusUpdates(stateOwnerSnapshot{State: state}, internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42})
+	if err != nil || len(plans) != 1 || plans[0].Request.GitHubIssueUpdate.StatusSequence != 2 || plans[0].Request.GitHubIssueUpdate.Status != "clear" {
+		t.Fatalf("repair plans=%#v err=%v", plans, err)
 	}
 }
 

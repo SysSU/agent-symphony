@@ -419,7 +419,7 @@ func TestStateOwnerPersistenceFailureKeepsCommittedSnapshotAndDispatchesNothing(
 	}()
 	<-entered
 	snapshot, err := owner.snapshot(t.Context())
-	if err != nil || snapshot.State.Revision != 1 || len(snapshot.State.Tombstones) != 0 || len(snapshot.State.Effects) != 0 || len(snapshot.State.Attempts) != 1 {
+	if err != nil || snapshot.State.Revision != 1 || len(snapshot.State.Tombstones) != 0 || len(snapshot.State.Effects) != 0 || len(snapshot.State.Attempts) != 1 || len(snapshot.State.MachineStatuses) != 0 {
 		t.Fatalf("visible snapshot=%#v err=%v manifest=%#v", snapshot, err, manifest)
 	}
 	unblock()
@@ -427,8 +427,123 @@ func TestStateOwnerPersistenceFailureKeepsCommittedSnapshotAndDispatchesNothing(
 		t.Fatalf("err=%v", err)
 	}
 	snapshot, err = owner.snapshot(t.Context())
-	if err != nil || snapshot.State.Revision != 1 || len(snapshot.State.Tombstones) != 0 || len(snapshot.State.Effects) != 0 || len(snapshot.State.Attempts) != 1 {
+	if err != nil || snapshot.State.Revision != 1 || len(snapshot.State.Tombstones) != 0 || len(snapshot.State.Effects) != 0 || len(snapshot.State.Attempts) != 1 || len(snapshot.State.MachineStatuses) != 0 {
 		t.Fatalf("committed snapshot=%#v err=%v", snapshot, err)
+	}
+}
+
+func TestMachineStatusAdmissionIsGenerationBoundAndSurvivesRestart(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 333, 1, "running")
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "active", false)
+	state.Epoch, state.Revision = 1, 1
+	attemptRoot := productionAttemptRoot(root)
+	owner, err := startTestStateOwner(t, root, state, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, attemptRoot, next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	issueKey, attemptKey := ownerIssueKey("o/r", 333), ownerAttemptKey("o/r", 333, 1)
+	snapshot := mustOwnerSnapshot(t, owner)
+	snapshot, err = owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], Source: "orchestrator", SourceSequence: 41, Status: "needs-attention", Reason: "monitoring: operator decision required"})
+	if err != nil || snapshot.State.MachineStatuses[issueKey].Sequence != 1 {
+		t.Fatalf("admitted=%#v err=%v", snapshot.State.MachineStatuses[issueKey], err)
+	}
+	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], Source: "orchestrator", SourceSequence: 40, Status: "clear", Reason: "monitoring: stale"}); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("out-of-order source sequence err=%v", err)
+	}
+	oldIssueGeneration, oldAttemptGeneration := snapshot.State.IssueGenerations[issueKey], snapshot.State.AttemptGenerations[attemptKey]
+	snapshot, _, err = owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: oldIssueGeneration, ExpectedAttemptGeneration: oldAttemptGeneration, Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := snapshot.State.MachineStatuses[issueKey]
+	if status.Sequence != 2 || status.Status != "clear" || status.Source != "destructive" || status.AttemptGeneration != snapshot.State.AttemptGenerations[attemptKey] {
+		t.Fatalf("destructive compensation=%#v", status)
+	}
+	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: oldIssueGeneration, ExpectedAttemptGeneration: oldAttemptGeneration, Source: "orchestrator", SourceSequence: 42, Status: "needs-attention", Reason: "monitoring: stale"}); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("stale admission err=%v", err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := readRuntimeOwnerState(root, "o/r")
+	if err != nil || restarted.MachineStatuses[issueKey] != status {
+		t.Fatalf("restarted status=%#v err=%v", restarted.MachineStatuses[issueKey], err)
+	}
+}
+
+func TestDependencyClearCannotOverrideWorkerBlocker(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 333, 1, "running")
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "active", false)
+	issueKey, attemptKey := ownerIssueKey("o/r", 333), ownerAttemptKey("o/r", 333, 1)
+	observation := state.Observations[issueKey]
+	observation.IssueUpdates = append(observation.IssueUpdates, reconciliationIssueUpdateProposal{Repository: "o/r", Issue: 333, Kind: githubIssueDependencyClear, AttributionAttempt: 1, Dependency: 332})
+	state.Observations[issueKey] = observation
+	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 333, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 7, Source: "worker", SourceSequence: 4, Status: "needs-attention", Reason: "worker needs an operator decision"}
+	err := applyAdmitMachineStatus(&state, admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: 1, ExpectedAttemptGeneration: state.AttemptGenerations[attemptKey], ExpectedObservationGeneration: observation.Generation, Dependency: 332, Source: "dependency", SourceSequence: observation.Generation, Status: "clear", Reason: "monitoring: dependency #332 is complete"})
+	if !errors.Is(err, errStaleStateResult) || state.MachineStatuses[issueKey].Status != "needs-attention" || state.MachineStatuses[issueKey].Sequence != 7 {
+		t.Fatalf("dependency clear err=%v status=%#v", err, state.MachineStatuses[issueKey])
+	}
+}
+
+func TestConcurrentMachineStatusAdmissionsOnDistinctIssuesCommitIndependently(t *testing.T) {
+	root := resolvedTempDir(t)
+	first := ownerTestManifest(t, root, 333, 1, "running")
+	owner, err := startTestStateOwner(t, root, runtimeEffectInitialState(first), func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	second := ownerTestManifest(t, root, 334, 1, "running")
+	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: second}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := mustOwnerSnapshot(t, owner)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, manifest := range []agentruntime.Manifest{first, second} {
+		go func(manifest agentruntime.Manifest) {
+			<-start
+			issueKey := ownerIssueKey(manifest.Repository, manifest.Issue)
+			attemptKey := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+			_, err := owner.admitMachineStatus(context.Background(), admitMachineStatusCommand{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], Source: "orchestrator", SourceSequence: uint64(manifest.Issue), Status: "needs-attention", Reason: "monitoring: concurrent admission"})
+			results <- err
+		}(manifest)
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	committed := mustOwnerSnapshot(t, owner)
+	for _, manifest := range []agentruntime.Manifest{first, second} {
+		status := committed.State.MachineStatuses[ownerIssueKey(manifest.Repository, manifest.Issue)]
+		if status.Issue != manifest.Issue || status.Status != "needs-attention" || status.Sequence != 1 {
+			t.Fatalf("issue %d status=%#v", manifest.Issue, status)
+		}
+	}
+}
+
+func TestLegacyWorkerStatusMigratesIntoIssueOwnerDomain(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 335, 1, "running")
+	manifest.WorkerStatus, manifest.WorkerStatusReason, manifest.WorkerStatusSeq = "needs-attention", "operator decision required", 8
+	state := runtimeEffectInitialState(manifest)
+	state.MachineStatuses = nil
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	status := mustOwnerSnapshot(t, owner).State.MachineStatuses[ownerIssueKey("o/r", 335)]
+	if status.Source != "worker" || status.SourceSequence != 8 || status.Status != "needs-attention" || status.AppliedSequence != 0 {
+		t.Fatalf("migrated status=%#v", status)
 	}
 }
 
