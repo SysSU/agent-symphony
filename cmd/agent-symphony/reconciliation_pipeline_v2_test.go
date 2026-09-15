@@ -1042,6 +1042,7 @@ func TestPublicationPlannerBeginsInitialAndCompletedOutcomeTransitions(t *testin
 		newHead := strings.Repeat("c", 40)
 		record.Manifest.State, record.Manifest.ReviewState, record.Manifest.ReviewMode = "completed", "clean", agentruntime.ReviewModeImplementation
 		record.Manifest.ReviewBase, record.Manifest.ReviewHead, record.Manifest.ReviewTarget = record.Manifest.BaseSHA, newHead, record.Manifest.BaseSHA+".."+newHead
+		record.Manifest.ReviewRunCleaned = true
 		state.Attempts[key] = record
 		restarted, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
 		if err != nil {
@@ -1090,6 +1091,7 @@ func TestPublicationPlannerBeginsInitialAndCompletedOutcomeTransitions(t *testin
 		newHead := strings.Repeat("c", 40)
 		record.Manifest.State, record.Manifest.ReviewState, record.Manifest.ReviewMode = "completed", "clean", agentruntime.ReviewModeImplementation
 		record.Manifest.ReviewBase, record.Manifest.ReviewHead, record.Manifest.ReviewTarget = record.Manifest.BaseSHA, newHead, record.Manifest.BaseSHA+".."+newHead
+		record.Manifest.ReviewRunCleaned = true
 		state.Attempts[key] = record
 		restarted, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
 		if err != nil {
