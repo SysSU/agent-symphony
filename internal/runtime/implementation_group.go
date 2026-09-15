@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
 // ImplementationGroupStart is external supervision evidence, not runtime
@@ -102,7 +101,8 @@ func WriteImplementationGroupDead(manifest Manifest, binding ImplementationLaunc
 	if !validImplementationGroupRecord(manifest, binding, record) {
 		return errors.New("implementation group death identity is invalid")
 	}
-	if err := syscall.Kill(-record.GroupPID, 0); err == nil || !errors.Is(err, syscall.ESRCH) {
+	terminated, err := implementationGroupTerminated(record.GroupPID)
+	if err != nil || !terminated {
 		return errors.New("implementation worker group termination is unproved")
 	}
 	body, err := json.Marshal(record)

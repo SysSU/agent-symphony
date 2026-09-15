@@ -180,6 +180,180 @@ func TestV2DashboardDismissSurvivesAliveMonitorDuringGitHubPreflight(t *testing.
 	}
 }
 
+func TestOperatorActionsRecomputePreflightAfterSameGenerationManifestChange(t *testing.T) {
+	for index, action := range []string{"dismiss", "archive", "abandon", "remove", "cancel"} {
+		t.Run(action, func(t *testing.T) {
+			issue := 450 + index
+			var owner *stateOwner
+			var manifest agentruntime.Manifest
+			switch action {
+			case "dismiss":
+				owner, manifest = operatorTestOwner(t, issue, "completed", true)
+			case "cancel":
+				owner, manifest = operatorTestOwner(t, issue, "active", false)
+			default:
+				owner, manifest = operatorCleanupRestartOwner(t, issue, action)
+			}
+			if err := os.MkdirAll(productionSnapshotRoot(owner.stateRoot), 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			entered, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			block := func() {
+				once.Do(func() { close(entered) })
+				<-release
+			}
+			boundary := &operatorAdmissionBarrier{block: block}
+			service := operatorServiceWithCleanup(t, owner, t.Context(), boundary)
+			service.effects.stopped = true
+			service.issueClosed = func(context.Context, string, int) (bool, error) {
+				if action == "dismiss" {
+					block()
+				}
+				return true, nil
+			}
+			if action == "cancel" {
+				service.beforeAdmission = block
+			}
+
+			result := make(chan controlResult, 1)
+			request := operatorRequest("manifest-change-"+action, action, manifest, action != "dismiss" && action != "cancel")
+			go func() { result <- service.perform(t.Context(), request) }()
+			<-entered
+
+			before := mustOwnerSnapshot(t, owner).State
+			key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+			generation := before.AttemptGenerations[key]
+			if action == "abandon" {
+				commitWorkerStatusManifestChange(t, owner, manifest.Repository, manifest.Issue, manifest.Attempt)
+			} else {
+				commitReviewManifestChange(t, owner, manifest.Repository, manifest.Issue, manifest.Attempt)
+			}
+			changed := mustOwnerSnapshot(t, owner).State
+			if changed.AttemptGenerations[key] != generation || reflect.DeepEqual(changed.Attempts[key].Manifest, before.Attempts[key].Manifest) {
+				t.Fatalf("fixture did not change only the same-generation manifest: before=%#v after=%#v", before.Attempts[key], changed.Attempts[key])
+			}
+			close(release)
+
+			got := <-result
+			if !got.OK || got.Status != http.StatusAccepted {
+				t.Fatalf("same-generation reconciliation change caused operator failure: %#v", got)
+			}
+			committed := mustOwnerSnapshot(t, owner).State
+			receipt, ok := operatorReceiptByID(committed, request.RequestID)
+			if !ok || receipt.State != "pending" || receipt.EffectID == "" {
+				t.Fatalf("operator mutation was not durably committed: %#v", receipt)
+			}
+			if action == "cancel" {
+				if committed.Effects[receipt.EffectID].Action != string(agentruntime.EffectStop) {
+					t.Fatalf("cancel did not commit Stop: %#v", committed.Effects[receipt.EffectID])
+				}
+			} else if tombstone := committed.Tombstones[key]; tombstone.Action != operatorTombstoneAction(action) {
+				t.Fatalf("%s did not invalidate the attempt: %#v", action, tombstone)
+			}
+		})
+	}
+}
+
+func TestOperatorStalePreflightRevalidatesEligibilityAndPreservesPersistenceFailure(t *testing.T) {
+	t.Run("eligibility", func(t *testing.T) {
+		owner, manifest := operatorTestOwner(t, 455, "completed", true)
+		service := operatorTestMutationService(t, owner)
+		entered, release := make(chan struct{}), make(chan struct{})
+		var calls atomic.Int32
+		service.issueClosed = func(context.Context, string, int) (bool, error) {
+			if calls.Add(1) == 1 {
+				close(entered)
+				<-release
+				return true, nil
+			}
+			return false, nil
+		}
+		result := make(chan controlResult, 1)
+		go func() {
+			result <- service.perform(t.Context(), operatorRequest("stale-eligibility", "dismiss", manifest, false))
+		}()
+		<-entered
+		commitReviewManifestChange(t, owner, manifest.Repository, manifest.Issue, manifest.Attempt)
+		close(release)
+		got := <-result
+		if got.OK || got.Status != http.StatusConflict || !strings.Contains(got.Error, "GitHub issue is open") || calls.Load() != 2 {
+			t.Fatalf("stale eligibility was not revalidated: result=%#v calls=%d", got, calls.Load())
+		}
+		state := mustOwnerSnapshot(t, owner).State
+		if _, ok := operatorReceiptByID(state, "stale-eligibility"); ok || len(state.Tombstones) != 0 {
+			t.Fatalf("invalid action committed owner state: %#v", state)
+		}
+	})
+
+	t.Run("persistence", func(t *testing.T) {
+		root := resolvedTempDir(t)
+		manifest := ownerTestManifest(t, root, 456, 1, "completed")
+		state := runtimeEffectInitialState(manifest)
+		addOperatorObservation(&state, manifest, "completed", true)
+		state.Epoch, state.Revision = 1, 1
+		var fail atomic.Bool
+		owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error {
+			if fail.Load() {
+				return errors.New("injected stale-retry persistence failure")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = owner.close(context.Background()) })
+		refreshOperatorObservation(t, owner)
+		service := operatorTestMutationService(t, owner)
+		entered, release := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		service.issueClosed = func(context.Context, string, int) (bool, error) {
+			once.Do(func() { close(entered) })
+			<-release
+			return true, nil
+		}
+		result := make(chan controlResult, 1)
+		go func() {
+			result <- service.perform(t.Context(), operatorRequest("stale-persistence", "dismiss", manifest, false))
+		}()
+		<-entered
+		commitReviewManifestChange(t, owner, manifest.Repository, manifest.Issue, manifest.Attempt)
+		fail.Store(true)
+		close(release)
+		got := <-result
+		if got.OK || got.Status != http.StatusInternalServerError || !strings.Contains(got.Error, "injected stale-retry persistence failure") {
+			t.Fatalf("persistence failure was hidden by stale recomputation: %#v", got)
+		}
+		state = mustOwnerSnapshot(t, owner).State
+		if _, ok := operatorReceiptByID(state, "stale-persistence"); ok || len(state.Tombstones) != 0 {
+			t.Fatalf("failed persistence changed committed state: %#v", state)
+		}
+	})
+}
+
+func TestOperatorAdmissionStopsAfterRepeatedSameGenerationChurn(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 457, "active", false)
+	service := operatorTestMutationService(t, owner)
+	service.effects.stopped = true
+	var admissions atomic.Int32
+	service.beforeAdmission = func() {
+		admissions.Add(1)
+		commitMonitorTimestampChange(t, owner, manifest.Repository, manifest.Issue, manifest.Attempt)
+	}
+	result := service.perform(t.Context(), operatorRequest("continuous-churn", "cancel", manifest, false))
+	if result.OK || result.Status != http.StatusConflict || result.Error != "attempt or issue kept changing during operator admission" {
+		t.Fatalf("result=%#v", result)
+	}
+	if admissions.Load() != maxOperatorAdmissionAttempts {
+		t.Fatalf("admissions=%d want=%d", admissions.Load(), maxOperatorAdmissionAttempts)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	if _, ok := operatorReceiptByID(state, "continuous-churn"); ok {
+		t.Fatalf("exhausted admission committed a receipt: %#v", state.ControlReceipts)
+	}
+}
+
 func TestClosedLocalOrphanOperatorAdmissionAfterIssueFallsOutOfCollector(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 191, "orphaned", true)
 	applyReconciliationInput(t, owner, reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: manifest.Repository}, Complete: true})
@@ -4204,6 +4378,75 @@ type operatorCleanupBoundary struct {
 	enterOnce       sync.Once
 	calls           atomic.Int32
 	err             error
+}
+
+type operatorAdmissionBarrier struct {
+	block func()
+}
+
+func (b *operatorAdmissionBarrier) call(_ context.Context, operation string, _ agentruntime.Command) (agentruntime.Result, error) {
+	if strings.HasPrefix(operation, "validate-") {
+		b.block()
+		return agentruntime.Result{}, nil
+	}
+	return agentruntime.Result{}, fmt.Errorf("unexpected cleanup operation %q", operation)
+}
+
+func commitWorkerStatusManifestChange(t *testing.T, owner *stateOwner, repository string, issue, attempt int) {
+	t.Helper()
+	snapshot := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey(repository, issue), ownerAttemptKey(repository, issue, attempt)
+	manifest := snapshot.State.Attempts[attemptKey].Manifest
+	identity := stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[issueKey], AttemptGeneration: snapshot.State.AttemptGenerations[attemptKey]}
+	_, effect, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectMonitor, Manifest: manifest, RequestDigest: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.WorkerStatus, manifest.WorkerStatusReason, manifest.WorkerStatusSeq = "needs-attention", "operator decision required", manifest.WorkerStatusSeq+1
+	manifest.UpdatedAt = manifest.UpdatedAt.Add(time.Second)
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectMonitor, Manifest: manifest}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func commitMonitorTimestampChange(t *testing.T, owner *stateOwner, repository string, issue, attempt int) {
+	t.Helper()
+	snapshot := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey(repository, issue), ownerAttemptKey(repository, issue, attempt)
+	manifest := snapshot.State.Attempts[attemptKey].Manifest
+	identity := stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[issueKey], AttemptGeneration: snapshot.State.AttemptGenerations[attemptKey]}
+	_, effect, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectMonitor, Manifest: manifest, RequestDigest: digestText(fmt.Sprintf("monitor-timestamp-%d", snapshot.State.Revision))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.UpdatedAt = manifest.UpdatedAt.Add(time.Second)
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectMonitor, Manifest: manifest}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func commitReviewManifestChange(t *testing.T, owner *stateOwner, repository string, issue, attempt int) {
+	t.Helper()
+	snapshot := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey(repository, issue), ownerAttemptKey(repository, issue, attempt)
+	manifest := snapshot.State.Attempts[attemptKey].Manifest
+	identity := stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[issueKey], AttemptGeneration: snapshot.State.AttemptGenerations[attemptKey]}
+	head := strings.Repeat("c", 40)
+	target := manifest.BaseSHA + ".." + head
+	runID := digestText(fmt.Sprintf("preflight-review-%d-%d", issue, attempt))
+	review := agentruntime.ReviewTransition{State: "clean", Mode: agentruntime.ReviewModeImplementation, Target: target, RunID: runID, Base: manifest.BaseSHA, Head: head}
+	review.Snapshot, review.Session = reviewRunIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(owner.stateRoot), target, runID)
+	_, effect, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectReview, Manifest: manifest, Review: &review, RequestDigest: strings.Repeat("b", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := agentruntime.ReviewEffectResult(owner.attemptRoot, owner.stateRoot, manifest, review)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectReview, Manifest: result}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (b *operatorCleanupBoundary) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
