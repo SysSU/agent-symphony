@@ -116,7 +116,6 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		if leaseErr != nil {
 			return nil, leaseErr
 		}
-		supersedePendingOperatorWorkflows(state, request.Repository, request.Issue, request.Attempt, request.Action)
 		policy := command.CleanupPolicy
 		effect, err = applyInvalidateAttempt(attemptRoot, stateRoot, state, invalidateAttemptCommand{
 			Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt,
@@ -125,6 +124,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 			EffectAction: string(agentruntime.EffectCleanup), EffectRequestDigest: command.CleanupDigest,
 		})
 		if err == nil && effect != nil {
+			supersedePendingOperatorWorkflows(state, request.Repository, request.Issue, request.Attempt, request.Action)
 			bindSupersededReviewer(effect, reviewer)
 			tombstone := state.Tombstones[attemptKey]
 			tombstone.ReviewerLeaseID = leaseID
@@ -155,7 +155,6 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		if reviewerErr != nil {
 			return nil, reviewerErr
 		}
-		supersedePendingOperatorWorkflows(state, request.Repository, request.Issue, request.Attempt, request.Action)
 		policy := command.CleanupPolicy
 		effect, err = applyInvalidateAttempt(attemptRoot, stateRoot, state, invalidateAttemptCommand{
 			Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt,
@@ -163,7 +162,8 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 			Action: operatorTombstoneAction(request.Action), CleanupPhase: "pending", PublishedHead: publishedHead, Manifest: &manifest, CleanupPolicy: &policy,
 			EffectAction: string(agentruntime.EffectCleanup), EffectRequestDigest: command.CleanupDigest,
 		})
-		if effect != nil {
+		if err == nil && effect != nil {
+			supersedePendingOperatorWorkflows(state, request.Repository, request.Issue, request.Attempt, request.Action)
 			bindSupersededReviewer(effect, reviewer)
 		}
 		phase = operatorPhaseCleanupPending

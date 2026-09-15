@@ -173,15 +173,17 @@ func TestStopPendingStartCannotClaimCancelledWithoutCandidateProof(t *testing.T)
 
 func operatorOwnerWithPendingStart(t *testing.T, issue int, status string, closed bool) (*stateOwner, agentruntime.Manifest) {
 	t.Helper()
+	return operatorOwnerWithPendingStartProfile(t, issue, status, closed, strings.Repeat("f", 64))
+}
+
+func operatorOwnerWithPendingStartProfile(t *testing.T, issue int, status string, closed bool, activeProfile string) (*stateOwner, agentruntime.Manifest) {
+	t.Helper()
 	base, manifest := operatorTestOwner(t, issue, status, closed, true)
 	state := cloneRuntimeOwnerState(mustOwnerSnapshot(t, base).State)
 	if err := base.close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
-	effect := runtimeEffectIntent{Action: string(agentruntime.EffectStart), Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: state.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: state.AttemptGenerations[key], IntentEpoch: state.Epoch, IntentRevision: state.Revision, State: "pending", RequestDigest: strings.Repeat("e", 64), StartGateNonce: strings.Repeat("d", 32), StartMayRun: true, StartCandidates: []startGateCandidate{{Nonce: strings.Repeat("d", 32), MayRun: true}}}
-	effect.ID = runtimeEffectID(effect)
-	state.Effects[effect.ID] = effect
+	state.WorkerProfileDigest = activeProfile
 	root := base.stateRoot
 	owner, err := startTestStateOwner(t, root, state, func(next runtimeOwnerState) error {
 		return writeRuntimeOwnerState(root, productionAttemptRoot(root), next)
@@ -191,31 +193,17 @@ func operatorOwnerWithPendingStart(t *testing.T, issue int, status string, close
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	refreshOperatorObservation(t, owner)
+	snapshot := mustOwnerSnapshot(t, owner)
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	if _, effect, err := owner.recordEffect(t.Context(), recordEffectCommand{Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: snapshot.State.AttemptGenerations[key]}, Action: string(agentruntime.EffectStart), Manifest: manifest}); err != nil || effect == nil {
+		t.Fatalf("begin pending Start fixture: effect=%#v err=%v", effect, err)
+	}
 	return owner, manifest
 }
 
 func operatorOwnerWithConfinedPendingStart(t *testing.T, issue int, status string, closed bool) (*stateOwner, agentruntime.Manifest) {
 	t.Helper()
-	owner, manifest := operatorOwnerWithPendingStart(t, issue, status, closed)
-	state := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
-	if err := owner.close(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
-	generation := state.AttemptGenerations[key]
-	manifest.WorkerGeneration, manifest.WorkerProfileDigest = generation, config.WorkerProfileDigest()
-	record := state.Attempts[key]
-	record.Manifest = manifest
-	state.Attempts[key] = record
-	restarted, err := startTestStateOwner(t, owner.stateRoot, state, func(next runtimeOwnerState) error {
-		return writeRuntimeOwnerState(owner.stateRoot, productionAttemptRoot(owner.stateRoot), next)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = restarted.close(context.Background()) })
-	refreshOperatorObservation(t, restarted)
-	return restarted, manifest
+	return operatorOwnerWithPendingStartProfile(t, issue, status, closed, config.WorkerProfileDigest())
 }
 
 func TestOperatorSameSnapshotDismissAndCleanupRequestsConverge(t *testing.T) {
@@ -1073,7 +1061,7 @@ func TestAbandonCapturesPendingReviewerIdentityBeforeTombstone(t *testing.T) {
 	}
 	proofKey := reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, review.Reviewer.Mode, review.Reviewer.Target)
 	prior := cloneRuntimeOwnerState(committed.State)
-	priorProof := reviewerProcessProof{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, RunID: digestText("different prior run"), EffectID: strings.Repeat("f", 32), IssueGeneration: reviewer.IssueGeneration, AttemptGeneration: reviewer.AttemptGeneration, GroupPID: 7777, DeadProved: true, ProfileDigest: activeWorkerProfileDigest(prior)}
+	priorProof := reviewerProcessProof{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, RunID: digestText("different prior run"), EffectID: strings.Repeat("f", 32), IssueGeneration: reviewer.IssueGeneration, AttemptGeneration: reviewer.AttemptGeneration, GroupPID: 7777, DeadProved: true, ProfileDigest: activeWorkerProfileDigest(prior), ConfinementVersion: reviewerConfinementVersion}
 	prior.ReviewerProofs[proofKey] = priorProof
 	if err := restarted.close(t.Context()); err != nil {
 		t.Fatal(err)

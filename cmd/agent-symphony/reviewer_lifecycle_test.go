@@ -783,13 +783,20 @@ func TestRestartDemotesLegacyReviewerGroupDeathCertificate(t *testing.T) {
 	state := cloneRuntimeOwnerState(snapshot.State)
 	proof := reviewerProcessProof{Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, EffectID: strings.Repeat("a", 32), IssueGeneration: state.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], AttemptGeneration: state.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)], GroupPID: 99999999, DeadProved: true}
 	state.ReviewerSafetyMigrated = false // A pre-upgrade ledger has no migration marker.
+	state.ReviewerConfinementTracked = false
 	state.ReviewerRunTracked = false
+	state.ReviewerPolicyTracked = false
+	state.ReviewerPolicyVersion = 0
 	key := reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)
 	state.ReviewerProofs[key] = proof
 	if err := owner.close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeRuntimeOwnerState(root, owner.attemptRoot, state); err != nil {
+	body, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, runtimeOwnerStateFile), body, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	restarted, err := startTestStateOwner(t, root, state, func(value runtimeOwnerState) error {
