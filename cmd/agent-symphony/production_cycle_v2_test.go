@@ -131,6 +131,35 @@ func TestPlanRuntimeLifecycleEmitsOneGenerationCurrentActionPerAttempt(t *testin
 	}
 }
 
+func TestLegacyRunningAttemptDoesNotScheduleUnprovableMonitor(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 355, 1, "running") // v1 has no durable pane identity.
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "active", false)
+	state.Epoch, state.Revision = 1, 1
+	owner, err := startTestStateOwner(t, root, state, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, productionAttemptRoot(root), next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
+	snapshot := mustOwnerSnapshot(t, owner)
+	issue := expandIssueFact(snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "body"
+	batch := reconciliationV2Batch{Input: repositoryInput(true, issue)}
+	plans, err := planRuntimeLifecycle(snapshot, batch, config.Default(manifest.Repository), time.Now().UTC(), owner.attemptRoot, owner.stateRoot)
+	if err != nil || len(plans) != 0 {
+		t.Fatalf("legacy monitor was scheduled without pane proof: %#v, %v", plans, err)
+	}
+	wakes := 0
+	reconciler := productionReconciliation{owner: owner, config: config.Default(manifest.Repository), attemptRoot: owner.attemptRoot, stateRoot: owner.stateRoot, wake: func() error { wakes++; return nil }}
+	if err := reconciler.runRuntimePhase(t.Context(), batch, "source", agentruntime.EffectMonitor); err != nil || wakes != 0 {
+		t.Fatalf("Check now repeated an unprovable legacy monitor: wakes=%d err=%v", wakes, err)
+	}
+}
+
 func TestPlanRuntimeLifecycleNeverReusesOwnedAttemptAfterRestart(t *testing.T) {
 	root := resolvedTempDir(t)
 	attemptRoot := filepath.Join(root, "worktrees")
@@ -261,7 +290,11 @@ func TestReplacementLifecycleCommitsPrepareBindAndStartOnOneReservation(t *testi
 		t.Fatal(err)
 	}
 	running := cloneManifest(start.Request.Manifest)
+	if err := owner.authorizeRuntimeEffect(t.Context(), authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*startEffect)), Action: agentruntime.EffectStart, GateNonce: startEffect.StartGateNonce}); err != nil {
+		t.Fatal(err)
+	}
 	running.State = "running"
+	running.LaunchID = startEffect.StartGateNonce
 	finished, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*startEffect)), Action: agentruntime.EffectStart, Manifest: running})
 	if err != nil {
 		t.Fatal(err)
@@ -360,9 +393,11 @@ func TestProductionTriggerImmediatelyCoalescesRecollectWithoutFailure(t *testing
 func TestResumePendingMonitorReconstructsExactlyAndRunsAsynchronously(t *testing.T) {
 	owner := newReconciliationTestOwner(t)
 	manifest := ownerTestManifest(t, owner.stateRoot, 41, 1, "running")
-	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
+	created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	if err != nil {
 		t.Fatal(err)
 	}
+	manifest = created.State.Attempts[ownerAttemptKey("o/r", 41, 1)].Manifest
 	issue := internalgithub.RecoveryIssueFact{
 		Repository: "o/r", Issue: 41, Attempt: 1, Active: true,
 		DispatchAuthorized: true, BaseSHA: manifest.BaseSHA, Body: "exact body",
@@ -371,7 +406,7 @@ func TestResumePendingMonitorReconstructsExactlyAndRunsAsynchronously(t *testing
 
 	lifecycle, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	runner := &barrierEffectRunner{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	runner := &barrierEffectRunner{entered: make(chan struct{}, 1), release: make(chan struct{}), pane: boundRuntimeEffectTestPane(t, manifest)}
 	runtimeState := &agentruntime.Runtime{
 		Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: runner, Tmux: "tmux",
 		VerifyWorker: func(context.Context) error { return nil },
@@ -398,6 +433,202 @@ func TestResumePendingMonitorReconstructsExactlyAndRunsAsynchronously(t *testing
 	<-woke
 	if err := effects.shutdown(t.Context()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPermittedStartWithMissingSessionRemainsQuarantinedAfterRestart(t *testing.T) {
+	owner := newReconciliationTestOwner(t)
+	manifest := ownerTestManifest(t, owner.stateRoot, 412, 1, "preparing")
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
+	created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest = created.State.Attempts[ownerAttemptKey("o/r", 412, 1)].Manifest
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 412, Attempt: 1, Active: true, DispatchAuthorized: true, BaseSHA: manifest.BaseSHA, Body: "exact body"}
+	input := repositoryInput(true, issue)
+	applyReconciliationInput(t, owner, input)
+	runner := &barrierEffectRunner{}
+	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: runner, Tmux: "tmux", Helper: "agent-symphony-helper", VerifyWorker: func(context.Context) error { return nil }}
+	effects, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := reconciliationV2Batch{Input: input}
+	snapshot := mustOwnerSnapshot(t, owner)
+	observation := snapshot.State.Observations[ownerIssueKey("o/r", 412)]
+	accepted := expandIssueFact(observation.Fact)
+	accepted.Body, accepted.Attempt, accepted.BaseSHA = issue.Body, manifest.Attempt, manifest.BaseSHA
+	attempt, err := runtimeLaunchAttempt(config.Default("o/r"), accepted, manifest, owner.attemptRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := effects.beginWithSource(t.Context(), snapshot, agentruntime.EffectRequest{Action: agentruntime.EffectStart, Attempt: attempt, Manifest: manifest, Eligible: true}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := mustOwnerSnapshot(t, owner)
+	var pending runtimeEffectIntent
+	for _, effect := range before.State.Effects {
+		if effect.Action == string(agentruntime.EffectStart) && effect.State == "pending" {
+			pending = effect
+		}
+	}
+	if pending.ID == "" || pending.StartGateNonce == "" {
+		t.Fatalf("missing pending Start candidate: %#v", before.State.Effects)
+	}
+	run, err := effects.acquire(t.Context(), bound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingCycle := &productionReconciliation{owner: owner, effects: effects, config: config.Default("o/r"), attemptRoot: owner.attemptRoot, stateRoot: owner.stateRoot}
+	if err := pendingCycle.resumePendingRuntime(t.Context(), batch, ""); err != nil {
+		t.Fatal(err)
+	}
+	afterOverlap := mustOwnerSnapshot(t, owner).State.Effects[pending.ID]
+	if afterOverlap.StartGateNonce != pending.StartGateNonce || len(afterOverlap.StartCandidates) != 1 {
+		t.Fatalf("overlapping reconciliation rotated an active Start: before=%#v after=%#v", pending, afterOverlap)
+	}
+	effects.release(bound, run)
+	if err := owner.authorizeRuntimeEffect(t.Context(), authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(pending)), Action: agentruntime.EffectStart, GateNonce: pending.StartGateNonce}); err != nil {
+		t.Fatal(err)
+	}
+	if err := effects.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted := restartOwnerWithInput(t, owner, input)
+	recoveredEffects, err := newRuntimeEffectCoordinator(t.Context(), restarted, agentruntime.EffectExecutor{Runtime: runtimeState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &productionReconciliation{owner: restarted, effects: recoveredEffects, config: config.Default("o/r"), attemptRoot: owner.attemptRoot, stateRoot: owner.stateRoot}
+	if err := p.resumePendingRuntime(t.Context(), batch, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoveredEffects.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	after := mustOwnerSnapshot(t, restarted)
+	effect := after.State.Effects[pending.ID]
+	if effect.State != "pending" || !effect.StartMayRun || effect.StartGateNonce != pending.StartGateNonce || effect.Diagnostic != "pending Start launch identity or worker absence is unproved" || runner.blocked.Load() != 0 {
+		t.Fatalf("permitted missing candidate was replayed or lost: effect=%#v external dispatches=%d", effect, runner.blocked.Load())
+	}
+}
+
+func TestPendingLegacyStartAfterRestartIsQuarantinedWithoutReplaying(t *testing.T) {
+	root := resolvedTempDir(t)
+	attemptRoot := productionAttemptRoot(root)
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := ownerTestManifest(t, root, 410, 1, "preparing")
+	persist := func(state runtimeOwnerState) error { return writeRuntimeOwnerState(root, attemptRoot, state) }
+	owner, err := startTestStateOwner(t, root, runtimeEffectInitialState(legacy), persist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := mustOwnerSnapshot(t, owner)
+	_, pending, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{
+		Identity: stateResultIdentity{Epoch: before.State.Epoch, SourceRevision: before.State.Revision, IssueGeneration: 1, AttemptGeneration: 1},
+		Action:   agentruntime.EffectStart, Manifest: legacy, RequestDigest: strings.Repeat("2", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(root, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, root, loaded, persist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	input := repositoryInput(true, internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 410, Attempt: 1, Active: true, DispatchAuthorized: true, BaseSHA: legacy.BaseSHA, Body: "legacy"}, issueFact(411, "unrelated"))
+	applyReconciliationInput(t, restarted, input)
+	runner := &barrierEffectRunner{}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Runner: runner, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
+	effects, err := newRuntimeEffectCoordinator(t.Context(), restarted, agentruntime.EffectExecutor{Runtime: runtimeState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &productionReconciliation{owner: restarted, effects: effects, config: config.Default("o/r"), attemptRoot: attemptRoot, stateRoot: root}
+	if err := p.resumePendingRuntime(t.Context(), reconciliationV2Batch{Input: input}, ""); err != nil {
+		t.Fatal(err)
+	}
+	after := mustOwnerSnapshot(t, restarted)
+	if effect := after.State.Effects[pending.ID]; effect.State != "pending" || effect.Diagnostic != "legacy launch identity unproved; manual migration required" {
+		t.Fatalf("legacy Start was not durably quarantined: %#v", effect)
+	}
+	if err := p.resumePendingRuntime(t.Context(), reconciliationV2Batch{Input: input}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := effects.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := runner.calls.Load(); got != 0 {
+		t.Fatalf("legacy Start replayed %d external calls", got)
+	}
+	if repeated := mustOwnerSnapshot(t, restarted); repeated.State.Revision != after.State.Revision {
+		t.Fatalf("quarantine caused a recurring commit: before=%d after=%d", after.State.Revision, repeated.State.Revision)
+	}
+	applyReconciliationInput(t, restarted, repositoryInput(true, issueFact(411, "unrelated next cycle")))
+	status, err := projectOwnerStatus(mustOwnerSnapshot(t, restarted), 4, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundLegacy, foundUnrelated := false, false
+	for _, entry := range status.Statuses {
+		switch entry.Issue {
+		case 410:
+			foundLegacy = true
+			if entry.Diagnostic != "legacy launch identity unproved; manual migration required" {
+				t.Fatalf("legacy diagnostic not visible: %#v", entry)
+			}
+		case 411:
+			foundUnrelated = true
+			if entry.Diagnostic == "legacy launch identity unproved; manual migration required" {
+				t.Fatalf("legacy quarantine poisoned unrelated issue: %#v", entry)
+			}
+		}
+	}
+	if !foundLegacy || !foundUnrelated {
+		t.Fatalf("quarantine status missing legacy or unrelated issue: %#v", status.Statuses)
+	}
+	identityUnproved := mustOwnerSnapshot(t, restarted)
+	effect := identityUnproved.State.Effects[pending.ID]
+	effect.Diagnostic = "pending Start launch identity or worker absence is unproved"
+	identityUnproved.State.Effects[pending.ID] = effect
+	status, err = projectOwnerStatus(identityUnproved, 4, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundUnproved := false
+	for _, entry := range status.Statuses {
+		if entry.Issue != 410 {
+			continue
+		}
+		foundUnproved = true
+		if entry.Diagnostic != effect.Diagnostic || !entry.NeedsAttention || entry.Action != "inspect the unproved implementation launch before retry" {
+			t.Fatalf("pending Start quarantine was not visible: %#v", entry)
+		}
+	}
+	if !foundUnproved {
+		t.Fatalf("pending Start quarantine status is missing: %#v", status.Statuses)
+	}
+	invalidated := mustOwnerSnapshot(t, restarted)
+	invalidated.State.AttemptGenerations[ownerAttemptKey(legacy.Repository, legacy.Issue, legacy.Attempt)]++
+	status, err = projectOwnerStatus(invalidated, 4, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range status.Statuses {
+		if entry.Issue == 410 && (entry.Diagnostic == effect.Diagnostic || entry.Action == "inspect the unproved implementation launch before retry" || entry.Action == "manually migrate the legacy implementation launch identity") {
+			t.Fatalf("stale Start diagnostic survived attempt-generation invalidation: %#v", entry)
+		}
 	}
 }
 
@@ -1329,8 +1560,9 @@ func TestStartupMarkerSweepReclaimsOrphanProofAbsentFromLedger(t *testing.T) {
 }
 
 func TestProductionRuntimeFinishesOperatorMarkerBeforeAdmission(t *testing.T) {
-	owner, manifest := operatorTestOwner(t, 48, "running", false)
+	owner, manifest := operatorTestOwner(t, 48, "running", false, true)
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	service.effects.executor.Runtime.Runner = &barrierEffectRunner{pane: boundRuntimeEffectTestPane(t, manifest)}
 	request := operatorRequest("startup-marker", "cancel", manifest, false)
 	command, work, err := service.prepareAdmission(t.Context(), mustOwnerSnapshot(t, owner), request)
 	if err != nil {
@@ -1655,9 +1887,11 @@ func TestMonitoringCheckInIsGenerationBoundAndDurablyCompleted(t *testing.T) {
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
+	created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	if err != nil {
 		t.Fatal(err)
 	}
+	manifest = created.State.Attempts[ownerAttemptKey("o/r", 45, 1)].Manifest
 	remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 45, Attempt: 1, BaseSHA: manifest.BaseSHA, State: "active"}
 	issue := internalgithub.RecoveryIssueFact{
 		Repository: "o/r", Issue: 45, Attempt: 1, Active: true, NeedsAttention: true,
@@ -1671,7 +1905,7 @@ func TestMonitoringCheckInIsGenerationBoundAndDurablyCompleted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := &recordingCheckInRunner{branch: manifest.Branch}
+	runner := &recordingCheckInRunner{branch: manifest.Branch, pane: boundRuntimeEffectTestPane(t, manifest)}
 	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Git: "git", Tmux: "tmux", Runner: runner, VerifyWorker: func(context.Context) error { return nil }}
 	effects, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
 	if err != nil {
@@ -1748,11 +1982,25 @@ func TestStartupSweepLeavesUnmarkedMonitoringCheckInPendingWithoutDelivery(t *te
 type recordingCheckInRunner struct {
 	branch     string
 	deliveries int
+	pane       *agentruntime.ImplementationPane
 }
 
 func (r *recordingCheckInRunner) Run(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
 	if command.Name == "git" {
 		return agentruntime.Result{Output: r.branch + "\n"}, nil
+	}
+	if r.pane != nil && len(command.Args) > 0 && command.Args[0] == "display-message" && command.Args[len(command.Args)-1] == agentruntime.ImplementationPaneFormat {
+		pane := r.pane
+		return agentruntime.Result{Output: fmt.Sprintf("%s|%s|%s|%d|%d|%d|%s|%s|%s\n", pane.SessionName, pane.SessionID, pane.PaneID, pane.PanePID, pane.ServerPID, pane.ServerStart, pane.StartPath, pane.Token, pane.Command)}, nil
+	}
+	if len(command.Args) > 5 && command.Args[0] == "if-shell" {
+		if strings.Contains(command.Args[5], "load-buffer") {
+			r.deliveries++
+		}
+		if strings.Contains(command.Args[5], "display-message") {
+			return agentruntime.Result{Output: "0"}, nil
+		}
+		return agentruntime.Result{}, nil
 	}
 	if len(command.Args) > 0 && command.Args[0] == "load-buffer" {
 		r.deliveries++

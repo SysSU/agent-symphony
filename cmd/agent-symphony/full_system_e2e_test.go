@@ -51,6 +51,8 @@ type synchronizedBuffer struct {
 	buffer bytes.Buffer
 }
 
+const fullSystemIssueBody = "## Context\nProtect the full operator journey.\n\n## Acceptance criteria\n- The change is visible.\n\n## Checklist\n- [ ] Implement and review.\n\n## Validation\nRun the deterministic full-system test.\n\n## Dependencies\n#72"
+
 func (b *synchronizedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -80,7 +82,7 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := "2026-09-09T12:00:00Z"
-	body := "## Context\nProtect the full operator journey.\n\n## Acceptance criteria\n- The change is visible.\n\n## Checklist\n- [ ] Implement and review.\n\n## Validation\nRun the deterministic full-system test.\n\n## Dependencies\n#72"
+	body := fullSystemIssueBody
 	labels := make([]map[string]string, 0, len(f.labels))
 	for label, present := range f.labels {
 		if present {
@@ -143,11 +145,33 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == "/repos/o/r/issues/73/comments":
 		writeFixtureJSON(w, f.comments)
 	case r.Method == http.MethodGet && path == "/repos/o/r/issues/73/timeline":
-		writeFixtureJSON(w, []any{
-			map[string]any{"id": 731, "event": "labeled", "label": map[string]string{"name": "agent-ready"}, "created_at": now, "actor": map[string]any{"id": 42}},
-			map[string]any{"id": 732, "event": "labeled", "label": map[string]string{"name": "priority:P1"}, "created_at": now, "actor": map[string]any{"id": 42}},
-			map[string]any{"id": 733, "event": "labeled", "label": map[string]string{"name": "autonomous-merge"}, "created_at": now, "actor": map[string]any{"id": 42}},
-		})
+		events := []any{}
+		for _, item := range []struct {
+			id    int
+			label string
+		}{{731, "agent-ready"}, {732, "priority:P1"}, {733, "autonomous-merge"}} {
+			id, label := item.id, item.label
+			if f.labels[label] {
+				events = append(events, map[string]any{"id": id, "event": "labeled", "label": map[string]string{"name": label}, "created_at": now, "actor": map[string]any{"id": 42}})
+			}
+		}
+		if f.closed {
+			events = append(events, map[string]any{"id": 734, "event": "closed", "created_at": now, "actor": map[string]any{"id": 42}})
+		}
+		writeFixtureJSON(w, events)
+	case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/o/r/issues/comments/"):
+		id, _ := strconv.ParseInt(strings.TrimPrefix(path, "/repos/o/r/issues/comments/"), 10, 64)
+		for _, comment := range f.comments {
+			if commentID, ok := comment["id"].(int64); ok && commentID == id {
+				writeFixtureJSON(w, comment)
+				return
+			}
+			if commentID, ok := comment["id"].(int); ok && int64(commentID) == id {
+				writeFixtureJSON(w, comment)
+				return
+			}
+		}
+		http.Error(w, `{"message":"comment not found"}`, http.StatusNotFound)
 	case r.Method == http.MethodGet && path == "/repos/o/r/pulls":
 		pulls := []any{}
 		for _, pull := range f.historicalPulls {
@@ -399,11 +423,20 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	stopped := false
 	currentSession := "as-o-r-964584196b5c-73-1"
 	t.Cleanup(func() {
-		_ = stopFullSystemTmux(server.Env, currentSession)
-		_ = stopFullSystemProcesses(root)
 		if !stopped {
-			_ = server.Process.Kill()
-			_ = server.Wait()
+			if err := stopFullSystemDaemon(server); err != nil {
+				t.Errorf("join full-system daemon before resource cleanup: %v", err)
+			}
+			stopped = true
+		}
+		if err := stopFullSystemTmux(server.Env, currentSession); err != nil {
+			t.Errorf("stop full-system tmux: %v", err)
+		}
+		if fullSystemTmuxSessionExists(server.Env, currentSession) {
+			t.Errorf("full-system tmux session remained after cleanup: %s", currentSession)
+		}
+		if err := stopFullSystemProcesses(root); err != nil {
+			t.Errorf("stop full-system child processes: %v", err)
 		}
 	})
 	waitHTTP(t, "http://"+address+"/status.json", deadline(15*time.Second), output)
@@ -1029,12 +1062,27 @@ func waitHTTP(t *testing.T, target string, timeout time.Duration, output fmt.Str
 	t.Fatalf("server did not become ready: %s", output.String())
 }
 
+func TestWaitForKeepsFirstSuccessfulSample(t *testing.T) {
+	calls := 0
+	if !waitFor(time.Second, func() bool {
+		calls++
+		return calls == 1
+	}) || calls != 1 {
+		t.Fatalf("successful sample was lost or evaluated twice: calls=%d", calls)
+	}
+}
+
 func waitFor(timeout time.Duration, ready func() bool) bool {
 	deadline := time.Now().Add(timeout)
-	for !ready() && time.Now().Before(deadline) {
+	for {
+		if ready() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	return ready()
 }
 
 func fullSystemAttemptDiagnostics(address, stateRoot, implementationSession string, environment []string) string {
@@ -1104,11 +1152,52 @@ func stopFullSystemTmux(environment []string, session string) error {
 	return nil
 }
 
+func stopFullSystemDaemon(command *exec.Cmd) error {
+	if command == nil || command.Process == nil || command.ProcessState != nil {
+		return nil
+	}
+	killErr := command.Process.Kill()
+	waitErr := command.Wait()
+	if errors.Is(killErr, os.ErrProcessDone) {
+		killErr = nil
+	}
+	var exit *exec.ExitError
+	if killErr == nil && errors.As(waitErr, &exit) {
+		waitErr = nil
+	}
+	return errors.Join(killErr, waitErr)
+}
+
 func stopFullSystemProcesses(root string) error {
-	listed, err := exec.Command("ps", "-axo", "pid=,command=").Output()
+	pids, err := fullSystemProcessIDs(root)
 	if err != nil {
 		return err
 	}
+	for _, pid := range pids {
+		process, err := os.FindProcess(pid)
+		if err != nil {
+			return err
+		}
+		if err := process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return err
+		}
+	}
+	remaining, err := fullSystemProcessIDs(root)
+	if err != nil {
+		return err
+	}
+	if len(remaining) != 0 {
+		return fmt.Errorf("isolated processes remained after cleanup: %v", remaining)
+	}
+	return nil
+}
+
+func fullSystemProcessIDs(root string) ([]int, error) {
+	listed, err := exec.Command("ps", "-axo", "pid=,command=").Output()
+	if err != nil {
+		return nil, err
+	}
+	var pids []int
 	for _, line := range strings.Split(string(listed), "\n") {
 		if !strings.Contains(line, root) {
 			continue
@@ -1119,13 +1208,9 @@ func stopFullSystemProcesses(root string) error {
 		}
 		pid, err := strconv.Atoi(fields[0])
 		if err != nil || pid <= 1 {
-			return fmt.Errorf("invalid isolated process identity %q", line)
+			return nil, fmt.Errorf("invalid isolated process identity %q", line)
 		}
-		process, err := os.FindProcess(pid)
-		if err != nil {
-			return err
-		}
-		_ = process.Kill()
+		pids = append(pids, pid)
 	}
-	return nil
+	return pids, nil
 }

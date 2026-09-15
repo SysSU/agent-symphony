@@ -393,6 +393,77 @@ func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
 	}
 }
 
+func TestImplementationBoundaryAcceptsOnlyBoundTmuxLaunchAndMutation(t *testing.T) {
+	stateRoot := t.TempDir()
+	root := filepath.Join(stateRoot, "worktrees")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	session := "as-o-r-0123456789ab-310-1"
+	worktree := filepath.Join(root, strings.TrimPrefix(session, "as-"))
+	token := strings.Repeat("a", 32)
+	env := []string{"PATH=/bin", "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0"}
+	args := agentruntime.TmuxNewSessionArgs(session, worktree, env)
+	args = slices.Insert(args, 7, "-P", "-F", agentruntime.ImplementationPaneFormat)
+	args = append(args, "/bin/sh", ";", "set-option", "-p", "-t", agentruntime.PaneTarget(session), "@agent-symphony-launch-token", token,
+		";", "set-option", "-w", "-t", agentruntime.PaneTarget(session), "remain-on-exit", "on",
+		";", "set-option", "-w", "-t", agentruntime.PaneTarget(session), "history-limit", "5000",
+		";", "set-option", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneExitStatusOption, "",
+		";", "set-option", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneExitSignalOption, "")
+	if !validTmuxBoundaryArgs(args, env, root, root) {
+		t.Fatal("owner-bound launch was rejected by worker boundary")
+	}
+	tampered := slices.Clone(args)
+	tampered[21] = "not-a-launch-token"
+	if validTmuxBoundaryArgs(tampered, env, root, root) {
+		t.Fatal("unbound launch token crossed worker boundary")
+	}
+	gated := slices.Clone(args)
+	helper, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(stateRoot, "attempts", "o-r-0123456789ab", "310-1", "agent.log")
+	gated = slices.Replace(gated, 14, 15, helper, "implementation-gate", "tmux", logPath, worktree, session, token, token, "--", "/bin/sh")
+	gated = append([]string{"wait-for", "-L", agentruntime.ImplementationGateChannel(token), ";"}, gated...)
+	if !validTmuxBoundaryArgs(gated, env, root, root) {
+		t.Fatal("parked implementation launch was rejected by worker boundary")
+	}
+	foreignLog := slices.Clone(gated)
+	foreignLog[21] = filepath.Join(stateRoot, "attempts", "o-r-0123456789ab", "310-2", "agent.log")
+	if validTmuxBoundaryArgs(foreignLog, env, root, root) {
+		t.Fatal("worker boundary accepted a log path for a different attempt")
+	}
+	foreignGate := slices.Clone(gated)
+	foreignGate[25] = strings.Repeat("b", 32)
+	if validTmuxBoundaryArgs(foreignGate, env, root, root) {
+		t.Fatal("worker boundary accepted a gate candidate different from the owner channel")
+	}
+	binding := agentruntime.ImplementationLaunchBinding{ServerPID: 2345, ServerStart: 6789, SessionName: session, SessionID: "$2", PaneID: "%3", PanePID: 3456, Token: token, Command: "gate"}
+	pane := agentruntime.ImplementationPane{ServerPID: 2345, ServerStart: 6789, SessionName: session, SessionID: "$2", PaneID: "%3", PanePID: 3456, Token: token, Command: "gate"}
+	nested, err := agentruntime.TmuxCommandString([]string{"respawn-pane", "-k", "-t", pane.PaneID, "--", "/bin/sh", "-c", "printf 'ready'"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guarded, err := agentruntime.GuardedImplementationArgs(binding, pane, nested)
+	if err != nil || !validTmuxBoundaryArgs(guarded, nil, root, root) {
+		t.Fatalf("bound respawn rejected: %v", err)
+	}
+	for name, change := range map[string]func([]string){
+		"wrong pane":     func(args []string) { args[3] = "%4" },
+		"no guard":       func(args []string) { args[4] = "1" },
+		"foreign target": func(args []string) { args[5] = "'respawn-pane' '-k' '-t' '%4' '--' '/bin/sh'" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := slices.Clone(guarded)
+			change(bad)
+			if validTmuxBoundaryArgs(bad, nil, root, root) {
+				t.Fatal("invalid guarded mutation crossed worker boundary")
+			}
+		})
+	}
+}
+
 func TestWorkerBoundaryAllowsOnlyExactAncestryCheck(t *testing.T) {
 	root := t.TempDir()
 	worktree := filepath.Join(root, "attempt")
@@ -744,73 +815,6 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(tmuxTmp) })
 	t.Setenv("TMUX_TMPDIR", tmuxTmp)
 
-	t.Run("findings persist without a separate signal", func(t *testing.T) {
-		oldExec := hostExecRunner
-		calls := 0
-		recipient := ""
-		prompt := ""
-		statusCleared := false
-		var submission agentruntime.Command
-		hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
-			calls++
-			if command.Args[0] == "load-buffer" {
-				body, _ := io.ReadAll(command.Stdin)
-				prompt = string(body)
-			}
-			if slices.Contains(command.Args, "show-options") {
-				return agentruntime.Result{Output: recipient}, nil
-			}
-			if command.Args[0] == "respawn-pane" {
-				if !statusCleared {
-					return agentruntime.Result{}, errors.New("prior pane exit status was not cleared")
-				}
-				submission = command
-				var err error
-				recipient, err = acknowledgeHandoffLaunch(command)
-				return agentruntime.Result{}, err
-			}
-			if command.Args[0] == "set-option" {
-				if slices.Contains(command.Args, agentruntime.PaneExitStatusOption) && command.Args[len(command.Args)-1] == "" {
-					statusCleared = true
-				}
-				recipient = command.Args[len(command.Args)-1]
-			}
-			return agentruntime.Result{}, nil
-		}
-		t.Cleanup(func() { hostExecRunner = oldExec })
-		root := t.TempDir()
-		worktree := filepath.Join(root, "attempt")
-		if err := os.Mkdir(worktree, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		handoff := []byte(`{"type":"agent-symphony-handoff-v1","key":"pane-test","human_instructions":["keep the YAML ignored"]}`)
-		request, _ := json.Marshal(struct {
-			Manifest     agentruntime.Manifest `json:"manifest"`
-			Handoff      json.RawMessage       `json:"handoff"`
-			OutcomePath  string                `json:"outcome_path"`
-			OutcomeToken string                `json:"outcome_token"`
-			Command      []string              `json:"command"`
-		}{agentruntime.Manifest{Worktree: worktree, Session: "as-23-1", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, handoffReceiptPath(worktree, "pane-test"), "token", []string{"implementation"}})
-		if _, err := acceptHandoff(t.Context(), request, root); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := acceptHandoff(t.Context(), request, root); err != nil {
-			t.Fatal(err)
-		}
-		if calls != 6 {
-			t.Fatalf("worker made %d tmux calls, want lookup, buffer load, both result clears, launch, and ready binding", calls)
-		}
-		if !slices.Contains(submission.Args, "worker-capture-handoff-ready") || !slices.Contains(submission.Args, "implementation") || slices.Contains(submission.Args, "paste-buffer") || slices.Contains(submission.Args, "send-keys") {
-			t.Fatalf("handoff did not use the stdin capture helper: %#v", submission.Args)
-		}
-		if !strings.Contains(prompt, humanInstructionPrecedence) || !strings.Contains(prompt, "keep the YAML ignored") {
-			t.Fatalf("handoff omitted human instruction precedence: %q", prompt)
-		}
-		if _, err := os.ReadFile(filepath.Join(worktree, ".agent-symphony", "handoffs", "pane-test.json")); err != nil {
-			t.Fatalf("durable handoff: %v", err)
-		}
-	})
-
 	t.Run("export", func(t *testing.T) {
 		root := t.TempDir()
 		primary := filepath.Join(root, "primary")
@@ -1034,104 +1038,78 @@ func TestWorkerResultArtifactRedactsInteractiveCredentials(t *testing.T) {
 	}
 }
 
-func TestPendingHandoffRetriesWithoutDuplicateExecution(t *testing.T) {
-	for _, test := range []struct {
-		name, failure, kind string
-		accept              func(context.Context, []byte, string) (string, error)
-	}{
-		{"load-buffer", "load-buffer", "", acceptHandoff},
-		{"submission", "submission", "", acceptHandoff},
-		{"respawn-side-effect", "respawn-side-effect", "", acceptHandoff},
-		{"receipt", "receipt", "", acceptHandoff},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			oldExec, oldDirSync := hostExecRunner, immutableDirSync
-			t.Cleanup(func() { hostExecRunner, immutableDirSync = oldExec, oldDirSync })
-			root := t.TempDir()
-			worktree := filepath.Join(root, "attempt")
-			if err := os.Mkdir(worktree, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			resultPath := agentruntime.ResultPath(worktree)
-			previousResult := `{"type":"agent-symphony-result-v1","validation":"previous turn passed","documentation":"none"}`
-			if err := os.WriteFile(resultPath, []byte(previousResult), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			handoff, _ := json.Marshal(struct{ Type, Key, Kind string }{"agent-symphony-handoff-v1", "retry-key", test.kind})
-			request, _ := json.Marshal(struct {
-				Manifest     agentruntime.Manifest `json:"manifest"`
-				Handoff      json.RawMessage       `json:"handoff"`
-				OutcomePath  string                `json:"outcome_path"`
-				OutcomeToken string                `json:"outcome_token"`
-				Command      []string              `json:"command"`
-			}{agentruntime.Manifest{Worktree: worktree, Session: "as-retry", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, handoffReceiptPath(worktree, "retry-key"), "token", []string{"implementation"}})
-			recipient, deliveries, injected := "", 0, false
-			hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
-				if command.Args[0] == "set-option" {
-					if len(command.Args) == 5 {
-						recipient = ""
-					} else {
-						recipient = command.Args[len(command.Args)-1]
-					}
-					return agentruntime.Result{}, nil
-				}
-				if slices.Contains(command.Args, "show-options") {
-					return agentruntime.Result{Output: recipient}, nil
-				}
-				if slices.Contains(command.Args, "display-message") {
-					return agentruntime.Result{Output: "1"}, nil
-				}
-				if !injected && test.failure == "load-buffer" && slices.Contains(command.Args, "load-buffer") {
-					injected = true
-					return agentruntime.Result{}, errors.New("injected load failure")
-				}
-				if command.Args[0] == "respawn-pane" {
-					if !injected && test.failure == "submission" {
-						injected = true
-						return agentruntime.Result{}, errors.New("injected submission failure")
-					}
-					launchedRecipient, launchErr := acknowledgeHandoffLaunch(command)
-					if launchErr != nil {
-						return agentruntime.Result{}, launchErr
-					}
-					if !injected && test.failure == "respawn-side-effect" {
-						injected = true
-						deliveries++
-						recipient = launchedRecipient
-						return agentruntime.Result{}, errors.New("injected failure after respawn")
-					}
-					recipient, deliveries = launchedRecipient, deliveries+1
-				}
-				return agentruntime.Result{}, nil
-			}
-			immutableDirSync = func(dir string) error {
-				if !injected && test.failure == "receipt" && dir == filepath.Join(worktree, ".agent-symphony", "handoffs") && recipient != "" {
-					injected = true
-					return errors.New("injected receipt sync failure")
-				}
-				return oldDirSync(dir)
-			}
-			if _, err := test.accept(t.Context(), request, root); err == nil {
-				t.Fatal("injected failure succeeded")
-			}
-			if retained, err := os.ReadFile(resultPath); err != nil || string(retained) != previousResult {
-				t.Fatalf("previous result was not retained across %s failure: %q err=%v", test.failure, retained, err)
-			}
-			if _, err := os.Stat(filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.json")); err != nil {
-				t.Fatalf("pending state lost: %v", err)
-			}
-			if test.failure == "respawn-side-effect" {
-				if _, err := os.Stat(filepath.Join(worktree, ".agent-symphony", "handoffs", "retry-key.launching")); err != nil {
-					t.Fatalf("durable launch state lost: %v", err)
-				}
-			}
-			if _, err := test.accept(t.Context(), request, root); err != nil {
-				t.Fatalf("restart retry: %v", err)
-			}
-			if deliveries != 1 {
-				t.Fatalf("deliveries=%d, want 1", deliveries)
-			}
-		})
+func TestLegacyHandoffDoesNotRespawnSameNameForeignPane(t *testing.T) {
+	oldExec := hostExecRunner
+	t.Cleanup(func() { hostExecRunner = oldExec })
+	root := t.TempDir()
+	worktree := filepath.Join(root, "attempt")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	handoff := json.RawMessage(`{"type":"agent-symphony-handoff-v1","key":"foreign-pane"}`)
+	request, err := json.Marshal(struct {
+		Manifest     agentruntime.Manifest `json:"manifest"`
+		Handoff      json.RawMessage       `json:"handoff"`
+		OutcomePath  string                `json:"outcome_path"`
+		OutcomeToken string                `json:"outcome_token"`
+		Command      []string              `json:"command"`
+	}{agentruntime.Manifest{Worktree: worktree, Session: "as-foreign-pane", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, handoffReceiptPath(worktree, "foreign-pane"), "token", []string{"implementation"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignAlive := true
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		if command.Args[0] == "respawn-pane" || command.Args[0] == "kill-pane" || command.Args[0] == "kill-session" {
+			foreignAlive = false
+		}
+		return agentruntime.Result{}, nil
+	}
+	if _, err := acceptHandoff(t.Context(), request, root); err == nil || !strings.Contains(err.Error(), "legacy implementation pane has no durable handoff identity") {
+		t.Fatalf("unbound legacy handoff was not rejected explicitly: %v", err)
+	}
+	if !foreignAlive {
+		t.Fatal("name-only legacy handoff mutated a foreign pane")
+	}
+}
+
+func TestLegacyHandoffProbeDoesNotCertifyCopiedPaneOption(t *testing.T) {
+	oldExec := hostExecRunner
+	t.Cleanup(func() { hostExecRunner = oldExec })
+	root := t.TempDir()
+	worktree := filepath.Join(root, "attempt")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	handoff := json.RawMessage(`{"type":"agent-symphony-handoff-v1","key":"copied-option"}`)
+	request, err := json.Marshal(struct {
+		Manifest     agentruntime.Manifest `json:"manifest"`
+		Handoff      json.RawMessage       `json:"handoff"`
+		OutcomePath  string                `json:"outcome_path"`
+		OutcomeToken string                `json:"outcome_token"`
+		Command      []string              `json:"command"`
+	}{agentruntime.Manifest{Worktree: worktree, Session: "as-copied-option", LogPath: filepath.Join(worktree, "attempt.log")}, handoff, handoffReceiptPath(worktree, "copied-option"), "token", []string{"implementation"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, parsed, err := decodeHandoffRequest(request, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, recipient := handoffBinding(decoded)
+	if err := os.MkdirAll(filepath.Join(worktree, ".agent-symphony", "handoffs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeImmutable(filepath.Join(worktree, ".agent-symphony", "handoffs", parsed.Key+".json"), binding); err != nil {
+		t.Fatal(err)
+	}
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		if slices.Contains(command.Args, "show-options") {
+			return agentruntime.Result{Output: recipient}, nil // Same-name replacement copied the option.
+		}
+		return agentruntime.Result{}, nil
+	}
+	if receipt, err := verifyHandoff(t.Context(), request, root); err == nil || receipt != "" || !strings.Contains(err.Error(), "legacy implementation pane has no durable handoff identity") {
+		t.Fatalf("copied option certified legacy execution: receipt=%q err=%v", receipt, err)
 	}
 }
 
@@ -1162,7 +1140,7 @@ func cleanupTestManifest(t *testing.T, root string) agentruntime.Manifest {
 	return manifest
 }
 
-func TestCleanupAttemptRemovesOnlyVerifiedRuntimeResources(t *testing.T) {
+func TestCleanupAttemptRetainsUnboundLegacyResourcesEvenWhenNameIsAbsent(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -1201,17 +1179,21 @@ func TestCleanupAttemptRemovesOnlyVerifiedRuntimeResources(t *testing.T) {
 			t.Fatalf("cleanup preflight mutated %s: %v", path, err)
 		}
 	}
+	if err := cleanupAttempt(t.Context(), body, root); err == nil || !strings.Contains(err.Error(), "legacy implementation session") {
+		t.Fatalf("live unbound legacy session was removed: %v", err)
+	}
+	live = false
 	for range 2 {
-		if err := cleanupAttempt(t.Context(), body, root); err != nil {
-			t.Fatal(err)
+		if err := cleanupAttempt(t.Context(), body, root); err == nil || !strings.Contains(err.Error(), "legacy implementation session") {
+			t.Fatalf("absent legacy name authorized cleanup: %v", err)
 		}
 	}
-	if kills != 1 {
-		t.Fatalf("tmux kills = %d, want 1", kills)
+	if kills != 0 {
+		t.Fatalf("legacy tmux kills = %d, want 0", kills)
 	}
 	for _, path := range []string{manifest.Worktree, resultPath} {
-		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("cleanup retained %s: %v", path, err)
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("unsafe cleanup removed %s: %v", path, err)
 		}
 	}
 	if got, err := os.ReadFile(logPath); err != nil || string(got) != "retained diagnostics" {
@@ -1219,7 +1201,7 @@ func TestCleanupAttemptRemovesOnlyVerifiedRuntimeResources(t *testing.T) {
 	}
 }
 
-func TestAbandonAttemptAcceptsExactFailedWorktreeWithoutWeakeningCleanup(t *testing.T) {
+func TestAbandonAttemptRetainsFailedLegacyWorktreeWithoutProcessProof(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -1245,11 +1227,11 @@ func TestAbandonAttemptAcceptsExactFailedWorktreeWithoutWeakeningCleanup(t *test
 	if _, err := os.Stat(manifest.Worktree); err != nil {
 		t.Fatalf("abandon preflight mutated worktree: %v", err)
 	}
-	if err := abandonAttempt(t.Context(), body, root); err != nil {
-		t.Fatal(err)
+	if err := abandonAttempt(t.Context(), body, root); err == nil || !strings.Contains(err.Error(), "legacy implementation session") {
+		t.Fatalf("unbound legacy attempt was abandoned: %v", err)
 	}
-	if _, err := os.Stat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("abandon retained worktree: %v", err)
+	if _, err := os.Stat(manifest.Worktree); err != nil {
+		t.Fatalf("unsafe abandon removed worktree: %v", err)
 	}
 }
 
@@ -1282,36 +1264,65 @@ func TestPermanentRemovalRejectsDirtyOrUnpublishedWorkAndRetriesSafely(t *testin
 		t.Fatalf("unpublished preflight = %v", err)
 	}
 	publishedHead = runGit(t, manifest.Worktree, "rev-parse", "HEAD")
-	oldExec := hostExecRunner
-	live, kills := true, 0
-	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
-		switch command.Args[0] {
-		case "has-session":
-			if live {
-				return agentruntime.Result{}, nil
-			}
-			return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
-		case "kill-session":
-			live, kills = false, kills+1
-			return agentruntime.Result{}, nil
-		default:
-			return agentruntime.Result{}, fmt.Errorf("unexpected tmux command %v", command.Args)
-		}
+	tmuxBinary, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
 	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-permanent-removal-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmuxBinary, "kill-server").Run() })
+	if output, err := exec.Command(tmuxBinary, "new-session", "-d", "-s", "keeper").CombinedOutput(); err != nil {
+		t.Fatalf("create unrelated keeper pane: %v: %s", err, output)
+	}
+	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("c", 32), strings.Repeat("d", 32)
+	manifest.LogPath = filepath.Join(root, "attempts", "o-r", "23-1", "agent.log")
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(manifest.Worktree, ".git", "info", "exclude"), []byte(".agent-symphony/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gate := agentruntime.ImplementationGateChannel(manifest.LaunchID)
+	parked := []string{"wait-for", "-L", gate, ";", "new-session", "-d", "-s", manifest.Session, "-c", manifest.Worktree, "--", "/bin/sh", "-c", `"$1" wait-for -L "$2" && "$1" wait-for -U "$2" && shift 2 && exec "$@"`, "agent-symphony-gate", tmuxBinary, gate}
+	parked = append(parked, agentruntime.BoundPaneExitStatusCommand(os.Args[0], tmuxBinary, manifest, []string{"/bin/sh"})...)
+	if output, err := exec.Command(tmuxBinary, parked...).CombinedOutput(); err != nil {
+		t.Fatalf("create bound implementation pane: %v: %s", err, output)
+	}
+	if output, err := exec.Command(tmuxBinary, "set-option", "-p", "-t", agentruntime.PaneTarget(manifest.Session), "@agent-symphony-launch-token", manifest.LaunchToken).CombinedOutput(); err != nil {
+		t.Fatalf("tag bound implementation pane: %v: %s", err, output)
+	}
+	observed, err := exec.Command(tmuxBinary, "display-message", "-p", "-t", agentruntime.PaneTarget(manifest.Session), agentruntime.ImplementationPaneFormat).CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := agentruntime.ParseImplementationPane(string(observed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := agentruntime.BindImplementationPane(manifest, manifest.LaunchID, "interactive", pane)
+	if err != nil || agentruntime.WriteImplementationBinding(manifest, binding) != nil {
+		t.Fatalf("bind implementation pane: %v, pane=%#v manifest=%#v", err, pane, manifest)
+	}
+	oldExec := hostExecRunner
+	hostExecRunner = (agentruntime.ExecRunner{}).Run
 	t.Cleanup(func() { hostExecRunner = oldExec })
 	if err := permanentlyRemoveAttempt(t.Context(), request(publishedHead), root, false); err != nil {
 		t.Fatalf("safe preflight: %v", err)
 	}
-	if _, err := os.Stat(manifest.Worktree); err != nil || kills != 0 {
-		t.Fatalf("preflight mutated worktree/session: stat=%v kills=%d", err, kills)
+	if _, err := os.Stat(manifest.Worktree); err != nil {
+		t.Fatalf("preflight mutated worktree: %v", err)
 	}
 	for range 2 {
 		if err := permanentlyRemoveAttempt(t.Context(), request(publishedHead), root, true); err != nil {
 			t.Fatalf("idempotent removal: %v", err)
 		}
 	}
-	if kills != 1 {
-		t.Fatalf("tmux kills=%d, want 1", kills)
+	if output, err := exec.Command(tmuxBinary, "has-session", "-t", "="+manifest.Session).CombinedOutput(); err == nil {
+		t.Fatalf("bound tmux session survived removal: %s", output)
 	}
 	if _, err := os.Stat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("worktree remains: %v", err)
@@ -1493,13 +1504,12 @@ func TestResumeHandoffFetchesThroughAgentHostBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runtimeState := agentruntime.Runtime{Root: root, StateRoot: stateRoot, Source: bundle, Runner: agentHostRuntimeRunner{}}
-	resumed, err := runtimeState.ResumeHandoff(t.Context(), attempt)
+	_, err = (agentHostRuntimeRunner{}).Run(t.Context(), agentruntime.Command{Name: "git", Args: []string{"-C", manifest.Worktree, "fetch", "--no-tags", bundle, "+refs/heads/*:refs/remotes/agent-symphony/*"}, Dir: manifest.Worktree})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := runGit(t, manifest.Worktree, "rev-parse", "refs/remotes/agent-symphony/"+branch); resumed.State != "running" || got != want {
-		t.Fatalf("resumed=%#v fetched=%s want=%s", resumed, got, want)
+	if got := runGit(t, manifest.Worktree, "rev-parse", "refs/remotes/agent-symphony/"+branch); got != want {
+		t.Fatalf("fetched=%s want=%s", got, want)
 	}
 	if validGitBoundaryArgs([]string{"-C", manifest.Worktree, "fetch", "--no-tags", filepath.Join(t.TempDir(), "outside.source.bundle"), "+refs/heads/*:refs/remotes/agent-symphony/*"}, root, root) ||
 		validGitBoundaryArgs([]string{"-C", manifest.Worktree, "fetch", "--no-tags", bundle, "+refs/heads/*:refs/remotes/origin/*"}, root, root) {

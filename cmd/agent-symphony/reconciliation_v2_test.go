@@ -242,9 +242,11 @@ func TestReconciliationRejectsStaleEpochAndDiscardsStaleGeneration(t *testing.T)
 	}
 	t.Cleanup(func() { _ = attemptOwner.close(context.Background()) })
 	manifest := ownerTestManifest(t, root, 176, 1, "running")
-	if _, err := attemptOwner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
+	created, err := attemptOwner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	if err != nil {
 		t.Fatal(err)
 	}
+	manifest = created.State.Attempts[ownerAttemptKey("o/r", 176, 1)].Manifest
 	attemptSnapshot, _ := attemptOwner.reconciliationSnapshot(t.Context())
 	attemptInput := repositoryInput(true, issueFact(176, "issue"))
 	attemptInput.Attempts = []internalgithub.RecoveryAttemptFact{attemptFact(176, 1, "stale")}
@@ -336,9 +338,11 @@ func TestReconciliationGenerationAdvanceMasksNestedAttemptFacts(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = owner.close(context.Background()) })
 			manifest := ownerTestManifest(t, root, 177, 1, "running")
-			if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
+			created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+			if err != nil {
 				t.Fatal(err)
 			}
+			manifest = created.State.Attempts[ownerAttemptKey("o/r", 177, 1)].Manifest
 			snapshot, _ := owner.reconciliationSnapshot(t.Context())
 			remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 177, Attempt: 1, PR: 9, BaseSHA: manifest.BaseSHA, HeadSHA: strings.Repeat("b", 40), State: "completed"}
 			issue := issueFact(177, "stale")
@@ -358,8 +362,13 @@ func TestReconciliationGenerationAdvanceMasksNestedAttemptFacts(t *testing.T) {
 			}
 			request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 177, Attempt: 1, Manifest: &manifest, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, ExecutionDigest: strings.Repeat("a", 64), GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueEvidence, HeadSHA: remote.HeadSHA}}
 			identity := stateResultIdentity{Epoch: applied.State.Epoch, SourceRevision: applied.State.Revision, IssueGeneration: 1, AttemptGeneration: 2}
-			if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: identity, Request: request}); !errors.Is(err, errStaleStateResult) {
-				t.Fatalf("stale nested fact admitted an effect: %v", err)
+			before := len(applied.State.Effects)
+			if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: identity, Request: request}); err == nil {
+				t.Fatal("stale nested fact admitted an effect")
+			}
+			after := mustOwnerSnapshot(t, owner)
+			if len(after.State.Effects) != before {
+				t.Fatalf("rejected stale nested fact changed effects: before=%d after=%d", before, len(after.State.Effects))
 			}
 		})
 	}

@@ -918,7 +918,8 @@ func TestStateOwnerRejectsManifestRootChosenByCaller(t *testing.T) {
 
 func TestStateOwnerTransitionsUseBoundIdentityWithoutFilesystemAccess(t *testing.T) {
 	root := resolvedTempDir(t)
-	manifest := ownerTestManifest(t, root, 61, 1, "running")
+	manifest := ownerTestManifest(t, root, 61, 1, "preparing")
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
 	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -927,7 +928,13 @@ func TestStateOwnerTransitionsUseBoundIdentityWithoutFilesystemAccess(t *testing
 	if err := os.RemoveAll(root); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	initial := mustOwnerSnapshot(t, owner)
+	snapshot, _, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{
+		Identity:      stateResultIdentity{Epoch: initial.State.Epoch, SourceRevision: initial.State.Revision},
+		Action:        agentruntime.EffectPrepare,
+		Manifest:      manifest,
+		RequestDigest: strings.Repeat("1", 64),
+	})
 	key := ownerAttemptKey("o/r", 61, 1)
 	if err != nil || snapshot.State.Revision <= 1 || snapshot.State.Attempts[key].Manifest.Worktree != manifest.Worktree {
 		t.Fatalf("snapshot=%#v err=%v", snapshot, err)
@@ -965,6 +972,15 @@ func (o *stateOwner) upsertAttempt(ctx context.Context, command upsertAttemptCom
 		return stateOwnerSnapshot{}, errors.New("test fixture cannot replace existing attempt authority")
 	}
 	target := cloneManifest(command.Manifest)
+	// Legacy records are exercised by dedicated compatibility tests. This
+	// helper synthesizes a successful new launch through the owner, so it must
+	// provide the v2 launch token and the admitted Start effect ID.
+	target.Version = agentruntime.ManifestVersion2
+	target.LaunchToken, err = agentruntime.NewLaunchToken()
+	if err != nil {
+		return stateOwnerSnapshot{}, err
+	}
+	target.LaunchID = ""
 	manifest := cloneManifest(target)
 	manifest.State, manifest.Diagnostic = "preparing", ""
 	identity := stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)]}
@@ -974,18 +990,23 @@ func (o *stateOwner) upsertAttempt(ctx context.Context, command upsertAttemptCom
 	}
 	committed, err = o.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectPrepare, Manifest: manifest})
 	if err != nil || target.State == "preparing" {
-		return committed, err
+		return committed, writeTestCommittedManifest(committed, key, err)
 	}
 	identity = stateResultIdentity{Epoch: committed.State.Epoch, SourceRevision: committed.State.Revision, IssueGeneration: committed.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: committed.State.AttemptGenerations[key]}
 	_, effect, err = o.beginRuntimeEffect(ctx, beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStart, Manifest: manifest, RequestDigest: strings.Repeat("2", 64)})
 	if err != nil {
 		return stateOwnerSnapshot{}, err
 	}
+	if err := o.authorizeRuntimeEffect(ctx, authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectStart, GateNonce: effect.StartGateNonce}); err != nil {
+		return stateOwnerSnapshot{}, err
+	}
 	running := cloneManifest(target)
 	running.State, running.Diagnostic = "running", ""
+	running.LaunchID = effect.StartGateNonce
+	target.LaunchID = effect.StartGateNonce
 	committed, err = o.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectStart, Manifest: running})
 	if err != nil || target.State == "running" {
-		return committed, err
+		return committed, writeTestCommittedManifest(committed, key, err)
 	}
 	identity = stateResultIdentity{Epoch: committed.State.Epoch, SourceRevision: committed.State.Revision, IssueGeneration: committed.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: committed.State.AttemptGenerations[key]}
 	action, reason := agentruntime.EffectMonitor, ""
@@ -1000,7 +1021,20 @@ func (o *stateOwner) upsertAttempt(ctx context.Context, command upsertAttemptCom
 	if err != nil {
 		return stateOwnerSnapshot{}, err
 	}
-	return o.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: action, Manifest: target})
+	committed, err = o.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: action, Manifest: target})
+	return committed, writeTestCommittedManifest(committed, key, err)
+}
+
+func writeTestCommittedManifest(snapshot stateOwnerSnapshot, key string, transitionErr error) error {
+	if transitionErr != nil {
+		return transitionErr
+	}
+	manifest := snapshot.State.Attempts[key].Manifest
+	body, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600)
 }
 
 func advanceTestAttemptGeneration(t *testing.T, owner *stateOwner, manifest agentruntime.Manifest) stateOwnerSnapshot {
@@ -1017,6 +1051,157 @@ func advanceTestAttemptGeneration(t *testing.T, owner *stateOwner, manifest agen
 		t.Fatal(err)
 	}
 	return committed
+}
+
+func TestPendingStartPermitAndTombstoneSurviveRestart(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 899, 1, "preparing")
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
+	attemptRoot := productionAttemptRoot(root)
+	persist := func(state runtimeOwnerState) error { return writeRuntimeOwnerState(root, attemptRoot, state) }
+	owner, err := startTestStateOwner(t, root, runtimeEffectInitialState(manifest), persist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := mustOwnerSnapshot(t, owner)
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	issueKey := ownerIssueKey(manifest.Repository, manifest.Issue)
+	_, start, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: stateResultIdentity{Epoch: current.State.Epoch, SourceRevision: current.State.Revision, IssueGeneration: current.State.IssueGenerations[issueKey], AttemptGeneration: current.State.AttemptGenerations[key]}, Action: agentruntime.EffectStart, Manifest: manifest, RequestDigest: strings.Repeat("2", 64)})
+	if err != nil || !agentruntime.ValidLaunchToken(start.StartGateNonce) || len(start.StartCandidates) != 1 {
+		t.Fatalf("Start intent=%#v err=%v", start, err)
+	}
+	oldNonce := start.StartGateNonce
+	identity := ownerEffectIdentity(effectRequestIdentity(*start))
+	_, rotated, err := owner.rotateStartGate(t.Context(), rotateStartGateCommand{Identity: identity, OldNonce: oldNonce})
+	if err != nil || rotated.StartGateNonce == oldNonce || len(rotated.StartCandidates) != 2 || rotated.StartCandidates[0] != (startGateCandidate{Nonce: oldNonce}) {
+		t.Fatalf("pre-permit rotation=%#v err=%v", rotated, err)
+	}
+	start = rotated
+	if err := owner.authorizeRuntimeEffect(t.Context(), authorizeRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStart, GateNonce: oldNonce}); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("retired gate permit err=%v", err)
+	}
+	if err := owner.authorizeRuntimeEffect(t.Context(), authorizeRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStart, GateNonce: start.StartGateNonce}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := owner.rotateStartGate(t.Context(), rotateStartGateCommand{Identity: identity, OldNonce: start.StartGateNonce}); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("post-permit rotation err=%v", err)
+	}
+	current = mustOwnerSnapshot(t, owner)
+	if !current.State.Effects[start.ID].StartMayRun {
+		t.Fatal("owner did not commit may-run before release")
+	}
+	releaseLateStart := make(chan struct{})
+	lateResult := make(chan error, 1)
+	go func() {
+		<-releaseLateStart
+		running := cloneManifest(manifest)
+		running.State, running.LaunchID = "running", start.StartGateNonce
+		_, finishErr := owner.finishRuntimeEffect(context.Background(), finishRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStart, Manifest: running})
+		lateResult <- finishErr
+	}()
+	_, _, err = owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, ExpectedIssueGeneration: current.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: current.State.AttemptGenerations[key], Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(releaseLateStart)
+	if finishErr := <-lateResult; !errors.Is(finishErr, errStaleStateResult) {
+		t.Fatalf("late permitted Start resurrected dismissed attempt: %v", finishErr)
+	}
+	if err := owner.close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(root, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstone := loaded.Tombstones[key]
+	if _, exists := loaded.Effects[start.ID]; exists || tombstone.InvalidatedStart == nil || tombstone.InvalidatedStart.EffectID != start.ID || len(tombstone.InvalidatedStart.Candidates) != 2 || tombstone.InvalidatedStart.Candidates[0] != (startGateCandidate{Nonce: oldNonce}) || tombstone.InvalidatedStart.Candidates[1] != (startGateCandidate{Nonce: start.StartGateNonce, MayRun: true}) {
+		t.Fatalf("destructive commit lost pending Start physical obligation: %#v", tombstone)
+	}
+	if err := validateRuntimeOwnerState(loaded, attemptRoot, root, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStartRunningCommitRequiresExactDurableGrant(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 900, 1, "preparing")
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
+	owner, err := startTestStateOwner(t, root, runtimeEffectInitialState(manifest), func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	snapshot := mustOwnerSnapshot(t, owner)
+	_, start, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]}, Action: agentruntime.EffectStart, Manifest: manifest, RequestDigest: strings.Repeat("2", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := ownerEffectIdentity(effectRequestIdentity(*start))
+	running := cloneManifest(manifest)
+	running.State, running.LaunchID = "running", start.StartGateNonce
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStart, Manifest: running}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("ungranted Start committed running: %v", err)
+	}
+	oldNonce := start.StartGateNonce
+	_, start, err = owner.rotateStartGate(t.Context(), rotateStartGateCommand{Identity: identity, OldNonce: oldNonce})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.authorizeRuntimeEffect(t.Context(), authorizeRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStart, GateNonce: start.StartGateNonce}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStart, Manifest: running}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("retired candidate committed running: %v", err)
+	}
+	running.LaunchID = start.StartGateNonce
+	finished, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStart, Manifest: running})
+	if err != nil || finished.State.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Manifest.LaunchID != start.StartGateNonce {
+		t.Fatalf("exact granted Start did not commit: revision=%d err=%v", finished.State.Revision, err)
+	}
+}
+
+func TestOwnerRejectsChangedQueuedReviewFindings(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 901, 1, "completed")
+	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
+	head := strings.Repeat("c", 40)
+	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.ReviewState, manifest.ReviewMode = "findings-queued", agentruntime.ReviewModeImplementation
+	manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead = manifest.BaseSHA+".."+head, manifest.BaseSHA, head
+	manifest.ReviewSnapshot, manifest.ReviewSession = filepath.Join(root, "review-snapshot"), session
+	manifest.ReviewFindings, manifest.ReviewHandoffQueued = []string{"original finding"}, true
+	owner, err := startTestStateOwner(t, root, runtimeEffectInitialState(manifest), func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	snapshot := mustOwnerSnapshot(t, owner)
+	identity := stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]}
+	changed := agentruntime.ReviewTransition{State: "findings-queued", Mode: manifest.ReviewMode, Target: manifest.ReviewTarget, Base: manifest.ReviewBase, Head: manifest.ReviewHead, Snapshot: manifest.ReviewSnapshot, Session: manifest.ReviewSession, Findings: []string{"different finding"}, HandoffQueued: true}
+	if _, _, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectReview, Manifest: manifest, Review: &changed, RequestDigest: strings.Repeat("d", 64)}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("owner accepted rewrite of queued review findings: %v", err)
+	}
+	unchanged := changed
+	unchanged.Findings = slices.Clone(manifest.ReviewFindings)
+	_, effect, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectReview, Manifest: manifest, Review: &unchanged, RequestDigest: strings.Repeat("e", 64)})
+	if err != nil {
+		t.Fatalf("owner rejected identical queued review findings: %v", err)
+	}
+	result, err := agentruntime.ReviewEffectResult(owner.attemptRoot, owner.stateRoot, manifest, unchanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finish := finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectReview, Manifest: result}
+	if _, err := owner.finishRuntimeEffect(t.Context(), finish); err != nil {
+		t.Fatalf("owner rejected identical queued review completion: %v", err)
+	}
+	if _, err := owner.finishRuntimeEffect(t.Context(), finish); err != nil {
+		t.Fatalf("owner rejected idempotent queued review replay: %v", err)
+	}
 }
 
 func TestRuntimeOwnerRejectsInvalidIssueGenerationKey(t *testing.T) {
