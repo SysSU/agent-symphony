@@ -1681,6 +1681,16 @@ func TestOwnerGitIgnoresAmbientConfigAndObjectRedirects(t *testing.T) {
 	}
 	runExternal(t, source, "git", "add", ".gitattributes", "payload")
 	runExternal(t, source, "git", "commit", "-qm", "fixture")
+	original := strings.TrimSpace(runExternal(t, source, "git", "rev-parse", "HEAD"))
+	if err := os.WriteFile(filepath.Join(source, "payload"), []byte("replaced\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runExternal(t, source, "git", "commit", "-qam", "replacement")
+	replacement := strings.TrimSpace(runExternal(t, source, "git", "rev-parse", "HEAD"))
+	runExternal(t, source, "git", "replace", original, replacement)
+	if out, err := ownerGitCommand(t.Context(), "-C", source, "show", original+":payload").CombinedOutput(); err != nil || string(out) != "safe\n" {
+		t.Fatalf("owner Git honored worker replacement ref: %q: %v", out, err)
+	}
 
 	canary, global := filepath.Join(root, "filter-ran"), filepath.Join(root, "global.gitconfig")
 	if err := os.WriteFile(global, []byte("[filter \"hostile\"]\n\tsmudge = touch "+canary+"\n\trequired = true\n"), 0o600); err != nil {
@@ -1691,7 +1701,7 @@ func TestOwnerGitIgnoresAmbientConfigAndObjectRedirects(t *testing.T) {
 	if out, err := ownerGitCommand(t.Context(), "clone", "--no-local", "--no-checkout", source, snapshot).CombinedOutput(); err != nil {
 		t.Fatalf("clone with scrubbed owner environment: %v: %s", err, out)
 	}
-	if out, err := ownerGitCommand(t.Context(), "-C", snapshot, "checkout", "--detach", "HEAD").CombinedOutput(); err != nil {
+	if out, err := ownerGitCommand(t.Context(), "-C", snapshot, "checkout", "--detach", original).CombinedOutput(); err != nil {
 		t.Fatalf("checkout with scrubbed owner environment: %v: %s", err, out)
 	}
 	if _, err := os.Stat(canary); !errors.Is(err, os.ErrNotExist) {

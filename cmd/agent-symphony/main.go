@@ -2064,6 +2064,7 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 func ownerGitCommand(ctx context.Context, args ...string) *exec.Cmd {
 	base := []string{
 		"--no-optional-locks",
+		"--no-replace-objects",
 		"-c", "core.hooksPath=/dev/null",
 		"-c", "core.attributesFile=/dev/null",
 		"-c", "core.fsmonitor=false",
