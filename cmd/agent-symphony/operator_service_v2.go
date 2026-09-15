@@ -43,6 +43,7 @@ type operatorMutationService struct {
 	watchers          map[string]context.CancelFunc
 	stopping          chan struct{}
 	stopped           bool
+	beforeAdmission   func()
 }
 
 type operatorWork struct {
@@ -58,6 +59,8 @@ type operatorReceiptStatus struct {
 	EffectID   string `json:"effect_id,omitempty"`
 	Diagnostic string `json:"diagnostic,omitempty"`
 }
+
+const maxOperatorAdmissionAttempts = 3
 
 func newOperatorMutationService(lifecycle context.Context, owner *stateOwner, effects *runtimeEffectCoordinator, cleanup operatorCleanupExecutor, collector reconciliationV2Collector, reviewer boundaryCaller, reviewSource string, reviewEnvironment, reviewCommand []string) (*operatorMutationService, error) {
 	if lifecycle == nil || owner == nil || effects == nil || effects.owner != owner || effects.executor.Runtime == nil || cleanup.runtime == nil || cleanup.stateRoot != owner.stateRoot || collector.API.HTTP == nil || collector.Config.Repository == "" || collector.Config.ActorID < 1 || reviewer == nil {
@@ -108,135 +111,165 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		}
 		defer s.release("request:" + request.RequestID)
 	}
-	snapshot, err := s.owner.snapshot(ctx)
-	if err != nil {
-		return operatorResultForError(request, err)
-	}
-	if receipt, ok := operatorReceiptByID(snapshot.State, request.RequestID); ok {
-		if receipt.Request != request {
-			return operatorErrorResult(request, http.StatusConflict, "operator request identity was already used for different input")
-		}
-		if receipt.State == "pending" {
-			if synchronous {
-				if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
-					if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
-						return s.currentReceiptResult(ctx, request)
-					}
-					return operatorResultForError(request, err)
-				}
-				return s.currentReceiptResult(ctx, request)
-			}
-			s.dispatchResume(request.RequestID)
-		}
-		return operatorResultForReceipt(snapshot, receipt)
-	}
-	if replay, ok := s.tombstoneReplayCommand(snapshot, request); ok {
-		committed, effect, err := s.owner.beginOperatorMutation(ctx, replay)
+	for admission := range maxOperatorAdmissionAttempts {
+		snapshot, err := s.owner.snapshot(ctx)
 		if err != nil {
 			return operatorResultForError(request, err)
 		}
-		if effect != nil && effect.State == "pending" {
-			if synchronous {
-				if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
-					if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
-						return s.currentReceiptResult(ctx, request)
-					}
-					return operatorResultForError(request, err)
-				}
-				return s.currentReceiptResult(ctx, request)
+		if receipt, ok := operatorReceiptByID(snapshot.State, request.RequestID); ok {
+			if receipt.Request != request {
+				return operatorErrorResult(request, http.StatusConflict, "operator request identity was already used for different input")
 			}
-			s.dispatchResume(request.RequestID)
+			if receipt.State == "pending" {
+				if synchronous {
+					if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+						if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
+							return s.currentReceiptResult(ctx, request)
+						}
+						return operatorResultForError(request, err)
+					}
+					return s.currentReceiptResult(ctx, request)
+				}
+				s.dispatchResume(request.RequestID)
+			}
+			return operatorResultForReceipt(snapshot, receipt)
 		}
-		receipt, found := operatorReceiptByID(committed.State, request.RequestID)
-		if !found {
-			return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
-		}
-		if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup {
-			s.dispatchResume(request.RequestID)
-		}
-		return operatorResultForReceipt(committed, receipt)
-	}
-	if attach, ok := s.recoveryAttachCommand(snapshot, request); ok {
-		committed, _, err := s.owner.beginOperatorMutation(ctx, attach)
-		if err != nil {
-			return operatorResultForError(request, err)
-		}
-		if synchronous {
-			if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+		if replay, ok := s.tombstoneReplayCommand(snapshot, request); ok {
+			committed, effect, err := s.owner.beginOperatorMutation(ctx, replay)
+			if errors.Is(err, errStaleStateResult) {
+				if admission+1 < maxOperatorAdmissionAttempts {
+					continue
+				}
+				return operatorErrorResult(request, http.StatusConflict, "attempt or issue kept changing during operator admission")
+			}
+			if err != nil {
 				return operatorResultForError(request, err)
 			}
-			return s.currentReceiptResult(ctx, request)
+			if effect != nil && effect.State == "pending" {
+				if synchronous {
+					if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+						if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
+							return s.currentReceiptResult(ctx, request)
+						}
+						return operatorResultForError(request, err)
+					}
+					return s.currentReceiptResult(ctx, request)
+				}
+				s.dispatchResume(request.RequestID)
+			}
+			receipt, found := operatorReceiptByID(committed.State, request.RequestID)
+			if !found {
+				return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
+			}
+			if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup {
+				s.dispatchResume(request.RequestID)
+			}
+			return operatorResultForReceipt(committed, receipt)
 		}
-		s.dispatchResume(request.RequestID)
-		receipt, found := operatorReceiptByID(committed.State, request.RequestID)
-		if !found {
-			return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
+		if attach, ok := s.recoveryAttachCommand(snapshot, request); ok {
+			committed, _, err := s.owner.beginOperatorMutation(ctx, attach)
+			if errors.Is(err, errStaleStateResult) {
+				if admission+1 < maxOperatorAdmissionAttempts {
+					continue
+				}
+				return operatorErrorResult(request, http.StatusConflict, "attempt or issue kept changing during operator admission")
+			}
+			if err != nil {
+				return operatorResultForError(request, err)
+			}
+			if synchronous {
+				if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+					return operatorResultForError(request, err)
+				}
+				return s.currentReceiptResult(ctx, request)
+			}
+			s.dispatchResume(request.RequestID)
+			receipt, found := operatorReceiptByID(committed.State, request.RequestID)
+			if !found {
+				return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
+			}
+			return operatorResultForReceipt(committed, receipt)
 		}
-		return operatorResultForReceipt(committed, receipt)
-	}
 
-	if (request.Action == "archive" || request.Action == "dismiss") && !ownerHasAttempt(snapshot.State, request) {
-		fresh, batch, err := s.collectIssue(ctx, request.Issue)
+		if (request.Action == "archive" || request.Action == "dismiss") && !ownerHasAttempt(snapshot.State, request) {
+			fresh, batch, err := s.collectIssue(ctx, request.Issue)
+			if err != nil {
+				return operatorResultForError(request, err)
+			}
+			command, err := remoteOnlyOperatorCommand(fresh, batch, request)
+			if err != nil {
+				return operatorResultForError(request, err)
+			}
+			committed, _, err := s.owner.beginOperatorMutation(ctx, command)
+			if errors.Is(err, errStaleStateResult) {
+				if admission+1 < maxOperatorAdmissionAttempts {
+					continue
+				}
+				return operatorErrorResult(request, http.StatusConflict, "attempt or issue kept changing during operator admission")
+			}
+			if err != nil {
+				return operatorResultForError(request, err)
+			}
+			s.effects.cancelInvalidated(committed)
+			receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
+			if !ok {
+				return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
+			}
+			return operatorResultForReceipt(committed, receipt)
+		}
+		command, work, err := s.prepareAdmission(ctx, snapshot, request)
 		if err != nil {
 			return operatorResultForError(request, err)
 		}
-		command, err := remoteOnlyOperatorCommand(fresh, batch, request)
-		if err != nil {
-			return operatorResultForError(request, err)
+		if s.beforeAdmission != nil {
+			s.beforeAdmission()
 		}
-		committed, _, err := s.owner.beginOperatorMutation(ctx, command)
+		committed, effect, err := s.owner.beginOperatorMutation(ctx, command)
+		if errors.Is(err, errStaleStateResult) {
+			if admission+1 < maxOperatorAdmissionAttempts {
+				continue
+			}
+			return operatorErrorResult(request, http.StatusConflict, "attempt or issue kept changing during operator admission")
+		}
 		if err != nil {
 			return operatorResultForError(request, err)
 		}
 		s.effects.cancelInvalidated(committed)
-		receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
-		if !ok {
+		s.cancelSupersededPlanWatchers(snapshot, committed)
+		receipt, receiptOK := operatorReceiptByID(committed.State, request.RequestID)
+		if !receiptOK {
 			return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
+		}
+		deferredCleanup := receipt.Phase == operatorPhaseHandoffCleanup || receipt.Phase == operatorPhaseStartCleanup
+		if effect != nil {
+			work.requestID = request.RequestID
+			bindOperatorWorkIdentity(&work, *effect)
+			work.stopReviewerID = effect.SupersededReviewerID
+			if synchronous && !deferredCleanup {
+				if err := s.executeOnce(work, ""); err != nil {
+					if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
+						return s.currentReceiptResult(ctx, request)
+					}
+					return operatorResultForError(request, err)
+				}
+				return s.currentReceiptResult(ctx, request)
+			}
+			if !deferredCleanup {
+				s.dispatch(work)
+			}
+		}
+		if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup {
+			if synchronous {
+				if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+					return operatorResultForError(request, err)
+				}
+				return s.currentReceiptResult(ctx, request)
+			}
+			s.dispatchResume(request.RequestID)
 		}
 		return operatorResultForReceipt(committed, receipt)
 	}
-	command, work, err := s.prepareAdmission(ctx, snapshot, request)
-	if err != nil {
-		return operatorResultForError(request, err)
-	}
-	committed, effect, err := s.owner.beginOperatorMutation(ctx, command)
-	if err != nil {
-		return operatorResultForError(request, err)
-	}
-	s.effects.cancelInvalidated(committed)
-	s.cancelSupersededPlanWatchers(snapshot, committed)
-	receipt, receiptOK := operatorReceiptByID(committed.State, request.RequestID)
-	if !receiptOK {
-		return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
-	}
-	deferredCleanup := receipt.Phase == operatorPhaseHandoffCleanup || receipt.Phase == operatorPhaseStartCleanup
-	if effect != nil {
-		work.requestID = request.RequestID
-		bindOperatorWorkIdentity(&work, *effect)
-		work.stopReviewerID = effect.SupersededReviewerID
-		if synchronous && !deferredCleanup {
-			if err := s.executeOnce(work, ""); err != nil {
-				if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
-					return s.currentReceiptResult(ctx, request)
-				}
-				return operatorResultForError(request, err)
-			}
-			return s.currentReceiptResult(ctx, request)
-		}
-		if !deferredCleanup {
-			s.dispatch(work)
-		}
-	}
-	if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup {
-		if synchronous {
-			if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
-				return operatorResultForError(request, err)
-			}
-			return s.currentReceiptResult(ctx, request)
-		}
-		s.dispatchResume(request.RequestID)
-	}
-	return operatorResultForReceipt(committed, receipt)
+	return operatorErrorResult(request, http.StatusInternalServerError, "operator admission stopped unexpectedly")
 }
 
 func ownerHasAttempt(state runtimeOwnerState, request controlRequest) bool {

@@ -2245,6 +2245,15 @@ func TestDismissCommitsWhileConfinedDetachedChildLivesAndRejectsItsStaleResult(t
 			t.Fatal(err)
 		}
 	}
+	for _, name := range []string{".codex", ".agents"} {
+		directory := filepath.Join(workspace, name)
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, "deny"), []byte("deny\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	siblingCanary, stateCanary := filepath.Join(sibling, "deny"), filepath.Join(base, "state-deny")
 	for _, path := range []string{siblingCanary, stateCanary} {
 		if err := os.WriteFile(path, []byte("deny\n"), 0o600); err != nil {
