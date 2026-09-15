@@ -244,6 +244,10 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	if err != nil {
 		return err
 	}
+	applied, err = p.admitDependencyStatuses(ctx, applied)
+	if err != nil {
+		return err
+	}
 	p.effects.cancelInvalidated(applied)
 	if resolved, err := p.resolveInvalidatedGitHubEffect(ctx, p.api); err != nil || resolved {
 		if err != nil {
@@ -262,6 +266,12 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 		p.operator.scanPendingPlanReviewers(ctx, applied)
 	}
 	if resumed, err := p.resumePendingReconciliation(ctx, api, batch); err != nil || resumed {
+		if err != nil {
+			return err
+		}
+		return errReconciliationRecollect
+	}
+	if changed, err := p.runMachineStatusPhase(ctx, api); err != nil || changed {
 		if err != nil {
 			return err
 		}
@@ -339,6 +349,51 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	return p.runRetirementPhase(ctx)
 }
 
+func (p *productionReconciliation) admitDependencyStatuses(ctx context.Context, snapshot stateOwnerSnapshot) (stateOwnerSnapshot, error) {
+	for issueKey, observation := range snapshot.State.Observations {
+		if !observation.Present || !observation.Fact.NeedsAttention || observation.OwnerGeneration != snapshot.State.IssueGenerations[issueKey] {
+			continue
+		}
+		for _, proposal := range observation.IssueUpdates {
+			if proposal.Kind != githubIssueDependencyClear {
+				continue
+			}
+			if current, exists := snapshot.State.MachineStatuses[issueKey]; exists && current.Source != "dependency" {
+				continue
+			}
+			attemptGeneration := snapshot.State.AttemptGenerations[ownerAttemptKey(proposal.Repository, proposal.Issue, proposal.AttributionAttempt)]
+			var err error
+			snapshot, err = p.owner.admitMachineStatus(ctx, admitMachineStatusCommand{
+				Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.AttributionAttempt,
+				ExpectedIssueGeneration: observation.OwnerGeneration, ExpectedAttemptGeneration: attemptGeneration,
+				ExpectedObservationGeneration: observation.Generation, Dependency: proposal.Dependency, PullRequest: proposal.PullRequest,
+				Source: "dependency", SourceSequence: observation.Generation, Status: "clear", Reason: fmt.Sprintf("monitoring: dependency #%d is complete", proposal.Dependency),
+			})
+			if err != nil {
+				return stateOwnerSnapshot{}, err
+			}
+		}
+	}
+	return snapshot, nil
+}
+
+func (p *productionReconciliation) runMachineStatusPhase(ctx context.Context, api internalgithub.API) (bool, error) {
+	snapshot, err := p.owner.snapshot(ctx)
+	if err != nil {
+		return false, err
+	}
+	plans, err := planMachineStatusUpdates(snapshot, p.collector.Config)
+	if err != nil || len(plans) == 0 {
+		return false, err
+	}
+	plan, err := p.effects.beginReconciliation(ctx, plans[0])
+	if err != nil {
+		return false, err
+	}
+	_, err = p.effects.executeIssueUpdate(ctx, api, plan)
+	return err == nil, err
+}
+
 func (p *productionReconciliation) resolveInvalidatedGitHubEffect(ctx context.Context, api internalgithub.API) (bool, error) {
 	snapshot, err := p.owner.snapshot(ctx)
 	if err != nil {
@@ -368,7 +423,7 @@ func (p *productionReconciliation) resolveInvalidatedGitHubEffect(ctx context.Co
 func (p *productionReconciliation) resolveOneInvalidatedGitHubEffect(ctx context.Context, api internalgithub.API, effect runtimeEffectIntent) (bool, error) {
 	request := *effect.Reconciliation
 	key, generation := ownerIssueKey(effect.Repository, effect.Issue), uint64(0)
-	run, err := p.effects.acquireKey(ctx, key, effect.IssueGeneration, generation, request.ObservationGeneration)
+	run, err := p.effects.acquireKey(ctx, key, effect.IssueGeneration, generation, request.ObservationGeneration, effect.ID)
 	if err != nil {
 		return false, err
 	}
@@ -389,16 +444,24 @@ func (p *productionReconciliation) resolveOneInvalidatedGitHubEffect(ctx context
 			outcome.PR, outcome.HeadSHA = pr.Number, request.GitHubPublish.HeadSHA
 		}
 	case reconciliationGitHubIssueUpdate:
-		if request.ControlRepair || reconciliationEffectIssueScoped(request) {
+		if request.GitHubIssueUpdate.Kind == githubIssueMachineStatus {
+			var snapshot stateOwnerSnapshot
+			snapshot, err = p.owner.snapshot(run.ctx)
+			current, ok := snapshot.State.MachineStatuses[ownerIssueKey(request.Repository, request.Issue)]
+			if err == nil && (!ok || current.Sequence <= request.GitHubIssueUpdate.StatusSequence) {
+				err = errStaleStateResult
+			}
+			if err == nil {
+				err = api.EnsureOwnerStatus(run.ctx, current.Repository, current.Issue, current.Attempt, current.Sequence, current.Status == "needs-attention", current.Reason, p.collector.Config.ActorID)
+				if err == nil {
+					outcome.Observed, err = api.OwnerStatusApplied(run.ctx, current.Repository, current.Issue, current.Attempt, current.Sequence, current.Status == "needs-attention", current.Reason, p.collector.Config.ActorID)
+					outcome.StatusSequence = current.Sequence
+				}
+			}
+		} else if request.ControlRepair || reconciliationEffectIssueScoped(request) {
 			outcome.Observed, err = internalgithub.ControlSnapshotRepairApplied(run.ctx, api, p.collector.Config, request.Repository, request.Issue, request.GitHubIssueUpdate.ControlSnapshotBody)
 		} else if request.GitHubIssueUpdate.Kind == githubIssueRetry {
 			outcome.Observed, err = internalgithub.EnsureRetrySuppressed(run.ctx, api, p.collector.Config, request.Issue, request.Attempt, time.Unix(0, request.GitHubIssueUpdate.FailedAtUnixNano))
-		} else if request.GitHubIssueUpdate.Kind == githubIssueWorkerStatus {
-			sequence := request.GitHubIssueUpdate.StatusSequence + 1
-			err = api.EnsureOwnerStatus(run.ctx, request.Repository, request.Issue, request.Attempt, sequence, false, "attempt invalidated", p.collector.Config.ActorID)
-			if err == nil {
-				outcome.Observed, err = api.OwnerStatusApplied(run.ctx, request.Repository, request.Issue, request.Attempt, sequence, false, "attempt invalidated", p.collector.Config.ActorID)
-			}
 		} else {
 			outcome.Observed, err = attemptIssueUpdateApplied(run.ctx, api, request, p.collector.Config)
 		}
@@ -586,6 +649,14 @@ func (p *productionReconciliation) resumeUnmarkedReconciliation(ctx context.Cont
 		_, err = p.effects.executePublication(ctx, api, plan, material)
 		return err == nil, err
 	case reconciliationGitHubIssueUpdate:
+		if request.GitHubIssueUpdate.Kind == githubIssueMachineStatus {
+			plan.Material = reconciliationIssueUpdateMaterial{Config: p.collector.Config}
+			if issueUpdateExecutionDigest(request, plan.Material) != request.ExecutionDigest {
+				return false, errStateConflict
+			}
+			_, err := p.effects.executeIssueUpdate(ctx, api, plan)
+			return err == nil, err
+		}
 		if reconciliationEffectIssueScoped(request) {
 			update := request.GitHubIssueUpdate
 			accepted := reconciliationIssueUpdateProposal{Repository: request.Repository, Issue: request.Issue, Kind: update.Kind, ControlSnapshotDigest: update.ControlSnapshotDigest, AttributionAttempt: update.AttributionAttempt, Dependency: update.Dependency, PullRequest: update.PullRequest}

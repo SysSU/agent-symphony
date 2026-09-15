@@ -224,20 +224,11 @@ func ExecuteIssueUpdateProposal(ctx context.Context, api API, cfg PRAdapterConfi
 	if err != nil || applied {
 		return err
 	}
-	source := &GitHubPRSource{API: api, Config: cfg}
 	switch proposal.Kind {
 	case IssueUpdateControlSnapshot:
 		err = api.createControlSnapshot(ctx, proposal.Repository, proposal.Issue, proposal.ControlSnapshotBody)
 	case IssueUpdateDependencyClear:
-		status, readErr := source.directStatus(ctx, proposal.Issue, proposal.PullRequest)
-		if readErr != nil || status.monitoringDependency != proposal.Dependency || !status.NeedsAttention {
-			return errors.Join(errors.New("monitoring dependency proposal is no longer current"), readErr)
-		}
-		complete, readErr := source.dependencyComplete(ctx, proposal.Dependency)
-		if readErr != nil || !complete {
-			return errors.Join(errors.New("monitoring dependency is not complete"), readErr)
-		}
-		_, err = source.clearResolvedMonitoringDependencyStatus(ctx, proposal.Issue, proposal.PullRequest, proposal.AttributionAttempt, status)
+		return errors.New("dependency status mutations require runtime-owner admission")
 	default:
 		return errors.New("unknown issue update proposal")
 	}
@@ -399,7 +390,7 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 				if status.attributionIssue != issue {
 					continue
 				}
-				if latestMarked.commentID == 0 || status.attributionAttempt > latestMarked.attributionAttempt || status.attributionAttempt == latestMarked.attributionAttempt && (status.statusSequence > latestMarked.statusSequence || status.statusSequence == latestMarked.statusSequence && newerDirectStatus(status, latestMarked)) {
+				if latestMarked.commentID == 0 || status.statusSequence > latestMarked.statusSequence || status.statusSequence == latestMarked.statusSequence && newerDirectStatus(status, latestMarked) {
 					latestMarked = status
 				}
 			} else if latestUnmarked.commentID == 0 || newerDirectStatus(status, latestUnmarked) {
@@ -408,7 +399,7 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 		}
 	}
 	latest := latestMarked
-	if latest.commentID == 0 || latestUnmarked.commentID != 0 && newerDirectStatus(latestUnmarked, latest) {
+	if latest.commentID == 0 {
 		latest = latestUnmarked
 	}
 	var current struct{ Labels []struct{ Name string } }
@@ -463,6 +454,9 @@ func (a API) EnsureOwnerStatus(ctx context.Context, repository string, issue, at
 	if err != nil {
 		return err
 	}
+	if status.attributionIssue == issue && (status.statusSequence > sequence || status.statusSequence == sequence && (status.attributionAttempt != attempt || status.requestedAttention != needsAttention || status.requestedReason != reason)) {
+		return errors.New("owner status sequence is stale or conflicting")
+	}
 	if status.commentID == 0 || status.attributionAttempt != attempt || status.statusSequence != sequence || status.requestedAttention != needsAttention || status.requestedReason != reason {
 		name := "clear"
 		if needsAttention {
@@ -492,52 +486,6 @@ func (a API) EnsureOwnerStatus(ctx context.Context, repository string, issue, at
 		return errors.New("owner status did not match after apply")
 	}
 	return nil
-}
-
-func (s *GitHubPRSource) clearResolvedMonitoringDependencyStatus(ctx context.Context, issue, pullRequest, attempt int, status directStatus) (directStatus, error) {
-	dependency := status.monitoringDependency
-	if dependency < 1 || attempt < 1 {
-		return status, errors.New("monitoring dependency status requires an issue, attempt, and dependency")
-	}
-	attribution := Mutation{Issue: issue, Attempt: attempt}
-	if status.requestedAttention {
-		body := fmt.Sprintf("%sclear: monitoring: dependency #%d is complete", directStatusPrefix, dependency)
-		if err := s.API.mutateAttributed(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", s.Config.Repository, issue), map[string]string{"body": body}, attribution); err != nil {
-			fresh, readErr := s.directStatus(ctx, issue, pullRequest)
-			if readErr != nil || fresh.requestedAttention || fresh.monitoringDependency != dependency {
-				return status, errors.Join(err, readErr)
-			}
-			status = fresh
-		}
-	}
-	if status.requestedAttention {
-		fresh, err := s.directStatus(ctx, issue, pullRequest)
-		if err != nil || fresh.requestedAttention || fresh.monitoringDependency != dependency {
-			return status, errors.Join(errors.New("monitoring dependency clear comment was not observed"), err)
-		}
-		status = fresh
-	}
-	if !status.NeedsAttention {
-		return status, nil
-	}
-	if err := s.API.SyncReviewLabel(ctx, s.Config.Repository, issue, NeedsAttentionLabel, true, false, attribution); err != nil {
-		fresh, readErr := s.directStatus(ctx, issue, pullRequest)
-		if readErr == nil {
-			status = fresh
-			if !fresh.NeedsAttention && !fresh.requestedAttention && fresh.monitoringDependency == dependency {
-				return fresh, nil
-			}
-		}
-		return status, errors.Join(err, readErr)
-	}
-	fresh, err := s.directStatus(ctx, issue, pullRequest)
-	if err != nil {
-		return status, err
-	}
-	if fresh.NeedsAttention || fresh.requestedAttention || fresh.monitoringDependency != dependency {
-		return fresh, errors.New("monitoring dependency status remains after clear")
-	}
-	return fresh, nil
 }
 
 type markerConflicts struct {
@@ -840,8 +788,6 @@ func fetchRecoveryIssueFact(ctx context.Context, api API, cfg PRAdapterConfig, s
 		if err == nil && complete {
 			if mode == issueFactsProposeUpdates {
 				proposals = append(proposals, IssueUpdateProposal{Kind: IssueUpdateDependencyClear, Repository: cfg.Repository, Issue: issue.Number, AttributionAttempt: max(1, currentAttempt), Dependency: status.monitoringDependency, PullRequest: pullRequest})
-			} else {
-				status, err = source.clearResolvedMonitoringDependencyStatus(ctx, issue.Number, pullRequest, max(1, currentAttempt), status)
 			}
 		}
 		if err != nil {
