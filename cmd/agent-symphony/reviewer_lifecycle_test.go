@@ -1851,7 +1851,9 @@ func TestReviewerPaneRecordsExactLaunchAndTerminalIdentity(t *testing.T) {
 		t.Fatalf("reviewer wrapper result code=%d signal=%d err=%v", code, signal, err)
 	}
 	record, err := readReviewerTerminal(launch, terminal, identity)
-	if err != nil || record == nil || record.ExitCode != 0 || record.Signal != 0 {
+	var launched reviewerLaunchIdentity
+	launchedOK, launchErr := readReviewerRecord(launch, &launched)
+	if err != nil || record == nil || record.ExitCode != 0 || record.Signal != 0 || launchErr != nil || !launchedOK || launched.ChildPID < 2 || record.Identity.ChildPID != launched.ChildPID {
 		t.Fatalf("exact terminal record=%#v err=%v", record, err)
 	}
 	changed := identity

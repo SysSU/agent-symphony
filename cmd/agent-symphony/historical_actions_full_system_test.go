@@ -42,7 +42,11 @@ func TestHistoricalAttemptActionsFullSystemE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := os.MkdirTemp("/tmp", "agent-symphony-historical-actions-")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(home, ".agent-symphony-historical-actions-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +178,16 @@ test "$endpoint" = graphql && endpoint=/graphql
 if [ "$input" -eq 1 ]; then exec curl -sS -i -X "$method" --data-binary @- "$FAKE_GITHUB_URL$endpoint"; fi
 exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 `)
-	writeExecutable(t, filepath.Join(binDir, "codex"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(binDir, "codex"), `#!/bin/sh
+if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
+if [ "$1" = sandbox ]; then
+  while [ "$1" != -- ]; do shift; done
+  shift
+  if [ "$2" = sandbox-probe ]; then printf '%s\n' '{"confined":true,"shared_temp_read":true,"shared_temp_write":true}' > "$3"; exit 0; fi
+  exec "$@"
+fi
+exit 0
+`)
 	cfg := config.Default("o/r")
 	cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
 	cfg.ReconciliationIntervalSeconds = 1

@@ -519,14 +519,14 @@ func applyMarkPlanReviewRunning(stateRoot string, state *runtimeOwnerState, comm
 	if request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe" || request.Manifest == nil || command.GroupPID < 2 || effect.ReviewerGateProtocol && !effect.ReviewerSessionRequested {
 		return errStateConflict
 	}
-	if err := reconciliationEffectFinishCurrent(stateRoot, *state, effect); err != nil {
-		return err
-	}
 	if effect.ReviewerLaunched {
 		if effect.ReviewerGroupPID != command.GroupPID {
 			return errStateConflict
 		}
 		return nil
+	}
+	if err := reconciliationEffectFinishCurrent(stateRoot, *state, effect); err != nil {
+		return err
 	}
 	if state.ReviewerProofs == nil {
 		state.ReviewerProofs = map[string]reviewerProcessProof{}

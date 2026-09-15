@@ -199,10 +199,14 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				t.Skipf("cannot create fake boundary root: %v", err)
 			}
+			environment := []string{"MODEL_API_KEY=model-canary", "PATH=/bin", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="}
+			if mode == "implementation" {
+				environment = append(environment, agentruntime.WorkerStatusEnvironment+"="+agentruntime.StatusPath(dir), agentruntime.WorkerGenerationEnv+"=7", agentruntime.WorkerLaunchIDEnv+"="+strings.Repeat("a", 32))
+			}
 			payload, _ := json.Marshal(struct {
 				Operation string          `json:"operation"`
 				Command   boundaryCommand `json:"command"`
-			}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=model-canary", "PATH=/bin", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="}}})
+			}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: environment}})
 			var out bytes.Buffer
 			if err := agentHost(t.Context(), mode, bytes.NewReader(payload), &out); err != nil {
 				t.Fatal(err)
@@ -215,6 +219,9 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 				if count := slices.Index(launched.Env, entry); count < 0 {
 					t.Fatalf("host boundary omitted managed Git environment %q", entry)
 				}
+			}
+			if mode == "implementation" && !slices.Contains(launched.Env, agentruntime.WorkerLaunchIDEnv+"="+strings.Repeat("a", 32)) {
+				t.Fatal("host boundary omitted the owner-bound worker control environment")
 			}
 		})
 	}
@@ -463,6 +470,33 @@ func TestImplementationBoundaryAcceptsOnlyBoundTmuxLaunchAndMutation(t *testing.
 				t.Fatal("invalid guarded mutation crossed worker boundary")
 			}
 		})
+	}
+}
+
+func TestReviewBoundaryAcceptsOnlySnapshotLocalLifecyclePaths(t *testing.T) {
+	root := t.TempDir()
+	snapshot := filepath.Join(root, "o-r-0123456789ab-73-2")
+	if err := os.Mkdir(snapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	helper, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), IssueGeneration: 3, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64), GateProtocol: true, SessionRequested: true}
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultRoot := filepath.Join(snapshot, ".agent-symphony-review-0123456789abcdef")
+	args := append(agentruntime.TmuxNewSessionArgs("as-r-0123456789abcdef-73-2", snapshot, nil), "--", helper, "review-pane", "tmux", filepath.Join(resultRoot, "launch.json"), filepath.Join(resultRoot, "terminal.json"), reviewerSignal(identity), reviewerStartSignal(identity), string(encoded), "--", "/bin/sh")
+	if !validTmuxBoundaryArgs(args, nil, snapshot, root) {
+		t.Fatal("snapshot-local reviewer lifecycle paths were rejected")
+	}
+	foreign := slices.Clone(args)
+	foreign[15] = filepath.Join(root, ".agent-symphony-review-0123456789abcdef", "launch.json")
+	if validTmuxBoundaryArgs(foreign, nil, snapshot, root) {
+		t.Fatal("reviewer lifecycle path outside the exact snapshot crossed the boundary")
 	}
 }
 

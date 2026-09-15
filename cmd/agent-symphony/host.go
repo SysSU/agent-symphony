@@ -1473,7 +1473,32 @@ func validateBoundaryCommand(c boundaryCommand, root string) error {
 	if _, err := boundaryEnvironment(c.Env); err != nil {
 		return err
 	}
+	if !validWorkerControlEnvironment(c.Env, root) {
+		return errors.New("invalid worker control environment")
+	}
 	return nil
+}
+
+func validWorkerControlEnvironment(environment []string, root string) bool {
+	values := map[string]string{}
+	for _, entry := range environment {
+		name, value, _ := strings.Cut(entry, "=")
+		if !slices.Contains([]string{agentruntime.WorkerStatusEnvironment, agentruntime.WorkerGenerationEnv, agentruntime.WorkerLaunchIDEnv}, name) {
+			continue
+		}
+		if _, duplicate := values[name]; duplicate {
+			return false
+		}
+		values[name] = value
+	}
+	if len(values) == 0 {
+		return true
+	}
+	generation, err := strconv.ParseUint(values[agentruntime.WorkerGenerationEnv], 10, 64)
+	status := values[agentruntime.WorkerStatusEnvironment]
+	workspace := filepath.Dir(filepath.Dir(status))
+	return len(values) == 3 && generation > 0 && err == nil && agentruntime.ValidLaunchToken(values[agentruntime.WorkerLaunchIDEnv]) &&
+		filepath.Dir(workspace) == root && status == agentruntime.StatusPath(workspace)
 }
 
 func boundaryEnvironment(environment []string) ([]string, error) {
@@ -1589,7 +1614,10 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 				return false
 			}
 			helper, err := os.Executable()
-			if err != nil || args[7] != helper || filepath.Base(args[10]) != "launch.json" || filepath.Base(args[11]) != "terminal.json" || filepath.Dir(args[10]) != filepath.Dir(args[11]) || !strings.HasPrefix(filepath.Dir(args[10]), args[5]+".result-") {
+			resultRoot := filepath.Dir(args[10])
+			resultName := strings.TrimPrefix(filepath.Base(resultRoot), ".agent-symphony-review-")
+			resultDigest, digestErr := hex.DecodeString(resultName)
+			if err != nil || args[7] != helper || filepath.Base(args[10]) != "launch.json" || filepath.Base(args[11]) != "terminal.json" || resultRoot != filepath.Dir(args[11]) || filepath.Dir(resultRoot) != args[5] || digestErr != nil || len(resultDigest) != 8 || strings.ToLower(resultName) != resultName {
 				return false
 			}
 			var identity reviewerLaunchIdentity
@@ -1862,7 +1890,7 @@ func reservedHostEnvironment(name string) bool {
 	}
 	upper := strings.ToUpper(name)
 	if strings.HasPrefix(upper, "AGENT_SYMPHONY_") {
-		return upper != "AGENT_SYMPHONY_IMPLEMENTATION_RESULT" && upper != "AGENT_SYMPHONY_REVIEW_RESULT"
+		return !slices.Contains([]string{"AGENT_SYMPHONY_IMPLEMENTATION_RESULT", "AGENT_SYMPHONY_REVIEW_RESULT", agentruntime.WorkerStatusEnvironment, agentruntime.WorkerGenerationEnv, agentruntime.WorkerLaunchIDEnv}, upper)
 	}
 	if upper == "HOME" || upper == "TMUX_TMPDIR" {
 		return true

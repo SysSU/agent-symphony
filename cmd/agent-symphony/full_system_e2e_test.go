@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,6 +45,9 @@ type fullSystemGitHub struct {
 	listedIssues       []map[string]any
 	historicalComments map[int][]map[string]any
 	historicalPulls    []map[string]any
+	holdIssueList      atomic.Bool
+	issueListEntered   chan struct{}
+	issueListRelease   <-chan struct{}
 }
 
 type synchronizedBuffer struct {
@@ -66,6 +70,16 @@ func (b *synchronizedBuffer) String() string {
 }
 
 func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues" && f.holdIssueList.CompareAndSwap(true, false) {
+		if f.issueListEntered != nil {
+			close(f.issueListEntered)
+		}
+		select {
+		case <-f.issueListRelease:
+		case <-r.Context().Done():
+			return
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests = append(f.requests, r.Method+" "+r.URL.RequestURI())
@@ -286,11 +300,17 @@ func TestFullSystemE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := os.MkdirTemp("/tmp", "agent-symphony-full-system-")
+	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root, err := os.MkdirTemp(home, ".agent-symphony-full-system-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(root)
+	})
 	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
 		t.Fatal(err)
@@ -309,6 +329,10 @@ func TestFullSystemE2E(t *testing.T) {
 	runExternal(t, repository, "git", "remote", "add", "origin", origin)
 	runExternal(t, repository, "git", "push", "-q", "-u", "origin", "main")
 	base := strings.TrimSpace(runExternal(t, repository, "git", "rev-parse", "HEAD"))
+	firstLaunchRelease := filepath.Join(root, "first-launch-release")
+	runExternal(t, "", "mkfifo", firstLaunchRelease)
+	reviewRelease := filepath.Join(root, "review-release")
+	runExternal(t, "", "mkfifo", reviewRelease)
 
 	fixture := &fullSystemGitHub{base: base, origin: origin, labels: map[string]bool{"agent-ready": true, "priority:P1": true, "autonomous-merge": true}}
 	github := httptest.NewServer(fixture)
@@ -340,24 +364,22 @@ if [ "$input" -eq 1 ]; then exec curl -sS -i -X "$method" --data-binary @- "$FAK
 exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 `)
 	writeExecutable(t, filepath.Join(binDir, "codex"), `#!/bin/sh
+umask 077
+if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
+if [ "$1" = sandbox ]; then
+  while [ "$1" != -- ]; do shift; done
+  shift
+  if [ "$2" = sandbox-probe ]; then printf '%s\n' '{"confined":true,"shared_temp_read":true,"shared_temp_write":true}' > "$3"; exit 0; fi
+  exec "$@"
+fi
 HOME=$FULL_SYSTEM_FIXTURE/empty-git-home
 export HOME
 mkdir -p "$HOME"
-trusted=0
-bypass=0
-want_trust=$(printf 'projects={"%s"={trust_level="trusted"}}' "$PWD")
-for argument do
-  test "$argument" != "$want_trust" || trusted=1
-  test "$argument" != --dangerously-bypass-approvals-and-sandbox || bypass=1
-done
-test "$trusted" -eq 1 || { printf 'Do you trust the contents of this directory?\n' >&2; exit 18; }
-test "$bypass" -eq 1 || { printf 'Approval required\n' >&2; exit 19; }
 if [ -n "${AGENT_SYMPHONY_REVIEW_RESULT:-}" ]; then
-	  sleep 1
 	  if ! grep -qx reworked change.txt; then
 	    if [ ! -e "$FULL_SYSTEM_FIXTURE/reviewed-once" ]; then
 	    : >"$FULL_SYSTEM_FIXTURE/review-started"
-	    while [ ! -e "$FULL_SYSTEM_FIXTURE/allow-review" ]; do sleep 0.05; done
+	    IFS= read -r _ <"$FULL_SYSTEM_FIXTURE/review-release"
 	    fi
 	    : >"$FULL_SYSTEM_FIXTURE/reviewed-once"
 	    result='{"type":"agent-symphony-review-v1","status":"findings","findings":["append the reviewed marker"]}'
@@ -369,7 +391,9 @@ if [ -n "${AGENT_SYMPHONY_REVIEW_RESULT:-}" ]; then
 	  mv "$AGENT_SYMPHONY_REVIEW_RESULT.tmp" "$AGENT_SYMPHONY_REVIEW_RESULT"
 	  exit 0
 fi
-	if [ "$1" = exec ]; then
+	last=
+	for arg in "$@"; do last=$arg; done
+	if [ "$last" = - ]; then
 	  IFS= read -r prompt || exit 19
 	  case "$prompt" in
 	    *"Apply this authorized Agent Symphony handoff"*)
@@ -382,17 +406,20 @@ fi
 	fi
 if [ ! -e "$FULL_SYSTEM_FIXTURE/launched-once" ]; then
   : >"$FULL_SYSTEM_FIXTURE/launched-once"
+	IFS= read -r _ <"$FULL_SYSTEM_FIXTURE/first-launch-release"
   printf 'scripted launch failure\n' >&2
   exit 42
 fi
 printf 'implementation-ready\n'
 IFS= read -r message || exit 20
-printf '%s' '{"body":"/agent-symphony status needs-attention: waiting for operator decision"}' | gh api --method POST /repos/o/r/issues/73/comments --input - >/dev/null || exit 21
-printf '%s' '{"labels":["needs-attention"]}' | gh api --method POST /repos/o/r/issues/73/labels --input - >/dev/null || exit 22
+printf '{"type":"agent-symphony-status-v1","generation":%s,"launch_id":"%s","sequence":1,"status":"needs-attention","reason":"waiting for operator decision"}' "$AGENT_SYMPHONY_WORKER_GENERATION" "$AGENT_SYMPHONY_WORKER_LAUNCH_ID" >"$AGENT_SYMPHONY_STATUS_REQUEST.tmp" || exit 21
+chmod 0600 "$AGENT_SYMPHONY_STATUS_REQUEST.tmp" || exit 21
+mv "$AGENT_SYMPHONY_STATUS_REQUEST.tmp" "$AGENT_SYMPHONY_STATUS_REQUEST" || exit 22
 printf 'attention-status-set\n'
 IFS= read -r message || exit 23
-printf '%s' '{"body":"/agent-symphony status clear: operator supplied the decision"}' | gh api --method POST /repos/o/r/issues/73/comments --input - >/dev/null || exit 24
-gh api --method DELETE /repos/o/r/issues/73/labels/needs-attention >/dev/null || exit 25
+printf '{"type":"agent-symphony-status-v1","generation":%s,"launch_id":"%s","sequence":2,"status":"clear","reason":"operator supplied the decision"}' "$AGENT_SYMPHONY_WORKER_GENERATION" "$AGENT_SYMPHONY_WORKER_LAUNCH_ID" >"$AGENT_SYMPHONY_STATUS_REQUEST.tmp" || exit 24
+chmod 0600 "$AGENT_SYMPHONY_STATUS_REQUEST.tmp" || exit 24
+mv "$AGENT_SYMPHONY_STATUS_REQUEST.tmp" "$AGENT_SYMPHONY_STATUS_REQUEST" || exit 25
 printf 'operator-message-received:%s\n' "$message"
 printf 'reviewed\n' >>change.txt
 git add change.txt && git -c user.name='Full system fixture' -c user.email=fixture@example.invalid commit -qm 'implement fixture journey' || exit 26
@@ -440,6 +467,20 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		}
 	})
 	waitHTTP(t, "http://"+address+"/status.json", deadline(15*time.Second), output)
+	initialReconcile, err := http.NewRequest(http.MethodPost, "http://"+address+"/actions/reconcile", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialReconcile.Header.Set("Origin", "http://"+address)
+	initialResponse, err := http.DefaultClient.Do(initialReconcile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialBody, _ := io.ReadAll(initialResponse.Body)
+	_ = initialResponse.Body.Close()
+	if initialResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("initial reconciliation HTTP %d: %s\n%s", initialResponse.StatusCode, initialBody, output.String())
+	}
 	response, err := http.Get("http://" + address + "/status.json")
 	if err != nil {
 		t.Fatal(err)
@@ -449,6 +490,27 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	fixture.mu.Lock()
 	t.Logf("initial status=%s requests=%q", statusBody, fixture.requests)
 	fixture.mu.Unlock()
+	if !waitFor(deadline(15*time.Second), func() bool {
+		response, err := http.Get("http://" + address + "/status.json")
+		if err != nil {
+			return false
+		}
+		defer response.Body.Close()
+		var snapshot dashboardStatusSnapshot
+		return json.NewDecoder(response.Body).Decode(&snapshot) == nil && slices.ContainsFunc(snapshot.Statuses, func(status orchestrator.RecoveryStatus) bool {
+			return status.Attempt == 1 && status.State == "active" && status.CurrentPhase == "implementation"
+		})
+	}) {
+		t.Fatalf("first launch was not owner-committed before the failure barrier: %s\nserve=%s", fullSystemAttemptDiagnostics(address, stateRoot, currentSession, server.Env), output.String())
+	}
+	release, err := os.OpenFile(firstLaunchRelease, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := release.WriteString("release\n")
+	if closeErr := release.Close(); writeErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(writeErr, closeErr))
+	}
 	failureStarted := time.Now()
 	if !waitFor(deadline(15*time.Second), func() bool {
 		response, err := http.Get("http://" + address + "/status.json")
@@ -459,7 +521,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		var snapshot dashboardStatusSnapshot
 		return json.NewDecoder(response.Body).Decode(&snapshot) == nil && len(snapshot.Statuses) == 1 && snapshot.Statuses[0].State == "failed" && snapshot.Statuses[0].Retryable && snapshot.Statuses[0].Attempt == 1
 	}) {
-		t.Fatalf("scripted launch failure did not become recoverable: %s", output.String())
+		t.Fatalf("scripted launch failure did not become recoverable: %s\nserve=%s", fullSystemAttemptDiagnostics(address, stateRoot, currentSession, server.Env), output.String())
 	}
 	if elapsed := time.Since(failureStarted); elapsed >= latencyBudget {
 		t.Fatalf("launch failure projection latency=%s", elapsed)
@@ -573,7 +635,15 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	}
 	stopped = false
 	waitHTTP(t, "http://"+address+"/status.json", deadline(15*time.Second), output)
-	if err := os.WriteFile(filepath.Join(root, "allow-review"), nil, 0o600); err != nil {
+	reviewGate, err := os.OpenFile(reviewRelease, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(reviewGate, "continue\n"); err != nil {
+		_ = reviewGate.Close()
+		t.Fatal(err)
+	}
+	if err := reviewGate.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if !waitFor(deadline(30*time.Second), func() bool {
@@ -732,12 +802,58 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	fixture.mu.Lock()
 	fixture.denyMutations = true
 	fixture.mu.Unlock()
+	removeReconcileEntered, removeReconcileRelease := make(chan struct{}), make(chan struct{})
+	fixture.issueListEntered, fixture.issueListRelease = removeReconcileEntered, removeReconcileRelease
+	fixture.holdIssueList.Store(true)
+	removeReconcileDone := make(chan error, 1)
+	go func() {
+		request, requestErr := http.NewRequest(http.MethodPost, "http://"+restartAddress+"/actions/reconcile", nil)
+		if requestErr != nil {
+			removeReconcileDone <- requestErr
+			return
+		}
+		request.Header.Set("Origin", "http://"+restartAddress)
+		response, requestErr := http.DefaultClient.Do(request)
+		if requestErr != nil {
+			removeReconcileDone <- requestErr
+			return
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusNoContent {
+			body, _ := io.ReadAll(response.Body)
+			removeReconcileDone <- fmt.Errorf("reconciliation returned HTTP %d: %s", response.StatusCode, body)
+			return
+		}
+		removeReconcileDone <- nil
+	}()
+	select {
+	case <-removeReconcileEntered:
+	case err := <-removeReconcileDone:
+		t.Fatalf("reconciliation finished before the GitHub barrier: %v", err)
+	case <-time.After(deadline(15 * time.Second)):
+		t.Fatal("reconciliation did not reach the GitHub issue-list barrier")
+	}
 	removalPlaywright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "removal-playwright"))
 	removalPlaywright.Dir = source
 	removalPlaywright.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+restartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL)
 	if removalOutput, removalErr := removalPlaywright.CombinedOutput(); removalErr != nil {
+		close(removeReconcileRelease)
 		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 		t.Fatalf("real permanent-removal Playwright: %v\n%s\nledger=%s\nserve:\n%s", removalErr, removalOutput, ledger, restartOutput.String())
+	}
+	select {
+	case err := <-removeReconcileDone:
+		t.Fatalf("permanent removal waited for blocked reconciliation: %v", err)
+	default:
+	}
+	close(removeReconcileRelease)
+	select {
+	case err := <-removeReconcileDone:
+		if err != nil {
+			t.Fatalf("release blocked reconciliation after permanent removal: %v", err)
+		}
+	case <-time.After(deadline(15 * time.Second)):
+		t.Fatal("blocked reconciliation did not finish after release")
 	}
 	var removedState runtimeOwnerState
 	var tombstone runtimeTombstone

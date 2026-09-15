@@ -1062,8 +1062,16 @@ func (p *productionReconciliation) runReviewerPhase(ctx context.Context, candida
 			return err
 		}
 		key := ownerAttemptKey(plan.Request.Repository, plan.Request.Issue, plan.Request.Attempt)
-		if _, pending, err := p.effects.executeReviewer(ctx, p.reviewer, plan, material[key]); err != nil {
-			return err
+		if _, pending, runErr := p.effects.executeReviewer(ctx, p.reviewer, plan, material[key]); runErr != nil {
+			diagnostic := "reviewer effect failed: " + internalgithub.Redact(runErr.Error())
+			if len(diagnostic) > maxReconciliationStringBytes {
+				diagnostic = diagnostic[:maxReconciliationStringBytes]
+			}
+			_, diagnoseErr := p.owner.diagnoseReconciliationEffect(ctx, diagnoseReconciliationEffectCommand{Identity: plan.Identity, Action: reconciliationReviewer, Diagnostic: diagnostic})
+			if errors.Is(diagnoseErr, errStaleStateResult) {
+				diagnoseErr = nil
+			}
+			return errors.Join(runErr, diagnoseErr)
 		} else if pending {
 			return nil
 		}

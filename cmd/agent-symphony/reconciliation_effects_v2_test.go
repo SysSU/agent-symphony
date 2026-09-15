@@ -233,7 +233,7 @@ func TestWorkerStatusOutcomeCannotApplyOutOfOrderOrAfterInvalidation(t *testing.
 	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 2, Source: "worker", SourceID: "worker-7", SourceSequence: 7, Status: "needs-attention", Reason: "operator decision required"}
 	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 329, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueMachineStatus, AttributionAttempt: 1, Status: "needs-attention", StatusReason: "operator decision required", StatusSequence: 2, StatusSource: "worker", StatusSourceSequence: 7}}
 	result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueMachineStatus, Observed: true}}
-	if err := applyReconciliationEffectOutcome(&state, request, result); err != nil || state.MachineStatuses[issueKey].AppliedSequence != 2 || state.Attempts[key].Manifest.WorkerStatusApplied != 2 {
+	if err := applyReconciliationEffectOutcome(&state, request, result); err != nil || state.MachineStatuses[issueKey].AppliedSequence != 2 || state.Attempts[key].Manifest.WorkerStatusApplied != 7 {
 		t.Fatalf("current status outcome failed: status=%#v err=%v", state.MachineStatuses[issueKey], err)
 	}
 	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 3, AppliedSequence: 2, Source: "orchestrator", SourceID: "proposal-9", SourceSequence: 3, Status: "clear", Reason: "monitoring: recovered"}
@@ -471,6 +471,15 @@ func TestPlanReviewRunningTransitionRequiresExactPendingEffect(t *testing.T) {
 	again, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999})
 	if err != nil || again.State.Revision != running.State.Revision {
 		t.Fatalf("idempotent running transition revision=%d want=%d err=%v", again.State.Revision, running.State.Revision, err)
+	}
+	advanced := cloneRuntimeOwnerState(running.State)
+	advanced.Revision++
+	observation := advanced.Observations[ownerIssueKey(request.Repository, request.Issue)]
+	observation.Generation++
+	advanced.Observations[ownerIssueKey(request.Repository, request.Issue)] = observation
+	beforeReplay := cloneRuntimeOwnerState(advanced)
+	if err := applyMarkPlanReviewRunning(owner.stateRoot, &advanced, markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil || !reflect.DeepEqual(advanced, beforeReplay) {
+		t.Fatalf("exact launch replay after observation advance changed state or failed: changed=%v err=%v", !reflect.DeepEqual(advanced, beforeReplay), err)
 	}
 	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999998}); !errors.Is(err, errStateConflict) {
 		t.Fatalf("different process group replaced committed reviewer binding: %v", err)

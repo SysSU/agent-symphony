@@ -386,7 +386,7 @@ if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
 if [ "$1" = sandbox ]; then
   while [ "$1" != -- ]; do shift; done
   shift
-  if [ "$2" = sandbox-probe ]; then printf '%s\n' confined > "$3"; exit 0; fi
+  if [ "$2" = sandbox-probe ]; then printf '%s\n' '{"confined":true,"shared_temp_read":true,"shared_temp_write":true}' > "$3"; exit 0; fi
   exec "$@"
 fi
 ` + strings.TrimPrefix(codex, "#!/bin/sh\n")

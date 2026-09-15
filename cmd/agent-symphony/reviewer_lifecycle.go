@@ -348,9 +348,8 @@ func runReviewerPane(args []string, stdout, stderr io.Writer) (int, syscall.Sign
 	gateCtx, cancelGate := context.WithCancel(context.Background())
 	defer cancelGate()
 	code, childSignal, err := agentruntime.RunPaneCommandAfterStart(context.Background(), args[0], args[7:], os.Stdin, stdout, stderr, func(pid int) error {
-		launch := identity
-		launch.ChildPID = pid
-		if err := writeReviewerRecord(launchPath, launch); err != nil {
+		identity.ChildPID = pid
+		if err := writeReviewerRecord(launchPath, identity); err != nil {
 			return err
 		}
 		_ = reader.Close()

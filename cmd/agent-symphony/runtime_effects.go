@@ -141,11 +141,19 @@ func (c *runtimeEffectCoordinator) execute(_ context.Context, request agentrunti
 	if err != nil {
 		return agentruntime.EffectResult{}, err
 	}
-	return c.executeWithRun(request, run)
+	defer c.release(request, run)
+	result, executeErr := c.executeWithRun(request, run)
+	if executeErr != nil && !errors.Is(executeErr, errStaleStateResult) && !errors.Is(executeErr, context.Canceled) {
+		_, _ = c.owner.diagnoseRuntimeEffect(c.lifecycle, diagnoseRuntimeEffectCommand{
+			Identity:   ownerEffectIdentity(request.Identity),
+			Action:     request.Action,
+			Diagnostic: "runtime effect failed: " + internalgithub.Redact(executeErr.Error()),
+		})
+	}
+	return result, executeErr
 }
 
 func (c *runtimeEffectCoordinator) executeWithRun(request agentruntime.EffectRequest, run *activeRuntimeEffect) (agentruntime.EffectResult, error) {
-	defer c.release(request, run)
 	snapshot, err := c.owner.snapshot(c.lifecycle)
 	if err != nil {
 		return agentruntime.EffectResult{}, err
@@ -189,6 +197,7 @@ func (c *runtimeEffectCoordinator) dispatch(request agentruntime.EffectRequest, 
 		return err
 	}
 	go func() {
+		defer c.release(request, run)
 		_, executeErr := c.executeWithRun(request, run)
 		if executeErr != nil && !errors.Is(executeErr, errStaleStateResult) && !errors.Is(executeErr, context.Canceled) {
 			_, _ = c.owner.diagnoseRuntimeEffect(c.lifecycle, diagnoseRuntimeEffectCommand{

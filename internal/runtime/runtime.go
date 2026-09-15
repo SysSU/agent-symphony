@@ -224,7 +224,13 @@ func observeWorkerStatus(manifest Manifest, generation uint64) (Manifest, error)
 	var request workerStatusRequest
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&request) != nil || decoder.Decode(&struct{}{}) != io.EOF || request.Type != "agent-symphony-status-v1" || request.Generation != generation || request.LaunchID != manifest.LaunchID || request.Sequence == 0 || request.Sequence > 1<<53 || !slices.Contains([]string{"needs-attention", "clear"}, request.Status) || strings.TrimSpace(request.Reason) == "" || len(request.Reason) > 1024 || strings.ContainsRune(request.Reason, 0) {
+	if decoder.Decode(&request) != nil || decoder.Decode(&struct{}{}) != io.EOF || request.Type != "agent-symphony-status-v1" {
+		return manifest, errors.New("worker status request is invalid or stale")
+	}
+	if request.Generation != generation || request.LaunchID != manifest.LaunchID {
+		return manifest, nil
+	}
+	if request.Sequence == 0 || request.Sequence > 1<<53 || !slices.Contains([]string{"needs-attention", "clear"}, request.Status) || strings.TrimSpace(request.Reason) == "" || len(request.Reason) > 1024 || strings.ContainsRune(request.Reason, 0) {
 		return manifest, errors.New("worker status request is invalid or stale")
 	}
 	if request.Sequence <= manifest.WorkerStatusSeq {

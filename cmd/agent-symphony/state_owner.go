@@ -1349,7 +1349,7 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 	if record := state.Attempts[attemptKey]; record.StopEffectID != "" && command.Action != agentruntime.EffectStop {
 		return nil, errStateConflict
 	}
-	if command.Action != agentruntime.EffectStop && issueHasUnprovedReviewer(*state, manifest.Repository, manifest.Issue) {
+	if command.Action != agentruntime.EffectStop && command.Action != agentruntime.EffectMonitor && issueHasUnprovedReviewer(*state, manifest.Repository, manifest.Issue) {
 		return nil, errStateConflict
 	}
 	if command.Action == agentruntime.EffectStop {

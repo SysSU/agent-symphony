@@ -37,7 +37,11 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := os.MkdirTemp("/tmp", "agent-symphony-orchestrator-e2e-")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(home, ".agent-symphony-orchestrator-e2e-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,6 +265,13 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 		_ = os.Remove(failAudit)
 	})
 	writeExecutable(t, filepath.Join(binDir, "codex"), strings.NewReplacer("@EVENTS@", fixtureEvents, "@HOLD@", holdAudit, "@RELEASE@", releaseAudit, "@FAIL@", failAudit).Replace(`#!/bin/sh
+if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
+if [ "$1" = sandbox ]; then
+  while [ "$1" != -- ]; do shift; done
+  shift
+  if [ "$2" = sandbox-probe ]; then printf '%s\n' '{"confined":true,"shared_temp_read":true,"shared_temp_write":true}' > "$3"; exit 0; fi
+  exec "$@"
+fi
 if [ "$1" = audit ]; then
   audit_context=$(cat)
   case "$audit_context" in

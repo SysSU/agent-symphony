@@ -18,6 +18,11 @@ import (
 // the live process PID. The launch token is a pane option, not a session name.
 const ImplementationPaneFormat = "#{session_name}|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{start_time}|#{pane_start_path}|#{@agent-symphony-launch-token}|#{pane_start_command}"
 
+// Launch commands include the bounded issue context. Keep every durable
+// identity record bounded while allowing the full worker contract to be
+// re-read after authorization and restart.
+const implementationIdentityMaxBytes = 128 << 10
+
 // Inventory exposes only the server generation and stable pane ID. A missing
 // pane target can silently fall back to a different tmux pane; list-panes -a
 // is the read-only exact-absence check while the original server is live.
@@ -142,6 +147,9 @@ func WriteImplementationGateEntered(manifest Manifest, binding ImplementationLau
 	if err != nil {
 		return err
 	}
+	if len(body)+1 > implementationIdentityMaxBytes {
+		return errors.New("implementation launch binding exceeds limit")
+	}
 	return writeImmutableImplementationGroup(implementationGateEnteredPath(manifest), body)
 }
 
@@ -264,9 +272,9 @@ func readImmutableIdentity(path string) ([]byte, error) {
 	}
 	listed, listErr := os.Lstat(path)
 	opened, statErr := file.Stat()
-	body, readErr := io.ReadAll(io.LimitReader(file, 4096))
+	body, readErr := io.ReadAll(io.LimitReader(file, implementationIdentityMaxBytes+1))
 	closeErr := file.Close()
-	if listErr != nil || statErr != nil || readErr != nil || closeErr != nil || !os.SameFile(listed, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 || len(body) >= 4096 {
+	if listErr != nil || statErr != nil || readErr != nil || closeErr != nil || !os.SameFile(listed, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 || len(body) > implementationIdentityMaxBytes {
 		return nil, errors.New("implementation identity proof is unsafe")
 	}
 	return body, nil
@@ -352,9 +360,9 @@ func readImplementationBinding(manifest Manifest, launchID string) (Implementati
 	}
 	listed, listErr := os.Lstat(path)
 	opened, statErr := file.Stat()
-	body, readErr := io.ReadAll(io.LimitReader(file, 4096))
+	body, readErr := io.ReadAll(io.LimitReader(file, implementationIdentityMaxBytes+1))
 	closeErr := file.Close()
-	if listErr != nil || statErr != nil || readErr != nil || closeErr != nil || !os.SameFile(listed, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 || len(body) >= 4096 {
+	if listErr != nil || statErr != nil || readErr != nil || closeErr != nil || !os.SameFile(listed, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 || len(body) > implementationIdentityMaxBytes {
 		return ImplementationLaunchBinding{}, errors.New("implementation launch binding is unsafe")
 	}
 	var binding ImplementationLaunchBinding

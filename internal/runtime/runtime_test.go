@@ -56,11 +56,12 @@ func TestWorkerStatusRequestIsGenerationAndLaunchBound(t *testing.T) {
 		t.Fatalf("observed=%#v err=%v", observed, err)
 	}
 	write(6, 2, "clear", "stale worker")
-	if _, err := observeWorkerStatus(observed, 7); err == nil {
-		t.Fatal("stale generation status was accepted")
+	unchanged, err := observeWorkerStatus(observed, 7)
+	if err != nil || unchanged.WorkerStatus != observed.WorkerStatus || unchanged.WorkerStatusReason != observed.WorkerStatusReason || unchanged.WorkerStatusSeq != observed.WorkerStatusSeq {
+		t.Fatalf("stale generation status blocked lifecycle or changed status: %#v err=%v", unchanged, err)
 	}
 	write(7, 1, "clear", "out of order")
-	unchanged, err := observeWorkerStatus(observed, 7)
+	unchanged, err = observeWorkerStatus(observed, 7)
 	if err != nil || unchanged.WorkerStatus != observed.WorkerStatus || unchanged.WorkerStatusSeq != observed.WorkerStatusSeq {
 		t.Fatalf("out-of-order request changed status: %#v err=%v", unchanged, err)
 	}
@@ -2074,6 +2075,38 @@ func TestNewImplementationSessionBindsBeforeAgentLaunch(t *testing.T) {
 	}
 	if err := r.stop(t.Context(), manifest); err == nil {
 		t.Fatal("raw test worker without a bound group was falsely certified stopped")
+	}
+}
+
+func TestImplementationIdentityRetainsBoundedWorkerContext(t *testing.T) {
+	dir := t.TempDir()
+	manifest := Manifest{
+		Version:     boundManifestVersion,
+		LaunchToken: strings.Repeat("a", 32),
+		LaunchID:    strings.Repeat("b", 32),
+		Session:     "bounded-worker-context",
+		Worktree:    dir,
+		LogPath:     filepath.Join(dir, "attempt", "agent.log"),
+	}
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binding := ImplementationLaunchBinding{
+		Version: 1, Role: "interactive", Token: manifest.LaunchToken, EffectID: manifest.LaunchID,
+		ServerPID: 10, ServerStart: 11, SessionName: manifest.Session, SessionID: "$1",
+		PaneID: "%1", PanePID: 12, StartPath: manifest.Worktree, Command: strings.Repeat("worker-context-", 512),
+	}
+	if err := WriteImplementationBinding(manifest, binding); err != nil {
+		t.Fatalf("write bounded launch identity: %v", err)
+	}
+	if got, err := ReadImplementationBinding(manifest); err != nil || got != binding {
+		t.Fatalf("read bounded launch identity = %#v, %v", got, err)
+	}
+	if err := WriteImplementationPermit(manifest, binding); err != nil {
+		t.Fatalf("write bounded launch permit: %v", err)
+	}
+	if err := WriteImplementationRelease(manifest, binding); err != nil {
+		t.Fatalf("write bounded launch release: %v", err)
 	}
 }
 

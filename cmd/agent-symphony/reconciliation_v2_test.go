@@ -374,6 +374,33 @@ func TestReconciliationGenerationAdvanceMasksNestedAttemptFacts(t *testing.T) {
 	}
 }
 
+func TestReconciliationCollectionIncludesIssueAttemptMarkers(t *testing.T) {
+	owner := newReconciliationTestOwner(t)
+	snapshot, err := owner.reconciliationSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 78, Attempt: 2, BaseSHA: strings.Repeat("a", 40), State: "active"}
+	failed := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 78, Attempt: 1, BaseSHA: strings.Repeat("b", 40), State: "failed", Diagnostic: "worker exited"}
+	issue := issueFact(78, "bound attempts")
+	issue.ActiveAttempt = &active
+	issue.TerminalAttempts = []internalgithub.RecoveryAttemptFact{failed}
+
+	collection, err := collectionFromSnapshot(snapshot, repositoryInput(true, issue))
+	if err != nil || len(collection.Issues) != 1 || len(collection.Issues[0].Attempts) != 2 {
+		t.Fatalf("issue markers were not promoted to attempt observations: collection=%#v err=%v", collection, err)
+	}
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{active, failed}
+	if duplicate, err := collectionFromSnapshot(snapshot, input); err != nil || len(duplicate.Issues[0].Attempts) != 2 {
+		t.Fatalf("matching top-level attempt facts were not deduplicated: collection=%#v err=%v", duplicate, err)
+	}
+	input.Attempts[0].BaseSHA = strings.Repeat("c", 40)
+	if _, err := collectionFromSnapshot(snapshot, input); !errors.Is(err, errStateConflict) {
+		t.Fatalf("conflicting attempt facts err=%v", err)
+	}
+}
+
 func TestReconciliationFactsAreBoundedValidatedAndDeepCloned(t *testing.T) {
 	owner := newReconciliationTestOwner(t)
 	snapshot, _ := owner.reconciliationSnapshot(t.Context())

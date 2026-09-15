@@ -374,7 +374,16 @@ func collectionFromSnapshot(snapshot stateOwnerSnapshot, input reconciliationInp
 		if _, exists := groups[key]; exists {
 			return reconciliationCollection{}, errStateConflict
 		}
-		groups[key] = &reconciliationIssueGroup{Fact: fact}
+		group := &reconciliationIssueGroup{Fact: fact}
+		if fact.ActiveAttempt != nil {
+			group.Attempts = append(group.Attempts, *fact.ActiveAttempt)
+		}
+		for _, attempt := range fact.TerminalAttempts {
+			if err := appendReconciliationAttempt(group, attempt); err != nil {
+				return reconciliationCollection{}, err
+			}
+		}
+		groups[key] = group
 	}
 	for _, raw := range input.Attempts {
 		fact, err := reduceAttemptFact(snapshot.State.Repository, raw)
@@ -385,7 +394,9 @@ func collectionFromSnapshot(snapshot stateOwnerSnapshot, input reconciliationInp
 		if group == nil {
 			continue
 		}
-		group.Attempts = append(group.Attempts, fact)
+		if err := appendReconciliationAttempt(group, fact); err != nil {
+			return reconciliationCollection{}, err
+		}
 	}
 	for _, proposal := range input.IssueUpdates {
 		group := groups[ownerIssueKey(proposal.Repository, proposal.Issue)]
@@ -403,6 +414,19 @@ func collectionFromSnapshot(snapshot stateOwnerSnapshot, input reconciliationInp
 		return reconciliationCollection{}, err
 	}
 	return cloneReconciliationCollection(collection), nil
+}
+
+func appendReconciliationAttempt(group *reconciliationIssueGroup, fact reconciliationAttemptFact) error {
+	if index := slices.IndexFunc(group.Attempts, func(current reconciliationAttemptFact) bool {
+		return current.Repository == fact.Repository && current.Issue == fact.Issue && current.Attempt == fact.Attempt
+	}); index >= 0 {
+		if !reflect.DeepEqual(group.Attempts[index], fact) {
+			return errStateConflict
+		}
+		return nil
+	}
+	group.Attempts = append(group.Attempts, fact)
+	return nil
 }
 
 func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCommand, appliedCycles map[string]appliedReconciliationCycle) error {
