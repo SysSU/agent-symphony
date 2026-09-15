@@ -710,7 +710,7 @@ func readReviewResult(input []byte, root string) (string, error) {
 	if !agentruntime.ValidReviewMetadata(request.Mode, request.Target) || !validReviewTarget(request.Mode, request.Target, request.Repository, request.Issue, request.Head) || request.LegacyHeadArtifact && request.Mode != agentruntime.ReviewModeImplementation {
 		return "", errors.New("invalid review result request")
 	}
-	snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+	snapshot, _ := reviewTargetIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root, request.Target)
 	path := reviewResultPath(snapshot, request.Target)
 	if !belowRoot(path, root) {
 		return "", errors.New("review result path escapes snapshot root")
@@ -1278,7 +1278,7 @@ func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.M
 			}
 		}
 		if publishedHead != "" {
-			status, statusErr := run("status", "--porcelain=v1", "--untracked-files=all")
+			status, statusErr := run("status", "--porcelain=v1", "--untracked-files=all", "--", ".", ":(exclude).agent-symphony")
 			if statusErr != nil || status != "" {
 				return errors.New("permanent removal refused because the worktree has uncommitted changes")
 			}

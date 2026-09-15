@@ -1235,7 +1235,9 @@ func validateManifestIdentity(want, manifest Manifest) error {
 	}
 	if manifest.ReviewSession != "" {
 		wantReview, err := AttemptSessionName(SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
-		if err != nil || manifest.ReviewSession != wantReview {
+		digest := sha256.Sum256([]byte(manifest.ReviewTarget))
+		targetReview := wantReview + "-" + hex.EncodeToString(digest[:8])
+		if err != nil || manifest.ReviewSession != wantReview && manifest.ReviewSession != targetReview {
 			return errors.New("review session does not match deterministic attempt resources")
 		}
 	}

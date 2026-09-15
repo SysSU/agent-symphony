@@ -27,27 +27,31 @@ import (
 )
 
 type fullSystemGitHub struct {
-	mu                 sync.Mutex
-	base               string
-	origin             string
-	comments           []map[string]any
-	labels             map[string]bool
-	requests           []string
-	failNext           bool
-	failedRequest      string
-	pr                 map[string]any
-	merged             bool
-	closed             bool
-	includeClosedIssue bool
-	denyMutations      bool
-	deniedMutations    []string
-	historicalIssues   map[int]map[string]any
-	listedIssues       []map[string]any
-	historicalComments map[int][]map[string]any
-	historicalPulls    []map[string]any
-	holdIssueList      atomic.Bool
-	issueListEntered   chan struct{}
-	issueListRelease   <-chan struct{}
+	mu                        sync.Mutex
+	base                      string
+	origin                    string
+	comments                  []map[string]any
+	labels                    map[string]bool
+	requests                  []string
+	failNext                  bool
+	failedRequest             string
+	pr                        map[string]any
+	merged                    bool
+	closed                    bool
+	includeClosedIssue        bool
+	denyMutations             bool
+	expectedStatusBody        string
+	expectedControlBody       string
+	expectedControlGeneration uint64
+	deniedMutations           []string
+	removalRepairs            []string
+	historicalIssues          map[int]map[string]any
+	listedIssues              []map[string]any
+	historicalComments        map[int][]map[string]any
+	historicalPulls           []map[string]any
+	holdIssueList             atomic.Bool
+	issueListEntered          chan struct{}
+	issueListRelease          <-chan struct{}
 }
 
 type synchronizedBuffer struct {
@@ -84,8 +88,23 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	f.requests = append(f.requests, r.Method+" "+r.URL.RequestURI())
 	w.Header().Set("Content-Type", "application/json")
-	if f.denyMutations && githubMutationRequest(r) {
-		f.deniedMutations = append(f.deniedMutations, r.Method+" "+r.URL.RequestURI())
+	allowedRepair, mutationBody := false, ""
+	if f.denyMutations && r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/73/comments" {
+		body, readErr := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var input map[string]string
+		jsonErr := json.Unmarshal(body, &input)
+		mutationBody = input["body"]
+		if readErr == nil && jsonErr == nil && f.expectedControlBody != "" && input["body"] == f.expectedControlBody {
+			allowedRepair = true
+			f.removalRepairs = append(f.removalRepairs, fmt.Sprintf("control:%d", f.expectedControlGeneration))
+		} else if readErr == nil && jsonErr == nil && f.expectedStatusBody != "" && input["body"] == f.expectedStatusBody {
+			allowedRepair = true
+			f.removalRepairs = append(f.removalRepairs, "status")
+		}
+	}
+	if f.denyMutations && githubMutationRequest(r) && !allowedRepair {
+		f.deniedMutations = append(f.deniedMutations, r.Method+" "+r.URL.RequestURI()+": "+mutationBody)
 		http.Error(w, `{"message":"GitHub mutation forbidden during removal"}`, http.StatusInternalServerError)
 		return
 	}
@@ -799,9 +818,6 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	for _, session := range []string{removedManifest.Session, unrelatedSession} {
 		ensureFullSystemTmuxSession(t, tmuxEnvironment, session, repository)
 	}
-	fixture.mu.Lock()
-	fixture.denyMutations = true
-	fixture.mu.Unlock()
 	removeReconcileEntered, removeReconcileRelease := make(chan struct{}), make(chan struct{})
 	fixture.issueListEntered, fixture.issueListRelease = removeReconcileEntered, removeReconcileRelease
 	fixture.holdIssueList.Store(true)
@@ -841,6 +857,23 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 		t.Fatalf("real permanent-removal Playwright: %v\n%s\nledger=%s\nserve:\n%s", removalErr, removalOutput, ledger, restartOutput.String())
 	}
+	removedDuringBlock, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := removedDuringBlock.MachineStatuses[ownerIssueKey("o/r", 73)]
+	expectedStatusBody, err := internalgithub.AttributedBody(73, status.Attempt, fmt.Sprintf("/agent-symphony status clear: %s\n\n<!-- agent-symphony:status:v2:sequence:%d -->", status.Reason, status.Sequence))
+	if err != nil || status.Status != "clear" || status.Reason != "attempt invalidated" {
+		t.Fatalf("permanent removal did not commit an exact owner status repair: status=%#v err=%v", status, err)
+	}
+	repair, hasControlRepair := removedDuringBlock.ControlRepairs[ownerIssueKey("o/r", 73)]
+	fixture.mu.Lock()
+	fixture.expectedStatusBody = expectedStatusBody
+	if hasControlRepair {
+		fixture.expectedControlBody, fixture.expectedControlGeneration = repair.Body, repair.Generation
+	}
+	fixture.denyMutations = true
+	fixture.mu.Unlock()
 	select {
 	case err := <-removeReconcileDone:
 		t.Fatalf("permanent removal waited for blocked reconciliation: %v", err)
@@ -850,7 +883,10 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	select {
 	case err := <-removeReconcileDone:
 		if err != nil {
-			t.Fatalf("release blocked reconciliation after permanent removal: %v", err)
+			fixture.mu.Lock()
+			denied := append([]string(nil), fixture.deniedMutations...)
+			fixture.mu.Unlock()
+			t.Fatalf("release blocked reconciliation after permanent removal: %v; denied=%q", err, denied)
 		}
 	case <-time.After(deadline(15 * time.Second)):
 		t.Fatal("blocked reconciliation did not finish after release")
@@ -904,9 +940,19 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	}
 	fixture.mu.Lock()
 	deniedMutations := append([]string(nil), fixture.deniedMutations...)
+	removalRepairs := append([]string(nil), fixture.removalRepairs...)
 	fixture.mu.Unlock()
 	if len(deniedMutations) != 0 {
 		t.Fatalf("permanent removal attempted GitHub mutations: %q", deniedMutations)
+	}
+	expectedRepairs := []string{"status"}
+	if hasControlRepair {
+		expectedRepairs = append(expectedRepairs, fmt.Sprintf("control:%d", repair.Generation))
+	}
+	slices.Sort(removalRepairs)
+	slices.Sort(expectedRepairs)
+	if !slices.Equal(removalRepairs, expectedRepairs) {
+		t.Fatalf("permanent removal did not converge through only the exact generation-bound repairs: got=%v want=%v", removalRepairs, expectedRepairs)
 	}
 	if err := restarted.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)

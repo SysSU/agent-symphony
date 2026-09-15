@@ -41,33 +41,34 @@ var (
 )
 
 type runtimeOwnerState struct {
-	WorkerProfileDigest       string                               `json:"-"`
-	Version                   int                                  `json:"version"`
-	Repository                string                               `json:"repository"`
-	Epoch                     uint64                               `json:"epoch"`
-	Revision                  uint64                               `json:"revision"`
-	IssueGenerations          map[string]uint64                    `json:"issue_generations"`
-	AttemptGenerations        map[string]uint64                    `json:"attempt_generations"`
-	Attempts                  map[string]runtimeAttemptRecord      `json:"attempts"`
-	Observations              map[string]reconciliationObservation `json:"observations"`
-	Recoveries                map[string]runtimePRRecovery         `json:"recoveries"`
-	Tombstones                map[string]runtimeTombstone          `json:"tombstones"`
-	Effects                   map[string]runtimeEffectIntent       `json:"effects"`
-	ReviewerProofs            map[string]reviewerProcessProof      `json:"reviewer_proofs"`
-	ReviewerSafetyMigrated    bool                                 `json:"reviewer_safety_migrated,omitempty"`
-	LegacyReviewerQuarantines map[string]string                    `json:"legacy_reviewer_quarantines"`
-	ReviewerRevocationTracked bool                                 `json:"reviewer_revocation_tracked,omitempty"`
-	ExternalDispatchTracked   bool                                 `json:"external_dispatch_tracked,omitempty"`
-	ControlReceipts           []controlReceipt                     `json:"control_receipts"`
-	ControlGenerations        map[string]uint64                    `json:"control_generations,omitempty"`
-	ControlRepairs            map[string]controlSnapshotRepair     `json:"control_repairs,omitempty"`
-	MachineStatuses           map[string]machineStatusRecord       `json:"machine_statuses,omitempty"`
-	CycleDiagnostic           string                               `json:"cycle_diagnostic,omitempty"`
-	CycleDiagnosticAt         time.Time                            `json:"cycle_diagnostic_at,omitzero"`
-	CycleOutcomeEpoch         uint64                               `json:"cycle_outcome_epoch,omitempty"`
-	CycleOutcomeID            uint64                               `json:"cycle_outcome_id,omitempty"`
-	CycleOutcomeSource        uint64                               `json:"cycle_outcome_source_revision,omitempty"`
-	StaleReconciliations      uint64                               `json:"stale_reconciliations,omitempty"`
+	WorkerProfileDigest        string                               `json:"-"`
+	Version                    int                                  `json:"version"`
+	Repository                 string                               `json:"repository"`
+	Epoch                      uint64                               `json:"epoch"`
+	Revision                   uint64                               `json:"revision"`
+	IssueGenerations           map[string]uint64                    `json:"issue_generations"`
+	AttemptGenerations         map[string]uint64                    `json:"attempt_generations"`
+	Attempts                   map[string]runtimeAttemptRecord      `json:"attempts"`
+	Observations               map[string]reconciliationObservation `json:"observations"`
+	Recoveries                 map[string]runtimePRRecovery         `json:"recoveries"`
+	Tombstones                 map[string]runtimeTombstone          `json:"tombstones"`
+	Effects                    map[string]runtimeEffectIntent       `json:"effects"`
+	ReviewerProofs             map[string]reviewerProcessProof      `json:"reviewer_proofs"`
+	ReviewerSafetyMigrated     bool                                 `json:"reviewer_safety_migrated,omitempty"`
+	ReviewerConfinementTracked bool                                 `json:"reviewer_confinement_tracked,omitempty"`
+	LegacyReviewerQuarantines  map[string]string                    `json:"legacy_reviewer_quarantines"`
+	ReviewerRevocationTracked  bool                                 `json:"reviewer_revocation_tracked,omitempty"`
+	ExternalDispatchTracked    bool                                 `json:"external_dispatch_tracked,omitempty"`
+	ControlReceipts            []controlReceipt                     `json:"control_receipts"`
+	ControlGenerations         map[string]uint64                    `json:"control_generations,omitempty"`
+	ControlRepairs             map[string]controlSnapshotRepair     `json:"control_repairs,omitempty"`
+	MachineStatuses            map[string]machineStatusRecord       `json:"machine_statuses,omitempty"`
+	CycleDiagnostic            string                               `json:"cycle_diagnostic,omitempty"`
+	CycleDiagnosticAt          time.Time                            `json:"cycle_diagnostic_at,omitzero"`
+	CycleOutcomeEpoch          uint64                               `json:"cycle_outcome_epoch,omitempty"`
+	CycleOutcomeID             uint64                               `json:"cycle_outcome_id,omitempty"`
+	CycleOutcomeSource         uint64                               `json:"cycle_outcome_source_revision,omitempty"`
+	StaleReconciliations       uint64                               `json:"stale_reconciliations,omitempty"`
 }
 
 // machineStatusRecord is the single owner-issued ordering domain for every
@@ -127,6 +128,7 @@ type reviewerProcessProof struct {
 	DeadProved        bool   `json:"dead_proved,omitempty"`
 	NeverRan          bool   `json:"never_ran,omitempty"`
 	LegacyUnverified  bool   `json:"legacy_unverified,omitempty"`
+	ProfileDigest     string `json:"profile_digest,omitempty"`
 }
 
 func reviewerProofKey(repository string, issue, attempt int, mode, target string) string {
@@ -241,6 +243,7 @@ type runtimeEffectIntent struct {
 	ReviewerSessionRequested            bool                             `json:"reviewer_session_requested,omitempty"`
 	ReviewerGroupPID                    int                              `json:"reviewer_group_pid,omitempty"`
 	ReviewerResultDigest                string                           `json:"reviewer_result_digest,omitempty"`
+	ReviewerProfileDigest               string                           `json:"reviewer_profile_digest,omitempty"`
 	ReviewerStopped                     bool                             `json:"reviewer_stopped,omitempty"`
 	ReviewerRevoked                     bool                             `json:"reviewer_revoked,omitempty"`
 	SupersededReviewerID                string                           `json:"superseded_reviewer_id,omitempty"`
@@ -1069,6 +1072,16 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 			migrateLegacyReviewerSafety(&candidate)
 			candidate.ReviewerSafetyMigrated = true
 		}
+		if !candidate.ReviewerConfinementTracked {
+			for key, proof := range candidate.ReviewerProofs {
+				if !proof.NeverRan {
+					proof.ProfileDigest = ""
+					proof.LegacyUnverified = true
+					candidate.ReviewerProofs[key] = proof
+				}
+			}
+			candidate.ReviewerConfinementTracked = true
+		}
 		if !candidate.ExternalDispatchTracked {
 			for id, effect := range candidate.Effects {
 				if effect.State == "pending" && effect.Reconciliation != nil && reconciliationMutatesGitHub(effect.Reconciliation.Action) {
@@ -1364,7 +1377,7 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 	if record := state.Attempts[attemptKey]; record.StopEffectID != "" && command.Action != agentruntime.EffectStop {
 		return nil, errStateConflict
 	}
-	if command.Action != agentruntime.EffectStop && command.Action != agentruntime.EffectMonitor && issueHasUnprovedReviewer(*state, manifest.Repository, manifest.Issue) {
+	if command.Action != agentruntime.EffectStop && command.Action != agentruntime.EffectMonitor && issueHasUnconfinedReviewer(*state, manifest.Repository, manifest.Issue) {
 		return nil, errStateConflict
 	}
 	if command.Action == agentruntime.EffectStop {
@@ -1826,6 +1839,29 @@ func issueHasUnprovedReviewer(state runtimeOwnerState, repository string, issue 
 	return false
 }
 
+// A retained reviewer lease blocks authority only when it predates the
+// managed rootless profile. A confined reviewer keeps its immutable snapshot
+// lease but cannot reach owner state, GitHub, or another review target.
+func issueHasUnconfinedReviewer(state runtimeOwnerState, repository string, issue int) bool {
+	if state.LegacyReviewerQuarantines[ownerIssueKey(repository, issue)] != "" {
+		return true
+	}
+	for _, proof := range state.ReviewerProofs {
+		if proof.Repository == repository && proof.Issue == issue && !proof.NeverRan && (proof.LegacyUnverified || proof.ProfileDigest != config.WorkerProfileDigest()) {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewerAdmissionBlocked(state runtimeOwnerState, request reconciliationEffectRequest) bool {
+	if request.Reviewer == nil || issueHasUnconfinedReviewer(state, request.Repository, request.Issue) {
+		return true
+	}
+	proof, ok := state.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)]
+	return ok && !proof.NeverRan && !proof.DeadProved
+}
+
 func issueHasUnresolvedExternalEffect(state runtimeOwnerState, repository string, issue int) bool {
 	for _, effect := range state.Effects {
 		if effect.Repository == repository && effect.Issue == issue && effect.State == "invalidated" && effect.Dispatched && effect.Reconciliation != nil && reconciliationMutatesGitHub(effect.Reconciliation.Action) {
@@ -1913,6 +1949,15 @@ func attemptHasUnprovedReviewer(state runtimeOwnerState, repository string, issu
 	return false
 }
 
+func attemptHasUnconfinedReviewer(state runtimeOwnerState, repository string, issue, attempt int) bool {
+	for _, proof := range state.ReviewerProofs {
+		if proof.Repository == repository && proof.Issue == issue && proof.Attempt == attempt && !proof.NeverRan && (proof.LegacyUnverified || proof.ProfileDigest != config.WorkerProfileDigest()) {
+			return true
+		}
+	}
+	return false
+}
+
 func finishRuntimeOwnerTransition(attemptRoot, stateRoot string, candidate runtimeOwnerState, effect *runtimeEffectIntent, operatorRequestIDs ...string) (runtimeOwnerState, *runtimeEffectIntent, error) {
 	if candidate.Revision == ^uint64(0) {
 		return runtimeOwnerState{}, nil, errors.New("runtime revision overflow")
@@ -1971,7 +2016,7 @@ func applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot string, state *ru
 		return errStateConflict
 	}
 	for _, proof := range state.ReviewerProofs {
-		if proof.Repository == manifest.Repository && proof.Issue == manifest.Issue && proof.Attempt != manifest.Attempt && !proof.NeverRan {
+		if proof.Repository == manifest.Repository && proof.Issue == manifest.Issue && proof.Attempt != manifest.Attempt && !proof.NeverRan && (proof.LegacyUnverified || proof.ProfileDigest != config.WorkerProfileDigest()) {
 			return errStateConflict
 		}
 	}
@@ -1983,7 +2028,7 @@ func applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot string, state *ru
 		return errStateConflict
 	}
 	if generation == 0 {
-		if issueHasUnprovedReviewer(*state, manifest.Repository, manifest.Issue) || issueHasUnresolvedExternalEffect(*state, manifest.Repository, manifest.Issue) {
+		if issueHasUnconfinedReviewer(*state, manifest.Repository, manifest.Issue) || issueHasUnresolvedExternalEffect(*state, manifest.Repository, manifest.Issue) {
 			return errStateConflict
 		}
 		if issueGeneration == ^uint64(0) {
@@ -3036,7 +3081,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		}
 	}
 	for key, proof := range state.ReviewerProofs {
-		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || (proof.GroupPID < 2 && !(proof.GroupPID == 0 && (!proof.DeadProved || proof.NeverRan))) || proof.NeverRan && (proof.GroupPID != 0 || !proof.DeadProved || proof.LegacyUnverified) || proof.LegacyUnverified && proof.DeadProved || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] {
+		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || (proof.GroupPID < 2 && !(proof.GroupPID == 0 && (!proof.DeadProved || proof.NeverRan))) || proof.NeverRan && (proof.GroupPID != 0 || !proof.DeadProved || proof.LegacyUnverified) || proof.LegacyUnverified && proof.DeadProved || proof.ProfileDigest != "" && !validDigest(proof.ProfileDigest) || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] {
 			return errors.New("runtime owner reviewer process proof is invalid")
 		}
 	}
@@ -3097,7 +3142,7 @@ func runtimeOwnerAttemptRoot(stateRoot string) string {
 }
 
 func newRuntimeOwnerState(repository string) runtimeOwnerState {
-	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, WorkerProfileDigest: config.WorkerProfileDigest(), ReviewerRevocationTracked: true, ReviewerSafetyMigrated: true, ExternalDispatchTracked: true, LegacyReviewerQuarantines: map[string]string{}, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}, ControlGenerations: map[string]uint64{}, ControlRepairs: map[string]controlSnapshotRepair{}, MachineStatuses: map[string]machineStatusRecord{}}
+	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, WorkerProfileDigest: config.WorkerProfileDigest(), ReviewerRevocationTracked: true, ReviewerSafetyMigrated: true, ReviewerConfinementTracked: true, ExternalDispatchTracked: true, LegacyReviewerQuarantines: map[string]string{}, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}, ControlGenerations: map[string]uint64{}, ControlRepairs: map[string]controlSnapshotRepair{}, MachineStatuses: map[string]machineStatusRecord{}}
 }
 
 func activeWorkerProfileDigest(state runtimeOwnerState) string {

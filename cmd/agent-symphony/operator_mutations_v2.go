@@ -456,7 +456,7 @@ func retainReviewerLease(state *runtimeOwnerState, repository string, issue, att
 		}
 		if !exists {
 			neverRan := pending.ReviewerGateProtocol && !pending.ReviewerSessionRequested && !pending.ReviewerLaunched && pending.ReviewerGroupPID == 0
-			proof = reviewerProcessProof{Repository: repository, Issue: issue, Attempt: attempt, Mode: reviewer.Mode, Target: reviewer.Target, EffectID: pending.ID, IssueGeneration: pending.IssueGeneration, AttemptGeneration: pending.AttemptGeneration, GroupPID: pending.ReviewerGroupPID, DeadProved: neverRan, NeverRan: neverRan}
+			proof = reviewerProcessProof{Repository: repository, Issue: issue, Attempt: attempt, Mode: reviewer.Mode, Target: reviewer.Target, EffectID: pending.ID, IssueGeneration: pending.IssueGeneration, AttemptGeneration: pending.AttemptGeneration, GroupPID: pending.ReviewerGroupPID, DeadProved: neverRan, NeverRan: neverRan, ProfileDigest: pending.ReviewerProfileDigest}
 			state.ReviewerProofs[key] = proof
 		}
 	}

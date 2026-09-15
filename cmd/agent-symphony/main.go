@@ -2358,6 +2358,12 @@ func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, 
 	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", repository, attempt.Issue, attempt.Number)), session
 }
 
+func reviewTargetIdentity(attempt agentruntime.Attempt, snapshotRoot, target string) (string, string) {
+	snapshot, session := reviewIdentity(attempt, snapshotRoot)
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(target)))[:16]
+	return snapshot + "-" + digest, session + "-" + digest
+}
+
 func reviewResultPath(snapshot, target string) string {
 	sum := sha256.Sum256([]byte(target))
 	return filepath.Join(snapshot, fmt.Sprintf(".agent-symphony-review-%x", sum[:8]), "result.json")
@@ -2381,7 +2387,7 @@ func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCalle
 			return errors.New("reviewer cleanup certificate does not match the attempt and target")
 		}
 	}
-	expectedSnapshot, expectedSession := reviewIdentity(attempt, snapshotRoot)
+	expectedSnapshot, expectedSession := reviewTargetIdentity(attempt, snapshotRoot, target)
 	if (snapshot != "" && snapshot != expectedSnapshot) || (session != "" && session != expectedSession) {
 		return errors.New("persisted reviewer cleanup identity mismatch")
 	}
@@ -2575,7 +2581,7 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if mode == agentruntime.ReviewModePlan && (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") && manifest.ReviewMode == mode && agentruntime.ValidReviewTarget(mode, manifest.ReviewTarget, attempt.Repository, attempt.Issue) {
 		target, reviewBase, head = manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead
 	}
-	snapshot, session := reviewIdentity(attempt, snapshotRoot)
+	snapshot, session := reviewTargetIdentity(attempt, snapshotRoot, target)
 	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
 		return independentReviewResult{}, false, fmt.Errorf("prepare review snapshot root: %w", err)
 	}

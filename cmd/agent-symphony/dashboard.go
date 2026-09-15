@@ -642,7 +642,7 @@ func cleanupAttemptReviewResourcesProved(ctx context.Context, stateRoot string, 
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.New("review snapshot root is unsafe")
 	}
-	expectedSnapshot, expectedSession := reviewIdentity(attempt, snapshotRoot)
+	expectedSnapshot, expectedSession := reviewTargetIdentity(attempt, snapshotRoot, manifest.ReviewTarget)
 	if manifest.ReviewSnapshot != "" && manifest.ReviewSnapshot != expectedSnapshot || manifest.ReviewSession != "" && manifest.ReviewSession != expectedSession || !belowRoot(expectedSnapshot, snapshotRoot) {
 		return errors.New("persisted reviewer cleanup identity mismatch")
 	}

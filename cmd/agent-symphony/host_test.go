@@ -1345,9 +1345,7 @@ func TestPermanentRemovalRejectsDirtyOrUnpublishedWorkAndRetriesSafely(t *testin
 	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(manifest.Worktree, ".git", "info", "exclude"), []byte(".agent-symphony/\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	mustWriteFile(t, agentruntime.ResultPath(manifest.Worktree), `{"type":"agent-symphony-result-v1"}`)
 	gate := agentruntime.ImplementationGateChannel(manifest.LaunchID)
 	parked := []string{"wait-for", "-L", gate, ";", "new-session", "-d", "-s", manifest.Session, "-c", manifest.Worktree, "--", "/bin/sh", "-c", `"$1" wait-for -L "$2" && "$1" wait-for -U "$2" && shift 2 && exec "$@"`, "agent-symphony-gate", tmuxBinary, gate}
 	parked = append(parked, agentruntime.BoundPaneExitStatusCommand(os.Args[0], tmuxBinary, manifest, []string{"/bin/sh"})...)

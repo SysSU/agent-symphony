@@ -509,6 +509,40 @@ func TestPlanReviewRunningTransitionRequiresExactPendingEffect(t *testing.T) {
 	}
 }
 
+func TestConfinedReviewerLeaseAllowsOnlyDistinctReviewTarget(t *testing.T) {
+	test := reconciliationEffectCaseNamed(t, "reviewer-run-observe")
+	test.request.Reviewer.Mode = agentruntime.ReviewModeImplementation
+	owner, snapshot, request := reconciliationEffectTestOwner(t, test.request)
+	oldTarget := request.Manifest.BaseSHA + ".." + strings.Repeat("c", 40)
+	proof := reviewerProcessProof{
+		Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt,
+		Mode: agentruntime.ReviewModeImplementation, Target: oldTarget,
+		EffectID: "1234567890abcdef1234567890abcdef", IssueGeneration: 1, AttemptGeneration: 1,
+		GroupPID: 99999998, ProfileDigest: config.WorkerProfileDigest(),
+	}
+	state := cloneRuntimeOwnerState(snapshot.State)
+	state.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, proof.Mode, proof.Target)] = proof
+	projected, err := projectOwnerStatus(stateOwnerSnapshot{State: state}, 1, time.Unix(1, 0))
+	if err != nil || len(projected.Statuses) != 1 || projected.Statuses[0].NeedsAttention || strings.Contains(projected.Statuses[0].Diagnostic, "descendant absence") {
+		t.Fatalf("confined reviewer lease was projected as an authority warning: status=%#v err=%v", projected.Statuses, err)
+	}
+	if _, err := applyBeginReconciliationEffect(owner.attemptRoot, owner.stateRoot, &state, beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request}); err != nil {
+		t.Fatalf("distinct target was blocked by confined immutable reviewer lease: %v", err)
+	}
+	state = cloneRuntimeOwnerState(snapshot.State)
+	proof.Target = request.Reviewer.Target
+	state.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, proof.Mode, proof.Target)] = proof
+	if _, err := applyBeginReconciliationEffect(owner.attemptRoot, owner.stateRoot, &state, beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("same target reused immutable reviewer resources: %v", err)
+	}
+	state = cloneRuntimeOwnerState(snapshot.State)
+	proof.Target, proof.ProfileDigest, proof.LegacyUnverified = oldTarget, "", true
+	state.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, proof.Mode, proof.Target)] = proof
+	if _, err := applyBeginReconciliationEffect(owner.attemptRoot, owner.stateRoot, &state, beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("legacy reviewer lease admitted a distinct target: %v", err)
+	}
+}
+
 func TestSealedReviewerResultReplaysAfterRestartWithoutDeathProof(t *testing.T) {
 	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
 	root, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
@@ -1031,7 +1065,7 @@ func verifyReconciliationEffectOutcome(t *testing.T, state runtimeOwnerState, re
 		}
 	case reconciliationHandoffDeliver:
 		if request.Handoff.Kind == "review-findings" {
-			if !manifest.ReviewHandoffQueued || !manifest.ReviewHandoffAck || manifest.State != "running" {
+			if !manifest.ReviewHandoffQueued || !manifest.ReviewHandoffAck || manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" || manifest.State != "running" {
 				t.Fatalf("review handoff was not applied: %#v", manifest)
 			}
 			return
@@ -1915,8 +1949,6 @@ func configureEffectFixture(root string, request reconciliationEffectRequest, ma
 	case reconciliationGitHubPRGovernance:
 		request.GitHubPRGovernance.HeadSHA = head
 	case reconciliationReviewer:
-		snapshot, session := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, productionSnapshotRoot(root))
-		request.Reviewer.Snapshot, request.Reviewer.Session = snapshot, session
 		if request.Reviewer.Mode == agentruntime.ReviewModeImplementation {
 			manifest.State = "completed"
 			request.Reviewer.BaseSHA, request.Reviewer.HeadSHA = manifest.BaseSHA, head
@@ -1926,6 +1958,8 @@ func configureEffectFixture(root string, request reconciliationEffectRequest, ma
 			request.Reviewer.BaseSHA, request.Reviewer.HeadSHA = manifest.BaseSHA, manifest.BaseSHA
 			request.Reviewer.Target = fmt.Sprintf("%s#%d plan sha256:%x", request.Repository, request.Issue, sha256Sum("body"))
 		}
+		snapshot, session := reviewTargetIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, productionSnapshotRoot(root), request.Reviewer.Target)
+		request.Reviewer.Snapshot, request.Reviewer.Session = snapshot, session
 		if request.Reviewer.Phase == "cleanup" {
 			manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget = "clean", request.Reviewer.Mode, request.Reviewer.Target
 			manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = request.Reviewer.BaseSHA, request.Reviewer.HeadSHA, snapshot, session

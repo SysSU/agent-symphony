@@ -457,7 +457,7 @@ func planReconciliationReviewers(snapshot stateOwnerSnapshot, stateRoot string, 
 			continue
 		}
 		phase, mode, target, base, head := "run-observe", manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead
-		snapshotPath, session := reviewIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(stateRoot))
+		snapshotPath, session := reviewTargetIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(stateRoot), target)
 		if (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued" || manifest.ReviewState == "failed") && (manifest.ReviewSnapshot != "" || manifest.ReviewSession != "") {
 			if manifest.ReviewSnapshot != snapshotPath || manifest.ReviewSession != session || !reviewerCleanupProved(snapshot.State, manifest.Repository, manifest.Issue, manifest.Attempt, manifest.ReviewMode, manifest.ReviewTarget) {
 				continue
@@ -474,6 +474,9 @@ func planReconciliationReviewers(snapshot stateOwnerSnapshot, stateRoot string, 
 			}
 		} else {
 			continue
+		}
+		if phase == "run-observe" {
+			snapshotPath, session = reviewTargetIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(stateRoot), target)
 		}
 		request := reconciliationEffectRequest{Action: reconciliationReviewer, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Manifest: ptrManifest(manifest), ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, Reviewer: &reviewerEffectRequest{Phase: phase, Mode: mode, Target: target, BaseSHA: base, HeadSHA: head, Snapshot: snapshotPath, Session: session}}
 		if phase == "run-observe" && mode == agentruntime.ReviewModeImplementation {
@@ -629,8 +632,8 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		if err := os.MkdirAll(root, 0o700); err != nil {
 			return reconciliationEffectResult{}, false, err
 		}
-		oldSnapshot, oldSession := reviewIdentity(attempt, root)
 		for _, target := range oldTargets {
+			oldSnapshot, oldSession := reviewTargetIdentity(attempt, root, target)
 			if err := cleanupCertifiedReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, target, oldSnapshot, oldSession, root, oldProofs[target]); err != nil {
 				return reconciliationEffectResult{}, false, err
 			}

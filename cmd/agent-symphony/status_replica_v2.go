@@ -192,7 +192,7 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 				break
 			}
 		}
-		if attemptHasUnprovedReviewer(snapshot.State, status.Repository, status.Issue, status.Attempt) {
+		if attemptHasUnconfinedReviewer(snapshot.State, status.Repository, status.Issue, status.Attempt) {
 			status.NeedsAttention = true
 			status.DispatchAuthorized = false
 			status.Retryable = false

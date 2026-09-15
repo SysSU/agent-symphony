@@ -537,7 +537,7 @@ func (s *operatorMutationService) preparePlanReview(ctx context.Context, snapsho
 	issue.Body = body
 	issue.Attempt, issue.BaseSHA = manifest.Attempt, manifest.BaseSHA
 	target := manifest.Repository + "#" + strconv.Itoa(manifest.Issue) + " plan sha256:" + observation.Fact.BodyDigest
-	snapshotPath, session := reviewIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(s.owner.stateRoot))
+	snapshotPath, session := reviewTargetIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(s.owner.stateRoot), target)
 	request := reconciliationEffectRequest{Action: reconciliationReviewer, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Manifest: ptrManifest(manifest), ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, Reviewer: &reviewerEffectRequest{Phase: "run-observe", Mode: agentruntime.ReviewModePlan, Target: target, BaseSHA: manifest.BaseSHA, HeadSHA: manifest.BaseSHA, Snapshot: snapshotPath, Session: session}}
 	material := reviewerExecutionMaterial{Issue: issue, Source: s.reviewSource, HeadSHA: manifest.BaseSHA, Env: slices.Clone(s.reviewEnvironment), Command: slices.Clone(s.reviewCommand)}
 	request.ExecutionDigest = reviewerExecutionDigest(request, material)
@@ -1586,12 +1586,8 @@ func (s *operatorMutationService) stopBoundReviewer(ctx context.Context, request
 	if !current || effect.State != "pending" || effect.SupersededReviewerID != reviewerID || effect.Action != string(request.Action) || effect.IssueGeneration != request.Identity.IssueGeneration || effect.AttemptGeneration != request.Identity.AttemptGeneration {
 		return errStaleStateResult
 	}
-	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
-	if err != nil {
-		return err
-	}
 	snapshotRoot := productionSnapshotRoot(s.owner.stateRoot)
-	reviewSnapshot, _ := reviewIdentity(operatorEffectAttempt(manifest), snapshotRoot)
+	reviewSnapshot, session := reviewTargetIdentity(operatorEffectAttempt(manifest), snapshotRoot, effect.SupersededReviewerTarget)
 	launchPath, terminalPath := reviewerLifecyclePaths(reviewSnapshot, effect.SupersededReviewerTarget)
 	bind := func(pid int) error {
 		_, err := s.owner.bindReviewerStopping(run.ctx, bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), GroupPID: pid})
