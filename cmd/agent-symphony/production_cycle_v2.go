@@ -240,6 +240,9 @@ func reconciliationCycleDisposition(phaseErr, outcomeErr error) error {
 }
 
 func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleSnapshot stateOwnerSnapshot) error {
+	if p.operator != nil {
+		p.operator.scanPendingAdmissions(cycleSnapshot)
+	}
 	api := p.api.WithReadSnapshot()
 	collector := p.collector
 	collector.API = api

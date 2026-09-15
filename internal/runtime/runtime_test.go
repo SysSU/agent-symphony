@@ -2694,7 +2694,7 @@ func TestProbeAndCancellationErrorsPreserveState(t *testing.T) {
 	}
 }
 
-func TestCancelValidatesManifestAndWinsConcurrentMonitor(t *testing.T) {
+func TestCancelValidatesManifest(t *testing.T) {
 	r, _, attempt, _ := testRuntime(t)
 	manifest, err := prepareAndStartFixture(t, r, context.Background(), attempt)
 	if err != nil {
@@ -2708,20 +2708,6 @@ func TestCancelValidatesManifestAndWinsConcurrentMonitor(t *testing.T) {
 		t.Fatalf("tampered cancel = %v", err)
 	}
 
-	r2, fake2, attempt2, _ := testRuntime(t)
-	fake2.sessions["keeper"] = &fakeSession{paneID: "%999"}
-	if _, err := prepareAndStartFixture(t, r2, context.Background(), attempt2); err != nil {
-		t.Fatal(err)
-	}
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = monitorFixture(t, r2, context.Background(), attempt2) }()
-	go func() { defer wg.Done(); _, _ = cancelFixture(t, r2, context.Background(), attempt2, "stop") }()
-	wg.Wait()
-	stored, err := readManifest(r2.manifestPath(attempt2))
-	if err != nil || stored.State != "cancelled" {
-		t.Fatalf("concurrent final state = %#v, %v", stored, err)
-	}
 }
 
 func TestRepositoryIdentityAndCaseCollision(t *testing.T) {

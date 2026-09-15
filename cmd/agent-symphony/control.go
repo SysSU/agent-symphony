@@ -23,6 +23,7 @@ import (
 	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
+	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
 const (
@@ -58,12 +59,29 @@ type controlResult struct {
 }
 
 type controlReceipt struct {
-	Request    controlRequest `json:"request"`
-	State      string         `json:"state"`
-	Phase      string         `json:"phase,omitempty"`
-	EffectID   string         `json:"effect_id,omitempty"`
-	Diagnostic string         `json:"diagnostic,omitempty"`
-	Result     *controlResult `json:"result,omitempty"`
+	Request    controlRequest     `json:"request"`
+	State      string             `json:"state"`
+	Phase      string             `json:"phase,omitempty"`
+	EffectID   string             `json:"effect_id,omitempty"`
+	Diagnostic string             `json:"diagnostic,omitempty"`
+	Result     *controlResult     `json:"result,omitempty"`
+	Admission  *operatorAdmission `json:"admission,omitempty"`
+}
+
+// operatorAdmission is the owner's durable claim on the exact attempt state
+// being validated outside the owner. While it exists, no owner transition may
+// change that manifest; completion either consumes the claim atomically or
+// releases it without applying the requested action.
+type operatorAdmission struct {
+	Epoch                 uint64                `json:"epoch"`
+	IssueGeneration       uint64                `json:"issue_generation"`
+	AttemptGeneration     uint64                `json:"attempt_generation"`
+	Manifest              agentruntime.Manifest `json:"manifest"`
+	IssueClosed           bool                  `json:"issue_closed,omitempty"`
+	RemoteOnly            bool                  `json:"remote_only,omitempty"`
+	ObservationGeneration uint64                `json:"observation_generation,omitempty"`
+	ObservationCycleID    uint64                `json:"observation_cycle_id,omitempty"`
+	ObservationBodyDigest string                `json:"observation_body_digest,omitempty"`
 }
 
 type controlReceiptState struct {

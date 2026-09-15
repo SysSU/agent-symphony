@@ -169,7 +169,10 @@ type reconciliationTriggerRunner struct {
 	beforeRun func()
 }
 
-type applyReconciliationCommand struct{ Collection reconciliationCollection }
+type applyReconciliationCommand struct {
+	Collection        reconciliationCollection
+	OperatorRequestID string
+}
 
 func (r reconciliationRunner) run(ctx context.Context) (stateOwnerSnapshot, error) {
 	if r.owner == nil || r.collect == nil {
@@ -347,7 +350,17 @@ func (r *reconciliationTriggerRunner) loop() {
 }
 
 func (o *stateOwner) applyReconciliation(ctx context.Context, collection reconciliationCollection) (stateOwnerSnapshot, error) {
+	snapshot, _, err := o.applyReconciliationWithDisposition(ctx, collection)
+	return snapshot, err
+}
+
+func (o *stateOwner) applyReconciliationWithDisposition(ctx context.Context, collection reconciliationCollection) (stateOwnerSnapshot, bool, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerApplyReconciliation, reconcile: applyReconciliationCommand{Collection: cloneReconciliationCollection(collection)}})
+	return result.snapshot, result.reconciliationStale, err
+}
+
+func (o *stateOwner) refreshOperatorAdmission(ctx context.Context, requestID string, collection reconciliationCollection) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerApplyReconciliation, reconcile: applyReconciliationCommand{Collection: cloneReconciliationCollection(collection), OperatorRequestID: requestID}})
 	return result.snapshot, err
 }
 
@@ -550,7 +563,7 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 			}
 		}
 		next := reconciliationObservation{Generation: generation, OwnerGeneration: state.IssueGenerations[key], ObservationEpoch: identity.Epoch, LastCycleID: identity.CycleID, InputDigest: digest, Attempts: map[string]reconciliationAttemptObservation{}}
-		if exists && previous.ObservationEpoch == identity.Epoch && reconciliationObservationContentEqual(previous, next) {
+		if exists && previous.ObservationEpoch == identity.Epoch && reconciliationObservationContentEqual(previous, next) && !hasObservationSensitiveAdmission(*state, key) {
 			continue
 		}
 		state.Observations[key] = next
@@ -722,7 +735,7 @@ func applyReconciliationIssue(state *runtimeOwnerState, collection reconciliatio
 		}
 	}
 	next := reconciliationObservation{Present: true, Generation: issueGeneration, OwnerGeneration: ownerIssueGeneration, ObservationEpoch: identity.Epoch, LastCycleID: identity.CycleID, InputDigest: digest, Fact: cloneReconciliationIssueFact(group.Fact), IssueUpdates: slices.Clone(group.IssueUpdates), Attempts: attempts}
-	if exists && previous.ObservationEpoch == identity.Epoch && reconciliationObservationContentEqual(previous, next) {
+	if exists && previous.ObservationEpoch == identity.Epoch && reconciliationObservationContentEqual(previous, next) && !hasObservationSensitiveAdmission(*state, key) {
 		return nil
 	}
 	state.Observations[key] = next
