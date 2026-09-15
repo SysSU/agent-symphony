@@ -93,7 +93,7 @@ grep -qF '$codexNative = "/usr/local/codex/lib/node_modules/@openai/codex/node_m
 grep -qF 'sudo rm -f /usr/local/codex/bin/codex; sudo chown -R 0:0 /usr/local/codex; sudo chmod -R go-w /usr/local/codex' .github/workflows/release-validation.yml
 grep -qF "throw 'Pinned WSL Codex installation is unsafe or invalid'" .github/workflows/release-validation.yml
 grep -qF "throw 'WSL rootless Codex confinement proof failed'" .github/workflows/release-validation.yml
-grep -qF 'env "CODEX_NATIVE=$codexNative" bash -lc' .github/workflows/release-validation.yml
+test "$(grep -cF 'set -- /usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex; test "$#" -eq 1; CODEX_NATIVE=$1' .github/workflows/release-validation.yml)" -eq 2
 grep -qF 'PATH="$(dirname "$CODEX_NATIVE"):/usr/local/node/bin:/usr/local/go/bin:' .github/workflows/release-validation.yml
 grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl' .github/workflows/release-validation.yml
 grep -qF "throw 'WSL release validation failed'" .github/workflows/release-validation.yml
