@@ -918,7 +918,8 @@ func TestStateOwnerRejectsManifestRootChosenByCaller(t *testing.T) {
 
 func TestStateOwnerTransitionsUseBoundIdentityWithoutFilesystemAccess(t *testing.T) {
 	root := resolvedTempDir(t)
-	manifest := ownerTestManifest(t, root, 61, 1, "running")
+	manifest := ownerTestManifest(t, root, 61, 1, "preparing")
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
 	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -927,7 +928,13 @@ func TestStateOwnerTransitionsUseBoundIdentityWithoutFilesystemAccess(t *testing
 	if err := os.RemoveAll(root); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	initial := mustOwnerSnapshot(t, owner)
+	snapshot, _, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{
+		Identity:      stateResultIdentity{Epoch: initial.State.Epoch, SourceRevision: initial.State.Revision},
+		Action:        agentruntime.EffectPrepare,
+		Manifest:      manifest,
+		RequestDigest: strings.Repeat("1", 64),
+	})
 	key := ownerAttemptKey("o/r", 61, 1)
 	if err != nil || snapshot.State.Revision <= 1 || snapshot.State.Attempts[key].Manifest.Worktree != manifest.Worktree {
 		t.Fatalf("snapshot=%#v err=%v", snapshot, err)

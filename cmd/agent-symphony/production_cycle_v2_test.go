@@ -463,7 +463,8 @@ func TestPermittedStartWithMissingSessionRemainsQuarantinedAfterRestart(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := effects.beginWithSource(t.Context(), snapshot, agentruntime.EffectRequest{Action: agentruntime.EffectStart, Attempt: attempt, Manifest: manifest, Eligible: true}, ""); err != nil {
+	bound, err := effects.beginWithSource(t.Context(), snapshot, agentruntime.EffectRequest{Action: agentruntime.EffectStart, Attempt: attempt, Manifest: manifest, Eligible: true}, "")
+	if err != nil {
 		t.Fatal(err)
 	}
 	before := mustOwnerSnapshot(t, owner)
@@ -476,6 +477,19 @@ func TestPermittedStartWithMissingSessionRemainsQuarantinedAfterRestart(t *testi
 	if pending.ID == "" || pending.StartGateNonce == "" {
 		t.Fatalf("missing pending Start candidate: %#v", before.State.Effects)
 	}
+	run, err := effects.acquire(t.Context(), bound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingCycle := &productionReconciliation{owner: owner, effects: effects, config: config.Default("o/r"), attemptRoot: owner.attemptRoot, stateRoot: owner.stateRoot}
+	if err := pendingCycle.resumePendingRuntime(t.Context(), batch, ""); err != nil {
+		t.Fatal(err)
+	}
+	afterOverlap := mustOwnerSnapshot(t, owner).State.Effects[pending.ID]
+	if afterOverlap.StartGateNonce != pending.StartGateNonce || len(afterOverlap.StartCandidates) != 1 {
+		t.Fatalf("overlapping reconciliation rotated an active Start: before=%#v after=%#v", pending, afterOverlap)
+	}
+	effects.release(bound, run)
 	if err := owner.authorizeRuntimeEffect(t.Context(), authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(pending)), Action: agentruntime.EffectStart, GateNonce: pending.StartGateNonce}); err != nil {
 		t.Fatal(err)
 	}
