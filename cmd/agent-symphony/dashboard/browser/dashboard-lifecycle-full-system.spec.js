@@ -206,31 +206,26 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       const status = await page.request.get(`${baseURL}/status.json`).then((response) => response.json());
       const old = status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1);
       const next = status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
-      if (next) {
-        expect(next.session).toBeTruthy();
-        expect(next.session).not.toBe(old?.session);
+      let nextAttempt = next;
+      if (!nextAttempt && old?.retryable && !old.operator_blocked) {
+        await expect.poll(async () => {
+          const fresh = await page.request.get(`${baseURL}/status.json`).then((result) => result.json());
+          nextAttempt = fresh.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
+          if (nextAttempt) return "progressed";
+          if (!await canceledCard.getByRole("button", { name: "Recover attempt" }).isVisible()) return "pending";
+          const confirmed = await page.request.get(`${baseURL}/status.json`).then((result) => result.json());
+          nextAttempt = confirmed.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
+          return nextAttempt ? "progressed" : "recoverable";
+        }, { timeout: 20_000 }).toMatch(/^(progressed|recoverable)$/);
+      }
+      if (nextAttempt) {
+        expect(nextAttempt.session).toBeTruthy();
+        expect(nextAttempt.session).not.toBe(old?.session);
         await page.reload();
         await expect(card).toContainText(/Attempt 2(?!\d)/);
         canceledCard = await historicalAttempt();
         await expect(canceledCard).toContainText(/cancelled|failed/);
         await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toHaveCount(0);
-      } else if (old?.retryable && !old.operator_blocked) {
-        try {
-          await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toBeVisible();
-        } catch (error) {
-          let detail = `historical=${canceledHistorical} original_old=${JSON.stringify({ state: old.state, retryable: old.retryable, operator_blocked: old.operator_blocked })} original_next=${next?.state ?? "none"}`;
-          try {
-            const fresh = await page.request.get(`${baseURL}/status.json`, { timeout: 1_000 }).then((response) => response.json());
-            const freshOld = fresh.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1);
-            const freshNext = fresh.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
-            const currentAttempt2 = /Attempt 2(?!\d)/.test(await card.innerText({ timeout: 1_000 }));
-            detail += ` current_attempt_2=${currentAttempt2} fresh_old=${JSON.stringify({ state: freshOld?.state, retryable: freshOld?.retryable, operator_blocked: freshOld?.operator_blocked })} fresh_next=${freshNext?.state ?? "none"}`;
-          } catch (diagnosticError) {
-            detail += ` diagnostic_error=${String(diagnosticError)}`;
-          }
-          error.message += `\nRecover button diagnostic: ${detail}`;
-          throw error;
-        }
       }
       await expect(canceledCard.getByRole("button", { name: "Reviewer terminal unavailable; show why" })).toHaveCount(0);
       expect(errors).toEqual([]);
