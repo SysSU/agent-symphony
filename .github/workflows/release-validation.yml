@@ -11,6 +11,9 @@ permissions:
 
 jobs:
   test:
+    env:
+      AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX: '1'
+      CODEX_VERSION: '0.153.0'
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +29,10 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: cmd/agent-symphony/dashboard/package-lock.json
+      - name: Install pinned Codex sandbox
+        run: |
+          npm install --global "@openai/codex@$CODEX_VERSION"
+          test "$(codex --version)" = "codex-cli $CODEX_VERSION"
       - run: scripts/build-dashboard.sh
       - run: cmd/agent-symphony/dashboard/node_modules/.bin/playwright install --with-deps chromium
       - name: Install full-system test prerequisite (Ubuntu)
@@ -34,6 +41,13 @@ jobs:
       - name: Install full-system test prerequisite (macOS)
         if: matrix.os == 'macos-latest'
         run: brew install tmux
+      - name: Prove rootless worker confinement as the runner user
+        run: |
+          test "$(id -u)" -ne 0
+          config=.agent-symphony-ci.yaml
+          trap 'rm -f "$config"' EXIT
+          go run ./cmd/agent-symphony init --config "$config"
+          go run ./cmd/agent-symphony doctor --offline --config "$config" --runtime-state "$HOME/.agent-symphony-doctor-ci"
       - name: Run deterministic full-system gate
         run: |
           tmux -V
@@ -82,7 +96,12 @@ jobs:
           $nodeVersion = '22.15.1'
           wsl -d $distribution -- bash -lc "set -e; curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v${nodeVersion}/node-v${nodeVersion}-linux-${nodeArch}.tar.xz; printf '%s  %s\n' '${nodeSHA256}' /tmp/node.tar.xz | sha256sum -c -; sudo rm -rf /usr/local/node; sudo mkdir /usr/local/node; sudo tar -C /usr/local/node --strip-components=1 -xJf /tmp/node.tar.xz"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install pinned Node.js toolchain in WSL' }
-          wsl -d $distribution -- bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin scripts/validate-release.sh 0.0.0-wsl'
+          $codexVersion = '0.153.0'
+          wsl -d $distribution -- bash -lc "sudo env PATH=/usr/local/node/bin:/usr/bin:/bin /usr/local/node/bin/npm install --global '@openai/codex@${codexVersion}'"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to install pinned Codex CLI in WSL' }
+          wsl -d $distribution -- bash -lc 'set -euo pipefail; cd ~/agent-symphony-ci; export PATH=/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; test "$(id -u)" -ne 0; test "$(codex --version)" = "codex-cli 0.153.0"; go run ./cmd/agent-symphony init --config .agent-symphony-ci.yaml; go run ./cmd/agent-symphony doctor --offline --config .agent-symphony-ci.yaml --runtime-state "$HOME/.local/state/agent-symphony-doctor"'
+          if ($LASTEXITCODE -ne 0) { throw 'WSL rootless Codex confinement proof failed' }
+          wsl -d $distribution -- bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl'
           if ($LASTEXITCODE -ne 0) { throw 'WSL release validation failed' }
 
   artifacts:

@@ -64,9 +64,13 @@ grep -qF "'x86_64' { \$goArch = 'amd64'; \$goSHA256 = 'aac1b08a0fb0c4e0a7c1555be
 grep -qF "'aarch64' { \$goArch = 'arm64'; \$goSHA256 = 'bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd'; \$nodeArch = 'arm64'; \$nodeSHA256 = 'f4ae8ddf7487dfaf7da92fef463ee55cc29d8772d62891361dc3fc8b8e469205' }" .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install pinned Node.js toolchain in WSL'" .github/workflows/release-validation.yml
 grep -qF 'sudo tar -C /usr/local/node --strip-components=1 -xJf /tmp/node.tar.xz' .github/workflows/release-validation.yml
-grep -qF "bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin scripts/validate-release.sh 0.0.0-wsl'" .github/workflows/release-validation.yml
+grep -qF "CODEX_VERSION: '0.153.0'" .github/workflows/release-validation.yml
+grep -qF "\$codexVersion = '0.153.0'" .github/workflows/release-validation.yml
+grep -qF "throw 'Failed to install pinned Codex CLI in WSL'" .github/workflows/release-validation.yml
+grep -qF "throw 'WSL rootless Codex confinement proof failed'" .github/workflows/release-validation.yml
+grep -qF "bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl'" .github/workflows/release-validation.yml
 grep -qF "throw 'WSL release validation failed'" .github/workflows/release-validation.yml
-! grep -F '$PATH' .github/workflows/release-validation.yml | grep -qF 'scripts/validate-release.sh 0.0.0-wsl'
+! grep -F '$PATH' .github/workflows/release-validation.yml | grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl'
 git diff --check
 CGO_ENABLED=0 go build -o "$tmp/agent-symphony" ./cmd/agent-symphony
 go test ./cmd/agent-symphony -run 'Test(PRGovernanceCommandWiresFakeGitHubAndRecoveryState|ProductionHandoffOutcomeIsCompletedWithoutRedelivery|DaemonLockIsSingleInstanceAndNoFollow|DaemonGitHubAuthenticationBoundary|ReviewAuthenticationCrossesIndependentReviewBoundary|SudoPolicyPreservesOnlyBoundedGitHubEnvironment|AdvancedAgentHostRejectsLocalRootSeamBeforeExecution)' -count=1

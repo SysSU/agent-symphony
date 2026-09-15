@@ -1857,8 +1857,7 @@ func TestBinarySubstitutionRollbackRemovesNewAuthority(t *testing.T) {
 	}
 }
 
-// fakeNoHostIsolation simulates a host where install-host has never been run,
-// which is the sole signal that selects the zero-admin default (local) boundary.
+// fakeNoHostIsolation simulates a host with no obsolete provisioned identities.
 func fakeNoHostIsolation(t *testing.T) {
 	t.Helper()
 	old := hostLookupUser
@@ -1980,6 +1979,9 @@ func TestAgentHostLocalModeVerifyProvisionsPrivateRoot(t *testing.T) {
 
 func TestRootlessCodexConfinementDeniesDetachedChildAuthority(t *testing.T) {
 	if _, err := exec.LookPath("codex"); err != nil {
+		if os.Getenv("AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX") == "1" {
+			t.Fatal("required Codex sandbox CLI is unavailable")
+		}
 		t.Skip("codex CLI is unavailable")
 	}
 	home, err := os.UserHomeDir()
@@ -2008,8 +2010,53 @@ func TestRootlessCodexConfinementDeniesDetachedChildAuthority(t *testing.T) {
 	oldExecutable := sandboxExecutable
 	sandboxExecutable = func() (string, error) { return binary, nil }
 	t.Cleanup(func() { sandboxExecutable = oldExecutable })
-	if err := verifyRootlessCodex(t.Context(), attemptRoot, codexHome); err != nil {
+	proof, err := verifyRootlessCodex(t.Context(), "codex", attemptRoot, codexHome)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !proof.Confined {
+		t.Fatal("Codex sandbox did not produce its confinement proof")
+	}
+}
+
+func TestRootlessCodexConfinementFailsClosedWithoutSupportedSandbox(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := os.MkdirTemp(home, ".as-diagnostic-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	attemptRoot, codexHome := filepath.Join(base, "attempts"), filepath.Join(base, "worker-home")
+	for _, path := range []string{attemptRoot, codexHome} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldExecutable := sandboxExecutable
+	sandboxExecutable = os.Executable
+	t.Cleanup(func() { sandboxExecutable = oldExecutable })
+	for _, test := range []struct {
+		name, script, want string
+	}{
+		{"missing", "", "executable file not found"},
+		{"unsupported", "#!/bin/sh\necho unsupported-sandbox >&2\nexit 2\n", "unsupported-sandbox"},
+		{"ineffective", "#!/bin/sh\nexit 0\n", "produced no proof"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if test.script != "" {
+				if err := os.WriteFile(filepath.Join(dir, "codex"), []byte(test.script), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("PATH", dir)
+			if _, err := verifyRootlessCodex(t.Context(), "codex", attemptRoot, codexHome); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -2054,6 +2101,15 @@ func TestDismissCommitsWhileConfinedDetachedChildLivesAndRejectsItsStaleResult(t
 		t.Fatal(err)
 	}
 	defer unixListener.Close()
+	sharedTemp, err := os.CreateTemp("/tmp", ".as-shared-temp-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedTempPath := sharedTemp.Name()
+	if err := sharedTemp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(sharedTempPath) })
 	binary := filepath.Join(workspace, "probe")
 	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build probe binary: %v: %s", err, output)
@@ -2075,9 +2131,13 @@ func TestDismissCommitsWhileConfinedDetachedChildLivesAndRejectsItsStaleResult(t
 	}
 	defer releaseFile.Close()
 	proof := filepath.Join(workspace, "proof")
-	args := config.WorkerSandboxArgs(workspace, binary, "sandbox-probe", proof, siblingCanary, stateCanary, authCanary, tcpListener.Addr().String(), unixPath, ready, release)
+	args := config.WorkerSandboxArgs(workspace, binary, "sandbox-probe", proof, siblingCanary, stateCanary, authCanary, tcpListener.Addr().String(), unixPath, sharedTempPath, ready, release)
 	command := exec.CommandContext(t.Context(), "codex", args...)
-	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(workspace, ".agent-symphony")}
+	privateTemp := filepath.Join(workspace, ".agent-symphony", "tmp")
+	if err := os.Mkdir(privateTemp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + privateTemp}
 	var output bytes.Buffer
 	command.Stdout, command.Stderr = &output, &output
 	if err := command.Start(); err != nil {
@@ -2128,7 +2188,9 @@ func TestDismissCommitsWhileConfinedDetachedChildLivesAndRejectsItsStaleResult(t
 	if err := <-done; err != nil {
 		t.Fatalf("confined child: %v: %s", err, output.String())
 	}
-	if body, err := os.ReadFile(proof); err != nil || string(body) != "confined\n" {
+	body, err := os.ReadFile(proof)
+	var confinement codexConfinementProof
+	if err != nil || json.Unmarshal(body, &confinement) != nil || !confinement.Confined {
 		t.Fatalf("confined child proof=%q err=%v", body, err)
 	}
 	if err := owner.close(t.Context()); err != nil {
@@ -2146,10 +2208,26 @@ func TestDismissCommitsWhileConfinedDetachedChildLivesAndRejectsItsStaleResult(t
 
 func TestHostDiagnosticFallsBackToLocalModeWhenNotInstalled(t *testing.T) {
 	fakeNoHostIsolation(t)
-	stateRoot := t.TempDir()
-	d := hostDiagnostic(stateRoot)
-	if d.Status != "pass" || !strings.Contains(d.Message, "rootless") {
+	source := t.TempDir()
+	t.Setenv("CODEX_HOME", source)
+	oldVerify := rootlessCodexVerify
+	var gotCodex, gotRoot, gotHome string
+	rootlessCodexVerify = func(_ context.Context, codex, root, home string) (codexConfinementProof, error) {
+		gotCodex = codex
+		gotRoot, gotHome = root, home
+		return codexConfinementProof{Confined: true}, nil
+	}
+	t.Cleanup(func() { rootlessCodexVerify = oldVerify })
+	stateRoot := privateDiagnosticRoot(t)
+	d := hostDiagnostic("/configured/codex", stateRoot)
+	if d.Status != "pass" || !strings.Contains(d.Message, "proof passed") {
 		t.Fatalf("diagnostic=%#v", d)
+	}
+	if gotCodex != "/configured/codex" {
+		t.Fatalf("canary executable=%q", gotCodex)
+	}
+	if gotRoot != localAttemptRoot(stateRoot) || gotHome != workerCodexHome(stateRoot) {
+		t.Fatalf("canary root=%q home=%q", gotRoot, gotHome)
 	}
 	for _, root := range []string{localAttemptRoot(stateRoot), localSnapshotRoot(stateRoot)} {
 		info, err := os.Stat(root)
@@ -2159,11 +2237,66 @@ func TestHostDiagnosticFallsBackToLocalModeWhenNotInstalled(t *testing.T) {
 	}
 }
 
+func TestHostDiagnosticReportsCodexConfinementFailure(t *testing.T) {
+	fakeNoHostIsolation(t)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	oldVerify := rootlessCodexVerify
+	rootlessCodexVerify = func(context.Context, string, string, string) (codexConfinementProof, error) {
+		return codexConfinementProof{}, errors.New("unsupported sandbox")
+	}
+	t.Cleanup(func() { rootlessCodexVerify = oldVerify })
+	d := hostDiagnostic("codex", privateDiagnosticRoot(t))
+	if d.Status != "fail" || !strings.Contains(d.Message, "unsupported sandbox") || !strings.Contains(d.Action, "@openai/codex@0.153.0") {
+		t.Fatalf("diagnostic=%#v", d)
+	}
+}
+
+func TestHostDiagnosticWarnsWhenPlatformExposesSharedTemporaryFiles(t *testing.T) {
+	fakeNoHostIsolation(t)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	oldVerify := rootlessCodexVerify
+	rootlessCodexVerify = func(context.Context, string, string, string) (codexConfinementProof, error) {
+		return codexConfinementProof{Confined: true, SharedTempRead: true, SharedTempWrite: true}, nil
+	}
+	t.Cleanup(func() { rootlessCodexVerify = oldVerify })
+	d := hostDiagnostic("codex", privateDiagnosticRoot(t))
+	if d.Status != "warn" || !strings.Contains(d.Message, "cannot isolate shared temporary files") || !strings.Contains(d.Action, "private runtime state root") {
+		t.Fatalf("diagnostic=%#v", d)
+	}
+}
+
 func TestLocalHostDiagnosticRequiresRuntimeStateRoot(t *testing.T) {
 	fakeNoHostIsolation(t)
-	if d := hostDiagnostic(""); d.Status != "fail" {
+	if d := hostDiagnostic("codex", ""); d.Status != "fail" {
 		t.Fatalf("expected fail without a runtime state root, got %#v", d)
 	}
+}
+
+func TestHostDiagnosticRejectsSharedTemporaryRuntimeState(t *testing.T) {
+	oldVerify := rootlessCodexVerify
+	rootlessCodexVerify = func(context.Context, string, string, string) (codexConfinementProof, error) {
+		t.Fatal("shared temporary state reached the Codex canary")
+		return codexConfinementProof{}, nil
+	}
+	t.Cleanup(func() { rootlessCodexVerify = oldVerify })
+	d := hostDiagnostic("codex", t.TempDir())
+	if d.Status != "fail" || !strings.Contains(d.Message, "shared temporary directory") {
+		t.Fatalf("diagnostic=%#v", d)
+	}
+}
+
+func privateDiagnosticRoot(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(home, ".as-doctor-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	return root
 }
 
 func TestEnsureLocalRootRejectsGroupOrWorldAccessibleDirectory(t *testing.T) {

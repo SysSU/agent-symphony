@@ -91,7 +91,8 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 				if _, err := implementation.call(ctx, "verify", agentruntime.Command{}); err != nil {
 					return err
 				}
-				return verifyRootlessCodex(ctx, attemptRoot, workerCodexHome(stateRoot))
+				_, err := verifyRootlessCodex(ctx, cfg.Commands.Implementation[0], attemptRoot, workerCodexHome(stateRoot))
+				return err
 			})
 		},
 	}
