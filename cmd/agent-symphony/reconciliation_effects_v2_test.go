@@ -1,16 +1,21 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -18,6 +23,78 @@ import (
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
+
+func TestEscapedImplementationChildBlocksGitHubPublication(t *testing.T) {
+	if os.Getenv("AGENT_SYMPHONY_ESCAPED_IMPLEMENTATION_HELPER") == "1" {
+		child := exec.Command("/bin/sleep", "30")
+		child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if err := child.Start(); err != nil {
+			os.Exit(125)
+		}
+		_, _ = fmt.Fprintf(os.Stdout, "%d\n", child.Process.Pid)
+		os.Exit(0)
+	}
+	request := reconciliationEffectCaseNamed(t, "github-publish").request
+	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
+	baseline := cloneRuntimeOwnerState(snapshot.State)
+	if _, err := applyBeginReconciliationEffect(owner.attemptRoot, owner.stateRoot, &baseline, beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request}); err != nil {
+		t.Fatalf("publish fixture is not otherwise admissible: %v", err)
+	}
+	launcher := exec.Command(os.Args[0], "-test.run=^TestEscapedImplementationChildBlocksGitHubPublication$")
+	launcher.Env = append(os.Environ(), "AGENT_SYMPHONY_ESCAPED_IMPLEMENTATION_HELPER=1")
+	launcher.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdout, err := launcher.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := launcher.Start(); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil || childPID < 2 {
+		t.Fatalf("escaped child PID %q: %v", line, err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	if err := launcher.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if group, err := syscall.Getpgid(childPID); err != nil || group == launcher.Process.Pid {
+		t.Fatalf("child did not escape original process group: group=%d original=%d err=%v", group, launcher.Process.Pid, err)
+	}
+	state := cloneRuntimeOwnerState(snapshot.State)
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	record := state.Attempts[key]
+	manifest := record.Manifest
+	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
+	record.Manifest = manifest
+	state.Attempts[key] = record
+	request.Manifest = &manifest
+	if err := validateOwnerManifest(state.Repository, owner.attemptRoot, owner.stateRoot, manifest); err != nil {
+		t.Fatalf("launched manifest fixture is invalid: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binding := agentruntime.ImplementationLaunchBinding{Version: 1, Role: "interactive", Token: manifest.LaunchToken, EffectID: manifest.LaunchID, ServerPID: os.Getpid(), ServerStart: 1, SessionName: manifest.Session, SessionID: "$1", PaneID: "%1", PanePID: launcher.Process.Pid, StartPath: manifest.Worktree, Command: "bound-worker"}
+	if _, err := agentruntime.WriteImplementationGroupStart(manifest, binding, "interactive", launcher.Process.Pid, launcher.Process.Pid); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := agentruntime.ImplementationWorkerGone(manifest, binding); err == nil || gone {
+		t.Fatalf("escaped child was certified absent: gone=%t err=%v", gone, err)
+	}
+	for _, action := range []reconciliationEffectAction{reconciliationGitHubBind, reconciliationGitHubPublish, reconciliationGitHubIssueUpdate, reconciliationGitHubPRGovernance} {
+		if !implementationLeaseBlocksGitHub(state, action, request.Repository, request.Issue) {
+			t.Fatalf("%s ignored live implementation lease", action)
+		}
+	}
+	if _, err := applyBeginReconciliationEffect(owner.attemptRoot, owner.stateRoot, &state, beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("owner admitted GitHub publication while escaped child may live: %v", err)
+	}
+}
 
 func TestReconciliationEffectVariantsAreExactIdempotentAndConflictSafe(t *testing.T) {
 	for _, test := range reconciliationEffectCases(t) {

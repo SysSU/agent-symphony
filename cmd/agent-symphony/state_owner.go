@@ -108,6 +108,52 @@ type runtimeTombstone struct {
 	CleanupPolicy         *agentruntime.EffectCleanupPolicy `json:"cleanup_policy,omitempty"`
 	EffectID              string                            `json:"effect_id,omitempty"`
 	Diagnostic            string                            `json:"diagnostic,omitempty"`
+	InvalidatedHandoff    *handoffCandidateInvalidation     `json:"invalidated_handoff,omitempty"`
+	HandoffCompensated    bool                              `json:"handoff_compensated,omitempty"`
+	InvalidatedStart      *startCandidateInvalidation       `json:"invalidated_start,omitempty"`
+}
+
+type startGateCandidate struct {
+	Nonce  string `json:"nonce"`
+	MayRun bool   `json:"may_run,omitempty"`
+}
+
+type startCandidateInvalidation struct {
+	EffectID   string                `json:"effect_id"`
+	Manifest   agentruntime.Manifest `json:"manifest"`
+	Candidates []startGateCandidate  `json:"candidates"`
+}
+
+// The owner retains this candidate after deleting its pending handoff intent.
+// External cleanup may act only on its exact durable pane binding.
+type handoffCandidateInvalidation struct {
+	EffectID string                `json:"effect_id"`
+	Token    string                `json:"token"`
+	Key      string                `json:"key"`
+	Manifest agentruntime.Manifest `json:"manifest"`
+}
+
+func validHandoffCandidateInvalidation(candidate handoffCandidateInvalidation, manifest agentruntime.Manifest) bool {
+	decoded, err := hex.DecodeString(candidate.EffectID)
+	return err == nil && len(decoded) == 16 && agentruntime.ValidLaunchToken(candidate.Token) && candidate.Token != manifest.LaunchToken && candidate.Key != "" && filepath.Base(candidate.Key) == candidate.Key && !strings.ContainsAny(candidate.Key, "/\\\x00\r\n") && candidate.Manifest.Version == agentruntime.ManifestVersion2 && sameAttemptIdentity(candidate.Manifest, manifest) && candidate.Manifest.LaunchToken == manifest.LaunchToken && candidate.Manifest.LaunchID == manifest.LaunchID
+}
+
+func validStartCandidates(candidates []startGateCandidate) bool {
+	if len(candidates) == 0 {
+		return false
+	}
+	seen := make(map[string]bool, len(candidates))
+	for index, candidate := range candidates {
+		if !agentruntime.ValidLaunchToken(candidate.Nonce) || seen[candidate.Nonce] || candidate.MayRun && index != len(candidates)-1 {
+			return false
+		}
+		seen[candidate.Nonce] = true
+	}
+	return true
+}
+
+func validStartCandidateInvalidation(candidate startCandidateInvalidation, manifest agentruntime.Manifest) bool {
+	return agentruntime.ValidLaunchToken(candidate.EffectID) && candidate.Manifest.Version == agentruntime.ManifestVersion2 && sameAttemptIdentity(candidate.Manifest, manifest) && candidate.Manifest.LaunchToken == manifest.LaunchToken && candidate.Manifest.LaunchID == manifest.LaunchID && validStartCandidates(candidate.Candidates)
 }
 
 type runtimeEffectIntent struct {
@@ -122,6 +168,10 @@ type runtimeEffectIntent struct {
 	IntentRevision                      uint64                         `json:"intent_revision"`
 	State                               string                         `json:"state"`
 	RequestDigest                       string                         `json:"request_digest"`
+	CandidateLaunchToken                string                         `json:"candidate_launch_token,omitempty"`
+	StartGateNonce                      string                         `json:"start_gate_nonce,omitempty"`
+	StartMayRun                         bool                           `json:"start_may_run,omitempty"`
+	StartCandidates                     []startGateCandidate           `json:"start_candidates,omitempty"`
 	Reason                              string                         `json:"reason,omitempty"`
 	Review                              *agentruntime.ReviewTransition `json:"review,omitempty"`
 	Reconciliation                      *reconciliationEffectRequest   `json:"reconciliation,omitempty"`
@@ -142,6 +192,8 @@ type runtimeEffectIntent struct {
 	SupersededReviewerIssueGeneration   uint64                         `json:"superseded_reviewer_issue_generation,omitempty"`
 	SupersededReviewerAttemptGeneration uint64                         `json:"superseded_reviewer_attempt_generation,omitempty"`
 	Diagnostic                          string                         `json:"diagnostic,omitempty"`
+	InvalidatedHandoff                  *handoffCandidateInvalidation  `json:"invalidated_handoff,omitempty"`
+	InvalidatedStart                    *startCandidateInvalidation    `json:"invalidated_start,omitempty"`
 }
 
 type stateResultIdentity struct {
@@ -206,6 +258,8 @@ type beginRuntimeEffectCommand struct {
 	RequestDigest        string
 	Review               *agentruntime.ReviewTransition
 	SupersededReviewerID string
+	CandidateLaunchToken string
+	StartGateNonce       string
 }
 
 type finishRuntimeEffectCommand struct {
@@ -215,8 +269,15 @@ type finishRuntimeEffectCommand struct {
 }
 
 type authorizeRuntimeEffectCommand struct {
+	Identity  stateResultIdentity
+	Action    agentruntime.EffectAction
+	GateNonce string
+}
+
+type rotateStartGateCommand struct {
 	Identity stateResultIdentity
-	Action   agentruntime.EffectAction
+	OldNonce string
+	NewNonce string
 }
 
 type diagnoseRuntimeEffectCommand struct {
@@ -299,6 +360,11 @@ type recordOperatorDiagnosticCommand struct {
 	Diagnostic string
 }
 
+type completeHandoffCompensationCommand struct {
+	RequestID string
+	Proof     handoffCompensationProof
+}
+
 type beginOperatorMutationCommand struct {
 	Request               controlRequest
 	Identity              stateResultIdentity
@@ -346,6 +412,7 @@ const (
 	stateOwnerBeginRuntimeEffect
 	stateOwnerFinishRuntimeEffect
 	stateOwnerAuthorizeRuntimeEffect
+	stateOwnerRotateStartGate
 	stateOwnerDiagnoseRuntimeEffect
 	stateOwnerApplyReconciliation
 	stateOwnerBeginReconciliationEffect
@@ -361,6 +428,7 @@ const (
 	stateOwnerMutatePRRecovery
 	stateOwnerRecordControlReceipt
 	stateOwnerRecordOperatorDiagnostic
+	stateOwnerCompleteHandoffCompensation
 	stateOwnerBeginOperatorMutation
 	stateOwnerStartOperatorCleanup
 	stateOwnerFinishOperatorRuntimeEffect
@@ -378,6 +446,7 @@ type stateOwnerCommand struct {
 	begin                        beginRuntimeEffectCommand
 	finish                       finishRuntimeEffectCommand
 	authorize                    authorizeRuntimeEffectCommand
+	rotateStartGate              rotateStartGateCommand
 	diagnoseRuntime              diagnoseRuntimeEffectCommand
 	reconcile                    applyReconciliationCommand
 	beginReconciliation          beginReconciliationEffectCommand
@@ -393,6 +462,7 @@ type stateOwnerCommand struct {
 	mutatePRRecovery             mutatePRRecoveryCommand
 	receipt                      recordControlReceiptCommand
 	operatorDiagnostic           recordOperatorDiagnosticCommand
+	completeHandoff              completeHandoffCompensationCommand
 	beginOperator                beginOperatorMutationCommand
 	startOperatorCleanup         startOperatorCleanupCommand
 	finishOperatorRuntime        finishOperatorRuntimeEffectCommand
@@ -742,6 +812,13 @@ func (o *stateOwner) completeEffect(ctx context.Context, command completeEffectC
 }
 
 func (o *stateOwner) beginRuntimeEffect(ctx context.Context, command beginRuntimeEffectCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
+	if command.Action == agentruntime.EffectStart && command.StartGateNonce == "" {
+		var err error
+		command.StartGateNonce, err = agentruntime.NewLaunchToken()
+		if err != nil {
+			return stateOwnerSnapshot{}, nil, err
+		}
+	}
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerBeginRuntimeEffect, begin: command})
 	return result.snapshot, result.effect, err
 }
@@ -756,6 +833,16 @@ func (o *stateOwner) authorizeRuntimeEffect(ctx context.Context, command authori
 	return err
 }
 
+func (o *stateOwner) rotateStartGate(ctx context.Context, command rotateStartGateCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
+	var err error
+	command.NewNonce, err = agentruntime.NewLaunchToken()
+	if err != nil {
+		return stateOwnerSnapshot{}, nil, err
+	}
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRotateStartGate, rotateStartGate: command})
+	return result.snapshot, result.effect, err
+}
+
 func (o *stateOwner) recordControlReceipt(ctx context.Context, receipt controlReceipt) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRecordControlReceipt, receipt: recordControlReceiptCommand{Receipt: receipt}})
 	return result.snapshot, err
@@ -763,6 +850,11 @@ func (o *stateOwner) recordControlReceipt(ctx context.Context, receipt controlRe
 
 func (o *stateOwner) recordOperatorDiagnostic(ctx context.Context, command recordOperatorDiagnosticCommand) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRecordOperatorDiagnostic, operatorDiagnostic: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) completeHandoffCompensation(ctx context.Context, command completeHandoffCompensationCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerCompleteHandoffCompensation, completeHandoff: command})
 	return result.snapshot, err
 }
 
@@ -872,9 +964,15 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerAuthorizeRuntimeEffect:
-		if err := applyAuthorizeRuntimeEffect(candidate, command.authorize); err != nil {
+		if err := applyAuthorizeRuntimeEffect(&candidate, command.authorize); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
+	case stateOwnerRotateStartGate:
+		if err := applyRotateStartGate(&candidate, command.rotateStartGate); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+		effect := candidate.Effects[command.rotateStartGate.Identity.EffectID]
+		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, &effect)
 	case stateOwnerDiagnoseRuntimeEffect:
 		if err := applyDiagnoseRuntimeEffect(&candidate, command.diagnoseRuntime); err != nil {
 			return runtimeOwnerState{}, nil, err
@@ -940,6 +1038,10 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if err := applyRecordOperatorDiagnostic(&candidate, command.operatorDiagnostic); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
+	case stateOwnerCompleteHandoffCompensation:
+		if err := applyCompleteHandoffCompensation(&candidate, command.completeHandoff); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
 	case stateOwnerBeginOperatorMutation:
 		effect, err := applyBeginOperatorMutation(attemptRoot, stateRoot, &candidate, command.beginOperator)
 		if err != nil {
@@ -1001,7 +1103,7 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 	return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, nil)
 }
 
-func applyAuthorizeRuntimeEffect(state runtimeOwnerState, command authorizeRuntimeEffectCommand) error {
+func applyAuthorizeRuntimeEffect(state *runtimeOwnerState, command authorizeRuntimeEffectCommand) error {
 	identity := command.Identity
 	if !validRuntimeEffectAction(command.Action) || identity.EffectID == "" || identity.SourceRevision == 0 || !agentruntime.ValidEffectRequestDigest(identity.RequestDigest) {
 		return errStaleStateResult
@@ -1012,17 +1114,56 @@ func applyAuthorizeRuntimeEffect(state runtimeOwnerState, command authorizeRunti
 	}
 	issueKey := ownerIssueKey(effect.Repository, effect.Issue)
 	attemptKey := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
-	if state.AttemptGenerations[attemptKey] != identity.AttemptGeneration || state.IssueGenerations[issueKey] != identity.IssueGeneration && !effectAuthorizedByTombstone(state, effect) {
+	if state.AttemptGenerations[attemptKey] != identity.AttemptGeneration || state.IssueGenerations[issueKey] != identity.IssueGeneration && !effectAuthorizedByTombstone(*state, effect) {
 		return errStaleStateResult
 	}
-	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned && !effectAuthorizedByTombstone(state, effect) {
+	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned && !effectAuthorizedByTombstone(*state, effect) {
 		return errAttemptTombstoned
 	}
+	if command.Action == agentruntime.EffectStart {
+		if !agentruntime.ValidLaunchToken(command.GateNonce) || effect.StartGateNonce != command.GateNonce || len(effect.StartCandidates) == 0 || effect.StartCandidates[len(effect.StartCandidates)-1].Nonce != command.GateNonce {
+			return errStaleStateResult
+		}
+		effect.StartMayRun = true
+		effect.StartCandidates[len(effect.StartCandidates)-1].MayRun = true
+		state.Effects[effect.ID] = effect
+	} else if command.GateNonce != "" {
+		return errStateConflict
+	}
+	return nil
+}
+
+func applyRotateStartGate(state *runtimeOwnerState, command rotateStartGateCommand) error {
+	identity := command.Identity
+	effect, ok := state.Effects[identity.EffectID]
+	if !ok || effect.State != "pending" || effect.Action != string(agentruntime.EffectStart) || effect.IntentEpoch != identity.Epoch || effect.IntentRevision != identity.SourceRevision || effect.IssueGeneration != identity.IssueGeneration || effect.AttemptGeneration != identity.AttemptGeneration || effect.RequestDigest != identity.RequestDigest || effect.StartMayRun || effect.StartGateNonce != command.OldNonce || !agentruntime.ValidLaunchToken(command.NewNonce) || command.NewNonce == command.OldNonce || !validStartCandidates(effect.StartCandidates) {
+		return errStaleStateResult
+	}
+	issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+	if state.IssueGenerations[issueKey] != identity.IssueGeneration || state.AttemptGenerations[attemptKey] != identity.AttemptGeneration {
+		return errStaleStateResult
+	}
+	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned {
+		return errAttemptTombstoned
+	}
+	for _, candidate := range effect.StartCandidates {
+		if candidate.Nonce == command.NewNonce || candidate.MayRun {
+			return errStateConflict
+		}
+	}
+	effect.StartGateNonce = command.NewNonce
+	effect.StartCandidates = append(effect.StartCandidates, startGateCandidate{Nonce: command.NewNonce})
+	state.Effects[effect.ID] = effect
 	return nil
 }
 
 func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerState, command beginRuntimeEffectCommand) (*runtimeEffectIntent, error) {
 	manifest, identity := cloneManifest(command.Manifest), command.Identity
+	// Handoff launches are committed by the reconciliation handoff intent.
+	// There is no production runtime-Handoff producer or restart scheduler.
+	if command.Action == agentruntime.EffectHandoff || command.CandidateLaunchToken != "" || command.Action == agentruntime.EffectStart && !agentruntime.ValidLaunchToken(command.StartGateNonce) || command.Action != agentruntime.EffectStart && command.StartGateNonce != "" {
+		return nil, errStateConflict
+	}
 	if !validRuntimeEffectInput(command.Action, command.Reason) || !agentruntime.ValidEffectRequestDigest(command.RequestDigest) || command.Action == agentruntime.EffectCleanup || command.Action != agentruntime.EffectStop && command.SupersededReviewerID != "" || identity.Epoch != state.Epoch || identity.EffectID != "" {
 		return nil, errStaleStateResult
 	}
@@ -1059,6 +1200,19 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 		}
 	}
 	var supersededReviewer runtimeEffectIntent
+	var invalidatedHandoff *handoffCandidateInvalidation
+	var invalidatedStart *startCandidateInvalidation
+	if command.Action == agentruntime.EffectStop {
+		var err error
+		invalidatedHandoff, err = pendingHandoffCandidate(*state, manifest.Repository, manifest.Issue, manifest.Attempt)
+		if err != nil {
+			return nil, err
+		}
+		invalidatedStart, err = pendingStartCandidate(*state, manifest)
+		if err != nil {
+			return nil, err
+		}
+	}
 	switch command.Action {
 	case agentruntime.EffectPrepare:
 		if _, exists := state.Attempts[attemptKey]; exists || identity.AttemptGeneration != 0 || hasAttemptEffect(*state, manifest.Repository, manifest.Issue, manifest.Attempt) {
@@ -1091,7 +1245,11 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 		}
 		pruneCompletedAttemptEffects(state, manifest.Repository, manifest.Issue, manifest.Attempt)
 	}
-	effect := &runtimeEffectIntent{Action: string(command.Action), Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: identity.IssueGeneration, AttemptGeneration: identity.AttemptGeneration, IntentEpoch: state.Epoch, State: "pending", RequestDigest: command.RequestDigest, Reason: command.Reason, Review: cloneReviewTransition(command.Review)}
+	effect := &runtimeEffectIntent{Action: string(command.Action), Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: identity.IssueGeneration, AttemptGeneration: identity.AttemptGeneration, IntentEpoch: state.Epoch, State: "pending", RequestDigest: command.RequestDigest, Reason: command.Reason, Review: cloneReviewTransition(command.Review), CandidateLaunchToken: command.CandidateLaunchToken, InvalidatedHandoff: invalidatedHandoff, InvalidatedStart: invalidatedStart}
+	if command.Action == agentruntime.EffectStart {
+		effect.StartGateNonce = command.StartGateNonce
+		effect.StartCandidates = []startGateCandidate{{Nonce: command.StartGateNonce}}
+	}
 	bindSupersededReviewer(effect, supersededReviewer)
 	return effect, nil
 }
@@ -1116,6 +1274,9 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || manifest.Repository != effect.Repository || manifest.Issue != effect.Issue || manifest.Attempt != effect.Attempt {
 		return errStateConflict
 	}
+	if command.Action == agentruntime.EffectStart && manifest.State == "running" && (!effect.StartMayRun || !validStartCandidates(effect.StartCandidates)) {
+		return errStateConflict
+	}
 	if runtimeEffectAppliesManifest(command.Action) {
 		if _, tombstoned := state.Tombstones[attemptKey]; tombstoned {
 			return errAttemptTombstoned
@@ -1123,6 +1284,14 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 		record, exists := state.Attempts[attemptKey]
 		if !exists || record.Generation != identity.AttemptGeneration {
 			return errStaleStateResult
+		}
+		if command.Action == agentruntime.EffectReview {
+			if effect.Review == nil {
+				return errStateConflict
+			}
+			if _, err := agentruntime.ReviewEffectResult(attemptRoot, stateRoot, record.Manifest, *effect.Review); err != nil {
+				return errStateConflict
+			}
 		}
 		if !validRuntimeEffectResult(command.Action, effect, record.Manifest, manifest) {
 			return errStateConflict
@@ -1240,7 +1409,19 @@ func applyBindReviewerStopping(state *runtimeOwnerState, command bindReviewerSto
 }
 
 func validRuntimeEffectResult(action agentruntime.EffectAction, effect runtimeEffectIntent, current, result agentruntime.Manifest) bool {
-	if !sameRuntimeEffectManifestBase(current, result, action == agentruntime.EffectReview) {
+	switch action {
+	case agentruntime.EffectStart:
+		if result.LaunchToken != current.LaunchToken || result.LaunchID != current.LaunchID && result.LaunchID != effect.StartGateNonce || result.State == "running" && result.LaunchID != effect.StartGateNonce {
+			return false
+		}
+	case agentruntime.EffectHandoff:
+		unchanged := result.LaunchToken == current.LaunchToken && result.LaunchID == current.LaunchID
+		relaunched := result.LaunchToken == effect.CandidateLaunchToken && result.LaunchID == effect.ID && agentruntime.ValidLaunchToken(effect.CandidateLaunchToken)
+		if !unchanged && !relaunched {
+			return false
+		}
+	}
+	if !sameRuntimeEffectManifestBase(current, result, action) {
 		return false
 	}
 	switch action {
@@ -1280,10 +1461,13 @@ func validOwnerRuntimeEffectInput(attemptRoot, stateRoot string, action agentrun
 	}
 }
 
-func sameRuntimeEffectManifestBase(current, result agentruntime.Manifest, review bool) bool {
+func sameRuntimeEffectManifestBase(current, result agentruntime.Manifest, action agentruntime.EffectAction) bool {
 	copy := cloneManifest(result)
 	copy.State, copy.Diagnostic, copy.UpdatedAt = current.State, current.Diagnostic, current.UpdatedAt
-	if review {
+	if action == agentruntime.EffectStart || action == agentruntime.EffectHandoff {
+		copy.LaunchToken, copy.LaunchID = current.LaunchToken, current.LaunchID
+	}
+	if action == agentruntime.EffectReview {
 		copy.ReviewState, copy.ReviewMode, copy.ReviewTarget = current.ReviewState, current.ReviewMode, current.ReviewTarget
 		copy.ReviewDiagnostic = current.ReviewDiagnostic
 		copy.ReviewBase, copy.ReviewHead, copy.ReviewSnapshot, copy.ReviewSession = current.ReviewBase, current.ReviewHead, current.ReviewSnapshot, current.ReviewSession
@@ -1473,6 +1657,42 @@ func applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot string, state *ru
 	return nil
 }
 
+func pendingHandoffCandidate(state runtimeOwnerState, repository string, issue, attempt int) (*handoffCandidateInvalidation, error) {
+	var candidate *handoffCandidateInvalidation
+	for _, effect := range state.Effects {
+		if effect.State != "pending" || effect.Action != string(reconciliationHandoffDeliver) || effect.Repository != repository || effect.Issue != issue || effect.Attempt != attempt || effect.Reconciliation == nil || effect.Reconciliation.Manifest == nil || effect.Reconciliation.Handoff == nil {
+			continue
+		}
+		manifest := *effect.Reconciliation.Manifest
+		if manifest.Version != agentruntime.ManifestVersion2 {
+			continue
+		}
+		if candidate != nil || !agentruntime.ValidLaunchToken(effect.Reconciliation.Handoff.CandidateLaunchToken) {
+			return nil, errStateConflict
+		}
+		candidate = &handoffCandidateInvalidation{EffectID: effect.ID, Token: effect.Reconciliation.Handoff.CandidateLaunchToken, Key: effect.Reconciliation.Handoff.Key, Manifest: cloneManifest(manifest)}
+	}
+	return candidate, nil
+}
+
+func pendingStartCandidate(state runtimeOwnerState, manifest agentruntime.Manifest) (*startCandidateInvalidation, error) {
+	var candidate *startCandidateInvalidation
+	for _, effect := range state.Effects {
+		if effect.State != "pending" || effect.Action != string(agentruntime.EffectStart) || effect.Repository != manifest.Repository || effect.Issue != manifest.Issue || effect.Attempt != manifest.Attempt {
+			continue
+		}
+		if candidate != nil || manifest.Version != agentruntime.ManifestVersion2 {
+			return nil, errStateConflict
+		}
+		gates := slices.Clone(effect.StartCandidates)
+		if len(gates) == 0 {
+			gates = []startGateCandidate{{Nonce: effect.ID, MayRun: true}} // Legacy intent has no pre-release proof.
+		}
+		candidate = &startCandidateInvalidation{EffectID: effect.ID, Manifest: cloneManifest(manifest), Candidates: gates}
+	}
+	return candidate, nil
+}
+
 func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState, command invalidateAttemptCommand) (*runtimeEffectIntent, error) {
 	if command.Repository != state.Repository || command.Issue < 1 || command.Attempt < 1 || !validTombstoneAction(command.Action) || !validCleanupPhase(command.CleanupPhase) {
 		return nil, errStateConflict
@@ -1504,6 +1724,17 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 		}
 		command.Manifest = &manifest
 	}
+	invalidatedHandoff, err := pendingHandoffCandidate(*state, command.Repository, command.Issue, command.Attempt)
+	if err != nil {
+		return nil, err
+	}
+	var invalidatedStart *startCandidateInvalidation
+	if command.Manifest != nil {
+		invalidatedStart, err = pendingStartCandidate(*state, *command.Manifest)
+		if err != nil {
+			return nil, err
+		}
+	}
 	invalidated := command.ExpectedAttemptGeneration
 	if invalidated == ^uint64(0) {
 		return nil, errors.New("attempt generation overflow")
@@ -1522,7 +1753,7 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 	state.Tombstones[attemptKey] = runtimeTombstone{
 		Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt, Action: command.Action,
 		InvalidatedGeneration: invalidated, Generation: generation, CleanupPhase: command.CleanupPhase,
-		PublishedHead: command.PublishedHead, Manifest: command.Manifest, CleanupPolicy: cloneCleanupPolicy(command.CleanupPolicy), Diagnostic: command.Diagnostic,
+		PublishedHead: command.PublishedHead, Manifest: command.Manifest, CleanupPolicy: cloneCleanupPolicy(command.CleanupPolicy), Diagnostic: command.Diagnostic, InvalidatedHandoff: invalidatedHandoff, InvalidatedStart: invalidatedStart,
 	}
 	if command.EffectAction == "" {
 		return nil, nil
@@ -1605,7 +1836,7 @@ func applyControlReceipt(state *runtimeOwnerState, receipt controlReceipt) error
 }
 
 func applyRecordOperatorDiagnostic(state *runtimeOwnerState, command recordOperatorDiagnosticCommand) error {
-	if command.RequestID == "" || command.Phase != operatorPhaseTerminalAwait && command.Phase != operatorPhaseRetryAwait || !boundedText(command.Diagnostic, maxReconciliationStringBytes, true) {
+	if command.RequestID == "" || command.Phase != operatorPhaseTerminalAwait && command.Phase != operatorPhaseRetryAwait && command.Phase != operatorPhaseHandoffCleanup && command.Phase != operatorPhaseStartCleanup || !boundedText(command.Diagnostic, maxReconciliationStringBytes, true) {
 		return errStateConflict
 	}
 	for index := range state.ControlReceipts {
@@ -1620,6 +1851,48 @@ func applyRecordOperatorDiagnostic(state *runtimeOwnerState, command recordOpera
 		return nil
 	}
 	return errStaleStateResult
+}
+
+func applyCompleteHandoffCompensation(state *runtimeOwnerState, command completeHandoffCompensationCommand) error {
+	if command.RequestID == "" || command.Proof.EffectID == "" {
+		return errStateConflict
+	}
+	var tombstoneKey string
+	for _, receipt := range state.ControlReceipts {
+		if receipt.Request.RequestID != command.RequestID {
+			continue
+		}
+		if receipt.Request.Action != "dismiss" {
+			return errStateConflict
+		}
+		tombstoneKey = ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)
+		break
+	}
+	if tombstoneKey == "" {
+		return errStaleStateResult
+	}
+	tombstone, ok := state.Tombstones[tombstoneKey]
+	if !ok || tombstone.Action != "dismissed" || tombstone.InvalidatedHandoff == nil || tombstone.InvalidatedHandoff.EffectID != command.Proof.EffectID || tombstone.InvalidatedHandoff.Token != command.Proof.Token || !command.Proof.PreserveOld || command.Proof.OldSessionID == "" || command.Proof.OldPaneID == "" || !slices.Contains([]string{"absent", "marked-old", "killed"}, command.Proof.Disposition) {
+		return errStaleStateResult
+	}
+	if tombstone.HandoffCompensated {
+		return nil
+	}
+	completed := false
+	for index := range state.ControlReceipts {
+		receipt := &state.ControlReceipts[index]
+		if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup && ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt) == tombstoneKey {
+			receipt.State, receipt.Phase, receipt.Diagnostic = "completed", operatorPhaseCompleted, ""
+			receipt.Result = successfulOperatorResult(receipt.Request, state.Revision+1)
+			completed = true
+		}
+	}
+	if !completed {
+		return errStateConflict
+	}
+	tombstone.HandoffCompensated = true
+	state.Tombstones[tombstoneKey] = tombstone
+	return nil
 }
 
 func loadOrMigrateRuntimeOwnerState(stateRoot, legacyRecoveryPath, repository string) (runtimeOwnerState, bool, error) {
@@ -1982,6 +2255,15 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 				return errors.New("runtime owner tombstone manifest is invalid")
 			}
 		}
+		if tombstone.InvalidatedHandoff != nil && (tombstone.Manifest == nil || !validHandoffCandidateInvalidation(*tombstone.InvalidatedHandoff, *tombstone.Manifest)) {
+			return errors.New("runtime owner tombstone handoff invalidation is invalid")
+		}
+		if tombstone.InvalidatedStart != nil && (tombstone.Manifest == nil || !validStartCandidateInvalidation(*tombstone.InvalidatedStart, *tombstone.Manifest)) {
+			return errors.New("runtime owner tombstone Start invalidation is invalid")
+		}
+		if tombstone.HandoffCompensated && tombstone.InvalidatedHandoff == nil {
+			return errors.New("runtime owner handoff compensation has no candidate")
+		}
 		if !validTombstoneCleanupPolicy(tombstone) {
 			return errors.New("runtime owner tombstone cleanup policy is invalid")
 		}
@@ -2030,6 +2312,25 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID) || !agentruntime.ValidReviewTarget(effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.Repository, effect.Issue) || effect.SupersededReviewerIssueGeneration == 0 || effect.SupersededReviewerAttemptGeneration == 0 || effect.SupersededReviewerSessionRequested && !effect.SupersededReviewerGateProtocol || effect.SupersededReviewerGateProtocol && !validDigest(effect.SupersededReviewerRequestDigest)) || effect.SupersededReviewerID == "" && (effect.SupersededReviewerTarget != "" || effect.SupersededReviewerMode != "" || effect.SupersededReviewerIssueGeneration != 0 || effect.SupersededReviewerAttemptGeneration != 0 || effect.ReviewerStopped || effect.SupersededReviewerGateProtocol || effect.SupersededReviewerSessionRequested || effect.SupersededReviewerRequestDigest != "") {
 			return errors.New("runtime owner superseded reviewer binding is invalid")
 		}
+		if effect.InvalidatedHandoff != nil {
+			record, ok := state.Attempts[attemptKey]
+			if effect.Action != string(agentruntime.EffectStop) || !ok || !validHandoffCandidateInvalidation(*effect.InvalidatedHandoff, record.Manifest) {
+				return errors.New("runtime owner stop handoff invalidation is invalid")
+			}
+		}
+		if effect.InvalidatedStart != nil {
+			record, ok := state.Attempts[attemptKey]
+			if effect.Action != string(agentruntime.EffectStop) || !ok || !validStartCandidateInvalidation(*effect.InvalidatedStart, record.Manifest) {
+				return errors.New("runtime owner Stop Start invalidation is invalid")
+			}
+		}
+		if effect.Action == string(agentruntime.EffectStart) && len(effect.StartCandidates) != 0 {
+			if !validStartCandidates(effect.StartCandidates) || effect.StartGateNonce != effect.StartCandidates[len(effect.StartCandidates)-1].Nonce || effect.StartMayRun != effect.StartCandidates[len(effect.StartCandidates)-1].MayRun {
+				return errors.New("runtime owner Start gate candidates are invalid")
+			}
+		} else if effect.StartGateNonce != "" || effect.StartMayRun || len(effect.StartCandidates) != 0 {
+			return errors.New("runtime owner unexpected Start gate state")
+		}
 		if effect.RequestDigest != "" && effect.Action == string(agentruntime.EffectReview) {
 			record, ok := state.Attempts[attemptKey]
 			if !ok {
@@ -2064,6 +2365,18 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			effect, ok := state.Effects[receipt.EffectID]
 			if !ok || effect.State != operatorReceiptEffectState(receipt) || !operatorReceiptMatchesEffect(receipt, effect) {
 				return errors.New("runtime owner control receipt effect is invalid")
+			}
+		}
+		if receipt.Phase == operatorPhaseHandoffCleanup {
+			tombstone, ok := state.Tombstones[ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)]
+			if !ok || tombstone.Action != "dismissed" || tombstone.InvalidatedHandoff == nil || tombstone.HandoffCompensated {
+				return errors.New("pending handoff compensation receipt is unbound")
+			}
+		}
+		if receipt.Phase == operatorPhaseStartCleanup {
+			tombstone, ok := state.Tombstones[ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)]
+			if !ok || tombstone.Action != "dismissed" || tombstone.InvalidatedStart == nil {
+				return errors.New("pending start cleanup receipt is unbound")
 			}
 		}
 		seenReceipts[receipt.Request.RequestID] = true
@@ -2118,6 +2431,8 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 			tombstone.Manifest = &manifest
 		}
 		tombstone.CleanupPolicy = cloneCleanupPolicy(tombstone.CleanupPolicy)
+		tombstone.InvalidatedHandoff = cloneHandoffInvalidation(tombstone.InvalidatedHandoff)
+		tombstone.InvalidatedStart = cloneStartInvalidation(tombstone.InvalidatedStart)
 		clone.Tombstones[key] = tombstone
 	}
 	clone.Effects = make(map[string]runtimeEffectIntent, len(state.Effects))
@@ -2125,6 +2440,9 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 		effect.Review = cloneReviewTransition(effect.Review)
 		effect.Reconciliation = cloneReconciliationEffectRequest(effect.Reconciliation)
 		effect.ReconciliationResult = cloneReconciliationEffectResult(effect.ReconciliationResult)
+		effect.InvalidatedHandoff = cloneHandoffInvalidation(effect.InvalidatedHandoff)
+		effect.InvalidatedStart = cloneStartInvalidation(effect.InvalidatedStart)
+		effect.StartCandidates = slices.Clone(effect.StartCandidates)
 		clone.Effects[key] = effect
 	}
 	clone.ReviewerProofs = make(map[string]reviewerProcessProof, len(state.ReviewerProofs))
@@ -2176,6 +2494,28 @@ func cloneEffect(effect *runtimeEffectIntent) *runtimeEffectIntent {
 	clone.Review = cloneReviewTransition(effect.Review)
 	clone.Reconciliation = cloneReconciliationEffectRequest(effect.Reconciliation)
 	clone.ReconciliationResult = cloneReconciliationEffectResult(effect.ReconciliationResult)
+	clone.InvalidatedHandoff = cloneHandoffInvalidation(effect.InvalidatedHandoff)
+	clone.InvalidatedStart = cloneStartInvalidation(effect.InvalidatedStart)
+	clone.StartCandidates = slices.Clone(effect.StartCandidates)
+	return &clone
+}
+
+func cloneStartInvalidation(candidate *startCandidateInvalidation) *startCandidateInvalidation {
+	if candidate == nil {
+		return nil
+	}
+	clone := *candidate
+	clone.Manifest = cloneManifest(clone.Manifest)
+	clone.Candidates = slices.Clone(clone.Candidates)
+	return &clone
+}
+
+func cloneHandoffInvalidation(candidate *handoffCandidateInvalidation) *handoffCandidateInvalidation {
+	if candidate == nil {
+		return nil
+	}
+	clone := *candidate
+	clone.Manifest = cloneManifest(clone.Manifest)
 	return &clone
 }
 
