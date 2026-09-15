@@ -37,7 +37,7 @@ runs = workflow.fetch("jobs").fetch("wsl2").fetch("steps").map { |step| step["ru
 snapshots = runs.flat_map(&:lines).grep(/commit -qm snapshot/)
 abort "expected one WSL snapshot command" unless snapshots.length == 1
 commands = snapshots.first.match(/bash -lc "(.*)"\s*$/)&.captures&.first&.split(/;\s*/)
-chmod = "chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/live-pilot.sh scripts/live-pilot-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh"
+chmod = "chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/live-pilot.sh scripts/live-pilot-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh scripts/wsl-release-validation.sh"
 abort "invalid WSL snapshot chmod" unless File.read(path).scan(/\bchmod\b/).length == 1 && commands&.count(chmod) == 1
 index = commands.index(chmod)
 abort "WSL snapshot chmod must immediately precede git init" unless index && commands[index + 1] == "git init -q"
@@ -71,11 +71,11 @@ grep -qF 'printf '\''CODEX_NATIVE=%s\n'\'' "$native" >> "$GITHUB_ENV"' .github/w
 grep -qF 'dirname "$native" >> "$GITHUB_PATH"' .github/workflows/release-validation.yml
 grep -qF 'sed "s#\"codex\"#\"$CODEX_NATIVE\"#g" "$config" > "$config.native"' .github/workflows/release-validation.yml
 grep -qF "/usr/local/node/bin/npm install --global --prefix /usr/local/codex '@openai/codex@" .github/workflows/release-validation.yml
-grep -qF 'test "$(command -v node)" = /usr/local/node/bin/node' .github/workflows/release-validation.yml
-grep -qF 'test "$(command -v codex)" = "$CODEX_NATIVE"' .github/workflows/release-validation.yml
-grep -qF 'test "$(/usr/local/node/bin/node --version)" = v22.15.1' .github/workflows/release-validation.yml
-grep -qF 'test "$("$CODEX_NATIVE" --version)" = "codex-cli 0.153.0"' .github/workflows/release-validation.yml
-grep -qF 'sed -i "s#\"codex\"#\"$CODEX_NATIVE\"#g" .agent-symphony-ci.yaml' .github/workflows/release-validation.yml
+grep -qF 'test "$(command -v node)" = /usr/local/node/bin/node' scripts/wsl-release-validation.sh
+grep -qF 'test "$(command -v codex)" = "$codex_native"' scripts/wsl-release-validation.sh
+grep -qF 'test "$(/usr/local/node/bin/node --version)" = v22.15.1' scripts/wsl-release-validation.sh
+grep -qF 'test "$("$codex_native" --version)" = "codex-cli 0.153.0"' scripts/wsl-release-validation.sh
+grep -qF 'sed "s#\"codex\"#\"$codex_native\"#g" "$config" > "$config.native"' scripts/wsl-release-validation.sh
 grep -qF 'kernel.unprivileged_userns_clone=1' .github/workflows/release-validation.yml
 grep -qF 'kernel.apparmor_restrict_unprivileged_userns=0' .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to enable WSL unprivileged user namespaces'" .github/workflows/release-validation.yml
@@ -99,10 +99,13 @@ grep -qF "find '\${codexRoot}' ! -type d ! -type f -print -quit" .github/workflo
 grep -qF 'find '\''${codexRoot}'\'' \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \)' .github/workflows/release-validation.yml
 grep -qF "throw 'Pinned WSL Codex installation is unsafe or invalid'" .github/workflows/release-validation.yml
 grep -qF "throw 'WSL rootless Codex confinement proof failed'" .github/workflows/release-validation.yml
-test "$(grep -cF 'CODEX_NATIVE=$1' .github/workflows/release-validation.yml)" -eq 2
-test "$(grep -cF 'agent-symphony "$codexNative"' .github/workflows/release-validation.yml)" -eq 2
-grep -qF 'PATH="$(dirname "$CODEX_NATIVE"):/usr/local/node/bin:/usr/local/go/bin:' .github/workflows/release-validation.yml
-grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl' .github/workflows/release-validation.yml
+grep -qF -- "--cd '~' -- bash agent-symphony-ci/scripts/wsl-release-validation.sh proof \"\$codexNative\"" .github/workflows/release-validation.yml
+grep -qF -- "--cd '~' -- bash agent-symphony-ci/scripts/wsl-release-validation.sh release \"\$codexNative\"" .github/workflows/release-validation.yml
+! grep -F 'bash -lc' .github/workflows/release-validation.yml | grep -qF 'wsl-release-validation.sh'
+grep -qF 'codex_native=${2:-}' scripts/wsl-release-validation.sh
+grep -qF 'test -f "$codex_native" && test ! -L "$codex_native" && test -x "$codex_native"' scripts/wsl-release-validation.sh
+grep -qF 'test "$(command -v codex)" = "$codex_native"' scripts/wsl-release-validation.sh
+grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl' scripts/wsl-release-validation.sh
 grep -qF "throw 'WSL release validation failed'" .github/workflows/release-validation.yml
 ! grep -F '$PATH' .github/workflows/release-validation.yml | grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl'
 git diff --check
