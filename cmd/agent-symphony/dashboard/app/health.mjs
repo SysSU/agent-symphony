@@ -84,7 +84,7 @@ export function overallHealth(snapshot, error, statuses, now) {
     return {
       state: "attention",
       title: "Agent Symphony needs attention",
-      detail: `${attention} visible attempt${attention === 1 ? "" : "s"} need attention. See the status cards below.`,
+      detail: `${attention} attempt${attention === 1 ? "" : "s"} need attention. See the status cards and cleanup notices below.`,
     };
   }
 

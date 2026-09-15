@@ -1130,7 +1130,7 @@ func TestProductionCycleCollectsAppliesAndPlansWithoutLegacyWriters(t *testing.T
 	}
 }
 
-func TestProductionCycleStopsReceiptBoundPlanReviewerAfterFreshExternalAbsence(t *testing.T) {
+func TestProductionCycleQuarantinesReceiptBoundPlanReviewerAfterFreshExternalAbsence(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 473, "active", false)
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
 	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
@@ -1156,20 +1156,21 @@ func TestProductionCycleStopsReceiptBoundPlanReviewerAfterFreshExternalAbsence(t
 		body, _ := json.Marshal(value)
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
 	})}}
-	production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, api: api, collector: reconciliationV2Collector{API: api, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}, Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: "o/r"}}}
+	production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, api: api, config: config.Default("o/r"), collector: reconciliationV2Collector{API: api, Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}, Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: "o/r"}}, stateRoot: owner.stateRoot, attemptRoot: owner.attemptRoot}
 	cycle, err := owner.reconciliationSnapshot(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := production.cycleFromSnapshot(t.Context(), cycle); !errors.Is(err, errReconciliationRecollect) {
-		t.Fatalf("fresh collector cycle did not preempt reviewer: %v", err)
+	if err := production.cycleFromSnapshot(t.Context(), cycle); err != nil {
+		t.Fatalf("fresh collector cycle failed while quarantining reviewer: %v", err)
 	}
 	state := mustOwnerSnapshot(t, owner).State
 	receipt, ok := operatorReceiptByID(state, fmt.Sprintf("pending-plan-%d", manifest.Issue))
+	effect := state.Effects[reviewer.ID]
 	proof := state.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, agentruntime.ReviewModePlan, reviewer.Reconciliation.Reviewer.Target)]
 	gone, groupErr := reviewerGroupGone(proof.GroupPID)
-	if reads == 0 || !ok || receipt.State != "completed" || receipt.Result == nil || receipt.Result.Status != http.StatusConflict || !proof.DeadProved || !gone || groupErr != nil || len(boundary.killed) != 1 {
-		t.Fatalf("cycle failed to stop live review: reads=%d receipt=%#v proof=%#v gone=%v groupErr=%v killed=%v", reads, receipt, proof, gone, groupErr, boundary.killed)
+	if reads == 0 || !ok || receipt.State != "pending" || receipt.Result != nil || !effect.ReviewerRevoked || effect.State != "pending" || !strings.Contains(effect.Diagnostic, "stop remains pending") || proof.DeadProved || !gone || groupErr != nil || len(boundary.killed) != 1 {
+		t.Fatalf("cycle failed to quarantine stopped reviewer: reads=%d receipt=%#v effect=%#v proof=%#v gone=%v groupErr=%v killed=%v", reads, receipt, effect, proof, gone, groupErr, boundary.killed)
 	}
 }
 
@@ -1403,12 +1404,13 @@ func TestHealthyPendingReviewerReplayLetsOtherEffectFinish(t *testing.T) {
 	}
 	replayBoundary := workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `payload=$(cat)
 case "$payload" in
+	*'#{session_id}'*) printf %s "$REPLAY_PANE" ;;
   *'#{pane_start_command}'*) printf %s "$REPLAY_START" ;;
   *'#{pane_pid}'*) printf %s "$REPLAY_PID" ;;
   *'#{pane_dead}'*) printf %s "$REPLAY_PANE" ;;
   *'"wait-for"'*) printf %s "$REPLAY_OK" ;;
   *) exit 1 ;;
-esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode(parts[6]), "REPLAY_PANE=" + encode("0||||"), "REPLAY_OK=" + encode("")}}
+esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode(parts[6]), "REPLAY_PANE=" + encode(live.status.Output), "REPLAY_OK=" + encode("")}}
 	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
 	cfg := config.Default("o/r")
 	cfg.Commands.Reviewer = []string{"reviewer"}
