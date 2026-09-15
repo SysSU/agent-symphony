@@ -993,6 +993,13 @@ func (r *Runtime) startEffect(ctx context.Context, request EffectRequest, author
 	}, request.Identity.AttemptGeneration, r.WorkerProfileDigest) {
 		return manifest, errors.New("implementation confinement binding does not match the authorized launch")
 	}
+	if !manifest.Interactive {
+		if _, err := os.Lstat(ResultPath(manifest.Worktree)); err == nil {
+			return manifest, fmt.Errorf("worker result already exists: %s", ResultPath(manifest.Worktree))
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return manifest, err
+		}
+	}
 	candidate := manifest
 	candidate.LaunchID = request.GateNonce
 	if candidate.LaunchID == "" {

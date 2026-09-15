@@ -286,9 +286,20 @@ func issueUpdateApplied(ctx context.Context, api API, cfg PRAdapterConfig, propo
 		if err != nil {
 			return false, err
 		}
-		return slices.ContainsFunc(comments, func(comment issueCommentRecord) bool {
-			return comment.User.ID == cfg.ActorID && comment.Body == proposal.ControlSnapshotBody
-		}), nil
+		want, err := ParseSnapshotComment(proposal.ControlSnapshotBody, cfg.ActorID, cfg.ActorID)
+		if err != nil {
+			return false, err
+		}
+		var latest Snapshot
+		var latestID int64
+		var latestBody string
+		for _, comment := range comments {
+			parsed, err := ParseSnapshotComment(comment.Body, comment.User.ID, cfg.ActorID)
+			if err == nil && (latestID == 0 || parsed.OwnerGeneration > latest.OwnerGeneration || parsed.OwnerGeneration == latest.OwnerGeneration && comment.ID > latestID) {
+				latest, latestID, latestBody = parsed, comment.ID, comment.Body
+			}
+		}
+		return latestID > 0 && latest.OwnerGeneration == want.OwnerGeneration && latestBody == proposal.ControlSnapshotBody, nil
 	case IssueUpdateDependencyClear:
 		if proposal.AttributionAttempt < 1 || proposal.Dependency < 1 || proposal.ControlSnapshotBody != "" || proposal.PullRequest < 0 {
 			return false, errors.New("dependency clear proposal is invalid")
@@ -314,6 +325,9 @@ type directStatus struct {
 	createdAt            time.Time
 	commentID            int64
 	requestedReason      string
+	attributionIssue     int
+	attributionAttempt   int
+	statusSequence       uint64
 }
 
 func monitoringDependencyStatus(reason string, needsAttention bool) int {
@@ -329,7 +343,8 @@ func monitoringDependencyStatus(reason string, needsAttention bool) int {
 }
 
 func parseDirectStatus(body string) (directStatus, bool) {
-	line, _, _ := strings.Cut(strings.TrimSpace(body), "\n")
+	trimmed := strings.TrimSpace(body)
+	line, rest, _ := strings.Cut(trimmed, "\n")
 	command, reason, found := strings.Cut(strings.TrimSpace(line), ":")
 	reason = strings.TrimSpace(reason)
 	if !found || reason == "" || len(reason) > 1024 || strings.ContainsRune(reason, 0) {
@@ -345,11 +360,19 @@ func parseDirectStatus(body string) (directStatus, bool) {
 		return directStatus{}, false
 	}
 	status.monitoringDependency = monitoringDependencyStatus(reason, status.requestedAttention)
+	var issue, attempt int
+	marker := strings.TrimSpace(rest)
+	var sequence uint64
+	if _, err := fmt.Sscanf(marker, "<!-- agent-symphony:status:v1:sequence:%d -->\n\n<!-- agent-symphony:issue:%d:attempt:%d -->", &sequence, &issue, &attempt); err == nil && marker == fmt.Sprintf("<!-- agent-symphony:status:v1:sequence:%d -->\n\n<!-- agent-symphony:issue:%d:attempt:%d -->", sequence, issue, attempt) && sequence > 0 && issue > 0 && attempt > 0 {
+		status.attributionAttempt = attempt
+		status.attributionIssue = issue
+		status.statusSequence = sequence
+	}
 	return status, true
 }
 
 func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest int) (directStatus, error) {
-	var latest directStatus
+	var latestMarked, latestUnmarked directStatus
 	for _, number := range []int{issue, pullRequest} {
 		if number == 0 {
 			continue
@@ -370,12 +393,23 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 				}
 				status = directStatus{NeedsAttention: true, Reason: "direct status intent is incomplete: use needs-attention or clear with a nonempty reason", incomplete: true}
 			}
-			if latest.commentID == 0 || comment.CreatedAt.After(latest.createdAt) || comment.CreatedAt.Equal(latest.createdAt) && comment.ID > latest.commentID {
-				status.requestedReason = status.Reason
-				status.createdAt, status.commentID = comment.CreatedAt, comment.ID
-				latest = status
+			status.requestedReason = status.Reason
+			status.createdAt, status.commentID = comment.CreatedAt, comment.ID
+			if status.attributionAttempt > 0 {
+				if status.attributionIssue != issue {
+					continue
+				}
+				if latestMarked.commentID == 0 || status.attributionAttempt > latestMarked.attributionAttempt || status.attributionAttempt == latestMarked.attributionAttempt && (status.statusSequence > latestMarked.statusSequence || status.statusSequence == latestMarked.statusSequence && newerDirectStatus(status, latestMarked)) {
+					latestMarked = status
+				}
+			} else if latestUnmarked.commentID == 0 || newerDirectStatus(status, latestUnmarked) {
+				latestUnmarked = status
 			}
 		}
+	}
+	latest := latestMarked
+	if latest.commentID == 0 || latestUnmarked.commentID != 0 && newerDirectStatus(latestUnmarked, latest) {
+		latest = latestUnmarked
 	}
 	var current struct{ Labels []struct{ Name string } }
 	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", s.Config.Repository, issue), "", &current); err != nil {
@@ -402,21 +436,25 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 	return latest, nil
 }
 
+func newerDirectStatus(candidate, current directStatus) bool {
+	return candidate.createdAt.After(current.createdAt) || candidate.createdAt.Equal(current.createdAt) && candidate.commentID > current.commentID
+}
+
 // OwnerStatusApplied verifies the exact owner-authored status comment and label pair.
-func (a API) OwnerStatusApplied(ctx context.Context, repository string, issue, attempt int, needsAttention bool, reason string, actorID int) (bool, error) {
+func (a API) OwnerStatusApplied(ctx context.Context, repository string, issue, attempt int, sequence uint64, needsAttention bool, reason string, actorID int) (bool, error) {
 	reason = strings.TrimSpace(reason)
-	if repository == "" || issue < 1 || attempt < 1 || actorID < 1 || reason == "" || len(reason) > 1024 || strings.ContainsRune(reason, 0) {
+	if repository == "" || issue < 1 || attempt < 1 || sequence == 0 || actorID < 1 || reason == "" || len(reason) > 1024 || strings.ContainsRune(reason, 0) {
 		return false, errors.New("owner status requires a bound attempt and reason")
 	}
 	source := GitHubPRSource{API: a, Config: PRAdapterConfig{Repository: repository, ActorID: actorID}}
 	status, err := source.directStatus(ctx, issue, 0)
-	return err == nil && status.commentID > 0 && !status.incomplete && status.NeedsAttention == needsAttention && status.Reason == reason, err
+	return err == nil && status.commentID > 0 && !status.incomplete && status.attributionIssue == issue && status.attributionAttempt == attempt && status.statusSequence == sequence && status.NeedsAttention == needsAttention && status.Reason == reason, err
 }
 
 // EnsureOwnerStatus applies an untrusted worker request through owner credentials.
-func (a API) EnsureOwnerStatus(ctx context.Context, repository string, issue, attempt int, needsAttention bool, reason string, actorID int) error {
+func (a API) EnsureOwnerStatus(ctx context.Context, repository string, issue, attempt int, sequence uint64, needsAttention bool, reason string, actorID int) error {
 	reason = strings.TrimSpace(reason)
-	applied, err := a.OwnerStatusApplied(ctx, repository, issue, attempt, needsAttention, reason, actorID)
+	applied, err := a.OwnerStatusApplied(ctx, repository, issue, attempt, sequence, needsAttention, reason, actorID)
 	if err != nil || applied {
 		return err
 	}
@@ -425,12 +463,12 @@ func (a API) EnsureOwnerStatus(ctx context.Context, repository string, issue, at
 	if err != nil {
 		return err
 	}
-	if status.commentID == 0 || status.requestedAttention != needsAttention || status.requestedReason != reason {
+	if status.commentID == 0 || status.attributionAttempt != attempt || status.statusSequence != sequence || status.requestedAttention != needsAttention || status.requestedReason != reason {
 		name := "clear"
 		if needsAttention {
 			name = "needs-attention"
 		}
-		body, err := AttributedBody(issue, attempt, directStatusPrefix+name+": "+reason)
+		body, err := AttributedBody(issue, attempt, directStatusPrefix+name+": "+reason+fmt.Sprintf("\n\n<!-- agent-symphony:status:v1:sequence:%d -->", sequence))
 		if err != nil {
 			return err
 		}
@@ -446,7 +484,7 @@ func (a API) EnsureOwnerStatus(ctx context.Context, repository string, issue, at
 	if err := a.SyncReviewLabel(ctx, repository, issue, NeedsAttentionLabel, hasLabel, needsAttention, Mutation{Issue: issue, Attempt: attempt}); err != nil {
 		return err
 	}
-	applied, err = a.OwnerStatusApplied(ctx, repository, issue, attempt, needsAttention, reason, actorID)
+	applied, err = a.OwnerStatusApplied(ctx, repository, issue, attempt, sequence, needsAttention, reason, actorID)
 	if err != nil {
 		return err
 	}

@@ -1261,7 +1261,7 @@ func (s *GitHubPRSource) authorizedControlsWithProposal(ctx context.Context, num
 			if found && comment.ID == snapshotCommentID {
 				return Controls{}, false, nil, errors.New("duplicate control snapshot")
 			}
-			if !found || comment.ID > snapshotCommentID {
+			if !found || parsed.OwnerGeneration > snapshot.OwnerGeneration || parsed.OwnerGeneration == snapshot.OwnerGeneration && comment.ID > snapshotCommentID {
 				snapshot, snapshotCommentID, found = parsed, comment.ID, true
 			}
 		}

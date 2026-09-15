@@ -140,7 +140,7 @@ func verifyLocalAccess(root string) error {
 	return os.RemoveAll(canary)
 }
 
-func verifyRootlessCodex(ctx context.Context, root, codexHome string) error {
+func verifyRootlessCodex(ctx context.Context, root, codexHome, codexExecutable string) error {
 	if err := verifyLocalAccess(root); err != nil {
 		return err
 	}
@@ -211,7 +211,7 @@ func verifyRootlessCodex(ctx context.Context, root, codexHome string) error {
 	}
 	proof := filepath.Join(workspace, "proof")
 	args := config.WorkerSandboxArgs(workspace, probe, "sandbox-probe", proof, canaryPath, stateCanary, authCanary, tcpListener.Addr().String(), unixPath)
-	command := exec.CommandContext(ctx, "codex", args...)
+	command := exec.CommandContext(ctx, codexExecutable, args...)
 	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(private, "tmp")}
 	if err := os.Mkdir(filepath.Join(private, "tmp"), 0o700); err != nil {
 		return err
@@ -1181,7 +1181,26 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if mode != "implementation" {
 			return errors.New("review boundary cannot export implementation attempts")
 		}
-		result.Output, err = exportAttempt(ctx, request.Command.Input, root)
+		var manifest agentruntime.Manifest
+		decoder := json.NewDecoder(bytes.NewReader(request.Command.Input))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF || !belowRoot(manifest.Worktree, root) {
+			return errors.New("invalid export manifest")
+		}
+		binary, binaryErr := os.Executable()
+		if binaryErr != nil {
+			return binaryErr
+		}
+		tmp := filepath.Join(manifest.Worktree, ".agent-symphony", "tmp")
+		if err := os.MkdirAll(tmp, 0o700); err != nil {
+			return err
+		}
+		codexExecutable := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_CODEX_EXECUTABLE"))
+		profileDigest := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_WORKER_PROFILE_DIGEST"))
+		if !filepath.IsAbs(codexExecutable) || !validDigest(profileDigest) || manifest.WorkerProfileDigest != profileDigest {
+			return errors.New("worker export confinement identity is unavailable")
+		}
+		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgs(manifest.Worktree, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp}, Stdin: bytes.NewReader(request.Command.Input)})
 	case "validate-cleanup", "cleanup":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot clean implementation attempts")
@@ -1358,7 +1377,8 @@ func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) err
 	if manifest.Version != agentruntime.ManifestVersion2 {
 		return errors.New("legacy implementation session has no durable launch identity")
 	}
-	confined := agentruntime.WorkerConfinementBound(manifest, manifest.WorkerGeneration, config.WorkerProfileDigest())
+	profileDigest := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_WORKER_PROFILE_DIGEST"))
+	confined := agentruntime.WorkerConfinementBound(manifest, manifest.WorkerGeneration, profileDigest)
 	if manifest.LaunchID == "" && confined {
 		return nil
 	}

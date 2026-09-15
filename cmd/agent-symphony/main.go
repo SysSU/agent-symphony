@@ -715,6 +715,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	command := args[0]
+	if command == "export-attempt" {
+		if len(args) != 2 {
+			fmt.Fprintln(stderr, "invalid export attempt invocation")
+			return 1
+		}
+		input, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20+1))
+		if err != nil || len(input) > 1<<20 {
+			fmt.Fprintln(stderr, "invalid export attempt input")
+			return 1
+		}
+		output, err := exportAttempt(context.Background(), input, args[1])
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprint(stdout, output)
+		return 0
+	}
 	if command == "sandbox-probe" || command == "sandbox-probe-child" {
 		if err := runSandboxProbe(args[1:], command == "sandbox-probe-child"); err != nil {
 			fmt.Fprintln(stderr, err)
@@ -1862,10 +1880,13 @@ func prepareWorkerSeal(ctx context.Context, stateRoot string, generation uint64,
 
 func installWorkerSeal(ctx context.Context, temp, stateRoot string, generation uint64, manifest agentruntime.Manifest, exported workerExport) (string, error) {
 	final := workerSealPath(stateRoot, generation, manifest, exported.HeadSHA)
-	seal := workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, config.WorkerProfileDigest()}
+	seal := workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, manifest.WorkerProfileDigest}
 	body, _ := json.Marshal(seal)
 	if err := os.WriteFile(filepath.Join(temp, "agent-symphony-seal.json"), body, 0o600); err != nil {
 		return "", err
+	}
+	if err := syncWorkerSeal(temp); err != nil {
+		return "", fmt.Errorf("sync owner-private worker seal: %w", err)
 	}
 	workerSealBeforeRename()
 	if err := os.Rename(temp, final); err != nil {
@@ -1876,10 +1897,44 @@ func installWorkerSeal(ctx context.Context, temp, stateRoot string, generation u
 			return "", errors.Join(errors.New("install owner-private worker seal"), err, validationErr)
 		}
 	}
+	if err := immutableDirSync(filepath.Dir(final)); err != nil {
+		return "", fmt.Errorf("sync installed worker seal: %w", err)
+	}
 	if err := validateWorkerSeal(ctx, final, generation, manifest, exported); err != nil {
 		return "", errors.New("installed worker seal failed validation")
 	}
 	return final, nil
+}
+
+func syncWorkerSeal(root string) error {
+	var directories []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			directories = append(directories, path)
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		err = errors.Join(file.Sync(), file.Close())
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	for index := len(directories) - 1; index >= 0; index-- {
+		if err := immutableDirSync(directories[index]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateWorkerSeal(ctx context.Context, path string, generation uint64, manifest agentruntime.Manifest, exported workerExport) error {
@@ -1904,7 +1959,7 @@ func validWorkerSeal(path string, generation uint64, manifest agentruntime.Manif
 	var seal workerSeal
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(&seal) == nil && decoder.Decode(&struct{}{}) == io.EOF && seal == (workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, config.WorkerProfileDigest()})
+	return decoder.Decode(&seal) == nil && decoder.Decode(&struct{}{}) == io.EOF && seal == (workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, manifest.WorkerProfileDigest})
 }
 
 const (

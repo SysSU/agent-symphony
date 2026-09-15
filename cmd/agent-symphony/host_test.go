@@ -202,13 +202,13 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 			payload, _ := json.Marshal(struct {
 				Operation string          `json:"operation"`
 				Command   boundaryCommand `json:"command"`
-			}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=model-canary", "GH_TOKEN=github-canary", "PATH=/bin", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="}}})
+			}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=model-canary", "PATH=/bin", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="}}})
 			var out bytes.Buffer
 			if err := agentHost(t.Context(), mode, bytes.NewReader(payload), &out); err != nil {
 				t.Fatal(err)
 			}
 			var result agentruntime.Result
-			if err := json.Unmarshal(out.Bytes(), &result); err != nil || strings.Contains(result.Output, "model-canary") || strings.Contains(result.Output, "github-canary") || !slices.Contains(launched.Env, "MODEL_API_KEY=model-canary") || !slices.Contains(launched.Env, "GH_TOKEN=github-canary") || !slices.Contains(launched.Env, "HOME="+spec.home) || slices.Contains(launched.Env, "HOME="+os.Getenv("HOME")) {
+			if err := json.Unmarshal(out.Bytes(), &result); err != nil || strings.Contains(result.Output, "model-canary") || strings.Contains(result.Output, "github-canary") || !slices.Contains(launched.Env, "MODEL_API_KEY=model-canary") || slices.Contains(launched.Env, "GH_TOKEN=github-canary") || !slices.Contains(launched.Env, "HOME="+spec.home) || slices.Contains(launched.Env, "HOME="+os.Getenv("HOME")) {
 				t.Fatal("host boundary did not deliver and redact its filtered credential environment")
 			}
 			for _, entry := range []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="} {
@@ -292,7 +292,7 @@ func TestAgentHostRedactsCredentialFromReturnedBoundaryError(t *testing.T) {
 	payload, _ := json.Marshal(struct {
 		Operation string          `json:"operation"`
 		Command   boundaryCommand `json:"command"`
-	}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"GH_TOKEN=" + canary, "PATH=/bin"}}})
+	}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=" + canary, "PATH=/bin"}}})
 	err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{})
 	if err == nil || strings.Contains(err.Error(), canary) || !strings.Contains(err.Error(), "boundary failure") {
 		t.Fatal("host boundary returned an unredacted or unclear error")
@@ -363,7 +363,7 @@ func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
 	canary := "host-boundary-auth-canary"
 	t.Setenv("TMUX_TMPDIR", "/tmp/denied-tmux-canary")
 	t.Setenv("UNRELATED_SECRET", "denied-secret-canary")
-	sessionEnv := []string{"PATH=/bin", "GH_TOKEN=" + canary}
+	sessionEnv := []string{"PATH=/bin"}
 	newSession := agentruntime.TmuxNewSessionArgs("as-o-r-131-3", root, sessionEnv)
 	payload, _ = json.Marshal(struct {
 		Operation string          `json:"operation"`
@@ -372,7 +372,7 @@ func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
 	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(launched.Args, "HOME=/var/lib/agent-symphony-worker") || launched.Dir != "/tmp" || !slices.Contains(launched.Env, "GH_TOKEN="+canary) || strings.Contains(strings.Join(launched.Args, " "), canary) || slices.ContainsFunc(launched.Env, func(value string) bool {
+	if !slices.Contains(launched.Args, "HOME=/var/lib/agent-symphony-worker") || launched.Dir != "/tmp" || slices.Contains(launched.Env, "GH_TOKEN="+canary) || strings.Contains(strings.Join(launched.Args, " "), canary) || slices.ContainsFunc(launched.Env, func(value string) bool {
 		return strings.HasPrefix(value, "TMUX_TMPDIR=") || strings.HasPrefix(value, "UNRELATED_SECRET=")
 	}) {
 		t.Fatal("new tmux session did not receive a safely transported worker environment")
@@ -2008,7 +2008,11 @@ func TestRootlessCodexConfinementDeniesDetachedChildAuthority(t *testing.T) {
 	oldExecutable := sandboxExecutable
 	sandboxExecutable = func() (string, error) { return binary, nil }
 	t.Cleanup(func() { sandboxExecutable = oldExecutable })
-	if err := verifyRootlessCodex(t.Context(), attemptRoot, codexHome); err != nil {
+	codex, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyRootlessCodex(t.Context(), attemptRoot, codexHome, codex); err != nil {
 		t.Fatal(err)
 	}
 }

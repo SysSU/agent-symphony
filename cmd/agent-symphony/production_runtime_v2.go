@@ -44,10 +44,15 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	if err := prepareProductionMarkerDirectories(stateRoot); err != nil {
 		return nil, err
 	}
+	workerProfileDigest, err := config.BindWorkerExecutable(parent, &cfg.Commands)
+	if err != nil {
+		return nil, err
+	}
 	initial, _, err := loadOrMigrateRuntimeOwnerState(stateRoot, legacyRecoveryPath, cfg.Repository)
 	if err != nil {
 		return nil, err
 	}
+	initial.WorkerProfileDigest = workerProfileDigest
 	lifecycle, cancel := context.WithCancel(parent)
 	runtime := &productionRuntimeV2{cancel: cancel}
 	fail := func(err error) (*productionRuntimeV2, error) {
@@ -81,17 +86,25 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	}
 	implementation := implementationBoundary(stateRoot)
 	reviewer := reviewBoundary(stateRoot)
+	for _, boundary := range []*workerBoundaryRunner{&implementation, &reviewer} {
+		boundary.Env = append(boundary.Env, "AGENT_SYMPHONY_CODEX_EXECUTABLE="+cfg.Commands.Implementation[0], "AGENT_SYMPHONY_WORKER_PROFILE_DIGEST="+workerProfileDigest)
+	}
 	var preflight successfulCheck
 	runtimeState := &agentruntime.Runtime{
 		Root: attemptRoot, StateRoot: stateRoot, Source: source, Git: "git", Tmux: "tmux", Helper: binary,
 		Runner: implementation, AllowEnv: cfg.Commands.Environment, WorkerHome: workerCodexHome(stateRoot),
-		WorkerProfileDigest: config.WorkerProfileDigest(),
+		WorkerProfileDigest: workerProfileDigest,
 		VerifyWorker: func(ctx context.Context) error {
+			check := cfg.Commands
+			digest, err := config.BindWorkerExecutable(ctx, &check)
+			if err != nil || digest != workerProfileDigest || check.Implementation[0] != cfg.Commands.Implementation[0] {
+				return errors.Join(errors.New("codex worker executable identity changed"), err)
+			}
 			return preflight.Do(func() error {
 				if _, err := implementation.call(ctx, "verify", agentruntime.Command{}); err != nil {
 					return err
 				}
-				return verifyRootlessCodex(ctx, attemptRoot, workerCodexHome(stateRoot))
+				return verifyRootlessCodex(ctx, attemptRoot, workerCodexHome(stateRoot), cfg.Commands.Implementation[0])
 			})
 		},
 	}
