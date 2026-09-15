@@ -200,6 +200,7 @@ func (p *productionReconciliation) runCycle(ctx context.Context) error {
 		return err
 	}
 	err = p.cycleFromSnapshot(ctx, cycleSnapshot)
+	err = reconciliationCycleDisposition(err, nil)
 	diagnostic := ""
 	var at time.Time
 	if err != nil && !errors.Is(err, errReconciliationRecollect) {
@@ -209,7 +210,7 @@ func (p *productionReconciliation) runCycle(ctx context.Context) error {
 	identity := stateResultIdentity{Epoch: cycleSnapshot.State.Epoch, SourceRevision: cycleSnapshot.State.Revision, CycleID: cycleSnapshot.CycleID}
 	committed, outcomeErr := p.owner.recordCycleOutcome(ctx, recordCycleOutcomeCommand{Identity: identity, Diagnostic: diagnostic, At: at})
 	if outcomeErr != nil {
-		return errors.Join(err, outcomeErr)
+		return reconciliationCycleDisposition(err, outcomeErr)
 	}
 	if p.supervisor != nil && p.capacity > 0 {
 		status, projectErr := projectOwnerStatus(committed, p.capacity, time.Now().UTC())
@@ -226,6 +227,16 @@ func (p *productionReconciliation) runCycle(ctx context.Context) error {
 		}
 	}
 	return err
+}
+
+func reconciliationCycleDisposition(phaseErr, outcomeErr error) error {
+	if outcomeErr != nil {
+		return outcomeErr
+	}
+	if errors.Is(phaseErr, errStaleStateResult) {
+		return errReconciliationRecollect
+	}
+	return phaseErr
 }
 
 func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleSnapshot stateOwnerSnapshot) error {
@@ -393,7 +404,11 @@ func (p *productionReconciliation) runMachineStatusPhase(ctx context.Context, ap
 		}
 		return false, nil
 	}
-	plan, err := p.effects.beginReconciliation(ctx, plans[0])
+	return p.runMachineStatusPlan(ctx, api, plans[0])
+}
+
+func (p *productionReconciliation) runMachineStatusPlan(ctx context.Context, api internalgithub.API, plan reconciliationPlannedEffect) (bool, error) {
+	plan, err := p.effects.beginReconciliation(ctx, plan)
 	if err != nil {
 		return false, fmt.Errorf("admit machine-status update: %w", err)
 	}
