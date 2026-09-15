@@ -40,6 +40,20 @@ func TestOperatorDismissCommitsCompletedTombstoneReceiptWithoutCleanup(t *testin
 	}
 }
 
+func TestOperatorWithoutTombstoneStillRejectsMissingObservation(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 371, "completed", false)
+	before := mustOwnerSnapshot(t, owner)
+	command := operatorCommand(before, operatorRequest("archive-stale-observation", "archive", manifest, true), manifest)
+	applyReconciliationInput(t, owner, reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: manifest.Repository}, Complete: true})
+	if _, _, err := owner.beginOperatorMutation(t.Context(), command); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("missing observation without tombstone err=%v", err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	if _, exists := state.Tombstones[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]; exists {
+		t.Fatal("stale request created tombstone")
+	}
+}
+
 func TestDismissPendingStartKeepsPhysicalCleanupPendingAcrossRestart(t *testing.T) {
 	owner, manifest := operatorOwnerWithPendingStart(t, 397, "completed", true)
 	request := operatorRequest("dismiss-start-candidate", "dismiss", manifest, false)
@@ -765,7 +779,6 @@ func TestCancelBindsObservedReviewerGroupBeforeStopAndSurvivesRestart(t *testing
 	identity := ownerEffectIdentity(effectRequestIdentity(*stop))
 	proofKey := reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, review.Reviewer.Mode, review.Reviewer.Target)
 	prior := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
-	prior.ReviewerProofs[proofKey] = reviewerProcessProof{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, EffectID: strings.Repeat("f", 32), IssueGeneration: reviewer.IssueGeneration, AttemptGeneration: reviewer.AttemptGeneration, GroupPID: 7777, DeadProved: true}
 	if err := owner.close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -792,12 +805,20 @@ func TestCancelBindsObservedReviewerGroupBeforeStopAndSurvivesRestart(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = restarted.close(context.Background()) })
-	if _, err := restarted.markReviewerStopped(t.Context(), markReviewerStoppedCommand{Identity: identity, Observation: reviewerStopObservation{GroupPID: 12345}}); err != nil {
+	if _, err := restarted.markReviewerStopped(t.Context(), markReviewerStoppedCommand{Identity: identity, Observation: reviewerStopObservation{GroupPID: 12345}}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("group absence falsely completed reviewer stop after restart: %v", err)
+	}
+	current := mustOwnerSnapshot(t, restarted)
+	proof = current.State.ReviewerProofs[proofKey]
+	if proof.DeadProved || current.State.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].StopEffectID != stop.ID {
+		t.Fatalf("restart lost pending stop lease: proof=%#v attempt=%#v", proof, current.State.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)])
+	}
+	projected, err := projectOwnerStatus(current, 1, time.Now())
+	if err != nil {
 		t.Fatal(err)
 	}
-	proof = mustOwnerSnapshot(t, restarted).State.ReviewerProofs[proofKey]
-	if !proof.DeadProved {
-		t.Fatalf("restart did not retain group-death certificate: %#v", proof)
+	if len(projected.Statuses) != 1 || !projected.Statuses[0].NeedsAttention || !projected.Statuses[0].OperatorBlocked || projected.Statuses[0].CurrentPhase != "stop-pending" {
+		t.Fatalf("pending reviewer stop was projected as runnable: %#v", projected.Statuses)
 	}
 }
 

@@ -98,12 +98,19 @@ func TestRuntimeOwnerMigratesCompletedLegacyRemovalWithoutResourceIdentity(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if slices.ContainsFunc(projected.Statuses, func(status orchestrator.RecoveryStatus) bool { return status.Issue == 42 && status.Attempt == 1 }) {
-		t.Fatalf("completed removal was resurrected: %#v", projected.Statuses)
+	if slices.ContainsFunc(projected.Statuses, func(status orchestrator.RecoveryStatus) bool {
+		return status.Issue == 42 && status.Attempt == 1 && status.CurrentPhase != "physical-unverified"
+	}) {
+		t.Fatalf("completed removal was resurrected as an attempt: %#v", projected.Statuses)
+	}
+	if !slices.ContainsFunc(projected.Statuses, func(status orchestrator.RecoveryStatus) bool {
+		return status.Issue == 42 && status.Attempt == 1 && status.CurrentPhase == "physical-unverified" && status.NeedsAttention && status.OperatorBlocked
+	}) {
+		t.Fatalf("completed removal did not expose its independent legacy quarantine: %#v", projected.Statuses)
 	}
 }
 
-func TestRuntimeOwnerMigratedPendingRemovalResumesTypedCleanup(t *testing.T) {
+func TestRuntimeOwnerMigratedPendingRemovalRemainsQuarantined(t *testing.T) {
 	root := resolvedTempDir(t)
 	if err := bindDeployment(root, "o/r"); err != nil {
 		t.Fatal(err)
@@ -124,13 +131,13 @@ func TestRuntimeOwnerMigratedPendingRemovalResumesTypedCleanup(t *testing.T) {
 	}
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
 	requestID := mustOwnerSnapshot(t, owner).State.ControlReceipts[0].Request.RequestID
-	if err := service.resumeReceipt(t.Context(), requestID); err != nil {
-		t.Fatal(err)
+	if err := service.resumeReceipt(t.Context(), requestID); err == nil {
+		t.Fatal("legacy cleanup without descendant proof completed")
 	}
 	final := mustOwnerSnapshot(t, owner).State
 	key := ownerAttemptKey("o/r", 43, 1)
 	tombstone := final.Tombstones[key]
-	if tombstone.CleanupPhase != "completed" || final.Effects[tombstone.EffectID].State != "completed" || len(final.ControlReceipts) != 1 || final.ControlReceipts[0].State != "completed" {
+	if tombstone.CleanupPhase == "completed" || final.Effects[tombstone.EffectID].State != "pending" || len(final.ControlReceipts) != 1 || final.ControlReceipts[0].State != "pending" || final.LegacyReviewerQuarantines[ownerIssueKey("o/r", 43)] == "" {
 		t.Fatalf("state=%#v", final)
 	}
 }
@@ -918,7 +925,8 @@ func TestStateOwnerRejectsManifestRootChosenByCaller(t *testing.T) {
 
 func TestStateOwnerTransitionsUseBoundIdentityWithoutFilesystemAccess(t *testing.T) {
 	root := resolvedTempDir(t)
-	manifest := ownerTestManifest(t, root, 61, 1, "running")
+	manifest := ownerTestManifest(t, root, 61, 1, "preparing")
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
 	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -927,7 +935,13 @@ func TestStateOwnerTransitionsUseBoundIdentityWithoutFilesystemAccess(t *testing
 	if err := os.RemoveAll(root); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	initial := mustOwnerSnapshot(t, owner)
+	snapshot, _, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{
+		Identity:      stateResultIdentity{Epoch: initial.State.Epoch, SourceRevision: initial.State.Revision},
+		Action:        agentruntime.EffectPrepare,
+		Manifest:      manifest,
+		RequestDigest: strings.Repeat("1", 64),
+	})
 	key := ownerAttemptKey("o/r", 61, 1)
 	if err != nil || snapshot.State.Revision <= 1 || snapshot.State.Attempts[key].Manifest.Worktree != manifest.Worktree {
 		t.Fatalf("snapshot=%#v err=%v", snapshot, err)

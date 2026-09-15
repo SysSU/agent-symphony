@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
@@ -188,7 +189,14 @@ func (c *runtimeEffectCoordinator) dispatch(request agentruntime.EffectRequest, 
 		return err
 	}
 	go func() {
-		_, _ = c.executeWithRun(request, run)
+		_, executeErr := c.executeWithRun(request, run)
+		if executeErr != nil && !errors.Is(executeErr, errStaleStateResult) && !errors.Is(executeErr, context.Canceled) {
+			_, _ = c.owner.diagnoseRuntimeEffect(c.lifecycle, diagnoseRuntimeEffectCommand{
+				Identity:   ownerEffectIdentity(request.Identity),
+				Action:     request.Action,
+				Diagnostic: "runtime effect failed: " + internalgithub.Redact(executeErr.Error()),
+			})
+		}
 		if finished != nil {
 			finished()
 		}
@@ -375,6 +383,14 @@ func (c *runtimeEffectCoordinator) cancelOlder(manifest agentruntime.Manifest, g
 		run.cancel()
 	}
 	c.mu.Unlock()
+}
+
+func (c *runtimeEffectCoordinator) effectActive(manifest agentruntime.Manifest, effectID string) bool {
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	run := c.active[key]
+	return run != nil && run.effectID == effectID
 }
 
 func (c *runtimeEffectCoordinator) cancelEffect(effectID string) {

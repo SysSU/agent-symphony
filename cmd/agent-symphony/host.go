@@ -1752,13 +1752,49 @@ func validBoundImplementationNewSession(args []string, gate, dir, root string) b
 		return slices.Equal(launch, []string{"/bin/sh"})
 	}
 	helper, err := os.Executable()
-	if err != nil || len(launch) < 10 || launch[0] != helper || launch[1] != "implementation-gate" || launch[2] != "tmux" || !boundedCommandPath(launch[3], dir, root) || launch[4] != args[8] || launch[5] != args[6] || launch[6] != token || launch[7] != strings.TrimPrefix(gate, "implementation-") || launch[8] != "--" || launch[9] == "" {
+	if err != nil || len(launch) < 10 || launch[0] != helper || launch[1] != "implementation-gate" || launch[2] != "tmux" || !validImplementationLogPath(launch[3], args[8], args[6], dir, root) || launch[4] != args[8] || launch[5] != args[6] || launch[6] != token || launch[7] != strings.TrimPrefix(gate, "implementation-") || launch[8] != "--" || launch[9] == "" {
 		return false
 	}
 	return !slices.Contains(launch, ";")
 }
 
-var implementationGuardPattern = regexp.MustCompile(`^#\{&&:#\{==:#\{pid\},([1-9][0-9]*)\},#\{&&:#\{==:#\{start_time\},([1-9][0-9]*)\},#\{&&:#\{==:#\{session_name\},(as-[0-9a-f]{16}-[1-9][0-9]*-[1-9][0-9]*)\},#\{&&:#\{==:#\{session_id\},(\$[0-9]+)\},#\{&&:#\{==:#\{pane_id\},(%[0-9]+)\},#\{&&:#\{==:#\{pane_pid\},([1-9][0-9]*)\},#\{==:#\{@agent-symphony-launch-token\},([0-9a-f]{32})\}\}\}\}\}\}\}$`)
+func validImplementationLogPath(logPath, worktree, session, dir, root string) bool {
+	if boundedCommandPath(logPath, dir, root) {
+		return true
+	}
+	if filepath.Base(root) != "worktrees" || filepath.Dir(worktree) != root || filepath.Base(worktree) != strings.TrimPrefix(session, "as-") {
+		return false
+	}
+	identity := filepath.Base(worktree)
+	last := strings.LastIndexByte(identity, '-')
+	if last < 1 {
+		return false
+	}
+	previous := strings.LastIndexByte(identity[:last], '-')
+	if previous < 1 {
+		return false
+	}
+	repository, issue, attempt := identity[:previous], identity[previous+1:last], identity[last+1:]
+	if repository == "" || !positiveDecimal(issue) || !positiveDecimal(attempt) {
+		return false
+	}
+	want := filepath.Join(filepath.Dir(root), "attempts", repository, issue+"-"+attempt, "agent.log")
+	return filepath.Clean(logPath) == logPath && logPath == want
+}
+
+func positiveDecimal(value string) bool {
+	if value == "" || value[0] == '0' {
+		return false
+	}
+	for _, digit := range value {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+var implementationGuardPattern = regexp.MustCompile(`^#\{&&:#\{==:#\{pid\},([1-9][0-9]*)\},#\{&&:#\{==:#\{start_time\},([1-9][0-9]*)\},#\{&&:#\{==:#\{session_name\},(as-[a-z0-9][a-z0-9._-]{0,39}-[0-9a-f]{12}-[1-9][0-9]*-[1-9][0-9]*)\},#\{&&:#\{==:#\{session_id\},(\$[0-9]+)\},#\{&&:#\{==:#\{pane_id\},(%[0-9]+)\},#\{&&:#\{==:#\{pane_pid\},([1-9][0-9]*)\},#\{==:#\{@agent-symphony-launch-token\},([0-9a-f]{32})\}\}\}\}\}\}\}$`)
 
 func validImplementationGuardedArgs(args []string) bool {
 	if len(args) != 7 || args[1] != "-F" || args[2] != "-t" || args[6] != "display-message -p "+agentruntime.ImplementationGuardMismatch {

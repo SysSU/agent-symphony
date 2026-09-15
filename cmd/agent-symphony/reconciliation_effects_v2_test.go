@@ -192,6 +192,7 @@ func TestReconciliationEffectVariantsAreExactIdempotentAndConflictSafe(t *testin
 				t.Fatalf("conflicting begin err=%v", err)
 			}
 			finishIdentity := reconciliationIntentIdentity(*first)
+			result := test.result(request)
 			if err := owner.authorizeReconciliationEffect(t.Context(), authorizeReconciliationEffectCommand{Identity: finishIdentity, Action: request.Action}); err != nil {
 				t.Fatalf("authorize effect: %v", err)
 			}
@@ -202,11 +203,8 @@ func TestReconciliationEffectVariantsAreExactIdempotentAndConflictSafe(t *testin
 				if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: finishIdentity, GroupPID: 99999999}); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: finishIdentity, GroupPID: 99999999}); err != nil {
-					t.Fatal(err)
-				}
+				sealTestReviewerResult(t, owner, *first, result)
 			}
-			result := test.result(request)
 			completed, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: finishIdentity, Result: result})
 			if err != nil {
 				t.Fatal(err)
@@ -261,14 +259,69 @@ func TestPlanReviewRunningTransitionRequiresExactPendingEffect(t *testing.T) {
 	if _, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: result}); !errors.Is(err, errStateConflict) {
 		t.Fatalf("launched reviewer finished without owner process-death proof: %v", err)
 	}
-	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
-		t.Fatalf("record reviewer process-death proof: %v", err)
+	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("group absence falsely proved descendant death: %v", err)
+	}
+	launchPath, terminalPath := reviewerLifecyclePaths(request.Reviewer.Snapshot, request.Reviewer.Target)
+	pane, err := parseReviewerPaneIdentity(reviewerPaneTestOutput("1|0|||", request.Reviewer.Session, "$9", os.Getpid(), "agent-symphony review-pane tmux "+launchPath+" "+terminalPath+" "+reviewerSignal(reviewerIdentity(identity))+" "+identity.RequestDigest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalIdentity := reviewerIdentity(identity)
+	terminalIdentity.GateProtocol, terminalIdentity.SessionRequested, terminalIdentity.ChildPID = true, true, 99999999
+	if _, err := owner.sealReviewerResult(t.Context(), sealReviewerResultCommand{Identity: identity, Result: result, Pane: pane, Terminal: reviewerTerminalRecord{Identity: terminalIdentity}}); err != nil {
+		t.Fatalf("seal exact business result: %v", err)
 	}
 	if _, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: result}); err != nil {
 		t.Fatalf("exact running effect did not finish: %v", err)
 	}
 	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity}); !errors.Is(err, errStaleStateResult) {
 		t.Fatalf("completed effect could restart reviewer: %v", err)
+	}
+}
+
+func TestSealedReviewerResultReplaysAfterRestartWithoutDeathProof(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
+	root, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	request = bindEffectObservation(snapshot, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := ownerReconciliationEffectIdentity(*effect)
+	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+		t.Fatal(err)
+	}
+	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(request)
+	sealTestReviewerResult(t, owner, *effect, result)
+	if err := writeReconciliationEffectMarker(root, identity, request, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(root, request.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, root, loaded, func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, owner.attemptRoot, state)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted}
+	if got, err := coordinator.verifyPendingReconciliation(t.Context(), loaded.Effects[effect.ID]); err != nil || got == nil || !reflect.DeepEqual(*got, result) {
+		t.Fatalf("sealed reviewer marker did not replay: result=%#v err=%v", got, err)
+	}
+	current := mustOwnerSnapshot(t, restarted).State
+	proof := current.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)]
+	if proof.DeadProved || current.Effects[effect.ID].State != "completed" {
+		t.Fatalf("replay falsely certified physical death or lost business result: proof=%#v effect=%#v", proof, current.Effects[effect.ID])
 	}
 }
 
@@ -1398,6 +1451,23 @@ func reconciliationEffectTestOwner(t *testing.T, request reconciliationEffectReq
 	return owner, snapshot, bindEffectObservation(snapshot, request)
 }
 
+func sealTestReviewerResult(t *testing.T, owner *stateOwner, effect runtimeEffectIntent, result reconciliationEffectResult) {
+	t.Helper()
+	current := mustOwnerSnapshot(t, owner).State.Effects[effect.ID]
+	identity := ownerReconciliationEffectIdentity(current)
+	reviewer := current.Reconciliation.Reviewer
+	launchPath, terminalPath := reviewerLifecyclePaths(reviewer.Snapshot, reviewer.Target)
+	pane, err := parseReviewerPaneIdentity(reviewerPaneTestOutput("1|0|||", reviewer.Session, "$9", os.Getpid(), "agent-symphony review-pane tmux "+launchPath+" "+terminalPath+" "+reviewerSignal(reviewerIdentity(identity))+" "+identity.RequestDigest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalIdentity := reviewerIdentity(identity)
+	terminalIdentity.GateProtocol, terminalIdentity.SessionRequested, terminalIdentity.ChildPID = current.ReviewerGateProtocol, current.ReviewerSessionRequested, current.ReviewerGroupPID
+	if _, err := owner.sealReviewerResult(t.Context(), sealReviewerResultCommand{Identity: identity, Result: result, Pane: pane, Terminal: reviewerTerminalRecord{Identity: terminalIdentity}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func reconciliationEffectPersistentOwner(t *testing.T, request reconciliationEffectRequest) (string, *stateOwner, stateOwnerSnapshot) {
 	t.Helper()
 	var root string
@@ -1418,7 +1488,7 @@ func reconciliationEffectPersistentOwnerWithPersist(t *testing.T, request reconc
 		state.AttemptGenerations[attemptKey] = 1
 		state.Attempts[attemptKey] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
 		if request.Reviewer != nil && request.Reviewer.Phase == "cleanup" {
-			proof := reviewerProcessProof{Repository: "o/r", Issue: request.Issue, Attempt: request.Attempt, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, EffectID: "1234567890abcdef1234567890abcdef", IssueGeneration: 1, AttemptGeneration: 1, GroupPID: 99999999, DeadProved: true}
+			proof := reviewerProcessProof{Repository: "o/r", Issue: request.Issue, Attempt: request.Attempt, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, EffectID: "1234567890abcdef1234567890abcdef", IssueGeneration: 1, AttemptGeneration: 1, NeverRan: true, DeadProved: true}
 			state.ReviewerProofs[reviewerProofKey("o/r", request.Issue, request.Attempt, proof.Mode, proof.Target)] = proof
 		}
 		if request.Action == reconciliationGitHubPRGovernance || request.Handoff != nil && request.Handoff.Kind == "recovery" || request.GitHubPublish != nil && request.GitHubPublish.Prepared != nil {

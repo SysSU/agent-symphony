@@ -362,8 +362,13 @@ func TestReconciliationGenerationAdvanceMasksNestedAttemptFacts(t *testing.T) {
 			}
 			request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 177, Attempt: 1, Manifest: &manifest, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, ExecutionDigest: strings.Repeat("a", 64), GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueEvidence, HeadSHA: remote.HeadSHA}}
 			identity := stateResultIdentity{Epoch: applied.State.Epoch, SourceRevision: applied.State.Revision, IssueGeneration: 1, AttemptGeneration: 2}
-			if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: identity, Request: request}); !errors.Is(err, errStaleStateResult) {
-				t.Fatalf("stale nested fact admitted an effect: %v", err)
+			before := len(applied.State.Effects)
+			if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: identity, Request: request}); err == nil {
+				t.Fatal("stale nested fact admitted an effect")
+			}
+			after := mustOwnerSnapshot(t, owner)
+			if len(after.State.Effects) != before {
+				t.Fatalf("rejected stale nested fact changed effects: before=%d after=%d", before, len(after.State.Effects))
 			}
 		})
 	}

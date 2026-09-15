@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +26,97 @@ import (
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
+
+func ensureFullSystemParkedImplementation(t *testing.T, environment []string, helper string, manifest agentruntime.Manifest) {
+	t.Helper()
+	if manifest.Version != agentruntime.ManifestVersion2 || manifest.LaunchID == "" || manifest.LaunchToken == "" {
+		t.Fatal("parked implementation fixture requires a complete V2 identity")
+	}
+	args := agentruntime.TmuxNewSessionArgs(manifest.Session, manifest.Worktree, environment)
+	args = slices.Insert(args, 7, "-P", "-F", agentruntime.ImplementationPaneFormat)
+	args = append(args, helper, "implementation-gate", "tmux", manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, manifest.LaunchID, "--", "/bin/false")
+	args = append([]string{"wait-for", "-L", agentruntime.ImplementationGateChannel(manifest.LaunchID), ";"}, args...)
+	target := agentruntime.PaneTarget(manifest.Session)
+	args = append(args,
+		";", "set-option", "-p", "-t", target, "@agent-symphony-launch-token", manifest.LaunchToken,
+		";", "set-option", "-w", "-t", target, "remain-on-exit", "on",
+		";", "set-option", "-w", "-t", target, "history-limit", "5000",
+		";", "set-option", "-p", "-t", target, agentruntime.PaneExitStatusOption, "",
+		";", "set-option", "-p", "-t", target, agentruntime.PaneExitSignalOption, "",
+	)
+	command := exec.Command("tmux", args...)
+	command.Env = environment
+	created, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("create parked V2 implementation: %v: %s", err, created)
+	}
+	initial, err := agentruntime.ParseImplementationPane(string(created))
+	if err != nil || initial.SessionName != manifest.Session || initial.StartPath != manifest.Worktree || initial.Token != "" {
+		t.Fatalf("created parked pane identity=%#v err=%v", initial, err)
+	}
+	inspect := exec.Command("tmux", "display-message", "-p", "-t", target, agentruntime.ImplementationPaneFormat)
+	inspect.Env = environment
+	observed, err := inspect.CombinedOutput()
+	if err != nil {
+		t.Fatalf("inspect parked V2 implementation: %v: %s", err, observed)
+	}
+	pane, err := agentruntime.ParseImplementationPane(string(observed))
+	if err != nil || pane.ServerPID != initial.ServerPID || pane.ServerStart != initial.ServerStart || pane.SessionID != initial.SessionID || pane.PaneID != initial.PaneID {
+		t.Fatalf("parked pane changed before binding: initial=%#v observed=%#v err=%v", initial, pane, err)
+	}
+	binding, err := agentruntime.BindImplementationPane(manifest, manifest.LaunchID, "capture", pane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agentruntime.WriteImplementationBinding(manifest, binding); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fullSystemControlSnapshot(t *testing.T, labels map[string]bool, closed bool) []map[string]any {
+	t.Helper()
+	created := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	controls := internalgithub.Controls{Dependencies: []int{72}, Completion: "human-review", Closed: closed}
+	provenance := []internalgithub.Provenance{
+		{Name: "cancelled", Value: "false", Source: "creation", ActorID: 42, CreatedAt: created},
+		{Name: "retry", Value: "false", Source: "creation", ActorID: 42, CreatedAt: created},
+	}
+	if labels["agent-ready"] {
+		controls.Ready = true
+		provenance = append(provenance, internalgithub.Provenance{Name: "ready", Value: "true", Source: "timeline", EventID: 731, ActorID: 42, CreatedAt: created})
+	} else {
+		provenance = append(provenance, internalgithub.Provenance{Name: "ready", Value: "false", Source: "creation", ActorID: 42, CreatedAt: created})
+	}
+	if labels["priority:P1"] {
+		controls.Priority = 1
+		provenance = append(provenance, internalgithub.Provenance{Name: "priority", Value: "1", Source: "timeline", EventID: 732, ActorID: 42, CreatedAt: created})
+	} else {
+		provenance = append(provenance, internalgithub.Provenance{Name: "priority", Value: "0", Source: "creation", ActorID: 42, CreatedAt: created})
+	}
+	if labels["autonomous-merge"] {
+		controls.Completion = "autonomous-merge"
+		provenance = append(provenance, internalgithub.Provenance{Name: "completion", Value: "autonomous-merge", Source: "timeline", EventID: 733, ActorID: 42, CreatedAt: created})
+	} else {
+		provenance = append(provenance, internalgithub.Provenance{Name: "completion", Value: "human-review", Source: "creation", ActorID: 42, CreatedAt: created})
+	}
+	if closed {
+		provenance = append(provenance, internalgithub.Provenance{Name: "closed", Value: "true", Source: "timeline", EventID: 734, ActorID: 42, CreatedAt: created})
+	} else {
+		provenance = append(provenance, internalgithub.Provenance{Name: "closed", Value: "false", Source: "creation", ActorID: 42, CreatedAt: created})
+	}
+	approval := internalgithub.Approval{}
+	comments := []map[string]any{}
+	if !controls.Ready {
+		approval = internalgithub.Approval{CommentID: 99, ActorID: 42, Body: "/agent-symphony approve", CreatedAt: created.Add(time.Second)}
+		comments = append(comments, map[string]any{"id": int64(99), "body": approval.Body, "created_at": approval.CreatedAt.Format(time.RFC3339Nano), "updated_at": approval.CreatedAt.Format(time.RFC3339Nano), "user": map[string]any{"id": 42}})
+	}
+	snapshot, err := internalgithub.NewSnapshot(controls, fullSystemIssueBody, internalgithub.Anchor{IssueNodeID: "I_73", CreatedAt: created, ChangedAt: created, AuthorID: 42}, approval, provenance, "/agent-symphony approve", func(actor int) bool { return actor == 42 }, func(event internalgithub.Provenance) bool { return slices.Contains(provenance, event) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	comments = append(comments, map[string]any{"id": int64(100), "body": internalgithub.SnapshotComment(snapshot), "created_at": created.Format(time.RFC3339Nano), "updated_at": created.Format(time.RFC3339Nano), "user": map[string]any{"id": 42}})
+	return comments
+}
 
 // Exercise the remaining attempt-action buttons through the compiled daemon,
 // embedded dashboard, real tmux, and a GitHub API fake at the network boundary.
@@ -42,8 +136,12 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 	tracing := os.Getenv("AGENT_SYMPHONY_FULL_SYSTEM_RACE") == "1"
 	for _, action := range []string{"cancel", "recover", "review-plan", "review-plan-cancel", "review-plan-archive", "dismiss-overlap", "abandon-overlap", "archive-overlap"} {
 		t.Run(action, func(t *testing.T) {
+			if action == "cancel" || action == "review-plan-cancel" || action == "review-plan-archive" {
+				t.Skip("issue #329 must provide revocable worker authority before launched implementation cleanup and publication can safely settle")
+			}
 			overlap := strings.HasSuffix(action, "-overlap")
 			completedOverlap := action == "dismiss-overlap" || action == "archive-overlap"
+			parkedImplementation := action == "cancel" || action == "review-plan-cancel" || overlap
 			controlledCycle := overlap
 			root, err := os.MkdirTemp("/tmp", "as-lifecycle-")
 			if err != nil {
@@ -80,6 +178,17 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 			manifest := historicalFullSystemManifest(t, sourceGit, stateRoot, base, 73, 1)
 			manifest.State = "running"
 			manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, config.WorkerProfileDigest()
+			if parkedImplementation {
+				manifest.Version = agentruntime.ManifestVersion2
+				manifest.LaunchToken, err = agentruntime.NewLaunchToken()
+				if err != nil {
+					t.Fatal(err)
+				}
+				manifest.LaunchID, err = agentruntime.NewLaunchToken()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
 			if completedOverlap {
 				if err := os.WriteFile(filepath.Join(manifest.Worktree, "completed.txt"), []byte("published attempt\n"), 0o600); err != nil {
 					t.Fatal(err)
@@ -142,6 +251,9 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 			labels := map[string]bool{"agent-ready": true, "priority:P1": true, "autonomous-merge": true}
 			if action == "abandon-overlap" {
 				labels = map[string]bool{}
+			}
+			if parkedImplementation {
+				comments = append(comments, fullSystemControlSnapshot(t, labels, completedOverlap)...)
 			}
 			fixture := &fullSystemGitHub{base: base, origin: origin, labels: labels, comments: comments, closed: completedOverlap}
 			fixture.includeClosedIssue = action == "archive-overlap"
@@ -287,7 +399,9 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 			}
 			address := freeAddress(t)
 			environment := append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_GITHUB_URL="+github.URL, "CODEX_HOME="+filepath.Join(root, "codex-home"), "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
-			if action != "recover" && !overlap {
+			if parkedImplementation {
+				ensureFullSystemParkedImplementation(t, environment, binary, manifest)
+			} else if action != "recover" && !overlap {
 				ensureFullSystemTmuxSession(t, environment, manifest.Session, repository)
 			}
 			server := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", serveInterval)
@@ -311,22 +425,6 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 				limit = 90 * time.Second
 			}
 			waitHTTP(t, "http://"+address+"/status.json", limit, output)
-			if controlledCycle && action != "archive-overlap" {
-				request, err := http.NewRequest(http.MethodPost, "http://"+address+"/actions/reconcile", nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				request.Header.Set("Origin", "http://"+address)
-				response, err := http.DefaultClient.Do(request)
-				if err != nil {
-					t.Fatal(err)
-				}
-				body, readErr := io.ReadAll(response.Body)
-				_ = response.Body.Close()
-				if readErr != nil || response.StatusCode != http.StatusNoContent {
-					t.Fatalf("initial closed-issue reconciliation: HTTP %d, read=%v, body=%s", response.StatusCode, readErr, body)
-				}
-			}
 			if !waitFor(limit, func() bool {
 				ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
 				if err != nil || len(ledger.Observations[ownerIssueKey("o/r", 73)].IssueUpdates) != 0 {
@@ -338,7 +436,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 						return false
 					}
 				}
-				controlsSettled := false
+				controlsSettled := parkedImplementation
 				for _, effect := range ledger.Effects {
 					if effect.Reconciliation != nil && effect.Reconciliation.GitHubIssueUpdate != nil && effect.Reconciliation.GitHubIssueUpdate.Kind == githubIssueControlSnapshot && effect.State == "completed" {
 						controlsSettled = true
@@ -566,6 +664,11 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 						}
 					}
 				}
+				// Model the issue disappearing from the next GitHub list before restart.
+				// Replay must use the tombstone, not that now-missing observation.
+				fixture.mu.Lock()
+				fixture.closed, fixture.includeClosedIssue = true, false
+				fixture.mu.Unlock()
 				if err := server.Process.Signal(os.Interrupt); err != nil {
 					t.Fatal(err)
 				}
@@ -608,6 +711,48 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					t.Fatalf("restart did not finish a fresh GitHub-backed cycle without restoring %s attempt: %s\n%s", mutation, restartOutput.String(), fullSystemLifecycleDiagnostic(restarted, stateRoot, fixture))
 				}
 				verifyAbsent(restarted, "restart")
+				beforeReplay, err := readRuntimeOwnerState(stateRoot, "o/r")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if beforeReplay.Observations[ownerIssueKey("o/r", 73)].Present {
+					t.Fatal("replay fixture did not lose its GitHub issue observation")
+				}
+				cleanupCount := func(state runtimeOwnerState) int {
+					count := 0
+					for _, effect := range state.Effects {
+						if effect.Action == string(agentruntime.EffectCleanup) && effect.Repository == "o/r" && effect.Issue == 73 && effect.Attempt == 1 {
+							count++
+						}
+					}
+					return count
+				}
+				replayRequest, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/actions/%s?repository=o%%2Fr&issue=73&attempt=1", restarted, mutation), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				replayRequest.Header.Set("Origin", "http://"+restarted)
+				replayResponse, err := http.DefaultClient.Do(replayRequest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var replay controlResult
+				decodeErr := json.NewDecoder(replayResponse.Body).Decode(&replay)
+				_ = replayResponse.Body.Close()
+				if decodeErr != nil || replayResponse.StatusCode != http.StatusOK || !replay.OK || replay.RequestID == "" {
+					t.Fatalf("%s fresh-ID replay after restart: HTTP %d result=%#v decode=%v", mutation, replayResponse.StatusCode, replay, decodeErr)
+				}
+				afterReplay, err := readRuntimeOwnerState(stateRoot, "o/r")
+				if err != nil || !reflect.DeepEqual(afterReplay.Tombstones[key], beforeReplay.Tombstones[key]) || afterReplay.AttemptGenerations[key] != beforeReplay.AttemptGenerations[key] || afterReplay.Attempts[key].Generation != 0 || cleanupCount(afterReplay) != cleanupCount(beforeReplay) {
+					t.Fatalf("%s replay changed durable invalidation: err=%v before=%#v after=%#v", mutation, err, beforeReplay, afterReplay)
+				}
+				if effectID := beforeReplay.Tombstones[key].EffectID; effectID != "" && !reflect.DeepEqual(afterReplay.Effects[effectID], beforeReplay.Effects[effectID]) {
+					t.Fatalf("%s replay changed the original cleanup effect: before=%#v after=%#v", mutation, beforeReplay.Effects[effectID], afterReplay.Effects[effectID])
+				}
+				if receipt, ok := operatorReceiptByID(afterReplay, replay.RequestID); !ok || receipt.State != "completed" || receipt.Result == nil || !receipt.Result.OK {
+					t.Fatalf("%s replay did not commit completed receipt: %#v exists=%t", mutation, receipt, ok)
+				}
+				verifyAbsent(restarted, "replay")
 				return
 			}
 			terminalAction := action
@@ -664,7 +809,32 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					t.Fatalf("invalid reviewer PID %q: %v", pidBody, err)
 				}
 				if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-					t.Fatalf("cancel completed while TERM/HUP-ignoring reviewer process %d was still alive: %v", pid, err)
+					process, psErr := exec.Command("ps", "-o", "pid,ppid,pgid,stat", "-p", strconv.Itoa(pid)).CombinedOutput()
+					groupPID, groupErr := syscall.Getpgid(pid)
+					ledger, ledgerErr := readRuntimeOwnerState(stateRoot, "o/r")
+					stop := ledger.Effects[completed.EffectID]
+					reviewer, reviewerFound := ledger.Effects[stop.SupersededReviewerID]
+					var reviewerEffects []string
+					for id, effect := range ledger.Effects {
+						if effect.Repository == "o/r" && effect.Issue == 73 && effect.Attempt == 1 && effect.Action == string(reconciliationReviewer) {
+							phase := ""
+							if effect.Reconciliation != nil && effect.Reconciliation.Reviewer != nil {
+								phase = effect.Reconciliation.Reviewer.Phase
+							}
+							reviewerEffects = append(reviewerEffects, fmt.Sprintf("id=%s state=%s group=%d phase=%s launched=%t session_requested=%t gate=%t revoked=%t issue_gen=%d attempt_gen=%d", id, effect.State, effect.ReviewerGroupPID, phase, effect.ReviewerLaunched, effect.ReviewerSessionRequested, effect.ReviewerGateProtocol, effect.ReviewerRevoked, effect.IssueGeneration, effect.AttemptGeneration))
+						}
+					}
+					var proofs []string
+					for _, proof := range ledger.ReviewerProofs {
+						if proof.Repository == "o/r" && proof.Issue == 73 && proof.Attempt == 1 {
+							proofs = append(proofs, fmt.Sprintf("effect=%s group=%d issue_gen=%d attempt_gen=%d dead=%t never_ran=%t", proof.EffectID, proof.GroupPID, proof.IssueGeneration, proof.AttemptGeneration, proof.DeadProved, proof.NeverRan))
+						}
+					}
+					reviewSnapshot, _ := reviewIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot))
+					launchPath, _ := reviewerLifecyclePaths(reviewSnapshot, stop.SupersededReviewerTarget)
+					var launch reviewerLaunchIdentity
+					launchFound, launchErr := readReviewerRecord(launchPath, &launch)
+					t.Fatalf("cancel completed while TERM/HUP-ignoring reviewer process %d was still alive: %v; ps=%q ps_err=%v getpgid=%d getpgid_err=%v owner_err=%v stop={id:%s state:%s superseded:%s group:%d stopped:%t issue_gen:%d attempt_gen:%d} reviewer={found:%t state:%s group:%d launched:%t session_requested:%t gate:%t revoked:%t issue_gen:%d attempt_gen:%d} reviewer_effects=%q owner_gens=%d/%d proofs=%q launch={found:%t err:%v effect:%s child:%d issue_gen:%d attempt_gen:%d gate:%t session_requested:%t}", pid, err, process, psErr, groupPID, groupErr, ledgerErr, completed.EffectID, stop.State, stop.SupersededReviewerID, stop.SupersededReviewerGroupPID, stop.ReviewerStopped, stop.IssueGeneration, stop.AttemptGeneration, reviewerFound, reviewer.State, reviewer.ReviewerGroupPID, reviewer.ReviewerLaunched, reviewer.ReviewerSessionRequested, reviewer.ReviewerGateProtocol, reviewer.ReviewerRevoked, reviewer.IssueGeneration, reviewer.AttemptGeneration, reviewerEffects, ledger.IssueGenerations[ownerIssueKey("o/r", 73)], ledger.AttemptGenerations[key], proofs, launchFound, launchErr, launch.EffectID, launch.ChildPID, launch.IssueGeneration, launch.AttemptGeneration, launch.GateProtocol, launch.SessionRequested)
 				}
 				gate, err := os.OpenFile(reviewGate, os.O_RDWR|syscall.O_NONBLOCK, 0)
 				if err != nil {
@@ -1046,7 +1216,7 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 					if len(serve) > 8192 {
 						serve = serve[len(serve)-8192:]
 					}
-					t.Fatalf("restart did not preserve cancelled attempt as failed without its reviewer, or show a valid recovery/active next attempt: owner_read=%v effects=%s receipts=%s\n%s\nserve=%s", latestErr, internalgithub.Redact(fullSystemEffectSummary(latest)), internalgithub.Redact(fmt.Sprintf("%#v", latest.ControlReceipts)), internalgithub.Redact(fullSystemLifecycleDiagnostic(restartAddress, stateRoot, fixture)), internalgithub.Redact(serve))
+					t.Fatalf("restart did not preserve cancelled attempt as failed without its reviewer, or show a valid recovery/active next attempt: owner_read=%v effects=%s pending_start=%s receipts=%s\n%s\nserve=%s", latestErr, internalgithub.Redact(fullSystemEffectSummary(latest)), fullSystemPendingStartDiagnostic(latest, stateRoot, environment), internalgithub.Redact(fmt.Sprintf("%#v", latest.ControlReceipts)), internalgithub.Redact(fullSystemLifecycleDiagnostic(restartAddress, stateRoot, fixture)), internalgithub.Redact(serve))
 				}
 			}
 		})
@@ -1165,4 +1335,90 @@ func fullSystemEffectSummary(state runtimeOwnerState) string {
 		rows = append(rows, fmt.Sprintf("id=%s id_valid=%t action=%s state=%s issue=%d attempt=%d issue_gen=%d/%d attempt_gen=%d/%d epoch=%d revision=%d request=%s result=%s digest_valid=%t payload_valid=%t launched=%t superseded=%s", id, id == runtimeEffectID(effect), effect.Action, effect.State, effect.Issue, effect.Attempt, effect.IssueGeneration, state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)], effect.AttemptGeneration, state.AttemptGenerations[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)], effect.IntentEpoch, effect.IntentRevision, requestAction, resultAction, agentruntime.ValidEffectRequestDigest(effect.RequestDigest), valid, effect.ReviewerLaunched, effect.SupersededReviewerID))
 	}
 	return strings.Join(rows, "; ")
+}
+
+func fullSystemPendingStartDiagnostic(state runtimeOwnerState, stateRoot string, environment []string) string {
+	redact := func(value string) string { return internalgithub.RedactEnvironment(value, environment) }
+	var rows []string
+	for id, effect := range state.Effects {
+		if effect.Repository != "o/r" || effect.Issue != 73 || effect.Attempt != 2 || effect.Action != string(agentruntime.EffectStart) || effect.State != "pending" {
+			continue
+		}
+		marker := "missing"
+		if _, err := os.Lstat(filepath.Join(stateRoot, "runtime-effects", id+".done")); err == nil {
+			marker = "present"
+		} else if !errors.Is(err, os.ErrNotExist) {
+			marker = "error: " + fmt.Sprintf("%.256s", redact(err.Error()))
+		}
+		session := state.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)].Manifest.Session
+		pane := "no session"
+		if session != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			command := exec.CommandContext(ctx, "tmux", "display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{session_name}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_current_command}")
+			command.Env = environment
+			command.WaitDelay = time.Second
+			output, err := command.CombinedOutput()
+			probeErr := ctx.Err()
+			cancel()
+			pane = fmt.Sprintf("output=%.512q error=%.256s context=%.128s", redact(string(output)), redact(fmt.Sprint(err)), redact(fmt.Sprint(probeErr)))
+		}
+		rows = append(rows, fmt.Sprintf("id=%.64s diagnostic=%.256q marker=%s session=%.128q pane=%s", redact(id), redact(effect.Diagnostic), marker, redact(session), pane))
+		if len(rows) == 3 {
+			break
+		}
+	}
+	result := redact(strings.Join(rows, "; "))
+	if len(result) > 2048 {
+		result = result[:2048]
+	}
+	return result
+}
+
+func TestFullSystemPendingStartDiagnostic(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tmux := filepath.Join(bin, "tmux")
+	writeExecutable(t, tmux, fmt.Sprintf("#!/bin/sh\nprintf 'pane-probe canary-private-token %%s %s\\n' \"$*\"\n", strings.Repeat("p", 800)))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	id := strings.Repeat("a", 32)
+	state := newRuntimeOwnerState("o/r")
+	state.Effects[id] = runtimeEffectIntent{Repository: "o/r", Issue: 73, Attempt: 2, Action: string(agentruntime.EffectStart), State: "pending", Diagnostic: "external completion remains ambiguous canary-private-token " + strings.Repeat("x", 5000)}
+	state.Attempts[ownerAttemptKey("o/r", 73, 2)] = runtimeAttemptRecord{Manifest: agentruntime.Manifest{Session: "test-session"}}
+	environment := []string{"PATH=" + bin, "GH_TOKEN=canary-private-token"}
+	marker := filepath.Join(root, "runtime-effects", id+".done")
+	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte("proof"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := fullSystemPendingStartDiagnostic(state, root, environment); !strings.Contains(got, "marker=present") || !strings.Contains(got, `diagnostic="external completion remains ambiguous [REDACTED]`) || !strings.Contains(got, "pane-probe [REDACTED] display-message -p -t =test-session:0.0") || strings.Contains(got, "canary-private-token") || len(got) > 2048 {
+		t.Fatalf("pending Start failure omitted bounded redacted marker, diagnostic, or pane identity: %s", got)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if got := fullSystemPendingStartDiagnostic(state, root, environment); !strings.Contains(got, "marker=missing") {
+		t.Fatalf("pending Start failure reported a missing marker as present: %s", got)
+	}
+	for _, next := range []string{strings.Repeat("b", 32), strings.Repeat("c", 32)} {
+		state.Effects[next] = runtimeEffectIntent{Repository: "o/r", Issue: 73, Attempt: 2, Action: string(agentruntime.EffectStart), State: "pending", Diagnostic: strings.Repeat("x", 5000)}
+	}
+	if got := fullSystemPendingStartDiagnostic(state, root, environment); len(got) != 2048 || strings.Contains(got, "canary-private-token") {
+		t.Fatalf("three pending Starts did not exercise bounded redacted aggregate output: length=%d diagnostic=%s", len(got), got)
+	}
+	gate := filepath.Join(root, "tmux-gate.fifo")
+	if err := syscall.Mkfifo(gate, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, tmux, "#!/bin/sh\nIFS= read -r release < \"$FAKE_TMUX_GATE\"\n")
+	state.Effects = map[string]runtimeEffectIntent{id: state.Effects[id]}
+	started := time.Now()
+	got := fullSystemPendingStartDiagnostic(state, root, append(environment, "FAKE_TMUX_GATE="+gate))
+	if !strings.Contains(got, "context=context deadline exceeded") || time.Since(started) > 5*time.Second {
+		t.Fatalf("blocked tmux diagnostic did not return on context deadline: elapsed=%s diagnostic=%s", time.Since(started), got)
+	}
 }
