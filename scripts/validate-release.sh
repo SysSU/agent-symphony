@@ -64,6 +64,7 @@ grep -qF 'sudo chown -R 0:0 "$prefix"' .github/workflows/release-validation.yml
 grep -qF 'sudo chmod -R go-w "$prefix"' .github/workflows/release-validation.yml
 grep -qF 'find "$prefix" \( ! -user root -o -perm -020 -o -perm -002 \)' .github/workflows/release-validation.yml
 grep -qF 'printf '\''CODEX_NATIVE=%s\n'\'' "$native" >> "$GITHUB_ENV"' .github/workflows/release-validation.yml
+grep -qF 'dirname "$native" >> "$GITHUB_PATH"' .github/workflows/release-validation.yml
 grep -qF 'sed "s#\"codex\"#\"$CODEX_NATIVE\"#g" "$config" > "$config.native"' .github/workflows/release-validation.yml
 grep -qF "/usr/local/node/bin/npm install --global --prefix /usr/local/codex '@openai/codex@" .github/workflows/release-validation.yml
 grep -qF 'test "$(command -v node)" = /usr/local/node/bin/node' .github/workflows/release-validation.yml

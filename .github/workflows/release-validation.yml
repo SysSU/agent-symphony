@@ -49,6 +49,7 @@ jobs:
           test -z "$(find "$prefix" \( ! -user root -o -perm -020 -o -perm -002 \) -print -quit)"
           test "$("$native" --version)" = "codex-cli $CODEX_VERSION"
           printf 'CODEX_NATIVE=%s\n' "$native" >> "$GITHUB_ENV"
+          dirname "$native" >> "$GITHUB_PATH"
       - run: scripts/build-dashboard.sh
       - run: cmd/agent-symphony/dashboard/node_modules/.bin/playwright install --with-deps chromium
       - name: Install full-system test prerequisite (Ubuntu)
