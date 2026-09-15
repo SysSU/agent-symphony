@@ -3,6 +3,8 @@ package github
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -117,14 +119,133 @@ type PRSignals interface {
 	RerunValidation(context.Context, PRState) error
 }
 
+type GovernancePhase struct {
+	ID                string `json:"id"`
+	Kind              string `json:"kind"`
+	Repository        string `json:"repository"`
+	HeadSHA           string `json:"head_sha"`
+	PayloadDigest     string `json:"payload_digest"`
+	Payload           string `json:"payload"`
+	PR                int    `json:"pr"`
+	Issue             int    `json:"issue"`
+	Attempt           int    `json:"attempt"`
+	Epoch             uint64 `json:"epoch"`
+	SourceRevision    uint64 `json:"source_revision"`
+	IssueGeneration   uint64 `json:"issue_generation"`
+	AttemptGeneration uint64 `json:"attempt_generation"`
+	State             string `json:"state"`
+}
+
+type GovernancePhaseRecorder interface {
+	AdmitGovernancePhase(context.Context, GovernancePhase) error
+	CompleteGovernancePhase(context.Context, GovernancePhase) error
+}
+
 type PRCoordinator struct {
 	API         API
 	Source      PRSource
 	Signals     PRSignals
+	Phases      GovernancePhaseRecorder
 	Attempts    map[int]RecoveryAttemptFact
 	ReviewLabel string
 	MergeMethod string
 	ActorID     int
+}
+
+func NewGovernancePhase(state PRState, kind, payload string) (GovernancePhase, error) {
+	if !validPRState(state, state.Number, state.Repository, Mutation{Issue: state.Issue, Attempt: state.Attempt}) || kind == "" || payload == "" {
+		return GovernancePhase{}, errors.New("governance phase identity is invalid")
+	}
+	digest := sha256.Sum256([]byte(payload))
+	payloadDigest := hex.EncodeToString(digest[:])
+	id := sha256.Sum256([]byte(kind + "\x00" + state.Repository + "\x00" + fmt.Sprint(state.Number) + "\x00" + state.HeadSHA + "\x00" + payloadDigest))
+	return GovernancePhase{ID: hex.EncodeToString(id[:]), Kind: kind, Repository: state.Repository, PR: state.Number, Issue: state.Issue, Attempt: state.Attempt, HeadSHA: state.HeadSHA, PayloadDigest: payloadDigest, Payload: payload}, nil
+}
+
+func (p GovernancePhase) Valid() bool {
+	if p.Repository == "" || p.PR < 1 || p.Issue < 1 || p.Attempt < 1 || !regexpSHA.MatchString(p.HeadSHA) || p.Payload == "" || !slices.Contains([]string{"review-label", "decision-comment", "feedback-disposition-comment", "feedback-delegation", "validation-queue", "policy-status", "policy-failure-comment", "merge-prepared-comment", "merge-dispatched-comment", "merge-resolved-comment", "merge"}, p.Kind) {
+		return false
+	}
+	digest := sha256.Sum256([]byte(p.Payload))
+	payloadDigest := hex.EncodeToString(digest[:])
+	id := sha256.Sum256([]byte(p.Kind + "\x00" + p.Repository + "\x00" + fmt.Sprint(p.PR) + "\x00" + p.HeadSHA + "\x00" + payloadDigest))
+	return p.PayloadDigest == payloadDigest && p.ID == hex.EncodeToString(id[:])
+}
+
+func (c PRCoordinator) governanceMutation(ctx context.Context, state PRState, kind, payload string, mutate func() error) error {
+	if c.Phases == nil { // Offline/legacy reconciler compatibility; RunPRGovernance always supplies the owner recorder.
+		return mutate()
+	}
+	phase, err := NewGovernancePhase(state, kind, payload)
+	if err != nil {
+		return err
+	}
+	if err := c.Phases.AdmitGovernancePhase(ctx, phase); err != nil {
+		return err
+	}
+	if err := mutate(); err != nil {
+		return err
+	}
+	return c.Phases.CompleteGovernancePhase(ctx, phase)
+}
+
+// GovernancePreMergeObserved performs an exact read after a canceled or
+// restarted admitted phase. An absent or different postcondition remains
+// unresolved because a response-lost mutation may still become visible.
+func GovernancePreMergeObserved(ctx context.Context, api API, phase GovernancePhase, actorID int) (bool, error) {
+	if !phase.Valid() || phase.State != "admitted" && phase.State != "completed" {
+		return false, errors.New("governance phase is invalid")
+	}
+	if phase.State == "completed" {
+		return true, nil
+	}
+	switch phase.Kind {
+	case "feedback-delegation", "validation-queue":
+		return true, nil // Owner commands cannot commit after their attempt is invalidated.
+	case "review-label":
+		var expected struct {
+			Label   string
+			Present bool
+		}
+		if json.Unmarshal([]byte(phase.Payload), &expected) != nil || expected.Label == "" {
+			return false, errors.New("review-label phase payload is invalid")
+		}
+		var issue struct{ Labels []struct{ Name string } }
+		_, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", phase.Repository, phase.PR), "", &issue)
+		if err != nil {
+			return false, err
+		}
+		present := slices.ContainsFunc(issue.Labels, func(label struct{ Name string }) bool { return label.Name == expected.Label })
+		return present == expected.Present, nil
+	case "policy-status":
+		var result PolicyResult
+		if json.Unmarshal([]byte(phase.Payload), &result) != nil {
+			return false, errors.New("policy-status phase payload is invalid")
+		}
+		for page := 1; ; page++ {
+			var statuses []struct{ Context, State string }
+			_, _, err := api.Read(ctx, fmt.Sprintf("/repos/%s/commits/%s/statuses?per_page=100&page=%d", phase.Repository, phase.HeadSHA, page), "", &statuses)
+			if err != nil {
+				return false, err
+			}
+			for _, status := range statuses {
+				if status.Context == PolicyCheck {
+					return status.State == policyStatus(result), nil
+				}
+			}
+			if len(statuses) < 100 {
+				return false, nil
+			}
+		}
+	case "decision-comment", "feedback-disposition-comment", "merge-prepared-comment", "merge-dispatched-comment", "merge-resolved-comment", "policy-failure-comment":
+		number := phase.Issue
+		if phase.Kind == "policy-failure-comment" {
+			number = phase.PR
+		}
+		return HasAttemptComment(ctx, api, phase.Repository, number, phase.Payload, actorID)
+	default:
+		return false, errors.New("unknown pre-merge governance phase")
+	}
 }
 
 const prReconcileConcurrency = 10
@@ -209,10 +330,20 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 		if err != nil {
 			return err
 		}
-		return c.API.CreateIssueComment(ctx, state.Repository, state.Issue, body, attribution)
+		return c.governanceMutation(ctx, state, "merge-resolved-comment", body, func() error {
+			return c.API.CreateIssueComment(ctx, state.Repository, state.Issue, body, attribution)
+		})
 	}
-	if err := c.API.SyncReviewLabel(ctx, state.Repository, number, c.ReviewLabel, state.ReviewLabelPresent, state.Facts.NeedsHumanReview, attribution); err != nil {
-		return err
+	if state.ReviewLabelPresent != state.Facts.NeedsHumanReview {
+		labelPayload, _ := json.Marshal(struct {
+			Label   string
+			Present bool
+		}{c.ReviewLabel, state.Facts.NeedsHumanReview})
+		if err := c.governanceMutation(ctx, state, "review-label", string(labelPayload), func() error {
+			return c.API.SyncReviewLabel(ctx, state.Repository, number, c.ReviewLabel, state.ReviewLabelPresent, state.Facts.NeedsHumanReview, attribution)
+		}); err != nil {
+			return err
+		}
 	}
 	seenDecisions := make(map[string]bool, len(state.Decisions))
 	for _, decision := range state.Decisions {
@@ -224,7 +355,9 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 		if err != nil {
 			return err
 		}
-		if err := c.API.CreateIssueComment(ctx, state.Repository, state.Issue, body, attribution); err != nil {
+		if err := c.governanceMutation(ctx, state, "decision-comment", body, func() error {
+			return c.API.CreateIssueComment(ctx, state.Repository, state.Issue, body, attribution)
+		}); err != nil {
 			return err
 		}
 	}
@@ -233,7 +366,9 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 		if err != nil {
 			return err
 		}
-		if err := c.API.CreateIssueComment(ctx, state.Repository, state.Issue, body, attribution); err != nil {
+		if err := c.governanceMutation(ctx, state, "feedback-disposition-comment", body, func() error {
+			return c.API.CreateIssueComment(ctx, state.Repository, state.Issue, body, attribution)
+		}); err != nil {
 			return err
 		}
 	}
@@ -257,13 +392,18 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 			if err != nil || !validPRState(confirmedState, number, repository, attribution) || confirmedState.HeadSHA != state.HeadSHA {
 				return errors.New("pull request identity changed immediately before feedback delegation")
 			}
-			if err := c.Signals.DelegateFeedback(ctx, confirmedState, fresh); err != nil {
+			payload := fmt.Sprintf("%s:%d:%s", fresh.identity(), fresh.ActorID, fresh.Body)
+			if err := c.governanceMutation(ctx, confirmedState, "feedback-delegation", payload, func() error {
+				return c.Signals.DelegateFeedback(ctx, confirmedState, fresh)
+			}); err != nil {
 				return err
 			}
 		}
 	}
 	if hasAddressedFeedback(state.Facts.Feedback) && state.Facts.ValidationSHA != state.HeadSHA && state.ValidationQueuedSHA != state.HeadSHA {
-		if err := c.Signals.RerunValidation(ctx, state); err != nil {
+		if err := c.governanceMutation(ctx, state, "validation-queue", state.HeadSHA, func() error {
+			return c.Signals.RerunValidation(ctx, state)
+		}); err != nil {
 			return err
 		}
 	}
@@ -276,7 +416,10 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 	}
 	result := EvaluatePR(state.Facts)
 	if status := policyStatus(result); state.CheckHead != state.HeadSHA || state.PolicyStatus != status {
-		if err := c.API.PublishPolicyStatus(ctx, state.Repository, state.HeadSHA, result, attribution); err != nil {
+		payload, _ := json.Marshal(result)
+		if err := c.governanceMutation(ctx, state, "policy-status", string(payload), func() error {
+			return c.API.PublishPolicyStatus(ctx, state.Repository, state.HeadSHA, result, attribution)
+		}); err != nil {
 			return err
 		}
 	}
@@ -290,7 +433,9 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 			return err
 		}
 		if !present {
-			if err := c.API.CreateIssueComment(ctx, state.Repository, state.Number, body, attribution); err != nil {
+			if err := c.governanceMutation(ctx, state, "policy-failure-comment", body, func() error {
+				return c.API.CreateIssueComment(ctx, state.Repository, state.Number, body, attribution)
+			}); err != nil {
 				return err
 			}
 		}
@@ -314,7 +459,9 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 		if err != nil {
 			return err
 		}
-		if err := c.API.CreateIssueComment(ctx, state.Repository, state.Issue, prepared, attribution); err != nil {
+		if err := c.governanceMutation(ctx, state, "merge-prepared-comment", prepared, func() error {
+			return c.API.CreateIssueComment(ctx, state.Repository, state.Issue, prepared, attribution)
+		}); err != nil {
 			return err
 		}
 	}
@@ -322,10 +469,14 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 	if err != nil {
 		return err
 	}
-	if err := c.API.CreateIssueComment(ctx, state.Repository, state.Issue, dispatched, attribution); err != nil {
+	if err := c.governanceMutation(ctx, state, "merge-dispatched-comment", dispatched, func() error {
+		return c.API.CreateIssueComment(ctx, state.Repository, state.Issue, dispatched, attribution)
+	}); err != nil {
 		return err
 	}
-	err = c.API.MergePullRequest(ctx, state.Repository, number, state.HeadSHA, c.MergeMethod, attribution)
+	err = c.governanceMutation(ctx, state, "merge", c.MergeMethod, func() error {
+		return c.API.MergePullRequest(ctx, state.Repository, number, state.HeadSHA, c.MergeMethod, attribution)
+	})
 	if err == nil || IsAmbiguousMutation(err) {
 		return err
 	}
@@ -333,7 +484,9 @@ func (c PRCoordinator) reconcileOne(ctx context.Context, number int) error {
 	if bodyErr != nil {
 		return errors.Join(err, bodyErr)
 	}
-	return errors.Join(err, c.API.CreateIssueComment(ctx, state.Repository, state.Issue, body, attribution))
+	return errors.Join(err, c.governanceMutation(ctx, state, "merge-resolved-comment", body, func() error {
+		return c.API.CreateIssueComment(ctx, state.Repository, state.Issue, body, attribution)
+	}))
 }
 
 func mergeDisposition(head, state string) string {

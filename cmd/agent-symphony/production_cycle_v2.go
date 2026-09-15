@@ -403,13 +403,30 @@ func (p *productionReconciliation) resolveOneInvalidatedGitHubEffect(ctx context
 			outcome.Observed, err = attemptIssueUpdateApplied(run.ctx, api, request, p.collector.Config)
 		}
 	case reconciliationGitHubPRGovernance:
-		outcome.Merged, err = api.PullRequestMerged(run.ctx, request.Repository, request.GitHubPRGovernance.PR)
+		// A pre-phase-ledger effect may already have reached merge under the old
+		// coarse dispatch bit, so an empty ledger is conservatively merge-admitted.
+		mergeAdmitted := len(effect.GovernancePhases) == 0 || slices.ContainsFunc(effect.GovernancePhases, func(phase internalgithub.GovernancePhase) bool { return phase.Kind == "merge" })
+		if mergeAdmitted {
+			outcome.Merged, err = api.PullRequestMerged(run.ctx, request.Repository, request.GitHubPRGovernance.PR)
+		}
 		if err == nil && outcome.Merged {
 			var facts []internalgithub.RecoveryAttemptFact
 			facts, err = internalgithub.FetchAttemptFacts(run.ctx, api, request.Repository, request.GitHubPRGovernance.Policy.ActorID)
-			outcome.Observed = slices.ContainsFunc(facts, func(fact internalgithub.RecoveryAttemptFact) bool {
-				return fact.PR == request.GitHubPRGovernance.PR && fact.Issue == request.Issue && fact.Attempt == request.Attempt && fact.HeadSHA == request.GitHubPRGovernance.HeadSHA && fact.State == "completed"
-			})
+			outcome.Observed = exactGovernanceMergeObserved(request, facts)
+		} else if err == nil {
+			outcome.Observed = true
+			for _, phase := range effect.GovernancePhases {
+				if phase.Kind == "merge" {
+					continue
+				}
+				observed, observeErr := internalgithub.GovernancePreMergeObserved(run.ctx, api, phase, request.GitHubPRGovernance.Policy.ActorID)
+				if observeErr != nil {
+					err = observeErr
+					break
+				}
+				outcome.Observed = outcome.Observed && observed
+			}
+			outcome.Superseded = outcome.Observed
 		}
 		outcome.PR, outcome.HeadSHA = request.GitHubPRGovernance.PR, request.GitHubPRGovernance.HeadSHA
 	default:
@@ -418,13 +435,19 @@ func (p *productionReconciliation) resolveOneInvalidatedGitHubEffect(ctx context
 	if err != nil {
 		return false, err
 	}
-	if request.Action == reconciliationGitHubPRGovernance && (!outcome.Merged || !outcome.Observed) || request.Action != reconciliationGitHubPRGovernance && !outcome.Observed {
+	if request.Action == reconciliationGitHubPRGovernance && (!outcome.Observed || !outcome.Merged && !outcome.Superseded) || request.Action != reconciliationGitHubPRGovernance && !outcome.Observed {
 		return false, nil
 	}
 	if err := p.owner.resolveInvalidatedReconciliationEffect(ctx, resolveInvalidatedReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Outcome: outcome}); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+func exactGovernanceMergeObserved(request reconciliationEffectRequest, facts []internalgithub.RecoveryAttemptFact) bool {
+	return request.GitHubPRGovernance != nil && slices.ContainsFunc(facts, func(fact internalgithub.RecoveryAttemptFact) bool {
+		return fact.Repository == request.Repository && fact.PR == request.GitHubPRGovernance.PR && fact.Issue == request.Issue && fact.Attempt == request.Attempt && fact.HeadSHA == request.GitHubPRGovernance.HeadSHA && fact.State == "completed"
+	})
 }
 
 // Receipt-bound Plan reviews are excluded from generic reconciliation replay.

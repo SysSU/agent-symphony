@@ -1271,6 +1271,148 @@ func TestOwnerAttemptRecoveryMutatesOnlyCurrentGovernanceEffect(t *testing.T) {
 	}
 }
 
+func TestGovernancePhaseAdmissionIsDurableGenerationBoundAndInvalidated(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "github-pr-governance").request
+	root, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	request = bindEffectObservation(snapshot, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := ownerAttemptRecovery{owner: owner, identity: ownerReconciliationEffectIdentity(*effect)}
+	state, err := recovery.PullRequestState(t.Context(), "o/r", request.GitHubPRGovernance.PR, request.Issue, request.Attempt, request.GitHubPRGovernance.HeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Facts.HeadSHA = state.HeadSHA
+	phase, err := internalgithub.NewGovernancePhase(state, "merge", "squash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.AdmitGovernancePhase(t.Context(), phase); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(root, request.Repository)
+	stored := loaded.Effects[effect.ID].GovernancePhases
+	if err != nil || len(stored) != 1 || stored[0].State != "admitted" || stored[0].Epoch != effect.IntentEpoch || stored[0].SourceRevision != effect.IntentRevision || stored[0].IssueGeneration != effect.IssueGeneration || stored[0].AttemptGeneration != effect.AttemptGeneration {
+		t.Fatalf("durable governance phase=%#v err=%v", stored, err)
+	}
+	wrong := recovery
+	wrong.identity.AttemptGeneration++
+	if err := wrong.CompleteGovernancePhase(t.Context(), phase); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("wrong generation completion err=%v", err)
+	}
+	current := mustOwnerSnapshot(t, owner)
+	manifest := *request.Manifest
+	_, _, err = owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, ExpectedIssueGeneration: current.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], ExpectedAttemptGeneration: current.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)], Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.CompleteGovernancePhase(t.Context(), phase); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("invalidated phase completion err=%v", err)
+	}
+	invalidated := mustOwnerSnapshot(t, owner).State.Effects[effect.ID]
+	if invalidated.State != "invalidated" || len(invalidated.GovernancePhases) != 1 || invalidated.GovernancePhases[0].State != "admitted" {
+		t.Fatalf("invalidation lost admitted governance phase: %#v", invalidated)
+	}
+	loaded, err = readRuntimeOwnerState(root, request.Repository)
+	outcome := invalidatedExternalOutcome{Action: reconciliationGitHubPRGovernance, Observed: true, PR: phase.PR, HeadSHA: phase.HeadSHA, Superseded: true}
+	if err != nil || applyResolveInvalidatedReconciliationEffect(&loaded, resolveInvalidatedReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(loaded.Effects[effect.ID]), Outcome: outcome}) != nil {
+		t.Fatalf("restart did not resolve terminal unmerged governance: %v", err)
+	}
+	if got := loaded.Tombstones[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)].ExternalOutcomes[effect.ID]; got != outcome {
+		t.Fatalf("governance outcome=%#v", got)
+	}
+}
+
+func TestGovernancePhasePersistenceFailureDoesNotAuthorizeMutation(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "github-pr-governance").request
+	fail := false
+	_, owner, snapshot := reconciliationEffectPersistentOwnerWithPersist(t, request, func(runtimeOwnerState) error {
+		if fail {
+			return errors.New("injected persistence failure")
+		}
+		return nil
+	})
+	request = bindEffectObservation(snapshot, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := ownerAttemptRecovery{owner: owner, identity: ownerReconciliationEffectIdentity(*effect)}
+	state, err := recovery.PullRequestState(t.Context(), "o/r", request.GitHubPRGovernance.PR, request.Issue, request.Attempt, request.GitHubPRGovernance.HeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Facts.HeadSHA = state.HeadSHA
+	phase, _ := internalgithub.NewGovernancePhase(state, "policy-status", `{"CheckStatus":"completed","CheckConclusion":"success"}`)
+	fail = true
+	if err := recovery.AdmitGovernancePhase(t.Context(), phase); err == nil {
+		t.Fatal("phase admission survived failed persistence")
+	}
+	if got := mustOwnerSnapshot(t, owner).State.Effects[effect.ID].GovernancePhases; len(got) != 0 {
+		t.Fatalf("failed phase admission leaked into owner: %#v", got)
+	}
+}
+
+func TestInvalidatedGovernanceRequiresExactMergeProof(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "github-pr-governance").request
+	effect := runtimeEffectIntent{Reconciliation: &request}
+	for _, test := range []struct {
+		name    string
+		outcome invalidatedExternalOutcome
+		valid   bool
+	}{
+		{"exact merged head", invalidatedExternalOutcome{Action: reconciliationGitHubPRGovernance, Observed: true, Merged: true, PR: request.GitHubPRGovernance.PR, HeadSHA: request.GitHubPRGovernance.HeadSHA}, true},
+		{"wrong merged head", invalidatedExternalOutcome{Action: reconciliationGitHubPRGovernance, Observed: true, Merged: true, PR: request.GitHubPRGovernance.PR, HeadSHA: strings.Repeat("c", 40)}, false},
+		{"weak merged observation", invalidatedExternalOutcome{Action: reconciliationGitHubPRGovernance, Merged: true, PR: request.GitHubPRGovernance.PR, HeadSHA: request.GitHubPRGovernance.HeadSHA}, false},
+		{"terminal unmerged", invalidatedExternalOutcome{Action: reconciliationGitHubPRGovernance, Observed: true, Superseded: true, PR: request.GitHubPRGovernance.PR, HeadSHA: request.GitHubPRGovernance.HeadSHA}, true},
+		{"ambiguous unmerged", invalidatedExternalOutcome{Action: reconciliationGitHubPRGovernance, Observed: true, PR: request.GitHubPRGovernance.PR, HeadSHA: request.GitHubPRGovernance.HeadSHA}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validInvalidatedExternalOutcome(effect, test.outcome); got != test.valid {
+				t.Fatalf("valid=%v want %v", got, test.valid)
+			}
+		})
+	}
+}
+
+func TestEveryGovernancePhaseSurvivesRestart(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "github-pr-governance").request
+	root, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	request = bindEffectObservation(snapshot, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := ownerAttemptRecovery{owner: owner, identity: ownerReconciliationEffectIdentity(*effect)}
+	state, err := recovery.PullRequestState(t.Context(), "o/r", request.GitHubPRGovernance.PR, request.Issue, request.Attempt, request.GitHubPRGovernance.HeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Facts.HeadSHA = state.HeadSHA
+	kinds := []string{"review-label", "decision-comment", "feedback-disposition-comment", "feedback-delegation", "validation-queue", "policy-status", "policy-failure-comment", "merge-prepared-comment", "merge-dispatched-comment", "merge-resolved-comment", "merge"}
+	for _, kind := range kinds {
+		phase, phaseErr := internalgithub.NewGovernancePhase(state, kind, "payload:"+kind)
+		if phaseErr != nil {
+			t.Fatal(phaseErr)
+		}
+		if err := recovery.AdmitGovernancePhase(t.Context(), phase); err != nil {
+			t.Fatalf("admit %s: %v", kind, err)
+		}
+	}
+	loaded, err := readRuntimeOwnerState(root, request.Repository)
+	phases := loaded.Effects[effect.ID].GovernancePhases
+	if err != nil || len(phases) != len(kinds) {
+		t.Fatalf("restart phases=%#v err=%v", phases, err)
+	}
+	for i, phase := range phases {
+		if phase.Kind != kinds[i] || phase.State != "admitted" || !phase.Valid() {
+			t.Fatalf("phase %d=%#v", i, phase)
+		}
+	}
+}
+
 func TestAttemptInvalidationRevokesIssueScopedDependencyClear(t *testing.T) {
 	request := reconciliationEffectCaseNamed(t, "issue-dependency-clear").request
 	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
