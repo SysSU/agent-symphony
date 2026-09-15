@@ -871,13 +871,14 @@ func parseHostOrchestratorProposal(input io.Reader) (orchestratoragent.MessagePr
 		IssueGeneration       uint64 `json:"issue_generation,omitempty"`
 		AttemptGeneration     uint64 `json:"attempt_generation,omitempty"`
 		MachineStatusSequence uint64 `json:"machine_status_sequence,omitempty"`
+		OwnerCausalityToken   string `json:"owner_causality_token,omitempty"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&proposal) != nil || decoder.Decode(&struct{}{}) != io.EOF || proposal.Version != 1 {
 		return orchestratoragent.MessageProposal{}, nil, errors.New("invalid orchestrator proposal schema")
 	}
-	parsed := orchestratoragent.MessageProposal{Version: proposal.Version, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, Action: proposal.Action, RequestID: proposal.RequestID, HandoffID: proposal.HandoffID, Detail: proposal.Detail, IssueGeneration: proposal.IssueGeneration, AttemptGeneration: proposal.AttemptGeneration, MachineStatusSequence: proposal.MachineStatusSequence}
+	parsed := orchestratoragent.MessageProposal{Version: proposal.Version, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, Action: proposal.Action, RequestID: proposal.RequestID, HandoffID: proposal.HandoffID, Detail: proposal.Detail, IssueGeneration: proposal.IssueGeneration, AttemptGeneration: proposal.AttemptGeneration, MachineStatusSequence: proposal.MachineStatusSequence, OwnerCausalityToken: proposal.OwnerCausalityToken}
 	if err := orchestratoragent.ValidateMessageProposal(parsed); err != nil {
 		return orchestratoragent.MessageProposal{}, nil, err
 	}

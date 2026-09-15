@@ -447,11 +447,12 @@ func TestMachineStatusAdmissionIsGenerationBoundAndSurvivesRestart(t *testing.T)
 	}
 	issueKey, attemptKey := ownerIssueKey("o/r", 333), ownerAttemptKey("o/r", 333, 1)
 	snapshot := mustOwnerSnapshot(t, owner)
-	snapshot, err = owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], Source: "orchestrator", SourceID: "proposal-41", Status: "needs-attention", Reason: "monitoring: operator decision required"})
+	causality := ownerAttemptCausalityToken(snapshot.State, "o/r", 333, 1)
+	snapshot, err = owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], ExpectedCausalityToken: causality, Source: "orchestrator", SourceID: "proposal-41", Status: "needs-attention", Reason: "monitoring: operator decision required"})
 	if err != nil || snapshot.State.MachineStatuses[issueKey].Sequence != 1 {
 		t.Fatalf("admitted=%#v err=%v", snapshot.State.MachineStatuses[issueKey], err)
 	}
-	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], ExpectedStatusSequence: 0, Source: "orchestrator", SourceID: "proposal-40", Status: "clear", Reason: "monitoring: stale"}); !errors.Is(err, errStaleStateResult) {
+	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], ExpectedStatusSequence: 0, ExpectedCausalityToken: causality, Source: "orchestrator", SourceID: "proposal-40", Status: "clear", Reason: "monitoring: stale"}); !errors.Is(err, errStaleStateResult) {
 		t.Fatalf("out-of-order source sequence err=%v", err)
 	}
 	oldIssueGeneration, oldAttemptGeneration := snapshot.State.IssueGenerations[issueKey], snapshot.State.AttemptGenerations[attemptKey]
@@ -463,7 +464,7 @@ func TestMachineStatusAdmissionIsGenerationBoundAndSurvivesRestart(t *testing.T)
 	if status.Sequence != 2 || status.Status != "clear" || status.Source != "destructive" || status.AttemptGeneration != snapshot.State.AttemptGenerations[attemptKey] {
 		t.Fatalf("destructive compensation=%#v", status)
 	}
-	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: oldIssueGeneration, ExpectedAttemptGeneration: oldAttemptGeneration, ExpectedStatusSequence: 1, Source: "orchestrator", SourceID: "proposal-42", Status: "needs-attention", Reason: "monitoring: stale"}); !errors.Is(err, errStaleStateResult) {
+	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: oldIssueGeneration, ExpectedAttemptGeneration: oldAttemptGeneration, ExpectedStatusSequence: 1, ExpectedCausalityToken: causality, Source: "orchestrator", SourceID: "proposal-42", Status: "needs-attention", Reason: "monitoring: stale"}); !errors.Is(err, errStaleStateResult) {
 		t.Fatalf("stale admission err=%v", err)
 	}
 	if err := owner.close(t.Context()); err != nil {
@@ -511,7 +512,7 @@ func TestConcurrentMachineStatusAdmissionsOnDistinctIssuesCommitIndependently(t 
 			<-start
 			issueKey := ownerIssueKey(manifest.Repository, manifest.Issue)
 			attemptKey := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
-			_, err := owner.admitMachineStatus(context.Background(), admitMachineStatusCommand{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], Source: "orchestrator", SourceID: fmt.Sprintf("issue-%d", manifest.Issue), Status: "needs-attention", Reason: "monitoring: concurrent admission"})
+			_, err := owner.admitMachineStatus(context.Background(), admitMachineStatusCommand{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], ExpectedCausalityToken: ownerAttemptCausalityToken(snapshot.State, manifest.Repository, manifest.Issue, manifest.Attempt), Source: "orchestrator", SourceID: fmt.Sprintf("issue-%d", manifest.Issue), Status: "needs-attention", Reason: "monitoring: concurrent admission"})
 			results <- err
 		}(manifest)
 	}
@@ -542,7 +543,7 @@ func TestLegacyWorkerStatusMigratesIntoIssueOwnerDomain(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	status := mustOwnerSnapshot(t, owner).State.MachineStatuses[ownerIssueKey("o/r", 335)]
-	if status.Source != "worker" || status.SourceSequence != 1 || status.Status != "needs-attention" || status.AppliedSequence != 0 {
+	if status.Source != "worker" || status.SourceSequence != 8 || status.Status != "needs-attention" || status.AppliedSequence != 0 {
 		t.Fatalf("migrated status=%#v", status)
 	}
 }
