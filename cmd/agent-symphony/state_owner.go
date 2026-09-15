@@ -1807,6 +1807,15 @@ func issueHasUnprovedReviewer(state runtimeOwnerState, repository string, issue 
 	return false
 }
 
+func issueHasUnresolvedExternalEffect(state runtimeOwnerState, repository string, issue int) bool {
+	for _, effect := range state.Effects {
+		if effect.Repository == repository && effect.Issue == issue && effect.State == "invalidated" && effect.Dispatched && effect.Reconciliation != nil && reconciliationMutatesGitHub(effect.Reconciliation.Action) {
+			return true
+		}
+	}
+	return false
+}
+
 // Older group-only death certificates and completed cleanup records cannot
 // establish descendant absence. Preserve old business receipts and quarantine
 // only the affected issue; never synthesize a physical-completion proof.
@@ -1955,7 +1964,7 @@ func applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot string, state *ru
 		return errStateConflict
 	}
 	if generation == 0 {
-		if issueHasUnprovedReviewer(*state, manifest.Repository, manifest.Issue) {
+		if issueHasUnprovedReviewer(*state, manifest.Repository, manifest.Issue) || issueHasUnresolvedExternalEffect(*state, manifest.Repository, manifest.Issue) {
 			return errStateConflict
 		}
 		if issueGeneration == ^uint64(0) {

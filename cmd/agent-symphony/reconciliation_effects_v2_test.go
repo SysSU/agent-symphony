@@ -325,6 +325,8 @@ func TestDestructiveInvalidationDurablySupersedesPendingControlSnapshot(t *testi
 	if err := applyResolveInvalidatedReconciliationEffect(&loaded, resolveInvalidatedReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(loaded.Effects[effect.ID]), Outcome: invalidatedExternalOutcome{Action: reconciliationGitHubIssueUpdate, Observed: true}}); err != nil {
 		t.Fatalf("resolve invalidated control snapshot: %v", err)
 	}
+	publish := reconciliationEffectRequest{Action: reconciliationGitHubPublish, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, GitHubPublish: &githubPublishEffectRequest{}}
+	loaded.Effects["ambiguous-publish"] = runtimeEffectIntent{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "invalidated", Dispatched: true, Reconciliation: &publish}
 	plans, err := planControlSnapshotRepairs(stateOwnerSnapshot{State: loaded}, internalgithub.PRAdapterConfig{Repository: manifest.Repository, ActorID: 42})
 	if err != nil || len(plans) != 1 || !plans[0].Request.ControlRepair || plans[0].Request.ControlGeneration != 2 {
 		t.Fatalf("restart repair plans=%#v err=%v", plans, err)

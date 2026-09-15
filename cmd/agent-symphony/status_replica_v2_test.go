@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,6 +127,25 @@ func TestOwnerStatusProjectionMasksTombstonedAttempts(t *testing.T) {
 		if projected.Issue == request.Issue && projected.Attempt == request.GitHubIssueUpdate.AttributionAttempt && projected.PR != 0 {
 			t.Fatalf("tombstoned remote attempt was projected: %#v", projected)
 		}
+	}
+}
+
+func TestOwnerStatusProjectionQuarantinesUnresolvedGitHubMutation(t *testing.T) {
+	state := newRuntimeOwnerState("o/r")
+	state.Epoch, state.Revision = 1, 1
+	issueKey, attemptKey := ownerIssueKey("o/r", 330), ownerAttemptKey("o/r", 330, 1)
+	state.IssueGenerations[issueKey], state.AttemptGenerations[attemptKey] = 2, 2
+	state.Tombstones[attemptKey] = runtimeTombstone{Repository: "o/r", Issue: 330, Attempt: 1, Action: "dismissed", CleanupPhase: "completed", InvalidatedGeneration: 1, Generation: 2, Revision: 1}
+	request := reconciliationEffectRequest{Action: reconciliationGitHubPublish, Repository: "o/r", Issue: 330, Attempt: 1, GitHubPublish: &githubPublishEffectRequest{}}
+	state.Effects["ambiguous"] = runtimeEffectIntent{Repository: "o/r", Issue: 330, Attempt: 1, State: "invalidated", Dispatched: true, Reconciliation: &request}
+
+	projected, err := projectOwnerStatus(stateOwnerSnapshot{State: state}, 1, time.Unix(2, 0))
+	if err != nil || len(projected.Statuses) != 1 {
+		t.Fatalf("quarantine projection=%#v err=%v", projected.Statuses, err)
+	}
+	status := projected.Statuses[0]
+	if status.Issue != 330 || status.Attempt != 1 || !status.NeedsAttention || !status.OperatorBlocked || status.CurrentPhase != "physical-unverified" || !strings.Contains(status.Diagnostic, "unresolved external outcome") {
+		t.Fatalf("unresolved GitHub mutation was not visibly quarantined: %#v", status)
 	}
 }
 

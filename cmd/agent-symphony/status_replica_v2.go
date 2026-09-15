@@ -227,6 +227,12 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 	// projection. Keep its unresolved physical safety lease visible anyway.
 	for _, tombstone := range snapshot.State.Tombstones {
 		diagnostic := legacyReviewerDiagnostic(snapshot.State, tombstone.Repository, tombstone.Issue, tombstone.Attempt)
+		if issueHasUnresolvedExternalEffect(snapshot.State, tombstone.Repository, tombstone.Issue) {
+			if diagnostic != "" {
+				diagnostic += "; "
+			}
+			diagnostic += "an admitted GitHub mutation has an unresolved external outcome; same-issue reuse remains quarantined"
+		}
 		if tombstone.ReviewerLeaseID != "" || attemptHasUnprovedReviewer(snapshot.State, tombstone.Repository, tombstone.Issue, tombstone.Attempt) {
 			if diagnostic == "" {
 				diagnostic = "reviewer descendant absence is unproved; physical cleanup remains pending"

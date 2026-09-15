@@ -1499,19 +1499,19 @@ func planControlSnapshotRepairs(snapshot stateOwnerSnapshot, cfg internalgithub.
 	slices.Sort(keys)
 	var plans []reconciliationPlannedEffect
 	for _, key := range keys {
+		repair := snapshot.State.ControlRepairs[key]
+		observation, ok := snapshot.State.Observations[key]
+		if !ok || !observation.Present || repair.Generation != controlGeneration(snapshot.State, key) || repair.Body == "" || cfg.Repository != snapshot.State.Repository || cfg.ActorID < 1 {
+			continue
+		}
 		blocked := false
 		for _, effect := range snapshot.State.Effects {
-			if ownerIssueKey(effect.Repository, effect.Issue) == key && effect.State == "invalidated" && effect.Action != string(reconciliationGitHubPRGovernance) {
+			if invalidatedEffectBlocksControlRepair(effect, snapshot.State.Repository, observation.Fact.Issue) {
 				blocked = true
 				break
 			}
 		}
 		if blocked {
-			continue
-		}
-		repair := snapshot.State.ControlRepairs[key]
-		observation, ok := snapshot.State.Observations[key]
-		if !ok || !observation.Present || repair.Generation != controlGeneration(snapshot.State, key) || repair.Body == "" || cfg.Repository != snapshot.State.Repository || cfg.ActorID < 1 {
 			continue
 		}
 		request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: snapshot.State.Repository, Issue: observation.Fact.Issue, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, ControlGeneration: repair.Generation, ControlRepair: true, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueControlSnapshot, ControlSnapshotDigest: digestText(repair.Body), ControlSnapshotBody: repair.Body}}
