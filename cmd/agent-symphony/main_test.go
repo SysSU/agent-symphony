@@ -1667,6 +1667,41 @@ func TestWorkerTreeRejectsSharedSubtreeRecursiveOutputAmplification(t *testing.T
 	}
 }
 
+func TestOwnerGitIgnoresAmbientConfigAndObjectRedirects(t *testing.T) {
+	root := t.TempDir()
+	source, snapshot := filepath.Join(root, "source"), filepath.Join(root, "snapshot")
+	runExternal(t, "", "git", "init", "-q", source)
+	runExternal(t, source, "git", "config", "user.name", "fixture")
+	runExternal(t, source, "git", "config", "user.email", "fixture@example.invalid")
+	if err := os.WriteFile(filepath.Join(source, ".gitattributes"), []byte("payload filter=hostile\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "payload"), []byte("safe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runExternal(t, source, "git", "add", ".gitattributes", "payload")
+	runExternal(t, source, "git", "commit", "-qm", "fixture")
+
+	canary, global := filepath.Join(root, "filter-ran"), filepath.Join(root, "global.gitconfig")
+	if err := os.WriteFile(global, []byte("[filter \"hostile\"]\n\tsmudge = touch "+canary+"\n\trequired = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	t.Setenv("GIT_OBJECT_DIRECTORY", filepath.Join(root, "missing-objects"))
+	if out, err := ownerGitCommand(t.Context(), "clone", "--no-local", "--no-checkout", source, snapshot).CombinedOutput(); err != nil {
+		t.Fatalf("clone with scrubbed owner environment: %v: %s", err, out)
+	}
+	if out, err := ownerGitCommand(t.Context(), "-C", snapshot, "checkout", "--detach", "HEAD").CombinedOutput(); err != nil {
+		t.Fatalf("checkout with scrubbed owner environment: %v: %s", err, out)
+	}
+	if _, err := os.Stat(canary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ambient Git filter ran with owner authority: %v", err)
+	}
+	if body, err := os.ReadFile(filepath.Join(snapshot, "payload")); err != nil || string(body) != "safe\n" {
+		t.Fatalf("unexpected checked-out payload %q: %v", body, err)
+	}
+}
+
 func TestValidateJSONSuccessAndFailure(t *testing.T) {
 	root := gitRepository(t)
 	path := filepath.Join(root, config.DefaultPath)

@@ -2061,10 +2061,30 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func ownerGitCommand(ctx context.Context, args ...string) *exec.Cmd {
+	base := []string{
+		"--no-optional-locks",
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.attributesFile=/dev/null",
+		"-c", "core.fsmonitor=false",
+		"-c", "credential.helper=",
+		"-c", "protocol.ext.allow=never",
+	}
+	cmd := exec.CommandContext(ctx, "git", append(base, args...)...)
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_TERMINAL_PROMPT=0",
+	}
+	return cmd
+}
+
 func scanGit(ctx context.Context, repo string, stdin io.Reader, args []string, line func([]byte) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", repo}, args...)...)
+	cmd := ownerGitCommand(ctx, append([]string{"-C", repo}, args...)...)
 	cmd.Stdin = stdin
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -2664,13 +2684,13 @@ launch:
 		return independentReviewResult{}, false, fmt.Errorf("clean previous reviewer resources: %w", err)
 	}
 	priorResourcesCleared = true
-	if out, err := exec.CommandContext(ctx, "git", "clone", "--no-local", "--no-checkout", source, snapshot).CombinedOutput(); err != nil {
+	if out, err := ownerGitCommand(ctx, "clone", "--no-local", "--no-checkout", source, snapshot).CombinedOutput(); err != nil {
 		return independentReviewResult{}, false, fmt.Errorf("create snapshot: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	if out, err := exec.CommandContext(ctx, "git", "-C", snapshot, "fetch", "--no-tags", source, head+":refs/agent-symphony/attested-review").CombinedOutput(); err != nil {
+	if out, err := ownerGitCommand(ctx, "-C", snapshot, "fetch", "--no-tags", source, head+":refs/agent-symphony/attested-review").CombinedOutput(); err != nil {
 		return independentReviewResult{}, false, fmt.Errorf("transfer attested head: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	if out, err := exec.CommandContext(ctx, "git", "-C", snapshot, "checkout", "--detach", head).CombinedOutput(); err != nil {
+	if out, err := ownerGitCommand(ctx, "-C", snapshot, "checkout", "--detach", head).CombinedOutput(); err != nil {
 		return independentReviewResult{}, false, fmt.Errorf("checkout attested head: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	if got, err := gitSingleLine(ctx, snapshot, "rev-parse", "HEAD"); err != nil || got != head {
@@ -2679,9 +2699,9 @@ launch:
 	if err := scanGit(ctx, snapshot, nil, []string{"merge-base", "--is-ancestor", reviewBase, "HEAD"}, nil); err != nil || mode == agentruntime.ReviewModeImplementation && strings.EqualFold(reviewBase, head) {
 		return independentReviewResult{}, false, errors.New("review base is unavailable or not an ancestor of attested HEAD")
 	}
-	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "remote", "remove", "origin").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "update-ref", "-d", "refs/agent-symphony/attested-review").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "config", "--local", "credential.helper", "").Run()
+	_ = ownerGitCommand(ctx, "-C", snapshot, "remote", "remove", "origin").Run()
+	_ = ownerGitCommand(ctx, "-C", snapshot, "update-ref", "-d", "refs/agent-symphony/attested-review").Run()
+	_ = ownerGitCommand(ctx, "-C", snapshot, "config", "--local", "credential.helper", "").Run()
 	reviewGID := -1
 	resultPath := reviewResultPath(snapshot, target)
 	resultRoot := filepath.Dir(resultPath)
