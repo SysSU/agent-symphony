@@ -211,6 +211,54 @@ func (o *stateOwner) mutatePRRecovery(ctx context.Context, command mutatePRRecov
 	return result.snapshot, err
 }
 
+func (o *stateOwner) mutateGovernancePhase(ctx context.Context, command mutateGovernancePhaseCommand) error {
+	_, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerMutateGovernancePhase, mutateGovernancePhase: command})
+	return err
+}
+
+func applyMutateGovernancePhase(stateRoot string, state *runtimeOwnerState, command mutateGovernancePhaseCommand) error {
+	effect, ok := state.Effects[command.Identity.EffectID]
+	if !ok || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationGitHubPRGovernance || !reconciliationEffectIdentityMatches(effect, command.Identity) || !validGovernancePhase(effect, command.Phase) {
+		return errStaleStateResult
+	}
+	if err := reconciliationEffectCurrent(stateRoot, *state, effect); err != nil {
+		return err
+	}
+	for i, phase := range effect.GovernancePhases {
+		if phase.ID != command.Phase.ID {
+			continue
+		}
+		expected := command.Phase
+		expected.State = phase.State
+		if phase != expected || phase.State != "admitted" && phase.State != "completed" {
+			return errStateConflict
+		}
+		if command.Complete {
+			effect.GovernancePhases[i].State = "completed"
+			state.Effects[effect.ID] = effect
+		}
+		return nil
+	}
+	if command.Complete || len(effect.GovernancePhases) >= maxPRRecoveryEntries {
+		return errStateConflict
+	}
+	command.Phase.State = "admitted"
+	effect.Dispatched = true
+	effect.GovernancePhases = append(effect.GovernancePhases, command.Phase)
+	state.Effects[effect.ID] = effect
+	return nil
+}
+
+func validGovernancePhase(effect runtimeEffectIntent, phase internalgithub.GovernancePhase) bool {
+	state := phase.State
+	phase.State = ""
+	request := effect.Reconciliation
+	if request == nil || request.GitHubPRGovernance == nil || state != "" && state != "admitted" && state != "completed" || !phase.Valid() || !boundedText(phase.Payload, maxReconciliationBodyBytes, true) {
+		return false
+	}
+	return phase.Repository == effect.Repository && phase.PR == request.GitHubPRGovernance.PR && phase.Issue == effect.Issue && phase.Attempt == effect.Attempt && phase.HeadSHA == request.GitHubPRGovernance.HeadSHA && phase.Epoch == effect.IntentEpoch && phase.SourceRevision == effect.IntentRevision && phase.IssueGeneration == effect.IssueGeneration && phase.AttemptGeneration == effect.AttemptGeneration && slices.Contains([]string{"review-label", "decision-comment", "feedback-disposition-comment", "feedback-delegation", "validation-queue", "policy-status", "policy-failure-comment", "merge-prepared-comment", "merge-dispatched-comment", "merge-resolved-comment", "merge"}, phase.Kind)
+}
+
 func applyMutatePRRecovery(stateRoot string, state *runtimeOwnerState, command mutatePRRecoveryCommand) error {
 	effect, ok := state.Effects[command.Identity.EffectID]
 	if !ok || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationGitHubPRGovernance || !reconciliationEffectIdentityMatches(effect, command.Identity) {
@@ -420,7 +468,7 @@ func validInvalidatedExternalOutcome(effect runtimeEffectIntent, outcome invalid
 	case reconciliationGitHubPublish:
 		return !outcome.Merged && outcome.PR > 0 && effect.Reconciliation.GitHubPublish != nil && outcome.HeadSHA == effect.Reconciliation.GitHubPublish.HeadSHA
 	case reconciliationGitHubPRGovernance:
-		return outcome.Merged && outcome.PR > 0 && effect.Reconciliation.GitHubPRGovernance != nil && outcome.PR == effect.Reconciliation.GitHubPRGovernance.PR && outcome.HeadSHA == effect.Reconciliation.GitHubPRGovernance.HeadSHA
+		return outcome.Merged != outcome.Superseded && outcome.PR > 0 && effect.Reconciliation.GitHubPRGovernance != nil && outcome.PR == effect.Reconciliation.GitHubPRGovernance.PR && outcome.HeadSHA == effect.Reconciliation.GitHubPRGovernance.HeadSHA
 	default:
 		return false
 	}
@@ -898,6 +946,13 @@ func validPersistedReconciliationEffect(state runtimeOwnerState, effect runtimeE
 	request := effect.Reconciliation
 	if request == nil || effect.Review != nil || effect.Reason != "" || effect.SupersededReviewerID != "" || !boundedText(effect.Diagnostic, maxReconciliationStringBytes, false) || effect.Action != string(request.Action) || effect.Repository != request.Repository || effect.Issue != request.Issue || effect.Attempt != request.Attempt || effect.RequestDigest != reconciliationEffectDigest(*request) || !validReconciliationEffectRequest(state.Repository, *request) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || effect.ReviewerLaunched != (effect.ReviewerGroupPID > 1) || effect.ReviewerSessionRequested && !effect.ReviewerGateProtocol || (effect.ReviewerLaunched || effect.ReviewerGateProtocol) && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe") || effect.ReviewerRevoked && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Mode != agentruntime.ReviewModePlan || request.Reviewer.Phase != "run-observe") || effect.ReviewerResultDigest != "" && (!validDigest(effect.ReviewerResultDigest) || !effect.ReviewerLaunched) {
 		return false
+	}
+	seenGovernancePhases := map[string]bool{}
+	for _, phase := range effect.GovernancePhases {
+		if seenGovernancePhases[phase.ID] || !validGovernancePhase(effect, phase) {
+			return false
+		}
+		seenGovernancePhases[phase.ID] = true
 	}
 	if effect.State == "pending" {
 		return effect.ReconciliationResult == nil

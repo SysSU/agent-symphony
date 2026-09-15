@@ -1059,9 +1059,6 @@ func (c *runtimeEffectCoordinator) executeGovernance(ctx context.Context, api in
 	}) {
 		return reconciliationEffectResult{}, errStaleStateResult
 	}
-	if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
-		return reconciliationEffectResult{}, err
-	}
 	if err := internalgithub.RunPRGovernance(run.ctx, api, request.GitHubPRGovernance.Policy, ownerAttemptRecovery{owner: c.owner, identity: plan.Identity}, *plan.Attempt); err != nil {
 		return reconciliationEffectResult{}, err
 	}
