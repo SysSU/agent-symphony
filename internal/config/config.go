@@ -121,6 +121,16 @@ func BindWorkerExecutable(ctx context.Context, commands *Commands) (string, erro
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(material))), nil
 }
 
+func VerifyWorkerExecutable(ctx context.Context, path, expectedDigest string) error {
+	commands := Default("worker/verification").Commands
+	commands.Implementation[0], commands.Reviewer[0] = path, path
+	digest, err := BindWorkerExecutable(ctx, &commands)
+	if err != nil || digest != expectedDigest || commands.Implementation[0] != path {
+		return errors.Join(errors.New("codex worker executable identity changed"), err)
+	}
+	return nil
+}
+
 // WorkerSandboxArgs runs a deterministic capability probe under the same profile.
 func WorkerSandboxArgs(workspace string, command ...string) []string {
 	args := []string{"sandbox", "-c", workerPermissions, "-P", workerProfileName, "-C", workspace, "--"}

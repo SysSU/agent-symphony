@@ -33,6 +33,9 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	if parent == nil || api.HTTP == nil || user.ID < 1 || cfg.Repository == "" || stateRoot == "" || legacyRecoveryPath == "" || checkout == "" || log == nil {
 		return nil, errors.New("production v2 runtime is incomplete")
 	}
+	if err := validateProductionStateRoot(stateRoot); err != nil {
+		return nil, err
+	}
 	identity, err := readDeploymentIdentity(stateRoot)
 	if err != nil || identity.Version != deploymentIdentityVersion || identity.Repository != cfg.Repository {
 		return nil, errors.New("production v2 deployment fence is not installed")
@@ -130,6 +133,7 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		stateRoot: stateRoot, attemptRoot: attemptRoot, checkout: checkout,
 		implementation: implementation, reviewer: reviewer, operator: operator, reviewEnv: reviewEnvironment,
 		supervisor: agent, capacity: cfg.Concurrency, log: log,
+		workerProfileDigest: workerProfileDigest,
 	}
 	runtime.cycle = cycle
 	status, err := startOwnerStatusReplica(lifecycle, owner, cfg.Concurrency, log)

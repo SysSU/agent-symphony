@@ -27,6 +27,9 @@ type runtimeLifecyclePlan struct {
 }
 
 func (p *productionReconciliation) selectedWorkerExport(ctx context.Context, record runtimeAttemptRecord) (workerResult, string, string, error) {
+	if err := p.verifyWorkerExecutable(ctx); err != nil {
+		return workerResult{}, "", "", err
+	}
 	if record.WorkerSeal != nil {
 		selection := *record.WorkerSeal
 		exported := workerExport{Repository: record.Manifest.Repository, Branch: record.Manifest.Branch, BaseSHA: record.Manifest.BaseSHA, HeadSHA: selection.HeadSHA, BundleSHA256: selection.BundleSHA256, Result: selection.Result}
@@ -159,22 +162,33 @@ func (p *productionReconciliation) sweepPendingMarkers(ctx context.Context) erro
 var errReconciliationRecollect = errors.New("reconciliation requires fresh external observations")
 
 type productionReconciliation struct {
-	owner          *stateOwner
-	effects        *runtimeEffectCoordinator
-	collector      reconciliationV2Collector
-	config         config.Config
-	api            internalgithub.API
-	stateRoot      string
-	attemptRoot    string
-	checkout       string
-	implementation workerBoundaryRunner
-	reviewer       workerBoundaryRunner
-	operator       *operatorMutationService
-	reviewEnv      []string
-	wake           func() error
-	supervisor     *orchestratoragent.Supervisor
-	capacity       int
-	log            io.Writer
+	owner               *stateOwner
+	effects             *runtimeEffectCoordinator
+	collector           reconciliationV2Collector
+	config              config.Config
+	api                 internalgithub.API
+	stateRoot           string
+	attemptRoot         string
+	checkout            string
+	implementation      workerBoundaryRunner
+	reviewer            workerBoundaryRunner
+	operator            *operatorMutationService
+	reviewEnv           []string
+	wake                func() error
+	supervisor          *orchestratoragent.Supervisor
+	capacity            int
+	workerProfileDigest string
+	log                 io.Writer
+}
+
+func (p *productionReconciliation) verifyWorkerExecutable(ctx context.Context) error {
+	if p.workerProfileDigest == "" { // Unit fixtures do not launch a production worker.
+		return nil
+	}
+	if !validDigest(p.workerProfileDigest) || len(p.config.Commands.Implementation) == 0 {
+		return errors.New("worker executable binding is unavailable")
+	}
+	return config.VerifyWorkerExecutable(ctx, p.config.Commands.Implementation[0], p.workerProfileDigest)
 }
 
 func (p *productionReconciliation) runCycle(ctx context.Context) error {
@@ -377,6 +391,8 @@ func (p *productionReconciliation) resolveOneInvalidatedGitHubEffect(ctx context
 	case reconciliationGitHubIssueUpdate:
 		if request.ControlRepair || reconciliationEffectIssueScoped(request) {
 			outcome.Observed, err = internalgithub.ControlSnapshotRepairApplied(run.ctx, api, p.collector.Config, request.Repository, request.Issue, request.GitHubIssueUpdate.ControlSnapshotBody)
+		} else if request.GitHubIssueUpdate.Kind == githubIssueRetry {
+			outcome.Observed, err = internalgithub.EnsureRetrySuppressed(run.ctx, api, p.collector.Config, request.Issue, request.Attempt, time.Unix(0, request.GitHubIssueUpdate.FailedAtUnixNano))
 		} else if request.GitHubIssueUpdate.Kind == githubIssueWorkerStatus {
 			sequence := request.GitHubIssueUpdate.StatusSequence + 1
 			err = api.EnsureOwnerStatus(run.ctx, request.Repository, request.Issue, request.Attempt, sequence, false, "attempt invalidated", p.collector.Config.ActorID)
@@ -929,6 +945,9 @@ func (p *productionReconciliation) executionCandidates(ctx context.Context, snap
 
 func (p *productionReconciliation) runReviewerPhase(ctx context.Context, candidates []reviewerExecutionMaterial) error {
 	for {
+		if err := p.verifyWorkerExecutable(ctx); err != nil {
+			return err
+		}
 		snapshot, err := p.owner.snapshot(ctx)
 		if err != nil {
 			return err

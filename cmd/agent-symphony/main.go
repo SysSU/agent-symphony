@@ -375,7 +375,62 @@ func configureProjectRuntimeState(stateRoot string) error {
 	return nil
 }
 
+var allowSharedTempRuntimeStateForTest = strings.HasSuffix(os.Args[0], ".test")
+
+func validateProductionStateRoot(stateRoot string) error {
+	if allowSharedTempRuntimeStateForTest {
+		return nil
+	}
+	root, err := canonicalPathWithMissingLeaf(stateRoot)
+	if err != nil {
+		return fmt.Errorf("resolve runtime state root: %w", err)
+	}
+	for _, shared := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
+		shared, err = filepath.EvalSymlinks(shared)
+		if err != nil {
+			continue
+		}
+		relative, relErr := filepath.Rel(shared, root)
+		if relErr == nil && (relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
+			return errors.New("runtime state root must not be inside shared temporary storage")
+		}
+	}
+	return nil
+}
+
+func canonicalPathWithMissingLeaf(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	current := filepath.Clean(abs)
+	var missing []string
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			for index := len(missing) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, missing[index])
+			}
+			return filepath.Clean(resolved), nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", errors.New("runtime state root has no existing ancestor")
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
 func prepareProductionDeploymentLocked(stateRoot, repository string) error {
+	if err := validateProductionStateRoot(stateRoot); err != nil {
+		return err
+	}
 	identity, err := readDeploymentIdentity(stateRoot)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := bindDeployment(stateRoot, repository); err != nil {
@@ -1021,6 +1076,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		c, err := config.Load(*path)
 		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		if err := validateProductionStateRoot(*runtimeState); err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		peerProjects, err := validateDashboardProjectURLs(dashboardProjects)

@@ -167,7 +167,7 @@ func TestDestructiveInvalidationDurablySupersedesPendingControlSnapshot(t *testi
 	if err != nil || loaded.ControlRepairs[issueKey] != repair {
 		t.Fatalf("restart lost control repair: repair=%#v err=%v", loaded.ControlRepairs[issueKey], err)
 	}
-	if err := applyResolveInvalidatedReconciliationEffect(&loaded, resolveInvalidatedReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(loaded.Effects[effect.ID]), Outcome: invalidatedExternalOutcome{Action: reconciliationGitHubIssueUpdate}}); err != nil {
+	if err := applyResolveInvalidatedReconciliationEffect(&loaded, resolveInvalidatedReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(loaded.Effects[effect.ID]), Outcome: invalidatedExternalOutcome{Action: reconciliationGitHubIssueUpdate, Observed: true}}); err != nil {
 		t.Fatalf("resolve invalidated control snapshot: %v", err)
 	}
 	plans, err := planControlSnapshotRepairs(stateOwnerSnapshot{State: loaded}, internalgithub.PRAdapterConfig{Repository: manifest.Repository, ActorID: 42})

@@ -386,7 +386,7 @@ func applyAuthorizeReconciliationEffect(stateRoot string, state *runtimeOwnerSta
 
 func applyResolveInvalidatedReconciliationEffect(state *runtimeOwnerState, command resolveInvalidatedReconciliationEffectCommand) error {
 	effect, ok := state.Effects[command.Identity.EffectID]
-	if !ok || effect.State != "invalidated" || !effect.Dispatched || effect.Reconciliation == nil || !reconciliationMutatesGitHub(effect.Reconciliation.Action) || !reconciliationEffectIdentityMatches(effect, command.Identity) || command.Outcome.Action != effect.Reconciliation.Action || command.Outcome.PR < 0 || command.Outcome.HeadSHA != "" && !preflightObjectID.MatchString(command.Outcome.HeadSHA) {
+	if !ok || effect.State != "invalidated" || !effect.Dispatched || effect.Reconciliation == nil || !reconciliationMutatesGitHub(effect.Reconciliation.Action) || !reconciliationEffectIdentityMatches(effect, command.Identity) || !validInvalidatedExternalOutcome(effect, command.Outcome) {
 		return errStaleStateResult
 	}
 	key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
@@ -408,6 +408,22 @@ func applyResolveInvalidatedReconciliationEffect(state *runtimeOwnerState, comma
 	effect.State, effect.Diagnostic = "invalidated-resolved", ""
 	state.Effects[effect.ID] = effect
 	return nil
+}
+
+func validInvalidatedExternalOutcome(effect runtimeEffectIntent, outcome invalidatedExternalOutcome) bool {
+	if effect.Reconciliation == nil || outcome.Action != effect.Reconciliation.Action || !outcome.Observed {
+		return false
+	}
+	switch outcome.Action {
+	case reconciliationGitHubBind, reconciliationGitHubIssueUpdate:
+		return !outcome.Merged && outcome.PR == 0 && outcome.HeadSHA == ""
+	case reconciliationGitHubPublish:
+		return !outcome.Merged && outcome.PR > 0 && effect.Reconciliation.GitHubPublish != nil && outcome.HeadSHA == effect.Reconciliation.GitHubPublish.HeadSHA
+	case reconciliationGitHubPRGovernance:
+		return outcome.Merged && outcome.PR > 0 && effect.Reconciliation.GitHubPRGovernance != nil && outcome.PR == effect.Reconciliation.GitHubPRGovernance.PR && outcome.HeadSHA == effect.Reconciliation.GitHubPRGovernance.HeadSHA
+	default:
+		return false
+	}
 }
 
 func applyMarkReviewerSessionRequested(stateRoot string, state *runtimeOwnerState, command markReviewerSessionRequestedCommand) error {

@@ -2091,9 +2091,9 @@ func validWorkerSealSelection(stateRoot string, manifest agentruntime.Manifest, 
 		selection.ProfileDigest == manifest.WorkerProfileDigest &&
 		selection.Root == expectedRoot &&
 		selection.Result.Type == "agent-symphony-result-v1" &&
-		boundedText(selection.Result.Validation, maxReconciliationStringBytes, false) &&
-		boundedText(selection.Result.Documentation, maxReconciliationStringBytes, false) &&
-		boundedText(selection.Result.Decisions, maxReconciliationStringBytes, true)
+		boundedText(selection.Result.Validation, maxReconciliationStringBytes, true) &&
+		boundedText(selection.Result.Documentation, maxReconciliationStringBytes, true) &&
+		boundedText(selection.Result.Decisions, maxReconciliationStringBytes, false)
 }
 
 func applyRecordEffect(state *runtimeOwnerState, command recordEffectCommand) (*runtimeEffectIntent, error) {
@@ -2638,7 +2638,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			if decodeErr != nil || len(decoded) != 16 || outcome.Action == "" || outcome.PR < 0 || outcome.HeadSHA != "" && !preflightObjectID.MatchString(outcome.HeadSHA) {
 				return errors.New("runtime owner invalidated external outcome is invalid")
 			}
-			if ok && (effect.State != "invalidated-resolved" || effect.Repository != tombstone.Repository || effect.Issue != tombstone.Issue || effect.Attempt != tombstone.Attempt || effect.AttemptGeneration != tombstone.InvalidatedGeneration || effect.Reconciliation == nil || outcome.Action != effect.Reconciliation.Action) {
+			if ok && (effect.State != "invalidated-resolved" || effect.Repository != tombstone.Repository || effect.Issue != tombstone.Issue || effect.Attempt != tombstone.Attempt || effect.AttemptGeneration != tombstone.InvalidatedGeneration || !validInvalidatedExternalOutcome(effect, outcome)) {
 				return errors.New("runtime owner invalidated external outcome binding is invalid")
 			}
 		}

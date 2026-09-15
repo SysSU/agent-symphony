@@ -1200,6 +1200,9 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if !filepath.IsAbs(codexExecutable) || !validDigest(profileDigest) || manifest.WorkerProfileDigest != profileDigest {
 			return errors.New("worker export confinement identity is unavailable")
 		}
+		if err := config.VerifyWorkerExecutable(ctx, codexExecutable, profileDigest); err != nil {
+			return err
+		}
 		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgs(manifest.Worktree, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp}, Stdin: bytes.NewReader(request.Command.Input)})
 	case "validate-cleanup", "cleanup":
 		if mode != "implementation" {

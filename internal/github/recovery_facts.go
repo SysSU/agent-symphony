@@ -1071,6 +1071,36 @@ func RetryCommandApplied(ctx context.Context, api API, cfg PRAdapterConfig, issu
 	return latest != nil && name == "retry" && latest.User.ID == cfg.ActorID && latest.CreatedAt.After(terminal.FailedAt), nil
 }
 
+// EnsureRetrySuppressed makes a late owner-generated retry harmless after its
+// source attempt was invalidated. The newer cancel command is an observable,
+// idempotent postcondition; absence of the retry is not treated as final.
+func EnsureRetrySuppressed(ctx context.Context, api API, cfg PRAdapterConfig, issue, attempt int, failedAt time.Time) (bool, error) {
+	source := GitHubPRSource{API: api, Config: cfg}
+	check := func() (bool, error) {
+		comments, err := source.issueComments(ctx, issue)
+		if err != nil {
+			return false, err
+		}
+		latest, name := latestControlCommand(comments, cfg.CancelCommand, cfg.RetryCommand)
+		return latest != nil && name == "cancelled" && latest.User.ID == cfg.ActorID && latest.CreatedAt.After(failedAt.UTC()), nil
+	}
+	if suppressed, err := check(); err != nil || suppressed {
+		return suppressed, err
+	}
+	applied, err := RetryCommandApplied(ctx, api, cfg, issue, attempt, failedAt)
+	if err != nil || !applied {
+		return false, err
+	}
+	if err := api.CreateIssueComment(ctx, cfg.Repository, issue, cfg.CancelCommand, Mutation{Issue: issue, Attempt: attempt}); err != nil {
+		return false, err
+	}
+	suppressed, err := check()
+	if err != nil || !suppressed {
+		return false, errors.Join(errors.New("late retry suppression was not observed"), err)
+	}
+	return true, nil
+}
+
 func fetchTerminalFailures(ctx context.Context, api API, cfg PRAdapterConfig, issue int) ([]terminalMarkerPayload, markerConflicts, error) {
 	found := map[int]terminalMarkerPayload{}
 	conflicts := markerConflicts{Attempts: map[int]bool{}}

@@ -1282,6 +1282,27 @@ func mustOutput(t *testing.T, cmd *exec.Cmd) []byte {
 	return out
 }
 
+func TestProductionStateRootRejectsSharedTemporaryStorageWithoutCreatingIt(t *testing.T) {
+	previous := allowSharedTempRuntimeStateForTest
+	allowSharedTempRuntimeStateForTest = false
+	t.Cleanup(func() { allowSharedTempRuntimeStateForTest = previous })
+	for _, shared := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
+		if _, err := os.Stat(shared); err != nil {
+			continue
+		}
+		t.Run(strings.ReplaceAll(shared, "/", "_"), func(t *testing.T) {
+			parent := filepath.Join(shared, fmt.Sprintf("agent-symphony-rejected-%d", os.Getpid()))
+			root := filepath.Join(parent, "runtime")
+			if err := validateProductionStateRoot(root); err == nil || !strings.Contains(err.Error(), "shared temporary") {
+				t.Fatalf("root=%q err=%v", root, err)
+			}
+			if _, err := os.Lstat(parent); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("rejected root created state: %v", err)
+			}
+		})
+	}
+}
+
 func TestWorkerExportRejectsMaliciousOrOversizedBundleBeforeImport(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "boundary")
