@@ -521,13 +521,7 @@ func TestOperatorStopDigestBindsExactAttemptIdentity(t *testing.T) {
 	}
 }
 
-func TestOperatorBlockedRecoverSelfAdvancesToRetryCompletion(t *testing.T) {
-	root := resolvedTempDir(t)
-	manifest := ownerTestManifest(t, root, 329, 1, "running")
-	manifest, pane := boundRuntimeEffectTestManifest(t, manifest)
-	state := runtimeEffectInitialState(manifest)
-	addOperatorObservation(&state, manifest, "active", false)
-	state.Epoch, state.Revision = 1, 1
+func TestOperatorFailedRecoverSelfAdvancesToRetryCompletion(t *testing.T) {
 	completed := make(chan struct{})
 	var completion sync.Once
 	persist := func(state runtimeOwnerState) error {
@@ -536,34 +530,38 @@ func TestOperatorBlockedRecoverSelfAdvancesToRetryCompletion(t *testing.T) {
 		}
 		return nil
 	}
-	owner, err := startTestStateOwner(t, root, state, persist)
-	if err != nil {
-		t.Fatal(err)
-	}
-	refreshOperatorObservation(t, owner)
-	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	owner, manifest := operatorNeverLaunchedOwner(t, 329, "failed", "failed", persist)
 	service := operatorTestMutationService(t, owner)
-	service.effects.executor.Runtime.Runner = &barrierEffectRunner{pane: pane}
-	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
-	service.reviewer = bindLiveReviewerForService(t, owner, reviewer)
 	service.collector.Config.ActorID = 42
 	service.collector.Config.RetryCommand = "/agent-symphony retry"
 	var collections atomic.Int32
 	service.collect = func(_ context.Context, _ stateOwnerSnapshot, issueNumber int) (reconciliationV2Batch, error) {
-		active := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: issueNumber, Attempt: 1, BaseSHA: manifest.BaseSHA, State: "active", Checks: []string{}}
+		failed := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: issueNumber, Attempt: 1, BaseSHA: manifest.BaseSHA, State: "failed", Checks: []string{}}
 		issue := issueFact(issueNumber, "recover")
-		issue.Attempt, issue.CurrentAttempt = 1, 1
-		if collections.Add(1) == 1 {
-			issue.Active, issue.ActiveAttempt = true, &active
-			return reconciliationV2Batch{Input: reconciliationInput{Scope: issueScope(issueNumber), Complete: true, Issues: []internalgithub.RecoveryIssueFact{issue}, Attempts: []internalgithub.RecoveryAttemptFact{active}}}, nil
-		}
-		failed := active
-		failed.State = "failed"
-		issue.RecoveryAuthorized = true
+		issue.Attempt, issue.CurrentAttempt, issue.RecoveryAttempt, issue.RecoveryAuthorized = 1, 1, 1, true
 		issue.TerminalAttempts = []internalgithub.RecoveryAttemptFact{failed}
+		collections.Add(1)
 		return reconciliationV2Batch{Input: reconciliationInput{Scope: issueScope(issueNumber), Complete: true, Issues: []internalgithub.RecoveryIssueFact{issue}, Attempts: []internalgithub.RecoveryAttemptFact{failed}}}, nil
 	}
 	service.collector.API = internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/user" {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":42,"login":"owner"}`)), Request: request}, nil
+		}
+		if request.URL.Path == "/repos/o/r/pulls" {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`[]`)), Request: request}, nil
+		}
+		if request.URL.Path == "/repos/o/r" {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"full_name":"o/r","default_branch":"main","permissions":{"pull":true}}`)), Request: request}, nil
+		}
+		if request.URL.Path == "/repos/o/r/branches/main" {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"commit":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`)), Request: request}, nil
+		}
+		if request.URL.Path == "/repos/o/r/issues/329" {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"number":329,"node_id":"I_329","title":"recover","body":"body","state":"open","created_at":"2026-09-14T00:00:00Z","user":{"id":42},"labels":[]}`)), Request: request}, nil
+		}
+		if request.URL.Path == "/repos/o/r/issues/329/timeline" {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`[]`)), Request: request}, nil
+		}
 		if !strings.Contains(request.URL.Path, "/comments") {
 			return nil, fmt.Errorf("unexpected GitHub request %s", request.URL.String())
 		}
@@ -596,12 +594,34 @@ func TestOperatorBlockedRecoverSelfAdvancesToRetryCompletion(t *testing.T) {
 	}
 	final := mustOwnerSnapshot(t, owner).State
 	receipt, ok := operatorReceiptByID(final, "recover-self-advance")
-	if !ok || receipt.State != "completed" || receipt.Phase != operatorPhaseCompleted || receipt.Result == nil || receipt.Result.Status != http.StatusOK || collections.Load() != 2 {
+	if !ok || receipt.State != "completed" || receipt.Phase != operatorPhaseCompleted || receipt.Result == nil || receipt.Result.Status != http.StatusOK || collections.Load() != 1 {
 		t.Fatalf("receipt=%#v collections=%d effects=%#v", receipt, collections.Load(), final.Effects)
 	}
-	proof := final.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, reviewer.Reconciliation.Reviewer.Mode, reviewer.Reconciliation.Reviewer.Target)]
-	if !proof.DeadProved || proof.NeverRan || proof.GroupPID < 2 || final.Effects[reviewer.ID].State == "pending" {
-		t.Fatalf("Recover completed without stopped reviewer proof: proof=%#v reviewer=%#v", proof, final.Effects[reviewer.ID])
+	if manifest.LaunchID != "" {
+		t.Fatalf("never-launched recovery fixture acquired launch authority: %#v", manifest)
+	}
+}
+
+func TestOperatorActiveNeverLaunchedRecoverStaysPendingWithoutStopProof(t *testing.T) {
+	owner, manifest := operatorNeverLaunchedOwner(t, 330, "running", "active", func(runtimeOwnerState) error { return nil })
+	service := operatorTestMutationService(t, owner)
+	var githubRequests atomic.Int32
+	service.collector.API = internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		githubRequests.Add(1)
+		return nil, fmt.Errorf("unexpected GitHub request %s", request.URL.String())
+	})}}
+	result := service.perform(t.Context(), operatorRequest("recover-unproved-stop", "recover", manifest, false))
+	if !result.OK || result.Status != http.StatusAccepted {
+		t.Fatalf("result=%#v", result)
+	}
+	if err := service.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	final := mustOwnerSnapshot(t, owner).State
+	receipt, ok := operatorReceiptByID(final, result.RequestID)
+	effect := final.Effects[receipt.EffectID]
+	if !ok || receipt.State != "pending" || receipt.Phase != operatorPhaseStopPending || effect.State != "pending" || effect.Action != string(agentruntime.EffectStop) || githubRequests.Load() != 0 {
+		t.Fatalf("unproved Stop advanced: receipt=%#v effect=%#v GitHub_requests=%d", receipt, effect, githubRequests.Load())
 	}
 }
 
@@ -1514,6 +1534,10 @@ func TestOperatorRecoverConvergesWithBackgroundRetry(t *testing.T) {
 func TestOperatorServiceCancellationAfterOwnerAdmissionReturnsCommittedReceipt(t *testing.T) {
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, 344, 1, "running")
+	manifest, pane := boundRuntimeEffectTestManifest(t, manifest)
+	if pane.PaneID == "" {
+		t.Fatal("bound fixture did not return an exact pane identity")
+	}
 	state := runtimeEffectInitialState(manifest)
 	addOperatorObservation(&state, manifest, "active", false)
 	state.Epoch, state.Revision = 1, 1
@@ -1560,8 +1584,11 @@ func TestOperatorServiceCancellationAfterOwnerAdmissionReturnsCommittedReceipt(t
 	if err := service.shutdown(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if receipt, ok := operatorReceiptByID(mustOwnerSnapshot(t, owner).State, got.RequestID); !ok || receipt.State != "completed" || receipt.EffectID == "" || runner.calls.Load() != 1 {
-		t.Fatalf("completed receipt=%#v exists=%v calls=%d", receipt, ok, runner.calls.Load())
+	final := mustOwnerSnapshot(t, owner).State
+	receipt, ok := operatorReceiptByID(final, got.RequestID)
+	effect := final.Effects[receipt.EffectID]
+	if !ok || receipt.State != "completed" || receipt.EffectID == "" || effect.State != "completed" || effect.Action != string(agentruntime.EffectStop) || runner.calls.Load() != 2 {
+		t.Fatalf("completed receipt=%#v exists=%v effect=%#v boundary_calls=%d", receipt, ok, effect, runner.calls.Load())
 	}
 }
 
@@ -1743,6 +1770,13 @@ func TestCleanupInvalidatesBlockedGitHubBindBeforeMutation(t *testing.T) {
 		return nil, request.Context().Err()
 	})}, Retries: -1}
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := service.shutdown(ctx); err != nil {
+			t.Errorf("join Abandon cleanup before owner teardown: %v", err)
+		}
+	})
 	effects := service.effects
 	plan, err := effects.beginReconciliation(t.Context(), plans[0])
 	if err != nil {
@@ -1764,8 +1798,18 @@ func TestCleanupInvalidatesBlockedGitHubBindBeforeMutation(t *testing.T) {
 	if requests.Load() != 1 {
 		t.Fatalf("GitHub bind performed %d requests after invalidation", requests.Load())
 	}
-	if tombstone := mustOwnerSnapshot(t, owner).State.Tombstones[ownerAttemptKey("o/r", manifest.Issue, 1)]; tombstone.Action != "abandoned" {
-		t.Fatalf("tombstone=%#v", tombstone)
+	if err := service.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	final := mustOwnerSnapshot(t, owner).State
+	key := ownerAttemptKey("o/r", manifest.Issue, 1)
+	tombstone := final.Tombstones[key]
+	receipt, ok := operatorReceiptByID(final, "abandon-blocked-bind")
+	if tombstone.Action != "abandoned" || tombstone.CleanupPhase != "completed" || final.Effects[tombstone.EffectID].State != "completed" || !ok || receipt.State != "completed" || receipt.Result == nil || !receipt.Result.OK {
+		t.Fatalf("Abandon did not complete after blocked GitHub bind: tombstone=%#v receipt=%#v found=%t effect=%#v", tombstone, receipt, ok, final.Effects[tombstone.EffectID])
+	}
+	if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Abandon left worktree after completed cleanup: %v", err)
 	}
 }
 
@@ -1858,8 +1902,8 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 		{name: "terminal-awaiting-attached", checkpoint: operatorPhaseTerminalAwait, attached: true},
 		{name: "retry-awaiting-single", checkpoint: operatorPhaseRetryAwait},
 		{name: "retry-awaiting-attached", checkpoint: operatorPhaseRetryAwait, attached: true},
-		{name: "stop-marker-single", checkpoint: operatorPhaseStopPending, marked: true},
-		{name: "stop-marker-attached", checkpoint: operatorPhaseStopPending, marked: true, attached: true},
+		{name: "stop-unproved-single", checkpoint: operatorPhaseStopPending},
+		{name: "stop-unproved-attached", checkpoint: operatorPhaseStopPending, attached: true},
 		{name: "terminal-marker-single", checkpoint: operatorPhaseTerminal, marked: true},
 		{name: "terminal-marker-attached", checkpoint: operatorPhaseTerminal, marked: true, attached: true},
 		{name: "retry-marker-single", checkpoint: operatorPhaseRetryPending, marked: true},
@@ -1867,9 +1911,8 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 		{name: "retry-posted-unmarked", checkpoint: operatorPhaseRetryPending, posted: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			owner, manifest := operatorTestOwner(t, 348, "active", false, true)
+			owner, manifest := operatorNeverLaunchedOwner(t, 348, "running", "active", func(runtimeOwnerState) error { return nil })
 			service := operatorTestMutationService(t, owner)
-			service.effects.executor.Runtime.Runner = &barrierEffectRunner{pane: boundRuntimeEffectTestPane(t, manifest)}
 			request := operatorRequest("recover-checkpoint", "recover", manifest, false)
 			command := operatorCommand(mustOwnerSnapshot(t, owner), request, manifest)
 			stopRequest, err := service.prepareStop(manifest, "dashboard recovery: runtime liveness mismatch")
@@ -1937,21 +1980,14 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 				}
 			}
 			if test.marked {
-				if test.checkpoint == operatorPhaseStopPending {
-					stopRequest.Identity = effectRequestIdentity(*stopEffect)
-					if result, err := service.effects.executor.Execute(t.Context(), stopRequest); err != nil || result.Disposition != agentruntime.EffectResultReady {
-						t.Fatalf("stop marker result=%#v err=%v", result, err)
-					}
-				} else {
-					effect := terminalEffect
-					kind := githubIssueTerminalFailure
-					if retryEffect != nil {
-						effect, kind = retryEffect, githubIssueRetry
-					}
-					result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: kind, Observed: true}}
-					if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*effect), *effect.Reconciliation, result); err != nil {
-						t.Fatal(err)
-					}
+				effect := terminalEffect
+				kind := githubIssueTerminalFailure
+				if retryEffect != nil {
+					effect, kind = retryEffect, githubIssueRetry
+				}
+				result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: kind, Observed: true}}
+				if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*effect), *effect.Reconciliation, result); err != nil {
+					t.Fatal(err)
 				}
 			}
 			var postedComments []map[string]any
@@ -2072,11 +2108,14 @@ func TestOperatorRecoverResumesAwaitingAndMarkerBeforeLedgerCheckpointsOnce(t *t
 			final := mustOwnerSnapshot(t, restarted).State
 			original, _ := operatorReceiptByID(final, request.RequestID)
 			attached, attachedFound := operatorReceiptByID(final, attachedRequest.RequestID)
+			if test.checkpoint == operatorPhaseStopPending {
+				if original.State != "pending" || original.Phase != operatorPhaseStopPending || attachedFound != test.attached || test.attached && (attached.State != "pending" || attached.Phase != operatorPhaseStopPending || attached.EffectID != original.EffectID) || final.Effects[original.EffectID].State != "pending" || stopCollections != 0 {
+					t.Fatalf("unproved Stop advanced: original=%#v attached=%#v effect=%#v collections=%d", original, attached, final.Effects[original.EffectID], stopCollections)
+				}
+				return
+			}
 			wantEffects := 2
 			remainingInputs := len(inputs)
-			if test.checkpoint == operatorPhaseStopPending {
-				remainingInputs = max(0, 2-stopCollections)
-			}
 			if original.State != "completed" || attachedFound != test.attached || test.attached && (attached.State != "completed" || original.EffectID != attached.EffectID) || len(final.Effects) != wantEffects || remainingInputs != 0 {
 				t.Fatalf("original=%#v attached=%#v effects=%#v remaining_inputs=%d", original, attached, final.Effects, remainingInputs)
 			}
@@ -2257,6 +2296,23 @@ func operatorTestMutationService(t *testing.T, owner *stateOwner) *operatorMutat
 	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: &barrierEffectRunner{}, VerifyWorker: func(context.Context) error { return nil }}
 	effects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, executor: agentruntime.EffectExecutor{Runtime: runtimeState}, active: map[string]*activeRuntimeEffect{}}
 	return &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, collector: reconciliationV2Collector{Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}}
+}
+
+func operatorNeverLaunchedOwner(t *testing.T, issue int, manifestState, observedState string, persist func(runtimeOwnerState) error) (*stateOwner, agentruntime.Manifest) {
+	t.Helper()
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, issue, 1, manifestState)
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, observedState, false)
+	state.Epoch, state.Revision = 1, 1
+	owner, err := startTestStateOwner(t, root, state, persist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
+	return owner, manifest
 }
 
 func TestV2DashboardConstructionRejectsWrongOwnerBinding(t *testing.T) {
