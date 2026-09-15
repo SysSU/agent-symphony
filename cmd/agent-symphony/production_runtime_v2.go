@@ -47,7 +47,7 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	if err := prepareProductionMarkerDirectories(stateRoot); err != nil {
 		return nil, err
 	}
-	workerProfileDigest, err := config.BindWorkerExecutable(parent, &cfg.Commands)
+	workerProfileDigest, err := config.PinWorkerExecutable(parent, stateRoot, &cfg.Commands)
 	if err != nil {
 		return nil, err
 	}
@@ -62,8 +62,8 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		_ = runtime.shutdown(context.Background())
 		return nil, err
 	}
-	owner, err := startStateOwner(lifecycle, stateRoot, attemptRoot, initial, func(state runtimeOwnerState) error {
-		return writeRuntimeOwnerState(stateRoot, attemptRoot, state)
+	owner, err := startStateOwner(lifecycle, stateRoot, attemptRoot, initial, func(ctx context.Context, state runtimeOwnerState) error {
+		return writeRuntimeOwnerStateContext(ctx, stateRoot, attemptRoot, state)
 	})
 	if err != nil {
 		cancel()
@@ -98,10 +98,8 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		Runner: implementation, AllowEnv: cfg.Commands.Environment, WorkerHome: workerCodexHome(stateRoot),
 		WorkerProfileDigest: workerProfileDigest,
 		VerifyWorker: func(ctx context.Context) error {
-			check := cfg.Commands
-			digest, err := config.BindWorkerExecutable(ctx, &check)
-			if err != nil || digest != workerProfileDigest || check.Implementation[0] != cfg.Commands.Implementation[0] {
-				return errors.Join(errors.New("codex worker executable identity changed"), err)
+			if err := config.VerifyWorkerExecutable(ctx, cfg.Commands.Implementation[0], workerProfileDigest); err != nil {
+				return err
 			}
 			return preflight.Do(func() error {
 				if _, err := implementation.call(ctx, "verify", agentruntime.Command{}); err != nil {

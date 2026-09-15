@@ -342,9 +342,9 @@ func TestFullSystemE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(binDir, "agent-symphony")
-	buildArgs := []string{"build", "-o", binary, "."}
+	buildArgs := []string{"build", "-tags", "agent_symphony_test", "-o", binary, "."}
 	if raceMode {
-		buildArgs = []string{"build", "-race", "-o", binary, "."}
+		buildArgs = []string{"build", "-race", "-tags", "agent_symphony_test", "-o", binary, "."}
 	}
 	runExternal(t, source, "go", buildArgs...)
 	writeExecutable(t, filepath.Join(binDir, "gh"), `#!/bin/sh

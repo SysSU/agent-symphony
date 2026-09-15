@@ -228,6 +228,7 @@ type Supervisor struct {
 	ProposalCommand       []string
 	ProposalStatusCommand []string
 	Env                   []string
+	AuditEnv              []string
 	Runner                agentruntime.Runner
 	Now                   func() time.Time
 
@@ -1241,7 +1242,7 @@ func (s *Supervisor) runAudit(ctx context.Context, cancel context.CancelFunc, wo
 	if runner == nil {
 		runner = agentruntime.ExecRunner{}
 	}
-	result, runErr := runner.Run(ctx, agentruntime.Command{Name: s.Launcher[0], Args: slices.Clone(s.Launcher[1:]), Dir: workspace, Env: s.Env, MaxOutputBytes: maxAuditReportBytes})
+	result, runErr := runner.Run(ctx, agentruntime.Command{Name: s.Launcher[0], Args: slices.Clone(s.Launcher[1:]), Dir: workspace, Env: s.AuditEnv, MaxOutputBytes: maxAuditReportBytes})
 	resultPath := filepath.Join(workspace, auditResultFile)
 	if slices.ContainsFunc(s.AuditCommand, func(arg string) bool { return strings.Contains(arg, auditResultPlaceholder) }) {
 		if runErr == nil {
@@ -1249,10 +1250,10 @@ func (s *Supervisor) runAudit(ctx context.Context, cancel context.CancelFunc, wo
 		}
 		_ = os.Remove(resultPath)
 	}
-	report := heartbeatReport{Version: stateVersion, StartedAt: startedAt, CompletedAt: s.now(), ProjectionDigest: projectionDigest, State: "completed", Report: clean(internalgithub.RedactEnvironment(result.Output, s.Env), maxAuditReportBytes), ReconciliationDiagnostic: diagnostic}
+	report := heartbeatReport{Version: stateVersion, StartedAt: startedAt, CompletedAt: s.now(), ProjectionDigest: projectionDigest, State: "completed", Report: clean(internalgithub.RedactEnvironment(result.Output, s.AuditEnv), maxAuditReportBytes), ReconciliationDiagnostic: diagnostic}
 	if runErr != nil {
 		report.State = "failed"
-		report.Diagnostic = bounded(internalgithub.RedactEnvironment(runErr.Error(), s.Env))
+		report.Diagnostic = bounded(internalgithub.RedactEnvironment(runErr.Error(), s.AuditEnv))
 	}
 	completionCtx, token, current := s.claimAuditCompletion(generation, contextEpoch)
 	if !current {

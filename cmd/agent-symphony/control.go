@@ -89,9 +89,6 @@ func controlSocketPath(stateRoot string) string {
 
 func validateControlSocketParent(path, stateRoot string, create bool) error {
 	parent := filepath.Dir(path)
-	if parent == filepath.Clean(stateRoot) {
-		return nil
-	}
 	canonical, err := canonicalPathWithMissingLeaf(parent)
 	if err != nil || canonical != parent || pathInSharedTemporaryStorage(canonical) {
 		return errors.New("running-daemon control directory is unsafe")
@@ -101,8 +98,7 @@ func validateControlSocketParent(path, stateRoot string, create bool) error {
 			return err
 		}
 	}
-	info, err := os.Lstat(parent)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
+	if err := validatePrivateOwnedDirectory(parent); err != nil {
 		return errors.New("running-daemon control directory is unsafe")
 	}
 	return nil
@@ -377,8 +373,7 @@ func writeControlResult(w http.ResponseWriter, result controlResult) {
 }
 
 func callRunningDaemon(ctx context.Context, stateRoot string, request controlRequest) (controlResult, error) {
-	rootInfo, err := os.Lstat(stateRoot)
-	if err != nil || rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() || !ownedByCurrentUser(rootInfo) {
+	if err := validatePrivateOwnedDirectory(stateRoot); err != nil {
 		return controlResult{}, errors.New("runtime state root is unsafe")
 	}
 	identity, err := readDeploymentIdentity(stateRoot)

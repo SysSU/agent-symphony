@@ -780,11 +780,27 @@ func runHostOrchestrator(ctx context.Context, root, home string, local bool) err
 			return errors.New("unsafe orchestrator command argument")
 		}
 	}
-	env, err := internalgithub.AgentEnvironmentWith(os.Environ())
+	var env []string
+	if launch.OneShot {
+		env, err = internalgithub.WorkerEnvironmentWith(os.Environ())
+	} else {
+		env, err = internalgithub.AgentEnvironmentWith(os.Environ())
+	}
 	if err != nil {
 		return err
 	}
-	env = append(env, "HOME="+home)
+	if launch.OneShot {
+		auditHome := dir
+		for _, value := range env {
+			if strings.HasPrefix(value, "CODEX_HOME=") && strings.TrimPrefix(value, "CODEX_HOME=") != "" {
+				auditHome = strings.TrimPrefix(value, "CODEX_HOME=")
+				break
+			}
+		}
+		env = append(env, "HOME="+auditHome)
+	} else {
+		env = append(env, "HOME="+home)
+	}
 	if local {
 		env = append(env, "AGENT_SYMPHONY_ORCHESTRATOR_ROOT="+root)
 	}

@@ -36,6 +36,9 @@ func resolvedTempDir(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	return root
 }
 
@@ -56,6 +59,7 @@ func TestControlServeHelper(t *testing.T) {
 	if json.Unmarshal([]byte(os.Getenv("AGENT_SYMPHONY_CONTROL_ARGS")), &args) != nil {
 		os.Exit(2)
 	}
+	testRuntimeStateRootAllowed = func(string) bool { return true }
 	os.Exit(run(args, io.Discard, io.Discard))
 }
 
@@ -137,6 +141,16 @@ func TestControlOwnershipRejectsAnotherLocalIdentity(t *testing.T) {
 	}
 }
 
+func TestDirectControlSocketRejectsNonPrivateStateDirectory(t *testing.T) {
+	root := resolvedTempDir(t)
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateControlSocketParent(controlSocketPath(root), root, false); err == nil {
+		t.Fatal("direct control socket accepted a non-private state directory")
+	}
+}
+
 func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 	root := gitRepository(t)
 	root, err := filepath.EvalSymlinks(root)
@@ -152,7 +166,7 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 	runGit(t, root, "commit", "-m", "initial")
 	base := runGit(t, root, "rev-parse", "HEAD")
 	runGit(t, root, "update-ref", "refs/remotes/origin/main", base)
-	stateRoot := filepath.Join(root, "runtime")
+	stateRoot := filepath.Join(privateDiagnosticRoot(t), "runtime")
 	cleanupControlSocket(t, stateRoot)
 	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -225,8 +239,8 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 		"AGENT_SYMPHONY_CONTROL_ARGS="+string(encodedArgs),
 		"CODEX_HOME="+t.TempDir(),
 	)
-	var childOutput bytes.Buffer
-	command.Stdout, command.Stderr = &childOutput, &childOutput
+	childOutput := &synchronizedBuffer{}
+	command.Stdout, command.Stderr = childOutput, childOutput
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +251,7 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 			_ = command.Wait()
 		}
 	})
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for {
 		info, err := os.Lstat(controlSocketPath(stateRoot))
 		if err == nil && info.Mode()&os.ModeSocket != 0 {

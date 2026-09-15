@@ -105,7 +105,9 @@ func TestBoundHandoffParksBeforeReleaseAndPreservesPaneIdentity(t *testing.T) {
 	}
 	cleanup, _ := json.Marshal(handoffCompensationRequest{Candidate: handoffCandidateInvalidation{EffectID: request.CandidateLaunchID, Token: request.CandidateLaunchToken, Key: "test", Manifest: manifest}})
 	result, err := compensateHandoffV2(ctx, cleanup, root)
-	assertHandoffCompensationProof(t, result, err, request, false, "killed")
+	if result != "" || err == nil || !strings.Contains(err.Error(), "descendants remain unproved") || !strings.Contains(err.Error(), "termination is unconfirmed") {
+		t.Fatalf("compensation fabricated descendant proof: result=%q err=%v", result, err)
+	}
 	if output, err := exec.Command(tmux, "has-session", "-t", "="+manifest.Session).CombinedOutput(); err == nil {
 		t.Fatalf("compensated candidate still has a session: %s", output)
 	}

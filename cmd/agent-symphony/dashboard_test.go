@@ -166,7 +166,7 @@ func TestDashboardRejectsContaminatedPeerProjection(t *testing.T) {
 }
 
 func TestDashboardAggregatesTwoProjectsReadOnlyAndRejectsCrossProjectRoutes(t *testing.T) {
-	firstRoot, secondRoot := t.TempDir(), t.TempDir()
+	firstRoot, secondRoot := resolvedTempDir(t), resolvedTempDir(t)
 	firstRepository, secondRepository := "owner/first", "owner/second"
 	firstSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, firstRepository, 7, 1)
 	secondSession, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, secondRepository, 7, 1)
@@ -1076,6 +1076,10 @@ func TestDashboardAndCLIRejectRetainedDeadImplementationPane(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := bindDeployment(root, "o/r"); err != nil {
 		t.Fatal(err)
 	}

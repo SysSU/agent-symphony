@@ -1222,36 +1222,25 @@ func TestOrchestratorAuthenticationCrossesItsSessionBoundary(t *testing.T) {
 	}
 }
 
-func TestHeartbeatAuthenticationCrossesItsOneShotBoundary(t *testing.T) {
-	for _, test := range []struct {
-		name, token, state string
-	}{{"authenticated", "heartbeat-auth-canary", "completed"}, {"missing", "", "failed"}, {"invalid", "heartbeat-invalid-canary", "failed"}} {
-		t.Run(test.name, func(t *testing.T) {
-			now := time.Date(2026, 8, 15, 1, 2, 3, 0, time.UTC)
-			runner := &fakeRunner{auditAuth: true, validAuth: "heartbeat-auth-canary", auditOutput: "VERIFIED: authenticated"}
-			agent := newTestSupervisor(t, runner, &now)
-			agent.Launcher = []string{"agent-symphony", "agent-host", "orchestrator"}
-			agent.AuditCommand = []string{"heartbeat-agent"}
-			agent.Env = []string{"PATH=/bin", "GH_REPO=" + agent.Repository}
-			if test.token != "" {
-				agent.Env = append(agent.Env, "GH_TOKEN="+test.token)
-			}
-			if _, err := agent.Observe(t.Context(), []orchestrator.RecoveryStatus{{Repository: agent.Repository, Issue: 1, Attempt: 1, State: "active"}}); err != nil {
-				t.Fatal(err)
-			}
-			report := waitHeartbeatReport(t, agent.Workspace, test.state)
-			waitAuditIdle(t, agent)
-			if test.state == "completed" && !strings.Contains(report.Report, "authenticated") {
-				t.Fatal("authenticated heartbeat did not produce its report")
-			}
-			if test.state == "failed" && !strings.Contains(report.Diagnostic, "GitHub CLI authentication") {
-				t.Fatal("heartbeat authentication failure was unclear")
-			}
-			body, readErr := os.ReadFile(filepath.Join(agent.Workspace, HeartbeatReportFile))
-			if readErr != nil || test.token != "" && bytes.Contains(body, []byte(test.token)) {
-				t.Fatalf("credential reached heartbeat report: read=%v", readErr)
-			}
-		})
+func TestHeartbeatAuditDoesNotInheritPrimaryGitHubAuthority(t *testing.T) {
+	now := time.Date(2026, 8, 15, 1, 2, 3, 0, time.UTC)
+	runner := &fakeRunner{auditAuth: true, validAuth: "heartbeat-auth-canary"}
+	agent := newTestSupervisor(t, runner, &now)
+	agent.Launcher = []string{"agent-symphony", "agent-host", "orchestrator"}
+	agent.AuditCommand = []string{"heartbeat-agent"}
+	agent.Env = []string{"PATH=/bin", "GH_REPO=" + agent.Repository, "GH_TOKEN=heartbeat-auth-canary"}
+	agent.AuditEnv = []string{"PATH=/bin"}
+	if _, err := agent.Observe(t.Context(), []orchestrator.RecoveryStatus{{Repository: agent.Repository, Issue: 1, Attempt: 1, State: "active"}}); err != nil {
+		t.Fatal(err)
+	}
+	report := waitHeartbeatReport(t, agent.Workspace, "failed")
+	waitAuditIdle(t, agent)
+	if !strings.Contains(report.Diagnostic, "GitHub CLI authentication is missing") {
+		t.Fatalf("audit unexpectedly inherited GitHub authority: %#v", report)
+	}
+	body, readErr := os.ReadFile(filepath.Join(agent.Workspace, HeartbeatReportFile))
+	if readErr != nil || bytes.Contains(body, []byte("heartbeat-auth-canary")) {
+		t.Fatalf("credential reached heartbeat report: read=%v", readErr)
 	}
 }
 

@@ -638,11 +638,12 @@ type stateOwner struct {
 	snapshots   chan stateOwnerSnapshotRequest
 	stop        chan struct{}
 	stopOnce    sync.Once
+	persistStop context.CancelFunc
 	done        chan struct{}
 	commits     chan stateOwnerSnapshot
 }
 
-func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial runtimeOwnerState, persist func(runtimeOwnerState) error) (*stateOwner, error) {
+func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial runtimeOwnerState, persist func(context.Context, runtimeOwnerState) error) (*stateOwner, error) {
 	if persist == nil {
 		return nil, errors.New("state persistence is required")
 	}
@@ -667,10 +668,19 @@ func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial
 		done:        make(chan struct{}),
 		commits:     make(chan stateOwnerSnapshot, 1),
 	}
+	persistContext, stopPersistence := context.WithCancel(ctx)
+	owner.persistStop = stopPersistence
 	persistRequests := make(chan statePersistenceRequest, 1)
 	persistDone := make(chan struct{})
-	go runStatePersistence(persistRequests, persistDone, persist)
+	go runStatePersistence(persistContext, persistRequests, persistDone, persist)
 	go owner.run(initial, persistRequests, persistDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			owner.closeSignal()
+		case <-owner.done:
+		}
+	}()
 	if _, err := owner.submit(ctx, stateOwnerCommand{kind: stateOwnerStart}); err != nil {
 		_ = owner.close(context.Background())
 		return nil, err
@@ -678,10 +688,10 @@ func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial
 	return owner, nil
 }
 
-func runStatePersistence(requests <-chan statePersistenceRequest, done chan<- struct{}, persist func(runtimeOwnerState) error) {
+func runStatePersistence(ctx context.Context, requests <-chan statePersistenceRequest, done chan<- struct{}, persist func(context.Context, runtimeOwnerState) error) {
 	defer close(done)
 	for request := range requests {
-		request.reply <- persist(request.state)
+		request.reply <- persist(ctx, request.state)
 	}
 }
 
@@ -811,6 +821,7 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 			inFlight, persistenceResult = nil, nil
 		case <-stopInput:
 			stopping = true
+			o.persistStop()
 			for _, command := range queue {
 				command.reply <- stateOwnerResult{err: errStateOwnerStopped}
 			}
@@ -825,13 +836,17 @@ func (o *stateOwner) close(ctx context.Context) error {
 		return nil
 	default:
 	}
-	o.stopOnce.Do(func() { close(o.stop) })
+	o.closeSignal()
 	select {
 	case <-o.done:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (o *stateOwner) closeSignal() {
+	o.stopOnce.Do(func() { close(o.stop) })
 }
 
 func (o *stateOwner) snapshot(ctx context.Context) (stateOwnerSnapshot, error) {
@@ -2755,6 +2770,13 @@ func bindMigratedRemovalReceipts(state *runtimeOwnerState) error {
 }
 
 func writeRuntimeOwnerState(stateRoot, attemptRoot string, state runtimeOwnerState) error {
+	return writeRuntimeOwnerStateContext(context.Background(), stateRoot, attemptRoot, state)
+}
+
+func writeRuntimeOwnerStateContext(ctx context.Context, stateRoot, attemptRoot string, state runtimeOwnerState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := validateRuntimeOwnerState(state, attemptRoot, stateRoot, true); err != nil {
 		return err
 	}
@@ -2791,6 +2813,9 @@ func writeRuntimeOwnerState(stateRoot, attemptRoot string, state runtimeOwnerSta
 		return err
 	}
 	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := os.Rename(name, path); err != nil {

@@ -432,6 +432,91 @@ func TestStateOwnerPersistenceFailureKeepsCommittedSnapshotAndDispatchesNothing(
 	}
 }
 
+func TestStateOwnerShutdownCancelsBlockedPersistenceWithoutLateCommit(t *testing.T) {
+	root := resolvedTempDir(t)
+	attemptRoot := productionAttemptRoot(root)
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	attemptRoot, _ = filepath.EvalSymlinks(attemptRoot)
+	entered := make(chan struct{})
+	writes := 0
+	owner, err := startStateOwner(t.Context(), root, attemptRoot, newRuntimeOwnerState("o/r"), func(ctx context.Context, _ runtimeOwnerState) error {
+		writes++
+		if writes == 1 {
+			return nil
+		}
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation := make(chan error, 1)
+	go func() {
+		_, err := owner.advanceIssueGeneration(context.Background(), advanceIssueGenerationCommand{Repository: "o/r", Issue: 338})
+		mutation <- err
+	}()
+	<-entered
+	if err := owner.close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-mutation; !errors.Is(err, context.Canceled) && !errors.Is(err, errStateOwnerStopped) {
+		t.Fatalf("blocked mutation err=%v", err)
+	}
+	if writes != 2 {
+		t.Fatalf("persistence writes=%d after shutdown", writes)
+	}
+}
+
+func TestStateOwnerShutdownCompletesAlreadyInstalledCommit(t *testing.T) {
+	root := resolvedTempDir(t)
+	attemptRoot := productionAttemptRoot(root)
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	attemptRoot, _ = filepath.EvalSymlinks(attemptRoot)
+	installed, release := make(chan struct{}), make(chan struct{})
+	writes := 0
+	owner, err := startStateOwner(t.Context(), root, attemptRoot, newRuntimeOwnerState("o/r"), func(ctx context.Context, state runtimeOwnerState) error {
+		writes++
+		if err := writeRuntimeOwnerStateContext(ctx, root, attemptRoot, state); err != nil {
+			return err
+		}
+		if writes > 1 {
+			close(installed)
+			<-release
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation := make(chan error, 1)
+	go func() {
+		_, err := owner.advanceIssueGeneration(context.Background(), advanceIssueGenerationCommand{Repository: "o/r", Issue: 338})
+		mutation <- err
+	}()
+	<-installed
+	closed := make(chan error, 1)
+	go func() { closed <- owner.close(context.Background()) }()
+	close(release)
+	if err := <-mutation; err != nil {
+		t.Fatalf("installed mutation was relabeled failed: %v", err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	durable, err := readRuntimeOwnerState(root, "o/r")
+	if err != nil {
+		t.Fatalf("reload installed state: %v", err)
+	}
+	if durable.IssueGenerations[ownerIssueKey("o/r", 338)] != 1 || durable.Revision != 2 {
+		t.Fatalf("reloaded installed state=%#v", durable)
+	}
+}
+
 func TestMachineStatusAdmissionIsGenerationBoundAndSurvivesRestart(t *testing.T) {
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, 333, 1, "running")
@@ -1081,7 +1166,7 @@ func startTestStateOwner(t *testing.T, stateRoot string, state runtimeOwnerState
 	if err != nil {
 		t.Fatal(err)
 	}
-	return startStateOwner(t.Context(), stateRoot, canonical, state, persist)
+	return startStateOwner(t.Context(), stateRoot, canonical, state, func(_ context.Context, state runtimeOwnerState) error { return persist(state) })
 }
 
 func TestWorkerSealSelectionIsSingleGenerationBoundAndDurable(t *testing.T) {
