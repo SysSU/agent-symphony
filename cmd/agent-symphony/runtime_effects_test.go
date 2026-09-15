@@ -551,7 +551,10 @@ func TestRuntimeEffectRecoveryUsesIntentEpochAndExactMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := runtimeTestRequest(agentruntime.EffectReview, manifest, "")
-	request.Review = agentruntime.ReviewTransition{State: "clean"}
+	target := fmt.Sprintf("o/r#78 plan sha256:%s", digestText("review body"))
+	runID := digestText("runtime recovery review run")
+	snapshot, session := reviewRunIdentity(request.Attempt, productionSnapshotRoot(root), target, runID)
+	request.Review = agentruntime.ReviewTransition{State: "clean", Mode: agentruntime.ReviewModePlan, Target: target, RunID: runID, Base: manifest.BaseSHA, Head: manifest.BaseSHA, Snapshot: snapshot, Session: session}
 	request, err = coordinator.begin(t.Context(), mustOwnerSnapshot(t, owner), request)
 	if err != nil {
 		t.Fatal(err)
@@ -607,6 +610,9 @@ func TestRuntimeEffectPersistsDigestsWithoutRawSecretInputs(t *testing.T) {
 	}
 	manifest := ownerTestManifest(t, root, 84, 1, "preparing")
 	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	owner, err := startTestStateOwner(t, root, runtimeEffectInitialState(manifest), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)

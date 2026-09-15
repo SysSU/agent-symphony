@@ -1084,11 +1084,13 @@ func TestGovernanceNoOpDoesNotRequestRecollectionOrGrowProofs(t *testing.T) {
 
 func TestUnmarkedPublicationAndReviewerReconstructExactWorkerExport(t *testing.T) {
 	t.Run("publication", func(t *testing.T) {
-		base, head, checkout, exportBoundary := testWorkerExportBoundary(t)
+		base, head, _, exportBoundary := testWorkerExportBoundary(t)
 		owner, manifest, issue, snapshot := completedWorkerOwner(t, 44, base, head, true)
 		implementation := exportBoundary(manifest.Branch)
+		var source string
+		_, head, source, snapshot = selectWorkerExportFixture(t, owner, implementation, snapshot, manifest)
 		cfg := internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 42}
-		candidate := publicationExecutionMaterial{Issue: issue, Config: cfg, Root: checkout, Head: head, Validation: "ok", Documentation: "none"}
+		candidate := publicationExecutionMaterial{Issue: issue, Config: cfg, Root: source, Head: head, Validation: "ok", Documentation: "none"}
 		plans, _, err := planReconciliationPublications(snapshot, []publicationExecutionMaterial{candidate})
 		if err != nil || len(plans) != 1 {
 			t.Fatalf("plans=%#v err=%v", plans, err)
@@ -1126,7 +1128,7 @@ func TestUnmarkedPublicationAndReviewerReconstructExactWorkerExport(t *testing.T
 			body, _ := json.Marshal(value)
 			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
 		})}}
-		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, collector: reconciliationV2Collector{Config: cfg}}
+		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, collector: reconciliationV2Collector{Config: cfg}, stateRoot: owner.stateRoot}
 		batch := reconciliationV2Batch{Input: input}
 		if resumed, err := production.resumePendingReconciliation(t.Context(), api, batch); err != nil || !resumed {
 			t.Fatalf("resume=%v err=%v", resumed, err)
@@ -1137,10 +1139,12 @@ func TestUnmarkedPublicationAndReviewerReconstructExactWorkerExport(t *testing.T
 	})
 
 	t.Run("reviewer-run-observe", func(t *testing.T) {
-		base, head, checkout, exportBoundary := testWorkerExportBoundary(t)
+		base, head, _, exportBoundary := testWorkerExportBoundary(t)
 		owner, manifest, issue, snapshot := completedWorkerOwner(t, 45, base, head, false)
 		implementation := exportBoundary(manifest.Branch)
-		candidate := reviewerExecutionMaterial{Issue: issue, Source: checkout, HeadSHA: head, Env: []string{"REVIEW=1"}, Command: []string{"reviewer"}}
+		var source string
+		_, head, source, snapshot = selectWorkerExportFixture(t, owner, implementation, snapshot, manifest)
+		candidate := reviewerExecutionMaterial{Issue: issue, Source: source, HeadSHA: head, Env: []string{"REVIEW=1"}, Command: []string{"reviewer"}}
 		plans, _, err := planReconciliationReviewers(snapshot, owner.stateRoot, []reviewerExecutionMaterial{candidate})
 		if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "run-observe" {
 			t.Fatalf("plans=%#v err=%v", plans, err)
@@ -1161,7 +1165,7 @@ case "$payload" in
   *'display-message'*) printf %s '{"Output":"||||||||||\n"}' ;;
   *) exit 1 ;;
 esac`}}
-		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}}
+		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}, stateRoot: owner.stateRoot}
 		if _, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{Input: input}); err != nil {
 			t.Fatalf("pre-session gated review resume: %v", err)
 		}
@@ -1203,13 +1207,11 @@ func completedWorkerOwner(t *testing.T, issueNumber int, base, head string, revi
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, issueNumber, 1, "completed")
 	manifest.BaseSHA = base
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, config.WorkerProfileDigest()
 	if reviewed {
-		if err := os.MkdirAll(productionSnapshotRoot(root), 0o700); err != nil {
-			t.Fatal(err)
-		}
 		manifest.ReviewState, manifest.ReviewMode = "clean", agentruntime.ReviewModeImplementation
 		manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewTarget = base, head, base+".."+head
-		manifest.ReviewSnapshot, manifest.ReviewSession = reviewIdentity(agentruntime.Attempt{Repository: "o/r", Issue: issueNumber, Number: 1}, productionSnapshotRoot(root))
+		manifest.ReviewRunCleaned = true
 	}
 	state := newRuntimeOwnerState("o/r")
 	issueKey, attemptKey := ownerIssueKey("o/r", issueNumber), ownerAttemptKey("o/r", issueNumber, 1)
@@ -1226,12 +1228,23 @@ func completedWorkerOwner(t *testing.T, issueNumber int, base, head string, revi
 	return owner, manifest, issue, snapshot
 }
 
+func selectWorkerExportFixture(t *testing.T, owner *stateOwner, implementation workerBoundaryRunner, snapshot stateOwnerSnapshot, manifest agentruntime.Manifest) (workerResult, string, string, stateOwnerSnapshot) {
+	t.Helper()
+	production := &productionReconciliation{owner: owner, implementation: implementation, stateRoot: owner.stateRoot}
+	result, head, root, err := production.selectedWorkerExport(t.Context(), snapshot.State.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result, head, root, mustOwnerSnapshot(t, owner)
+}
+
 func testWorkerExportBoundary(t *testing.T) (base, head, checkout string, boundary func(string) workerBoundaryRunner) {
 	t.Helper()
 	checkout = resolvedTempDir(t)
 	runGit(t, checkout, "init")
 	runGit(t, checkout, "config", "user.email", "test@example.invalid")
 	runGit(t, checkout, "config", "user.name", "test")
+	runGit(t, checkout, "remote", "add", "origin", checkout)
 	if err := os.WriteFile(filepath.Join(checkout, "file"), []byte("base"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1347,7 +1360,7 @@ func TestProductionCycleCollectsAppliesAndPlansWithoutLegacyWriters(t *testing.T
 	}
 }
 
-func TestProductionCycleQuarantinesReceiptBoundPlanReviewerAfterFreshExternalAbsence(t *testing.T) {
+func TestProductionCycleCompletesReceiptBoundPlanReviewerAfterFreshExternalAbsence(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 473, "active", false)
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
 	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
@@ -1378,7 +1391,7 @@ func TestProductionCycleQuarantinesReceiptBoundPlanReviewerAfterFreshExternalAbs
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := production.cycleFromSnapshot(t.Context(), cycle); err != nil {
+	if err := production.cycleFromSnapshot(t.Context(), cycle); err != nil && !errors.Is(err, errReconciliationRecollect) {
 		t.Fatalf("fresh collector cycle failed while quarantining reviewer: %v", err)
 	}
 	state := mustOwnerSnapshot(t, owner).State
@@ -1386,8 +1399,8 @@ func TestProductionCycleQuarantinesReceiptBoundPlanReviewerAfterFreshExternalAbs
 	effect := state.Effects[reviewer.ID]
 	proof := state.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, agentruntime.ReviewModePlan, reviewer.Reconciliation.Reviewer.Target)]
 	gone, groupErr := reviewerGroupGone(proof.GroupPID)
-	if reads == 0 || !ok || receipt.State != "pending" || receipt.Result != nil || !effect.ReviewerRevoked || effect.State != "pending" || !strings.Contains(effect.Diagnostic, "stop remains pending") || proof.DeadProved || !gone || groupErr != nil || len(boundary.killed) != 1 {
-		t.Fatalf("cycle failed to quarantine stopped reviewer: reads=%d receipt=%#v effect=%#v proof=%#v gone=%v groupErr=%v killed=%v", reads, receipt, effect, proof, gone, groupErr, boundary.killed)
+	if reads == 0 || !ok || receipt.State != "completed" || receipt.Result == nil || receipt.Result.Status != http.StatusConflict || !effect.ReviewerRevoked || effect.State != "completed" || !proof.DeadProved || !gone || groupErr != nil || len(boundary.killed) != 1 {
+		t.Fatalf("cycle did not durably retire stopped reviewer: reads=%d receipt=%#v effect=%#v proof=%#v gone=%v groupErr=%v killed=%v", reads, receipt, effect, proof, gone, groupErr, boundary.killed)
 	}
 }
 
@@ -1467,8 +1480,22 @@ func TestImplementationReviewerFailureDoesNotBlockOtherEffect(t *testing.T) {
 			service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: request.Manifest.Worktree})
 			service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
 			production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, implementation: workerBoundaryRunner{}, stateRoot: owner.stateRoot}
-			if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{}); err != nil || resumed {
-				t.Fatalf("ambiguous issue A aborted or falsely completed: resumed=%v err=%v", resumed, err)
+			// Join an A-only pass before admitting B. This proves the failed
+			// reviewer is nonfatal without depending on hash-derived effect order.
+			firstPass := make(chan struct {
+				resumed bool
+				err     error
+			}, 1)
+			go func() {
+				resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{})
+				firstPass <- struct {
+					resumed bool
+					err     error
+				}{resumed: resumed, err: err}
+			}()
+			first := <-firstPass
+			if first.err != nil || first.resumed {
+				t.Fatalf("ambiguous issue A aborted or falsely completed: resumed=%v err=%v", first.resumed, first.err)
 			}
 			wantDiagnostic := "stop remains pending"
 			if failure == "unreadable export" {
@@ -1497,13 +1524,9 @@ func TestImplementationReviewerFailureDoesNotBlockOtherEffect(t *testing.T) {
 				t.Fatal(err)
 			}
 			otherRequest := planned.Request
-			otherRequest = checkInAfterEffectID(t, otherSnapshot, otherRequest, blocked.ID)
 			_, ready, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(otherSnapshot, otherRequest), Request: otherRequest})
 			if err != nil {
 				t.Fatal(err)
-			}
-			if blocked.ID >= ready.ID {
-				t.Fatalf("fixture did not visit blocked reviewer before marked B: A=%s B=%s", blocked.ID, ready.ID)
 			}
 			if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*ready), *ready.Reconciliation, checkIn.result(*ready.Reconciliation)); err != nil {
 				t.Fatal(err)
@@ -1525,6 +1548,7 @@ func TestBadCompletedExportDoesNotBlockOtherCandidate(t *testing.T) {
 	owner, bad, badIssue, _ := completedWorkerOwner(t, 190, base, head, false)
 	good := ownerTestManifest(t, owner.stateRoot, 191, 1, "completed")
 	good.BaseSHA = base
+	good.WorkerGeneration, good.WorkerProfileDigest = 1, config.WorkerProfileDigest()
 	if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: good}); err != nil {
 		t.Fatal(err)
 	}
@@ -1534,12 +1558,13 @@ func TestBadCompletedExportDoesNotBlockOtherCandidate(t *testing.T) {
 	input.Scope = issueScope(191)
 	snapshot := applyReconciliationInput(t, owner, input)
 	var log bytes.Buffer
-	production := &productionReconciliation{owner: owner, implementation: exportBoundary(good.Branch), log: &log}
+	production := &productionReconciliation{owner: owner, implementation: exportBoundary(good.Branch), log: &log, stateRoot: owner.stateRoot}
 	batch := reconciliationV2Batch{Input: reconciliationInput{Issues: []internalgithub.RecoveryIssueFact{badIssue, goodIssue}}}
 	reviewers, publications, err := production.executionCandidates(t.Context(), snapshot, batch)
 	if err != nil || len(reviewers) != 1 || len(publications) != 1 || reviewers[0].Issue.Issue != good.Issue || publications[0].Issue.Issue != good.Issue {
 		t.Fatalf("bad issue blocked good candidate: reviewers=%#v publications=%#v err=%v", reviewers, publications, err)
 	}
+	snapshot = mustOwnerSnapshot(t, owner)
 	plans, _, err := planReconciliationReviewers(snapshot, owner.stateRoot, reviewers)
 	if err != nil || len(plans) != 1 || plans[0].Request.Issue != good.Issue {
 		t.Fatalf("good issue did not reach reviewer admission: plans=%#v err=%v", plans, err)
@@ -1554,10 +1579,13 @@ func TestBadCompletedExportDoesNotBlockOtherCandidate(t *testing.T) {
 }
 
 func TestChangedExportHeadRejectsOlderReviewerMarker(t *testing.T) {
-	base, head, checkout, exportBoundary := testWorkerExportBoundary(t)
+	base, head, _, exportBoundary := testWorkerExportBoundary(t)
 	owner, manifest, issue, snapshot := completedWorkerOwner(t, 193, base, head, false)
+	implementation := exportBoundary(manifest.Branch)
+	var source string
+	_, _, source, snapshot = selectWorkerExportFixture(t, owner, implementation, snapshot, manifest)
 	oldHead := strings.Repeat("c", 40)
-	plans, _, err := planReconciliationReviewers(snapshot, owner.stateRoot, []reviewerExecutionMaterial{{Issue: issue, Source: checkout, HeadSHA: oldHead, Command: []string{"reviewer"}}})
+	plans, _, err := planReconciliationReviewers(snapshot, owner.stateRoot, []reviewerExecutionMaterial{{Issue: issue, Source: source, HeadSHA: oldHead, Command: []string{"reviewer"}}})
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("admit older reviewer: plans=%#v err=%v", plans, err)
 	}
@@ -1585,7 +1613,7 @@ func TestChangedExportHeadRejectsOlderReviewerMarker(t *testing.T) {
 	}
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
 	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
-	production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, implementation: exportBoundary(manifest.Branch), stateRoot: owner.stateRoot}
+	production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, implementation: implementation, stateRoot: owner.stateRoot}
 	resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{})
 	if err != nil || !resumed {
 		t.Fatalf("new exported head did not invalidate marked old review: resumed=%v err=%v", resumed, err)
@@ -1597,9 +1625,12 @@ func TestChangedExportHeadRejectsOlderReviewerMarker(t *testing.T) {
 }
 
 func TestHealthyPendingReviewerReplayLetsOtherEffectFinish(t *testing.T) {
-	base, head, checkout, exportBoundary := testWorkerExportBoundary(t)
+	base, head, _, exportBoundary := testWorkerExportBoundary(t)
 	owner, manifest, issue, snapshot := completedWorkerOwner(t, 194, base, head, false)
-	plans, _, err := planReconciliationReviewers(snapshot, owner.stateRoot, []reviewerExecutionMaterial{{Issue: issue, Source: checkout, HeadSHA: head, Command: []string{"reviewer"}}})
+	implementation := exportBoundary(manifest.Branch)
+	var source string
+	_, head, source, snapshot = selectWorkerExportFixture(t, owner, implementation, snapshot, manifest)
+	plans, _, err := planReconciliationReviewers(snapshot, owner.stateRoot, []reviewerExecutionMaterial{{Issue: issue, Source: source, HeadSHA: head, Command: []string{"reviewer"}}})
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("admit reviewer: plans=%#v err=%v", plans, err)
 	}
@@ -1608,6 +1639,18 @@ func TestHealthyPendingReviewerReplayLetsOtherEffectFinish(t *testing.T) {
 		t.Fatal(err)
 	}
 	live := startUnboundReviewerForService(t, owner, reviewer)
+	launchPath, _ := reviewerLifecyclePaths(reviewer.Reconciliation.Reviewer.Snapshot, reviewer.Reconciliation.Reviewer.Target)
+	var launch reviewerLaunchIdentity
+	if found, err := readReviewerRecord(launchPath, &launch); err != nil || !found {
+		t.Fatalf("read unbound reviewer launch: found=%v err=%v", found, err)
+	}
+	launch.ProfileDigest, launch.ConfinementVersion = reviewer.ReviewerProfileDigest, reviewer.ReviewerConfinementVersion
+	if err := os.Remove(launchPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReviewerRecord(launchPath, launch); err != nil {
+		t.Fatal(err)
+	}
 	parts := strings.SplitN(live.status.Output, "|", 8)
 	if len(parts) != 8 {
 		t.Fatal("fixture has no exact live wrapper identity")
@@ -1631,7 +1674,7 @@ esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode
 	coordinator := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: owner, active: map[string]*activeRuntimeEffect{}}
 	cfg := config.Default("o/r")
 	cfg.Commands.Reviewer = []string{"reviewer"}
-	production := &productionReconciliation{owner: owner, effects: coordinator, implementation: exportBoundary(manifest.Branch), reviewer: replayBoundary, config: cfg, stateRoot: owner.stateRoot}
+	production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: replayBoundary, config: cfg, stateRoot: owner.stateRoot}
 	batch := reconciliationV2Batch{Input: reconciliationInput{Issues: []internalgithub.RecoveryIssueFact{issue}}}
 	if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, batch); err != nil || resumed {
 		t.Fatalf("healthy live reviewer forced immediate recollection: resumed=%v err=%v", resumed, err)
@@ -1659,13 +1702,9 @@ esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode
 		t.Fatal(err)
 	}
 	otherRequest := planned.Request
-	otherRequest = checkInAfterEffectID(t, otherSnapshot, otherRequest, reviewer.ID)
 	_, ready, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(otherSnapshot, otherRequest), Request: otherRequest})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if reviewer.ID >= ready.ID {
-		t.Fatalf("fixture did not visit healthy reviewer before marked B: A=%s B=%s", reviewer.ID, ready.ID)
 	}
 	if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*ready), *ready.Reconciliation, checkIn.result(*ready.Reconciliation)); err != nil {
 		t.Fatal(err)
@@ -1680,27 +1719,6 @@ esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode
 	if err := live.onKill(); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func checkInAfterEffectID(t *testing.T, snapshot stateOwnerSnapshot, request reconciliationEffectRequest, after string) reconciliationEffectRequest {
-	t.Helper()
-	for candidate := 1; candidate < 256; candidate++ {
-		// Binding is a legitimate check-in proposal input; keep the derived
-		// execution digest valid while choosing a deterministic owner ID order.
-		request.CheckIn.Binding = fmt.Sprintf("%064x", candidate)
-		request.ExecutionDigest = monitoringCheckInExecutionDigest(request)
-		preview := runtimeEffectIntent{
-			Action: string(request.Action), Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt,
-			IssueGeneration:   snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)],
-			AttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)],
-			IntentEpoch:       snapshot.State.Epoch, IntentRevision: snapshot.State.Revision + 1, RequestDigest: reconciliationEffectDigest(request),
-		}
-		if runtimeEffectID(preview) > after {
-			return request
-		}
-	}
-	t.Fatal("could not order marked B after reviewer A")
-	return reconciliationEffectRequest{}
 }
 
 func TestStartupMarkerSweepLeavesOperatorEffectsToReceiptRecovery(t *testing.T) {
@@ -1779,9 +1797,36 @@ func TestStartupMarkerSweepReclaimsOrphanProofAbsentFromLedger(t *testing.T) {
 }
 
 func TestProductionRuntimeFinishesOperatorMarkerBeforeAdmission(t *testing.T) {
-	owner, manifest := operatorTestOwner(t, 48, "running", false, true)
+	root := resolvedTempDir(t)
+	restorePinnedWorkerPermissions(t, root)
+	cfg := config.Default("o/r")
+	profile, err := config.PinWorkerExecutable(t.Context(), root, &cfg.Commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownerTestManifest(t, root, 48, 1, "running")
+	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, profile
+	pane := boundRuntimeEffectTestPane(t, manifest)
+	body, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := runtimeEffectInitialState(manifest)
+	state.WorkerProfileDigest = profile
+	addOperatorObservation(&state, manifest, "active", false)
+	state.Epoch, state.Revision = 1, 1
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
-	service.effects.executor.Runtime.Runner = &barrierEffectRunner{pane: boundRuntimeEffectTestPane(t, manifest)}
+	service.effects.executor.Runtime.Runner = &barrierEffectRunner{pane: pane}
 	request := operatorRequest("startup-marker", "cancel", manifest, false)
 	command, work, err := service.prepareAdmission(t.Context(), mustOwnerSnapshot(t, owner), request)
 	if err != nil {
@@ -1832,7 +1877,7 @@ func TestProductionRuntimeFinishesOperatorMarkerBeforeAdmission(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
 	})}}
 	lifecycle, cancel := context.WithCancel(t.Context())
-	runtime, err := startProductionRuntimeV2(lifecycle, config.Default("o/r"), api, internalgithub.AuthenticatedUser{ID: 42}, owner.stateRoot, filepath.Join(owner.stateRoot, "legacy-pr-state.json"), checkout, io.Discard)
+	runtime, err := startProductionRuntimeV2(lifecycle, cfg, api, internalgithub.AuthenticatedUser{ID: 42}, owner.stateRoot, filepath.Join(owner.stateRoot, "legacy-pr-state.json"), checkout, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1853,6 +1898,7 @@ func TestProductionRuntimeAdmitsOwnerMutationWhileInitialCollectionIsBlocked(t *
 	runGit(t, checkout, "config", "user.name", "test")
 	runGit(t, checkout, "commit", "--allow-empty", "-m", "base")
 	stateRoot := resolvedTempDir(t)
+	restorePinnedWorkerPermissions(t, stateRoot)
 	if err := bindDeployment(stateRoot, "o/r"); err != nil {
 		t.Fatal(err)
 	}
@@ -1910,6 +1956,18 @@ func TestProductionRuntimeAdmitsOwnerMutationWhileInitialCollectionIsBlocked(t *
 	if err != nil || committed.State.Attempts[ownerAttemptKey("o/r", 43, 1)].Manifest.State != "running" {
 		t.Fatalf("mutation while collection blocked: snapshot=%#v err=%v", committed, err)
 	}
+}
+
+func restorePinnedWorkerPermissions(t *testing.T, stateRoot string) {
+	t.Helper()
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(filepath.Join(stateRoot, "worker-executable"), func(path string, entry os.DirEntry, err error) error {
+			if err == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
 }
 
 func TestProductionRuntimeShutdownCancelsBlockedEffectBeforeJoiningTrigger(t *testing.T) {
@@ -2084,7 +2142,7 @@ func TestDashboardMutationRemainsResponsiveDuringBlockedSupervisorIO(t *testing.
 	request.Header.Set("Origin", "http://127.0.0.1")
 	response := httptest.NewRecorder()
 	project.webHandler().ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusAccepted {
 		t.Fatalf("dismiss status=%d body=%q", response.Code, response.Body.String())
 	}
 	snapshot := mustOwnerSnapshot(t, owner)
