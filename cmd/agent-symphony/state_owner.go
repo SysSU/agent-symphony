@@ -162,6 +162,7 @@ type invalidatedExternalOutcome struct {
 	Action         reconciliationEffectAction `json:"action"`
 	Observed       bool                       `json:"observed"`
 	Merged         bool                       `json:"merged,omitempty"`
+	Superseded     bool                       `json:"superseded,omitempty"`
 	PR             int                        `json:"pr,omitempty"`
 	HeadSHA        string                     `json:"head_sha,omitempty"`
 	StatusSequence uint64                     `json:"status_sequence,omitempty"`
@@ -211,45 +212,46 @@ func validStartCandidateInvalidation(candidate startCandidateInvalidation, manif
 }
 
 type runtimeEffectIntent struct {
-	ID                                  string                         `json:"id"`
-	Action                              string                         `json:"action"`
-	Repository                          string                         `json:"repository"`
-	Issue                               int                            `json:"issue"`
-	Attempt                             int                            `json:"attempt"`
-	IssueGeneration                     uint64                         `json:"issue_generation"`
-	AttemptGeneration                   uint64                         `json:"attempt_generation"`
-	IntentEpoch                         uint64                         `json:"intent_epoch,omitempty"`
-	IntentRevision                      uint64                         `json:"intent_revision"`
-	State                               string                         `json:"state"`
-	Dispatched                          bool                           `json:"dispatched,omitempty"`
-	RequestDigest                       string                         `json:"request_digest"`
-	CandidateLaunchToken                string                         `json:"candidate_launch_token,omitempty"`
-	StartGateNonce                      string                         `json:"start_gate_nonce,omitempty"`
-	StartMayRun                         bool                           `json:"start_may_run,omitempty"`
-	StartCandidates                     []startGateCandidate           `json:"start_candidates,omitempty"`
-	Reason                              string                         `json:"reason,omitempty"`
-	Review                              *agentruntime.ReviewTransition `json:"review,omitempty"`
-	Reconciliation                      *reconciliationEffectRequest   `json:"reconciliation,omitempty"`
-	ReconciliationResult                *reconciliationEffectResult    `json:"reconciliation_result,omitempty"`
-	ReviewerLaunched                    bool                           `json:"reviewer_launched,omitempty"`
-	ReviewerGateProtocol                bool                           `json:"reviewer_gate_protocol,omitempty"`
-	ReviewerSessionRequested            bool                           `json:"reviewer_session_requested,omitempty"`
-	ReviewerGroupPID                    int                            `json:"reviewer_group_pid,omitempty"`
-	ReviewerResultDigest                string                         `json:"reviewer_result_digest,omitempty"`
-	ReviewerStopped                     bool                           `json:"reviewer_stopped,omitempty"`
-	ReviewerRevoked                     bool                           `json:"reviewer_revoked,omitempty"`
-	SupersededReviewerID                string                         `json:"superseded_reviewer_id,omitempty"`
-	SupersededReviewerGroupPID          int                            `json:"superseded_reviewer_group_pid,omitempty"`
-	SupersededReviewerGateProtocol      bool                           `json:"superseded_reviewer_gate_protocol,omitempty"`
-	SupersededReviewerSessionRequested  bool                           `json:"superseded_reviewer_session_requested,omitempty"`
-	SupersededReviewerRequestDigest     string                         `json:"superseded_reviewer_request_digest,omitempty"`
-	SupersededReviewerTarget            string                         `json:"superseded_reviewer_target,omitempty"`
-	SupersededReviewerMode              string                         `json:"superseded_reviewer_mode,omitempty"`
-	SupersededReviewerIssueGeneration   uint64                         `json:"superseded_reviewer_issue_generation,omitempty"`
-	SupersededReviewerAttemptGeneration uint64                         `json:"superseded_reviewer_attempt_generation,omitempty"`
-	Diagnostic                          string                         `json:"diagnostic,omitempty"`
-	InvalidatedHandoff                  *handoffCandidateInvalidation  `json:"invalidated_handoff,omitempty"`
-	InvalidatedStart                    *startCandidateInvalidation    `json:"invalidated_start,omitempty"`
+	ID                                  string                           `json:"id"`
+	Action                              string                           `json:"action"`
+	Repository                          string                           `json:"repository"`
+	Issue                               int                              `json:"issue"`
+	Attempt                             int                              `json:"attempt"`
+	IssueGeneration                     uint64                           `json:"issue_generation"`
+	AttemptGeneration                   uint64                           `json:"attempt_generation"`
+	IntentEpoch                         uint64                           `json:"intent_epoch,omitempty"`
+	IntentRevision                      uint64                           `json:"intent_revision"`
+	State                               string                           `json:"state"`
+	Dispatched                          bool                             `json:"dispatched,omitempty"`
+	GovernancePhases                    []internalgithub.GovernancePhase `json:"governance_phases,omitempty"`
+	RequestDigest                       string                           `json:"request_digest"`
+	CandidateLaunchToken                string                           `json:"candidate_launch_token,omitempty"`
+	StartGateNonce                      string                           `json:"start_gate_nonce,omitempty"`
+	StartMayRun                         bool                             `json:"start_may_run,omitempty"`
+	StartCandidates                     []startGateCandidate             `json:"start_candidates,omitempty"`
+	Reason                              string                           `json:"reason,omitempty"`
+	Review                              *agentruntime.ReviewTransition   `json:"review,omitempty"`
+	Reconciliation                      *reconciliationEffectRequest     `json:"reconciliation,omitempty"`
+	ReconciliationResult                *reconciliationEffectResult      `json:"reconciliation_result,omitempty"`
+	ReviewerLaunched                    bool                             `json:"reviewer_launched,omitempty"`
+	ReviewerGateProtocol                bool                             `json:"reviewer_gate_protocol,omitempty"`
+	ReviewerSessionRequested            bool                             `json:"reviewer_session_requested,omitempty"`
+	ReviewerGroupPID                    int                              `json:"reviewer_group_pid,omitempty"`
+	ReviewerResultDigest                string                           `json:"reviewer_result_digest,omitempty"`
+	ReviewerStopped                     bool                             `json:"reviewer_stopped,omitempty"`
+	ReviewerRevoked                     bool                             `json:"reviewer_revoked,omitempty"`
+	SupersededReviewerID                string                           `json:"superseded_reviewer_id,omitempty"`
+	SupersededReviewerGroupPID          int                              `json:"superseded_reviewer_group_pid,omitempty"`
+	SupersededReviewerGateProtocol      bool                             `json:"superseded_reviewer_gate_protocol,omitempty"`
+	SupersededReviewerSessionRequested  bool                             `json:"superseded_reviewer_session_requested,omitempty"`
+	SupersededReviewerRequestDigest     string                           `json:"superseded_reviewer_request_digest,omitempty"`
+	SupersededReviewerTarget            string                           `json:"superseded_reviewer_target,omitempty"`
+	SupersededReviewerMode              string                           `json:"superseded_reviewer_mode,omitempty"`
+	SupersededReviewerIssueGeneration   uint64                           `json:"superseded_reviewer_issue_generation,omitempty"`
+	SupersededReviewerAttemptGeneration uint64                           `json:"superseded_reviewer_attempt_generation,omitempty"`
+	Diagnostic                          string                           `json:"diagnostic,omitempty"`
+	InvalidatedHandoff                  *handoffCandidateInvalidation    `json:"invalidated_handoff,omitempty"`
+	InvalidatedStart                    *startCandidateInvalidation      `json:"invalidated_start,omitempty"`
 }
 
 type stateResultIdentity struct {
@@ -436,6 +438,12 @@ type mutatePRRecoveryCommand struct {
 	Feedback internalgithub.Feedback
 }
 
+type mutateGovernancePhaseCommand struct {
+	Identity stateResultIdentity
+	Phase    internalgithub.GovernancePhase
+	Complete bool
+}
+
 type recordControlReceiptCommand struct {
 	Receipt controlReceipt
 }
@@ -517,6 +525,7 @@ const (
 	stateOwnerFinishReconciliationEffect
 	stateOwnerDiagnoseReconciliationEffect
 	stateOwnerMutatePRRecovery
+	stateOwnerMutateGovernancePhase
 	stateOwnerRecordControlReceipt
 	stateOwnerRecordOperatorDiagnostic
 	stateOwnerCompleteHandoffCompensation
@@ -555,6 +564,7 @@ type stateOwnerCommand struct {
 	finishReconciliation         finishReconciliationEffectCommand
 	diagnoseReconciliation       diagnoseReconciliationEffectCommand
 	mutatePRRecovery             mutatePRRecoveryCommand
+	mutateGovernancePhase        mutateGovernancePhaseCommand
 	receipt                      recordControlReceiptCommand
 	operatorDiagnostic           recordOperatorDiagnosticCommand
 	completeHandoff              completeHandoffCompensationCommand
@@ -1180,6 +1190,10 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		}
 	case stateOwnerMutatePRRecovery:
 		if err := applyMutatePRRecovery(stateRoot, &candidate, command.mutatePRRecovery); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerMutateGovernancePhase:
+		if err := applyMutateGovernancePhase(stateRoot, &candidate, command.mutateGovernancePhase); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerRecordControlReceipt:
@@ -3048,6 +3062,7 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 		effect.InvalidatedHandoff = cloneHandoffInvalidation(effect.InvalidatedHandoff)
 		effect.InvalidatedStart = cloneStartInvalidation(effect.InvalidatedStart)
 		effect.StartCandidates = slices.Clone(effect.StartCandidates)
+		effect.GovernancePhases = slices.Clone(effect.GovernancePhases)
 		clone.Effects[key] = effect
 	}
 	clone.ReviewerProofs = make(map[string]reviewerProcessProof, len(state.ReviewerProofs))
@@ -3106,6 +3121,7 @@ func cloneEffect(effect *runtimeEffectIntent) *runtimeEffectIntent {
 	clone.InvalidatedHandoff = cloneHandoffInvalidation(effect.InvalidatedHandoff)
 	clone.InvalidatedStart = cloneStartInvalidation(effect.InvalidatedStart)
 	clone.StartCandidates = slices.Clone(effect.StartCandidates)
+	clone.GovernancePhases = slices.Clone(effect.GovernancePhases)
 	return &clone
 }
 

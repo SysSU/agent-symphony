@@ -54,4 +54,25 @@ func (r ownerAttemptRecovery) QueueValidation(ctx context.Context, state interna
 	return err
 }
 
+func (r ownerAttemptRecovery) AdmitGovernancePhase(ctx context.Context, phase internalgithub.GovernancePhase) error {
+	if r.owner == nil {
+		return errors.New("owner recovery is unavailable")
+	}
+	return r.owner.mutateGovernancePhase(ctx, mutateGovernancePhaseCommand{Identity: r.identity, Phase: r.bindGovernancePhase(phase)})
+}
+
+func (r ownerAttemptRecovery) CompleteGovernancePhase(ctx context.Context, phase internalgithub.GovernancePhase) error {
+	if r.owner == nil {
+		return errors.New("owner recovery is unavailable")
+	}
+	return r.owner.mutateGovernancePhase(ctx, mutateGovernancePhaseCommand{Identity: r.identity, Phase: r.bindGovernancePhase(phase), Complete: true})
+}
+
+func (r ownerAttemptRecovery) bindGovernancePhase(phase internalgithub.GovernancePhase) internalgithub.GovernancePhase {
+	phase.Epoch, phase.SourceRevision = r.identity.Epoch, r.identity.SourceRevision
+	phase.IssueGeneration, phase.AttemptGeneration = r.identity.IssueGeneration, r.identity.AttemptGeneration
+	return phase
+}
+
 var _ internalgithub.AttemptRecovery = ownerAttemptRecovery{}
+var _ internalgithub.GovernancePhaseRecorder = ownerAttemptRecovery{}

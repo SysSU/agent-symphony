@@ -825,6 +825,11 @@ func RunPRGovernance(ctx context.Context, api API, cfg PRAdapterConfig, recovery
 	if err != nil {
 		return err
 	}
+	phases, ok := recovery.(GovernancePhaseRecorder)
+	if !ok {
+		return errors.New("PR governance requires durable phase recording")
+	}
+	reconciler.PullRequests.Phases = phases
 	return reconciler.PullRequests.reconcileOne(ctx, attempt.PR)
 }
 
@@ -905,7 +910,11 @@ func NewPRReconciler(api API, cfg PRAdapterConfig, recovery AttemptRecovery, att
 		return Reconciler{}, errors.New("PR reconciliation requires repository policy, recovery, and issue reconciliation")
 	}
 	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery, Attempts: attempts}
-	return Reconciler{FullRead: fullRead, PullRequests: &PRCoordinator{API: api, Source: source, Signals: RecoverySignals{recovery}, Attempts: attempts, ReviewLabel: cfg.HumanReviewLabel, MergeMethod: cfg.MergeMethod, ActorID: cfg.ActorID}}, nil
+	coordinator := &PRCoordinator{API: api, Source: source, Signals: RecoverySignals{recovery}, Attempts: attempts, ReviewLabel: cfg.HumanReviewLabel, MergeMethod: cfg.MergeMethod, ActorID: cfg.ActorID}
+	if phases, ok := recovery.(GovernancePhaseRecorder); ok {
+		coordinator.Phases = phases
+	}
+	return Reconciler{FullRead: fullRead, PullRequests: coordinator}, nil
 }
 
 func (s *GitHubPRSource) OpenPullRequests(ctx context.Context) ([]int, error) {

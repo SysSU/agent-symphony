@@ -43,6 +43,28 @@ func TestSuccessfulCheckDoesNotCacheCancellation(t *testing.T) {
 	}
 }
 
+func TestGovernanceMergeObservationRequiresExactIdentityAndHead(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "github-pr-governance").request
+	exact := internalgithub.RecoveryAttemptFact{Repository: request.Repository, PR: request.GitHubPRGovernance.PR, Issue: request.Issue, Attempt: request.Attempt, HeadSHA: request.GitHubPRGovernance.HeadSHA, State: "completed"}
+	if !exactGovernanceMergeObserved(request, []internalgithub.RecoveryAttemptFact{exact}) {
+		t.Fatal("exact completed merge was not observed")
+	}
+	for _, mutate := range []func(*internalgithub.RecoveryAttemptFact){
+		func(f *internalgithub.RecoveryAttemptFact) { f.Repository = "other/repo" },
+		func(f *internalgithub.RecoveryAttemptFact) { f.PR++ },
+		func(f *internalgithub.RecoveryAttemptFact) { f.Issue++ },
+		func(f *internalgithub.RecoveryAttemptFact) { f.Attempt++ },
+		func(f *internalgithub.RecoveryAttemptFact) { f.HeadSHA = strings.Repeat("f", 40) },
+		func(f *internalgithub.RecoveryAttemptFact) { f.State = "active" },
+	} {
+		candidate := exact
+		mutate(&candidate)
+		if exactGovernanceMergeObserved(request, []internalgithub.RecoveryAttemptFact{candidate}) {
+			t.Fatalf("weak merge proof accepted: %#v", candidate)
+		}
+	}
+}
+
 func restartOwnerWithInput(t *testing.T, owner *stateOwner, input reconciliationInput) *stateOwner {
 	t.Helper()
 	before := mustOwnerSnapshot(t, owner)

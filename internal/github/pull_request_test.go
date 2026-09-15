@@ -318,6 +318,102 @@ func (s *prSignalsStub) DelegateFeedback(context.Context, PRState, Feedback) err
 	return nil
 }
 
+type phaseRecorderStub struct {
+	admitted, completed atomic.Bool
+	admission           chan struct{}
+}
+
+func (r *phaseRecorderStub) AdmitGovernancePhase(_ context.Context, phase GovernancePhase) error {
+	if !phase.Valid() {
+		return errors.New("invalid phase")
+	}
+	r.admitted.Store(true)
+	close(r.admission)
+	return nil
+}
+
+func (r *phaseRecorderStub) CompleteGovernancePhase(_ context.Context, phase GovernancePhase) error {
+	if !r.admitted.Load() || !phase.Valid() {
+		return errors.New("phase completed before admission")
+	}
+	r.completed.Store(true)
+	return nil
+}
+
+func TestPRGovernanceCommitsPhaseBeforeSlowGitHubMutation(t *testing.T) {
+	facts := eligiblePR()
+	facts.AutonomousMerge = false
+	state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: "abcdef0", Facts: facts}
+	state.Facts.HeadSHA, state.Facts.ValidationSHA, state.Facts.DocumentationSHA = state.HeadSHA, state.HeadSHA, state.HeadSHA
+	recorder := &phaseRecorderStub{admission: make(chan struct{})}
+	mutationStarted, releaseMutation := make(chan struct{}), make(chan struct{})
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		if !recorder.admitted.Load() {
+			t.Error("GitHub mutation started before durable phase admission")
+		}
+		close(mutationStarted)
+		<-releaseMutation
+		return httpResponse(http.StatusCreated, `{}`, nil), nil
+	})}}
+	done := make(chan error, 1)
+	go func() {
+		done <- (PRCoordinator{API: api, Source: &prSourceStub{state: state}, Signals: &prSignalsStub{}, Phases: recorder}).Reconcile(t.Context())
+	}()
+	<-recorder.admission
+	<-mutationStarted
+	if recorder.completed.Load() {
+		t.Fatal("blocked GitHub mutation was recorded complete")
+	}
+	close(releaseMutation)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !recorder.completed.Load() {
+		t.Fatal("acknowledged GitHub mutation was not recorded complete")
+	}
+}
+
+func TestPRGovernanceResponseLostLeavesPhaseAdmitted(t *testing.T) {
+	facts := eligiblePR()
+	facts.AutonomousMerge = false
+	state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: "abcdef0", Facts: facts}
+	state.Facts.HeadSHA, state.Facts.ValidationSHA, state.Facts.DocumentationSHA = state.HeadSHA, state.HeadSHA, state.HeadSHA
+	recorder := &phaseRecorderStub{admission: make(chan struct{})}
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("response lost")
+	})}}
+	err := (PRCoordinator{API: api, Source: &prSourceStub{state: state}, Signals: &prSignalsStub{}, Phases: recorder}).Reconcile(t.Context())
+	if err == nil || !recorder.admitted.Load() || recorder.completed.Load() {
+		t.Fatalf("err=%v admitted=%v completed=%v", err, recorder.admitted.Load(), recorder.completed.Load())
+	}
+}
+
+func TestGovernanceResponseLostNeedsExactRemotePostcondition(t *testing.T) {
+	state := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: "abcdef0", Facts: PRFacts{HeadSHA: "abcdef0"}}
+	body, _ := AttributedBody(state.Issue, state.Attempt, "durable decision")
+	phase, err := NewGovernancePhase(state, "decision-comment", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	phase.State = "admitted"
+	present := false
+	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		comments := []map[string]any{}
+		if present {
+			comments = append(comments, map[string]any{"body": body, "user": map[string]any{"id": 42}})
+		}
+		encoded, _ := json.Marshal(comments)
+		return httpResponse(http.StatusOK, string(encoded), nil), nil
+	})}}
+	if observed, err := GovernancePreMergeObserved(t.Context(), api, phase, 42); err != nil || observed {
+		t.Fatalf("absent response-lost mutation resolved: observed=%v err=%v", observed, err)
+	}
+	present = true
+	if observed, err := GovernancePreMergeObserved(t.Context(), api, phase, 42); err != nil || !observed {
+		t.Fatalf("exact remote postcondition not observed: observed=%v err=%v", observed, err)
+	}
+}
+
 func TestPRCoordinatorDoesNotMergeHeadChangedAfterPolicy(t *testing.T) {
 	firstFacts := eligiblePR()
 	first := PRState{Repository: "o/r", Number: 3, Issue: 10, Attempt: 2, HeadSHA: "abc", CheckHead: "abc", Facts: firstFacts}
