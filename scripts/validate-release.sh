@@ -55,6 +55,8 @@ grep -qF 'wsl --install --distribution $distribution --web-download --no-launch'
 grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap build-essential ca-certificates curl git ruby tmux xz-utils' .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install WSL validation prerequisites'" .github/workflows/release-validation.yml
 grep -qF "/usr/local/node/bin/npm install --global --prefix /usr/local/node '@openai/codex@" .github/workflows/release-validation.yml
+grep -qF "throw 'Failed to restore the pinned Node.js runtime after the WSL Codex install'" .github/workflows/release-validation.yml
+grep -qF 'test -x /usr/local/node/bin/node' .github/workflows/release-validation.yml
 grep -qF 'test "$(/usr/local/node/bin/codex --version)" = "codex-cli 0.153.0"' .github/workflows/release-validation.yml
 grep -qF 'sed -i s#\"codex\"#\"/usr/local/node/bin/codex\"#g .agent-symphony-ci.yaml' .github/workflows/release-validation.yml
 grep -qF 'kernel.unprivileged_userns_clone=1' .github/workflows/release-validation.yml

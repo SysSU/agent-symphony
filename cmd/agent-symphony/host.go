@@ -160,6 +160,15 @@ func verifyRootlessCodex(ctx context.Context, root, codexHome, codexExecutable s
 	if err := os.Mkdir(private, 0o700); err != nil {
 		return codexConfinementProof{}, err
 	}
+	for _, name := range []string{".codex", ".agents"} {
+		directory := filepath.Join(workspace, name)
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			return codexConfinementProof{}, err
+		}
+		if err := os.WriteFile(filepath.Join(directory, "deny"), []byte("deny\n"), 0o600); err != nil {
+			return codexConfinementProof{}, err
+		}
+	}
 	otherAttempt, err := os.MkdirTemp(root, ".sandbox-other-attempt-")
 	if err != nil {
 		return codexConfinementProof{}, err
@@ -295,8 +304,12 @@ func runSandboxProbe(args []string, child bool) error {
 	}
 	_, sharedReadErr := os.ReadFile(args[6])
 	sharedWriteErr := os.WriteFile(args[6], []byte("mutated"), 0o600)
-	for _, path := range []string{filepath.Join(filepath.Dir(args[0]), ".codex"), filepath.Join(filepath.Dir(args[0]), ".agents")} {
-		if err := os.Mkdir(path, 0o700); err == nil {
+	for _, directory := range []string{filepath.Join(filepath.Dir(args[0]), ".codex"), filepath.Join(filepath.Dir(args[0]), ".agents")} {
+		path := filepath.Join(directory, "deny")
+		if _, err := os.ReadFile(path); err == nil {
+			return errors.New("sandbox read denied local agent configuration")
+		}
+		if err := os.WriteFile(path, []byte("mutated"), 0o600); err == nil {
 			return errors.New("sandbox wrote denied local agent configuration")
 		}
 	}
@@ -1085,7 +1098,7 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF || !belowRoot(manifest.Worktree, root) {
 			return errors.New("invalid export manifest")
 		}
-		binary, binaryErr := os.Executable()
+		binary, binaryErr := hostExecutable()
 		if binaryErr != nil {
 			return binaryErr
 		}
@@ -1877,8 +1890,13 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	run := func(args ...string) (string, error) {
 		cmd := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", manifest.Worktree}, args...)...)
 		cmd.Env = append(minimalBoundaryEnvironment(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
-		out, err := cmd.CombinedOutput()
-		return strings.TrimSpace(string(out)), err
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			return strings.TrimSpace(string(out)), fmt.Errorf("git command failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+		}
+		return strings.TrimSpace(string(out)), nil
 	}
 	top, err := run("rev-parse", "--show-toplevel")
 	if err != nil || !samePath(top, manifest.Worktree) {
@@ -1909,12 +1927,12 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	status, err := run("status", "--porcelain", "--", ".", ":(exclude).agent-symphony")
+	status, err := run("status", "--porcelain", "--", ".", ":(exclude).agent-symphony", ":(exclude).agents", ":(exclude).codex")
 	if err != nil {
 		return "", errors.New("inspect export worktree")
 	}
 	if status != "" {
-		if _, err := run("add", "--all", "--", ".", ":(exclude).agent-symphony"); err != nil {
+		if _, err := run("add", "--all", "--", ".", ":(exclude).agent-symphony", ":(exclude).agents", ":(exclude).codex"); err != nil {
 			return "", fmt.Errorf("stage worker changes: %w", err)
 		}
 		if _, err := run("diff", "--cached", "--quiet"); err == nil || !isExitCode(err, 1) {
@@ -1932,7 +1950,7 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if branch, err := run("branch", "--show-current"); err != nil || branch != manifest.Branch {
 		return "", errors.New("export branch changed")
 	}
-	if status, err := run("status", "--porcelain", "--", ".", ":(exclude).agent-symphony"); err != nil || status != "" {
+	if status, err := run("status", "--porcelain", "--", ".", ":(exclude).agent-symphony", ":(exclude).agents", ":(exclude).codex"); err != nil || status != "" {
 		return "", errors.New("export worktree is not clean")
 	}
 	tmp, err := os.CreateTemp("", "agent-symphony-export-*.bundle")

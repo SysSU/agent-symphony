@@ -1091,12 +1091,17 @@ func EnsureRetrySuppressed(ctx context.Context, api API, cfg PRAdapterConfig, is
 	if err != nil || !applied {
 		return false, err
 	}
-	if err := api.CreateIssueComment(ctx, cfg.Repository, issue, cfg.CancelCommand, Mutation{Issue: issue, Attempt: attempt}); err != nil {
-		return false, err
+	body, _ := json.Marshal(map[string]string{"body": cfg.CancelCommand})
+	response, mutationErr := api.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", cfg.Repository, issue), "", body, Mutation{Issue: issue, Attempt: attempt})
+	if response != nil {
+		defer response.Body.Close()
+	}
+	if mutationErr == nil && (response == nil || response.StatusCode < 200 || response.StatusCode >= 300) {
+		mutationErr = errors.New("GitHub retry suppression returned no successful response")
 	}
 	suppressed, err := check()
 	if err != nil || !suppressed {
-		return false, errors.Join(errors.New("late retry suppression was not observed"), err)
+		return false, errors.Join(errors.New("late retry suppression was not observed"), mutationErr, err)
 	}
 	return true, nil
 }

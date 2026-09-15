@@ -389,17 +389,24 @@ func validatePrivateStateRoot(stateRoot string) error {
 	if err != nil {
 		return fmt.Errorf("resolve runtime state root: %w", err)
 	}
-	for _, shared := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
-		lexical, lexicalErr := filepath.Abs(shared)
-		if lexicalErr == nil && pathWithinRoot(root, lexical) {
-			return errors.New("runtime state root must not be inside shared temporary storage")
-		}
-		resolved, resolveErr := filepath.EvalSymlinks(shared)
-		if resolveErr == nil && pathWithinRoot(root, resolved) {
-			return errors.New("runtime state root must not be inside shared temporary storage")
-		}
+	if pathInSharedTemporaryStorage(root) {
+		return errors.New("runtime state root must not be inside shared temporary storage")
 	}
 	return nil
+}
+
+func pathInSharedTemporaryStorage(path string) bool {
+	for _, shared := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
+		lexical, lexicalErr := filepath.Abs(shared)
+		if lexicalErr == nil && pathWithinRoot(path, lexical) {
+			return true
+		}
+		resolved, resolveErr := filepath.EvalSymlinks(shared)
+		if resolveErr == nil && pathWithinRoot(path, resolved) {
+			return true
+		}
+	}
+	return false
 }
 
 func pathWithinRoot(path, root string) bool {

@@ -27,7 +27,7 @@ const (
 const (
 	workspaceTrustConfig = `projects={"{managed_workspace}"={trust_level="untrusted"}}`
 	legacyWorkspaceTrust = `projects={"{managed_workspace}"={trust_level="trusted"}}`
-	workerPermissions    = `permissions.agent-symphony-worker={filesystem={":root"="deny",":minimal"="read",":tmpdir"="deny",":slash_tmp"="deny",":workspace_roots"={"."="write",".codex"="deny",".agents"="deny"}},network={enabled=false}}`
+	workerPermissions    = `permissions.agent-symphony-worker={filesystem={":root"="deny",":minimal"="read",":tmpdir"="deny",":slash_tmp"="deny",":workspace_roots"={"."="write",".git"="write",".agent-symphony"="write",".codex"="deny",".agents"="deny"}},network={enabled=false}}`
 	workerEnvironment    = `shell_environment_policy={inherit="all",include_only=["^(PATH|TMPDIR|XDG_CACHE_HOME|GOCACHE|npm_config_cache|LANG|LC_ALL|TERM|COLORTERM|NO_COLOR|CODEX_HOME|AGENT_SYMPHONY_IMPLEMENTATION_RESULT|AGENT_SYMPHONY_STATUS_REQUEST|AGENT_SYMPHONY_WORKER_GENERATION|AGENT_SYMPHONY_WORKER_LAUNCH_ID|AGENT_SYMPHONY_REVIEW_RESULT)$"]}`
 	workerProfileName    = "agent-symphony-worker"
 )
