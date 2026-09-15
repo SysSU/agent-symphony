@@ -941,8 +941,6 @@ func planReconciliationAttemptIssueUpdates(snapshot stateOwnerSnapshot, batch re
 		var update *githubIssueUpdateEffectRequest
 		remote, remotelyObserved := observedReconciliationAttempt(observation, manifest.Attempt)
 		switch {
-		case manifest.WorkerStatusSeq > manifest.WorkerStatusApplied:
-			update = &githubIssueUpdateEffectRequest{Kind: githubIssueWorkerStatus, Status: manifest.WorkerStatus, StatusReason: manifest.WorkerStatusReason, StatusSequence: manifest.WorkerStatusSeq}
 		case manifest.State == "failed" || manifest.State == "cancelled":
 			terminal := slices.ContainsFunc(observation.Fact.TerminalAttempts, func(attempt reconciliationAttemptFact) bool {
 				return attempt.Attempt == manifest.Attempt
@@ -977,6 +975,37 @@ func planReconciliationAttemptIssueUpdates(snapshot stateOwnerSnapshot, batch re
 			continue
 		}
 		if completedReconciliationRequest(snapshot.State, request) {
+			continue
+		}
+		plans = append(plans, reconciliationPlannedEffect{Identity: ownerReconciliationBeginIdentity(snapshot, request), Request: request, Material: material})
+	}
+	sortReconciliationPlans(plans)
+	return plans, nil
+}
+
+func planMachineStatusUpdates(snapshot stateOwnerSnapshot, cfg internalgithub.PRAdapterConfig) ([]reconciliationPlannedEffect, error) {
+	if cfg.Repository == "" || cfg.Repository != snapshot.State.Repository || cfg.ActorID < 1 {
+		return nil, errors.New("machine status config does not match owner")
+	}
+	var plans []reconciliationPlannedEffect
+	for key, status := range snapshot.State.MachineStatuses {
+		observation, ok := snapshot.State.Observations[key]
+		if !ok || !observation.Present || observation.OwnerGeneration != status.IssueGeneration || status.IssueGeneration != snapshot.State.IssueGenerations[key] {
+			continue
+		}
+		needsAttention := status.Status == "needs-attention"
+		remoteCurrent := observation.Fact.NeedsAttention == needsAttention
+		if status.AppliedSequence == status.Sequence && remoteCurrent {
+			continue
+		}
+		update := &githubIssueUpdateEffectRequest{Kind: githubIssueMachineStatus, AttributionAttempt: status.Attempt, Status: status.Status, StatusReason: status.Reason, StatusSequence: status.Sequence, StatusSource: status.Source, StatusSourceSequence: status.SourceSequence}
+		request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: status.Repository, Issue: status.Issue, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, GitHubIssueUpdate: update}
+		material := reconciliationIssueUpdateMaterial{Config: cfg}
+		request.ExecutionDigest = issueUpdateExecutionDigest(request, material)
+		if !validReconciliationEffectRequest(snapshot.State.Repository, request) || !validReconciliationEffectStateBindings("", snapshot.State, request) {
+			return nil, errStateConflict
+		}
+		if status.AppliedSequence != status.Sequence && completedReconciliationRequest(snapshot.State, request) {
 			continue
 		}
 		plans = append(plans, reconciliationPlannedEffect{Identity: ownerReconciliationBeginIdentity(snapshot, request), Request: request, Material: material})
@@ -1130,6 +1159,9 @@ func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API
 			}
 		}
 		applied = true
+	} else if request.GitHubIssueUpdate.Kind == githubIssueMachineStatus {
+		update := request.GitHubIssueUpdate
+		applied, err = api.OwnerStatusApplied(run.ctx, request.Repository, request.Issue, update.AttributionAttempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, plan.Material.Config.ActorID)
 	} else if issueScoped {
 		applied, err = internalgithub.RevalidateIssueUpdateProposal(run.ctx, api, plan.Material.Config, plan.issueUpdateProposal())
 	} else {
@@ -1144,7 +1176,10 @@ func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API
 		}
 	}
 	if !applied {
-		if issueScoped {
+		if request.GitHubIssueUpdate.Kind == githubIssueMachineStatus {
+			update := request.GitHubIssueUpdate
+			err = api.EnsureOwnerStatus(run.ctx, request.Repository, request.Issue, update.AttributionAttempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, plan.Material.Config.ActorID)
+		} else if issueScoped {
 			err = internalgithub.ExecuteIssueUpdateProposal(run.ctx, api, plan.Material.Config, plan.issueUpdateProposal())
 		} else {
 			err = executeAttemptIssueUpdate(run.ctx, api, request, plan.Material.Config)
@@ -1161,7 +1196,16 @@ func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API
 			}
 		}
 	}
-	if !issueScoped {
+	if request.GitHubIssueUpdate.Kind == githubIssueMachineStatus {
+		update := request.GitHubIssueUpdate
+		applied, err = api.OwnerStatusApplied(run.ctx, request.Repository, request.Issue, update.AttributionAttempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, plan.Material.Config.ActorID)
+		if err != nil || !applied {
+			if err == nil {
+				err = errors.New("machine status update was not observable")
+			}
+			return reconciliationEffectResult{}, err
+		}
+	} else if !issueScoped {
 		proofContext := run.ctx
 		if request.GitHubIssueUpdate.Kind == githubIssueRetry {
 			proofContext = c.lifecycle
@@ -1228,7 +1272,7 @@ func executeAttemptIssueUpdate(ctx context.Context, api internalgithub.API, requ
 		return api.EnsureReviewFindings(ctx, request.Repository, request.Issue, request.Attempt, update.HeadSHA, update.Findings, cfg.ActorID)
 	case githubIssueRetry:
 		return internalgithub.EnsureRetryCommand(ctx, api, cfg, request.Issue, request.Attempt)
-	case githubIssueWorkerStatus:
+	case githubIssueMachineStatus:
 		return api.EnsureOwnerStatus(ctx, request.Repository, request.Issue, request.Attempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, cfg.ActorID)
 	default:
 		return errStateConflict
@@ -1261,7 +1305,7 @@ func attemptIssueUpdateApplied(ctx context.Context, api internalgithub.API, requ
 		bodies = []string{body}
 	case githubIssueRetry:
 		return internalgithub.RetryCommandApplied(ctx, api, cfg, request.Issue, request.Attempt, time.Unix(0, update.FailedAtUnixNano))
-	case githubIssueWorkerStatus:
+	case githubIssueMachineStatus:
 		return api.OwnerStatusApplied(ctx, request.Repository, request.Issue, request.Attempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, cfg.ActorID)
 	default:
 		return false, errStateConflict
@@ -1410,6 +1454,9 @@ func planReconciliationIssueUpdates(snapshot stateOwnerSnapshot, batch reconcili
 	var plans []reconciliationPlannedEffect
 	for _, material := range batch.IssueUpdates {
 		proposal := material.Proposal
+		if proposal.Kind == githubIssueDependencyClear {
+			continue // Admitted into the owner's shared machine-status order first.
+		}
 		key := ownerIssueKey(proposal.Repository, proposal.Issue)
 		observation, ok := snapshot.State.Observations[key]
 		if !ok || !observation.Present || observation.OwnerGeneration != snapshot.State.IssueGenerations[key] || !slices.Contains(observation.IssueUpdates, proposal) {

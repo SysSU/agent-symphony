@@ -170,6 +170,8 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 		status := &statuses[index]
 		key := ownerAttemptKey(status.Repository, status.Issue, status.Attempt)
 		issueKey := ownerIssueKey(status.Repository, status.Issue)
+		status.IssueGeneration = snapshot.State.IssueGenerations[issueKey]
+		status.AttemptGeneration = snapshot.State.AttemptGenerations[key]
 		observation := snapshot.State.Observations[issueKey]
 		record, owned := snapshot.State.Attempts[key]
 		accepted := observation.Attempts[key]

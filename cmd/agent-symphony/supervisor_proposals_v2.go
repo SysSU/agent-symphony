@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
@@ -86,6 +87,7 @@ func (s *supervisorProposalServiceV2) process(ctx context.Context) error {
 		return s.resolve(ctx, proposal.Binding, "refused", err)
 	}
 	var checkIn reconciliationPlannedEffect
+	var machineStatus reconciliationPlannedEffect
 	switch proposal.Action {
 	case orchestratoragent.ProposalActionRetry:
 		err = validateTransitionRetry(proposal, projection.Statuses)
@@ -95,6 +97,30 @@ func (s *supervisorProposalServiceV2) process(ctx context.Context) error {
 	case orchestratoragent.ProposalActionCheckIn:
 		if err = validateMonitoringCheckIn(proposal, projection.Statuses); err == nil {
 			checkIn, err = planMonitoringCheckIn(snapshot, proposal)
+		}
+	case orchestratoragent.ProposalActionStatusSet, orchestratoragent.ProposalActionStatusClear:
+		sequence, parseErr := strconv.ParseUint(proposal.Binding[:16], 16, 64)
+		if parseErr != nil {
+			err = errors.New("orchestrator status binding is invalid")
+			break
+		}
+		if sequence == 0 {
+			sequence = 1
+		}
+		status := "clear"
+		if proposal.Action == orchestratoragent.ProposalActionStatusSet {
+			status = "needs-attention"
+		}
+		var admitted stateOwnerSnapshot
+		admitted, err = s.owner.admitMachineStatus(ctx, admitMachineStatusCommand{Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, Source: "orchestrator", SourceSequence: sequence, Status: status, Reason: proposal.Detail})
+		if err == nil {
+			plans, planErr := planMachineStatusUpdates(admitted, s.operator.collector.Config)
+			err = planErr
+			if err == nil && len(plans) == 0 {
+				err = errors.New("owner status intent has no current external observation")
+			} else if err == nil {
+				machineStatus = plans[0]
+			}
 		}
 	default:
 		err = errors.New("unsupported orchestrator proposal action")
@@ -123,6 +149,11 @@ func (s *supervisorProposalServiceV2) process(ctx context.Context) error {
 			_, err = s.effects.executeMonitoringCheckIn(checkIn)
 		}
 		succeeded = "the generation-bound monitoring check-in was delivered and durably recorded"
+	case orchestratoragent.ProposalActionStatusSet, orchestratoragent.ProposalActionStatusClear:
+		if machineStatus, err = s.effects.beginReconciliation(ctx, machineStatus); err == nil {
+			_, err = s.effects.executeIssueUpdate(ctx, s.operator.collector.API, machineStatus)
+		}
+		succeeded = "the owner-issued machine status was observed on GitHub"
 	}
 	if err != nil {
 		return errors.Join(err, s.resolve(ctx, proposal.Binding, "failed", err))

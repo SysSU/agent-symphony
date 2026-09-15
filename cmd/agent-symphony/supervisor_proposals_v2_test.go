@@ -74,6 +74,35 @@ func TestSupervisorInvalidRetryIsRefusedBeforeRunning(t *testing.T) {
 	}
 }
 
+func TestSupervisorStatusProposalCannotRebindAfterDismiss(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 333, "active", false)
+	before := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey("o/r", 333), ownerAttemptKey("o/r", 333, 1)
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 333, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-333-1", Detail: "monitoring: stale heartbeat", IssueGeneration: before.State.IssueGenerations[issueKey], AttemptGeneration: before.State.AttemptGenerations[attemptKey]}
+	if _, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest}); err != nil {
+		t.Fatal(err)
+	}
+	agent := proposalTestSupervisor(t)
+	writeProposalV2(t, agent, proposal)
+	operator := operatorTestMutationService(t, owner)
+	trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
+	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
+	if err := service.process(t.Context()); err == nil {
+		t.Fatal("stale status proposal unexpectedly succeeded")
+	}
+	if status := readProposalStatusV2(t, agent); status.Resolution != "refused" {
+		t.Fatalf("proposal status=%#v", status)
+	}
+	committed := mustOwnerSnapshot(t, owner).State.MachineStatuses[issueKey]
+	if committed.Status != "clear" || committed.Source != "destructive" || committed.Sequence != 1 {
+		t.Fatalf("stale proposal changed owner status: %#v", committed)
+	}
+}
+
 func TestSupervisorRecoverWaitsForDurableReceipt(t *testing.T) {
 	owner, manifest := operatorNeverLaunchedOwner(t, 373, "failed", "failed", func(runtimeOwnerState) error { return nil })
 	snapshot, err := owner.reconciliationSnapshot(t.Context())

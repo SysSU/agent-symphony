@@ -962,21 +962,23 @@ func parseHostOrchestratorProposal(input io.Reader) (orchestratoragent.MessagePr
 		return orchestratoragent.MessageProposal{}, nil, errors.New("invalid bounded orchestrator proposal")
 	}
 	var proposal struct {
-		Version    int    `json:"version"`
-		Repository string `json:"repository"`
-		Issue      int    `json:"issue"`
-		Attempt    int    `json:"attempt"`
-		Action     string `json:"action,omitempty"`
-		RequestID  string `json:"request_id,omitempty"`
-		HandoffID  string `json:"handoff_id,omitempty"`
-		Detail     string `json:"detail,omitempty"`
+		Version           int    `json:"version"`
+		Repository        string `json:"repository"`
+		Issue             int    `json:"issue"`
+		Attempt           int    `json:"attempt"`
+		Action            string `json:"action,omitempty"`
+		RequestID         string `json:"request_id,omitempty"`
+		HandoffID         string `json:"handoff_id,omitempty"`
+		Detail            string `json:"detail,omitempty"`
+		IssueGeneration   uint64 `json:"issue_generation,omitempty"`
+		AttemptGeneration uint64 `json:"attempt_generation,omitempty"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&proposal) != nil || decoder.Decode(&struct{}{}) != io.EOF || proposal.Version != 1 {
 		return orchestratoragent.MessageProposal{}, nil, errors.New("invalid orchestrator proposal schema")
 	}
-	parsed := orchestratoragent.MessageProposal{Version: proposal.Version, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, Action: proposal.Action, RequestID: proposal.RequestID, HandoffID: proposal.HandoffID, Detail: proposal.Detail}
+	parsed := orchestratoragent.MessageProposal{Version: proposal.Version, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, Action: proposal.Action, RequestID: proposal.RequestID, HandoffID: proposal.HandoffID, Detail: proposal.Detail, IssueGeneration: proposal.IssueGeneration, AttemptGeneration: proposal.AttemptGeneration}
 	if err := orchestratoragent.ValidateMessageProposal(parsed); err != nil {
 		return orchestratoragent.MessageProposal{}, nil, err
 	}

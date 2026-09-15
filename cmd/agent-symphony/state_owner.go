@@ -61,12 +61,30 @@ type runtimeOwnerState struct {
 	ControlReceipts           []controlReceipt                     `json:"control_receipts"`
 	ControlGenerations        map[string]uint64                    `json:"control_generations,omitempty"`
 	ControlRepairs            map[string]controlSnapshotRepair     `json:"control_repairs,omitempty"`
+	MachineStatuses           map[string]machineStatusRecord       `json:"machine_statuses,omitempty"`
 	CycleDiagnostic           string                               `json:"cycle_diagnostic,omitempty"`
 	CycleDiagnosticAt         time.Time                            `json:"cycle_diagnostic_at,omitzero"`
 	CycleOutcomeEpoch         uint64                               `json:"cycle_outcome_epoch,omitempty"`
 	CycleOutcomeID            uint64                               `json:"cycle_outcome_id,omitempty"`
 	CycleOutcomeSource        uint64                               `json:"cycle_outcome_source_revision,omitempty"`
 	StaleReconciliations      uint64                               `json:"stale_reconciliations,omitempty"`
+}
+
+// machineStatusRecord is the single owner-issued ordering domain for every
+// Agent Symphony status producer. SourceSequence is producer-local; Sequence
+// is the durable per-issue order used at the GitHub boundary.
+type machineStatusRecord struct {
+	Repository        string `json:"repository"`
+	Issue             int    `json:"issue"`
+	Attempt           int    `json:"attempt"`
+	IssueGeneration   uint64 `json:"issue_generation"`
+	AttemptGeneration uint64 `json:"attempt_generation,omitempty"`
+	Sequence          uint64 `json:"sequence"`
+	AppliedSequence   uint64 `json:"applied_sequence,omitempty"`
+	Source            string `json:"source"`
+	SourceSequence    uint64 `json:"source_sequence"`
+	Status            string `json:"status"`
+	Reason            string `json:"reason"`
 }
 
 type controlSnapshotRepair struct {
@@ -141,11 +159,12 @@ type runtimeTombstone struct {
 }
 
 type invalidatedExternalOutcome struct {
-	Action   reconciliationEffectAction `json:"action"`
-	Observed bool                       `json:"observed"`
-	Merged   bool                       `json:"merged,omitempty"`
-	PR       int                        `json:"pr,omitempty"`
-	HeadSHA  string                     `json:"head_sha,omitempty"`
+	Action         reconciliationEffectAction `json:"action"`
+	Observed       bool                       `json:"observed"`
+	Merged         bool                       `json:"merged,omitempty"`
+	PR             int                        `json:"pr,omitempty"`
+	HeadSHA        string                     `json:"head_sha,omitempty"`
+	StatusSequence uint64                     `json:"status_sequence,omitempty"`
 }
 
 type startGateCandidate struct {
@@ -340,6 +359,18 @@ type selectWorkerSealCommand struct {
 	Selection          workerSealSelection
 }
 
+type admitMachineStatusCommand struct {
+	Repository                    string
+	Issue, Attempt                int
+	ExpectedIssueGeneration       uint64
+	ExpectedAttemptGeneration     uint64
+	ExpectedObservationGeneration uint64
+	Dependency, PullRequest       int
+	Source                        string
+	SourceSequence                uint64
+	Status, Reason                string
+}
+
 type resolveInvalidatedReconciliationEffectCommand struct {
 	Identity stateResultIdentity
 	Outcome  invalidatedExternalOutcome
@@ -475,6 +506,7 @@ const (
 	stateOwnerAuthorizeReconciliationEffect
 	stateOwnerResolveInvalidatedReconciliationEffect
 	stateOwnerSelectWorkerSeal
+	stateOwnerAdmitMachineStatus
 	stateOwnerMarkPlanReviewRunning
 	stateOwnerMarkReviewerSessionRequested
 	stateOwnerProveReviewerDead
@@ -512,6 +544,7 @@ type stateOwnerCommand struct {
 	authorizeReconciliation      authorizeReconciliationEffectCommand
 	resolveInvalidatedReconcile  resolveInvalidatedReconciliationEffectCommand
 	selectWorkerSeal             selectWorkerSealCommand
+	machineStatus                admitMachineStatusCommand
 	markPlanReviewRunning        markPlanReviewRunningCommand
 	markReviewerSessionRequested markReviewerSessionRequestedCommand
 	proveReviewerDead            proveReviewerDeadCommand
@@ -605,6 +638,7 @@ func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial
 	if err != nil || attempts != filepath.Clean(attemptRoot) {
 		return nil, errors.New("runtime attempt root is unsafe")
 	}
+	migrateLegacyMachineStatuses(&initial)
 	if err := validateRuntimeOwnerState(initial, attempts, root, false); err != nil {
 		return nil, err
 	}
@@ -868,6 +902,11 @@ func (o *stateOwner) selectWorkerSeal(ctx context.Context, command selectWorkerS
 	return result.snapshot, err
 }
 
+func (o *stateOwner) admitMachineStatus(ctx context.Context, command admitMachineStatusCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerAdmitMachineStatus, machineStatus: command})
+	return result.snapshot, err
+}
+
 func (o *stateOwner) recordEffect(ctx context.Context, command recordEffectCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRecordEffect, record: command})
 	return result.snapshot, result.effect, err
@@ -1008,6 +1047,9 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 			}
 			candidate.ExternalDispatchTracked = true
 		}
+		if candidate.MachineStatuses == nil {
+			candidate.MachineStatuses = map[string]machineStatusRecord{}
+		}
 		for id, effect := range candidate.Effects {
 			if effect.Action == string(agentruntime.EffectStop) && effect.State == "pending" {
 				key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
@@ -1094,6 +1136,10 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		}
 	case stateOwnerSelectWorkerSeal:
 		if err := applySelectWorkerSeal(stateRoot, &candidate, command.selectWorkerSeal); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerAdmitMachineStatus:
+		if err := applyAdmitMachineStatus(&candidate, command.machineStatus); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerMarkPlanReviewRunning:
@@ -1417,6 +1463,7 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 			}
 			return errStateConflict
 		}
+		previousWorkerSequence := record.Manifest.WorkerStatusSeq
 		record.Manifest = manifest
 		if command.Action == agentruntime.EffectStop {
 			if record.StopEffectID != "" && record.StopEffectID != effect.ID {
@@ -1425,6 +1472,15 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 			record.StopEffectID = ""
 		}
 		state.Attempts[attemptKey] = record
+		if command.Action == agentruntime.EffectMonitor && manifest.WorkerStatusSeq > previousWorkerSequence {
+			if err := applyAdmitMachineStatus(state, admitMachineStatusCommand{
+				Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt,
+				ExpectedIssueGeneration: identity.IssueGeneration, ExpectedAttemptGeneration: identity.AttemptGeneration,
+				Source: "worker", SourceSequence: manifest.WorkerStatusSeq, Status: manifest.WorkerStatus, Reason: manifest.WorkerStatusReason,
+			}); err != nil {
+				return err
+			}
+		}
 	} else {
 		stored := manifest
 		if tombstone, ok := state.Tombstones[attemptKey]; ok && tombstone.Manifest != nil {
@@ -1699,6 +1755,14 @@ func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueG
 		}
 	}
 	state.IssueGenerations[key] = generation + 1
+	if current, exists := state.MachineStatuses[key]; exists {
+		if current.SourceSequence == ^uint64(0) {
+			return errors.New("machine status source sequence overflow")
+		}
+		if err := applyAdmitMachineStatus(state, admitMachineStatusCommand{Repository: command.Repository, Issue: command.Issue, Attempt: current.Attempt, ExpectedIssueGeneration: generation + 1, ExpectedAttemptGeneration: state.AttemptGenerations[ownerAttemptKey(command.Repository, command.Issue, current.Attempt)], Source: "destructive", SourceSequence: current.SourceSequence + 1, Status: "clear", Reason: "issue generation invalidated"}); err != nil {
+			return err
+		}
+	}
 	delete(state.Observations, key)
 	deleteIssueRecoveries(state, command.Repository, command.Issue)
 	for id, effect := range state.Effects {
@@ -1876,13 +1940,22 @@ func applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot string, state *ru
 			return errors.New("issue generation overflow")
 		}
 		issueGeneration++
+		state.IssueGenerations[issueKey] = issueGeneration
+		generation = 1
+		state.AttemptGenerations[attemptKey] = generation
+		if current, exists := state.MachineStatuses[issueKey]; exists {
+			if current.SourceSequence == ^uint64(0) {
+				return errors.New("machine status source sequence overflow")
+			}
+			if err := applyAdmitMachineStatus(state, admitMachineStatusCommand{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, ExpectedIssueGeneration: issueGeneration, ExpectedAttemptGeneration: generation, Source: "destructive", SourceSequence: current.SourceSequence + 1, Status: "clear", Reason: "attempt superseded"}); err != nil {
+				return err
+			}
+		}
 		if err := pruneSupersededIssueEffects(state, manifest.Repository, manifest.Issue, issueGeneration); err != nil {
 			return err
 		}
-		state.IssueGenerations[issueKey] = issueGeneration
 		delete(state.Observations, issueKey)
 		deleteIssueRecoveries(state, manifest.Repository, manifest.Issue)
-		generation = 1
 	} else {
 		if generation == ^uint64(0) {
 			return errors.New("attempt generation overflow")
@@ -2053,6 +2126,13 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 		InvalidatedGeneration: invalidated, Generation: generation, CleanupPhase: command.CleanupPhase,
 		PublishedHead: command.PublishedHead, Manifest: command.Manifest, CleanupPolicy: cloneCleanupPolicy(command.CleanupPolicy), Diagnostic: command.Diagnostic, InvalidatedHandoff: invalidatedHandoff, InvalidatedStart: invalidatedStart, ExternalOutcomes: map[string]invalidatedExternalOutcome{},
 	}
+	if err := applyAdmitMachineStatus(state, admitMachineStatusCommand{
+		Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt,
+		ExpectedIssueGeneration: command.ExpectedIssueGeneration, ExpectedAttemptGeneration: generation,
+		Source: "destructive", SourceSequence: generation, Status: "clear", Reason: "attempt invalidated",
+	}); err != nil {
+		return nil, err
+	}
 	if command.EffectAction == "" {
 		return nil, nil
 	}
@@ -2080,6 +2160,70 @@ func applySelectWorkerSeal(stateRoot string, state *runtimeOwnerState, command s
 	selection := command.Selection
 	record.WorkerSeal = &selection
 	state.Attempts[key] = record
+	return nil
+}
+
+func applyAdmitMachineStatus(state *runtimeOwnerState, command admitMachineStatusCommand) error {
+	command.Reason = strings.TrimSpace(command.Reason)
+	issueKey := ownerIssueKey(command.Repository, command.Issue)
+	if command.Repository != state.Repository || command.Issue < 1 || command.Attempt < 1 ||
+		state.IssueGenerations[issueKey] != command.ExpectedIssueGeneration || command.ExpectedIssueGeneration == 0 ||
+		!slices.Contains([]string{"worker", "dependency", "orchestrator", "destructive"}, command.Source) ||
+		command.SourceSequence == 0 || !slices.Contains([]string{"needs-attention", "clear"}, command.Status) ||
+		!boundedText(command.Reason, 1024, true) {
+		return errStaleStateResult
+	}
+	attemptKey := ownerAttemptKey(command.Repository, command.Issue, command.Attempt)
+	if command.Source == "dependency" {
+		observation, ok := state.Observations[issueKey]
+		proposal := reconciliationIssueUpdateProposal{Repository: command.Repository, Issue: command.Issue, Kind: githubIssueDependencyClear, AttributionAttempt: command.Attempt, Dependency: command.Dependency, PullRequest: command.PullRequest}
+		current := state.MachineStatuses[issueKey]
+		if !ok || !observation.Present || observation.Generation != command.ExpectedObservationGeneration || observation.OwnerGeneration != command.ExpectedIssueGeneration || !slices.Contains(observation.IssueUpdates, proposal) ||
+			command.ExpectedAttemptGeneration == 0 || state.AttemptGenerations[attemptKey] != command.ExpectedAttemptGeneration || current.Repository != "" && current.Source != "dependency" {
+			return errStaleStateResult
+		}
+	} else if command.Source != "destructive" {
+		record, ok := state.Attempts[attemptKey]
+		if !ok || record.Generation != command.ExpectedAttemptGeneration || state.AttemptGenerations[attemptKey] != command.ExpectedAttemptGeneration {
+			return errStaleStateResult
+		}
+	} else if state.AttemptGenerations[attemptKey] != command.ExpectedAttemptGeneration {
+		return errStaleStateResult
+	}
+	current := state.MachineStatuses[issueKey]
+	if current.Repository != "" && current.Source == command.Source && current.Attempt == command.Attempt && current.AttemptGeneration == command.ExpectedAttemptGeneration {
+		if command.SourceSequence <= current.SourceSequence {
+			if command.SourceSequence == current.SourceSequence && current.Status == command.Status && current.Reason == command.Reason {
+				return nil
+			}
+			return errStaleStateResult
+		}
+	}
+	if current.Sequence == ^uint64(0) {
+		return errors.New("machine status sequence overflow")
+	}
+	sequence := current.Sequence + 1
+	if sequence == 0 {
+		sequence = 1
+	}
+	for id, effect := range state.Effects {
+		request := effect.Reconciliation
+		if effect.Repository != command.Repository || effect.Issue != command.Issue || effect.State != "pending" || request == nil || request.GitHubIssueUpdate == nil || request.GitHubIssueUpdate.Kind != githubIssueMachineStatus {
+			continue
+		}
+		if effect.Dispatched {
+			effect.State, effect.Diagnostic = "invalidated", ""
+			state.Effects[id] = effect
+		} else {
+			delete(state.Effects, id)
+		}
+	}
+	state.MachineStatuses[issueKey] = machineStatusRecord{
+		Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt,
+		IssueGeneration: command.ExpectedIssueGeneration, AttemptGeneration: command.ExpectedAttemptGeneration,
+		Sequence: sequence, AppliedSequence: current.AppliedSequence, Source: command.Source,
+		SourceSequence: command.SourceSequence, Status: command.Status, Reason: strings.TrimSpace(command.Reason),
+	}
 	return nil
 }
 
@@ -2261,6 +2405,7 @@ func readRuntimeOwnerState(stateRoot, repository string) (runtimeOwnerState, err
 	if decoder.Decode(&state) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return runtimeOwnerState{}, errors.New("runtime owner ledger is invalid")
 	}
+	migrateLegacyMachineStatuses(&state)
 	if err := validateRuntimeOwnerState(state, runtimeOwnerAttemptRoot(stateRoot), stateRoot, true); err != nil || state.Repository != repository {
 		if err == nil {
 			err = fmt.Errorf("runtime state is bound to project %s, not %s", state.Repository, repository)
@@ -2268,6 +2413,41 @@ func readRuntimeOwnerState(stateRoot, repository string) (runtimeOwnerState, err
 		return runtimeOwnerState{}, err
 	}
 	return state, nil
+}
+
+// Ledgers written before machine status joined the issue-scoped owner domain
+// stored worker status effects against an attempt. Rebuild one current intent
+// from each issue's newest manifest and let normal reconciliation publish the
+// canonical owner marker.
+func migrateLegacyMachineStatuses(state *runtimeOwnerState) {
+	if state.MachineStatuses != nil {
+		return
+	}
+	state.MachineStatuses = map[string]machineStatusRecord{}
+	for key, record := range state.Attempts {
+		manifest := record.Manifest
+		if manifest.WorkerStatusSeq == 0 || !slices.Contains([]string{"needs-attention", "clear"}, manifest.WorkerStatus) || strings.TrimSpace(manifest.WorkerStatusReason) == "" {
+			continue
+		}
+		issueKey := ownerIssueKey(manifest.Repository, manifest.Issue)
+		current := state.MachineStatuses[issueKey]
+		if current.Repository != "" && current.Attempt >= manifest.Attempt {
+			continue
+		}
+		state.MachineStatuses[issueKey] = machineStatusRecord{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: state.AttemptGenerations[key], Sequence: 1, Source: "worker", SourceSequence: manifest.WorkerStatusSeq, Status: manifest.WorkerStatus, Reason: strings.TrimSpace(manifest.WorkerStatusReason)}
+	}
+	for id, effect := range state.Effects {
+		if effect.Reconciliation != nil && effect.Reconciliation.GitHubIssueUpdate != nil && effect.Reconciliation.GitHubIssueUpdate.Kind == githubIssueMachineStatus && effect.Attempt > 0 {
+			issueKey := ownerIssueKey(effect.Repository, effect.Issue)
+			if _, current := state.MachineStatuses[issueKey]; !current {
+				attemptGeneration := state.AttemptGenerations[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
+				if state.IssueGenerations[issueKey] > 0 && attemptGeneration > 0 {
+					state.MachineStatuses[issueKey] = machineStatusRecord{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: attemptGeneration, Sequence: 1, Source: "destructive", SourceSequence: attemptGeneration, Status: "clear", Reason: "legacy status intent invalidated"}
+				}
+			}
+			delete(state.Effects, id)
+		}
+	}
 }
 
 func migrateLegacyRuntimeState(stateRoot, legacyRecoveryPath, repository string) (runtimeOwnerState, error) {
@@ -2582,6 +2762,17 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			return errors.New("runtime owner attempt generation is invalid")
 		}
 	}
+	for key, status := range state.MachineStatuses {
+		attemptKey := ownerAttemptKey(status.Repository, status.Issue, status.Attempt)
+		attemptBound := (status.Source == "dependency" || status.Source == "destructive") && status.AttemptGeneration == 0 || status.AttemptGeneration > 0 && status.AttemptGeneration == state.AttemptGenerations[attemptKey]
+		if key != ownerIssueKey(status.Repository, status.Issue) || status.Repository != state.Repository || status.Issue < 1 || status.Attempt < 1 ||
+			status.IssueGeneration == 0 || status.IssueGeneration != state.IssueGenerations[key] || !attemptBound ||
+			status.Sequence == 0 || status.AppliedSequence > status.Sequence || status.SourceSequence == 0 ||
+			!slices.Contains([]string{"worker", "dependency", "orchestrator", "destructive"}, status.Source) ||
+			!slices.Contains([]string{"needs-attention", "clear"}, status.Status) || !boundedText(status.Reason, 1024, true) {
+			return errors.New("runtime owner machine status is invalid")
+		}
+	}
 	for key, record := range state.Attempts {
 		if state.AttemptGenerations[key] != record.Generation || record.Generation == 0 || record.ObservationEpoch > state.Epoch || record.ObservationEpoch == 0 && record.LastCycleID != 0 || record.ObservationEpoch != 0 && record.LastCycleID == 0 || key != ownerAttemptKey(record.Manifest.Repository, record.Manifest.Issue, record.Manifest.Attempt) {
 			return errors.New("runtime owner attempt record is invalid")
@@ -2794,7 +2985,7 @@ func runtimeOwnerAttemptRoot(stateRoot string) string {
 }
 
 func newRuntimeOwnerState(repository string) runtimeOwnerState {
-	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, WorkerProfileDigest: config.WorkerProfileDigest(), ReviewerRevocationTracked: true, ReviewerSafetyMigrated: true, ExternalDispatchTracked: true, LegacyReviewerQuarantines: map[string]string{}, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}, ControlGenerations: map[string]uint64{}, ControlRepairs: map[string]controlSnapshotRepair{}}
+	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, WorkerProfileDigest: config.WorkerProfileDigest(), ReviewerRevocationTracked: true, ReviewerSafetyMigrated: true, ExternalDispatchTracked: true, LegacyReviewerQuarantines: map[string]string{}, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}, ControlGenerations: map[string]uint64{}, ControlRepairs: map[string]controlSnapshotRepair{}, MachineStatuses: map[string]machineStatusRecord{}}
 }
 
 func activeWorkerProfileDigest(state runtimeOwnerState) string {
@@ -2812,6 +3003,10 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 	clone.ControlRepairs = make(map[string]controlSnapshotRepair, len(state.ControlRepairs))
 	for key, repair := range state.ControlRepairs {
 		clone.ControlRepairs[key] = repair
+	}
+	clone.MachineStatuses = make(map[string]machineStatusRecord, len(state.MachineStatuses))
+	for key, status := range state.MachineStatuses {
+		clone.MachineStatuses[key] = status
 	}
 	clone.Attempts = make(map[string]runtimeAttemptRecord, len(state.Attempts))
 	for key, record := range state.Attempts {
@@ -3049,6 +3244,10 @@ func invalidatedExternalEffect(state runtimeOwnerState, effect runtimeEffectInte
 		return false
 	}
 	if effect.Attempt == 0 {
+		if effect.Reconciliation.GitHubIssueUpdate != nil && effect.Reconciliation.GitHubIssueUpdate.Kind == githubIssueMachineStatus {
+			status, ok := state.MachineStatuses[ownerIssueKey(effect.Repository, effect.Issue)]
+			return ok && effect.Reconciliation.GitHubIssueUpdate.StatusSequence < status.Sequence
+		}
 		return effect.Reconciliation.ControlGeneration < controlGeneration(state, ownerIssueKey(effect.Repository, effect.Issue))
 	}
 	tombstone, ok := state.Tombstones[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]

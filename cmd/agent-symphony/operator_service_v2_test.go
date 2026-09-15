@@ -370,7 +370,7 @@ func TestLocalTombstoneReplayIgnoresLaterMissingObservation(t *testing.T) {
 				t.Fatalf("cross-action replay=%#v", cross)
 			}
 			after := mustOwnerSnapshot(t, owner).State
-			if !reflect.DeepEqual(after.Tombstones[key], before.Tombstones[key]) || after.AttemptGenerations[key] != before.AttemptGenerations[key] || !reflect.DeepEqual(after.Effects, before.Effects) || !reflect.DeepEqual(after.Attempts, before.Attempts) {
+			if !reflect.DeepEqual(after.Tombstones[key], before.Tombstones[key]) || after.AttemptGenerations[key] != before.AttemptGenerations[key] || !reflect.DeepEqual(after.Effects, before.Effects) || !reflect.DeepEqual(after.Attempts, before.Attempts) || !reflect.DeepEqual(after.MachineStatuses, before.MachineStatuses) {
 				t.Fatalf("replay changed durable invalidation: before=%#v after=%#v", before, after)
 			}
 			if receipt, ok := operatorReceiptByID(after, action+"-replay"); !ok || receipt.EffectID != before.Tombstones[key].EffectID || receipt.State != map[bool]string{true: "completed", false: "pending"}[action == "dismiss"] {
@@ -428,7 +428,11 @@ func TestLocalTombstoneReplayIgnoresLaterMissingObservation(t *testing.T) {
 				t.Fatalf("restart replay=%#v", restartedReplay)
 			}
 			durable, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
-			if err != nil || !reflect.DeepEqual(durable.Tombstones[key], before.Tombstones[key]) || !reflect.DeepEqual(durable.Effects, before.Effects) {
+			wantTombstone := before.Tombstones[key]
+			if len(wantTombstone.ExternalOutcomes) == 0 {
+				wantTombstone.ExternalOutcomes = nil
+			}
+			if err != nil || !reflect.DeepEqual(durable.Tombstones[key], wantTombstone) || !reflect.DeepEqual(durable.Effects, before.Effects) || !reflect.DeepEqual(durable.MachineStatuses, before.MachineStatuses) {
 				t.Fatalf("restart changed durable invalidation: err=%v state=%#v", err, durable)
 			}
 		})
