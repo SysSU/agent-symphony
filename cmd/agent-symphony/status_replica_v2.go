@@ -170,9 +170,6 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 		status := &statuses[index]
 		key := ownerAttemptKey(status.Repository, status.Issue, status.Attempt)
 		issueKey := ownerIssueKey(status.Repository, status.Issue)
-		status.IssueGeneration = snapshot.State.IssueGenerations[issueKey]
-		status.AttemptGeneration = snapshot.State.AttemptGenerations[key]
-		status.MachineStatusSequence = snapshot.State.MachineStatuses[issueKey].Sequence
 		observation := snapshot.State.Observations[issueKey]
 		record, owned := snapshot.State.Attempts[key]
 		accepted := observation.Attempts[key]
@@ -261,6 +258,14 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 		if !found {
 			statuses = append(statuses, orchestrator.RecoveryStatus{Repository: tombstone.Repository, Issue: tombstone.Issue, Attempt: tombstone.Attempt, State: "blocked", CurrentPhase: "physical-unverified", NeedsAttention: true, OperatorBlocked: true, Diagnostic: diagnostic, Action: "inspect legacy reviewer descendants before reusing this issue"})
 		}
+	}
+	for index := range statuses {
+		status := &statuses[index]
+		issueKey, attemptKey := ownerIssueKey(status.Repository, status.Issue), ownerAttemptKey(status.Repository, status.Issue, status.Attempt)
+		status.IssueGeneration = snapshot.State.IssueGenerations[issueKey]
+		status.AttemptGeneration = snapshot.State.AttemptGenerations[attemptKey]
+		status.MachineStatusSequence = snapshot.State.MachineStatuses[issueKey].Sequence
+		status.OwnerCausalityToken = ownerAttemptCausalityToken(snapshot.State, status.Repository, status.Issue, status.Attempt)
 	}
 	slices.SortFunc(statuses, func(a, b orchestrator.RecoveryStatus) int {
 		if ordered := cmp.Compare(a.Repository, b.Repository); ordered != 0 {

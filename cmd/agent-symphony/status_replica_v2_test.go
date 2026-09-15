@@ -73,6 +73,12 @@ func TestOwnerStatusProjectionMatchesRecoveryProjection(t *testing.T) {
 			_, facts := recoveryAttemptFacts(input.Attempts, input.Issues)
 			committedLiveness := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
 			want, _ := projectRecoveryStatuses(context.Background(), facts, input.Issues, []agentruntime.Manifest{manifest}, 1, committedLiveness)
+			for index := range got.Statuses {
+				if !validDigest(got.Statuses[index].OwnerCausalityToken) {
+					t.Fatalf("owner projection lacks causality: %#v", got.Statuses[index])
+				}
+				got.Statuses[index].IssueGeneration, got.Statuses[index].AttemptGeneration, got.Statuses[index].MachineStatusSequence, got.Statuses[index].OwnerCausalityToken = 0, 0, 0, ""
+			}
 			if !reflect.DeepEqual(got.Statuses, want) {
 				t.Fatalf("owner projection=%#v\nv1 projection=%#v", got.Statuses, want)
 			}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,7 +23,8 @@ import (
 func TestSupervisorRetryWaitsForCompletedCycleBeforeSuccess(t *testing.T) {
 	owner, manifest := retryProposalOwner(t, 371)
 	agent := proposalTestSupervisor(t)
-	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Action: orchestratoragent.ProposalActionRetry, RequestID: "retry-371-1"}
+	snapshot := mustOwnerSnapshot(t, owner)
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Action: orchestratoragent.ProposalActionRetry, RequestID: "retry-371-1", OwnerCausalityToken: ownerAttemptCausalityToken(snapshot.State, manifest.Repository, manifest.Issue, manifest.Attempt)}
 	writeProposalV2(t, agent, proposal)
 
 	started, release := make(chan struct{}), make(chan struct{})
@@ -78,7 +80,7 @@ func TestSupervisorStatusProposalCannotRebindAfterDismiss(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 333, "active", false)
 	before := mustOwnerSnapshot(t, owner)
 	issueKey, attemptKey := ownerIssueKey("o/r", 333), ownerAttemptKey("o/r", 333, 1)
-	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 333, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-333-1", Detail: "monitoring: stale heartbeat", IssueGeneration: before.State.IssueGenerations[issueKey], AttemptGeneration: before.State.AttemptGenerations[attemptKey]}
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 333, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-333-1", Detail: "monitoring: stale heartbeat", IssueGeneration: before.State.IssueGenerations[issueKey], AttemptGeneration: before.State.AttemptGenerations[attemptKey], OwnerCausalityToken: ownerAttemptCausalityToken(before.State, "o/r", 333, 1)}
 	if _, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest}); err != nil {
 		t.Fatal(err)
 	}
@@ -91,8 +93,8 @@ func TestSupervisorStatusProposalCannotRebindAfterDismiss(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
 	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
-	if err := service.process(t.Context()); err == nil {
-		t.Fatal("stale status proposal unexpectedly succeeded")
+	if err := service.process(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	if status := readProposalStatusV2(t, agent); status.Resolution != "refused" {
 		t.Fatalf("proposal status=%#v", status)
@@ -107,8 +109,8 @@ func TestSupervisorStatusProposalCannotOverwriteNewerStatus(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 334, "active", false)
 	before := mustOwnerSnapshot(t, owner)
 	issueKey, attemptKey := ownerIssueKey("o/r", 334), ownerAttemptKey("o/r", 334, 1)
-	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 334, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-334-1", Detail: "monitoring: stale heartbeat", IssueGeneration: before.State.IssueGenerations[issueKey], AttemptGeneration: before.State.AttemptGenerations[attemptKey], MachineStatusSequence: 0}
-	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 334, Attempt: 1, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, ExpectedStatusSequence: 0, Source: "worker", SourceID: "new-clear", Status: "clear", Reason: "monitoring: recovered"}); err != nil {
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 334, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-334-1", Detail: "monitoring: stale heartbeat", IssueGeneration: before.State.IssueGenerations[issueKey], AttemptGeneration: before.State.AttemptGenerations[attemptKey], MachineStatusSequence: 0, OwnerCausalityToken: ownerAttemptCausalityToken(before.State, "o/r", 334, 1)}
+	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 334, Attempt: 1, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, ExpectedStatusSequence: 0, Source: "worker", SourceID: "new-clear", SourceSequence: 1, Status: "clear", Reason: "monitoring: recovered"}); err != nil {
 		t.Fatal(err)
 	}
 	agent := proposalTestSupervisor(t)
@@ -120,8 +122,8 @@ func TestSupervisorStatusProposalCannotOverwriteNewerStatus(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
 	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
-	if err := service.process(t.Context()); err == nil {
-		t.Fatal("stale supervisor proposal unexpectedly succeeded")
+	if err := service.process(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	if status := readProposalStatusV2(t, agent); status.Resolution != "refused" {
 		t.Fatalf("proposal status=%#v", status)
@@ -132,7 +134,7 @@ func TestSupervisorStatusProposalCannotOverwriteNewerStatus(t *testing.T) {
 	}
 }
 
-func TestSupervisorStatusAdmissionRemainsAcceptedWithoutObservation(t *testing.T) {
+func TestSupervisorStatusAdmissionFailsTerminallyWithoutFreshObservation(t *testing.T) {
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, 336, 1, "running")
 	state := runtimeEffectInitialState(manifest)
@@ -144,7 +146,68 @@ func TestSupervisorStatusAdmissionRemainsAcceptedWithoutObservation(t *testing.T
 	snapshot := mustOwnerSnapshot(t, owner)
 	issueKey, attemptKey := ownerIssueKey("o/r", 336), ownerAttemptKey("o/r", 336, 1)
 	agent := proposalTestSupervisor(t)
-	writeProposalV2(t, agent, orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 336, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-336-1", Detail: "monitoring: awaiting observation", IssueGeneration: snapshot.State.IssueGenerations[issueKey], AttemptGeneration: snapshot.State.AttemptGenerations[attemptKey]})
+	writeProposalV2(t, agent, orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 336, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-336-1", Detail: "monitoring: awaiting observation", IssueGeneration: snapshot.State.IssueGenerations[issueKey], AttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], OwnerCausalityToken: ownerAttemptCausalityToken(snapshot.State, "o/r", 336, 1)})
+	operator := operatorTestMutationService(t, owner)
+	trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
+	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
+	if err := service.process(t.Context()); err == nil {
+		t.Fatal("status without a fresh observation unexpectedly succeeded")
+	}
+	if status := readProposalStatusV2(t, agent); status.Resolution != "failed" || status.ResolvedBinding == "" {
+		t.Fatalf("durably admitted proposal was not terminally failed: %#v", status)
+	}
+	if status := mustOwnerSnapshot(t, owner).State.MachineStatuses[issueKey]; status.Status != "needs-attention" || status.Sequence != 1 {
+		t.Fatalf("owner status=%#v", status)
+	}
+}
+
+func TestSupervisorStatusExecutionFailureIsTerminal(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 337, "active", false)
+	snapshot := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey("o/r", 337), ownerAttemptKey("o/r", 337, 1)
+	agent := proposalTestSupervisor(t)
+	writeProposalV2(t, agent, orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 337, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-337-1", Detail: "monitoring: needs operator", IssueGeneration: snapshot.State.IssueGenerations[issueKey], AttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], OwnerCausalityToken: ownerAttemptCausalityToken(snapshot.State, "o/r", 337, 1)})
+	operator := operatorTestMutationService(t, owner)
+	trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
+	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
+	if err := service.process(t.Context()); err == nil {
+		t.Fatal("failed GitHub execution unexpectedly succeeded")
+	}
+	if status := readProposalStatusV2(t, agent); status.Resolution != "failed" {
+		t.Fatalf("execution failure was not terminal: %#v", status)
+	}
+}
+
+func TestSupervisorStatusProposalRejectsSameGenerationLifecycleDrift(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 338, "active", false)
+	before := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey("o/r", 338), ownerAttemptKey("o/r", 338, 1)
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 338, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-338-1", Detail: "monitoring: stale lifecycle", IssueGeneration: before.State.IssueGenerations[issueKey], AttemptGeneration: before.State.AttemptGenerations[attemptKey], OwnerCausalityToken: ownerAttemptCausalityToken(before.State, "o/r", 338, 1)}
+	observation := before.State.Observations[issueKey]
+	issue := expandIssueFact(observation.Fact)
+	issue.Title += " changed"
+	var attempts []internalgithub.RecoveryAttemptFact
+	for _, attempt := range observation.Attempts {
+		attempts = append(attempts, expandAttemptFact(attempt.Fact))
+	}
+	applyReconciliationInput(t, owner, reconciliationInput{Scope: issueScope(338), Complete: true, Issues: []internalgithub.RecoveryIssueFact{issue}, Attempts: attempts})
+	after := mustOwnerSnapshot(t, owner)
+	if after.State.IssueGenerations[issueKey] != proposal.IssueGeneration || after.State.AttemptGenerations[attemptKey] != proposal.AttemptGeneration || after.State.MachineStatuses[issueKey].Sequence != proposal.MachineStatusSequence || ownerAttemptCausalityToken(after.State, "o/r", 338, 1) == proposal.OwnerCausalityToken {
+		t.Fatalf("test did not create same-generation lifecycle drift")
+	}
+	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 338, Attempt: 1, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, ExpectedStatusSequence: proposal.MachineStatusSequence, ExpectedCausalityToken: proposal.OwnerCausalityToken, Source: "orchestrator", SourceID: strings.Repeat("a", 64), Status: "needs-attention", Reason: proposal.Detail}); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("owner accepted same-generation stale causality: %v", err)
+	}
+	agent := proposalTestSupervisor(t)
+	writeProposalV2(t, agent, proposal)
 	operator := operatorTestMutationService(t, owner)
 	trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(context.Context) error { return nil })
 	if err != nil {
@@ -155,11 +218,8 @@ func TestSupervisorStatusAdmissionRemainsAcceptedWithoutObservation(t *testing.T
 	if err := service.process(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if status := readProposalStatusV2(t, agent); status.Resolution != "running" {
-		t.Fatalf("durably admitted proposal was not pending: %#v", status)
-	}
-	if status := mustOwnerSnapshot(t, owner).State.MachineStatuses[issueKey]; status.Status != "needs-attention" || status.Sequence != 1 {
-		t.Fatalf("owner status=%#v", status)
+	if status := readProposalStatusV2(t, agent); status.Resolution != "refused" {
+		t.Fatalf("same-generation stale proposal status=%#v", status)
 	}
 }
 

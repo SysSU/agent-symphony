@@ -104,6 +104,7 @@ type MessageProposal struct {
 	IssueGeneration       uint64 `json:"issue_generation,omitempty"`
 	AttemptGeneration     uint64 `json:"attempt_generation,omitempty"`
 	MachineStatusSequence uint64 `json:"machine_status_sequence,omitempty"`
+	OwnerCausalityToken   string `json:"owner_causality_token,omitempty"`
 }
 
 // MessageProposalStatus is the control plane's last live observation of the
@@ -176,6 +177,7 @@ type sanitizedStatus struct {
 	IssueGeneration       uint64             `json:"issue_generation,omitempty"`
 	AttemptGeneration     uint64             `json:"attempt_generation,omitempty"`
 	MachineStatusSequence uint64             `json:"machine_status_sequence,omitempty"`
+	OwnerCausalityToken   string             `json:"owner_causality_token,omitempty"`
 }
 
 type sanitizedSession struct {
@@ -1373,7 +1375,7 @@ func (s *Supervisor) context(mode string) ([]byte, error) {
 	controlCommands, _ := json.Marshal(CoordinatorCLICommands(s.Repository, s.Root))
 	body.WriteString("Use no browser automation for coordinator recovery, lifecycle, or terminal actions. The complete allowed Agent Symphony argv values are ")
 	body.Write(controlCommands)
-	body.WriteString(". Replace `<request-id>` with one new bounded identity per logical control operation and reuse that same identity after a timeout. Replace only `<issue>` and `<attempt>` with the exact positive decimal identity from the current projection; every action and role is already fixed with all required flags. To set or clear machine attention, submit one `status_needs_attention` or `status_clear` proposal through the proposal command with the exact positive `issue_generation`, `attempt_generation`, and `machine_status_sequence` from that same projection and a concise `detail` prefixed `monitoring: `. A busy JSON result is retryable only when it says so; never retry forever. Re-read the authoritative projection after success.\n\nFor an exact active attempt already marked needs-attention, an automatic attention wake may submit `{")
+	body.WriteString(". Replace `<request-id>` with one new bounded identity per logical control operation and reuse that same identity after a timeout. Replace only `<issue>` and `<attempt>` with the exact positive decimal identity from the current projection; every action and role is already fixed with all required flags. To set or clear machine attention, submit one `status_needs_attention` or `status_clear` proposal through the proposal command with the exact positive `issue_generation`, `attempt_generation`, `machine_status_sequence`, and `owner_causality_token` from that same projection and a concise `detail` prefixed `monitoring: `. A busy JSON result is retryable only when it says so; never retry forever. Re-read the authoritative projection after success.\n\nFor an exact active attempt already marked needs-attention, an automatic attention wake may submit `{")
 	body.WriteString("\"version\":1,\"repository\":\"")
 	body.WriteString(s.Repository)
 	body.WriteString("\",\"issue\":123,\"attempt\":1,\"action\":\"check_in_attempt\",\"request_id\":\"unique-1\",\"handoff_id\":\"<64-hex-character-id>\"}` on standard input to ")
@@ -1445,13 +1447,14 @@ func decodeMessageProposal(body []byte, repository string) (MessageProposal, err
 		IssueGeneration       uint64 `json:"issue_generation,omitempty"`
 		AttemptGeneration     uint64 `json:"attempt_generation,omitempty"`
 		MachineStatusSequence uint64 `json:"machine_status_sequence,omitempty"`
+		OwnerCausalityToken   string `json:"owner_causality_token,omitempty"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&submitted) != nil || decoder.Decode(&struct{}{}) != io.EOF || submitted.Version != 1 || submitted.Repository != repository {
 		return MessageProposal{}, errors.New("orchestrator message proposal is invalid")
 	}
-	proposal := MessageProposal{Version: submitted.Version, Repository: submitted.Repository, Issue: submitted.Issue, Attempt: submitted.Attempt, Action: submitted.Action, RequestID: submitted.RequestID, HandoffID: submitted.HandoffID, Detail: submitted.Detail, IssueGeneration: submitted.IssueGeneration, AttemptGeneration: submitted.AttemptGeneration, MachineStatusSequence: submitted.MachineStatusSequence}
+	proposal := MessageProposal{Version: submitted.Version, Repository: submitted.Repository, Issue: submitted.Issue, Attempt: submitted.Attempt, Action: submitted.Action, RequestID: submitted.RequestID, HandoffID: submitted.HandoffID, Detail: submitted.Detail, IssueGeneration: submitted.IssueGeneration, AttemptGeneration: submitted.AttemptGeneration, MachineStatusSequence: submitted.MachineStatusSequence, OwnerCausalityToken: submitted.OwnerCausalityToken}
 	if err := ValidateMessageProposal(proposal); err != nil {
 		return MessageProposal{}, err
 	}
@@ -1637,28 +1640,28 @@ func (s *Supervisor) writeMessageProposalStatus(pending string, state persisted)
 func ValidateMessageProposal(proposal MessageProposal) error {
 	switch proposal.Action {
 	case ProposalActionCheckIn:
-		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) {
+		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || proposal.OwnerCausalityToken != "" || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) {
 			return errors.New("orchestrator monitoring check-in proposal is invalid")
 		}
 		return nil
 	case ProposalActionRetry:
-		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || !validProposalRequestID(proposal.RequestID) || proposal.HandoffID != "" && !validHandoffID(proposal.HandoffID) {
+		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || proposal.OwnerCausalityToken != "" && !validHandoffID(proposal.OwnerCausalityToken) || !validProposalRequestID(proposal.RequestID) || proposal.HandoffID != "" && !validHandoffID(proposal.HandoffID) {
 			return errors.New("orchestrator transition retry proposal is invalid")
 		}
 		return nil
 	case ProposalActionRecover:
-		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) {
+		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.Detail != "" || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || proposal.OwnerCausalityToken != "" || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) {
 			return errors.New("orchestrator attempt recovery proposal is invalid")
 		}
 		return nil
 	case ProposalActionAttention:
-		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) || strings.TrimSpace(proposal.Detail) == "" || len(proposal.Detail) > maxAttentionDetailBytes {
+		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.IssueGeneration != 0 || proposal.AttemptGeneration != 0 || proposal.MachineStatusSequence != 0 || proposal.OwnerCausalityToken != "" || !validProposalRequestID(proposal.RequestID) || !validHandoffID(proposal.HandoffID) || strings.TrimSpace(proposal.Detail) == "" || len(proposal.Detail) > maxAttentionDetailBytes {
 			return errors.New("orchestrator human-attention proposal is invalid")
 		}
 		return nil
 	case ProposalActionStatusSet, ProposalActionStatusClear:
 		detail := strings.TrimSpace(proposal.Detail)
-		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.IssueGeneration == 0 || proposal.AttemptGeneration == 0 || !validProposalRequestID(proposal.RequestID) || proposal.HandoffID != "" && !validHandoffID(proposal.HandoffID) || !strings.HasPrefix(detail, "monitoring: ") || len(detail) > 1024 || strings.ContainsRune(detail, 0) {
+		if proposal.Repository == "" || proposal.Issue < 1 || proposal.Attempt < 1 || proposal.IssueGeneration == 0 || proposal.AttemptGeneration == 0 || !validHandoffID(proposal.OwnerCausalityToken) || !validProposalRequestID(proposal.RequestID) || proposal.HandoffID != "" && !validHandoffID(proposal.HandoffID) || !strings.HasPrefix(detail, "monitoring: ") || len(detail) > 1024 || strings.ContainsRune(detail, 0) {
 			return errors.New("orchestrator machine status proposal is invalid")
 		}
 		return nil
@@ -1736,7 +1739,7 @@ func sanitizeProjection(repository string, statuses []orchestrator.RecoveryStatu
 		if pr < 1 {
 			pr = 0
 		}
-		result = append(result, sanitizedStatus{Repository: repository, Issue: status.Issue, Attempt: status.Attempt, State: clean(status.State, 64), CurrentPhase: clean(status.CurrentPhase, 64), PR: pr, HeadSHA: clean(status.HeadSHA, 64), Sessions: sessions, Blockers: clean(internalgithub.Redact(strings.Join(status.Blockers, "; ")), 512), Diagnostic: clean(internalgithub.Redact(status.Diagnostic), 512), NextAction: clean(status.Action, 512), Retryable: status.Retryable, DispatchAuthorized: status.DispatchAuthorized, NeedsAttention: status.NeedsAttention, IssueGeneration: status.IssueGeneration, AttemptGeneration: status.AttemptGeneration, MachineStatusSequence: status.MachineStatusSequence})
+		result = append(result, sanitizedStatus{Repository: repository, Issue: status.Issue, Attempt: status.Attempt, State: clean(status.State, 64), CurrentPhase: clean(status.CurrentPhase, 64), PR: pr, HeadSHA: clean(status.HeadSHA, 64), Sessions: sessions, Blockers: clean(internalgithub.Redact(strings.Join(status.Blockers, "; ")), 512), Diagnostic: clean(internalgithub.Redact(status.Diagnostic), 512), NextAction: clean(status.Action, 512), Retryable: status.Retryable, DispatchAuthorized: status.DispatchAuthorized, NeedsAttention: status.NeedsAttention, IssueGeneration: status.IssueGeneration, AttemptGeneration: status.AttemptGeneration, MachineStatusSequence: status.MachineStatusSequence, OwnerCausalityToken: status.OwnerCausalityToken})
 	}
 	slices.SortFunc(result, func(a, b sanitizedStatus) int {
 		if a.Issue != b.Issue {
@@ -1915,6 +1918,13 @@ func (s *Supervisor) writeAttentionHandoff(handoff *attentionHandoff) error {
 // coordinator projection. The primary agent cannot authorize from audit prose.
 func (s *Supervisor) ValidateAttentionProposal(proposal MessageProposal, statuses []orchestrator.RecoveryStatus) error {
 	if proposal.HandoffID == "" {
+		items := sanitizeProjection(s.Repository, statuses)
+		index := slices.IndexFunc(items, func(item sanitizedStatus) bool {
+			return item.Repository == proposal.Repository && item.Issue == proposal.Issue && item.Attempt == proposal.Attempt && item.OwnerCausalityToken == proposal.OwnerCausalityToken
+		})
+		if !validHandoffID(proposal.OwnerCausalityToken) || index < 0 {
+			return errors.New("proposal no longer matches the exact owner lifecycle projection")
+		}
 		return nil
 	}
 	_, generation, err := s.reserve(context.Background())

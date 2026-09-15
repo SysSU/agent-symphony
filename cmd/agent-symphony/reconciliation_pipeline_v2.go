@@ -1129,22 +1129,22 @@ func (c *runtimeEffectCoordinator) beginReconciliation(ctx context.Context, plan
 	return plan, nil
 }
 
-func (c *runtimeEffectCoordinator) executeIssueUpdate(_ context.Context, api internalgithub.API, plan reconciliationPlannedEffect) (reconciliationEffectResult, error) {
-	return c.executeIssueUpdateMode(api, plan, false)
+func (c *runtimeEffectCoordinator) executeIssueUpdate(ctx context.Context, api internalgithub.API, plan reconciliationPlannedEffect) (reconciliationEffectResult, error) {
+	return c.executeIssueUpdateMode(ctx, api, plan, false)
 }
 
 func (c *runtimeEffectCoordinator) executeOperatorIssueUpdate(api internalgithub.API, plan reconciliationPlannedEffect) (reconciliationEffectResult, error) {
-	return c.executeIssueUpdateMode(api, plan, true)
+	return c.executeIssueUpdateMode(c.lifecycle, api, plan, true)
 }
 
-func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API, plan reconciliationPlannedEffect, operator bool) (reconciliationEffectResult, error) {
+func (c *runtimeEffectCoordinator) executeIssueUpdateMode(ctx context.Context, api internalgithub.API, plan reconciliationPlannedEffect, operator bool) (reconciliationEffectResult, error) {
 	request := plan.Request
 	if request.Action != reconciliationGitHubIssueUpdate || request.GitHubIssueUpdate == nil || issueUpdateExecutionDigest(request, plan.Material) != request.ExecutionDigest {
 		return reconciliationEffectResult{}, errStateConflict
 	}
 	issueScoped := reconciliationEffectIssueScoped(request)
 	key, attemptGeneration := ownerIssueKey(request.Repository, request.Issue), uint64(0)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, attemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
+	run, err := c.acquireKey(ctx, key, plan.Identity.IssueGeneration, attemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}

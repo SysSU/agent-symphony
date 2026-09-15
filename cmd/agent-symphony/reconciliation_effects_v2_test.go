@@ -42,7 +42,7 @@ func testBlockedMachineStatusConvergence(t *testing.T, desired, action string) {
 	service.collector.Config.ActorID = 42
 	snapshot := mustOwnerSnapshot(t, owner)
 	issueKey, attemptKey := ownerIssueKey("o/r", 333), ownerAttemptKey("o/r", 333, 1)
-	snapshot, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], Source: "orchestrator", SourceID: "blocked-write", Status: desired, Reason: "monitoring: blocked write"})
+	snapshot, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: snapshot.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], ExpectedCausalityToken: ownerAttemptCausalityToken(snapshot.State, "o/r", 333, 1), Source: "orchestrator", SourceID: "blocked-write", Status: desired, Reason: "monitoring: blocked write"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,8 +230,8 @@ func TestWorkerStatusOutcomeCannotApplyOutOfOrderOrAfterInvalidation(t *testing.
 	state := newRuntimeOwnerState("o/r")
 	state.IssueGenerations[issueKey], state.AttemptGenerations[key] = 1, 1
 	state.Attempts[key] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
-	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 2, Source: "worker", SourceID: "worker-7", SourceSequence: 2, Status: "needs-attention", Reason: "operator decision required"}
-	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 329, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueMachineStatus, AttributionAttempt: 1, Status: "needs-attention", StatusReason: "operator decision required", StatusSequence: 2, StatusSource: "worker", StatusSourceSequence: 2}}
+	state.MachineStatuses[issueKey] = machineStatusRecord{Repository: "o/r", Issue: 329, Attempt: 1, IssueGeneration: 1, AttemptGeneration: 1, Sequence: 2, Source: "worker", SourceID: "worker-7", SourceSequence: 7, Status: "needs-attention", Reason: "operator decision required"}
+	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 329, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueMachineStatus, AttributionAttempt: 1, Status: "needs-attention", StatusReason: "operator decision required", StatusSequence: 2, StatusSource: "worker", StatusSourceSequence: 7}}
 	result := reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueMachineStatus, Observed: true}}
 	if err := applyReconciliationEffectOutcome(&state, request, result); err != nil || state.MachineStatuses[issueKey].AppliedSequence != 2 || state.Attempts[key].Manifest.WorkerStatusApplied != 7 {
 		t.Fatalf("current status outcome failed: status=%#v err=%v", state.MachineStatuses[issueKey], err)

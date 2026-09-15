@@ -321,7 +321,7 @@ func (c *runtimeEffectCoordinator) acquireKey(ctx context.Context, key string, i
 		}
 		previous := c.active[key]
 		if previous == nil {
-			runCtx, cancel := context.WithCancel(c.lifecycle)
+			runCtx, cancel := context.WithCancel(ctx)
 			run := &activeRuntimeEffect{issueGeneration: issueGeneration, attemptGeneration: attemptGeneration, observationGeneration: observationGeneration, admittedRevision: admitted.State.Revision, ctx: runCtx, cancel: cancel, done: make(chan struct{})}
 			if len(effectID) != 0 {
 				run.effectID = effectID[0]

@@ -62,6 +62,7 @@ type RecoveryStatus struct {
 	IssueGeneration       uint64           `json:"issue_generation,omitempty"`
 	AttemptGeneration     uint64           `json:"attempt_generation,omitempty"`
 	MachineStatusSequence uint64           `json:"machine_status_sequence,omitempty"`
+	OwnerCausalityToken   string           `json:"owner_causality_token,omitempty"`
 }
 
 type AttemptSession struct {

@@ -103,7 +103,7 @@ func (s *supervisorProposalServiceV2) process(ctx context.Context) error {
 			status = "needs-attention"
 		}
 		var admitted stateOwnerSnapshot
-		admitted, err = s.owner.admitMachineStatus(ctx, admitMachineStatusCommand{Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, ExpectedStatusSequence: proposal.MachineStatusSequence, Source: "orchestrator", SourceID: proposal.Binding, Status: status, Reason: proposal.Detail})
+		admitted, err = s.owner.admitMachineStatus(ctx, admitMachineStatusCommand{Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, ExpectedStatusSequence: proposal.MachineStatusSequence, ExpectedCausalityToken: proposal.OwnerCausalityToken, Source: "orchestrator", SourceID: proposal.Binding, Status: status, Reason: proposal.Detail})
 		if err == nil {
 			plans, planErr := planMachineStatusUpdates(admitted, s.operator.collector.Config)
 			err = planErr
@@ -139,21 +139,52 @@ func (s *supervisorProposalServiceV2) process(ctx context.Context) error {
 		}
 		succeeded = "the generation-bound monitoring check-in was delivered and durably recorded"
 	case orchestratoragent.ProposalActionStatusSet, orchestratoragent.ProposalActionStatusClear:
+		statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
 		if machineStatus.Request.Action == "" {
-			return nil
+			err = s.trigger.triggerAndWait(statusCtx)
+			if err == nil {
+				var refreshed stateOwnerSnapshot
+				refreshed, err = s.owner.snapshot(statusCtx)
+				if err == nil {
+					var plans []reconciliationPlannedEffect
+					plans, err = planMachineStatusUpdates(refreshed, s.operator.collector.Config)
+					if err == nil && len(plans) != 0 {
+						machineStatus = plans[0]
+					} else if err == nil && !supervisorStatusObserved(refreshed, proposal) {
+						err = errors.New("owner status intent has no current external observation")
+					}
+				}
+			}
 		}
-		if machineStatus, err = s.effects.beginReconciliation(ctx, machineStatus); err == nil {
-			_, err = s.effects.executeIssueUpdate(ctx, s.operator.collector.API, machineStatus)
+		if err == nil && machineStatus.Request.Action != "" {
+			machineStatus, err = s.effects.beginReconciliation(statusCtx, machineStatus)
+		}
+		if err == nil && machineStatus.Request.Action != "" {
+			_, err = s.effects.executeIssueUpdate(statusCtx, s.operator.collector.API, machineStatus)
+		}
+		if err == nil {
+			var verified stateOwnerSnapshot
+			verified, err = s.owner.snapshot(statusCtx)
+			if err == nil && !supervisorStatusObserved(verified, proposal) {
+				err = errors.New("owner status marker was not durably observed")
+			}
 		}
 		succeeded = "the owner-issued machine status was observed on GitHub"
 	}
 	if err != nil {
-		if proposal.Action == orchestratoragent.ProposalActionStatusSet || proposal.Action == orchestratoragent.ProposalActionStatusClear {
-			return err
-		}
 		return errors.Join(err, s.resolve(ctx, proposal.Binding, "failed", err))
 	}
 	return s.agent.ResolveMessageProposal(ctx, proposal.Binding, "succeeded", succeeded)
+}
+
+func supervisorStatusObserved(snapshot stateOwnerSnapshot, proposal orchestratoragent.MessageProposal) bool {
+	status, ok := snapshot.State.MachineStatuses[ownerIssueKey(proposal.Repository, proposal.Issue)]
+	want := "clear"
+	if proposal.Action == orchestratoragent.ProposalActionStatusSet {
+		want = "needs-attention"
+	}
+	return ok && status.Source == "orchestrator" && status.SourceID == proposal.Binding && status.Attempt == proposal.Attempt && status.IssueGeneration == proposal.IssueGeneration && status.AttemptGeneration == proposal.AttemptGeneration && status.Status == want && status.Reason == proposal.Detail && status.AppliedSequence == status.Sequence
 }
 
 func (s *supervisorProposalServiceV2) resolve(ctx context.Context, binding, resolution string, cause error) error {

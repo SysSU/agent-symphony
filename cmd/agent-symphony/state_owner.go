@@ -372,6 +372,8 @@ type admitMachineStatusCommand struct {
 	Dependency, PullRequest       int
 	Source                        string
 	SourceID                      string
+	SourceSequence                uint64
+	ExpectedCausalityToken        string
 	Status, Reason                string
 }
 
@@ -1484,9 +1486,11 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 				Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt,
 				ExpectedIssueGeneration: identity.IssueGeneration, ExpectedAttemptGeneration: identity.AttemptGeneration,
 				ExpectedStatusSequence: effect.MachineStatusSequence,
-				Source:                 "worker", SourceID: fmt.Sprintf("%d:%d", identity.AttemptGeneration, manifest.WorkerStatusSeq), Status: manifest.WorkerStatus, Reason: manifest.WorkerStatusReason,
+				Source:                 "worker", SourceID: fmt.Sprintf("%d:%d", identity.AttemptGeneration, manifest.WorkerStatusSeq), SourceSequence: manifest.WorkerStatusSeq, Status: manifest.WorkerStatus, Reason: manifest.WorkerStatusReason,
 			}); err != nil {
-				return err
+				if !errors.Is(err, errStaleStateResult) {
+					return err
+				}
 			}
 		}
 	} else {
@@ -2172,7 +2176,7 @@ func applyAdmitMachineStatus(state *runtimeOwnerState, command admitMachineStatu
 	if command.Repository != state.Repository || command.Issue < 1 || command.Attempt < 1 ||
 		state.IssueGenerations[issueKey] != command.ExpectedIssueGeneration || command.ExpectedIssueGeneration == 0 ||
 		!slices.Contains([]string{"worker", "dependency", "orchestrator", "destructive"}, command.Source) ||
-		!boundedText(command.SourceID, 128, true) || !slices.Contains([]string{"needs-attention", "clear"}, command.Status) ||
+		!boundedText(command.SourceID, 128, true) || command.Source == "worker" && command.SourceSequence == 0 || command.Source != "worker" && command.SourceSequence != 0 || !slices.Contains([]string{"needs-attention", "clear"}, command.Status) ||
 		!boundedText(command.Reason, 1024, true) {
 		return errStaleStateResult
 	}
@@ -2197,6 +2201,13 @@ func applyAdmitMachineStatus(state *runtimeOwnerState, command admitMachineStatu
 	if current.Repository != "" && current.Source == command.Source && current.SourceID == command.SourceID && current.Attempt == command.Attempt && current.AttemptGeneration == command.ExpectedAttemptGeneration && current.Status == command.Status && current.Reason == command.Reason {
 		return nil
 	}
+	if command.Source == "orchestrator" {
+		if !validDigest(command.ExpectedCausalityToken) || ownerAttemptCausalityToken(*state, command.Repository, command.Issue, command.Attempt) != command.ExpectedCausalityToken {
+			return errStaleStateResult
+		}
+	} else if command.ExpectedCausalityToken != "" {
+		return errStaleStateResult
+	}
 	if current.Sequence != command.ExpectedStatusSequence {
 		return errStaleStateResult
 	}
@@ -2206,6 +2217,10 @@ func applyAdmitMachineStatus(state *runtimeOwnerState, command admitMachineStatu
 	sequence := current.Sequence + 1
 	if sequence == 0 {
 		sequence = 1
+	}
+	sourceSequence := sequence
+	if command.Source == "worker" {
+		sourceSequence = command.SourceSequence
 	}
 	for id, effect := range state.Effects {
 		request := effect.Reconciliation
@@ -2223,9 +2238,30 @@ func applyAdmitMachineStatus(state *runtimeOwnerState, command admitMachineStatu
 		Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt,
 		IssueGeneration: command.ExpectedIssueGeneration, AttemptGeneration: command.ExpectedAttemptGeneration,
 		Sequence: sequence, AppliedSequence: current.AppliedSequence, Source: command.Source,
-		SourceID: command.SourceID, SourceSequence: sequence, Status: command.Status, Reason: strings.TrimSpace(command.Reason),
+		SourceID: command.SourceID, SourceSequence: sourceSequence, Status: command.Status, Reason: strings.TrimSpace(command.Reason),
 	}
 	return nil
+}
+
+func ownerAttemptCausalityToken(state runtimeOwnerState, repository string, issue, attempt int) string {
+	issueKey, attemptKey := ownerIssueKey(repository, issue), ownerAttemptKey(repository, issue, attempt)
+	var effects []runtimeEffectIntent
+	for _, effect := range state.Effects {
+		if effect.Repository == repository && effect.Issue == issue && (effect.Attempt == 0 || effect.Attempt == attempt) {
+			effects = append(effects, effect)
+		}
+	}
+	slices.SortFunc(effects, func(a, b runtimeEffectIntent) int { return strings.Compare(a.ID, b.ID) })
+	body, _ := json.Marshal(struct {
+		IssueGeneration, AttemptGeneration uint64
+		Attempt                            runtimeAttemptRecord
+		Observation                        reconciliationObservation
+		Recovery                           runtimePRRecovery
+		Tombstone                          runtimeTombstone
+		Status                             machineStatusRecord
+		Effects                            []runtimeEffectIntent
+	}{state.IssueGenerations[issueKey], state.AttemptGenerations[attemptKey], state.Attempts[attemptKey], state.Observations[issueKey], state.Recoveries[attemptKey], state.Tombstones[attemptKey], state.MachineStatuses[issueKey], effects})
+	return digestText(string(body))
 }
 
 func validWorkerSealSelection(stateRoot string, manifest agentruntime.Manifest, generation uint64, selection workerSealSelection) bool {
@@ -2426,7 +2462,9 @@ func migrateLegacyMachineStatuses(state *runtimeOwnerState) {
 			if status.SourceID == "" {
 				status.SourceID = fmt.Sprintf("legacy:%s:%d", status.Source, status.SourceSequence)
 			}
-			status.SourceSequence = status.Sequence
+			if status.Source != "worker" {
+				status.SourceSequence = status.Sequence
+			}
 			state.MachineStatuses[key] = status
 		}
 		return
@@ -2442,7 +2480,7 @@ func migrateLegacyMachineStatuses(state *runtimeOwnerState) {
 		if current.Repository != "" && current.Attempt >= manifest.Attempt {
 			continue
 		}
-		state.MachineStatuses[issueKey] = machineStatusRecord{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: state.AttemptGenerations[key], Sequence: 1, Source: "worker", SourceID: fmt.Sprintf("legacy:worker:%d", manifest.WorkerStatusSeq), SourceSequence: 1, Status: manifest.WorkerStatus, Reason: strings.TrimSpace(manifest.WorkerStatusReason)}
+		state.MachineStatuses[issueKey] = machineStatusRecord{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: state.AttemptGenerations[key], Sequence: 1, Source: "worker", SourceID: fmt.Sprintf("legacy:worker:%d", manifest.WorkerStatusSeq), SourceSequence: manifest.WorkerStatusSeq, Status: manifest.WorkerStatus, Reason: strings.TrimSpace(manifest.WorkerStatusReason)}
 	}
 	for id, effect := range state.Effects {
 		if effect.Reconciliation != nil && effect.Reconciliation.GitHubIssueUpdate != nil && effect.Reconciliation.GitHubIssueUpdate.Kind == githubIssueMachineStatus && effect.Attempt > 0 {
