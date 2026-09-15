@@ -291,7 +291,7 @@ func TestRuntimeEffectsSerializeSameAttemptAndOverlapDifferentAttempts(t *testin
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
-	runner := &barrierEffectRunner{entered: make(chan struct{}, 2), release: make(chan struct{})}
+	runner := &barrierEffectRunner{entered: make(chan struct{}, 2), release: make(chan struct{}), blockMissingSession: true}
 	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: root, Runner: runner, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
 	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState, Cleanup: func(context.Context, agentruntime.EffectRequest) error { return nil }, VerifyCleanup: func(context.Context, agentruntime.EffectRequest) (bool, error) { return true, nil }})
 	if err != nil {
@@ -313,6 +313,48 @@ func TestRuntimeEffectsSerializeSameAttemptAndOverlapDifferentAttempts(t *testin
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConcurrentIdenticalStartDispatchDoesNotLaunchAfterCompletion(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 75, 1, "preparing")
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
+	owner, err := startTestStateOwner(t, root, runtimeEffectInitialState(manifest), func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	runner := &barrierEffectRunner{}
+	runtimeState := &agentruntime.Runtime{Root: productionAttemptRoot(root), StateRoot: root, Runner: runner, Tmux: "tmux", Helper: "agent-symphony-helper", VerifyWorker: func(context.Context) error { return nil }}
+	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := beginRuntimeTestEffect(t, coordinator, owner, agentruntime.EffectStart, manifest, "")
+	first, err := coordinator.acquire(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		_, executeErr := coordinator.execute(t.Context(), request)
+		secondDone <- executeErr
+	}()
+	if err := owner.authorizeRuntimeEffect(t.Context(), authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: agentruntime.EffectStart, GateNonce: request.GateNonce}); err != nil {
+		t.Fatal(err)
+	}
+	running := cloneManifest(manifest)
+	running.State, running.LaunchID = "running", request.GateNonce
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: agentruntime.EffectStart, Manifest: running}); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.release(request, first)
+	if err := <-secondDone; !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("duplicate Start dispatch result=%v", err)
+	}
+	if calls := runner.calls.Load(); calls != 0 {
+		t.Fatalf("duplicate completed Start performed %d external calls", calls)
 	}
 }
 
@@ -815,11 +857,12 @@ func (r *monitorSequenceRunner) Run(_ context.Context, command agentruntime.Comm
 }
 
 type barrierEffectRunner struct {
-	entered chan struct{}
-	release chan struct{}
-	calls   atomic.Int32
-	blocked atomic.Int32
-	pane    *agentruntime.ImplementationPane
+	entered             chan struct{}
+	release             chan struct{}
+	calls               atomic.Int32
+	blocked             atomic.Int32
+	pane                *agentruntime.ImplementationPane
+	blockMissingSession bool
 }
 
 func (r *barrierEffectRunner) Run(ctx context.Context, command agentruntime.Command) (agentruntime.Result, error) {
@@ -831,7 +874,7 @@ func (r *barrierEffectRunner) Run(ctx context.Context, command agentruntime.Comm
 	if r.pane != nil && len(command.Args) > 0 && command.Args[0] == "list-panes" {
 		return agentruntime.Result{Output: fmt.Sprintf("%d|%d|%%999\n", r.pane.ServerPID, r.pane.ServerStart)}, nil
 	}
-	if len(command.Args) > 0 && command.Args[0] == "has-session" {
+	if len(command.Args) > 0 && command.Args[0] == "has-session" && !r.blockMissingSession {
 		return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
 	}
 	r.blocked.Add(1)
@@ -844,6 +887,9 @@ func (r *barrierEffectRunner) Run(ctx context.Context, command agentruntime.Comm
 		case <-ctx.Done():
 			return agentruntime.Result{}, ctx.Err()
 		}
+	}
+	if len(command.Args) > 0 && command.Args[0] == "has-session" {
+		return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
 	}
 	return agentruntime.Result{Output: "0||||\n"}, nil
 }
