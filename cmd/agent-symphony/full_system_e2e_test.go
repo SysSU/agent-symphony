@@ -144,6 +144,16 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				writeFixtureJSON(w, f.historicalComments[number])
 				return
 			}
+			if r.Method == http.MethodPost && path == prefix+"/comments" {
+				var input map[string]string
+				_ = json.NewDecoder(r.Body).Decode(&input)
+				created := time.Now().UTC().Format(time.RFC3339Nano)
+				comments := f.historicalComments[number]
+				comment := map[string]any{"id": nextFixtureCommentID(comments), "body": input["body"], "created_at": created, "updated_at": created, "user": map[string]any{"id": 42}}
+				f.historicalComments[number] = append(comments, comment)
+				writeFixtureStatusJSON(w, http.StatusCreated, comment)
+				return
+			}
 			if r.Method == http.MethodGet && (path == prefix+"/timeline" || path == prefix+"/events") {
 				writeFixtureJSON(w, []any{})
 				return
@@ -1272,7 +1282,7 @@ func main() {
 
 func removeFullSystemFixtureRoot(root string) error {
 	base := filepath.Base(root)
-	if !strings.HasPrefix(base, ".as-lifecycle-") && !strings.HasPrefix(base, ".agent-symphony-full-system-") {
+	if !strings.HasPrefix(base, ".as-lifecycle-") && !strings.HasPrefix(base, ".agent-symphony-full-system-") && !strings.HasPrefix(base, ".agent-symphony-orchestrator-e2e-") && !strings.HasPrefix(base, ".agent-symphony-historical-actions-") {
 		return fmt.Errorf("refusing to remove unexpected fixture root %q", root)
 	}
 	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
