@@ -147,7 +147,7 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 			if effect.ReviewerLaunched {
 				phase = "running"
 			}
-			session := orchestrator.AttemptSession{Role: agentruntime.SessionRoleReviewer, Name: reviewer.Session, State: phase, Mode: reviewer.Mode, Target: reviewer.Target, Current: true}
+			session := orchestrator.AttemptSession{Role: agentruntime.SessionRoleReviewer, Name: reviewer.Session, State: phase, Mode: reviewer.Mode, Target: reviewer.Target, RunID: reviewer.RunID, Current: true}
 			replaced := false
 			for i := range status.Sessions {
 				status.Sessions[i].Current = false
@@ -223,6 +223,11 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 	// A historical cleanup may have removed the attempt from ordinary recovery
 	// projection. Keep its unresolved physical safety lease visible anyway.
 	for _, tombstone := range snapshot.State.Tombstones {
+		// Dismiss is the explicit hide action. Its durable cleanup receipt remains
+		// queryable, but it must never resurrect the attempt as an active card.
+		if tombstone.Action == "dismissed" {
+			continue
+		}
 		diagnostic := legacyReviewerDiagnostic(snapshot.State, tombstone.Repository, tombstone.Issue, tombstone.Attempt)
 		if issueHasUnresolvedExternalEffect(snapshot.State, tombstone.Repository, tombstone.Issue) {
 			if diagnostic != "" {

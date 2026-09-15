@@ -30,7 +30,7 @@ const (
 func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwnerState, command beginOperatorMutationCommand) (*runtimeEffectIntent, error) {
 	request := command.Request
 	if !validOperatorRequest(request, state.Repository) {
-		return nil, errStateConflict
+		return nil, errors.Join(errors.New("validate operator request"), errStateConflict)
 	}
 	if receipt, ok := operatorReceiptByID(*state, request.RequestID); ok {
 		if receipt.Request != request {
@@ -51,7 +51,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 	}
 	manifest := cloneManifest(command.Manifest)
 	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || manifest.Issue != request.Issue || manifest.Attempt != request.Attempt {
-		return nil, errStateConflict
+		return nil, errors.Join(errors.New("validate operator manifest"), errStateConflict)
 	}
 	tombstone, tombstoned := state.Tombstones[attemptKey]
 	if tombstoned {
@@ -91,7 +91,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 	}
 	status, statuses, err := ownerOperatorStatus(*state, request.Issue, request.Attempt)
 	if err != nil {
-		return nil, errStateConflict
+		return nil, errors.Join(errors.New("project current operator status"), errStateConflict)
 	}
 	if absentOrphan {
 		if status.State != "orphaned" {
@@ -103,7 +103,9 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 	phase := operatorPhaseCompleted
 	switch request.Action {
 	case "dismiss":
-		if !command.IssueClosed || !canDismissClosedAttempt(status) || command.CleanupDigest != "" || command.CleanupPolicy != (agentruntime.EffectCleanupPolicy{}) || command.PublishedHead != "" || command.Runtime != nil || command.Reconciliation != nil {
+		// The admission's direct GitHub read is newer than the status replica.
+		status.IssueClosed = command.IssueClosed
+		if !command.IssueClosed || !canDismissClosedAttempt(status) || !command.CleanupValid || !agentruntime.ValidEffectRequestDigest(command.CleanupDigest) || command.CleanupPolicy.Action != request.Action || command.CleanupPolicy.PublishedHead != "" || command.PublishedHead != "" || command.Runtime != nil || command.Reconciliation != nil {
 			return nil, errStateConflict
 		}
 		reviewer, reviewerErr := pendingReviewerEffect(*state, request.Repository, request.Issue, request.Attempt)
@@ -115,26 +117,25 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 			return nil, leaseErr
 		}
 		supersedePendingOperatorWorkflows(state, request.Repository, request.Issue, request.Attempt, request.Action)
-		cleanupPhase := "completed"
-		if leaseID != "" {
-			cleanupPhase = "pending"
-		}
-		_, err = applyInvalidateAttempt(attemptRoot, stateRoot, state, invalidateAttemptCommand{
+		policy := command.CleanupPolicy
+		effect, err = applyInvalidateAttempt(attemptRoot, stateRoot, state, invalidateAttemptCommand{
 			Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt,
 			ExpectedIssueGeneration: command.Identity.IssueGeneration, ExpectedAttemptGeneration: command.Identity.AttemptGeneration,
-			Action: "dismissed", CleanupPhase: cleanupPhase, Manifest: &manifest,
+			Action: "dismissed", CleanupPhase: "pending", Manifest: &manifest, CleanupPolicy: &policy,
+			EffectAction: string(agentruntime.EffectCleanup), EffectRequestDigest: command.CleanupDigest,
 		})
-		if err == nil {
+		if err == nil && effect != nil {
+			bindSupersededReviewer(effect, reviewer)
 			tombstone := state.Tombstones[attemptKey]
-			if leaseID != "" {
-				tombstone.ReviewerLeaseID = leaseID
-				tombstone.Diagnostic = "reviewer descendant absence is unproved; physical cleanup remains pending"
-				state.Tombstones[attemptKey] = tombstone
-			}
+			tombstone.ReviewerLeaseID = leaseID
+			tombstone.Diagnostic = "reviewer cleanup remains pending"
+			state.Tombstones[attemptKey] = tombstone
 			if tombstone.InvalidatedStart != nil {
 				phase = operatorPhaseStartCleanup
 			} else if tombstone.InvalidatedHandoff != nil {
 				phase = operatorPhaseHandoffCleanup
+			} else {
+				phase = operatorPhaseCleanupPending
 			}
 		}
 	case "archive", "abandon", "remove":
@@ -223,17 +224,29 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		}
 	case "review-plan":
 		if command.Reconciliation == nil || command.Runtime != nil || command.CleanupDigest != "" || command.PublishedHead != "" {
-			return nil, errStateConflict
+			return nil, errors.Join(errors.New("review-plan command shape"), errStateConflict)
 		}
 		if manifest.State != "running" || command.Reconciliation.Request.Action != reconciliationReviewer || command.Reconciliation.Request.Reviewer == nil || command.Reconciliation.Request.Reviewer.Mode != agentruntime.ReviewModePlan {
-			return nil, errStateConflict
+			return nil, errors.Join(errors.New("review-plan runtime state"), errStateConflict)
 		}
 		begin := *command.Reconciliation
 		if !sameOperatorBeginIdentity(begin.Identity, command.Identity) {
 			return nil, errStaleStateResult
 		}
+		if state.Revision == ^uint64(0) {
+			return nil, errors.New("runtime revision overflow")
+		}
+		admissionRevision := state.Revision + 1
+		reviewer := *begin.Request.Reviewer
+		reviewer.RunID = reviewerRunID(state.Epoch, admissionRevision, command.Identity.IssueGeneration, command.Identity.AttemptGeneration, request.Repository, request.Issue, request.Attempt, reviewer.Mode, reviewer.Target)
+		reviewer.Snapshot, reviewer.Session = reviewRunIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot), reviewer.Target, reviewer.RunID)
+		begin.Request.Reviewer = &reviewer
+		begin.ReviewerSourceRevision = admissionRevision
 		begin.Identity.SourceRevision = state.Revision
 		effect, err = applyBeginReconciliationEffect(attemptRoot, stateRoot, state, begin)
+		if err != nil {
+			return nil, errors.Join(errors.New("finalize current reviewer admission"), err)
+		}
 		phase = operatorPhaseReviewPending
 	default:
 		return nil, errStateConflict
@@ -456,16 +469,16 @@ func retainReviewerLease(state *runtimeOwnerState, repository string, issue, att
 		}
 		if !exists {
 			neverRan := pending.ReviewerGateProtocol && !pending.ReviewerSessionRequested && !pending.ReviewerLaunched && pending.ReviewerGroupPID == 0
-			proof = reviewerProcessProof{Repository: repository, Issue: issue, Attempt: attempt, Mode: reviewer.Mode, Target: reviewer.Target, EffectID: pending.ID, IssueGeneration: pending.IssueGeneration, AttemptGeneration: pending.AttemptGeneration, GroupPID: pending.ReviewerGroupPID, DeadProved: neverRan, NeverRan: neverRan, ProfileDigest: pending.ReviewerProfileDigest}
+			proof = reviewerProcessProof{Repository: repository, Issue: issue, Attempt: attempt, Mode: reviewer.Mode, Target: reviewer.Target, RunID: reviewer.RunID, EffectID: pending.ID, IssueGeneration: pending.IssueGeneration, AttemptGeneration: pending.AttemptGeneration, GroupPID: pending.ReviewerGroupPID, DeadProved: neverRan, NeverRan: neverRan, ProfileDigest: pending.ReviewerProfileDigest, ConfinementVersion: pending.ReviewerConfinementVersion}
 			state.ReviewerProofs[key] = proof
 		}
 	}
 	leaseID := ""
 	for key, proof := range state.ReviewerProofs {
-		if proof.Repository != repository || proof.Issue != issue || proof.Attempt != attempt || proof.NeverRan {
+		if proof.Repository != repository || proof.Issue != issue || proof.Attempt != attempt || reviewerCleanupAuthorized(proof, activeWorkerProfileDigest(*state)) {
 			continue
 		}
-		if proof.DeadProved {
+		if !reviewerCleanupAuthorized(proof, activeWorkerProfileDigest(*state)) && proof.DeadProved && proof.LegacyUnverified {
 			proof.DeadProved = false // Old group-only certificates do not prove descendant death.
 			state.ReviewerProofs[key] = proof
 		}
@@ -485,8 +498,11 @@ func bindSupersededReviewer(effect *runtimeEffectIntent, reviewer runtimeEffectI
 	effect.SupersededReviewerGateProtocol = reviewer.ReviewerGateProtocol
 	effect.SupersededReviewerSessionRequested = reviewer.ReviewerSessionRequested
 	effect.SupersededReviewerRequestDigest = reviewer.RequestDigest
+	effect.SupersededReviewerProfileDigest = reviewer.ReviewerProfileDigest
+	effect.SupersededReviewerConfinementVersion = reviewer.ReviewerConfinementVersion
 	effect.SupersededReviewerMode = reviewer.Reconciliation.Reviewer.Mode
 	effect.SupersededReviewerTarget = reviewer.Reconciliation.Reviewer.Target
+	effect.SupersededReviewerRunID = reviewer.Reconciliation.Reviewer.RunID
 	effect.SupersededReviewerIssueGeneration = reviewer.IssueGeneration
 	effect.SupersededReviewerAttemptGeneration = reviewer.AttemptGeneration
 }
@@ -512,33 +528,28 @@ func replayOperatorTombstone(state *runtimeOwnerState, request controlRequest, m
 		return nil, errStateConflict
 	}
 	if request.Action == "dismiss" {
-		if cleanupDigest != "" || cleanupPolicy != (agentruntime.EffectCleanupPolicy{}) || tombstone.EffectID != "" || tombstone.CleanupPolicy != nil {
-			return nil, errStateConflict
-		}
 		if tombstone.InvalidatedStart != nil {
-			if err := appendOperatorReceipt(state, controlReceipt{Request: request, State: "pending", Phase: operatorPhaseStartCleanup}); err != nil {
+			if err := appendOperatorReceipt(state, controlReceipt{Request: request, State: "pending", Phase: operatorPhaseStartCleanup, EffectID: tombstone.EffectID}); err != nil {
 				return nil, err
 			}
 			return nil, nil
 		}
 		if tombstone.InvalidatedHandoff != nil && !tombstone.HandoffCompensated {
-			if err := appendOperatorReceipt(state, controlReceipt{Request: request, State: "pending", Phase: operatorPhaseHandoffCleanup}); err != nil {
+			if err := appendOperatorReceipt(state, controlReceipt{Request: request, State: "pending", Phase: operatorPhaseHandoffCleanup, EffectID: tombstone.EffectID}); err != nil {
 				return nil, err
 			}
 			return nil, nil
 		}
-		result := successfulOperatorResult(request, 0)
-		if tombstone.ReviewerLeaseID != "" {
-			result = pendingReviewerResult(request, 0, tombstone.Diagnostic)
-		} else if diagnostic := legacyReviewerDiagnostic(*state, request.Repository, request.Issue, request.Attempt); diagnostic != "" {
-			result = pendingReviewerResult(request, 0, diagnostic)
+		if tombstone.EffectID == "" {
+			if cleanupDigest != "" || cleanupPolicy != (agentruntime.EffectCleanupPolicy{}) || tombstone.CleanupPolicy != nil || tombstone.CleanupPhase != "completed" {
+				return nil, errStateConflict
+			}
+			return nil, appendOperatorReceipt(state, controlReceipt{Request: request, State: "completed", Phase: operatorPhaseCompleted, Result: successfulOperatorResult(request, 0)})
 		}
-		return nil, appendOperatorReceipt(state, controlReceipt{Request: request, State: "completed", Phase: operatorPhaseCompleted, Result: result})
-	} else {
-		effect, ok := state.Effects[tombstone.EffectID]
-		if !ok || effect.Action != string(agentruntime.EffectCleanup) || effect.RequestDigest != cleanupDigest || tombstone.CleanupPolicy == nil || *tombstone.CleanupPolicy != cleanupPolicy {
-			return nil, errStateConflict
-		}
+	}
+	effect, ok := state.Effects[tombstone.EffectID]
+	if !ok || effect.Action != string(agentruntime.EffectCleanup) || effect.RequestDigest != cleanupDigest || tombstone.CleanupPolicy == nil || *tombstone.CleanupPolicy != cleanupPolicy {
+		return nil, errStateConflict
 	}
 	if tombstone.CleanupPhase == "completed" {
 		result := successfulOperatorResult(request, 0)
@@ -548,8 +559,7 @@ func replayOperatorTombstone(state *runtimeOwnerState, request controlRequest, m
 		receipt := controlReceipt{Request: request, State: "completed", Phase: operatorPhaseCompleted, EffectID: tombstone.EffectID, Result: result}
 		return nil, appendOperatorReceipt(state, receipt)
 	}
-	effect, ok := state.Effects[tombstone.EffectID]
-	if !ok || effect.State != "pending" || effect.Action != string(agentruntime.EffectCleanup) {
+	if effect.State != "pending" {
 		return nil, errStateConflict
 	}
 	phase := operatorPhaseCleanupPending
@@ -682,7 +692,13 @@ func operatorTombstoneAction(action string) string {
 
 func validTombstoneCleanupPolicy(tombstone runtimeTombstone) bool {
 	if tombstone.Action == "dismissed" {
-		return tombstone.CleanupPolicy == nil && tombstone.PublishedHead == "" && tombstone.EffectID == "" && (tombstone.CleanupPhase == "completed" && tombstone.ReviewerLeaseID == "" || tombstone.CleanupPhase == "pending" && tombstone.ReviewerLeaseID != "")
+		if tombstone.PublishedHead != "" {
+			return false
+		}
+		if tombstone.EffectID == "" {
+			return tombstone.CleanupPolicy == nil && tombstone.CleanupPhase == "completed" && tombstone.ReviewerLeaseID == ""
+		}
+		return tombstone.CleanupPolicy != nil && tombstone.CleanupPolicy.Action == "dismiss" && tombstone.CleanupPolicy.PublishedHead == ""
 	}
 	if tombstone.ReviewerLeaseID != "" {
 		return false
@@ -744,10 +760,8 @@ func validOperatorReceiptBinding(receipt controlReceipt) bool {
 	if receipt.State == "completed" {
 		return receipt.Phase == operatorPhaseCompleted && receipt.Result != nil && receipt.Diagnostic == ""
 	}
-	if receipt.Request.Action == "dismiss" && (receipt.Phase == operatorPhaseHandoffCleanup || receipt.Phase == operatorPhaseStartCleanup) {
-		return receipt.State == "pending" && receipt.EffectID == "" && receipt.Result == nil && boundedText(receipt.Diagnostic, maxReconciliationStringBytes, false)
-	}
-	return receipt.State == "pending" && receipt.Phase != operatorPhaseCompleted && receipt.EffectID != "" && receipt.Result == nil && boundedText(receipt.Diagnostic, maxReconciliationStringBytes, false)
+	legacyHandoff := receipt.Request.Action == "dismiss" && receipt.Phase == operatorPhaseHandoffCleanup && receipt.EffectID == ""
+	return receipt.State == "pending" && receipt.Phase != operatorPhaseCompleted && (receipt.EffectID != "" || legacyHandoff) && receipt.Result == nil && boundedText(receipt.Diagnostic, maxReconciliationStringBytes, false)
 }
 
 func sameOperatorBeginIdentity(begin, operator stateResultIdentity) bool {
@@ -759,7 +773,7 @@ func operatorReceiptMatchesEffect(receipt controlReceipt, effect runtimeEffectIn
 		return false
 	}
 	switch receipt.Request.Action {
-	case "archive", "abandon", "remove":
+	case "dismiss", "archive", "abandon", "remove":
 		return effect.Action == string(agentruntime.EffectCleanup)
 	case "cancel":
 		return effect.Action == string(agentruntime.EffectStop)

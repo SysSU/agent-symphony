@@ -328,6 +328,55 @@ func TestReconciliationTombstoneMasksAttempt(t *testing.T) {
 	}
 }
 
+func TestReconciliationCollectionIgnoresConflictingTombstonedAttemptFacts(t *testing.T) {
+	for _, nestedKind := range []string{"active", "terminal"} {
+		t.Run(nestedKind, func(t *testing.T) {
+			root := resolvedTempDir(t)
+			owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = owner.close(context.Background()) })
+			manifest := ownerTestManifest(t, root, 79, 1, "running")
+			created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+			if err != nil {
+				t.Fatal(err)
+			}
+			issueKey, attemptKey := ownerIssueKey("o/r", 79), ownerAttemptKey("o/r", 79, 1)
+			invalidated, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 79, Attempt: 1, ExpectedIssueGeneration: created.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: created.State.AttemptGenerations[attemptKey], Action: "dismissed", CleanupPhase: "completed"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := owner.reconciliationSnapshot(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			nested := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 79, Attempt: 1, PR: 90, BaseSHA: manifest.BaseSHA, HeadSHA: strings.Repeat("a", 40), State: "completed"}
+			topLevel := nested
+			topLevel.HeadSHA = strings.Repeat("b", 40)
+			issue := issueFact(79, "stale removed attempt")
+			if nestedKind == "active" {
+				issue.ActiveAttempt = &nested
+			} else {
+				issue.TerminalAttempts = []internalgithub.RecoveryAttemptFact{nested}
+			}
+			input := repositoryInput(true, issue)
+			input.Attempts = []internalgithub.RecoveryAttemptFact{topLevel}
+			collection, err := collectionFromSnapshot(snapshot, input)
+			if err != nil || len(collection.Issues) != 1 || collection.Issues[0].Fact.ActiveAttempt != nil || len(collection.Issues[0].Fact.TerminalAttempts) != 0 || len(collection.Issues[0].Attempts) != 0 {
+				t.Fatalf("tombstoned conflicting facts were not masked before deduplication: collection=%#v err=%v", collection, err)
+			}
+			applied := applyCollection(t, owner, collection)
+			if applied.State.Tombstones[attemptKey].Action != invalidated.State.Tombstones[attemptKey].Action {
+				t.Fatalf("reconciliation changed tombstone: %#v", applied.State.Tombstones[attemptKey])
+			}
+			if _, exists := applied.State.Attempts[attemptKey]; exists || applied.State.Observations[issueKey].Attempts[attemptKey].Present {
+				t.Fatalf("reconciliation resurrected tombstoned attempt: %#v", applied.State)
+			}
+		})
+	}
+}
+
 func TestReconciliationGenerationAdvanceMasksNestedAttemptFacts(t *testing.T) {
 	for _, nested := range []string{"active", "terminal"} {
 		t.Run(nested, func(t *testing.T) {

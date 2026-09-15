@@ -138,17 +138,22 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, action := range []string{"cancel", "recover", "review-plan", "review-plan-cancel", "review-plan-archive", "dismiss-overlap", "abandon-overlap", "archive-overlap"} {
+	for _, action := range []string{"cancel", "recover", "review-plan", "review-plan-cancel", "review-plan-dismiss", "review-plan-archive", "dismiss-overlap", "abandon-overlap", "archive-overlap"} {
 		t.Run(action, func(t *testing.T) {
 			overlap := strings.HasSuffix(action, "-overlap")
 			completedOverlap := action == "dismiss-overlap" || action == "archive-overlap"
-			parkedImplementation := action == "cancel" || action == "review-plan-cancel" || overlap
+			reviewCleanupFlow := action == "review-plan-archive" || action == "review-plan-dismiss"
+			parkedImplementation := action == "cancel" || action == "review-plan-cancel" || overlap || reviewCleanupFlow
 			controlledCycle := overlap
 			root, err := os.MkdirTemp(home, ".as-lifecycle-")
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { _ = os.RemoveAll(root) })
+			t.Cleanup(func() {
+				if err := removeFullSystemFixtureRoot(root); err != nil {
+					t.Errorf("remove lifecycle fixture root: %v", err)
+				}
+			})
 			root, err = filepath.EvalSymlinks(root)
 			if err != nil {
 				t.Fatal(err)
@@ -190,13 +195,19 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if completedOverlap {
+			if completedOverlap || reviewCleanupFlow {
 				if err := os.WriteFile(filepath.Join(manifest.Worktree, "completed.txt"), []byte("published attempt\n"), 0o600); err != nil {
 					t.Fatal(err)
 				}
 				runExternal(t, manifest.Worktree, "git", "-c", "user.name=Lifecycle fixture", "-c", "user.email=fixture@example.invalid", "add", "completed.txt")
 				runExternal(t, manifest.Worktree, "git", "-c", "user.name=Lifecycle fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "completed attempt")
 				manifest.State, manifest.ReviewHead = "completed", strings.TrimSpace(runExternal(t, manifest.Worktree, "git", "rev-parse", "HEAD"))
+				if reviewCleanupFlow {
+					manifest.ReviewHead = ""
+				}
+				if err := os.MkdirAll(filepath.Dir(agentruntime.ResultPath(manifest.Worktree)), 0o700); err != nil {
+					t.Fatal(err)
+				}
 				if err := os.WriteFile(agentruntime.ResultPath(manifest.Worktree), []byte(`{"type":"agent-symphony-result-v1","validation":"completed fixture passed","documentation":"none"}`), 0o600); err != nil {
 					t.Fatal(err)
 				}
@@ -230,13 +241,23 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 				comments = append(comments, map[string]any{"id": 2, "body": "Attempt failed closed: fixture worker failed\n\n" + terminal, "created_at": manifest.UpdatedAt.Format(time.RFC3339Nano), "updated_at": manifest.UpdatedAt.Format(time.RFC3339Nano), "user": map[string]any{"id": 42}})
 			}
 			var completedComment map[string]any
-			if completedOverlap {
-				marker, err := internalgithub.AttemptMarker(73, 1, manifest.Branch, manifest.ReviewHead, 91, "review")
+			if completedOverlap || reviewCleanupFlow {
+				completedHead := strings.TrimSpace(runExternal(t, manifest.Worktree, "git", "rev-parse", "HEAD"))
+				marker, err := internalgithub.AttemptMarker(73, 1, manifest.Branch, completedHead, 91, "review")
 				if err != nil {
 					t.Fatal(err)
 				}
 				completedComment = map[string]any{"id": 73, "body": marker, "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}}
 				comments = []map[string]any{completedComment}
+				if reviewCleanupFlow {
+					for index, kind := range []string{"validation", "documentation"} {
+						evidence, evidenceErr := internalgithub.EvidenceBody(73, 1, kind, completedHead)
+						if evidenceErr != nil {
+							t.Fatal(evidenceErr)
+						}
+						comments = append(comments, map[string]any{"id": 74 + index, "body": evidence, "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}})
+					}
+				}
 				if action == "archive-overlap" {
 					// The older remote head keeps startup reconciliation from retiring the local worktree before Archive.
 					older, err := internalgithub.AttemptMarker(73, 1, manifest.Branch, base, 91, "review")
@@ -258,28 +279,84 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 			}
 			fixture := &fullSystemGitHub{base: base, origin: origin, labels: labels, comments: comments, closed: completedOverlap}
 			fixture.includeClosedIssue = action == "archive-overlap"
-			if completedOverlap {
+			if completedOverlap || reviewCleanupFlow {
 				head := manifest.ReviewHead
+				state, merged := "closed", true
+				if reviewCleanupFlow {
+					head = strings.TrimSpace(runExternal(t, manifest.Worktree, "git", "rev-parse", "HEAD"))
+					state, merged = "open", false
+				}
 				if action == "archive-overlap" {
 					head = base
 				}
-				fixture.pr = map[string]any{"number": 91, "body": comments[0]["body"], "state": "closed", "merged": true, "merged_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": manifest.Branch}, "base": map[string]any{"sha": base}}
+				prBody, err := internalgithub.PullRequestBody(73, 1, "full-system-ci passed", "none", "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				prBody, err = internalgithub.BindPullRequestBody(prBody, 73, 1, manifest.Branch, head, 91)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fixture.pr = map[string]any{"number": 91, "body": prBody, "state": state, "merged": merged, "mergeable": true, "mergeable_state": "clean", "draft": false, "user": map[string]any{"id": 42}, "head": map[string]any{"sha": head, "ref": manifest.Branch}, "base": map[string]any{"sha": base, "ref": "main"}}
+				if merged {
+					fixture.pr["merged_at"] = "2026-09-09T12:00:00Z"
+				}
 			}
 			retryEntered, retryRelease := make(chan struct{}, 1), make(chan struct{})
 			var releaseRetry sync.Once
 			var holdReconcile atomic.Bool
 			var markerExposed, markerObserved atomic.Bool
 			var heldIssueListObserved atomic.Bool
+			var reviewBarrierClaimed atomic.Bool
 			reconcileEntered, reconcileRelease := make(chan struct{}), make(chan struct{})
 			var releaseReconcile sync.Once
 			var holdRestartReconcile atomic.Bool
 			restartReconcileEntered, restartReconcileRelease := make(chan struct{}), make(chan struct{})
 			var releaseRestartReconcile sync.Once
 			github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if action == "review-plan-dismiss" && r.Method == http.MethodPost && r.URL.Path == "/fixture/close-issue" {
+					fixture.mu.Lock()
+					fixture.closed, fixture.includeClosedIssue = true, false
+					fixture.mu.Unlock()
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				if action == "review-plan-archive" && r.Method == http.MethodPost && r.URL.Path == "/fixture/merge-pr" {
+					fixture.mu.Lock()
+					fixture.closed, fixture.includeClosedIssue, fixture.merged = true, true, true
+					fixture.pr["state"], fixture.pr["merged"], fixture.pr["merged_at"] = "closed", true, time.Now().UTC().Format(time.RFC3339Nano)
+					head := fixture.pr["head"].(map[string]any)["sha"].(string)
+					_ = exec.Command("git", "--git-dir", fixture.origin, "update-ref", "refs/heads/main", head).Run()
+					fixture.mu.Unlock()
+					current, err := readRuntimeOwnerState(stateRoot, "o/r")
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusInternalServerError)
+						return
+					}
+					if seal := current.Attempts[ownerAttemptKey("o/r", 73, 1)].WorkerSeal; seal.Root != "" {
+						if err := os.RemoveAll(seal.Root); err != nil {
+							http.Error(w, err.Error(), http.StatusInternalServerError)
+							return
+						}
+					}
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 				if overlap && r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/73/comments" && markerExposed.Load() {
 					markerObserved.Store(true)
 				}
-				if overlap && r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues" && holdReconcile.CompareAndSwap(true, false) {
+				if reviewCleanupFlow && r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues" && !heldIssueListObserved.Load() {
+					current, err := readRuntimeOwnerState(stateRoot, "o/r")
+					if err == nil {
+						for _, proof := range current.ReviewerProofs {
+							if proof.Repository == "o/r" && proof.Issue == 73 && proof.Attempt == 1 && proof.Mode == agentruntime.ReviewModeImplementation && proof.DeadProved && validDigest(proof.RunID) && reviewBarrierClaimed.CompareAndSwap(false, true) {
+								holdReconcile.Store(true)
+								break
+							}
+						}
+					}
+				}
+				if (overlap || reviewCleanupFlow) && r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues" && holdReconcile.CompareAndSwap(true, false) {
 					close(reconcileEntered)
 					select {
 					case <-reconcileRelease:
@@ -355,29 +432,39 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 			codex := "#!/bin/sh\nexec tail -f /dev/null\n"
 			reviewGate := ""
 			reviewerPID := filepath.Join(root, "reviewer.pid")
+			reviewerIdentityPath := filepath.Join(root, "reviewer-identity.json")
+			var cancelledReviewerSnapshot, cancelledReviewerSession string
+			var archiveReviewerTarget, archiveReviewerRunID, archiveReviewerSession string
+			var archiveReviewerProofs []reviewerProcessProof
 			if strings.HasPrefix(action, "review-plan") {
 				reviewGate = filepath.Join(root, "release-review.fifo")
 				if err := syscall.Mkfifo(reviewGate, 0o600); err != nil {
 					t.Fatal(err)
 				}
 				codex = fmt.Sprintf(`#!/bin/sh
+umask 077
 IFS= read -r release < %q || exit 1
 test "$release" = release || exit 1
 result='{"type":"agent-symphony-review-v1","status":"clean","findings":[]}'
 tmp="$AGENT_SYMPHONY_REVIEW_RESULT.tmp.$$"
 printf '%%s\n' "$result" > "$tmp" || exit 1
+chmod 600 "$tmp" || exit 1
 mv "$tmp" "$AGENT_SYMPHONY_REVIEW_RESULT" || exit 1
 printf '%%s\n' "$result"
 `, reviewGate)
 				if action == "review-plan-cancel" {
 					codex = fmt.Sprintf(`#!/bin/sh
+umask 077
 trap '' TERM HUP
 printf '%%s\n' "$$" > %q || exit 1
 IFS= read -r release < %q || exit 1
 test "$release" = release || exit 1
 printf '%%s\n' '{"body":"/agent-symphony status needs-attention: reviewer wrote after cancellation"}' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- %q
 result='{"type":"agent-symphony-review-v1","status":"clean","findings":[]}'
-printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
+tmp="$AGENT_SYMPHONY_REVIEW_RESULT.tmp.$$"
+printf '%%s\n' "$result" > "$tmp" || exit 1
+chmod 600 "$tmp" || exit 1
+mv "$tmp" "$AGENT_SYMPHONY_REVIEW_RESULT"
 `, reviewerPID, reviewGate, github.URL+"/repos/o/r/issues/73/comments")
 				}
 			}
@@ -390,10 +477,11 @@ if [ "$1" = sandbox ]; then
   exec "$@"
 fi
 ` + strings.TrimPrefix(codex, "#!/bin/sh\n")
-			writeExecutable(t, filepath.Join(binDir, "codex"), codex)
+			buildNativeCodexFixture(t, filepath.Join(binDir, "codex"), codex)
 			cfg := config.Default("o/r")
 			cfg.Commands.Implementation[0], cfg.Commands.Reviewer[0] = filepath.Join(binDir, "codex"), filepath.Join(binDir, "codex")
-			profileDigest, err := config.BindWorkerExecutable(t.Context(), &cfg.Commands)
+			cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
+			profileDigest, err := config.PinWorkerExecutable(t.Context(), stateRoot, &cfg.Commands)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -406,7 +494,6 @@ fi
 			if err := writeRuntimeOwnerState(stateRoot, productionAttemptRoot(stateRoot), state); err != nil {
 				t.Fatal(err)
 			}
-			cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
 			cfg.ReconciliationIntervalSeconds = 1
 			serveInterval := "200ms"
 			if controlledCycle {
@@ -426,7 +513,7 @@ fi
 			if parkedImplementation {
 				ensureFullSystemParkedImplementation(t, environment, binary, manifest)
 			} else if action != "recover" && !overlap {
-				ensureFullSystemTmuxSession(t, environment, manifest.Session, repository)
+				ensureFullSystemTmuxSession(t, environment, manifest.Session, manifest.Worktree)
 			}
 			server := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", serveInterval)
 			server.Dir, server.Env = repository, environment
@@ -469,6 +556,14 @@ fi
 				if !overlap && !controlsSettled {
 					return false
 				}
+				if reviewCleanupFlow {
+					for _, effect := range ledger.Effects {
+						if effect.State == "pending" && effect.ReviewerLaunched && effect.Reconciliation != nil && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Mode == agentruntime.ReviewModeImplementation && validDigest(effect.Reconciliation.Reviewer.RunID) {
+							return true
+						}
+					}
+					return false
+				}
 				response, err := http.Get("http://" + address + "/status.json")
 				if err != nil {
 					return false
@@ -480,7 +575,7 @@ fi
 				}
 				for _, status := range snapshot.Statuses {
 					if status.Issue == 73 && status.Attempt == 1 {
-						return action == "recover" && status.Retryable || completedOverlap && status.State == "completed" && status.IssueClosed && !status.OperatorBlocked || action == "abandon-overlap" && status.State == "orphaned" && !status.OperatorBlocked || action != "recover" && !overlap && status.State == "active"
+						return action == "recover" && status.Retryable || completedOverlap && status.State == "completed" && status.IssueClosed && !status.OperatorBlocked || action == "abandon-overlap" && status.State == "orphaned" && !status.OperatorBlocked || reviewCleanupFlow && (status.State == "review-ready" || status.State == "completed") || action != "recover" && !overlap && !reviewCleanupFlow && status.State == "active"
 					}
 				}
 				return false
@@ -565,7 +660,7 @@ fi
 			}
 			playwright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "playwright"))
 			playwright.Dir = source
-			playwright.Env = append(os.Environ(), "AGENT_SYMPHONY_LIFECYCLE_E2E_URL=http://"+address, "AGENT_SYMPHONY_LIFECYCLE_E2E_ACTION="+action, "AGENT_SYMPHONY_LIFECYCLE_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEW_GATE="+reviewGate, "AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEWER_PID="+reviewerPID, "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(tracing))
+			playwright.Env = append(os.Environ(), "AGENT_SYMPHONY_LIFECYCLE_E2E_URL=http://"+address, "AGENT_SYMPHONY_LIFECYCLE_E2E_ACTION="+action, "AGENT_SYMPHONY_LIFECYCLE_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEW_GATE="+reviewGate, "AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEWER_PID="+reviewerPID, "AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEWER_IDENTITY="+reviewerIdentityPath, "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(tracing))
 			if browserOutput, err := playwright.CombinedOutput(); err != nil {
 				ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 				reviewerArtifact := ""
@@ -782,11 +877,11 @@ fi
 			terminalAction := action
 			if action == "review-plan-cancel" {
 				terminalAction = "cancel"
-			} else if action == "review-plan-archive" {
+			} else if action == "review-plan-archive" || action == "review-plan-dismiss" {
 				terminalAction = "review-plan"
 			}
 			var completed controlReceipt
-			if !waitFor(limit, func() bool {
+			if !reviewCleanupFlow && !waitFor(limit, func() bool {
 				ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
 				if err != nil {
 					return false
@@ -817,12 +912,22 @@ fi
 				}
 			}
 			if action == "review-plan-cancel" {
-				reviewerSession, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 73, 1)
-				if err != nil {
-					t.Fatal(err)
+				var captured struct {
+					Name   string `json:"name"`
+					Target string `json:"target"`
+					RunID  string `json:"run_id"`
+				}
+				body, err := os.ReadFile(reviewerIdentityPath)
+				if err != nil || json.Unmarshal(body, &captured) != nil || captured.Name == "" || captured.Target == "" || !validDigest(captured.RunID) {
+					t.Fatalf("browser did not capture exact pre-%s reviewer identity: body=%q err=%v", terminalAction, body, err)
+				}
+				reviewSnapshot, reviewerSession := reviewRunIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot), captured.Target, captured.RunID)
+				cancelledReviewerSnapshot, cancelledReviewerSession = reviewSnapshot, reviewerSession
+				if reviewerSession != captured.Name {
+					t.Fatalf("captured reviewer name does not match exact RunID: captured=%#v derived=%s", captured, reviewerSession)
 				}
 				if !waitFor(limit, func() bool { return !fullSystemTmuxSessionExists(environment, reviewerSession) }) {
-					t.Fatalf("cancel left reviewer tmux session %s active", reviewerSession)
+					t.Fatalf("%s left reviewer tmux session %s active", terminalAction, reviewerSession)
 				}
 				pidBody, err := os.ReadFile(reviewerPID)
 				if err != nil {
@@ -854,11 +959,11 @@ fi
 							proofs = append(proofs, fmt.Sprintf("effect=%s group=%d issue_gen=%d attempt_gen=%d dead=%t never_ran=%t", proof.EffectID, proof.GroupPID, proof.IssueGeneration, proof.AttemptGeneration, proof.DeadProved, proof.NeverRan))
 						}
 					}
-					reviewSnapshot, _ := reviewIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot))
-					launchPath, _ := reviewerLifecyclePaths(reviewSnapshot, stop.SupersededReviewerTarget)
+					reviewSnapshot, _ := reviewRunIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot), captured.Target, captured.RunID)
+					launchPath, _ := reviewerLifecyclePaths(reviewSnapshot, captured.Target)
 					var launch reviewerLaunchIdentity
 					launchFound, launchErr := readReviewerRecord(launchPath, &launch)
-					t.Fatalf("cancel completed while TERM/HUP-ignoring reviewer process %d was still alive: %v; ps=%q ps_err=%v getpgid=%d getpgid_err=%v owner_err=%v stop={id:%s state:%s superseded:%s group:%d stopped:%t issue_gen:%d attempt_gen:%d} reviewer={found:%t state:%s group:%d launched:%t session_requested:%t gate:%t revoked:%t issue_gen:%d attempt_gen:%d} reviewer_effects=%q owner_gens=%d/%d proofs=%q launch={found:%t err:%v effect:%s child:%d issue_gen:%d attempt_gen:%d gate:%t session_requested:%t}", pid, err, process, psErr, groupPID, groupErr, ledgerErr, completed.EffectID, stop.State, stop.SupersededReviewerID, stop.SupersededReviewerGroupPID, stop.ReviewerStopped, stop.IssueGeneration, stop.AttemptGeneration, reviewerFound, reviewer.State, reviewer.ReviewerGroupPID, reviewer.ReviewerLaunched, reviewer.ReviewerSessionRequested, reviewer.ReviewerGateProtocol, reviewer.ReviewerRevoked, reviewer.IssueGeneration, reviewer.AttemptGeneration, reviewerEffects, ledger.IssueGenerations[ownerIssueKey("o/r", 73)], ledger.AttemptGenerations[key], proofs, launchFound, launchErr, launch.EffectID, launch.ChildPID, launch.IssueGeneration, launch.AttemptGeneration, launch.GateProtocol, launch.SessionRequested)
+					t.Fatalf("%s completed while TERM/HUP-ignoring reviewer process %d was still alive: %v; ps=%q ps_err=%v getpgid=%d getpgid_err=%v owner_err=%v stop={id:%s state:%s superseded:%s group:%d stopped:%t issue_gen:%d attempt_gen:%d} reviewer={found:%t state:%s group:%d launched:%t session_requested:%t gate:%t revoked:%t issue_gen:%d attempt_gen:%d} reviewer_effects=%q owner_gens=%d/%d proofs=%q launch={found:%t err:%v effect:%s child:%d issue_gen:%d attempt_gen:%d gate:%t session_requested:%t}", terminalAction, pid, err, process, psErr, groupPID, groupErr, ledgerErr, completed.EffectID, stop.State, stop.SupersededReviewerID, stop.SupersededReviewerGroupPID, stop.ReviewerStopped, stop.IssueGeneration, stop.AttemptGeneration, reviewerFound, reviewer.State, reviewer.ReviewerGroupPID, reviewer.ReviewerLaunched, reviewer.ReviewerSessionRequested, reviewer.ReviewerGateProtocol, reviewer.ReviewerRevoked, reviewer.IssueGeneration, reviewer.AttemptGeneration, reviewerEffects, ledger.IssueGenerations[ownerIssueKey("o/r", 73)], ledger.AttemptGenerations[key], proofs, launchFound, launchErr, launch.EffectID, launch.ChildPID, launch.IssueGeneration, launch.AttemptGeneration, launch.GateProtocol, launch.SessionRequested)
 				}
 				gate, err := os.OpenFile(reviewGate, os.O_RDWR|syscall.O_NONBLOCK, 0)
 				if err != nil {
@@ -871,6 +976,15 @@ fi
 					t.Fatal(err)
 				}
 				assertNoCancelledReviewerGitHubStatus(t, fixture)
+				cancelledOwner, err := readRuntimeOwnerState(stateRoot, "o/r")
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, proofExists := cancelledOwner.ReviewerProofs[reviewerProofKey("o/r", 73, 1, agentruntime.ReviewModePlan, captured.Target)]
+				_, statErr := os.Lstat(reviewSnapshot)
+				if proofExists || !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("%s did not retire the exact reviewer proof and resources: proof_exists=%t snapshot_err=%v", terminalAction, proofExists, statErr)
+				}
 				if !waitFor(limit, func() bool {
 					current, err := readRuntimeOwnerState(stateRoot, "o/r")
 					return err == nil && completed.Result != nil && current.CycleOutcomeSource >= completed.Result.OwnerRevision
@@ -878,122 +992,185 @@ fi
 					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
 					t.Errorf("no reconciliation cycle completed after cancel: outcome source=%d cancel revision=%d diagnostic=%q", current.CycleOutcomeSource, completed.Result.OwnerRevision, current.CycleDiagnostic)
 				}
+				if action == "review-plan-dismiss" {
+					if tombstone := cancelledOwner.Tombstones[key]; tombstone.Action != "dismissed" || tombstone.CleanupPhase != "completed" || tombstone.ReviewerLeaseID != "" {
+						t.Fatalf("Dismiss did not durably finish reviewer-only cleanup: %#v", tombstone)
+					}
+					for _, path := range []string{manifest.Worktree, manifest.LogPath} {
+						if _, err := os.Stat(path); err != nil {
+							t.Fatalf("Dismiss removed retained implementation artifact %s: %v", path, err)
+						}
+					}
+				}
 			}
-			if action == "review-plan-archive" {
-				if ledger, err := readRuntimeOwnerState(stateRoot, "o/r"); err != nil || ledger.Attempts[key].Manifest.ReviewState != "clean" {
-					t.Fatalf("archive fixture never completed owner-bound plan review: attempt=%#v err=%v", ledger.Attempts[key], err)
-				}
-				if err := os.WriteFile(filepath.Join(manifest.Worktree, "reviewed.txt"), []byte("reviewed implementation\n"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-				runExternal(t, manifest.Worktree, "git", "-c", "user.name=Lifecycle fixture", "-c", "user.email=fixture@example.invalid", "add", "reviewed.txt")
-				runExternal(t, manifest.Worktree, "git", "-c", "user.name=Lifecycle fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "reviewed implementation")
+			if action == "review-plan-archive" || action == "review-plan-dismiss" {
 				reviewedHead := strings.TrimSpace(runExternal(t, manifest.Worktree, "git", "rev-parse", "HEAD"))
-				if err := os.WriteFile(agentruntime.ResultPath(manifest.Worktree), []byte(`{"type":"agent-symphony-result-v1","validation":"reviewed fixture passed","documentation":"none"}`), 0o600); err != nil {
-					t.Fatal(err)
-				}
-				target := agentruntime.PaneTarget(manifest.Session)
-				for _, args := range [][]string{{"set-option", "-w", "-t", target, "remain-on-exit", "on"}, {"respawn-pane", "-k", "-t", target, "--", binary, "pane-exit-status", "tmux", "--", "true"}} {
-					command := exec.Command("tmux", args...)
-					command.Env = environment
-					if result, err := command.CombinedOutput(); err != nil {
-						t.Fatalf("complete reviewed implementation pane: %v: %s", err, result)
-					}
-				}
 				if !waitFor(limit, func() bool {
 					current, err := readRuntimeOwnerState(stateRoot, "o/r")
-					return err == nil && current.Attempts[key].Manifest.State == "completed"
-				}) {
-					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
-					t.Fatalf("reviewed implementation did not complete: attempt=%#v serve=%s", current.Attempts[key], output.String())
-				}
-				if !waitFor(limit, func() bool {
-					current, err := readRuntimeOwnerState(stateRoot, "o/r")
-					if err != nil {
+					if err != nil || current.Attempts[key].Manifest.State != "completed" || current.Attempts[key].Manifest.ReviewState != "clean" || current.Attempts[key].Manifest.ReviewMode != agentruntime.ReviewModeImplementation {
 						return false
 					}
-					for _, effect := range current.Effects {
-						if effect.Action == string(reconciliationReviewer) && effect.State == "pending" && effect.ReviewerLaunched && effect.ReviewerGroupPID > 1 && effect.IssueGeneration == current.IssueGenerations[ownerIssueKey("o/r", 73)] && effect.AttemptGeneration == current.AttemptGenerations[key] && effect.Reconciliation != nil && effect.Reconciliation.Reviewer != nil {
-							reviewer := effect.Reconciliation.Reviewer
-							if reviewer.Mode != agentruntime.ReviewModeImplementation || reviewer.Phase != "run-observe" || reviewer.BaseSHA != manifest.BaseSHA || reviewer.HeadSHA != reviewedHead || reviewer.Target != manifest.BaseSHA+".."+reviewedHead || reviewer.Snapshot == "" || reviewer.Session == "" || !fullSystemTmuxSessionExists(environment, reviewer.Session) {
-								continue
-							}
-							response, err := http.Get("http://" + address + "/status.json")
-							if err != nil {
-								return false
-							}
-							var snapshot dashboardStatusSnapshot
-							err = json.NewDecoder(response.Body).Decode(&snapshot)
-							_ = response.Body.Close()
-							if err != nil || response.StatusCode != http.StatusOK {
-								return false
-							}
-							for _, status := range snapshot.Statuses {
-								if status.Repository == "o/r" && status.Issue == 73 && status.Attempt == 1 {
-									for _, session := range status.Sessions {
-										if session.Role == agentruntime.SessionRoleReviewer && session.Name == reviewer.Session && session.State == "running" && session.Mode == reviewer.Mode && session.Target == reviewer.Target && session.Current {
-											return true
-										}
-									}
-								}
-							}
-						}
-					}
-					return false
-				}) {
-					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
-					var pending []runtimeEffectIntent
-					for _, effect := range current.Effects {
-						if effect.Action == string(reconciliationReviewer) && effect.State == "pending" {
-							pending = append(pending, effect)
-						}
-					}
-					t.Fatalf("Plan cleanup did not yield an implementation reviewer: attempt=%#v diagnostic=%q pending_reviewer=%#v effects=%s serve=%s", current.Attempts[key], current.CycleDiagnostic, pending, fullSystemEffectSummary(current), output.String())
-				}
-				gate, err := os.OpenFile(reviewGate, os.O_RDWR|syscall.O_NONBLOCK, 0)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := gate.WriteString("release\n"); err != nil {
-					t.Fatal(err)
-				}
-				if !waitFor(limit, func() bool {
-					current, err := readRuntimeOwnerState(stateRoot, "o/r")
-					attempt := current.Attempts[key].Manifest
-					return err == nil && attempt.ReviewState == "clean" && attempt.ReviewMode == agentruntime.ReviewModeImplementation
-				}) {
-					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
-					t.Fatalf("implementation reviewer did not finish clean: attempt=%#v effects=%s serve=%s", current.Attempts[key], fullSystemEffectSummary(current), output.String())
-				}
-				if err := gate.Close(); err != nil {
-					t.Fatal(err)
-				}
-				if !waitFor(limit, func() bool {
-					current, err := readRuntimeOwnerState(stateRoot, "o/r")
-					if err != nil {
-						return false
-					}
-					for _, effect := range current.Effects {
-						if effect.Action == string(reconciliationGitHubPublish) && effect.Issue == 73 && effect.Attempt == 1 && effect.State == "completed" {
+					for _, proof := range current.ReviewerProofs {
+						if proof.Repository == "o/r" && proof.Issue == 73 && proof.Attempt == 1 && proof.Mode == agentruntime.ReviewModeImplementation && proof.Target == manifest.BaseSHA+".."+reviewedHead && proof.DeadProved && validDigest(proof.RunID) {
 							return true
 						}
 					}
 					return false
 				}) {
 					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
-					t.Fatalf("reviewed implementation was not published by an owner effect: effects=%s serve=%s", fullSystemEffectSummary(current), output.String())
+					t.Fatalf("implementation reviewer did not seal an exact proof: attempt=%#v proofs=%#v effects=%s diagnostic=%q serve=%s", current.Attempts[key], current.ReviewerProofs, fullSystemEffectSummary(current), current.CycleDiagnostic, output.String())
 				}
-				if !waitFor(limit, func() bool {
-					fixture.mu.Lock()
-					defer fixture.mu.Unlock()
-					return fixture.merged && fixture.closed
-				}) {
-					fixture.mu.Lock()
-					pr := fixture.pr
-					fixture.mu.Unlock()
-					t.Fatalf("published reviewed PR was not merged and closed: pr=%#v serve=%s", pr, output.String())
+				beforeAction, err := readRuntimeOwnerState(stateRoot, "o/r")
+				if err != nil {
+					t.Fatal(err)
 				}
+				for _, proof := range beforeAction.ReviewerProofs {
+					if proof.Repository != "o/r" || proof.Issue != 73 || proof.Attempt != 1 {
+						continue
+					}
+					archiveReviewerProofs = append(archiveReviewerProofs, proof)
+					snapshotPath, _ := persistedReviewIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot), proof.Target, proof.RunID)
+					if _, err := os.Lstat(snapshotPath); err != nil {
+						t.Fatalf("%s precondition lost exact reviewer snapshot for run %s: %v", action, proof.RunID, err)
+					}
+					if proof.Mode == agentruntime.ReviewModeImplementation {
+						archiveReviewerTarget, archiveReviewerRunID = proof.Target, proof.RunID
+						_, archiveReviewerSession = persistedReviewIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot), proof.Target, proof.RunID)
+					}
+				}
+				if len(archiveReviewerProofs) == 0 {
+					t.Fatalf("%s precondition did not retain the sealed reviewer proof", action)
+				}
+				select {
+				case <-reconcileEntered:
+				case <-time.After(limit):
+					t.Fatalf("%s fixture did not block the post-review issue collection", action)
+				}
+				endpoint := "close-issue"
+				if action == "review-plan-archive" {
+					endpoint = "merge-pr"
+				}
+				response, err := http.Post(github.URL+"/fixture/"+endpoint, "application/json", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = response.Body.Close()
+				if response.StatusCode != http.StatusNoContent {
+					t.Fatalf("%s fixture transition returned HTTP %d", action, response.StatusCode)
+				}
+				if action == "review-plan-dismiss" {
+					releaseReconcile.Do(func() { close(reconcileRelease) })
+					if !waitFor(limit, func() bool {
+						response, err := http.Get("http://" + address + "/status.json")
+						if err != nil {
+							return false
+						}
+						defer response.Body.Close()
+						var snapshot dashboardStatusSnapshot
+						if json.NewDecoder(response.Body).Decode(&snapshot) != nil {
+							return false
+						}
+						for _, status := range snapshot.Statuses {
+							if status.Repository == "o/r" && status.Issue == 73 && status.Attempt == 1 {
+								return status.State == "orphaned" && !status.OperatorBlocked
+							}
+						}
+						return false
+					}) {
+						t.Fatal("sealed-reviewer Dismiss did not become eligible after the closed issue left collection")
+					}
+					dismiss := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "dismiss-playwright"))
+					dismiss.Dir = source
+					dismiss.Env = append(os.Environ(), "AGENT_SYMPHONY_LIFECYCLE_E2E_URL=http://"+address, "AGENT_SYMPHONY_LIFECYCLE_E2E_ACTION=review-plan-dismiss-click", "AGENT_SYMPHONY_LIFECYCLE_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(tracing))
+					if browserOutput, err := dismiss.CombinedOutput(); err != nil {
+						t.Fatalf("live-reviewer Dismiss browser: %v\n%s\nserve=%s", err, browserOutput, output.String())
+					}
+					if !waitFor(limit, func() bool {
+						current, err := readRuntimeOwnerState(stateRoot, "o/r")
+						tombstone := current.Tombstones[key]
+						if err != nil || tombstone.Action != "dismissed" || tombstone.CleanupPhase != "completed" || tombstone.EffectID == "" || current.Effects[tombstone.EffectID].State != "completed" || current.Attempts[key].Generation != 0 {
+							return false
+						}
+						for _, proof := range current.ReviewerProofs {
+							if proof.Repository == "o/r" && proof.Issue == 73 && proof.Attempt == 1 {
+								return false
+							}
+						}
+						return true
+					}) {
+						current, _ := readRuntimeOwnerState(stateRoot, "o/r")
+						t.Fatalf("live-reviewer Dismiss did not complete exact cleanup: tombstone=%#v proofs=%#v effects=%s serve=%s", current.Tombstones[key], current.ReviewerProofs, fullSystemEffectSummary(current), output.String())
+					}
+					for _, proof := range archiveReviewerProofs {
+						snapshotPath, reviewerSession := persistedReviewIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot), proof.Target, proof.RunID)
+						for _, path := range []string{snapshotPath, reviewResultPath(snapshotPath, proof.Target)} {
+							if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+								t.Fatalf("Dismiss retained exact reviewer resource %s: %v", path, err)
+							}
+						}
+						if fullSystemTmuxSessionExists(environment, reviewerSession) {
+							t.Fatalf("Dismiss retained reviewer session %s", reviewerSession)
+						}
+						if proof.GroupPID > 1 && !errors.Is(syscall.Kill(-proof.GroupPID, 0), syscall.ESRCH) {
+							t.Fatalf("Dismiss left reviewer process group %d alive", proof.GroupPID)
+						}
+					}
+					for _, path := range []string{manifest.Worktree, manifest.LogPath} {
+						if _, err := os.Stat(path); err != nil {
+							t.Fatalf("Dismiss removed retained implementation artifact %s: %v", path, err)
+						}
+					}
+					if !fullSystemTmuxSessionExists(environment, manifest.Session) {
+						t.Fatal("Dismiss removed retained implementation session")
+					}
+					if err := server.Process.Signal(os.Interrupt); err != nil {
+						t.Fatal(err)
+					}
+					if err := server.Wait(); err != nil {
+						t.Fatalf("Dismiss shutdown: %v\n%s", err, output.String())
+					}
+					stopped = true
+					restarted := freeAddress(t)
+					restart := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", restarted, "--interval", serveInterval)
+					restart.Dir, restart.Env = repository, environment
+					restartOutput := &synchronizedBuffer{}
+					restart.Stdout, restart.Stderr = restartOutput, restartOutput
+					if err := restart.Start(); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = restart.Process.Kill(); _ = restart.Wait() })
+					waitHTTP(t, "http://"+restarted+"/status.json", limit, restartOutput)
+					persisted, err := readRuntimeOwnerState(stateRoot, "o/r")
+					if err != nil || persisted.Tombstones[key].Action != "dismissed" || persisted.Tombstones[key].CleanupPhase != "completed" || persisted.Attempts[key].Generation != 0 {
+						t.Fatalf("restart did not preserve hidden completed Dismiss: tombstone=%#v attempt=%#v err=%v", persisted.Tombstones[key], persisted.Attempts[key], err)
+					}
+					for _, proof := range archiveReviewerProofs {
+						snapshotPath, reviewerSession := persistedReviewIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot), proof.Target, proof.RunID)
+						if _, err := os.Lstat(snapshotPath); !errors.Is(err, os.ErrNotExist) || fullSystemTmuxSessionExists(environment, reviewerSession) {
+							t.Fatalf("restart restored Dismiss reviewer resources: snapshot=%v session=%t", err, fullSystemTmuxSessionExists(environment, reviewerSession))
+						}
+					}
+					if !fullSystemTmuxSessionExists(environment, manifest.Session) {
+						t.Fatal("restart lost retained implementation session after Dismiss")
+					}
+					verify := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "dismiss-restart-playwright"))
+					verify.Dir = source
+					verify.Env = append(os.Environ(), "AGENT_SYMPHONY_LIFECYCLE_E2E_URL=http://"+restarted, "AGENT_SYMPHONY_LIFECYCLE_E2E_ACTION=review-plan-dismiss-verify", "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(tracing))
+					if browserOutput, err := verify.CombinedOutput(); err != nil {
+						t.Fatalf("Dismiss restart browser: %v\n%s", err, browserOutput)
+					}
+					return
+				}
+				releaseReconcile.Do(func() { close(reconcileRelease) })
 				if !waitFor(limit, func() bool {
+					current, err := readRuntimeOwnerState(stateRoot, "o/r")
+					if err != nil {
+						return false
+					}
+					proof, ok := current.ReviewerProofs[reviewerProofKey("o/r", 73, 1, agentruntime.ReviewModeImplementation, archiveReviewerTarget)]
+					if !ok || proof.RunID != archiveReviewerRunID || !proof.DeadProved {
+						return false
+					}
 					response, err := http.Get("http://" + address + "/status.json")
 					if err != nil {
 						return false
@@ -1004,14 +1181,17 @@ fi
 						return false
 					}
 					for _, status := range snapshot.Statuses {
-						if status.Issue == 73 && status.Attempt == 1 {
+						if status.Repository == "o/r" && status.Issue == 73 && status.Attempt == 1 {
 							return status.State == "completed" && !status.OperatorBlocked
 						}
 					}
 					return false
 				}) {
 					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
-					t.Fatalf("reviewed attempt never became Archive-eligible: observation=%#v cycle=%q serve=%s", current.Observations[ownerIssueKey("o/r", 73)], current.CycleDiagnostic, output.String())
+					t.Fatalf("reviewed attempt never became Archive-eligible: observation=%#v proofs=%#v cycle=%q serve=%s", current.Observations[ownerIssueKey("o/r", 73)], current.ReviewerProofs, current.CycleDiagnostic, output.String())
+				}
+				if len(archiveReviewerProofs) == 0 || !validDigest(archiveReviewerRunID) || archiveReviewerTarget == "" || archiveReviewerSession == "" {
+					t.Fatalf("Archive precondition did not retain an exact completed reviewer proof: proofs=%#v target=%q run=%q session=%q", archiveReviewerProofs, archiveReviewerTarget, archiveReviewerRunID, archiveReviewerSession)
 				}
 				archive := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "archive-playwright"))
 				archive.Dir = source
@@ -1025,7 +1205,12 @@ fi
 						return false
 					}
 					for _, receipt := range current.ControlReceipts {
-						if receipt.Request.Action == "archive" && receipt.Request.Issue == 73 && receipt.Request.Attempt == 1 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK && receipt.EffectID == current.Tombstones[key].EffectID && (receipt.EffectID == "" || current.Effects[receipt.EffectID].State == "completed") {
+						if receipt.Request.Action == "archive" && receipt.Request.Issue == 73 && receipt.Request.Attempt == 1 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK && receipt.EffectID != "" && receipt.EffectID == current.Tombstones[key].EffectID && current.Effects[receipt.EffectID].State == "completed" {
+							for _, proof := range current.ReviewerProofs {
+								if proof.Repository == "o/r" && proof.Issue == 73 && proof.Attempt == 1 {
+									return false
+								}
+							}
 							return true
 						}
 					}
@@ -1034,15 +1219,20 @@ fi
 					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
 					t.Fatalf("reviewed Archive did not commit: tombstone=%#v receipts=%#v effects=%#v serve=%s", current.Tombstones[key], current.ControlReceipts, current.Effects, output.String())
 				}
-				snapshotPath, _ := reviewIdentity(agentruntime.Attempt{Repository: "o/r", Issue: 73, Number: 1}, productionSnapshotRoot(stateRoot))
-				current, err := readRuntimeOwnerState(stateRoot, "o/r")
-				if err != nil || current.Effects[completed.EffectID].Reconciliation == nil || current.Effects[completed.EffectID].Reconciliation.Reviewer == nil {
-					t.Fatalf("reviewer effect identity lost after Archive: effect=%#v err=%v", current.Effects[completed.EffectID], err)
-				}
-				reviewer := current.Effects[completed.EffectID].Reconciliation.Reviewer
-				for _, path := range []string{manifest.Worktree, snapshotPath, reviewResultPath(snapshotPath, reviewer.Target)} {
+				for _, path := range []string{manifest.Worktree} {
 					if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 						t.Fatalf("Archive retained runtime resource %s: %v", path, err)
+					}
+				}
+				for _, proof := range archiveReviewerProofs {
+					snapshotPath, reviewerSession := persistedReviewIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot), proof.Target, proof.RunID)
+					for _, path := range []string{snapshotPath, reviewResultPath(snapshotPath, proof.Target)} {
+						if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+							t.Fatalf("Archive retained exact reviewer resource %s for run %s: %v", path, proof.RunID, err)
+						}
+					}
+					if fullSystemTmuxSessionExists(environment, reviewerSession) {
+						t.Fatalf("Archive retained exact reviewer session %s for run %s", reviewerSession, proof.RunID)
 					}
 				}
 				if fullSystemTmuxSessionExists(environment, manifest.Session) {
@@ -1068,10 +1258,27 @@ fi
 				beforeRestartCycle := fullSystemHeldRestartCycle(t, restarted, stateRoot, &holdRestartReconcile, restartReconcileEntered, func() { releaseRestartReconcile.Do(func() { close(restartReconcileRelease) }) }, limit)
 				if !waitFor(limit, func() bool {
 					persisted, err := readRuntimeOwnerState(stateRoot, "o/r")
-					return err == nil && fullSystemNewCycleAfter(persisted, beforeRestartCycle) && persisted.Tombstones[key].Action == "archived" && persisted.Tombstones[key].CleanupPhase == "completed" && persisted.Attempts[key].Generation == 0
+					if err != nil || !fullSystemNewCycleAfter(persisted, beforeRestartCycle) || persisted.Tombstones[key].Action != "archived" || persisted.Tombstones[key].CleanupPhase != "completed" || persisted.Attempts[key].Generation != 0 {
+						return false
+					}
+					for _, proof := range persisted.ReviewerProofs {
+						if proof.Repository == "o/r" && proof.Issue == 73 && proof.Attempt == 1 {
+							return false
+						}
+					}
+					return true
 				}) {
 					persisted, _ := readRuntimeOwnerState(stateRoot, "o/r")
 					t.Fatalf("reviewed Archive restart did not finish a fresh GitHub-backed cycle without restoring the attempt: tombstone=%#v attempt=%#v serve=%s\n%s", persisted.Tombstones[key], persisted.Attempts[key], restartOutput.String(), fullSystemLifecycleDiagnostic(restarted, stateRoot, fixture))
+				}
+				for _, proof := range archiveReviewerProofs {
+					snapshotPath, reviewerSession := persistedReviewIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot), proof.Target, proof.RunID)
+					if _, err := os.Lstat(snapshotPath); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("restart restored exact reviewer snapshot %s for run %s: %v", snapshotPath, proof.RunID, err)
+					}
+					if fullSystemTmuxSessionExists(environment, reviewerSession) {
+						t.Fatalf("restart restored exact reviewer session %s for run %s", reviewerSession, proof.RunID)
+					}
 				}
 				verify := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "archive-restart-playwright"))
 				verify.Dir = source
@@ -1149,6 +1356,11 @@ fi
 				if !fullSystemTmuxSessionExists(environment, manifest.Session) {
 					t.Fatal("plan review terminated the implementation session")
 				}
+			case "review-plan-dismiss":
+				tombstone := ledger.Tombstones[key]
+				if tombstone.Action != "dismissed" || tombstone.CleanupPhase != "completed" || ledger.Attempts[key].Generation != 0 || !fullSystemTmuxSessionExists(environment, manifest.Session) {
+					t.Fatalf("Dismiss did not hide only the attempt while retaining implementation resources: tombstone=%#v attempt=%#v", tombstone, ledger.Attempts[key])
+				}
 			}
 			restartAddress := freeAddress(t)
 			restart := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", restartAddress, "--interval", "200ms")
@@ -1205,6 +1417,17 @@ fi
 			}
 			if action == "review-plan-cancel" {
 				assertNoCancelledReviewerGitHubStatus(t, fixture)
+				for _, proof := range persisted.ReviewerProofs {
+					if proof.Repository == "o/r" && proof.Issue == 73 && proof.Attempt == 1 {
+						t.Fatalf("restart resurrected cancelled reviewer proof: %#v", proof)
+					}
+				}
+				if _, err := os.Lstat(cancelledReviewerSnapshot); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("restart resurrected cancelled reviewer snapshot %s: %v", cancelledReviewerSnapshot, err)
+				}
+				if fullSystemTmuxSessionExists(environment, cancelledReviewerSession) {
+					t.Fatalf("restart restored cancelled reviewer session %s", cancelledReviewerSession)
+				}
 				if !waitFor(limit, func() bool {
 					response, err := http.Get("http://" + restartAddress + "/status.json")
 					if err != nil {
@@ -1241,6 +1464,31 @@ fi
 						serve = serve[len(serve)-8192:]
 					}
 					t.Fatalf("restart did not preserve cancelled attempt as failed without its reviewer, or show a valid recovery/active next attempt: owner_read=%v effects=%s pending_start=%s receipts=%s\n%s\nserve=%s", latestErr, internalgithub.Redact(fullSystemEffectSummary(latest)), fullSystemPendingStartDiagnostic(latest, stateRoot, environment), internalgithub.Redact(fmt.Sprintf("%#v", latest.ControlReceipts)), internalgithub.Redact(fullSystemLifecycleDiagnostic(restartAddress, stateRoot, fixture)), internalgithub.Redact(serve))
+				}
+			}
+			if action == "review-plan-dismiss" {
+				tombstone := persisted.Tombstones[key]
+				if tombstone.Action != "dismissed" || tombstone.CleanupPhase != "completed" || tombstone.ReviewerLeaseID != "" || persisted.Attempts[key].Generation != 0 {
+					t.Fatalf("restart did not preserve completed Dismiss: tombstone=%#v attempt=%#v", tombstone, persisted.Attempts[key])
+				}
+				for _, proof := range persisted.ReviewerProofs {
+					if proof.Repository == "o/r" && proof.Issue == 73 && proof.Attempt == 1 {
+						t.Fatalf("restart restored dismissed reviewer proof: %#v", proof)
+					}
+				}
+				if _, err := os.Lstat(cancelledReviewerSnapshot); !errors.Is(err, os.ErrNotExist) || fullSystemTmuxSessionExists(environment, cancelledReviewerSession) {
+					t.Fatalf("restart restored dismissed reviewer resources: snapshot=%v session=%t", err, fullSystemTmuxSessionExists(environment, cancelledReviewerSession))
+				}
+				for _, path := range []string{manifest.Worktree, manifest.LogPath} {
+					if _, err := os.Stat(path); err != nil {
+						t.Fatalf("restart lost retained Dismiss artifact %s: %v", path, err)
+					}
+				}
+				verify := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/dashboard-lifecycle-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "dismiss-restart-playwright"))
+				verify.Dir = source
+				verify.Env = append(os.Environ(), "AGENT_SYMPHONY_LIFECYCLE_E2E_URL=http://"+restartAddress, "AGENT_SYMPHONY_LIFECYCLE_E2E_ACTION=review-plan-dismiss-verify", "AGENT_SYMPHONY_FULL_SYSTEM_RACE="+strconv.FormatBool(tracing))
+				if browserOutput, err := verify.CombinedOutput(); err != nil {
+					t.Fatalf("Dismiss restart browser: %v\n%s", err, browserOutput)
 				}
 			}
 		})

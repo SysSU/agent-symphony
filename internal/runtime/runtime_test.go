@@ -748,6 +748,37 @@ func TestResumeHandoffRefreshesTrustedSourceRefs(t *testing.T) {
 	}
 }
 
+func TestReviewSessionNameIsTargetUniqueAndBounded(t *testing.T) {
+	maximum := int(^uint(0) >> 1)
+	first, err := ReviewSessionName("owner/repository", maximum, maximum, strings.Repeat("a", 40)+".."+strings.Repeat("b", 40))
+	if err != nil || len(first) > maxResourceName {
+		t.Fatalf("largest reviewer identity name=%q length=%d err=%v", first, len(first), err)
+	}
+	second, err := ReviewSessionName("owner/repository", maximum, maximum, strings.Repeat("a", 40)+".."+strings.Repeat("c", 40))
+	if err != nil || first == second {
+		t.Fatalf("distinct targets shared reviewer identity: first=%q second=%q err=%v", first, second, err)
+	}
+}
+
+func TestReviewRunSessionNameBindsTargetAndNeverReusedRun(t *testing.T) {
+	maximum := int(^uint(0) >> 1)
+	first, err := ReviewRunSessionName("owner/repository", maximum, maximum, "owner/repository#1 plan sha256:"+strings.Repeat("a", 64), strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	differentTarget, err := ReviewRunSessionName("owner/repository", maximum, maximum, "owner/repository#1 plan sha256:"+strings.Repeat("c", 64), strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	differentRun, err := ReviewRunSessionName("owner/repository", maximum, maximum, "owner/repository#1 plan sha256:"+strings.Repeat("a", 64), strings.Repeat("d", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == differentTarget || first == differentRun || differentTarget == differentRun || len(first) > maxResourceName {
+		t.Fatalf("run sessions are not unique and bounded: %q %q %q", first, differentTarget, differentRun)
+	}
+}
+
 func TestResumeHandoffRecreatesMissingSessionBeforeStateTransition(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)

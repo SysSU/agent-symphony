@@ -56,6 +56,10 @@ type runtimeOwnerState struct {
 	ReviewerProofs             map[string]reviewerProcessProof      `json:"reviewer_proofs"`
 	ReviewerSafetyMigrated     bool                                 `json:"reviewer_safety_migrated,omitempty"`
 	ReviewerConfinementTracked bool                                 `json:"reviewer_confinement_tracked,omitempty"`
+	ReviewerRunTracked         bool                                 `json:"reviewer_run_tracked,omitempty"`
+	ReviewerPolicyTracked      bool                                 `json:"reviewer_policy_tracked,omitempty"`
+	ReviewerPolicyVersion      uint64                               `json:"reviewer_policy_version,omitempty"`
+	DismissCleanupTracked      bool                                 `json:"dismiss_cleanup_tracked,omitempty"`
 	LegacyReviewerQuarantines  map[string]string                    `json:"legacy_reviewer_quarantines"`
 	ReviewerRevocationTracked  bool                                 `json:"reviewer_revocation_tracked,omitempty"`
 	ExternalDispatchTracked    bool                                 `json:"external_dispatch_tracked,omitempty"`
@@ -96,12 +100,13 @@ type controlSnapshotRepair struct {
 }
 
 type runtimeAttemptRecord struct {
-	Generation       uint64                `json:"generation"`
-	ObservationEpoch uint64                `json:"observation_epoch,omitempty"`
-	LastCycleID      uint64                `json:"last_cycle_id,omitempty"`
-	StopEffectID     string                `json:"stop_effect_id,omitempty"`
-	Manifest         agentruntime.Manifest `json:"manifest"`
-	WorkerSeal       *workerSealSelection  `json:"worker_seal,omitempty"`
+	Generation                   uint64                `json:"generation"`
+	ObservationEpoch             uint64                `json:"observation_epoch,omitempty"`
+	LastCycleID                  uint64                `json:"last_cycle_id,omitempty"`
+	StopEffectID                 string                `json:"stop_effect_id,omitempty"`
+	WorkerAuthorityRevokedDigest string                `json:"worker_authority_revoked_digest,omitempty"`
+	Manifest                     agentruntime.Manifest `json:"manifest"`
+	WorkerSeal                   *workerSealSelection  `json:"worker_seal,omitempty"`
 }
 
 type workerSealSelection struct {
@@ -116,20 +121,28 @@ type workerSealSelection struct {
 // A completed review's filesystem root outlives bounded operator receipts.
 // This owner-held certificate is retained until destructive cleanup commits.
 type reviewerProcessProof struct {
-	Repository        string `json:"repository"`
-	Issue             int    `json:"issue"`
-	Attempt           int    `json:"attempt"`
-	Target            string `json:"target"`
-	Mode              string `json:"mode"`
-	EffectID          string `json:"effect_id"`
-	IssueGeneration   uint64 `json:"issue_generation"`
-	AttemptGeneration uint64 `json:"attempt_generation"`
-	GroupPID          int    `json:"group_pid"`
-	DeadProved        bool   `json:"dead_proved,omitempty"`
-	NeverRan          bool   `json:"never_ran,omitempty"`
-	LegacyUnverified  bool   `json:"legacy_unverified,omitempty"`
-	ProfileDigest     string `json:"profile_digest,omitempty"`
+	Repository         string `json:"repository"`
+	Issue              int    `json:"issue"`
+	Attempt            int    `json:"attempt"`
+	Target             string `json:"target"`
+	RunID              string `json:"run_id,omitempty"`
+	Mode               string `json:"mode"`
+	EffectID           string `json:"effect_id"`
+	IssueGeneration    uint64 `json:"issue_generation"`
+	AttemptGeneration  uint64 `json:"attempt_generation"`
+	GroupPID           int    `json:"group_pid"`
+	DeadProved         bool   `json:"dead_proved,omitempty"`
+	NeverRan           bool   `json:"never_ran,omitempty"`
+	LegacyUnverified   bool   `json:"legacy_unverified,omitempty"`
+	ProfileDigest      string `json:"profile_digest,omitempty"`
+	ConfinementVersion uint64 `json:"confinement_version,omitempty"`
 }
+
+// reviewerConfinementVersion attests the sandbox guarantees that make an old
+// DeadProved reviewer run safe to clean after an executable/profile upgrade.
+// Bump it, with fail-closed migration/quarantine handling, whenever those
+// guarantees change; a profile digest alone is deliberately not the policy.
+const reviewerConfinementVersion uint64 = 1
 
 func reviewerProofKey(repository string, issue, attempt int, mode, target string) string {
 	return ownerAttemptKey(repository, issue, attempt) + "\x00" + mode + "\x00" + target
@@ -142,24 +155,25 @@ type runtimePRRecovery struct {
 }
 
 type runtimeTombstone struct {
-	Repository            string                                `json:"repository"`
-	Issue                 int                                   `json:"issue"`
-	Attempt               int                                   `json:"attempt"`
-	Action                string                                `json:"action"`
-	InvalidatedGeneration uint64                                `json:"invalidated_generation"`
-	Generation            uint64                                `json:"generation"`
-	Revision              uint64                                `json:"revision"`
-	CleanupPhase          string                                `json:"cleanup_phase"`
-	PublishedHead         string                                `json:"published_head,omitempty"`
-	Manifest              *agentruntime.Manifest                `json:"manifest,omitempty"`
-	CleanupPolicy         *agentruntime.EffectCleanupPolicy     `json:"cleanup_policy,omitempty"`
-	EffectID              string                                `json:"effect_id,omitempty"`
-	ReviewerLeaseID       string                                `json:"reviewer_lease_id,omitempty"`
-	Diagnostic            string                                `json:"diagnostic,omitempty"`
-	InvalidatedHandoff    *handoffCandidateInvalidation         `json:"invalidated_handoff,omitempty"`
-	HandoffCompensated    bool                                  `json:"handoff_compensated,omitempty"`
-	InvalidatedStart      *startCandidateInvalidation           `json:"invalidated_start,omitempty"`
-	ExternalOutcomes      map[string]invalidatedExternalOutcome `json:"external_outcomes,omitempty"`
+	Repository                   string                                `json:"repository"`
+	Issue                        int                                   `json:"issue"`
+	Attempt                      int                                   `json:"attempt"`
+	Action                       string                                `json:"action"`
+	InvalidatedGeneration        uint64                                `json:"invalidated_generation"`
+	Generation                   uint64                                `json:"generation"`
+	Revision                     uint64                                `json:"revision"`
+	CleanupPhase                 string                                `json:"cleanup_phase"`
+	PublishedHead                string                                `json:"published_head,omitempty"`
+	Manifest                     *agentruntime.Manifest                `json:"manifest,omitempty"`
+	CleanupPolicy                *agentruntime.EffectCleanupPolicy     `json:"cleanup_policy,omitempty"`
+	EffectID                     string                                `json:"effect_id,omitempty"`
+	ReviewerLeaseID              string                                `json:"reviewer_lease_id,omitempty"`
+	WorkerAuthorityRevokedDigest string                                `json:"worker_authority_revoked_digest,omitempty"`
+	Diagnostic                   string                                `json:"diagnostic,omitempty"`
+	InvalidatedHandoff           *handoffCandidateInvalidation         `json:"invalidated_handoff,omitempty"`
+	HandoffCompensated           bool                                  `json:"handoff_compensated,omitempty"`
+	InvalidatedStart             *startCandidateInvalidation           `json:"invalidated_start,omitempty"`
+	ExternalOutcomes             map[string]invalidatedExternalOutcome `json:"external_outcomes,omitempty"`
 }
 
 type invalidatedExternalOutcome struct {
@@ -216,58 +230,66 @@ func validStartCandidateInvalidation(candidate startCandidateInvalidation, manif
 }
 
 type runtimeEffectIntent struct {
-	ID                                  string                           `json:"id"`
-	Action                              string                           `json:"action"`
-	Repository                          string                           `json:"repository"`
-	Issue                               int                              `json:"issue"`
-	Attempt                             int                              `json:"attempt"`
-	IssueGeneration                     uint64                           `json:"issue_generation"`
-	AttemptGeneration                   uint64                           `json:"attempt_generation"`
-	IntentEpoch                         uint64                           `json:"intent_epoch,omitempty"`
-	IntentRevision                      uint64                           `json:"intent_revision"`
-	State                               string                           `json:"state"`
-	Dispatched                          bool                             `json:"dispatched,omitempty"`
-	GovernancePhases                    []internalgithub.GovernancePhase `json:"governance_phases,omitempty"`
-	RequestDigest                       string                           `json:"request_digest"`
-	MachineStatusSequence               uint64                           `json:"machine_status_sequence,omitempty"`
-	CandidateLaunchToken                string                           `json:"candidate_launch_token,omitempty"`
-	StartGateNonce                      string                           `json:"start_gate_nonce,omitempty"`
-	StartMayRun                         bool                             `json:"start_may_run,omitempty"`
-	StartCandidates                     []startGateCandidate             `json:"start_candidates,omitempty"`
-	Reason                              string                           `json:"reason,omitempty"`
-	Review                              *agentruntime.ReviewTransition   `json:"review,omitempty"`
-	Reconciliation                      *reconciliationEffectRequest     `json:"reconciliation,omitempty"`
-	ReconciliationResult                *reconciliationEffectResult      `json:"reconciliation_result,omitempty"`
-	ReviewerLaunched                    bool                             `json:"reviewer_launched,omitempty"`
-	ReviewerGateProtocol                bool                             `json:"reviewer_gate_protocol,omitempty"`
-	ReviewerSessionRequested            bool                             `json:"reviewer_session_requested,omitempty"`
-	ReviewerGroupPID                    int                              `json:"reviewer_group_pid,omitempty"`
-	ReviewerResultDigest                string                           `json:"reviewer_result_digest,omitempty"`
-	ReviewerProfileDigest               string                           `json:"reviewer_profile_digest,omitempty"`
-	ReviewerStopped                     bool                             `json:"reviewer_stopped,omitempty"`
-	ReviewerRevoked                     bool                             `json:"reviewer_revoked,omitempty"`
-	SupersededReviewerID                string                           `json:"superseded_reviewer_id,omitempty"`
-	SupersededReviewerGroupPID          int                              `json:"superseded_reviewer_group_pid,omitempty"`
-	SupersededReviewerGateProtocol      bool                             `json:"superseded_reviewer_gate_protocol,omitempty"`
-	SupersededReviewerSessionRequested  bool                             `json:"superseded_reviewer_session_requested,omitempty"`
-	SupersededReviewerRequestDigest     string                           `json:"superseded_reviewer_request_digest,omitempty"`
-	SupersededReviewerTarget            string                           `json:"superseded_reviewer_target,omitempty"`
-	SupersededReviewerMode              string                           `json:"superseded_reviewer_mode,omitempty"`
-	SupersededReviewerIssueGeneration   uint64                           `json:"superseded_reviewer_issue_generation,omitempty"`
-	SupersededReviewerAttemptGeneration uint64                           `json:"superseded_reviewer_attempt_generation,omitempty"`
-	Diagnostic                          string                           `json:"diagnostic,omitempty"`
-	InvalidatedHandoff                  *handoffCandidateInvalidation    `json:"invalidated_handoff,omitempty"`
-	InvalidatedStart                    *startCandidateInvalidation      `json:"invalidated_start,omitempty"`
+	ID                                   string                           `json:"id"`
+	Action                               string                           `json:"action"`
+	Repository                           string                           `json:"repository"`
+	Issue                                int                              `json:"issue"`
+	Attempt                              int                              `json:"attempt"`
+	IssueGeneration                      uint64                           `json:"issue_generation"`
+	AttemptGeneration                    uint64                           `json:"attempt_generation"`
+	IntentEpoch                          uint64                           `json:"intent_epoch,omitempty"`
+	IntentRevision                       uint64                           `json:"intent_revision"`
+	State                                string                           `json:"state"`
+	Dispatched                           bool                             `json:"dispatched,omitempty"`
+	GovernancePhases                     []internalgithub.GovernancePhase `json:"governance_phases,omitempty"`
+	RequestDigest                        string                           `json:"request_digest"`
+	MachineStatusSequence                uint64                           `json:"machine_status_sequence,omitempty"`
+	CandidateLaunchToken                 string                           `json:"candidate_launch_token,omitempty"`
+	StartGateNonce                       string                           `json:"start_gate_nonce,omitempty"`
+	StartMayRun                          bool                             `json:"start_may_run,omitempty"`
+	StartCandidates                      []startGateCandidate             `json:"start_candidates,omitempty"`
+	Reason                               string                           `json:"reason,omitempty"`
+	Review                               *agentruntime.ReviewTransition   `json:"review,omitempty"`
+	Reconciliation                       *reconciliationEffectRequest     `json:"reconciliation,omitempty"`
+	ReconciliationResult                 *reconciliationEffectResult      `json:"reconciliation_result,omitempty"`
+	ReviewerLaunched                     bool                             `json:"reviewer_launched,omitempty"`
+	ReviewerSourceRevision               uint64                           `json:"reviewer_source_revision,omitempty"`
+	ReviewerGateProtocol                 bool                             `json:"reviewer_gate_protocol,omitempty"`
+	ReviewerSessionRequested             bool                             `json:"reviewer_session_requested,omitempty"`
+	ReviewerGroupPID                     int                              `json:"reviewer_group_pid,omitempty"`
+	ReviewerResultDigest                 string                           `json:"reviewer_result_digest,omitempty"`
+	ReviewerProfileDigest                string                           `json:"reviewer_profile_digest,omitempty"`
+	ReviewerConfinementVersion           uint64                           `json:"reviewer_confinement_version,omitempty"`
+	ReviewerStopped                      bool                             `json:"reviewer_stopped,omitempty"`
+	ReviewerRevoked                      bool                             `json:"reviewer_revoked,omitempty"`
+	SupersededReviewerID                 string                           `json:"superseded_reviewer_id,omitempty"`
+	SupersededReviewerGroupPID           int                              `json:"superseded_reviewer_group_pid,omitempty"`
+	SupersededReviewerGateProtocol       bool                             `json:"superseded_reviewer_gate_protocol,omitempty"`
+	SupersededReviewerSessionRequested   bool                             `json:"superseded_reviewer_session_requested,omitempty"`
+	SupersededReviewerRequestDigest      string                           `json:"superseded_reviewer_request_digest,omitempty"`
+	SupersededReviewerProfileDigest      string                           `json:"superseded_reviewer_profile_digest,omitempty"`
+	SupersededReviewerConfinementVersion uint64                           `json:"superseded_reviewer_confinement_version,omitempty"`
+	SupersededReviewerTarget             string                           `json:"superseded_reviewer_target,omitempty"`
+	SupersededReviewerRunID              string                           `json:"superseded_reviewer_run_id,omitempty"`
+	SupersededReviewerMode               string                           `json:"superseded_reviewer_mode,omitempty"`
+	SupersededReviewerIssueGeneration    uint64                           `json:"superseded_reviewer_issue_generation,omitempty"`
+	SupersededReviewerAttemptGeneration  uint64                           `json:"superseded_reviewer_attempt_generation,omitempty"`
+	ReviewerCleanupDigest                string                           `json:"reviewer_cleanup_digest,omitempty"`
+	Diagnostic                           string                           `json:"diagnostic,omitempty"`
+	InvalidatedHandoff                   *handoffCandidateInvalidation    `json:"invalidated_handoff,omitempty"`
+	InvalidatedStart                     *startCandidateInvalidation      `json:"invalidated_start,omitempty"`
 }
 
 type stateResultIdentity struct {
-	Epoch             uint64
-	SourceRevision    uint64
-	CycleID           uint64
-	IssueGeneration   uint64
-	AttemptGeneration uint64
-	EffectID          string
-	RequestDigest     string
+	Epoch                 uint64
+	SourceRevision        uint64
+	CycleID               uint64
+	IssueGeneration       uint64
+	AttemptGeneration     uint64
+	EffectID              string
+	RequestDigest         string
+	ReviewRunID           string
+	ReviewerProfileDigest string
 }
 
 type stateOwnerSnapshot struct {
@@ -351,8 +373,9 @@ type diagnoseRuntimeEffectCommand struct {
 }
 
 type beginReconciliationEffectCommand struct {
-	Identity stateResultIdentity
-	Request  reconciliationEffectRequest
+	Identity               stateResultIdentity
+	ReviewerSourceRevision uint64
+	Request                reconciliationEffectRequest
 }
 
 type authorizeReconciliationEffectCommand struct {
@@ -417,6 +440,16 @@ type markReviewerStoppedCommand struct {
 type bindReviewerStoppingCommand struct {
 	Identity stateResultIdentity
 	GroupPID int
+}
+
+type forgetReviewerProofCommand struct {
+	Identity stateResultIdentity
+	Proof    reviewerProcessProof
+}
+
+type markReviewerResourcesCleanedCommand struct {
+	Identity stateResultIdentity
+	Proofs   []reviewerProcessProof
 }
 
 type reviewerStopObservation struct {
@@ -530,6 +563,8 @@ const (
 	stateOwnerSealReviewerResult
 	stateOwnerMarkReviewerStopped
 	stateOwnerBindReviewerStopping
+	stateOwnerForgetReviewerProof
+	stateOwnerMarkReviewerResourcesCleaned
 	stateOwnerSupersedePlanReview
 	stateOwnerFinishReconciliationEffect
 	stateOwnerDiagnoseReconciliationEffect
@@ -569,6 +604,8 @@ type stateOwnerCommand struct {
 	sealReviewerResult           sealReviewerResultCommand
 	markReviewerStopped          markReviewerStoppedCommand
 	bindReviewerStopping         bindReviewerStoppingCommand
+	forgetReviewerProof          forgetReviewerProofCommand
+	markReviewerResourcesCleaned markReviewerResourcesCleanedCommand
 	supersedePlanReview          supersedePlanReviewCommand
 	finishReconciliation         finishReconciliationEffectCommand
 	diagnoseReconciliation       diagnoseReconciliationEffectCommand
@@ -659,6 +696,7 @@ func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial
 		return nil, errors.New("runtime attempt root is unsafe")
 	}
 	migrateLegacyMachineStatuses(&initial)
+	migrateLegacyDismissCleanup(&initial)
 	if err := validateRuntimeOwnerState(initial, attempts, root, false); err != nil {
 		return nil, err
 	}
@@ -1048,6 +1086,16 @@ func (o *stateOwner) bindReviewerStopping(ctx context.Context, command bindRevie
 	return result.snapshot, err
 }
 
+func (o *stateOwner) forgetReviewerProof(ctx context.Context, command forgetReviewerProofCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerForgetReviewerProof, forgetReviewerProof: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) markReviewerResourcesCleaned(ctx context.Context, command markReviewerResourcesCleanedCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerMarkReviewerResourcesCleaned, markReviewerResourcesCleaned: command})
+	return result.snapshot, err
+}
+
 func (o *stateOwner) supersedePlanReview(ctx context.Context, command supersedePlanReviewCommand) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerSupersedePlanReview, supersedePlanReview: command})
 	return result.snapshot, err
@@ -1061,6 +1109,7 @@ func (o *stateOwner) advanceOperatorRecovery(ctx context.Context, command advanc
 func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwnerState, command stateOwnerCommand, appliedCycles map[string]appliedReconciliationCycle) (runtimeOwnerState, *runtimeEffectIntent, error) {
 	candidate := cloneRuntimeOwnerState(committed)
 	if command.kind == stateOwnerStart {
+		migrateLegacyDismissCleanup(&candidate)
 		if candidate.Epoch == ^uint64(0) {
 			return runtimeOwnerState{}, nil, errors.New("runtime epoch overflow")
 		}
@@ -1082,6 +1131,36 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 			}
 			candidate.ReviewerConfinementTracked = true
 		}
+		if !candidate.ReviewerRunTracked {
+			if candidate.LegacyReviewerQuarantines == nil {
+				candidate.LegacyReviewerQuarantines = map[string]string{}
+			}
+			for key, proof := range candidate.ReviewerProofs {
+				if !proof.NeverRan && !validDigest(proof.RunID) {
+					proof.DeadProved, proof.LegacyUnverified = false, true
+					candidate.ReviewerProofs[key] = proof
+					candidate.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] = "legacy reviewer run identity is missing; physical cleanup cannot be certified"
+				}
+			}
+			for _, record := range candidate.Attempts {
+				manifest := record.Manifest
+				if manifest.ReviewState != "" && !manifest.ReviewRunCleaned && !validDigest(manifest.ReviewRunID) {
+					candidate.LegacyReviewerQuarantines[ownerIssueKey(manifest.Repository, manifest.Issue)] = "legacy reviewer run identity is missing; physical cleanup cannot be certified"
+				}
+			}
+			for _, tombstone := range candidate.Tombstones {
+				if tombstone.Manifest != nil && tombstone.Manifest.ReviewState != "" && !tombstone.Manifest.ReviewRunCleaned && !validDigest(tombstone.Manifest.ReviewRunID) {
+					candidate.LegacyReviewerQuarantines[ownerIssueKey(tombstone.Repository, tombstone.Issue)] = "legacy reviewer run identity is missing; physical cleanup cannot be certified"
+				}
+			}
+			for _, effect := range candidate.Effects {
+				if effect.Reconciliation != nil && effect.Reconciliation.Reviewer != nil && !validDigest(effect.Reconciliation.Reviewer.RunID) || effect.SupersededReviewerID != "" && !validDigest(effect.SupersededReviewerRunID) {
+					candidate.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] = "legacy reviewer run identity is missing; physical cleanup cannot be certified"
+				}
+			}
+			candidate.ReviewerRunTracked = true
+		}
+		migrateReviewerPolicy(&candidate)
 		if !candidate.ExternalDispatchTracked {
 			for id, effect := range candidate.Effects {
 				if effect.State == "pending" && effect.Reconciliation != nil && reconciliationMutatesGitHub(effect.Reconciliation.Action) {
@@ -1208,6 +1287,14 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		}
 	case stateOwnerBindReviewerStopping:
 		if err := applyBindReviewerStopping(&candidate, command.bindReviewerStopping); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerForgetReviewerProof:
+		if err := applyForgetReviewerProof(&candidate, command.forgetReviewerProof); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerMarkReviewerResourcesCleaned:
+		if err := applyMarkReviewerResourcesCleaned(&candidate, command.markReviewerResourcesCleaned); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerSupersedePlanReview:
@@ -1472,10 +1559,22 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 	if !ok || effect.Action != string(command.Action) || effect.IntentEpoch != identity.Epoch || effect.IntentRevision != identity.SourceRevision || effect.IssueGeneration != identity.IssueGeneration || effect.AttemptGeneration != identity.AttemptGeneration || effect.RequestDigest != identity.RequestDigest {
 		return errStaleStateResult
 	}
+	if effect.State == "completed" && command.Action == agentruntime.EffectStop {
+		manifest := cloneManifest(command.Manifest)
+		if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || manifest.Repository != effect.Repository || manifest.Issue != effect.Issue || manifest.Attempt != effect.Attempt {
+			return errStateConflict
+		}
+		normalizeStoppedReviewManifest(&manifest)
+		record, exists := state.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
+		if exists && record.StopEffectID == "" && reflect.DeepEqual(record.Manifest, manifest) && effect.Diagnostic == manifest.Diagnostic && revokedWorkerCredentialCurrent(record) {
+			return nil
+		}
+		return errStateConflict
+	}
 	if effect.SupersededReviewerID != "" && !effect.ReviewerStopped {
 		return errStateConflict
 	}
-	if (command.Action == agentruntime.EffectCleanup || command.Action == agentruntime.EffectStop) && (attemptHasUnprovedReviewer(*state, effect.Repository, effect.Issue, effect.Attempt) || state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] != "") {
+	if (command.Action == agentruntime.EffectCleanup || command.Action == agentruntime.EffectStop) && effectReviewerCleanupBlocked(*state, effect) {
 		return errStateConflict
 	}
 	issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
@@ -1508,6 +1607,16 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 		if !validRuntimeEffectResult(command.Action, effect, record.Manifest, manifest) {
 			return errStateConflict
 		}
+		if command.Action == agentruntime.EffectStop {
+			if record.Manifest.LaunchID != "" && !agentruntime.WorkerConfinementBound(record.Manifest, record.Manifest.WorkerGeneration, activeWorkerProfileDigest(*state)) {
+				return errStateConflict
+			}
+			manifest.WorkerGeneration, manifest.WorkerProfileDigest = record.Manifest.WorkerGeneration, record.Manifest.WorkerProfileDigest
+			normalizeStoppedReviewManifest(&manifest)
+			if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil {
+				return errStateConflict
+			}
+		}
 		if effect.State == "completed" {
 			if reflect.DeepEqual(record.Manifest, manifest) && effect.Diagnostic == manifest.Diagnostic {
 				return nil
@@ -1517,9 +1626,17 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 		previousWorkerSequence := record.Manifest.WorkerStatusSeq
 		record.Manifest = manifest
 		if command.Action == agentruntime.EffectStop {
-			// The stop generation invalidates the launch-bound worker authority.
-			record.Manifest.WorkerGeneration = 0
-			record.Manifest.WorkerProfileDigest = ""
+			// This owner-only credential records that the exact confined launch
+			// lost authority before its generation was invalidated. Keep the
+			// launch tuple for later exact cleanup; cancellation alone is never
+			// sufficient to release GitHub authority.
+			record.WorkerAuthorityRevokedDigest = revokedWorkerDigest(record.Manifest, record.Generation)
+			if record.Manifest.LaunchID != "" && record.WorkerAuthorityRevokedDigest == "" {
+				return errStateConflict
+			}
+			if record.Manifest.LaunchID == "" {
+				record.Manifest.WorkerGeneration, record.Manifest.WorkerProfileDigest = 0, ""
+			}
 			if record.StopEffectID != "" && record.StopEffectID != effect.ID {
 				return errStateConflict
 			}
@@ -1557,7 +1674,7 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 	}
 	effect.State, effect.Diagnostic = "completed", manifest.Diagnostic
 	state.Effects[effect.ID] = effect
-	if command.Action == agentruntime.EffectCleanup {
+	if command.Action == agentruntime.EffectStop || command.Action == agentruntime.EffectCleanup {
 		for key, proof := range state.ReviewerProofs {
 			if proof.Repository == effect.Repository && proof.Issue == effect.Issue && proof.Attempt == effect.Attempt {
 				delete(state.ReviewerProofs, key)
@@ -1566,17 +1683,32 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 	}
 	if tombstone, ok := state.Tombstones[attemptKey]; ok && tombstone.EffectID == effect.ID {
 		tombstone.CleanupPhase = "completed"
+		tombstone.ReviewerLeaseID = ""
+		tombstone.Diagnostic = ""
+		if tombstone.Manifest != nil && (tombstone.Manifest.ReviewRunID != "" || tombstone.Manifest.ReviewSnapshot != "" || tombstone.Manifest.ReviewSession != "") {
+			manifest := cloneManifest(*tombstone.Manifest)
+			manifest.ReviewRunID, manifest.ReviewSnapshot, manifest.ReviewSession = "", "", ""
+			manifest.ReviewRunCleaned = true
+			tombstone.Manifest = &manifest
+		}
 		state.Tombstones[attemptKey] = tombstone
 	}
 	return nil
 }
 
-func applyMarkReviewerStopped(state *runtimeOwnerState, command markReviewerStoppedCommand) error {
-	// A stopped tmux session or vanished process group is not proof that a
-	// launched reviewer's detached descendants are gone.
-	if !command.Observation.NeverRan {
-		return errStateConflict
+func normalizeStoppedReviewManifest(manifest *agentruntime.Manifest) {
+	if manifest.ReviewRunID == "" && manifest.ReviewSnapshot == "" && manifest.ReviewSession == "" {
+		return
 	}
+	manifest.ReviewRunID, manifest.ReviewSnapshot, manifest.ReviewSession = "", "", ""
+	manifest.ReviewRunCleaned = true
+	if manifest.ReviewState == "preparing" || manifest.ReviewState == "running" {
+		manifest.ReviewState = "failed"
+		manifest.ReviewDiagnostic = "reviewer stopped by runtime transition"
+	}
+}
+
+func applyMarkReviewerStopped(state *runtimeOwnerState, command markReviewerStoppedCommand) error {
 	effect, ok := state.Effects[command.Identity.EffectID]
 	if !ok || effect.State != "pending" || effect.SupersededReviewerID == "" || effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || effect.IntentEpoch != command.Identity.Epoch || effect.IntentRevision != command.Identity.SourceRevision || effect.IssueGeneration != command.Identity.IssueGeneration || effect.AttemptGeneration != command.Identity.AttemptGeneration || effect.RequestDigest != command.Identity.RequestDigest {
 		return errStaleStateResult
@@ -1591,19 +1723,30 @@ func applyMarkReviewerStopped(state *runtimeOwnerState, command markReviewerStop
 	}
 	if effect.SupersededReviewerGroupPID > 0 {
 		proof, exists := state.ReviewerProofs[key]
-		if !exists || proof.EffectID != effect.SupersededReviewerID || proof.GroupPID != effect.SupersededReviewerGroupPID || proof.IssueGeneration != effect.SupersededReviewerIssueGeneration || proof.AttemptGeneration != effect.SupersededReviewerAttemptGeneration {
+		if !exists || !reviewerProofMatchesSuperseded(effect, proof) {
 			return errStateConflict
 		}
 		proof.DeadProved = true
+		// Exact group death is authority-safe only for the current confined
+		// profile; escaped descendants cannot cross the invalidated target.
+		if !reviewerCleanupAuthorized(proof, activeWorkerProfileDigest(*state)) {
+			return errStateConflict
+		}
 		state.ReviewerProofs[key] = proof
 	} else {
 		if state.ReviewerProofs == nil {
 			state.ReviewerProofs = map[string]reviewerProcessProof{}
 		}
-		state.ReviewerProofs[key] = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.SupersededReviewerMode, Target: effect.SupersededReviewerTarget, EffectID: effect.SupersededReviewerID, IssueGeneration: effect.SupersededReviewerIssueGeneration, AttemptGeneration: effect.SupersededReviewerAttemptGeneration, GroupPID: observed.GroupPID, DeadProved: true, NeverRan: observed.NeverRan}
+		state.ReviewerProofs[key] = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.SupersededReviewerMode, Target: effect.SupersededReviewerTarget, RunID: effect.SupersededReviewerRunID, EffectID: effect.SupersededReviewerID, IssueGeneration: effect.SupersededReviewerIssueGeneration, AttemptGeneration: effect.SupersededReviewerAttemptGeneration, GroupPID: observed.GroupPID, DeadProved: true, NeverRan: observed.NeverRan, ProfileDigest: effect.SupersededReviewerProfileDigest, ConfinementVersion: effect.SupersededReviewerConfinementVersion}
 	}
 	effect.ReviewerStopped = true
 	state.Effects[effect.ID] = effect
+	key = ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+	if tombstone, ok := state.Tombstones[key]; ok && tombstone.EffectID == effect.ID && tombstone.ReviewerLeaseID == effect.SupersededReviewerID {
+		tombstone.ReviewerLeaseID = ""
+		tombstone.Diagnostic = "reviewer resource cleanup remains pending"
+		state.Tombstones[key] = tombstone
+	}
 	return nil
 }
 
@@ -1619,23 +1762,23 @@ func applyBindReviewerStopping(state *runtimeOwnerState, command bindReviewerSto
 		if !effect.ReviewerGateProtocol || !effect.ReviewerSessionRequested || effect.ReviewerGroupPID != 0 && effect.ReviewerGroupPID != command.GroupPID {
 			return errStateConflict
 		}
-		proof = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.Reconciliation.Reviewer.Mode, Target: effect.Reconciliation.Reviewer.Target, EffectID: effect.ID, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, GroupPID: command.GroupPID}
+		proof = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.Reconciliation.Reviewer.Mode, Target: effect.Reconciliation.Reviewer.Target, RunID: effect.Reconciliation.Reviewer.RunID, EffectID: effect.ID, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, GroupPID: command.GroupPID, ProfileDigest: effect.ReviewerProfileDigest, ConfinementVersion: effect.ReviewerConfinementVersion}
 		effect.ReviewerGroupPID = command.GroupPID
 		effect.ReviewerLaunched = true
 	} else if effect.SupersededReviewerID != "" && (effect.Action == string(agentruntime.EffectStop) || effect.Action == string(agentruntime.EffectCleanup)) {
 		if !effect.SupersededReviewerGateProtocol || !effect.SupersededReviewerSessionRequested || effect.SupersededReviewerGroupPID != 0 && effect.SupersededReviewerGroupPID != command.GroupPID {
 			return errStateConflict
 		}
-		proof = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.SupersededReviewerMode, Target: effect.SupersededReviewerTarget, EffectID: effect.SupersededReviewerID, IssueGeneration: effect.SupersededReviewerIssueGeneration, AttemptGeneration: effect.SupersededReviewerAttemptGeneration, GroupPID: command.GroupPID}
+		proof = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.SupersededReviewerMode, Target: effect.SupersededReviewerTarget, RunID: effect.SupersededReviewerRunID, EffectID: effect.SupersededReviewerID, IssueGeneration: effect.SupersededReviewerIssueGeneration, AttemptGeneration: effect.SupersededReviewerAttemptGeneration, GroupPID: command.GroupPID, ProfileDigest: effect.SupersededReviewerProfileDigest, ConfinementVersion: effect.SupersededReviewerConfinementVersion}
 		effect.SupersededReviewerGroupPID = command.GroupPID
 	} else {
 		return errStateConflict
 	}
 	key := reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target)
 	if old, exists := state.ReviewerProofs[key]; exists {
-		if old.EffectID == proof.EffectID && old.GroupPID == proof.GroupPID && old.IssueGeneration == proof.IssueGeneration && old.AttemptGeneration == proof.AttemptGeneration {
+		if sameReviewerProofIdentity(old, proof) {
 			proof = old
-		} else if !old.DeadProved || old.EffectID == proof.EffectID || old.Repository != proof.Repository || old.Issue != proof.Issue || old.Attempt != proof.Attempt || old.Mode != proof.Mode || old.Target != proof.Target || old.IssueGeneration > proof.IssueGeneration || old.AttemptGeneration > proof.AttemptGeneration {
+		} else {
 			return errStateConflict
 		}
 	}
@@ -1643,6 +1786,117 @@ func applyBindReviewerStopping(state *runtimeOwnerState, command bindReviewerSto
 		state.ReviewerProofs = map[string]reviewerProcessProof{}
 	}
 	state.ReviewerProofs[key] = proof
+	state.Effects[effect.ID] = effect
+	return nil
+}
+
+func applyForgetReviewerProof(state *runtimeOwnerState, command forgetReviewerProofCommand) error {
+	effect, ok := state.Effects[command.Identity.EffectID]
+	if !ok || effect.State != "pending" || !reconciliationEffectIdentityMatches(effect, command.Identity) {
+		return errStaleStateResult
+	}
+	if effect.Action == string(agentruntime.EffectStop) {
+		// Stop retains every exact cleanup certificate until its final owner
+		// transition atomically clears both the proofs and manifest identity.
+		return errStateConflict
+	}
+	proof := command.Proof
+	key := reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target)
+	stored, ok := state.ReviewerProofs[key]
+	if !ok || !reflect.DeepEqual(stored, proof) || proof.Repository != effect.Repository || proof.Issue != effect.Issue || proof.Attempt != effect.Attempt || !reviewerCleanupAuthorized(proof, activeWorkerProfileDigest(*state)) {
+		return errStateConflict
+	}
+	if effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationReviewer || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Phase != "run-observe" || proof.RunID == effect.Reconciliation.Reviewer.RunID || proof.AttemptGeneration == 0 || proof.AttemptGeneration > effect.AttemptGeneration {
+		return errStateConflict
+	}
+	delete(state.ReviewerProofs, key)
+	return nil
+}
+
+func attemptReviewerProofs(state runtimeOwnerState, repository string, issue, attempt int) []reviewerProcessProof {
+	keys := make([]string, 0)
+	for key, proof := range state.ReviewerProofs {
+		if proof.Repository == repository && proof.Issue == issue && proof.Attempt == attempt {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	proofs := make([]reviewerProcessProof, 0, len(keys))
+	for _, key := range keys {
+		proofs = append(proofs, state.ReviewerProofs[key])
+	}
+	return proofs
+}
+
+func reviewerProofSetDigest(proofs []reviewerProcessProof) string {
+	encoded, _ := json.Marshal(proofs)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func revokedWorkerDigest(manifest agentruntime.Manifest, revokedGeneration uint64) string {
+	if manifest.Version != agentruntime.ManifestVersion2 || manifest.State != "cancelled" || manifest.LaunchID == "" || !agentruntime.ValidLaunchToken(manifest.LaunchToken) || manifest.WorkerGeneration == 0 || manifest.WorkerGeneration == ^uint64(0) || manifest.WorkerGeneration+1 != revokedGeneration || !agentruntime.ValidEffectRequestDigest(manifest.WorkerProfileDigest) {
+		return ""
+	}
+	material := struct {
+		Domain            string
+		Repository        string
+		Issue             int
+		Attempt           int
+		Branch            string
+		Worktree          string
+		Session           string
+		LaunchToken       string
+		LaunchID          string
+		WorkerGeneration  uint64
+		RevokedGeneration uint64
+		ProfileDigest     string
+	}{
+		Domain: "agent-symphony-revoked-worker-v1", Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt,
+		Branch: manifest.Branch, Worktree: manifest.Worktree, Session: manifest.Session, LaunchToken: manifest.LaunchToken, LaunchID: manifest.LaunchID,
+		WorkerGeneration: manifest.WorkerGeneration, RevokedGeneration: revokedGeneration, ProfileDigest: manifest.WorkerProfileDigest,
+	}
+	body, err := json.Marshal(material)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(body)
+	return hex.EncodeToString(digest[:])
+}
+
+func revokedWorkerCredentialCurrent(record runtimeAttemptRecord) bool {
+	if record.Manifest.LaunchID == "" {
+		return record.WorkerAuthorityRevokedDigest == ""
+	}
+	return validDigest(record.WorkerAuthorityRevokedDigest) && record.WorkerAuthorityRevokedDigest == revokedWorkerDigest(record.Manifest, record.Generation)
+}
+
+func revokedWorkerTombstoneCredentialCurrent(tombstone runtimeTombstone) bool {
+	if tombstone.Manifest == nil || tombstone.Manifest.LaunchID == "" {
+		return tombstone.WorkerAuthorityRevokedDigest == ""
+	}
+	revokedGeneration := tombstone.Manifest.WorkerGeneration + 1
+	return revokedGeneration > 1 && revokedGeneration <= tombstone.InvalidatedGeneration && validDigest(tombstone.WorkerAuthorityRevokedDigest) && tombstone.WorkerAuthorityRevokedDigest == revokedWorkerDigest(*tombstone.Manifest, revokedGeneration)
+}
+
+func applyMarkReviewerResourcesCleaned(state *runtimeOwnerState, command markReviewerResourcesCleanedCommand) error {
+	effect, ok := state.Effects[command.Identity.EffectID]
+	if !ok || effect.State != "pending" || effect.Action != string(agentruntime.EffectStop) || !reconciliationEffectIdentityMatches(effect, command.Identity) {
+		return errStaleStateResult
+	}
+	proofs := attemptReviewerProofs(*state, effect.Repository, effect.Issue, effect.Attempt)
+	if !reflect.DeepEqual(proofs, command.Proofs) {
+		return errStateConflict
+	}
+	if effect.SupersededReviewerID != "" && !effect.ReviewerStopped {
+		return errStateConflict
+	}
+	for _, proof := range proofs {
+		if proof.AttemptGeneration == 0 || proof.AttemptGeneration >= effect.AttemptGeneration || !reviewerCleanupAuthorized(proof, activeWorkerProfileDigest(*state)) || proof.EffectID == effect.SupersededReviewerID && !reviewerProofMatchesSuperseded(effect, proof) {
+			return errStateConflict
+		}
+	}
+	effect.ReviewerCleanupDigest = reviewerProofSetDigest(proofs)
 	state.Effects[effect.ID] = effect
 	return nil
 }
@@ -1708,6 +1962,8 @@ func sameRuntimeEffectManifestBase(current, result agentruntime.Manifest, action
 	}
 	if action == agentruntime.EffectReview {
 		copy.ReviewState, copy.ReviewMode, copy.ReviewTarget = current.ReviewState, current.ReviewMode, current.ReviewTarget
+		copy.ReviewRunID = current.ReviewRunID
+		copy.ReviewRunCleaned = current.ReviewRunCleaned
 		copy.ReviewDiagnostic = current.ReviewDiagnostic
 		copy.ReviewBase, copy.ReviewHead, copy.ReviewSnapshot, copy.ReviewSession = current.ReviewBase, current.ReviewHead, current.ReviewSnapshot, current.ReviewSession
 		copy.ReviewFindings = slices.Clone(current.ReviewFindings)
@@ -1735,7 +1991,7 @@ func reviewTransitionMatches(review agentruntime.ReviewTransition, current, resu
 	if review.State != "findings-queued" {
 		wantFindings, wantQueued, wantAcknowledged = nil, false, false
 	}
-	return result.State == wantState && result.Diagnostic == wantDiagnostic && result.ReviewState == review.State && result.ReviewDiagnostic == current.ReviewDiagnostic && result.ReviewMode == review.Mode && result.ReviewTarget == review.Target && result.ReviewBase == review.Base && result.ReviewHead == review.Head && result.ReviewSnapshot == review.Snapshot && result.ReviewSession == review.Session && slices.Equal(result.ReviewFindings, wantFindings) && result.ReviewHandoffQueued == wantQueued && result.ReviewHandoffAck == wantAcknowledged
+	return result.State == wantState && result.Diagnostic == wantDiagnostic && result.ReviewState == review.State && result.ReviewDiagnostic == current.ReviewDiagnostic && result.ReviewMode == review.Mode && result.ReviewTarget == review.Target && result.ReviewRunID == review.RunID && !result.ReviewRunCleaned && result.ReviewBase == review.Base && result.ReviewHead == review.Head && result.ReviewSnapshot == review.Snapshot && result.ReviewSession == review.Session && slices.Equal(result.ReviewFindings, wantFindings) && result.ReviewHandoffQueued == wantQueued && result.ReviewHandoffAck == wantAcknowledged
 }
 
 func validRuntimeEffectAction(action agentruntime.EffectAction) bool {
@@ -1788,7 +2044,7 @@ func pendingReviewerDeathUnproved(state runtimeOwnerState, effect runtimeEffectI
 	}
 	reviewer := effect.Reconciliation.Reviewer
 	proof, ok := state.ReviewerProofs[reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, reviewer.Mode, reviewer.Target)]
-	return !ok || proof.EffectID != effect.ID || !proof.DeadProved
+	return !ok || proof.EffectID != effect.ID || proof.RunID != reviewer.RunID || !proof.DeadProved
 }
 
 func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueGenerationCommand) error {
@@ -1831,8 +2087,9 @@ func issueHasUnprovedReviewer(state runtimeOwnerState, repository string, issue 
 	if state.LegacyReviewerQuarantines[ownerIssueKey(repository, issue)] != "" {
 		return true
 	}
+	activeProfileDigest := activeWorkerProfileDigest(state)
 	for _, proof := range state.ReviewerProofs {
-		if proof.Repository == repository && proof.Issue == issue && !proof.NeverRan {
+		if proof.Repository == repository && proof.Issue == issue && !reviewerCleanupAuthorized(proof, activeProfileDigest) {
 			return true
 		}
 	}
@@ -1847,7 +2104,7 @@ func issueHasUnconfinedReviewer(state runtimeOwnerState, repository string, issu
 		return true
 	}
 	for _, proof := range state.ReviewerProofs {
-		if proof.Repository == repository && proof.Issue == issue && !proof.NeverRan && (proof.LegacyUnverified || proof.ProfileDigest != config.WorkerProfileDigest()) {
+		if proof.Repository == repository && proof.Issue == issue && !proof.NeverRan && !reviewerCleanupAuthorized(proof, activeWorkerProfileDigest(state)) && (proof.LegacyUnverified || !validDigest(proof.RunID) || proof.ProfileDigest != activeWorkerProfileDigest(state)) {
 			return true
 		}
 	}
@@ -1941,8 +2198,21 @@ func migrateLegacyReviewerSafety(state *runtimeOwnerState) {
 }
 
 func attemptHasUnprovedReviewer(state runtimeOwnerState, repository string, issue, attempt int) bool {
+	if state.LegacyReviewerQuarantines[ownerIssueKey(repository, issue)] != "" {
+		return true
+	}
+	activeProfileDigest := activeWorkerProfileDigest(state)
 	for _, proof := range state.ReviewerProofs {
-		if proof.Repository == repository && proof.Issue == issue && proof.Attempt == attempt && !proof.NeverRan {
+		if proof.Repository == repository && proof.Issue == issue && proof.Attempt == attempt && !reviewerCleanupAuthorized(proof, activeProfileDigest) {
+			return true
+		}
+	}
+	return false
+}
+
+func attemptHasReviewerProof(state runtimeOwnerState, repository string, issue, attempt int) bool {
+	for _, proof := range state.ReviewerProofs {
+		if proof.Repository == repository && proof.Issue == issue && proof.Attempt == attempt {
 			return true
 		}
 	}
@@ -1951,7 +2221,59 @@ func attemptHasUnprovedReviewer(state runtimeOwnerState, repository string, issu
 
 func attemptHasUnconfinedReviewer(state runtimeOwnerState, repository string, issue, attempt int) bool {
 	for _, proof := range state.ReviewerProofs {
-		if proof.Repository == repository && proof.Issue == issue && proof.Attempt == attempt && !proof.NeverRan && (proof.LegacyUnverified || proof.ProfileDigest != config.WorkerProfileDigest()) {
+		if proof.Repository == repository && proof.Issue == issue && proof.Attempt == attempt && !proof.NeverRan && !reviewerCleanupAuthorized(proof, activeWorkerProfileDigest(state)) && (proof.LegacyUnverified || !validDigest(proof.RunID) || proof.ProfileDigest != activeWorkerProfileDigest(state)) {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewerCleanupAuthorized(proof reviewerProcessProof, activeProfileDigest string) bool {
+	return proof.DeadProved && (proof.NeverRan && proof.GroupPID == 0 || validDigest(proof.RunID) && proof.GroupPID >= 2 && !proof.LegacyUnverified && validDigest(proof.ProfileDigest) && proof.ConfinementVersion == reviewerConfinementVersion)
+}
+
+func reviewerProofMatchesSuperseded(effect runtimeEffectIntent, proof reviewerProcessProof) bool {
+	return effect.SupersededReviewerID != "" && proof.EffectID == effect.SupersededReviewerID && proof.RunID == effect.SupersededReviewerRunID && proof.Mode == effect.SupersededReviewerMode && proof.Target == effect.SupersededReviewerTarget && proof.IssueGeneration == effect.SupersededReviewerIssueGeneration && proof.AttemptGeneration == effect.SupersededReviewerAttemptGeneration && proof.GroupPID == effect.SupersededReviewerGroupPID && proof.ProfileDigest == effect.SupersededReviewerProfileDigest && proof.ConfinementVersion == effect.SupersededReviewerConfinementVersion
+}
+
+func sameReviewerProofIdentity(left, right reviewerProcessProof) bool {
+	return left.Repository == right.Repository && left.Issue == right.Issue && left.Attempt == right.Attempt && left.Mode == right.Mode && left.Target == right.Target && left.RunID == right.RunID && left.EffectID == right.EffectID && left.IssueGeneration == right.IssueGeneration && left.AttemptGeneration == right.AttemptGeneration && left.GroupPID == right.GroupPID && left.ProfileDigest == right.ProfileDigest && left.ConfinementVersion == right.ConfinementVersion
+}
+
+func effectReviewerCleanupBlocked(state runtimeOwnerState, effect runtimeEffectIntent) bool {
+	if state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] != "" {
+		return true
+	}
+	if effect.Action == string(agentruntime.EffectStop) {
+		if effect.SupersededReviewerID != "" && !effect.ReviewerStopped {
+			return true
+		}
+		proofs := attemptReviewerProofs(state, effect.Repository, effect.Issue, effect.Attempt)
+		record := state.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
+		hasReviewResources := record.Manifest.ReviewRunID != "" || record.Manifest.ReviewSnapshot != "" || record.Manifest.ReviewSession != ""
+		if (len(proofs) != 0 || hasReviewResources) && (effect.ReviewerCleanupDigest == "" || effect.ReviewerCleanupDigest != reviewerProofSetDigest(proofs)) {
+			return true
+		}
+		if effect.ReviewerCleanupDigest != "" && effect.ReviewerCleanupDigest != reviewerProofSetDigest(proofs) {
+			return true
+		}
+		for _, proof := range proofs {
+			if proof.AttemptGeneration == 0 || proof.AttemptGeneration >= effect.AttemptGeneration || !reviewerCleanupAuthorized(proof, activeWorkerProfileDigest(state)) || proof.EffectID == effect.SupersededReviewerID && !reviewerProofMatchesSuperseded(effect, proof) {
+				return true
+			}
+		}
+		return false
+	}
+	expectedAttemptGeneration := effect.AttemptGeneration
+	if effect.Action == string(agentruntime.EffectCleanup) {
+		tombstone, ok := state.Tombstones[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
+		if !ok || tombstone.EffectID != effect.ID || tombstone.Generation != effect.AttemptGeneration || tombstone.InvalidatedGeneration+1 != tombstone.Generation {
+			return true
+		}
+		expectedAttemptGeneration = tombstone.InvalidatedGeneration
+	}
+	for _, proof := range state.ReviewerProofs {
+		if proof.Repository == effect.Repository && proof.Issue == effect.Issue && proof.Attempt == effect.Attempt && (proof.AttemptGeneration == 0 || proof.AttemptGeneration > expectedAttemptGeneration || !reviewerCleanupAuthorized(proof, activeWorkerProfileDigest(state))) {
 			return true
 		}
 	}
@@ -1990,7 +2312,7 @@ func finishRuntimeOwnerTransition(attemptRoot, stateRoot string, candidate runti
 	}
 	revokeInvalidPlanReviewers(&candidate, false)
 	if err := validateRuntimeOwnerState(candidate, attemptRoot, stateRoot, true); err != nil {
-		return runtimeOwnerState{}, nil, err
+		return runtimeOwnerState{}, nil, fmt.Errorf("validate committed runtime owner transition: %w", err)
 	}
 	return candidate, cloneEffect(effect), nil
 }
@@ -2016,7 +2338,7 @@ func applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot string, state *ru
 		return errStateConflict
 	}
 	for _, proof := range state.ReviewerProofs {
-		if proof.Repository == manifest.Repository && proof.Issue == manifest.Issue && proof.Attempt != manifest.Attempt && !proof.NeverRan && (proof.LegacyUnverified || proof.ProfileDigest != config.WorkerProfileDigest()) {
+		if proof.Repository == manifest.Repository && proof.Issue == manifest.Issue && proof.Attempt != manifest.Attempt && !proof.NeverRan && (proof.LegacyUnverified || proof.ProfileDigest != activeWorkerProfileDigest(*state)) {
 			return errStateConflict
 		}
 	}
@@ -2206,6 +2528,10 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 	if generation == 0 {
 		generation = 1
 	}
+	revokedDigest := ""
+	if record, ok := state.Attempts[attemptKey]; ok && command.Manifest != nil && reflect.DeepEqual(record.Manifest, *command.Manifest) && revokedWorkerCredentialCurrent(record) {
+		revokedDigest = record.WorkerAuthorityRevokedDigest
+	}
 	state.AttemptGenerations[attemptKey] = generation
 	delete(state.Attempts, attemptKey)
 	if err := deleteAttemptObservation(state, command.Repository, command.Issue, command.Attempt); err != nil {
@@ -2216,7 +2542,7 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 	state.Tombstones[attemptKey] = runtimeTombstone{
 		Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt, Action: command.Action,
 		InvalidatedGeneration: invalidated, Generation: generation, CleanupPhase: command.CleanupPhase,
-		PublishedHead: command.PublishedHead, Manifest: command.Manifest, CleanupPolicy: cloneCleanupPolicy(command.CleanupPolicy), Diagnostic: command.Diagnostic, InvalidatedHandoff: invalidatedHandoff, InvalidatedStart: invalidatedStart, ExternalOutcomes: map[string]invalidatedExternalOutcome{},
+		PublishedHead: command.PublishedHead, Manifest: command.Manifest, CleanupPolicy: cloneCleanupPolicy(command.CleanupPolicy), WorkerAuthorityRevokedDigest: revokedDigest, Diagnostic: command.Diagnostic, InvalidatedHandoff: invalidatedHandoff, InvalidatedStart: invalidatedStart, ExternalOutcomes: map[string]invalidatedExternalOutcome{},
 	}
 	if err := applyAdmitMachineStatus(state, admitMachineStatusCommand{
 		Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt,
@@ -2387,6 +2713,11 @@ func applyCompleteEffect(state *runtimeOwnerState, command completeEffectCommand
 	if !ok || effect.IssueGeneration != identity.IssueGeneration || effect.AttemptGeneration != identity.AttemptGeneration || state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] != identity.IssueGeneration && !effectAuthorizedByTombstone(*state, effect) {
 		return errStaleStateResult
 	}
+	if effect.Action == string(agentruntime.EffectStop) || effect.Action == string(agentruntime.EffectCleanup) {
+		// Physical transitions have dedicated finish commands that validate the
+		// exact external result and reviewer cleanup certificates atomically.
+		return errStateConflict
+	}
 	if effect.State == "completed" {
 		if effect.Diagnostic == command.Diagnostic {
 			return nil
@@ -2395,9 +2726,6 @@ func applyCompleteEffect(state *runtimeOwnerState, command completeEffectCommand
 	}
 	if effect.State != "pending" {
 		return errStaleStateResult
-	}
-	if (effect.Action == string(agentruntime.EffectCleanup) || effect.Action == string(agentruntime.EffectStop)) && (attemptHasUnprovedReviewer(*state, effect.Repository, effect.Issue, effect.Attempt) || state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] != "") {
-		return errStateConflict
 	}
 	attemptKey := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 	if state.AttemptGenerations[attemptKey] != identity.AttemptGeneration {
@@ -2441,18 +2769,26 @@ func applyRecordOperatorDiagnostic(state *runtimeOwnerState, command recordOpera
 	if command.RequestID == "" || command.Phase != operatorPhaseTerminalAwait && command.Phase != operatorPhaseRetryAwait && command.Phase != operatorPhaseHandoffCleanup && command.Phase != operatorPhaseStartCleanup || !boundedText(command.Diagnostic, maxReconciliationStringBytes, true) {
 		return errStateConflict
 	}
+	found := false
 	for index := range state.ControlReceipts {
 		receipt := &state.ControlReceipts[index]
-		if receipt.Request.RequestID != command.RequestID {
-			continue
+		if receipt.Request.RequestID == command.RequestID {
+			if receipt.State != "pending" || receipt.Phase != command.Phase || receipt.EffectID != command.EffectID {
+				return errStaleStateResult
+			}
+			found = true
 		}
-		if receipt.State != "pending" || receipt.Phase != command.Phase || receipt.EffectID != command.EffectID {
-			return errStaleStateResult
-		}
-		receipt.Diagnostic = command.Diagnostic
-		return nil
 	}
-	return errStaleStateResult
+	if !found {
+		return errStaleStateResult
+	}
+	for index := range state.ControlReceipts {
+		receipt := &state.ControlReceipts[index]
+		if receipt.State == "pending" && receipt.Phase == command.Phase && receipt.EffectID == command.EffectID {
+			receipt.Diagnostic = command.Diagnostic
+		}
+	}
+	return nil
 }
 
 func applyCompleteHandoffCompensation(state *runtimeOwnerState, command completeHandoffCompensationCommand) error {
@@ -2480,16 +2816,20 @@ func applyCompleteHandoffCompensation(state *runtimeOwnerState, command complete
 	if tombstone.HandoffCompensated {
 		return nil
 	}
-	completed := false
+	advanced := false
 	for index := range state.ControlReceipts {
 		receipt := &state.ControlReceipts[index]
 		if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup && ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt) == tombstoneKey {
-			receipt.State, receipt.Phase, receipt.Diagnostic = "completed", operatorPhaseCompleted, ""
-			receipt.Result = successfulOperatorResult(receipt.Request, state.Revision+1)
-			completed = true
+			if tombstone.EffectID == "" {
+				receipt.State, receipt.Phase, receipt.Diagnostic = "completed", operatorPhaseCompleted, ""
+				receipt.Result = successfulOperatorResult(receipt.Request, state.Revision+1)
+			} else {
+				receipt.Phase, receipt.Diagnostic = operatorPhaseCleanupPending, ""
+			}
+			advanced = true
 		}
 	}
-	if !completed {
+	if !advanced {
 		return errStateConflict
 	}
 	tombstone.HandoffCompensated = true
@@ -2541,6 +2881,8 @@ func readRuntimeOwnerState(stateRoot, repository string) (runtimeOwnerState, err
 		}
 	}
 	migrateLegacyMachineStatuses(&state)
+	migrateLegacyDismissCleanup(&state)
+	migrateReviewerPolicy(&state)
 	if err := validateRuntimeOwnerState(state, runtimeOwnerAttemptRoot(stateRoot), stateRoot, true); err != nil || state.Repository != repository {
 		if err == nil {
 			err = fmt.Errorf("runtime state is bound to project %s, not %s", state.Repository, repository)
@@ -2548,6 +2890,85 @@ func readRuntimeOwnerState(stateRoot, repository string) (runtimeOwnerState, err
 		return runtimeOwnerState{}, err
 	}
 	return state, nil
+}
+
+func migrateReviewerPolicy(state *runtimeOwnerState) {
+	migrateReviewerPolicyTo(state, reviewerConfinementVersion)
+}
+
+func migrateReviewerPolicyTo(state *runtimeOwnerState, current uint64) {
+	if state.ReviewerPolicyVersion == 0 && state.ReviewerPolicyTracked {
+		state.ReviewerPolicyVersion = 1 // The boolean marker shipped with confinement policy v1.
+	}
+	if state.ReviewerPolicyTracked && state.ReviewerPolicyVersion == current {
+		return
+	}
+	if state.LegacyReviewerQuarantines == nil {
+		state.LegacyReviewerQuarantines = map[string]string{}
+	}
+	for key, proof := range state.ReviewerProofs {
+		if !proof.NeverRan && proof.ConfinementVersion != current {
+			proof.DeadProved, proof.LegacyUnverified = false, true
+			state.ReviewerProofs[key] = proof
+			state.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] = "legacy reviewer confinement policy is unknown; physical cleanup cannot be certified"
+		}
+	}
+	for _, effect := range state.Effects {
+		if effect.ReviewerGateProtocol && effect.ReviewerConfinementVersion != current || effect.SupersededReviewerID != "" && effect.SupersededReviewerConfinementVersion != current {
+			state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] = "legacy reviewer confinement policy is unknown; physical cleanup cannot be certified"
+		}
+	}
+	state.ReviewerPolicyTracked = true
+	state.ReviewerPolicyVersion = current
+}
+
+// Old Dismiss commits hid the attempt but could retain a reviewer lease after
+// deleting the only effect that carried its stop authority. Keep the logical
+// dismissal, but never reconstruct that lost authority from physical names.
+func migrateLegacyDismissCleanup(state *runtimeOwnerState) {
+	if state.DismissCleanupTracked {
+		return
+	}
+	if state.LegacyReviewerQuarantines == nil {
+		state.LegacyReviewerQuarantines = map[string]string{}
+	}
+	for key, tombstone := range state.Tombstones {
+		if tombstone.Action != "dismissed" || tombstone.EffectID != "" {
+			continue
+		}
+		unresolved := tombstone.ReviewerLeaseID != "" || tombstone.InvalidatedStart != nil
+		if tombstone.Manifest != nil && tombstone.Manifest.ReviewState != "" && !tombstone.Manifest.ReviewRunCleaned {
+			unresolved = true
+		}
+		for _, proof := range state.ReviewerProofs {
+			if proof.Repository == tombstone.Repository && proof.Issue == tombstone.Issue && proof.Attempt == tombstone.Attempt {
+				unresolved = true
+				break
+			}
+		}
+		tombstone.CleanupPhase = "completed"
+		tombstone.CleanupPolicy = nil
+		tombstone.ReviewerLeaseID = ""
+		if unresolved {
+			tombstone.Diagnostic = "legacy Dismiss cleanup authority is unavailable; reviewer resources are quarantined"
+			state.LegacyReviewerQuarantines[ownerIssueKey(tombstone.Repository, tombstone.Issue)] = tombstone.Diagnostic
+		}
+		state.Tombstones[key] = tombstone
+
+		for index := range state.ControlReceipts {
+			receipt := &state.ControlReceipts[index]
+			if receipt.Request.Action != "dismiss" || ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt) != key {
+				continue
+			}
+			if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup && tombstone.InvalidatedHandoff != nil && !tombstone.HandoffCompensated {
+				receipt.EffectID = ""
+				continue
+			}
+			receipt.State, receipt.Phase, receipt.EffectID, receipt.Diagnostic = "completed", operatorPhaseCompleted, "", ""
+			receipt.Result = successfulOperatorResult(receipt.Request, max(uint64(1), state.Revision))
+		}
+	}
+	state.DismissCleanupTracked = true
 }
 
 // Ledgers written before machine status joined the issue-scoped owner domain
@@ -2934,9 +3355,15 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, record.Manifest); err != nil {
 			return err
 		}
+		if state.ReviewerRunTracked && record.Manifest.ReviewState != "" && !validDigest(record.Manifest.ReviewRunID) && !record.Manifest.ReviewRunCleaned && state.LegacyReviewerQuarantines[ownerIssueKey(record.Manifest.Repository, record.Manifest.Issue)] == "" {
+			return errors.New("runtime owner attempt reviewer run identity is invalid")
+		}
+		if record.WorkerAuthorityRevokedDigest != "" && !revokedWorkerCredentialCurrent(record) {
+			return errors.New("runtime owner revoked worker credential is invalid")
+		}
 		if record.Manifest.WorkerProfileDigest != "" && record.Manifest.WorkerGeneration != record.Generation {
 			stop, stopping := state.Effects[record.StopEffectID]
-			if !stopping || record.Manifest.WorkerGeneration == ^uint64(0) || record.Manifest.WorkerGeneration+1 != record.Generation || stop.Action != string(agentruntime.EffectStop) || stop.State != "pending" || stop.Repository != record.Manifest.Repository || stop.Issue != record.Manifest.Issue || stop.Attempt != record.Manifest.Attempt || stop.AttemptGeneration != record.Generation {
+			if !revokedWorkerCredentialCurrent(record) && (!stopping || record.Manifest.WorkerGeneration == ^uint64(0) || record.Manifest.WorkerGeneration+1 != record.Generation || stop.Action != string(agentruntime.EffectStop) || stop.State != "pending" || stop.Repository != record.Manifest.Repository || stop.Issue != record.Manifest.Issue || stop.Attempt != record.Manifest.Attempt || stop.AttemptGeneration != record.Generation) {
 				return errors.New("runtime owner worker confinement generation is invalid")
 			}
 		}
@@ -2967,9 +3394,17 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, *tombstone.Manifest); err != nil || tombstone.Manifest.Issue != tombstone.Issue || tombstone.Manifest.Attempt != tombstone.Attempt {
 				return errors.New("runtime owner tombstone manifest is invalid")
 			}
-			if tombstone.Manifest.WorkerProfileDigest != "" && tombstone.Manifest.WorkerGeneration != tombstone.InvalidatedGeneration {
+			if state.ReviewerRunTracked && tombstone.Manifest.ReviewState != "" && !validDigest(tombstone.Manifest.ReviewRunID) && !tombstone.Manifest.ReviewRunCleaned && state.LegacyReviewerQuarantines[ownerIssueKey(tombstone.Repository, tombstone.Issue)] == "" {
+				return errors.New("runtime owner tombstone reviewer run identity is invalid")
+			}
+			if tombstone.WorkerAuthorityRevokedDigest != "" && !revokedWorkerTombstoneCredentialCurrent(tombstone) {
+				return errors.New("runtime owner tombstone revoked worker credential is invalid")
+			}
+			if tombstone.Manifest.WorkerProfileDigest != "" && tombstone.Manifest.WorkerGeneration != tombstone.InvalidatedGeneration && !revokedWorkerTombstoneCredentialCurrent(tombstone) {
 				return errors.New("runtime owner tombstone confinement generation is invalid")
 			}
+		} else if tombstone.WorkerAuthorityRevokedDigest != "" {
+			return errors.New("runtime owner tombstone revoked worker credential has no manifest")
 		}
 		if tombstone.InvalidatedHandoff != nil && (tombstone.Manifest == nil || !validHandoffCandidateInvalidation(*tombstone.InvalidatedHandoff, *tombstone.Manifest)) {
 			return errors.New("runtime owner tombstone handoff invalidation is invalid")
@@ -2994,9 +3429,10 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			return errors.New("runtime owner tombstone cleanup policy is invalid")
 		}
 		if tombstone.ReviewerLeaseID != "" {
+			effect, effectBound := state.Effects[tombstone.EffectID]
 			bound := false
 			for _, proof := range state.ReviewerProofs {
-				if proof.Repository == tombstone.Repository && proof.Issue == tombstone.Issue && proof.Attempt == tombstone.Attempt && proof.EffectID == tombstone.ReviewerLeaseID && !proof.NeverRan && !proof.DeadProved {
+				if effectBound && effect.State == "pending" && effect.Action == string(agentruntime.EffectCleanup) && proof.Repository == tombstone.Repository && proof.Issue == tombstone.Issue && proof.Attempt == tombstone.Attempt && proof.EffectID == tombstone.ReviewerLeaseID && reviewerProofMatchesSuperseded(effect, proof) {
 					bound = true
 				}
 			}
@@ -3048,7 +3484,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if effect.RequestDigest != "" && (!agentruntime.ValidEffectRequestDigest(effect.RequestDigest) || effect.IntentEpoch == 0 || effect.IntentEpoch > maxEpoch || !validRuntimeEffectInput(agentruntime.EffectAction(effect.Action), effect.Reason) || (effect.Action == string(agentruntime.EffectReview)) != (effect.Review != nil)) {
 			return errors.New("runtime owner typed effect intent is invalid")
 		}
-		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID) || !agentruntime.ValidReviewTarget(effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.Repository, effect.Issue) || effect.SupersededReviewerIssueGeneration == 0 || effect.SupersededReviewerAttemptGeneration == 0 || effect.SupersededReviewerSessionRequested && !effect.SupersededReviewerGateProtocol || effect.SupersededReviewerGateProtocol && !validDigest(effect.SupersededReviewerRequestDigest)) || effect.SupersededReviewerID == "" && (effect.SupersededReviewerTarget != "" || effect.SupersededReviewerMode != "" || effect.SupersededReviewerIssueGeneration != 0 || effect.SupersededReviewerAttemptGeneration != 0 || effect.ReviewerStopped || effect.SupersededReviewerGateProtocol || effect.SupersededReviewerSessionRequested || effect.SupersededReviewerRequestDigest != "") {
+		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID) || !agentruntime.ValidReviewTarget(effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.Repository, effect.Issue) || state.ReviewerRunTracked && !validDigest(effect.SupersededReviewerRunID) && state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] == "" || effect.SupersededReviewerIssueGeneration == 0 || effect.SupersededReviewerAttemptGeneration == 0 || effect.SupersededReviewerSessionRequested && !effect.SupersededReviewerGateProtocol || effect.SupersededReviewerGateProtocol && (!validDigest(effect.SupersededReviewerRequestDigest) || !validDigest(effect.SupersededReviewerProfileDigest) && state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] == "" || state.ReviewerPolicyTracked && effect.SupersededReviewerConfinementVersion != reviewerConfinementVersion && state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] == "")) || effect.SupersededReviewerID == "" && (effect.SupersededReviewerTarget != "" || effect.SupersededReviewerRunID != "" || effect.SupersededReviewerMode != "" || effect.SupersededReviewerIssueGeneration != 0 || effect.SupersededReviewerAttemptGeneration != 0 || effect.ReviewerStopped || effect.SupersededReviewerGateProtocol || effect.SupersededReviewerSessionRequested || effect.SupersededReviewerRequestDigest != "" || effect.SupersededReviewerProfileDigest != "" || effect.SupersededReviewerConfinementVersion != 0) || effect.ReviewerCleanupDigest != "" && (effect.Action != string(agentruntime.EffectStop) || !validDigest(effect.ReviewerCleanupDigest)) {
 			return errors.New("runtime owner superseded reviewer binding is invalid")
 		}
 		if effect.InvalidatedHandoff != nil {
@@ -3081,7 +3517,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		}
 	}
 	for key, proof := range state.ReviewerProofs {
-		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || (proof.GroupPID < 2 && !(proof.GroupPID == 0 && (!proof.DeadProved || proof.NeverRan))) || proof.NeverRan && (proof.GroupPID != 0 || !proof.DeadProved || proof.LegacyUnverified) || proof.LegacyUnverified && proof.DeadProved || proof.ProfileDigest != "" && !validDigest(proof.ProfileDigest) || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] {
+		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || proof.RunID != "" && !validDigest(proof.RunID) || state.ReviewerRunTracked && !proof.NeverRan && !proof.LegacyUnverified && !validDigest(proof.RunID) && state.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] == "" || (proof.GroupPID < 2 && !(proof.GroupPID == 0 && (!proof.DeadProved || proof.NeverRan))) || proof.NeverRan && (proof.GroupPID != 0 || !proof.DeadProved || proof.LegacyUnverified || proof.ConfinementVersion != 0 && proof.ConfinementVersion != reviewerConfinementVersion) || proof.LegacyUnverified && proof.DeadProved || proof.ProfileDigest != "" && !validDigest(proof.ProfileDigest) || state.ReviewerPolicyTracked && !proof.NeverRan && !proof.LegacyUnverified && proof.ConfinementVersion != reviewerConfinementVersion && state.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] == "" || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] {
 			return errors.New("runtime owner reviewer process proof is invalid")
 		}
 	}
@@ -3142,7 +3578,7 @@ func runtimeOwnerAttemptRoot(stateRoot string) string {
 }
 
 func newRuntimeOwnerState(repository string) runtimeOwnerState {
-	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, WorkerProfileDigest: config.WorkerProfileDigest(), ReviewerRevocationTracked: true, ReviewerSafetyMigrated: true, ReviewerConfinementTracked: true, ExternalDispatchTracked: true, LegacyReviewerQuarantines: map[string]string{}, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}, ControlGenerations: map[string]uint64{}, ControlRepairs: map[string]controlSnapshotRepair{}, MachineStatuses: map[string]machineStatusRecord{}}
+	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, WorkerProfileDigest: config.WorkerProfileDigest(), ReviewerRevocationTracked: true, ReviewerSafetyMigrated: true, ReviewerConfinementTracked: true, ReviewerRunTracked: true, ReviewerPolicyTracked: true, ReviewerPolicyVersion: reviewerConfinementVersion, DismissCleanupTracked: true, ExternalDispatchTracked: true, LegacyReviewerQuarantines: map[string]string{}, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}, ControlGenerations: map[string]uint64{}, ControlRepairs: map[string]controlSnapshotRepair{}, MachineStatuses: map[string]machineStatusRecord{}}
 }
 
 func activeWorkerProfileDigest(state runtimeOwnerState) string {
@@ -3335,7 +3771,7 @@ func validCleanupPhase(phase string) bool {
 func runtimeEffectID(effect runtimeEffectIntent) string {
 	material := fmt.Sprintf("%s\x00%s\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%s\x00%s", effect.Action, effect.Repository, effect.Issue, effect.Attempt, effect.IssueGeneration, effect.AttemptGeneration, effect.IntentRevision, effect.IntentEpoch, effect.RequestDigest, effect.Reason)
 	if effect.SupersededReviewerID != "" {
-		material += fmt.Sprintf("\x00%s\x00%s\x00%s\x00%d\x00%d", effect.SupersededReviewerID, effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.SupersededReviewerIssueGeneration, effect.SupersededReviewerAttemptGeneration)
+		material += fmt.Sprintf("\x00%s\x00%s\x00%s\x00%s\x00%d\x00%d", effect.SupersededReviewerID, effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.SupersededReviewerRunID, effect.SupersededReviewerIssueGeneration, effect.SupersededReviewerAttemptGeneration)
 	}
 	digest := sha256.Sum256([]byte(material))
 	return hex.EncodeToString(digest[:16])

@@ -415,10 +415,12 @@ func TestChatSelectsExactReviewerAndRunningDaemonOrchestrator(t *testing.T) {
 		t.Fatal(err)
 	}
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 23, 4)
-	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 23, 4)
+	reviewTarget := "o/r#23 plan sha256:" + strings.Repeat("a", 64)
+	reviewRunID := digestText("chat reviewer run")
+	reviewer, _ := agentruntime.ReviewRunSessionName("o/r", 23, 4, reviewTarget, reviewRunID)
 	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 23, Attempt: 4, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{
 		{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "completed"},
-		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModePlan, Target: "o/r#23 plan sha256:" + strings.Repeat("a", 64), Current: true},
+		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModePlan, Target: reviewTarget, RunID: reviewRunID, Current: true},
 	}}
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
 		t.Fatal(err)

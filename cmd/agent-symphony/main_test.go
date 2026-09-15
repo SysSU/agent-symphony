@@ -1564,7 +1564,7 @@ func TestReviewCleanupRejectsForeignOutsideAndSymlinkIdentity(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var boundary countingReviewBoundary
-			if err := cleanupReviewResources(t.Context(), &boundary, nil, attempt, strings.Repeat("a", 40), "", test.snapshot, test.session, reviewSnapshotRoot); err == nil {
+			if err := cleanupReviewResources(t.Context(), &boundary, nil, attempt, strings.Repeat("a", 40), "", "", test.snapshot, test.session, reviewSnapshotRoot); err == nil {
 				t.Fatal("unsafe cleanup identity accepted")
 			}
 			if boundary != 0 {
@@ -1574,6 +1574,26 @@ func TestReviewCleanupRejectsForeignOutsideAndSymlinkIdentity(t *testing.T) {
 				t.Fatalf("outside path mutated: %v", err)
 			}
 		})
+	}
+}
+
+func TestReviewRunIdentityNeverReusesTargetResources(t *testing.T) {
+	root := t.TempDir()
+	attempt := agentruntime.Attempt{Repository: "owner/repository", Issue: int(^uint(0) >> 1), Number: int(^uint(0) >> 1)}
+	targetA := strings.Repeat("a", 40) + ".." + strings.Repeat("b", 40)
+	targetB := strings.Repeat("a", 40) + ".." + strings.Repeat("c", 40)
+	runA, runB := digestText("review run A"), digestText("review run B")
+	snapshotA, sessionA := reviewRunIdentity(attempt, root, targetA, runA)
+	snapshotB, sessionB := reviewRunIdentity(attempt, root, targetA, runB)
+	snapshotOtherTarget, sessionOtherTarget := reviewRunIdentity(attempt, root, targetB, runA)
+	if snapshotA == "" || sessionA == "" || snapshotA == snapshotB || sessionA == sessionB || reviewResultPath(snapshotA, targetA) == reviewResultPath(snapshotB, targetA) {
+		t.Fatalf("same target reused reviewer run resources: A=%q/%q B=%q/%q", snapshotA, sessionA, snapshotB, sessionB)
+	}
+	if snapshotA == snapshotOtherTarget || sessionA == sessionOtherTarget {
+		t.Fatalf("different target reused reviewer run resources: A=%q/%q other=%q/%q", snapshotA, sessionA, snapshotOtherTarget, sessionOtherTarget)
+	}
+	if len(sessionA) > 64 || !belowRoot(snapshotA, root) || !belowRoot(snapshotB, root) || !belowRoot(snapshotOtherTarget, root) {
+		t.Fatalf("reviewer identity is unbounded or outside root: %q %q %q", sessionA, snapshotA, snapshotB)
 	}
 }
 
@@ -1593,7 +1613,7 @@ func TestReviewIdentitySeparatesRepositories(t *testing.T) {
 		t.Fatalf("review session exceeds runtime limit: %q", largestSession)
 	}
 	var boundary countingReviewBoundary
-	if err := cleanupReviewResources(t.Context(), &boundary, nil, first, strings.Repeat("a", 40), "", secondSnapshot, secondSession, root); err == nil {
+	if err := cleanupReviewResources(t.Context(), &boundary, nil, first, strings.Repeat("a", 40), "", "", secondSnapshot, secondSession, root); err == nil {
 		t.Fatal("cleanup accepted another repository identity")
 	}
 	if boundary != 0 {

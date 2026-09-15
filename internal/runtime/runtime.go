@@ -175,6 +175,8 @@ type Manifest struct {
 	ReviewInvalidated   bool      `json:"review_invalidated,omitempty"`
 	ReviewMode          string    `json:"review_mode,omitempty"`
 	ReviewTarget        string    `json:"review_target,omitempty"`
+	ReviewRunID         string    `json:"review_run_id,omitempty"`
+	ReviewRunCleaned    bool      `json:"review_run_cleaned,omitempty"`
 	ReviewBase          string    `json:"review_base,omitempty"`
 	ReviewHead          string    `json:"review_head,omitempty"`
 	ReviewSnapshot      string    `json:"review_snapshot,omitempty"`
@@ -251,6 +253,8 @@ func (r *Runtime) RecordReview(attempt Attempt, state, mode, target, base, head,
 		return Manifest{}, errors.New("direct bound review mutation is unavailable; submit an owner Review effect")
 	}
 	manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget = state, mode, target
+	manifest.ReviewRunID = ""
+	manifest.ReviewRunCleaned = false
 	manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = base, head, snapshot, session
 	if state != "findings-queued" {
 		manifest.ReviewFindings, manifest.ReviewHandoffQueued, manifest.ReviewHandoffAck = nil, false, false
@@ -373,6 +377,30 @@ func AttemptSessionName(role, repository string, issue, attempt int) (string, er
 		return "", fmt.Errorf("attempt session name exceeds %d bytes", maxResourceName)
 	}
 	return name, nil
+}
+
+// ReviewSessionName binds a reviewer tmux name to the full attempt and target
+// identity while staying below tmux's resource-name limit.
+func ReviewSessionName(repository string, issue, attempt int, target string) (string, error) {
+	base, err := AttemptSessionName(SessionRoleReviewer, repository, issue, attempt)
+	if err != nil || strings.TrimSpace(target) == "" || len(target) > 512 || strings.ContainsAny(target, "\x00\r\n") {
+		return "", errors.New("invalid target-bound reviewer session identity")
+	}
+	digest := sha256.Sum256([]byte(base + "\x00" + target))
+	return "as-r-" + hex.EncodeToString(digest[:24]), nil
+}
+
+// ReviewRunSessionName binds a reviewer tmux name to one never-reused owner run.
+func ReviewRunSessionName(repository string, issue, attempt int, target, runID string) (string, error) {
+	base, err := AttemptSessionName(SessionRoleReviewer, repository, issue, attempt)
+	if err != nil || strings.TrimSpace(target) == "" || len(target) > 4096 || strings.ContainsAny(target, "\x00\r\n") || len(runID) != 64 {
+		return "", errors.New("invalid reviewer run identity")
+	}
+	if _, err := hex.DecodeString(runID); err != nil {
+		return "", errors.New("invalid reviewer run identity")
+	}
+	digest := sha256.Sum256([]byte(base + "\x00target\x00" + target + "\x00run\x00" + runID))
+	return "as-r-" + hex.EncodeToString(digest[:24]), nil
 }
 
 func ResultPath(worktree string) string {
@@ -1204,7 +1232,7 @@ func validateManifestIdentity(want, manifest Manifest) error {
 	}
 	switch manifest.ReviewState {
 	case "":
-		if manifest.ReviewMode != "" || manifest.ReviewTarget != "" || manifest.ReviewSession != "" {
+		if manifest.ReviewMode != "" || manifest.ReviewTarget != "" || manifest.ReviewRunID != "" || manifest.ReviewRunCleaned || manifest.ReviewSession != "" {
 			return errors.New("review metadata has no lifecycle state")
 		}
 	case "preparing", "running", "clean", "findings-queued", "failed":
@@ -1234,12 +1262,21 @@ func validateManifestIdentity(want, manifest Manifest) error {
 		return errors.New("review head is invalid")
 	}
 	if manifest.ReviewSession != "" {
-		wantReview, err := AttemptSessionName(SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
-		digest := sha256.Sum256([]byte(manifest.ReviewTarget))
-		targetReview := wantReview + "-" + hex.EncodeToString(digest[:8])
-		if err != nil || manifest.ReviewSession != wantReview && manifest.ReviewSession != targetReview {
-			return errors.New("review session does not match deterministic attempt resources")
+		if manifest.ReviewRunID != "" {
+			runReview, runErr := ReviewRunSessionName(manifest.Repository, manifest.Issue, manifest.Attempt, manifest.ReviewTarget, manifest.ReviewRunID)
+			if runErr != nil || manifest.ReviewSession != runReview {
+				return errors.New("review session does not match deterministic run resources")
+			}
+		} else {
+			wantReview, err := AttemptSessionName(SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
+			targetReview, targetErr := ReviewSessionName(manifest.Repository, manifest.Issue, manifest.Attempt, manifest.ReviewTarget)
+			if targetErr != nil || manifest.ReviewSession != targetReview && (err != nil || manifest.ReviewSession != wantReview) {
+				return errors.New("review session does not match deterministic attempt resources")
+			}
 		}
+	}
+	if manifest.ReviewRunCleaned && (manifest.ReviewRunID != "" || manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" || !slices.Contains([]string{"clean", "findings-queued", "failed"}, manifest.ReviewState)) {
+		return errors.New("cleaned review run retains physical identity")
 	}
 	switch manifest.State {
 	case "preparing", "running", "completed", "failed", "cancelled":

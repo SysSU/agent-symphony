@@ -21,13 +21,16 @@ import (
 // The files are durable proof from the exact reviewer wrapper. They are not
 // owner state; the owner still validates every completion before committing it.
 type reviewerLaunchIdentity struct {
-	EffectID          string `json:"effect_id"`
-	IssueGeneration   uint64 `json:"issue_generation"`
-	AttemptGeneration uint64 `json:"attempt_generation"`
-	RequestDigest     string `json:"request_digest"`
-	GateProtocol      bool   `json:"gate_protocol,omitempty"`
-	SessionRequested  bool   `json:"session_requested,omitempty"`
-	ChildPID          int    `json:"child_pid,omitempty"`
+	EffectID           string `json:"effect_id"`
+	RunID              string `json:"run_id"`
+	IssueGeneration    uint64 `json:"issue_generation"`
+	AttemptGeneration  uint64 `json:"attempt_generation"`
+	RequestDigest      string `json:"request_digest"`
+	ProfileDigest      string `json:"profile_digest"`
+	ConfinementVersion uint64 `json:"confinement_version"`
+	GateProtocol       bool   `json:"gate_protocol,omitempty"`
+	SessionRequested   bool   `json:"session_requested,omitempty"`
+	ChildPID           int    `json:"child_pid,omitempty"`
 }
 
 type reviewerTerminalRecord struct {
@@ -39,7 +42,7 @@ type reviewerTerminalRecord struct {
 var errReviewerTerminal = errors.New("reviewer terminal failure")
 
 func reviewerIdentity(identity stateResultIdentity) reviewerLaunchIdentity {
-	return reviewerLaunchIdentity{EffectID: identity.EffectID, IssueGeneration: identity.IssueGeneration, AttemptGeneration: identity.AttemptGeneration, RequestDigest: identity.RequestDigest}
+	return reviewerLaunchIdentity{EffectID: identity.EffectID, RunID: identity.ReviewRunID, IssueGeneration: identity.IssueGeneration, AttemptGeneration: identity.AttemptGeneration, RequestDigest: identity.RequestDigest, ProfileDigest: identity.ReviewerProfileDigest, ConfinementVersion: reviewerConfinementVersion}
 }
 
 func sameReviewerIdentity(actual, expected reviewerLaunchIdentity) bool {
@@ -192,6 +195,11 @@ func missingTmuxServer(result agentruntime.Result) bool {
 	return result.Exited && result.Code == 1 && (strings.HasPrefix(message, "error connecting to ") && strings.HasSuffix(message, " (No such file or directory)") || strings.HasPrefix(message, "no server running on /"))
 }
 
+func exactTmuxSessionAbsent(result agentruntime.Result, session string) bool {
+	message := strings.TrimSpace(result.Output)
+	return missingTmuxServer(result) || result.Exited && result.Code == 1 && message == "can't find session: "+session
+}
+
 func verifyReviewerChildBinding(ctx context.Context, boundary boundaryCaller, env []string, session, launchPath, terminalPath string, identity reviewerLaunchIdentity, candidate int) error {
 	if candidate < 2 {
 		return errors.New("reviewer child process identity is missing")
@@ -319,7 +327,7 @@ func runReviewerPane(args []string, stdout, stderr io.Writer) (int, syscall.Sign
 		return 125, 0, errors.New("invalid internal reviewer pane invocation")
 	}
 	var identity reviewerLaunchIdentity
-	if json.Unmarshal([]byte(args[5]), &identity) != nil || identity.EffectID == "" || identity.IssueGeneration == 0 || identity.AttemptGeneration == 0 || identity.RequestDigest == "" || reviewerSignal(identity) != args[3] || reviewerStartSignal(identity) != args[4] {
+	if json.Unmarshal([]byte(args[5]), &identity) != nil || identity.EffectID == "" || !validDigest(identity.RunID) || identity.IssueGeneration == 0 || identity.AttemptGeneration == 0 || identity.RequestDigest == "" || !validDigest(identity.ProfileDigest) || identity.ConfinementVersion != reviewerConfinementVersion || reviewerSignal(identity) != args[3] || reviewerStartSignal(identity) != args[4] {
 		return 125, 0, errors.New("invalid reviewer launch identity")
 	}
 	launchPath, terminalPath := args[1], args[2]

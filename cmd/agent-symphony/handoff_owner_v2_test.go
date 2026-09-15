@@ -71,7 +71,7 @@ func TestDashboardStopAdmitsWhileBoundHandoffHostIsBlocked(t *testing.T) {
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, 352, 1, "running")
 	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
-	manifest.ReviewState, manifest.ReviewHead, manifest.ReviewFindings = "findings-queued", manifest.BaseSHA, []string{"apply review finding"}
+	manifest.ReviewState, manifest.ReviewHead, manifest.ReviewFindings, manifest.ReviewRunCleaned = "findings-queued", manifest.BaseSHA, []string{"apply review finding"}, true
 	state := runtimeEffectInitialState(manifest)
 	addOperatorObservation(&state, manifest, "active", false)
 	state.Epoch, state.Revision = 1, 1
@@ -206,12 +206,12 @@ func TestDashboardDismissHidesLegacyAttemptWithoutTouchingLiveUnboundPane(t *tes
 	request.Header.Set("Origin", "http://localhost")
 	response := httptest.NewRecorder()
 	server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusAccepted {
 		t.Fatalf("legacy Dismiss = HTTP %d %s", response.Code, response.Body.String())
 	}
 	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
 	committed := mustOwnerSnapshot(t, owner).State
-	if _, exists := committed.Attempts[key]; exists || committed.Tombstones[key].Action != "dismissed" {
+	if _, exists := committed.Attempts[key]; exists || committed.Tombstones[key].Action != "dismissed" || committed.Tombstones[key].CleanupPhase != "pending" || committed.Tombstones[key].EffectID == "" {
 		t.Fatalf("legacy Dismiss did not hide attempt: %#v", committed.Tombstones[key])
 	}
 	if output, err := exec.Command(tmux, "has-session", "-t", "="+manifest.Session).CombinedOutput(); err != nil {
@@ -250,7 +250,7 @@ func TestDashboardDismissAdmitsWhileBoundHandoffHostIsBlocked(t *testing.T) {
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, 351, 1, "running")
 	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
-	manifest.ReviewState, manifest.ReviewHead, manifest.ReviewFindings = "findings-queued", manifest.BaseSHA, []string{"apply review finding"}
+	manifest.ReviewState, manifest.ReviewHead, manifest.ReviewFindings, manifest.ReviewRunCleaned = "findings-queued", manifest.BaseSHA, []string{"apply review finding"}, true
 	state := runtimeEffectInitialState(manifest)
 	addOperatorObservation(&state, manifest, "orphaned", true)
 	state.Epoch, state.Revision = 1, 1
@@ -359,7 +359,7 @@ func TestDashboardDismissAdmitsWhileBoundHandoffHostIsBlocked(t *testing.T) {
 	}
 	for _, receipt := range failed.ControlReceipts {
 		if receipt.Request.Action == "dismiss" && receipt.Request.Issue == manifest.Issue && (receipt.State != "pending" || receipt.Phase != operatorPhaseHandoffCleanup || !strings.Contains(receipt.Diagnostic, "simulated host compensation failure")) {
-			t.Fatalf("failed compensation did not persist pending diagnostic: %#v", receipt)
+			t.Fatalf("failed compensation did not persist pending diagnostic: %#v effects=%#v", receipt, failed.Effects)
 		}
 	}
 	if err := owner.close(context.Background()); err != nil {

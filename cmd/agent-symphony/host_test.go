@@ -498,6 +498,19 @@ func TestReviewBoundaryAcceptsOnlySnapshotLocalLifecyclePaths(t *testing.T) {
 	if validTmuxBoundaryArgs(foreign, nil, snapshot, root) {
 		t.Fatal("reviewer lifecycle path outside the exact snapshot crossed the boundary")
 	}
+	runSession, err := agentruntime.ReviewRunSessionName("o/r", 73, 2, "o/r#73 plan sha256:"+strings.Repeat("c", 64), strings.Repeat("d", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane := reviewerPaneIdentity{ServerPID: 2345, StartTime: 6789, Name: runSession, SessionID: "$7", PID: 3456}
+	guarded := []string{"if-shell", "-F", "-t", agentruntime.PaneTarget(runSession), reviewerGuardCondition(pane), "kill-session -t " + pane.SessionID, "display-message -p " + reviewerGuardMismatch}
+	if !validTmuxBoundaryArgs(guarded, nil, snapshot, root) {
+		t.Fatal("exact RunID reviewer guarded stop was rejected")
+	}
+	guarded[4] = strings.Replace(guarded[4], runSession, "as-r-"+strings.Repeat("e", 47), 1)
+	if validTmuxBoundaryArgs(guarded, nil, snapshot, root) {
+		t.Fatal("malformed RunID reviewer session crossed guarded stop boundary")
+	}
 }
 
 func TestWorkerBoundaryAllowsOnlyExactAncestryCheck(t *testing.T) {
@@ -681,7 +694,7 @@ func TestHostOrchestratorLaunchContractIsReadOnlyAndCredentialFiltered(t *testin
 
 func TestReviewResultArtifactFailsClosed(t *testing.T) {
 	const valid = `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`
-	request := reviewResultRequest{Repository: "o/r", Issue: 23, Attempt: 1, Mode: agentruntime.ReviewModeImplementation, Target: strings.Repeat("b", 40) + ".." + strings.Repeat("a", 40), Head: strings.Repeat("a", 40)}
+	request := reviewResultRequest{Repository: "o/r", Issue: 23, Attempt: 1, Mode: agentruntime.ReviewModeImplementation, Target: strings.Repeat("b", 40) + ".." + strings.Repeat("a", 40), RunID: strings.Repeat("c", 64), Head: strings.Repeat("a", 40)}
 	requestBody, _ := json.Marshal(request)
 
 	for _, test := range []struct {
@@ -707,13 +720,17 @@ func TestReviewResultArtifactFailsClosed(t *testing.T) {
 			}
 		}, false},
 		{"stale head", func(t *testing.T, _ string, root string) {
-			snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+			snapshot, _ := reviewRunIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root, request.Target, request.RunID)
 			mustWriteFile(t, reviewResultPath(snapshot, strings.Repeat("b", 40)), valid)
+		}, false},
+		{"mismatched run", func(t *testing.T, _ string, root string) {
+			snapshot, _ := reviewRunIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root, request.Target, strings.Repeat("d", 64))
+			mustWriteFile(t, reviewResultPath(snapshot, request.Target), valid)
 		}, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
-			snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+			snapshot, _ := reviewRunIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root, request.Target, request.RunID)
 			path := reviewResultPath(snapshot, request.Target)
 			test.setup(t, path, root)
 			output, err := readReviewResult(requestBody, root)
@@ -731,7 +748,7 @@ func TestReviewResultArtifactFailsClosed(t *testing.T) {
 
 	t.Run("legacy head artifact", func(t *testing.T) {
 		root := resolvedTempDir(t)
-		snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+		snapshot, _ := reviewRunIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root, request.Target, request.RunID)
 		mustWriteFile(t, reviewResultPath(snapshot, request.Head), valid)
 		legacy := request
 		legacy.LegacyHeadArtifact = true
@@ -777,7 +794,7 @@ func TestReviewResultArtifactFailsClosed(t *testing.T) {
 
 	t.Run("substitution", func(t *testing.T) {
 		root := t.TempDir()
-		snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+		snapshot, _ := reviewRunIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root, request.Target, request.RunID)
 		path := reviewResultPath(snapshot, request.Target)
 		mustWriteFile(t, path, valid)
 		oldOpen := hostReviewResultOpen
@@ -795,7 +812,7 @@ func TestReviewResultArtifactFailsClosed(t *testing.T) {
 	})
 
 	root := t.TempDir()
-	snapshot, _ := reviewIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root)
+	snapshot, _ := reviewRunIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root, request.Target, request.RunID)
 	mustWriteFile(t, reviewResultPath(snapshot, request.Target), valid)
 	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
 	operation, _ := json.Marshal(struct {
@@ -807,6 +824,12 @@ func TestReviewResultArtifactFailsClosed(t *testing.T) {
 		err := agentHost(t.Context(), mode, bytes.NewReader(operation), &output)
 		if mode == "review" && err != nil {
 			t.Fatalf("review boundary rejected result: %v", err)
+		}
+		if mode == "review" {
+			var result agentruntime.Result
+			if err := json.Unmarshal(output.Bytes(), &result); err != nil || result.Exited || result.Code != 0 || result.Output != valid {
+				t.Fatalf("review boundary result=%#v err=%v", result, err)
+			}
 		}
 		if mode == "implementation" && err == nil {
 			t.Fatal("implementation boundary read review result")
@@ -844,9 +867,6 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux is unavailable")
 	}
-	if _, err := exec.LookPath("codex"); err != nil {
-		t.Skip("codex is unavailable")
-	}
 	tmuxTmp, err := os.MkdirTemp("/tmp", "as-tmux-")
 	if err != nil {
 		t.Fatal(err)
@@ -872,6 +892,14 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
 			t.Fatalf("build export helper: %v: %s", err, output)
 		}
+		codex := filepath.Join(root, "codex")
+		buildNativeCodexFixture(t, codex, `if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
+if [ "$1" = sandbox ]; then
+  while [ "$1" != -- ]; do shift; done
+  shift
+  exec "$@"
+fi
+exit 1`)
 		previousExecutable := hostExecutable
 		hostExecutable = func() (string, error) { return binary, nil }
 		t.Cleanup(func() { hostExecutable = previousExecutable })
@@ -944,6 +972,7 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 		manifest := identity
 		manifest.State = "completed"
 		commands := config.Default("o/r").Commands
+		commands.Implementation[0], commands.Reviewer[0] = codex, codex
 		profileDigest, err := config.BindWorkerExecutable(t.Context(), &commands)
 		if err != nil {
 			t.Fatal(err)
@@ -2302,7 +2331,7 @@ func TestDismissCommitsWhileConfinedDetachedChildLivesAndRejectsItsStaleResult(t
 		t.Fatal(err)
 	}
 	receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
-	if !ok || receipt.State != "completed" {
+	if !ok || receipt.State != "pending" || receipt.Phase != operatorPhaseCleanupPending || receipt.EffectID == "" {
 		t.Fatalf("dismissal did not commit while child was blocked: %#v", receipt)
 	}
 	stale := manifest

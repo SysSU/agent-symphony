@@ -254,6 +254,9 @@ func TestRuntimeOwnerMigrationRejectsUnprovedLegacyWork(t *testing.T) {
 			if err := bindDeployment(root, "o/r"); err != nil {
 				t.Fatal(err)
 			}
+			if err := os.MkdirAll(productionAttemptRoot(root), 0o700); err != nil {
+				t.Fatal(err)
+			}
 			test.setup(t, root)
 			if _, _, err := loadOrMigrateRuntimeOwnerState(root, filepath.Join(root, "pr-state.json"), "o/r"); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("err=%v", err)
@@ -384,6 +387,122 @@ func TestRuntimeOwnerExistingLedgerIsOneWayAndRestartIncrementsEpoch(t *testing.
 	restarted, err := readRuntimeOwnerState(root, "o/r")
 	if err != nil || restarted.Epoch != 2 || restarted.Revision != 2 {
 		t.Fatalf("restarted=%#v err=%v", restarted, err)
+	}
+}
+
+func TestRuntimeOwnerMigratesEveryLegacyDismissCleanupShapeBeforeValidation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		phase   string
+		lease   bool
+		start   bool
+		handoff bool
+		receipt bool
+	}{
+		{name: "completed without lease", phase: "completed"},
+		{name: "completed receipt with pending reviewer lease", phase: "completed", lease: true, receipt: true},
+		{name: "pending start cleanup without effect", phase: "pending", start: true, receipt: true},
+		{name: "pending handoff cleanup without effect", phase: "pending", handoff: true, receipt: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := resolvedTempDir(t)
+			if err := bindDeployment(root, "o/r"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(productionAttemptRoot(root), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			identity, err := agentruntime.AttemptIdentity(productionAttemptRoot(root), agentruntime.Attempt{Repository: "o/r", Issue: 330, Number: 1, BaseSHA: strings.Repeat("a", 40)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest := identity
+			manifest.Version = agentruntime.ManifestVersion2
+			manifest.LogPath = filepath.Join(root, "attempts", internalgithub.RepositoryIdentifier("o/r"), "330-1", "agent.log")
+			manifest.State, manifest.CreatedAt, manifest.UpdatedAt = "failed", time.Now().UTC(), time.Now().UTC()
+			manifest.LaunchToken = strings.Repeat("1", 32)
+			if err := validateOwnerManifest("o/r", productionAttemptRoot(root), root, manifest); err != nil {
+				t.Fatalf("test manifest: %v identity=%#v root=%q attempts=%q", err, manifest, root, productionAttemptRoot(root))
+			}
+			state := newRuntimeOwnerState("o/r")
+			state.DismissCleanupTracked = false
+			state.Epoch, state.Revision = 1, 1
+			issueKey, attemptKey := ownerIssueKey("o/r", 330), ownerAttemptKey("o/r", 330, 1)
+			state.IssueGenerations[issueKey], state.AttemptGenerations[attemptKey] = 1, 2
+			tombstone := runtimeTombstone{Repository: "o/r", Issue: 330, Attempt: 1, Action: "dismissed", InvalidatedGeneration: 1, Generation: 2, Revision: 1, CleanupPhase: test.phase, Manifest: &manifest}
+			if test.start {
+				tombstone.InvalidatedStart = &startCandidateInvalidation{EffectID: strings.Repeat("2", 32), Manifest: manifest, Candidates: []startGateCandidate{{Nonce: strings.Repeat("3", 32)}}}
+			}
+			if test.handoff {
+				tombstone.InvalidatedHandoff = &handoffCandidateInvalidation{EffectID: strings.Repeat("4", 32), Token: strings.Repeat("5", 32), Key: "candidate", Manifest: manifest}
+			}
+			if test.lease {
+				tombstone.ReviewerLeaseID = strings.Repeat("6", 32)
+				proof := reviewerProcessProof{Repository: "o/r", Issue: 330, Attempt: 1, Mode: agentruntime.ReviewModePlan, Target: "o/r#330 plan sha256:" + strings.Repeat("a", 64), RunID: strings.Repeat("7", 64), EffectID: tombstone.ReviewerLeaseID, IssueGeneration: 1, AttemptGeneration: 1, GroupPID: 222, ProfileDigest: strings.Repeat("8", 64), ConfinementVersion: reviewerConfinementVersion}
+				state.ReviewerProofs[reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target)] = proof
+			}
+			state.Tombstones[attemptKey] = tombstone
+			if test.receipt {
+				request := controlRequest{Version: controlVersion, RequestID: "legacy-dismiss-330", Repository: "o/r", Action: "dismiss", Issue: 330, Attempt: 1}
+				receipt := controlReceipt{Request: request, State: "pending", Phase: operatorPhaseCleanupPending, EffectID: strings.Repeat("9", 32)}
+				if test.phase == "completed" {
+					receipt.State, receipt.Phase, receipt.Result = "completed", operatorPhaseCompleted, successfulOperatorResult(request, 1)
+				}
+				if test.start {
+					receipt.Phase = operatorPhaseStartCleanup
+				}
+				if test.handoff {
+					receipt.Phase = operatorPhaseHandoffCleanup
+				}
+				state.ControlReceipts = append(state.ControlReceipts, receipt)
+			}
+			writeLegacyStateFixture(t, root, runtimeOwnerStateFile, state)
+
+			loaded, err := readRuntimeOwnerState(root, "o/r")
+			if err != nil {
+				t.Fatalf("legacy Dismiss did not migrate before validation: %v", err)
+			}
+			got := loaded.Tombstones[attemptKey]
+			if !loaded.DismissCleanupTracked || got.CleanupPhase != "completed" || got.EffectID != "" || got.CleanupPolicy != nil || got.ReviewerLeaseID != "" {
+				t.Fatalf("migrated tombstone=%#v marker=%t", got, loaded.DismissCleanupTracked)
+			}
+			if test.lease || test.start {
+				if loaded.LegacyReviewerQuarantines[issueKey] == "" || len(loaded.ReviewerProofs) != map[bool]int{true: 1, false: 0}[test.lease] {
+					t.Fatalf("lost fail-closed quarantine/proof: %#v", loaded)
+				}
+			}
+			if test.receipt {
+				receipt := loaded.ControlReceipts[0]
+				if test.handoff {
+					if receipt.State != "pending" || receipt.Phase != operatorPhaseHandoffCleanup || receipt.EffectID != "" {
+						t.Fatalf("safe handoff replay was lost: %#v", receipt)
+					}
+					owner, err := startTestStateOwner(t, root, loaded, func(next runtimeOwnerState) error {
+						return writeRuntimeOwnerState(root, productionAttemptRoot(root), next)
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					proof := handoffCompensationProof{EffectID: got.InvalidatedHandoff.EffectID, Token: got.InvalidatedHandoff.Token, OldSessionID: "old-session", OldPaneID: "%9", PreserveOld: true, Disposition: "marked-old"}
+					completed, err := owner.completeHandoffCompensation(t.Context(), completeHandoffCompensationCommand{RequestID: receipt.Request.RequestID, Proof: proof})
+					if err != nil {
+						t.Fatal(err)
+					}
+					migratedReceipt, ok := operatorReceiptByID(completed.State, receipt.Request.RequestID)
+					if !ok || migratedReceipt.State != "completed" || migratedReceipt.Phase != operatorPhaseCompleted || !completed.State.Tombstones[attemptKey].HandoffCompensated {
+						t.Fatalf("legacy handoff did not converge after restart: receipt=%#v tombstone=%#v", migratedReceipt, completed.State.Tombstones[attemptKey])
+					}
+					if err := owner.close(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					if persisted, err := readRuntimeOwnerState(root, "o/r"); err != nil || !persisted.Tombstones[attemptKey].HandoffCompensated {
+						t.Fatalf("handoff migration was not durable: state=%#v err=%v", persisted, err)
+					}
+				} else if receipt.State != "completed" || receipt.Phase != operatorPhaseCompleted || receipt.EffectID != "" || receipt.Result == nil {
+					t.Fatalf("irreducible legacy receipt was not settled: %#v", receipt)
+				}
+			}
+		})
 	}
 }
 
@@ -836,7 +955,7 @@ func TestStateOwnerRejectsEffectCompletionAfterIssueGenerationChanges(t *testing
 	}
 }
 
-func TestStateOwnerCompletesTombstoneCleanupAfterIssueGenerationChanges(t *testing.T) {
+func TestStateOwnerRejectsGenericTombstoneCleanupCompletion(t *testing.T) {
 	root := resolvedTempDir(t)
 	owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
 	if err != nil {
@@ -857,13 +976,13 @@ func TestStateOwnerCompletesTombstoneCleanupAfterIssueGenerationChanges(t *testi
 		t.Fatalf("advanced=%#v err=%v", advanced, err)
 	}
 	identity := stateResultIdentity{Epoch: advanced.State.Epoch, EffectID: effect.ID, IssueGeneration: 1, AttemptGeneration: 2}
-	completed, err := owner.completeEffect(t.Context(), completeEffectCommand{Identity: identity, Diagnostic: "cleanup verified"})
-	if err != nil {
-		t.Fatal(err)
+	if _, err := owner.completeEffect(t.Context(), completeEffectCommand{Identity: identity, Diagnostic: "cleanup verified"}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("generic completion bypassed the typed cleanup verifier: %v", err)
 	}
-	tombstone := completed.State.Tombstones[ownerAttemptKey("o/r", 48, 1)]
-	if tombstone.CleanupPhase != "completed" || completed.State.Effects[effect.ID].State != "completed" || validateRuntimeOwnerState(completed.State, runtimeOwnerAttemptRoot(root), root, true) != nil {
-		t.Fatalf("completed=%#v", completed)
+	current := mustOwnerSnapshot(t, owner).State
+	tombstone := current.Tombstones[ownerAttemptKey("o/r", 48, 1)]
+	if tombstone.CleanupPhase != "cleanup-started" || current.Effects[effect.ID].State != "pending" || validateRuntimeOwnerState(current, runtimeOwnerAttemptRoot(root), root, true) != nil {
+		t.Fatalf("generic cleanup rejection changed owner state: %#v", current)
 	}
 }
 

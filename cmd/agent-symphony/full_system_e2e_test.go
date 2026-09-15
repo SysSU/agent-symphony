@@ -31,6 +31,7 @@ type fullSystemGitHub struct {
 	base                      string
 	origin                    string
 	comments                  []map[string]any
+	prComments                []map[string]any
 	labels                    map[string]bool
 	requests                  []string
 	failNext                  bool
@@ -230,7 +231,16 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&input)
 		f.pr["body"] = input["body"]
 		writeFixtureJSON(w, f.pr)
-	case r.Method == http.MethodGet && (path == "/repos/o/r/issues/91/comments" || path == "/repos/o/r/pulls/91/comments" || path == "/repos/o/r/pulls/91/reviews"):
+	case r.Method == http.MethodGet && path == "/repos/o/r/issues/91/comments":
+		writeFixtureJSON(w, f.prComments)
+	case r.Method == http.MethodPost && path == "/repos/o/r/issues/91/comments":
+		var input map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&input)
+		created := time.Now().UTC().Format(time.RFC3339Nano)
+		comment := map[string]any{"id": nextFixtureCommentID(f.prComments), "body": input["body"], "created_at": created, "updated_at": created, "user": map[string]any{"id": 42}}
+		f.prComments = append(f.prComments, comment)
+		writeFixtureStatusJSON(w, http.StatusCreated, comment)
+	case r.Method == http.MethodGet && (path == "/repos/o/r/pulls/91/comments" || path == "/repos/o/r/pulls/91/reviews"):
 		writeFixtureJSON(w, []any{})
 	case r.Method == http.MethodGet && strings.Contains(path, "/commits/") && strings.HasSuffix(path, "/check-runs"):
 		writeFixtureJSON(w, map[string]any{"check_runs": []any{map[string]any{"name": "full-system-ci", "status": "completed", "conclusion": "success"}}})
@@ -254,7 +264,7 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var input map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&input)
 		created := time.Now().UTC().Format(time.RFC3339Nano)
-		comment := map[string]any{"id": len(f.comments) + 1, "body": input["body"], "created_at": created, "updated_at": created, "user": map[string]any{"id": 42}}
+		comment := map[string]any{"id": nextFixtureCommentID(f.comments), "body": input["body"], "created_at": created, "updated_at": created, "user": map[string]any{"id": 42}}
 		f.comments = append(f.comments, comment)
 		writeFixtureStatusJSON(w, http.StatusCreated, comment)
 	case r.Method == http.MethodPost && path == "/repos/o/r/issues/73/labels":
@@ -274,6 +284,19 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, fmt.Sprintf(`{"message":"unhandled fixture endpoint %s %s"}`, r.Method, r.URL.RequestURI()), http.StatusNotFound)
 	}
+}
+
+func nextFixtureCommentID(comments []map[string]any) int64 {
+	var latest int64
+	for _, comment := range comments {
+		switch id := comment["id"].(type) {
+		case int:
+			latest = max(latest, int64(id))
+		case int64:
+			latest = max(latest, id)
+		}
+	}
+	return latest + 1
 }
 
 func githubMutationRequest(r *http.Request) bool {
@@ -328,7 +351,9 @@ func TestFullSystemE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = os.RemoveAll(root)
+		if err := removeFullSystemFixtureRoot(root); err != nil {
+			t.Errorf("remove full-system fixture root: %v", err)
+		}
 	})
 	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
@@ -382,7 +407,7 @@ test "$endpoint" = graphql && endpoint=/graphql
 if [ "$input" -eq 1 ]; then exec curl -sS -i -X "$method" --data-binary @- "$FAKE_GITHUB_URL$endpoint"; fi
 exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 `)
-	writeExecutable(t, filepath.Join(binDir, "codex"), `#!/bin/sh
+	buildNativeCodexFixture(t, filepath.Join(binDir, "codex"), `#!/bin/sh
 umask 077
 if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
 if [ "$1" = sandbox ]; then
@@ -708,6 +733,14 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	}) {
 		t.Fatalf("merged state did not reach the owner projection: statuses=%#v serve=%s", completed.Statuses, output.String())
 	}
+	completedOwner, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedRecord, ok := completedOwner.Attempts[ownerAttemptKey("o/r", 73, 2)]
+	if !ok || attemptHasReviewerProof(completedOwner, "o/r", 73, 2) || !completedRecord.Manifest.ReviewRunCleaned || completedRecord.Manifest.ReviewRunID != "" || completedRecord.Manifest.ReviewSnapshot != "" || completedRecord.Manifest.ReviewSession != "" {
+		t.Fatalf("completed lifecycle did not automatically retire exact reviewer authority and resources: record=%#v proofs=%#v", completedRecord, completedOwner.ReviewerProofs)
+	}
 	if err := server.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
 	}
@@ -800,14 +833,11 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 			t.Fatal(err)
 		}
 	}
-	removedAttempt := agentruntime.Attempt{Repository: "o/r", Issue: 73, Number: 1, BaseSHA: removedManifest.BaseSHA}
 	snapshotRoot := productionSnapshotRoot(stateRoot)
 	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	removedSnapshot, removedReviewSession := reviewIdentity(removedAttempt, snapshotRoot)
 	unrelatedSnapshot := filepath.Join(snapshotRoot, "unrelated-snapshot")
-	removedReviewResult := removedSnapshot + ".result-0123456789abcdef"
 	for _, path := range []string{unrelatedSnapshot} {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
@@ -849,6 +879,9 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	case <-time.After(deadline(15 * time.Second)):
 		t.Fatal("reconciliation did not reach the GitHub issue-list barrier")
 	}
+	fixture.mu.Lock()
+	removalMutationStart := len(fixture.requests)
+	fixture.mu.Unlock()
 	removalPlaywright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "removal-playwright"))
 	removalPlaywright.Dir = source
 	removalPlaywright.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+restartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL)
@@ -856,6 +889,14 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		close(removeReconcileRelease)
 		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 		t.Fatalf("real permanent-removal Playwright: %v\n%s\nledger=%s\nserve:\n%s", removalErr, removalOutput, ledger, restartOutput.String())
+	}
+	fixture.mu.Lock()
+	removalActionRequests := append([]string(nil), fixture.requests[removalMutationStart:]...)
+	fixture.mu.Unlock()
+	if slices.ContainsFunc(removalActionRequests, func(request string) bool {
+		return !strings.HasPrefix(request, "GET ") && !strings.HasPrefix(request, "HEAD ")
+	}) {
+		t.Fatalf("permanent removal performed GitHub mutation before committed repair admission: %q", removalActionRequests)
 	}
 	removedDuringBlock, err := readRuntimeOwnerState(stateRoot, "o/r")
 	if err != nil {
@@ -913,12 +954,12 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	if _, exists := removedState.Attempts[removedKey]; exists {
 		t.Fatal("permanently removed attempt remains authoritative")
 	}
-	for _, path := range []string{removedManifest.Worktree, removedResult, filepath.Dir(removedManifest.LogPath), removedSnapshot, removedReviewResult} {
+	for _, path := range []string{removedManifest.Worktree, removedResult, filepath.Dir(removedManifest.LogPath)} {
 		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("selected resource remains after permanent removal: %s: %v", path, err)
 		}
 	}
-	for _, session := range []string{removedManifest.Session, removedReviewSession} {
+	for _, session := range []string{removedManifest.Session} {
 		if fullSystemTmuxSessionExists(tmuxEnvironment, session) {
 			t.Fatalf("selected tmux session remains after permanent removal: %s", session)
 		}
@@ -1063,6 +1104,9 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	if generated.Generation == 0 || generated.Manifest.Session == "" || generated.Manifest.Worktree == "" || !afterRemovalCycle.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey].Present {
 		t.Fatalf("real daemon-generated attempt is unavailable in owner observation for Archive: origin=%#v current=%#v", generated, afterRemovalCycle.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey])
 	}
+	fixture.mu.Lock()
+	fixture.denyMutations = false
+	fixture.mu.Unlock()
 	archiveBrowser := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "generated-archive-playwright"))
 	archiveBrowser.Dir = source
 	archiveBrowser.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+removalRestartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_REMOVAL_E2E_PHASE=archive-generated-click")
@@ -1079,7 +1123,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 			return false
 		}
 		for _, receipt := range current.ControlReceipts {
-			if receipt.Request.Action == "archive" && receipt.Request.Issue == 73 && receipt.Request.Attempt == 2 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK && receipt.EffectID == "" && current.Tombstones[generatedKey].EffectID == "" {
+			if receipt.Request.Action == "archive" && receipt.Request.Issue == 73 && receipt.Request.Attempt == 2 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK && receipt.EffectID == "" && current.Tombstones[generatedKey].EffectID == "" && !attemptHasReviewerProof(current, "o/r", 73, 2) {
 				return true
 			}
 		}
@@ -1139,6 +1183,9 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	if _, exists := afterArchiveRestart.Attempts[generatedKey]; exists {
 		t.Fatal("restart/reconcile recreated archived generated owner attempt")
 	}
+	if attemptHasReviewerProof(afterArchiveRestart, "o/r", 73, 2) {
+		t.Fatalf("restart restored archived reviewer proofs: %#v", afterArchiveRestart.ReviewerProofs)
+	}
 	archiveRestartBrowser := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "generated-archive-restart-playwright"))
 	archiveRestartBrowser.Dir = source
 	archiveRestartBrowser.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+archiveRestartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_REMOVAL_E2E_PHASE=post-archive-restart")
@@ -1158,7 +1205,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	if err := stopFullSystemProcesses(root); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.RemoveAll(root); err != nil {
+	if err := removeFullSystemFixtureRoot(root); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(root); !os.IsNotExist(err) {
@@ -1193,6 +1240,53 @@ func writeExecutable(t *testing.T, path, body string) {
 	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func buildNativeCodexFixture(t *testing.T, path, script string) {
+	t.Helper()
+	source := filepath.Join(t.TempDir(), "main.go")
+	body := `package main
+import (
+	"os"
+	"os/exec"
+)
+const script = ` + strconv.Quote(script) + `
+func main() {
+	command := exec.Command("/bin/sh", append([]string{"-c", script, "codex"}, os.Args[1:]...)...)
+	command.Stdin, command.Stdout, command.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := command.Run(); err != nil {
+		if exit, ok := err.(*exec.ExitError); ok { os.Exit(exit.ExitCode()) }
+		os.Exit(127)
+	}
+}
+`
+	if err := os.WriteFile(source, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("go", "build", "-o", path, source)
+	command.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build native Codex fixture: %v: %s", err, output)
+	}
+}
+
+func removeFullSystemFixtureRoot(root string) error {
+	base := filepath.Base(root)
+	if !strings.HasPrefix(base, ".as-lifecycle-") && !strings.HasPrefix(base, ".agent-symphony-full-system-") {
+		return fmt.Errorf("refusing to remove unexpected fixture root %q", root)
+	}
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return os.Chmod(path, 0o700)
+		}
+		return nil
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.RemoveAll(root)
 }
 
 func freeAddress(t *testing.T) string {

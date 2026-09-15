@@ -72,7 +72,7 @@ func compensateHandoffV2(ctx context.Context, input []byte, root string) (string
 	}
 	status, err := runHostTmux(ctx, []string{"has-session", "-t", old.SessionID}, nil)
 	if err != nil {
-		if status.Exited && status.Code == 1 {
+		if exactTmuxSessionAbsent(status, old.SessionID) {
 			// Name absence is not process absence: a pane can outlive a
 			// renamed/unlinked session, and a replaced socket can hide S1.
 			absent, paneErr := hostBoundImplementationPaneAbsent(ctx, old)

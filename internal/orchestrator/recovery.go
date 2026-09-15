@@ -71,6 +71,7 @@ type AttemptSession struct {
 	State     string    `json:"state"`
 	Mode      string    `json:"mode,omitempty"`
 	Target    string    `json:"target,omitempty"`
+	RunID     string    `json:"run_id,omitempty"`
 	Current   bool      `json:"current,omitempty"`
 	CreatedAt time.Time `json:"created_at,omitzero"`
 	UpdatedAt time.Time `json:"updated_at,omitzero"`
@@ -259,15 +260,18 @@ func projectAttemptLifecycle(status *RecoveryStatus, manifest agentruntime.Manif
 	if manifest.ReviewState == "failed" && manifest.ReviewDiagnostic != "" {
 		status.Diagnostic = manifest.ReviewDiagnostic
 	}
-	add := func(role, name, state, mode, target string, created time.Time) {
+	add := func(role, name, state, mode, target, runID string, created time.Time) {
 		want, err := agentruntime.AttemptSessionName(role, manifest.Repository, manifest.Issue, manifest.Attempt)
+		if role == agentruntime.SessionRoleReviewer {
+			want, err = agentruntime.ReviewRunSessionName(manifest.Repository, manifest.Issue, manifest.Attempt, target, runID)
+		}
 		if err == nil && name == want && state != "" {
-			status.Sessions = append(status.Sessions, AttemptSession{Role: role, Name: name, State: state, Mode: mode, Target: target, CreatedAt: created, UpdatedAt: manifest.UpdatedAt})
+			status.Sessions = append(status.Sessions, AttemptSession{Role: role, Name: name, State: state, Mode: mode, Target: target, RunID: runID, CreatedAt: created, UpdatedAt: manifest.UpdatedAt})
 		}
 	}
-	add(agentruntime.SessionRoleImplementation, manifest.Session, manifest.State, "", "", manifest.CreatedAt)
+	add(agentruntime.SessionRoleImplementation, manifest.Session, manifest.State, "", "", "", manifest.CreatedAt)
 	if manifest.ReviewSession != "" && agentruntime.ValidReviewBinding(manifest.ReviewMode, manifest.ReviewTarget, manifest.Repository, manifest.Issue, manifest.ReviewBase, manifest.ReviewHead, manifest.BaseSHA) {
-		add(agentruntime.SessionRoleReviewer, manifest.ReviewSession, manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget, time.Time{})
+		add(agentruntime.SessionRoleReviewer, manifest.ReviewSession, manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewRunID, time.Time{})
 	}
 
 	switch status.State {

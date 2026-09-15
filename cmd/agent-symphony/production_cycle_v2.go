@@ -234,24 +234,24 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	collector.API = api
 	batch, err := collector.collect(ctx, cycleSnapshot)
 	if err != nil {
-		return err
+		return fmt.Errorf("collect GitHub reconciliation facts: %w", err)
 	}
 	collection, err := collectionFromSnapshot(cycleSnapshot, batch.Input)
 	if err != nil {
-		return err
+		return fmt.Errorf("reduce reconciliation snapshot: %w", err)
 	}
 	applied, err := p.owner.applyReconciliation(ctx, collection)
 	if err != nil {
-		return err
+		return fmt.Errorf("apply collected reconciliation: %w", err)
 	}
 	applied, err = p.admitDependencyStatuses(ctx, applied)
 	if err != nil {
-		return err
+		return fmt.Errorf("admit dependency status: %w", err)
 	}
 	p.effects.cancelInvalidated(applied)
 	if resolved, err := p.resolveInvalidatedGitHubEffect(ctx, p.api); err != nil || resolved {
 		if err != nil {
-			return err
+			return fmt.Errorf("resolve invalidated GitHub effect: %w", err)
 		}
 		return errReconciliationRecollect
 	}
@@ -259,7 +259,7 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 		p.operator.cancelSupersededPlanWatchers(cycleSnapshot, applied)
 		if superseded, err := p.supersedeInvalidPendingPlanReviewers(ctx, applied); err != nil || superseded {
 			if err != nil {
-				return err
+				return fmt.Errorf("supersede invalid plan reviewer: %w", err)
 			}
 			return errReconciliationRecollect
 		}
@@ -267,19 +267,19 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	}
 	if resumed, err := p.resumePendingReconciliation(ctx, api, batch); err != nil || resumed {
 		if err != nil {
-			return err
+			return fmt.Errorf("resume pending reconciliation effect: %w", err)
 		}
 		return errReconciliationRecollect
 	}
 	if changed, err := p.runMachineStatusPhase(ctx, api); err != nil || changed {
 		if err != nil {
-			return err
+			return fmt.Errorf("run machine-status phase: %w", err)
 		}
 		return errReconciliationRecollect
 	}
 	if changed, err := p.runIssueUpdatePhase(ctx, api, batch, false); err != nil || changed {
 		if err != nil {
-			return err
+			return fmt.Errorf("run pre-runtime issue-update phase: %w", err)
 		}
 		return errReconciliationRecollect
 	}
@@ -290,25 +290,25 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	}
 	source, err := seedImmutableAttemptSource(ctx, p.checkout, p.config.Repository, p.attemptRoot, baseBranch, baseSHA)
 	if err != nil {
-		return err
+		return fmt.Errorf("seed immutable attempt source: %w", err)
 	}
 	if err := p.resumePendingRuntime(ctx, batch, source); err != nil {
-		return err
+		return fmt.Errorf("resume pending runtime: %w", err)
 	}
 	if err := p.runRuntimePhase(ctx, batch, source, agentruntime.EffectPrepare); err != nil {
-		return err
+		return fmt.Errorf("run prepare phase: %w", err)
 	}
 	if changed, err := p.runBindPhase(ctx, api); err != nil || changed {
 		if err != nil {
-			return err
+			return fmt.Errorf("run bind phase: %w", err)
 		}
 		return errReconciliationRecollect
 	}
 	if err := p.runRuntimePhase(ctx, batch, source, agentruntime.EffectStart); err != nil {
-		return err
+		return fmt.Errorf("run start phase: %w", err)
 	}
 	if err := p.runRuntimePhase(ctx, batch, source, agentruntime.EffectMonitor); err != nil {
-		return err
+		return fmt.Errorf("run monitor phase: %w", err)
 	}
 
 	snapshot, err := p.owner.snapshot(ctx)
@@ -317,36 +317,39 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	}
 	reviewers, publications, err := p.executionCandidates(ctx, snapshot, batch)
 	if err != nil {
-		return err
+		return fmt.Errorf("build execution candidates: %w", err)
 	}
 	if err := p.runReviewerPhase(ctx, reviewers); err != nil {
-		return err
+		return fmt.Errorf("run reviewer phase: %w", err)
 	}
 	if err := p.runHandoffOutcomePhase(ctx); err != nil {
-		return err
+		return fmt.Errorf("run handoff outcome phase: %w", err)
 	}
 	if err := p.runHandoffPhase(ctx); err != nil {
-		return err
+		return fmt.Errorf("run handoff phase: %w", err)
 	}
 	if changed, err := p.runPublicationPhase(ctx, api, publications); err != nil || changed {
 		if err != nil {
-			return err
+			return fmt.Errorf("run publication phase: %w", err)
 		}
 		return errReconciliationRecollect
 	}
 	if changed, err := p.runIssueUpdatePhase(ctx, api, batch, true); err != nil || changed {
 		if err != nil {
-			return err
+			return fmt.Errorf("run post-runtime issue-update phase: %w", err)
 		}
 		return errReconciliationRecollect
 	}
 	if changed, err := p.runGovernancePhase(ctx, api); err != nil || changed {
 		if err != nil {
-			return err
+			return fmt.Errorf("run governance phase: %w", err)
 		}
 		return errReconciliationRecollect
 	}
-	return p.runRetirementPhase(ctx)
+	if err := p.runRetirementPhase(ctx); err != nil {
+		return fmt.Errorf("run retirement phase: %w", err)
+	}
+	return nil
 }
 
 func (p *productionReconciliation) admitDependencyStatuses(ctx context.Context, snapshot stateOwnerSnapshot) (stateOwnerSnapshot, error) {
@@ -385,14 +388,20 @@ func (p *productionReconciliation) runMachineStatusPhase(ctx context.Context, ap
 	}
 	plans, err := planMachineStatusUpdates(snapshot, p.collector.Config)
 	if err != nil || len(plans) == 0 {
-		return false, err
+		if err != nil {
+			return false, fmt.Errorf("plan machine-status update: %w", err)
+		}
+		return false, nil
 	}
 	plan, err := p.effects.beginReconciliation(ctx, plans[0])
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("admit machine-status update: %w", err)
 	}
 	_, err = p.effects.executeIssueUpdate(ctx, api, plan)
-	return err == nil, err
+	if err != nil {
+		return false, fmt.Errorf("execute machine-status update: %w", err)
+	}
+	return true, nil
 }
 
 func (p *productionReconciliation) resolveInvalidatedGitHubEffect(ctx context.Context, api internalgithub.API) (bool, error) {
@@ -972,14 +981,20 @@ func (p *productionReconciliation) runIssueUpdatePhase(ctx context.Context, api 
 		}
 	}
 	if err != nil || len(plans) == 0 {
-		return false, err
+		if err != nil {
+			return false, fmt.Errorf("plan issue update: %w", err)
+		}
+		return false, nil
 	}
 	plan, err := p.effects.beginReconciliation(ctx, plans[0])
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("admit issue update: %w", err)
 	}
 	_, err = p.effects.executeIssueUpdate(ctx, api, plan)
-	return err == nil, err
+	if err != nil {
+		return false, fmt.Errorf("execute issue update: %w", err)
+	}
+	return true, nil
 }
 
 func (p *productionReconciliation) runBindPhase(ctx context.Context, api internalgithub.API) (bool, error) {

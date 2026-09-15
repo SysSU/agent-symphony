@@ -780,15 +780,14 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, session := reviewIdentity(attempt, snapshotRoot)
-	if err := os.Mkdir(snapshot, 0o700); err != nil {
-		t.Fatal(err)
-	}
 	targetOne := "o/r#31 plan sha256:" + strings.Repeat("a", 64)
 	targetTwo := "o/r#31 plan sha256:" + strings.Repeat("b", 64)
-	resultOne, resultTwo := filepath.Dir(reviewResultPath(snapshot, targetOne)), filepath.Dir(reviewResultPath(snapshot, targetTwo))
+	runOne, runTwo := digestText("review run one"), digestText("review run two")
+	snapshotOne, _ := reviewRunIdentity(attempt, snapshotRoot, targetOne, runOne)
+	snapshotTwo, sessionTwo := reviewRunIdentity(attempt, snapshotRoot, targetTwo, runTwo)
+	resultOne, resultTwo := filepath.Dir(reviewResultPath(snapshotOne, targetOne)), filepath.Dir(reviewResultPath(snapshotTwo, targetTwo))
 	for _, path := range []string{resultOne, resultTwo} {
-		if err := os.Mkdir(path, 0o700); err != nil {
+		if err := os.MkdirAll(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -796,11 +795,11 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	if err := os.Mkdir(sibling, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, ReviewHead: strings.Repeat("b", 40), ReviewTarget: targetTwo, ReviewSnapshot: snapshot, ReviewSession: session}
+	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, ReviewHead: strings.Repeat("b", 40), ReviewTarget: targetTwo, ReviewRunID: runTwo, ReviewSnapshot: snapshotTwo, ReviewSession: sessionTwo}
 	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, false); err != nil {
 		t.Fatalf("review preflight: %v", err)
 	}
-	for _, path := range []string{snapshot, resultOne, resultTwo} {
+	for _, path := range []string{snapshotOne, snapshotTwo, resultOne, resultTwo} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("preflight removed %s: %v", path, err)
 		}
@@ -808,14 +807,41 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	if err := cleanupAttemptReviewResources(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true); err == nil {
 		t.Fatal("unbound reviewer artifacts were cleaned without process-death proof")
 	}
+	activeProfile := strings.Repeat("c", 64)
+	ranButLive := map[string]reviewerProcessProof{
+		targetOne: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetOne, RunID: runOne, GroupPID: 1234, ProfileDigest: activeProfile, ConfinementVersion: reviewerConfinementVersion},
+		targetTwo: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetTwo, RunID: runTwo, GroupPID: 5678, ProfileDigest: activeProfile, ConfinementVersion: reviewerConfinementVersion},
+	}
+	if err := cleanupAttemptReviewResourcesBound(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true, activeProfile, ranButLive); err == nil || !strings.Contains(err.Error(), "certificate is missing") {
+		t.Fatalf("matching confined profile without exact process-death proof cleanup=%v", err)
+	}
 	proofs := map[string]reviewerProcessProof{
-		targetOne: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetOne, DeadProved: true, NeverRan: true},
-		targetTwo: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetTwo, DeadProved: true, NeverRan: true},
+		targetOne: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetOne, RunID: runOne, DeadProved: true, NeverRan: true},
+		targetTwo: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetTwo, RunID: runTwo, DeadProved: true, NeverRan: true},
+	}
+	baseSnapshot, _ := reviewIdentity(attempt, snapshotRoot)
+	unknown := baseSnapshot + "-0123456789abcdef"
+	if unknown == snapshotOne || unknown == snapshotTwo {
+		t.Fatal("test target digest unexpectedly collided")
+	}
+	if err := os.Mkdir(unknown, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupAttemptReviewResourcesProved(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true, proofs); err == nil || !strings.Contains(err.Error(), "no owner process-death certificate") {
+		t.Fatalf("unknown target-specific snapshot cleanup=%v", err)
+	}
+	for _, path := range []string{snapshotOne, snapshotTwo, unknown} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("failed cleanup changed %s: %v", path, err)
+		}
+	}
+	if err := os.Remove(unknown); err != nil {
+		t.Fatal(err)
 	}
 	if err := cleanupAttemptReviewResourcesProved(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true, proofs); err != nil {
 		t.Fatalf("review cleanup: %v", err)
 	}
-	for _, path := range []string{snapshot, resultOne, resultTwo} {
+	for _, path := range []string{snapshotOne, snapshotTwo, resultOne, resultTwo} {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("review artifact remains %s: %v", path, err)
 		}
@@ -823,9 +849,21 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	if _, err := os.Stat(sibling); err != nil {
 		t.Fatalf("unrelated review resource removed: %v", err)
 	}
+	for _, path := range []string{resultOne, resultTwo} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for target, proof := range ranButLive {
+		proof.DeadProved = true
+		ranButLive[target] = proof
+	}
+	if err := cleanupAttemptReviewResourcesBound(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true, strings.Repeat("d", 64), ranButLive); err != nil {
+		t.Fatalf("exact dead confined reviewer cleanup: %v", err)
+	}
 
 	canary := t.TempDir()
-	unsafe := snapshot + ".result-aaaaaaaaaaaaaaaa"
+	unsafe := snapshotTwo
 	if err := os.Symlink(canary, unsafe); err != nil {
 		t.Fatal(err)
 	}
@@ -1119,7 +1157,6 @@ func TestDashboardAndCLIRejectRetainedDeadImplementationPane(t *testing.T) {
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
 		t.Fatal(err)
 	}
-
 	if err := chatIssue(root, 214, strings.NewReader("must not be sent\n"), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "missing or inactive") {
 		t.Fatalf("retained-dead CLI error=%v", err)
 	}
@@ -1179,10 +1216,12 @@ func TestDashboardImplementationTerminalRequiresRunningCurrentProjection(t *test
 func TestAttemptSessionRoutingNeedsNoOrchestrator(t *testing.T) {
 	root := t.TempDir()
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 226, 1)
-	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 226, 1)
+	reviewTarget := strings.Repeat("a", 40) + ".." + strings.Repeat("b", 40)
+	reviewRunID := digestText("routing reviewer run")
+	reviewer, _ := agentruntime.ReviewRunSessionName("o/r", 226, 1, reviewTarget, reviewRunID)
 	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 226, Attempt: 1, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{
 		{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "running", Current: true},
-		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModeImplementation, Target: strings.Repeat("a", 40) + ".." + strings.Repeat("b", 40), Current: true},
+		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModeImplementation, Target: reviewTarget, RunID: reviewRunID, Current: true},
 	}}
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
 		t.Fatal(err)
@@ -1222,11 +1261,29 @@ func TestDashboardRejectsReviewerTerminalWithoutBlockingImplementation(t *testin
 	root := t.TempDir()
 	repository, issue, attempt := "o/r", 23, 2
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, repository, issue, attempt)
-	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, repository, issue, attempt)
+	target := "o/r#23 plan sha256:" + strings.Repeat("a", 64)
+	runID := digestText("dashboard reviewer run")
+	reviewer, _ := agentruntime.ReviewRunSessionName(repository, issue, attempt, target, runID)
 	status := orchestrator.RecoveryStatus{Repository: repository, Issue: issue, Attempt: attempt, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{
 		{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "running", Current: true},
-		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModePlan, Target: "o/r#23 plan sha256:" + strings.Repeat("a", 64), Current: true},
+		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModePlan, Target: target, RunID: runID, Current: true},
 	}}
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
+		t.Fatal(err)
+	}
+	projection := dashboardServer{stateRoot: root}
+	if _, err := projection.projectedStatus(issue, attempt); err != nil {
+		t.Fatalf("valid run-bound reviewer hid implementation status: %v", err)
+	}
+	forged := status
+	forged.Sessions = slices.Clone(status.Sessions)
+	forged.Sessions[1].RunID = ""
+	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{forged}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := projection.projectedStatus(issue, attempt); err == nil {
+		t.Fatal("reviewer session without its run identity was accepted")
+	}
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
 		t.Fatal(err)
 	}

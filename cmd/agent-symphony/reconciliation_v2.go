@@ -374,6 +374,16 @@ func collectionFromSnapshot(snapshot stateOwnerSnapshot, input reconciliationInp
 		if _, exists := groups[key]; exists {
 			return reconciliationCollection{}, errStateConflict
 		}
+		if fact.ActiveAttempt != nil {
+			attemptKey := ownerAttemptKey(fact.ActiveAttempt.Repository, fact.ActiveAttempt.Issue, fact.ActiveAttempt.Attempt)
+			if _, tombstoned := snapshot.State.Tombstones[attemptKey]; tombstoned {
+				fact.ActiveAttempt = nil
+			}
+		}
+		fact.TerminalAttempts = slices.DeleteFunc(fact.TerminalAttempts, func(attempt reconciliationAttemptFact) bool {
+			_, tombstoned := snapshot.State.Tombstones[ownerAttemptKey(attempt.Repository, attempt.Issue, attempt.Attempt)]
+			return tombstoned
+		})
 		group := &reconciliationIssueGroup{Fact: fact}
 		if fact.ActiveAttempt != nil {
 			group.Attempts = append(group.Attempts, *fact.ActiveAttempt)
@@ -389,6 +399,9 @@ func collectionFromSnapshot(snapshot stateOwnerSnapshot, input reconciliationInp
 		fact, err := reduceAttemptFact(snapshot.State.Repository, raw)
 		if err != nil {
 			return reconciliationCollection{}, err
+		}
+		if _, tombstoned := snapshot.State.Tombstones[ownerAttemptKey(fact.Repository, fact.Issue, fact.Attempt)]; tombstoned {
+			continue
 		}
 		group := groups[ownerIssueKey(fact.Repository, fact.Issue)]
 		if group == nil {

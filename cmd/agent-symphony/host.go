@@ -687,6 +687,7 @@ type reviewResultRequest struct {
 	Attempt            int    `json:"attempt"`
 	Mode               string `json:"mode"`
 	Target             string `json:"target"`
+	RunID              string `json:"run_id"`
 	Head               string `json:"head"`
 	LegacyHeadArtifact bool   `json:"legacy_head_artifact,omitempty"`
 }
@@ -707,10 +708,10 @@ func readReviewResult(input []byte, root string) (string, error) {
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || len(request.Repository) > 256 || strings.ContainsAny(request.Repository, "\\\x00\r\n") {
 		return "", errors.New("invalid review result request")
 	}
-	if !agentruntime.ValidReviewMetadata(request.Mode, request.Target) || !validReviewTarget(request.Mode, request.Target, request.Repository, request.Issue, request.Head) || request.LegacyHeadArtifact && request.Mode != agentruntime.ReviewModeImplementation {
+	if !agentruntime.ValidReviewMetadata(request.Mode, request.Target) || !validReviewTarget(request.Mode, request.Target, request.Repository, request.Issue, request.Head) || !validDigest(request.RunID) || request.LegacyHeadArtifact && request.Mode != agentruntime.ReviewModeImplementation {
 		return "", errors.New("invalid review result request")
 	}
-	snapshot, _ := reviewTargetIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root, request.Target)
+	snapshot, _ := reviewRunIdentity(agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt}, root, request.Target, request.RunID)
 	path := reviewResultPath(snapshot, request.Target)
 	if !belowRoot(path, root) {
 		return "", errors.New("review result path escapes snapshot root")
@@ -1326,7 +1327,7 @@ func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) err
 		if err == nil {
 			return true, nil
 		}
-		if result.Exited && result.Code == 1 {
+		if exactTmuxSessionAbsent(result, session) {
 			return false, nil
 		}
 		return false, err
@@ -1673,7 +1674,7 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	}
 }
 
-var reviewerGuardFormatPattern = regexp.MustCompile(`^#\{&&:#\{==:#\{pid\},([1-9][0-9]*)\},#\{&&:#\{==:#\{start_time\},([1-9][0-9]*)\},#\{&&:#\{==:#\{session_name\},(as-r-[0-9a-f]{16}-[1-9][0-9]*-[1-9][0-9]*)\},#\{&&:#\{==:#\{session_id\},(\$[0-9]+)\},#\{==:#\{pane_pid\},([1-9][0-9]*)\}\}\}\}\}$`)
+var reviewerGuardFormatPattern = regexp.MustCompile(`^#\{&&:#\{==:#\{pid\},([1-9][0-9]*)\},#\{&&:#\{==:#\{start_time\},([1-9][0-9]*)\},#\{&&:#\{==:#\{session_name\},(as-r-(?:[0-9a-f]{48}|[0-9a-f]{16}-[1-9][0-9]*-[1-9][0-9]*))\},#\{&&:#\{==:#\{session_id\},(\$[0-9]+)\},#\{==:#\{pane_pid\},([1-9][0-9]*)\}\}\}\}\}$`)
 
 func validReviewerGuardedKillArgs(args []string) bool {
 	if len(args) != 7 || args[1] != "-F" || args[2] != "-t" || args[6] != "display-message -p "+reviewerGuardMismatch {

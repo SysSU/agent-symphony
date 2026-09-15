@@ -1,10 +1,10 @@
 # GitHub CLI integration
 
-Agent Symphony uses the installed `gh` executable for every GitHub API request and for Git push authentication. The daemon, orchestrator, heartbeat, implementation, and review roles all receive the same GitHub CLI capability. GitHub credentials remain runtime environment or `gh` credential-store state, never Agent Symphony configuration or repository files.
+Agent Symphony uses the installed `gh` executable for GitHub API requests and Git publication. The daemon is the only workflow publication/mutation authority; implementation and review workers have no GitHub credential, CLI, or network capability. The optional trusted advisory orchestrator is a separate coordinator-user process described in [Security](security.md#advisory-orchestrator). See the [ownership architecture](architecture.md#system-boundaries-and-ownership).
 
 ## Authentication
 
-Install GitHub CLI and authenticate the operating-system account that runs Agent Symphony:
+Install GitHub CLI and authenticate the ordinary operating-system account that runs Agent Symphony:
 
 ```sh
 gh auth login
@@ -12,20 +12,22 @@ gh auth status
 gh repo view OWNER/REPOSITORY
 ```
 
-For non-interactive use, set `GH_TOKEN` or `GITHUB_TOKEN` in the Agent Symphony process instead. The shared agent environment boundary forwards those variables, their GitHub Enterprise equivalents, and `GH_HOST`, `GH_REPO`, or `GH_CONFIG_DIR`; unrelated credential variables remain blocked. A GitHub App user access token is supported because it identifies a user; App IDs, private keys, installation tokens, and token minting remain outside Agent Symphony. The token path is optional in zero-admin mode when `gh auth login` is already configured, because every role uses the same operating-system account and credential store.
+For non-interactive service use, set `GH_TOKEN` or `GITHUB_TOKEN` in the daemon environment. GitHub Enterprise equivalents and target variables are also service inputs. Agent Symphony never copies them into implementation/review worker environments, workspaces, snapshots, manifests, logs, launch contracts, status mailboxes, or repository configuration. A GitHub App user access token is supported because it identifies a user; App IDs, private keys, installation tokens, and token minting remain outside Agent Symphony.
 
-Agent session creation imports only the filtered variable names from the tmux client environment; credential values do not appear in tmux command arguments. Advanced host isolation uses command-scoped sudo `env_keep` entries for the same fixed GitHub CLI allowlist and does not grant `SETENV`. Implementation and review requests carry their filtered environment inside the bounded adapter input rather than the sudo process environment. Returned launch errors, retained pane logs, diagnostics, and manifests redact credential values.
+The authenticated account must be able to read issues, pull requests, reviews, checks, commit statuses, and available repository rules, and to perform the mutations enabled by repository policy. Use `gh auth refresh` if the account lacks a required scope. `agent-symphony doctor` verifies the daemon's authenticated identity, configured repository, and effective permission.
 
-Advanced host isolation uses separate worker and reviewer accounts, so the coordinator user's stored login is not available there. Supply one of the supported token variables to the Agent Symphony service or authenticate each fixed account separately. Agent Symphony passes runtime values through the bounded process environment and does not write them to worktrees, snapshots, manifests, logs, launch contracts, or repository configuration. Attempt worktrees still have no remote or Git credential helper; use `gh` for authorized issue and pull-request operations, not `git push`.
+## Worker boundary
 
-The authenticated account must be able to read issues, pull requests, reviews, checks, commit statuses, and any available branch protection or rules, and to perform the mutations enabled by the repository's Agent Symphony policy. Branch protection is optional. Use `gh auth refresh` if the account is missing a required scope.
+Implementation and review workers use an isolated `CODEX_HOME` containing only Codex model-authentication assets. They do not receive the daemon's GitHub environment or `gh` configuration. The managed Codex profile disables command network access and ambient capability tools. Attempt clones have no remote or credential helper, so local Git work cannot publish directly.
 
-`agent-symphony doctor` verifies the daemon's executable, authenticated identity, configured repository, and effective repository permissions. In an agent session, `gh auth status` and `gh repo view "$GH_REPO"` verify that role's same runtime path. Missing or invalid authentication returns the GitHub CLI authentication error and a nonzero status; no role reports success from configuration alone.
+While running, a worker requests `needs-attention` or `clear` through its private status mailbox. The request is bound to its generation, launch ID, increasing sequence, and permission-profile digest. The owner validates current state and performs the GitHub comment/label effect. A mailbox write proves only that the request was submitted; current GitHub state proves whether the status changed.
+
+Completion follows the same rule. The worker returns a bounded result and credential-free bundle. The coordinator verifies and seals the exact generation and content in owner-private storage, then uses its own GitHub session to publish from that immutable seal. Workers never create pull requests, push branches, post comments, change labels, or merge.
 
 ## Runtime behavior
 
-The daemon invokes `gh api` for reconciliation reads and writes. It discovers its stable coordinator identity from `gh api /user`, uses that user ID to recognize its own markers and comments, and publishes `agent-symphony/policy` as a commit status. Authorized agents invoke the same installed CLI directly. Git publication remains daemon-owned through `gh auth git-credential`; agent worktrees have no authenticated Git remote.
+The daemon invokes `gh api` for reconciliation reads and owner-issued writes and `gh auth git-credential` for authenticated publication. It discovers its stable identity from `gh api /user` and uses that identity to recognize coordinator markers and comments. Every asynchronous GitHub result is checked against its source revision, issue/attempt generation, and effect identity before it commits local state.
 
-Direct workflow status uses the two immutable comment commands documented in [GitHub controls](github-controls.md#direct-agent-status). Reconciliation reads the newest valid issue/PR command into the same projection served by the CLI and dashboard; no coordinator relay or dashboard mutation endpoint is involved.
+An HTTP request already accepted by GitHub cannot be cancelled retroactively. If a reversible or discoverable effect lands after local invalidation, the owner records a generation-bound convergence effect. An exact-head merge accepted before cancellation remains a GitHub fact; the owner reconciles the invalidated intent and keeps the local tombstone so the runtime attempt cannot return.
 
-`serve` reads current GitHub state immediately at startup and then polls at the configured interval, capped at 60 seconds. `reconcile` performs the same authoritative read once. No inbound HTTP endpoint or event subscription is part of the integration.
+`serve` reads GitHub at startup and on the configured cadence. `reconcile` requests the same authoritative collection through the running daemon. No inbound GitHub webhook or event subscription is part of this integration.

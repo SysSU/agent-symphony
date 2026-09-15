@@ -184,7 +184,14 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 	created := time.Date(2026, 8, 20, 1, 2, 3, 0, time.UTC)
 	updated := created.Add(time.Minute)
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 4, 2)
-	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 4, 2)
+	reviewRunID := strings.Repeat("c", 64)
+	reviewerSession := func(target string) string {
+		name, err := agentruntime.ReviewRunSessionName("o/r", 4, 2, target, reviewRunID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return name
+	}
 	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "active"}
 	base := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: fact.BaseSHA, State: "completed", Session: implementation, CreatedAt: created, UpdatedAt: updated}
 
@@ -200,15 +207,15 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 		{"validation", base, "validation", "", 1, "validate"},
 		{"review running", func() agentruntime.Manifest {
 			m := base
-			m.ReviewState, m.ReviewSession = "running", reviewer
-			m.ReviewMode, m.ReviewTarget = agentruntime.ReviewModeImplementation, "aaaaaaa..bbbbbbb"
+			m.ReviewMode, m.ReviewTarget, m.ReviewRunID = agentruntime.ReviewModeImplementation, "aaaaaaa..bbbbbbb", reviewRunID
+			m.ReviewState, m.ReviewSession = "running", reviewerSession(m.ReviewTarget)
 			m.ReviewBase, m.ReviewHead = "aaaaaaa", "bbbbbbb"
 			return m
 		}(), "review", "reviewer", 2, "reviewer session"},
 		{"plan review running alongside implementation", func() agentruntime.Manifest {
 			m := base
-			m.State, m.ReviewState, m.ReviewSession = "running", "running", reviewer
-			m.ReviewMode, m.ReviewTarget = agentruntime.ReviewModePlan, "o/r#4 plan sha256:"+strings.Repeat("b", 64)
+			m.ReviewMode, m.ReviewTarget, m.ReviewRunID = agentruntime.ReviewModePlan, "o/r#4 plan sha256:"+strings.Repeat("b", 64), reviewRunID
+			m.State, m.ReviewState, m.ReviewSession = "running", "running", reviewerSession(m.ReviewTarget)
 			m.ReviewBase, m.ReviewHead = fact.BaseSHA, fact.BaseSHA
 			return m
 		}(), "review", "reviewer", 2, "reviewer session"},
@@ -238,7 +245,7 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 				if session.Name == implementation && (session.CreatedAt != created || session.UpdatedAt != updated) {
 					t.Fatalf("implementation timestamps = %#v", session)
 				}
-				if session.Name == reviewer && test.name == "review running" && (session.Mode != agentruntime.ReviewModeImplementation || session.Target != "aaaaaaa..bbbbbbb") {
+				if session.Role == agentruntime.SessionRoleReviewer && test.name == "review running" && (session.Mode != agentruntime.ReviewModeImplementation || session.Target != "aaaaaaa..bbbbbbb" || session.RunID != reviewRunID) {
 					t.Fatalf("review metadata = %#v", session)
 				}
 			}

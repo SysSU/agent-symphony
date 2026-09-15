@@ -51,6 +51,7 @@ type ReviewTransition struct {
 	State               string
 	Mode                string
 	Target              string
+	RunID               string
 	Base                string
 	Head                string
 	Snapshot            string
@@ -698,7 +699,7 @@ var effectObjectID = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
 
 func validEffectCleanupPolicy(policy EffectCleanupPolicy) bool {
 	switch policy.Action {
-	case "archive", "abandon":
+	case "archive", "abandon", "dismiss":
 		return policy.PublishedHead == ""
 	case "remove":
 		return effectObjectID.MatchString(policy.PublishedHead)
@@ -1256,11 +1257,12 @@ func (r *Runtime) reviewEffect(request EffectRequest) (Manifest, error) {
 // an owner-approved review result.
 func ReviewEffectResult(root, stateRoot string, manifest Manifest, review ReviewTransition) (Manifest, error) {
 	if manifest.ReviewHandoffQueued && review.State == "findings-queued" {
-		if !review.HandoffQueued || manifest.ReviewHead != review.Head || !slices.Equal(manifest.ReviewFindings, review.Findings) || manifest.ReviewHandoffAck && !review.HandoffAcknowledged || manifest.ReviewMode != review.Mode || manifest.ReviewTarget != review.Target || manifest.ReviewBase != review.Base || manifest.ReviewSnapshot != review.Snapshot || manifest.ReviewSession != review.Session {
+		if !review.HandoffQueued || manifest.ReviewHead != review.Head || !slices.Equal(manifest.ReviewFindings, review.Findings) || manifest.ReviewHandoffAck && !review.HandoffAcknowledged || manifest.ReviewMode != review.Mode || manifest.ReviewTarget != review.Target || manifest.ReviewRunID != review.RunID || manifest.ReviewBase != review.Base || manifest.ReviewSnapshot != review.Snapshot || manifest.ReviewSession != review.Session {
 			return Manifest{}, errors.New("queued review handoff is immutable")
 		}
 	}
 	manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget = review.State, review.Mode, review.Target
+	manifest.ReviewRunID = review.RunID
 	manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = review.Base, review.Head, review.Snapshot, review.Session
 	manifest.ReviewFindings = slices.Clone(review.Findings)
 	manifest.ReviewHandoffQueued, manifest.ReviewHandoffAck = review.HandoffQueued, review.HandoffAcknowledged

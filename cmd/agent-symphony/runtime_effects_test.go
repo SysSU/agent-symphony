@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
@@ -246,6 +247,9 @@ func TestRuntimeEffectCancelledStartCleanupRemainsPending(t *testing.T) {
 	}
 	manifest := ownerTestManifest(t, root, 88, 1, "preparing")
 	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	owner, err := startTestStateOwner(t, root, runtimeEffectInitialState(manifest), func(runtimeOwnerState) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -264,7 +268,11 @@ func TestRuntimeEffectCancelledStartCleanupRemainsPending(t *testing.T) {
 		_, err := coordinator.execute(t.Context(), request)
 		done <- err
 	}()
-	<-runner.entered
+	select {
+	case <-runner.entered:
+	case err := <-done:
+		t.Fatalf("partial start returned before launch: %v", err)
+	}
 	cancel()
 	if err := <-done; err == nil {
 		t.Fatal("cancelled partial start returned no error")
@@ -900,7 +908,7 @@ func (r *cancelledStartRunner) Run(ctx context.Context, command agentruntime.Com
 		return agentruntime.Result{}, err
 	}
 	if len(command.Args) > 0 && command.Args[0] == "has-session" {
-		return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
+		return missingTmuxSession(command), errors.New("missing session")
 	}
 	if slices.Contains(command.Args, "new-session") {
 		close(r.entered)
@@ -966,7 +974,7 @@ func (r *barrierEffectRunner) Run(ctx context.Context, command agentruntime.Comm
 		return agentruntime.Result{Output: fmt.Sprintf("%d|%d|%%999\n", r.pane.ServerPID, r.pane.ServerStart)}, nil
 	}
 	if len(command.Args) > 0 && command.Args[0] == "has-session" && !r.blockMissingSession {
-		return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
+		return missingTmuxSession(command), errors.New("missing session")
 	}
 	r.blocked.Add(1)
 	if r.entered != nil {
@@ -980,9 +988,14 @@ func (r *barrierEffectRunner) Run(ctx context.Context, command agentruntime.Comm
 		}
 	}
 	if len(command.Args) > 0 && command.Args[0] == "has-session" {
-		return agentruntime.Result{Code: 1, Exited: true}, errors.New("missing session")
+		return missingTmuxSession(command), errors.New("missing session")
 	}
 	return agentruntime.Result{Output: "0||||\n"}, nil
+}
+
+func missingTmuxSession(command agentruntime.Command) agentruntime.Result {
+	session := strings.TrimPrefix(command.Args[len(command.Args)-1], "=")
+	return agentruntime.Result{Code: 1, Exited: true, Output: "can't find session: " + session}
 }
 
 func runtimeEffectTestCoordinator(t *testing.T, issue int, bound ...bool) (*runtimeEffectCoordinator, *stateOwner, *barrierEffectRunner, agentruntime.Manifest) {
@@ -1015,6 +1028,7 @@ func runtimeEffectTestCoordinator(t *testing.T, issue int, bound ...bool) (*runt
 func boundRuntimeEffectTestManifest(t *testing.T, manifest agentruntime.Manifest) (agentruntime.Manifest, *agentruntime.ImplementationPane) {
 	t.Helper()
 	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, config.WorkerProfileDigest()
 	pane := boundRuntimeEffectTestPane(t, manifest)
 	body, err := json.Marshal(manifest)
 	if err != nil {

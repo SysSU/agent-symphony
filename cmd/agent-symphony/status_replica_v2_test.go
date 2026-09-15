@@ -123,7 +123,8 @@ func TestOwnerStatusProjectionMasksTombstonedAttempts(t *testing.T) {
 	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
 	masked, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: request.Repository, Issue: request.Issue, Attempt: request.GitHubIssueUpdate.AttributionAttempt, ExpectedIssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.GitHubIssueUpdate.AttributionAttempt)], Action: "dismissed", CleanupPhase: "completed"})
 	if err != nil {
-		t.Fatal(err)
+		current := mustOwnerSnapshot(t, owner)
+		t.Fatalf("invalidate tombstoned projection fixture: %v attempts=%#v effects=%#v proofs=%#v", err, current.State.Attempts, current.State.Effects, current.State.ReviewerProofs)
 	}
 	status, err := projectOwnerStatus(masked, 1, time.Unix(20, 0))
 	if err != nil {

@@ -353,6 +353,9 @@ func resolveNativeCodex(path string) (string, error) {
 }
 
 func validateNativeExecutable(path string) error {
+	if testNativeWorkerExecutableAllowed(path) {
+		return nil
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -375,6 +378,10 @@ func validateNativeExecutable(path string) error {
 	}
 	return nil
 }
+
+// The production build has no configurable escape hatch for script workers.
+// A build-tagged full-system fixture replaces this hook in test binaries only.
+var testNativeWorkerExecutableAllowed = func(string) bool { return false }
 
 func copyPinnedTree(ctx context.Context, root, executable, destination string) (string, string, error) {
 	single := root == executable

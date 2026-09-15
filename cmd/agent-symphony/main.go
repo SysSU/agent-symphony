@@ -2358,10 +2358,32 @@ func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, 
 	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", repository, attempt.Issue, attempt.Number)), session
 }
 
-func reviewTargetIdentity(attempt agentruntime.Attempt, snapshotRoot, target string) (string, string) {
-	snapshot, session := reviewIdentity(attempt, snapshotRoot)
-	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(target)))[:16]
-	return snapshot + "-" + digest, session + "-" + digest
+func legacyReviewTargetIdentity(attempt agentruntime.Attempt, snapshotRoot, target string) (string, string) {
+	snapshot, _ := reviewIdentity(attempt, snapshotRoot)
+	targetDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(target)))[:16]
+	session, _ := agentruntime.ReviewSessionName(attempt.Repository, attempt.Issue, attempt.Number, target)
+	return snapshot + "-" + targetDigest, session
+}
+
+func persistedReviewIdentity(attempt agentruntime.Attempt, snapshotRoot, target, runID string) (string, string) {
+	if validDigest(runID) {
+		return reviewRunIdentity(attempt, snapshotRoot, target, runID)
+	}
+	return legacyReviewTargetIdentity(attempt, snapshotRoot, target)
+}
+
+func reviewerRunID(epoch, sourceRevision, issueGeneration, attemptGeneration uint64, repository string, issue, attempt int, mode, target string) string {
+	return digestText(fmt.Sprintf("agent-symphony-review-run-v1\x00%d\x00%d\x00%d\x00%d\x00%s\x00%d\x00%d\x00%s\x00%s", epoch, sourceRevision, issueGeneration, attemptGeneration, repository, issue, attempt, mode, target))
+}
+
+func reviewRunIdentity(attempt agentruntime.Attempt, snapshotRoot, target, runID string) (string, string) {
+	snapshot, _ := reviewIdentity(attempt, snapshotRoot)
+	if !validDigest(runID) {
+		return "", ""
+	}
+	targetDigest := sha256.Sum256([]byte(target))
+	session, _ := agentruntime.ReviewRunSessionName(attempt.Repository, attempt.Issue, attempt.Number, target, runID)
+	return snapshot + "-target-" + hex.EncodeToString(targetDigest[:24]) + "-run-" + runID, session
 }
 
 func reviewResultPath(snapshot, target string) string {
@@ -2369,33 +2391,46 @@ func reviewResultPath(snapshot, target string) string {
 	return filepath.Join(snapshot, fmt.Sprintf(".agent-symphony-review-%x", sum[:8]), "result.json")
 }
 
-func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string) error {
-	return cleanupReviewResourcesWithProof(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot, nil)
+func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, runID, snapshot, session, snapshotRoot string) error {
+	return cleanupReviewResourcesWithProof(ctx, boundary, env, attempt, head, target, runID, snapshot, session, snapshotRoot, nil)
 }
 
 func cleanupCertifiedReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string, proofs ...reviewerProcessProof) error {
 	if len(proofs) == 0 {
 		return errors.New("reviewer cleanup has no owner process-death certificate")
 	}
-	return cleanupReviewResourcesWithProof(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot, proofs)
+	runID := ""
+	if len(proofs) == 1 {
+		runID = proofs[0].RunID
+	}
+	return cleanupBoundReviewResources(ctx, boundary, env, attempt, head, target, runID, snapshot, session, snapshotRoot, "", proofs...)
 }
 
-func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string, proofs []reviewerProcessProof) error {
+func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, runID, snapshot, session, snapshotRoot string, proofs []reviewerProcessProof) error {
+	return cleanupBoundReviewResources(ctx, boundary, env, attempt, head, target, runID, snapshot, session, snapshotRoot, "", proofs...)
+}
+
+func cleanupBoundReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, runID, snapshot, session, snapshotRoot, activeProfileDigest string, proofs ...reviewerProcessProof) error {
 	certified := len(proofs) > 0
 	for _, proof := range proofs {
-		if !proof.DeadProved || !proof.NeverRan || proof.Repository != attempt.Repository || proof.Issue != attempt.Issue || proof.Attempt != attempt.Number || target != "" && len(proofs) == 1 && proof.Target != target {
+		if !reviewerCleanupAuthorized(proof, activeProfileDigest) || proof.Repository != attempt.Repository || proof.Issue != attempt.Issue || proof.Attempt != attempt.Number || target != "" && len(proofs) == 1 && proof.Target != target {
 			return errors.New("reviewer cleanup certificate does not match the attempt and target")
 		}
 	}
-	expectedSnapshot, expectedSession := reviewTargetIdentity(attempt, snapshotRoot, target)
+	if len(proofs) == 1 && proofs[0].RunID != runID {
+		return errors.New("reviewer cleanup certificate does not match the run")
+	}
+	expectedSnapshot, expectedSession := persistedReviewIdentity(attempt, snapshotRoot, target, runID)
 	if (snapshot != "" && snapshot != expectedSnapshot) || (session != "" && session != expectedSession) {
 		return errors.New("persisted reviewer cleanup identity mismatch")
 	}
+	snapshotExists := false
 	if snapshot != "" {
 		info, err := os.Lstat(snapshot)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+		snapshotExists = err == nil
 		if (err == nil && info.Mode()&os.ModeSymlink != 0) || !belowRoot(snapshot, filepath.Dir(expectedSnapshot)) {
 			return errors.New("review snapshot cleanup path is not a non-symlink descendant of the snapshot root")
 		}
@@ -2415,10 +2450,18 @@ func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCalle
 		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		status, err := boundary.call(cleanupCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerPaneIdentityFormat}, Dir: filepath.Dir(snapshot), Env: env})
+		sessionAbsent := false
 		if err != nil && !missingTmuxServer(status) {
-			return err
+			if !certified {
+				return err
+			}
+			absent, absentErr := boundary.call(cleanupCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + session}, Dir: filepath.Dir(snapshot), Env: env})
+			if absentErr == nil || !exactTmuxSessionAbsent(absent, session) {
+				return err
+			}
+			sessionAbsent = true
 		}
-		if !reviewerPaneAbsent(status.Output) && !missingTmuxServer(status) {
+		if !sessionAbsent && !reviewerPaneAbsent(status.Output) && !missingTmuxServer(status) {
 			pane, err := parseReviewerPaneIdentity(status.Output)
 			if err != nil {
 				return err
@@ -2434,7 +2477,7 @@ func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCalle
 				launchPath, terminalPath := reviewerLifecyclePaths(expectedSnapshot, proof.Target)
 				var launch reviewerLaunchIdentity
 				found, readErr := readReviewerRecord(launchPath, &launch)
-				if readErr == nil && found && launch.EffectID == proof.EffectID && launch.IssueGeneration == proof.IssueGeneration && launch.AttemptGeneration == proof.AttemptGeneration && reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, launch) {
+				if readErr == nil && found && launch.EffectID == proof.EffectID && launch.RunID == proof.RunID && launch.IssueGeneration == proof.IssueGeneration && launch.AttemptGeneration == proof.AttemptGeneration && reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, launch) {
 					matched = true
 					break
 				}
@@ -2454,6 +2497,19 @@ func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCalle
 			return err
 		}
 	}
+	if certified && snapshotExists {
+		if err := filepath.WalkDir(snapshot, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return os.Chmod(path, 0o750)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
 	if info, err := os.Lstat(resultRoot); err == nil {
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || os.RemoveAll(resultRoot) != nil {
 			return errors.New("review result cleanup path is invalid")
@@ -2462,12 +2518,6 @@ func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCalle
 		return err
 	}
 	if snapshot != "" {
-		_ = filepath.WalkDir(snapshot, func(path string, entry os.DirEntry, err error) error {
-			if err == nil && entry.IsDir() {
-				_ = os.Chmod(path, 0o750)
-			}
-			return nil
-		})
 		if err := os.RemoveAll(snapshot); err != nil {
 			return err
 		}
@@ -2553,6 +2603,9 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
 	}
+	if binding != nil && binding.RunID != manifest.ReviewRunID {
+		return independentReviewResult{}, false, errors.New("reviewer launch identity does not match the persisted review run")
+	}
 	if issue.Repository != "" && issue.Repository != attempt.Repository || issue.Issue != 0 && issue.Issue != attempt.Issue || issue.Attempt != 0 && issue.Attempt != attempt.Number {
 		return independentReviewResult{}, false, errors.New("review issue target does not match the attempt")
 	}
@@ -2581,7 +2634,10 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if mode == agentruntime.ReviewModePlan && (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") && manifest.ReviewMode == mode && agentruntime.ValidReviewTarget(mode, manifest.ReviewTarget, attempt.Repository, attempt.Issue) {
 		target, reviewBase, head = manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead
 	}
-	snapshot, session := reviewTargetIdentity(attempt, snapshotRoot, target)
+	snapshot, session := reviewRunIdentity(attempt, snapshotRoot, target, manifest.ReviewRunID)
+	if snapshot == "" || session == "" {
+		return independentReviewResult{}, false, errors.New("review run identity is missing or invalid")
+	}
 	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
 		return independentReviewResult{}, false, fmt.Errorf("prepare review snapshot root: %w", err)
 	}
@@ -2617,7 +2673,7 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 				if binding.SessionRequested {
 					return independentReviewResult{}, true, errors.New("reviewer session was requested but launch identity is missing; gated child death is unproved")
 				}
-				if cleanupErr := cleanupReviewResources(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot); cleanupErr != nil {
+				if cleanupErr := cleanupReviewResources(ctx, boundary, env, attempt, head, target, manifest.ReviewRunID, snapshot, session, snapshotRoot); cleanupErr != nil {
 					return independentReviewResult{}, true, fmt.Errorf("clean previous reviewer resources before no-run proof: %w", cleanupErr)
 				}
 				priorResourcesCleared = true
@@ -2645,7 +2701,7 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 				return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
 			}
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot)
+			cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, manifest.ReviewRunID, snapshot, session, snapshotRoot)
 			cancel()
 			if cleanupErr != nil {
 				return independentReviewResult{}, true, fmt.Errorf("stop unmarked reviewer pane: %w", cleanupErr)
@@ -2683,7 +2739,7 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 			if terminal.ExitCode != 0 || terminal.Signal != 0 {
 				return independentReviewResult{}, false, reviewerLifecycleError(errors.New(reviewerTerminalDiagnostic(*terminal)))
 			}
-			request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, Head: head})
+			request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, RunID: manifest.ReviewRunID, Head: head})
 			artifact, err := boundary.call(ctx, "review-result", agentruntime.Command{Stdin: bytes.NewReader(request)})
 			if err != nil {
 				if artifact.Exited && artifact.Code == reviewResultInvalidCode {
@@ -2720,7 +2776,7 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 			if pane.ExitStatus != 0 {
 				return independentReviewResult{}, false, fmt.Errorf("reviewer exited %d; inspect reviewer session %s and retry the attempt after correcting the failure", pane.ExitStatus, session)
 			} else {
-				request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, Head: head, LegacyHeadArtifact: legacyHeadArtifact})
+				request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, RunID: manifest.ReviewRunID, Head: head, LegacyHeadArtifact: legacyHeadArtifact})
 				artifact, err := boundary.call(ctx, "review-result", agentruntime.Command{Stdin: bytes.NewReader(request)})
 				if err != nil {
 					if artifact.Exited && artifact.Code == reviewResultInvalidCode {
@@ -2741,7 +2797,7 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	}
 
 launch:
-	if err := cleanupReviewResources(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot); err != nil {
+	if err := cleanupReviewResources(ctx, boundary, env, attempt, head, target, manifest.ReviewRunID, snapshot, session, snapshotRoot); err != nil {
 		if binding != nil {
 			return independentReviewResult{}, true, fmt.Errorf("clean previous reviewer resources: %w", err)
 		}
