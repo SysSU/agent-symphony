@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	goruntime "runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -861,7 +862,6 @@ func TestBoundHandoffShellStopsOnRealTmux(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
 	t.Setenv("TMUX_TMPDIR", socketRoot)
-	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
 	helper := filepath.Join(t.TempDir(), "agent-symphony")
 	if output, err := exec.Command("go", "build", "-o", helper, "../../cmd/agent-symphony").CombinedOutput(); err != nil {
 		t.Fatalf("build bound helper: %v: %s", err, output)
@@ -887,6 +887,22 @@ func TestBoundHandoffShellStopsOnRealTmux(t *testing.T) {
 	if err != nil || binding.Role != "interactive" {
 		t.Fatalf("handoff shell binding = %#v, %v", binding, err)
 	}
+	// Retire the isolated tmux server and join its exact bound wrapper before
+	// TempDir cleanup can race the wrapper's terminal proof write.
+	t.Cleanup(func() {
+		_ = exec.Command(tmux, "kill-server").Run()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if err := syscall.Kill(binding.PanePID, 0); errors.Is(err, syscall.ESRCH) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("bound handoff wrapper %d did not exit", binding.PanePID)
+				return
+			}
+			goruntime.Gosched()
+		}
+	})
 	if err := WriteImplementationPermit(manifest, binding); err != nil {
 		t.Fatal(err)
 	}

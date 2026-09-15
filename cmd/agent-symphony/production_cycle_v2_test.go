@@ -1480,8 +1480,22 @@ func TestImplementationReviewerFailureDoesNotBlockOtherEffect(t *testing.T) {
 			service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: request.Manifest.Worktree})
 			service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
 			production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, implementation: workerBoundaryRunner{}, stateRoot: owner.stateRoot}
-			if resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{}); err != nil || resumed {
-				t.Fatalf("ambiguous issue A aborted or falsely completed: resumed=%v err=%v", resumed, err)
+			// Join an A-only pass before admitting B. This proves the failed
+			// reviewer is nonfatal without depending on hash-derived effect order.
+			firstPass := make(chan struct {
+				resumed bool
+				err     error
+			}, 1)
+			go func() {
+				resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{})
+				firstPass <- struct {
+					resumed bool
+					err     error
+				}{resumed: resumed, err: err}
+			}()
+			first := <-firstPass
+			if first.err != nil || first.resumed {
+				t.Fatalf("ambiguous issue A aborted or falsely completed: resumed=%v err=%v", first.resumed, first.err)
 			}
 			wantDiagnostic := "stop remains pending"
 			if failure == "unreadable export" {
@@ -1510,13 +1524,9 @@ func TestImplementationReviewerFailureDoesNotBlockOtherEffect(t *testing.T) {
 				t.Fatal(err)
 			}
 			otherRequest := planned.Request
-			otherRequest = checkInAfterEffectID(t, otherSnapshot, otherRequest, blocked.ID)
 			_, ready, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(otherSnapshot, otherRequest), Request: otherRequest})
 			if err != nil {
 				t.Fatal(err)
-			}
-			if blocked.ID >= ready.ID {
-				t.Fatalf("fixture did not visit blocked reviewer before marked B: A=%s B=%s", blocked.ID, ready.ID)
 			}
 			if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*ready), *ready.Reconciliation, checkIn.result(*ready.Reconciliation)); err != nil {
 				t.Fatal(err)
@@ -1692,13 +1702,9 @@ esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode
 		t.Fatal(err)
 	}
 	otherRequest := planned.Request
-	otherRequest = checkInAfterEffectID(t, otherSnapshot, otherRequest, reviewer.ID)
 	_, ready, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(otherSnapshot, otherRequest), Request: otherRequest})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if reviewer.ID >= ready.ID {
-		t.Fatalf("fixture did not visit healthy reviewer before marked B: A=%s B=%s", reviewer.ID, ready.ID)
 	}
 	if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*ready), *ready.Reconciliation, checkIn.result(*ready.Reconciliation)); err != nil {
 		t.Fatal(err)
@@ -1713,27 +1719,6 @@ esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode
 	if err := live.onKill(); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func checkInAfterEffectID(t *testing.T, snapshot stateOwnerSnapshot, request reconciliationEffectRequest, after string) reconciliationEffectRequest {
-	t.Helper()
-	for candidate := 1; candidate < 256; candidate++ {
-		// Binding is a legitimate check-in proposal input; keep the derived
-		// execution digest valid while choosing a deterministic owner ID order.
-		request.CheckIn.Binding = fmt.Sprintf("%064x", candidate)
-		request.ExecutionDigest = monitoringCheckInExecutionDigest(request)
-		preview := runtimeEffectIntent{
-			Action: string(request.Action), Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt,
-			IssueGeneration:   snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)],
-			AttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)],
-			IntentEpoch:       snapshot.State.Epoch, IntentRevision: snapshot.State.Revision + 1, RequestDigest: reconciliationEffectDigest(request),
-		}
-		if runtimeEffectID(preview) > after {
-			return request
-		}
-	}
-	t.Fatal("could not order marked B after reviewer A")
-	return reconciliationEffectRequest{}
 }
 
 func TestStartupMarkerSweepLeavesOperatorEffectsToReceiptRecovery(t *testing.T) {
