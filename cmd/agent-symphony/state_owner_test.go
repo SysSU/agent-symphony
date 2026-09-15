@@ -1528,13 +1528,10 @@ func TestOwnerRejectsChangedQueuedReviewFindings(t *testing.T) {
 	manifest := ownerTestManifest(t, root, 901, 1, "completed")
 	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
 	head := strings.Repeat("c", 40)
-	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
-	if err != nil {
-		t.Fatal(err)
-	}
 	manifest.ReviewState, manifest.ReviewMode = "findings-queued", agentruntime.ReviewModeImplementation
 	manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead = manifest.BaseSHA+".."+head, manifest.BaseSHA, head
-	manifest.ReviewSnapshot, manifest.ReviewSession = filepath.Join(root, "review-snapshot"), session
+	manifest.ReviewRunID = strings.Repeat("f", 64)
+	manifest.ReviewSnapshot, manifest.ReviewSession = reviewRunIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(root), manifest.ReviewTarget, manifest.ReviewRunID)
 	manifest.ReviewFindings, manifest.ReviewHandoffQueued = []string{"original finding"}, true
 	owner, err := startTestStateOwner(t, root, runtimeEffectInitialState(manifest), func(runtimeOwnerState) error { return nil })
 	if err != nil {
@@ -1543,7 +1540,7 @@ func TestOwnerRejectsChangedQueuedReviewFindings(t *testing.T) {
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	snapshot := mustOwnerSnapshot(t, owner)
 	identity := stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]}
-	changed := agentruntime.ReviewTransition{State: "findings-queued", Mode: manifest.ReviewMode, Target: manifest.ReviewTarget, Base: manifest.ReviewBase, Head: manifest.ReviewHead, Snapshot: manifest.ReviewSnapshot, Session: manifest.ReviewSession, Findings: []string{"different finding"}, HandoffQueued: true}
+	changed := agentruntime.ReviewTransition{State: "findings-queued", Mode: manifest.ReviewMode, Target: manifest.ReviewTarget, RunID: manifest.ReviewRunID, Base: manifest.ReviewBase, Head: manifest.ReviewHead, Snapshot: manifest.ReviewSnapshot, Session: manifest.ReviewSession, Findings: []string{"different finding"}, HandoffQueued: true}
 	if _, _, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectReview, Manifest: manifest, Review: &changed, RequestDigest: strings.Repeat("d", 64)}); !errors.Is(err, errStateConflict) {
 		t.Fatalf("owner accepted rewrite of queued review findings: %v", err)
 	}
