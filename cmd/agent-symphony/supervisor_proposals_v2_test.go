@@ -74,8 +74,8 @@ func TestSupervisorInvalidRetryIsRefusedBeforeRunning(t *testing.T) {
 	}
 }
 
-func TestSupervisorRecoverWaitsForTerminalDurableReceipt(t *testing.T) {
-	owner, manifest := operatorTestOwner(t, 373, "active", false)
+func TestSupervisorRecoverWaitsForDurableReceipt(t *testing.T) {
+	owner, manifest := operatorNeverLaunchedOwner(t, 373, "failed", "failed", func(runtimeOwnerState) error { return nil })
 	snapshot, err := owner.reconciliationSnapshot(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -94,21 +94,33 @@ func TestSupervisorRecoverWaitsForTerminalDurableReceipt(t *testing.T) {
 	var collections int
 	service.collect = func(_ context.Context, _ stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
 		collections++
-		active := internalgithub.RecoveryAttemptFact{Repository: manifest.Repository, Issue: issue, Attempt: manifest.Attempt, BaseSHA: manifest.BaseSHA, State: "active", Checks: []string{}}
+		failed := internalgithub.RecoveryAttemptFact{Repository: manifest.Repository, Issue: issue, Attempt: manifest.Attempt, BaseSHA: manifest.BaseSHA, State: "failed", Checks: []string{}}
 		fact := issueFact(issue, "recover")
-		fact.Attempt, fact.CurrentAttempt, fact.NeedsAttention = manifest.Attempt, manifest.Attempt, true
-		if collections == 1 {
-			fact.Active, fact.ActiveAttempt = true, &active
-			return reconciliationV2Batch{Input: reconciliationInput{Scope: issueScope(issue), Complete: true, Issues: []internalgithub.RecoveryIssueFact{fact}, Attempts: []internalgithub.RecoveryAttemptFact{active}}}, nil
-		}
-		failed := active
-		failed.State = "failed"
-		fact.RecoveryAuthorized, fact.TerminalAttempts = true, []internalgithub.RecoveryAttemptFact{failed}
+		fact.Attempt, fact.CurrentAttempt, fact.RecoveryAttempt, fact.NeedsAttention, fact.RecoveryAuthorized = manifest.Attempt, manifest.Attempt, manifest.Attempt, true, true
+		fact.TerminalAttempts = []internalgithub.RecoveryAttemptFact{failed}
 		return reconciliationV2Batch{Input: reconciliationInput{Scope: issueScope(issue), Complete: true, Issues: []internalgithub.RecoveryIssueFact{fact}, Attempts: []internalgithub.RecoveryAttemptFact{failed}}}, nil
 	}
 	entered, release := make(chan struct{}), make(chan struct{})
 	first := true
+	jsonResponse := func(request *http.Request, value any) *http.Response {
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body)), Request: request}
+	}
 	service.collector.API = internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/user":
+			return jsonResponse(request, map[string]any{"id": 42, "login": "owner"}), nil
+		case "/repos/o/r/pulls":
+			return jsonResponse(request, []any{}), nil
+		case "/repos/o/r":
+			return jsonResponse(request, map[string]any{"full_name": "o/r", "default_branch": "main", "permissions": map[string]any{"pull": true}}), nil
+		case "/repos/o/r/branches/main":
+			return jsonResponse(request, map[string]any{"commit": map[string]any{"sha": manifest.BaseSHA}}), nil
+		case "/repos/o/r/issues/373":
+			return jsonResponse(request, map[string]any{"number": 373, "node_id": "I_373", "title": "recover", "body": "body", "state": "open", "created_at": "2026-09-14T00:00:00Z", "user": map[string]any{"id": 42}, "labels": []any{}}), nil
+		case "/repos/o/r/issues/373/timeline":
+			return jsonResponse(request, []any{}), nil
+		}
 		if !strings.Contains(request.URL.Path, "/comments") {
 			return nil, fmt.Errorf("unexpected GitHub request %s", request.URL.String())
 		}
