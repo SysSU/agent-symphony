@@ -294,6 +294,20 @@ func planReconciliationHandoffs(snapshot stateOwnerSnapshot, command, humanInstr
 		if handoff == nil {
 			continue
 		}
+		if manifest.Version == agentruntime.ManifestVersion2 {
+			for _, effect := range snapshot.State.Effects {
+				if effect.State == "pending" && effect.Action == string(reconciliationHandoffDeliver) && effect.Repository == manifest.Repository && effect.Issue == manifest.Issue && effect.Attempt == manifest.Attempt && effect.Reconciliation != nil && effect.Reconciliation.Handoff != nil && effect.Reconciliation.Handoff.Kind == handoff.Kind && effect.Reconciliation.Handoff.Key == handoff.Key && reflect.DeepEqual(effect.Reconciliation.Manifest, &manifest) {
+					handoff.CandidateLaunchToken = effect.Reconciliation.Handoff.CandidateLaunchToken
+					break
+				}
+			}
+			if handoff.CandidateLaunchToken == "" {
+				handoff.CandidateLaunchToken, err = agentruntime.NewLaunchToken()
+				if err != nil {
+					return nil, nil, err
+				}
+			}
+		}
 		request := reconciliationEffectRequest{Action: reconciliationHandoffDeliver, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Manifest: ptrManifest(manifest), ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, Handoff: handoff}
 		value := handoffExecutionMaterial{Command: expanded}
 		request.ExecutionDigest = handoffExecutionDigest(request, value)
@@ -325,7 +339,7 @@ func (c *runtimeEffectCoordinator) executeHandoff(_ context.Context, boundary bo
 		return reconciliationEffectResult{}, err
 	}
 	defer c.releaseKey(key, run)
-	payload, err := handoffBoundaryPayload(request, material.Command)
+	payload, err := handoffBoundaryPayload(request, plan.Identity.EffectID, material.Command)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -337,7 +351,20 @@ func (c *runtimeEffectCoordinator) executeHandoff(_ context.Context, boundary bo
 		return reconciliationEffectResult{}, err
 	}
 	if !applied {
-		accepted, err := boundary.call(run.ctx, "accept-handoff", agentruntime.Command{Stdin: bytes.NewReader(payload)})
+		operation := "accept-handoff"
+		if request.Manifest.Version == agentruntime.ManifestVersion2 {
+			operation = "prepare-handoff"
+		}
+		accepted, err := boundary.call(run.ctx, operation, agentruntime.Command{Stdin: bytes.NewReader(payload)})
+		if request.Manifest.Version == agentruntime.ManifestVersion2 && err == nil {
+			if strings.TrimSpace(accepted.Output) != plan.Identity.EffectID+":"+request.Handoff.CandidateLaunchToken {
+				return reconciliationEffectResult{}, errors.New("handoff candidate preparation binding mismatch")
+			}
+			if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
+				return reconciliationEffectResult{}, err
+			}
+			accepted, err = boundary.call(run.ctx, "release-handoff", agentruntime.Command{Stdin: bytes.NewReader(payload)})
+		}
 		if err != nil || !validHandoffAck(accepted.Output, request.Handoff) {
 			if err == nil {
 				err = errors.New("handoff acceptance binding mismatch")
@@ -353,13 +380,19 @@ func (c *runtimeEffectCoordinator) executeHandoff(_ context.Context, boundary bo
 		return reconciliationEffectResult{}, err
 	}
 	result := reconciliationEffectResult{Action: request.Action, Handoff: &handoffEffectResult{Kind: request.Handoff.Kind, Key: request.Handoff.Key, OutcomePath: request.Handoff.OutcomePath, OutcomeToken: request.Handoff.OutcomeToken, Observed: true}}
+	if request.Manifest.Version == agentruntime.ManifestVersion2 {
+		result.Handoff.LaunchToken, result.Handoff.LaunchID = request.Handoff.CandidateLaunchToken, plan.Identity.EffectID
+	}
 	if err := c.finishReconciliationWithMarker(plan.Identity, request, result); err != nil {
 		return reconciliationEffectResult{}, err
 	}
 	return result, nil
 }
 
-func handoffBoundaryPayload(request reconciliationEffectRequest, command []string) ([]byte, error) {
+func handoffBoundaryPayload(request reconciliationEffectRequest, effectID string, command []string) ([]byte, error) {
+	if request.Manifest.Version != agentruntime.ManifestVersion2 {
+		effectID = ""
+	}
 	var handoff []byte
 	if request.Handoff.Kind == "review-findings" {
 		handoff, _ = json.Marshal(struct {
@@ -377,12 +410,14 @@ func handoffBoundaryPayload(request reconciliationEffectRequest, command []strin
 		}{"agent-symphony-handoff-v1", value.Key, value.PR, value.HeadSHA, value.Validation, value.Feedback})
 	}
 	body, err := json.Marshal(struct {
-		Manifest     agentruntime.Manifest `json:"manifest"`
-		Handoff      json.RawMessage       `json:"handoff"`
-		OutcomePath  string                `json:"outcome_path"`
-		OutcomeToken string                `json:"outcome_token"`
-		Command      []string              `json:"command"`
-	}{*request.Manifest, handoff, request.Handoff.OutcomePath, request.Handoff.OutcomeToken, command})
+		Manifest             agentruntime.Manifest `json:"manifest"`
+		Handoff              json.RawMessage       `json:"handoff"`
+		OutcomePath          string                `json:"outcome_path"`
+		OutcomeToken         string                `json:"outcome_token"`
+		Command              []string              `json:"command"`
+		CandidateLaunchToken string                `json:"candidate_launch_token,omitempty"`
+		CandidateLaunchID    string                `json:"candidate_launch_id,omitempty"`
+	}{*request.Manifest, handoff, request.Handoff.OutcomePath, request.Handoff.OutcomeToken, command, request.Handoff.CandidateLaunchToken, effectID})
 	return body, err
 }
 

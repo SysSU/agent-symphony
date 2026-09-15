@@ -63,15 +63,17 @@ type ReviewTransition struct {
 // EffectRequest is immutable input for external runtime work. Eligible is a
 // captured owner decision; callbacks are rejected because they are not a snapshot.
 type EffectRequest struct {
-	Identity EffectIdentity
-	Action   EffectAction
-	Attempt  Attempt
-	Manifest Manifest
-	Runtime  EffectRuntime
-	Eligible bool
-	Reason   string
-	Review   ReviewTransition
-	Cleanup  EffectCleanupPolicy
+	Identity             EffectIdentity
+	Action               EffectAction
+	Attempt              Attempt
+	Manifest             Manifest
+	Runtime              EffectRuntime
+	Eligible             bool
+	Reason               string
+	Review               ReviewTransition
+	Cleanup              EffectCleanupPolicy
+	CandidateLaunchToken string
+	GateNonce            string
 }
 
 // EffectCleanupPolicy binds destructive authorization to one closed resource
@@ -118,6 +120,7 @@ const (
 	EffectVerified EffectDisposition = "verified"
 	EffectRetry    EffectDisposition = "retry"
 	EffectPending  EffectDisposition = "pending"
+	EffectRotate   EffectDisposition = "rotate"
 )
 
 // EffectVerification carries a reconstructed result only when external state
@@ -130,9 +133,10 @@ type EffectVerification struct {
 // EffectExecutor performs runtime I/O without reading or writing authoritative
 // manifests. The caller owns command sequencing and result application.
 type EffectExecutor struct {
-	Runtime       *Runtime
-	Cleanup       func(context.Context, EffectRequest) error
-	VerifyCleanup func(context.Context, EffectRequest) (bool, error)
+	Runtime         *Runtime
+	Cleanup         func(context.Context, EffectRequest) error
+	VerifyCleanup   func(context.Context, EffectRequest) (bool, error)
+	AuthorizeLaunch func(context.Context, EffectRequest) error
 }
 
 // BindRequest captures all runtime inputs before intent persistence.
@@ -160,7 +164,7 @@ func (e EffectExecutor) Execute(ctx context.Context, request EffectRequest) (Eff
 	case EffectPrepare:
 		manifest, err = r.prepareEffect(ctx, request)
 	case EffectStart:
-		manifest, err = r.startEffect(ctx, request)
+		manifest, err = r.startEffect(ctx, request, e.AuthorizeLaunch)
 	case EffectMonitor:
 		manifest, err = r.monitorEffect(ctx, request)
 	case EffectStop:
@@ -168,7 +172,7 @@ func (e EffectExecutor) Execute(ctx context.Context, request EffectRequest) (Eff
 	case EffectReview:
 		manifest, err = r.reviewEffect(request)
 	case EffectHandoff:
-		manifest, err = r.handoffEffect(ctx, request)
+		manifest, err = r.handoffEffect(ctx, request, e.AuthorizeLaunch)
 	case EffectCleanup:
 		if e.Cleanup == nil || e.VerifyCleanup == nil {
 			err = errors.New("runtime cleanup executor is missing")
@@ -197,6 +201,7 @@ func (e EffectExecutor) Execute(ctx context.Context, request EffectRequest) (Eff
 // effect. Retry means the owner may safely reconstruct and dispatch the request.
 func (e EffectExecutor) VerifyPending(ctx context.Context, request EffectRequest) (EffectVerification, error) {
 	request = cloneEffectRequest(request)
+	legacyHandoffWithoutHelper := request.Action == EffectHandoff && request.Runtime.Helper == ""
 	if err := e.validateIdentity(request.Action, request.Identity); err != nil {
 		return EffectVerification{}, err
 	}
@@ -218,6 +223,11 @@ func (e EffectExecutor) VerifyPending(ctx context.Context, request EffectRequest
 	request, err := e.BindRequest(request)
 	if err != nil {
 		return EffectVerification{}, err
+	}
+	if legacyHandoffWithoutHelper {
+		// Keep the old persisted digest intact. Such an intent may reuse an
+		// exact bound pane, but cannot create a replacement worker.
+		request.Runtime.Helper = ""
 	}
 	if err := e.validate(request); err != nil {
 		return EffectVerification{}, err
@@ -241,6 +251,38 @@ func (e EffectExecutor) VerifyPending(ctx context.Context, request EffectRequest
 			return EffectVerification{}, err
 		}
 		if live {
+			candidate := request.Manifest
+			if request.Action == EffectStart {
+				candidate.LaunchID = request.GateNonce
+				if candidate.LaunchID == "" {
+					return EffectVerification{Disposition: EffectPending}, nil
+				}
+			} else if request.CandidateLaunchToken != "" {
+				candidate.LaunchToken, candidate.LaunchID = request.CandidateLaunchToken, request.Identity.EffectID
+			}
+			binding, pane, err := r.observeBound(ctx, candidate)
+			if err != nil {
+				return EffectVerification{Disposition: EffectPending}, nil
+			}
+			if request.Action == EffectStart {
+				entered, err := ImplementationGateEntered(candidate, binding)
+				if err != nil || entered {
+					return EffectVerification{Disposition: EffectPending}, nil
+				}
+				status, err := r.guardedBoundResult(ctx, binding, pane, "display-message -p -t "+pane.PaneID+" #{pane_dead}", nil)
+				if err != nil || strings.TrimSpace(status.Output) != "0" {
+					return EffectVerification{Disposition: EffectPending}, nil
+				}
+				return retry, nil
+			}
+			return EffectVerification{Disposition: EffectPending}, nil
+		}
+		if request.Action == EffectStart {
+			// The owner may rotate only a never-permitted candidate. A missing
+			// name alone never authorizes replaying this candidate.
+			if request.GateNonce != "" {
+				return EffectVerification{Disposition: EffectRotate}, nil
+			}
 			return EffectVerification{Disposition: EffectPending}, nil
 		}
 		return retry, nil
@@ -250,6 +292,21 @@ func (e EffectExecutor) VerifyPending(ctx context.Context, request EffectRequest
 			return EffectVerification{}, err
 		}
 		if !live {
+			if request.Manifest.Version != boundManifestVersion {
+				return EffectVerification{Disposition: EffectPending}, nil
+			}
+			binding, err := ReadImplementationBinding(request.Manifest)
+			if err != nil {
+				return EffectVerification{Disposition: EffectPending}, nil
+			}
+			absent, err := r.boundPaneAbsent(ctx, binding)
+			if err != nil || !absent {
+				return EffectVerification{Disposition: EffectPending}, nil
+			}
+			gone, err := ImplementationWorkerGone(request.Manifest, binding)
+			if err != nil || !gone {
+				return EffectVerification{Disposition: EffectPending}, nil
+			}
 			return verified(cancelledEffect(request.Manifest, request.Reason)), nil
 		}
 		return retry, nil
@@ -581,8 +638,18 @@ func (e EffectExecutor) ValidateRequest(request EffectRequest) error {
 	if err := ValidateManifest(e.Runtime.Root, e.Runtime.StateRoot, request.Manifest); err != nil {
 		return err
 	}
+	if request.Action == EffectHandoff && request.Manifest.Version == boundManifestVersion {
+		if !ValidLaunchToken(request.CandidateLaunchToken) || request.CandidateLaunchToken == request.Manifest.LaunchToken {
+			return errors.New("handoff candidate launch token is invalid")
+		}
+	} else if request.CandidateLaunchToken != "" {
+		return errors.New("unexpected candidate launch token")
+	}
 	if !validEffectRuntime(request) {
 		return errors.New("runtime effect configuration is invalid")
+	}
+	if (request.Action == EffectPrepare || request.Action == EffectStart) && strings.TrimSpace(request.Runtime.Helper) == "" {
+		return errors.New("bound attempt helper is required")
 	}
 	switch request.Action {
 	case EffectPrepare:
@@ -636,7 +703,7 @@ func validEffectCleanupPolicy(policy EffectCleanupPolicy) bool {
 func invalidEffectLaunchInput(request EffectRequest) bool {
 	return len(request.Attempt.Command) == 0 || strings.TrimSpace(request.Attempt.Command[0]) == "" ||
 		request.Attempt.Interactive && strings.TrimSpace(request.Attempt.Context) == "" ||
-		request.Attempt.Context != "" && !request.Attempt.Interactive && strings.TrimSpace(request.Runtime.Helper) == ""
+		strings.TrimSpace(request.Runtime.Helper) == ""
 }
 
 func (e EffectExecutor) validateIdentity(action EffectAction, identity EffectIdentity) error {
@@ -668,13 +735,14 @@ func EffectRequestDigest(request EffectRequest) (string, error) {
 			Command     []string
 			Interactive bool
 		}
-		Manifest Manifest
-		Runtime  EffectRuntime
-		Eligible bool
-		Reason   string
-		Review   ReviewTransition
-		Cleanup  EffectCleanupPolicy
-	}{Action: request.Action, Manifest: request.Manifest, Runtime: request.Runtime}
+		Manifest             Manifest
+		Runtime              EffectRuntime
+		Eligible             bool
+		Reason               string
+		Review               ReviewTransition
+		Cleanup              EffectCleanupPolicy
+		CandidateLaunchToken string `json:"CandidateLaunchToken,omitempty"`
+	}{Action: request.Action, Manifest: request.Manifest, Runtime: request.Runtime, CandidateLaunchToken: request.CandidateLaunchToken}
 	material.Attempt.Repository, material.Attempt.Issue = request.Attempt.Repository, request.Attempt.Issue
 	material.Attempt.Number, material.Attempt.BaseSHA = request.Attempt.Number, request.Attempt.BaseSHA
 	if slices.Contains([]EffectAction{EffectPrepare, EffectStart}, request.Action) {
@@ -725,6 +793,11 @@ func PreparingManifest(root, stateRoot string, attempt Attempt, now time.Time) (
 	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), fmt.Sprintf("%d-%d", attempt.Issue, attempt.Number), "agent.log")
 	manifest.State, manifest.Interactive = "preparing", attempt.Interactive
 	manifest.CreatedAt, manifest.UpdatedAt = now.UTC(), now.UTC()
+	manifest.Version = boundManifestVersion
+	manifest.LaunchToken, err = newLaunchToken()
+	if err != nil {
+		return Manifest{}, err
+	}
 	if err := ValidateManifest(root, stateRoot, manifest); err != nil {
 		return Manifest{}, err
 	}
@@ -752,7 +825,7 @@ func effectRuntimeSnapshot(r *Runtime, request EffectRequest) (EffectRuntime, er
 	case EffectStop:
 		config.Tmux, config.StopWait = r.tmux(), r.StopWait
 	case EffectHandoff:
-		config.Tmux = r.tmux()
+		config.Tmux, config.Helper = r.tmux(), r.Helper
 		if request.Manifest.State == "completed" {
 			config.Source, config.Git = r.Source, r.git()
 		}
@@ -801,7 +874,7 @@ func validEffectRuntime(request EffectRequest) bool {
 		return config.Source == "" && config.Git == "" && config.Tmux != "" && config.Helper == "" && !environment
 	case EffectHandoff:
 		source := config.Source == "" && config.Git == "" && request.Manifest.State == "running" || config.Source != "" && config.Git != "" && request.Manifest.State == "completed"
-		return source && config.Tmux != "" && config.Helper == "" && environment && config.StopWait == 0
+		return source && config.Tmux != "" && environment && config.StopWait == 0
 	case EffectCleanup:
 		return config.Source == "" && config.Git == "" && config.Tmux != "" && config.Helper == "" && !environment && config.StopWait == 0
 	case EffectReview:
@@ -828,8 +901,8 @@ func (r *Runtime) prepareEffect(ctx context.Context, request EffectRequest) (Man
 	if request.Attempt.Interactive && strings.TrimSpace(request.Attempt.Context) == "" {
 		return request.Manifest, errors.New("interactive attempt context is required")
 	}
-	if request.Attempt.Context != "" && !request.Attempt.Interactive && strings.TrimSpace(r.Helper) == "" {
-		return request.Manifest, errors.New("attempt capture helper is required")
+	if strings.TrimSpace(r.Helper) == "" {
+		return request.Manifest, errors.New("bound attempt helper is required")
 	}
 	if len(effectEnvironment(request)) == 0 {
 		return request.Manifest, errors.New("worker environment is missing")
@@ -837,6 +910,9 @@ func (r *Runtime) prepareEffect(ctx context.Context, request EffectRequest) (Man
 	manifest := request.Manifest
 	if manifest.State != "preparing" {
 		return manifest, errors.New("prepare effect requires preparing state")
+	}
+	if err := r.rejectCaseCollision(manifest.Repository); err != nil {
+		return manifest, err
 	}
 	if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
 		if err == nil {
@@ -884,50 +960,98 @@ func (r *Runtime) prepareEffect(ctx context.Context, request EffectRequest) (Man
 	return manifest, nil
 }
 
-func (r *Runtime) startEffect(ctx context.Context, request EffectRequest) (Manifest, error) {
+func (r *Runtime) startEffect(ctx context.Context, request EffectRequest, authorize func(context.Context, EffectRequest) error) (Manifest, error) {
 	manifest := request.Manifest
+	if authorize == nil {
+		return manifest, errors.New("implementation Start lacks owner authorization")
+	}
 	if !request.Eligible {
 		return cancelledEffect(manifest, "attempt became ineligible before launch"), errors.New("attempt became ineligible before launch")
+	}
+	if strings.TrimSpace(r.Helper) == "" {
+		return manifest, errors.New("bound attempt helper is required")
 	}
 	if err := r.verifyEffectWorker(ctx); err != nil {
 		return manifest, err
 	}
 	env := effectEnvironment(request)
+	candidate := manifest
+	candidate.LaunchID = request.GateNonce
+	if candidate.LaunchID == "" {
+		candidate.LaunchID = request.Identity.EffectID // Old intents remain quarantined by the owner.
+	}
+	live, err := r.session(ctx, manifest.Session)
+	if err != nil {
+		return manifest, err
+	}
+	if live {
+		if _, _, err := r.observeBound(ctx, candidate); err != nil {
+			return manifest, fmt.Errorf("pending implementation launch identity changed: %w", err)
+		}
+	} else if _, err := ReadImplementationBinding(candidate); err == nil {
+		return manifest, errors.New("pending implementation launch remains bound; original pane and worker absence is unproved")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return manifest, fmt.Errorf("check pending implementation launch identity: %w", err)
+	}
 	if manifest.Interactive {
 		result, err := os.OpenFile(ResultPath(manifest.Worktree), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
-			return failedEffect(manifest, "prepare worker result", err)
-		}
-		if err := result.Close(); err != nil {
+			if !errors.Is(err, os.ErrExist) {
+				return failedEffect(manifest, "prepare worker result", err)
+			}
+			info, statErr := os.Lstat(ResultPath(manifest.Worktree))
+			if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size() > WorkerResultMaxBytes {
+				return failedEffect(manifest, "prepare worker result", errors.Join(err, statErr))
+			}
+		} else if err := result.Close(); err != nil {
 			return failedEffect(manifest, "prepare worker result", err)
 		}
 		env = append(env, WorkerResultEnvironment+"="+ResultPath(manifest.Worktree))
 	}
-	if err := r.startSession(ctx, manifest, env); err != nil {
-		return failedEffectStopping(ctx, r, manifest, "launch tmux", err)
-	}
-	target := PaneTarget(manifest.Session)
-	if request.Attempt.Context != "" && !request.Attempt.Interactive {
-		if _, err := r.run(ctx, r.tmux(), []string{"load-buffer", "-b", manifest.Session, "-"}, "", []string{}, strings.NewReader(request.Attempt.Context)); err != nil {
-			return failedEffectStopping(ctx, r, manifest, "load agent context", err)
-		}
-	}
 	command := slices.Clone(request.Attempt.Command)
+	buffer := "as-start-" + candidate.LaunchID
 	if request.Attempt.Interactive {
 		command = append(command, request.Attempt.Context)
 	} else if request.Attempt.Context != "" {
-		command = PromptCommand(r.Helper, r.tmux(), manifest.Session, ResultPath(manifest.Worktree), command)
+		command = BoundPromptCommand(r.Helper, r.tmux(), buffer, ResultPath(manifest.Worktree), candidate, command)
 	}
-	if r.Helper != "" {
-		command = PaneExitStatusCommand(r.Helper, r.tmux(), command)
+	if request.Attempt.Interactive || request.Attempt.Context == "" {
+		command = BoundPaneExitStatusCommand(r.Helper, r.tmux(), candidate, command)
 	}
-	for _, option := range []string{PaneExitStatusOption, PaneExitSignalOption} {
-		if _, err := r.run(ctx, r.tmux(), []string{"set-option", "-p", "-t", target, option, ""}, "", []string{}, nil); err != nil {
-			return failedEffectStopping(ctx, r, manifest, "reset pane exit result", err)
+	if !live {
+		if err := r.startSession(ctx, candidate, env, candidate.LaunchID, command); err != nil {
+			return manifest, fmt.Errorf("launch tmux remains ambiguous: %w", err)
 		}
 	}
-	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
-		return failedEffectStopping(ctx, r, manifest, "start agent", err)
+	manifest.LaunchID = candidate.LaunchID
+	if request.Attempt.Context != "" && !request.Attempt.Interactive {
+		binding, pane, err := r.observeBound(ctx, manifest)
+		if err != nil {
+			return manifest, fmt.Errorf("bind agent context: %w", err)
+		}
+		load, err := TmuxCommandString([]string{"load-buffer", "-b", buffer, "-"})
+		if err != nil {
+			return manifest, fmt.Errorf("bind agent context: %w", err)
+		}
+		if _, err := r.guardedBoundResult(ctx, binding, pane, load, strings.NewReader(request.Attempt.Context)); err != nil {
+			return manifest, fmt.Errorf("load agent context: %w", err)
+		}
+	}
+	if err := authorize(ctx, request); err != nil {
+		return manifest, fmt.Errorf("authorize agent release: %w", err)
+	}
+	binding, _, err := r.observeBound(ctx, manifest)
+	if err != nil {
+		return manifest, err
+	}
+	if err := WriteImplementationPermit(manifest, binding); err != nil {
+		return manifest, err
+	}
+	if err := ctx.Err(); err != nil {
+		return manifest, err
+	}
+	if err := r.launchAgent(ctx, manifest); err != nil {
+		return manifest, fmt.Errorf("start agent remains ambiguous: %w", err)
 	}
 	manifest.State, manifest.Diagnostic, manifest.UpdatedAt = "running", "", time.Now().UTC()
 	return manifest, nil
@@ -938,10 +1062,24 @@ func (r *Runtime) monitorEffect(ctx context.Context, request EffectRequest) (Man
 	if !request.Eligible {
 		return manifest, errors.New("ineligible attempt requires a generation-invalidating stop effect")
 	}
+	if manifest.Version != boundManifestVersion {
+		live, err := r.session(ctx, manifest.Session)
+		if err != nil {
+			return manifest, err
+		}
+		if !live {
+			return manifest, nil // Do not infer completion from an absent legacy pane.
+		}
+		return manifest, errors.New("legacy implementation pane has no durable observation identity")
+	}
 	if err := r.verifyEffectWorker(ctx); err != nil {
 		return manifest, err
 	}
-	result, runErr := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", PaneTarget(manifest.Session), PaneStatusFormat}, "", []string{}, nil)
+	var result Result
+	var runErr error
+	result, runErr = r.observeBoundCommand(ctx, manifest, func(pane ImplementationPane) []string {
+		return []string{"display-message", "-p", "-t", pane.PaneID, PaneStatusFormat}
+	})
 	if runErr != nil {
 		if err := ctx.Err(); err != nil {
 			return manifest, err
@@ -956,7 +1094,11 @@ func (r *Runtime) monitorEffect(ctx context.Context, request EffectRequest) (Man
 		return manifest, nil
 	}
 	env := effectEnvironment(request)
-	capture, captureErr := r.run(ctx, r.tmux(), []string{"capture-pane", "-p", "-S", "-", "-t", PaneTarget(manifest.Session)}, "", []string{}, nil)
+	var capture Result
+	var captureErr error
+	capture, captureErr = r.observeBoundCommand(ctx, manifest, func(pane ImplementationPane) []string {
+		return []string{"capture-pane", "-p", "-S", "-", "-t", pane.PaneID}
+	})
 	if captureErr != nil {
 		captureErr = errors.New(internalgithub.RedactEnvironment(captureErr.Error(), env))
 	}
@@ -993,14 +1135,17 @@ func (r *Runtime) stopEffect(ctx context.Context, request EffectRequest) (Manife
 	if err := r.verifyEffectWorker(ctx); err != nil {
 		return manifest, err
 	}
-	if err := r.stop(ctx, manifest.Session); err != nil {
+	if err := r.stop(ctx, manifest); err != nil {
 		return manifest, err
 	}
 	return cancelledEffect(manifest, request.Reason), nil
 }
 
-func (r *Runtime) handoffEffect(ctx context.Context, request EffectRequest) (Manifest, error) {
+func (r *Runtime) handoffEffect(ctx context.Context, request EffectRequest, authorize func(context.Context, EffectRequest) error) (Manifest, error) {
 	manifest := request.Manifest
+	if authorize == nil {
+		return manifest, errors.New("implementation Handoff lacks owner authorization")
+	}
 	if !request.Eligible {
 		return manifest, errors.New("attempt is no longer eligible")
 	}
@@ -1022,11 +1167,45 @@ func (r *Runtime) handoffEffect(ctx context.Context, request EffectRequest) (Man
 	if err != nil {
 		return manifest, err
 	}
+	candidate := manifest
+	candidate.LaunchToken, candidate.LaunchID = request.CandidateLaunchToken, request.Identity.EffectID
+	newLaunch := false
+	if live && manifest.Version == boundManifestVersion {
+		if _, err := r.observeBoundCommand(ctx, manifest, func(pane ImplementationPane) []string {
+			return []string{"display-message", "-p", "-t", pane.PaneID, "#{pane_dead}"}
+		}); err != nil {
+			if _, _, candidateErr := r.observeBound(ctx, candidate); candidateErr != nil {
+				return manifest, errors.Join(err, candidateErr)
+			}
+			newLaunch = true
+		}
+	}
 	if !live {
 		env := effectEnvironment(request)
-		if err := r.startSession(ctx, manifest, env); err != nil {
+		if r.Helper == "" {
+			return manifest, errors.New("bound handoff shell helper is required")
+		}
+		command := BoundPaneExitStatusCommand(r.Helper, r.tmux(), candidate, []string{"/bin/sh"})
+		if err := r.startSession(ctx, candidate, env, candidate.LaunchID, command); err != nil {
 			return manifest, err
 		}
+		newLaunch = true
+	}
+	if newLaunch {
+		if err := authorize(ctx, request); err != nil {
+			return manifest, err
+		}
+		binding, _, err := r.observeBound(ctx, candidate)
+		if err != nil {
+			return manifest, err
+		}
+		if err := WriteImplementationPermit(candidate, binding); err != nil {
+			return manifest, err
+		}
+		if err := r.launchAgent(ctx, candidate); err != nil {
+			return manifest, err
+		}
+		manifest.LaunchToken, manifest.LaunchID = candidate.LaunchToken, candidate.LaunchID
 	}
 	manifest.State, manifest.Diagnostic, manifest.UpdatedAt = "running", "", time.Now().UTC()
 	return manifest, nil
@@ -1039,6 +1218,11 @@ func (r *Runtime) reviewEffect(request EffectRequest) (Manifest, error) {
 // ReviewEffectResult constructs and validates the pure manifest transition for
 // an owner-approved review result.
 func ReviewEffectResult(root, stateRoot string, manifest Manifest, review ReviewTransition) (Manifest, error) {
+	if manifest.ReviewHandoffQueued && review.State == "findings-queued" {
+		if !review.HandoffQueued || manifest.ReviewHead != review.Head || !slices.Equal(manifest.ReviewFindings, review.Findings) || manifest.ReviewHandoffAck && !review.HandoffAcknowledged || manifest.ReviewMode != review.Mode || manifest.ReviewTarget != review.Target || manifest.ReviewBase != review.Base || manifest.ReviewSnapshot != review.Snapshot || manifest.ReviewSession != review.Session {
+			return Manifest{}, errors.New("queued review handoff is immutable")
+		}
+	}
 	manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget = review.State, review.Mode, review.Target
 	manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = review.Base, review.Head, review.Snapshot, review.Session
 	manifest.ReviewFindings = slices.Clone(review.Findings)
@@ -1149,13 +1333,6 @@ func (r *Runtime) verifyEffectWorker(ctx context.Context) error {
 func failedEffect(manifest Manifest, stage string, cause error) (Manifest, error) {
 	manifest.State, manifest.Diagnostic, manifest.UpdatedAt = "failed", stage+": "+diagnostic(cause), time.Now().UTC()
 	return manifest, fmt.Errorf("%s: %w", stage, cause)
-}
-
-func failedEffectStopping(ctx context.Context, r *Runtime, manifest Manifest, stage string, cause error) (Manifest, error) {
-	if stopErr := r.stop(ctx, manifest.Session); stopErr != nil {
-		return manifest, fmt.Errorf("%s failed and session cleanup is ambiguous: %w", stage, errors.Join(cause, stopErr))
-	}
-	return failedEffect(manifest, stage, cause)
 }
 
 func cancelledEffect(manifest Manifest, reason string) Manifest {

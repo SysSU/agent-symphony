@@ -53,6 +53,14 @@ code=$?
 printf '%d\n' "$code" >&3
 IFS= read -r _ <&4`
 
+const boundWorkerWrapper = `set +m
+IFS= read -r ready <&5 || exit 125
+[ "$ready" = go ] || exit 125
+"$@" 3>&- 4>&- 5>&-
+code=$?
+printf '%d\n' "$code" >&3
+IFS= read -r _ <&4`
+
 // CaptureWorker runs command with a tmux prompt and bounded result channel.
 func CaptureWorker(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer) (int, error) {
 	return captureWorker(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", false)
@@ -72,6 +80,12 @@ func captureWorker(ctx context.Context, tmux, buffer, resultPath string, command
 // replacement worker has started successfully.
 func CaptureWorkerReplacingResultAfterStart(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, afterStart func() error) (int, error) {
 	return captureWorkerAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", true, afterStart)
+}
+
+// CaptureBoundWorker is the v2 pane process. It binds the sole worker group
+// before allowing any user command to execute.
+func CaptureBoundWorker(ctx context.Context, manifest Manifest, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, replace bool, afterStart func() error) (int, error) {
+	return captureWorkerBoundAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", replace, afterStart, &manifest)
 }
 
 // RunPaneCommand preserves normal exit status while leaving signaled exits for
@@ -275,8 +289,19 @@ func recordPaneExitOption(ctx context.Context, tmux, option string, value int) e
 }
 
 func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, tempDir string, replace bool, afterStart func() error) (int, error) {
+	return captureWorkerBoundAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, tempDir, replace, afterStart, nil)
+}
+
+func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, tempDir string, replace bool, afterStart func() error, manifest *Manifest) (code int, err error) {
 	if tmux == "" || buffer == "" || len(command) == 0 || command[0] == "" || (resultPath != "" && !filepath.IsAbs(resultPath)) {
 		return 1, errors.New("invalid worker capture request")
+	}
+	var binding ImplementationLaunchBinding
+	if manifest != nil {
+		binding, err = ReadImplementationBinding(*manifest)
+		if err != nil || os.Getenv("TMUX_PANE") != binding.PaneID || os.Getpid() != binding.PanePID {
+			return 1, errors.Join(err, errors.New("bound worker pane identity is unavailable"))
+		}
 	}
 	prompt, err := os.CreateTemp(tempDir, "agent-symphony-prompt-")
 	if err != nil {
@@ -325,13 +350,29 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 	defer holdReader.Close()
 	defer holdWriter.Close()
 
-	args := append([]string{"-c", workerWrapper, "agent-symphony-worker"}, command...)
+	wrapper := workerWrapper
+	if manifest != nil {
+		wrapper = boundWorkerWrapper
+	}
+	args := append([]string{"-c", wrapper, "agent-symphony-worker"}, command...)
 	child := exec.Command("/bin/sh", args...)
+	var gateReader, gateWriter *os.File
+	if manifest != nil {
+		gateReader, gateWriter, err = os.Pipe()
+		if err != nil {
+			return 1, err
+		}
+		defer gateReader.Close()
+		defer gateWriter.Close()
+	}
 	ready := make(chan struct{})
 	var readyOnce sync.Once
 	markReady := func() { readyOnce.Do(func() { close(ready) }) }
 	child.Stdin, child.Stderr, child.Env = prompt, readyWriter{Writer: stderr, ready: markReady}, captureEnvironment(os.Environ())
 	child.ExtraFiles = []*os.File{statusWriter, holdReader}
+	if gateReader != nil {
+		child.ExtraFiles = append(child.ExtraFiles, gateReader)
+	}
 	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var result *os.File
 	resultName := resultPath
@@ -365,6 +406,24 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 	}
 	if err := child.Start(); err != nil {
 		return 1, err
+	}
+	if gateReader != nil {
+		_ = gateReader.Close()
+	}
+	if manifest != nil {
+		start, startErr := WriteImplementationGroupStart(*manifest, binding, "capture", child.Process.Pid, child.Process.Pid)
+		if startErr != nil {
+			_ = killProcessGroup(child)
+			_ = child.Wait()
+			return 1, startErr
+		}
+		defer func() { err = errors.Join(err, WriteImplementationGroupDead(*manifest, binding, start)) }()
+		if _, writeErr := io.WriteString(gateWriter, "go\n"); writeErr != nil {
+			_ = killProcessGroup(child)
+			_ = child.Wait()
+			return 1, writeErr
+		}
+		_ = gateWriter.Close()
 	}
 	pipeFD := int(pipe.Fd())
 	if err := syscall.SetNonblock(pipeFD, true); err != nil {
