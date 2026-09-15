@@ -48,7 +48,8 @@ jobs:
           native="$native_root/vendor/$target/bin/codex"
           sudo chown -R 0:0 "$prefix"
           sudo chmod -R go-w "$prefix"
-          test -f "$native" && test -x "$native"
+          test -f "$native" && test ! -L "$native" && test -x "$native"
+          test -z "$(find "$native_root" ! -type d ! -type f -print -quit)"
           test -z "$(find "$native_root" \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \) -print -quit)"
           test "$("$native" --version)" = "codex-cli $CODEX_VERSION"
           printf 'CODEX_NATIVE=%s\n' "$native" >> "$GITHUB_ENV"
@@ -112,9 +113,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install WSL validation prerequisites' }
           wsl -d $distribution -- bash -lc 'set -euo pipefail; current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"; if test -n "$current_userns" && test "$current_userns" != 1; then sudo sysctl -w kernel.unprivileged_userns_clone=1; fi; current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"; if test -n "$current_apparmor" && test "$current_apparmor" != 0; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi'
           if ($LASTEXITCODE -ne 0) { throw 'Failed to enable WSL unprivileged user namespaces' }
-          wsl -d $distribution -- bash -lc 'rm -rf ~/agent-symphony-ci && mkdir ~/agent-symphony-ci'
-          git archive --format=tar HEAD | wsl -d $distribution -- bash -lc 'tar -xf - -C ~/agent-symphony-ci'
-          wsl -d $distribution -- bash -lc "cd ~/agent-symphony-ci; chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/live-pilot.sh scripts/live-pilot-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh; git init -q; git remote add origin '$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git'; git add .; git -c user.name=ci -c user.email=ci@invalid commit -qm snapshot"
+          $validationUser = 'agent-symphony-ci'
+          wsl -d $distribution --user root -- useradd --create-home --user-group --shell /bin/bash $validationUser
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to provision the WSL validation user' }
+          wsl -d $distribution --user $validationUser -- mkdir "/home/$validationUser/agent-symphony-ci"
+          git archive --format=tar HEAD | wsl -d $distribution --user $validationUser -- tar -xf - -C "/home/$validationUser/agent-symphony-ci"
+          wsl -d $distribution --user $validationUser --cd "/home/$validationUser/agent-symphony-ci" -- bash -lc "chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/live-pilot.sh scripts/live-pilot-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh scripts/wsl-release-validation.sh; git init -q; git remote add origin '$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git'; git add .; git -c user.name=ci -c user.email=ci@invalid commit -qm snapshot"
           $goArchiveVersion = '1.26.0'
           $goDirective = (Select-String '^go ([0-9.]+)$' go.mod).Matches.Groups[1].Value
           $goDirectiveMatch = [regex]::Match($goDirective, '^(\d+)\.(\d+)(?:\.\d+)?$')
@@ -138,11 +142,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install pinned Codex CLI in WSL' }
           $codexRoot = "/usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-${codexPlatform}"
           $codexNative = "/usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-${codexPlatform}/vendor/${codexTarget}/bin/codex"
-          wsl -d $distribution -- bash -lc "set -e; sudo chown -R 0:0 /usr/local/codex; sudo chmod -R go-w /usr/local/codex; test -f '${codexNative}' && test -x '${codexNative}'; ! find '${codexRoot}' \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \) -print -quit | grep -q .; '${codexNative}' --version | grep -qx 'codex-cli ${codexVersion}'"
+          wsl -d $distribution -- bash -lc "set -e; sudo chown -R 0:0 /usr/local/codex; sudo chmod -R go-w /usr/local/codex; test -f '${codexNative}' && test ! -L '${codexNative}' && test -x '${codexNative}'; ! find '${codexRoot}' ! -type d ! -type f -print -quit | grep -q .; ! find '${codexRoot}' \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \) -print -quit | grep -q .; '${codexNative}' --version | grep -qx 'codex-cli ${codexVersion}'"
           if ($LASTEXITCODE -ne 0) { throw 'Pinned WSL Codex installation is unsafe or invalid' }
-          wsl -d $distribution -- bash -lc 'set -euo pipefail; CODEX_NATIVE=$1; cd ~/agent-symphony-ci; export PATH="$(dirname "$CODEX_NATIVE"):/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; test "$(id -u)" -ne 0; test "$(command -v node)" = /usr/local/node/bin/node; test "$(command -v codex)" = "$CODEX_NATIVE"; test "$(/usr/local/node/bin/node --version)" = v22.15.1; test "$("$CODEX_NATIVE" --version)" = "codex-cli 0.153.0"; go run ./cmd/agent-symphony init --config .agent-symphony-ci.yaml; sed -i "s#\"codex\"#\"$CODEX_NATIVE\"#g" .agent-symphony-ci.yaml; go run ./cmd/agent-symphony validate --config .agent-symphony-ci.yaml; go run ./cmd/agent-symphony doctor --offline --config .agent-symphony-ci.yaml --runtime-state "$HOME/.local/state/agent-symphony-doctor"' agent-symphony "$codexNative"
+          wsl -d $distribution --user $validationUser --cd "/home/$validationUser" -- bash agent-symphony-ci/scripts/wsl-release-validation.sh proof "$codexNative"
           if ($LASTEXITCODE -ne 0) { throw 'WSL rootless Codex confinement proof failed' }
-          wsl -d $distribution -- bash -lc 'set -e; CODEX_NATIVE=$1; cd ~/agent-symphony-ci && PATH="$(dirname "$CODEX_NATIVE"):/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl' agent-symphony "$codexNative"
+          wsl -d $distribution --user $validationUser --cd "/home/$validationUser" -- bash agent-symphony-ci/scripts/wsl-release-validation.sh release "$codexNative"
           if ($LASTEXITCODE -ne 0) { throw 'WSL release validation failed' }
 
   artifacts:
