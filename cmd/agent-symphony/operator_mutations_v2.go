@@ -14,21 +14,252 @@ import (
 )
 
 const (
-	operatorPhaseCleanupPending = "cleanup-pending"
-	operatorPhaseCleanupStarted = "cleanup-started"
-	operatorPhaseStopPending    = "stop-pending"
-	operatorPhaseTerminalAwait  = "terminal-awaiting"
-	operatorPhaseTerminal       = "terminal-pending"
-	operatorPhaseRetryAwait     = "retry-awaiting"
-	operatorPhaseRetryPending   = "retry-pending"
-	operatorPhaseReviewPending  = "review-pending"
-	operatorPhaseHandoffCleanup = "handoff-cleanup-pending"
-	operatorPhaseStartCleanup   = "start-cleanup-pending"
-	operatorPhaseCompleted      = "completed"
+	operatorPhaseAdmissionPending = "admission-pending"
+	operatorPhaseCleanupPending   = "cleanup-pending"
+	operatorPhaseCleanupStarted   = "cleanup-started"
+	operatorPhaseStopPending      = "stop-pending"
+	operatorPhaseTerminalAwait    = "terminal-awaiting"
+	operatorPhaseTerminal         = "terminal-pending"
+	operatorPhaseRetryAwait       = "retry-awaiting"
+	operatorPhaseRetryPending     = "retry-pending"
+	operatorPhaseReviewPending    = "review-pending"
+	operatorPhaseHandoffCleanup   = "handoff-cleanup-pending"
+	operatorPhaseStartCleanup     = "start-cleanup-pending"
+	operatorPhaseCompleted        = "completed"
 )
+
+func applyReserveOperatorAdmission(state *runtimeOwnerState, command reserveOperatorAdmissionCommand) error {
+	request := command.Request
+	if !validOperatorRequest(request, state.Repository) || !slices.Contains([]string{"dismiss", "archive", "abandon", "remove", "cancel", "recover"}, request.Action) {
+		return errStateConflict
+	}
+	if receipt, ok := operatorReceiptByID(*state, request.RequestID); ok {
+		if receipt.Request != request {
+			return errStateConflict
+		}
+		return nil
+	}
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	for _, receipt := range state.ControlReceipts {
+		if receipt.State == "pending" && receipt.Phase == operatorPhaseAdmissionPending && ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt) == key {
+			if receipt.Request.Action != request.Action || receipt.Admission == nil {
+				return errStateConflict
+			}
+			admission := *receipt.Admission
+			admission.Manifest = cloneManifest(admission.Manifest)
+			return appendOperatorReceipt(state, controlReceipt{Request: request, State: "pending", Phase: operatorPhaseAdmissionPending, Admission: &admission})
+		}
+	}
+	record, ok := state.Attempts[key]
+	issueKey := ownerIssueKey(request.Repository, request.Issue)
+	if !ok {
+		if !slices.Contains([]string{"archive", "dismiss"}, request.Action) {
+			return errStaleStateResult
+		}
+		observation, observed := state.Observations[issueKey]
+		attempt, accepted := observation.Attempts[key]
+		if !observed || !observation.Present || observation.ObservationEpoch > state.Epoch || observation.OwnerGeneration != state.IssueGenerations[issueKey] || observation.Fact.CurrentAttempt != request.Attempt || request.Action == "dismiss" && !observation.Fact.Closed || !accepted || !attempt.Present || attempt.ObservationEpoch > state.Epoch || attempt.SourceIssueGeneration != observation.Generation || attempt.OwnerGeneration != state.AttemptGenerations[key] || attempt.Fact.State != "completed" || attempt.Fact.Repository != request.Repository || attempt.Fact.Issue != request.Issue || attempt.Fact.Attempt != request.Attempt {
+			return errStateConflict
+		}
+		admission := &operatorAdmission{Epoch: state.Epoch, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: state.AttemptGenerations[key], IssueClosed: request.Action == "dismiss", RemoteOnly: true, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, ObservationBodyDigest: observation.Fact.BodyDigest}
+		return appendOperatorReceipt(state, controlReceipt{Request: request, State: "pending", Phase: operatorPhaseAdmissionPending, Admission: admission})
+	}
+	if record.Generation == 0 || record.Generation != state.AttemptGenerations[key] {
+		return errStaleStateResult
+	}
+	status, statuses, err := ownerOperatorStatus(*state, request.Issue, request.Attempt)
+	if err != nil {
+		return errors.Join(err, errStateConflict)
+	}
+	switch request.Action {
+	case "dismiss":
+		observation, observed := state.Observations[issueKey]
+		if !observed || observation.ObservationEpoch > state.Epoch {
+			return errStaleStateResult
+		}
+		status.IssueClosed = true
+		if !canDismissClosedAttempt(status) {
+			return errStateConflict
+		}
+	case "archive", "abandon", "remove":
+		if !validDestructiveOperatorStatus(request.Action, status, statuses) {
+			return errStateConflict
+		}
+	}
+	admission := &operatorAdmission{Epoch: state.Epoch, IssueGeneration: state.IssueGenerations[issueKey], AttemptGeneration: record.Generation, Manifest: cloneManifest(record.Manifest)}
+	if request.Action == "recover" || request.Action == "dismiss" {
+		observation := state.Observations[issueKey]
+		admission.ObservationGeneration, admission.ObservationCycleID, admission.ObservationBodyDigest = observation.Generation, observation.LastCycleID, observation.Fact.BodyDigest
+	}
+	return appendOperatorReceipt(state, controlReceipt{Request: request, State: "pending", Phase: operatorPhaseAdmissionPending, Admission: admission})
+}
+
+func applyAbortOperatorAdmission(state *runtimeOwnerState, command abortOperatorAdmissionCommand) error {
+	for index, receipt := range state.ControlReceipts {
+		if receipt.Request.RequestID != command.Request.RequestID {
+			continue
+		}
+		if receipt.Request != command.Request || receipt.State != "pending" || receipt.Phase != operatorPhaseAdmissionPending || receipt.Admission == nil {
+			return errStateConflict
+		}
+		state.ControlReceipts = slices.Delete(state.ControlReceipts, index, index+1)
+		return nil
+	}
+	return nil
+}
+
+func applyFailOperatorAdmission(state *runtimeOwnerState, command failOperatorAdmissionCommand) error {
+	var admission *operatorAdmission
+	for index := range state.ControlReceipts {
+		receipt := &state.ControlReceipts[index]
+		if receipt.Request.RequestID != command.Request.RequestID {
+			continue
+		}
+		if receipt.Request != command.Request || receipt.State != "pending" || receipt.Phase != operatorPhaseAdmissionPending || receipt.Admission == nil || state.Revision == ^uint64(0) || command.Result.OK || command.Result.Status < 400 || !validRecordedControlResult(command.Result, command.Request) {
+			return errStateConflict
+		}
+		copy := *receipt.Admission
+		admission = &copy
+		break
+	}
+	if admission == nil {
+		return errStaleStateResult
+	}
+	key := ownerAttemptKey(command.Request.Repository, command.Request.Issue, command.Request.Attempt)
+	for index := range state.ControlReceipts {
+		receipt := &state.ControlReceipts[index]
+		if receipt.State != "pending" || receipt.Phase != operatorPhaseAdmissionPending || receipt.Admission == nil || receipt.Request.Action != command.Request.Action || ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt) != key || !reflect.DeepEqual(*receipt.Admission, *admission) {
+			continue
+		}
+		result := command.Result
+		result.RequestID, result.Action, result.OwnerRevision = receipt.Request.RequestID, receipt.Request.Action, state.Revision+1
+		receipt.State, receipt.Phase, receipt.Admission, receipt.Result = "completed", operatorPhaseCompleted, nil, &result
+	}
+	return nil
+}
+
+func matchingOperatorAdmissions(state runtimeOwnerState, request controlRequest) []controlRequest {
+	receipt, ok := operatorReceiptByID(state, request.RequestID)
+	if !ok || receipt.State != "pending" || receipt.Phase != operatorPhaseAdmissionPending || receipt.Admission == nil {
+		return nil
+	}
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	requests := []controlRequest{}
+	for _, candidate := range state.ControlReceipts {
+		if candidate.State == "pending" && candidate.Phase == operatorPhaseAdmissionPending && candidate.Admission != nil && candidate.Request.Action == request.Action && ownerAttemptKey(candidate.Request.Repository, candidate.Request.Issue, candidate.Request.Attempt) == key && reflect.DeepEqual(candidate.Admission, receipt.Admission) {
+			requests = append(requests, candidate.Request)
+		}
+	}
+	return requests
+}
+
+func operatorAdmissionLeader(state runtimeOwnerState, receipt controlReceipt) bool {
+	for _, candidate := range state.ControlReceipts {
+		if candidate.State == "pending" && candidate.Phase == operatorPhaseAdmissionPending && candidate.Admission != nil && candidate.Request.Action == receipt.Request.Action && ownerAttemptKey(candidate.Request.Repository, candidate.Request.Issue, candidate.Request.Attempt) == ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt) && reflect.DeepEqual(candidate.Admission, receipt.Admission) {
+			return candidate.Request.RequestID == receipt.Request.RequestID
+		}
+	}
+	return false
+}
+
+func hasObservationSensitiveAdmission(state runtimeOwnerState, issueKey string) bool {
+	return slices.ContainsFunc(state.ControlReceipts, func(receipt controlReceipt) bool {
+		return receipt.State == "pending" && receipt.Phase == operatorPhaseAdmissionPending && observationSensitiveOperatorAdmission(receipt) && ownerIssueKey(receipt.Request.Repository, receipt.Request.Issue) == issueKey
+	})
+}
+
+func observationSensitiveOperatorAdmission(receipt controlReceipt) bool {
+	return receipt.Admission != nil && (slices.Contains([]string{"dismiss", "recover"}, receipt.Request.Action) || receipt.Request.Action == "archive" && receipt.Admission.RemoteOnly)
+}
+
+func remoteOnlyOperatorAdmissionEligible(state runtimeOwnerState, receipt controlReceipt, observation reconciliationObservation) bool {
+	admission := receipt.Admission
+	issueKey := ownerIssueKey(receipt.Request.Repository, receipt.Request.Issue)
+	attemptKey := ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)
+	attempt, accepted := observation.Attempts[attemptKey]
+	_, owned := state.Attempts[attemptKey]
+	_, invalidated := state.Tombstones[attemptKey]
+	return admission != nil && admission.RemoteOnly && slices.Contains([]string{"archive", "dismiss"}, receipt.Request.Action) && !owned && !invalidated &&
+		observation.Present && observation.ObservationEpoch <= state.Epoch && observation.OwnerGeneration == admission.IssueGeneration && observation.Fact.CurrentAttempt == receipt.Request.Attempt &&
+		(receipt.Request.Action != "dismiss" || admission.IssueClosed && observation.Fact.Closed) && accepted && attempt.Present && attempt.ObservationEpoch <= state.Epoch &&
+		attempt.SourceIssueGeneration == observation.Generation && attempt.OwnerGeneration == admission.AttemptGeneration && attempt.Fact.State == "completed" &&
+		attempt.Fact.Repository == receipt.Request.Repository && attempt.Fact.Issue == receipt.Request.Issue && attempt.Fact.Attempt == receipt.Request.Attempt &&
+		!attemptHasReviewerProof(state, receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt) && state.LegacyReviewerQuarantines[issueKey] == ""
+}
+
+func reconcileOperatorAdmissions(state *runtimeOwnerState, collection reconciliationCollection) {
+	for index := range state.ControlReceipts {
+		receipt := &state.ControlReceipts[index]
+		if receipt.State != "pending" || receipt.Phase != operatorPhaseAdmissionPending || !observationSensitiveOperatorAdmission(*receipt) {
+			continue
+		}
+		issueKey := ownerIssueKey(receipt.Request.Repository, receipt.Request.Issue)
+		if !reconciliationScopeContains(collection.Scope, issueKey) {
+			continue
+		}
+		observation, observed := state.Observations[issueKey]
+		if !observed || observation.ObservationEpoch != collection.Identity.Epoch || observation.LastCycleID != collection.Identity.CycleID {
+			continue
+		}
+		if receipt.Admission.ObservationGeneration == observation.Generation && receipt.Admission.ObservationCycleID == observation.LastCycleID && receipt.Admission.ObservationBodyDigest == observation.Fact.BodyDigest {
+			continue
+		}
+		if receipt.Admission.RemoteOnly && !remoteOnlyOperatorAdmissionEligible(*state, *receipt, observation) || !receipt.Admission.RemoteOnly && (!observation.Present || receipt.Request.Action == "dismiss" && !observation.Fact.Closed) {
+			result := operatorErrorResult(receipt.Request, http.StatusConflict, "attempt or issue changed; refresh and retry")
+			result.OwnerRevision = state.Revision + 1
+			receipt.State, receipt.Phase, receipt.Admission, receipt.Result = "completed", operatorPhaseCompleted, nil, &result
+			continue
+		}
+		receipt.Admission.ObservationGeneration = observation.Generation
+		receipt.Admission.ObservationCycleID = observation.LastCycleID
+		receipt.Admission.ObservationBodyDigest = observation.Fact.BodyDigest
+	}
+}
+
+func validateOperatorAdmissionRefresh(state runtimeOwnerState, command applyReconciliationCommand) error {
+	receipt, ok := operatorReceiptByID(state, command.OperatorRequestID)
+	if !ok || receipt.Request.Action != "recover" || receipt.State != "pending" || receipt.Phase != operatorPhaseAdmissionPending || receipt.Admission == nil {
+		return errStaleStateResult
+	}
+	admission := receipt.Admission
+	issueKey := ownerIssueKey(receipt.Request.Repository, receipt.Request.Issue)
+	attemptKey := ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)
+	observation, observed := state.Observations[issueKey]
+	identity := command.Collection.Identity
+	if command.Collection.Scope != (reconciliationScope{Kind: reconciliationIssueScope, Repository: receipt.Request.Repository, Issue: receipt.Request.Issue}) || !command.Collection.Complete || identity.Epoch != admission.Epoch || identity.SourceRevision == 0 || identity.SourceRevision > state.Revision || identity.CycleID == 0 || admission.IssueGeneration != state.IssueGenerations[issueKey] || admission.AttemptGeneration != state.AttemptGenerations[attemptKey] || command.Collection.IssueGenerations[issueKey] != admission.IssueGeneration || command.Collection.AttemptGenerations[attemptKey] != admission.AttemptGeneration || !observed || observation.Generation != admission.ObservationGeneration || observation.LastCycleID != admission.ObservationCycleID || observation.Fact.BodyDigest != admission.ObservationBodyDigest {
+		return errStaleStateResult
+	}
+	return nil
+}
+
+func bindOperatorAdmissionRefresh(state *runtimeOwnerState, command applyReconciliationCommand) error {
+	receipt, ok := operatorReceiptByID(*state, command.OperatorRequestID)
+	if !ok || receipt.Admission == nil {
+		return errStaleStateResult
+	}
+	issueKey := ownerIssueKey(receipt.Request.Repository, receipt.Request.Issue)
+	observation, observed := state.Observations[issueKey]
+	group := slices.IndexFunc(command.Collection.Issues, func(group reconciliationIssueGroup) bool {
+		return group.Fact.Repository == receipt.Request.Repository && group.Fact.Issue == receipt.Request.Issue
+	})
+	if !observed || !observation.Present || observation.ObservationEpoch > state.Epoch || group < 0 || !reflect.DeepEqual(observation.Fact, command.Collection.Issues[group].Fact) {
+		return errStaleStateResult
+	}
+	previous := *receipt.Admission
+	for index := range state.ControlReceipts {
+		candidate := &state.ControlReceipts[index]
+		if candidate.State == "pending" && candidate.Phase == operatorPhaseAdmissionPending && candidate.Request.Action == "recover" && candidate.Admission != nil && reflect.DeepEqual(*candidate.Admission, previous) {
+			candidate.Admission.ObservationGeneration = observation.Generation
+			candidate.Admission.ObservationCycleID = observation.LastCycleID
+			candidate.Admission.ObservationBodyDigest = observation.Fact.BodyDigest
+		}
+	}
+	return nil
+}
 
 func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwnerState, command beginOperatorMutationCommand) (*runtimeEffectIntent, error) {
 	request := command.Request
+	admitted := false
 	if !validOperatorRequest(request, state.Repository) {
 		return nil, errors.Join(errors.New("validate operator request"), errStateConflict)
 	}
@@ -36,7 +267,38 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		if receipt.Request != request {
 			return nil, errStateConflict
 		}
-		return effectForOperatorReceipt(*state, receipt)
+		if receipt.State != "pending" || receipt.Phase != operatorPhaseAdmissionPending || receipt.Admission == nil {
+			return effectForOperatorReceipt(*state, receipt)
+		}
+		admission := receipt.Admission
+		if admission.Epoch != state.Epoch || admission.IssueGeneration != state.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)] || admission.AttemptGeneration != state.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)] || !reflect.DeepEqual(admission.Manifest, command.Manifest) || admission.RemoteOnly != command.RemoteOnly {
+			return nil, errStaleStateResult
+		}
+		if observationSensitiveOperatorAdmission(receipt) && (command.ObservationGeneration != admission.ObservationGeneration || command.ObservationCycleID != admission.ObservationCycleID || command.ObservationBodyDigest != admission.ObservationBodyDigest) {
+			return nil, errStaleStateResult
+		}
+		command.Identity = stateResultIdentity{Epoch: admission.Epoch, SourceRevision: state.Revision, IssueGeneration: admission.IssueGeneration, AttemptGeneration: admission.AttemptGeneration}
+		admitted = true
+		if command.Runtime != nil {
+			if !operatorAdmissionIdentityCurrent(command.Runtime.Identity, *admission, state.Revision) {
+				return nil, errStaleStateResult
+			}
+			runtime := *command.Runtime
+			runtime.Identity = command.Identity
+			command.Runtime = &runtime
+		}
+		if command.Reconciliation != nil {
+			if !operatorAdmissionIdentityCurrent(command.Reconciliation.Identity, *admission, state.Revision) {
+				return nil, errStaleStateResult
+			}
+			reconciliation := *command.Reconciliation
+			reconciliation.Identity = command.Identity
+			command.Reconciliation = &reconciliation
+		}
+		state.ControlReceipts = slices.DeleteFunc(state.ControlReceipts, func(candidate controlReceipt) bool { return candidate.Request.RequestID == request.RequestID })
+		if observation, exists := state.Observations[ownerIssueKey(request.Repository, request.Issue)]; exists {
+			command.ObservationGeneration, command.ObservationCycleID, command.ObservationBodyDigest = observation.Generation, observation.LastCycleID, observation.Fact.BodyDigest
+		}
 	}
 	if command.Identity.Epoch != state.Epoch || command.Identity.SourceRevision == 0 || command.Identity.SourceRevision > state.Revision {
 		return nil, errStaleStateResult
@@ -47,7 +309,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 	}
 	observation, ok := state.Observations[issueKey]
 	if command.RemoteOnly {
-		return applyRemoteOnlyOperatorMutation(attemptRoot, stateRoot, state, command, observation, ok)
+		return applyRemoteOnlyOperatorMutation(attemptRoot, stateRoot, state, command, observation, ok, admitted)
 	}
 	manifest := cloneManifest(command.Manifest)
 	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || manifest.Issue != request.Issue || manifest.Attempt != request.Attempt {
@@ -62,11 +324,11 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		}
 		return replayOperatorTombstone(state, request, manifest, command.PublishedHead, command.CleanupDigest, command.CleanupPolicy, tombstone)
 	}
-	absentOrphan := ok && !observation.Present && (request.Action == "dismiss" && command.IssueClosed || request.Action == "abandon") && observation.ObservationEpoch == state.Epoch
+	absentOrphan := ok && !observation.Present && (request.Action == "dismiss" && command.IssueClosed || request.Action == "abandon") && observation.ObservationEpoch <= state.Epoch
 	if !ok || !observation.Present && !absentOrphan || command.ObservationGeneration != observation.Generation || command.ObservationCycleID != observation.LastCycleID || command.ObservationBodyDigest != observation.Fact.BodyDigest {
 		return nil, errStaleStateResult
 	}
-	if observation.ObservationEpoch != state.Epoch {
+	if observation.ObservationEpoch != state.Epoch && (!admitted || observation.ObservationEpoch > state.Epoch) {
 		return nil, errStaleStateResult
 	}
 	if request.Action == "recover" {
@@ -270,7 +532,11 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 	return effect, nil
 }
 
-func applyRemoteOnlyOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwnerState, command beginOperatorMutationCommand, observation reconciliationObservation, observed bool) (*runtimeEffectIntent, error) {
+func operatorAdmissionIdentityCurrent(identity stateResultIdentity, admission operatorAdmission, revision uint64) bool {
+	return identity.Epoch == admission.Epoch && identity.SourceRevision > 0 && identity.SourceRevision <= revision && identity.IssueGeneration == admission.IssueGeneration && identity.AttemptGeneration == admission.AttemptGeneration && identity.CycleID == 0 && identity.EffectID == "" && identity.RequestDigest == ""
+}
+
+func applyRemoteOnlyOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwnerState, command beginOperatorMutationCommand, observation reconciliationObservation, observed, admitted bool) (*runtimeEffectIntent, error) {
 	request := command.Request
 	issueKey, attemptKey := ownerIssueKey(request.Repository, request.Issue), ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
 	if tombstone, exists := state.Tombstones[attemptKey]; exists {
@@ -280,7 +546,7 @@ func applyRemoteOnlyOperatorMutation(attemptRoot, stateRoot string, state *runti
 		return nil, appendOperatorReceipt(state, controlReceipt{Request: request, State: "completed", Phase: operatorPhaseCompleted, Result: successfulOperatorResult(request, 0)})
 	}
 	attempt, accepted := observation.Attempts[attemptKey]
-	if !slices.Contains([]string{"archive", "dismiss"}, request.Action) || request.Action == "dismiss" && !command.IssueClosed || command.IssueClosed != observation.Fact.Closed || !reflect.DeepEqual(command.Manifest, agentruntime.Manifest{}) || command.CleanupValid || command.CleanupDigest != "" || command.CleanupPolicy != (agentruntime.EffectCleanupPolicy{}) || command.Runtime != nil || command.Reconciliation != nil || command.PublishedHead != "" || !observed || !observation.Present || observation.ObservationEpoch != state.Epoch || observation.Fact.CurrentAttempt != request.Attempt || observation.Generation != command.ObservationGeneration || observation.LastCycleID != command.ObservationCycleID || observation.Fact.BodyDigest != command.ObservationBodyDigest || !accepted || !attempt.Present || attempt.ObservationEpoch != state.Epoch || attempt.SourceIssueGeneration != observation.Generation || attempt.OwnerGeneration != command.Identity.AttemptGeneration || attempt.Fact.State != "completed" || attempt.Fact.Repository != request.Repository || attempt.Fact.Issue != request.Issue || attempt.Fact.Attempt != request.Attempt || state.AttemptGenerations[attemptKey] != command.Identity.AttemptGeneration {
+	if !slices.Contains([]string{"archive", "dismiss"}, request.Action) || request.Action == "dismiss" && !command.IssueClosed || command.IssueClosed != observation.Fact.Closed || !reflect.DeepEqual(command.Manifest, agentruntime.Manifest{}) || command.CleanupValid || command.CleanupDigest != "" || command.CleanupPolicy != (agentruntime.EffectCleanupPolicy{}) || command.Runtime != nil || command.Reconciliation != nil || command.PublishedHead != "" || !observed || !observation.Present || observation.ObservationEpoch != state.Epoch && (!admitted || observation.ObservationEpoch > state.Epoch) || observation.Fact.CurrentAttempt != request.Attempt || observation.Generation != command.ObservationGeneration || observation.LastCycleID != command.ObservationCycleID || observation.Fact.BodyDigest != command.ObservationBodyDigest || !accepted || !attempt.Present || attempt.ObservationEpoch != state.Epoch && (!admitted || attempt.ObservationEpoch > state.Epoch) || attempt.SourceIssueGeneration != observation.Generation || attempt.OwnerGeneration != command.Identity.AttemptGeneration || attempt.Fact.State != "completed" || attempt.Fact.Repository != request.Repository || attempt.Fact.Issue != request.Issue || attempt.Fact.Attempt != request.Attempt || state.AttemptGenerations[attemptKey] != command.Identity.AttemptGeneration {
 		return nil, errStaleStateResult
 	}
 	if _, exists := state.Attempts[attemptKey]; exists {
@@ -605,6 +871,9 @@ func attachOperatorRecovery(state *runtimeOwnerState, command beginOperatorMutat
 		if receipt.Request.Action != "recover" || receipt.State != "pending" || receipt.Request.Repository != command.Request.Repository || receipt.Request.Issue != command.Request.Issue || receipt.Request.Attempt != command.Request.Attempt {
 			continue
 		}
+		if receipt.Phase == operatorPhaseAdmissionPending {
+			continue
+		}
 		effect, ok := state.Effects[receipt.EffectID]
 		generation := state.AttemptGenerations[key]
 		captured := command.Identity.AttemptGeneration
@@ -752,16 +1021,19 @@ func validDestructiveOperatorStatus(action string, status orchestrator.RecoveryS
 
 func validOperatorReceiptBinding(receipt controlReceipt) bool {
 	if receipt.Phase == "" {
-		return receipt.EffectID == "" && receipt.Diagnostic == ""
+		return receipt.EffectID == "" && receipt.Diagnostic == "" && receipt.Admission == nil
 	}
-	if !slices.Contains([]string{operatorPhaseCleanupPending, operatorPhaseCleanupStarted, operatorPhaseStopPending, operatorPhaseTerminalAwait, operatorPhaseTerminal, operatorPhaseRetryAwait, operatorPhaseRetryPending, operatorPhaseReviewPending, operatorPhaseHandoffCleanup, operatorPhaseStartCleanup, operatorPhaseCompleted}, receipt.Phase) {
+	if !slices.Contains([]string{operatorPhaseAdmissionPending, operatorPhaseCleanupPending, operatorPhaseCleanupStarted, operatorPhaseStopPending, operatorPhaseTerminalAwait, operatorPhaseTerminal, operatorPhaseRetryAwait, operatorPhaseRetryPending, operatorPhaseReviewPending, operatorPhaseHandoffCleanup, operatorPhaseStartCleanup, operatorPhaseCompleted}, receipt.Phase) {
 		return false
 	}
 	if receipt.State == "completed" {
-		return receipt.Phase == operatorPhaseCompleted && receipt.Result != nil && receipt.Diagnostic == ""
+		return receipt.Phase == operatorPhaseCompleted && receipt.Result != nil && receipt.Diagnostic == "" && receipt.Admission == nil
+	}
+	if receipt.Phase == operatorPhaseAdmissionPending {
+		return receipt.EffectID == "" && receipt.Result == nil && receipt.Diagnostic == "" && receipt.Admission != nil
 	}
 	legacyHandoff := receipt.Request.Action == "dismiss" && receipt.Phase == operatorPhaseHandoffCleanup && receipt.EffectID == ""
-	return receipt.State == "pending" && receipt.Phase != operatorPhaseCompleted && (receipt.EffectID != "" || legacyHandoff) && receipt.Result == nil && boundedText(receipt.Diagnostic, maxReconciliationStringBytes, false)
+	return receipt.State == "pending" && receipt.Phase != operatorPhaseCompleted && (receipt.EffectID != "" || legacyHandoff) && receipt.Result == nil && receipt.Admission == nil && boundedText(receipt.Diagnostic, maxReconciliationStringBytes, false)
 }
 
 func sameOperatorBeginIdentity(begin, operator stateResultIdentity) bool {

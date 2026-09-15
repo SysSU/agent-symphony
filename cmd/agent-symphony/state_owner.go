@@ -520,6 +520,19 @@ type beginOperatorMutationCommand struct {
 	Reconciliation        *beginReconciliationEffectCommand
 }
 
+type reserveOperatorAdmissionCommand struct {
+	Request controlRequest
+}
+
+type abortOperatorAdmissionCommand struct {
+	Request controlRequest
+}
+
+type failOperatorAdmissionCommand struct {
+	Request controlRequest
+	Result  controlResult
+}
+
 type startOperatorCleanupCommand struct {
 	Identity stateResultIdentity
 }
@@ -573,6 +586,9 @@ const (
 	stateOwnerRecordControlReceipt
 	stateOwnerRecordOperatorDiagnostic
 	stateOwnerCompleteHandoffCompensation
+	stateOwnerReserveOperatorAdmission
+	stateOwnerAbortOperatorAdmission
+	stateOwnerFailOperatorAdmission
 	stateOwnerBeginOperatorMutation
 	stateOwnerStartOperatorCleanup
 	stateOwnerFinishOperatorRuntimeEffect
@@ -614,6 +630,9 @@ type stateOwnerCommand struct {
 	receipt                      recordControlReceiptCommand
 	operatorDiagnostic           recordOperatorDiagnosticCommand
 	completeHandoff              completeHandoffCompensationCommand
+	reserveOperator              reserveOperatorAdmissionCommand
+	abortOperator                abortOperatorAdmissionCommand
+	failOperator                 failOperatorAdmissionCommand
 	beginOperator                beginOperatorMutationCommand
 	startOperatorCleanup         startOperatorCleanupCommand
 	finishOperatorRuntime        finishOperatorRuntimeEffectCommand
@@ -639,9 +658,10 @@ type recordCycleOutcomeCommand struct {
 }
 
 type stateOwnerResult struct {
-	snapshot stateOwnerSnapshot
-	effect   *runtimeEffectIntent
-	err      error
+	snapshot            stateOwnerSnapshot
+	effect              *runtimeEffectIntent
+	reconciliationStale bool
+	err                 error
 }
 
 type stateOwnerSnapshotRequest struct {
@@ -660,9 +680,10 @@ func (e statePersistenceInstalledError) Error() string { return e.err.Error() }
 func (e statePersistenceInstalledError) Unwrap() error { return e.err }
 
 type pendingStateCommit struct {
-	command   stateOwnerCommand
-	candidate runtimeOwnerState
-	effect    *runtimeEffectIntent
+	command             stateOwnerCommand
+	candidate           runtimeOwnerState
+	effect              *runtimeEffectIntent
+	reconciliationStale bool
 }
 
 type appliedReconciliationCycle struct {
@@ -777,13 +798,14 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				command.reply <- stateOwnerResult{err: err}
 				continue
 			}
+			reconciliationStale := command.kind == stateOwnerApplyReconciliation && candidate.StaleReconciliations > committed.StaleReconciliations
 			if reflect.DeepEqual(candidate, committed) {
 				if !claimStateOwnerCommand(command) {
 					command.reply <- stateOwnerResult{err: commandCancellationError(command)}
 					continue
 				}
 				recordAppliedReconciliationCycles(appliedCycles, command, committed, false)
-				command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(effect)}
+				command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(effect), reconciliationStale: reconciliationStale}
 				continue
 			}
 			reply := make(chan error, 1)
@@ -793,7 +815,7 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				continue
 			}
 			persistence <- request
-			inFlight = &pendingStateCommit{command: command, candidate: candidate, effect: effect}
+			inFlight = &pendingStateCommit{command: command, candidate: candidate, effect: effect, reconciliationStale: reconciliationStale}
 			persistenceResult = reply
 		}
 	}
@@ -847,7 +869,7 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				committed = inFlight.candidate
 				publish()
 				recordAppliedReconciliationCycles(appliedCycles, inFlight.command, committed, true)
-				inFlight.command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(inFlight.effect)}
+				inFlight.command.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}, effect: cloneEffect(inFlight.effect), reconciliationStale: inFlight.reconciliationStale}
 			} else {
 				inFlight.command.reply <- stateOwnerResult{err: err}
 				var installed statePersistenceInstalledError
@@ -1036,6 +1058,21 @@ func (o *stateOwner) completeHandoffCompensation(ctx context.Context, command co
 	return result.snapshot, err
 }
 
+func (o *stateOwner) reserveOperatorAdmission(ctx context.Context, command reserveOperatorAdmissionCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerReserveOperatorAdmission, reserveOperator: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) abortOperatorAdmission(ctx context.Context, command abortOperatorAdmissionCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerAbortOperatorAdmission, abortOperator: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) failOperatorAdmission(ctx context.Context, command failOperatorAdmissionCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerFailOperatorAdmission, failOperator: command})
+	return result.snapshot, err
+}
+
 func (o *stateOwner) beginOperatorMutation(ctx context.Context, command beginOperatorMutationCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerBeginOperatorMutation, beginOperator: command})
 	return result.snapshot, result.effect, err
@@ -1183,6 +1220,11 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 			}
 		}
 		candidate.Epoch++
+		for index := range candidate.ControlReceipts {
+			if admission := candidate.ControlReceipts[index].Admission; candidate.ControlReceipts[index].Phase == operatorPhaseAdmissionPending && admission != nil {
+				admission.Epoch = candidate.Epoch
+			}
+		}
 		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, nil)
 	}
 	switch command.kind {
@@ -1237,8 +1279,24 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerApplyReconciliation:
+		if command.reconcile.OperatorRequestID != "" {
+			if err := validateOperatorAdmissionRefresh(candidate, command.reconcile); err != nil {
+				return runtimeOwnerState{}, nil, err
+			}
+		}
+		staleBefore := candidate.StaleReconciliations
 		if err := applyReconciliation(&candidate, command.reconcile, appliedCycles); err != nil {
 			return runtimeOwnerState{}, nil, err
+		}
+		if command.reconcile.OperatorRequestID != "" {
+			if candidate.StaleReconciliations != staleBefore {
+				return runtimeOwnerState{}, nil, errStaleStateResult
+			}
+			if err := bindOperatorAdmissionRefresh(&candidate, command.reconcile); err != nil {
+				return runtimeOwnerState{}, nil, err
+			}
+		} else {
+			reconcileOperatorAdmissions(&candidate, command.reconcile.Collection)
 		}
 	case stateOwnerBeginReconciliationEffect:
 		effect, err := applyBeginReconciliationEffect(attemptRoot, stateRoot, &candidate, command.beginReconciliation)
@@ -1329,15 +1387,50 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if err := applyCompleteHandoffCompensation(&candidate, command.completeHandoff); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
+	case stateOwnerReserveOperatorAdmission:
+		if err := applyReserveOperatorAdmission(&candidate, command.reserveOperator); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerAbortOperatorAdmission:
+		if err := applyAbortOperatorAdmission(&candidate, command.abortOperator); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerFailOperatorAdmission:
+		if err := applyFailOperatorAdmission(&candidate, command.failOperator); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
 	case stateOwnerBeginOperatorMutation:
+		admittedRequests := matchingOperatorAdmissions(candidate, command.beginOperator.Request)
 		effect, err := applyBeginOperatorMutation(attemptRoot, stateRoot, &candidate, command.beginOperator)
 		if err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
+		requestIDs := []string{command.beginOperator.Request.RequestID}
+		if len(admittedRequests) > 1 {
+			primary, ok := operatorReceiptByID(candidate, command.beginOperator.Request.RequestID)
+			if !ok || primary.Phase == operatorPhaseAdmissionPending {
+				return runtimeOwnerState{}, nil, errStateConflict
+			}
+			for _, request := range admittedRequests {
+				if request.RequestID == command.beginOperator.Request.RequestID {
+					continue
+				}
+				candidate.ControlReceipts = slices.DeleteFunc(candidate.ControlReceipts, func(receipt controlReceipt) bool { return receipt.Request.RequestID == request.RequestID })
+				attached := cloneControlReceipt(primary)
+				attached.Request = request
+				if attached.Result != nil {
+					attached.Result.RequestID, attached.Result.Action = request.RequestID, request.Action
+				}
+				if err := appendOperatorReceipt(&candidate, attached); err != nil {
+					return runtimeOwnerState{}, nil, err
+				}
+				requestIDs = append(requestIDs, request.RequestID)
+			}
+		}
 		if reflect.DeepEqual(candidate, committed) {
 			return candidate, cloneEffect(effect), nil
 		}
-		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect, command.beginOperator.Request.RequestID)
+		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect, requestIDs...)
 	case stateOwnerStartOperatorCleanup:
 		if err := applyStartOperatorCleanup(&candidate, command.startOperatorCleanup); err != nil {
 			return runtimeOwnerState{}, nil, err
@@ -2907,7 +3000,10 @@ func migrateReviewerPolicyTo(state *runtimeOwnerState, current uint64) {
 		state.LegacyReviewerQuarantines = map[string]string{}
 	}
 	for key, proof := range state.ReviewerProofs {
-		if !proof.NeverRan && proof.ConfinementVersion != current {
+		if proof.NeverRan && proof.ConfinementVersion != 0 && proof.ConfinementVersion != current {
+			proof.ConfinementVersion = 0
+			state.ReviewerProofs[key] = proof
+		} else if !proof.NeverRan && proof.ConfinementVersion != current {
 			proof.DeadProved, proof.LegacyUnverified = false, true
 			state.ReviewerProofs[key] = proof
 			state.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] = "legacy reviewer confinement policy is unknown; physical cleanup cannot be certified"
@@ -3525,6 +3621,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		return errors.New("runtime owner control receipts are invalid")
 	}
 	seenReceipts := map[string]bool{}
+	reservedAttempts := map[string]controlReceipt{}
 	for _, receipt := range state.ControlReceipts {
 		if seenReceipts[receipt.Request.RequestID] || !validControlRequest(receipt.Request, state.Repository) || receipt.State != "pending" && receipt.State != "completed" || receipt.State == "pending" && receipt.Result != nil || receipt.State == "completed" && (receipt.Result == nil || !validRecordedControlResult(*receipt.Result, receipt.Request)) || !validOperatorReceiptBinding(receipt) {
 			return errors.New("runtime owner control receipt is invalid")
@@ -3553,6 +3650,30 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			if !ok || tombstone.Action != "dismissed" || tombstone.InvalidatedStart == nil {
 				return errors.New("pending start cleanup receipt is unbound")
 			}
+		}
+		if receipt.Phase == operatorPhaseAdmissionPending {
+			admission := receipt.Admission
+			attemptKey := ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)
+			record, exists := state.Attempts[attemptKey]
+			issueKey := ownerIssueKey(receipt.Request.Repository, receipt.Request.Issue)
+			reserved, alreadyReserved := reservedAttempts[attemptKey]
+			invalid := admission == nil || alreadyReserved && (reserved.Request.Action != receipt.Request.Action || !reflect.DeepEqual(reserved.Admission, admission)) || admission.Epoch != state.Epoch || admission.IssueGeneration != state.IssueGenerations[issueKey] || admission.AttemptGeneration != state.AttemptGenerations[attemptKey] || !slices.Contains([]string{"dismiss", "archive", "abandon", "remove", "cancel", "recover"}, receipt.Request.Action) || receipt.Request.Action != "dismiss" && admission.IssueClosed
+			if !invalid && admission.RemoteOnly {
+				observation, observed := state.Observations[issueKey]
+				invalid = exists || !reflect.DeepEqual(admission.Manifest, agentruntime.Manifest{}) || !observed || !remoteOnlyOperatorAdmissionEligible(state, receipt, observation) || observation.Generation != admission.ObservationGeneration || observation.LastCycleID != admission.ObservationCycleID || observation.Fact.BodyDigest != admission.ObservationBodyDigest
+			} else if !invalid {
+				invalid = !exists || record.Generation != admission.AttemptGeneration || !reflect.DeepEqual(record.Manifest, admission.Manifest)
+				if !invalid && (receipt.Request.Action == "recover" || receipt.Request.Action == "dismiss") {
+					observation, observed := state.Observations[issueKey]
+					invalid = !observed || receipt.Request.Action == "recover" && !observation.Present || observation.ObservationEpoch > state.Epoch || observation.Generation != admission.ObservationGeneration || observation.LastCycleID != admission.ObservationCycleID || observation.Fact.BodyDigest != admission.ObservationBodyDigest
+				} else if !invalid {
+					invalid = admission.ObservationGeneration != 0 || admission.ObservationCycleID != 0 || admission.ObservationBodyDigest != ""
+				}
+			}
+			if invalid {
+				return errors.Join(errors.New("runtime owner operator admission is invalid"), errStaleStateResult)
+			}
+			reservedAttempts[attemptKey] = receipt
 		}
 		seenReceipts[receipt.Request.RequestID] = true
 	}
@@ -3681,6 +3802,11 @@ func cloneCleanupPolicy(policy *agentruntime.EffectCleanupPolicy) *agentruntime.
 }
 
 func cloneControlReceipt(receipt controlReceipt) controlReceipt {
+	if receipt.Admission != nil {
+		admission := *receipt.Admission
+		admission.Manifest = cloneManifest(admission.Manifest)
+		receipt.Admission = &admission
+	}
 	if receipt.Result != nil {
 		result := *receipt.Result
 		result.Data = slices.Clone(result.Data)

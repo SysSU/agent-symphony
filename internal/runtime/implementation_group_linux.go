@@ -27,60 +27,78 @@ func implementationGroupTerminated(pgid int) (bool, error) {
 		return false, err
 	}
 	deadline := time.Now().Add(implementationGroupExitWait)
+	return waitForLinuxProcessGroup(pgid, func() time.Duration { return time.Until(deadline) }, activeLinuxProcessGroupMembers, openLinuxPIDFD, waitLinuxPIDFDs)
+}
+
+func waitForLinuxProcessGroup(pgid int, remaining func() time.Duration, scan func(int) ([]int, error), open func(int) (int, error), wait func([]int, time.Duration) error) (bool, error) {
 	for {
-		pids, err := activeLinuxProcessGroupMembers(pgid)
-		if err != nil || len(pids) == 0 {
-			return len(pids) == 0, err
+		pids, err := scan(pgid)
+		if err != nil {
+			return false, err
+		}
+		if len(pids) == 0 {
+			return true, nil
+		}
+		left := remaining()
+		if left <= 0 {
+			return false, nil
 		}
 		fds := make([]int, 0, len(pids))
 		for _, pid := range pids {
-			fd, _, errno := syscall.Syscall(linuxPIDFDOpen, uintptr(pid), 0, 0)
-			if errno == 0 {
-				fds = append(fds, int(fd))
-			} else if errno != syscall.ESRCH {
+			fd, err := open(pid)
+			if err == nil {
+				fds = append(fds, fd)
+			} else if !errors.Is(err, syscall.ESRCH) {
 				for _, open := range fds {
 					_ = syscall.Close(open)
 				}
-				return false, errno
+				return false, err
 			}
 		}
 		if len(fds) == 0 {
 			continue
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			for _, fd := range fds {
-				_ = syscall.Close(fd)
-			}
-			return false, nil
-		}
-		var ready syscall.FdSet
-		maxFD := 0
-		for _, fd := range fds {
-			if fd >= len(ready.Bits)*64 {
-				for _, open := range fds {
-					_ = syscall.Close(open)
-				}
-				return false, errors.New("implementation pidfd exceeds select capacity")
-			}
-			ready.Bits[fd/64] |= 1 << uint(fd%64)
-			if fd > maxFD {
-				maxFD = fd
-			}
-		}
-		timeout := syscall.NsecToTimeval(remaining.Nanoseconds())
-		_, selectErr := syscall.Select(maxFD+1, &ready, nil, nil, &timeout)
+		err = wait(fds, left)
 		for _, fd := range fds {
 			_ = syscall.Close(fd)
 		}
-		if selectErr != nil && selectErr != syscall.EINTR {
-			return false, selectErr
+		if err != nil && !errors.Is(err, syscall.EINTR) {
+			return false, err
 		}
 	}
 }
 
+func openLinuxPIDFD(pid int) (int, error) {
+	fd, _, errno := syscall.Syscall(linuxPIDFDOpen, uintptr(pid), 0, 0)
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(fd), nil
+}
+
+func waitLinuxPIDFDs(fds []int, remaining time.Duration) error {
+	var ready syscall.FdSet
+	maxFD := 0
+	for _, fd := range fds {
+		if fd >= len(ready.Bits)*64 {
+			return errors.New("implementation pidfd exceeds select capacity")
+		}
+		ready.Bits[fd/64] |= 1 << uint(fd%64)
+		if fd > maxFD {
+			maxFD = fd
+		}
+	}
+	timeout := syscall.NsecToTimeval(remaining.Nanoseconds())
+	_, err := syscall.Select(maxFD+1, &ready, nil, nil, &timeout)
+	return err
+}
+
 func activeLinuxProcessGroupMembers(pgid int) ([]int, error) {
-	entries, err := os.ReadDir("/proc")
+	return activeLinuxProcessGroupMembersAt("/proc", pgid)
+}
+
+func activeLinuxProcessGroupMembersAt(root string, pgid int) ([]int, error) {
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +108,7 @@ func activeLinuxProcessGroupMembers(pgid int) ([]int, error) {
 		if err != nil || pid < 2 {
 			continue
 		}
-		body, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		body, err := os.ReadFile(filepath.Join(root, entry.Name(), "stat"))
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}

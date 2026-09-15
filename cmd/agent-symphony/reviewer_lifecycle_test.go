@@ -866,6 +866,44 @@ func TestReviewerPolicyVersionUpgradeQuarantinesPriorAttestation(t *testing.T) {
 	}
 }
 
+func TestReviewerPolicyUpgradeReadsAndStartsWithNeverRanProof(t *testing.T) {
+	root := resolvedTempDir(t)
+	state := newRuntimeOwnerState("o/r")
+	state.Epoch, state.Revision = 1, 1
+	state.ReviewerPolicyTracked = true
+	state.ReviewerPolicyVersion = reviewerConfinementVersion + 1
+	proof := reviewerProcessProof{
+		Repository: "o/r", Issue: 902, Attempt: 1, Mode: agentruntime.ReviewModePlan,
+		Target: "o/r#902 plan sha256:" + strings.Repeat("a", 64), RunID: strings.Repeat("b", 64), EffectID: strings.Repeat("c", 32),
+		IssueGeneration: 1, AttemptGeneration: 1, DeadProved: true, NeverRan: true, ConfinementVersion: reviewerConfinementVersion + 1,
+	}
+	state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] = 1
+	state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] = 1
+	state.ReviewerProofs[reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target)] = proof
+	body, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, runtimeOwnerStateFile), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(root, state.Repository)
+	if err != nil {
+		t.Fatalf("read upgraded ledger: %v", err)
+	}
+	loadedProof := loaded.ReviewerProofs[reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target)]
+	if loaded.ReviewerPolicyVersion != reviewerConfinementVersion || loadedProof.ConfinementVersion != 0 || !loadedProof.NeverRan || !loadedProof.DeadProved {
+		t.Fatalf("never-ran proof was not normalized safely: version=%d proof=%#v", loaded.ReviewerPolicyVersion, loadedProof)
+	}
+	owner, err := startTestStateOwner(t, root, loaded, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatalf("start owner with upgraded ledger: %v", err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLegacyCompletedCleanupWithoutReviewerIdentityQuarantinesOnlyItsIssue(t *testing.T) {
 	for _, action := range []string{"dismissed", "archived", "abandoned", "removed"} {
 		t.Run(action, func(t *testing.T) {
