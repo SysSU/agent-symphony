@@ -2968,13 +2968,18 @@ func TestCancelPreservesExactReviewerStopBindingAcrossRestart(t *testing.T) {
 	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||\n"}}
 	restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: restarted.stateRoot, Runner: &barrierEffectRunner{}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
 	restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
-	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, reviewer: boundary, active: map[string]bool{}, released: map[string]chan struct{}{}}
-	if err := restartService.resumeReceipt(t.Context(), cancelRequest.RequestID); err != nil {
-		t.Fatalf("restart could not resume Cancel after reviewer stop: %v", err)
+	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: service.collector, reviewer: boundary, active: map[string]bool{}, released: map[string]chan struct{}{}}
+	if result := restartService.performSynchronously(t.Context(), cancelRequest); !result.OK || result.Status != http.StatusAccepted {
+		t.Fatalf("restart did not expose physical-pending Cancel: %#v", result)
 	}
 	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
 	if err != nil || len(boundary.killed) != 0 {
-		t.Fatalf("restart failed to prove already-stopped reviewer before continuing Cancel: session=%s killed=%v err=%v", session, boundary.killed, err)
+		t.Fatalf("restart touched an absent reviewer session: session=%s killed=%v err=%v", session, boundary.killed, err)
+	}
+	current := mustOwnerSnapshot(t, restarted).State
+	currentReceipt, ok := operatorReceiptByID(current, cancelRequest.RequestID)
+	if !ok || currentReceipt.State != "pending" || current.Effects[stop.ID].ReviewerStopped || current.Attempts[key].StopEffectID != stop.ID {
+		t.Fatalf("restart lost physical-pending Cancel lease: receipt=%#v effect=%#v attempt=%#v", currentReceipt, current.Effects[stop.ID], current.Attempts[key])
 	}
 }
 

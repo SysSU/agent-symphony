@@ -1483,7 +1483,7 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 			return reviewerStopObservation{}, fmt.Errorf("reviewer group death is unproved after session loss: %w", proofErr)
 		}
 		s.cancelPlanWatcher(reviewerID)
-		return reviewerStopObservation{GroupPID: groupPID}, nil
+		return reviewerStopObservation{GroupPID: groupPID}, agentruntime.ErrRuntimeResourcesRemain
 	}
 	pane, err := parseReviewerPaneIdentity(status.Output)
 	if err != nil {
@@ -1561,7 +1561,7 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 		return reviewerStopObservation{}, fmt.Errorf("reviewer process group remains live or unknown: %w", proofErr)
 	}
 	s.cancelPlanWatcher(reviewerID)
-	return reviewerStopObservation{GroupPID: groupPID}, nil
+	return reviewerStopObservation{GroupPID: groupPID}, agentruntime.ErrRuntimeResourcesRemain
 }
 
 func (s *operatorMutationService) stopBoundReviewer(ctx context.Context, request agentruntime.EffectRequest, reviewerID string) error {

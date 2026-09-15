@@ -537,7 +537,7 @@ func TestHostAllowsOnlyExactReviewerGuardedKill(t *testing.T) {
 	}
 }
 
-func TestReviewerMissingSessionWithLiveTmuxServerNeedsGroupDeath(t *testing.T) {
+func TestReviewerMissingSessionWithLiveTmuxServerCannotCertifyGroupDeath(t *testing.T) {
 	boundary, run := reviewerGuardTmux(t)
 	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 300, 1)
 	if err != nil {
@@ -558,8 +558,8 @@ func TestReviewerMissingSessionWithLiveTmuxServerNeedsGroupDeath(t *testing.T) {
 	if _, err := service.stopReviewerSessionAt(t.Context(), session, strings.Repeat("a", 32), "", syscall.Getpgrp(), false, false, "", "", 1, 1); err == nil {
 		t.Fatal("live or ambiguous group was certified from missing tmux session")
 	}
-	if observed, err := service.stopReviewerSessionAt(t.Context(), session, strings.Repeat("a", 32), "", 99999999, false, false, "", "", 1, 1); err != nil || observed.GroupPID != 99999999 {
-		t.Fatalf("dead owner-bound group did not converge after session loss: observation=%#v err=%v", observed, err)
+	if observed, err := service.stopReviewerSessionAt(t.Context(), session, strings.Repeat("a", 32), "", 99999999, false, false, "", "", 1, 1); !errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) || observed.GroupPID != 99999999 {
+		t.Fatalf("dead owner-bound group was treated as whole-descendant proof: observation=%#v err=%v", observed, err)
 	}
 	root := t.TempDir()
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 300, Number: 1, BaseSHA: strings.Repeat("a", 40)}
@@ -575,12 +575,12 @@ func TestReviewerMissingSessionWithLiveTmuxServerNeedsGroupDeath(t *testing.T) {
 		}
 	}
 	proof := reviewerProcessProof{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: target, Mode: agentruntime.ReviewModePlan, EffectID: strings.Repeat("a", 32), IssueGeneration: 1, AttemptGeneration: 1, GroupPID: 99999999, DeadProved: true}
-	if err := cleanupCertifiedReviewResources(t.Context(), boundary, nil, attempt, attempt.BaseSHA, target, snapshot, session, root, proof); err != nil {
-		t.Fatalf("certified cleanup did not converge with absent session and live server: %v", err)
+	if err := cleanupCertifiedReviewResources(t.Context(), boundary, nil, attempt, attempt.BaseSHA, target, snapshot, session, root, proof); err == nil {
+		t.Fatal("group-only death certificate authorized physical cleanup")
 	}
 	for _, path := range []string{snapshot, resultRoot} {
-		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("certified cleanup retained %s: %v", path, err)
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("refused cleanup did not retain %s: %v", path, err)
 		}
 	}
 }
