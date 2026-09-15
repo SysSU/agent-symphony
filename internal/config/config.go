@@ -137,6 +137,14 @@ func WorkerSandboxArgs(workspace string, command ...string) []string {
 	return append(args, command...)
 }
 
+// WorkerSandboxArgsForExecutable makes the attested Codex installation
+// readable when it lives outside the platform's minimal system roots.
+func WorkerSandboxArgsForExecutable(workspace, codexExecutable string, command ...string) []string {
+	installRoot := filepath.Dir(filepath.Dir(filepath.Clean(codexExecutable)))
+	args := []string{"sandbox", "-c", workerPermissions, "-P", workerProfileName, "-C", workspace, "--sandbox-state-readable-root", installRoot, "--"}
+	return append(args, command...)
+}
+
 type Config struct {
 	Version                       int                `json:"version"`
 	Repository                    string             `json:"repository"`

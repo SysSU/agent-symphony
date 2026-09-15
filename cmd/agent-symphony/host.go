@@ -236,7 +236,7 @@ func verifyRootlessCodex(ctx context.Context, root, codexHome, codexExecutable s
 		return codexConfinementProof{}, err
 	}
 	proof := filepath.Join(workspace, "proof")
-	args := config.WorkerSandboxArgs(workspace, probe, "sandbox-probe", proof, canaryPath, stateCanary, authCanary, tcpListener.Addr().String(), unixPath, sharedTempPath)
+	args := config.WorkerSandboxArgsForExecutable(workspace, codexExecutable, probe, "sandbox-probe", proof, canaryPath, stateCanary, authCanary, tcpListener.Addr().String(), unixPath, sharedTempPath)
 	command := exec.CommandContext(ctx, codexExecutable, args...)
 	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(private, "tmp")}
 	if err := os.Mkdir(filepath.Join(private, "tmp"), 0o700); err != nil {
@@ -1114,7 +1114,7 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if err := config.VerifyWorkerExecutable(ctx, codexExecutable, profileDigest); err != nil {
 			return err
 		}
-		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgs(manifest.Worktree, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp}, Stdin: bytes.NewReader(request.Command.Input)})
+		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgsForExecutable(manifest.Worktree, codexExecutable, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp}, Stdin: bytes.NewReader(request.Command.Input)})
 	case "validate-cleanup", "cleanup":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot clean implementation attempts")
