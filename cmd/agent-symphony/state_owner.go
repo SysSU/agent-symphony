@@ -1480,6 +1480,9 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 		previousWorkerSequence := record.Manifest.WorkerStatusSeq
 		record.Manifest = manifest
 		if command.Action == agentruntime.EffectStop {
+			// The stop generation invalidates the launch-bound worker authority.
+			record.Manifest.WorkerGeneration = 0
+			record.Manifest.WorkerProfileDigest = ""
 			if record.StopEffectID != "" && record.StopEffectID != effect.ID {
 				return errStateConflict
 			}
@@ -2419,6 +2422,18 @@ func readRuntimeOwnerState(stateRoot, repository string) (runtimeOwnerState, err
 	if decoder.Decode(&state) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return runtimeOwnerState{}, errors.New("runtime owner ledger is invalid")
 	}
+	if state.ControlGenerations == nil {
+		state.ControlGenerations = map[string]uint64{}
+	}
+	if state.ControlRepairs == nil {
+		state.ControlRepairs = map[string]controlSnapshotRepair{}
+	}
+	for key, tombstone := range state.Tombstones {
+		if tombstone.ExternalOutcomes == nil {
+			tombstone.ExternalOutcomes = map[string]invalidatedExternalOutcome{}
+			state.Tombstones[key] = tombstone
+		}
+	}
 	migrateLegacyMachineStatuses(&state)
 	if err := validateRuntimeOwnerState(state, runtimeOwnerAttemptRoot(stateRoot), stateRoot, true); err != nil || state.Repository != repository {
 		if err == nil {
@@ -2795,7 +2810,10 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			return err
 		}
 		if record.Manifest.WorkerProfileDigest != "" && record.Manifest.WorkerGeneration != record.Generation {
-			return errors.New("runtime owner worker confinement generation is invalid")
+			stop, stopping := state.Effects[record.StopEffectID]
+			if !stopping || record.Manifest.WorkerGeneration == ^uint64(0) || record.Manifest.WorkerGeneration+1 != record.Generation || stop.Action != string(agentruntime.EffectStop) || stop.State != "pending" || stop.Repository != record.Manifest.Repository || stop.Issue != record.Manifest.Issue || stop.Attempt != record.Manifest.Attempt || stop.AttemptGeneration != record.Generation {
+				return errors.New("runtime owner worker confinement generation is invalid")
+			}
 		}
 		if record.WorkerSeal != nil && !validWorkerSealSelection(stateRoot, record.Manifest, record.Generation, *record.WorkerSeal) {
 			return errors.New("runtime owner worker seal selection is invalid")

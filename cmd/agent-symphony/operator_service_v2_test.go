@@ -428,11 +428,14 @@ func TestLocalTombstoneReplayIgnoresLaterMissingObservation(t *testing.T) {
 				t.Fatalf("restart replay=%#v", restartedReplay)
 			}
 			durable, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
-			wantTombstone := before.Tombstones[key]
-			if len(wantTombstone.ExternalOutcomes) == 0 {
-				wantTombstone.ExternalOutcomes = nil
+			beforeTombstone, durableTombstone := before.Tombstones[key], durable.Tombstones[key]
+			if len(beforeTombstone.ExternalOutcomes) == 0 {
+				beforeTombstone.ExternalOutcomes = nil
 			}
-			if err != nil || !reflect.DeepEqual(durable.Tombstones[key], wantTombstone) || !reflect.DeepEqual(durable.Effects, before.Effects) || !reflect.DeepEqual(durable.MachineStatuses, before.MachineStatuses) {
+			if len(durableTombstone.ExternalOutcomes) == 0 {
+				durableTombstone.ExternalOutcomes = nil
+			}
+			if err != nil || !reflect.DeepEqual(durableTombstone, beforeTombstone) || !reflect.DeepEqual(durable.Effects, before.Effects) || !reflect.DeepEqual(durable.MachineStatuses, before.MachineStatuses) {
 				t.Fatalf("restart changed durable invalidation: err=%v state=%#v", err, durable)
 			}
 		})

@@ -1114,7 +1114,7 @@ func operatorResultForReceipt(snapshot stateOwnerSnapshot, receipt controlReceip
 
 func operatorResultForError(request controlRequest, err error) controlResult {
 	status := http.StatusInternalServerError
-	message := "operator mutation failed"
+	message := "operator mutation failed: " + internalgithub.Redact(err.Error())
 	if errors.Is(err, errStateConflict) {
 		status, message = http.StatusConflict, internalgithub.Redact(err.Error())
 	} else if errors.Is(err, errStaleStateResult) {
