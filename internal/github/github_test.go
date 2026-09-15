@@ -703,6 +703,27 @@ func TestAgentEnvironmentCarriesIsolatedCodexHomeButNotCoordinatorHome(t *testin
 	}
 }
 
+func TestWorkerEnvironmentExcludesGitHubAndHostCredentials(t *testing.T) {
+	env, err := WorkerEnvironmentWith([]string{
+		"PATH=/bin", "CODEX_HOME=/worker/codex", "GITHUB_TOKEN=github-canary", "GH_TOKEN=gh-canary",
+		"GH_REPO=o/r", "SSH_AUTH_SOCK=/tmp/agent", "OPENAI_API_KEY=model-canary",
+	}, "OPENAI_API_KEY")
+	joined := strings.Join(env, "\n")
+	if err != nil || !strings.Contains(joined, "OPENAI_API_KEY=model-canary") || !strings.Contains(joined, "CODEX_HOME=/worker/codex") {
+		t.Fatalf("worker environment=%q err=%v", joined, err)
+	}
+	for _, secret := range []string{"github-canary", "gh-canary", "GH_REPO=", "SSH_AUTH_SOCK="} {
+		if strings.Contains(joined, secret) {
+			t.Fatalf("worker environment exposed %q: %s", secret, joined)
+		}
+	}
+	for _, name := range GitHubCLIEnvironmentNames() {
+		if _, err := WorkerEnvironmentWith(nil, name); err == nil {
+			t.Fatalf("worker allowlist accepted GitHub variable %s", name)
+		}
+	}
+}
+
 func TestAgentEnvironmentRejectsConfiguredHome(t *testing.T) {
 	if _, err := AgentEnvironmentWith(nil, "HOME"); err == nil {
 		t.Fatal("configured HOME allowlist was accepted")

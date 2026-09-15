@@ -1,11 +1,12 @@
 import { expect, test } from "@playwright/test";
 import { constants } from "node:fs";
-import { open, readFile } from "node:fs/promises";
+import { open, readFile, writeFile } from "node:fs/promises";
 
 const baseURL = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_URL;
 const action = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_ACTION;
 const reviewGate = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEW_GATE;
 const reviewerPID = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEWER_PID;
+const reviewerIdentity = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEWER_IDENTITY;
 const fakeGitHubURL = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_FAKE_GITHUB_URL;
 test.skip(!baseURL || !action, "run through the compiled dashboard lifecycle harness");
 test.setTimeout(process.env.AGENT_SYMPHONY_FULL_SYSTEM_RACE === "true" ? 180_000 : 90_000);
@@ -24,6 +25,26 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
     await expect(history).toHaveAttribute("open", "");
     return history.getByRole("listitem").filter({ hasText: /Attempt 1(?!\d)/ });
   };
+  if (action === "review-plan-archive" || action === "review-plan-dismiss") {
+    let reviewer;
+    await expect.poll(async () => {
+      const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
+      reviewer = status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.sessions?.find((session) => session.role === "reviewer" && session.mode === "implementation-review");
+      return reviewer?.state;
+    }, { timeout: 20_000 }).toBe("running");
+    const gate = await open(reviewGate, constants.O_RDWR | constants.O_NONBLOCK);
+    try {
+      await gate.writeFile("release\n");
+      await expect.poll(async () => {
+        const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
+        return status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.sessions?.find((session) => session.run_id === reviewer.run_id)?.state;
+      }, { timeout: 20_000 }).toBe("clean");
+    } finally {
+      await gate.close();
+    }
+    expect(errors).toEqual([]);
+    return;
+  }
   if (action.endsWith("-overlap-verify")) {
     await expect.poll(async () => {
       const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
@@ -52,7 +73,25 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
     expect(errors).toEqual([]);
     return;
   }
-  if (action === "review-plan-archive-verify") {
+	if (action === "review-plan-dismiss-click") {
+	  await expect(card).toContainText("Attempt 1");
+	  const dismiss = card.getByRole("button", { name: "Dismiss issue #73, attempt 1; keep diagnostics" });
+	  await expect(dismiss).toBeVisible();
+	  const responsePromise = page.waitForResponse((response) => response.url().includes("/actions/dismiss?") && response.request().method() === "POST");
+	  page.once("dialog", (dialog) => dialog.accept());
+	  await dismiss.click();
+	  const response = await responsePromise;
+	  expect([200, 202], await response.text()).toContain(response.status());
+	  await expect.poll(async () => {
+		const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
+		return status.statuses?.some((entry) => entry.issue === 73 && entry.attempt === 1);
+	  }).toBe(false);
+	  await page.reload();
+	  await expect(exactAttempt).toHaveCount(0);
+	  expect(errors).toEqual([]);
+	  return;
+	}
+  if (action === "review-plan-archive-verify" || action === "review-plan-dismiss-verify") {
     await expect.poll(async () => {
       const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
       return status.statuses?.some((entry) => entry.issue === 73 && entry.attempt === 1);
@@ -68,6 +107,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
     "review-plan": card.getByRole("button", { name: "Start plan review" }),
     "review-plan-archive": card.getByRole("button", { name: "Start plan review" }),
     "review-plan-cancel": card.getByRole("button", { name: "Start plan review" }),
+    "review-plan-dismiss": card.getByRole("button", { name: "Start plan review" }),
     "archive-overlap": card.getByRole("button", { name: "Archive" }),
     "dismiss-overlap": card.getByRole("button", { name: "Dismiss issue #73, attempt 1; keep diagnostics" }),
     "abandon-overlap": card.getByRole("button", { name: "Abandon attempt" }),
@@ -125,54 +165,69 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       return reviewer?.state;
     }, { timeout: 20_000 }).toBe("running");
     expect(reviewer.name).toMatch(/^as-/);
-    const reviewerButton = card.getByRole("button", { name: "Open reviewer terminal" });
+    const reviewerButton = card.getByRole("button", { name: "Reviewer terminal unavailable; show why" });
     await expect(reviewerButton).toBeVisible();
     await reviewerButton.click();
-    const terminal = page.getByRole("dialog", { name: reviewer.name });
-    await expect(terminal).toBeVisible();
-    await expect(terminal.getByRole("status")).toHaveText("Connected");
-    await terminal.getByRole("button", { name: "Close" }).click();
-    if (action === "review-plan-cancel") {
+    await expect(page.getByRole("status").filter({ hasText: "Reviewer terminal is unavailable until session identity can be verified safely." })).toBeVisible();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    const terminal = await page.request.get(`${baseURL}/reviewer/terminal?repository=o%2Fr&issue=73&attempt=1`, { headers: { Origin: baseURL } });
+    expect(terminal.status()).toBe(409);
+    expect(await terminal.text()).toContain("session identity can be verified safely");
+	if (action === "review-plan-cancel") {
+	  await writeFile(reviewerIdentity, JSON.stringify({ name: reviewer.name, target: reviewer.target, run_id: reviewer.run_id }), { mode: 0o600 });
       await expect.poll(async () => {
         try { return Number((await readFile(reviewerPID, "utf8")).trim()) > 1; }
         catch { return false; }
       }, { timeout: 20_000 }).toBe(true);
-      const cancel = card.getByRole("button", { name: "Cancel issue #73, attempt 1; retain diagnostics" });
-      await expect(cancel).toBeVisible();
-      const cancelResponse = page.waitForResponse((result) => result.url().includes("/actions/cancel?") && result.request().method() === "POST");
+	  const destructiveAction = "cancel";
+	  const cancel = card.getByRole("button", { name: "Cancel issue #73, attempt 1; retain diagnostics" });
+	  await expect(cancel).toBeVisible();
+	  const cancelResponse = page.waitForResponse((result) => result.url().includes(`/actions/${destructiveAction}?`) && result.request().method() === "POST");
       page.once("dialog", (dialog) => dialog.accept());
       await cancel.click();
       const canceled = await cancelResponse;
       expect([200, 202], await canceled.text()).toContain(canceled.status());
       await expect(page.getByRole("status").filter({ hasText: "issue #73, attempt 1" })).toBeVisible();
-      await expect.poll(async () => {
+	  await expect.poll(async () => {
         const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
         return status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.state;
-      }, { timeout: 20_000 }).toBe("failed");
+      }, { timeout: 20_000 }).toMatch(/^(cancelled|failed)$/);
       await page.reload();
       await expect(card).toBeVisible();
-      let canceledCard = /Attempt 2(?!\d)/.test(await card.innerText()) ? await historicalAttempt() : exactAttempt;
+      let canceledHistorical = /Attempt 2(?!\d)/.test(await card.innerText());
+      let canceledCard = canceledHistorical ? await historicalAttempt() : exactAttempt;
       try {
-        await expect(canceledCard).toContainText("failed");
+        await expect(canceledCard).toContainText(/cancelled|failed/);
       } catch {
+        canceledHistorical = true;
         canceledCard = await historicalAttempt();
-        await expect(canceledCard).toContainText("failed");
+        await expect(canceledCard).toContainText(/cancelled|failed/);
       }
       const status = await page.request.get(`${baseURL}/status.json`).then((response) => response.json());
       const old = status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1);
       const next = status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
-      if (next) {
-        expect(next.session).toBeTruthy();
-        expect(next.session).not.toBe(old?.session);
+      let nextAttempt = next;
+      if (!nextAttempt && old?.retryable && !old.operator_blocked) {
+        await expect.poll(async () => {
+          const fresh = await page.request.get(`${baseURL}/status.json`).then((result) => result.json());
+          nextAttempt = fresh.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
+          if (nextAttempt) return "progressed";
+          if (!await canceledCard.getByRole("button", { name: "Recover attempt" }).isVisible()) return "pending";
+          const confirmed = await page.request.get(`${baseURL}/status.json`).then((result) => result.json());
+          nextAttempt = confirmed.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
+          return nextAttempt ? "progressed" : "recoverable";
+        }, { timeout: 20_000 }).toMatch(/^(progressed|recoverable)$/);
+      }
+      if (nextAttempt) {
+        expect(nextAttempt.session).toBeTruthy();
+        expect(nextAttempt.session).not.toBe(old?.session);
         await page.reload();
         await expect(card).toContainText(/Attempt 2(?!\d)/);
         canceledCard = await historicalAttempt();
-        await expect(canceledCard).toContainText("failed");
+        await expect(canceledCard).toContainText(/cancelled|failed/);
         await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toHaveCount(0);
-      } else if (old?.retryable && !old.operator_blocked) {
-        await expect(canceledCard.getByRole("button", { name: "Recover attempt" })).toBeVisible();
       }
-      await expect(canceledCard.getByRole("button", { name: "Open reviewer terminal" })).toHaveCount(0);
+      await expect(canceledCard.getByRole("button", { name: "Reviewer terminal unavailable; show why" })).toHaveCount(0);
       expect(errors).toEqual([]);
       return;
     }

@@ -16,11 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
-func TestOperatorDismissCommitsCompletedTombstoneReceiptWithoutCleanup(t *testing.T) {
+func TestOperatorDismissCommitsReviewerOnlyCleanupIntent(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 301, "completed", true)
 	snapshot := mustOwnerSnapshot(t, owner)
 	request := operatorRequest("dismiss-one", "dismiss", manifest, false)
@@ -31,12 +32,178 @@ func TestOperatorDismissCommitsCompletedTombstoneReceiptWithoutCleanup(t *testin
 	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
 	tombstone := committed.State.Tombstones[key]
 	receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
-	if effect != nil || !ok || receipt.State != "completed" || receipt.Phase != operatorPhaseCompleted || receipt.EffectID != "" || receipt.Result == nil || receipt.Result.OwnerRevision != committed.State.Revision {
+	if effect == nil || !ok || receipt.State != "pending" || receipt.Phase != operatorPhaseCleanupPending || receipt.EffectID != effect.ID || receipt.Result != nil {
 		t.Fatalf("effect=%#v receipt=%#v revision=%d", effect, receipt, committed.State.Revision)
 	}
-	if tombstone.Action != "dismissed" || tombstone.CleanupPhase != "completed" || tombstone.Manifest == nil || !reflect.DeepEqual(*tombstone.Manifest, manifest) || len(committed.State.Effects) != 0 {
+	if tombstone.Action != "dismissed" || tombstone.CleanupPhase != "pending" || tombstone.Manifest == nil || !reflect.DeepEqual(*tombstone.Manifest, manifest) || tombstone.EffectID != effect.ID || tombstone.CleanupPolicy == nil || tombstone.CleanupPolicy.Action != "dismiss" {
 		t.Fatalf("tombstone=%#v effects=%#v", tombstone, committed.State.Effects)
 	}
+}
+
+func TestOperatorWithoutTombstoneStillRejectsMissingObservation(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 371, "completed", false)
+	before := mustOwnerSnapshot(t, owner)
+	command := operatorCommand(before, operatorRequest("archive-stale-observation", "archive", manifest, true), manifest)
+	applyReconciliationInput(t, owner, reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: manifest.Repository}, Complete: true})
+	if _, _, err := owner.beginOperatorMutation(t.Context(), command); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("missing observation without tombstone err=%v", err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	if _, exists := state.Tombstones[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]; exists {
+		t.Fatal("stale request created tombstone")
+	}
+}
+
+func TestDismissPendingStartKeepsPhysicalCleanupPendingAcrossRestart(t *testing.T) {
+	owner, manifest := operatorOwnerWithPendingStart(t, 397, "completed", true)
+	request := operatorRequest("dismiss-start-candidate", "dismiss", manifest, false)
+	committed, effect, err := owner.beginOperatorMutation(t.Context(), operatorCommand(mustOwnerSnapshot(t, owner), request, manifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
+	if effect == nil || !ok || receipt.State != "pending" || receipt.Phase != operatorPhaseStartCleanup || receipt.EffectID != effect.ID || committed.State.Tombstones[key].InvalidatedStart == nil {
+		t.Fatalf("effect=%#v receipt=%#v tombstone=%#v", effect, receipt, committed.State.Tombstones[key])
+	}
+	if _, exists := committed.State.Attempts[key]; exists {
+		t.Fatal("dismissed attempt remained live")
+	}
+	if got := operatorResultForReceipt(committed, receipt); got.Status != http.StatusAccepted || !got.OK {
+		t.Fatalf("dismiss reported physical cleanup complete: %#v", got)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := loaded.Attempts[key]; exists || loaded.Tombstones[key].InvalidatedStart == nil {
+		t.Fatalf("restart resurrected dismissed attempt or lost candidate: %#v", loaded)
+	}
+}
+
+func TestDismissConfinedPendingStartSettlesAndRemainsRevokedAfterRestart(t *testing.T) {
+	owner, manifest := operatorOwnerWithConfinedPendingStart(t, 329, "completed", true)
+	request := operatorRequest("dismiss-confined-start", "dismiss", manifest, false)
+	committed, effect, err := owner.beginOperatorMutation(t.Context(), operatorCommand(mustOwnerSnapshot(t, owner), request, manifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
+	if effect == nil || !ok || receipt.State != "pending" || receipt.Phase != operatorPhaseCleanupPending || receipt.EffectID != effect.ID || committed.State.Tombstones[key].InvalidatedStart != nil {
+		t.Fatalf("confined dismissal did not settle: effect=%#v receipt=%#v tombstone=%#v", effect, receipt, committed.State.Tombstones[key])
+	}
+	if implementationLeaseBlocksGitHub(committed.State, reconciliationGitHubIssueUpdate, manifest.Repository, manifest.Issue) {
+		t.Fatal("revoked confined Start retained GitHub authority")
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := loaded.Attempts[key]; exists || loaded.Tombstones[key].InvalidatedStart != nil || implementationLeaseBlocksGitHub(loaded, reconciliationGitHubIssueUpdate, manifest.Repository, manifest.Issue) {
+		t.Fatalf("restart restored confined worker authority: %#v", loaded)
+	}
+}
+
+func TestAbandonAndRemovePendingStartNeverRunPhysicalCleanupWithoutProof(t *testing.T) {
+	for _, action := range []string{"abandon", "remove"} {
+		t.Run(action, func(t *testing.T) {
+			owner, manifest := operatorOwnerWithPendingStart(t, 398, "completed", true)
+			snapshot := mustOwnerSnapshot(t, owner)
+			key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+			published := ""
+			if action == "remove" {
+				published = manifest.BaseSHA
+			}
+			policy := agentruntime.EffectCleanupPolicy{Action: action, PublishedHead: published}
+			committed, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, ExpectedIssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[key], Action: operatorTombstoneAction(action), CleanupPhase: "pending", PublishedHead: published, Manifest: &manifest, CleanupPolicy: &policy, EffectAction: string(agentruntime.EffectCleanup), EffectRequestDigest: strings.Repeat("f", 64)})
+			if err != nil || effect == nil || committed.State.Tombstones[key].InvalidatedStart == nil {
+				t.Fatalf("invalidation effect=%#v err=%v tombstone=%#v", effect, err, committed.State.Tombstones[key])
+			}
+			boundary := &forbiddenReviewerBoundary{}
+			cleanup := operatorCleanupExecutor{owner: owner, reviewer: boundary, implementation: boundary, runtime: &agentruntime.Runtime{}}
+			request := agentruntime.EffectRequest{Action: agentruntime.EffectCleanup, Manifest: manifest, Identity: effectRequestIdentity(*effect), Cleanup: policy}
+			if err := cleanup.execute(t.Context(), request); !errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) || boundary.calls != 0 {
+				t.Fatalf("cleanup improperly ran: err=%v calls=%d", err, boundary.calls)
+			}
+			if complete, err := cleanup.verify(t.Context(), request); err != nil || complete {
+				t.Fatalf("cleanup improperly verified: complete=%t err=%v", complete, err)
+			}
+			if err := owner.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loaded.Tombstones[key].InvalidatedStart == nil || loaded.Tombstones[key].CleanupPhase == "completed" {
+				t.Fatalf("restart lost pending candidate cleanup: %#v", loaded.Tombstones[key])
+			}
+		})
+	}
+}
+
+func TestStopPendingStartCannotClaimCancelledWithoutCandidateProof(t *testing.T) {
+	owner, manifest := operatorOwnerWithPendingStart(t, 399, "active", false)
+	snapshot := mustOwnerSnapshot(t, owner)
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	_, stop, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: snapshot.State.AttemptGenerations[key]}, Action: agentruntime.EffectStop, Manifest: manifest, Reason: "operator cancelled attempt", RequestDigest: strings.Repeat("c", 64)})
+	if err != nil || stop == nil || stop.InvalidatedStart == nil {
+		t.Fatalf("Stop lost Start candidate: effect=%#v err=%v", stop, err)
+	}
+	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: &agentruntime.Runtime{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := coordinator.executeOperator(agentruntime.EffectRequest{Action: agentruntime.EffectStop, Manifest: manifest, Identity: effectRequestIdentity(*stop)})
+	if !errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) || result.Disposition != agentruntime.EffectResultAmbiguous {
+		t.Fatalf("Stop claimed terminal result before physical proof: result=%#v err=%v", result, err)
+	}
+	current := mustOwnerSnapshot(t, owner).State
+	if current.Effects[stop.ID].State != "pending" || current.Attempts[key].Manifest.State != manifest.State {
+		t.Fatalf("Stop claimed cancelled: effect=%#v attempt=%#v", current.Effects[stop.ID], current.Attempts[key])
+	}
+}
+
+func operatorOwnerWithPendingStart(t *testing.T, issue int, status string, closed bool) (*stateOwner, agentruntime.Manifest) {
+	t.Helper()
+	return operatorOwnerWithPendingStartProfile(t, issue, status, closed, strings.Repeat("f", 64))
+}
+
+func operatorOwnerWithPendingStartProfile(t *testing.T, issue int, status string, closed bool, activeProfile string) (*stateOwner, agentruntime.Manifest) {
+	t.Helper()
+	base, manifest := operatorTestOwner(t, issue, status, closed, true)
+	state := cloneRuntimeOwnerState(mustOwnerSnapshot(t, base).State)
+	if err := base.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	state.WorkerProfileDigest = activeProfile
+	root := base.stateRoot
+	owner, err := startTestStateOwner(t, root, state, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, productionAttemptRoot(root), next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	refreshOperatorObservation(t, owner)
+	snapshot := mustOwnerSnapshot(t, owner)
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	if _, effect, err := owner.recordEffect(t.Context(), recordEffectCommand{Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], AttemptGeneration: snapshot.State.AttemptGenerations[key]}, Action: string(agentruntime.EffectStart), Manifest: manifest}); err != nil || effect == nil {
+		t.Fatalf("begin pending Start fixture: effect=%#v err=%v", effect, err)
+	}
+	return owner, manifest
+}
+
+func operatorOwnerWithConfinedPendingStart(t *testing.T, issue int, status string, closed bool) (*stateOwner, agentruntime.Manifest) {
+	t.Helper()
+	return operatorOwnerWithPendingStartProfile(t, issue, status, closed, config.WorkerProfileDigest())
 }
 
 func TestOperatorSameSnapshotDismissAndCleanupRequestsConverge(t *testing.T) {
@@ -54,8 +221,13 @@ func TestOperatorSameSnapshotDismissAndCleanupRequestsConverge(t *testing.T) {
 			}
 		}
 		state := mustOwnerSnapshot(t, owner).State
-		if len(state.Tombstones) != 1 || len(state.Effects) != 0 || len(state.ControlReceipts) != 2 || state.AttemptGenerations[ownerAttemptKey("o/r", 302, 1)] != 2 {
+		if len(state.Tombstones) != 1 || len(state.Effects) != 1 || len(state.ControlReceipts) != 2 || state.AttemptGenerations[ownerAttemptKey("o/r", 302, 1)] != 2 {
 			t.Fatalf("state=%#v", state)
+		}
+		for _, receipt := range state.ControlReceipts {
+			if receipt.State != "pending" || receipt.Phase != operatorPhaseCleanupPending || receipt.EffectID == "" || receipt.EffectID != state.Tombstones[ownerAttemptKey("o/r", 302, 1)].EffectID {
+				t.Fatalf("concurrent Dismiss did not converge on one cleanup effect: %#v", state.ControlReceipts)
+			}
 		}
 	})
 
@@ -195,7 +367,7 @@ func TestOperatorReceiptReplaySurvivesLaterRevisionAndRestart(t *testing.T) {
 		t.Fatalf("restart replay: %v", err)
 	}
 	receipt, ok := operatorReceiptByID(replayed.State, request.RequestID)
-	if !ok || receipt.Result == nil || receipt.Result.OwnerRevision == 0 {
+	if !ok || receipt.State != "pending" || receipt.Phase != operatorPhaseCleanupPending || receipt.EffectID == "" || receipt.Result != nil {
 		t.Fatalf("receipt=%#v", receipt)
 	}
 }
@@ -203,7 +375,14 @@ func TestOperatorReceiptReplaySurvivesLaterRevisionAndRestart(t *testing.T) {
 func TestOperatorCompletedReceiptRequiresCommittedOwnerRevision(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 308, "completed", true)
 	command := operatorCommand(mustOwnerSnapshot(t, owner), operatorRequest("dismiss-revision", "dismiss", manifest, false), manifest)
-	committed, _, err := owner.beginOperatorMutation(t.Context(), command)
+	committed, effect, err := owner.beginOperatorMutation(t.Context(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effect == nil {
+		t.Fatal("Dismiss did not admit reviewer-only cleanup effect")
+	}
+	committed, err = owner.finishOperatorRuntimeEffect(t.Context(), finishOperatorRuntimeEffectCommand{Finish: finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectCleanup, Manifest: manifest}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,6 +618,148 @@ func TestOperatorBlockedRecoveryAdvancesThroughDurablePhases(t *testing.T) {
 	}
 }
 
+func TestVerifiedStopDurablyRevokesExactWorkerAuthorityForGitHubProgress(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 339, 1, "running")
+	manifest, _ = boundRuntimeEffectTestManifest(t, manifest)
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, config.WorkerProfileDigest()
+	state := runtimeEffectInitialState(manifest)
+	addOperatorObservation(&state, manifest, "active", false)
+	state.Epoch, state.Revision = 1, 1
+	persist := func(state runtimeOwnerState) error {
+		return writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), state)
+	}
+	owner, err := startTestStateOwner(t, root, state, persist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	current := mustOwnerSnapshot(t, owner)
+	_, stop, err := owner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{
+		Identity: stateResultIdentity{
+			Epoch: current.State.Epoch, SourceRevision: current.State.Revision,
+			IssueGeneration:   current.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)],
+			AttemptGeneration: current.State.AttemptGenerations[key],
+		},
+		Action: agentruntime.EffectStop, Manifest: manifest, Reason: "operator cancelled attempt", RequestDigest: strings.Repeat("c", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled := manifest
+	cancelled.State, cancelled.Diagnostic = "cancelled", stop.Reason
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*stop)), Action: agentruntime.EffectStop, Manifest: cancelled}); err != nil {
+		t.Fatal(err)
+	}
+	committed := mustOwnerSnapshot(t, owner)
+	record := committed.State.Attempts[key]
+	if !revokedWorkerCredentialCurrent(record) || record.Manifest.LaunchID != manifest.LaunchID || record.Manifest.WorkerGeneration != manifest.WorkerGeneration || implementationLeaseBlocksGitHub(committed.State, reconciliationGitHubIssueUpdate, manifest.Repository, manifest.Issue) {
+		t.Fatalf("verified Stop did not preserve and revoke the exact worker authority: %#v", record)
+	}
+
+	active := internalgithub.RecoveryAttemptFact{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, BaseSHA: manifest.BaseSHA, State: "active", Checks: []string{}}
+	issue := issueFact(manifest.Issue, "cancelled")
+	issue.Attempt, issue.CurrentAttempt, issue.Active, issue.ActiveAttempt = manifest.Attempt, manifest.Attempt, true, &active
+	plan := applyAndPlanRecover(t, owner, repositoryInput(true, issue), []internalgithub.RecoveryAttemptFact{active}, githubIssueTerminalFailure)
+	if _, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plan.Identity, Request: plan.Request}); err != nil || effect == nil {
+		t.Fatalf("terminal failure was not admitted after verified Stop: effect=%#v err=%v", effect, err)
+	}
+	if _, retained := mustOwnerSnapshot(t, owner).State.Effects[stop.ID]; retained {
+		t.Fatal("terminal admission retained the completed Stop effect instead of relying on the durable owner credential")
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(root, manifest.Repository)
+	if err != nil || !revokedWorkerCredentialCurrent(loaded.Attempts[key]) || implementationLeaseBlocksGitHub(loaded, reconciliationGitHubIssueUpdate, manifest.Repository, manifest.Issue) {
+		t.Fatalf("restart lost exact worker revocation: record=%#v err=%v", loaded.Attempts[key], err)
+	}
+	for _, action := range []string{"dismiss", "archive", "abandon", "remove"} {
+		t.Run(action, func(t *testing.T) {
+			candidate := cloneRuntimeOwnerState(committed.State)
+			destructive, err := startTestStateOwner(t, root, candidate, persist)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := mustOwnerSnapshot(t, destructive)
+			currentManifest := current.State.Attempts[key].Manifest
+			published := ""
+			if action == "remove" {
+				published = currentManifest.BaseSHA
+			}
+			policy := agentruntime.EffectCleanupPolicy{Action: action, PublishedHead: published}
+			committed, _, err := destructive.invalidateAttempt(t.Context(), invalidateAttemptCommand{
+				Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt,
+				ExpectedIssueGeneration:   current.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)],
+				ExpectedAttemptGeneration: current.State.AttemptGenerations[key], Action: operatorTombstoneAction(action), CleanupPhase: "pending",
+				PublishedHead: published, Manifest: &currentManifest, CleanupPolicy: &policy, EffectAction: string(agentruntime.EffectCleanup), EffectRequestDigest: strings.Repeat("f", 64),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tombstone := committed.State.Tombstones[key]
+			if !revokedWorkerTombstoneCredentialCurrent(tombstone) || implementationLeaseBlocksGitHub(committed.State, reconciliationGitHubIssueUpdate, manifest.Repository, manifest.Issue) {
+				t.Fatalf("%s lost exact worker revocation: %#v", action, tombstone)
+			}
+			if err := destructive.close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := readRuntimeOwnerState(root, manifest.Repository)
+			if err != nil || !revokedWorkerTombstoneCredentialCurrent(restarted.Tombstones[key]) || implementationLeaseBlocksGitHub(restarted, reconciliationGitHubIssueUpdate, manifest.Repository, manifest.Issue) {
+				t.Fatalf("%s restart lost exact worker revocation: tombstone=%#v err=%v", action, restarted.Tombstones[key], err)
+			}
+		})
+	}
+
+	legacy := runtimeEffectInitialState(cancelled)
+	legacy.AttemptGenerations[key] = 2
+	legacy.Attempts[key] = runtimeAttemptRecord{Generation: 2, Manifest: cancelled}
+	if !implementationLeaseBlocksGitHub(legacy, reconciliationGitHubIssueUpdate, manifest.Repository, manifest.Issue) {
+		t.Fatal("cancelled V2 manifest without an owner revocation credential gained GitHub authority")
+	}
+	for name, mutate := range map[string]func(*runtimeAttemptRecord){
+		"generation": func(record *runtimeAttemptRecord) { record.Generation++ },
+		"launch":     func(record *runtimeAttemptRecord) { record.Manifest.LaunchID = strings.Repeat("d", 32) },
+		"profile":    func(record *runtimeAttemptRecord) { record.Manifest.WorkerProfileDigest = strings.Repeat("e", 64) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			tampered := record
+			mutate(&tampered)
+			if revokedWorkerCredentialCurrent(tampered) {
+				t.Fatalf("tampered worker authority retained revocation: %#v", tampered)
+			}
+		})
+	}
+	t.Run("noncurrent profile cannot mint", func(t *testing.T) {
+		candidate := cloneRuntimeOwnerState(state)
+		unconfined := candidate.Attempts[key]
+		unconfined.Manifest.WorkerProfileDigest = strings.Repeat("e", 64)
+		candidate.Attempts[key] = unconfined
+		unconfinedOwner, err := startTestStateOwner(t, root, candidate, func(runtimeOwnerState) error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = unconfinedOwner.close(context.Background()) }()
+		current := mustOwnerSnapshot(t, unconfinedOwner)
+		_, stop, err := unconfinedOwner.beginRuntimeEffect(t.Context(), beginRuntimeEffectCommand{
+			Identity: stateResultIdentity{
+				Epoch: current.State.Epoch, SourceRevision: current.State.Revision,
+				IssueGeneration:   current.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)],
+				AttemptGeneration: current.State.AttemptGenerations[key],
+			},
+			Action: agentruntime.EffectStop, Manifest: unconfined.Manifest, Reason: "operator cancelled attempt", RequestDigest: strings.Repeat("d", 64),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := unconfined.Manifest
+		result.State, result.Diagnostic = "cancelled", stop.Reason
+		if _, err := unconfinedOwner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*stop)), Action: agentruntime.EffectStop, Manifest: result}); !errors.Is(err, errStateConflict) {
+			t.Fatalf("Stop minted revocation for a noncurrent worker profile: %v", err)
+		}
+	})
+}
+
 func TestOperatorCanceledBeforeSubmitDoesNotCommit(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 312, "completed", true)
 	before := mustOwnerSnapshot(t, owner)
@@ -600,7 +921,6 @@ func TestCancelBindsObservedReviewerGroupBeforeStopAndSurvivesRestart(t *testing
 	identity := ownerEffectIdentity(effectRequestIdentity(*stop))
 	proofKey := reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, review.Reviewer.Mode, review.Reviewer.Target)
 	prior := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
-	prior.ReviewerProofs[proofKey] = reviewerProcessProof{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, EffectID: strings.Repeat("f", 32), IssueGeneration: reviewer.IssueGeneration, AttemptGeneration: reviewer.AttemptGeneration, GroupPID: 7777, DeadProved: true}
 	if err := owner.close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -628,11 +948,19 @@ func TestCancelBindsObservedReviewerGroupBeforeStopAndSurvivesRestart(t *testing
 	}
 	t.Cleanup(func() { _ = restarted.close(context.Background()) })
 	if _, err := restarted.markReviewerStopped(t.Context(), markReviewerStoppedCommand{Identity: identity, Observation: reviewerStopObservation{GroupPID: 12345}}); err != nil {
+		t.Fatalf("exact confined reviewer group death did not complete after restart: %v", err)
+	}
+	current := mustOwnerSnapshot(t, restarted)
+	proof = current.State.ReviewerProofs[proofKey]
+	if !proof.DeadProved || !reviewerCleanupAuthorized(proof, activeWorkerProfileDigest(current.State)) || !current.State.Effects[stop.ID].ReviewerStopped || current.State.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].StopEffectID != stop.ID {
+		t.Fatalf("restart lost exact stopped reviewer proof: proof=%#v attempt=%#v effect=%#v", proof, current.State.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)], current.State.Effects[stop.ID])
+	}
+	projected, err := projectOwnerStatus(current, 1, time.Now())
+	if err != nil {
 		t.Fatal(err)
 	}
-	proof = mustOwnerSnapshot(t, restarted).State.ReviewerProofs[proofKey]
-	if !proof.DeadProved {
-		t.Fatalf("restart did not retain group-death certificate: %#v", proof)
+	if len(projected.Statuses) != 1 || projected.Statuses[0].CurrentPhase != "stop-pending" {
+		t.Fatalf("runtime stop was not projected after reviewer authority ended: %#v", projected.Statuses)
 	}
 }
 
@@ -733,7 +1061,8 @@ func TestAbandonCapturesPendingReviewerIdentityBeforeTombstone(t *testing.T) {
 	}
 	proofKey := reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, review.Reviewer.Mode, review.Reviewer.Target)
 	prior := cloneRuntimeOwnerState(committed.State)
-	prior.ReviewerProofs[proofKey] = reviewerProcessProof{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, EffectID: strings.Repeat("f", 32), IssueGeneration: reviewer.IssueGeneration, AttemptGeneration: reviewer.AttemptGeneration, GroupPID: 7777, DeadProved: true}
+	priorProof := reviewerProcessProof{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, RunID: digestText("different prior run"), EffectID: strings.Repeat("f", 32), IssueGeneration: reviewer.IssueGeneration, AttemptGeneration: reviewer.AttemptGeneration, GroupPID: 7777, DeadProved: true, ProfileDigest: activeWorkerProfileDigest(prior), ConfinementVersion: reviewerConfinementVersion}
+	prior.ReviewerProofs[proofKey] = priorProof
 	if err := restarted.close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -742,16 +1071,15 @@ func TestAbandonCapturesPendingReviewerIdentityBeforeTombstone(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = bindingOwner.close(context.Background()) })
-	bound, err := bindingOwner.bindReviewerStopping(t.Context(), bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*cleanup)), GroupPID: 12345})
-	if err != nil {
-		t.Fatalf("Abandon cleanup could not replace prior certified proof: %v", err)
+	if _, err := bindingOwner.bindReviewerStopping(t.Context(), bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*cleanup)), GroupPID: 12345}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("Abandon cleanup replaced a different never-reused reviewer proof: %v", err)
 	}
-	if proof := bound.State.ReviewerProofs[proofKey]; proof.EffectID != reviewer.ID || proof.GroupPID != 12345 || proof.DeadProved {
-		t.Fatalf("Abandon cleanup kept stale proof after new live bind: %#v", proof)
+	if proof := mustOwnerSnapshot(t, bindingOwner).State.ReviewerProofs[proofKey]; !reflect.DeepEqual(proof, priorProof) {
+		t.Fatalf("rejected Abandon binding changed the prior proof: %#v", proof)
 	}
 }
 
-func TestBindReviewerStoppingReplacesOnlyPriorDeadSameTargetProof(t *testing.T) {
+func TestBindReviewerStoppingRequiresPriorRunProofToBeForgotten(t *testing.T) {
 	review := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
 	const oldID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const newID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -759,14 +1087,16 @@ func TestBindReviewerStoppingReplacesOnlyPriorDeadSameTargetProof(t *testing.T) 
 	for _, action := range []string{string(agentruntime.EffectStop), string(agentruntime.EffectCleanup), string(reconciliationReviewer), "implementation run-observe"} {
 		t.Run(action, func(t *testing.T) {
 			review := review
+			review.Reviewer.RunID = digestText("new run " + action)
 			if action == "implementation run-observe" {
 				review.Reviewer.Mode = agentruntime.ReviewModeImplementation
 			}
 			state := newRuntimeOwnerState(review.Repository)
 			key := reviewerProofKey(review.Repository, review.Issue, review.Attempt, review.Reviewer.Mode, review.Reviewer.Target)
-			old := reviewerProcessProof{Repository: review.Repository, Issue: review.Issue, Attempt: review.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, EffectID: oldID, IssueGeneration: 1, AttemptGeneration: 1, GroupPID: 11111, DeadProved: true}
+			state.WorkerProfileDigest = digestText("active profile")
+			old := reviewerProcessProof{Repository: review.Repository, Issue: review.Issue, Attempt: review.Attempt, Mode: review.Reviewer.Mode, Target: review.Reviewer.Target, RunID: digestText("old run " + action), EffectID: oldID, IssueGeneration: 1, AttemptGeneration: 1, GroupPID: 11111, DeadProved: true, ProfileDigest: state.WorkerProfileDigest}
 			state.ReviewerProofs[key] = old
-			effect := runtimeEffectIntent{ID: stopID, Action: action, Repository: review.Repository, Issue: review.Issue, Attempt: review.Attempt, IssueGeneration: 2, AttemptGeneration: 2, IntentEpoch: 1, IntentRevision: 3, State: "pending", RequestDigest: strings.Repeat("d", 64), ReviewerGateProtocol: true, ReviewerSessionRequested: true}
+			effect := runtimeEffectIntent{ID: stopID, Action: action, Repository: review.Repository, Issue: review.Issue, Attempt: review.Attempt, IssueGeneration: 2, AttemptGeneration: 2, IntentEpoch: 1, IntentRevision: 3, State: "pending", RequestDigest: strings.Repeat("d", 64), ReviewerGateProtocol: true, ReviewerSessionRequested: true, ReviewerProfileDigest: state.WorkerProfileDigest}
 			if action == string(reconciliationReviewer) || action == "implementation run-observe" {
 				effect.Action = string(reconciliationReviewer)
 				effect.ID = newID
@@ -777,22 +1107,29 @@ func TestBindReviewerStoppingReplacesOnlyPriorDeadSameTargetProof(t *testing.T) 
 				effect.SupersededReviewerSessionRequested = true
 				effect.SupersededReviewerMode = review.Reviewer.Mode
 				effect.SupersededReviewerTarget = review.Reviewer.Target
+				effect.SupersededReviewerRunID = review.Reviewer.RunID
+				effect.SupersededReviewerProfileDigest = state.WorkerProfileDigest
 				effect.SupersededReviewerIssueGeneration = 2
 				effect.SupersededReviewerAttemptGeneration = 2
 			}
 			state.Effects[effect.ID] = effect
 			command := bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), GroupPID: 22222}
-			if err := applyBindReviewerStopping(&state, command); err != nil {
-				t.Fatalf("prior dead same-target review blocked new reviewer binding: %v", err)
-			}
-			proof := state.ReviewerProofs[key]
-			if proof.EffectID != newID || proof.GroupPID != 22222 || proof.IssueGeneration != 2 || proof.AttemptGeneration != 2 || proof.DeadProved {
-				t.Fatalf("new live reviewer proof was not bound exactly: %#v", proof)
-			}
-			old.DeadProved = false
-			state.ReviewerProofs[key] = old
 			if err := applyBindReviewerStopping(&state, command); !errors.Is(err, errStateConflict) {
-				t.Fatalf("live prior reviewer proof was overwritten: %v", err)
+				t.Fatalf("different prior run proof was replaced: %v", err)
+			}
+			if !reflect.DeepEqual(state.ReviewerProofs[key], old) {
+				t.Fatalf("rejected binding changed the prior run proof: %#v", state.ReviewerProofs[key])
+			}
+			delete(state.ReviewerProofs, key) // Physical cleanup plus owner forget occurs before a new run can bind.
+			if err := applyBindReviewerStopping(&state, command); err != nil {
+				t.Fatalf("new reviewer could not bind after prior proof was forgotten: %v", err)
+			}
+			bound := state.ReviewerProofs[key]
+			if bound.RunID != review.Reviewer.RunID || bound.GroupPID != 22222 || bound.DeadProved {
+				t.Fatalf("new live reviewer proof was not bound exactly: %#v", bound)
+			}
+			if err := applyBindReviewerStopping(&state, command); err != nil || !reflect.DeepEqual(state.ReviewerProofs[key], bound) {
+				t.Fatalf("exact reviewer binding replay changed state: proof=%#v err=%v", state.ReviewerProofs[key], err)
 			}
 		})
 	}
@@ -843,7 +1180,7 @@ func completedLegacyReceipt(id, repository string) controlReceipt {
 	return controlReceipt{Request: request, State: "completed", Result: successfulOperatorResult(request, 0)}
 }
 
-func operatorTestOwner(t *testing.T, issue int, status string, closed bool) (*stateOwner, agentruntime.Manifest) {
+func operatorTestOwner(t *testing.T, issue int, status string, closed bool, bound ...bool) (*stateOwner, agentruntime.Manifest) {
 	t.Helper()
 	root := resolvedTempDir(t)
 	manifestState := "running"
@@ -851,6 +1188,9 @@ func operatorTestOwner(t *testing.T, issue int, status string, closed bool) (*st
 		manifestState = "completed"
 	}
 	manifest := ownerTestManifest(t, root, issue, 1, manifestState)
+	if len(bound) != 0 && bound[0] {
+		manifest, _ = boundRuntimeEffectTestManifest(t, manifest)
+	}
 	state := runtimeEffectInitialState(manifest)
 	addOperatorObservation(&state, manifest, status, closed)
 	state.Epoch, state.Revision = 1, 1
@@ -903,13 +1243,16 @@ func operatorRequest(id, action string, manifest agentruntime.Manifest, confirm 
 
 func operatorCommand(snapshot stateOwnerSnapshot, request controlRequest, manifest agentruntime.Manifest) beginOperatorMutationCommand {
 	observation := snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
-	command := beginOperatorMutationCommand{Request: request, Manifest: manifest, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, ObservationBodyDigest: observation.Fact.BodyDigest, IssueClosed: request.Action == "dismiss", CleanupValid: slices.Contains([]string{"archive", "abandon", "remove"}, request.Action), Identity: stateResultIdentity{
+	command := beginOperatorMutationCommand{Request: request, Manifest: manifest, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, ObservationBodyDigest: observation.Fact.BodyDigest, IssueClosed: request.Action == "dismiss", CleanupValid: slices.Contains([]string{"dismiss", "archive", "abandon", "remove"}, request.Action), Identity: stateResultIdentity{
 		Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision,
 		IssueGeneration:   snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)],
 		AttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)],
 	}}
 	if command.CleanupValid {
 		command.CleanupPolicy.Action = request.Action
+		if request.Action == "dismiss" {
+			command.CleanupDigest = strings.Repeat("d", 64)
+		}
 	}
 	return command
 }

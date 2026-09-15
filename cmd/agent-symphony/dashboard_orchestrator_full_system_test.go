@@ -37,11 +37,22 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := os.MkdirTemp("/tmp", "agent-symphony-orchestrator-e2e-")
+	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = stopFullSystemProcesses(root); _ = os.RemoveAll(root) })
+	root, err := os.MkdirTemp(home, ".agent-symphony-orchestrator-e2e-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := stopFullSystemProcesses(root); err != nil {
+			t.Errorf("stop orchestrator full-system processes: %v", err)
+		}
+		if err := removeFullSystemFixtureRoot(root); err != nil {
+			t.Errorf("remove orchestrator full-system root: %v", err)
+		}
+	})
 	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
 		t.Fatal(err)
@@ -204,10 +215,10 @@ func TestDashboardOrchestratorFullSystemE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(binDir, "agent-symphony")
-	build := []string{"build", "-o", binary, "."}
+	build := []string{"build", "-tags", "agent_symphony_test", "-o", binary, "."}
 	raceMode := os.Getenv("AGENT_SYMPHONY_FULL_SYSTEM_RACE") == "1"
 	if raceMode {
-		build = []string{"build", "-race", "-o", binary, "."}
+		build = []string{"build", "-race", "-tags", "agent_symphony_test", "-o", binary, "."}
 	}
 	runExternal(t, source, "go", build...)
 	writeExecutable(t, filepath.Join(binDir, "gh"), `#!/bin/sh
@@ -260,8 +271,22 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 		_ = os.Remove(releaseAudit)
 		_ = os.Remove(failAudit)
 	})
-	writeExecutable(t, filepath.Join(binDir, "codex"), strings.NewReplacer("@EVENTS@", fixtureEvents, "@HOLD@", holdAudit, "@RELEASE@", releaseAudit, "@FAIL@", failAudit).Replace(`#!/bin/sh
-if [ "$1" = audit ]; then
+	codexPath := filepath.Join(binDir, "codex")
+	buildNativeCodexFixture(t, codexPath, strings.NewReplacer("@EVENTS@", fixtureEvents, "@HOLD@", holdAudit, "@RELEASE@", releaseAudit, "@FAIL@", failAudit).Replace(`#!/bin/sh
+if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
+if [ "$1" = sandbox ]; then
+  while [ "$1" != -- ]; do shift; done
+  shift
+  if [ "$2" = sandbox-probe ]; then printf '%s\n' '{"confined":true,"shared_temp_read":true,"shared_temp_write":true}' > "$3"; exit 0; fi
+  exec "$@"
+fi
+audit_result=
+want_result=0
+for arg in "$@"; do
+  if [ "$want_result" -eq 1 ]; then audit_result=$arg; want_result=0; continue; fi
+  if [ "$arg" = --output-last-message ]; then want_result=1; fi
+done
+if [ -n "$audit_result" ]; then
   audit_context=$(cat)
   case "$audit_context" in
     *'"issue":191,"attempt":9'*) printf 'audit:191:9\n' >> "@EVENTS@" ;;
@@ -276,7 +301,7 @@ if [ "$1" = audit ]; then
     printf 'fixture audit failed\n' >&2
     exit 17
   fi
-  printf 'fixture audit complete\n'
+  printf 'fixture audit complete\n' > "$audit_result"
   exit 0
 fi
 printf 'orchestrator-ready\n'
@@ -285,8 +310,12 @@ case "$2" in *conversation-before-clear*) printf 'start:stale-conversation\n' >>
 while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 'received:%s\n' "$line" >> "@EVENTS@"; done
 `))
 	cfg := config.Default("o/r")
-	cfg.Commands.Orchestrator = []string{"codex", "orchestrate"}
-	cfg.Commands.OrchestratorAudit = []string{"codex", "audit"}
+	cfg.Commands.Implementation[0], cfg.Commands.Reviewer[0] = codexPath, codexPath
+	cfg.Commands.Orchestrator = []string{codexPath, "orchestrate"}
+	cfg.Commands.OrchestratorAudit[0] = codexPath
+	if _, err := config.PinWorkerExecutable(t.Context(), stateRoot, &cfg.Commands); err != nil {
+		t.Fatal(err)
+	}
 	cfg.ReconciliationIntervalSeconds = 60
 	configPath := filepath.Join(repository, config.DefaultPath)
 	if err := config.Write(configPath, cfg); err != nil {

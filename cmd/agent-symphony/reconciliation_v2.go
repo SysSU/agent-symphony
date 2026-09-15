@@ -56,32 +56,37 @@ type reconciliationAttemptFact struct {
 }
 
 type reconciliationIssueFact struct {
-	Repository            string                      `json:"repository"`
-	Title                 string                      `json:"title,omitempty"`
-	BodyDigest            string                      `json:"body_digest"`
-	BaseSHA               string                      `json:"base_sha,omitempty"`
-	BaseBranch            string                      `json:"base_branch,omitempty"`
-	Issue                 int                         `json:"issue"`
-	Attempt               int                         `json:"attempt,omitempty"`
-	CurrentAttempt        int                         `json:"current_attempt,omitempty"`
-	Priority              int                         `json:"priority,omitempty"`
-	CreatedAtUnixNano     int64                       `json:"created_at_unix_nano,omitempty"`
-	Dependencies          []int                       `json:"dependencies"`
-	SatisfiedDependencies []int                       `json:"satisfied_dependencies"`
-	Paths                 []string                    `json:"paths"`
-	Blockers              []string                    `json:"blockers"`
-	Eligible              bool                        `json:"eligible,omitempty"`
-	Active                bool                        `json:"active,omitempty"`
-	Completed             bool                        `json:"completed,omitempty"`
-	Retry                 bool                        `json:"retry,omitempty"`
-	Cancelled             bool                        `json:"cancelled,omitempty"`
-	Closed                bool                        `json:"closed,omitempty"`
-	DispatchAuthorized    bool                        `json:"dispatch_authorized,omitempty"`
-	RecoveryAuthorized    bool                        `json:"recovery_authorized,omitempty"`
-	RecoveryAttempt       int                         `json:"recovery_attempt,omitempty"`
-	NeedsAttention        bool                        `json:"needs_attention,omitempty"`
-	ActiveAttempt         *reconciliationAttemptFact  `json:"active_attempt,omitempty"`
-	TerminalAttempts      []reconciliationAttemptFact `json:"terminal_attempts"`
+	Repository                  string                      `json:"repository"`
+	Title                       string                      `json:"title,omitempty"`
+	BodyDigest                  string                      `json:"body_digest"`
+	BaseSHA                     string                      `json:"base_sha,omitempty"`
+	BaseBranch                  string                      `json:"base_branch,omitempty"`
+	Issue                       int                         `json:"issue"`
+	Attempt                     int                         `json:"attempt,omitempty"`
+	CurrentAttempt              int                         `json:"current_attempt,omitempty"`
+	Priority                    int                         `json:"priority,omitempty"`
+	CreatedAtUnixNano           int64                       `json:"created_at_unix_nano,omitempty"`
+	Dependencies                []int                       `json:"dependencies"`
+	SatisfiedDependencies       []int                       `json:"satisfied_dependencies"`
+	Paths                       []string                    `json:"paths"`
+	Blockers                    []string                    `json:"blockers"`
+	Eligible                    bool                        `json:"eligible,omitempty"`
+	Active                      bool                        `json:"active,omitempty"`
+	Completed                   bool                        `json:"completed,omitempty"`
+	Retry                       bool                        `json:"retry,omitempty"`
+	Cancelled                   bool                        `json:"cancelled,omitempty"`
+	Closed                      bool                        `json:"closed,omitempty"`
+	DispatchAuthorized          bool                        `json:"dispatch_authorized,omitempty"`
+	RecoveryAuthorized          bool                        `json:"recovery_authorized,omitempty"`
+	RecoveryAttempt             int                         `json:"recovery_attempt,omitempty"`
+	NeedsAttention              bool                        `json:"needs_attention,omitempty"`
+	MachineStatusProtocol       int                         `json:"machine_status_protocol,omitempty"`
+	MachineStatusAttempt        int                         `json:"machine_status_attempt,omitempty"`
+	MachineStatusSequence       uint64                      `json:"machine_status_sequence,omitempty"`
+	MachineStatusNeedsAttention bool                        `json:"machine_status_needs_attention,omitempty"`
+	MachineStatusReason         string                      `json:"machine_status_reason,omitempty"`
+	ActiveAttempt               *reconciliationAttemptFact  `json:"active_attempt,omitempty"`
+	TerminalAttempts            []reconciliationAttemptFact `json:"terminal_attempts"`
 }
 
 type reconciliationAttemptObservation struct {
@@ -164,7 +169,10 @@ type reconciliationTriggerRunner struct {
 	beforeRun func()
 }
 
-type applyReconciliationCommand struct{ Collection reconciliationCollection }
+type applyReconciliationCommand struct {
+	Collection        reconciliationCollection
+	OperatorRequestID string
+}
 
 func (r reconciliationRunner) run(ctx context.Context) (stateOwnerSnapshot, error) {
 	if r.owner == nil || r.collect == nil {
@@ -342,7 +350,17 @@ func (r *reconciliationTriggerRunner) loop() {
 }
 
 func (o *stateOwner) applyReconciliation(ctx context.Context, collection reconciliationCollection) (stateOwnerSnapshot, error) {
+	snapshot, _, err := o.applyReconciliationWithDisposition(ctx, collection)
+	return snapshot, err
+}
+
+func (o *stateOwner) applyReconciliationWithDisposition(ctx context.Context, collection reconciliationCollection) (stateOwnerSnapshot, bool, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerApplyReconciliation, reconcile: applyReconciliationCommand{Collection: cloneReconciliationCollection(collection)}})
+	return result.snapshot, result.reconciliationStale, err
+}
+
+func (o *stateOwner) refreshOperatorAdmission(ctx context.Context, requestID string, collection reconciliationCollection) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerApplyReconciliation, reconcile: applyReconciliationCommand{Collection: cloneReconciliationCollection(collection), OperatorRequestID: requestID}})
 	return result.snapshot, err
 }
 
@@ -369,18 +387,42 @@ func collectionFromSnapshot(snapshot stateOwnerSnapshot, input reconciliationInp
 		if _, exists := groups[key]; exists {
 			return reconciliationCollection{}, errStateConflict
 		}
-		groups[key] = &reconciliationIssueGroup{Fact: fact}
+		if fact.ActiveAttempt != nil {
+			attemptKey := ownerAttemptKey(fact.ActiveAttempt.Repository, fact.ActiveAttempt.Issue, fact.ActiveAttempt.Attempt)
+			if _, tombstoned := snapshot.State.Tombstones[attemptKey]; tombstoned {
+				fact.ActiveAttempt = nil
+			}
+		}
+		fact.TerminalAttempts = slices.DeleteFunc(fact.TerminalAttempts, func(attempt reconciliationAttemptFact) bool {
+			_, tombstoned := snapshot.State.Tombstones[ownerAttemptKey(attempt.Repository, attempt.Issue, attempt.Attempt)]
+			return tombstoned
+		})
+		group := &reconciliationIssueGroup{Fact: fact}
+		if fact.ActiveAttempt != nil {
+			group.Attempts = append(group.Attempts, *fact.ActiveAttempt)
+		}
+		for _, attempt := range fact.TerminalAttempts {
+			if err := appendReconciliationAttempt(group, attempt); err != nil {
+				return reconciliationCollection{}, err
+			}
+		}
+		groups[key] = group
 	}
 	for _, raw := range input.Attempts {
 		fact, err := reduceAttemptFact(snapshot.State.Repository, raw)
 		if err != nil {
 			return reconciliationCollection{}, err
 		}
+		if _, tombstoned := snapshot.State.Tombstones[ownerAttemptKey(fact.Repository, fact.Issue, fact.Attempt)]; tombstoned {
+			continue
+		}
 		group := groups[ownerIssueKey(fact.Repository, fact.Issue)]
 		if group == nil {
 			continue
 		}
-		group.Attempts = append(group.Attempts, fact)
+		if err := appendReconciliationAttempt(group, fact); err != nil {
+			return reconciliationCollection{}, err
+		}
 	}
 	for _, proposal := range input.IssueUpdates {
 		group := groups[ownerIssueKey(proposal.Repository, proposal.Issue)]
@@ -398,6 +440,19 @@ func collectionFromSnapshot(snapshot stateOwnerSnapshot, input reconciliationInp
 		return reconciliationCollection{}, err
 	}
 	return cloneReconciliationCollection(collection), nil
+}
+
+func appendReconciliationAttempt(group *reconciliationIssueGroup, fact reconciliationAttemptFact) error {
+	if index := slices.IndexFunc(group.Attempts, func(current reconciliationAttemptFact) bool {
+		return current.Repository == fact.Repository && current.Issue == fact.Issue && current.Attempt == fact.Attempt
+	}); index >= 0 {
+		if !reflect.DeepEqual(group.Attempts[index], fact) {
+			return errStateConflict
+		}
+		return nil
+	}
+	group.Attempts = append(group.Attempts, fact)
+	return nil
 }
 
 func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCommand, appliedCycles map[string]appliedReconciliationCycle) error {
@@ -508,7 +563,7 @@ func applyReconciliation(state *runtimeOwnerState, command applyReconciliationCo
 			}
 		}
 		next := reconciliationObservation{Generation: generation, OwnerGeneration: state.IssueGenerations[key], ObservationEpoch: identity.Epoch, LastCycleID: identity.CycleID, InputDigest: digest, Attempts: map[string]reconciliationAttemptObservation{}}
-		if exists && previous.ObservationEpoch == identity.Epoch && reconciliationObservationContentEqual(previous, next) {
+		if exists && previous.ObservationEpoch == identity.Epoch && reconciliationObservationContentEqual(previous, next) && !hasObservationSensitiveAdmission(*state, key) {
 			continue
 		}
 		state.Observations[key] = next
@@ -680,7 +735,7 @@ func applyReconciliationIssue(state *runtimeOwnerState, collection reconciliatio
 		}
 	}
 	next := reconciliationObservation{Present: true, Generation: issueGeneration, OwnerGeneration: ownerIssueGeneration, ObservationEpoch: identity.Epoch, LastCycleID: identity.CycleID, InputDigest: digest, Fact: cloneReconciliationIssueFact(group.Fact), IssueUpdates: slices.Clone(group.IssueUpdates), Attempts: attempts}
-	if exists && previous.ObservationEpoch == identity.Epoch && reconciliationObservationContentEqual(previous, next) {
+	if exists && previous.ObservationEpoch == identity.Epoch && reconciliationObservationContentEqual(previous, next) && !hasObservationSensitiveAdmission(*state, key) {
 		return nil
 	}
 	state.Observations[key] = next
@@ -1020,9 +1075,13 @@ func reduceIssueFact(repository string, raw internalgithub.RecoveryIssueFact) (r
 		Dependencies: slices.Clone(raw.Dependencies), SatisfiedDependencies: slices.Clone(raw.SatisfiedDependencies), Paths: slices.Clone(raw.Paths), Blockers: slices.Clone(raw.Blockers),
 		Eligible: raw.Eligible, Active: raw.Active, Completed: raw.Completed, Retry: raw.Retry, Cancelled: raw.Cancelled, Closed: raw.Closed,
 		DispatchAuthorized: raw.DispatchAuthorized, RecoveryAuthorized: raw.RecoveryAuthorized, RecoveryAttempt: raw.RecoveryAttempt, NeedsAttention: raw.NeedsAttention,
+		MachineStatusProtocol: raw.MachineStatusProtocol, MachineStatusAttempt: raw.MachineStatusAttempt, MachineStatusSequence: raw.MachineStatusSequence, MachineStatusNeedsAttention: raw.MachineStatusNeedsAttention, MachineStatusReason: raw.MachineStatusReason,
 	}
 	if raw.CreatedAt.IsZero() {
 		fact.CreatedAtUnixNano = 0
+	}
+	if raw.MachineStatusProtocol == 0 {
+		fact.MachineStatusAttempt, fact.MachineStatusSequence, fact.MachineStatusNeedsAttention, fact.MachineStatusReason = 0, 0, false, ""
 	}
 	if raw.ActiveAttempt != nil {
 		active, err := reduceAttemptFact(repository, *raw.ActiveAttempt)
@@ -1053,7 +1112,7 @@ func reduceAttemptFact(repository string, raw internalgithub.RecoveryAttemptFact
 }
 
 func validateReconciliationIssueFact(repository string, fact reconciliationIssueFact) error {
-	if fact.Repository != repository || fact.Issue < 1 || fact.Attempt < 0 || fact.CurrentAttempt < 0 || fact.RecoveryAttempt < 0 || len(fact.Title) > maxReconciliationStringBytes || len(fact.BaseBranch) > maxReconciliationStringBytes || strings.ContainsRune(fact.Title, 0) || strings.ContainsRune(fact.BaseBranch, 0) || !validDigest(fact.BodyDigest) || !validOptionalObjectID(fact.BaseSHA) || !validIntList(fact.Dependencies) || !validIntList(fact.SatisfiedDependencies) || !validStringList(fact.Paths, maxReconciliationPathCount, maxReconciliationPathBytes) || !validStringList(fact.Blockers, maxReconciliationRelationCount, maxReconciliationStringBytes) || len(fact.TerminalAttempts) > maxReconciliationRelationCount {
+	if fact.Repository != repository || fact.Issue < 1 || fact.Attempt < 0 || fact.CurrentAttempt < 0 || fact.RecoveryAttempt < 0 || len(fact.Title) > maxReconciliationStringBytes || len(fact.BaseBranch) > maxReconciliationStringBytes || strings.ContainsRune(fact.Title, 0) || strings.ContainsRune(fact.BaseBranch, 0) || !validDigest(fact.BodyDigest) || !validOptionalObjectID(fact.BaseSHA) || !validIntList(fact.Dependencies) || !validIntList(fact.SatisfiedDependencies) || !validStringList(fact.Paths, maxReconciliationPathCount, maxReconciliationPathBytes) || !validStringList(fact.Blockers, maxReconciliationRelationCount, maxReconciliationStringBytes) || len(fact.TerminalAttempts) > maxReconciliationRelationCount || !validObservedMachineStatus(fact) {
 		return errStateConflict
 	}
 	if fact.ActiveAttempt != nil && (fact.ActiveAttempt.Issue != fact.Issue || validateReconciliationAttemptFact(repository, *fact.ActiveAttempt) != nil) {
@@ -1065,6 +1124,13 @@ func validateReconciliationIssueFact(repository string, fact reconciliationIssue
 		}
 	}
 	return nil
+}
+
+func validObservedMachineStatus(fact reconciliationIssueFact) bool {
+	if fact.MachineStatusProtocol == 0 {
+		return fact.MachineStatusAttempt == 0 && fact.MachineStatusSequence == 0 && !fact.MachineStatusNeedsAttention && fact.MachineStatusReason == ""
+	}
+	return (fact.MachineStatusProtocol == 1 || fact.MachineStatusProtocol == 2) && fact.MachineStatusAttempt > 0 && fact.MachineStatusSequence > 0 && boundedText(fact.MachineStatusReason, 1024, true)
 }
 
 func validateReconciliationAttemptFact(repository string, fact reconciliationAttemptFact) error {

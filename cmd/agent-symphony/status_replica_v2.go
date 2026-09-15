@@ -147,7 +147,7 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 			if effect.ReviewerLaunched {
 				phase = "running"
 			}
-			session := orchestrator.AttemptSession{Role: agentruntime.SessionRoleReviewer, Name: reviewer.Session, State: phase, Mode: reviewer.Mode, Target: reviewer.Target, Current: true}
+			session := orchestrator.AttemptSession{Role: agentruntime.SessionRoleReviewer, Name: reviewer.Session, State: phase, Mode: reviewer.Mode, Target: reviewer.Target, RunID: reviewer.RunID, Current: true}
 			replaced := false
 			for i := range status.Sessions {
 				status.Sessions[i].Current = false
@@ -180,6 +180,103 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 			status.Retryable = false
 			status.Action = "inspect inconsistent completed local attempt before recovery"
 		}
+		for id, effect := range snapshot.State.Effects {
+			if id == effect.ID && effect.State == "pending" && effect.Action == string(agentruntime.EffectStart) && effect.Repository == status.Repository && effect.Issue == status.Issue && effect.Attempt == status.Attempt && effect.IssueGeneration == snapshot.State.IssueGenerations[issueKey] && effect.AttemptGeneration == snapshot.State.AttemptGenerations[key] && owned && record.Generation == effect.AttemptGeneration && (effect.Diagnostic == "legacy launch identity unproved; manual migration required" || effect.Diagnostic == "pending Start launch identity or worker absence is unproved") {
+				status.Diagnostic = effect.Diagnostic
+				if effect.Diagnostic == "legacy launch identity unproved; manual migration required" {
+					status.Action = "manually migrate the legacy implementation launch identity"
+				} else {
+					status.Action = "inspect the unproved implementation launch before retry"
+				}
+				status.NeedsAttention = true
+				break
+			}
+		}
+		if attemptHasUnconfinedReviewer(snapshot.State, status.Repository, status.Issue, status.Attempt) {
+			status.NeedsAttention = true
+			status.DispatchAuthorized = false
+			status.Retryable = false
+			status.Diagnostic = "reviewer descendant absence is unproved; physical cleanup remains pending"
+			status.Action = "archive, abandon, remove, or dismiss can hide the attempt while physical cleanup remains pending"
+		}
+		if diagnostic := snapshot.State.LegacyReviewerQuarantines[issueKey]; diagnostic != "" {
+			status.NeedsAttention = true
+			status.OperatorBlocked = true
+			status.DispatchAuthorized = false
+			status.Retryable = false
+			status.CurrentPhase = "physical-unverified"
+			status.Diagnostic = diagnostic
+			status.Action = "inspect legacy reviewer descendants before reusing this issue"
+		}
+		if record.StopEffectID != "" {
+			status.State = "blocked"
+			status.CurrentPhase = "stop-pending"
+			status.NeedsAttention = true
+			status.OperatorBlocked = true
+			status.Retryable = false
+			status.DispatchAuthorized = false
+			status.Blockers = append(status.Blockers, "physical stop remains pending")
+			status.Diagnostic = "stop requested; reviewer descendant absence is unproved"
+			status.Action = "wait for verified physical cleanup before retrying or dispatching"
+		}
+	}
+	// A historical cleanup may have removed the attempt from ordinary recovery
+	// projection. Keep its unresolved physical safety lease visible anyway.
+	for _, tombstone := range snapshot.State.Tombstones {
+		// Dismiss is the explicit hide action. Its durable cleanup receipt remains
+		// queryable, but it must never resurrect the attempt as an active card.
+		if tombstone.Action == "dismissed" {
+			continue
+		}
+		diagnostic := legacyReviewerDiagnostic(snapshot.State, tombstone.Repository, tombstone.Issue, tombstone.Attempt)
+		if issueHasUnresolvedExternalEffect(snapshot.State, tombstone.Repository, tombstone.Issue) {
+			if diagnostic != "" {
+				diagnostic += "; "
+			}
+			diagnostic += "an admitted GitHub mutation has an unresolved external outcome; same-issue reuse remains quarantined"
+		}
+		if tombstone.ReviewerLeaseID != "" || attemptHasUnprovedReviewer(snapshot.State, tombstone.Repository, tombstone.Issue, tombstone.Attempt) {
+			if diagnostic == "" {
+				diagnostic = "reviewer descendant absence is unproved; physical cleanup remains pending"
+			}
+		}
+		if tombstone.InvalidatedStart != nil {
+			if diagnostic != "" {
+				diagnostic += "; "
+			}
+			diagnostic += "implementation start candidate absence is unproved; physical cleanup remains pending"
+		}
+		if tombstone.InvalidatedHandoff != nil && !tombstone.HandoffCompensated {
+			if diagnostic != "" {
+				diagnostic += "; "
+			}
+			diagnostic += "implementation handoff compensation remains pending"
+		}
+		if diagnostic == "" {
+			continue
+		}
+		found := false
+		for index := range statuses {
+			if statuses[index].Repository == tombstone.Repository && statuses[index].Issue == tombstone.Issue && statuses[index].Attempt == tombstone.Attempt {
+				statuses[index].NeedsAttention = true
+				statuses[index].OperatorBlocked = true
+				statuses[index].DispatchAuthorized = false
+				statuses[index].CurrentPhase = "physical-unverified"
+				statuses[index].Diagnostic = diagnostic
+				found = true
+			}
+		}
+		if !found {
+			statuses = append(statuses, orchestrator.RecoveryStatus{Repository: tombstone.Repository, Issue: tombstone.Issue, Attempt: tombstone.Attempt, State: "blocked", CurrentPhase: "physical-unverified", NeedsAttention: true, OperatorBlocked: true, Diagnostic: diagnostic, Action: "inspect legacy reviewer descendants before reusing this issue"})
+		}
+	}
+	for index := range statuses {
+		status := &statuses[index]
+		issueKey, attemptKey := ownerIssueKey(status.Repository, status.Issue), ownerAttemptKey(status.Repository, status.Issue, status.Attempt)
+		status.IssueGeneration = snapshot.State.IssueGenerations[issueKey]
+		status.AttemptGeneration = snapshot.State.AttemptGenerations[attemptKey]
+		status.MachineStatusSequence = snapshot.State.MachineStatuses[issueKey].Sequence
+		status.OwnerCausalityToken = ownerAttemptCausalityToken(snapshot.State, status.Repository, status.Issue, status.Attempt)
 	}
 	slices.SortFunc(statuses, func(a, b orchestrator.RecoveryStatus) int {
 		if ordered := cmp.Compare(a.Repository, b.Repository); ordered != 0 {
@@ -193,12 +290,24 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 	return dashboardStatusSnapshot{UpdatedAt: now.UTC(), OwnerEpoch: snapshot.State.Epoch, OwnerRevision: snapshot.State.Revision, Statuses: statuses, ReconciliationError: snapshot.State.CycleDiagnostic, ReconciliationErrorAt: snapshot.State.CycleDiagnosticAt}, nil
 }
 
+func legacyReviewerDiagnostic(state runtimeOwnerState, repository string, issue, attempt int) string {
+	if diagnostic := state.LegacyReviewerQuarantines[ownerIssueKey(repository, issue)]; diagnostic != "" {
+		return diagnostic
+	}
+	for _, proof := range state.ReviewerProofs {
+		if proof.Repository == repository && proof.Issue == issue && proof.Attempt == attempt && proof.LegacyUnverified {
+			return "legacy reviewer descendant absence is unverified; physical cleanup cannot be certified"
+		}
+	}
+	return ""
+}
+
 func expandIssueFact(fact reconciliationIssueFact) internalgithub.RecoveryIssueFact {
 	var createdAt time.Time
 	if fact.CreatedAtUnixNano != 0 {
 		createdAt = time.Unix(0, fact.CreatedAtUnixNano)
 	}
-	result := internalgithub.RecoveryIssueFact{Repository: fact.Repository, Title: fact.Title, BaseSHA: fact.BaseSHA, BaseBranch: fact.BaseBranch, Issue: fact.Issue, Attempt: fact.Attempt, CurrentAttempt: fact.CurrentAttempt, Priority: fact.Priority, CreatedAt: createdAt, Dependencies: slices.Clone(fact.Dependencies), SatisfiedDependencies: slices.Clone(fact.SatisfiedDependencies), Paths: slices.Clone(fact.Paths), Blockers: slices.Clone(fact.Blockers), Eligible: fact.Eligible, Active: fact.Active, Completed: fact.Completed, Retry: fact.Retry, Cancelled: fact.Cancelled, Closed: fact.Closed, DispatchAuthorized: fact.DispatchAuthorized, RecoveryAuthorized: fact.RecoveryAuthorized, RecoveryAttempt: fact.RecoveryAttempt, NeedsAttention: fact.NeedsAttention}
+	result := internalgithub.RecoveryIssueFact{Repository: fact.Repository, Title: fact.Title, BaseSHA: fact.BaseSHA, BaseBranch: fact.BaseBranch, Issue: fact.Issue, Attempt: fact.Attempt, CurrentAttempt: fact.CurrentAttempt, Priority: fact.Priority, CreatedAt: createdAt, Dependencies: slices.Clone(fact.Dependencies), SatisfiedDependencies: slices.Clone(fact.SatisfiedDependencies), Paths: slices.Clone(fact.Paths), Blockers: slices.Clone(fact.Blockers), Eligible: fact.Eligible, Active: fact.Active, Completed: fact.Completed, Retry: fact.Retry, Cancelled: fact.Cancelled, Closed: fact.Closed, DispatchAuthorized: fact.DispatchAuthorized, RecoveryAuthorized: fact.RecoveryAuthorized, RecoveryAttempt: fact.RecoveryAttempt, NeedsAttention: fact.NeedsAttention, MachineStatusProtocol: fact.MachineStatusProtocol, MachineStatusAttempt: fact.MachineStatusAttempt, MachineStatusSequence: fact.MachineStatusSequence, MachineStatusNeedsAttention: fact.MachineStatusNeedsAttention, MachineStatusReason: fact.MachineStatusReason}
 	if fact.ActiveAttempt != nil {
 		active := expandAttemptFact(*fact.ActiveAttempt)
 		result.ActiveAttempt = &active

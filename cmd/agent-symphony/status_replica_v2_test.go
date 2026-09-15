@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,6 +74,12 @@ func TestOwnerStatusProjectionMatchesRecoveryProjection(t *testing.T) {
 			_, facts := recoveryAttemptFacts(input.Attempts, input.Issues)
 			committedLiveness := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
 			want, _ := projectRecoveryStatuses(context.Background(), facts, input.Issues, []agentruntime.Manifest{manifest}, 1, committedLiveness)
+			for index := range got.Statuses {
+				if !validDigest(got.Statuses[index].OwnerCausalityToken) {
+					t.Fatalf("owner projection lacks causality: %#v", got.Statuses[index])
+				}
+				got.Statuses[index].IssueGeneration, got.Statuses[index].AttemptGeneration, got.Statuses[index].MachineStatusSequence, got.Statuses[index].OwnerCausalityToken = 0, 0, 0, ""
+			}
 			if !reflect.DeepEqual(got.Statuses, want) {
 				t.Fatalf("owner projection=%#v\nv1 projection=%#v", got.Statuses, want)
 			}
@@ -116,7 +123,8 @@ func TestOwnerStatusProjectionMasksTombstonedAttempts(t *testing.T) {
 	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
 	masked, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: request.Repository, Issue: request.Issue, Attempt: request.GitHubIssueUpdate.AttributionAttempt, ExpectedIssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.GitHubIssueUpdate.AttributionAttempt)], Action: "dismissed", CleanupPhase: "completed"})
 	if err != nil {
-		t.Fatal(err)
+		current := mustOwnerSnapshot(t, owner)
+		t.Fatalf("invalidate tombstoned projection fixture: %v attempts=%#v effects=%#v proofs=%#v", err, current.State.Attempts, current.State.Effects, current.State.ReviewerProofs)
 	}
 	status, err := projectOwnerStatus(masked, 1, time.Unix(20, 0))
 	if err != nil {
@@ -126,6 +134,25 @@ func TestOwnerStatusProjectionMasksTombstonedAttempts(t *testing.T) {
 		if projected.Issue == request.Issue && projected.Attempt == request.GitHubIssueUpdate.AttributionAttempt && projected.PR != 0 {
 			t.Fatalf("tombstoned remote attempt was projected: %#v", projected)
 		}
+	}
+}
+
+func TestOwnerStatusProjectionQuarantinesUnresolvedGitHubMutation(t *testing.T) {
+	state := newRuntimeOwnerState("o/r")
+	state.Epoch, state.Revision = 1, 1
+	issueKey, attemptKey := ownerIssueKey("o/r", 330), ownerAttemptKey("o/r", 330, 1)
+	state.IssueGenerations[issueKey], state.AttemptGenerations[attemptKey] = 2, 2
+	state.Tombstones[attemptKey] = runtimeTombstone{Repository: "o/r", Issue: 330, Attempt: 1, Action: "dismissed", CleanupPhase: "completed", InvalidatedGeneration: 1, Generation: 2, Revision: 1}
+	request := reconciliationEffectRequest{Action: reconciliationGitHubPublish, Repository: "o/r", Issue: 330, Attempt: 1, GitHubPublish: &githubPublishEffectRequest{}}
+	state.Effects["ambiguous"] = runtimeEffectIntent{Repository: "o/r", Issue: 330, Attempt: 1, State: "invalidated", Dispatched: true, Reconciliation: &request}
+
+	projected, err := projectOwnerStatus(stateOwnerSnapshot{State: state}, 1, time.Unix(2, 0))
+	if err != nil || len(projected.Statuses) != 1 {
+		t.Fatalf("quarantine projection=%#v err=%v", projected.Statuses, err)
+	}
+	status := projected.Statuses[0]
+	if status.Issue != 330 || status.Attempt != 1 || !status.NeedsAttention || !status.OperatorBlocked || status.CurrentPhase != "physical-unverified" || !strings.Contains(status.Diagnostic, "unresolved external outcome") {
+		t.Fatalf("unresolved GitHub mutation was not visibly quarantined: %#v", status)
 	}
 }
 

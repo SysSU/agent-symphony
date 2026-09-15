@@ -12,13 +12,363 @@ import (
 	"time"
 )
 
+type cancelAfterNewSessionRunner struct {
+	*fakeRunner
+	cancel context.CancelFunc
+}
+
+type replaceBeforeStartBufferRunner struct {
+	*fakeRunner
+	session string
+	foreign *fakeSession
+	swapped bool
+}
+
+func (runner *replaceBeforeStartBufferRunner) Run(ctx context.Context, command Command) (Result, error) {
+	if len(command.Args) > 5 && command.Args[0] == "if-shell" && strings.Contains(command.Args[5], "load-buffer") {
+		runner.fakeRunner.sessions[runner.session] = runner.foreign
+		runner.swapped = true
+		return Result{Output: ImplementationGuardMismatch}, nil
+	}
+	return runner.fakeRunner.Run(ctx, command)
+}
+
+func (runner cancelAfterNewSessionRunner) Run(ctx context.Context, command Command) (Result, error) {
+	result, err := runner.fakeRunner.Run(ctx, command)
+	if err == nil && slices.Contains(command.Args, "new-session") {
+		runner.cancel()
+	}
+	return result, err
+}
+
+func TestHandoffEffectReauthorizesExactParkedCandidateOnReplay(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(fake.sessions, manifest.Session)
+	candidate := manifest
+	candidate.LaunchToken = strings.Repeat("c", 32)
+	candidate.LaunchID = strings.Repeat("d", 32)
+	command := BoundPaneExitStatusCommand(r.Helper, r.tmux(), candidate, []string{"/bin/sh"})
+	if err := r.startSession(t.Context(), candidate, nil, candidate.LaunchID, command); err != nil {
+		t.Fatal(err)
+	}
+	request := EffectRequest{Manifest: manifest, Attempt: attempt, Eligible: true, CandidateLaunchToken: candidate.LaunchToken, Identity: EffectIdentity{EffectID: candidate.LaunchID}}
+	if !slices.Contains(fake.sessions[manifest.Session].agent, "implementation-gate") {
+		t.Fatal("fixture did not park the handoff candidate")
+	}
+	if _, err := r.handoffEffect(t.Context(), request, func(context.Context, EffectRequest) error {
+		return errors.New("stale owner generation")
+	}); err == nil {
+		t.Fatal("stale owner intent released the candidate")
+	}
+	if !slices.Contains(fake.sessions[manifest.Session].agent, "implementation-gate") {
+		t.Fatal("authorization failure released the parked candidate")
+	}
+	resumed, err := r.handoffEffect(t.Context(), request, func(context.Context, EffectRequest) error { return nil })
+	if err != nil || resumed.LaunchID != candidate.LaunchID || resumed.LaunchToken != candidate.LaunchToken || resumed.State != "running" {
+		t.Fatalf("handoff replay result=%#v err=%v", resumed, err)
+	}
+	if slices.Contains(fake.sessions[manifest.Session].agent, "implementation-gate") {
+		t.Fatal("authorized replay did not release the exact candidate")
+	}
+}
+
+func TestPendingStartReplaysOnlyExactParkedPane(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "a")
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "b")
+	candidate := start.Manifest
+	candidate.LaunchID = start.Identity.EffectID
+	if err := r.startSession(t.Context(), candidate, nil, candidate.LaunchID, []string{"/bin/sh"}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(fake.sessions[manifest.Session].agent, "implementation-gate") {
+		t.Fatal("fixture did not park the Start pane")
+	}
+	if verification, err := executor.VerifyPending(t.Context(), start); err != nil || verification.Disposition != EffectRetry {
+		t.Fatalf("exact parked Start was not replayable: %#v, %v", verification, err)
+	}
+	before := len(fake.seen)
+	result, err := executor.Execute(t.Context(), start)
+	if err != nil || result.Disposition != EffectResultReady || result.Manifest.State != "running" {
+		t.Fatalf("parked Start replay result=%#v err=%v", result, err)
+	}
+	for _, command := range fake.seen[before:] {
+		if slices.Contains(command.Args, "new-session") {
+			t.Fatalf("parked Start replay created a second pane: %#v", command)
+		}
+	}
+	if slices.Contains(fake.sessions[manifest.Session].agent, "implementation-gate") {
+		t.Fatal("owner-authorized Start did not release the exact parked pane")
+	}
+}
+
+func TestStartLoadsContextOnlyThroughBoundEffectBuffer(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "6")
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "7")
+	result, err := executor.Execute(t.Context(), start)
+	if err != nil || result.Manifest.State != "running" {
+		t.Fatalf("bound Start result=%#v err=%v", result, err)
+	}
+	if fake.buffers["as-start-"+start.Identity.EffectID] != attempt.Context || fake.buffers[manifest.Session] != "" {
+		t.Fatalf("Start context used a shared buffer: %#v", fake.buffers)
+	}
+	guardedLoad := false
+	for index, command := range fake.seen {
+		if len(command.Args) == 0 || command.Args[0] != "load-buffer" {
+			continue
+		}
+		if index == 0 || len(fake.seen[index-1].Args) == 0 || fake.seen[index-1].Args[0] != "if-shell" {
+			t.Fatalf("Start context loaded without a pane guard: %#v", command)
+		}
+		guardedLoad = true
+	}
+	if !guardedLoad {
+		t.Fatal("Start did not load its context")
+	}
+}
+
+func TestStartDoesNotLoadContextAfterPaneReplacement(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "8")
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := &fakeSession{paneID: "%9", worktree: manifest.Worktree}
+	runner := &replaceBeforeStartBufferRunner{fakeRunner: fake, session: manifest.Session, foreign: foreign}
+	r.Runner = runner
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "a")
+	result, err := executor.Execute(t.Context(), start)
+	if !runner.swapped || err == nil || result.Disposition != EffectResultAmbiguous {
+		t.Fatalf("replacement was not rejected before context load: swapped=%t result=%#v err=%v", runner.swapped, result, err)
+	}
+	if fake.sessions[manifest.Session] != foreign || len(fake.buffers) != 0 {
+		t.Fatalf("replacement received context or was mutated: session=%#v buffers=%#v", fake.sessions[manifest.Session], fake.buffers)
+	}
+}
+
+func TestPendingStartDoesNotDuplicateRenamedLivePane(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "c")
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "d")
+	candidate := start.Manifest
+	candidate.LaunchID = start.Identity.EffectID
+	if err := r.startSession(t.Context(), candidate, nil, candidate.LaunchID, []string{"/bin/sh"}); err != nil {
+		t.Fatal(err)
+	}
+	bound := fake.sessions[manifest.Session]
+	delete(fake.sessions, manifest.Session)
+	fake.sessions["renamed-live-pane"] = bound // The original pane survives; only its session name changes.
+	if verification, err := executor.VerifyPending(t.Context(), start); err != nil || verification.Disposition != EffectRotate {
+		t.Errorf("renamed live pane incorrectly authorized same-candidate retry: %#v, %v", verification, err)
+	}
+	before := len(fake.seen)
+	_, _ = executor.Execute(t.Context(), start)
+	for _, command := range fake.seen[before:] {
+		if slices.Contains(command.Args, "new-session") {
+			t.Fatalf("Start created a second pane while its original bound pane lives: %#v", command)
+		}
+	}
+	if fake.sessions["renamed-live-pane"] != bound {
+		t.Fatal("recovery changed the original live pane")
+	}
+}
+
+func TestPendingStartBeforeSessionCreationStaysUnproved(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: manifest, Eligible: true}, "9")
+	verification, err := executor.VerifyPending(t.Context(), start)
+	if err != nil || verification.Disposition != EffectRotate {
+		t.Fatalf("pre-session Start did not require owner candidate rotation: %#v, %v", verification, err)
+	}
+	if len(fake.sessions) != 0 {
+		t.Fatalf("verification created a session: %#v", fake.sessions)
+	}
+}
+
+func TestPendingStartDoesNotAdoptUnboundSameNamePane(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: manifest, Eligible: true}, "e")
+	foreign := &fakeSession{paneID: "%8", worktree: manifest.Worktree}
+	fake.sessions[manifest.Session] = foreign // Crash before the immutable binding was fsynced, or a replacement pane.
+	if verification, err := executor.VerifyPending(t.Context(), start); err != nil || verification.Disposition != EffectPending {
+		t.Fatalf("unbound same-name pane was not quarantined: %#v, %v", verification, err)
+	}
+	before := len(fake.seen)
+	if _, err := executor.Execute(t.Context(), start); err == nil {
+		t.Fatal("unbound same-name pane was adopted as an owner-bound Start")
+	}
+	for _, command := range fake.seen[before:] {
+		if slices.Contains(command.Args, "new-session") || slices.Contains(command.Args, "kill-pane") {
+			t.Fatalf("recovery mutated an unbound pane: %#v", command)
+		}
+	}
+	if fake.sessions[manifest.Session] != foreign {
+		t.Fatal("recovery replaced the unbound pane")
+	}
+}
+
+func TestCanceledStartAfterNewSessionDoesNotReleaseWorker(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	fake.sessions["keeper"] = &fakeSession{paneID: "%999"} // Keep the original server available for exact pane-absence proof.
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "f")
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	r.Runner = cancelAfterNewSessionRunner{fakeRunner: fake, cancel: cancel}
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "1")
+	result, err := executor.Execute(ctx, start)
+	if !errors.Is(err, context.Canceled) || result.Disposition != EffectResultAmbiguous || result.Manifest.State != "preparing" {
+		t.Fatalf("canceled Start result=%#v err=%v", result, err)
+	}
+	if fake.sessions[manifest.Session] == nil || !slices.Contains(fake.sessions[manifest.Session].agent, "implementation-gate") {
+		t.Fatal("canceled Start did not preserve its parked candidate for owner recovery")
+	}
+	for _, command := range fake.seen {
+		if slices.Contains(command.Args, "wait-for") && slices.Contains(command.Args, "-U") {
+			t.Fatalf("canceled Start released its worker: %#v", command)
+		}
+	}
+}
+
+func TestEffectPrepareRejectsMissingBoundWorkerHelperBeforeExternalWork(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	r.Helper = ""
+	attempt.Context = "" // No prompt path may fall back to an unbound raw worker.
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(8, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	request := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "e")
+	if _, err := executor.Execute(t.Context(), request); err == nil || !strings.Contains(err.Error(), "helper") {
+		t.Fatalf("unbound worker helper was accepted: %v", err)
+	}
+	if len(fake.seen) != 0 {
+		t.Fatalf("missing helper was rejected after external work: %#v", fake.seen)
+	}
+	if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing helper created worktree: %v", err)
+	}
+}
+
+func TestEffectExecutorHandoffRecreatesMissingSessionWithBoundHelper(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Root, err = filepath.EvalSymlinks(r.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(fake.sessions, manifest.Session)
+	fake.sessions["keeper"] = &fakeSession{paneID: "%999"}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	request := effectTestRequest(t, executor, EffectRequest{Action: EffectHandoff, Attempt: attempt, Manifest: manifest, Eligible: true, CandidateLaunchToken: strings.Repeat("c", 32)}, "d")
+	result, err := executor.Execute(t.Context(), request)
+	if err != nil || result.Disposition != EffectResultReady || result.Manifest.State != "running" || result.Manifest.LaunchID != request.Identity.EffectID || result.Manifest.LaunchToken != request.CandidateLaunchToken {
+		t.Fatalf("bound handoff launch=%#v err=%v", result, err)
+	}
+	if binding, err := ReadImplementationBinding(result.Manifest); err != nil || binding.Role != "interactive" || binding.Token != request.CandidateLaunchToken {
+		t.Fatalf("bound handoff helper identity=%#v err=%v", binding, err)
+	}
+}
+
+func TestPersistedEmptyHelperHandoffDoesNotChangeDigestOrLaunchRawWorker(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Root, err = filepath.EvalSymlinks(r.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(fake.sessions, manifest.Session)
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	request := effectTestRequest(t, executor, EffectRequest{Action: EffectHandoff, Attempt: attempt, Manifest: manifest, Eligible: true, CandidateLaunchToken: strings.Repeat("c", 32)}, "d")
+	request.Runtime.Helper = "" // Persisted by the predecessor binary.
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verification, err := executor.VerifyPending(t.Context(), request); err != nil || verification.Disposition != EffectRetry {
+		t.Fatalf("legacy handoff digest changed on recovery: %#v, %v", verification, err)
+	}
+	before := len(fake.seen)
+	if _, err := executor.Execute(t.Context(), request); err == nil || !strings.Contains(err.Error(), "helper") {
+		t.Fatalf("legacy handoff recreated unbound worker: %v", err)
+	}
+	for _, command := range fake.seen[before:] {
+		if slices.Contains(command.Args, "new-session") {
+			t.Fatalf("legacy handoff launched a raw worker: %#v", command)
+		}
+	}
+}
+
 func TestEffectExecutorMonitorNoopAndTerminalResult(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(1, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := EffectExecutor{Runtime: r}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
 	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "a")
 	prepared, err := executor.Execute(t.Context(), prepare)
 	if err != nil {
@@ -30,6 +380,9 @@ func TestEffectExecutorMonitorNoopAndTerminalResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest = started.Manifest
+	if binding, err := ReadImplementationBinding(manifest); err != nil || binding.Role != "capture" {
+		t.Fatalf("successful launch lacks capture role: %#v, %v", binding, err)
+	}
 	request := effectTestRequest(t, executor, EffectRequest{Action: EffectMonitor, Attempt: attempt, Manifest: manifest, Eligible: true}, "c")
 	live, err := executor.Execute(t.Context(), request)
 	if err != nil || live.Disposition != EffectResultReady || !reflect.DeepEqual(live.Manifest, manifest) {
@@ -49,7 +402,7 @@ func TestEffectExecutorPrepareAndStartNeverWritesManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := EffectExecutor{Runtime: r}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
 	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "a")
 	prepared, err := executor.Execute(t.Context(), prepare)
 	if err != nil || prepared.Manifest.State != "preparing" {
@@ -101,7 +454,7 @@ func TestReclaimOrphanEffectMarkersRetainsPendingAndFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := EffectExecutor{Runtime: r}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
 	request := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "c")
 	result, err := executor.Execute(t.Context(), request)
 	if err != nil || result.Disposition != EffectResultReady {
@@ -190,7 +543,7 @@ func TestEffectVerificationRejectsChangedRuntimeAndAllowedEnvironment(t *testing
 		if err != nil {
 			t.Fatal(err)
 		}
-		executor := EffectExecutor{Runtime: r}
+		executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
 		request := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "1")
 		r.Source = filepath.Join(t.TempDir(), "changed-source")
 		if _, err := executor.VerifyPending(t.Context(), request); err == nil || !strings.Contains(err.Error(), "digest") {
@@ -206,7 +559,7 @@ func TestEffectVerificationRejectsChangedRuntimeAndAllowedEnvironment(t *testing
 			t.Fatal(err)
 		}
 		manifest.State = "running"
-		executor := EffectExecutor{Runtime: r}
+		executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
 		request := effectTestRequest(t, executor, EffectRequest{Action: EffectMonitor, Attempt: attempt, Manifest: manifest, Eligible: true}, "2")
 		t.Setenv("TEST_EFFECT_ALLOWED", "second")
 		if _, err := executor.VerifyPending(t.Context(), request); err == nil || !strings.Contains(err.Error(), "digest") {
@@ -215,27 +568,57 @@ func TestEffectVerificationRejectsChangedRuntimeAndAllowedEnvironment(t *testing
 	})
 }
 
-func TestEffectExecutorPersistsDefinitiveStartFailure(t *testing.T) {
+func TestEffectExecutorRetainsAmbiguousStartUntilExactGateProof(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
+	// Keep the original fake tmux server observable after the attempt pane is
+	// killed, so cleanup has exact same-server absence proof.
+	fake.sessions["keeper"] = &fakeSession{paneID: "%999"}
 	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(7, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := EffectExecutor{Runtime: r}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
 	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "3")
 	prepared, err := executor.Execute(t.Context(), prepare)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fake.fail = "respawn-pane"
+	fake.fail = "wait-for"
 	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "4")
-	failed, err := executor.Execute(t.Context(), start)
-	if err == nil || failed.Disposition != EffectResultReady || failed.Manifest.State != "failed" || failed.Manifest.Diagnostic == "" {
-		t.Fatalf("failed=%#v err=%v", failed, err)
+	partial, err := executor.Execute(t.Context(), start)
+	if err == nil || partial.Disposition != EffectResultAmbiguous || partial.Manifest.State != "preparing" {
+		t.Fatalf("partial=%#v err=%v", partial, err)
 	}
 	verification, verifyErr := executor.VerifyPending(t.Context(), start)
-	if verifyErr != nil || verification.Disposition != EffectVerified || verification.Result == nil || verification.Result.Manifest.State != "failed" {
+	if verifyErr != nil || verification.Disposition != EffectRetry || verification.Result != nil {
 		t.Fatalf("verification=%#v err=%v", verification, verifyErr)
+	}
+}
+
+func TestInteractiveStartReusesSafeReservedResultAfterCandidateRotation(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	attempt.Interactive = true
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(7, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "3")
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultPath := ResultPath(prepared.Manifest.Worktree)
+	if err := os.Mkdir(PrivatePath(prepared.Manifest.Worktree), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(resultPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "4")
+	started, err := executor.Execute(t.Context(), start)
+	if err != nil || started.Manifest.State != "running" {
+		t.Fatalf("rotated Start rejected safe reserved result: result=%#v err=%v", started, err)
 	}
 }
 
@@ -247,7 +630,7 @@ func TestEffectExecuteUsesBoundRuntimeSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := EffectExecutor{Runtime: r}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
 	request := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "5")
 	r.Source = filepath.Join(t.TempDir(), "changed-source")
 	t.Setenv("TEST_EFFECT_BOUND", "second")
@@ -266,7 +649,7 @@ func TestEffectResultMarkerIsBoundedValidatedAndImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := EffectExecutor{Runtime: r}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
 	request := effectTestRequest(t, executor, EffectRequest{Action: EffectReview, Attempt: attempt, Manifest: manifest, Eligible: true, Review: ReviewTransition{State: "clean"}}, "f")
 	result, err := executor.Execute(t.Context(), request)
 	if err != nil {
@@ -303,7 +686,7 @@ func TestEffectVerificationRejectsChangedInputAndDoesNotInferFromLiveness(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := EffectExecutor{Runtime: r}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
 	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: manifest, Eligible: true}, "c")
 	fake.sessions[manifest.Session] = &fakeSession{}
 	verification, err := executor.VerifyPending(t.Context(), start)
@@ -312,6 +695,7 @@ func TestEffectVerificationRejectsChangedInputAndDoesNotInferFromLiveness(t *tes
 	}
 	handoff := start
 	handoff.Action, handoff.Manifest.State = EffectHandoff, "running"
+	handoff.CandidateLaunchToken = strings.Repeat("e", 32)
 	handoff = effectTestRequest(t, executor, handoff, "7")
 	if verification, err := executor.VerifyPending(t.Context(), handoff); err != nil || verification.Disposition != EffectPending || verification.Result != nil {
 		t.Fatalf("live handoff session was treated as completion: %#v err=%v", verification, err)
@@ -336,18 +720,53 @@ func TestEffectVerificationRejectsChangedInputAndDoesNotInferFromLiveness(t *tes
 	}
 }
 
-func TestEffectVerificationReconstructsStopFromDurableReason(t *testing.T) {
+func TestEffectVerificationDoesNotReconstructLegacyStopFromMissingName(t *testing.T) {
 	r, _, attempt, _ := testRuntime(t)
 	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(3, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	manifest.State = "running"
-	executor := EffectExecutor{Runtime: r}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
 	request := effectTestRequest(t, executor, EffectRequest{Action: EffectStop, Attempt: attempt, Manifest: manifest, Reason: "issue closed"}, "e")
 	verification, err := executor.VerifyPending(t.Context(), request)
-	if err != nil || verification.Disposition != EffectVerified || verification.Result == nil || verification.Result.Manifest.State != "cancelled" || verification.Result.Manifest.Diagnostic != "issue closed" {
+	if err != nil || verification.Disposition != EffectPending || verification.Result != nil {
 		t.Fatalf("verification=%#v err=%v", verification, err)
+	}
+}
+
+func TestEffectVerificationSettlesGenerationBoundConfinedStopAfterRestart(t *testing.T) {
+	r, _, attempt, _ := testRuntime(t)
+	profile := strings.Repeat("a", 64)
+	r.WorkerProfileDigest = profile
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(3, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err = BindWorkerConfinement(manifest, 7, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r}
+	request := effectTestRequest(t, executor, EffectRequest{Action: EffectStop, Attempt: attempt, Manifest: manifest, Reason: "operator cancelled"}, "f")
+	request.Identity.AttemptGeneration = 7
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := executor.VerifyPending(t.Context(), request)
+	if err != nil || verification.Disposition != EffectVerified || verification.Result == nil || verification.Result.Manifest.State != "cancelled" {
+		t.Fatalf("confined restart verification=%#v err=%v", verification, err)
+	}
+
+	wrongProfile := request
+	wrongProfile.Runtime.WorkerProfileDigest = strings.Repeat("b", 64)
+	wrongProfile.Identity.RequestDigest, err = EffectRequestDigest(wrongProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = executor.VerifyPending(t.Context(), wrongProfile); err == nil {
+		t.Fatal("mismatched profile escaped confinement validation")
 	}
 }
 
@@ -408,6 +827,9 @@ func effectTestRequest(t *testing.T, executor EffectExecutor, request EffectRequ
 		t.Fatal(err)
 	}
 	request.Identity = EffectIdentity{Repository: request.Manifest.Repository, Issue: request.Manifest.Issue, Attempt: request.Manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: strings.Repeat(id, 32)}
+	if request.Action == EffectStart {
+		request.GateNonce = request.Identity.EffectID
+	}
 	digest, err := EffectRequestDigest(request)
 	if err != nil {
 		t.Fatal(err)

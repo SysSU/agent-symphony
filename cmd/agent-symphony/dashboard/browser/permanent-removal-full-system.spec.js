@@ -89,7 +89,10 @@ test("removes a historical attempt and archives a generated attempt", async ({ p
     confirmation = dialog.message();
     await dialog.accept();
   });
+  const responsePromise = page.waitForResponse((response) => response.url().includes("/actions/remove?") && response.request().method() === "POST");
   await remove.click();
+  const response = await responsePromise;
+  expect([200, 202], await response.text()).toContain(response.status());
   await expect(page.getByRole("status").filter({ hasText: "Permanently remove accepted for issue #73, attempt 1." })).toBeVisible();
   expect(confirmation).toContain("cannot be restored");
 

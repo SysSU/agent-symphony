@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -42,6 +43,7 @@ type operatorMutationService struct {
 	watchers          map[string]context.CancelFunc
 	stopping          chan struct{}
 	stopped           bool
+	beforeAdmission   func()
 }
 
 type operatorWork struct {
@@ -116,8 +118,14 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 			return operatorErrorResult(request, http.StatusConflict, "operator request identity was already used for different input")
 		}
 		if receipt.State == "pending" {
-			if synchronous {
+			if receipt.Phase == operatorPhaseAdmissionPending && !operatorAdmissionLeader(snapshot.State, receipt) {
+				return operatorResultForReceipt(snapshot, receipt)
+			}
+			if synchronous || receipt.Phase == operatorPhaseAdmissionPending {
 				if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+					if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
+						return s.currentReceiptResult(ctx, request)
+					}
 					return operatorResultForError(request, err)
 				}
 				return s.currentReceiptResult(ctx, request)
@@ -126,25 +134,8 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		}
 		return operatorResultForReceipt(snapshot, receipt)
 	}
-	if replay, ok := s.tombstoneReplayCommand(snapshot, request); ok {
-		committed, effect, err := s.owner.beginOperatorMutation(ctx, replay)
-		if err != nil {
-			return operatorResultForError(request, err)
-		}
-		if effect != nil && effect.State == "pending" {
-			if synchronous {
-				if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
-					return operatorResultForError(request, err)
-				}
-				return s.currentReceiptResult(ctx, request)
-			}
-			s.dispatchResume(request.RequestID)
-		}
-		receipt, found := operatorReceiptByID(committed.State, request.RequestID)
-		if !found {
-			return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
-		}
-		return operatorResultForReceipt(committed, receipt)
+	if result, ok := s.performTombstoneReplay(ctx, snapshot, request, synchronous); ok {
+		return result
 	}
 	if attach, ok := s.recoveryAttachCommand(snapshot, request); ok {
 		committed, _, err := s.owner.beginOperatorMutation(ctx, attach)
@@ -164,52 +155,256 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		}
 		return operatorResultForReceipt(committed, receipt)
 	}
-
-	if (request.Action == "archive" || request.Action == "dismiss") && !ownerHasAttempt(snapshot.State, request) {
-		fresh, batch, err := s.collectIssue(ctx, request.Issue)
+	if slices.Contains([]string{"dismiss", "archive", "abandon", "remove", "cancel", "recover"}, request.Action) {
+		reservation := reserveOperatorAdmissionCommand{Request: request}
+		snapshot, err = s.owner.reserveOperatorAdmission(ctx, reservation)
 		if err != nil {
+			if ctx.Err() != nil {
+				if committed, snapshotErr := s.owner.snapshot(s.lifecycle); snapshotErr == nil {
+					if receipt, ok := operatorReceiptByID(committed.State, request.RequestID); ok && receipt.Request == request {
+						if receipt.State == "pending" {
+							s.dispatchResume(request.RequestID)
+						}
+						return operatorResultForReceipt(committed, receipt)
+					}
+				}
+			}
+			if errors.Is(err, errStateConflict) || errors.Is(err, errStaleStateResult) {
+				if current, snapshotErr := s.owner.snapshot(ctx); snapshotErr == nil {
+					if result, ok := s.performTombstoneReplay(ctx, current, request, synchronous); ok {
+						return result
+					}
+				}
+			}
 			return operatorResultForError(request, err)
 		}
-		command, err := remoteOnlyOperatorCommand(fresh, batch, request)
+		if result, done := s.resultForConcurrentAdmission(ctx, snapshot, request, synchronous); done {
+			return result
+		}
+		committed, effect, work, err := s.finishReservedAdmission(ctx, snapshot, request)
 		if err != nil {
+			if errors.Is(err, errStaleStateResult) {
+				return s.pendingReservedAdmission(request)
+			}
 			return operatorResultForError(request, err)
 		}
-		committed, _, err := s.owner.beginOperatorMutation(ctx, command)
-		if err != nil {
-			return operatorResultForError(request, err)
-		}
-		s.effects.cancelInvalidated(committed)
-		receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
-		if !ok {
-			return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
-		}
-		return operatorResultForReceipt(committed, receipt)
+		return s.resultForCommittedAdmission(ctx, request, snapshot, committed, effect, work, synchronous)
 	}
 	command, work, err := s.prepareAdmission(ctx, snapshot, request)
 	if err != nil {
 		return operatorResultForError(request, err)
 	}
+	if s.beforeAdmission != nil {
+		s.beforeAdmission()
+	}
 	committed, effect, err := s.owner.beginOperatorMutation(ctx, command)
 	if err != nil {
 		return operatorResultForError(request, err)
 	}
+	return s.resultForCommittedAdmission(ctx, request, snapshot, committed, effect, work, synchronous)
+}
+
+func (s *operatorMutationService) performTombstoneReplay(ctx context.Context, snapshot stateOwnerSnapshot, request controlRequest, synchronous bool) (controlResult, bool) {
+	replay, ok := s.tombstoneReplayCommand(snapshot, request)
+	if !ok {
+		return controlResult{}, false
+	}
+	committed, effect, err := s.owner.beginOperatorMutation(ctx, replay)
+	if err != nil {
+		return operatorResultForError(request, err), true
+	}
+	if effect != nil && effect.State == "pending" {
+		if synchronous {
+			if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+				if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
+					return s.currentReceiptResult(ctx, request), true
+				}
+				return operatorResultForError(request, err), true
+			}
+			return s.currentReceiptResult(ctx, request), true
+		}
+		s.dispatchResume(request.RequestID)
+	}
+	receipt, found := operatorReceiptByID(committed.State, request.RequestID)
+	if !found {
+		return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed"), true
+	}
+	if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup {
+		s.dispatchResume(request.RequestID)
+	}
+	return operatorResultForReceipt(committed, receipt), true
+}
+
+func (s *operatorMutationService) resultForConcurrentAdmission(ctx context.Context, snapshot stateOwnerSnapshot, request controlRequest, synchronous bool) (controlResult, bool) {
+	receipt, ok := operatorReceiptByID(snapshot.State, request.RequestID)
+	if !ok {
+		return controlResult{}, false
+	}
+	if receipt.Phase == operatorPhaseAdmissionPending {
+		if !operatorAdmissionLeader(snapshot.State, receipt) {
+			return operatorResultForReceipt(snapshot, receipt), true
+		}
+		return controlResult{}, false
+	}
+	if receipt.Request != request {
+		return operatorErrorResult(request, http.StatusConflict, "operator request identity was already used for different input"), true
+	}
+	if receipt.State == "pending" {
+		if synchronous {
+			if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+				return operatorResultForError(request, err), true
+			}
+			return s.currentReceiptResult(ctx, request), true
+		}
+		s.dispatchResume(request.RequestID)
+	}
+	return operatorResultForReceipt(snapshot, receipt), true
+}
+
+func (s *operatorMutationService) finishReservedAdmission(ctx context.Context, snapshot stateOwnerSnapshot, request controlRequest) (stateOwnerSnapshot, *runtimeEffectIntent, operatorWork, error) {
+	var command beginOperatorMutationCommand
+	var work operatorWork
+	receipt, reserved := operatorReceiptByID(snapshot.State, request.RequestID)
+	var err error
+	if reserved && receipt.Admission != nil && receipt.Admission.RemoteOnly {
+		command, err = s.prepareRemoteOnlyAdmission(ctx, snapshot, request)
+	} else {
+		command, work, err = s.prepareAdmission(ctx, snapshot, request)
+	}
+	if err != nil {
+		if errors.Is(err, errStaleStateResult) {
+			if current, resolved := s.resolvedReservedAdmission(request); resolved {
+				return current, nil, operatorWork{}, nil
+			}
+			return stateOwnerSnapshot{}, nil, operatorWork{}, err
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if abortErr := s.abortReservedAdmission(request); abortErr != nil {
+				return stateOwnerSnapshot{}, nil, operatorWork{}, abortErr
+			}
+			return stateOwnerSnapshot{}, nil, operatorWork{}, err
+		}
+		err = fmt.Errorf("prepare reserved operator admission: %w", err)
+		failure := operatorResultForError(request, err)
+		if _, failErr := s.owner.failOperatorAdmission(s.lifecycle, failOperatorAdmissionCommand{Request: request, Result: failure}); failErr != nil {
+			return stateOwnerSnapshot{}, nil, operatorWork{}, failErr
+		}
+		return stateOwnerSnapshot{}, nil, operatorWork{}, err
+	}
+	if s.beforeAdmission != nil {
+		s.beforeAdmission()
+	}
+	committed, effect, err := s.owner.beginOperatorMutation(ctx, command)
+	if err != nil {
+		if ctx.Err() != nil {
+			if current, snapshotErr := s.owner.snapshot(s.lifecycle); snapshotErr == nil {
+				if receipt, ok := operatorReceiptByID(current.State, request.RequestID); ok && receipt.Request == request {
+					if receipt.Phase == operatorPhaseAdmissionPending {
+						return current, nil, work, nil
+					}
+					effect, effectErr := effectForOperatorReceipt(current.State, receipt)
+					if effectErr == nil {
+						return current, effect, work, nil
+					}
+				}
+			}
+		}
+		if errors.Is(err, errStaleStateResult) {
+			if current, resolved := s.resolvedReservedAdmission(request); resolved {
+				return current, nil, work, nil
+			}
+			return stateOwnerSnapshot{}, nil, operatorWork{}, err
+		}
+		err = fmt.Errorf("commit reserved operator admission: %w", err)
+		failure := operatorResultForError(request, err)
+		if _, failErr := s.owner.failOperatorAdmission(s.lifecycle, failOperatorAdmissionCommand{Request: request, Result: failure}); failErr != nil {
+			return stateOwnerSnapshot{}, nil, operatorWork{}, failErr
+		}
+		return stateOwnerSnapshot{}, nil, operatorWork{}, err
+	}
+	return committed, effect, work, nil
+}
+
+func (s *operatorMutationService) resolvedReservedAdmission(request controlRequest) (stateOwnerSnapshot, bool) {
+	current, err := s.owner.snapshot(s.lifecycle)
+	if err != nil {
+		return stateOwnerSnapshot{}, false
+	}
+	receipt, ok := operatorReceiptByID(current.State, request.RequestID)
+	return current, ok && receipt.Request == request && receipt.Phase != operatorPhaseAdmissionPending
+}
+
+func (s *operatorMutationService) pendingReservedAdmission(request controlRequest) controlResult {
+	current, err := s.owner.snapshot(s.lifecycle)
+	if err != nil {
+		return operatorResultForError(request, err)
+	}
+	receipt, ok := operatorReceiptByID(current.State, request.RequestID)
+	if !ok || receipt.Request != request {
+		return operatorResultForError(request, errStaleStateResult)
+	}
+	if receipt.State == "pending" {
+		s.dispatchResume(request.RequestID)
+	}
+	return operatorResultForReceipt(current, receipt)
+}
+
+func (s *operatorMutationService) prepareRemoteOnlyAdmission(ctx context.Context, snapshot stateOwnerSnapshot, request controlRequest) (beginOperatorMutationCommand, error) {
+	if s.collect == nil {
+		return beginOperatorMutationCommand{}, errors.New("operator collector is unavailable")
+	}
+	batch, err := s.collect(ctx, snapshot, request.Issue)
+	if err != nil {
+		return beginOperatorMutationCommand{}, err
+	}
+	return remoteOnlyOperatorCommand(snapshot, batch, request)
+}
+
+func (s *operatorMutationService) abortReservedAdmission(request controlRequest) error {
+	committed, err := s.owner.abortOperatorAdmission(s.lifecycle, abortOperatorAdmissionCommand{Request: request})
+	if err == nil {
+		s.scanPendingAdmissions(committed)
+	}
+	return err
+}
+
+func (s *operatorMutationService) resultForCommittedAdmission(ctx context.Context, request controlRequest, before, committed stateOwnerSnapshot, effect *runtimeEffectIntent, work operatorWork, synchronous bool) controlResult {
 	s.effects.cancelInvalidated(committed)
-	s.cancelSupersededPlanWatchers(snapshot, committed)
+	s.cancelSupersededPlanWatchers(before, committed)
+	receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
+	if !ok {
+		return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
+	}
+	if receipt.State == "pending" && receipt.Phase == operatorPhaseAdmissionPending {
+		s.dispatchResume(request.RequestID)
+		return operatorResultForReceipt(committed, receipt)
+	}
+	deferredCleanup := receipt.Phase == operatorPhaseHandoffCleanup || receipt.Phase == operatorPhaseStartCleanup
 	if effect != nil {
 		work.requestID = request.RequestID
 		bindOperatorWorkIdentity(&work, *effect)
 		work.stopReviewerID = effect.SupersededReviewerID
-		if synchronous {
+		if synchronous && !deferredCleanup {
 			if err := s.executeOnce(work, ""); err != nil {
+				if errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) {
+					return s.currentReceiptResult(ctx, request)
+				}
 				return operatorResultForError(request, err)
 			}
 			return s.currentReceiptResult(ctx, request)
 		}
-		s.dispatch(work)
+		if !deferredCleanup {
+			s.dispatch(work)
+		}
 	}
-	receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
-	if !ok {
-		return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
+	if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup {
+		if synchronous {
+			if err := s.resumeReceipt(ctx, request.RequestID); err != nil {
+				return operatorResultForError(request, err)
+			}
+			return s.currentReceiptResult(ctx, request)
+		}
+		s.dispatchResume(request.RequestID)
 	}
 	return operatorResultForReceipt(committed, receipt)
 }
@@ -230,7 +425,7 @@ func remoteOnlyOperatorCommand(snapshot stateOwnerSnapshot, batch reconciliation
 		reduced, err := reduceAttemptFact(request.Repository, fact)
 		return err == nil && reflect.DeepEqual(reduced, attempt.Fact)
 	})
-	if !issueFound || !attemptFound || !ok || !observation.Present || observation.ObservationEpoch != snapshot.State.Epoch || request.Action == "dismiss" && !observation.Fact.Closed || observation.Fact.CurrentAttempt != request.Attempt || !accepted || !attempt.Present || attempt.ObservationEpoch != snapshot.State.Epoch || attempt.SourceIssueGeneration != observation.Generation || attempt.OwnerGeneration != snapshot.State.AttemptGenerations[attemptKey] || attempt.Fact.State != "completed" || attempt.Fact.Repository != request.Repository || attempt.Fact.Issue != request.Issue || attempt.Fact.Attempt != request.Attempt || ownerHasAttempt(snapshot.State, request) {
+	if !issueFound || !attemptFound || !ok || !observation.Present || observation.ObservationEpoch > snapshot.State.Epoch || request.Action == "dismiss" && !observation.Fact.Closed || observation.Fact.CurrentAttempt != request.Attempt || !accepted || !attempt.Present || attempt.ObservationEpoch > snapshot.State.Epoch || attempt.SourceIssueGeneration != observation.Generation || attempt.OwnerGeneration != snapshot.State.AttemptGenerations[attemptKey] || attempt.Fact.State != "completed" || attempt.Fact.Repository != request.Repository || attempt.Fact.Issue != request.Issue || attempt.Fact.Attempt != request.Attempt || ownerHasAttempt(snapshot.State, request) || attemptHasReviewerProof(snapshot.State, request.Repository, request.Issue, request.Attempt) || snapshot.State.LegacyReviewerQuarantines[issueKey] != "" {
 		return beginOperatorMutationCommand{}, errStateConflict
 	}
 	return beginOperatorMutationCommand{Request: request, RemoteOnly: true, IssueClosed: observation.Fact.Closed,
@@ -263,6 +458,9 @@ func (s *operatorMutationService) recoveryAttachCommand(snapshot stateOwnerSnaps
 	for _, receipt := range snapshot.State.ControlReceipts {
 		if receipt.State != "pending" || receipt.Request.Action != "recover" || receipt.Request.Repository != request.Repository || receipt.Request.Issue != request.Issue || receipt.Request.Attempt != request.Attempt {
 			continue
+		}
+		if receipt.Phase == operatorPhaseAdmissionPending {
+			return beginOperatorMutationCommand{}, false
 		}
 		effect, exists := snapshot.State.Effects[receipt.EffectID]
 		if !exists || !operatorReceiptMatchesEffect(receipt, effect) {
@@ -323,6 +521,12 @@ func (s *operatorMutationService) prepareAdmission(ctx context.Context, snapshot
 		ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, ObservationBodyDigest: observation.Fact.BodyDigest,
 		Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], AttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)]},
 	}
+	if receipt, ok := operatorReceiptByID(snapshot.State, request.RequestID); ok && receipt.Phase == operatorPhaseAdmissionPending && receipt.Admission != nil {
+		if receipt.Request != request || !reflect.DeepEqual(receipt.Admission.Manifest, manifest) {
+			return beginOperatorMutationCommand{}, operatorWork{}, errStaleStateResult
+		}
+		command.IssueClosed = receipt.Admission.IssueClosed
+	}
 	var work operatorWork
 	if request.Action == "dismiss" && !observation.Present {
 		if s.issueClosed == nil {
@@ -352,6 +556,26 @@ func (s *operatorMutationService) prepareAdmission(ctx context.Context, snapshot
 			}
 			command.IssueClosed = true
 		}
+		cleanup := agentruntime.EffectRequest{Action: agentruntime.EffectCleanup, Attempt: operatorEffectAttempt(manifest), Manifest: manifest, Cleanup: agentruntime.EffectCleanupPolicy{Action: request.Action}}
+		cleanup, err = s.cleanup.bindPolicy(cleanup)
+		if err == nil {
+			cleanup, err = s.effects.executor.BindRequest(cleanup)
+		}
+		if err == nil {
+			err = s.effects.executor.ValidateRequest(cleanup)
+		}
+		if err == nil {
+			err = s.cleanup.validate(ctx, cleanup)
+		}
+		if err != nil {
+			return beginOperatorMutationCommand{}, operatorWork{}, err
+		}
+		digest, err := agentruntime.EffectRequestDigest(cleanup)
+		if err != nil {
+			return beginOperatorMutationCommand{}, operatorWork{}, err
+		}
+		command.CleanupValid, command.CleanupDigest, command.CleanupPolicy = true, digest, cleanup.Cleanup
+		work.runtime = &cleanup
 	case "archive", "abandon", "remove":
 		cleanup := agentruntime.EffectRequest{Action: agentruntime.EffectCleanup, Attempt: operatorEffectAttempt(manifest), Manifest: manifest, Cleanup: agentruntime.EffectCleanupPolicy{Action: request.Action}}
 		if request.Action == "remove" {
@@ -400,11 +624,35 @@ func (s *operatorMutationService) prepareAdmission(ctx context.Context, snapshot
 			command.Runtime = &beginRuntimeEffectCommand{Identity: command.Identity, Action: agentruntime.EffectStop, Manifest: manifest, Reason: effect.Reason, RequestDigest: effect.Identity.RequestDigest}
 			work.runtime = &effect
 		} else {
-			fresh, batch, err := s.collectIssue(ctx, request.Issue)
+			if s.collect == nil {
+				return beginOperatorMutationCommand{}, operatorWork{}, errors.New("operator collector is unavailable")
+			}
+			collectionSnapshot, err := s.owner.reconciliationSnapshot(ctx)
 			if err != nil {
 				return beginOperatorMutationCommand{}, operatorWork{}, err
 			}
-			return s.prepareRecoveryAdmission(fresh, batch, request, githubIssueRetry)
+			batch, err := s.collect(ctx, collectionSnapshot, request.Issue)
+			if err != nil {
+				return beginOperatorMutationCommand{}, operatorWork{}, err
+			}
+			collection, err := collectionFromSnapshot(collectionSnapshot, batch.Input)
+			if err != nil {
+				return beginOperatorMutationCommand{}, operatorWork{}, err
+			}
+			if !slices.ContainsFunc(collection.Issues, func(group reconciliationIssueGroup) bool {
+				return group.Fact.Repository == request.Repository && group.Fact.Issue == request.Issue
+			}) {
+				return beginOperatorMutationCommand{}, operatorWork{}, errors.Join(errors.New("recover issue is no longer present"), errStateConflict)
+			}
+			refreshed, err := s.owner.refreshOperatorAdmission(ctx, request.RequestID, collection)
+			if err != nil {
+				return beginOperatorMutationCommand{}, operatorWork{}, fmt.Errorf("refresh Recover admission: %w", err)
+			}
+			command, work, err := s.prepareRecoveryAdmission(refreshed, batch, request, githubIssueRetry)
+			if err != nil {
+				return beginOperatorMutationCommand{}, operatorWork{}, fmt.Errorf("prepare refreshed Recover: %w", err)
+			}
+			return command, work, nil
 		}
 	case "review-plan":
 		plan, material, err := s.preparePlanReview(ctx, snapshot, manifest)
@@ -441,8 +689,10 @@ func operatorAttempt(snapshot stateOwnerSnapshot, request controlRequest) (agent
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
 	record, ok := snapshot.State.Attempts[key]
 	observation, observed := snapshot.State.Observations[ownerIssueKey(request.Repository, request.Issue)]
-	absentOrphan := !observation.Present && (request.Action == "dismiss" || request.Action == "abandon") && observation.ObservationEpoch == snapshot.State.Epoch
-	if !ok || !observed || !observation.Present && !absentOrphan || record.Generation != snapshot.State.AttemptGenerations[key] || observation.OwnerGeneration != snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)] {
+	receipt, admitted := operatorReceiptByID(snapshot.State, request.RequestID)
+	admitted = admitted && receipt.Request == request && receipt.State == "pending" && receipt.Phase == operatorPhaseAdmissionPending && receipt.Admission != nil
+	absentOrphan := !observation.Present && (request.Action == "dismiss" || request.Action == "abandon") && observation.ObservationEpoch <= snapshot.State.Epoch
+	if !ok || !observed || observation.ObservationEpoch != snapshot.State.Epoch && (!admitted || observation.ObservationEpoch > snapshot.State.Epoch) || !observation.Present && !absentOrphan || record.Generation != snapshot.State.AttemptGenerations[key] || observation.OwnerGeneration != snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)] {
 		return agentruntime.Manifest{}, orchestrator.RecoveryStatus{}, errStaleStateResult
 	}
 	status, _, err := ownerOperatorStatus(snapshot.State, request.Issue, request.Attempt)
@@ -468,9 +718,12 @@ func (s *operatorMutationService) collectIssue(ctx context.Context, issue int) (
 	if err != nil {
 		return stateOwnerSnapshot{}, reconciliationV2Batch{}, err
 	}
-	committed, err := s.owner.applyReconciliation(ctx, collection)
+	committed, stale, err := s.owner.applyReconciliationWithDisposition(ctx, collection)
 	if err != nil {
 		return stateOwnerSnapshot{}, reconciliationV2Batch{}, err
+	}
+	if stale {
+		return stateOwnerSnapshot{}, reconciliationV2Batch{}, errStaleStateResult
 	}
 	s.effects.cancelInvalidated(committed)
 	s.cancelSupersededPlanWatchers(snapshot, committed)
@@ -499,7 +752,14 @@ func (s *operatorMutationService) prepareRecoveryAdmission(snapshot stateOwnerSn
 }
 
 func (s *operatorMutationService) preparePlanReview(ctx context.Context, snapshot stateOwnerSnapshot, manifest agentruntime.Manifest) (reconciliationPlannedEffect, reviewerExecutionMaterial, error) {
-	if err := freshRuntime(s.effects.executor.Runtime, s.effects.executor.Runtime.Source).VerifyOwned(ctx, manifest); err != nil {
+	runtime := freshRuntime(s.effects.executor.Runtime, s.effects.executor.Runtime.Source)
+	var err error
+	if manifest.Version == agentruntime.ManifestVersion2 {
+		err = runtime.VerifyOwned(ctx, manifest)
+	} else {
+		err = runtime.VerifyWorkspace(ctx, manifest)
+	}
+	if err != nil {
 		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, err
 	}
 	observation := snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
@@ -508,18 +768,26 @@ func (s *operatorMutationService) preparePlanReview(ctx context.Context, snapsho
 		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, err
 	}
 	if digestText(body) != observation.Fact.BodyDigest {
-		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, errStateConflict
+		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, fmt.Errorf("plan body changed: %w", errStateConflict)
 	}
 	issue := expandIssueFact(observation.Fact)
 	issue.Body = body
 	issue.Attempt, issue.BaseSHA = manifest.Attempt, manifest.BaseSHA
 	target := manifest.Repository + "#" + strconv.Itoa(manifest.Issue) + " plan sha256:" + observation.Fact.BodyDigest
-	snapshotPath, session := reviewIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(s.owner.stateRoot))
-	request := reconciliationEffectRequest{Action: reconciliationReviewer, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Manifest: ptrManifest(manifest), ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, Reviewer: &reviewerEffectRequest{Phase: "run-observe", Mode: agentruntime.ReviewModePlan, Target: target, BaseSHA: manifest.BaseSHA, HeadSHA: manifest.BaseSHA, Snapshot: snapshotPath, Session: session}}
+	identity := ownerReconciliationBeginIdentity(snapshot, reconciliationEffectRequest{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt})
+	if snapshot.State.Revision == ^uint64(0) {
+		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, errors.New("runtime revision overflow")
+	}
+	runID := reviewerRunID(identity.Epoch, snapshot.State.Revision+1, identity.IssueGeneration, identity.AttemptGeneration, manifest.Repository, manifest.Issue, manifest.Attempt, agentruntime.ReviewModePlan, target)
+	snapshotPath, session := reviewRunIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(s.owner.stateRoot), target, runID)
+	request := reconciliationEffectRequest{Action: reconciliationReviewer, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Manifest: ptrManifest(manifest), ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, Reviewer: &reviewerEffectRequest{Phase: "run-observe", Mode: agentruntime.ReviewModePlan, Target: target, RunID: runID, BaseSHA: manifest.BaseSHA, HeadSHA: manifest.BaseSHA, Snapshot: snapshotPath, Session: session}}
 	material := reviewerExecutionMaterial{Issue: issue, Source: s.reviewSource, HeadSHA: manifest.BaseSHA, Env: slices.Clone(s.reviewEnvironment), Command: slices.Clone(s.reviewCommand)}
 	request.ExecutionDigest = reviewerExecutionDigest(request, material)
-	if !validReconciliationEffectRequest(snapshot.State.Repository, request) || !validReconciliationEffectStateBindings(s.owner.stateRoot, snapshot.State, request) {
-		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, errStateConflict
+	validRequest := validReconciliationEffectRequest(snapshot.State.Repository, request)
+	validBindings := validReconciliationEffectStateBindings(s.owner.stateRoot, snapshot.State, request)
+	if !validRequest || !validBindings {
+		body, _ := json.Marshal(request)
+		return reconciliationPlannedEffect{}, reviewerExecutionMaterial{}, fmt.Errorf("prepared plan reviewer is invalid (request=%t reviewer=%t shape=%t bytes=%d/%d bindings=%t run=%q snapshot=%q session=%q): %w", validRequest, validReviewerRequest(*request.Reviewer), validReconciliationEffectBindings(request), len(body), maxReconciliationEffectBytes, validBindings, request.Reviewer.RunID, request.Reviewer.Snapshot, request.Reviewer.Session, errStateConflict)
 	}
 	return reconciliationPlannedEffect{Identity: ownerReconciliationBeginIdentity(snapshot, request), Request: request}, material, nil
 }
@@ -632,7 +900,10 @@ func (s *operatorMutationService) execute(work operatorWork) error {
 
 func (s *operatorMutationService) executeReserved(work operatorWork, reserved string) error {
 	if work.runtime != nil {
-		if work.stopReviewerID != "" {
+		if err := s.compensateWorkHandoff(s.lifecycle, *work.runtime); err != nil {
+			return err
+		}
+		if work.runtime.Action == agentruntime.EffectStop || work.stopReviewerID != "" {
 			if err := s.stopBoundReviewer(s.lifecycle, *work.runtime, work.stopReviewerID); err != nil {
 				return err
 			}
@@ -819,6 +1090,47 @@ func (s *operatorMutationService) scanPendingPlanReviewers(ctx context.Context, 
 		}
 		s.dispatchResume(receipt.Request.RequestID)
 	}
+}
+
+func (s *operatorMutationService) compensateHandoff(ctx context.Context, candidate handoffCandidateInvalidation, preserveOld bool) (handoffCompensationProof, error) {
+	if s.cleanup.implementation == nil {
+		return handoffCompensationProof{}, errors.New("implementation compensation boundary is unavailable")
+	}
+	request := handoffCompensationRequest{Candidate: candidate, PreserveOld: preserveOld}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return handoffCompensationProof{}, err
+	}
+	result, err := s.cleanup.implementation.call(ctx, "compensate-handoff", agentruntime.Command{Stdin: bytes.NewReader(body)})
+	if err != nil {
+		return handoffCompensationProof{}, err
+	}
+	old, err := agentruntime.ReadImplementationBinding(candidate.Manifest)
+	if err != nil {
+		return handoffCompensationProof{}, err
+	}
+	var proof handoffCompensationProof
+	if json.Unmarshal([]byte(result.Output), &proof) != nil || !validHandoffCompensationProof(proof, request, old) {
+		return handoffCompensationProof{}, errors.New("bound handoff compensation proof is invalid")
+	}
+	return proof, nil
+}
+
+func (s *operatorMutationService) compensateWorkHandoff(ctx context.Context, request agentruntime.EffectRequest) error {
+	snapshot, err := s.owner.snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	key := ownerAttemptKey(request.Manifest.Repository, request.Manifest.Issue, request.Manifest.Attempt)
+	if tombstone, ok := snapshot.State.Tombstones[key]; ok && tombstone.InvalidatedHandoff != nil {
+		_, err := s.compensateHandoff(ctx, *tombstone.InvalidatedHandoff, false)
+		return err
+	}
+	if effect, ok := snapshot.State.Effects[request.Identity.EffectID]; ok && effect.InvalidatedHandoff != nil {
+		_, err := s.compensateHandoff(ctx, *effect.InvalidatedHandoff, false)
+		return err
+	}
+	return nil
 }
 
 func (s *operatorMutationService) dispatchResume(requestID string) {
@@ -1034,7 +1346,12 @@ func (s *operatorMutationService) shutdown(ctx context.Context) error {
 
 func operatorResultForReceipt(snapshot stateOwnerSnapshot, receipt controlReceipt) controlResult {
 	if receipt.State == "completed" {
-		return *receipt.Result
+		result := *receipt.Result
+		if diagnostic := legacyReviewerDiagnostic(snapshot.State, receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt); diagnostic != "" {
+			result.Status = http.StatusAccepted
+			result.Data, _ = json.Marshal(operatorReceiptStatus{Phase: "physical-unverified", Diagnostic: diagnostic})
+		}
+		return result
 	}
 	body, _ := json.Marshal(operatorReceiptStatus{Phase: receipt.Phase, EffectID: receipt.EffectID, Diagnostic: receipt.Diagnostic})
 	return controlResult{Version: controlVersion, RequestID: receipt.Request.RequestID, Action: receipt.Request.Action, OK: true, Status: http.StatusAccepted, OwnerRevision: snapshot.State.Revision, Data: body}
@@ -1042,7 +1359,7 @@ func operatorResultForReceipt(snapshot stateOwnerSnapshot, receipt controlReceip
 
 func operatorResultForError(request controlRequest, err error) controlResult {
 	status := http.StatusInternalServerError
-	message := "operator mutation failed"
+	message := "operator mutation failed: " + internalgithub.Redact(err.Error())
 	if errors.Is(err, errStateConflict) {
 		status, message = http.StatusConflict, internalgithub.Redact(err.Error())
 	} else if errors.Is(err, errStaleStateResult) {
@@ -1073,6 +1390,50 @@ func (s *operatorMutationService) resumeReceiptReserved(ctx context.Context, req
 	}
 	receipt, ok := operatorReceiptByID(snapshot.State, requestID)
 	if !ok || receipt.State == "completed" {
+		return nil
+	}
+	if receipt.Phase == operatorPhaseAdmissionPending {
+		if !operatorAdmissionLeader(snapshot.State, receipt) {
+			return nil
+		}
+		committed, effect, work, err := s.finishReservedAdmission(ctx, snapshot, receipt.Request)
+		if err != nil {
+			return err
+		}
+		s.effects.cancelInvalidated(committed)
+		s.cancelSupersededPlanWatchers(snapshot, committed)
+		current, ok := operatorReceiptByID(committed.State, requestID)
+		if !ok {
+			return errStateConflict
+		}
+		if current.Phase == operatorPhaseHandoffCleanup {
+			return s.resumeReceiptReserved(ctx, requestID, reserved)
+		}
+		if current.Phase == operatorPhaseStartCleanup || effect == nil {
+			return nil
+		}
+		work.requestID = requestID
+		bindOperatorWorkIdentity(&work, *effect)
+		work.stopReviewerID = effect.SupersededReviewerID
+		return s.executeOnce(work, reserved)
+	}
+	if receipt.Phase == operatorPhaseHandoffCleanup {
+		tombstone, ok := snapshot.State.Tombstones[ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)]
+		if !ok || tombstone.InvalidatedHandoff == nil || tombstone.Action != "dismissed" {
+			return errStateConflict
+		}
+		proof, err := s.compensateHandoff(ctx, *tombstone.InvalidatedHandoff, true)
+		if err != nil {
+			return errors.Join(err, s.recordAwaitingDiagnostic(receipt, err))
+		}
+		if _, err = s.owner.completeHandoffCompensation(ctx, completeHandoffCompensationCommand{RequestID: requestID, Proof: proof}); err != nil {
+			return err
+		}
+		return s.resumeReceiptReserved(ctx, requestID, reserved)
+	}
+	if receipt.Phase == operatorPhaseStartCleanup {
+		// The invalidated Start still has a physical candidate obligation.
+		// Do not claim cleanup from a tmux name or a process-group guess.
 		return nil
 	}
 	if receipt.Phase == operatorPhaseTerminalAwait || receipt.Phase == operatorPhaseRetryAwait {
@@ -1137,7 +1498,7 @@ func (s *operatorMutationService) resumeReceiptReserved(ctx context.Context, req
 	if err != nil {
 		return err
 	}
-	if effect.SupersededReviewerID != "" {
+	if effect.Action == string(agentruntime.EffectStop) || effect.SupersededReviewerID != "" {
 		if err := s.stopBoundReviewer(ctx, request, effect.SupersededReviewerID); err != nil {
 			return err
 		}
@@ -1162,6 +1523,14 @@ func (s *operatorMutationService) resumeReceiptReserved(ctx context.Context, req
 		return errStateConflict
 	}
 	return s.executeOnce(operatorWork{requestID: requestID, runtime: &bound}, reserved)
+}
+
+func (s *operatorMutationService) scanPendingAdmissions(snapshot stateOwnerSnapshot) {
+	for _, receipt := range snapshot.State.ControlReceipts {
+		if receipt.State == "pending" && receipt.Phase == operatorPhaseAdmissionPending && operatorAdmissionLeader(snapshot.State, receipt) {
+			s.dispatchResume(receipt.Request.RequestID)
+		}
+	}
 }
 
 // A local completion marker proves the reviewer finished, but not that the
@@ -1190,7 +1559,11 @@ func (s *operatorMutationService) validatePendingPlanReviewMarker(ctx context.Co
 }
 
 func (s *operatorMutationService) recordAwaitingDiagnostic(receipt controlReceipt, cause error) error {
-	diagnostic := strings.ToValidUTF8("recovery admission remains pending: "+internalgithub.Redact(cause.Error()), "?")
+	prefix := "recovery admission remains pending: "
+	if receipt.Phase == operatorPhaseHandoffCleanup {
+		prefix = "handoff compensation remains pending: "
+	}
+	diagnostic := strings.ToValidUTF8(prefix+internalgithub.Redact(cause.Error()), "?")
 	if len(diagnostic) > maxReconciliationStringBytes {
 		diagnostic = diagnostic[:maxReconciliationStringBytes]
 	}
@@ -1276,13 +1649,12 @@ func (s *operatorMutationService) resumeUnmarkedReconciliation(ctx context.Conte
 			}
 			return err
 		}
-		if effect.Reconciliation.Manifest != nil && sameReconciliationManifest(request, record.Manifest, *request.Manifest) {
-			// Reuse the admitted immutable request after a monitor-only timestamp
-			// change; the fresh owner/GitHub checks above still gate replay.
-			plan.Request.Manifest = ptrManifest(*effect.Reconciliation.Manifest)
+		if plan.Request.Reviewer == nil || request.Reviewer == nil || plan.Request.Reviewer.Mode != request.Reviewer.Mode || plan.Request.Reviewer.Target != request.Reviewer.Target || plan.Request.Reviewer.BaseSHA != request.Reviewer.BaseSHA || plan.Request.Reviewer.HeadSHA != request.Reviewer.HeadSHA {
+			return errStateConflict
 		}
-		plan.Request.ObservationCycleID = effect.Reconciliation.ObservationCycleID
-		plan.Request.ObservationGeneration = effect.Reconciliation.ObservationGeneration
+		// A restart revalidates current owner and GitHub facts above, but resumes
+		// the already-admitted never-reused run instead of deriving a new RunID.
+		plan.Request = cloneReconciliationRequest(request)
 		plan.Request.ExecutionDigest = reviewerExecutionDigest(plan.Request, material)
 		if !reflect.DeepEqual(plan.Request, *effect.Reconciliation) {
 			return errStateConflict
@@ -1319,7 +1691,7 @@ func (s *operatorMutationService) supersedeInvalidPlanReview(ctx context.Context
 		_, err := s.owner.bindReviewerStopping(ctx, bindReviewerStoppingCommand{Identity: ownerReconciliationEffectIdentity(effect), GroupPID: pid})
 		return err
 	}
-	observation, err := s.stopReviewerSessionAt(ctx, reviewer.Session, effect.ID, effect.RequestDigest, effect.ReviewerGroupPID, effect.ReviewerGateProtocol, effect.ReviewerSessionRequested, launchPath, terminalPath, effect.IssueGeneration, effect.AttemptGeneration, bind)
+	observation, err := s.stopReviewerSessionAtBound(ctx, reviewer.Session, effect.ID, reviewer.RunID, effect.RequestDigest, effect.ReviewerProfileDigest, effect.ReviewerConfinementVersion, effect.ReviewerGroupPID, effect.ReviewerGateProtocol, effect.ReviewerSessionRequested, launchPath, terminalPath, effect.IssueGeneration, effect.AttemptGeneration, bind)
 	if err != nil {
 		return false, err
 	}
@@ -1346,11 +1718,15 @@ func (s *operatorMutationService) supersedeInvalidPlanReview(ctx context.Context
 // before signalling, can authorize reviewer cancellation. A lifecycle JSON
 // file or tmux kill-session acknowledgement is not process-death proof.
 func (s *operatorMutationService) stopReviewerSession(ctx context.Context, session, reviewerID string, groupPID int) error {
-	_, err := s.stopReviewerSessionAt(ctx, session, reviewerID, "", groupPID, false, false, "", "", 0, 0)
+	_, err := s.stopReviewerSessionAt(ctx, session, reviewerID, "", "", groupPID, false, false, "", "", 0, 0)
 	return err
 }
 
-func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, session, reviewerID, requestDigest string, groupPID int, gateProtocol, sessionRequested bool, launchPath, terminalPath string, issueGeneration, attemptGeneration uint64, beforeKill ...func(int) error) (reviewerStopObservation, error) {
+func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, session, reviewerID, runID, requestDigest string, groupPID int, gateProtocol, sessionRequested bool, launchPath, terminalPath string, issueGeneration, attemptGeneration uint64, beforeKill ...func(int) error) (reviewerStopObservation, error) {
+	return s.stopReviewerSessionAtBound(ctx, session, reviewerID, runID, requestDigest, "", 0, groupPID, gateProtocol, sessionRequested, launchPath, terminalPath, issueGeneration, attemptGeneration, beforeKill...)
+}
+
+func (s *operatorMutationService) stopReviewerSessionAtBound(ctx context.Context, session, reviewerID, runID, requestDigest, profileDigest string, confinementVersion uint64, groupPID int, gateProtocol, sessionRequested bool, launchPath, terminalPath string, issueGeneration, attemptGeneration uint64, beforeKill ...func(int) error) (reviewerStopObservation, error) {
 	s.mu.Lock()
 	cancelWatcher := s.watchers[reviewerID]
 	s.mu.Unlock()
@@ -1411,7 +1787,7 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 		}
 		candidate := 0
 		if strings.Contains(pane.Start, " review-pane ") {
-			if !found || launch.EffectID != reviewerID || launch.IssueGeneration != issueGeneration || launch.AttemptGeneration != attemptGeneration || launch.RequestDigest != requestDigest || launch.GateProtocol != gateProtocol || launch.SessionRequested != sessionRequested || !reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, launch) {
+			if !found || launch.EffectID != reviewerID || launch.RunID != runID || launch.IssueGeneration != issueGeneration || launch.AttemptGeneration != attemptGeneration || launch.RequestDigest != requestDigest || launch.ProfileDigest != profileDigest || launch.ConfinementVersion != confinementVersion || launch.GateProtocol != gateProtocol || launch.SessionRequested != sessionRequested || !reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, launch) {
 				return reviewerStopObservation{}, errors.New("unbound reviewer launch identity is unavailable")
 			}
 			candidate = launch.ChildPID
@@ -1445,7 +1821,7 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 		return reviewerStopObservation{GroupPID: candidate, NeverRan: candidate == 0}, nil
 	}
 	if !pane.Status.Dead {
-		if err := verifyReviewerChildAtPane(ctx, pane, launchPath, terminalPath, reviewerLaunchIdentity{EffectID: reviewerID, RequestDigest: requestDigest}, groupPID); err != nil {
+		if err := verifyReviewerChildAtPane(ctx, pane, launchPath, terminalPath, reviewerLaunchIdentity{EffectID: reviewerID, RunID: runID, IssueGeneration: issueGeneration, AttemptGeneration: attemptGeneration, RequestDigest: requestDigest, ProfileDigest: profileDigest, ConfinementVersion: confinementVersion, GateProtocol: gateProtocol, SessionRequested: sessionRequested}, groupPID); err != nil {
 			return reviewerStopObservation{}, err
 		}
 		if err := guardedReviewerKillSession(ctx, s.reviewer, pane, session, "", nil); err != nil {
@@ -1472,9 +1848,6 @@ func (s *operatorMutationService) stopReviewerSessionAt(ctx context.Context, ses
 }
 
 func (s *operatorMutationService) stopBoundReviewer(ctx context.Context, request agentruntime.EffectRequest, reviewerID string) error {
-	if reviewerID == "" {
-		return nil
-	}
 	if s.reviewer == nil || request.Action != agentruntime.EffectStop && request.Action != agentruntime.EffectCleanup {
 		return errStateConflict
 	}
@@ -1493,23 +1866,47 @@ func (s *operatorMutationService) stopBoundReviewer(ctx context.Context, request
 	if !current || effect.State != "pending" || effect.SupersededReviewerID != reviewerID || effect.Action != string(request.Action) || effect.IssueGeneration != request.Identity.IssueGeneration || effect.AttemptGeneration != request.Identity.AttemptGeneration {
 		return errStaleStateResult
 	}
-	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
-	if err != nil {
-		return err
-	}
 	snapshotRoot := productionSnapshotRoot(s.owner.stateRoot)
-	reviewSnapshot, _ := reviewIdentity(operatorEffectAttempt(manifest), snapshotRoot)
-	launchPath, terminalPath := reviewerLifecyclePaths(reviewSnapshot, effect.SupersededReviewerTarget)
-	bind := func(pid int) error {
-		_, err := s.owner.bindReviewerStopping(run.ctx, bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), GroupPID: pid})
-		return err
+	if reviewerID != "" && !effect.ReviewerStopped {
+		reviewSnapshot, session := reviewRunIdentity(operatorEffectAttempt(manifest), snapshotRoot, effect.SupersededReviewerTarget, effect.SupersededReviewerRunID)
+		launchPath, terminalPath := reviewerLifecyclePaths(reviewSnapshot, effect.SupersededReviewerTarget)
+		bind := func(pid int) error {
+			_, err := s.owner.bindReviewerStopping(run.ctx, bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), GroupPID: pid})
+			return err
+		}
+		observation, err := s.stopReviewerSessionAtBound(run.ctx, session, reviewerID, effect.SupersededReviewerRunID, effect.SupersededReviewerRequestDigest, effect.SupersededReviewerProfileDigest, effect.SupersededReviewerConfinementVersion, effect.SupersededReviewerGroupPID, effect.SupersededReviewerGateProtocol, effect.SupersededReviewerSessionRequested, launchPath, terminalPath, effect.SupersededReviewerIssueGeneration, effect.SupersededReviewerAttemptGeneration, bind)
+		if err != nil {
+			return err
+		}
+		if _, err := s.owner.markReviewerStopped(run.ctx, markReviewerStoppedCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), Observation: observation}); err != nil {
+			return err
+		}
 	}
-	observation, err := s.stopReviewerSessionAt(run.ctx, session, reviewerID, effect.SupersededReviewerRequestDigest, effect.SupersededReviewerGroupPID, effect.SupersededReviewerGateProtocol, effect.SupersededReviewerSessionRequested, launchPath, terminalPath, effect.SupersededReviewerIssueGeneration, effect.SupersededReviewerAttemptGeneration, bind)
-	if err != nil {
-		return err
-	}
-	if _, err := s.owner.markReviewerStopped(run.ctx, markReviewerStoppedCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), Observation: observation}); err != nil {
-		return err
+	if request.Action == agentruntime.EffectStop {
+		current, err := s.owner.snapshot(run.ctx)
+		if err != nil {
+			return err
+		}
+		effect = current.State.Effects[request.Identity.EffectID]
+		proofs := make(map[string]reviewerProcessProof)
+		for _, proof := range current.State.ReviewerProofs {
+			if proof.Repository != manifest.Repository || proof.Issue != manifest.Issue || proof.Attempt != manifest.Attempt {
+				continue
+			}
+			if previous, exists := proofs[proof.Target]; exists && !reflect.DeepEqual(previous, proof) {
+				return errors.New("multiple reviewer cleanup certificates claim the same target")
+			}
+			proofs[proof.Target] = proof
+		}
+		if err := cleanupAttemptReviewResourcesBound(run.ctx, s.owner.stateRoot, s.reviewer, manifest, true, activeWorkerProfileDigest(current.State), proofs); err != nil {
+			return err
+		}
+		if _, err := s.owner.markReviewerResourcesCleaned(run.ctx, markReviewerResourcesCleanedCommand{
+			Identity: ownerEffectIdentity(effectRequestIdentity(effect)),
+			Proofs:   attemptReviewerProofs(current.State, manifest.Repository, manifest.Issue, manifest.Attempt),
+		}); err != nil {
+			return err
+		}
 	}
 	s.cancelPlanWatcher(reviewerID)
 	return nil
@@ -1536,11 +1933,25 @@ func (s *operatorMutationService) resumePending(ctx context.Context) error {
 		if !ok || receipt.State != "pending" {
 			continue
 		}
+		if receipt.Phase == operatorPhaseAdmissionPending && operatorAdmissionLeader(snapshot.State, receipt) {
+			s.dispatchResume(requestID)
+			continue
+		}
+		if receipt.Phase == operatorPhaseAdmissionPending {
+			continue
+		}
 		if receipt.Phase == operatorPhaseTerminalAwait || receipt.Phase == operatorPhaseRetryAwait {
 			if receipt.Diagnostic != "" {
 				continue
 			}
 			s.dispatchResume(requestID)
+			continue
+		}
+		if receipt.Phase == operatorPhaseHandoffCleanup {
+			s.dispatchResume(requestID)
+			continue
+		}
+		if receipt.Phase == operatorPhaseStartCleanup {
 			continue
 		}
 		effect, ok := snapshot.State.Effects[receipt.EffectID]
