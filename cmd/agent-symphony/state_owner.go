@@ -1331,6 +1331,14 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 		if !exists || record.Generation != identity.AttemptGeneration {
 			return errStaleStateResult
 		}
+		if command.Action == agentruntime.EffectReview {
+			if effect.Review == nil {
+				return errStateConflict
+			}
+			if _, err := agentruntime.ReviewEffectResult(attemptRoot, stateRoot, record.Manifest, *effect.Review); err != nil {
+				return errStateConflict
+			}
+		}
 		if !validRuntimeEffectResult(command.Action, effect, record.Manifest, manifest) {
 			return errStateConflict
 		}

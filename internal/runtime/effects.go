@@ -1203,6 +1203,11 @@ func (r *Runtime) reviewEffect(request EffectRequest) (Manifest, error) {
 // ReviewEffectResult constructs and validates the pure manifest transition for
 // an owner-approved review result.
 func ReviewEffectResult(root, stateRoot string, manifest Manifest, review ReviewTransition) (Manifest, error) {
+	if manifest.ReviewHandoffQueued && review.State == "findings-queued" {
+		if !review.HandoffQueued || manifest.ReviewHead != review.Head || !slices.Equal(manifest.ReviewFindings, review.Findings) || manifest.ReviewHandoffAck && !review.HandoffAcknowledged || manifest.ReviewMode != review.Mode || manifest.ReviewTarget != review.Target || manifest.ReviewBase != review.Base || manifest.ReviewSnapshot != review.Snapshot || manifest.ReviewSession != review.Session {
+			return Manifest{}, errors.New("queued review handoff is immutable")
+		}
+	}
 	manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget = review.State, review.Mode, review.Target
 	manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = review.Base, review.Head, review.Snapshot, review.Session
 	manifest.ReviewFindings = slices.Clone(review.Findings)

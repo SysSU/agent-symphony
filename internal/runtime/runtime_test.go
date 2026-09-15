@@ -717,7 +717,7 @@ func TestResumeHandoffRecreatesMissingSessionBeforeStateTransition(t *testing.T)
 	if err != nil || resumed.State != "running" || fake.sessions[manifest.Session] == nil {
 		t.Fatalf("resumed=%#v session=%#v err=%v", resumed, fake.sessions[manifest.Session], err)
 	}
-	cancelled, err := r.Cancel(t.Context(), attempt, "operator stopped handoff")
+	cancelled, err := cancelFixture(t, r, t.Context(), attempt, "operator stopped handoff")
 	if err != nil || cancelled.State != "cancelled" || fake.sessions[manifest.Session] != nil || fake.sessions["keeper"] == nil {
 		t.Fatalf("handoff cleanup left a running session: manifest=%#v session=%#v err=%v", cancelled, fake.sessions[manifest.Session], err)
 	}
@@ -929,14 +929,14 @@ func TestAgentFailureCancelAndIneligibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	recovered2 := Attempt{Repository: attempt2.Repository, Issue: attempt2.Issue, Number: attempt2.Number, BaseSHA: attempt2.BaseSHA}
-	manifest2, err = r2.Cancel(context.Background(), recovered2, "issue closed")
+	manifest2, err = cancelFixture(t, r2, context.Background(), recovered2, "issue closed")
 	if _, live := fake2.sessions[manifest2.Session]; err != nil || manifest2.State != "cancelled" || live {
 		t.Fatalf("cancel = %#v, %v", manifest2, err)
 	}
 
 	r3, _, attempt3, _ := testRuntime(t)
 	attempt3.Eligible = func() bool { return false }
-	if _, err := prepareAndStartFixture(t, r3, context.Background(), attempt3); err == nil || !strings.Contains(err.Error(), "eligibility") {
+	if _, err := prepareAndStartFixture(t, r3, context.Background(), attempt3); err == nil || !strings.Contains(err.Error(), "input is invalid") {
 		t.Fatalf("ineligible = %v", err)
 	}
 }
@@ -953,7 +953,7 @@ func TestMonitorStopsAttemptThatBecomesIneligible(t *testing.T) {
 	session := manifest.Session
 	eligible = false
 	manifest, err = monitorFixture(t, r, context.Background(), attempt)
-	if err == nil || !strings.Contains(err.Error(), "generation-invalidating stop") {
+	if err == nil || !strings.Contains(err.Error(), "input is invalid") {
 		t.Fatalf("ineligible monitor should defer to owner Stop: %#v, %v", manifest, err)
 	}
 	if _, live := fake.sessions[session]; !live {
@@ -2414,7 +2414,7 @@ func TestResumeHandoffEligibilityOwnsStateTransition(t *testing.T) {
 		eligibilityChecked = true
 		return false
 	}
-	if _, err := resumeHandoffFixture(t, r, t.Context(), attempt); err == nil || !strings.Contains(err.Error(), "eligibility") {
+	if _, err := resumeHandoffFixture(t, r, t.Context(), attempt); err == nil || !strings.Contains(err.Error(), "input is invalid") {
 		t.Fatalf("ineligible resume=%v", err)
 	}
 	current, err := r.Discover()
@@ -2543,7 +2543,7 @@ func TestProbeAndCancellationErrorsPreserveState(t *testing.T) {
 	}
 	delete(fake.failCode, "display-message")
 	fake.ignoreInterrupt, fake.keepAfterKill = true, true
-	if got, err := r.Cancel(context.Background(), attempt, "stop"); err == nil || got.State != "running" {
+	if got, err := cancelFixture(t, r, context.Background(), attempt, "stop"); err == nil || got.State != "running" {
 		t.Fatalf("uncertain cancellation = %#v, %v", got, err)
 	}
 	stored, err := readManifest(r.manifestPath(attempt))
@@ -2556,7 +2556,7 @@ func TestProbeAndCancellationErrorsPreserveState(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake2.failCode["has-session"] = 2
-	if got, err := r2.Cancel(context.Background(), attempt2, "stop"); err == nil || got.State != "running" {
+	if got, err := cancelFixture(t, r2, context.Background(), attempt2, "stop"); err == nil || got.State != "running" {
 		t.Fatalf("probe permission error = %#v, %v", got, err)
 	}
 
@@ -2568,7 +2568,7 @@ func TestProbeAndCancellationErrorsPreserveState(t *testing.T) {
 	fake3.ignoreInterrupt = true
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if got, err := r3.Cancel(cancelled, attempt3, "stop"); !errors.Is(err, context.Canceled) || got.State != "running" {
+	if got, err := cancelFixture(t, r3, cancelled, attempt3, "stop"); !errors.Is(err, context.Canceled) || got.State != "running" {
 		t.Fatalf("cancellation timeout = %#v, %v", got, err)
 	}
 }
@@ -2583,7 +2583,7 @@ func TestCancelValidatesManifestAndWinsConcurrentMonitor(t *testing.T) {
 	if err := r.writeManifest(attempt, manifest); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Cancel(context.Background(), attempt, "stop"); err == nil || !strings.Contains(err.Error(), "deterministic") {
+	if _, err := cancelFixture(t, r, context.Background(), attempt, "stop"); err == nil || !strings.Contains(err.Error(), "deterministic") {
 		t.Fatalf("tampered cancel = %v", err)
 	}
 
@@ -2595,7 +2595,7 @@ func TestCancelValidatesManifestAndWinsConcurrentMonitor(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); _, _ = monitorFixture(t, r2, context.Background(), attempt2) }()
-	go func() { defer wg.Done(); _, _ = r2.Cancel(context.Background(), attempt2, "stop") }()
+	go func() { defer wg.Done(); _, _ = cancelFixture(t, r2, context.Background(), attempt2, "stop") }()
 	wg.Wait()
 	stored, err := readManifest(r2.manifestPath(attempt2))
 	if err != nil || stored.State != "cancelled" {
@@ -2806,6 +2806,46 @@ func monitorFixture(t *testing.T, r *Runtime, ctx context.Context, attempt Attem
 	}
 	if writeErr := r.writeManifest(attempt, result.Manifest); writeErr != nil {
 		return result.Manifest, errors.Join(effectErr, writeErr)
+	}
+	return result.Manifest, effectErr
+}
+
+func cancelFixture(t *testing.T, r *Runtime, ctx context.Context, attempt Attempt, reason string) (Manifest, error) {
+	t.Helper()
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if manifest.Version != boundManifestVersion {
+		return r.Cancel(ctx, attempt, reason)
+	}
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		return Manifest{}, err
+	}
+	effectAttempt := attempt
+	effectAttempt.Eligible = nil
+	executor := EffectExecutor{Runtime: r}
+	request, err := executor.BindRequest(EffectRequest{Action: EffectStop, Attempt: effectAttempt, Manifest: manifest, Reason: reason})
+	if err != nil {
+		return manifest, err
+	}
+	id, err := newLaunchToken()
+	if err != nil {
+		return manifest, err
+	}
+	request.Identity = EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: id}
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		return manifest, err
+	}
+	result, effectErr := executor.Execute(ctx, request)
+	if result.Manifest.Repository == "" {
+		return manifest, effectErr
+	}
+	if effectErr == nil {
+		if writeErr := r.writeManifest(attempt, result.Manifest); writeErr != nil {
+			return result.Manifest, writeErr
+		}
 	}
 	return result.Manifest, effectErr
 }
