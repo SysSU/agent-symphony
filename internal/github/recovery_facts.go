@@ -248,6 +248,30 @@ func ExecuteIssueUpdateProposal(ctx context.Context, api API, cfg PRAdapterConfi
 	return errors.Join(err, verifyErr, errors.New("issue update postcondition was not observed"))
 }
 
+// EnsureControlSnapshotRepair posts a generation-unique owner snapshot even
+// when an older, semantically equivalent snapshot is already present.
+func EnsureControlSnapshotRepair(ctx context.Context, api API, cfg PRAdapterConfig, repository string, issue int, body string) error {
+	if repository != cfg.Repository || issue < 1 {
+		return errors.New("control snapshot repair identity is invalid")
+	}
+	snapshot, err := ParseSnapshotComment(body, cfg.ActorID, cfg.ActorID)
+	if err != nil || snapshot.OwnerGeneration == 0 {
+		return errors.New("control snapshot repair body is invalid")
+	}
+	if err := api.createControlSnapshot(ctx, repository, issue, body); err != nil {
+		return err
+	}
+	applied, err := issueUpdateApplied(ctx, api, cfg, IssueUpdateProposal{Kind: IssueUpdateControlSnapshot, Repository: repository, Issue: issue, ControlSnapshotBody: body})
+	if err != nil || !applied {
+		return errors.Join(err, errors.New("control snapshot repair was not observed"))
+	}
+	return nil
+}
+
+func ControlSnapshotRepairApplied(ctx context.Context, api API, cfg PRAdapterConfig, repository string, issue int, body string) (bool, error) {
+	return issueUpdateApplied(ctx, api, cfg, IssueUpdateProposal{Kind: IssueUpdateControlSnapshot, Repository: repository, Issue: issue, ControlSnapshotBody: body})
+}
+
 func issueUpdateApplied(ctx context.Context, api API, cfg PRAdapterConfig, proposal IssueUpdateProposal) (bool, error) {
 	if proposal.Repository != cfg.Repository || proposal.Issue < 1 {
 		return false, errors.New("issue update proposal identity is invalid")
@@ -262,9 +286,20 @@ func issueUpdateApplied(ctx context.Context, api API, cfg PRAdapterConfig, propo
 		if err != nil {
 			return false, err
 		}
-		return slices.ContainsFunc(comments, func(comment issueCommentRecord) bool {
-			return comment.User.ID == cfg.ActorID && comment.Body == proposal.ControlSnapshotBody
-		}), nil
+		want, err := ParseSnapshotComment(proposal.ControlSnapshotBody, cfg.ActorID, cfg.ActorID)
+		if err != nil {
+			return false, err
+		}
+		var latest Snapshot
+		var latestID int64
+		var latestBody string
+		for _, comment := range comments {
+			parsed, err := ParseSnapshotComment(comment.Body, comment.User.ID, cfg.ActorID)
+			if err == nil && (latestID == 0 || parsed.OwnerGeneration > latest.OwnerGeneration || parsed.OwnerGeneration == latest.OwnerGeneration && comment.ID > latestID) {
+				latest, latestID, latestBody = parsed, comment.ID, comment.Body
+			}
+		}
+		return latestID > 0 && latest.OwnerGeneration == want.OwnerGeneration && latestBody == proposal.ControlSnapshotBody, nil
 	case IssueUpdateDependencyClear:
 		if proposal.AttributionAttempt < 1 || proposal.Dependency < 1 || proposal.ControlSnapshotBody != "" || proposal.PullRequest < 0 {
 			return false, errors.New("dependency clear proposal is invalid")
@@ -289,6 +324,10 @@ type directStatus struct {
 	incomplete           bool
 	createdAt            time.Time
 	commentID            int64
+	requestedReason      string
+	attributionIssue     int
+	attributionAttempt   int
+	statusSequence       uint64
 }
 
 func monitoringDependencyStatus(reason string, needsAttention bool) int {
@@ -304,7 +343,9 @@ func monitoringDependencyStatus(reason string, needsAttention bool) int {
 }
 
 func parseDirectStatus(body string) (directStatus, bool) {
-	command, reason, found := strings.Cut(strings.TrimSpace(body), ":")
+	trimmed := strings.TrimSpace(body)
+	line, rest, _ := strings.Cut(trimmed, "\n")
+	command, reason, found := strings.Cut(strings.TrimSpace(line), ":")
 	reason = strings.TrimSpace(reason)
 	if !found || reason == "" || len(reason) > 1024 || strings.ContainsRune(reason, 0) {
 		return directStatus{}, false
@@ -319,11 +360,19 @@ func parseDirectStatus(body string) (directStatus, bool) {
 		return directStatus{}, false
 	}
 	status.monitoringDependency = monitoringDependencyStatus(reason, status.requestedAttention)
+	var issue, attempt int
+	marker := strings.TrimSpace(rest)
+	var sequence uint64
+	if _, err := fmt.Sscanf(marker, "<!-- agent-symphony:status:v1:sequence:%d -->\n\n<!-- agent-symphony:issue:%d:attempt:%d -->", &sequence, &issue, &attempt); err == nil && marker == fmt.Sprintf("<!-- agent-symphony:status:v1:sequence:%d -->\n\n<!-- agent-symphony:issue:%d:attempt:%d -->", sequence, issue, attempt) && sequence > 0 && issue > 0 && attempt > 0 {
+		status.attributionAttempt = attempt
+		status.attributionIssue = issue
+		status.statusSequence = sequence
+	}
 	return status, true
 }
 
 func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest int) (directStatus, error) {
-	var latest directStatus
+	var latestMarked, latestUnmarked directStatus
 	for _, number := range []int{issue, pullRequest} {
 		if number == 0 {
 			continue
@@ -344,11 +393,23 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 				}
 				status = directStatus{NeedsAttention: true, Reason: "direct status intent is incomplete: use needs-attention or clear with a nonempty reason", incomplete: true}
 			}
-			if latest.commentID == 0 || comment.CreatedAt.After(latest.createdAt) || comment.CreatedAt.Equal(latest.createdAt) && comment.ID > latest.commentID {
-				status.createdAt, status.commentID = comment.CreatedAt, comment.ID
-				latest = status
+			status.requestedReason = status.Reason
+			status.createdAt, status.commentID = comment.CreatedAt, comment.ID
+			if status.attributionAttempt > 0 {
+				if status.attributionIssue != issue {
+					continue
+				}
+				if latestMarked.commentID == 0 || status.attributionAttempt > latestMarked.attributionAttempt || status.attributionAttempt == latestMarked.attributionAttempt && (status.statusSequence > latestMarked.statusSequence || status.statusSequence == latestMarked.statusSequence && newerDirectStatus(status, latestMarked)) {
+					latestMarked = status
+				}
+			} else if latestUnmarked.commentID == 0 || newerDirectStatus(status, latestUnmarked) {
+				latestUnmarked = status
 			}
 		}
+	}
+	latest := latestMarked
+	if latest.commentID == 0 || latestUnmarked.commentID != 0 && newerDirectStatus(latestUnmarked, latest) {
+		latest = latestUnmarked
 	}
 	var current struct{ Labels []struct{ Name string } }
 	if _, _, err := s.API.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", s.Config.Repository, issue), "", &current); err != nil {
@@ -373,6 +434,64 @@ func (s *GitHubPRSource) directStatus(ctx context.Context, issue, pullRequest in
 		latest.NeedsAttention = true
 	}
 	return latest, nil
+}
+
+func newerDirectStatus(candidate, current directStatus) bool {
+	return candidate.createdAt.After(current.createdAt) || candidate.createdAt.Equal(current.createdAt) && candidate.commentID > current.commentID
+}
+
+// OwnerStatusApplied verifies the exact owner-authored status comment and label pair.
+func (a API) OwnerStatusApplied(ctx context.Context, repository string, issue, attempt int, sequence uint64, needsAttention bool, reason string, actorID int) (bool, error) {
+	reason = strings.TrimSpace(reason)
+	if repository == "" || issue < 1 || attempt < 1 || sequence == 0 || actorID < 1 || reason == "" || len(reason) > 1024 || strings.ContainsRune(reason, 0) {
+		return false, errors.New("owner status requires a bound attempt and reason")
+	}
+	source := GitHubPRSource{API: a, Config: PRAdapterConfig{Repository: repository, ActorID: actorID}}
+	status, err := source.directStatus(ctx, issue, 0)
+	return err == nil && status.commentID > 0 && !status.incomplete && status.attributionIssue == issue && status.attributionAttempt == attempt && status.statusSequence == sequence && status.NeedsAttention == needsAttention && status.Reason == reason, err
+}
+
+// EnsureOwnerStatus applies an untrusted worker request through owner credentials.
+func (a API) EnsureOwnerStatus(ctx context.Context, repository string, issue, attempt int, sequence uint64, needsAttention bool, reason string, actorID int) error {
+	reason = strings.TrimSpace(reason)
+	applied, err := a.OwnerStatusApplied(ctx, repository, issue, attempt, sequence, needsAttention, reason, actorID)
+	if err != nil || applied {
+		return err
+	}
+	source := GitHubPRSource{API: a, Config: PRAdapterConfig{Repository: repository, ActorID: actorID}}
+	status, err := source.directStatus(ctx, issue, 0)
+	if err != nil {
+		return err
+	}
+	if status.commentID == 0 || status.attributionAttempt != attempt || status.statusSequence != sequence || status.requestedAttention != needsAttention || status.requestedReason != reason {
+		name := "clear"
+		if needsAttention {
+			name = "needs-attention"
+		}
+		body, err := AttributedBody(issue, attempt, directStatusPrefix+name+": "+reason+fmt.Sprintf("\n\n<!-- agent-symphony:status:v1:sequence:%d -->", sequence))
+		if err != nil {
+			return err
+		}
+		if err := a.CreateIssueComment(ctx, repository, issue, body, Mutation{Issue: issue, Attempt: attempt}); err != nil {
+			return err
+		}
+	}
+	var current struct{ Labels []struct{ Name string } }
+	if _, _, err := a.Read(ctx, fmt.Sprintf("/repos/%s/issues/%d", repository, issue), "", &current); err != nil {
+		return err
+	}
+	hasLabel := slices.ContainsFunc(current.Labels, func(label struct{ Name string }) bool { return strings.EqualFold(label.Name, NeedsAttentionLabel) })
+	if err := a.SyncReviewLabel(ctx, repository, issue, NeedsAttentionLabel, hasLabel, needsAttention, Mutation{Issue: issue, Attempt: attempt}); err != nil {
+		return err
+	}
+	applied, err = a.OwnerStatusApplied(ctx, repository, issue, attempt, sequence, needsAttention, reason, actorID)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return errors.New("owner status did not match after apply")
+	}
+	return nil
 }
 
 func (s *GitHubPRSource) clearResolvedMonitoringDependencyStatus(ctx context.Context, issue, pullRequest, attempt int, status directStatus) (directStatus, error) {
@@ -950,6 +1069,41 @@ func RetryCommandApplied(ctx context.Context, api API, cfg PRAdapterConfig, issu
 	}
 	latest, name := latestControlCommand(comments, cfg.CancelCommand, cfg.RetryCommand)
 	return latest != nil && name == "retry" && latest.User.ID == cfg.ActorID && latest.CreatedAt.After(terminal.FailedAt), nil
+}
+
+// EnsureRetrySuppressed makes a late owner-generated retry harmless after its
+// source attempt was invalidated. The newer cancel command is an observable,
+// idempotent postcondition; absence of the retry is not treated as final.
+func EnsureRetrySuppressed(ctx context.Context, api API, cfg PRAdapterConfig, issue, attempt int, failedAt time.Time) (bool, error) {
+	source := GitHubPRSource{API: api, Config: cfg}
+	check := func() (bool, error) {
+		comments, err := source.issueComments(ctx, issue)
+		if err != nil {
+			return false, err
+		}
+		latest, name := latestControlCommand(comments, cfg.CancelCommand, cfg.RetryCommand)
+		return latest != nil && name == "cancelled" && latest.User.ID == cfg.ActorID && latest.CreatedAt.After(failedAt.UTC()), nil
+	}
+	if suppressed, err := check(); err != nil || suppressed {
+		return suppressed, err
+	}
+	applied, err := RetryCommandApplied(ctx, api, cfg, issue, attempt, failedAt)
+	if err != nil || !applied {
+		return false, err
+	}
+	body, _ := json.Marshal(map[string]string{"body": cfg.CancelCommand})
+	response, mutationErr := api.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", cfg.Repository, issue), "", body, Mutation{Issue: issue, Attempt: attempt})
+	if response != nil {
+		defer response.Body.Close()
+	}
+	if mutationErr == nil && (response == nil || response.StatusCode < 200 || response.StatusCode >= 300) {
+		mutationErr = errors.New("GitHub retry suppression returned no successful response")
+	}
+	suppressed, err := check()
+	if err != nil || !suppressed {
+		return false, errors.Join(errors.New("late retry suppression was not observed"), mutationErr, err)
+	}
+	return true, nil
 }
 
 func fetchTerminalFailures(ctx context.Context, api API, cfg PRAdapterConfig, issue int) ([]terminalMarkerPayload, markerConflicts, error) {

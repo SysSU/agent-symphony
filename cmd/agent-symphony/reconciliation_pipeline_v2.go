@@ -156,8 +156,8 @@ func (c *runtimeEffectCoordinator) executePublication(_ context.Context, api int
 	if request.Action != reconciliationGitHubPublish || request.GitHubPublish == nil || material.Config.Repository != request.Repository || material.Config.ActorID < 1 || publicationExecutionDigest(request, material) != request.ExecutionDigest || material.Head != request.GitHubPublish.HeadSHA {
 		return reconciliationEffectResult{}, errStateConflict
 	}
-	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	key := ownerIssueKey(request.Repository, request.Issue)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -334,7 +334,7 @@ func (c *runtimeEffectCoordinator) executeHandoff(_ context.Context, boundary bo
 		return reconciliationEffectResult{}, errStateConflict
 	}
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -773,7 +773,7 @@ func (c *runtimeEffectCoordinator) executeRetirement(_ context.Context, boundary
 		return reconciliationEffectResult{}, errStateConflict
 	}
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -843,8 +843,8 @@ func (c *runtimeEffectCoordinator) executeGitHubBind(_ context.Context, api inte
 	if request.Action != reconciliationGitHubBind || request.GitHubBind == nil || githubBindExecutionDigest(request, cfg) != request.ExecutionDigest {
 		return reconciliationEffectResult{}, errStateConflict
 	}
-	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	key := ownerIssueKey(request.Repository, request.Issue)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -941,6 +941,8 @@ func planReconciliationAttemptIssueUpdates(snapshot stateOwnerSnapshot, batch re
 		var update *githubIssueUpdateEffectRequest
 		remote, remotelyObserved := observedReconciliationAttempt(observation, manifest.Attempt)
 		switch {
+		case manifest.WorkerStatusSeq > manifest.WorkerStatusApplied:
+			update = &githubIssueUpdateEffectRequest{Kind: githubIssueWorkerStatus, Status: manifest.WorkerStatus, StatusReason: manifest.WorkerStatusReason, StatusSequence: manifest.WorkerStatusSeq}
 		case manifest.State == "failed" || manifest.State == "cancelled":
 			terminal := slices.ContainsFunc(observation.Fact.TerminalAttempts, func(attempt reconciliationAttemptFact) bool {
 				return attempt.Attempt == manifest.Attempt
@@ -1042,8 +1044,8 @@ func (c *runtimeEffectCoordinator) executeGovernance(ctx context.Context, api in
 	if request.Action != reconciliationGitHubPRGovernance || request.GitHubPRGovernance == nil || plan.Attempt == nil || governanceExecutionDigest(request, *plan.Attempt) != request.ExecutionDigest {
 		return reconciliationEffectResult{}, errStateConflict
 	}
-	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	key := ownerIssueKey(request.Repository, request.Issue)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -1110,16 +1112,25 @@ func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API
 	}
 	issueScoped := reconciliationEffectIssueScoped(request)
 	key, attemptGeneration := ownerIssueKey(request.Repository, request.Issue), uint64(0)
-	if !issueScoped {
-		key, attemptGeneration = ownerAttemptKey(request.Repository, request.Issue, request.Attempt), plan.Identity.AttemptGeneration
-	}
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, attemptGeneration, request.ObservationGeneration)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, attemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
 	defer c.releaseKey(key, run)
 	var applied bool
-	if issueScoped {
+	if request.ControlRepair {
+		if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
+			return reconciliationEffectResult{}, err
+		}
+		err = internalgithub.EnsureControlSnapshotRepair(run.ctx, api, plan.Material.Config, request.Repository, request.Issue, request.GitHubIssueUpdate.ControlSnapshotBody)
+		if err != nil {
+			applied, proofErr := internalgithub.ControlSnapshotRepairApplied(c.lifecycle, api, plan.Material.Config, request.Repository, request.Issue, request.GitHubIssueUpdate.ControlSnapshotBody)
+			if proofErr != nil || !applied {
+				return reconciliationEffectResult{}, errors.Join(err, proofErr)
+			}
+		}
+		applied = true
+	} else if issueScoped {
 		applied, err = internalgithub.RevalidateIssueUpdateProposal(run.ctx, api, plan.Material.Config, plan.issueUpdateProposal())
 	} else {
 		applied, err = revalidateAttemptIssueUpdate(run.ctx, api, request, plan.Material)
@@ -1127,8 +1138,10 @@ func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
-	if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
-		return reconciliationEffectResult{}, err
+	if !request.ControlRepair {
+		if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
+			return reconciliationEffectResult{}, err
+		}
 	}
 	if !applied {
 		if issueScoped {
@@ -1215,6 +1228,8 @@ func executeAttemptIssueUpdate(ctx context.Context, api internalgithub.API, requ
 		return api.EnsureReviewFindings(ctx, request.Repository, request.Issue, request.Attempt, update.HeadSHA, update.Findings, cfg.ActorID)
 	case githubIssueRetry:
 		return internalgithub.EnsureRetryCommand(ctx, api, cfg, request.Issue, request.Attempt)
+	case githubIssueWorkerStatus:
+		return api.EnsureOwnerStatus(ctx, request.Repository, request.Issue, request.Attempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, cfg.ActorID)
 	default:
 		return errStateConflict
 	}
@@ -1246,6 +1261,8 @@ func attemptIssueUpdateApplied(ctx context.Context, api internalgithub.API, requ
 		bodies = []string{body}
 	case githubIssueRetry:
 		return internalgithub.RetryCommandApplied(ctx, api, cfg, request.Issue, request.Attempt, time.Unix(0, update.FailedAtUnixNano))
+	case githubIssueWorkerStatus:
+		return api.OwnerStatusApplied(ctx, request.Repository, request.Issue, request.Attempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, cfg.ActorID)
 	default:
 		return false, errStateConflict
 	}
@@ -1412,7 +1429,8 @@ func planReconciliationIssueUpdates(snapshot stateOwnerSnapshot, batch reconcili
 		request := reconciliationEffectRequest{
 			Action: reconciliationGitHubIssueUpdate, Repository: proposal.Repository, Issue: proposal.Issue,
 			ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest,
-			GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: proposal.Kind, ControlSnapshotDigest: proposal.ControlSnapshotDigest, AttributionAttempt: proposal.AttributionAttempt, Dependency: proposal.Dependency, PullRequest: proposal.PullRequest},
+			ControlGeneration: controlGeneration(snapshot.State, key),
+			GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: proposal.Kind, ControlSnapshotDigest: proposal.ControlSnapshotDigest, ControlSnapshotBody: material.ControlSnapshotBody, AttributionAttempt: proposal.AttributionAttempt, Dependency: proposal.Dependency, PullRequest: proposal.PullRequest},
 		}
 		request.ExecutionDigest = issueUpdateExecutionDigest(request, material)
 		if !validReconciliationEffectRequest(snapshot.State.Repository, request) {
@@ -1422,6 +1440,40 @@ func planReconciliationIssueUpdates(snapshot stateOwnerSnapshot, batch reconcili
 			Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: observation.OwnerGeneration},
 			Request:  request, Material: material,
 		})
+	}
+	return plans, nil
+}
+
+func planControlSnapshotRepairs(snapshot stateOwnerSnapshot, cfg internalgithub.PRAdapterConfig) ([]reconciliationPlannedEffect, error) {
+	keys := make([]string, 0, len(snapshot.State.ControlRepairs))
+	for key := range snapshot.State.ControlRepairs {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	var plans []reconciliationPlannedEffect
+	for _, key := range keys {
+		blocked := false
+		for _, effect := range snapshot.State.Effects {
+			if ownerIssueKey(effect.Repository, effect.Issue) == key && effect.State == "invalidated" && effect.Action != string(reconciliationGitHubPRGovernance) {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
+		repair := snapshot.State.ControlRepairs[key]
+		observation, ok := snapshot.State.Observations[key]
+		if !ok || !observation.Present || repair.Generation != controlGeneration(snapshot.State, key) || repair.Body == "" || cfg.Repository != snapshot.State.Repository || cfg.ActorID < 1 {
+			continue
+		}
+		request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: snapshot.State.Repository, Issue: observation.Fact.Issue, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, ControlGeneration: repair.Generation, ControlRepair: true, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueControlSnapshot, ControlSnapshotDigest: digestText(repair.Body), ControlSnapshotBody: repair.Body}}
+		material := reconciliationIssueUpdateMaterial{Proposal: reconciliationIssueUpdateProposal{Repository: request.Repository, Issue: request.Issue, Kind: githubIssueControlSnapshot, ControlSnapshotDigest: request.GitHubIssueUpdate.ControlSnapshotDigest}, Config: cfg, ControlSnapshotBody: repair.Body}
+		request.ExecutionDigest = issueUpdateExecutionDigest(request, material)
+		if !validReconciliationEffectRequest(snapshot.State.Repository, request) || !validReconciliationEffectStateBindings("", snapshot.State, request) {
+			return nil, errors.New("control snapshot repair is invalid")
+		}
+		plans = append(plans, reconciliationPlannedEffect{Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[key]}, Request: request, Material: material})
 	}
 	return plans, nil
 }

@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +35,54 @@ type fakeRunner struct {
 	ignoreInterrupt bool
 	keepAfterKill   bool
 	seen            []Command
+}
+
+func TestWorkerStatusRequestIsGenerationAndLaunchBound(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.Mkdir(PrivatePath(workspace), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{Worktree: workspace, LaunchID: strings.Repeat("a", 32)}
+	write := func(generation, sequence uint64, status, reason string) {
+		t.Helper()
+		body, _ := json.Marshal(workerStatusRequest{Type: "agent-symphony-status-v1", Generation: generation, LaunchID: manifest.LaunchID, Sequence: sequence, Status: status, Reason: reason})
+		if err := os.WriteFile(StatusPath(workspace), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(7, 1, "needs-attention", "operator decision required")
+	observed, err := observeWorkerStatus(manifest, 7)
+	if err != nil || observed.WorkerStatus != "needs-attention" || observed.WorkerStatusReason != "operator decision required" || observed.WorkerStatusSeq != 1 {
+		t.Fatalf("observed=%#v err=%v", observed, err)
+	}
+	write(6, 2, "clear", "stale worker")
+	if _, err := observeWorkerStatus(observed, 7); err == nil {
+		t.Fatal("stale generation status was accepted")
+	}
+	write(7, 1, "clear", "out of order")
+	unchanged, err := observeWorkerStatus(observed, 7)
+	if err != nil || unchanged.WorkerStatus != observed.WorkerStatus || unchanged.WorkerStatusSeq != observed.WorkerStatusSeq {
+		t.Fatalf("out-of-order request changed status: %#v err=%v", unchanged, err)
+	}
+}
+
+func TestWorkerEnvironmentUsesOnlyAttemptPrivateTempAndStatusPaths(t *testing.T) {
+	workspace := t.TempDir()
+	manifest := Manifest{Worktree: workspace, LaunchID: strings.Repeat("b", 32)}
+	environment, err := workspaceEnvironment([]string{"PATH=/bin", "TMPDIR=/host/tmp", "GOCACHE=/host/cache", "GH_TOKEN=secret"}, manifest, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range environment {
+		if strings.Contains(entry, "/host/") || strings.HasPrefix(entry, "GH_TOKEN=") {
+			t.Fatalf("host path or GitHub credential survived: %q", entry)
+		}
+	}
+	for _, want := range []string{WorkerStatusEnvironment + "=" + StatusPath(workspace), WorkerGenerationEnv + "=9", WorkerLaunchIDEnv + "=" + manifest.LaunchID, "TMPDIR=" + filepath.Join(PrivatePath(workspace), "tmp")} {
+		if !slices.Contains(environment, want) {
+			t.Fatalf("missing managed worker environment %q in %#v", want, environment)
+		}
+	}
 }
 
 type inheritedEnvironmentRunner struct{}
@@ -529,7 +578,7 @@ func TestPaneExitStatusProcessHelper(t *testing.T) {
 	os.Exit(code)
 }
 
-func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *testing.T) {
+func TestLifecycleCreatesUncredentialedSessionWithoutCredentialedRepository(t *testing.T) {
 	r, fake, attempt, primary := testRuntime(t)
 	before := gitOutput(t, primary, "status", "--porcelain=v1", "--branch")
 	t.Setenv("GITHUB_TOKEN", "credential-canary")
@@ -554,7 +603,6 @@ func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *tes
 	if got := gitOutput(t, primary, "status", "--porcelain=v1", "--branch"); got != before {
 		t.Fatalf("primary checkout changed: before %q after %q", before, got)
 	}
-	credentialAvailable, repositoryBound := false, false
 	for _, command := range fake.seen {
 		if command.Name != "tmux" {
 			continue
@@ -563,11 +611,9 @@ func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *tes
 		if strings.Contains(args, "credential-canary") {
 			t.Fatal("GitHub credential reached tmux argv")
 		}
-		credentialAvailable = credentialAvailable || strings.Contains(env, "GITHUB_TOKEN=credential-canary")
-		repositoryBound = repositoryBound || strings.Contains(env, "GH_REPO=owner/repo")
-	}
-	if !credentialAvailable || !repositoryBound {
-		t.Fatal("GitHub CLI authentication or repository binding was unavailable in the implementation session")
+		if strings.Contains(env, "GITHUB_TOKEN=") || strings.Contains(env, "GH_REPO=") {
+			t.Fatal("GitHub authority reached the implementation session")
+		}
 	}
 	info, err := os.Stat(r.manifestPath(attempt))
 	if err != nil || info.Mode().Perm() != 0o600 {
@@ -889,16 +935,26 @@ func TestValidationTraversalExistingAndLaunchFailureDiagnostics(t *testing.T) {
 
 func TestStaleWorkerResultBlocksLaunch(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
-	identity, err := AttemptIdentity(r.Root, attempt)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(7, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(ResultPath(identity.Worktree), []byte("stale"), 0o600); err != nil {
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "a")
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
-	if err == nil || manifest.State != "" || !strings.Contains(err.Error(), "worker result already exists") {
-		t.Fatalf("manifest=%#v err=%v", manifest, err)
+	if err := os.MkdirAll(PrivatePath(prepared.Manifest.Worktree), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ResultPath(prepared.Manifest.Worktree), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "b")
+	result, err := executor.Execute(t.Context(), start)
+	if err == nil || result.Manifest.State != "preparing" || !strings.Contains(err.Error(), "worker result already exists") {
+		t.Fatalf("manifest=%#v err=%v", result.Manifest, err)
 	}
 	if len(fake.sessions) != 0 {
 		t.Fatalf("agent launched with stale result: %#v", fake.sessions)
@@ -1001,6 +1057,9 @@ func TestPromptCommandProvidesStdinBeforeFastConsumerStarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	resultPath := ResultPath(workspace)
+	if err := os.Mkdir(PrivatePath(workspace), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	canary := filepath.Join(dir, "outside-canary")
 	if err := os.WriteFile(canary, []byte("unchanged"), 0o600); err != nil {
 		t.Fatal(err)
@@ -2169,7 +2228,8 @@ func TestForgetRemovesOnlyCleanedAttemptRecord(t *testing.T) {
 func TestCredentialedSessionLaunchFailureIsRedacted(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	canary := "credential-canary"
-	t.Setenv("GITHUB_TOKEN", canary)
+	t.Setenv("MODEL_API_KEY", canary)
+	r.AllowEnv = append(r.AllowEnv, "MODEL_API_KEY")
 	fake.fail = "new-session"
 	fake.failOutput, fake.failErr = "launch output "+canary, errors.New("launch failure "+canary)
 	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
@@ -2186,31 +2246,23 @@ func TestCredentialedSessionLaunchFailureIsRedacted(t *testing.T) {
 		}
 	}
 	launch := fake.seen[slices.IndexFunc(fake.seen, func(command Command) bool { return slices.Contains(command.Args, "new-session") })]
-	if !slices.Contains(launch.Env, "GITHUB_TOKEN="+canary) || !strings.Contains(strings.Join(launch.Args, " "), "GITHUB_TOKEN") {
-		t.Fatal("tmux client did not receive the bounded credential environment")
+	if !slices.Contains(launch.Env, "MODEL_API_KEY="+canary) || !strings.Contains(strings.Join(launch.Args, " "), "MODEL_API_KEY") {
+		t.Fatal("tmux client did not receive the bounded model credential environment")
 	}
 }
 
-func TestImplementationAuthenticationCrossesRuntimeBoundary(t *testing.T) {
-	for _, test := range []struct {
-		name, token string
-		ok          bool
-	}{{"authenticated", "implementation-auth-canary", true}, {"missing", "", false}, {"invalid", "implementation-invalid-canary", false}} {
+func TestGitHubAuthenticationDoesNotCrossRuntimeBoundary(t *testing.T) {
+	for _, test := range []struct{ name, token string }{{"present", "implementation-auth-canary"}, {"missing", ""}} {
 		t.Run(test.name, func(t *testing.T) {
 			r, fake, attempt, _ := testRuntime(t)
-			fake.sessionAuth, fake.validAuth = true, "implementation-auth-canary"
 			t.Setenv("GH_TOKEN", test.token)
 			manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
-			if test.ok {
-				if err != nil || manifest.State != "running" {
-					t.Fatal("authenticated implementation did not reach running state")
-				}
-			} else if err == nil || !strings.Contains(err.Error(), "GitHub CLI authentication") || test.token != "" && (strings.Contains(err.Error(), test.token) || strings.Contains(manifest.Diagnostic, test.token)) {
-				t.Fatal("implementation authentication failure was unclear or exposed its credential")
+			if err != nil || manifest.State != "running" {
+				t.Fatalf("uncredentialed implementation did not reach running state: %#v %v", manifest, err)
 			}
 			for _, command := range fake.seen {
-				if test.token != "" && strings.Contains(strings.Join(command.Args, " "), test.token) {
-					t.Fatal("credential reached implementation command argv")
+				if strings.Contains(strings.Join(command.Args, " ")+strings.Join(command.Env, " "), "GH_TOKEN=") || test.token != "" && strings.Contains(strings.Join(command.Args, " ")+strings.Join(command.Env, " "), test.token) {
+					t.Fatal("GitHub credential reached implementation process")
 				}
 			}
 			body, readErr := os.ReadFile(r.manifestPath(attempt))
@@ -2224,7 +2276,8 @@ func TestImplementationAuthenticationCrossesRuntimeBoundary(t *testing.T) {
 func TestCredentialedPaneOutputIsRedactedBeforeLogPersistence(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	canary := "pane-credential-canary"
-	t.Setenv("GH_TOKEN", canary)
+	t.Setenv("MODEL_API_KEY", canary)
+	r.AllowEnv = append(r.AllowEnv, "MODEL_API_KEY")
 	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)

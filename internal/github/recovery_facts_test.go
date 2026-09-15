@@ -40,6 +40,74 @@ func TestDirectStatusRequiresTheSmallVocabularyAndReason(t *testing.T) {
 	}
 }
 
+func TestEnsureOwnerStatusAppliesExactCommentAndLabelIdempotently(t *testing.T) {
+	now := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
+	var comments []map[string]any
+	label := false
+	posts, labels := 0, 0
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		respond := func(value any) *http.Response {
+			body, _ := json.Marshal(value)
+			return httpResponse(http.StatusOK, string(body), nil)
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/9/comments":
+			return respond(comments), nil
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/9":
+			var issueLabels []map[string]string
+			if label {
+				issueLabels = append(issueLabels, map[string]string{"name": NeedsAttentionLabel})
+			}
+			return respond(map[string]any{"labels": issueLabels}), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/9/comments":
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil {
+				t.Fatal("invalid comment")
+			}
+			posts++
+			comments = append(comments, map[string]any{"id": posts, "body": payload.Body, "created_at": now.Add(time.Duration(posts) * time.Second), "updated_at": now.Add(time.Duration(posts) * time.Second), "user": map[string]any{"id": 42}})
+			return httpResponse(http.StatusCreated, `{}`, nil), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/9/labels":
+			label, labels = true, labels+1
+			return httpResponse(http.StatusOK, `{}`, nil), nil
+		case r.Method == http.MethodDelete && r.URL.Path == "/repos/o/r/issues/9/labels/needs-attention":
+			label, labels = false, labels+1
+			return httpResponse(http.StatusNoContent, ``, nil), nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			return nil, nil
+		}
+	})}}
+	for range 2 {
+		if err := api.EnsureOwnerStatus(t.Context(), "o/r", 9, 3, 1, true, "operator decision required", 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if posts != 1 || labels != 1 || !label {
+		t.Fatalf("needs-attention posts=%d labels=%d label=%v", posts, labels, label)
+	}
+	for range 2 {
+		if err := api.EnsureOwnerStatus(t.Context(), "o/r", 9, 3, 2, false, "operator decision supplied", 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if posts != 2 || labels != 2 || label {
+		t.Fatalf("clear posts=%d labels=%d label=%v", posts, labels, label)
+	}
+	if applied, err := api.OwnerStatusApplied(t.Context(), "o/r", 9, 2, 2, false, "operator decision supplied", 42); err != nil || applied {
+		t.Fatalf("old attempt falsely proved the current status: applied=%t err=%v", applied, err)
+	}
+	lateOld, _ := AttributedBody(9, 3, directStatusPrefix+"needs-attention: stale worker\n\n<!-- agent-symphony:status:v1:sequence:1 -->")
+	wrongIssue, _ := AttributedBody(8, 3, directStatusPrefix+"needs-attention: misplaced worker\n\n<!-- agent-symphony:status:v1:sequence:3 -->")
+	for index, body := range []string{lateOld, wrongIssue} {
+		created := now.Add(time.Duration(10+index) * time.Second)
+		comments = append(comments, map[string]any{"id": 10 + index, "body": body, "created_at": created, "updated_at": created, "user": map[string]any{"id": 42}})
+	}
+	if applied, err := api.OwnerStatusApplied(t.Context(), "o/r", 9, 3, 2, false, "operator decision supplied", 42); err != nil || !applied {
+		t.Fatalf("late old or cross-issue status displaced canonical clear: applied=%t err=%v", applied, err)
+	}
+}
+
 func TestDirectStatusUsesNewestAuthenticatedIssueOrPullRequestComment(t *testing.T) {
 	now := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
 	labelPresent := true
@@ -313,6 +381,43 @@ func TestEnsureRetryCommandIsAuthorizedExactAndIdempotent(t *testing.T) {
 	}
 	if posts != 1 {
 		t.Fatalf("retry posts=%d", posts)
+	}
+}
+
+func TestEnsureRetrySuppressedSurvivesLostAcceptedResponseAndRestart(t *testing.T) {
+	failedAt := time.Unix(10, 0).UTC()
+	active, _ := ActiveAttemptMarker("o/r", 4, 2, "abcdef0")
+	terminal, _ := TerminalFailureMarker(4, 2, failedAt)
+	comments := []map[string]any{
+		{"id": 1, "body": active, "created_at": failedAt.Add(-time.Minute), "updated_at": failedAt.Add(-time.Minute), "user": map[string]any{"id": 42}},
+		{"id": 2, "body": terminal, "created_at": failedAt, "updated_at": failedAt, "user": map[string]any{"id": 42}},
+		{"id": 3, "body": "/retry", "created_at": failedAt.Add(time.Minute), "updated_at": failedAt.Add(time.Minute), "user": map[string]any{"id": 42}},
+	}
+	posts := 0
+	api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet && r.URL.RequestURI() == "/repos/o/r/issues/4/comments?per_page=100&page=1" {
+			body, _ := json.Marshal(comments)
+			return httpResponse(http.StatusOK, string(body), nil), nil
+		}
+		if r.Method == http.MethodPost && r.URL.RequestURI() == "/repos/o/r/issues/4/comments" {
+			var payload struct{ Body string }
+			if json.NewDecoder(r.Body).Decode(&payload) != nil || payload.Body != "/cancel" {
+				t.Fatalf("suppression body=%q", payload.Body)
+			}
+			posts++
+			createdAt := failedAt.Add(2 * time.Minute)
+			comments = append(comments, map[string]any{"id": 4, "body": payload.Body, "created_at": createdAt, "updated_at": createdAt, "user": map[string]any{"id": 42}})
+			return nil, io.ErrUnexpectedEOF
+		}
+		t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		return nil, nil
+	})}}
+	cfg := PRAdapterConfig{Repository: "o/r", ActorID: 42, CancelCommand: "/cancel", RetryCommand: "/retry"}
+	if applied, err := EnsureRetrySuppressed(t.Context(), api, cfg, 4, 2, failedAt); err != nil || !applied {
+		t.Fatalf("lost accepted response was not converged: applied=%v err=%v", applied, err)
+	}
+	if applied, err := EnsureRetrySuppressed(t.Context(), api, cfg, 4, 2, failedAt); err != nil || !applied || posts != 1 {
+		t.Fatalf("restart suppression applied=%v posts=%d err=%v", applied, posts, err)
 	}
 }
 

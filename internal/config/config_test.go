@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,12 +10,57 @@ import (
 	"testing"
 )
 
+func TestBindWorkerExecutablePinsExactBinaryIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex")
+	write := func(marker string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n# "+marker+"\nprintf 'codex-cli 0.153.4\\n'\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("first")
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = path, path
+	first, err := BindWorkerExecutable(context.Background(), &commands)
+	canonical, _ := filepath.EvalSymlinks(path)
+	if err != nil || commands.Implementation[0] != canonical || len(first) != 64 {
+		t.Fatalf("first binding=%q commands=%#v err=%v", first, commands, err)
+	}
+	write("replacement")
+	second, err := BindWorkerExecutable(context.Background(), &commands)
+	if err != nil || first == second {
+		t.Fatalf("replacement binding=%q first=%q err=%v", second, first, err)
+	}
+}
+
+func TestWorkerSandboxArgsExposeAttestedCodexInstallation(t *testing.T) {
+	prefix := filepath.Join(t.TempDir(), "node")
+	executable := filepath.Join(prefix, "bin", "codex")
+	args := WorkerSandboxArgsForExecutable(t.TempDir(), executable, "probe")
+	index := slices.Index(args, "--sandbox-state-readable-root")
+	if index < 0 || index+1 >= len(args) || args[index+1] != prefix {
+		t.Fatalf("sandbox cannot read its attested installation root %q: %q", prefix, args)
+	}
+}
+
+func TestBindWorkerExecutableRejectsFakeCodexBasename(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'fake-codex 1\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = path, path
+	if _, err := BindWorkerExecutable(context.Background(), &commands); err == nil {
+		t.Fatal("accepted a basename-only fake Codex executable")
+	}
+}
+
 func TestLoadAndValidate(t *testing.T) {
 	c := Default("owner/repo")
 	if c.ReconciliationIntervalSeconds != 60 {
 		t.Fatalf("default reconciliation interval = %d", c.ReconciliationIntervalSeconds)
 	}
-	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "-c", `projects={"{managed_workspace}"={trust_level="trusted"}}`, "--dangerously-bypass-approvals-and-sandbox", "-"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "-c", `projects={"{managed_workspace}"={trust_level="trusted"}}`, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
+	if !slices.Equal(c.Commands.Implementation, defaultWorkerCommand(false)) || !slices.Equal(c.Commands.Reviewer, defaultWorkerCommand(true)) {
 		t.Fatalf("unexpected default commands: %#v", c.Commands)
 	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
@@ -25,7 +71,6 @@ func TestLoadAndValidate(t *testing.T) {
 	if !slices.Equal(c.Commands.OrchestratorAudit, wantAudit) {
 		t.Fatalf("unexpected default orchestrator audit: %#v", c.Commands.OrchestratorAudit)
 	}
-	c.Commands.Implementation = []string{"custom-agent", "--flag"}
 	path := filepath.Join(t.TempDir(), DefaultPath)
 	if err := Write(path, c); err != nil {
 		t.Fatal(err)
@@ -34,8 +79,12 @@ func TestLoadAndValidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Repository != "owner/repo" || c.Concurrency != 1 || c.ReconciliationIntervalSeconds != 60 || c.CompletionPolicies.Default != "human-review" || !slices.Equal(c.Commands.Implementation, []string{"custom-agent", "--flag"}) {
+	if c.Repository != "owner/repo" || c.Concurrency != 1 || c.ReconciliationIntervalSeconds != 60 || c.CompletionPolicies.Default != "human-review" || !slices.Equal(c.Commands.Implementation, defaultWorkerCommand(false)) {
 		t.Fatalf("unexpected defaults: %#v", c)
+	}
+	c.Commands.Implementation = []string{"custom-agent", "--flag"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "managed rootless Codex worker profile") {
+		t.Fatalf("custom worker command accepted: %v", err)
 	}
 }
 
@@ -180,7 +229,7 @@ func TestExpandManagedWorkspaceUsesOneExactEscapedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoded, _ := json.Marshal(workspace)
-	want := `projects={` + string(encoded) + `={trust_level="trusted"}}`
+	want := `projects={` + string(encoded) + `={trust_level="untrusted"}}`
 	if !slices.Equal(expanded, []string{"codex", "-c", want, "--no-alt-screen"}) {
 		t.Fatalf("expanded command=%q, want exact workspace %q", expanded, want)
 	}
@@ -264,8 +313,8 @@ func TestValidateRejectsUnsafePathsAndPolicy(t *testing.T) {
 	}
 	c := Default("owner/repo")
 	c.Commands.Environment = []string{"GITHUB_TOKEN"}
-	if err := c.Validate(); err != nil {
-		t.Fatalf("GitHub CLI authentication environment rejected: %v", err)
+	if err := c.Validate(); err == nil {
+		t.Fatal("worker GitHub authentication environment accepted")
 	}
 }
 

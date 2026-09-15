@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/user"
@@ -22,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
@@ -60,18 +62,12 @@ var (
 		}
 		return nil
 	}
-	hostOutput     = func(name string, args ...string) ([]byte, error) { return exec.Command(name, args...).Output() }
-	hostExecRunner = (agentruntime.ExecRunner{}).Run
-	hostProbe      = func(name string, args []string, input []byte) error {
-		cmd := exec.Command(name, args...)
-		cmd.Env, cmd.Stdin = minimalBoundaryEnvironment(), bytes.NewReader(input)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
-		}
-		return nil
-	}
+	hostOutput           = func(name string, args ...string) ([]byte, error) { return exec.Command(name, args...).Output() }
+	hostExecRunner       = (agentruntime.ExecRunner{}).Run
 	hostReviewResultOpen = syscall.Open
 	hostRoot             = ""
+	sandboxExecutable    = os.Executable
+	rootlessCodexVerify  = verifyRootlessCodex
 )
 
 func runHostTmux(ctx context.Context, args []string, stdin io.Reader) (agentruntime.Result, error) {
@@ -80,11 +76,8 @@ func runHostTmux(ctx context.Context, args []string, stdin io.Reader) (agentrunt
 
 func nativeRoot(path string) string { return filepath.Join(hostRoot, path) }
 
-// hostIsolationInstalled reports whether install-host has ever provisioned the
-// advanced cross-UID boundary. Its absence is the sole signal that selects the
-// zero-admin default (local) boundary instead: running install-host is itself
-// the explicit opt-in into advanced mode, so there is exactly one source of
-// truth and no separate config flag is needed.
+// hostIsolationInstalled reports legacy identities for migration diagnostics.
+// Their presence never changes the rootless runtime boundary.
 func hostIsolationInstalled() bool {
 	_, err := hostLookupUser(workerUser)
 	return err == nil
@@ -145,75 +138,192 @@ func verifyLocalAccess(root string) error {
 	return os.RemoveAll(canary)
 }
 
-func installHost(coordinator string) error {
-	if hostGOOS != "linux" && hostGOOS != "darwin" {
-		return errors.New("host isolation supports macOS and Linux/WSL2 only")
+type codexConfinementProof struct {
+	Confined        bool `json:"confined"`
+	SharedTempRead  bool `json:"shared_temp_read"`
+	SharedTempWrite bool `json:"shared_temp_write"`
+}
+
+func verifyRootlessCodex(ctx context.Context, root, codexHome, codexExecutable string) (codexConfinementProof, error) {
+	if err := verifyLocalAccess(root); err != nil {
+		return codexConfinementProof{}, err
 	}
-	if hostEUID() != 0 {
-		return errors.New("install-host must run as root")
+	if info, err := os.Lstat(codexHome); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return codexConfinementProof{}, errors.New("isolated worker CODEX_HOME is unavailable or unsafe")
 	}
-	if strings.TrimSpace(coordinator) != coordinator || coordinator == "" || strings.ContainsAny(coordinator, "/:\n\r") {
-		return errors.New("invalid coordinator user")
-	}
-	if _, err := hostLookupUser(coordinator); err != nil {
-		return fmt.Errorf("coordinator user: %w", err)
-	}
-	binary, err := hostExecutable()
+	workspace, err := os.MkdirTemp(root, ".sandbox-preflight-")
 	if err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
-	binary, err = filepath.EvalSymlinks(binary)
-	if err != nil {
-		return err
+	defer os.RemoveAll(workspace)
+	private := filepath.Join(workspace, ".agent-symphony")
+	if err := os.Mkdir(private, 0o700); err != nil {
+		return codexConfinementProof{}, err
 	}
-	if err := validateInstalledBinary(binary); err != nil {
-		return err
-	}
-	fd, err := syscall.Open(binary, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return errors.New("open immutable installed binary without following links")
-	}
-	defer syscall.Close(fd)
-	opened := os.NewFile(uintptr(fd), binary)
-	openedInfo, err := opened.Stat()
-	if err != nil {
-		return err
-	}
-	if listed, err := hostOutput("sudo", "-n", "-l", "-U", coordinator); err != nil || !installableSudoAuthority(listed, binary) {
-		return errors.New("coordinator has unmanaged or broader sudo authority; remove it before installation")
-	}
-	if err := provisionIdentities(coordinator); err != nil {
-		return err
-	}
-	if err := validateProvisionedIdentitySeparation(coordinator); err != nil {
-		return err
-	}
-	base := "/var/lib/agent-symphony"
-	if hostGOOS == "darwin" {
-		base = "/var/db/agent-symphony"
-	}
-	for _, root := range []struct{ path, owner, group, mode string }{
-		{base + "/attempts", workerUser, attemptGroup, "2770"},
-		{base + "/snapshots", coordinator, snapshotGroup, "0750"},
-	} {
-		if err := ensureHostRoot(nativeRoot(root.path), root.owner, root.group, root.mode); err != nil {
-			return err
+	for _, name := range []string{".codex", ".agents"} {
+		directory := filepath.Join(workspace, name)
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			return codexConfinementProof{}, err
+		}
+		if err := os.WriteFile(filepath.Join(directory, "deny"), []byte("deny\n"), 0o600); err != nil {
+			return codexConfinementProof{}, err
 		}
 	}
-	currentInfo, err := os.Lstat(binary)
-	if err != nil || !os.SameFile(openedInfo, currentInfo) {
-		return errors.New("installed binary changed during installation")
-	}
-	sudoersPath := nativeRoot("/etc/sudoers.d/agent-symphony")
-	previousSudoers, previousErr := os.ReadFile(sudoersPath)
-	installed, err := writeSudoers(coordinator, binary)
+	otherAttempt, err := os.MkdirTemp(root, ".sandbox-other-attempt-")
 	if err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
-	currentInfo, err = os.Lstat(binary)
-	if err != nil || !os.SameFile(openedInfo, currentInfo) {
-		_ = rollbackSudoers(sudoersPath, previousSudoers, !installed && previousErr == nil)
-		return errors.New("installed binary changed during installation; sudo rules were not trusted")
+	defer os.RemoveAll(otherAttempt)
+	canaryPath := filepath.Join(otherAttempt, "deny")
+	canary, err := os.OpenFile(canaryPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return codexConfinementProof{}, err
+	}
+	if canary.Chmod(0o600) != nil || func() error { _, err := canary.WriteString("deny\n"); return err }() != nil || canary.Close() != nil {
+		return codexConfinementProof{}, errors.New("prepare sandbox deny canary")
+	}
+	stateCanary := filepath.Join(filepath.Dir(root), fmt.Sprintf(".sandbox-state-%d", os.Getpid()))
+	if err := os.WriteFile(stateCanary, []byte("deny\n"), 0o600); err != nil {
+		return codexConfinementProof{}, err
+	}
+	defer os.Remove(stateCanary)
+	authCanary := filepath.Join(codexHome, ".sandbox-auth-link")
+	if err := os.Symlink(stateCanary, authCanary); err != nil {
+		return codexConfinementProof{}, err
+	}
+	defer os.Remove(authCanary)
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return codexConfinementProof{}, err
+	}
+	defer tcpListener.Close()
+	unixPath := filepath.Join(root, fmt.Sprintf(".sandbox-%d.sock", os.Getpid()))
+	unixListener, err := net.Listen("unix", unixPath)
+	if err != nil {
+		return codexConfinementProof{}, err
+	}
+	defer func() { unixListener.Close(); _ = os.Remove(unixPath) }()
+	sharedTemp, err := os.CreateTemp("/tmp", ".agent-symphony-sandbox-")
+	if err != nil {
+		return codexConfinementProof{}, err
+	}
+	sharedTempPath := sharedTemp.Name()
+	if _, err := sharedTemp.WriteString("deny\n"); err != nil {
+		sharedTemp.Close()
+		return codexConfinementProof{}, err
+	}
+	if err := sharedTemp.Close(); err != nil {
+		return codexConfinementProof{}, err
+	}
+	defer os.Remove(sharedTempPath)
+	executable, err := sandboxExecutable()
+	if err != nil {
+		return codexConfinementProof{}, err
+	}
+	probe := filepath.Join(workspace, "probe")
+	input, err := os.Open(executable)
+	if err != nil {
+		return codexConfinementProof{}, err
+	}
+	output, err := os.OpenFile(probe, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o700)
+	if err != nil {
+		input.Close()
+		return codexConfinementProof{}, err
+	}
+	_, copyErr := io.Copy(output, input)
+	err = errors.Join(copyErr, output.Sync(), output.Close(), input.Close())
+	if err != nil {
+		return codexConfinementProof{}, err
+	}
+	proof := filepath.Join(workspace, "proof")
+	args := config.WorkerSandboxArgsForExecutable(workspace, codexExecutable, probe, "sandbox-probe", proof, canaryPath, stateCanary, authCanary, tcpListener.Addr().String(), unixPath, sharedTempPath)
+	command := exec.CommandContext(ctx, codexExecutable, args...)
+	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(private, "tmp")}
+	if err := os.Mkdir(filepath.Join(private, "tmp"), 0o700); err != nil {
+		return codexConfinementProof{}, err
+	}
+	if out, err := command.CombinedOutput(); err != nil {
+		return codexConfinementProof{}, fmt.Errorf("rootless Codex confinement preflight failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	body, err := os.ReadFile(proof)
+	var result codexConfinementProof
+	if err != nil || json.Unmarshal(body, &result) != nil || !result.Confined {
+		return codexConfinementProof{}, errors.New("rootless Codex confinement preflight produced no proof")
+	}
+	return result, nil
+}
+
+func runSandboxProbe(args []string, child bool) error {
+	if len(args) != 7 && len(args) != 9 {
+		return errors.New("invalid sandbox probe")
+	}
+	if !child {
+		command := exec.Command(os.Args[0], append([]string{"sandbox-probe-child"}, args...)...)
+		command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if output, err := command.CombinedOutput(); err != nil {
+			return fmt.Errorf("detached sandbox probe failed: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+		return nil
+	}
+	if len(args) == 9 {
+		ready, err := os.OpenFile(args[7], os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		_, writeErr := ready.Write([]byte{1})
+		closeErr := ready.Close()
+		if writeErr != nil || closeErr != nil {
+			return errors.Join(writeErr, closeErr)
+		}
+		release, err := os.Open(args[8])
+		if err != nil {
+			return err
+		}
+		var signal [1]byte
+		_, readErr := io.ReadFull(release, signal[:])
+		closeErr = release.Close()
+		if readErr != nil || closeErr != nil {
+			return errors.Join(readErr, closeErr)
+		}
+	}
+	if _, err := os.ReadFile(args[1]); err == nil {
+		return errors.New("sandbox read sibling canary")
+	}
+	if err := os.WriteFile(args[1], []byte("mutated"), 0o600); err == nil {
+		return errors.New("sandbox wrote sibling canary")
+	}
+	if _, err := os.ReadFile(args[2]); err == nil {
+		return errors.New("sandbox read coordinator state canary")
+	}
+	if _, err := os.ReadFile(args[3]); err == nil {
+		return errors.New("sandbox read worker credential canary")
+	}
+	wantTemp := filepath.Join(filepath.Dir(args[0]), ".agent-symphony", "tmp")
+	if filepath.Clean(os.TempDir()) != wantTemp {
+		return errors.New("sandbox did not receive its attempt-private temporary directory")
+	}
+	_, sharedReadErr := os.ReadFile(args[6])
+	sharedWriteErr := os.WriteFile(args[6], []byte("mutated"), 0o600)
+	for _, directory := range []string{filepath.Join(filepath.Dir(args[0]), ".codex"), filepath.Join(filepath.Dir(args[0]), ".agents")} {
+		path := filepath.Join(directory, "deny")
+		if _, err := os.ReadFile(path); err == nil {
+			return errors.New("sandbox read denied local agent configuration")
+		}
+		if err := os.WriteFile(path, []byte("mutated"), 0o600); err == nil {
+			return errors.New("sandbox wrote denied local agent configuration")
+		}
+	}
+	if connection, err := net.Dial("tcp", args[4]); err == nil {
+		connection.Close()
+		return errors.New("sandbox opened network connection")
+	}
+	if connection, err := net.Dial("unix", args[5]); err == nil {
+		connection.Close()
+		return errors.New("sandbox opened coordinator socket")
+	}
+	proof, _ := json.Marshal(codexConfinementProof{Confined: true, SharedTempRead: sharedReadErr == nil, SharedTempWrite: sharedWriteErr == nil})
+	if err := os.WriteFile(args[0], proof, 0o600); err != nil {
+		return fmt.Errorf("sandbox cannot write disposable workspace: %w", err)
 	}
 	return nil
 }
@@ -325,27 +435,6 @@ func exactSudoAuthorityFor(body []byte, binary string, orchestrator, setenv bool
 	}
 	valid := want[workerUser+":"+attemptGroup+"\x00"+binary+" agent-host implementation"] && want[reviewerUser+":"+snapshotGroup+"\x00"+binary+" agent-host review"]
 	return valid && (!orchestrator || want[reviewerUser+":"+snapshotGroup+"\x00"+binary+" agent-host orchestrator"])
-}
-
-func validateInstalledBinary(binary string) error {
-	prefix := "/usr/local/libexec/agent-symphony/"
-	rel := strings.TrimPrefix(binary, prefix)
-	if rel == binary || rel == "agent-symphony" || filepath.Dir(rel) == "." || filepath.Base(binary) != "agent-symphony" || strings.Contains(filepath.Dir(rel), string(os.PathSeparator)) {
-		return errors.New("current binary must use /usr/local/libexec/agent-symphony/<version>/agent-symphony")
-	}
-	for path := binary; ; path = filepath.Dir(path) {
-		info, err := os.Lstat(path)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 || fileUID(info) != 0 || fileGID(info) != 0 || info.Mode().Perm()&0o022 != 0 {
-			return fmt.Errorf("installed binary path component %s must be root:root and not group/world writable", path)
-		}
-		if path == binary && (!info.Mode().IsRegular() || info.Mode().Perm() != 0o755) {
-			return errors.New("current binary must be a root-owned regular file mode 0755")
-		}
-		if path == string(os.PathSeparator) {
-			break
-		}
-	}
-	return nil
 }
 
 func ensureHostRoot(path, owner, group, mode string) error {
@@ -586,40 +675,6 @@ func parseDSCLRecord(body []byte) map[string]string {
 		}
 	}
 	return result
-}
-
-func writeSudoers(coordinator, binary string) (bool, error) {
-	body := sudoersPolicy(coordinator, binary)
-	dir, path := nativeRoot("/etc/sudoers.d"), nativeRoot("/etc/sudoers.d/agent-symphony")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return false, err
-	}
-	tmp, err := os.CreateTemp(dir, ".agent-symphony-")
-	if err != nil {
-		return false, err
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	if _, err = io.WriteString(tmp, body); err == nil {
-		err = tmp.Sync()
-	}
-	if closeErr := tmp.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return false, err
-	}
-	if err := os.Chmod(name, 0o440); err != nil {
-		return false, err
-	}
-	if err := os.Chown(name, 0, 0); err != nil {
-		return false, err
-	}
-	if err := hostRun("visudo", "-cf", name); err != nil {
-		return false, err
-	}
-	_, statErr := os.Lstat(path)
-	return errors.Is(statErr, os.ErrNotExist), os.Rename(name, path)
 }
 
 func sudoersPolicy(coordinator, binary string) string {
@@ -921,9 +976,6 @@ func credentialShapedArgument(value string) bool {
 
 func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writer) error {
 	localRoot := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_LOCAL_ROOT"))
-	if localRoot != "" && hostIsolationInstalled() {
-		return errors.New("local boundary root is disabled when host isolation is installed")
-	}
 	wantUser, wantGroup, root := workerUser, attemptGroup, "/var/lib/agent-symphony/attempts"
 	if hostGOOS == "darwin" {
 		root = "/var/db/agent-symphony/attempts"
@@ -940,15 +992,15 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 	} else if mode != "implementation" {
 		return errors.New("agent-host mode must be implementation, review, orchestrator, orchestrator-proposal, or orchestrator-proposal-status")
 	}
-	// AGENT_SYMPHONY_LOCAL_ROOT is only ever set by the coordinator's own
-	// implementationBoundary/reviewBoundary when install-host was never run;
+	// AGENT_SYMPHONY_LOCAL_ROOT is set by the coordinator's rootless boundary;
 	// there is no separate OS identity to verify in that mode, only the same
-	// user the coordinator itself runs as.
+	// user the coordinator itself runs as. The legacy decoder branch is not
+	// selected by the production launcher.
 	var homeDir string
 	var err error
 	if localRoot != "" {
-		if !filepath.IsAbs(localRoot) {
-			return errors.New("local boundary root must be absolute")
+		if !filepath.IsAbs(localRoot) || filepath.Clean(localRoot) != localRoot {
+			return errors.New("local boundary root must be canonical and absolute")
 		}
 		root = localRoot
 		var current *user.User
@@ -1040,7 +1092,29 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if mode != "implementation" {
 			return errors.New("review boundary cannot export implementation attempts")
 		}
-		result.Output, err = exportAttempt(ctx, request.Command.Input, root)
+		var manifest agentruntime.Manifest
+		decoder := json.NewDecoder(bytes.NewReader(request.Command.Input))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF || !belowRoot(manifest.Worktree, root) {
+			return errors.New("invalid export manifest")
+		}
+		binary, binaryErr := hostExecutable()
+		if binaryErr != nil {
+			return binaryErr
+		}
+		tmp := filepath.Join(manifest.Worktree, ".agent-symphony", "tmp")
+		if err := os.MkdirAll(tmp, 0o700); err != nil {
+			return err
+		}
+		codexExecutable := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_CODEX_EXECUTABLE"))
+		profileDigest := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_WORKER_PROFILE_DIGEST"))
+		if !filepath.IsAbs(codexExecutable) || !validDigest(profileDigest) || manifest.WorkerProfileDigest != profileDigest {
+			return errors.New("worker export confinement identity is unavailable")
+		}
+		if err := config.VerifyWorkerExecutable(ctx, codexExecutable, profileDigest); err != nil {
+			return err
+		}
+		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgsForExecutable(manifest.Worktree, codexExecutable, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp}, Stdin: bytes.NewReader(request.Command.Input)})
 	case "validate-cleanup", "cleanup":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot clean implementation attempts")
@@ -1191,13 +1265,13 @@ func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.M
 		}
 	}
 
-	resultPath := agentruntime.ResultPath(want.Worktree)
-	resultInfo, resultErr := os.Lstat(resultPath)
-	if resultErr != nil && !errors.Is(resultErr, os.ErrNotExist) {
-		return resultErr
+	privatePath := agentruntime.PrivatePath(want.Worktree)
+	privateInfo, privateErr := os.Lstat(privatePath)
+	if privateErr != nil && !errors.Is(privateErr, os.ErrNotExist) {
+		return privateErr
 	}
-	if resultErr == nil && (!resultInfo.Mode().IsRegular() || resultInfo.Mode()&os.ModeSymlink != 0) {
-		return errors.New("cleanup result is not a regular non-symlink file")
+	if privateErr == nil && (!privateInfo.IsDir() || privateInfo.Mode()&os.ModeSymlink != 0 || privateInfo.Mode().Perm()&0o077 != 0) {
+		return errors.New("cleanup worker-private path is unsafe")
 	}
 	if !remove {
 		return nil
@@ -1210,17 +1284,17 @@ func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.M
 			return err
 		}
 	}
-	if resultErr == nil {
-		if err := os.Remove(resultPath); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
 func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) error {
 	if manifest.Version != agentruntime.ManifestVersion2 {
 		return errors.New("legacy implementation session has no durable launch identity")
+	}
+	profileDigest := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_WORKER_PROFILE_DIGEST"))
+	confined := agentruntime.WorkerConfinementBound(manifest, manifest.WorkerGeneration, profileDigest)
+	if manifest.LaunchID == "" && confined {
+		return nil
 	}
 	binding, err := agentruntime.ReadImplementationBinding(manifest)
 	if err != nil {
@@ -1244,6 +1318,9 @@ func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) err
 	if !live {
 		absent, probeErr := hostBoundImplementationPaneAbsent(ctx, binding)
 		if probeErr == nil && absent {
+			if confined {
+				return nil
+			}
 			gone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding)
 			if groupErr == nil && gone {
 				return nil
@@ -1274,6 +1351,9 @@ func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) err
 	}
 	if !absent {
 		return errors.New("bound implementation pane remained after guarded cleanup")
+	}
+	if confined {
+		return nil
 	}
 	workerGone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding)
 	if groupErr != nil || !workerGone {
@@ -1393,7 +1473,7 @@ func validateBoundaryCommand(c boundaryCommand, root string) error {
 }
 
 func boundaryEnvironment(environment []string) ([]string, error) {
-	requiredGit := internalgithub.AgentEnvironment(nil)
+	requiredGit, _ := internalgithub.WorkerEnvironmentWith(nil)
 	managedGit := make(map[string]bool, len(requiredGit))
 	for _, entry := range requiredGit {
 		managedGit[entry] = false
@@ -1431,7 +1511,7 @@ func boundaryEnvironment(environment []string) ([]string, error) {
 			}
 		}
 	}
-	filtered, err := internalgithub.AgentEnvironmentWith(environment, names...)
+	filtered, err := internalgithub.WorkerEnvironmentWith(environment, names...)
 	if err != nil {
 		return nil, err
 	}
@@ -1810,8 +1890,13 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	run := func(args ...string) (string, error) {
 		cmd := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", manifest.Worktree}, args...)...)
 		cmd.Env = append(minimalBoundaryEnvironment(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
-		out, err := cmd.CombinedOutput()
-		return strings.TrimSpace(string(out)), err
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			return strings.TrimSpace(string(out)), fmt.Errorf("git command failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+		}
+		return strings.TrimSpace(string(out)), nil
 	}
 	top, err := run("rev-parse", "--show-toplevel")
 	if err != nil || !samePath(top, manifest.Worktree) {
@@ -1842,12 +1927,12 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	status, err := run("status", "--porcelain", "--", ".", ":(exclude).agent-symphony")
+	status, err := run("status", "--porcelain", "--", ".", ":(exclude).agent-symphony", ":(exclude).agents", ":(exclude).codex")
 	if err != nil {
 		return "", errors.New("inspect export worktree")
 	}
 	if status != "" {
-		if _, err := run("add", "--all", "--", ".", ":(exclude).agent-symphony"); err != nil {
+		if _, err := run("add", "--all", "--", ".", ":(exclude).agent-symphony", ":(exclude).agents", ":(exclude).codex"); err != nil {
 			return "", fmt.Errorf("stage worker changes: %w", err)
 		}
 		if _, err := run("diff", "--cached", "--quiet"); err == nil || !isExitCode(err, 1) {
@@ -1865,7 +1950,7 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if branch, err := run("branch", "--show-current"); err != nil || branch != manifest.Branch {
 		return "", errors.New("export branch changed")
 	}
-	if status, err := run("status", "--porcelain", "--", ".", ":(exclude).agent-symphony"); err != nil || status != "" {
+	if status, err := run("status", "--porcelain", "--", ".", ":(exclude).agent-symphony", ":(exclude).agents", ":(exclude).codex"); err != nil || status != "" {
 		return "", errors.New("export worktree is not clean")
 	}
 	tmp, err := os.CreateTemp("", "agent-symphony-export-*.bundle")
@@ -2094,122 +2179,35 @@ func belowRoot(path, root string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
 }
 
-func hostDiagnostic(stateRoot string) diagnostic {
-	if !hostIsolationInstalled() {
-		return localHostDiagnostic(stateRoot)
-	}
-	binary, err := hostExecutable()
-	if err != nil {
-		return diagnostic{"host isolation", "fail", err.Error(), "Install the current release with install-host."}
-	}
-	binary, err = filepath.EvalSymlinks(binary)
-	if err != nil || validateInstalledBinary(binary) != nil {
-		return diagnostic{"host isolation", "fail", "current binary is not the installed root-owned mode-0755 release", "Run doctor from /usr/local/libexec/agent-symphony/<version>/agent-symphony."}
-	}
-	current, currentErr := hostCurrentUser()
-	sudoList, sudoErr := hostOutput("sudo", "-n", "-l")
-	if currentErr != nil || sudoErr != nil || !exactSudoAuthority(sudoList, binary) {
-		return diagnostic{"host isolation", "fail", "effective sudo authority is missing, stale, or broader than the two managed tuples", "Remove unmanaged grants and rerun the current install-host."}
-	}
-	for _, pair := range [][2]string{{workerUser, attemptGroup}, {reviewerUser, snapshotGroup}} {
-		if err := validateIdentity(pair[0], pair[1]); err != nil {
-			return diagnostic{"host isolation", "fail", err.Error(), "Repair conflicting host identities, then rerun install-host."}
-		}
-	}
-	base := "/var/lib/agent-symphony"
-	if hostGOOS == "darwin" {
-		base = "/var/db/agent-symphony"
-	}
-	worker, _ := hostLookupUser(workerUser)
-	attempt, _ := hostLookupGroup(attemptGroup)
-	coordinator, coordinatorErr := hostLookupUser(current.Username)
-	snapshot, _ := hostLookupGroup(snapshotGroup)
-	if coordinatorErr != nil {
-		return diagnostic{"host isolation", "fail", "managed coordinator identity is missing", "Rerun install-host with the intended coordinator."}
-	}
-	groupOutput, groupErr := hostOutput("id", "-G", coordinator.Username)
-	memberships := map[string]bool{}
-	for _, gid := range strings.Fields(string(groupOutput)) {
-		memberships[gid] = true
-	}
-	if groupErr != nil || !memberships[attempt.Gid] || !memberships[snapshot.Gid] {
-		return diagnostic{"host isolation", "fail", "coordinator is missing required supplementary groups", "Rerun install-host, then start a new login session."}
-	}
-	for _, root := range []struct {
-		path, uid, gid string
-		mode           os.FileMode
-	}{{base + "/attempts", worker.Uid, attempt.Gid, os.ModeSetgid | 0o770}, {base + "/snapshots", coordinator.Uid, snapshot.Gid, 0o750}} {
-		info, statErr := os.Stat(root.path)
-		if statErr != nil || !info.IsDir() || info.Mode()&(os.ModePerm|os.ModeSetgid) != root.mode || fileUID(info) != atoi(root.uid) || fileGID(info) != atoi(root.gid) {
-			return diagnostic{"host isolation", "fail", root.path + " ownership or mode is unsafe", "Rerun install-host after repairing conflicting state."}
-		}
-	}
-	stateCanary, err := os.MkdirTemp("", "agent-symphony-doctor-state-")
-	if err != nil {
-		return diagnostic{"host isolation", "fail", "cannot create coordinator denial canaries", err.Error()}
-	}
-	defer os.RemoveAll(stateCanary)
-	secret := filepath.Join(stateCanary, "secret")
-	socket := filepath.Join(stateCanary, "control.sock")
-	if os.WriteFile(secret, []byte("secret-canary\n"), 0o600) != nil || os.WriteFile(socket, nil, 0o600) != nil {
-		return diagnostic{"host isolation", "fail", "cannot create coordinator denial canaries", "Repair the coordinator temporary directory."}
-	}
-	snapshotCanaryDir, err := os.MkdirTemp(base+"/snapshots", ".doctor-snapshot-")
-	if err != nil {
-		return diagnostic{"host isolation", "fail", "cannot create reviewer snapshot canary", "Repair snapshot root ownership."}
-	}
-	defer func() { _ = os.Chmod(snapshotCanaryDir, 0o750); _ = os.RemoveAll(snapshotCanaryDir) }()
-	snapshotCanary := filepath.Join(snapshotCanaryDir, "snapshot")
-	if err := os.WriteFile(snapshotCanary, []byte("agent-symphony-review-canary\n"), 0o440); err != nil || os.Chown(snapshotCanaryDir, -1, atoi(snapshot.Gid)) != nil || os.Chown(snapshotCanary, -1, atoi(snapshot.Gid)) != nil || os.Chmod(snapshotCanaryDir, 0o550) != nil {
-		return diagnostic{"host isolation", "fail", "cannot seal reviewer snapshot canary", "Repair snapshot group ownership."}
-	}
-	canary, _ := json.Marshal(struct {
-		Deny     []string `json:"deny"`
-		Snapshot string   `json:"snapshot"`
-	}{[]string{stateCanary, secret, socket}, snapshotCanary})
-	requestBody, _ := json.Marshal(struct {
-		Operation string          `json:"operation"`
-		Command   boundaryCommand `json:"command"`
-	}{"verify", boundaryCommand{Input: canary}})
-	request := requestBody
-	for _, probe := range []struct {
-		want  bool
-		user  string
-		group string
-		args  []string
-	}{
-		{true, workerUser, attemptGroup, []string{binary, "agent-host", "implementation"}},
-		{true, reviewerUser, snapshotGroup, []string{binary, "agent-host", "review"}},
-		{false, workerUser, snapshotGroup, []string{binary, "agent-host", "implementation"}},
-		{false, reviewerUser, attemptGroup, []string{binary, "agent-host", "review"}},
-		{false, workerUser, attemptGroup, []string{binary, "agent-host", "implementation", "extra"}},
-		{false, workerUser, attemptGroup, []string{"/bin/sh"}},
-		{false, workerUser, attemptGroup, []string{"/usr/bin/id"}},
-		{false, "root", "root", []string{binary, "agent-host", "implementation"}},
-	} {
-		args := append([]string{"-n", "-u", probe.user, "-g", probe.group}, probe.args...)
-		err := hostProbe("sudo", args, request)
-		if (err == nil) != probe.want {
-			return diagnostic{"host isolation", "fail", "sudo allow/deny or worker access canary failed", "Remove broader sudo grants, repair root access, and rerun install-host."}
-		}
-	}
-	return diagnostic{"host isolation", "pass", "current binary identities and exact managed sudo rules are installed", ""}
-}
-
-// localHostDiagnostic validates the zero-admin default boundary: a private
-// local root the coordinator can create and write to. It intentionally does
-// not attempt to prove OS-enforced isolation between the coordinator and the
-// agent process, because none exists in this mode — see docs/security.md.
-func localHostDiagnostic(stateRoot string) diagnostic {
+func hostDiagnostic(codex, stateRoot string) diagnostic {
 	if strings.TrimSpace(stateRoot) == "" {
-		return diagnostic{"host isolation", "fail", "runtime state root is required to provision the local attempt/snapshot roots", "Pass --runtime-state, or run install-host for the advanced host-isolated path."}
+		return diagnostic{"worker confinement", "fail", "runtime state root is required to provision the local attempt/snapshot roots", "Pass --runtime-state."}
+	}
+	if err := validatePrivateStateRoot(stateRoot); err != nil {
+		return diagnostic{"worker confinement", "fail", err.Error(), "Choose a private persistent --runtime-state path under the current user's home."}
 	}
 	for _, root := range []string{localAttemptRoot(stateRoot), localSnapshotRoot(stateRoot)} {
 		if err := verifyLocalAccess(root); err != nil {
-			return diagnostic{"host isolation", "fail", err.Error(), "Repair " + root + " ownership and mode, or run install-host for the advanced host-isolated path."}
+			return diagnostic{"worker confinement", "fail", err.Error(), "Repair " + root + " ownership and mode."}
 		}
 	}
-	return diagnostic{"host isolation", "pass", "zero-admin default boundary is active: no separate OS identity, reduced isolation from the agent process", "Run install-host for OS-enforced isolation between the coordinator and the agent."}
+	if err := configureProjectRuntimeState(stateRoot); err != nil {
+		return diagnostic{"worker confinement", "fail", err.Error(), "Repair the runtime state root and coordinator Codex installation."}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	proof, err := rootlessCodexVerify(ctx, localAttemptRoot(stateRoot), workerCodexHome(stateRoot), codex)
+	if err != nil {
+		return diagnostic{"worker confinement", "fail", err.Error(), "Install @openai/codex@0.153.0 and repair the managed sandbox profile. On Linux/WSL, the host must permit unprivileged user namespaces for bubblewrap."}
+	}
+	message := "real managed Codex sandbox confinement proof passed"
+	if hostIsolationInstalled() {
+		message += "; legacy install-host identities are present but unused"
+	}
+	if proof.SharedTempRead || proof.SharedTempWrite {
+		return diagnostic{"worker confinement", "warn", message + "; Codex cannot isolate shared temporary files on this platform", "Keep Agent Symphony authority and control paths under the private runtime state root."}
+	}
+	return diagnostic{"worker confinement", "pass", message, ""}
 }
 
 func fileUID(info os.FileInfo) int {

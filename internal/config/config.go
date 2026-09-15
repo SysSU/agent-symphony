@@ -2,6 +2,8 @@ package config
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,7 +24,126 @@ const (
 	OrchestratorWorkspacePlaceholder     = "{orchestrator_workspace}"
 )
 
-const workspaceTrustConfig = `projects={"{managed_workspace}"={trust_level="trusted"}}`
+const (
+	workspaceTrustConfig = `projects={"{managed_workspace}"={trust_level="untrusted"}}`
+	legacyWorkspaceTrust = `projects={"{managed_workspace}"={trust_level="trusted"}}`
+	workerPermissions    = `permissions.agent-symphony-worker={filesystem={":root"="deny",":minimal"="read",":tmpdir"="deny",":slash_tmp"="deny",":workspace_roots"={"."="write",".git"="write",".agent-symphony"="write",".codex"="deny",".agents"="deny"}},network={enabled=false}}`
+	workerEnvironment    = `shell_environment_policy={inherit="all",include_only=["^(PATH|TMPDIR|XDG_CACHE_HOME|GOCACHE|npm_config_cache|LANG|LC_ALL|TERM|COLORTERM|NO_COLOR|CODEX_HOME|AGENT_SYMPHONY_IMPLEMENTATION_RESULT|AGENT_SYMPHONY_STATUS_REQUEST|AGENT_SYMPHONY_WORKER_GENERATION|AGENT_SYMPHONY_WORKER_LAUNCH_ID|AGENT_SYMPHONY_REVIEW_RESULT)$"]}`
+	workerProfileName    = "agent-symphony-worker"
+)
+
+var workerSafetyArgs = []string{
+	"--strict-config",
+	"--ask-for-approval", "never",
+	"-c", workspaceTrustConfig,
+	"-c", `default_permissions="agent-symphony-worker"`,
+	"-c", workerPermissions,
+	"-c", workerEnvironment,
+	"-c", `web_search="disabled"`,
+	"--disable", "apps",
+	"--disable", "browser_use",
+	"--disable", "browser_use_external",
+	"--disable", "computer_use",
+	"--disable", "hooks",
+	"--disable", "image_generation",
+	"--disable", "in_app_browser",
+	"--disable", "multi_agent",
+	"--disable", "multi_agent_v2",
+	"--disable", "plugins",
+	"--disable", "skill_mcp_dependency_install",
+	"--disable", "skill_search",
+}
+
+func defaultWorkerCommand(interactive bool) []string {
+	command := append([]string{"codex"}, workerSafetyArgs...)
+	if interactive {
+		return append(command, "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral")
+	}
+	return append(command, "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "-")
+}
+
+// WorkerProfileDigest identifies the exact managed confinement contract.
+func WorkerProfileDigest() string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(workerSafetyArgs, "\x00"))))
+}
+
+// BindWorkerExecutable resolves and attests the exact Codex binary used by all
+// managed workers. The returned digest changes with the path, version, bytes,
+// or confinement profile, so a restart cannot trust a differently enforced
+// worker generation.
+func BindWorkerExecutable(ctx context.Context, commands *Commands) (string, error) {
+	if commands == nil {
+		return "", errors.New("worker commands are unavailable")
+	}
+	var canonical, version, binaryDigest string
+	for _, command := range []*[]string{&commands.Implementation, &commands.Reviewer} {
+		if len(*command) == 0 {
+			return "", errors.New("worker command is unavailable")
+		}
+		path, err := exec.LookPath((*command)[0])
+		if err != nil {
+			return "", fmt.Errorf("resolve Codex worker executable: %w", err)
+		}
+		path, err = filepath.Abs(path)
+		if err == nil {
+			path, err = filepath.EvalSymlinks(path)
+		}
+		if err != nil {
+			return "", fmt.Errorf("canonicalize Codex worker executable: %w", err)
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			return "", errors.New("codex worker executable is unsafe")
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return "", err
+		}
+		hash := sha256.New()
+		_, copyErr := io.Copy(hash, file)
+		closeErr := file.Close()
+		if copyErr != nil || closeErr != nil {
+			return "", errors.Join(copyErr, closeErr)
+		}
+		currentDigest := fmt.Sprintf("%x", hash.Sum(nil))
+		output, err := exec.CommandContext(ctx, path, "--version").Output()
+		currentVersion := strings.TrimSpace(string(output))
+		if err != nil || !strings.HasPrefix(currentVersion, "codex-cli 0.153.") {
+			return "", fmt.Errorf("unsupported Codex worker executable version %q", currentVersion)
+		}
+		if canonical != "" && (canonical != path || version != currentVersion || binaryDigest != currentDigest) {
+			return "", errors.New("implementation and reviewer must use the same Codex executable")
+		}
+		canonical, version, binaryDigest = path, currentVersion, currentDigest
+		(*command)[0] = path
+	}
+	material := strings.Join([]string{WorkerProfileDigest(), canonical, version, binaryDigest}, "\x00")
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(material))), nil
+}
+
+func VerifyWorkerExecutable(ctx context.Context, path, expectedDigest string) error {
+	commands := Default("worker/verification").Commands
+	commands.Implementation[0], commands.Reviewer[0] = path, path
+	digest, err := BindWorkerExecutable(ctx, &commands)
+	if err != nil || digest != expectedDigest || commands.Implementation[0] != path {
+		return errors.Join(errors.New("codex worker executable identity changed"), err)
+	}
+	return nil
+}
+
+// WorkerSandboxArgs runs a deterministic capability probe under the same profile.
+func WorkerSandboxArgs(workspace string, command ...string) []string {
+	args := []string{"sandbox", "-c", workerPermissions, "-P", workerProfileName, "-C", workspace, "--"}
+	return append(args, command...)
+}
+
+// WorkerSandboxArgsForExecutable makes the attested Codex installation
+// readable when it lives outside the platform's minimal system roots.
+func WorkerSandboxArgsForExecutable(workspace, codexExecutable string, command ...string) []string {
+	installRoot := filepath.Dir(filepath.Dir(filepath.Clean(codexExecutable)))
+	args := []string{"sandbox", "-c", workerPermissions, "-P", workerProfileName, "-C", workspace, "--sandbox-state-readable-root", installRoot, "--"}
+	return append(args, command...)
+}
 
 type Config struct {
 	Version                       int                `json:"version"`
@@ -85,10 +206,10 @@ func Default(repository string) Config {
 		WorktreeRoot:                  ".worktrees",
 		DocsPaths:                     []string{"README.md", "docs"},
 		Commands: Commands{
-			Implementation: []string{"codex", "exec", "-c", workspaceTrustConfig, "--dangerously-bypass-approvals-and-sandbox", "-"}, Reviewer: []string{"codex", "-c", workspaceTrustConfig, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"},
+			Implementation: defaultWorkerCommand(false), Reviewer: defaultWorkerCommand(true),
 			Orchestrator:      []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"},
 			OrchestratorAudit: []string{"codex", "--ask-for-approval", "never", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"},
-			Environment:       []string{"LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"},
+			Environment:       []string{"LANG", "LC_ALL", "PATH", "TERM"},
 		},
 		Status: Status{Format: "human", Color: "auto"},
 	}
@@ -153,10 +274,12 @@ func normalizeLegacyCodexCommand(c *Config) {
 	defaults := Default(c.Repository).Commands
 	c.Commands.Implementation = upgradeCodexCommand(c.Commands.Implementation, defaults.Implementation,
 		[]string{"exec", "--dangerously-bypass-approvals-and-sandbox"},
-		[]string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-"})
+		[]string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-"},
+		[]string{"exec", "-c", legacyWorkspaceTrust, "--dangerously-bypass-approvals-and-sandbox", "-"})
 	c.Commands.Reviewer = upgradeCodexCommand(c.Commands.Reviewer, defaults.Reviewer,
 		[]string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-"},
-		[]string{"--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"})
+		[]string{"--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"},
+		[]string{"-c", legacyWorkspaceTrust, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"})
 	c.Commands.OrchestratorAudit = upgradeCodexCommand(c.Commands.OrchestratorAudit, defaults.OrchestratorAudit,
 		[]string{"exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"})
 }
@@ -304,6 +427,8 @@ func (c Config) Validate() error {
 	for name, command := range map[string][]string{"implementation": c.Commands.Implementation, "reviewer": c.Commands.Reviewer} {
 		if len(command) == 0 || strings.TrimSpace(command[0]) == "" {
 			problems = append(problems, "commands."+name+" must contain an executable")
+		} else if !validWorkerCommand(command, name == "reviewer") {
+			problems = append(problems, "commands."+name+" must use the managed rootless Codex worker profile")
 		}
 		for _, arg := range command {
 			if strings.ContainsRune(arg, 0) || strings.ContainsAny(arg, "\r\n") {
@@ -340,6 +465,9 @@ func (c Config) Validate() error {
 		if forbiddenAgentEnvironment(name) {
 			problems = append(problems, fmt.Sprintf("commands.environment_allowlist contains forbidden credential variable %q", name))
 		}
+		if name == "TMPDIR" || name == "XDG_CACHE_HOME" || name == "GOCACHE" || name == "npm_config_cache" {
+			problems = append(problems, fmt.Sprintf("commands.environment_allowlist contains worker-managed path %q", name))
+		}
 	}
 	if c.Status.Format != "human" && c.Status.Format != "json" {
 		problems = append(problems, "status.format must be human or json")
@@ -351,6 +479,14 @@ func (c Config) Validate() error {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+func validWorkerCommand(command []string, interactive bool) bool {
+	if len(command) == 0 || filepath.Base(command[0]) != "codex" {
+		return false
+	}
+	want := defaultWorkerCommand(interactive)
+	return slices.Equal(command[1:], want[1:])
 }
 
 func environmentName(name string) bool {
@@ -366,7 +502,7 @@ func environmentName(name string) bool {
 }
 
 func forbiddenAgentEnvironment(name string) bool {
-	_, err := internalgithub.AgentEnvironmentWith(nil, name)
+	_, err := internalgithub.WorkerEnvironmentWith(nil, name)
 	return err != nil
 }
 

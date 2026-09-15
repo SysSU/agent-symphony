@@ -51,6 +51,7 @@ const (
 	githubIssueRetry           githubIssueUpdateKind = "retry"
 	githubIssueControlSnapshot githubIssueUpdateKind = "control-snapshot"
 	githubIssueDependencyClear githubIssueUpdateKind = "dependency-clear"
+	githubIssueWorkerStatus    githubIssueUpdateKind = "worker-status"
 )
 
 type reconciliationEffectRequest struct {
@@ -63,6 +64,8 @@ type reconciliationEffectRequest struct {
 	ObservationCycleID    uint64                          `json:"observation_cycle_id"`
 	BodyDigest            string                          `json:"body_digest"`
 	ExecutionDigest       string                          `json:"execution_digest"`
+	ControlGeneration     uint64                          `json:"control_generation,omitempty"`
+	ControlRepair         bool                            `json:"control_repair,omitempty"`
 	GitHubBind            *githubBindEffectRequest        `json:"github_bind,omitempty"`
 	GitHubPublish         *githubPublishEffectRequest     `json:"github_publish,omitempty"`
 	GitHubIssueUpdate     *githubIssueUpdateEffectRequest `json:"github_issue_update,omitempty"`
@@ -86,8 +89,11 @@ type githubIssueUpdateEffectRequest struct {
 	Findings                []string
 	FailedAtUnixNano        int64
 	ControlSnapshotDigest   string
+	ControlSnapshotBody     string
 	AttributionAttempt      int
 	Dependency, PullRequest int
+	Status, StatusReason    string
+	StatusSequence          uint64
 }
 
 type githubGovernanceEffectRequest struct {
@@ -181,6 +187,11 @@ func ownerReconciliationBeginIdentity(snapshot stateOwnerSnapshot, request recon
 
 func (o *stateOwner) authorizeReconciliationEffect(ctx context.Context, command authorizeReconciliationEffectCommand) error {
 	_, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerAuthorizeReconciliationEffect, authorizeReconciliation: command})
+	return err
+}
+
+func (o *stateOwner) resolveInvalidatedReconciliationEffect(ctx context.Context, command resolveInvalidatedReconciliationEffectCommand) error {
+	_, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerResolveInvalidatedReconciliationEffect, resolveInvalidatedReconcile: command})
 	return err
 }
 
@@ -358,12 +369,61 @@ func applyReconciliationBeginTransition(state *runtimeOwnerState, request reconc
 	return nil
 }
 
-func applyAuthorizeReconciliationEffect(stateRoot string, state runtimeOwnerState, command authorizeReconciliationEffectCommand) error {
+func applyAuthorizeReconciliationEffect(stateRoot string, state *runtimeOwnerState, command authorizeReconciliationEffectCommand) error {
 	effect, ok := state.Effects[command.Identity.EffectID]
 	if !ok || effect.Reconciliation == nil || effect.Action != string(command.Action) || !reconciliationEffectIdentityMatches(effect, command.Identity) || effect.State != "pending" {
 		return errStaleStateResult
 	}
-	return reconciliationEffectCurrent(stateRoot, state, effect)
+	if err := reconciliationEffectCurrent(stateRoot, *state, effect); err != nil {
+		return err
+	}
+	if reconciliationMutatesGitHub(effect.Reconciliation.Action) && !effect.Dispatched {
+		effect.Dispatched = true
+		state.Effects[effect.ID] = effect
+	}
+	return nil
+}
+
+func applyResolveInvalidatedReconciliationEffect(state *runtimeOwnerState, command resolveInvalidatedReconciliationEffectCommand) error {
+	effect, ok := state.Effects[command.Identity.EffectID]
+	if !ok || effect.State != "invalidated" || !effect.Dispatched || effect.Reconciliation == nil || !reconciliationMutatesGitHub(effect.Reconciliation.Action) || !reconciliationEffectIdentityMatches(effect, command.Identity) || !validInvalidatedExternalOutcome(effect, command.Outcome) {
+		return errStaleStateResult
+	}
+	key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+	if effect.Attempt == 0 {
+		if effect.Reconciliation.ControlGeneration >= controlGeneration(*state, ownerIssueKey(effect.Repository, effect.Issue)) {
+			return errStaleStateResult
+		}
+	} else {
+		tombstone, ok := state.Tombstones[key]
+		if !ok || tombstone.InvalidatedGeneration != effect.AttemptGeneration {
+			return errStaleStateResult
+		}
+		if tombstone.ExternalOutcomes == nil {
+			tombstone.ExternalOutcomes = map[string]invalidatedExternalOutcome{}
+		}
+		tombstone.ExternalOutcomes[effect.ID] = command.Outcome
+		state.Tombstones[key] = tombstone
+	}
+	effect.State, effect.Diagnostic = "invalidated-resolved", ""
+	state.Effects[effect.ID] = effect
+	return nil
+}
+
+func validInvalidatedExternalOutcome(effect runtimeEffectIntent, outcome invalidatedExternalOutcome) bool {
+	if effect.Reconciliation == nil || outcome.Action != effect.Reconciliation.Action || !outcome.Observed {
+		return false
+	}
+	switch outcome.Action {
+	case reconciliationGitHubBind, reconciliationGitHubIssueUpdate:
+		return !outcome.Merged && outcome.PR == 0 && outcome.HeadSHA == ""
+	case reconciliationGitHubPublish:
+		return !outcome.Merged && outcome.PR > 0 && effect.Reconciliation.GitHubPublish != nil && outcome.HeadSHA == effect.Reconciliation.GitHubPublish.HeadSHA
+	case reconciliationGitHubPRGovernance:
+		return outcome.Merged && outcome.PR > 0 && effect.Reconciliation.GitHubPRGovernance != nil && outcome.PR == effect.Reconciliation.GitHubPRGovernance.PR && outcome.HeadSHA == effect.Reconciliation.GitHubPRGovernance.HeadSHA
+	default:
+		return false
+	}
 }
 
 func applyMarkReviewerSessionRequested(stateRoot string, state *runtimeOwnerState, command markReviewerSessionRequestedCommand) error {
@@ -712,12 +772,18 @@ func implementationLeaseBlocksGitHub(state runtimeOwnerState, action reconciliat
 	}
 	for _, record := range state.Attempts {
 		manifest := record.Manifest
-		if manifest.Repository == repository && manifest.Issue == issue && manifest.Version == agentruntime.ManifestVersion2 && manifest.LaunchID != "" {
+		if manifest.Repository == repository && manifest.Issue == issue && manifest.Version == agentruntime.ManifestVersion2 && manifest.LaunchID != "" && !agentruntime.WorkerConfinementMatches(manifest, record.Generation, activeWorkerProfileDigest(state)) {
 			return true
 		}
 	}
 	for _, effect := range state.Effects {
 		if effect.Repository == repository && effect.Issue == issue && effect.Action == string(agentruntime.EffectStart) && effect.StartMayRun {
+			key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+			record, current := state.Attempts[key]
+			tombstone, invalidated := state.Tombstones[key]
+			if current && agentruntime.WorkerConfinementBound(record.Manifest, effect.AttemptGeneration, activeWorkerProfileDigest(state)) || invalidated && tombstone.InvalidatedStart != nil && agentruntime.WorkerConfinementBound(tombstone.InvalidatedStart.Manifest, tombstone.InvalidatedGeneration, activeWorkerProfileDigest(state)) {
+				continue
+			}
 			return true
 		}
 	}
@@ -725,10 +791,11 @@ func implementationLeaseBlocksGitHub(state runtimeOwnerState, action reconciliat
 		if tombstone.Repository != repository || tombstone.Issue != issue {
 			continue
 		}
-		if tombstone.Manifest != nil && tombstone.Manifest.Version == agentruntime.ManifestVersion2 && tombstone.Manifest.LaunchID != "" || tombstone.InvalidatedHandoff != nil {
+		confined := tombstone.Manifest != nil && agentruntime.WorkerConfinementBound(*tombstone.Manifest, tombstone.InvalidatedGeneration, activeWorkerProfileDigest(state))
+		if !confined && (tombstone.Manifest != nil && tombstone.Manifest.Version == agentruntime.ManifestVersion2 && tombstone.Manifest.LaunchID != "" || tombstone.InvalidatedHandoff != nil) {
 			return true
 		}
-		if tombstone.InvalidatedStart != nil {
+		if tombstone.InvalidatedStart != nil && !agentruntime.WorkerConfinementBound(tombstone.InvalidatedStart.Manifest, tombstone.InvalidatedGeneration, activeWorkerProfileDigest(state)) {
 			for _, candidate := range tombstone.InvalidatedStart.Candidates {
 				if candidate.MayRun {
 					return true
@@ -835,6 +902,19 @@ func validPersistedReconciliationEffect(state runtimeOwnerState, effect runtimeE
 	if effect.State == "pending" {
 		return effect.ReconciliationResult == nil
 	}
+	if effect.State == "invalidated" {
+		return effect.Dispatched && effect.ReconciliationResult == nil && reconciliationMutatesGitHub(request.Action) && (request.Attempt > 0 || request.ControlGeneration < controlGeneration(state, ownerIssueKey(effect.Repository, effect.Issue)))
+	}
+	if effect.State == "invalidated-resolved" {
+		if !effect.Dispatched || effect.ReconciliationResult != nil || !reconciliationMutatesGitHub(request.Action) {
+			return false
+		}
+		if request.Attempt == 0 {
+			return request.ControlGeneration < controlGeneration(state, ownerIssueKey(effect.Repository, effect.Issue))
+		}
+		_, ok := state.Tombstones[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)].ExternalOutcomes[effect.ID]
+		return ok
+	}
 	return effect.Diagnostic == "" && effect.ReconciliationResult != nil && validReconciliationEffectResult(*request, *effect.ReconciliationResult) && (effect.ReviewerResultDigest == "" || effect.ReviewerResultDigest == reviewerResultDigest(*effect.ReconciliationResult))
 }
 
@@ -843,6 +923,9 @@ func validReconciliationEffectRequest(repository string, request reconciliationE
 		return false
 	}
 	issueScoped := reconciliationEffectIssueScoped(request)
+	if !issueScoped && request.ControlGeneration != 0 || request.ControlRepair && (!issueScoped || request.ControlGeneration == 0 || request.GitHubIssueUpdate.Kind != githubIssueControlSnapshot) {
+		return false
+	}
 	if issueScoped != (request.Attempt == 0 && request.Manifest == nil) || !issueScoped && (request.Attempt < 1 || request.Manifest == nil) {
 		return false
 	}
@@ -946,6 +1029,14 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 		if request.Action != reconciliationGitHubIssueUpdate || request.GitHubIssueUpdate == nil {
 			return false
 		}
+		currentControl := controlGeneration(state, ownerIssueKey(request.Repository, request.Issue))
+		if request.ControlGeneration != 0 && request.ControlGeneration != currentControl || request.ControlGeneration == 0 && currentControl != 1 {
+			return false
+		}
+		if request.ControlRepair {
+			repair, ok := state.ControlRepairs[ownerIssueKey(request.Repository, request.Issue)]
+			return ok && repair.Generation == request.ControlGeneration && repair.Body == request.GitHubIssueUpdate.ControlSnapshotBody && digestText(repair.Body) == request.GitHubIssueUpdate.ControlSnapshotDigest
+		}
 		proposal := reconciliationIssueUpdateProposal{Repository: request.Repository, Issue: request.Issue, Kind: request.GitHubIssueUpdate.Kind, ControlSnapshotDigest: request.GitHubIssueUpdate.ControlSnapshotDigest, AttributionAttempt: request.GitHubIssueUpdate.AttributionAttempt, Dependency: request.GitHubIssueUpdate.Dependency, PullRequest: request.GitHubIssueUpdate.PullRequest}
 		return slices.Contains(observation.IssueUpdates, proposal)
 	}
@@ -1040,6 +1131,8 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 			return (manifest.State == "failed" || manifest.State == "cancelled") && request.GitHubIssueUpdate.FailedAtUnixNano == manifest.UpdatedAt.UnixNano() && (observation.Fact.Attempt == request.Attempt || observation.Fact.CurrentAttempt == request.Attempt)
 		case githubIssueDependencyClear:
 			return slices.Contains(observation.Fact.Dependencies, request.GitHubIssueUpdate.Dependency) && slices.Contains(observation.Fact.SatisfiedDependencies, request.GitHubIssueUpdate.Dependency)
+		case githubIssueWorkerStatus:
+			return record.Generation == state.AttemptGenerations[attemptKey] && request.GitHubIssueUpdate.StatusSequence > manifest.WorkerStatusApplied && request.GitHubIssueUpdate.StatusSequence == manifest.WorkerStatusSeq && request.GitHubIssueUpdate.Status == manifest.WorkerStatus && request.GitHubIssueUpdate.StatusReason == manifest.WorkerStatusReason
 		default:
 			return true
 		}
@@ -1246,6 +1339,24 @@ func validReconciliationEffectResult(request reconciliationEffectRequest, result
 
 func applyReconciliationEffectOutcome(state *runtimeOwnerState, request reconciliationEffectRequest, result reconciliationEffectResult) error {
 	if request.Attempt == 0 {
+		if request.ControlRepair {
+			key := ownerIssueKey(request.Repository, request.Issue)
+			repair, ok := state.ControlRepairs[key]
+			if !ok || repair.Generation != request.ControlGeneration || repair.Body != request.GitHubIssueUpdate.ControlSnapshotBody {
+				return errStaleStateResult
+			}
+			for _, effect := range state.Effects {
+				if effect.Repository == request.Repository && effect.Issue == request.Issue && effect.State == "invalidated" {
+					return errStateConflict
+				}
+			}
+			delete(state.ControlRepairs, key)
+			for id, effect := range state.Effects {
+				if effect.Repository == request.Repository && effect.Issue == request.Issue && effect.State == "invalidated-resolved" {
+					delete(state.Effects, id)
+				}
+			}
+		}
 		return nil
 	}
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
@@ -1287,6 +1398,14 @@ func applyReconciliationEffectOutcome(state *runtimeOwnerState, request reconcil
 			}
 		}
 		state.Attempts[key] = record
+	case reconciliationGitHubIssueUpdate:
+		if request.GitHubIssueUpdate.Kind == githubIssueWorkerStatus {
+			if request.GitHubIssueUpdate.StatusSequence <= record.Manifest.WorkerStatusApplied || request.GitHubIssueUpdate.StatusSequence != record.Manifest.WorkerStatusSeq {
+				return errStaleStateResult
+			}
+			record.Manifest.WorkerStatusApplied = request.GitHubIssueUpdate.StatusSequence
+			state.Attempts[key] = record
+		}
 	case reconciliationHandoffDeliver:
 		if request.Manifest.Version == agentruntime.ManifestVersion2 {
 			record.Manifest.LaunchToken, record.Manifest.LaunchID = result.Handoff.LaunchToken, result.Handoff.LaunchID
@@ -1330,6 +1449,12 @@ func validGitHubPublish(request githubPublishEffectRequest) bool {
 }
 
 func validGitHubIssueUpdate(request githubIssueUpdateEffectRequest, issueScoped bool) bool {
+	if request.Kind != githubIssueWorkerStatus && (request.Status != "" || request.StatusReason != "" || request.StatusSequence != 0) {
+		return false
+	}
+	if request.Kind != githubIssueControlSnapshot && request.ControlSnapshotBody != "" {
+		return false
+	}
 	switch request.Kind {
 	case githubIssueTerminalFailure:
 		return !issueScoped && request.FailedAtUnixNano != 0 && boundedText(request.Diagnostic, 4096, true) && request.HeadSHA == "" && request.Findings == nil && request.ControlSnapshotDigest == "" && request.AttributionAttempt == 0 && request.Dependency == 0 && request.PullRequest == 0
@@ -1340,9 +1465,11 @@ func validGitHubIssueUpdate(request githubIssueUpdateEffectRequest, issueScoped 
 	case githubIssueRetry:
 		return !issueScoped && request.FailedAtUnixNano != 0 && request.HeadSHA == "" && request.Diagnostic == "" && request.Findings == nil && request.ControlSnapshotDigest == "" && request.AttributionAttempt == 0 && request.Dependency == 0 && request.PullRequest == 0
 	case githubIssueControlSnapshot:
-		return issueScoped && validDigest(request.ControlSnapshotDigest) && request.HeadSHA == "" && request.Diagnostic == "" && request.Findings == nil && request.FailedAtUnixNano == 0 && request.AttributionAttempt == 0 && request.Dependency == 0 && request.PullRequest == 0
+		return issueScoped && validDigest(request.ControlSnapshotDigest) && (request.ControlSnapshotBody == "" || digestText(request.ControlSnapshotBody) == request.ControlSnapshotDigest) && request.HeadSHA == "" && request.Diagnostic == "" && request.Findings == nil && request.FailedAtUnixNano == 0 && request.AttributionAttempt == 0 && request.Dependency == 0 && request.PullRequest == 0
 	case githubIssueDependencyClear:
 		return issueScoped && request.AttributionAttempt > 0 && request.Dependency > 0 && request.PullRequest >= 0 && request.HeadSHA == "" && request.Diagnostic == "" && request.Findings == nil && request.FailedAtUnixNano == 0 && request.ControlSnapshotDigest == ""
+	case githubIssueWorkerStatus:
+		return !issueScoped && request.AttributionAttempt == 0 && request.Dependency == 0 && request.PullRequest == 0 && request.HeadSHA == "" && request.Diagnostic == "" && request.Findings == nil && request.FailedAtUnixNano == 0 && request.ControlSnapshotDigest == "" && slices.Contains([]string{"needs-attention", "clear"}, request.Status) && boundedText(request.StatusReason, 1024, true) && request.StatusSequence > 0
 	default:
 		return false
 	}

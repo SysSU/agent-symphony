@@ -134,16 +134,17 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	tracing := os.Getenv("AGENT_SYMPHONY_FULL_SYSTEM_RACE") == "1"
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, action := range []string{"cancel", "recover", "review-plan", "review-plan-cancel", "review-plan-archive", "dismiss-overlap", "abandon-overlap", "archive-overlap"} {
 		t.Run(action, func(t *testing.T) {
-			if action == "cancel" || action == "review-plan-cancel" || action == "review-plan-archive" {
-				t.Skip("issue #329 must provide revocable worker authority before launched implementation cleanup and publication can safely settle")
-			}
 			overlap := strings.HasSuffix(action, "-overlap")
 			completedOverlap := action == "dismiss-overlap" || action == "archive-overlap"
 			parkedImplementation := action == "cancel" || action == "review-plan-cancel" || overlap
 			controlledCycle := overlap
-			root, err := os.MkdirTemp("/tmp", "as-lifecycle-")
+			root, err := os.MkdirTemp(home, ".as-lifecycle-")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -177,6 +178,7 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 			runExternal(t, repository, "git", "push", "-q", "runtime-fixture", "main")
 			manifest := historicalFullSystemManifest(t, sourceGit, stateRoot, base, 73, 1)
 			manifest.State = "running"
+			manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, config.WorkerProfileDigest()
 			if parkedImplementation {
 				manifest.Version = agentruntime.ManifestVersion2
 				manifest.LaunchToken, err = agentruntime.NewLaunchToken()
