@@ -201,6 +201,8 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 				if manifest.State == "failed" {
 					status.Diagnostic = manifest.Diagnostic
 				}
+			case manifest.State == "cancelled":
+				status.State, status.Diagnostic, status.Action, status.Retryable = "cancelled", manifest.Diagnostic, "none; cancelled work must not be resumed", false
 			case manifest.State == "failed":
 				status.State, status.Diagnostic, status.Action = "failed", manifest.Diagnostic, "inspect the retained log and retry with a new attempt"
 			case fact.State == "active" && fact.PR == 0 && manifest.State == "completed":
@@ -221,7 +223,7 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 			projectAttemptLifecycle(&status, manifest)
 			break
 		}
-		if (fact.State == "active" || fact.State == "review-ready") && status.Session == "" {
+		if (status.State == "active" || status.State == "review-ready") && status.Session == "" {
 			status.State, status.CurrentPhase, status.Blockers, status.Diagnostic, status.Action = "blocked", "blocked", []string{"runtime resources missing"}, "GitHub says active but local attempt resources are missing", "reconstruct the resources or create a new traceable attempt"
 		}
 		if status.CurrentPhase == "" {

@@ -381,8 +381,31 @@ printf '%%s\n' "$result" > "$AGENT_SYMPHONY_REVIEW_RESULT"
 `, reviewerPID, reviewGate, github.URL+"/repos/o/r/issues/73/comments")
 				}
 			}
+			codex = `#!/bin/sh
+if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
+if [ "$1" = sandbox ]; then
+  while [ "$1" != -- ]; do shift; done
+  shift
+  if [ "$2" = sandbox-probe ]; then printf '%s\n' confined > "$3"; exit 0; fi
+  exec "$@"
+fi
+` + strings.TrimPrefix(codex, "#!/bin/sh\n")
 			writeExecutable(t, filepath.Join(binDir, "codex"), codex)
 			cfg := config.Default("o/r")
+			cfg.Commands.Implementation[0], cfg.Commands.Reviewer[0] = filepath.Join(binDir, "codex"), filepath.Join(binDir, "codex")
+			profileDigest, err := config.BindWorkerExecutable(t.Context(), &cfg.Commands)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest.WorkerProfileDigest, state.WorkerProfileDigest = profileDigest, profileDigest
+			state.Attempts[key] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
+			body, _ = json.Marshal(manifest)
+			if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeRuntimeOwnerState(stateRoot, productionAttemptRoot(stateRoot), state); err != nil {
+				t.Fatal(err)
+			}
 			cfg.Commands.Orchestrator, cfg.Commands.OrchestratorAudit = nil, nil
 			cfg.ReconciliationIntervalSeconds = 1
 			serveInterval := "200ms"

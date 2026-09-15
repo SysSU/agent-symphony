@@ -821,7 +821,19 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 	t.Setenv("TMUX_TMPDIR", tmuxTmp)
 
 	t.Run("export", func(t *testing.T) {
-		root := resolvedTempDir(t)
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		root, err := os.MkdirTemp(home, ".as-export-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(root) })
+		root, err = filepath.EvalSymlinks(root)
+		if err != nil {
+			t.Fatal(err)
+		}
 		binary := filepath.Join(root, "agent-symphony")
 		if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
 			t.Fatalf("build export helper: %v: %s", err, output)

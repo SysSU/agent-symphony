@@ -2055,12 +2055,17 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if status, err := run("status", "--porcelain", "--", ".", ":(exclude).agent-symphony", ":(exclude).agents", ":(exclude).codex"); err != nil || status != "" {
 		return "", errors.New("export worktree is not clean")
 	}
-	tmp, err := os.CreateTemp("", "agent-symphony-export-*.bundle")
+	tmp, err := os.CreateTemp(manifest.Worktree, ".agent-symphony-export-*.bundle")
 	if err != nil {
 		return "", err
 	}
 	name := tmp.Name()
-	tmp.Close()
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Remove(name); err != nil {
+		return "", err
+	}
 	defer os.Remove(name)
 	if out, err := run("bundle", "create", name, "HEAD"); err != nil {
 		return "", fmt.Errorf("create export bundle: %w: %s", err, out)

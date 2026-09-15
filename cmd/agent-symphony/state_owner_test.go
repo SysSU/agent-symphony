@@ -863,6 +863,7 @@ func TestRuntimeOwnerWriterRoundTripsPrivateValidatedState(t *testing.T) {
 	root := resolvedTempDir(t)
 	state := newRuntimeOwnerState("o/r")
 	state.Epoch, state.Revision = 1, 1
+	state.WorkerProfileDigest = ""
 	if err := writeRuntimeOwnerState(root, runtimeOwnerAttemptRoot(root), state); err != nil {
 		t.Fatal(err)
 	}
