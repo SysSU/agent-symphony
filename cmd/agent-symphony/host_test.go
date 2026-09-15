@@ -394,11 +394,16 @@ func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
 }
 
 func TestImplementationBoundaryAcceptsOnlyBoundTmuxLaunchAndMutation(t *testing.T) {
-	root := t.TempDir()
-	session := "as-0123456789abcdef-310-1"
+	stateRoot := t.TempDir()
+	root := filepath.Join(stateRoot, "worktrees")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	session := "as-o-r-0123456789ab-310-1"
+	worktree := filepath.Join(root, strings.TrimPrefix(session, "as-"))
 	token := strings.Repeat("a", 32)
 	env := []string{"PATH=/bin", "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0"}
-	args := agentruntime.TmuxNewSessionArgs(session, root, env)
+	args := agentruntime.TmuxNewSessionArgs(session, worktree, env)
 	args = slices.Insert(args, 7, "-P", "-F", agentruntime.ImplementationPaneFormat)
 	args = append(args, "/bin/sh", ";", "set-option", "-p", "-t", agentruntime.PaneTarget(session), "@agent-symphony-launch-token", token,
 		";", "set-option", "-w", "-t", agentruntime.PaneTarget(session), "remain-on-exit", "on",
@@ -418,10 +423,16 @@ func TestImplementationBoundaryAcceptsOnlyBoundTmuxLaunchAndMutation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	gated = slices.Replace(gated, 14, 15, helper, "implementation-gate", "tmux", filepath.Join(root, "agent.log"), root, session, token, token, "--", "/bin/sh")
+	logPath := filepath.Join(stateRoot, "attempts", "o-r-0123456789ab", "310-1", "agent.log")
+	gated = slices.Replace(gated, 14, 15, helper, "implementation-gate", "tmux", logPath, worktree, session, token, token, "--", "/bin/sh")
 	gated = append([]string{"wait-for", "-L", agentruntime.ImplementationGateChannel(token), ";"}, gated...)
 	if !validTmuxBoundaryArgs(gated, env, root, root) {
 		t.Fatal("parked implementation launch was rejected by worker boundary")
+	}
+	foreignLog := slices.Clone(gated)
+	foreignLog[21] = filepath.Join(stateRoot, "attempts", "o-r-0123456789ab", "310-2", "agent.log")
+	if validTmuxBoundaryArgs(foreignLog, env, root, root) {
+		t.Fatal("worker boundary accepted a log path for a different attempt")
 	}
 	foreignGate := slices.Clone(gated)
 	foreignGate[25] = strings.Repeat("b", 32)
