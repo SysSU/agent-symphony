@@ -104,6 +104,27 @@ test("keeps the last projection visible when reconciliation is stale", async ({ 
   await expect(page.getByRole("link", { name: "#161 Show attempt lanes" })).toBeVisible();
 });
 
+for (const action of ["dismissed", "abandoned", "archived", "removed"]) {
+  test(`shows ${action} physical quarantine without restoring the attempt card`, async ({ page }) => {
+    const status = { repository: "SysSU/agent-symphony", issue: 191, attempt: 1, state: "blocked", current_phase: "physical-unverified", needs_attention: true, diagnostic: "reviewer descendant absence is unverified" };
+    const dashboard = await mockDashboard(page, [status]);
+    dashboard.hide(status, action);
+    await page.goto("/");
+
+    const notice = page.getByRole("region", { name: "Physical cleanup needs attention" });
+    await expect(notice).toContainText("#191 attempt 1: reviewer descendant absence is unverified");
+    await expect(page.getByRole("heading", { name: "Agent Symphony needs attention" })).toBeVisible();
+    const board = page.getByRole("region", { name: "Issue status board" });
+    await expect(board.getByRole("link", { name: /#191/ })).toHaveCount(0);
+    await expect(board.getByRole("button", { name: /Dismiss|Abandon|Archive|Remove/ })).toHaveCount(0);
+    await expect(board.locator("article.card")).toHaveCount(0);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(notice).toBeVisible();
+    await expect(board.locator("article.card")).toHaveCount(0);
+  });
+}
+
 test("renders every board lane and keeps overflowing lanes keyboard reachable", async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 900 });
   await mockDashboard(page, statuses);

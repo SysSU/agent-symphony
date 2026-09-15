@@ -809,8 +809,8 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 		t.Fatal("unbound reviewer artifacts were cleaned without process-death proof")
 	}
 	proofs := map[string]reviewerProcessProof{
-		targetOne: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetOne, GroupPID: 99999999, DeadProved: true},
-		targetTwo: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetTwo, GroupPID: 99999998, DeadProved: true},
+		targetOne: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetOne, DeadProved: true, NeverRan: true},
+		targetTwo: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetTwo, DeadProved: true, NeverRan: true},
 	}
 	if err := cleanupAttemptReviewResourcesProved(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true, proofs); err != nil {
 		t.Fatalf("review cleanup: %v", err)

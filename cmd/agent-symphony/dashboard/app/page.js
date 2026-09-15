@@ -141,7 +141,7 @@ export default function Dashboard() {
 
   const view = projectView(projects, selectedRepository, snapshot, dashboardState, error);
   const { remote: remoteProject, snapshot: visibleSnapshot, error: visibleError } = view;
-  const { statuses, historical, counts, title, lanes, health } = projectBoard(view, now);
+  const { statuses, historical, quarantined, counts, title, lanes, health } = projectBoard(view, now);
   const remoteURL = remoteProject?.url || "";
   const openAttemptTerminal = (status, session) => {
     const selected = session ?? { role: "implementation", name: status.session }, route = { implementation: "/terminal", reviewer: "/reviewer/terminal" }[selected.role];
@@ -181,7 +181,11 @@ export default function Dashboard() {
       />
 
       {actionNotice ? <p className="notice" role="status">{actionNotice}</p> : null}
-      {!visibleError && visibleSnapshot && statuses.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
+      {quarantined.length ? <section className="notice" aria-label="Physical cleanup needs attention">
+        <h2>Physical cleanup needs attention</h2>
+        <ul>{quarantined.map((status) => <li key={attemptKey(status)}>{`#${status.issue} attempt ${status.attempt}: ${status.diagnostic || "Physical cleanup is unverified."}`}</li>)}</ul>
+      </section> : null}
+      {!visibleError && visibleSnapshot && statuses.length === 0 && quarantined.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
 
       <section className="board" aria-label="Issue status board" tabIndex={0} onKeyDown={(event) => {
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;

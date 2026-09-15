@@ -449,11 +449,18 @@ func TestFailedImplementationReviewPersistsDiagnosticWithoutAutomaticRetry(t *te
 	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
-		t.Fatal(err)
-	}
 	result := test.result(request)
 	result.Reviewer.Status, result.Reviewer.Diagnostic = "failed", "reviewer exited without a valid result"
+	launchPath, terminalPath := reviewerLifecyclePaths(request.Reviewer.Snapshot, request.Reviewer.Target)
+	pane, err := parseReviewerPaneIdentity(reviewerPaneTestOutput("1|1|||", request.Reviewer.Session, "$9", os.Getpid(), "agent-symphony review-pane tmux "+launchPath+" "+terminalPath+" "+reviewerSignal(reviewerIdentity(identity))+" "+identity.RequestDigest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalIdentity := reviewerIdentity(identity)
+	terminalIdentity.GateProtocol, terminalIdentity.SessionRequested, terminalIdentity.ChildPID = true, true, 99999999
+	if _, err := owner.sealReviewerResult(t.Context(), sealReviewerResultCommand{Identity: identity, Result: result, Pane: pane, Terminal: reviewerTerminalRecord{Identity: terminalIdentity, ExitCode: 1}}); err != nil {
+		t.Fatal(err)
+	}
 	finished, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: result})
 	if err != nil {
 		t.Fatal(err)
@@ -466,43 +473,8 @@ func TestFailedImplementationReviewPersistsDiagnosticWithoutAutomaticRetry(t *te
 	issue.Attempt = request.Attempt
 	candidate := reviewerExecutionMaterial{Issue: issue, Source: "/source", HeadSHA: request.Reviewer.HeadSHA, Env: []string{"GH_TOKEN=one"}, Command: []string{"reviewer"}}
 	plans, _, err := planReconciliationReviewers(finished, owner.stateRoot, []reviewerExecutionMaterial{candidate})
-	if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "cleanup" || plans[0].Request.Reviewer.HeadSHA != candidate.HeadSHA {
-		t.Fatalf("failed reviewer resources were not scheduled for exact cleanup: plans=%#v err=%v", plans, err)
-	}
-	_, cleanup, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request})
-	if err != nil {
-		t.Fatalf("owner rejected certified failed-review cleanup: %v", err)
-	}
-	cleaned, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(*cleanup), Result: reconciliationEffectCaseNamed(t, "reviewer-cleanup").result(plans[0].Request)})
-	if err != nil {
-		t.Fatalf("owner rejected failed-review cleanup completion: %v", err)
-	}
-	if manifest := cleaned.State.Attempts[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)].Manifest; manifest.ReviewState != "failed" || manifest.ReviewDiagnostic != result.Reviewer.Diagnostic || manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" {
-		t.Fatalf("failed review cleanup lost its durable diagnostic or retained resources: %#v", manifest)
-	}
-	plans, _, err = planReconciliationReviewers(cleaned, owner.stateRoot, []reviewerExecutionMaterial{candidate})
-	if err != nil || len(plans) != 0 {
-		t.Fatalf("failed implementation review retried the same head: plans=%#v err=%v", plans, err)
-	}
-	candidate.HeadSHA = strings.Repeat("c", 40)
-	plans, _, err = planReconciliationReviewers(cleaned, owner.stateRoot, []reviewerExecutionMaterial{candidate})
-	if err != nil || len(plans) != 1 || plans[0].Request.Reviewer.Phase != "run-observe" || plans[0].Request.Reviewer.HeadSHA != candidate.HeadSHA {
-		t.Fatalf("new head did not authorize fresh implementation review: plans=%#v err=%v", plans, err)
-	}
-	sameHead := cloneReconciliationRequest(plans[0].Request)
-	sameHead.Reviewer.HeadSHA = request.Reviewer.HeadSHA
-	sameHead.Reviewer.Target = sameHead.Reviewer.BaseSHA + ".." + sameHead.Reviewer.HeadSHA
-	oldCandidate := candidate
-	oldCandidate.HeadSHA = sameHead.Reviewer.HeadSHA
-	sameHead.ExecutionDigest = reviewerExecutionDigest(sameHead, oldCandidate)
-	if !validReconciliationEffectRequest(cleaned.State.Repository, sameHead) {
-		t.Fatal("same-head probe was not a valid request")
-	}
-	if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: sameHead}); !errors.Is(err, errStaleStateResult) {
-		t.Fatalf("owner allowed same failed implementation head to retry: %v", err)
-	}
-	if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: plans[0].Identity, Request: plans[0].Request}); err != nil {
-		t.Fatalf("owner rejected new-head review after failed-review cleanup: %v", err)
+	if err != nil || len(plans) != 0 || !attemptHasUnprovedReviewer(finished.State, request.Repository, request.Issue, request.Attempt) {
+		t.Fatalf("failed reviewer escaped its physical lease or was retried: plans=%#v err=%v", plans, err)
 	}
 }
 

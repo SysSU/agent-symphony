@@ -1522,19 +1522,21 @@ func TestAbandonAcceptsAndStopsLiveBoundReviewerThroughService(t *testing.T) {
 	service.reviewer, service.cleanup.reviewer, service.cleanup.owner = boundary, boundary, owner
 	service.effects.executor.Cleanup, service.effects.executor.VerifyCleanup = service.cleanup.execute, service.cleanup.verify
 	applyReconciliationInput(t, owner, reconciliationInput{Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: manifest.Repository}, Complete: true})
-	result := service.performSynchronously(t.Context(), operatorRequest("abandon-live-reviewer", "abandon", manifest, true))
-	if !result.OK || result.Status != http.StatusOK {
+	result := service.perform(t.Context(), operatorRequest("abandon-live-reviewer", "abandon", manifest, true))
+	if !result.OK || result.Status != http.StatusAccepted {
 		current := mustOwnerSnapshot(t, owner).State
 		pending, _ := operatorReceiptByID(current, "abandon-live-reviewer")
-		t.Fatalf("Abandon did not complete after live reviewer stop: result=%#v receipt=%#v effect=%#v", result, pending, current.Effects[pending.EffectID])
+		t.Fatalf("Abandon did not admit physical-pending cleanup: result=%#v receipt=%#v effect=%#v", result, pending, current.Effects[pending.EffectID])
+	}
+	if err := service.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	final := mustOwnerSnapshot(t, owner).State
 	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
 	receipt, ok := operatorReceiptByID(final, "abandon-live-reviewer")
 	effect := final.Effects[receipt.EffectID]
-	groupGone, groupErr := reviewerGroupGone(effect.SupersededReviewerGroupPID)
-	if !ok || receipt.State != "completed" || final.Tombstones[key].Action != "abandoned" || !effect.ReviewerStopped || effect.SupersededReviewerGroupPID < 2 || !groupGone || groupErr != nil || len(boundary.killed) != 1 {
-		t.Fatalf("Abandon did not prove exact reviewer death before completion: receipt=%#v effect=%#v tombstone=%#v groupGone=%v groupErr=%v killed=%v", receipt, effect, final.Tombstones[key], groupGone, groupErr, boundary.killed)
+	if !ok || receipt.State != "pending" || final.Tombstones[key].Action != "abandoned" || final.Tombstones[key].CleanupPhase == "completed" || effect.ReviewerStopped || effect.SupersededReviewerGroupPID < 2 || len(boundary.killed) != 1 {
+		t.Fatalf("Abandon falsely completed with unproved reviewer descendants: receipt=%#v effect=%#v tombstone=%#v killed=%v", receipt, effect, final.Tombstones[key], boundary.killed)
 	}
 }
 
@@ -2969,7 +2971,7 @@ func TestV2PlanReviewAdmitsAndResumesAfterMonitorOnlyTimestampChange(t *testing.
 	t.Cleanup(func() { _ = restarted.close(context.Background()) })
 	restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: restarted.stateRoot, Runner: operatorOwnedRunner{manifest: updated}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
 	restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
-	boundary := &completedPlanReviewBoundary{}
+	boundary := &completedPlanReviewBoundary{pane: reviewerPaneTestOutput("1|0|||", effect.Reconciliation.Reviewer.Session, "$9", os.Getpid(), "agent-symphony review-pane tmux "+launchPath+" "+terminalPath+" "+reviewerSignal(launch)+" "+launch.RequestDigest)}
 	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: service.collector, reviewer: boundary, reviewSource: "source", reviewCommand: []string{"review"}}
 	restartService.collect = func(_ context.Context, _ stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
 		if issue != manifest.Issue {
@@ -3174,26 +3176,32 @@ func TestCancelPreservesExactReviewerStopBindingAcrossRestart(t *testing.T) {
 	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||\n"}}
 	restartRuntime := &agentruntime.Runtime{Root: restarted.attemptRoot, StateRoot: restarted.stateRoot, Runner: &barrierEffectRunner{}, Tmux: "tmux", Git: "git", VerifyWorker: func(context.Context) error { return nil }}
 	restartEffects := &runtimeEffectCoordinator{lifecycle: t.Context(), owner: restarted, executor: agentruntime.EffectExecutor{Runtime: restartRuntime}, active: map[string]*activeRuntimeEffect{}}
-	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, reviewer: boundary, active: map[string]bool{}, released: map[string]chan struct{}{}}
-	if err := restartService.resumeReceipt(t.Context(), cancelRequest.RequestID); err != nil {
-		t.Fatalf("restart could not resume Cancel after reviewer stop: %v", err)
+	restartService := &operatorMutationService{lifecycle: t.Context(), owner: restarted, effects: restartEffects, collector: service.collector, reviewer: boundary, active: map[string]bool{}, released: map[string]chan struct{}{}}
+	if result := restartService.performSynchronously(t.Context(), cancelRequest); !result.OK || result.Status != http.StatusAccepted {
+		t.Fatalf("restart did not expose physical-pending Cancel: %#v", result)
 	}
 	session, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
 	if err != nil || len(boundary.killed) != 0 {
-		t.Fatalf("restart failed to prove already-stopped reviewer before continuing Cancel: session=%s killed=%v err=%v", session, boundary.killed, err)
+		t.Fatalf("restart touched an absent reviewer session: session=%s killed=%v err=%v", session, boundary.killed, err)
+	}
+	current := mustOwnerSnapshot(t, restarted).State
+	currentReceipt, ok := operatorReceiptByID(current, cancelRequest.RequestID)
+	if !ok || currentReceipt.State != "pending" || current.Effects[stop.ID].ReviewerStopped || current.Attempts[key].StopEffectID != stop.ID {
+		t.Fatalf("restart lost physical-pending Cancel lease: receipt=%#v effect=%#v attempt=%#v", currentReceipt, current.Effects[stop.ID], current.Attempts[key])
 	}
 }
 
 type completedPlanReviewBoundary struct {
 	panes   atomic.Int32
 	results atomic.Int32
+	pane    string
 }
 
 func (b *completedPlanReviewBoundary) call(_ context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
 	if operation == "run" && command.Name == "tmux" && slices.Contains(command.Args, "display-message") {
 		b.panes.Add(1)
 		if command.Args[len(command.Args)-1] == reviewerPaneIdentityFormat {
-			return agentruntime.Result{Output: "||||||||||"}, nil
+			return agentruntime.Result{Output: b.pane}, nil
 		}
 		return agentruntime.Result{Output: "1|0|||"}, nil
 	}
