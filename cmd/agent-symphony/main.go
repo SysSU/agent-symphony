@@ -256,13 +256,16 @@ func readDeploymentIdentityVersion(stateRoot string, supportedVersion int) (depl
 }
 
 func bindDeployment(stateRoot, repository string) error {
-	if info, err := os.Lstat(stateRoot); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return errors.New("runtime state root must be a non-symlink directory")
+	if _, err := os.Lstat(stateRoot); err == nil {
+		if err := validatePrivateOwnedDirectory(stateRoot); err != nil {
+			return fmt.Errorf("runtime state root is unsafe: %w", err)
 		}
 	} else if errors.Is(err, os.ErrNotExist) {
 		if err := os.MkdirAll(stateRoot, 0o700); err != nil {
 			return fmt.Errorf("prepare runtime state root: %w", err)
+		}
+		if err := validatePrivateOwnedDirectory(stateRoot); err != nil {
+			return fmt.Errorf("runtime state root is unsafe: %w", err)
 		}
 	} else {
 		return fmt.Errorf("inspect runtime state root: %w", err)
@@ -394,6 +397,52 @@ func validatePrivateStateRoot(stateRoot string) error {
 	if pathInSharedTemporaryStorage(root) {
 		return errors.New("runtime state root must not be inside shared temporary storage")
 	}
+	if _, err := os.Lstat(stateRoot); err == nil {
+		if err := validatePrivateOwnedDirectory(stateRoot); err != nil {
+			return fmt.Errorf("runtime state root is unsafe: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect runtime state root: %w", err)
+	}
+	return nil
+}
+
+// tightenPrivateStateRoot is a one-time compatibility migration used only by
+// daemon startup. Control clients never change permissions while connecting.
+func tightenPrivateStateRoot(stateRoot string) error {
+	info, err := os.Lstat(stateRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect runtime state root: %w", err)
+	}
+	abs, absErr := filepath.Abs(stateRoot)
+	resolved, resolveErr := filepath.EvalSymlinks(stateRoot)
+	if absErr != nil || filepath.Clean(stateRoot) != abs || resolveErr != nil || resolved != abs || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(info) {
+		return errors.New("runtime state root is unsafe")
+	}
+	if info.Mode().Perm() != 0o700 {
+		if err := os.Chmod(stateRoot, 0o700); err != nil {
+			return fmt.Errorf("tighten runtime state root permissions: %w", err)
+		}
+	}
+	return nil
+}
+
+func validatePrivateOwnedDirectory(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil || filepath.Clean(path) != abs {
+		return errors.New("directory must be canonical and absolute")
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil || resolved != abs {
+		return errors.New("directory must not contain symlinks")
+	}
+	info, err := os.Lstat(abs)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
+		return errors.New("directory must be owned by the current user with mode 0700")
+	}
 	return nil
 }
 
@@ -446,6 +495,9 @@ func canonicalPathWithMissingLeaf(path string) (string, error) {
 }
 
 func prepareProductionDeploymentLocked(stateRoot, repository string) error {
+	if err := tightenPrivateStateRoot(stateRoot); err != nil {
+		return err
+	}
 	if err := validateProductionStateRoot(stateRoot); err != nil {
 		return err
 	}
@@ -1095,6 +1147,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		c, err := config.Load(*path)
 		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		if err := tightenPrivateStateRoot(*runtimeState); err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		if err := validateProductionStateRoot(*runtimeState); err != nil {

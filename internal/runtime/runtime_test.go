@@ -1735,7 +1735,7 @@ func TestStopInterruptsPaneZeroWhenAnotherPaneIsActive(t *testing.T) {
 	}
 }
 
-func TestStopDoesNotKillReplacementOnReusedTmuxSocket(t *testing.T) {
+func TestStopDoesNotKillReplacementOnReusedTmuxName(t *testing.T) {
 	tmux, err := exec.LookPath("tmux")
 	if err != nil {
 		t.Skip("tmux is unavailable")
@@ -1765,12 +1765,9 @@ func TestStopDoesNotKillReplacementOnReusedTmuxSocket(t *testing.T) {
 	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, nil); err != nil {
 		t.Fatal(err)
 	}
-	firstID := run("display-message", "-p", "-t", "="+session, "#{session_id}")
-	run("kill-server")
-	run("-f", "/dev/null", "new-session", "-d", "-s", session, "sleep", "30")
-	if secondID := run("display-message", "-p", "-t", "="+session, "#{session_id}"); secondID != firstID {
-		t.Fatalf("replacement did not reuse session ID: %q != %q", secondID, firstID)
-	}
+	run("new-session", "-d", "-s", "replacement-anchor", "sleep", "30")
+	run("kill-session", "-t", "="+session)
+	run("new-session", "-d", "-s", session, "sleep", "30")
 	if err := r.stop(t.Context(), manifest); err == nil {
 		t.Fatal("stop accepted an unbound replacement")
 	}
@@ -2099,8 +2096,11 @@ func TestGuardedStopDoesNotSignalReplacementBetweenProbeAndCommand(t *testing.T)
 	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, nil); err != nil {
 		t.Fatal(err)
 	}
+	if output, err := exec.Command(tmux, "new-session", "-d", "-s", "guard-anchor", "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("create guard anchor: %v: %s", err, output)
+	}
 	runner.swap = func() error {
-		for _, args := range [][]string{{"kill-server"}, {"-f", "/dev/null", "new-session", "-d", "-s", manifest.Session, "sleep", "30"}} {
+		for _, args := range [][]string{{"kill-session", "-t", "=" + manifest.Session}, {"new-session", "-d", "-s", manifest.Session, "sleep", "30"}} {
 			if output, err := exec.Command(tmux, args...).CombinedOutput(); err != nil {
 				return fmt.Errorf("tmux %v: %w: %s", args, err, output)
 			}
@@ -2171,8 +2171,11 @@ func TestGuardedObservationRejectsReplacementBetweenProbeAndRead(t *testing.T) {
 	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, nil); err != nil {
 		t.Fatal(err)
 	}
+	if output, err := exec.Command(tmux, "new-session", "-d", "-s", "observation-anchor", "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("create observation anchor: %v: %s", err, output)
+	}
 	runner.swap = func() error {
-		for _, args := range [][]string{{"kill-server"}, {"-f", "/dev/null", "new-session", "-d", "-s", manifest.Session, "sleep", "30"}} {
+		for _, args := range [][]string{{"kill-session", "-t", "=" + manifest.Session}, {"new-session", "-d", "-s", manifest.Session, "sleep", "30"}} {
 			if output, err := exec.Command(tmux, args...).CombinedOutput(); err != nil {
 				return fmt.Errorf("tmux %v: %w: %s", args, err, output)
 			}

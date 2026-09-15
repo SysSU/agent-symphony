@@ -199,6 +199,12 @@ func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 	if !slices.Contains(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+root) || !slices.Contains(agent.Env, "GH_REPO="+cfg.Repository) || !slices.Equal(agent.ProposalCommand, []string{binary, "agent-host", "orchestrator-proposal"}) || !slices.Equal(agent.ProposalStatusCommand, []string{binary, "agent-host", "orchestrator-proposal-status"}) || agent.AuditWorkspace != filepath.Join(root, "orchestrator-audit-"+internalgithub.RepositoryIdentifier(cfg.Repository)) || len(agent.AuditCommand) == 0 {
 		t.Fatalf("zero-admin environment=%#v proposal=%#v status=%#v", agent.Env, agent.ProposalCommand, agent.ProposalStatusCommand)
 	}
+	if slices.ContainsFunc(agent.AuditEnv, func(value string) bool {
+		name := strings.SplitN(value, "=", 2)[0]
+		return internalgithub.GitHubCLIEnvironmentVariable(name) || name == "HOME"
+	}) || !slices.Contains(agent.AuditEnv, "CODEX_HOME="+workerCodexHome(stateRoot)) {
+		t.Fatalf("heartbeat auditor inherited coordinator authority: %#v", agent.AuditEnv)
+	}
 	agent.Runner = &orchestratorTestRunner{}
 	if _, err := agent.Observe(t.Context(), nil); err != nil {
 		t.Fatal(err)
@@ -232,8 +238,8 @@ func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 	}
 }
 
-func TestAdvancedOrchestratorLaunchContractUsesSnapshotGroup(t *testing.T) {
-	gid := fakeAdvancedOrchestratorHost(t)
+func TestAdvancedOrchestratorLaunchContractUsesRootlessBoundary(t *testing.T) {
+	fakeAdvancedOrchestratorHost(t)
 
 	cfg := config.Default("SysSU/example")
 	cfg.Commands.Orchestrator = []string{"operator-agent", "--read-only"}
@@ -241,8 +247,9 @@ func TestAdvancedOrchestratorLaunchContractUsesSnapshotGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(agent.Launcher[:6], []string{"sudo", "-n", "-u", reviewerUser, "-g", snapshotGroup}) {
-		t.Fatalf("orchestrator was not pinned to the reviewer identity: %#v", agent.Launcher)
+	binary, _ := os.Executable()
+	if !slices.Equal(agent.Launcher, []string{binary, "agent-host", "orchestrator"}) {
+		t.Fatalf("orchestrator did not use the rootless boundary: %#v", agent.Launcher)
 	}
 	agent.Runner = &orchestratorTestRunner{}
 	if _, err := agent.Observe(context.Background(), nil); err != nil {
@@ -252,28 +259,28 @@ func TestAdvancedOrchestratorLaunchContractUsesSnapshotGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if workspace.Mode()&(os.ModePerm|os.ModeSetgid) != os.ModeSetgid|0o750 || fileGID(workspace) != gid {
-		t.Fatalf("workspace mode=%v gid=%d", workspace.Mode(), fileGID(workspace))
+	if workspace.Mode().Perm() != 0o750 || !ownedByCurrentUser(workspace) {
+		t.Fatalf("workspace mode=%v uid=%d", workspace.Mode(), fileUID(workspace))
 	}
 	auditWorkspace, err := os.Stat(agent.AuditWorkspace)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if auditWorkspace.Mode()&(os.ModePerm|os.ModeSetgid) != os.ModeSetgid|0o750 || fileGID(auditWorkspace) != gid {
-		t.Fatalf("audit workspace mode=%v gid=%d", auditWorkspace.Mode(), fileGID(auditWorkspace))
+	if auditWorkspace.Mode().Perm() != 0o750 || !ownedByCurrentUser(auditWorkspace) {
+		t.Fatalf("audit workspace mode=%v uid=%d", auditWorkspace.Mode(), fileUID(auditWorkspace))
 	}
 	contract, err := os.Stat(filepath.Join(agent.Workspace, orchestratorLaunchFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if contract.Mode().Perm() != 0o440 || fileGID(contract) != gid {
-		t.Fatalf("launch contract mode=%v gid=%d", contract.Mode(), fileGID(contract))
+	if contract.Mode().Perm() != 0o440 || !ownedByCurrentUser(contract) {
+		t.Fatalf("launch contract mode=%v uid=%d", contract.Mode(), fileUID(contract))
 	}
 	proposal, err := os.Stat(filepath.Join(agent.Workspace, orchestratoragent.MessageProposalFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if proposal.Mode().Perm() != 0o620 || fileGID(proposal) != gid {
-		t.Fatalf("proposal artifact mode=%v gid=%d err=%v", proposal.Mode(), fileGID(proposal), err)
+	if proposal.Mode().Perm() != 0o620 || !ownedByCurrentUser(proposal) {
+		t.Fatalf("proposal artifact mode=%v uid=%d err=%v", proposal.Mode(), fileUID(proposal), err)
 	}
 }

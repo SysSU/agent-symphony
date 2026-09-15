@@ -39,6 +39,13 @@ func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratorage
 	}
 	agent.Env = append(env, "GH_REPO="+cfg.Repository, "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
 	agent.Env = append(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+productionSnapshotRoot(stateRoot))
+	if cfg.Commands.OrchestratorAudit != nil {
+		auditEnv, err := configuredWorkerEnvironment(cfg.Commands.Environment, stateRoot)
+		if err != nil {
+			return nil, err
+		}
+		agent.AuditEnv = append(auditEnv, "TMUX_TMPDIR="+projectTmuxRoot(stateRoot), "AGENT_SYMPHONY_LOCAL_ROOT="+productionSnapshotRoot(stateRoot))
+	}
 	for _, path := range workspaces {
 		if err := os.MkdirAll(path, 0o750); err != nil {
 			return nil, fmt.Errorf("prepare orchestrator workspace: %w", err)

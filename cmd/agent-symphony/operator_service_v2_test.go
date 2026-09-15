@@ -966,23 +966,22 @@ func TestFreshReconciliationStopsInvalidLivePlanReviewer(t *testing.T) {
 			} else {
 				superseded, err = pipeline.supersedeInvalidPendingPlanReviewers(t.Context(), applied)
 			}
-			if err != nil || !superseded {
-				t.Fatalf("fresh %s observation did not stop review: superseded=%v err=%v", change, superseded, err)
+			if superseded || change == "body restored" && !errors.Is(err, agentruntime.ErrRuntimeResourcesRemain) || change != "body restored" && err != nil {
+				t.Fatalf("fresh %s observation did not remain pending without descendant proof: superseded=%v err=%v", change, superseded, err)
 			}
 			<-released
 			final := mustOwnerSnapshot(t, owner).State
 			receipt, ok := operatorReceiptByID(final, fmt.Sprintf("pending-plan-%d", manifest.Issue))
 			proof := final.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, agentruntime.ReviewModePlan, reviewer.Reconciliation.Reviewer.Target)]
-			gone, groupErr := reviewerGroupGone(proof.GroupPID)
-			if !ok || receipt.State != "completed" || receipt.Result == nil || receipt.Result.Status != http.StatusConflict || final.Effects[reviewer.ID].State != "completed" || !proof.DeadProved || !gone || groupErr != nil || len(boundary.killed) != 1 {
-				t.Fatalf("invalidated review remained executable: receipt=%#v proof=%#v gone=%v groupErr=%v killed=%v", receipt, proof, gone, groupErr, boundary.killed)
+			if !ok || receipt.State != "pending" || receipt.Result != nil || final.Effects[reviewer.ID].State != "pending" || !final.Effects[reviewer.ID].ReviewerRevoked || proof.DeadProved || len(boundary.killed) != 1 {
+				t.Fatalf("invalidated review was completed without descendant proof: receipt=%#v effect=%#v proof=%#v killed=%v", receipt, final.Effects[reviewer.ID], proof, boundary.killed)
 			}
 			if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, final); err != nil {
 				t.Fatal(err)
 			}
 			reloaded, err := readRuntimeOwnerState(owner.stateRoot, final.Repository)
-			if err != nil || reloaded.Effects[reviewer.ID].State != "completed" || !reloaded.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, agentruntime.ReviewModePlan, reviewer.Reconciliation.Reviewer.Target)].DeadProved {
-				t.Fatalf("restart lost terminal reviewer proof: err=%v effect=%#v", err, reloaded.Effects[reviewer.ID])
+			if err != nil || reloaded.Effects[reviewer.ID].State != "pending" || !reloaded.Effects[reviewer.ID].ReviewerRevoked {
+				t.Fatalf("restart lost conservative reviewer invalidation: err=%v effect=%#v", err, reloaded.Effects[reviewer.ID])
 			}
 		})
 	}
@@ -993,13 +992,7 @@ func TestPreupgradeInvalidPlanObservationRevokesBeforeRestartEpoch(t *testing.T)
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
 	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
 	identity := ownerReconciliationEffectIdentity(*reviewer)
-	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, NeverRan: true}); err != nil {
 		t.Fatal(err)
 	}
 	state := mustOwnerSnapshot(t, owner).State
@@ -1170,7 +1163,7 @@ func TestPlanRevocationMigrationPersistenceFailureDoesNotStart(t *testing.T) {
 	}
 }
 
-func TestImplementationSupersessionBindsUnboundLiveReviewerBeforeKill(t *testing.T) {
+func TestImplementationSupersessionBindsUnboundReviewerAndWaitsForDescendantProof(t *testing.T) {
 	request := reconciliationEffectCaseNamed(t, "reviewer-run-observe").request
 	request.Reviewer.Mode, request.Reviewer.DigestVersion = agentruntime.ReviewModeImplementation, 1
 	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
@@ -1192,15 +1185,15 @@ func TestImplementationSupersessionBindsUnboundLiveReviewerBeforeKill(t *testing
 	applyReconciliationInput(t, owner, input)
 	current := mustOwnerSnapshot(t, owner).State.Effects[reviewer.ID]
 	superseded, err := service.supersedeInvalidPlanReview(t.Context(), current)
-	if err != nil || !superseded {
-		t.Fatalf("unbound implementation reviewer did not stop after drift: superseded=%v err=%v", superseded, err)
+	if superseded || !errors.Is(err, errStateConflict) {
+		t.Fatalf("unbound implementation reviewer bypassed descendant proof: superseded=%v err=%v", superseded, err)
 	}
 	final := mustOwnerSnapshot(t, owner).State
 	effect := final.Effects[reviewer.ID]
 	proof := final.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)]
 	gone, groupErr := reviewerGroupGone(proof.GroupPID)
-	if effect.State != "completed" || effect.ReviewerGroupPID < 2 || !proof.DeadProved || proof.EffectID != reviewer.ID || !gone || groupErr != nil || len(boundary.killed) != 1 {
-		t.Fatalf("implementation reviewer was not durably bound and stopped: effect=%#v proof=%#v gone=%v groupErr=%v killed=%v", effect, proof, gone, groupErr, boundary.killed)
+	if effect.State != "pending" || effect.ReviewerGroupPID < 2 || proof.DeadProved || proof.EffectID != reviewer.ID || !gone || groupErr != nil || len(boundary.killed) != 1 {
+		t.Fatalf("implementation reviewer did not retain the conservative stop proof: effect=%#v proof=%#v gone=%v groupErr=%v killed=%v", effect, proof, gone, groupErr, boundary.killed)
 	}
 }
 
@@ -3045,9 +3038,6 @@ func TestV2PlanReviewMarkerReplayRejectsChangedGitHubBodyAfterRestart(t *testing
 			if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
-				t.Fatal(err)
-			}
 			reviewer := effect.Reconciliation.Reviewer
 			result := reconciliationEffectResult{Action: reconciliationReviewer, Reviewer: &reviewerEffectResult{Phase: reviewer.Phase, Status: "clean", Mode: reviewer.Mode, Target: reviewer.Target, BaseSHA: reviewer.BaseSHA, HeadSHA: reviewer.HeadSHA, Snapshot: reviewer.Snapshot, Session: reviewer.Session}}
 			if err := writeReconciliationEffectMarker(owner.stateRoot, identity, *effect.Reconciliation, result); err != nil {
@@ -3101,7 +3091,7 @@ func TestV2PlanReviewMarkerReplayRejectsChangedGitHubBodyAfterRestart(t *testing
 			}
 			final := mustOwnerSnapshot(t, restarted).State
 			receipt := final.ControlReceipts[0]
-			if receipt.State != "completed" || receipt.Result == nil || receipt.Result.Status != http.StatusConflict || final.Effects[effect.ID].ReconciliationResult == nil || final.Effects[effect.ID].ReconciliationResult.Reviewer.Status != "failed" || final.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Manifest.ReviewState == "clean" {
+			if receipt.State != "pending" || receipt.Result != nil || !final.Effects[effect.ID].ReviewerRevoked || final.Effects[effect.ID].ReconciliationResult != nil || final.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Manifest.ReviewState == "clean" {
 				t.Fatalf("stale marker committed review: receipt=%#v effect=%#v", receipt, final.Effects[effect.ID])
 			}
 		})

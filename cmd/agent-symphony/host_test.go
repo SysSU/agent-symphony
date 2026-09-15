@@ -629,8 +629,8 @@ func TestHostOrchestratorLaunchContractIsReadOnlyAndCredentialFiltered(t *testin
 	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(got.Args, []string{"--read-only", "-"}) || stdin != "audit prompt" {
-		t.Fatalf("one-shot launch args=%q stdin=%q", got.Args, stdin)
+	if !slices.Equal(got.Args, []string{"--read-only", "-"}) || stdin != "audit prompt" || slices.Contains(got.Env, "GH_TOKEN=github-canary") || slices.Contains(got.Env, "HOME=/reviewer-home") {
+		t.Fatalf("one-shot launch args=%q stdin=%q env=%q", got.Args, stdin, got.Env)
 	}
 	hostEGID = func() int { return expectedGID + 1 }
 	if err := runHostOrchestrator(t.Context(), root, "/reviewer-home", false); err == nil {
@@ -2426,6 +2426,48 @@ func TestPrivateStateRootValidatorCoversNativeSharedRoots(t *testing.T) {
 	}
 	if err := validatePrivateStateRoot(privateDiagnosticRoot(t)); err != nil {
 		t.Fatalf("private home root was rejected: %v", err)
+	}
+}
+
+func TestPrivateStateRootRejectsExistingNonPrivateOrSymlinkedDirectory(t *testing.T) {
+	parent := privateDiagnosticRoot(t)
+	open := filepath.Join(parent, "open")
+	if err := os.Mkdir(open, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateStateRoot(open); err == nil || !strings.Contains(err.Error(), "mode 0700") {
+		t.Fatalf("non-private root err=%v", err)
+	}
+	link := filepath.Join(parent, "link")
+	if err := os.Symlink(open, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateStateRoot(link); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlinked root err=%v", err)
+	}
+}
+
+func TestDaemonStartupTightensOwnedStateRootWithoutFollowingSymlinks(t *testing.T) {
+	parent := privateDiagnosticRoot(t)
+	root := filepath.Join(parent, "existing")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := tightenPrivateStateRoot(root); err != nil {
+		t.Fatalf("tighten current-user state root: %v", err)
+	}
+	if info, err := os.Lstat(root); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("tightened state root=%v err=%v", info, err)
+	}
+	link := filepath.Join(parent, "link")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := tightenPrivateStateRoot(link); err == nil {
+		t.Fatal("daemon startup followed a symlinked state root")
+	}
+	if info, err := os.Lstat(root); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("rejected symlink changed its target: %v err=%v", info, err)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -28,8 +29,10 @@ const (
 	workspaceTrustConfig = `projects={"{managed_workspace}"={trust_level="untrusted"}}`
 	legacyWorkspaceTrust = `projects={"{managed_workspace}"={trust_level="trusted"}}`
 	workerPermissions    = `permissions.agent-symphony-worker={filesystem={":root"="deny",":minimal"="read",":tmpdir"="deny",":slash_tmp"="deny",":workspace_roots"={"."="write",".git"="write",".agent-symphony"="write",".codex"="deny",".agents"="deny"}},network={enabled=false}}`
+	auditorPermissions   = `permissions.agent-symphony-auditor={filesystem={":root"="deny",":minimal"="read",":tmpdir"="deny",":slash_tmp"="deny",":workspace_roots"={"."="read"}},network={enabled=false}}`
 	workerEnvironment    = `shell_environment_policy={inherit="all",include_only=["^(PATH|TMPDIR|XDG_CACHE_HOME|GOCACHE|npm_config_cache|LANG|LC_ALL|TERM|COLORTERM|NO_COLOR|CODEX_HOME|AGENT_SYMPHONY_IMPLEMENTATION_RESULT|AGENT_SYMPHONY_STATUS_REQUEST|AGENT_SYMPHONY_WORKER_GENERATION|AGENT_SYMPHONY_WORKER_LAUNCH_ID|AGENT_SYMPHONY_REVIEW_RESULT)$"]}`
 	workerProfileName    = "agent-symphony-worker"
+	auditorProfileName   = "agent-symphony-auditor"
 )
 
 var workerSafetyArgs = []string{
@@ -52,6 +55,10 @@ var workerSafetyArgs = []string{
 	"--disable", "plugins",
 	"--disable", "skill_mcp_dependency_install",
 	"--disable", "skill_search",
+}
+
+func defaultAuditorCommand() []string {
+	return []string{"codex", "--strict-config", "--ask-for-approval", "never", "-c", `projects={"{orchestrator_workspace}"={trust_level="untrusted"}}`, "-c", `default_permissions="agent-symphony-auditor"`, "-c", auditorPermissions, "-c", workerEnvironment, "-c", `web_search="disabled"`, "--disable", "apps", "--disable", "browser_use", "--disable", "browser_use_external", "--disable", "computer_use", "--disable", "hooks", "--disable", "image_generation", "--disable", "in_app_browser", "--disable", "multi_agent", "--disable", "multi_agent_v2", "--disable", "plugins", "--disable", "skill_mcp_dependency_install", "--disable", "skill_search", "exec", "--ignore-user-config", "--ignore-rules", "--sandbox", auditorProfileName, "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"}
 }
 
 func defaultWorkerCommand(interactive bool) []string {
@@ -88,11 +95,14 @@ func BindWorkerExecutable(ctx context.Context, commands *Commands) (string, erro
 		if err == nil {
 			path, err = filepath.EvalSymlinks(path)
 		}
+		if err == nil {
+			path, err = resolveNativeCodex(path)
+		}
 		if err != nil {
 			return "", fmt.Errorf("canonicalize Codex worker executable: %w", err)
 		}
 		info, err := os.Stat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 {
 			return "", errors.New("codex worker executable is unsafe")
 		}
 		file, err := os.Open(path)
@@ -119,6 +129,202 @@ func BindWorkerExecutable(ctx context.Context, commands *Commands) (string, erro
 	}
 	material := strings.Join([]string{WorkerProfileDigest(), canonical, version, binaryDigest}, "\x00")
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(material))), nil
+}
+
+// PinWorkerExecutable copies the verified Codex installation into the private
+// runtime root. Workers execute only this read-only artifact, so replacing the
+// configured path after startup cannot change what they run.
+func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Commands) (string, error) {
+	if commands == nil || len(commands.Implementation) == 0 || len(commands.Reviewer) == 0 {
+		return "", errors.New("worker commands are unavailable")
+	}
+	auditSource := ""
+	if len(commands.OrchestratorAudit) > 0 {
+		if path, err := exec.LookPath(commands.OrchestratorAudit[0]); err == nil {
+			if path, err = filepath.Abs(path); err == nil {
+				if path, err = filepath.EvalSymlinks(path); err == nil {
+					auditSource, _ = resolveNativeCodex(path)
+				}
+			}
+		}
+	}
+	var source string
+	for _, command := range [][]string{commands.Implementation, commands.Reviewer} {
+		path, err := exec.LookPath(command[0])
+		if err != nil {
+			return "", fmt.Errorf("resolve Codex worker executable: %w", err)
+		}
+		path, err = filepath.Abs(path)
+		if err == nil {
+			path, err = filepath.EvalSymlinks(path)
+		}
+		if err == nil {
+			path, err = resolveNativeCodex(path)
+		}
+		info, statErr := os.Stat(path)
+		if err != nil || statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 || !safeExecutableOwner(info) {
+			return "", errors.New("codex worker executable is unsafe")
+		}
+		if source != "" && source != path {
+			return "", errors.New("implementation and reviewer must use the same Codex executable")
+		}
+		source = path
+	}
+	if len(commands.OrchestratorAudit) > 0 && auditSource != source {
+		return "", errors.New("orchestrator auditor must use the same Codex executable as managed workers")
+	}
+	root := source
+	if filepath.Base(filepath.Dir(source)) == "bin" {
+		candidate := filepath.Dir(filepath.Dir(source))
+		if info, err := os.Stat(filepath.Join(candidate, "package.json")); err == nil && info.Mode().IsRegular() {
+			root = candidate
+		}
+	}
+	pinRoot := filepath.Join(stateRoot, "worker-executable")
+	if err := os.MkdirAll(pinRoot, 0o700); err != nil {
+		return "", fmt.Errorf("prepare pinned worker executable: %w", err)
+	}
+	if err := validatePinnedDirectory(pinRoot, 0o700); err != nil {
+		return "", err
+	}
+	stage, err := os.MkdirTemp(pinRoot, ".pin-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(stage)
+	if err := os.Chmod(stage, 0o700); err != nil {
+		return "", err
+	}
+	treeDigest, relative, err := copyPinnedTree(ctx, root, source, stage)
+	if err != nil {
+		return "", err
+	}
+	target := filepath.Join(pinRoot, treeDigest)
+	if err := os.Rename(stage, target); err != nil {
+		if validationErr := validatePinnedDirectory(target, 0o500); validationErr != nil {
+			return "", err
+		}
+	}
+	pinned := filepath.Join(target, relative)
+	commands.Implementation[0], commands.Reviewer[0] = pinned, pinned
+	digest, err := BindWorkerExecutable(ctx, commands)
+	if err != nil {
+		return "", err
+	}
+	if len(commands.OrchestratorAudit) > 0 && auditSource == source {
+		commands.OrchestratorAudit[0] = commands.Implementation[0]
+	}
+	return digest, nil
+}
+
+func resolveNativeCodex(path string) (string, error) {
+	if filepath.Base(path) != "codex.js" {
+		return path, nil
+	}
+	platform := map[string]string{
+		"darwin/amd64": "darwin-x64", "darwin/arm64": "darwin-arm64",
+		"linux/amd64": "linux-x64", "linux/arm64": "linux-arm64",
+		"windows/amd64": "win32-x64", "windows/arm64": "win32-arm64",
+	}[runtime.GOOS+"/"+runtime.GOARCH]
+	if platform == "" {
+		return "", errors.New("codex npm wrapper has no supported native worker executable")
+	}
+	packageRoot := filepath.Dir(filepath.Dir(path))
+	matches, err := filepath.Glob(filepath.Join(packageRoot, "node_modules", "@openai", "codex-"+platform, "vendor", "*", "bin", "codex"))
+	if err != nil || len(matches) != 1 {
+		return "", errors.New("codex npm wrapper has no exact native worker executable")
+	}
+	return filepath.EvalSymlinks(matches[0])
+}
+
+func copyPinnedTree(ctx context.Context, root, executable, destination string) (string, string, error) {
+	single := root == executable
+	relative := filepath.Base(executable)
+	if !single {
+		var err error
+		relative, err = filepath.Rel(root, executable)
+		if err != nil || relative == "." || strings.HasPrefix(relative, "..") {
+			return "", "", errors.New("codex worker executable escaped its installation")
+		}
+	}
+	hash := sha256.New()
+	var directories []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel := relative
+		if !single {
+			var err error
+			rel, err = filepath.Rel(root, path)
+			if err != nil || strings.HasPrefix(rel, "..") {
+				return errors.New("codex worker installation escaped its root")
+			}
+		}
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || !safeExecutableOwner(info) {
+			return errors.New("codex worker installation is unsafe")
+		}
+		if !entry.IsDir() && !info.Mode().IsRegular() {
+			return errors.New("codex worker installation contains a special file")
+		}
+		_, _ = io.WriteString(hash, rel+"\x00")
+		target := filepath.Join(destination, rel)
+		if entry.IsDir() {
+			if rel != "." {
+				if err := os.Mkdir(target, 0o700); err != nil {
+					return err
+				}
+			}
+			directories = append(directories, target)
+			return nil
+		}
+		input, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		opened, err := input.Stat()
+		if err != nil || !os.SameFile(info, opened) {
+			_ = input.Close()
+			return errors.New("codex worker installation changed while opening")
+		}
+		output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, err = io.Copy(io.MultiWriter(output, hash), input)
+		}
+		closeInput, closeOutput := input.Close(), error(nil)
+		if output != nil {
+			closeOutput = output.Close()
+		}
+		if err = errors.Join(err, closeInput, closeOutput); err != nil {
+			return err
+		}
+		mode := os.FileMode(0o400)
+		if info.Mode().Perm()&0o111 != 0 {
+			mode = 0o500
+		}
+		return os.Chmod(target, mode)
+	})
+	if err != nil {
+		return "", "", err
+	}
+	for index := len(directories) - 1; index >= 0; index-- {
+		if err := os.Chmod(directories[index], 0o500); err != nil {
+			return "", "", err
+		}
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), relative, nil
+}
+
+func validatePinnedDirectory(path string, mode os.FileMode) error {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != mode || !safeExecutableOwner(info) {
+		return errors.New("pinned worker executable directory is unsafe")
+	}
+	return nil
 }
 
 func VerifyWorkerExecutable(ctx context.Context, path, expectedDigest string) error {
@@ -208,7 +414,7 @@ func Default(repository string) Config {
 		Commands: Commands{
 			Implementation: defaultWorkerCommand(false), Reviewer: defaultWorkerCommand(true),
 			Orchestrator:      []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"},
-			OrchestratorAudit: []string{"codex", "--ask-for-approval", "never", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"},
+			OrchestratorAudit: defaultAuditorCommand(),
 			Environment:       []string{"LANG", "LC_ALL", "PATH", "TERM"},
 		},
 		Status: Status{Format: "human", Color: "auto"},
@@ -281,6 +487,7 @@ func normalizeLegacyCodexCommand(c *Config) {
 		[]string{"--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"},
 		[]string{"-c", legacyWorkspaceTrust, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"})
 	c.Commands.OrchestratorAudit = upgradeCodexCommand(c.Commands.OrchestratorAudit, defaults.OrchestratorAudit,
+		[]string{"--ask-for-approval", "never", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"},
 		[]string{"exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"})
 }
 
@@ -458,6 +665,9 @@ func (c Config) Validate() error {
 			}
 		}
 	}
+	if c.Commands.OrchestratorAudit != nil && !validAuditorCommand(c.Commands.OrchestratorAudit) {
+		problems = append(problems, "commands.orchestrator_audit must use the managed rootless read-only Codex auditor profile")
+	}
 	for _, name := range c.Commands.Environment {
 		if !environmentName(name) {
 			problems = append(problems, "commands.environment_allowlist contains an invalid variable name")
@@ -486,6 +696,14 @@ func validWorkerCommand(command []string, interactive bool) bool {
 		return false
 	}
 	want := defaultWorkerCommand(interactive)
+	return slices.Equal(command[1:], want[1:])
+}
+
+func validAuditorCommand(command []string) bool {
+	if len(command) == 0 || filepath.Base(command[0]) != "codex" {
+		return false
+	}
+	want := defaultAuditorCommand()
 	return slices.Equal(command[1:], want[1:])
 }
 

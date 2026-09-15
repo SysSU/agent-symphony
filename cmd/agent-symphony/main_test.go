@@ -113,7 +113,7 @@ func TestServeTickerSelection(t *testing.T) {
 }
 
 func TestRuntimeStateBindsExactlyOneProject(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "state")
+	root := filepath.Join(resolvedTempDir(t), "state")
 	if err := bindDeployment(root, "owner/first"); err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestRuntimeStateBindsExactlyOneProject(t *testing.T) {
 }
 
 func TestRuntimeStateRefusesForeignExistingProjectBeforeBinding(t *testing.T) {
-	root := t.TempDir()
+	root := resolvedTempDir(t)
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{{Repository: "owner/first", Issue: 1, Attempt: 1}}); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestDeploymentBindingRecoversFromInterruptedImmutableWriteAndInstall(t *tes
 	})
 	for _, stage := range []string{"write", "install"} {
 		t.Run(stage, func(t *testing.T) {
-			root := filepath.Join(t.TempDir(), "state")
+			root := filepath.Join(resolvedTempDir(t), "state")
 			immutableCreate, immutableWrite, immutableFileSync, immutableInstall, immutableDirSync = origCreate, origWrite, origFileSync, origInstall, origDirSync
 			if stage == "write" {
 				immutableWrite = func(f *os.File, body []byte) error {
@@ -195,7 +195,7 @@ func TestServeRepositoryVerificationFailureDoesNotBindDeployment(t *testing.T) {
 		body, _ := json.Marshal(response)
 		return &http.Response{StatusCode: status, Status: http.StatusText(status), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
 	})}
-	stateRoot := filepath.Join(root, "runtime-state")
+	stateRoot := filepath.Join(privateDiagnosticRoot(t), "runtime-state")
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"serve", "--config", configPath, "--state", filepath.Join(root, "state.json"), "--runtime-state", stateRoot}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "verify GitHub repository") {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
@@ -211,7 +211,7 @@ func TestForeignBoundDeploymentRemainsUnchanged(t *testing.T) {
 	if err := config.Write(configPath, config.Default("owner/second")); err != nil {
 		t.Fatal(err)
 	}
-	stateRoot := filepath.Join(root, "runtime-state")
+	stateRoot := filepath.Join(privateDiagnosticRoot(t), "runtime-state")
 	if err := bindDeployment(stateRoot, "owner/first"); err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +416,7 @@ func TestImplementationChatTargetRequiresOneRunningCurrentSession(t *testing.T) 
 }
 
 func TestChatIssueExchangesInputWithExactTmuxSessionAndReportsMissingRuntime(t *testing.T) {
-	root := t.TempDir()
+	root := resolvedTempDir(t)
 	if err := bindDeployment(root, "o/r"); err != nil {
 		t.Fatal(err)
 	}
@@ -462,7 +462,7 @@ func TestChatIssueExchangesInputWithExactTmuxSessionAndReportsMissingRuntime(t *
 }
 
 func TestChatIssueRejectsStatusFromForeignRepositoryBeforeTmux(t *testing.T) {
-	root := t.TempDir()
+	root := resolvedTempDir(t)
 	if err := bindDeployment(root, "owner/local"); err != nil {
 		t.Fatal(err)
 	}
@@ -853,14 +853,8 @@ func TestInteractivePaneSIGHUPTerminatesForkedWorker(t *testing.T) {
 			t.Fatalf("forked interactive worker survived pane SIGHUP: PID=%d state=%s", childPID, state)
 		}
 	}
-	for {
-		gone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding)
-		if groupErr == nil && gone {
-			break
-		}
-		if readyCtx.Err() != nil {
-			t.Fatalf("bound interactive worker death was unproved: %v", groupErr)
-		}
+	if gone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding); groupErr == nil || gone || !strings.Contains(groupErr.Error(), "descendants remain unproved") {
+		t.Fatalf("bound interactive worker acquired fabricated descendant proof: gone=%v err=%v", gone, groupErr)
 	}
 	for {
 		state, psErr := exec.Command("ps", "-p", strconv.Itoa(binding.PanePID), "-o", "state=").CombinedOutput()
@@ -1289,7 +1283,7 @@ printf started`
 			}
 			encoded, _ := json.Marshal(role.workspace)
 			trust := `projects={` + string(encoded) + `={trust_level="trusted"}}`
-			if role.name == "implementation" || role.name == "review" {
+			if role.name == "implementation" || role.name == "review" || role.name == "heartbeat" {
 				trust = `projects={` + string(encoded) + `={trust_level="untrusted"}}`
 			}
 			process := exec.Command(command[0], command[1:]...)
@@ -1313,6 +1307,9 @@ func mustOutput(t *testing.T, cmd *exec.Cmd) []byte {
 }
 
 func TestProductionStateRootRejectsSharedTemporaryStorageWithoutCreatingIt(t *testing.T) {
+	oldSeam := testRuntimeStateRootAllowed
+	testRuntimeStateRootAllowed = nil
+	t.Cleanup(func() { testRuntimeStateRootAllowed = oldSeam })
 	for _, shared := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
 		if _, err := os.Stat(shared); err != nil {
 			continue
@@ -1331,6 +1328,9 @@ func TestProductionStateRootRejectsSharedTemporaryStorageWithoutCreatingIt(t *te
 }
 
 func TestServeRejectsSharedTemporaryStateBeforeNetworkOrFilesystemMutation(t *testing.T) {
+	oldSeam := testRuntimeStateRootAllowed
+	testRuntimeStateRootAllowed = nil
+	t.Cleanup(func() { testRuntimeStateRootAllowed = oldSeam })
 	repository := t.TempDir()
 	runGit(t, repository, "init")
 	configuration := config.Default("o/r")

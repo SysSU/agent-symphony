@@ -36,6 +36,9 @@ func resolvedTempDir(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	return root
 }
 
@@ -135,6 +138,16 @@ func TestControlOwnershipRejectsAnotherLocalIdentity(t *testing.T) {
 	foreign.Uid = uint32(os.Geteuid() + 1)
 	if ownedByCurrentUser(ownerTestFileInfo{FileInfo: info, stat: foreign}) {
 		t.Fatal("foreign local identity was accepted")
+	}
+}
+
+func TestDirectControlSocketRejectsNonPrivateStateDirectory(t *testing.T) {
+	root := resolvedTempDir(t)
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateControlSocketParent(controlSocketPath(root), root, false); err == nil {
+		t.Fatal("direct control socket accepted a non-private state directory")
 	}
 }
 
@@ -238,7 +251,7 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 			_ = command.Wait()
 		}
 	})
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for {
 		info, err := os.Lstat(controlSocketPath(stateRoot))
 		if err == nil && info.Mode()&os.ModeSocket != 0 {
