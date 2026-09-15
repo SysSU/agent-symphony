@@ -54,12 +54,12 @@ git -C "$tmp/tag-binding" tag -fam moved v0.0.0
 grep -qF 'wsl --install --distribution $distribution --web-download --no-launch' .github/workflows/release-validation.yml
 grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap build-essential ca-certificates curl git ruby tmux xz-utils' .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install WSL validation prerequisites'" .github/workflows/release-validation.yml
-grep -qF "/usr/local/node/bin/npm install --global --prefix /usr/local/node '@openai/codex@" .github/workflows/release-validation.yml
-grep -qF "throw 'Failed to restore the pinned Node.js runtime after the WSL Codex install'" .github/workflows/release-validation.yml
+grep -qF "/usr/local/node/bin/npm install --global --prefix /usr/local/codex '@openai/codex@" .github/workflows/release-validation.yml
 grep -qF 'test "$(command -v node)" = /usr/local/node/bin/node' .github/workflows/release-validation.yml
+grep -qF 'test "$(command -v codex)" = /usr/local/codex/bin/codex' .github/workflows/release-validation.yml
 grep -qF 'test "$(/usr/bin/env node --version)" = v22.15.1' .github/workflows/release-validation.yml
-grep -qF 'test "$(/usr/local/node/bin/codex --version)" = "codex-cli 0.153.0"' .github/workflows/release-validation.yml
-grep -qF 'sed -i s#\"codex\"#\"/usr/local/node/bin/codex\"#g .agent-symphony-ci.yaml' .github/workflows/release-validation.yml
+grep -qF 'test "$(codex --version)" = "codex-cli 0.153.0"' .github/workflows/release-validation.yml
+grep -qF 'sed -i s#\"codex\"#\"/usr/local/codex/bin/codex\"#g .agent-symphony-ci.yaml' .github/workflows/release-validation.yml
 grep -qF 'kernel.unprivileged_userns_clone=1' .github/workflows/release-validation.yml
 grep -qF 'kernel.apparmor_restrict_unprivileged_userns=0' .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to enable WSL unprivileged user namespaces'" .github/workflows/release-validation.yml
@@ -72,12 +72,12 @@ grep -qF 'https://nodejs.org/dist/v${nodeVersion}/node-v${nodeVersion}-linux-${n
 grep -qF "'x86_64' { \$goArch = 'amd64'; \$goSHA256 = 'aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235'; \$nodeArch = 'x64'; \$nodeSHA256 = '7dca2ab34ec817aa4781e2e99dfd34d349eff9be86e5d5fbaa7e96cae8ee3179' }" .github/workflows/release-validation.yml
 grep -qF "'aarch64' { \$goArch = 'arm64'; \$goSHA256 = 'bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd'; \$nodeArch = 'arm64'; \$nodeSHA256 = 'f4ae8ddf7487dfaf7da92fef463ee55cc29d8772d62891361dc3fc8b8e469205' }" .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install pinned Node.js toolchain in WSL'" .github/workflows/release-validation.yml
-grep -qF 'sudo tar -C /usr/local/node --strip-components=1 -xJf /tmp/node.tar.xz' .github/workflows/release-validation.yml
+! grep -qF -- '--prefix /usr/local/node' .github/workflows/release-validation.yml
 grep -qF "CODEX_VERSION: '0.153.0'" .github/workflows/release-validation.yml
 grep -qF "\$codexVersion = '0.153.0'" .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install pinned Codex CLI in WSL'" .github/workflows/release-validation.yml
 grep -qF "throw 'WSL rootless Codex confinement proof failed'" .github/workflows/release-validation.yml
-grep -qF "bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl'" .github/workflows/release-validation.yml
+grep -qF "bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/codex/bin:/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl'" .github/workflows/release-validation.yml
 grep -qF "throw 'WSL release validation failed'" .github/workflows/release-validation.yml
 ! grep -F '$PATH' .github/workflows/release-validation.yml | grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl'
 git diff --check
