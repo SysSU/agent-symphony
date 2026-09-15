@@ -268,6 +268,15 @@ func TestRecoverOmitsUnknownSessionIdentityAndKeepsTerminalHistory(t *testing.T)
 	}
 }
 
+func TestRecoverProjectsCommittedCancellationOverStaleActiveFact(t *testing.T) {
+	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "active"}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: fact.BaseSHA, State: "cancelled", Diagnostic: "operator cancelled attempt"}
+	got := Recover([]AttemptFact{fact}, []agentruntime.Manifest{manifest})
+	if len(got) != 1 || got[0].State != "cancelled" || got[0].Retryable || got[0].Diagnostic != manifest.Diagnostic {
+		t.Fatalf("got %#v", got)
+	}
+}
+
 func TestRecoverOmitsMalformedReviewTarget(t *testing.T) {
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 4, 2)
 	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 4, 2)

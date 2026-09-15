@@ -16,7 +16,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -314,15 +316,6 @@ func TestMissingTmuxReviewerPaneFromRealTmux(t *testing.T) {
 	}
 }
 
-func acknowledgeHandoffLaunch(command agentruntime.Command) (string, error) {
-	index := slices.Index(command.Args, "worker-capture-handoff-ready")
-	if index < 0 || index+5 >= len(command.Args) {
-		return "", nil
-	}
-	recipient := command.Args[index+5]
-	return recipient, writeImmutable(command.Args[index+4], []byte(recipient))
-}
-
 func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"--help"}, &stdout, &stderr); code != 0 || stderr.Len() != 0 {
@@ -518,7 +511,7 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 	identity := agentruntime.Manifest{Branch: "agent-symphony/owner-repo/56-3", Worktree: "/attempts/owner-repo-56-3", Session: "as-owner-repo-56-3"}
 	for _, interactive := range []bool{false, true} {
 		prompt := implementationPrompt(issue, identity, interactive)
-		for _, want := range []string{"Project: owner/repo", "Issue: #56", "Attempt: 3", "Base branch: main", "Branch: " + identity.Branch, "Worktree: " + identity.Worktree, "Session: " + identity.Session, issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "installed gh CLI", "/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "Re-read both the comment and label", "updated directly with gh", "partial-update errors are failures, never success"} {
+		for _, want := range []string{"Project: owner/repo", "Issue: #56", "Attempt: 3", "Base branch: main", "Branch: " + identity.Branch, "Worktree: " + identity.Worktree, "Session: " + identity.Session, issue.Body, "exactly one JSON line", "at most 64 KiB", "nonempty validation and documentation", "GitHub and runtime-state mutations are owner-only", "Do not use gh", agentruntime.WorkerStatusEnvironment, agentruntime.WorkerGenerationEnv, agentruntime.WorkerLaunchIDEnv, "agent-symphony-status-v1"} {
 			if !strings.Contains(prompt, want) {
 				t.Fatalf("interactive=%v prompt omitted %q: %s", interactive, want, prompt)
 			}
@@ -540,12 +533,12 @@ func TestImplementationPromptDefinesAcceptedResultAndPreservesIssue(t *testing.T
 	}
 }
 
-func TestReviewPromptExposesTheSameDirectStatusContract(t *testing.T) {
+func TestReviewPromptKeepsMutationsOwnerOnly(t *testing.T) {
 	prompt, err := reviewPrompt(agentruntime.ReviewModeImplementation, strings.Repeat("a", 40)+".."+strings.Repeat("b", 40), internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 56, Attempt: 3, Body: "review contract"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"/agent-symphony status needs-attention: REASON", "/agent-symphony status clear: REASON", "`needs-attention` label", "nonempty reason", "fresh re-read", "partial-update errors are failures, never success"} {
+	for _, want := range []string{"GitHub and runtime-state mutations are owner-only", "Do not use gh", "findings for the owner"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("review prompt omitted %q: %s", want, prompt)
 		}
@@ -657,6 +650,199 @@ func TestWorkerCaptureInternalCLIAndHandoffPreStartRecovery(t *testing.T) {
 	}
 }
 
+func TestWorkerCaptureSIGHUPTerminatesExactChildGroup(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-capture-hup-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	if output, err := exec.Command(tmux, "new-session", "-d", "-s", "control").CombinedOutput(); err != nil {
+		t.Fatalf("start tmux control session: %v: %s", err, output)
+	}
+	buffer := exec.Command(tmux, "load-buffer", "-b", "capture-prompt", "-")
+	buffer.Stdin = strings.NewReader("prompt")
+	if output, err := buffer.CombinedOutput(); err != nil {
+		t.Fatalf("load worker prompt: %v: %s", err, output)
+	}
+	const readyChannel = "capture-hup-ready"
+	if output, err := exec.Command(tmux, "wait-for", "-L", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("lock readiness channel: %v: %s", err, output)
+	}
+	helper := filepath.Join(t.TempDir(), "agent-symphony")
+	if output, err := exec.Command("go", "build", "-o", helper, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build capture helper: %v: %s", err, output)
+	}
+	root := t.TempDir()
+	pidPath, fifoPath := filepath.Join(root, "child.pid"), filepath.Join(root, "hold.fifo")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	worker := exec.Command(helper, "pane-exit-status", tmux, "--", helper, "worker-capture", tmux, "capture-prompt", filepath.Join(root, "result.json"), "--", "/bin/sh", "-c", `printf '%d\n' "$$" > "$1"; tmux wait-for -U "$2"; exec cat "$3"`, "worker", pidPath, readyChannel, fifoPath)
+	if err := worker.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = worker.Process.Kill() })
+	readyCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if output, err := exec.CommandContext(readyCtx, tmux, "wait-for", "-L", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("worker did not signal readiness: %v: %s", err, output)
+	}
+	if output, err := exec.Command(tmux, "wait-for", "-U", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("unlock readiness channel: %v: %s", err, output)
+	}
+	pidBody, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidBody)))
+	if err != nil || childPID < 2 {
+		t.Fatalf("worker PID is invalid: %q, %v", pidBody, err)
+	}
+	groupID, err := syscall.Getpgid(childPID)
+	if err != nil || groupID < 2 {
+		t.Fatalf("worker group is invalid: %d, %v", groupID, err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-groupID, syscall.SIGKILL) })
+	if err := worker.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- worker.Wait() }()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("capture parent did not exit after SIGHUP")
+	}
+	state, err := exec.Command("ps", "-p", strconv.Itoa(childPID), "-o", "state=").CombinedOutput()
+	if err == nil && strings.TrimSpace(string(state)) != "" && !strings.HasPrefix(strings.TrimSpace(string(state)), "Z") {
+		t.Fatalf("worker child survived capture SIGHUP: PID=%d group=%d state=%s", childPID, groupID, state)
+	}
+}
+
+func TestInteractivePaneSIGHUPTerminatesForkedWorker(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-interactive-hup-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	if output, err := exec.Command(tmux, "new-session", "-d", "-s", "control").CombinedOutput(); err != nil {
+		t.Fatalf("start tmux control session: %v: %s", err, output)
+	}
+	const readyChannel = "interactive-hup-ready"
+	if output, err := exec.Command(tmux, "wait-for", "-L", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("lock readiness channel: %v: %s", err, output)
+	}
+	helper := filepath.Join(t.TempDir(), "agent-symphony")
+	if output, err := exec.Command("go", "build", "-o", helper, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build interactive helper: %v: %s", err, output)
+	}
+	root := t.TempDir()
+	manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, Session: "bound-interactive", Worktree: root, LogPath: filepath.Join(t.TempDir(), "agent.log"), LaunchToken: strings.Repeat("a", 32), LaunchID: strings.Repeat("b", 32), Interactive: true}
+	pidPath, fifoPath := filepath.Join(root, "child.pid"), filepath.Join(root, "hold.fifo")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gate := agentruntime.ImplementationGateChannel(manifest.LaunchID)
+	launch := exec.Command(tmux, "wait-for", "-L", gate, ";", "new-session", "-d", "-P", "-F", agentruntime.ImplementationPaneFormat, "-s", manifest.Session, "-c", root, "--", "/bin/sh", "-c", `"$1" wait-for -L "$2" && "$1" wait-for -U "$2" && shift 2 && exec "$@"`, "agent-symphony-gate", tmux, gate, helper, "pane-exit-status-bound", tmux, manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, manifest.LaunchID, "--", "/bin/sh", "-c", `sleep 30 & printf '%d\n' "$!" > "$1"; tmux wait-for -U "$2"; exec cat "$3"`, "worker", pidPath, readyChannel, fifoPath)
+	if output, err := launch.CombinedOutput(); err != nil {
+		t.Fatalf("start parked bound pane: %v: %s", err, output)
+	}
+	if output, err := exec.Command(tmux, "set-option", "-p", "-t", agentruntime.PaneTarget(manifest.Session), "@agent-symphony-launch-token", manifest.LaunchToken).CombinedOutput(); err != nil {
+		t.Fatalf("tag bound pane: %v: %s", err, output)
+	}
+	if output, err := exec.Command(tmux, "set-option", "-w", "-t", agentruntime.PaneTarget(manifest.Session), "remain-on-exit", "on").CombinedOutput(); err != nil {
+		t.Fatalf("retain bound pane: %v: %s", err, output)
+	}
+	observed, err := exec.Command(tmux, "display-message", "-p", "-t", agentruntime.PaneTarget(manifest.Session), agentruntime.ImplementationPaneFormat).CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := agentruntime.ParseImplementationPane(string(observed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := agentruntime.BindImplementationPane(manifest, manifest.LaunchID, "interactive", pane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agentruntime.WriteImplementationBinding(manifest, binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker ran before bound pane release: %v", err)
+	}
+	if err := agentruntime.WriteImplementationRelease(manifest, binding); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(tmux, "wait-for", "-U", gate).CombinedOutput(); err != nil {
+		paneStatus, _ := exec.Command(tmux, "display-message", "-p", "-t", binding.PaneID, agentruntime.PaneStatusFormat).CombinedOutput()
+		paneOutput, _ := exec.Command(tmux, "capture-pane", "-p", "-S", "-", "-t", binding.PaneID).CombinedOutput()
+		t.Fatalf("release bound pane: %v: %s; pane=%q output=%q", err, output, paneStatus, paneOutput)
+	}
+	readyCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if output, err := exec.CommandContext(readyCtx, tmux, "wait-for", "-L", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("worker did not signal readiness: %v: %s", err, output)
+	}
+	if output, err := exec.Command(tmux, "wait-for", "-U", readyChannel).CombinedOutput(); err != nil {
+		t.Fatalf("unlock readiness channel: %v: %s", err, output)
+	}
+	pidBody, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidBody)))
+	if err != nil || childPID < 2 {
+		t.Fatalf("worker PID is invalid: %q, %v", pidBody, err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	if _, err := os.Stat(agentruntime.ImplementationBindingPath(manifest, manifest.LaunchID) + ".interactive.start"); err != nil {
+		t.Fatalf("worker ran without durable group start: %v", err)
+	}
+	if output, err := exec.Command(tmux, "kill-pane", "-t", binding.PaneID).CombinedOutput(); err != nil {
+		t.Fatalf("kill exact bound pane: %v: %s", err, output)
+	}
+	for {
+		state, psErr := exec.Command("ps", "-p", strconv.Itoa(childPID), "-o", "state=").CombinedOutput()
+		if psErr != nil || strings.TrimSpace(string(state)) == "" || strings.HasPrefix(strings.TrimSpace(string(state)), "Z") {
+			break
+		}
+		if readyCtx.Err() != nil {
+			t.Fatalf("forked interactive worker survived pane SIGHUP: PID=%d state=%s", childPID, state)
+		}
+	}
+	for {
+		gone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding)
+		if groupErr == nil && gone {
+			break
+		}
+		if readyCtx.Err() != nil {
+			t.Fatalf("bound interactive worker death was unproved: %v", groupErr)
+		}
+	}
+	for {
+		state, psErr := exec.Command("ps", "-p", strconv.Itoa(binding.PanePID), "-o", "state=").CombinedOutput()
+		if psErr != nil || strings.TrimSpace(string(state)) == "" || strings.HasPrefix(strings.TrimSpace(string(state)), "Z") {
+			break
+		}
+		if readyCtx.Err() != nil {
+			t.Fatalf("bound pane helper did not exit after HUP: PID=%d state=%s", binding.PanePID, state)
+		}
+	}
+}
+
 func TestConfigureProjectTmuxUsesPrivateProjectNamespace(t *testing.T) {
 	stateRoot := t.TempDir()
 	t.Setenv("TMUX_TMPDIR", "previous")
@@ -701,6 +887,38 @@ func TestConfigureAgentCodexHomeLinksCapabilitiesAndIsolatesRuntimeState(t *test
 	}
 	if _, err := os.Lstat(filepath.Join(target, "thread-writer-locks")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("mutable Codex runtime state was shared: %v", err)
+	}
+}
+
+func TestConfigureWorkerCodexHomeLinksOnlyAuthentication(t *testing.T) {
+	source, stateRoot := t.TempDir(), t.TempDir()
+	for _, name := range agentCodexAssets {
+		path := filepath.Join(source, name)
+		if slices.Contains([]string{"skills", "plugins", "cache", "rules"}, name) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := os.WriteFile(path, []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("CODEX_HOME", source)
+	if err := configureWorkerCodexHome(stateRoot); err != nil {
+		t.Fatal(err)
+	}
+	target := workerCodexHome(stateRoot)
+	for _, name := range workerCodexAssets {
+		if got, err := os.Readlink(filepath.Join(target, name)); err != nil || got != filepath.Join(source, name) {
+			t.Fatalf("authentication %s link=%q err=%v", name, got, err)
+		}
+	}
+	for _, name := range []string{"config.toml", "AGENTS.md", "rules", "skills", "plugins", "cache", "hooks.json"} {
+		if _, err := os.Lstat(filepath.Join(target, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("worker loaded ambient capability %s: %v", name, err)
+		}
+	}
+	if info, err := os.Lstat(target); err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("worker Codex home is unsafe: %#v %v", info, err)
 	}
 }
 
@@ -867,7 +1085,7 @@ func TestReviewModesBindExactTargetsAndStatusPermissions(t *testing.T) {
 	}
 	for _, test := range []struct{ mode, target string }{{agentruntime.ReviewModePlan, plan}, {agentruntime.ReviewModeImplementation, implementation}} {
 		prompt, err := reviewPrompt(test.mode, test.target, issue)
-		if err != nil || !strings.Contains(prompt, "Review mode: "+test.mode) || !strings.Contains(prompt, test.target) || !strings.Contains(prompt, "Use the installed gh CLI") || !strings.Contains(prompt, "/agent-symphony status needs-attention: REASON") || !strings.Contains(prompt, "needs-attention` label") || strings.Contains(prompt, "ui-review") {
+		if err != nil || !strings.Contains(prompt, "Review mode: "+test.mode) || !strings.Contains(prompt, test.target) || !strings.Contains(prompt, "mutations are owner-only") || !strings.Contains(prompt, "Do not use gh") || strings.Contains(prompt, "ui-review") {
 			t.Fatalf("%s prompt did not preserve its exact target and permissions: %q err=%v", test.mode, prompt, err)
 		}
 	}
@@ -883,8 +1101,16 @@ func TestDefaultReviewerProductionShapeUsesExactDiffAndRejectsProse(t *testing.T
 	dir := t.TempDir()
 	codex := filepath.Join(dir, "codex")
 	const script = `#!/bin/sh
-test "$#" -eq 5 && test "$1" = -c && test "$2" = "projects={$FAKE_REVIEW_WORKSPACE={trust_level=\"trusted\"}}" && test "$3" = --dangerously-bypass-approvals-and-sandbox && test "$4" = --no-alt-screen || exit 20
-prompt=$5
+safe=0
+never=0
+previous=
+for argument do
+  test "$argument" != "projects={$FAKE_REVIEW_WORKSPACE={trust_level=\"untrusted\"}}" || safe=1
+  if test "$previous" = --ask-for-approval && test "$argument" = never; then never=1; fi
+  previous=$argument
+  prompt=$argument
+done
+test "$safe" -eq 1 && test "$never" -eq 1 || exit 20
 printf '%s' "$prompt" | grep -F "$FAKE_REVIEW_BASE..$FAKE_REVIEW_HEAD" >/dev/null || exit 22
 diff=$(git -C "$FAKE_REVIEW_REPO" diff --no-ext-diff "$FAKE_REVIEW_BASE" HEAD) || exit 23
 printf '%s' "$diff" | grep -F '+first implementation commit' >/dev/null || exit 24
@@ -976,16 +1202,18 @@ test "$CODEX_HOME" = "$EXPECTED_CODEX_HOME" || exit 10
 trusted=0
 bypass=0
 never=0
+profile=0
 previous=
 for argument do
   test "$argument" != "$EXPECTED_TRUST" || trusted=1
   test "$argument" != --dangerously-bypass-approvals-and-sandbox || bypass=1
+  test "$argument" != 'default_permissions="agent-symphony-worker"' || profile=1
   if test "$previous" = --ask-for-approval && test "$argument" = never; then never=1; fi
   previous=$argument
 done
 test "$trusted" -eq 1 || { printf 'Do you trust the contents of this directory?'; exit 20; }
 case "$ROLE" in
-implementation|review) test "$bypass" -eq 1 || exit 21;;
+implementation|review) test "$bypass" -eq 0 && test "$never" -eq 1 && test "$profile" -eq 1 || exit 21;;
 orchestrator|heartbeat) test "$never" -eq 1 || exit 22;;
 *) exit 23;;
 esac
@@ -1030,9 +1258,13 @@ printf started`
 				command = append(command, "task")
 			}
 			encoded, _ := json.Marshal(role.workspace)
+			trust := `projects={` + string(encoded) + `={trust_level="trusted"}}`
+			if role.name == "implementation" || role.name == "review" {
+				trust = `projects={` + string(encoded) + `={trust_level="untrusted"}}`
+			}
 			process := exec.Command(command[0], command[1:]...)
 			process.Dir = role.workspace
-			process.Env = []string{"CODEX_HOME=" + freshHome, "EXPECTED_CODEX_HOME=" + freshHome, "EXPECTED_TRUST=projects={" + string(encoded) + `={trust_level="trusted"}}`, "ROLE=" + role.name}
+			process.Env = []string{"CODEX_HOME=" + freshHome, "EXPECTED_CODEX_HOME=" + freshHome, "EXPECTED_TRUST=" + trust, "ROLE=" + role.name}
 			process.Stdin = strings.NewReader("task")
 			if output, err := process.CombinedOutput(); err != nil || string(output) != "started" {
 				t.Fatalf("managed %s startup output=%q err=%v command=%q", role.name, output, err, command)
@@ -1050,6 +1282,58 @@ func mustOutput(t *testing.T, cmd *exec.Cmd) []byte {
 	return out
 }
 
+func TestProductionStateRootRejectsSharedTemporaryStorageWithoutCreatingIt(t *testing.T) {
+	previous := allowSharedTempRuntimeStateForTest
+	allowSharedTempRuntimeStateForTest = false
+	t.Cleanup(func() { allowSharedTempRuntimeStateForTest = previous })
+	for _, shared := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
+		if _, err := os.Stat(shared); err != nil {
+			continue
+		}
+		t.Run(strings.ReplaceAll(shared, "/", "_"), func(t *testing.T) {
+			parent := filepath.Join(shared, fmt.Sprintf("agent-symphony-rejected-%d", os.Getpid()))
+			root := filepath.Join(parent, "runtime")
+			if err := validateProductionStateRoot(root); err == nil || !strings.Contains(err.Error(), "shared temporary") {
+				t.Fatalf("root=%q err=%v", root, err)
+			}
+			if _, err := os.Lstat(parent); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("rejected root created state: %v", err)
+			}
+		})
+	}
+}
+
+func TestServeRejectsSharedTemporaryStateBeforeNetworkOrFilesystemMutation(t *testing.T) {
+	previous := allowSharedTempRuntimeStateForTest
+	allowSharedTempRuntimeStateForTest = false
+	t.Cleanup(func() { allowSharedTempRuntimeStateForTest = previous })
+	repository := t.TempDir()
+	runGit(t, repository, "init")
+	configuration := config.Default("o/r")
+	path := filepath.Join(repository, config.DefaultPath)
+	if err := config.Write(path, configuration); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(os.TempDir(), fmt.Sprintf("agent-symphony-serve-rejected-%d", os.Getpid()))
+	stateRoot := filepath.Join(parent, "runtime")
+	var stdout, stderr bytes.Buffer
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repository); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	code := run([]string{"serve", "--config", path, "--state", filepath.Join(repository, "legacy.json"), "--runtime-state", stateRoot}, &stdout, &stderr)
+	if code == 0 || !strings.Contains(stderr.String(), "shared temporary storage") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if _, err := os.Lstat(parent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected serve created runtime state: %v", err)
+	}
+}
+
 func TestWorkerExportRejectsMaliciousOrOversizedBundleBeforeImport(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "boundary")
@@ -1059,7 +1343,7 @@ func TestWorkerExportRejectsMaliciousOrOversizedBundleBeforeImport(t *testing.T)
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' '"+string(result)+"'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, err := importWorkerExport(context.Background(), workerBoundaryRunner{Command: script}, agentruntime.Manifest{Repository: "o/r", Branch: "issue-4", BaseSHA: "abcdef1"})
+	_, _, _, err := importWorkerExport(context.Background(), workerBoundaryRunner{Command: script}, dir, 1, agentruntime.Manifest{Repository: "o/r", Branch: "issue-4", BaseSHA: "abcdef1"})
 	if err == nil || !strings.Contains(err.Error(), "invalid or oversized bundle") {
 		t.Fatalf("err=%v", err)
 	}
@@ -1072,6 +1356,7 @@ func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
 		runGit(t, repo, "config", "user.email", "test@example.invalid")
 		runGit(t, repo, "config", "user.name", "test")
 	}
+	runGit(t, coordinator, "remote", "add", "origin", "https://example.invalid/o/r.git")
 	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("base"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1112,7 +1397,7 @@ func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
 		if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' '"+string(boundaryJSON)+"'\n"), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		return importWorkerExport(t.Context(), workerBoundaryRunner{Command: script}, manifest)
+		return importWorkerExport(t.Context(), workerBoundaryRunner{Command: script}, filepath.Join(coordinator, "state"), 1, manifest)
 	}
 
 	if _, _, _, err := importBundle(head, "HEAD", "^"+base); err == nil || !strings.Contains(err.Error(), "worker bundle verification failed") {
@@ -1132,12 +1417,75 @@ func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
 		t.Fatalf("unchanged worker head err=%v", err)
 	}
 	result, importedHead, root, err := importBundle(head, "HEAD")
-	resolvedCoordinator, resolveErr := filepath.EvalSymlinks(coordinator)
-	if err != nil || resolveErr != nil || result.Validation != "ok" || importedHead != head || root != resolvedCoordinator {
+	if err != nil || result.Validation != "ok" || importedHead != head || root != workerSealPath(filepath.Join(coordinator, "state"), 1, manifest, head) {
 		t.Fatalf("result=%#v head=%q root=%q err=%v", result, importedHead, root, err)
 	}
-	if err := exec.Command("git", "-C", coordinator, "cat-file", "-e", head).Run(); err != nil {
-		t.Fatalf("verified head was not imported: %v", err)
+	if err := exec.Command("git", "-C", root, "cat-file", "-e", head).Run(); err != nil {
+		t.Fatalf("verified head was not sealed: %v", err)
+	}
+	if err := exec.Command("git", "-C", coordinator, "cat-file", "-e", head).Run(); err == nil {
+		t.Fatal("verified head leaked into the mutable coordinator checkout")
+	}
+}
+
+func TestConcurrentWorkerSealInstallValidatesCompleteExistingSeal(t *testing.T) {
+	root, source := t.TempDir(), t.TempDir()
+	runGit(t, source, "init")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "file")
+	runGit(t, source, "commit", "-m", "base")
+	base := runGit(t, source, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("head"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "commit", "-am", "head")
+	head := runGit(t, source, "rev-parse", "HEAD")
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 329, Attempt: 1, BaseSHA: base}
+	exported := workerExport{HeadSHA: head, BundleSHA256: strings.Repeat("b", 64)}
+	final := workerSealPath(root, 7, manifest, head)
+	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	temps := []string{filepath.Join(filepath.Dir(final), "seal-a.git"), filepath.Join(filepath.Dir(final), "seal-b.git")}
+	for _, temp := range temps {
+		runGit(t, "", "clone", "--bare", source, temp)
+	}
+	entered, release := make(chan struct{}, 2), make(chan struct{})
+	oldHook := workerSealBeforeRename
+	workerSealBeforeRename = func() { entered <- struct{}{}; <-release }
+	t.Cleanup(func() { workerSealBeforeRename = oldHook })
+	errorsByInstall := make(chan error, 2)
+	for _, temp := range temps {
+		go func(path string) {
+			_, err := installWorkerSeal(t.Context(), path, root, 7, manifest, exported)
+			errorsByInstall <- err
+		}(temp)
+	}
+	<-entered
+	<-entered
+	close(release)
+	for range temps {
+		if err := <-errorsByInstall; err != nil {
+			t.Fatalf("identical concurrent seal install: %v", err)
+		}
+	}
+	if err := validateWorkerSeal(t.Context(), final, 7, manifest, exported); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, final, "update-ref", "refs/heads/mutated", base)
+	if err := validateWorkerSeal(t.Context(), final, 7, manifest, exported); err != nil {
+		t.Fatalf("unrelated ref mutation changed content-addressed seal: %v", err)
+	}
+	object := filepath.Join(final, "objects", head[:2], head[2:])
+	if err := os.Remove(object); err != nil {
+		t.Fatalf("remove sealed commit fixture: %v", err)
+	}
+	if err := validateWorkerSeal(t.Context(), final, 7, manifest, exported); err == nil {
+		t.Fatal("seal with deleted source object remained valid")
 	}
 }
 

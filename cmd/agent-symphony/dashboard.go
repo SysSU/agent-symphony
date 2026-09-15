@@ -583,7 +583,7 @@ func (s *dashboardServer) readRemovalState() (dashboardRemovalState, error) {
 		want, identityErr := agentruntime.AttemptIdentity(productionAttemptRoot(s.stateRoot), attempt)
 		wantLog := filepath.Join(s.stateRoot, "attempts", internalgithub.RepositoryIdentifier(manifest.Repository), fmt.Sprintf("%d-%d", manifest.Issue, manifest.Attempt), "agent.log")
 		key := fmt.Sprintf("%s#%d/%d", manifest.Repository, manifest.Issue, manifest.Attempt)
-		if identityErr != nil || !preflightObjectID.MatchString(intent.PublishedHead) || manifest.Version != want.Version || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session || manifest.LogPath != wantLog || !slices.Contains([]string{"completed", "failed", "cancelled"}, manifest.State) || seen[key] {
+		if identityErr != nil || !preflightObjectID.MatchString(intent.PublishedHead) || !agentruntime.ValidManifestVersion(manifest) || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session || manifest.LogPath != wantLog || !slices.Contains([]string{"completed", "failed", "cancelled"}, manifest.State) || seen[key] {
 			return dashboardRemovalState{}, errors.New("invalid permanent removal journal")
 		}
 		seen[key] = true
@@ -859,6 +859,10 @@ func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request, 
 	}
 	if !sameDashboardOrigin(r) {
 		http.Error(w, "terminal requires the dashboard origin", http.StatusForbidden)
+		return
+	}
+	if role == agentruntime.SessionRoleReviewer {
+		http.Error(w, "Reviewer terminal is unavailable until session identity can be verified safely.", http.StatusConflict)
 		return
 	}
 	query := r.URL.Query()

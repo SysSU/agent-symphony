@@ -201,10 +201,20 @@ exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 	server, output := start(address)
 	stopped := false
 	t.Cleanup(func() {
-		_ = stopFullSystemProcesses(root)
 		if !stopped {
-			_ = server.Process.Kill()
-			_ = server.Wait()
+			if err := stopFullSystemDaemon(server); err != nil {
+				t.Errorf("join historical full-system daemon before resource cleanup: %v", err)
+			}
+			stopped = true
+		}
+		if err := stopFullSystemTmux(environment, manifests[160].Session); err != nil {
+			t.Errorf("stop historical full-system tmux: %v", err)
+		}
+		if fullSystemTmuxSessionExists(environment, manifests[160].Session) {
+			t.Errorf("historical full-system tmux session remained after cleanup: %s", manifests[160].Session)
+		}
+		if err := stopFullSystemProcesses(root); err != nil {
+			t.Errorf("stop historical full-system child processes: %v", err)
 		}
 	})
 	waitHTTP(t, "http://"+address+"/status.json", deadline(20*time.Second), output)

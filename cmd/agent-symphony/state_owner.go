@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -20,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
@@ -39,6 +41,7 @@ var (
 )
 
 type runtimeOwnerState struct {
+	WorkerProfileDigest       string                               `json:"-"`
 	Version                   int                                  `json:"version"`
 	Repository                string                               `json:"repository"`
 	Epoch                     uint64                               `json:"epoch"`
@@ -51,8 +54,13 @@ type runtimeOwnerState struct {
 	Tombstones                map[string]runtimeTombstone          `json:"tombstones"`
 	Effects                   map[string]runtimeEffectIntent       `json:"effects"`
 	ReviewerProofs            map[string]reviewerProcessProof      `json:"reviewer_proofs"`
+	ReviewerSafetyMigrated    bool                                 `json:"reviewer_safety_migrated,omitempty"`
+	LegacyReviewerQuarantines map[string]string                    `json:"legacy_reviewer_quarantines"`
 	ReviewerRevocationTracked bool                                 `json:"reviewer_revocation_tracked,omitempty"`
+	ExternalDispatchTracked   bool                                 `json:"external_dispatch_tracked,omitempty"`
 	ControlReceipts           []controlReceipt                     `json:"control_receipts"`
+	ControlGenerations        map[string]uint64                    `json:"control_generations,omitempty"`
+	ControlRepairs            map[string]controlSnapshotRepair     `json:"control_repairs,omitempty"`
 	CycleDiagnostic           string                               `json:"cycle_diagnostic,omitempty"`
 	CycleDiagnosticAt         time.Time                            `json:"cycle_diagnostic_at,omitzero"`
 	CycleOutcomeEpoch         uint64                               `json:"cycle_outcome_epoch,omitempty"`
@@ -61,11 +69,27 @@ type runtimeOwnerState struct {
 	StaleReconciliations      uint64                               `json:"stale_reconciliations,omitempty"`
 }
 
+type controlSnapshotRepair struct {
+	Generation uint64 `json:"generation"`
+	Body       string `json:"body"`
+}
+
 type runtimeAttemptRecord struct {
 	Generation       uint64                `json:"generation"`
 	ObservationEpoch uint64                `json:"observation_epoch,omitempty"`
 	LastCycleID      uint64                `json:"last_cycle_id,omitempty"`
+	StopEffectID     string                `json:"stop_effect_id,omitempty"`
 	Manifest         agentruntime.Manifest `json:"manifest"`
+	WorkerSeal       *workerSealSelection  `json:"worker_seal,omitempty"`
+}
+
+type workerSealSelection struct {
+	Generation    uint64       `json:"generation"`
+	HeadSHA       string       `json:"head_sha"`
+	Root          string       `json:"root"`
+	BundleSHA256  string       `json:"bundle_sha256"`
+	ProfileDigest string       `json:"profile_digest"`
+	Result        workerResult `json:"result"`
 }
 
 // A completed review's filesystem root outlives bounded operator receipts.
@@ -82,6 +106,7 @@ type reviewerProcessProof struct {
 	GroupPID          int    `json:"group_pid"`
 	DeadProved        bool   `json:"dead_proved,omitempty"`
 	NeverRan          bool   `json:"never_ran,omitempty"`
+	LegacyUnverified  bool   `json:"legacy_unverified,omitempty"`
 }
 
 func reviewerProofKey(repository string, issue, attempt int, mode, target string) string {
@@ -95,19 +120,75 @@ type runtimePRRecovery struct {
 }
 
 type runtimeTombstone struct {
-	Repository            string                            `json:"repository"`
-	Issue                 int                               `json:"issue"`
-	Attempt               int                               `json:"attempt"`
-	Action                string                            `json:"action"`
-	InvalidatedGeneration uint64                            `json:"invalidated_generation"`
-	Generation            uint64                            `json:"generation"`
-	Revision              uint64                            `json:"revision"`
-	CleanupPhase          string                            `json:"cleanup_phase"`
-	PublishedHead         string                            `json:"published_head,omitempty"`
-	Manifest              *agentruntime.Manifest            `json:"manifest,omitempty"`
-	CleanupPolicy         *agentruntime.EffectCleanupPolicy `json:"cleanup_policy,omitempty"`
-	EffectID              string                            `json:"effect_id,omitempty"`
-	Diagnostic            string                            `json:"diagnostic,omitempty"`
+	Repository            string                                `json:"repository"`
+	Issue                 int                                   `json:"issue"`
+	Attempt               int                                   `json:"attempt"`
+	Action                string                                `json:"action"`
+	InvalidatedGeneration uint64                                `json:"invalidated_generation"`
+	Generation            uint64                                `json:"generation"`
+	Revision              uint64                                `json:"revision"`
+	CleanupPhase          string                                `json:"cleanup_phase"`
+	PublishedHead         string                                `json:"published_head,omitempty"`
+	Manifest              *agentruntime.Manifest                `json:"manifest,omitempty"`
+	CleanupPolicy         *agentruntime.EffectCleanupPolicy     `json:"cleanup_policy,omitempty"`
+	EffectID              string                                `json:"effect_id,omitempty"`
+	ReviewerLeaseID       string                                `json:"reviewer_lease_id,omitempty"`
+	Diagnostic            string                                `json:"diagnostic,omitempty"`
+	InvalidatedHandoff    *handoffCandidateInvalidation         `json:"invalidated_handoff,omitempty"`
+	HandoffCompensated    bool                                  `json:"handoff_compensated,omitempty"`
+	InvalidatedStart      *startCandidateInvalidation           `json:"invalidated_start,omitempty"`
+	ExternalOutcomes      map[string]invalidatedExternalOutcome `json:"external_outcomes,omitempty"`
+}
+
+type invalidatedExternalOutcome struct {
+	Action   reconciliationEffectAction `json:"action"`
+	Observed bool                       `json:"observed"`
+	Merged   bool                       `json:"merged,omitempty"`
+	PR       int                        `json:"pr,omitempty"`
+	HeadSHA  string                     `json:"head_sha,omitempty"`
+}
+
+type startGateCandidate struct {
+	Nonce  string `json:"nonce"`
+	MayRun bool   `json:"may_run,omitempty"`
+}
+
+type startCandidateInvalidation struct {
+	EffectID   string                `json:"effect_id"`
+	Manifest   agentruntime.Manifest `json:"manifest"`
+	Candidates []startGateCandidate  `json:"candidates"`
+}
+
+// The owner retains this candidate after deleting its pending handoff intent.
+// External cleanup may act only on its exact durable pane binding.
+type handoffCandidateInvalidation struct {
+	EffectID string                `json:"effect_id"`
+	Token    string                `json:"token"`
+	Key      string                `json:"key"`
+	Manifest agentruntime.Manifest `json:"manifest"`
+}
+
+func validHandoffCandidateInvalidation(candidate handoffCandidateInvalidation, manifest agentruntime.Manifest) bool {
+	decoded, err := hex.DecodeString(candidate.EffectID)
+	return err == nil && len(decoded) == 16 && agentruntime.ValidLaunchToken(candidate.Token) && candidate.Token != manifest.LaunchToken && candidate.Key != "" && filepath.Base(candidate.Key) == candidate.Key && !strings.ContainsAny(candidate.Key, "/\\\x00\r\n") && candidate.Manifest.Version == agentruntime.ManifestVersion2 && sameAttemptIdentity(candidate.Manifest, manifest) && candidate.Manifest.LaunchToken == manifest.LaunchToken && candidate.Manifest.LaunchID == manifest.LaunchID
+}
+
+func validStartCandidates(candidates []startGateCandidate) bool {
+	if len(candidates) == 0 {
+		return false
+	}
+	seen := make(map[string]bool, len(candidates))
+	for index, candidate := range candidates {
+		if !agentruntime.ValidLaunchToken(candidate.Nonce) || seen[candidate.Nonce] || candidate.MayRun && index != len(candidates)-1 {
+			return false
+		}
+		seen[candidate.Nonce] = true
+	}
+	return true
+}
+
+func validStartCandidateInvalidation(candidate startCandidateInvalidation, manifest agentruntime.Manifest) bool {
+	return agentruntime.ValidLaunchToken(candidate.EffectID) && candidate.Manifest.Version == agentruntime.ManifestVersion2 && sameAttemptIdentity(candidate.Manifest, manifest) && candidate.Manifest.LaunchToken == manifest.LaunchToken && candidate.Manifest.LaunchID == manifest.LaunchID && validStartCandidates(candidate.Candidates)
 }
 
 type runtimeEffectIntent struct {
@@ -121,7 +202,12 @@ type runtimeEffectIntent struct {
 	IntentEpoch                         uint64                         `json:"intent_epoch,omitempty"`
 	IntentRevision                      uint64                         `json:"intent_revision"`
 	State                               string                         `json:"state"`
+	Dispatched                          bool                           `json:"dispatched,omitempty"`
 	RequestDigest                       string                         `json:"request_digest"`
+	CandidateLaunchToken                string                         `json:"candidate_launch_token,omitempty"`
+	StartGateNonce                      string                         `json:"start_gate_nonce,omitempty"`
+	StartMayRun                         bool                           `json:"start_may_run,omitempty"`
+	StartCandidates                     []startGateCandidate           `json:"start_candidates,omitempty"`
 	Reason                              string                         `json:"reason,omitempty"`
 	Review                              *agentruntime.ReviewTransition `json:"review,omitempty"`
 	Reconciliation                      *reconciliationEffectRequest   `json:"reconciliation,omitempty"`
@@ -130,6 +216,7 @@ type runtimeEffectIntent struct {
 	ReviewerGateProtocol                bool                           `json:"reviewer_gate_protocol,omitempty"`
 	ReviewerSessionRequested            bool                           `json:"reviewer_session_requested,omitempty"`
 	ReviewerGroupPID                    int                            `json:"reviewer_group_pid,omitempty"`
+	ReviewerResultDigest                string                         `json:"reviewer_result_digest,omitempty"`
 	ReviewerStopped                     bool                           `json:"reviewer_stopped,omitempty"`
 	ReviewerRevoked                     bool                           `json:"reviewer_revoked,omitempty"`
 	SupersededReviewerID                string                         `json:"superseded_reviewer_id,omitempty"`
@@ -142,6 +229,8 @@ type runtimeEffectIntent struct {
 	SupersededReviewerIssueGeneration   uint64                         `json:"superseded_reviewer_issue_generation,omitempty"`
 	SupersededReviewerAttemptGeneration uint64                         `json:"superseded_reviewer_attempt_generation,omitempty"`
 	Diagnostic                          string                         `json:"diagnostic,omitempty"`
+	InvalidatedHandoff                  *handoffCandidateInvalidation  `json:"invalidated_handoff,omitempty"`
+	InvalidatedStart                    *startCandidateInvalidation    `json:"invalidated_start,omitempty"`
 }
 
 type stateResultIdentity struct {
@@ -206,6 +295,8 @@ type beginRuntimeEffectCommand struct {
 	RequestDigest        string
 	Review               *agentruntime.ReviewTransition
 	SupersededReviewerID string
+	CandidateLaunchToken string
+	StartGateNonce       string
 }
 
 type finishRuntimeEffectCommand struct {
@@ -215,8 +306,15 @@ type finishRuntimeEffectCommand struct {
 }
 
 type authorizeRuntimeEffectCommand struct {
+	Identity  stateResultIdentity
+	Action    agentruntime.EffectAction
+	GateNonce string
+}
+
+type rotateStartGateCommand struct {
 	Identity stateResultIdentity
-	Action   agentruntime.EffectAction
+	OldNonce string
+	NewNonce string
 }
 
 type diagnoseRuntimeEffectCommand struct {
@@ -235,6 +333,18 @@ type authorizeReconciliationEffectCommand struct {
 	Action   reconciliationEffectAction
 }
 
+type selectWorkerSealCommand struct {
+	Repository         string
+	Issue, Attempt     int
+	ExpectedGeneration uint64
+	Selection          workerSealSelection
+}
+
+type resolveInvalidatedReconciliationEffectCommand struct {
+	Identity stateResultIdentity
+	Outcome  invalidatedExternalOutcome
+}
+
 type markPlanReviewRunningCommand struct {
 	Identity stateResultIdentity
 	GroupPID int
@@ -248,6 +358,13 @@ type proveReviewerDeadCommand struct {
 	Identity stateResultIdentity
 	GroupPID int
 	NeverRan bool
+}
+
+type sealReviewerResultCommand struct {
+	Identity stateResultIdentity
+	Result   reconciliationEffectResult
+	Pane     reviewerPaneIdentity
+	Terminal reviewerTerminalRecord
 }
 
 type markReviewerStoppedCommand struct {
@@ -299,6 +416,11 @@ type recordOperatorDiagnosticCommand struct {
 	Diagnostic string
 }
 
+type completeHandoffCompensationCommand struct {
+	RequestID string
+	Proof     handoffCompensationProof
+}
+
 type beginOperatorMutationCommand struct {
 	Request               controlRequest
 	Identity              stateResultIdentity
@@ -346,13 +468,17 @@ const (
 	stateOwnerBeginRuntimeEffect
 	stateOwnerFinishRuntimeEffect
 	stateOwnerAuthorizeRuntimeEffect
+	stateOwnerRotateStartGate
 	stateOwnerDiagnoseRuntimeEffect
 	stateOwnerApplyReconciliation
 	stateOwnerBeginReconciliationEffect
 	stateOwnerAuthorizeReconciliationEffect
+	stateOwnerResolveInvalidatedReconciliationEffect
+	stateOwnerSelectWorkerSeal
 	stateOwnerMarkPlanReviewRunning
 	stateOwnerMarkReviewerSessionRequested
 	stateOwnerProveReviewerDead
+	stateOwnerSealReviewerResult
 	stateOwnerMarkReviewerStopped
 	stateOwnerBindReviewerStopping
 	stateOwnerSupersedePlanReview
@@ -361,6 +487,7 @@ const (
 	stateOwnerMutatePRRecovery
 	stateOwnerRecordControlReceipt
 	stateOwnerRecordOperatorDiagnostic
+	stateOwnerCompleteHandoffCompensation
 	stateOwnerBeginOperatorMutation
 	stateOwnerStartOperatorCleanup
 	stateOwnerFinishOperatorRuntimeEffect
@@ -378,13 +505,17 @@ type stateOwnerCommand struct {
 	begin                        beginRuntimeEffectCommand
 	finish                       finishRuntimeEffectCommand
 	authorize                    authorizeRuntimeEffectCommand
+	rotateStartGate              rotateStartGateCommand
 	diagnoseRuntime              diagnoseRuntimeEffectCommand
 	reconcile                    applyReconciliationCommand
 	beginReconciliation          beginReconciliationEffectCommand
 	authorizeReconciliation      authorizeReconciliationEffectCommand
+	resolveInvalidatedReconcile  resolveInvalidatedReconciliationEffectCommand
+	selectWorkerSeal             selectWorkerSealCommand
 	markPlanReviewRunning        markPlanReviewRunningCommand
 	markReviewerSessionRequested markReviewerSessionRequestedCommand
 	proveReviewerDead            proveReviewerDeadCommand
+	sealReviewerResult           sealReviewerResultCommand
 	markReviewerStopped          markReviewerStoppedCommand
 	bindReviewerStopping         bindReviewerStoppingCommand
 	supersedePlanReview          supersedePlanReviewCommand
@@ -393,6 +524,7 @@ type stateOwnerCommand struct {
 	mutatePRRecovery             mutatePRRecoveryCommand
 	receipt                      recordControlReceiptCommand
 	operatorDiagnostic           recordOperatorDiagnosticCommand
+	completeHandoff              completeHandoffCompensationCommand
 	beginOperator                beginOperatorMutationCommand
 	startOperatorCleanup         startOperatorCleanupCommand
 	finishOperatorRuntime        finishOperatorRuntimeEffectCommand
@@ -731,6 +863,11 @@ func (o *stateOwner) invalidateAttempt(ctx context.Context, command invalidateAt
 	return result.snapshot, result.effect, err
 }
 
+func (o *stateOwner) selectWorkerSeal(ctx context.Context, command selectWorkerSealCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerSelectWorkerSeal, selectWorkerSeal: command})
+	return result.snapshot, err
+}
+
 func (o *stateOwner) recordEffect(ctx context.Context, command recordEffectCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRecordEffect, record: command})
 	return result.snapshot, result.effect, err
@@ -742,6 +879,13 @@ func (o *stateOwner) completeEffect(ctx context.Context, command completeEffectC
 }
 
 func (o *stateOwner) beginRuntimeEffect(ctx context.Context, command beginRuntimeEffectCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
+	if command.Action == agentruntime.EffectStart && command.StartGateNonce == "" {
+		var err error
+		command.StartGateNonce, err = agentruntime.NewLaunchToken()
+		if err != nil {
+			return stateOwnerSnapshot{}, nil, err
+		}
+	}
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerBeginRuntimeEffect, begin: command})
 	return result.snapshot, result.effect, err
 }
@@ -756,6 +900,16 @@ func (o *stateOwner) authorizeRuntimeEffect(ctx context.Context, command authori
 	return err
 }
 
+func (o *stateOwner) rotateStartGate(ctx context.Context, command rotateStartGateCommand) (stateOwnerSnapshot, *runtimeEffectIntent, error) {
+	var err error
+	command.NewNonce, err = agentruntime.NewLaunchToken()
+	if err != nil {
+		return stateOwnerSnapshot{}, nil, err
+	}
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRotateStartGate, rotateStartGate: command})
+	return result.snapshot, result.effect, err
+}
+
 func (o *stateOwner) recordControlReceipt(ctx context.Context, receipt controlReceipt) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRecordControlReceipt, receipt: recordControlReceiptCommand{Receipt: receipt}})
 	return result.snapshot, err
@@ -763,6 +917,11 @@ func (o *stateOwner) recordControlReceipt(ctx context.Context, receipt controlRe
 
 func (o *stateOwner) recordOperatorDiagnostic(ctx context.Context, command recordOperatorDiagnosticCommand) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerRecordOperatorDiagnostic, operatorDiagnostic: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) completeHandoffCompensation(ctx context.Context, command completeHandoffCompensationCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerCompleteHandoffCompensation, completeHandoff: command})
 	return result.snapshot, err
 }
 
@@ -801,6 +960,11 @@ func (o *stateOwner) proveReviewerDead(ctx context.Context, command proveReviewe
 	return result.snapshot, err
 }
 
+func (o *stateOwner) sealReviewerResult(ctx context.Context, command sealReviewerResultCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerSealReviewerResult, sealReviewerResult: command})
+	return result.snapshot, err
+}
+
 func (o *stateOwner) markReviewerStopped(ctx context.Context, command markReviewerStoppedCommand) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerMarkReviewerStopped, markReviewerStopped: command})
 	return result.snapshot, err
@@ -830,6 +994,28 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if !candidate.ReviewerRevocationTracked {
 			revokeInvalidPlanReviewers(&candidate, true) // Old ledgers cannot prove an A→B→A observation history.
 			candidate.ReviewerRevocationTracked = true
+		}
+		if !candidate.ReviewerSafetyMigrated {
+			migrateLegacyReviewerSafety(&candidate)
+			candidate.ReviewerSafetyMigrated = true
+		}
+		if !candidate.ExternalDispatchTracked {
+			for id, effect := range candidate.Effects {
+				if effect.State == "pending" && effect.Reconciliation != nil && reconciliationMutatesGitHub(effect.Reconciliation.Action) {
+					effect.Dispatched = true // A legacy pending effect may already have crossed the HTTP boundary.
+					candidate.Effects[id] = effect
+				}
+			}
+			candidate.ExternalDispatchTracked = true
+		}
+		for id, effect := range candidate.Effects {
+			if effect.Action == string(agentruntime.EffectStop) && effect.State == "pending" {
+				key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+				if record, ok := candidate.Attempts[key]; ok && record.Generation == effect.AttemptGeneration && record.StopEffectID == "" {
+					record.StopEffectID = id
+					candidate.Attempts[key] = record
+				}
+			}
 		}
 		candidate.Epoch++
 		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, nil)
@@ -872,9 +1058,15 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerAuthorizeRuntimeEffect:
-		if err := applyAuthorizeRuntimeEffect(candidate, command.authorize); err != nil {
+		if err := applyAuthorizeRuntimeEffect(&candidate, command.authorize); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
+	case stateOwnerRotateStartGate:
+		if err := applyRotateStartGate(&candidate, command.rotateStartGate); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+		effect := candidate.Effects[command.rotateStartGate.Identity.EffectID]
+		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, &effect)
 	case stateOwnerDiagnoseRuntimeEffect:
 		if err := applyDiagnoseRuntimeEffect(&candidate, command.diagnoseRuntime); err != nil {
 			return runtimeOwnerState{}, nil, err
@@ -893,7 +1085,15 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		}
 		return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, effect)
 	case stateOwnerAuthorizeReconciliationEffect:
-		if err := applyAuthorizeReconciliationEffect(stateRoot, candidate, command.authorizeReconciliation); err != nil {
+		if err := applyAuthorizeReconciliationEffect(stateRoot, &candidate, command.authorizeReconciliation); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerResolveInvalidatedReconciliationEffect:
+		if err := applyResolveInvalidatedReconciliationEffect(&candidate, command.resolveInvalidatedReconcile); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerSelectWorkerSeal:
+		if err := applySelectWorkerSeal(stateRoot, &candidate, command.selectWorkerSeal); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerMarkPlanReviewRunning:
@@ -906,6 +1106,10 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		}
 	case stateOwnerProveReviewerDead:
 		if err := applyProveReviewerDead(&candidate, command.proveReviewerDead); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerSealReviewerResult:
+		if err := applySealReviewerResult(stateRoot, &candidate, command.sealReviewerResult); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerMarkReviewerStopped:
@@ -938,6 +1142,10 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		}
 	case stateOwnerRecordOperatorDiagnostic:
 		if err := applyRecordOperatorDiagnostic(&candidate, command.operatorDiagnostic); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
+	case stateOwnerCompleteHandoffCompensation:
+		if err := applyCompleteHandoffCompensation(&candidate, command.completeHandoff); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerBeginOperatorMutation:
@@ -1001,7 +1209,7 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 	return finishRuntimeOwnerTransition(attemptRoot, stateRoot, candidate, nil)
 }
 
-func applyAuthorizeRuntimeEffect(state runtimeOwnerState, command authorizeRuntimeEffectCommand) error {
+func applyAuthorizeRuntimeEffect(state *runtimeOwnerState, command authorizeRuntimeEffectCommand) error {
 	identity := command.Identity
 	if !validRuntimeEffectAction(command.Action) || identity.EffectID == "" || identity.SourceRevision == 0 || !agentruntime.ValidEffectRequestDigest(identity.RequestDigest) {
 		return errStaleStateResult
@@ -1012,17 +1220,56 @@ func applyAuthorizeRuntimeEffect(state runtimeOwnerState, command authorizeRunti
 	}
 	issueKey := ownerIssueKey(effect.Repository, effect.Issue)
 	attemptKey := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
-	if state.AttemptGenerations[attemptKey] != identity.AttemptGeneration || state.IssueGenerations[issueKey] != identity.IssueGeneration && !effectAuthorizedByTombstone(state, effect) {
+	if state.AttemptGenerations[attemptKey] != identity.AttemptGeneration || state.IssueGenerations[issueKey] != identity.IssueGeneration && !effectAuthorizedByTombstone(*state, effect) {
 		return errStaleStateResult
 	}
-	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned && !effectAuthorizedByTombstone(state, effect) {
+	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned && !effectAuthorizedByTombstone(*state, effect) {
 		return errAttemptTombstoned
 	}
+	if command.Action == agentruntime.EffectStart {
+		if !agentruntime.ValidLaunchToken(command.GateNonce) || effect.StartGateNonce != command.GateNonce || len(effect.StartCandidates) == 0 || effect.StartCandidates[len(effect.StartCandidates)-1].Nonce != command.GateNonce {
+			return errStaleStateResult
+		}
+		effect.StartMayRun = true
+		effect.StartCandidates[len(effect.StartCandidates)-1].MayRun = true
+		state.Effects[effect.ID] = effect
+	} else if command.GateNonce != "" {
+		return errStateConflict
+	}
+	return nil
+}
+
+func applyRotateStartGate(state *runtimeOwnerState, command rotateStartGateCommand) error {
+	identity := command.Identity
+	effect, ok := state.Effects[identity.EffectID]
+	if !ok || effect.State != "pending" || effect.Action != string(agentruntime.EffectStart) || effect.IntentEpoch != identity.Epoch || effect.IntentRevision != identity.SourceRevision || effect.IssueGeneration != identity.IssueGeneration || effect.AttemptGeneration != identity.AttemptGeneration || effect.RequestDigest != identity.RequestDigest || effect.StartMayRun || effect.StartGateNonce != command.OldNonce || !agentruntime.ValidLaunchToken(command.NewNonce) || command.NewNonce == command.OldNonce || !validStartCandidates(effect.StartCandidates) {
+		return errStaleStateResult
+	}
+	issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+	if state.IssueGenerations[issueKey] != identity.IssueGeneration || state.AttemptGenerations[attemptKey] != identity.AttemptGeneration {
+		return errStaleStateResult
+	}
+	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned {
+		return errAttemptTombstoned
+	}
+	for _, candidate := range effect.StartCandidates {
+		if candidate.Nonce == command.NewNonce || candidate.MayRun {
+			return errStateConflict
+		}
+	}
+	effect.StartGateNonce = command.NewNonce
+	effect.StartCandidates = append(effect.StartCandidates, startGateCandidate{Nonce: command.NewNonce})
+	state.Effects[effect.ID] = effect
 	return nil
 }
 
 func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerState, command beginRuntimeEffectCommand) (*runtimeEffectIntent, error) {
 	manifest, identity := cloneManifest(command.Manifest), command.Identity
+	// Handoff launches are committed by the reconciliation handoff intent.
+	// There is no production runtime-Handoff producer or restart scheduler.
+	if command.Action == agentruntime.EffectHandoff || command.CandidateLaunchToken != "" || command.Action == agentruntime.EffectStart && !agentruntime.ValidLaunchToken(command.StartGateNonce) || command.Action != agentruntime.EffectStart && command.StartGateNonce != "" {
+		return nil, errStateConflict
+	}
 	if !validRuntimeEffectInput(command.Action, command.Reason) || !agentruntime.ValidEffectRequestDigest(command.RequestDigest) || command.Action == agentruntime.EffectCleanup || command.Action != agentruntime.EffectStop && command.SupersededReviewerID != "" || identity.Epoch != state.Epoch || identity.EffectID != "" {
 		return nil, errStaleStateResult
 	}
@@ -1033,6 +1280,12 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 		return nil, errStateConflict
 	}
 	issueKey, attemptKey := ownerIssueKey(manifest.Repository, manifest.Issue), ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	if record := state.Attempts[attemptKey]; record.StopEffectID != "" && command.Action != agentruntime.EffectStop {
+		return nil, errStateConflict
+	}
+	if command.Action != agentruntime.EffectStop && issueHasUnprovedReviewer(*state, manifest.Repository, manifest.Issue) {
+		return nil, errStateConflict
+	}
 	if command.Action == agentruntime.EffectStop {
 		for _, effect := range state.Effects {
 			record, exists := state.Attempts[attemptKey]
@@ -1059,6 +1312,19 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 		}
 	}
 	var supersededReviewer runtimeEffectIntent
+	var invalidatedHandoff *handoffCandidateInvalidation
+	var invalidatedStart *startCandidateInvalidation
+	if command.Action == agentruntime.EffectStop {
+		var err error
+		invalidatedHandoff, err = pendingHandoffCandidate(*state, manifest.Repository, manifest.Issue, manifest.Attempt)
+		if err != nil {
+			return nil, err
+		}
+		invalidatedStart, err = pendingStartCandidate(*state, manifest)
+		if err != nil {
+			return nil, err
+		}
+	}
 	switch command.Action {
 	case agentruntime.EffectPrepare:
 		if _, exists := state.Attempts[attemptKey]; exists || identity.AttemptGeneration != 0 || hasAttemptEffect(*state, manifest.Repository, manifest.Issue, manifest.Attempt) {
@@ -1091,7 +1357,11 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 		}
 		pruneCompletedAttemptEffects(state, manifest.Repository, manifest.Issue, manifest.Attempt)
 	}
-	effect := &runtimeEffectIntent{Action: string(command.Action), Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: identity.IssueGeneration, AttemptGeneration: identity.AttemptGeneration, IntentEpoch: state.Epoch, State: "pending", RequestDigest: command.RequestDigest, Reason: command.Reason, Review: cloneReviewTransition(command.Review)}
+	effect := &runtimeEffectIntent{Action: string(command.Action), Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, IssueGeneration: identity.IssueGeneration, AttemptGeneration: identity.AttemptGeneration, IntentEpoch: state.Epoch, State: "pending", RequestDigest: command.RequestDigest, Reason: command.Reason, Review: cloneReviewTransition(command.Review), CandidateLaunchToken: command.CandidateLaunchToken, InvalidatedHandoff: invalidatedHandoff, InvalidatedStart: invalidatedStart}
+	if command.Action == agentruntime.EffectStart {
+		effect.StartGateNonce = command.StartGateNonce
+		effect.StartCandidates = []startGateCandidate{{Nonce: command.StartGateNonce}}
+	}
 	bindSupersededReviewer(effect, supersededReviewer)
 	return effect, nil
 }
@@ -1108,12 +1378,18 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 	if effect.SupersededReviewerID != "" && !effect.ReviewerStopped {
 		return errStateConflict
 	}
+	if (command.Action == agentruntime.EffectCleanup || command.Action == agentruntime.EffectStop) && (attemptHasUnprovedReviewer(*state, effect.Repository, effect.Issue, effect.Attempt) || state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] != "") {
+		return errStateConflict
+	}
 	issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 	if state.IssueGenerations[issueKey] != identity.IssueGeneration && !effectAuthorizedByTombstone(*state, effect) || state.AttemptGenerations[attemptKey] != identity.AttemptGeneration {
 		return errStaleStateResult
 	}
 	manifest := cloneManifest(command.Manifest)
 	if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, manifest); err != nil || manifest.Repository != effect.Repository || manifest.Issue != effect.Issue || manifest.Attempt != effect.Attempt {
+		return errStateConflict
+	}
+	if command.Action == agentruntime.EffectStart && manifest.State == "running" && (!effect.StartMayRun || !validStartCandidates(effect.StartCandidates)) {
 		return errStateConflict
 	}
 	if runtimeEffectAppliesManifest(command.Action) {
@@ -1123,6 +1399,14 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 		record, exists := state.Attempts[attemptKey]
 		if !exists || record.Generation != identity.AttemptGeneration {
 			return errStaleStateResult
+		}
+		if command.Action == agentruntime.EffectReview {
+			if effect.Review == nil {
+				return errStateConflict
+			}
+			if _, err := agentruntime.ReviewEffectResult(attemptRoot, stateRoot, record.Manifest, *effect.Review); err != nil {
+				return errStateConflict
+			}
 		}
 		if !validRuntimeEffectResult(command.Action, effect, record.Manifest, manifest) {
 			return errStateConflict
@@ -1134,6 +1418,15 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 			return errStateConflict
 		}
 		record.Manifest = manifest
+		if command.Action == agentruntime.EffectStop {
+			// The stop generation invalidates the launch-bound worker authority.
+			record.Manifest.WorkerGeneration = 0
+			record.Manifest.WorkerProfileDigest = ""
+			if record.StopEffectID != "" && record.StopEffectID != effect.ID {
+				return errStateConflict
+			}
+			record.StopEffectID = ""
+		}
 		state.Attempts[attemptKey] = record
 	} else {
 		stored := manifest
@@ -1169,6 +1462,11 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 }
 
 func applyMarkReviewerStopped(state *runtimeOwnerState, command markReviewerStoppedCommand) error {
+	// A stopped tmux session or vanished process group is not proof that a
+	// launched reviewer's detached descendants are gone.
+	if !command.Observation.NeverRan {
+		return errStateConflict
+	}
 	effect, ok := state.Effects[command.Identity.EffectID]
 	if !ok || effect.State != "pending" || effect.SupersededReviewerID == "" || effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || effect.IntentEpoch != command.Identity.Epoch || effect.IntentRevision != command.Identity.SourceRevision || effect.IssueGeneration != command.Identity.IssueGeneration || effect.AttemptGeneration != command.Identity.AttemptGeneration || effect.RequestDigest != command.Identity.RequestDigest {
 		return errStaleStateResult
@@ -1240,7 +1538,19 @@ func applyBindReviewerStopping(state *runtimeOwnerState, command bindReviewerSto
 }
 
 func validRuntimeEffectResult(action agentruntime.EffectAction, effect runtimeEffectIntent, current, result agentruntime.Manifest) bool {
-	if !sameRuntimeEffectManifestBase(current, result, action == agentruntime.EffectReview) {
+	switch action {
+	case agentruntime.EffectStart:
+		if result.LaunchToken != current.LaunchToken || result.LaunchID != current.LaunchID && result.LaunchID != effect.StartGateNonce || result.State == "running" && result.LaunchID != effect.StartGateNonce {
+			return false
+		}
+	case agentruntime.EffectHandoff:
+		unchanged := result.LaunchToken == current.LaunchToken && result.LaunchID == current.LaunchID
+		relaunched := result.LaunchToken == effect.CandidateLaunchToken && result.LaunchID == effect.ID && agentruntime.ValidLaunchToken(effect.CandidateLaunchToken)
+		if !unchanged && !relaunched {
+			return false
+		}
+	}
+	if !sameRuntimeEffectManifestBase(current, result, action) {
 		return false
 	}
 	switch action {
@@ -1280,17 +1590,29 @@ func validOwnerRuntimeEffectInput(attemptRoot, stateRoot string, action agentrun
 	}
 }
 
-func sameRuntimeEffectManifestBase(current, result agentruntime.Manifest, review bool) bool {
+func sameRuntimeEffectManifestBase(current, result agentruntime.Manifest, action agentruntime.EffectAction) bool {
 	copy := cloneManifest(result)
 	copy.State, copy.Diagnostic, copy.UpdatedAt = current.State, current.Diagnostic, current.UpdatedAt
-	if review {
+	if action == agentruntime.EffectStart || action == agentruntime.EffectHandoff {
+		copy.LaunchToken, copy.LaunchID = current.LaunchToken, current.LaunchID
+	}
+	if action == agentruntime.EffectReview {
 		copy.ReviewState, copy.ReviewMode, copy.ReviewTarget = current.ReviewState, current.ReviewMode, current.ReviewTarget
 		copy.ReviewDiagnostic = current.ReviewDiagnostic
 		copy.ReviewBase, copy.ReviewHead, copy.ReviewSnapshot, copy.ReviewSession = current.ReviewBase, current.ReviewHead, current.ReviewSnapshot, current.ReviewSession
 		copy.ReviewFindings = slices.Clone(current.ReviewFindings)
 		copy.ReviewHandoffQueued, copy.ReviewHandoffAck = current.ReviewHandoffQueued, current.ReviewHandoffAck
 	}
-	return reflect.DeepEqual(copy, current)
+	if action == agentruntime.EffectMonitor {
+		copy.WorkerStatus, copy.WorkerStatusReason, copy.WorkerStatusSeq, copy.WorkerStatusApplied = current.WorkerStatus, current.WorkerStatusReason, current.WorkerStatusSeq, current.WorkerStatusApplied
+	}
+	if !reflect.DeepEqual(copy, current) {
+		return false
+	}
+	if action != agentruntime.EffectMonitor {
+		return result.WorkerStatus == current.WorkerStatus && result.WorkerStatusReason == current.WorkerStatusReason && result.WorkerStatusSeq == current.WorkerStatusSeq && result.WorkerStatusApplied == current.WorkerStatusApplied
+	}
+	return result.WorkerStatusApplied == current.WorkerStatusApplied && result.WorkerStatusSeq >= current.WorkerStatusSeq && (result.WorkerStatusSeq == current.WorkerStatusSeq && result.WorkerStatus == current.WorkerStatus && result.WorkerStatusReason == current.WorkerStatusReason || result.WorkerStatusSeq > current.WorkerStatusSeq && slices.Contains([]string{"needs-attention", "clear"}, result.WorkerStatus) && strings.TrimSpace(result.WorkerStatusReason) != "" && len(result.WorkerStatusReason) <= 1024)
 }
 
 func reviewTransitionMatches(review agentruntime.ReviewTransition, current, result agentruntime.Manifest) bool {
@@ -1371,6 +1693,9 @@ func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueG
 	if generation == ^uint64(0) {
 		return errors.New("issue generation overflow")
 	}
+	if issueHasUnprovedReviewer(*state, command.Repository, command.Issue) {
+		return errStateConflict
+	}
 	for _, effect := range state.Effects {
 		if effect.Repository == command.Repository && effect.Issue == command.Issue && !effectAuthorizedByTombstone(*state, effect) && pendingReviewerDeathUnproved(*state, effect) {
 			return errStateConflict
@@ -1380,11 +1705,101 @@ func applyAdvanceIssueGeneration(state *runtimeOwnerState, command advanceIssueG
 	delete(state.Observations, key)
 	deleteIssueRecoveries(state, command.Repository, command.Issue)
 	for id, effect := range state.Effects {
-		if effect.Repository == command.Repository && effect.Issue == command.Issue && !effectAuthorizedByTombstone(*state, effect) {
+		if effect.Repository == command.Repository && effect.Issue == command.Issue && !effectAuthorizedByTombstone(*state, effect) && !invalidatedExternalEffect(*state, effect) {
 			delete(state.Effects, id)
 		}
 	}
 	return nil
+}
+
+func issueHasUnprovedReviewer(state runtimeOwnerState, repository string, issue int) bool {
+	if state.LegacyReviewerQuarantines[ownerIssueKey(repository, issue)] != "" {
+		return true
+	}
+	for _, proof := range state.ReviewerProofs {
+		if proof.Repository == repository && proof.Issue == issue && !proof.NeverRan {
+			return true
+		}
+	}
+	return false
+}
+
+// Older group-only death certificates and completed cleanup records cannot
+// establish descendant absence. Preserve old business receipts and quarantine
+// only the affected issue; never synthesize a physical-completion proof.
+func migrateLegacyReviewerSafety(state *runtimeOwnerState) {
+	if state.LegacyReviewerQuarantines == nil {
+		state.LegacyReviewerQuarantines = map[string]string{}
+	}
+	if state.ReviewerProofs == nil {
+		state.ReviewerProofs = map[string]reviewerProcessProof{}
+	}
+	for key, proof := range state.ReviewerProofs {
+		if proof.NeverRan {
+			continue
+		}
+		proof.DeadProved = false
+		proof.LegacyUnverified = true
+		state.ReviewerProofs[key] = proof
+	}
+	for _, effect := range state.Effects {
+		if !effect.ReviewerLaunched {
+			continue
+		}
+		issueKey := ownerIssueKey(effect.Repository, effect.Issue)
+		if effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.ReviewerGroupPID < 2 {
+			state.LegacyReviewerQuarantines[issueKey] = "legacy reviewer identity is incomplete; physical cleanup cannot be certified"
+			continue
+		}
+		reviewer := effect.Reconciliation.Reviewer
+		key := reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, reviewer.Mode, reviewer.Target)
+		if existing, ok := state.ReviewerProofs[key]; ok {
+			if existing.EffectID != effect.ID {
+				state.LegacyReviewerQuarantines[issueKey] = "legacy reviewer identity conflicts; physical cleanup cannot be certified"
+			}
+			continue
+		}
+		state.ReviewerProofs[key] = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: reviewer.Mode, Target: reviewer.Target, EffectID: effect.ID, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, GroupPID: effect.ReviewerGroupPID, LegacyUnverified: true}
+	}
+	for _, record := range state.Attempts {
+		manifest := record.Manifest
+		if manifest.ReviewState == "" {
+			continue
+		}
+		found := false
+		for _, proof := range state.ReviewerProofs {
+			if proof.Repository == manifest.Repository && proof.Issue == manifest.Issue && proof.Attempt == manifest.Attempt && !proof.NeverRan {
+				found = true
+				break
+			}
+		}
+		if !found {
+			state.LegacyReviewerQuarantines[ownerIssueKey(manifest.Repository, manifest.Issue)] = "legacy reviewer history is incomplete; physical cleanup cannot be certified"
+		}
+	}
+	for _, tombstone := range state.Tombstones {
+		bound := false
+		for _, proof := range state.ReviewerProofs {
+			if proof.Repository == tombstone.Repository && proof.Issue == tombstone.Issue && proof.Attempt == tombstone.Attempt && !proof.NeverRan {
+				bound = true
+			}
+		}
+		if bound {
+			continue
+		}
+		if !bound {
+			state.LegacyReviewerQuarantines[ownerIssueKey(tombstone.Repository, tombstone.Issue)] = "legacy reviewer absence unknown; physical cleanup cannot be certified"
+		}
+	}
+}
+
+func attemptHasUnprovedReviewer(state runtimeOwnerState, repository string, issue, attempt int) bool {
+	for _, proof := range state.ReviewerProofs {
+		if proof.Repository == repository && proof.Issue == issue && proof.Attempt == attempt && !proof.NeverRan {
+			return true
+		}
+	}
+	return false
 }
 
 func finishRuntimeOwnerTransition(attemptRoot, stateRoot string, candidate runtimeOwnerState, effect *runtimeEffectIntent, operatorRequestIDs ...string) (runtimeOwnerState, *runtimeEffectIntent, error) {
@@ -1400,6 +1815,12 @@ func finishRuntimeOwnerTransition(attemptRoot, stateRoot string, candidate runti
 		if tombstone, ok := candidate.Tombstones[attemptKey]; ok && tombstone.Revision == 0 {
 			tombstone.EffectID = effect.ID
 			candidate.Tombstones[attemptKey] = tombstone
+		}
+		if effect.Action == string(agentruntime.EffectStop) {
+			if record, ok := candidate.Attempts[attemptKey]; ok && record.Generation == effect.AttemptGeneration {
+				record.StopEffectID = effect.ID
+				candidate.Attempts[attemptKey] = record
+			}
 		}
 	}
 	for _, requestID := range operatorRequestIDs {
@@ -1435,11 +1856,25 @@ func applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot string, state *ru
 	if _, tombstoned := state.Tombstones[attemptKey]; tombstoned {
 		return errAttemptTombstoned
 	}
+	if state.LegacyReviewerQuarantines[issueKey] != "" {
+		return errStateConflict
+	}
+	for _, proof := range state.ReviewerProofs {
+		if proof.Repository == manifest.Repository && proof.Issue == manifest.Issue && proof.Attempt != manifest.Attempt && !proof.NeverRan {
+			return errStateConflict
+		}
+	}
 	generation := state.AttemptGenerations[attemptKey]
 	if generation != command.ExpectedAttemptGeneration {
 		return errStaleStateResult
 	}
+	if state.Attempts[attemptKey].StopEffectID != "" {
+		return errStateConflict
+	}
 	if generation == 0 {
+		if issueHasUnprovedReviewer(*state, manifest.Repository, manifest.Issue) {
+			return errStateConflict
+		}
 		if issueGeneration == ^uint64(0) {
 			return errors.New("issue generation overflow")
 		}
@@ -1473,6 +1908,85 @@ func applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot string, state *ru
 	return nil
 }
 
+func pendingHandoffCandidate(state runtimeOwnerState, repository string, issue, attempt int) (*handoffCandidateInvalidation, error) {
+	var candidate *handoffCandidateInvalidation
+	for _, effect := range state.Effects {
+		if effect.State != "pending" || effect.Action != string(reconciliationHandoffDeliver) || effect.Repository != repository || effect.Issue != issue || effect.Attempt != attempt || effect.Reconciliation == nil || effect.Reconciliation.Manifest == nil || effect.Reconciliation.Handoff == nil {
+			continue
+		}
+		manifest := *effect.Reconciliation.Manifest
+		if manifest.Version != agentruntime.ManifestVersion2 {
+			continue
+		}
+		if candidate != nil || !agentruntime.ValidLaunchToken(effect.Reconciliation.Handoff.CandidateLaunchToken) {
+			return nil, errStateConflict
+		}
+		candidate = &handoffCandidateInvalidation{EffectID: effect.ID, Token: effect.Reconciliation.Handoff.CandidateLaunchToken, Key: effect.Reconciliation.Handoff.Key, Manifest: cloneManifest(manifest)}
+	}
+	return candidate, nil
+}
+
+func pendingStartCandidate(state runtimeOwnerState, manifest agentruntime.Manifest) (*startCandidateInvalidation, error) {
+	var candidate *startCandidateInvalidation
+	for _, effect := range state.Effects {
+		if effect.State != "pending" || effect.Action != string(agentruntime.EffectStart) || effect.Repository != manifest.Repository || effect.Issue != manifest.Issue || effect.Attempt != manifest.Attempt {
+			continue
+		}
+		if candidate != nil || manifest.Version != agentruntime.ManifestVersion2 {
+			return nil, errStateConflict
+		}
+		gates := slices.Clone(effect.StartCandidates)
+		if len(gates) == 0 {
+			gates = []startGateCandidate{{Nonce: effect.ID, MayRun: true}} // Legacy intent has no pre-release proof.
+		}
+		candidate = &startCandidateInvalidation{EffectID: effect.ID, Manifest: cloneManifest(manifest), Candidates: gates}
+	}
+	return candidate, nil
+}
+
+func controlGeneration(state runtimeOwnerState, issueKey string) uint64 {
+	if generation := state.ControlGenerations[issueKey]; generation > 0 {
+		return generation
+	}
+	return 1
+}
+
+func invalidateControlSnapshot(state *runtimeOwnerState, issueKey string) {
+	generation := controlGeneration(*state, issueKey) + 1
+	if state.ControlGenerations == nil {
+		state.ControlGenerations = map[string]uint64{}
+	}
+	if state.ControlRepairs == nil {
+		state.ControlRepairs = map[string]controlSnapshotRepair{}
+	}
+	state.ControlGenerations[issueKey] = generation
+	body := state.ControlRepairs[issueKey].Body
+	for id, effect := range state.Effects {
+		request := effect.Reconciliation
+		if effect.State != "pending" || request == nil || ownerIssueKey(effect.Repository, effect.Issue) != issueKey || request.Action != reconciliationGitHubIssueUpdate || request.GitHubIssueUpdate == nil || request.GitHubIssueUpdate.Kind != githubIssueControlSnapshot {
+			continue
+		}
+		if request.GitHubIssueUpdate.ControlSnapshotBody != "" {
+			body = request.GitHubIssueUpdate.ControlSnapshotBody
+		}
+		if !effect.Dispatched {
+			delete(state.Effects, id)
+			continue
+		}
+		effect.State = "invalidated"
+		state.Effects[id] = effect
+	}
+	if body == "" {
+		return
+	}
+	snapshot, err := internalgithub.ParseSnapshotComment(body, 1, 1)
+	if err != nil {
+		return
+	}
+	snapshot.OwnerGeneration = generation
+	state.ControlRepairs[issueKey] = controlSnapshotRepair{Generation: generation, Body: internalgithub.SnapshotComment(snapshot)}
+}
+
 func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerState, command invalidateAttemptCommand) (*runtimeEffectIntent, error) {
 	if command.Repository != state.Repository || command.Issue < 1 || command.Attempt < 1 || !validTombstoneAction(command.Action) || !validCleanupPhase(command.CleanupPhase) {
 		return nil, errStateConflict
@@ -1504,6 +2018,24 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 		}
 		command.Manifest = &manifest
 	}
+	invalidateControlSnapshot(state, issueKey)
+	invalidatedHandoff, err := pendingHandoffCandidate(*state, command.Repository, command.Issue, command.Attempt)
+	if err != nil {
+		return nil, err
+	}
+	var invalidatedStart *startCandidateInvalidation
+	if command.Manifest != nil {
+		invalidatedStart, err = pendingStartCandidate(*state, *command.Manifest)
+		if err != nil {
+			return nil, err
+		}
+		if invalidatedStart != nil && agentruntime.WorkerConfinementBound(invalidatedStart.Manifest, command.ExpectedAttemptGeneration, activeWorkerProfileDigest(*state)) {
+			// The generation change revokes all owner authority held by this
+			// rootless candidate. Its physically escaped descendants have no
+			// network, credentials, state, socket, or sibling-workspace access.
+			invalidatedStart = nil
+		}
+	}
 	invalidated := command.ExpectedAttemptGeneration
 	if invalidated == ^uint64(0) {
 		return nil, errors.New("attempt generation overflow")
@@ -1518,11 +2050,11 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 		return nil, err
 	}
 	delete(state.Recoveries, attemptKey)
-	deleteAttemptEffects(state, command.Repository, command.Issue, command.Attempt)
+	invalidateAttemptEffects(state, command.Repository, command.Issue, command.Attempt)
 	state.Tombstones[attemptKey] = runtimeTombstone{
 		Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt, Action: command.Action,
 		InvalidatedGeneration: invalidated, Generation: generation, CleanupPhase: command.CleanupPhase,
-		PublishedHead: command.PublishedHead, Manifest: command.Manifest, CleanupPolicy: cloneCleanupPolicy(command.CleanupPolicy), Diagnostic: command.Diagnostic,
+		PublishedHead: command.PublishedHead, Manifest: command.Manifest, CleanupPolicy: cloneCleanupPolicy(command.CleanupPolicy), Diagnostic: command.Diagnostic, InvalidatedHandoff: invalidatedHandoff, InvalidatedStart: invalidatedStart, ExternalOutcomes: map[string]invalidatedExternalOutcome{},
 	}
 	if command.EffectAction == "" {
 		return nil, nil
@@ -1531,6 +2063,40 @@ func applyInvalidateAttempt(attemptRoot, stateRoot string, state *runtimeOwnerSt
 		return nil, errStateConflict
 	}
 	return &runtimeEffectIntent{Action: command.EffectAction, Repository: command.Repository, Issue: command.Issue, Attempt: command.Attempt, IssueGeneration: command.ExpectedIssueGeneration, AttemptGeneration: generation, IntentEpoch: state.Epoch, State: "pending", RequestDigest: command.EffectRequestDigest}, nil
+}
+
+func applySelectWorkerSeal(stateRoot string, state *runtimeOwnerState, command selectWorkerSealCommand) error {
+	key := ownerAttemptKey(command.Repository, command.Issue, command.Attempt)
+	record, ok := state.Attempts[key]
+	if !ok || command.Repository != state.Repository || command.ExpectedGeneration == 0 || record.Generation != command.ExpectedGeneration || state.AttemptGenerations[key] != command.ExpectedGeneration {
+		return errStaleStateResult
+	}
+	if _, invalidated := state.Tombstones[key]; invalidated || record.Manifest.State != "completed" || !validWorkerSealSelection(stateRoot, record.Manifest, command.ExpectedGeneration, command.Selection) {
+		return errStateConflict
+	}
+	if record.WorkerSeal != nil {
+		if *record.WorkerSeal == command.Selection {
+			return nil
+		}
+		return errStateConflict
+	}
+	selection := command.Selection
+	record.WorkerSeal = &selection
+	state.Attempts[key] = record
+	return nil
+}
+
+func validWorkerSealSelection(stateRoot string, manifest agentruntime.Manifest, generation uint64, selection workerSealSelection) bool {
+	expectedRoot := workerSealPath(stateRoot, generation, manifest, selection.HeadSHA)
+	return generation != 0 && selection.Generation == generation &&
+		preflightObjectID.MatchString(selection.HeadSHA) && selection.HeadSHA != manifest.BaseSHA &&
+		validDigest(selection.BundleSHA256) && validDigest(selection.ProfileDigest) &&
+		selection.ProfileDigest == manifest.WorkerProfileDigest &&
+		selection.Root == expectedRoot &&
+		selection.Result.Type == "agent-symphony-result-v1" &&
+		boundedText(selection.Result.Validation, maxReconciliationStringBytes, true) &&
+		boundedText(selection.Result.Documentation, maxReconciliationStringBytes, true) &&
+		boundedText(selection.Result.Decisions, maxReconciliationStringBytes, false)
 }
 
 func applyRecordEffect(state *runtimeOwnerState, command recordEffectCommand) (*runtimeEffectIntent, error) {
@@ -1565,6 +2131,9 @@ func applyCompleteEffect(state *runtimeOwnerState, command completeEffectCommand
 	}
 	if effect.State != "pending" {
 		return errStaleStateResult
+	}
+	if (effect.Action == string(agentruntime.EffectCleanup) || effect.Action == string(agentruntime.EffectStop)) && (attemptHasUnprovedReviewer(*state, effect.Repository, effect.Issue, effect.Attempt) || state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] != "") {
+		return errStateConflict
 	}
 	attemptKey := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 	if state.AttemptGenerations[attemptKey] != identity.AttemptGeneration {
@@ -1605,7 +2174,7 @@ func applyControlReceipt(state *runtimeOwnerState, receipt controlReceipt) error
 }
 
 func applyRecordOperatorDiagnostic(state *runtimeOwnerState, command recordOperatorDiagnosticCommand) error {
-	if command.RequestID == "" || command.Phase != operatorPhaseTerminalAwait && command.Phase != operatorPhaseRetryAwait || !boundedText(command.Diagnostic, maxReconciliationStringBytes, true) {
+	if command.RequestID == "" || command.Phase != operatorPhaseTerminalAwait && command.Phase != operatorPhaseRetryAwait && command.Phase != operatorPhaseHandoffCleanup && command.Phase != operatorPhaseStartCleanup || !boundedText(command.Diagnostic, maxReconciliationStringBytes, true) {
 		return errStateConflict
 	}
 	for index := range state.ControlReceipts {
@@ -1620,6 +2189,48 @@ func applyRecordOperatorDiagnostic(state *runtimeOwnerState, command recordOpera
 		return nil
 	}
 	return errStaleStateResult
+}
+
+func applyCompleteHandoffCompensation(state *runtimeOwnerState, command completeHandoffCompensationCommand) error {
+	if command.RequestID == "" || command.Proof.EffectID == "" {
+		return errStateConflict
+	}
+	var tombstoneKey string
+	for _, receipt := range state.ControlReceipts {
+		if receipt.Request.RequestID != command.RequestID {
+			continue
+		}
+		if receipt.Request.Action != "dismiss" {
+			return errStateConflict
+		}
+		tombstoneKey = ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)
+		break
+	}
+	if tombstoneKey == "" {
+		return errStaleStateResult
+	}
+	tombstone, ok := state.Tombstones[tombstoneKey]
+	if !ok || tombstone.Action != "dismissed" || tombstone.InvalidatedHandoff == nil || tombstone.InvalidatedHandoff.EffectID != command.Proof.EffectID || tombstone.InvalidatedHandoff.Token != command.Proof.Token || !command.Proof.PreserveOld || command.Proof.OldSessionID == "" || command.Proof.OldPaneID == "" || !slices.Contains([]string{"absent", "marked-old", "killed"}, command.Proof.Disposition) {
+		return errStaleStateResult
+	}
+	if tombstone.HandoffCompensated {
+		return nil
+	}
+	completed := false
+	for index := range state.ControlReceipts {
+		receipt := &state.ControlReceipts[index]
+		if receipt.State == "pending" && receipt.Phase == operatorPhaseHandoffCleanup && ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt) == tombstoneKey {
+			receipt.State, receipt.Phase, receipt.Diagnostic = "completed", operatorPhaseCompleted, ""
+			receipt.Result = successfulOperatorResult(receipt.Request, state.Revision+1)
+			completed = true
+		}
+	}
+	if !completed {
+		return errStateConflict
+	}
+	tombstone.HandoffCompensated = true
+	state.Tombstones[tombstoneKey] = tombstone
+	return nil
 }
 
 func loadOrMigrateRuntimeOwnerState(stateRoot, legacyRecoveryPath, repository string) (runtimeOwnerState, bool, error) {
@@ -1653,6 +2264,18 @@ func readRuntimeOwnerState(stateRoot, repository string) (runtimeOwnerState, err
 	if decoder.Decode(&state) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return runtimeOwnerState{}, errors.New("runtime owner ledger is invalid")
 	}
+	if state.ControlGenerations == nil {
+		state.ControlGenerations = map[string]uint64{}
+	}
+	if state.ControlRepairs == nil {
+		state.ControlRepairs = map[string]controlSnapshotRepair{}
+	}
+	for key, tombstone := range state.Tombstones {
+		if tombstone.ExternalOutcomes == nil {
+			tombstone.ExternalOutcomes = map[string]invalidatedExternalOutcome{}
+			state.Tombstones[key] = tombstone
+		}
+	}
 	if err := validateRuntimeOwnerState(state, runtimeOwnerAttemptRoot(stateRoot), stateRoot, true); err != nil || state.Repository != repository {
 		if err == nil {
 			err = fmt.Errorf("runtime state is bound to project %s, not %s", state.Repository, repository)
@@ -1671,6 +2294,7 @@ func migrateLegacyRuntimeState(stateRoot, legacyRecoveryPath, repository string)
 		return runtimeOwnerState{}, fmt.Errorf("runtime state is bound to project %s, not %s", identity.Repository, repository)
 	}
 	state := newRuntimeOwnerState(repository)
+	state.ReviewerSafetyMigrated = false // Pre-ledger cleanup had no descendant proof.
 	server := dashboardServer{stateRoot: stateRoot, repository: repository}
 	manifests, err := (&agentruntime.Runtime{Root: productionAttemptRoot(stateRoot), StateRoot: stateRoot}).Discover()
 	if err != nil {
@@ -1944,6 +2568,23 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 	if (state.CycleOutcomeEpoch == 0) != (state.CycleOutcomeID == 0) || (state.CycleOutcomeEpoch == 0) != (state.CycleOutcomeSource == 0) || state.CycleOutcomeEpoch > state.Epoch || state.CycleOutcomeSource > state.Revision {
 		return errors.New("runtime owner cycle outcome identity is invalid")
 	}
+	for key, generation := range state.ControlGenerations {
+		if generation < 2 || issueFromOwnerKey(key) < 1 || key != ownerIssueKey(state.Repository, issueFromOwnerKey(key)) {
+			return errors.New("runtime owner control generation is invalid")
+		}
+	}
+	for key, repair := range state.ControlRepairs {
+		snapshot, err := internalgithub.ParseSnapshotComment(repair.Body, 1, 1)
+		if err != nil || repair.Generation != controlGeneration(state, key) || snapshot.OwnerGeneration != repair.Generation {
+			return errors.New("runtime owner control repair is invalid")
+		}
+	}
+	for key, diagnostic := range state.LegacyReviewerQuarantines {
+		issue := issueFromOwnerKey(key)
+		if issue < 1 || key != ownerIssueKey(state.Repository, issue) || !boundedText(diagnostic, maxReconciliationStringBytes, true) {
+			return errors.New("runtime owner legacy reviewer quarantine is invalid")
+		}
+	}
 	for key, generation := range state.IssueGenerations {
 		issue := issueFromOwnerKey(key)
 		if generation == 0 || issue < 1 || key != ownerIssueKey(state.Repository, issue) {
@@ -1963,6 +2604,21 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, record.Manifest); err != nil {
 			return err
 		}
+		if record.Manifest.WorkerProfileDigest != "" && record.Manifest.WorkerGeneration != record.Generation {
+			stop, stopping := state.Effects[record.StopEffectID]
+			if !stopping || record.Manifest.WorkerGeneration == ^uint64(0) || record.Manifest.WorkerGeneration+1 != record.Generation || stop.Action != string(agentruntime.EffectStop) || stop.State != "pending" || stop.Repository != record.Manifest.Repository || stop.Issue != record.Manifest.Issue || stop.Attempt != record.Manifest.Attempt || stop.AttemptGeneration != record.Generation {
+				return errors.New("runtime owner worker confinement generation is invalid")
+			}
+		}
+		if record.WorkerSeal != nil && !validWorkerSealSelection(stateRoot, record.Manifest, record.Generation, *record.WorkerSeal) {
+			return errors.New("runtime owner worker seal selection is invalid")
+		}
+		if record.StopEffectID != "" {
+			effect, ok := state.Effects[record.StopEffectID]
+			if !ok || effect.Action != string(agentruntime.EffectStop) || effect.State != "pending" || effect.Repository != record.Manifest.Repository || effect.Issue != record.Manifest.Issue || effect.Attempt != record.Manifest.Attempt || effect.AttemptGeneration != record.Generation || effect.IssueGeneration != state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] {
+				return errors.New("runtime owner pending stop is unbound")
+			}
+		}
 	}
 	if err := validateReconciliationObservations(state); err != nil {
 		return err
@@ -1981,9 +2637,42 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, *tombstone.Manifest); err != nil || tombstone.Manifest.Issue != tombstone.Issue || tombstone.Manifest.Attempt != tombstone.Attempt {
 				return errors.New("runtime owner tombstone manifest is invalid")
 			}
+			if tombstone.Manifest.WorkerProfileDigest != "" && tombstone.Manifest.WorkerGeneration != tombstone.InvalidatedGeneration {
+				return errors.New("runtime owner tombstone confinement generation is invalid")
+			}
+		}
+		if tombstone.InvalidatedHandoff != nil && (tombstone.Manifest == nil || !validHandoffCandidateInvalidation(*tombstone.InvalidatedHandoff, *tombstone.Manifest)) {
+			return errors.New("runtime owner tombstone handoff invalidation is invalid")
+		}
+		if tombstone.InvalidatedStart != nil && (tombstone.Manifest == nil || !validStartCandidateInvalidation(*tombstone.InvalidatedStart, *tombstone.Manifest)) {
+			return errors.New("runtime owner tombstone Start invalidation is invalid")
+		}
+		if tombstone.HandoffCompensated && tombstone.InvalidatedHandoff == nil {
+			return errors.New("runtime owner handoff compensation has no candidate")
+		}
+		for effectID, outcome := range tombstone.ExternalOutcomes {
+			effect, ok := state.Effects[effectID]
+			decoded, decodeErr := hex.DecodeString(effectID)
+			if decodeErr != nil || len(decoded) != 16 || outcome.Action == "" || outcome.PR < 0 || outcome.HeadSHA != "" && !preflightObjectID.MatchString(outcome.HeadSHA) {
+				return errors.New("runtime owner invalidated external outcome is invalid")
+			}
+			if ok && (effect.State != "invalidated-resolved" || effect.Repository != tombstone.Repository || effect.Issue != tombstone.Issue || effect.Attempt != tombstone.Attempt || effect.AttemptGeneration != tombstone.InvalidatedGeneration || !validInvalidatedExternalOutcome(effect, outcome)) {
+				return errors.New("runtime owner invalidated external outcome binding is invalid")
+			}
 		}
 		if !validTombstoneCleanupPolicy(tombstone) {
 			return errors.New("runtime owner tombstone cleanup policy is invalid")
+		}
+		if tombstone.ReviewerLeaseID != "" {
+			bound := false
+			for _, proof := range state.ReviewerProofs {
+				if proof.Repository == tombstone.Repository && proof.Issue == tombstone.Issue && proof.Attempt == tombstone.Attempt && proof.EffectID == tombstone.ReviewerLeaseID && !proof.NeverRan && !proof.DeadProved {
+					bound = true
+				}
+			}
+			if !bound {
+				return errors.New("runtime owner reviewer cleanup lease is unbound")
+			}
 		}
 		if tombstone.CleanupPhase != "completed" && tombstone.Manifest == nil {
 			return errors.New("pending tombstone lacks resource identity")
@@ -2009,11 +2698,13 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		}
 		issueKey, attemptKey := ownerIssueKey(effect.Repository, effect.Issue), ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 		receiptBoundCompletion := effect.State == "completed" && effectReferencedByReceipt(state, effect.ID)
-		issueCurrent := state.IssueGenerations[issueKey] == effect.IssueGeneration || effectAuthorizedByTombstone(state, effect) || receiptBoundCompletion
+		issueCurrent := state.IssueGenerations[issueKey] == effect.IssueGeneration || effectAuthorizedByTombstone(state, effect) || receiptBoundCompletion || invalidatedExternalEffect(state, effect)
 		if effect.Reconciliation != nil {
 			issueScoped := reconciliationEffectIssueScoped(*effect.Reconciliation)
-			attemptCurrent := issueScoped && effect.Attempt == 0 && effect.AttemptGeneration == 0 || !issueScoped && effect.Attempt > 0 && effect.AttemptGeneration > 0 && (state.AttemptGenerations[attemptKey] == effect.AttemptGeneration || receiptBoundCompletion)
-			if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Action == "" || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" || !issueCurrent || !attemptCurrent || !validPersistedReconciliationEffect(state, effect) {
+			tombstone := state.Tombstones[attemptKey]
+			invalidatedAttempt := (effect.State == "invalidated" || effect.State == "invalidated-resolved") && tombstone.InvalidatedGeneration == effect.AttemptGeneration
+			attemptCurrent := issueScoped && effect.Attempt == 0 && effect.AttemptGeneration == 0 || !issueScoped && effect.Attempt > 0 && effect.AttemptGeneration > 0 && (state.AttemptGenerations[attemptKey] == effect.AttemptGeneration || receiptBoundCompletion || invalidatedAttempt)
+			if key != effect.ID || effect.ID != runtimeEffectID(effect) || effect.Repository != state.Repository || effect.Issue < 1 || effect.Action == "" || effect.IntentRevision == 0 || effect.IntentRevision > maxRevision || effect.State != "pending" && effect.State != "completed" && effect.State != "invalidated" && effect.State != "invalidated-resolved" || !issueCurrent || !attemptCurrent || !validPersistedReconciliationEffect(state, effect) {
 				return fmt.Errorf("runtime owner reconciliation effect intent %s (%s) is invalid: identity=%t issue_current=%t attempt_current=%t payload=%t", effect.ID, effect.Action, key == effect.ID && effect.ID == runtimeEffectID(effect), issueCurrent, attemptCurrent, validPersistedReconciliationEffect(state, effect))
 			}
 			continue
@@ -2030,6 +2721,25 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID) || !agentruntime.ValidReviewTarget(effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.Repository, effect.Issue) || effect.SupersededReviewerIssueGeneration == 0 || effect.SupersededReviewerAttemptGeneration == 0 || effect.SupersededReviewerSessionRequested && !effect.SupersededReviewerGateProtocol || effect.SupersededReviewerGateProtocol && !validDigest(effect.SupersededReviewerRequestDigest)) || effect.SupersededReviewerID == "" && (effect.SupersededReviewerTarget != "" || effect.SupersededReviewerMode != "" || effect.SupersededReviewerIssueGeneration != 0 || effect.SupersededReviewerAttemptGeneration != 0 || effect.ReviewerStopped || effect.SupersededReviewerGateProtocol || effect.SupersededReviewerSessionRequested || effect.SupersededReviewerRequestDigest != "") {
 			return errors.New("runtime owner superseded reviewer binding is invalid")
 		}
+		if effect.InvalidatedHandoff != nil {
+			record, ok := state.Attempts[attemptKey]
+			if effect.Action != string(agentruntime.EffectStop) || !ok || !validHandoffCandidateInvalidation(*effect.InvalidatedHandoff, record.Manifest) {
+				return errors.New("runtime owner stop handoff invalidation is invalid")
+			}
+		}
+		if effect.InvalidatedStart != nil {
+			record, ok := state.Attempts[attemptKey]
+			if effect.Action != string(agentruntime.EffectStop) || !ok || !validStartCandidateInvalidation(*effect.InvalidatedStart, record.Manifest) {
+				return errors.New("runtime owner Stop Start invalidation is invalid")
+			}
+		}
+		if effect.Action == string(agentruntime.EffectStart) && len(effect.StartCandidates) != 0 {
+			if !validStartCandidates(effect.StartCandidates) || effect.StartGateNonce != effect.StartCandidates[len(effect.StartCandidates)-1].Nonce || effect.StartMayRun != effect.StartCandidates[len(effect.StartCandidates)-1].MayRun {
+				return errors.New("runtime owner Start gate candidates are invalid")
+			}
+		} else if effect.StartGateNonce != "" || effect.StartMayRun || len(effect.StartCandidates) != 0 {
+			return errors.New("runtime owner unexpected Start gate state")
+		}
 		if effect.RequestDigest != "" && effect.Action == string(agentruntime.EffectReview) {
 			record, ok := state.Attempts[attemptKey]
 			if !ok {
@@ -2041,7 +2751,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		}
 	}
 	for key, proof := range state.ReviewerProofs {
-		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || (proof.GroupPID < 2 && !(proof.NeverRan && proof.GroupPID == 0 && proof.DeadProved)) || proof.NeverRan && proof.GroupPID != 0 || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] {
+		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || (proof.GroupPID < 2 && !(proof.GroupPID == 0 && (!proof.DeadProved || proof.NeverRan))) || proof.NeverRan && (proof.GroupPID != 0 || !proof.DeadProved || proof.LegacyUnverified) || proof.LegacyUnverified && proof.DeadProved || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] {
 			return errors.New("runtime owner reviewer process proof is invalid")
 		}
 	}
@@ -2064,6 +2774,18 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			effect, ok := state.Effects[receipt.EffectID]
 			if !ok || effect.State != operatorReceiptEffectState(receipt) || !operatorReceiptMatchesEffect(receipt, effect) {
 				return errors.New("runtime owner control receipt effect is invalid")
+			}
+		}
+		if receipt.Phase == operatorPhaseHandoffCleanup {
+			tombstone, ok := state.Tombstones[ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)]
+			if !ok || tombstone.Action != "dismissed" || tombstone.InvalidatedHandoff == nil || tombstone.HandoffCompensated {
+				return errors.New("pending handoff compensation receipt is unbound")
+			}
+		}
+		if receipt.Phase == operatorPhaseStartCleanup {
+			tombstone, ok := state.Tombstones[ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt)]
+			if !ok || tombstone.Action != "dismissed" || tombstone.InvalidatedStart == nil {
+				return errors.New("pending start cleanup receipt is unbound")
 			}
 		}
 		seenReceipts[receipt.Request.RequestID] = true
@@ -2090,16 +2812,32 @@ func runtimeOwnerAttemptRoot(stateRoot string) string {
 }
 
 func newRuntimeOwnerState(repository string) runtimeOwnerState {
-	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, ReviewerRevocationTracked: true, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}}
+	return runtimeOwnerState{Version: runtimeOwnerStateVersion, Repository: repository, WorkerProfileDigest: config.WorkerProfileDigest(), ReviewerRevocationTracked: true, ReviewerSafetyMigrated: true, ExternalDispatchTracked: true, LegacyReviewerQuarantines: map[string]string{}, IssueGenerations: map[string]uint64{}, AttemptGenerations: map[string]uint64{}, Attempts: map[string]runtimeAttemptRecord{}, Observations: map[string]reconciliationObservation{}, Recoveries: map[string]runtimePRRecovery{}, Tombstones: map[string]runtimeTombstone{}, Effects: map[string]runtimeEffectIntent{}, ReviewerProofs: map[string]reviewerProcessProof{}, ControlReceipts: []controlReceipt{}, ControlGenerations: map[string]uint64{}, ControlRepairs: map[string]controlSnapshotRepair{}}
+}
+
+func activeWorkerProfileDigest(state runtimeOwnerState) string {
+	if validDigest(state.WorkerProfileDigest) {
+		return state.WorkerProfileDigest
+	}
+	return config.WorkerProfileDigest()
 }
 
 func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 	clone := state
 	clone.IssueGenerations = cloneMap(state.IssueGenerations)
 	clone.AttemptGenerations = cloneMap(state.AttemptGenerations)
+	clone.ControlGenerations = cloneMap(state.ControlGenerations)
+	clone.ControlRepairs = make(map[string]controlSnapshotRepair, len(state.ControlRepairs))
+	for key, repair := range state.ControlRepairs {
+		clone.ControlRepairs[key] = repair
+	}
 	clone.Attempts = make(map[string]runtimeAttemptRecord, len(state.Attempts))
 	for key, record := range state.Attempts {
 		record.Manifest = cloneManifest(record.Manifest)
+		if record.WorkerSeal != nil {
+			selection := *record.WorkerSeal
+			record.WorkerSeal = &selection
+		}
 		clone.Attempts[key] = record
 	}
 	clone.Observations = make(map[string]reconciliationObservation, len(state.Observations))
@@ -2117,7 +2855,12 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 			manifest := cloneManifest(*tombstone.Manifest)
 			tombstone.Manifest = &manifest
 		}
+		if tombstone.ExternalOutcomes != nil {
+			tombstone.ExternalOutcomes = maps.Clone(tombstone.ExternalOutcomes)
+		}
 		tombstone.CleanupPolicy = cloneCleanupPolicy(tombstone.CleanupPolicy)
+		tombstone.InvalidatedHandoff = cloneHandoffInvalidation(tombstone.InvalidatedHandoff)
+		tombstone.InvalidatedStart = cloneStartInvalidation(tombstone.InvalidatedStart)
 		clone.Tombstones[key] = tombstone
 	}
 	clone.Effects = make(map[string]runtimeEffectIntent, len(state.Effects))
@@ -2125,11 +2868,18 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 		effect.Review = cloneReviewTransition(effect.Review)
 		effect.Reconciliation = cloneReconciliationEffectRequest(effect.Reconciliation)
 		effect.ReconciliationResult = cloneReconciliationEffectResult(effect.ReconciliationResult)
+		effect.InvalidatedHandoff = cloneHandoffInvalidation(effect.InvalidatedHandoff)
+		effect.InvalidatedStart = cloneStartInvalidation(effect.InvalidatedStart)
+		effect.StartCandidates = slices.Clone(effect.StartCandidates)
 		clone.Effects[key] = effect
 	}
 	clone.ReviewerProofs = make(map[string]reviewerProcessProof, len(state.ReviewerProofs))
 	for key, proof := range state.ReviewerProofs {
 		clone.ReviewerProofs[key] = proof
+	}
+	clone.LegacyReviewerQuarantines = make(map[string]string, len(state.LegacyReviewerQuarantines))
+	for key, diagnostic := range state.LegacyReviewerQuarantines {
+		clone.LegacyReviewerQuarantines[key] = diagnostic
 	}
 	clone.ControlReceipts = make([]controlReceipt, len(state.ControlReceipts))
 	for index, receipt := range state.ControlReceipts {
@@ -2176,6 +2926,28 @@ func cloneEffect(effect *runtimeEffectIntent) *runtimeEffectIntent {
 	clone.Review = cloneReviewTransition(effect.Review)
 	clone.Reconciliation = cloneReconciliationEffectRequest(effect.Reconciliation)
 	clone.ReconciliationResult = cloneReconciliationEffectResult(effect.ReconciliationResult)
+	clone.InvalidatedHandoff = cloneHandoffInvalidation(effect.InvalidatedHandoff)
+	clone.InvalidatedStart = cloneStartInvalidation(effect.InvalidatedStart)
+	clone.StartCandidates = slices.Clone(effect.StartCandidates)
+	return &clone
+}
+
+func cloneStartInvalidation(candidate *startCandidateInvalidation) *startCandidateInvalidation {
+	if candidate == nil {
+		return nil
+	}
+	clone := *candidate
+	clone.Manifest = cloneManifest(clone.Manifest)
+	clone.Candidates = slices.Clone(clone.Candidates)
+	return &clone
+}
+
+func cloneHandoffInvalidation(candidate *handoffCandidateInvalidation) *handoffCandidateInvalidation {
+	if candidate == nil {
+		return nil
+	}
+	clone := *candidate
+	clone.Manifest = cloneManifest(clone.Manifest)
 	return &clone
 }
 
@@ -2252,9 +3024,23 @@ func deleteAttemptEffects(state *runtimeOwnerState, repository string, issue, at
 	}
 }
 
+func invalidateAttemptEffects(state *runtimeOwnerState, repository string, issue, attempt int) {
+	for id, effect := range state.Effects {
+		if effectReferencedByReceipt(*state, id) || effect.Repository != repository || effect.Issue != issue || effect.Attempt != attempt {
+			continue
+		}
+		if effect.Reconciliation != nil && reconciliationMutatesGitHub(effect.Reconciliation.Action) && effect.State == "pending" && effect.Dispatched {
+			effect.State, effect.Diagnostic = "invalidated", ""
+			state.Effects[id] = effect
+			continue
+		}
+		delete(state.Effects, id)
+	}
+}
+
 func pruneSupersededIssueEffects(state *runtimeOwnerState, repository string, issue int, nextGeneration uint64) error {
 	for id, effect := range state.Effects {
-		if effect.Repository != repository || effect.Issue != issue || effect.IssueGeneration >= nextGeneration || effectAuthorizedByTombstone(*state, effect) {
+		if effect.Repository != repository || effect.Issue != issue || effect.IssueGeneration >= nextGeneration || effectAuthorizedByTombstone(*state, effect) || invalidatedExternalEffect(*state, effect) {
 			continue
 		}
 		if effectReferencedByReceipt(*state, id) {
@@ -2274,4 +3060,15 @@ func pruneSupersededIssueEffects(state *runtimeOwnerState, repository string, is
 func effectAuthorizedByTombstone(state runtimeOwnerState, effect runtimeEffectIntent) bool {
 	tombstone, ok := state.Tombstones[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
 	return ok && tombstone.EffectID == effect.ID && tombstone.Generation == effect.AttemptGeneration
+}
+
+func invalidatedExternalEffect(state runtimeOwnerState, effect runtimeEffectIntent) bool {
+	if effect.Reconciliation == nil || !effect.Dispatched || effect.State != "invalidated" && effect.State != "invalidated-resolved" {
+		return false
+	}
+	if effect.Attempt == 0 {
+		return effect.Reconciliation.ControlGeneration < controlGeneration(state, ownerIssueKey(effect.Repository, effect.Issue))
+	}
+	tombstone, ok := state.Tombstones[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
+	return ok && tombstone.InvalidatedGeneration == effect.AttemptGeneration
 }

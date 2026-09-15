@@ -29,7 +29,7 @@ func planMonitoringCheckIn(snapshot stateOwnerSnapshot, proposal orchestratorage
 		Issue      int    `json:"issue"`
 		Attempt    int    `json:"attempt"`
 		Request    string `json:"request"`
-	}{"agent-symphony-monitoring-check-in-v1", proposal.Repository, proposal.Issue, proposal.Attempt, "Report current progress and the next step in this session. Continue only the implementation you already own. If blocked, set needs-attention with a specific reason through the direct GitHub status contract; clear a prior monitoring status only after fresh evidence shows recovery."})
+	}{"agent-symphony-monitoring-check-in-v1", proposal.Repository, proposal.Issue, proposal.Attempt, "Report current progress and the next step in this session. Continue only the implementation you already own. If blocked, request needs-attention with a specific reason through the owner-mediated status file described in the original prompt; clear a prior status only after fresh evidence shows recovery."})
 	checkIn := &monitoringCheckInEffectRequest{Session: manifest.Session, Binding: proposal.Binding, Payload: string(payload)}
 	request := reconciliationEffectRequest{
 		Action: reconciliationMonitoringCheckIn, Repository: proposal.Repository, Issue: proposal.Issue, Attempt: proposal.Attempt,
@@ -56,7 +56,7 @@ func (c *runtimeEffectCoordinator) executeMonitoringCheckIn(plan reconciliationP
 		return reconciliationEffectResult{}, errStateConflict
 	}
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}

@@ -809,8 +809,8 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 		t.Fatal("unbound reviewer artifacts were cleaned without process-death proof")
 	}
 	proofs := map[string]reviewerProcessProof{
-		targetOne: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetOne, GroupPID: 99999999, DeadProved: true},
-		targetTwo: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetTwo, GroupPID: 99999998, DeadProved: true},
+		targetOne: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetOne, DeadProved: true, NeverRan: true},
+		targetTwo: {Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Target: targetTwo, DeadProved: true, NeverRan: true},
 	}
 	if err := cleanupAttemptReviewResourcesProved(t.Context(), stateRoot, reviewBoundary(stateRoot), manifest, true, proofs); err != nil {
 		t.Fatalf("review cleanup: %v", err)
@@ -920,7 +920,7 @@ func TestDashboardRoutesOperatorInputDirectlyToLaunchedImplementationWithoutOrch
 		}
 	}
 	baseSHA := runGit(t, source, "rev-parse", "HEAD")
-	stateRoot, attemptRoot := t.TempDir(), filepath.Join(t.TempDir(), "attempts")
+	stateRoot, attemptRoot := resolvedTempDir(t), filepath.Join(resolvedTempDir(t), "attempts")
 	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -950,10 +950,48 @@ printf 'implementation-finished\r\n'
 	if err := os.WriteFile(agent, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Git: "git", Tmux: tmux, Runner: agentruntime.ExecRunner{}, AllowEnv: []string{"PATH", "TERM"}, VerifyWorker: func(context.Context) error { return nil }}
+	helper := filepath.Join(t.TempDir(), "agent-symphony")
+	if output, err := exec.Command("go", "build", "-o", helper, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build gate helper: %v: %s", err, output)
+	}
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Git: "git", Tmux: tmux, Helper: helper, Runner: agentruntime.ExecRunner{}, AllowEnv: []string{"PATH", "TERM"}, VerifyWorker: func(context.Context) error { return nil }}
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 214, Number: 1, BaseSHA: baseSHA, Context: "Issue: #214\nSession: " + identity.Session, Command: []string{agent}, Interactive: true}
-	manifest, err := runtimeState.PrepareAndStart(t.Context(), attempt)
+	manifest, err := agentruntime.PreparingManifest(attemptRoot, stateRoot, attempt, time.Now())
 	if err != nil {
+		t.Fatal(err)
+	}
+	executor := agentruntime.EffectExecutor{Runtime: runtimeState, AuthorizeLaunch: func(context.Context, agentruntime.EffectRequest) error { return nil }}
+	for _, step := range []struct {
+		action agentruntime.EffectAction
+		id     string
+	}{{agentruntime.EffectPrepare, strings.Repeat("a", 32)}, {agentruntime.EffectStart, strings.Repeat("b", 32)}} {
+		request, err := executor.BindRequest(agentruntime.EffectRequest{Action: step.action, Attempt: attempt, Manifest: manifest, Eligible: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Identity = agentruntime.EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 1, IssueGeneration: 1, AttemptGeneration: 1, EffectID: step.id}
+		if step.action == agentruntime.EffectStart {
+			request.GateNonce = step.id
+		}
+		request.Identity.RequestDigest, err = agentruntime.EffectRequestDigest(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := executor.Execute(t.Context(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifest = result.Manifest
+	}
+	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = exec.Command(tmux, "kill-session", "-t", "="+manifest.Session).Run() })
@@ -969,12 +1007,19 @@ printf 'implementation-finished\r\n'
 		t.Fatalf("terminal dial response=%v err=%v", response, err)
 	}
 	defer connection.CloseNow()
-	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("hello implementation\n")); err != nil {
-		t.Fatal(err)
-	}
 	var output strings.Builder
 	deadline, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
+	for !strings.Contains(output.String(), "implementation-ready") {
+		kind, message, err := connection.Read(deadline)
+		if err != nil || kind != websocket.MessageBinary {
+			t.Fatalf("terminal readiness output=%q kind=%v err=%v", output.String(), kind, err)
+		}
+		output.Write(message)
+	}
+	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("hello implementation\n")); err != nil {
+		t.Fatal(err)
+	}
 	for !strings.Contains(output.String(), "implementation-received:hello implementation") {
 		kind, message, err := connection.Read(deadline)
 		if err != nil || kind != websocket.MessageBinary {
@@ -996,7 +1041,17 @@ printf 'implementation-finished\r\n'
 	var monitored agentruntime.Manifest
 	monitorDeadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(monitorDeadline) {
-		monitored, err = runtimeState.Monitor(t.Context(), agentruntime.Attempt{Repository: attempt.Repository, Issue: attempt.Issue, Number: attempt.Number, BaseSHA: attempt.BaseSHA})
+		request, bindErr := executor.BindRequest(agentruntime.EffectRequest{Action: agentruntime.EffectMonitor, Attempt: attempt, Manifest: manifest, Eligible: true})
+		if bindErr != nil {
+			t.Fatal(bindErr)
+		}
+		request.Identity = agentruntime.EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: strings.Repeat("c", 32)}
+		request.Identity.RequestDigest, err = agentruntime.EffectRequestDigest(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, executeErr := executor.Execute(t.Context(), request)
+		monitored, err = result.Manifest, executeErr
 		if err != nil || monitored.State != "running" {
 			break
 		}
@@ -1159,13 +1214,13 @@ func TestAttemptSessionRoutingNeedsNoOrchestrator(t *testing.T) {
 	}
 }
 
-func TestDashboardRoutesOperatorInputDirectlyToReviewerWithoutOrchestrator(t *testing.T) {
+func TestDashboardRejectsReviewerTerminalWithoutBlockingImplementation(t *testing.T) {
 	root := t.TempDir()
 	repository, issue, attempt := "o/r", 23, 2
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, repository, issue, attempt)
 	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, repository, issue, attempt)
 	status := orchestrator.RecoveryStatus{Repository: repository, Issue: issue, Attempt: attempt, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{
-		{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "completed"},
+		{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "running", Current: true},
 		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModePlan, Target: "o/r#23 plan sha256:" + strings.Repeat("a", 64), Current: true},
 	}}
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
@@ -1179,7 +1234,7 @@ func TestDashboardRoutesOperatorInputDirectlyToReviewerWithoutOrchestrator(t *te
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("EXPECTED_SESSION", reviewer)
+	t.Setenv("EXPECTED_SESSION", implementation)
 	server := httptest.NewServer(newProjectDashboardHandlerWithOptions(t.Context(), root, repository, nil, script, nil, false, ""))
 	defer server.Close()
 	dial := func(path, extraQuery string) (*websocket.Conn, *http.Response, error) {
@@ -1196,8 +1251,20 @@ func TestDashboardRoutesOperatorInputDirectlyToReviewerWithoutOrchestrator(t *te
 		t.Fatalf("unknown role response=%v err=%v", response, err)
 	}
 	connection, response, err := dial("/reviewer/terminal", "")
+	if connection != nil {
+		connection.CloseNow()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusConflict {
+		t.Fatalf("reviewer terminal response=%v err=%v", response, err)
+	}
+	message, readErr := io.ReadAll(response.Body)
+	response.Body.Close()
+	if readErr != nil || !strings.Contains(string(message), "session identity can be verified safely") {
+		t.Fatalf("reviewer terminal reason=%q err=%v", message, readErr)
+	}
+	connection, response, err = dial("/terminal", "")
 	if err != nil {
-		t.Fatalf("review terminal dial response=%v err=%v", response, err)
+		t.Fatalf("implementation terminal dial response=%v err=%v", response, err)
 	}
 	defer connection.CloseNow()
 	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("review the dependency edge\n")); err != nil {
@@ -1207,7 +1274,7 @@ func TestDashboardRoutesOperatorInputDirectlyToReviewerWithoutOrchestrator(t *te
 	for {
 		kind, message, readErr := connection.Read(t.Context())
 		if readErr != nil {
-			t.Fatalf("reviewer terminal output=%q err=%v", output.String(), readErr)
+			t.Fatalf("implementation terminal output=%q err=%v", output.String(), readErr)
 		}
 		if kind == websocket.MessageBinary {
 			output.Write(message)
@@ -1291,7 +1358,7 @@ func TestDashboardTerminalRejectsTamperedIdentityAndInvalidMessages(t *testing.T
 	}
 }
 
-func TestDashboardMissingReviewerSessionClosesWithExplicitReason(t *testing.T) {
+func TestDashboardMissingReviewerSessionCannotAttach(t *testing.T) {
 	root := t.TempDir()
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 8, 1)
 	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 8, 1)
@@ -1301,7 +1368,7 @@ func TestDashboardMissingReviewerSessionClosesWithExplicitReason(t *testing.T) {
 	}
 	script := filepath.Join(t.TempDir(), "tmux")
 	attached := filepath.Join(t.TempDir(), "attached")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nif test \"$1\" = display-message; then exit 1; fi\ntouch \"$ATTACHED\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch \"$ATTACHED\"\nif test \"$1\" = display-message; then exit 1; fi\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("ATTACHED", attached)
@@ -1309,17 +1376,14 @@ func TestDashboardMissingReviewerSessionClosesWithExplicitReason(t *testing.T) {
 	defer server.Close()
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/reviewer/terminal?issue=8&attempt=1"
 	connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
-	if err != nil {
-		t.Fatalf("missing session dial response=%v err=%v", response, err)
+	if connection != nil {
+		connection.CloseNow()
 	}
-	defer connection.CloseNow()
-	_, _, err = connection.Read(t.Context())
-	var closeErr websocket.CloseError
-	if !errors.As(err, &closeErr) || closeErr.Code != websocket.StatusNormalClosure || closeErr.Reason != "Session ended." {
-		t.Fatalf("missing session close=%#v err=%v", closeErr, err)
+	if err == nil || response == nil || response.StatusCode != http.StatusConflict {
+		t.Fatalf("missing reviewer session response=%v err=%v", response, err)
 	}
 	if _, err := os.Stat(attached); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("missing session reached attachment: %v", err)
+		t.Fatalf("rejected reviewer terminal invoked tmux: %v", err)
 	}
 }
 
