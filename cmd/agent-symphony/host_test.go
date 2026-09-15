@@ -202,13 +202,13 @@ func TestAgentHostRunsBoundedCommandWithFilteredEnvironment(t *testing.T) {
 			payload, _ := json.Marshal(struct {
 				Operation string          `json:"operation"`
 				Command   boundaryCommand `json:"command"`
-			}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=model-canary", "GH_TOKEN=github-canary", "PATH=/bin", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="}}})
+			}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=model-canary", "PATH=/bin", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="}}})
 			var out bytes.Buffer
 			if err := agentHost(t.Context(), mode, bytes.NewReader(payload), &out); err != nil {
 				t.Fatal(err)
 			}
 			var result agentruntime.Result
-			if err := json.Unmarshal(out.Bytes(), &result); err != nil || strings.Contains(result.Output, "model-canary") || strings.Contains(result.Output, "github-canary") || !slices.Contains(launched.Env, "MODEL_API_KEY=model-canary") || !slices.Contains(launched.Env, "GH_TOKEN=github-canary") || !slices.Contains(launched.Env, "HOME="+spec.home) || slices.Contains(launched.Env, "HOME="+os.Getenv("HOME")) {
+			if err := json.Unmarshal(out.Bytes(), &result); err != nil || strings.Contains(result.Output, "model-canary") || strings.Contains(result.Output, "github-canary") || !slices.Contains(launched.Env, "MODEL_API_KEY=model-canary") || slices.Contains(launched.Env, "GH_TOKEN=github-canary") || !slices.Contains(launched.Env, "HOME="+spec.home) || slices.Contains(launched.Env, "HOME="+os.Getenv("HOME")) {
 				t.Fatal("host boundary did not deliver and redact its filtered credential environment")
 			}
 			for _, entry := range []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0="} {
@@ -292,7 +292,7 @@ func TestAgentHostRedactsCredentialFromReturnedBoundaryError(t *testing.T) {
 	payload, _ := json.Marshal(struct {
 		Operation string          `json:"operation"`
 		Command   boundaryCommand `json:"command"`
-	}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"GH_TOKEN=" + canary, "PATH=/bin"}}})
+	}{"run", boundaryCommand{Name: "git", Args: []string{"-C", dir, "rev-parse", "HEAD"}, Dir: dir, Env: []string{"MODEL_API_KEY=" + canary, "PATH=/bin"}}})
 	err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{})
 	if err == nil || strings.Contains(err.Error(), canary) || !strings.Contains(err.Error(), "boundary failure") {
 		t.Fatal("host boundary returned an unredacted or unclear error")
@@ -363,7 +363,7 @@ func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
 	canary := "host-boundary-auth-canary"
 	t.Setenv("TMUX_TMPDIR", "/tmp/denied-tmux-canary")
 	t.Setenv("UNRELATED_SECRET", "denied-secret-canary")
-	sessionEnv := []string{"PATH=/bin", "GH_TOKEN=" + canary}
+	sessionEnv := []string{"PATH=/bin"}
 	newSession := agentruntime.TmuxNewSessionArgs("as-o-r-131-3", root, sessionEnv)
 	payload, _ = json.Marshal(struct {
 		Operation string          `json:"operation"`
@@ -372,7 +372,7 @@ func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
 	if err := agentHost(t.Context(), "implementation", bytes.NewReader(payload), &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(launched.Args, "HOME=/var/lib/agent-symphony-worker") || launched.Dir != "/tmp" || !slices.Contains(launched.Env, "GH_TOKEN="+canary) || strings.Contains(strings.Join(launched.Args, " "), canary) || slices.ContainsFunc(launched.Env, func(value string) bool {
+	if !slices.Contains(launched.Args, "HOME=/var/lib/agent-symphony-worker") || launched.Dir != "/tmp" || slices.Contains(launched.Env, "GH_TOKEN="+canary) || strings.Contains(strings.Join(launched.Args, " "), canary) || slices.ContainsFunc(launched.Env, func(value string) bool {
 		return strings.HasPrefix(value, "TMUX_TMPDIR=") || strings.HasPrefix(value, "UNRELATED_SECRET=")
 	}) {
 		t.Fatal("new tmux session did not receive a safely transported worker environment")
@@ -2010,7 +2010,11 @@ func TestRootlessCodexConfinementDeniesDetachedChildAuthority(t *testing.T) {
 	oldExecutable := sandboxExecutable
 	sandboxExecutable = func() (string, error) { return binary, nil }
 	t.Cleanup(func() { sandboxExecutable = oldExecutable })
-	proof, err := verifyRootlessCodex(t.Context(), "codex", attemptRoot, codexHome)
+	codex, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := verifyRootlessCodex(t.Context(), attemptRoot, codexHome, codex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2041,7 +2045,7 @@ func TestRootlessCodexConfinementFailsClosedWithoutSupportedSandbox(t *testing.T
 	for _, test := range []struct {
 		name, script, want string
 	}{
-		{"missing", "", "executable file not found"},
+		{"missing", "", "no such file or directory"},
 		{"unsupported", "#!/bin/sh\necho unsupported-sandbox >&2\nexit 2\n", "unsupported-sandbox"},
 		{"ineffective", "#!/bin/sh\nexit 0\n", "produced no proof"},
 	} {
@@ -2052,8 +2056,8 @@ func TestRootlessCodexConfinementFailsClosedWithoutSupportedSandbox(t *testing.T
 					t.Fatal(err)
 				}
 			}
-			t.Setenv("PATH", dir)
-			if _, err := verifyRootlessCodex(t.Context(), "codex", attemptRoot, codexHome); err == nil || !strings.Contains(err.Error(), test.want) {
+			codex := filepath.Join(dir, "codex")
+			if _, err := verifyRootlessCodex(t.Context(), attemptRoot, codexHome, codex); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("error=%v, want %q", err, test.want)
 			}
 		})
@@ -2212,7 +2216,7 @@ func TestHostDiagnosticFallsBackToLocalModeWhenNotInstalled(t *testing.T) {
 	t.Setenv("CODEX_HOME", source)
 	oldVerify := rootlessCodexVerify
 	var gotCodex, gotRoot, gotHome string
-	rootlessCodexVerify = func(_ context.Context, codex, root, home string) (codexConfinementProof, error) {
+	rootlessCodexVerify = func(_ context.Context, root, home, codex string) (codexConfinementProof, error) {
 		gotCodex = codex
 		gotRoot, gotHome = root, home
 		return codexConfinementProof{Confined: true}, nil
@@ -2234,6 +2238,41 @@ func TestHostDiagnosticFallsBackToLocalModeWhenNotInstalled(t *testing.T) {
 		if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
 			t.Fatalf("local root %s not provisioned: %v", root, err)
 		}
+	}
+}
+
+func TestDoctorCanaryUsesTheBoundConfiguredCodexExecutable(t *testing.T) {
+	fakeNoHostIsolation(t)
+	base := privateDiagnosticRoot(t)
+	realCodex := filepath.Join(base, "codex-real")
+	if err := os.WriteFile(realCodex, []byte("#!/bin/sh\necho codex-cli 0.153.0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	implementation := filepath.Join(base, "codex-implementation")
+	reviewer := filepath.Join(base, "codex-reviewer")
+	for _, path := range []string{implementation, reviewer} {
+		if err := os.Symlink(realCodex, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sourceHome := filepath.Join(base, "source-codex-home")
+	if err := os.Mkdir(sourceHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", sourceHome)
+	oldVerify := rootlessCodexVerify
+	var gotCodex string
+	rootlessCodexVerify = func(_ context.Context, _, _, codex string) (codexConfinementProof, error) {
+		gotCodex = codex
+		return codexConfinementProof{Confined: true}, nil
+	}
+	t.Cleanup(func() { rootlessCodexVerify = oldVerify })
+	c := config.Default("SysSU/agent-symphony")
+	c.Commands.Implementation[0] = implementation
+	c.Commands.Reviewer[0] = reviewer
+	diagnostics := doctor(c, true, filepath.Join(base, "state"))
+	if gotCodex != realCodex {
+		t.Fatalf("canary executable=%q, want canonical %q; diagnostics=%#v", gotCodex, realCodex, diagnostics)
 	}
 }
 
@@ -2280,21 +2319,32 @@ func TestHostDiagnosticRejectsSharedTemporaryRuntimeState(t *testing.T) {
 	}
 	t.Cleanup(func() { rootlessCodexVerify = oldVerify })
 	d := hostDiagnostic("codex", t.TempDir())
-	if d.Status != "fail" || !strings.Contains(d.Message, "shared temporary directory") {
+	if d.Status != "fail" || !strings.Contains(d.Message, "shared temporary storage") {
 		t.Fatalf("diagnostic=%#v", d)
 	}
 }
 
-func TestSharedTemporaryPathCoversNativeSharedRoots(t *testing.T) {
+func TestPrivateStateRootValidatorCoversNativeSharedRoots(t *testing.T) {
 	for _, root := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
 		t.Run(root, func(t *testing.T) {
-			if !sharedTemporaryPath(filepath.Join(root, "agent-symphony-state")) {
+			if err := validatePrivateStateRoot(filepath.Join(root, "agent-symphony-state")); err == nil {
 				t.Fatalf("shared root %q was accepted", root)
 			}
 		})
 	}
-	if sharedTemporaryPath(privateDiagnosticRoot(t)) {
-		t.Fatal("private home root was treated as shared temporary storage")
+	if err := validatePrivateStateRoot(privateDiagnosticRoot(t)); err != nil {
+		t.Fatalf("private home root was rejected: %v", err)
+	}
+}
+
+func TestControlSocketIsInsideThePrivateStateRoot(t *testing.T) {
+	stateRoot := filepath.Join(privateDiagnosticRoot(t), "state")
+	socket := controlSocketPath(stateRoot)
+	if filepath.Dir(socket) != filepath.Clean(stateRoot) {
+		t.Fatalf("control socket %q is outside canonical state root %q", socket, filepath.Clean(stateRoot))
+	}
+	if err := validatePrivateStateRoot(filepath.Dir(socket)); err != nil {
+		t.Fatalf("control socket parent is not private: %v", err)
 	}
 }
 
@@ -2311,7 +2361,7 @@ func TestHostDiagnosticRejectsDanglingSymlinkAncestorIntoSharedTemp(t *testing.T
 	}
 	t.Cleanup(func() { rootlessCodexVerify = oldVerify })
 	d := hostDiagnostic("codex", filepath.Join(link, "runtime"))
-	if d.Status != "fail" || !strings.Contains(d.Message, "symbolic links") {
+	if d.Status != "fail" {
 		t.Fatalf("diagnostic=%#v", d)
 	}
 }

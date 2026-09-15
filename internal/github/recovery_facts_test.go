@@ -79,7 +79,7 @@ func TestEnsureOwnerStatusAppliesExactCommentAndLabelIdempotently(t *testing.T) 
 		}
 	})}}
 	for range 2 {
-		if err := api.EnsureOwnerStatus(t.Context(), "o/r", 9, 3, true, "operator decision required", 42); err != nil {
+		if err := api.EnsureOwnerStatus(t.Context(), "o/r", 9, 3, 1, true, "operator decision required", 42); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -87,12 +87,15 @@ func TestEnsureOwnerStatusAppliesExactCommentAndLabelIdempotently(t *testing.T) 
 		t.Fatalf("needs-attention posts=%d labels=%d label=%v", posts, labels, label)
 	}
 	for range 2 {
-		if err := api.EnsureOwnerStatus(t.Context(), "o/r", 9, 3, false, "operator decision supplied", 42); err != nil {
+		if err := api.EnsureOwnerStatus(t.Context(), "o/r", 9, 3, 2, false, "operator decision supplied", 42); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if posts != 2 || labels != 2 || label {
 		t.Fatalf("clear posts=%d labels=%d label=%v", posts, labels, label)
+	}
+	if applied, err := api.OwnerStatusApplied(t.Context(), "o/r", 9, 2, 2, false, "operator decision supplied", 42); err != nil || applied {
+		t.Fatalf("old attempt falsely proved the current status: applied=%t err=%v", applied, err)
 	}
 }
 

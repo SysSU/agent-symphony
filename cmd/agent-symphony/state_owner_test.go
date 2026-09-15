@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
@@ -964,6 +965,39 @@ func startTestStateOwner(t *testing.T, stateRoot string, state runtimeOwnerState
 		t.Fatal(err)
 	}
 	return startStateOwner(t.Context(), stateRoot, canonical, state, persist)
+}
+
+func TestWorkerSealSelectionIsSingleGenerationBoundAndDurable(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 329, 1, "completed")
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, config.WorkerProfileDigest()
+	state := runtimeEffectInitialState(manifest)
+	attemptRoot := productionAttemptRoot(root)
+	owner, err := startTestStateOwner(t, root, state, func(state runtimeOwnerState) error { return writeRuntimeOwnerState(root, attemptRoot, state) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := workerSealSelection{Generation: 1, HeadSHA: strings.Repeat("b", 40), BundleSHA256: strings.Repeat("c", 64), ProfileDigest: manifest.WorkerProfileDigest, Result: workerResult{Type: "agent-symphony-result-v1", Validation: "green", Documentation: "none"}}
+	selection.Root = workerSealPath(root, 1, manifest, selection.HeadSHA)
+	if !validWorkerSealSelection(root, manifest, 1, selection) {
+		t.Fatalf("test seal selection is invalid: %#v manifest=%#v", selection, manifest)
+	}
+	if _, err := owner.selectWorkerSeal(t.Context(), selectWorkerSealCommand{Repository: "o/r", Issue: 329, Attempt: 1, ExpectedGeneration: 1, Selection: selection}); err != nil {
+		t.Fatal(err)
+	}
+	other := selection
+	other.HeadSHA = strings.Repeat("d", 40)
+	other.Root = workerSealPath(root, 1, manifest, other.HeadSHA)
+	if _, err := owner.selectWorkerSeal(t.Context(), selectWorkerSealCommand{Repository: "o/r", Issue: 329, Attempt: 1, ExpectedGeneration: 1, Selection: other}); !errors.Is(err, errStateConflict) {
+		t.Fatalf("conflicting terminal seal err=%v", err)
+	}
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(root, "o/r")
+	if err != nil || loaded.Attempts[ownerAttemptKey("o/r", 329, 1)].WorkerSeal == nil || *loaded.Attempts[ownerAttemptKey("o/r", 329, 1)].WorkerSeal != selection {
+		t.Fatalf("loaded seal=%#v err=%v", loaded.Attempts[ownerAttemptKey("o/r", 329, 1)].WorkerSeal, err)
+	}
 }
 
 // upsertAttempt is test-only compatibility for fixtures that predate the

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -74,8 +73,7 @@ type controlReceiptState struct {
 type controlDeadlineContextKey struct{}
 
 func controlSocketPath(stateRoot string) string {
-	digest := sha256.Sum256([]byte(filepath.Clean(stateRoot)))
-	return filepath.Join("/tmp", "agent-symphony-control-"+hex.EncodeToString(digest[:12])+".sock")
+	return filepath.Join(filepath.Clean(stateRoot), "control.sock")
 }
 
 func newControlRequestID() (string, error) {

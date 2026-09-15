@@ -145,7 +145,7 @@ func TestDestructiveInvalidationDurablySupersedesPendingControlSnapshot(t *testi
 	observation.IssueUpdates = append(observation.IssueUpdates, proposal)
 	state.Observations[issueKey] = observation
 	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: manifest.Repository, Issue: manifest.Issue, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, ExecutionDigest: strings.Repeat("a", 64), ControlGeneration: 1, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueControlSnapshot, ControlSnapshotDigest: digestText(body), ControlSnapshotBody: body}}
-	effect := runtimeEffectIntent{Action: string(request.Action), Repository: request.Repository, Issue: request.Issue, IssueGeneration: state.IssueGenerations[issueKey], IntentEpoch: state.Epoch, IntentRevision: state.Revision, State: "pending", RequestDigest: reconciliationEffectDigest(request), Reconciliation: &request}
+	effect := runtimeEffectIntent{Action: string(request.Action), Repository: request.Repository, Issue: request.Issue, IssueGeneration: state.IssueGenerations[issueKey], IntentEpoch: state.Epoch, IntentRevision: state.Revision, State: "pending", Dispatched: true, RequestDigest: reconciliationEffectDigest(request), Reconciliation: &request}
 	effect.ID = runtimeEffectID(effect)
 	state.Effects[effect.ID] = effect
 	if _, err := applyInvalidateAttempt(owner.attemptRoot, owner.stateRoot, &state, invalidateAttemptCommand{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, ExpectedIssueGeneration: state.IssueGenerations[issueKey], ExpectedAttemptGeneration: state.AttemptGenerations[attemptKey], Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest}); err != nil {
@@ -167,9 +167,50 @@ func TestDestructiveInvalidationDurablySupersedesPendingControlSnapshot(t *testi
 	if err != nil || loaded.ControlRepairs[issueKey] != repair {
 		t.Fatalf("restart lost control repair: repair=%#v err=%v", loaded.ControlRepairs[issueKey], err)
 	}
+	if err := applyResolveInvalidatedReconciliationEffect(&loaded, resolveInvalidatedReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(loaded.Effects[effect.ID]), Outcome: invalidatedExternalOutcome{Action: reconciliationGitHubIssueUpdate, Observed: true}}); err != nil {
+		t.Fatalf("resolve invalidated control snapshot: %v", err)
+	}
 	plans, err := planControlSnapshotRepairs(stateOwnerSnapshot{State: loaded}, internalgithub.PRAdapterConfig{Repository: manifest.Repository, ActorID: 42})
 	if err != nil || len(plans) != 1 || !plans[0].Request.ControlRepair || plans[0].Request.ControlGeneration != 2 {
 		t.Fatalf("restart repair plans=%#v err=%v", plans, err)
+	}
+}
+
+func TestDispatchedGitHubEffectSurvivesDestructiveInvalidationAndRestart(t *testing.T) {
+	request := reconciliationEffectCaseNamed(t, "github-bind").request
+	root, owner, snapshot := reconciliationEffectPersistentOwner(t, request)
+	request = bindEffectObservation(snapshot, request)
+	_, effect, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: reconciliationBeginIdentity(snapshot, request), Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := ownerReconciliationEffectIdentity(*effect)
+	if err := owner.authorizeReconciliationEffect(t.Context(), authorizeReconciliationEffectCommand{Identity: identity, Action: request.Action}); err != nil {
+		t.Fatal(err)
+	}
+	authorized := mustOwnerSnapshot(t, owner)
+	if !authorized.State.Effects[effect.ID].Dispatched {
+		t.Fatal("GitHub dispatch admission was not persisted")
+	}
+	manifest := *request.Manifest
+	issueKey, attemptKey := ownerIssueKey(request.Repository, request.Issue), ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	invalidated, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, ExpectedIssueGeneration: authorized.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: authorized.State.AttemptGenerations[attemptKey], Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retained := invalidated.State.Effects[effect.ID]; retained.State != "invalidated" || !retained.Dispatched {
+		t.Fatalf("admitted external obligation was lost: %#v", retained)
+	}
+	loaded, err := readRuntimeOwnerState(root, request.Repository)
+	if err != nil || loaded.Effects[effect.ID].State != "invalidated" {
+		t.Fatalf("restart lost external obligation: state=%#v err=%v", loaded.Effects[effect.ID], err)
+	}
+	if err := applyResolveInvalidatedReconciliationEffect(&loaded, resolveInvalidatedReconciliationEffectCommand{Identity: identity, Outcome: invalidatedExternalOutcome{Action: request.Action, Observed: true}}); err != nil {
+		t.Fatal(err)
+	}
+	outcome := loaded.Tombstones[attemptKey].ExternalOutcomes[effect.ID]
+	if !outcome.Observed || outcome.Action != request.Action || loaded.Effects[effect.ID].State != "invalidated-resolved" {
+		t.Fatalf("external outcome was not durably bound to tombstone: outcome=%#v effect=%#v", outcome, loaded.Effects[effect.ID])
 	}
 }
 
@@ -589,7 +630,7 @@ func TestImplementationReviewerInFlightDriftCancelsOnlyChangedTarget(t *testing.
 	observation.Fact.NeedsAttention = !observation.Fact.NeedsAttention
 	state.Observations[issueKey] = observation
 	identity := ownerReconciliationEffectIdentity(*effect)
-	if err := applyAuthorizeReconciliationEffect(owner.stateRoot, state, authorizeReconciliationEffectCommand{Identity: identity, Action: reconciliationReviewer}); err != nil {
+	if err := applyAuthorizeReconciliationEffect(owner.stateRoot, &state, authorizeReconciliationEffectCommand{Identity: identity, Action: reconciliationReviewer}); err != nil {
 		t.Fatalf("compatible drift prevented first reviewer launch: %v", err)
 	}
 	if err := applyMarkReviewerSessionRequested(owner.stateRoot, &state, markReviewerSessionRequestedCommand{Identity: identity}); err != nil {

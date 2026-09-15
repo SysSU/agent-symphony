@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,6 +9,41 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestBindWorkerExecutablePinsExactBinaryIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex")
+	write := func(marker string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n# "+marker+"\nprintf 'codex-cli 0.153.4\\n'\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("first")
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = path, path
+	first, err := BindWorkerExecutable(context.Background(), &commands)
+	canonical, _ := filepath.EvalSymlinks(path)
+	if err != nil || commands.Implementation[0] != canonical || len(first) != 64 {
+		t.Fatalf("first binding=%q commands=%#v err=%v", first, commands, err)
+	}
+	write("replacement")
+	second, err := BindWorkerExecutable(context.Background(), &commands)
+	if err != nil || first == second {
+		t.Fatalf("replacement binding=%q first=%q err=%v", second, first, err)
+	}
+}
+
+func TestBindWorkerExecutableRejectsFakeCodexBasename(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'fake-codex 1\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = path, path
+	if _, err := BindWorkerExecutable(context.Background(), &commands); err == nil {
+		t.Fatal("accepted a basename-only fake Codex executable")
+	}
+}
 
 func TestLoadAndValidate(t *testing.T) {
 	c := Default("owner/repo")

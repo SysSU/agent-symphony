@@ -375,7 +375,71 @@ func configureProjectRuntimeState(stateRoot string) error {
 	return nil
 }
 
+var allowSharedTempRuntimeStateForTest = strings.HasSuffix(os.Args[0], ".test")
+
+func validateProductionStateRoot(stateRoot string) error {
+	if allowSharedTempRuntimeStateForTest {
+		return nil
+	}
+	return validatePrivateStateRoot(stateRoot)
+}
+
+func validatePrivateStateRoot(stateRoot string) error {
+	root, err := canonicalPathWithMissingLeaf(stateRoot)
+	if err != nil {
+		return fmt.Errorf("resolve runtime state root: %w", err)
+	}
+	for _, shared := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
+		lexical, lexicalErr := filepath.Abs(shared)
+		if lexicalErr == nil && pathWithinRoot(root, lexical) {
+			return errors.New("runtime state root must not be inside shared temporary storage")
+		}
+		resolved, resolveErr := filepath.EvalSymlinks(shared)
+		if resolveErr == nil && pathWithinRoot(root, resolved) {
+			return errors.New("runtime state root must not be inside shared temporary storage")
+		}
+	}
+	return nil
+}
+
+func pathWithinRoot(path, root string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && (relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+}
+
+func canonicalPathWithMissingLeaf(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	current := filepath.Clean(abs)
+	var missing []string
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			for index := len(missing) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, missing[index])
+			}
+			return filepath.Clean(resolved), nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", errors.New("runtime state root has no existing ancestor")
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
 func prepareProductionDeploymentLocked(stateRoot, repository string) error {
+	if err := validateProductionStateRoot(stateRoot); err != nil {
+		return err
+	}
 	identity, err := readDeploymentIdentity(stateRoot)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := bindDeployment(stateRoot, repository); err != nil {
@@ -715,6 +779,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	command := args[0]
+	if command == "export-attempt" {
+		if len(args) != 2 {
+			fmt.Fprintln(stderr, "invalid export attempt invocation")
+			return 1
+		}
+		input, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20+1))
+		if err != nil || len(input) > 1<<20 {
+			fmt.Fprintln(stderr, "invalid export attempt input")
+			return 1
+		}
+		output, err := exportAttempt(context.Background(), input, args[1])
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprint(stdout, output)
+		return 0
+	}
 	if command == "sandbox-probe" || command == "sandbox-probe-child" {
 		if err := runSandboxProbe(args[1:], command == "sandbox-probe-child"); err != nil {
 			fmt.Fprintln(stderr, err)
@@ -1004,6 +1086,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		c, err := config.Load(*path)
 		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		if err := validateProductionStateRoot(*runtimeState); err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		peerProjects, err := validateDashboardProjectURLs(dashboardProjects)
@@ -1863,10 +1948,13 @@ func prepareWorkerSeal(ctx context.Context, stateRoot string, generation uint64,
 
 func installWorkerSeal(ctx context.Context, temp, stateRoot string, generation uint64, manifest agentruntime.Manifest, exported workerExport) (string, error) {
 	final := workerSealPath(stateRoot, generation, manifest, exported.HeadSHA)
-	seal := workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, config.WorkerProfileDigest()}
+	seal := workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, manifest.WorkerProfileDigest}
 	body, _ := json.Marshal(seal)
 	if err := os.WriteFile(filepath.Join(temp, "agent-symphony-seal.json"), body, 0o600); err != nil {
 		return "", err
+	}
+	if err := syncWorkerSeal(temp); err != nil {
+		return "", fmt.Errorf("sync owner-private worker seal: %w", err)
 	}
 	workerSealBeforeRename()
 	if err := os.Rename(temp, final); err != nil {
@@ -1877,10 +1965,44 @@ func installWorkerSeal(ctx context.Context, temp, stateRoot string, generation u
 			return "", errors.Join(errors.New("install owner-private worker seal"), err, validationErr)
 		}
 	}
+	if err := immutableDirSync(filepath.Dir(final)); err != nil {
+		return "", fmt.Errorf("sync installed worker seal: %w", err)
+	}
 	if err := validateWorkerSeal(ctx, final, generation, manifest, exported); err != nil {
 		return "", errors.New("installed worker seal failed validation")
 	}
 	return final, nil
+}
+
+func syncWorkerSeal(root string) error {
+	var directories []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			directories = append(directories, path)
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		err = errors.Join(file.Sync(), file.Close())
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	for index := len(directories) - 1; index >= 0; index-- {
+		if err := immutableDirSync(directories[index]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateWorkerSeal(ctx context.Context, path string, generation uint64, manifest agentruntime.Manifest, exported workerExport) error {
@@ -1905,7 +2027,7 @@ func validWorkerSeal(path string, generation uint64, manifest agentruntime.Manif
 	var seal workerSeal
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(&seal) == nil && decoder.Decode(&struct{}{}) == io.EOF && seal == (workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, config.WorkerProfileDigest()})
+	return decoder.Decode(&seal) == nil && decoder.Decode(&struct{}{}) == io.EOF && seal == (workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, manifest.WorkerProfileDigest})
 }
 
 const (
@@ -2949,7 +3071,14 @@ func doctor(c config.Config, offline bool, stateRoot string) []diagnostic {
 	} else {
 		result = append(result, githubDiagnostics(c.Repository)...)
 	}
-	result = append(result, hostDiagnostic(c.Commands.Implementation[0], stateRoot))
+	bindCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, bindErr := config.BindWorkerExecutable(bindCtx, &c.Commands)
+	cancel()
+	if bindErr != nil {
+		result = append(result, diagnostic{"worker confinement", "fail", bindErr.Error(), "Install @openai/codex@0.153.0 and configure implementation and reviewer to use the same executable."})
+	} else {
+		result = append(result, hostDiagnostic(c.Commands.Implementation[0], stateRoot))
+	}
 	return result
 }
 

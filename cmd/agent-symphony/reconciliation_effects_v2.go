@@ -12,7 +12,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
@@ -191,6 +190,11 @@ func (o *stateOwner) authorizeReconciliationEffect(ctx context.Context, command 
 	return err
 }
 
+func (o *stateOwner) resolveInvalidatedReconciliationEffect(ctx context.Context, command resolveInvalidatedReconciliationEffectCommand) error {
+	_, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerResolveInvalidatedReconciliationEffect, resolveInvalidatedReconcile: command})
+	return err
+}
+
 func (o *stateOwner) finishReconciliationEffect(ctx context.Context, command finishReconciliationEffectCommand) (stateOwnerSnapshot, error) {
 	command.Result = cloneReconciliationResult(command.Result)
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerFinishReconciliationEffect, finishReconciliation: command})
@@ -365,12 +369,61 @@ func applyReconciliationBeginTransition(state *runtimeOwnerState, request reconc
 	return nil
 }
 
-func applyAuthorizeReconciliationEffect(stateRoot string, state runtimeOwnerState, command authorizeReconciliationEffectCommand) error {
+func applyAuthorizeReconciliationEffect(stateRoot string, state *runtimeOwnerState, command authorizeReconciliationEffectCommand) error {
 	effect, ok := state.Effects[command.Identity.EffectID]
 	if !ok || effect.Reconciliation == nil || effect.Action != string(command.Action) || !reconciliationEffectIdentityMatches(effect, command.Identity) || effect.State != "pending" {
 		return errStaleStateResult
 	}
-	return reconciliationEffectCurrent(stateRoot, state, effect)
+	if err := reconciliationEffectCurrent(stateRoot, *state, effect); err != nil {
+		return err
+	}
+	if reconciliationMutatesGitHub(effect.Reconciliation.Action) && !effect.Dispatched {
+		effect.Dispatched = true
+		state.Effects[effect.ID] = effect
+	}
+	return nil
+}
+
+func applyResolveInvalidatedReconciliationEffect(state *runtimeOwnerState, command resolveInvalidatedReconciliationEffectCommand) error {
+	effect, ok := state.Effects[command.Identity.EffectID]
+	if !ok || effect.State != "invalidated" || !effect.Dispatched || effect.Reconciliation == nil || !reconciliationMutatesGitHub(effect.Reconciliation.Action) || !reconciliationEffectIdentityMatches(effect, command.Identity) || !validInvalidatedExternalOutcome(effect, command.Outcome) {
+		return errStaleStateResult
+	}
+	key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+	if effect.Attempt == 0 {
+		if effect.Reconciliation.ControlGeneration >= controlGeneration(*state, ownerIssueKey(effect.Repository, effect.Issue)) {
+			return errStaleStateResult
+		}
+	} else {
+		tombstone, ok := state.Tombstones[key]
+		if !ok || tombstone.InvalidatedGeneration != effect.AttemptGeneration {
+			return errStaleStateResult
+		}
+		if tombstone.ExternalOutcomes == nil {
+			tombstone.ExternalOutcomes = map[string]invalidatedExternalOutcome{}
+		}
+		tombstone.ExternalOutcomes[effect.ID] = command.Outcome
+		state.Tombstones[key] = tombstone
+	}
+	effect.State, effect.Diagnostic = "invalidated-resolved", ""
+	state.Effects[effect.ID] = effect
+	return nil
+}
+
+func validInvalidatedExternalOutcome(effect runtimeEffectIntent, outcome invalidatedExternalOutcome) bool {
+	if effect.Reconciliation == nil || outcome.Action != effect.Reconciliation.Action || !outcome.Observed {
+		return false
+	}
+	switch outcome.Action {
+	case reconciliationGitHubBind, reconciliationGitHubIssueUpdate:
+		return !outcome.Merged && outcome.PR == 0 && outcome.HeadSHA == ""
+	case reconciliationGitHubPublish:
+		return !outcome.Merged && outcome.PR > 0 && effect.Reconciliation.GitHubPublish != nil && outcome.HeadSHA == effect.Reconciliation.GitHubPublish.HeadSHA
+	case reconciliationGitHubPRGovernance:
+		return outcome.Merged && outcome.PR > 0 && effect.Reconciliation.GitHubPRGovernance != nil && outcome.PR == effect.Reconciliation.GitHubPRGovernance.PR && outcome.HeadSHA == effect.Reconciliation.GitHubPRGovernance.HeadSHA
+	default:
+		return false
+	}
 }
 
 func applyMarkReviewerSessionRequested(stateRoot string, state *runtimeOwnerState, command markReviewerSessionRequestedCommand) error {
@@ -719,7 +772,7 @@ func implementationLeaseBlocksGitHub(state runtimeOwnerState, action reconciliat
 	}
 	for _, record := range state.Attempts {
 		manifest := record.Manifest
-		if manifest.Repository == repository && manifest.Issue == issue && manifest.Version == agentruntime.ManifestVersion2 && manifest.LaunchID != "" && !agentruntime.WorkerConfinementMatches(manifest, record.Generation, config.WorkerProfileDigest()) {
+		if manifest.Repository == repository && manifest.Issue == issue && manifest.Version == agentruntime.ManifestVersion2 && manifest.LaunchID != "" && !agentruntime.WorkerConfinementMatches(manifest, record.Generation, activeWorkerProfileDigest(state)) {
 			return true
 		}
 	}
@@ -728,7 +781,7 @@ func implementationLeaseBlocksGitHub(state runtimeOwnerState, action reconciliat
 			key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
 			record, current := state.Attempts[key]
 			tombstone, invalidated := state.Tombstones[key]
-			if current && agentruntime.WorkerConfinementBound(record.Manifest, effect.AttemptGeneration, config.WorkerProfileDigest()) || invalidated && tombstone.InvalidatedStart != nil && agentruntime.WorkerConfinementBound(tombstone.InvalidatedStart.Manifest, tombstone.InvalidatedGeneration, config.WorkerProfileDigest()) {
+			if current && agentruntime.WorkerConfinementBound(record.Manifest, effect.AttemptGeneration, activeWorkerProfileDigest(state)) || invalidated && tombstone.InvalidatedStart != nil && agentruntime.WorkerConfinementBound(tombstone.InvalidatedStart.Manifest, tombstone.InvalidatedGeneration, activeWorkerProfileDigest(state)) {
 				continue
 			}
 			return true
@@ -738,11 +791,11 @@ func implementationLeaseBlocksGitHub(state runtimeOwnerState, action reconciliat
 		if tombstone.Repository != repository || tombstone.Issue != issue {
 			continue
 		}
-		confined := tombstone.Manifest != nil && agentruntime.WorkerConfinementBound(*tombstone.Manifest, tombstone.InvalidatedGeneration, config.WorkerProfileDigest())
+		confined := tombstone.Manifest != nil && agentruntime.WorkerConfinementBound(*tombstone.Manifest, tombstone.InvalidatedGeneration, activeWorkerProfileDigest(state))
 		if !confined && (tombstone.Manifest != nil && tombstone.Manifest.Version == agentruntime.ManifestVersion2 && tombstone.Manifest.LaunchID != "" || tombstone.InvalidatedHandoff != nil) {
 			return true
 		}
-		if tombstone.InvalidatedStart != nil && !agentruntime.WorkerConfinementBound(tombstone.InvalidatedStart.Manifest, tombstone.InvalidatedGeneration, config.WorkerProfileDigest()) {
+		if tombstone.InvalidatedStart != nil && !agentruntime.WorkerConfinementBound(tombstone.InvalidatedStart.Manifest, tombstone.InvalidatedGeneration, activeWorkerProfileDigest(state)) {
 			for _, candidate := range tombstone.InvalidatedStart.Candidates {
 				if candidate.MayRun {
 					return true
@@ -850,7 +903,17 @@ func validPersistedReconciliationEffect(state runtimeOwnerState, effect runtimeE
 		return effect.ReconciliationResult == nil
 	}
 	if effect.State == "invalidated" {
-		return effect.ReconciliationResult == nil && request.ControlGeneration < controlGeneration(state, ownerIssueKey(effect.Repository, effect.Issue))
+		return effect.Dispatched && effect.ReconciliationResult == nil && reconciliationMutatesGitHub(request.Action) && (request.Attempt > 0 || request.ControlGeneration < controlGeneration(state, ownerIssueKey(effect.Repository, effect.Issue)))
+	}
+	if effect.State == "invalidated-resolved" {
+		if !effect.Dispatched || effect.ReconciliationResult != nil || !reconciliationMutatesGitHub(request.Action) {
+			return false
+		}
+		if request.Attempt == 0 {
+			return request.ControlGeneration < controlGeneration(state, ownerIssueKey(effect.Repository, effect.Issue))
+		}
+		_, ok := state.Tombstones[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)].ExternalOutcomes[effect.ID]
+		return ok
 	}
 	return effect.Diagnostic == "" && effect.ReconciliationResult != nil && validReconciliationEffectResult(*request, *effect.ReconciliationResult) && (effect.ReviewerResultDigest == "" || effect.ReviewerResultDigest == reviewerResultDigest(*effect.ReconciliationResult))
 }
@@ -1282,7 +1345,17 @@ func applyReconciliationEffectOutcome(state *runtimeOwnerState, request reconcil
 			if !ok || repair.Generation != request.ControlGeneration || repair.Body != request.GitHubIssueUpdate.ControlSnapshotBody {
 				return errStaleStateResult
 			}
+			for _, effect := range state.Effects {
+				if effect.Repository == request.Repository && effect.Issue == request.Issue && effect.State == "invalidated" {
+					return errStateConflict
+				}
+			}
 			delete(state.ControlRepairs, key)
+			for id, effect := range state.Effects {
+				if effect.Repository == request.Repository && effect.Issue == request.Issue && effect.State == "invalidated-resolved" {
+					delete(state.Effects, id)
+				}
+			}
 		}
 		return nil
 	}

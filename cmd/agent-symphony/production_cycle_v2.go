@@ -3,6 +3,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,44 @@ import (
 type runtimeLifecyclePlan struct {
 	Snapshot stateOwnerSnapshot
 	Request  agentruntime.EffectRequest
+}
+
+func (p *productionReconciliation) selectedWorkerExport(ctx context.Context, record runtimeAttemptRecord) (workerResult, string, string, error) {
+	if err := p.verifyWorkerExecutable(ctx); err != nil {
+		return workerResult{}, "", "", err
+	}
+	if record.WorkerSeal != nil {
+		selection := *record.WorkerSeal
+		exported := workerExport{Repository: record.Manifest.Repository, Branch: record.Manifest.Branch, BaseSHA: record.Manifest.BaseSHA, HeadSHA: selection.HeadSHA, BundleSHA256: selection.BundleSHA256, Result: selection.Result}
+		if !validWorkerSealSelection(p.stateRoot, record.Manifest, record.Generation, selection) || validateWorkerSeal(ctx, selection.Root, record.Generation, record.Manifest, exported) != nil {
+			return workerResult{}, "", "", errors.New("selected worker seal is invalid")
+		}
+		return selection.Result, selection.HeadSHA, selection.Root, nil
+	}
+	result, head, root, err := importWorkerExport(ctx, p.implementation, p.stateRoot, record.Generation, record.Manifest)
+	if err != nil {
+		return workerResult{}, "", "", err
+	}
+	body, err := os.ReadFile(filepath.Join(root, "agent-symphony-seal.json"))
+	if err != nil {
+		return workerResult{}, "", "", err
+	}
+	var seal workerSeal
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&seal) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return workerResult{}, "", "", errors.New("worker seal metadata is invalid")
+	}
+	selection := workerSealSelection{Generation: record.Generation, HeadSHA: head, Root: root, BundleSHA256: seal.BundleSHA256, ProfileDigest: seal.ProfileDigest, Result: result}
+	snapshot, err := p.owner.selectWorkerSeal(ctx, selectWorkerSealCommand{Repository: record.Manifest.Repository, Issue: record.Manifest.Issue, Attempt: record.Manifest.Attempt, ExpectedGeneration: record.Generation, Selection: selection})
+	if err != nil {
+		return workerResult{}, "", "", err
+	}
+	selected := snapshot.State.Attempts[ownerAttemptKey(record.Manifest.Repository, record.Manifest.Issue, record.Manifest.Attempt)].WorkerSeal
+	if selected == nil {
+		return workerResult{}, "", "", errors.New("worker seal selection was not committed")
+	}
+	return selected.Result, selected.HeadSHA, selected.Root, nil
 }
 
 // sweepPendingMarkers runs before production admission. It consumes immutable
@@ -123,22 +162,33 @@ func (p *productionReconciliation) sweepPendingMarkers(ctx context.Context) erro
 var errReconciliationRecollect = errors.New("reconciliation requires fresh external observations")
 
 type productionReconciliation struct {
-	owner          *stateOwner
-	effects        *runtimeEffectCoordinator
-	collector      reconciliationV2Collector
-	config         config.Config
-	api            internalgithub.API
-	stateRoot      string
-	attemptRoot    string
-	checkout       string
-	implementation workerBoundaryRunner
-	reviewer       workerBoundaryRunner
-	operator       *operatorMutationService
-	reviewEnv      []string
-	wake           func() error
-	supervisor     *orchestratoragent.Supervisor
-	capacity       int
-	log            io.Writer
+	owner               *stateOwner
+	effects             *runtimeEffectCoordinator
+	collector           reconciliationV2Collector
+	config              config.Config
+	api                 internalgithub.API
+	stateRoot           string
+	attemptRoot         string
+	checkout            string
+	implementation      workerBoundaryRunner
+	reviewer            workerBoundaryRunner
+	operator            *operatorMutationService
+	reviewEnv           []string
+	wake                func() error
+	supervisor          *orchestratoragent.Supervisor
+	capacity            int
+	workerProfileDigest string
+	log                 io.Writer
+}
+
+func (p *productionReconciliation) verifyWorkerExecutable(ctx context.Context) error {
+	if p.workerProfileDigest == "" { // Unit fixtures do not launch a production worker.
+		return nil
+	}
+	if !validDigest(p.workerProfileDigest) || len(p.config.Commands.Implementation) == 0 {
+		return errors.New("worker executable binding is unavailable")
+	}
+	return config.VerifyWorkerExecutable(ctx, p.config.Commands.Implementation[0], p.workerProfileDigest)
 }
 
 func (p *productionReconciliation) runCycle(ctx context.Context) error {
@@ -195,6 +245,12 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 		return err
 	}
 	p.effects.cancelInvalidated(applied)
+	if resolved, err := p.resolveInvalidatedGitHubEffect(ctx, p.api); err != nil || resolved {
+		if err != nil {
+			return err
+		}
+		return errReconciliationRecollect
+	}
 	if p.operator != nil {
 		p.operator.cancelSupersededPlanWatchers(cycleSnapshot, applied)
 		if superseded, err := p.supersedeInvalidPendingPlanReviewers(ctx, applied); err != nil || superseded {
@@ -283,6 +339,94 @@ func (p *productionReconciliation) cycleFromSnapshot(ctx context.Context, cycleS
 	return p.runRetirementPhase(ctx)
 }
 
+func (p *productionReconciliation) resolveInvalidatedGitHubEffect(ctx context.Context, api internalgithub.API) (bool, error) {
+	snapshot, err := p.owner.snapshot(ctx)
+	if err != nil {
+		return false, err
+	}
+	ids := make([]string, 0)
+	for id, effect := range snapshot.State.Effects {
+		if effect.State == "invalidated" && effect.Dispatched && effect.Reconciliation != nil && reconciliationMutatesGitHub(effect.Reconciliation.Action) {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return false, nil
+	}
+	slices.Sort(ids)
+	resolved := false
+	for _, id := range ids {
+		changed, resolveErr := p.resolveOneInvalidatedGitHubEffect(ctx, api, snapshot.State.Effects[id])
+		if resolveErr != nil {
+			return resolved, resolveErr
+		}
+		resolved = resolved || changed
+	}
+	return resolved, nil
+}
+
+func (p *productionReconciliation) resolveOneInvalidatedGitHubEffect(ctx context.Context, api internalgithub.API, effect runtimeEffectIntent) (bool, error) {
+	request := *effect.Reconciliation
+	key, generation := ownerIssueKey(effect.Repository, effect.Issue), uint64(0)
+	run, err := p.effects.acquireKey(ctx, key, effect.IssueGeneration, generation, request.ObservationGeneration)
+	if err != nil {
+		return false, err
+	}
+	defer p.effects.releaseKey(key, run)
+	outcome := invalidatedExternalOutcome{Action: request.Action}
+	switch request.Action {
+	case reconciliationGitHubBind:
+		outcome.Observed, err = observeGitHubBind(run.ctx, api, p.collector.Config, request)
+	case reconciliationGitHubPublish:
+		user, authErr := api.AuthenticatedUser(run.ctx)
+		err = authErr
+		if err == nil && user.ID != p.collector.Config.ActorID {
+			err = errors.New("authenticated GitHub actor changed")
+		}
+		if err == nil {
+			var pr internalgithub.PullRequest
+			outcome.Observed, pr, err = verifyPublishedAttempt(run.ctx, api, request, user.ID)
+			outcome.PR, outcome.HeadSHA = pr.Number, request.GitHubPublish.HeadSHA
+		}
+	case reconciliationGitHubIssueUpdate:
+		if request.ControlRepair || reconciliationEffectIssueScoped(request) {
+			outcome.Observed, err = internalgithub.ControlSnapshotRepairApplied(run.ctx, api, p.collector.Config, request.Repository, request.Issue, request.GitHubIssueUpdate.ControlSnapshotBody)
+		} else if request.GitHubIssueUpdate.Kind == githubIssueRetry {
+			outcome.Observed, err = internalgithub.EnsureRetrySuppressed(run.ctx, api, p.collector.Config, request.Issue, request.Attempt, time.Unix(0, request.GitHubIssueUpdate.FailedAtUnixNano))
+		} else if request.GitHubIssueUpdate.Kind == githubIssueWorkerStatus {
+			sequence := request.GitHubIssueUpdate.StatusSequence + 1
+			err = api.EnsureOwnerStatus(run.ctx, request.Repository, request.Issue, request.Attempt, sequence, false, "attempt invalidated", p.collector.Config.ActorID)
+			if err == nil {
+				outcome.Observed, err = api.OwnerStatusApplied(run.ctx, request.Repository, request.Issue, request.Attempt, sequence, false, "attempt invalidated", p.collector.Config.ActorID)
+			}
+		} else {
+			outcome.Observed, err = attemptIssueUpdateApplied(run.ctx, api, request, p.collector.Config)
+		}
+	case reconciliationGitHubPRGovernance:
+		outcome.Merged, err = api.PullRequestMerged(run.ctx, request.Repository, request.GitHubPRGovernance.PR)
+		if err == nil && outcome.Merged {
+			var facts []internalgithub.RecoveryAttemptFact
+			facts, err = internalgithub.FetchAttemptFacts(run.ctx, api, request.Repository, request.GitHubPRGovernance.Policy.ActorID)
+			outcome.Observed = slices.ContainsFunc(facts, func(fact internalgithub.RecoveryAttemptFact) bool {
+				return fact.PR == request.GitHubPRGovernance.PR && fact.Issue == request.Issue && fact.Attempt == request.Attempt && fact.HeadSHA == request.GitHubPRGovernance.HeadSHA && fact.State == "completed"
+			})
+		}
+		outcome.PR, outcome.HeadSHA = request.GitHubPRGovernance.PR, request.GitHubPRGovernance.HeadSHA
+	default:
+		err = errStateConflict
+	}
+	if err != nil {
+		return false, err
+	}
+	if request.Action == reconciliationGitHubPRGovernance && (!outcome.Merged || !outcome.Observed) || request.Action != reconciliationGitHubPRGovernance && !outcome.Observed {
+		return false, nil
+	}
+	if err := p.owner.resolveInvalidatedReconciliationEffect(ctx, resolveInvalidatedReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(effect), Outcome: outcome}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Receipt-bound Plan reviews are excluded from generic reconciliation replay.
 // A fresh observation must revoke them here, including while their pane lives.
 func (p *productionReconciliation) supersedeInvalidPendingPlanReviewers(ctx context.Context, snapshot stateOwnerSnapshot) (bool, error) {
@@ -355,7 +499,7 @@ func (p *productionReconciliation) resumePendingReconciliation(ctx context.Conte
 			head := ""
 			if !stale {
 				record := snapshot.State.Attempts[ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)]
-				_, currentHead, _, importErr := importWorkerExport(ctx, p.implementation, p.stateRoot, effect.AttemptGeneration, record.Manifest)
+				_, currentHead, _, importErr := p.selectedWorkerExport(ctx, record)
 				if importErr != nil {
 					if err := diagnose(effect, "pending reviewer export import failed: ", importErr); err != nil {
 						return false, err
@@ -430,7 +574,7 @@ func (p *productionReconciliation) resumeUnmarkedReconciliation(ctx context.Cont
 		if !ok || !supplied {
 			return false, errStaleStateResult
 		}
-		result, head, root, err := importWorkerExport(ctx, p.implementation, p.stateRoot, effect.AttemptGeneration, record.Manifest)
+		result, head, root, err := p.selectedWorkerExport(ctx, record)
 		if err != nil {
 			return false, err
 		}
@@ -482,7 +626,7 @@ func (p *productionReconciliation) resumeUnmarkedReconciliation(ctx context.Cont
 		if !ok || !supplied {
 			return false, errStaleStateResult
 		}
-		_, head, source, err := importWorkerExport(ctx, p.implementation, p.stateRoot, effect.AttemptGeneration, record.Manifest)
+		_, head, source, err := p.selectedWorkerExport(ctx, record)
 		if err != nil {
 			return false, err
 		}
@@ -778,7 +922,7 @@ func (p *productionReconciliation) executionCandidates(ctx context.Context, snap
 		if !ok || !currentReconciliationObservation(snapshot.State, ownerIssueKey(record.Manifest.Repository, record.Manifest.Issue), observation) || digestText(issue.Body) != observation.Fact.BodyDigest {
 			continue
 		}
-		result, head, root, err := importWorkerExport(ctx, p.implementation, p.stateRoot, record.Generation, record.Manifest)
+		result, head, root, err := p.selectedWorkerExport(ctx, record)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, nil, ctx.Err()
@@ -801,6 +945,9 @@ func (p *productionReconciliation) executionCandidates(ctx context.Context, snap
 
 func (p *productionReconciliation) runReviewerPhase(ctx context.Context, candidates []reviewerExecutionMaterial) error {
 	for {
+		if err := p.verifyWorkerExecutable(ctx); err != nil {
+			return err
+		}
 		snapshot, err := p.owner.snapshot(ctx)
 		if err != nil {
 			return err

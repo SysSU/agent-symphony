@@ -144,15 +144,7 @@ type codexConfinementProof struct {
 	SharedTempWrite bool `json:"shared_temp_write"`
 }
 
-func verifyRootlessCodex(ctx context.Context, codex, root, codexHome string) (codexConfinementProof, error) {
-	codexPath, err := exec.LookPath(codex)
-	if err != nil {
-		return codexConfinementProof{}, fmt.Errorf("configured Codex executable %q was not found: %w", codex, err)
-	}
-	codexPath, err = filepath.EvalSymlinks(codexPath)
-	if err != nil {
-		return codexConfinementProof{}, fmt.Errorf("resolve configured Codex executable: %w", err)
-	}
+func verifyRootlessCodex(ctx context.Context, root, codexHome, codexExecutable string) (codexConfinementProof, error) {
 	if err := verifyLocalAccess(root); err != nil {
 		return codexConfinementProof{}, err
 	}
@@ -236,7 +228,7 @@ func verifyRootlessCodex(ctx context.Context, codex, root, codexHome string) (co
 	}
 	proof := filepath.Join(workspace, "proof")
 	args := config.WorkerSandboxArgs(workspace, probe, "sandbox-probe", proof, canaryPath, stateCanary, authCanary, tcpListener.Addr().String(), unixPath, sharedTempPath)
-	command := exec.CommandContext(ctx, codexPath, args...)
+	command := exec.CommandContext(ctx, codexExecutable, args...)
 	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(private, "tmp")}
 	if err := os.Mkdir(filepath.Join(private, "tmp"), 0o700); err != nil {
 		return codexConfinementProof{}, err
@@ -1087,7 +1079,29 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if mode != "implementation" {
 			return errors.New("review boundary cannot export implementation attempts")
 		}
-		result.Output, err = exportAttempt(ctx, request.Command.Input, root)
+		var manifest agentruntime.Manifest
+		decoder := json.NewDecoder(bytes.NewReader(request.Command.Input))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF || !belowRoot(manifest.Worktree, root) {
+			return errors.New("invalid export manifest")
+		}
+		binary, binaryErr := os.Executable()
+		if binaryErr != nil {
+			return binaryErr
+		}
+		tmp := filepath.Join(manifest.Worktree, ".agent-symphony", "tmp")
+		if err := os.MkdirAll(tmp, 0o700); err != nil {
+			return err
+		}
+		codexExecutable := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_CODEX_EXECUTABLE"))
+		profileDigest := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_WORKER_PROFILE_DIGEST"))
+		if !filepath.IsAbs(codexExecutable) || !validDigest(profileDigest) || manifest.WorkerProfileDigest != profileDigest {
+			return errors.New("worker export confinement identity is unavailable")
+		}
+		if err := config.VerifyWorkerExecutable(ctx, codexExecutable, profileDigest); err != nil {
+			return err
+		}
+		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgs(manifest.Worktree, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp}, Stdin: bytes.NewReader(request.Command.Input)})
 	case "validate-cleanup", "cleanup":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot clean implementation attempts")
@@ -1264,7 +1278,8 @@ func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) err
 	if manifest.Version != agentruntime.ManifestVersion2 {
 		return errors.New("legacy implementation session has no durable launch identity")
 	}
-	confined := agentruntime.WorkerConfinementBound(manifest, manifest.WorkerGeneration, config.WorkerProfileDigest())
+	profileDigest := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_WORKER_PROFILE_DIGEST"))
+	confined := agentruntime.WorkerConfinementBound(manifest, manifest.WorkerGeneration, profileDigest)
 	if manifest.LaunchID == "" && confined {
 		return nil
 	}
@@ -2150,11 +2165,8 @@ func hostDiagnostic(codex, stateRoot string) diagnostic {
 	if strings.TrimSpace(stateRoot) == "" {
 		return diagnostic{"worker confinement", "fail", "runtime state root is required to provision the local attempt/snapshot roots", "Pass --runtime-state."}
 	}
-	if sharedTemporaryPath(stateRoot) {
-		return diagnostic{"worker confinement", "fail", "runtime state root must not be inside a shared temporary directory", "Choose a private persistent --runtime-state path under the current user's home."}
-	}
-	if pathContainsSymlink(stateRoot) {
-		return diagnostic{"worker confinement", "fail", "runtime state root path must not contain symbolic links", "Choose a direct private persistent --runtime-state path under the current user's home."}
+	if err := validatePrivateStateRoot(stateRoot); err != nil {
+		return diagnostic{"worker confinement", "fail", err.Error(), "Choose a private persistent --runtime-state path under the current user's home."}
 	}
 	for _, root := range []string{localAttemptRoot(stateRoot), localSnapshotRoot(stateRoot)} {
 		if err := verifyLocalAccess(root); err != nil {
@@ -2166,7 +2178,7 @@ func hostDiagnostic(codex, stateRoot string) diagnostic {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	proof, err := rootlessCodexVerify(ctx, codex, localAttemptRoot(stateRoot), workerCodexHome(stateRoot))
+	proof, err := rootlessCodexVerify(ctx, localAttemptRoot(stateRoot), workerCodexHome(stateRoot), codex)
 	if err != nil {
 		return diagnostic{"worker confinement", "fail", err.Error(), "Install @openai/codex@0.153.0 and repair the managed sandbox profile. On Linux/WSL, the host must permit unprivileged user namespaces for bubblewrap."}
 	}
@@ -2178,44 +2190,6 @@ func hostDiagnostic(codex, stateRoot string) diagnostic {
 		return diagnostic{"worker confinement", "warn", message + "; Codex cannot isolate shared temporary files on this platform", "Keep Agent Symphony authority and control paths under the private runtime state root."}
 	}
 	return diagnostic{"worker confinement", "pass", message, ""}
-}
-
-func pathContainsSymlink(path string) bool {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return true
-	}
-	current := filepath.VolumeName(abs) + string(os.PathSeparator)
-	for _, part := range strings.Split(strings.TrimPrefix(abs, current), string(os.PathSeparator)) {
-		if part == "" {
-			continue
-		}
-		current = filepath.Join(current, part)
-		info, err := os.Lstat(current)
-		if errors.Is(err, os.ErrNotExist) {
-			return false
-		}
-		if err != nil || info.Mode()&os.ModeSymlink != 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func sharedTemporaryPath(path string) bool {
-	for _, root := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
-		if lexicallyBelowRoot(path, root) || belowRoot(path, root) {
-			return true
-		}
-	}
-	return false
-}
-
-func lexicallyBelowRoot(path, root string) bool {
-	candidate, candidateErr := filepath.Abs(path)
-	root, rootErr := filepath.Abs(root)
-	rel, err := filepath.Rel(root, candidate)
-	return candidateErr == nil && rootErr == nil && err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
 }
 
 func fileUID(info os.FileInfo) int {

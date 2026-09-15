@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -64,6 +65,70 @@ func defaultWorkerCommand(interactive bool) []string {
 // WorkerProfileDigest identifies the exact managed confinement contract.
 func WorkerProfileDigest() string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(workerSafetyArgs, "\x00"))))
+}
+
+// BindWorkerExecutable resolves and attests the exact Codex binary used by all
+// managed workers. The returned digest changes with the path, version, bytes,
+// or confinement profile, so a restart cannot trust a differently enforced
+// worker generation.
+func BindWorkerExecutable(ctx context.Context, commands *Commands) (string, error) {
+	if commands == nil {
+		return "", errors.New("worker commands are unavailable")
+	}
+	var canonical, version, binaryDigest string
+	for _, command := range []*[]string{&commands.Implementation, &commands.Reviewer} {
+		if len(*command) == 0 {
+			return "", errors.New("worker command is unavailable")
+		}
+		path, err := exec.LookPath((*command)[0])
+		if err != nil {
+			return "", fmt.Errorf("resolve Codex worker executable: %w", err)
+		}
+		path, err = filepath.Abs(path)
+		if err == nil {
+			path, err = filepath.EvalSymlinks(path)
+		}
+		if err != nil {
+			return "", fmt.Errorf("canonicalize Codex worker executable: %w", err)
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			return "", errors.New("codex worker executable is unsafe")
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return "", err
+		}
+		hash := sha256.New()
+		_, copyErr := io.Copy(hash, file)
+		closeErr := file.Close()
+		if copyErr != nil || closeErr != nil {
+			return "", errors.Join(copyErr, closeErr)
+		}
+		currentDigest := fmt.Sprintf("%x", hash.Sum(nil))
+		output, err := exec.CommandContext(ctx, path, "--version").Output()
+		currentVersion := strings.TrimSpace(string(output))
+		if err != nil || !strings.HasPrefix(currentVersion, "codex-cli 0.153.") {
+			return "", fmt.Errorf("unsupported Codex worker executable version %q", currentVersion)
+		}
+		if canonical != "" && (canonical != path || version != currentVersion || binaryDigest != currentDigest) {
+			return "", errors.New("implementation and reviewer must use the same Codex executable")
+		}
+		canonical, version, binaryDigest = path, currentVersion, currentDigest
+		(*command)[0] = path
+	}
+	material := strings.Join([]string{WorkerProfileDigest(), canonical, version, binaryDigest}, "\x00")
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(material))), nil
+}
+
+func VerifyWorkerExecutable(ctx context.Context, path, expectedDigest string) error {
+	commands := Default("worker/verification").Commands
+	commands.Implementation[0], commands.Reviewer[0] = path, path
+	digest, err := BindWorkerExecutable(ctx, &commands)
+	if err != nil || digest != expectedDigest || commands.Implementation[0] != path {
+		return errors.Join(errors.New("codex worker executable identity changed"), err)
+	}
+	return nil
 }
 
 // WorkerSandboxArgs runs a deterministic capability probe under the same profile.
