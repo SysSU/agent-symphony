@@ -323,11 +323,41 @@ func TestHelpListsUserFacingCommandsAndFlags(t *testing.T) {
 	}
 	for _, want := range []string{
 		"install-host", "agent-host", "chat", "control", "init", "validate", "config view", "serve", "status", "list", "inspect", "reconcile", "doctor", "diagnostics", "pr-governance", "help",
-		"--config", "--state", "--runtime-state", "--attempts", "--issue", "--attempt", "--repository", "--role", "--action", "--confirm", "--request-id", "--timeout", "--interval", "--dashboard-address", "--allow-unsafe-dashboard-network", "--dashboard-password-file", "--offline", "--coordinator", "--json", "--help", "--version",
+		"--config", "--state", "--runtime-state", "--attempts", "--issue", "--attempt", "--repository", "--role", "--action", "--confirm", "--request-id", "--timeout", "--interval", "--dashboard-address", "--allow-unsafe-dashboard-network", "--dashboard-password-file", "--offline", "--json", "--help", "--version",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("help is missing %q", want)
 		}
+	}
+	if strings.Contains(stdout.String(), "run as root") || strings.Contains(stdout.String(), "--coordinator") {
+		t.Fatal("help still advertises privileged host installation")
+	}
+}
+
+func TestInstallHostIsAnOrdinaryUserNonMutatingLegacyDiagnostic(t *testing.T) {
+	fakeNoHostIsolation(t)
+	oldRun := hostRun
+	hostRun = func(string, ...string) error { t.Fatal("install-host attempted host mutation"); return nil }
+	t.Cleanup(func() { hostRun = oldRun })
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"install-host"}, &stdout, &stderr); code != 0 || stderr.Len() != 0 || !strings.Contains(stdout.String(), "obsolete") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"install-host", "--coordinator", "root"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("privileged legacy flags remain accepted: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestInstallHostReportsLegacyIdentitiesWithoutUsingThem(t *testing.T) {
+	fakeHostIdentity(t, 1234, 5678)
+	oldRun := hostRun
+	hostRun = func(string, ...string) error { t.Fatal("install-host attempted host mutation"); return nil }
+	t.Cleanup(func() { hostRun = oldRun })
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"install-host"}, &stdout, &stderr); code != 0 || stderr.Len() != 0 || !strings.Contains(stdout.String(), "detected but are unused") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 }
 

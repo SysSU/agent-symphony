@@ -33,6 +33,16 @@ func TestBindWorkerExecutablePinsExactBinaryIdentity(t *testing.T) {
 	}
 }
 
+func TestWorkerSandboxArgsExposeAttestedCodexInstallation(t *testing.T) {
+	prefix := filepath.Join(t.TempDir(), "node")
+	executable := filepath.Join(prefix, "bin", "codex")
+	args := WorkerSandboxArgsForExecutable(t.TempDir(), executable, "probe")
+	index := slices.Index(args, "--sandbox-state-readable-root")
+	if index < 0 || index+1 >= len(args) || args[index+1] != prefix {
+		t.Fatalf("sandbox cannot read its attested installation root %q: %q", prefix, args)
+	}
+}
+
 func TestBindWorkerExecutableRejectsFakeCodexBasename(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "codex")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'fake-codex 1\\n'\n"), 0o700); err != nil {

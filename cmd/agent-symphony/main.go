@@ -381,6 +381,10 @@ func validateProductionStateRoot(stateRoot string) error {
 	if allowSharedTempRuntimeStateForTest {
 		return nil
 	}
+	return validatePrivateStateRoot(stateRoot)
+}
+
+func validatePrivateStateRoot(stateRoot string) error {
 	root, err := canonicalPathWithMissingLeaf(stateRoot)
 	if err != nil {
 		return fmt.Errorf("resolve runtime state root: %w", err)
@@ -393,16 +397,21 @@ func validateProductionStateRoot(stateRoot string) error {
 
 func pathInSharedTemporaryStorage(path string) bool {
 	for _, shared := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
-		shared, err := filepath.EvalSymlinks(shared)
-		if err != nil {
-			continue
+		lexical, lexicalErr := filepath.Abs(shared)
+		if lexicalErr == nil && pathWithinRoot(path, lexical) {
+			return true
 		}
-		relative, relErr := filepath.Rel(shared, path)
-		if relErr == nil && (relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
+		resolved, resolveErr := filepath.EvalSymlinks(shared)
+		if resolveErr == nil && pathWithinRoot(path, resolved) {
 			return true
 		}
 	}
 	return false
+}
+
+func pathWithinRoot(path, root string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && (relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
 }
 
 func canonicalPathWithMissingLeaf(path string) (string, error) {
@@ -969,7 +978,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	allowUnsafeDashboardNetwork := fs.Bool("allow-unsafe-dashboard-network", false, "allow password-protected dashboard access outside loopback")
 	dashboardPasswordFile := fs.String("dashboard-password-file", "", "coordinator-only file containing the dashboard HTTP Basic authentication password")
 	offline := fs.Bool("offline", false, "skip network diagnostics")
-	coordinator := fs.String("coordinator", "", "coordinator OS user")
 	if err := fs.Parse(flagArgs); err != nil {
 		return misuse(stderr, wantsJSON, command, err.Error())
 	}
@@ -987,13 +995,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	switch command {
 	case "install-host":
-		if fs.NArg() != 0 || *coordinator == "" || !onlyFlags(fs, "coordinator", "json") {
-			return misuse(stderr, wantsJSON, command, "usage: agent-symphony install-host --coordinator USER")
+		if fs.NArg() != 0 || !onlyFlags(fs, "json") {
+			return misuse(stderr, wantsJSON, command, "usage: agent-symphony install-host [--json]")
 		}
-		if err := installHost(*coordinator); err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
+		legacy := hostIsolationInstalled()
+		message := "host installation is obsolete; Agent Symphony uses the current user's managed Codex sandbox"
+		if legacy {
+			message += "; legacy Agent Symphony host identities were detected but are unused"
 		}
-		return success(stdout, *jsonOutput, command, nil, "host isolation installed")
+		return success(stdout, *jsonOutput, command, map[string]bool{"legacy_host_identities_detected": legacy}, message)
 	case "agent-host":
 		if fs.NArg() != 1 || fs.NFlag() != 0 {
 			return misuse(stderr, wantsJSON, command, "usage: agent-symphony agent-host implementation|review|orchestrator|orchestrator-proposal|orchestrator-proposal-status")
@@ -3068,7 +3078,14 @@ func doctor(c config.Config, offline bool, stateRoot string) []diagnostic {
 	} else {
 		result = append(result, githubDiagnostics(c.Repository)...)
 	}
-	result = append(result, hostDiagnostic(stateRoot))
+	bindCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, bindErr := config.BindWorkerExecutable(bindCtx, &c.Commands)
+	cancel()
+	if bindErr != nil {
+		result = append(result, diagnostic{"worker confinement", "fail", bindErr.Error(), "Install @openai/codex@0.153.0 and configure implementation and reviewer to use the same executable."})
+	} else {
+		result = append(result, hostDiagnostic(c.Commands.Implementation[0], stateRoot))
+	}
 	return result
 }
 
@@ -3292,7 +3309,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, `usage: agent-symphony <command> [options]
 
 commands:
-	install-host  provision the native worker/reviewer boundary (run as root)
+	install-host  report obsolete host provisioning and legacy identities
 	agent-host    execute the implementation, review, or orchestrator boundary
 	chat          attach to an exact implementation, reviewer, or orchestrator session
 	control       invoke a guarded action in the running daemon
@@ -3329,7 +3346,6 @@ options:
 	--allow-unsafe-dashboard-network  permit non-loopback dashboard binding (requires password)
 	--dashboard-password-file path  coordinator-only HTTP Basic password file; username is agent-symphony
 	--offline     skip the GitHub probe in doctor or diagnostics
-	--coordinator user  coordinator OS user for install-host
 	--json        emit a versioned JSON envelope
 	-h, --help    show this help (top level only)
 	--version     show the release version`)

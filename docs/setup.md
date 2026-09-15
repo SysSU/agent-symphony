@@ -44,7 +44,7 @@ gh auth status
 gh repo view OWNER/REPOSITORY
 ```
 
-Agent Symphony uses that account to work with issues and pull requests. In zero-admin mode, daemon and agent roles share this stored login. For unattended or advanced host-isolated setups, `gh` can read `GH_TOKEN` or `GITHUB_TOKEN`; Agent Symphony forwards it only through the authorized role environments and does not write it to repository files. See [GitHub CLI integration](github-cli.md).
+Agent Symphony uses that account to work with issues and pull requests. Daemon and agent roles share this stored login. For unattended setups, `gh` can read `GH_TOKEN` or `GITHUB_TOKEN`; Agent Symphony forwards it only through the authorized role environments and does not write it to repository files. See [GitHub CLI integration](github-cli.md).
 
 ## 3. Initialize the repository
 
@@ -56,7 +56,7 @@ agent-symphony init
 agent-symphony validate
 ```
 
-The defaults use Codex with full implementation and reviewer access and no approval prompts. In zero-admin mode both processes have the coordinator user's filesystem and process access; install the advanced host boundary before delegating untrusted work. If you use another coding agent, update the `commands` section in `.agent-symphony.yaml` and list any API key variable it needs. See the [CLI reference](cli.md#configuration) for the full schema.
+The defaults require `@openai/codex` 0.153.x and use Agent Symphony's fixed no-approval, network-denied implementation/reviewer profile. Both commands must resolve to the same Codex executable. On Linux and WSL, the host must already permit unprivileged user namespaces for bubblewrap. Agent Symphony never invokes sudo or provisions that host capability. Run `doctor` before `serve`; it attests the exact executable and exercises the real managed sandbox without model traffic. See the [CLI reference](cli.md#configuration) for the full schema.
 
 ### Create the default labels
 
@@ -165,32 +165,20 @@ agent-symphony serve \
   --dashboard-project http://127.0.0.1:8081
 ```
 
-Each process still manages only its configured repository. On first use, its runtime-state root gets a private `deployment.json` identity; Agent Symphony rejects that root with any other project configuration. The project selector reads configured peers without combining state or forwarding controls. Peer aggregation is unauthenticated, so a dashboard protected by `--dashboard-password-file` appears unavailable to another deployment; open it directly and authenticate instead. The daemons share the authenticated GitHub CLI account and, in advanced mode, the provisioned worker/reviewer identities; source bundle, worktree, review snapshot, and tmux session names include the repository identity. Concurrency remains per daemon, so size the sum of their configured capacities for the host.
+Each process still manages only its configured repository. On first use, its runtime-state root gets a private `deployment.json` identity; Agent Symphony rejects that root with any other project configuration. The project selector reads configured peers without combining state or forwarding controls. Peer aggregation is unauthenticated, so a dashboard protected by `--dashboard-password-file` appears unavailable to another deployment; open it directly and authenticate instead. The daemons share the authenticated GitHub CLI account and ordinary OS identity; source bundle, worktree, review snapshot, and tmux session names include the repository identity. Concurrency remains per daemon, so size the sum of their configured capacities for the host.
 
 Before upgrading an existing installation to the first release with repository-namespaced reviewer sessions, let active independent reviews finish and reconcile their cleanup. Implementation attempt identities are unchanged.
 
 ## Advisory orchestrator
 
-New configuration created by `agent-symphony init` enables the advisory orchestrator. In zero-admin mode, its default Codex command lets the orchestrator use the coordinator user's authenticated `gh` CLI and inspect same-user tmux sessions:
+New configuration created by `agent-symphony init` enables the advisory orchestrator. Its default Codex command lets the orchestrator use the coordinator user's authenticated `gh` CLI and inspect same-user tmux sessions:
 
 ```json
 ["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"]
 ```
 
-Agent Symphony replaces `{orchestrator_workspace}` with the managed absolute path. Full Codex access is necessary for direct GitHub and tmux inspection, but it also exposes other resources readable by the coordinator user. Use it only with a trusted model. Advanced host isolation runs the orchestrator and heartbeat as the reviewer identity. They cannot inspect the coordinator user's stored login or tmux server, so provide a supported GitHub CLI token variable to the service or authenticate that fixed account separately. After changing the command, use the dashboard Rebuild action, then rerun `validate` and `doctor`.
+Agent Symphony replaces `{orchestrator_workspace}` with the managed absolute path. Full Codex access is necessary for direct GitHub and tmux inspection, but it also exposes other resources readable by the coordinator user. Use it only with a trusted model. After changing the command, use the dashboard Rebuild action, then rerun `validate` and `doctor`.
 
-## Advanced: host-isolated mode
+## Legacy host installations
 
-The default boundary runs implementation and review processes as the coordinator's operating-system user while filtering their environment, remotes, and credential helpers. For OS-enforced separation, install a versioned release as root and provision the fixed worker and reviewer identities:
-
-```sh
-sudo mkdir -p /usr/local/libexec/agent-symphony/VERSION
-sudo install -m 0755 agent-symphony_VERSION_OS_ARCH/agent-symphony \
-  /usr/local/libexec/agent-symphony/VERSION/agent-symphony
-sudo /usr/local/libexec/agent-symphony/VERSION/agent-symphony \
-  install-host --coordinator "$(whoami)"
-```
-
-Rerun `install-host` after every binary upgrade. `doctor` and `serve` automatically require the stricter boundary once it is installed. The boundary environment variables are test seams, not production setup.
-
-When the orchestrator is configured in this mode, Agent Symphony launches it through the reviewer identity and snapshot group. Start the service with `GH_TOKEN` or `GITHUB_TOKEN` (or the enterprise equivalent) so implementation, review, orchestrator, and heartbeat sessions use the same authenticated CLI path. Rerun `install-host` after upgrading so the exact reviewer-identity orchestrator rule and its bounded GitHub environment pass-through remain current.
+Older releases could provision worker/reviewer accounts and sudo rules. Current Agent Symphony does not use or modify them. `agent-symphony install-host` only reports whether obsolete Agent Symphony identities are present so an operator can plan a separate, reviewed host cleanup; it performs no migration and requires no privilege.

@@ -11,6 +11,9 @@ permissions:
 
 jobs:
   test:
+    env:
+      AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX: '1'
+      CODEX_VERSION: '0.153.0'
     strategy:
       fail-fast: false
       matrix:
@@ -26,14 +29,37 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: cmd/agent-symphony/dashboard/package-lock.json
+      - name: Install pinned Codex sandbox
+        run: |
+          npm install --global "@openai/codex@$CODEX_VERSION"
+          test "$(codex --version)" = "codex-cli $CODEX_VERSION"
       - run: scripts/build-dashboard.sh
       - run: cmd/agent-symphony/dashboard/node_modules/.bin/playwright install --with-deps chromium
       - name: Install full-system test prerequisite (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y tmux
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap tmux
+      - name: Enable the Ubuntu runner's unprivileged namespace prerequisite
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if test -n "$current_userns" && test "$current_userns" != 1; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if test -n "$current_apparmor" && test "$current_apparmor" != 0; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Install full-system test prerequisite (macOS)
         if: matrix.os == 'macos-latest'
         run: brew install tmux
+      - name: Prove rootless worker confinement as the runner user
+        run: |
+          test "$(id -u)" -ne 0
+          config=.agent-symphony-ci.yaml
+          trap 'rm -f "$config"' EXIT
+          go run ./cmd/agent-symphony init --config "$config"
+          go run ./cmd/agent-symphony doctor --offline --config "$config" --runtime-state "$HOME/.agent-symphony-doctor-ci"
       - name: Run deterministic full-system gate
         run: |
           tmux -V
@@ -59,8 +85,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Failed to initialize WSL distribution: $distribution" }
           $rows = ((wsl --list --verbose) -join "`n") -replace "`0", ''
           if ($rows -notmatch "(?m)^\s*\*?\s*$distribution\s+\S+\s+2\s*$") { throw "WSL distribution is not version 2:`n$rows" }
-          wsl -d $distribution -- bash -lc 'set -euo pipefail; sudo env DEBIAN_FRONTEND=noninteractive apt-get update; sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git ruby tmux xz-utils'
+          wsl -d $distribution -- bash -lc 'set -euo pipefail; sudo env DEBIAN_FRONTEND=noninteractive apt-get update; sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap build-essential ca-certificates curl git ruby tmux xz-utils'
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install WSL validation prerequisites' }
+          wsl -d $distribution -- bash -lc 'set -euo pipefail; current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"; if test -n "$current_userns" && test "$current_userns" != 1; then sudo sysctl -w kernel.unprivileged_userns_clone=1; fi; current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"; if test -n "$current_apparmor" && test "$current_apparmor" != 0; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi'
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to enable WSL unprivileged user namespaces' }
           wsl -d $distribution -- bash -lc 'rm -rf ~/agent-symphony-ci && mkdir ~/agent-symphony-ci'
           git archive --format=tar HEAD | wsl -d $distribution -- bash -lc 'tar -xf - -C ~/agent-symphony-ci'
           wsl -d $distribution -- bash -lc "cd ~/agent-symphony-ci; chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/live-pilot.sh scripts/live-pilot-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh; git init -q; git remote add origin '$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git'; git add .; git -c user.name=ci -c user.email=ci@invalid commit -qm snapshot"
@@ -82,7 +110,14 @@ jobs:
           $nodeVersion = '22.15.1'
           wsl -d $distribution -- bash -lc "set -e; curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v${nodeVersion}/node-v${nodeVersion}-linux-${nodeArch}.tar.xz; printf '%s  %s\n' '${nodeSHA256}' /tmp/node.tar.xz | sha256sum -c -; sudo rm -rf /usr/local/node; sudo mkdir /usr/local/node; sudo tar -C /usr/local/node --strip-components=1 -xJf /tmp/node.tar.xz"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install pinned Node.js toolchain in WSL' }
-          wsl -d $distribution -- bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin scripts/validate-release.sh 0.0.0-wsl'
+          $codexVersion = '0.153.0'
+          wsl -d $distribution -- bash -lc "sudo env PATH=/usr/local/node/bin:/usr/bin:/bin /usr/local/node/bin/npm install --global --prefix /usr/local/node '@openai/codex@${codexVersion}'"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to install pinned Codex CLI in WSL' }
+          wsl -d $distribution -- bash -lc 'sudo tar -C /usr/local/node --strip-components=1 -xJf /tmp/node.tar.xz'
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to restore the pinned Node.js runtime after the WSL Codex install' }
+          wsl -d $distribution -- bash -lc 'set -euo pipefail; cd ~/agent-symphony-ci; export PATH=/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; test "$(id -u)" -ne 0; test "$(command -v node)" = /usr/local/node/bin/node; test "$(/usr/bin/env node --version)" = v22.15.1; test "$(/usr/local/node/bin/codex --version)" = "codex-cli 0.153.0"; go run ./cmd/agent-symphony init --config .agent-symphony-ci.yaml; sed -i s#\"codex\"#\"/usr/local/node/bin/codex\"#g .agent-symphony-ci.yaml; go run ./cmd/agent-symphony validate --config .agent-symphony-ci.yaml; go run ./cmd/agent-symphony doctor --offline --config .agent-symphony-ci.yaml --runtime-state "$HOME/.local/state/agent-symphony-doctor"'
+          if ($LASTEXITCODE -ne 0) { throw 'WSL rootless Codex confinement proof failed' }
+          wsl -d $distribution -- bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl'
           if ($LASTEXITCODE -ne 0) { throw 'WSL release validation failed' }
 
   artifacts:

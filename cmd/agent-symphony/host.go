@@ -67,6 +67,7 @@ var (
 	hostReviewResultOpen = syscall.Open
 	hostRoot             = ""
 	sandboxExecutable    = os.Executable
+	rootlessCodexVerify  = verifyRootlessCodex
 )
 
 func runHostTmux(ctx context.Context, args []string, stdin io.Reader) (agentruntime.Result, error) {
@@ -75,11 +76,8 @@ func runHostTmux(ctx context.Context, args []string, stdin io.Reader) (agentrunt
 
 func nativeRoot(path string) string { return filepath.Join(hostRoot, path) }
 
-// hostIsolationInstalled reports whether install-host has ever provisioned the
-// advanced cross-UID boundary. Its absence is the sole signal that selects the
-// zero-admin default (local) boundary instead: running install-host is itself
-// the explicit opt-in into advanced mode, so there is exactly one source of
-// truth and no separate config flag is needed.
+// hostIsolationInstalled reports legacy identities for migration diagnostics.
+// Their presence never changes the rootless runtime boundary.
 func hostIsolationInstalled() bool {
 	_, err := hostLookupUser(workerUser)
 	return err == nil
@@ -140,102 +138,123 @@ func verifyLocalAccess(root string) error {
 	return os.RemoveAll(canary)
 }
 
-func verifyRootlessCodex(ctx context.Context, root, codexHome, codexExecutable string) error {
+type codexConfinementProof struct {
+	Confined        bool `json:"confined"`
+	SharedTempRead  bool `json:"shared_temp_read"`
+	SharedTempWrite bool `json:"shared_temp_write"`
+}
+
+func verifyRootlessCodex(ctx context.Context, root, codexHome, codexExecutable string) (codexConfinementProof, error) {
 	if err := verifyLocalAccess(root); err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	if info, err := os.Lstat(codexHome); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
-		return errors.New("isolated worker CODEX_HOME is unavailable or unsafe")
+		return codexConfinementProof{}, errors.New("isolated worker CODEX_HOME is unavailable or unsafe")
 	}
 	workspace, err := os.MkdirTemp(root, ".sandbox-preflight-")
 	if err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	defer os.RemoveAll(workspace)
 	private := filepath.Join(workspace, ".agent-symphony")
 	if err := os.Mkdir(private, 0o700); err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	for _, name := range []string{".codex", ".agents"} {
 		directory := filepath.Join(workspace, name)
 		if err := os.Mkdir(directory, 0o700); err != nil {
-			return err
+			return codexConfinementProof{}, err
 		}
 		if err := os.WriteFile(filepath.Join(directory, "deny"), []byte("deny\n"), 0o600); err != nil {
-			return err
+			return codexConfinementProof{}, err
 		}
 	}
 	otherAttempt, err := os.MkdirTemp(root, ".sandbox-other-attempt-")
 	if err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	defer os.RemoveAll(otherAttempt)
 	canaryPath := filepath.Join(otherAttempt, "deny")
 	canary, err := os.OpenFile(canaryPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	if canary.Chmod(0o600) != nil || func() error { _, err := canary.WriteString("deny\n"); return err }() != nil || canary.Close() != nil {
-		return errors.New("prepare sandbox deny canary")
+		return codexConfinementProof{}, errors.New("prepare sandbox deny canary")
 	}
 	stateCanary := filepath.Join(filepath.Dir(root), fmt.Sprintf(".sandbox-state-%d", os.Getpid()))
 	if err := os.WriteFile(stateCanary, []byte("deny\n"), 0o600); err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	defer os.Remove(stateCanary)
 	authCanary := filepath.Join(codexHome, ".sandbox-auth-link")
 	if err := os.Symlink(stateCanary, authCanary); err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	defer os.Remove(authCanary)
 	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	defer tcpListener.Close()
 	unixPath := filepath.Join(root, fmt.Sprintf(".sandbox-%d.sock", os.Getpid()))
 	unixListener, err := net.Listen("unix", unixPath)
 	if err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	defer func() { unixListener.Close(); _ = os.Remove(unixPath) }()
+	sharedTemp, err := os.CreateTemp("/tmp", ".agent-symphony-sandbox-")
+	if err != nil {
+		return codexConfinementProof{}, err
+	}
+	sharedTempPath := sharedTemp.Name()
+	if _, err := sharedTemp.WriteString("deny\n"); err != nil {
+		sharedTemp.Close()
+		return codexConfinementProof{}, err
+	}
+	if err := sharedTemp.Close(); err != nil {
+		return codexConfinementProof{}, err
+	}
+	defer os.Remove(sharedTempPath)
 	executable, err := sandboxExecutable()
 	if err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	probe := filepath.Join(workspace, "probe")
 	input, err := os.Open(executable)
 	if err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	output, err := os.OpenFile(probe, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o700)
 	if err != nil {
 		input.Close()
-		return err
+		return codexConfinementProof{}, err
 	}
 	_, copyErr := io.Copy(output, input)
 	err = errors.Join(copyErr, output.Sync(), output.Close(), input.Close())
 	if err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	proof := filepath.Join(workspace, "proof")
-	args := config.WorkerSandboxArgs(workspace, probe, "sandbox-probe", proof, canaryPath, stateCanary, authCanary, tcpListener.Addr().String(), unixPath)
+	args := config.WorkerSandboxArgsForExecutable(workspace, codexExecutable, probe, "sandbox-probe", proof, canaryPath, stateCanary, authCanary, tcpListener.Addr().String(), unixPath, sharedTempPath)
 	command := exec.CommandContext(ctx, codexExecutable, args...)
 	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(private, "tmp")}
 	if err := os.Mkdir(filepath.Join(private, "tmp"), 0o700); err != nil {
-		return err
+		return codexConfinementProof{}, err
 	}
 	if out, err := command.CombinedOutput(); err != nil {
-		return fmt.Errorf("rootless Codex confinement preflight failed: %w: %s", err, strings.TrimSpace(string(out)))
+		return codexConfinementProof{}, fmt.Errorf("rootless Codex confinement preflight failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	if body, err := os.ReadFile(proof); err != nil || string(body) != "confined\n" {
-		return errors.New("rootless Codex confinement preflight produced no proof")
+	body, err := os.ReadFile(proof)
+	var result codexConfinementProof
+	if err != nil || json.Unmarshal(body, &result) != nil || !result.Confined {
+		return codexConfinementProof{}, errors.New("rootless Codex confinement preflight produced no proof")
 	}
-	return nil
+	return result, nil
 }
 
 func runSandboxProbe(args []string, child bool) error {
-	if len(args) != 6 && len(args) != 8 {
+	if len(args) != 7 && len(args) != 9 {
 		return errors.New("invalid sandbox probe")
 	}
 	if !child {
@@ -246,8 +265,8 @@ func runSandboxProbe(args []string, child bool) error {
 		}
 		return nil
 	}
-	if len(args) == 8 {
-		ready, err := os.OpenFile(args[6], os.O_WRONLY, 0)
+	if len(args) == 9 {
+		ready, err := os.OpenFile(args[7], os.O_WRONLY, 0)
 		if err != nil {
 			return err
 		}
@@ -256,7 +275,7 @@ func runSandboxProbe(args []string, child bool) error {
 		if writeErr != nil || closeErr != nil {
 			return errors.Join(writeErr, closeErr)
 		}
-		release, err := os.Open(args[7])
+		release, err := os.Open(args[8])
 		if err != nil {
 			return err
 		}
@@ -279,6 +298,12 @@ func runSandboxProbe(args []string, child bool) error {
 	if _, err := os.ReadFile(args[3]); err == nil {
 		return errors.New("sandbox read worker credential canary")
 	}
+	wantTemp := filepath.Join(filepath.Dir(args[0]), ".agent-symphony", "tmp")
+	if filepath.Clean(os.TempDir()) != wantTemp {
+		return errors.New("sandbox did not receive its attempt-private temporary directory")
+	}
+	_, sharedReadErr := os.ReadFile(args[6])
+	sharedWriteErr := os.WriteFile(args[6], []byte("mutated"), 0o600)
 	for _, directory := range []string{filepath.Join(filepath.Dir(args[0]), ".codex"), filepath.Join(filepath.Dir(args[0]), ".agents")} {
 		path := filepath.Join(directory, "deny")
 		if _, err := os.ReadFile(path); err == nil {
@@ -296,81 +321,9 @@ func runSandboxProbe(args []string, child bool) error {
 		connection.Close()
 		return errors.New("sandbox opened coordinator socket")
 	}
-	if err := os.WriteFile(args[0], []byte("confined\n"), 0o600); err != nil {
+	proof, _ := json.Marshal(codexConfinementProof{Confined: true, SharedTempRead: sharedReadErr == nil, SharedTempWrite: sharedWriteErr == nil})
+	if err := os.WriteFile(args[0], proof, 0o600); err != nil {
 		return fmt.Errorf("sandbox cannot write disposable workspace: %w", err)
-	}
-	return nil
-}
-
-func installHost(coordinator string) error {
-	if hostGOOS != "linux" && hostGOOS != "darwin" {
-		return errors.New("host isolation supports macOS and Linux/WSL2 only")
-	}
-	if hostEUID() != 0 {
-		return errors.New("install-host must run as root")
-	}
-	if strings.TrimSpace(coordinator) != coordinator || coordinator == "" || strings.ContainsAny(coordinator, "/:\n\r") {
-		return errors.New("invalid coordinator user")
-	}
-	if _, err := hostLookupUser(coordinator); err != nil {
-		return fmt.Errorf("coordinator user: %w", err)
-	}
-	binary, err := hostExecutable()
-	if err != nil {
-		return err
-	}
-	binary, err = filepath.EvalSymlinks(binary)
-	if err != nil {
-		return err
-	}
-	if err := validateInstalledBinary(binary); err != nil {
-		return err
-	}
-	fd, err := syscall.Open(binary, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return errors.New("open immutable installed binary without following links")
-	}
-	defer syscall.Close(fd)
-	opened := os.NewFile(uintptr(fd), binary)
-	openedInfo, err := opened.Stat()
-	if err != nil {
-		return err
-	}
-	if listed, err := hostOutput("sudo", "-n", "-l", "-U", coordinator); err != nil || !installableSudoAuthority(listed, binary) {
-		return errors.New("coordinator has unmanaged or broader sudo authority; remove it before installation")
-	}
-	if err := provisionIdentities(coordinator); err != nil {
-		return err
-	}
-	if err := validateProvisionedIdentitySeparation(coordinator); err != nil {
-		return err
-	}
-	base := "/var/lib/agent-symphony"
-	if hostGOOS == "darwin" {
-		base = "/var/db/agent-symphony"
-	}
-	for _, root := range []struct{ path, owner, group, mode string }{
-		{base + "/attempts", workerUser, attemptGroup, "2770"},
-		{base + "/snapshots", coordinator, snapshotGroup, "0750"},
-	} {
-		if err := ensureHostRoot(nativeRoot(root.path), root.owner, root.group, root.mode); err != nil {
-			return err
-		}
-	}
-	currentInfo, err := os.Lstat(binary)
-	if err != nil || !os.SameFile(openedInfo, currentInfo) {
-		return errors.New("installed binary changed during installation")
-	}
-	sudoersPath := nativeRoot("/etc/sudoers.d/agent-symphony")
-	previousSudoers, previousErr := os.ReadFile(sudoersPath)
-	installed, err := writeSudoers(coordinator, binary)
-	if err != nil {
-		return err
-	}
-	currentInfo, err = os.Lstat(binary)
-	if err != nil || !os.SameFile(openedInfo, currentInfo) {
-		_ = rollbackSudoers(sudoersPath, previousSudoers, !installed && previousErr == nil)
-		return errors.New("installed binary changed during installation; sudo rules were not trusted")
 	}
 	return nil
 }
@@ -482,27 +435,6 @@ func exactSudoAuthorityFor(body []byte, binary string, orchestrator, setenv bool
 	}
 	valid := want[workerUser+":"+attemptGroup+"\x00"+binary+" agent-host implementation"] && want[reviewerUser+":"+snapshotGroup+"\x00"+binary+" agent-host review"]
 	return valid && (!orchestrator || want[reviewerUser+":"+snapshotGroup+"\x00"+binary+" agent-host orchestrator"])
-}
-
-func validateInstalledBinary(binary string) error {
-	prefix := "/usr/local/libexec/agent-symphony/"
-	rel := strings.TrimPrefix(binary, prefix)
-	if rel == binary || rel == "agent-symphony" || filepath.Dir(rel) == "." || filepath.Base(binary) != "agent-symphony" || strings.Contains(filepath.Dir(rel), string(os.PathSeparator)) {
-		return errors.New("current binary must use /usr/local/libexec/agent-symphony/<version>/agent-symphony")
-	}
-	for path := binary; ; path = filepath.Dir(path) {
-		info, err := os.Lstat(path)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 || fileUID(info) != 0 || fileGID(info) != 0 || info.Mode().Perm()&0o022 != 0 {
-			return fmt.Errorf("installed binary path component %s must be root:root and not group/world writable", path)
-		}
-		if path == binary && (!info.Mode().IsRegular() || info.Mode().Perm() != 0o755) {
-			return errors.New("current binary must be a root-owned regular file mode 0755")
-		}
-		if path == string(os.PathSeparator) {
-			break
-		}
-	}
-	return nil
 }
 
 func ensureHostRoot(path, owner, group, mode string) error {
@@ -743,40 +675,6 @@ func parseDSCLRecord(body []byte) map[string]string {
 		}
 	}
 	return result
-}
-
-func writeSudoers(coordinator, binary string) (bool, error) {
-	body := sudoersPolicy(coordinator, binary)
-	dir, path := nativeRoot("/etc/sudoers.d"), nativeRoot("/etc/sudoers.d/agent-symphony")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return false, err
-	}
-	tmp, err := os.CreateTemp(dir, ".agent-symphony-")
-	if err != nil {
-		return false, err
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	if _, err = io.WriteString(tmp, body); err == nil {
-		err = tmp.Sync()
-	}
-	if closeErr := tmp.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return false, err
-	}
-	if err := os.Chmod(name, 0o440); err != nil {
-		return false, err
-	}
-	if err := os.Chown(name, 0, 0); err != nil {
-		return false, err
-	}
-	if err := hostRun("visudo", "-cf", name); err != nil {
-		return false, err
-	}
-	_, statErr := os.Lstat(path)
-	return errors.Is(statErr, os.ErrNotExist), os.Rename(name, path)
 }
 
 func sudoersPolicy(coordinator, binary string) string {
@@ -1094,10 +992,10 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 	} else if mode != "implementation" {
 		return errors.New("agent-host mode must be implementation, review, orchestrator, orchestrator-proposal, or orchestrator-proposal-status")
 	}
-	// AGENT_SYMPHONY_LOCAL_ROOT is only ever set by the coordinator's own
-	// implementationBoundary/reviewBoundary when install-host was never run;
+	// AGENT_SYMPHONY_LOCAL_ROOT is set by the coordinator's rootless boundary;
 	// there is no separate OS identity to verify in that mode, only the same
-	// user the coordinator itself runs as.
+	// user the coordinator itself runs as. The legacy decoder branch is not
+	// selected by the production launcher.
 	var homeDir string
 	var err error
 	if localRoot != "" {
@@ -1216,7 +1114,7 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if err := config.VerifyWorkerExecutable(ctx, codexExecutable, profileDigest); err != nil {
 			return err
 		}
-		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgs(manifest.Worktree, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp}, Stdin: bytes.NewReader(request.Command.Input)})
+		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgsForExecutable(manifest.Worktree, codexExecutable, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp}, Stdin: bytes.NewReader(request.Command.Input)})
 	case "validate-cleanup", "cleanup":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot clean implementation attempts")
@@ -2281,24 +2179,33 @@ func belowRoot(path, root string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
 }
 
-func hostDiagnostic(stateRoot string) diagnostic {
-	return localHostDiagnostic(stateRoot)
-}
-
-// localHostDiagnostic validates the rootless runtime roots. Codex's managed
-// permission profile supplies the worker/owner authority boundary.
-func localHostDiagnostic(stateRoot string) diagnostic {
+func hostDiagnostic(codex, stateRoot string) diagnostic {
 	if strings.TrimSpace(stateRoot) == "" {
 		return diagnostic{"worker confinement", "fail", "runtime state root is required to provision the local attempt/snapshot roots", "Pass --runtime-state."}
+	}
+	if err := validatePrivateStateRoot(stateRoot); err != nil {
+		return diagnostic{"worker confinement", "fail", err.Error(), "Choose a private persistent --runtime-state path under the current user's home."}
 	}
 	for _, root := range []string{localAttemptRoot(stateRoot), localSnapshotRoot(stateRoot)} {
 		if err := verifyLocalAccess(root); err != nil {
 			return diagnostic{"worker confinement", "fail", err.Error(), "Repair " + root + " ownership and mode."}
 		}
 	}
-	message := "rootless Codex worker boundary is selected"
+	if err := configureProjectRuntimeState(stateRoot); err != nil {
+		return diagnostic{"worker confinement", "fail", err.Error(), "Repair the runtime state root and coordinator Codex installation."}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	proof, err := rootlessCodexVerify(ctx, localAttemptRoot(stateRoot), workerCodexHome(stateRoot), codex)
+	if err != nil {
+		return diagnostic{"worker confinement", "fail", err.Error(), "Install @openai/codex@0.153.0 and repair the managed sandbox profile. On Linux/WSL, the host must permit unprivileged user namespaces for bubblewrap."}
+	}
+	message := "real managed Codex sandbox confinement proof passed"
 	if hostIsolationInstalled() {
 		message += "; legacy install-host identities are present but unused"
+	}
+	if proof.SharedTempRead || proof.SharedTempWrite {
+		return diagnostic{"worker confinement", "warn", message + "; Codex cannot isolate shared temporary files on this platform", "Keep Agent Symphony authority and control paths under the private runtime state root."}
 	}
 	return diagnostic{"worker confinement", "pass", message, ""}
 }
