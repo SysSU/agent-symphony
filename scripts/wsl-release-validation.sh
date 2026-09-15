@@ -19,6 +19,7 @@ proof)
   test "$(command -v codex)" = "$codex_native"
   test "$(/usr/local/node/bin/node --version)" = v22.15.1
   test "$("$codex_native" --version)" = "codex-cli 0.153.0"
+  scripts/build-dashboard.sh
   config=.agent-symphony-ci.yaml
   go run ./cmd/agent-symphony init --config "$config"
   sed "s#\"codex\"#\"$codex_native\"#g" "$config" > "$config.native"

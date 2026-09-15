@@ -110,6 +110,7 @@ grep -qF 'codex_native=${2:-}' scripts/wsl-release-validation.sh
 grep -qF 'test -f "$codex_native" && test ! -L "$codex_native" && test -x "$codex_native"' scripts/wsl-release-validation.sh
 grep -qF 'test "$(id -u)" -ne 0' scripts/wsl-release-validation.sh
 grep -qF 'test "$(command -v codex)" = "$codex_native"' scripts/wsl-release-validation.sh
+test "$(grep -nF 'scripts/build-dashboard.sh' scripts/wsl-release-validation.sh | cut -d: -f1)" -lt "$(grep -nF 'go run ./cmd/agent-symphony init' scripts/wsl-release-validation.sh | cut -d: -f1)"
 grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl' scripts/wsl-release-validation.sh
 grep -qF "throw 'WSL release validation failed'" .github/workflows/release-validation.yml
 ! grep -F '$PATH' .github/workflows/release-validation.yml | grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl'
