@@ -37,7 +37,19 @@ jobs:
       - run: cmd/agent-symphony/dashboard/node_modules/.bin/playwright install --with-deps chromium
       - name: Install full-system test prerequisite (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y tmux
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap tmux
+      - name: Enable the Ubuntu runner's unprivileged namespace prerequisite
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if test -n "$current_userns" && test "$current_userns" != 1; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if test -n "$current_apparmor" && test "$current_apparmor" != 0; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Install full-system test prerequisite (macOS)
         if: matrix.os == 'macos-latest'
         run: brew install tmux
@@ -73,8 +85,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Failed to initialize WSL distribution: $distribution" }
           $rows = ((wsl --list --verbose) -join "`n") -replace "`0", ''
           if ($rows -notmatch "(?m)^\s*\*?\s*$distribution\s+\S+\s+2\s*$") { throw "WSL distribution is not version 2:`n$rows" }
-          wsl -d $distribution -- bash -lc 'set -euo pipefail; sudo env DEBIAN_FRONTEND=noninteractive apt-get update; sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git ruby tmux xz-utils'
+          wsl -d $distribution -- bash -lc 'set -euo pipefail; sudo env DEBIAN_FRONTEND=noninteractive apt-get update; sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap build-essential ca-certificates curl git ruby tmux xz-utils'
           if ($LASTEXITCODE -ne 0) { throw 'Failed to install WSL validation prerequisites' }
+          wsl -d $distribution -- bash -lc 'set -euo pipefail; current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"; if test -n "$current_userns" && test "$current_userns" != 1; then sudo sysctl -w kernel.unprivileged_userns_clone=1; fi; current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"; if test -n "$current_apparmor" && test "$current_apparmor" != 0; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi'
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to enable WSL unprivileged user namespaces' }
           wsl -d $distribution -- bash -lc 'rm -rf ~/agent-symphony-ci && mkdir ~/agent-symphony-ci'
           git archive --format=tar HEAD | wsl -d $distribution -- bash -lc 'tar -xf - -C ~/agent-symphony-ci'
           wsl -d $distribution -- bash -lc "cd ~/agent-symphony-ci; chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/live-pilot.sh scripts/live-pilot-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh; git init -q; git remote add origin '$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git'; git add .; git -c user.name=ci -c user.email=ci@invalid commit -qm snapshot"

@@ -2285,6 +2285,37 @@ func TestHostDiagnosticRejectsSharedTemporaryRuntimeState(t *testing.T) {
 	}
 }
 
+func TestSharedTemporaryPathCoversNativeSharedRoots(t *testing.T) {
+	for _, root := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
+		t.Run(root, func(t *testing.T) {
+			if !sharedTemporaryPath(filepath.Join(root, "agent-symphony-state")) {
+				t.Fatalf("shared root %q was accepted", root)
+			}
+		})
+	}
+	if sharedTemporaryPath(privateDiagnosticRoot(t)) {
+		t.Fatal("private home root was treated as shared temporary storage")
+	}
+}
+
+func TestHostDiagnosticRejectsDanglingSymlinkAncestorIntoSharedTemp(t *testing.T) {
+	root := privateDiagnosticRoot(t)
+	link := filepath.Join(root, "shared")
+	if err := os.Symlink(filepath.Join("/tmp", "agent-symphony-missing-331"), link); err != nil {
+		t.Fatal(err)
+	}
+	oldVerify := rootlessCodexVerify
+	rootlessCodexVerify = func(context.Context, string, string, string) (codexConfinementProof, error) {
+		t.Fatal("symlinked shared temporary state reached the Codex canary")
+		return codexConfinementProof{}, nil
+	}
+	t.Cleanup(func() { rootlessCodexVerify = oldVerify })
+	d := hostDiagnostic("codex", filepath.Join(link, "runtime"))
+	if d.Status != "fail" || !strings.Contains(d.Message, "symbolic links") {
+		t.Fatalf("diagnostic=%#v", d)
+	}
+}
+
 func privateDiagnosticRoot(t *testing.T) string {
 	t.Helper()
 	home, err := os.UserHomeDir()

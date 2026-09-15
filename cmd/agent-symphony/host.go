@@ -2153,6 +2153,9 @@ func hostDiagnostic(codex, stateRoot string) diagnostic {
 	if sharedTemporaryPath(stateRoot) {
 		return diagnostic{"worker confinement", "fail", "runtime state root must not be inside a shared temporary directory", "Choose a private persistent --runtime-state path under the current user's home."}
 	}
+	if pathContainsSymlink(stateRoot) {
+		return diagnostic{"worker confinement", "fail", "runtime state root path must not contain symbolic links", "Choose a direct private persistent --runtime-state path under the current user's home."}
+	}
 	for _, root := range []string{localAttemptRoot(stateRoot), localSnapshotRoot(stateRoot)} {
 		if err := verifyLocalAccess(root); err != nil {
 			return diagnostic{"worker confinement", "fail", err.Error(), "Repair " + root + " ownership and mode."}
@@ -2165,7 +2168,7 @@ func hostDiagnostic(codex, stateRoot string) diagnostic {
 	defer cancel()
 	proof, err := rootlessCodexVerify(ctx, codex, localAttemptRoot(stateRoot), workerCodexHome(stateRoot))
 	if err != nil {
-		return diagnostic{"worker confinement", "fail", err.Error(), "Install @openai/codex@0.153.0 and repair the managed sandbox profile."}
+		return diagnostic{"worker confinement", "fail", err.Error(), "Install @openai/codex@0.153.0 and repair the managed sandbox profile. On Linux/WSL, the host must permit unprivileged user namespaces for bubblewrap."}
 	}
 	message := "real managed Codex sandbox confinement proof passed"
 	if hostIsolationInstalled() {
@@ -2177,13 +2180,42 @@ func hostDiagnostic(codex, stateRoot string) diagnostic {
 	return diagnostic{"worker confinement", "pass", message, ""}
 }
 
-func sharedTemporaryPath(path string) bool {
-	for _, root := range []string{os.TempDir(), "/tmp", "/private/tmp"} {
-		if belowRoot(path, root) {
+func pathContainsSymlink(path string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return true
+	}
+	current := filepath.VolumeName(abs) + string(os.PathSeparator)
+	for _, part := range strings.Split(strings.TrimPrefix(abs, current), string(os.PathSeparator)) {
+		if part == "" {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
 			return true
 		}
 	}
 	return false
+}
+
+func sharedTemporaryPath(path string) bool {
+	for _, root := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
+		if lexicallyBelowRoot(path, root) || belowRoot(path, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func lexicallyBelowRoot(path, root string) bool {
+	candidate, candidateErr := filepath.Abs(path)
+	root, rootErr := filepath.Abs(root)
+	rel, err := filepath.Rel(root, candidate)
+	return candidateErr == nil && rootErr == nil && err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
 }
 
 func fileUID(info os.FileInfo) int {

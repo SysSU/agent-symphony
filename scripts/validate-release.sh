@@ -52,8 +52,11 @@ git -C "$tmp/tag-binding" commit --allow-empty -qm second
 git -C "$tmp/tag-binding" tag -fam moved v0.0.0
 ! test "$(git -C "$tmp/tag-binding" rev-parse --verify 'v0.0.0^{commit}')" = "$event_sha"
 grep -qF 'wsl --install --distribution $distribution --web-download --no-launch' .github/workflows/release-validation.yml
-grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git ruby tmux xz-utils' .github/workflows/release-validation.yml
+grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap build-essential ca-certificates curl git ruby tmux xz-utils' .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install WSL validation prerequisites'" .github/workflows/release-validation.yml
+grep -qF 'kernel.unprivileged_userns_clone=1' .github/workflows/release-validation.yml
+grep -qF 'kernel.apparmor_restrict_unprivileged_userns=0' .github/workflows/release-validation.yml
+grep -qF "throw 'Failed to enable WSL unprivileged user namespaces'" .github/workflows/release-validation.yml
 grep -qF "\$goArchiveVersion = '1.26.0'" .github/workflows/release-validation.yml
 grep -qF 'https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz' .github/workflows/release-validation.yml
 grep -qF "sha256sum -c -" .github/workflows/release-validation.yml
