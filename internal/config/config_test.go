@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -63,8 +64,8 @@ func TestPinWorkerExecutableSurvivesConfiguredPathSwap(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "codex")
 	write := func(path, marker string, mode os.FileMode) {
 		t.Helper()
-		body := "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.153.4\\n'; else printf '" + marker + "\\n'; fi\n"
-		if err := os.WriteFile(path, []byte(body), mode); err != nil {
+		buildNativeCodexFixture(t, path, marker)
+		if err := os.Chmod(path, mode); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -92,10 +93,7 @@ func TestPinWorkerExecutableSurvivesConfiguredPathSwap(t *testing.T) {
 
 func TestPinWorkerExecutableReusesOnlyValidatedArtifactOnRestart(t *testing.T) {
 	stateRoot, source := pinnedTestRoot(t), filepath.Join(t.TempDir(), "codex")
-	original := []byte("#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.153.4\\n'; else printf 'original\\n'; fi\n")
-	if err := os.WriteFile(source, original, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	buildNativeCodexFixture(t, source, "original")
 	t.Setenv("PATH", filepath.Dir(source)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	pin := func() (string, Commands) {
 		t.Helper()
@@ -138,9 +136,7 @@ func TestPinWorkerExecutableReusesOnlyValidatedArtifactOnRestart(t *testing.T) {
 
 func TestPinWorkerExecutableRecoversUnmarkedWritableCrashResidue(t *testing.T) {
 	stateRoot, source := pinnedTestRoot(t), filepath.Join(t.TempDir(), "codex")
-	if err := os.WriteFile(source, []byte("#!/bin/sh\nprintf 'codex-cli 0.153.4\\n'\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	buildNativeCodexFixture(t, source, "original")
 	t.Setenv("PATH", filepath.Dir(source)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	commands := Default("o/r").Commands
 	commands.Implementation[0], commands.Reviewer[0] = source, source
@@ -189,9 +185,7 @@ func TestBindWorkerExecutableRejectsWritableArtifact(t *testing.T) {
 func TestPinWorkerExecutableRejectsDifferentAuditorBinary(t *testing.T) {
 	worker, auditor := filepath.Join(t.TempDir(), "codex"), filepath.Join(t.TempDir(), "codex")
 	for _, path := range []string{worker, auditor} {
-		if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'codex-cli 0.153.4\\n'\n"), 0o700); err != nil {
-			t.Fatal(err)
-		}
+		buildNativeCodexFixture(t, path, "original")
 	}
 	commands := Default("o/r").Commands
 	commands.Implementation[0], commands.Reviewer[0], commands.OrchestratorAudit[0] = worker, worker, auditor
@@ -219,9 +213,7 @@ func TestPinWorkerExecutableReplacesNPMNodeWrapperWithNativeBinary(t *testing.T)
 	if err := os.WriteFile(wrapper, []byte("#!/usr/bin/env node\nprocess.exit(99)\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(native, []byte("#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.153.4\\n'; else printf 'native\\n'; fi\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	buildNativeCodexFixture(t, native, "native")
 	commands := Default("o/r").Commands
 	commands.Implementation[0], commands.Reviewer[0], commands.OrchestratorAudit[0] = wrapper, wrapper, wrapper
 	if _, err := PinWorkerExecutable(t.Context(), pinnedTestRoot(t), &commands); err != nil {
@@ -230,6 +222,35 @@ func TestPinWorkerExecutableReplacesNPMNodeWrapperWithNativeBinary(t *testing.T)
 	output, err := exec.Command(commands.Implementation[0]).Output()
 	if err != nil || strings.TrimSpace(string(output)) != "native" || commands.OrchestratorAudit[0] != commands.Implementation[0] || strings.Contains(commands.Implementation[0], "codex.js") {
 		t.Fatalf("npm wrapper remained executable: implementation=%q audit=%q output=%q err=%v", commands.Implementation[0], commands.OrchestratorAudit[0], output, err)
+	}
+}
+
+func TestPinWorkerExecutableRejectsVersionValidDelegatingShim(t *testing.T) {
+	shim := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.153.4\\n'; else exec /bin/echo delegated; fi\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = shim, shim
+	if _, err := PinWorkerExecutable(t.Context(), pinnedTestRoot(t), &commands); err == nil || !strings.Contains(err.Error(), "not a native") {
+		t.Fatalf("version-valid delegating shim was accepted: %v", err)
+	}
+}
+
+func buildNativeCodexFixture(t *testing.T, path, marker string) {
+	t.Helper()
+	source := filepath.Join(t.TempDir(), "main.go")
+	body := "package main\nimport (\"fmt\"; \"os\")\nfunc main() { if len(os.Args) > 1 && os.Args[1] == \"--version\" { fmt.Println(\"codex-cli 0.153.4\"); return }; fmt.Println(" + strconv.Quote(marker) + ") }\n"
+	if err := os.WriteFile(source, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("go", "build", "-o", path, source)
+	command.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build native Codex fixture: %v: %s", err, output)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
 	}
 }
 
