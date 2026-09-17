@@ -1298,7 +1298,24 @@ func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.M
 		return nil
 	}
 	if err := stopAttemptSession(ctx, manifest); err != nil {
-		return err
+		if !errors.Is(err, os.ErrNotExist) || worktreeErr == nil {
+			return err
+		}
+		if _, bindingErr := os.Lstat(agentruntime.ImplementationBindingPath(manifest, manifest.LaunchID)); !errors.Is(bindingErr, os.ErrNotExist) {
+			return errors.Join(err, bindingErr)
+		}
+		proved, proofErr := readImplementationStopProof(root, manifest)
+		if proofErr != nil || !proved {
+			return errors.Join(err, proofErr)
+		}
+		result, sessionErr := runHostTmux(ctx, []string{"has-session", "-t", "=" + manifest.Session}, nil)
+		if sessionErr == nil || !exactTmuxSessionAbsent(result, manifest.Session) {
+			return errors.Join(sessionErr, errors.New("implementation session may still exist"))
+		}
+	} else if manifest.LaunchID != "" {
+		if err := writeImplementationStopProof(root, manifest); err != nil {
+			return err
+		}
 	}
 	if worktreeErr == nil {
 		if err := os.RemoveAll(want.Worktree); err != nil {
@@ -1306,6 +1323,107 @@ func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.M
 		}
 	}
 	return nil
+}
+
+type implementationStopProof struct {
+	Version        int                                      `json:"version"`
+	ManifestDigest string                                   `json:"manifest_digest"`
+	Binding        agentruntime.ImplementationLaunchBinding `json:"binding"`
+}
+
+// Runtime accepts binding JSON up to 128 KiB. Canonical re-encoding can
+// expand one input byte to six (for example '<' to \u003c); leave room for
+// that expansion and certificate fields while keeping proof reads bounded.
+const implementationStopProofMaxBytes = 1 << 20
+
+func implementationStopManifestDigest(manifest agentruntime.Manifest) (string, error) {
+	body, err := json.Marshal(manifest)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(body)), nil
+}
+
+func implementationStopProofPath(root string, manifest agentruntime.Manifest, create bool) (string, error) {
+	stateRoot := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(manifest.LogPath))))
+	if !agentruntime.ValidLaunchToken(manifest.LaunchID) || agentruntime.ValidateManifest(root, stateRoot, manifest) != nil {
+		return "", errors.New("implementation stop proof identity is invalid")
+	}
+	info, err := os.Lstat(stateRoot)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(info) {
+		return "", errors.New("implementation stop proof state root is unsafe")
+	}
+	directory := filepath.Join(stateRoot, "implementation-stop-proofs")
+	if create {
+		if err := os.Mkdir(directory, 0o700); err == nil {
+			if err := immutableDirSync(stateRoot); err != nil {
+				return "", err
+			}
+		} else if !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+	}
+	info, err = os.Lstat(directory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
+		return "", errors.New("implementation stop proof directory is unsafe")
+	}
+	return filepath.Join(directory, manifest.LaunchID+".json"), nil
+}
+
+func writeImplementationStopProof(root string, manifest agentruntime.Manifest) error {
+	path, err := implementationStopProofPath(root, manifest, true)
+	if err != nil {
+		return err
+	}
+	binding, err := agentruntime.ReadImplementationBinding(manifest)
+	if err != nil {
+		return err
+	}
+	digest, err := implementationStopManifestDigest(manifest)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(implementationStopProof{Version: 1, ManifestDigest: digest, Binding: binding})
+	if err != nil || len(body) > implementationStopProofMaxBytes {
+		return errors.New("implementation stop proof is too large")
+	}
+	if err := writeImmutable(path, body); err != nil {
+		return err
+	}
+	proved, err := readImplementationStopProof(root, manifest)
+	if err != nil || !proved {
+		return errors.Join(err, errors.New("implementation stop proof was not durable"))
+	}
+	return nil
+}
+
+func readImplementationStopProof(root string, manifest agentruntime.Manifest) (bool, error) {
+	path, err := implementationStopProofPath(root, manifest, false)
+	if err != nil {
+		return false, err
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false, err
+	}
+	listed, listErr := os.Lstat(path)
+	opened, statErr := file.Stat()
+	body, readErr := io.ReadAll(io.LimitReader(file, implementationStopProofMaxBytes+1))
+	closeErr := file.Close()
+	if listErr != nil || statErr != nil || readErr != nil || closeErr != nil || !os.SameFile(listed, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 || !ownedByCurrentUser(opened) || len(body) > implementationStopProofMaxBytes {
+		return false, errors.New("implementation stop proof is unsafe")
+	}
+	var proof implementationStopProof
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&proof) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return false, errors.New("implementation stop proof conflicts with durable identity")
+	}
+	digest, digestErr := implementationStopManifestDigest(manifest)
+	if digestErr != nil || proof.Version != 1 || proof.ManifestDigest != digest || !agentruntime.ValidImplementationBinding(manifest, proof.Binding, manifest.LaunchID) {
+		return false, errors.New("implementation stop proof conflicts with durable identity")
+	}
+	return true, nil
 }
 
 func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) error {

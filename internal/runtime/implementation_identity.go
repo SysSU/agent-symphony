@@ -297,7 +297,7 @@ func (binding ImplementationLaunchBinding) Matches(manifest Manifest, pane Imple
 }
 
 func WriteImplementationBinding(manifest Manifest, binding ImplementationLaunchBinding) error {
-	if binding.Version != 1 || !validImplementationRole(binding.Role) || binding.Token != manifest.LaunchToken || binding.SessionName != manifest.Session || binding.StartPath != manifest.Worktree || !tmuxLaunchID(binding.EffectID) || binding.Command == "" || binding.PanePID < 2 || binding.ServerPID < 2 || binding.ServerStart == 0 || !tmuxID(binding.SessionID, '$') || !tmuxID(binding.PaneID, '%') {
+	if !ValidImplementationBinding(manifest, binding, binding.EffectID) {
 		return errors.New("implementation launch binding is invalid")
 	}
 	path := ImplementationBindingPath(manifest, binding.EffectID)
@@ -349,6 +349,12 @@ func ReadImplementationBinding(manifest Manifest) (ImplementationLaunchBinding, 
 	return readImplementationBinding(manifest, manifest.LaunchID)
 }
 
+// ValidImplementationBinding checks the durable binding's complete identity,
+// including fields needed after its original file has been removed.
+func ValidImplementationBinding(manifest Manifest, binding ImplementationLaunchBinding, launchID string) bool {
+	return binding.Version == 1 && validImplementationRole(binding.Role) && binding.Token == manifest.LaunchToken && binding.SessionName == manifest.Session && binding.StartPath == manifest.Worktree && binding.EffectID == launchID && tmuxLaunchID(launchID) && binding.Command != "" && binding.PanePID >= 2 && binding.ServerPID >= 2 && binding.ServerStart != 0 && tmuxID(binding.SessionID, '$') && tmuxID(binding.PaneID, '%')
+}
+
 func readImplementationBinding(manifest Manifest, launchID string) (ImplementationLaunchBinding, error) {
 	if !tmuxLaunchID(launchID) {
 		return ImplementationLaunchBinding{}, errors.New("implementation launch ID is invalid")
@@ -368,7 +374,7 @@ func readImplementationBinding(manifest Manifest, launchID string) (Implementati
 	var binding ImplementationLaunchBinding
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&binding) != nil || decoder.Decode(&struct{}{}) != io.EOF || binding.Version != 1 || !validImplementationRole(binding.Role) || binding.Token != manifest.LaunchToken || binding.SessionName != manifest.Session || binding.StartPath != manifest.Worktree || binding.EffectID != launchID || binding.Command == "" || binding.PanePID < 2 || binding.ServerPID < 2 || binding.ServerStart == 0 || !tmuxID(binding.SessionID, '$') || !tmuxID(binding.PaneID, '%') {
+	if decoder.Decode(&binding) != nil || decoder.Decode(&struct{}{}) != io.EOF || !ValidImplementationBinding(manifest, binding, launchID) {
 		return ImplementationLaunchBinding{}, fmt.Errorf("implementation launch binding is invalid")
 	}
 	return binding, nil
