@@ -1370,13 +1370,18 @@ func TestPermanentRemovalRejectsDirtyOrUnpublishedWorkAndRetriesSafely(t *testin
 		t.Fatalf("create unrelated keeper pane: %v: %s", err, output)
 	}
 	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("c", 32), strings.Repeat("d", 32)
-	manifest.LogPath = filepath.Join(root, "attempts", "o-r", "23-1", "agent.log")
+	manifest.LogPath = filepath.Join(root, "attempts", internalgithub.RepositoryIdentifier(manifest.Repository), "23-1", "agent.log")
+	manifest.ReviewState, manifest.ReviewHead, manifest.ReviewFindings = "findings-queued", publishedHead, []string{strings.Repeat("finding", 3000)}
+	if body, err := json.Marshal(manifest); err != nil || len(body) <= 16<<10 || agentruntime.ValidateManifest(root, root, manifest) != nil {
+		t.Fatalf("large review manifest is not valid: size=%d err=%v", len(body), err)
+	}
 	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	mustWriteFile(t, agentruntime.ResultPath(manifest.Worktree), `{"type":"agent-symphony-result-v1"}`)
 	gate := agentruntime.ImplementationGateChannel(manifest.LaunchID)
-	parked := []string{"wait-for", "-L", gate, ";", "new-session", "-d", "-s", manifest.Session, "-c", manifest.Worktree, "--", "/bin/sh", "-c", `"$1" wait-for -L "$2" && "$1" wait-for -U "$2" && shift 2 && exec "$@"`, "agent-symphony-gate", tmuxBinary, gate}
+	gateScript := `"$1" wait-for -L "$2" && "$1" wait-for -U "$2" && shift 2 && exec "$@" #` + strings.Repeat(`\`, 10<<10)
+	parked := []string{"wait-for", "-L", gate, ";", "new-session", "-d", "-s", manifest.Session, "-c", manifest.Worktree, "--", "/bin/sh", "-c", gateScript, "agent-symphony-gate", tmuxBinary, gate}
 	parked = append(parked, agentruntime.BoundPaneExitStatusCommand(os.Args[0], tmuxBinary, manifest, []string{"/bin/sh"})...)
 	if output, err := exec.Command(tmuxBinary, parked...).CombinedOutput(); err != nil {
 		t.Fatalf("create bound implementation pane: %v: %s", err, output)
@@ -1396,6 +1401,9 @@ func TestPermanentRemovalRejectsDirtyOrUnpublishedWorkAndRetriesSafely(t *testin
 	if err != nil || agentruntime.WriteImplementationBinding(manifest, binding) != nil {
 		t.Fatalf("bind implementation pane: %v, pane=%#v manifest=%#v", err, pane, manifest)
 	}
+	if body, err := json.Marshal(binding); err != nil || len(body) <= 16<<10 {
+		t.Fatalf("fixture binding is not large enough: %d %v", len(body), err)
+	}
 	oldExec := hostExecRunner
 	hostExecRunner = (agentruntime.ExecRunner{}).Run
 	t.Cleanup(func() { hostExecRunner = oldExec })
@@ -1405,16 +1413,175 @@ func TestPermanentRemovalRejectsDirtyOrUnpublishedWorkAndRetriesSafely(t *testin
 	if _, err := os.Stat(manifest.Worktree); err != nil {
 		t.Fatalf("preflight mutated worktree: %v", err)
 	}
-	for range 2 {
-		if err := permanentlyRemoveAttempt(t.Context(), request(publishedHead), root, true); err != nil {
-			t.Fatalf("idempotent removal: %v", err)
-		}
+	// Stop the real pane under its attested binding. A later accepted binding
+	// file can use noncanonical JSON without inventing a live pane with a
+	// different command; cleanup must still bound the durable proof.
+	if err := stopAttemptSession(t.Context(), manifest); err != nil {
+		t.Fatalf("stop bound implementation pane: %v", err)
+	}
+	binding.Command += strings.Repeat("<", 80<<10)
+	canonicalBinding, err := json.Marshal(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noncanonicalBinding := bytes.ReplaceAll(canonicalBinding, []byte(`\u003c`), []byte("<"))
+	if len(noncanonicalBinding)+1 > 128<<10 || len(canonicalBinding) <= 132<<10 {
+		t.Fatalf("fixture binding does not cross proof limit: persisted=%d canonical=%d", len(noncanonicalBinding)+1, len(canonicalBinding))
+	}
+	bindingPath := agentruntime.ImplementationBindingPath(manifest, manifest.LaunchID)
+	if err := os.Remove(bindingPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bindingPath, append(noncanonicalBinding, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := agentruntime.ReadImplementationBinding(manifest); err != nil || accepted != binding {
+		t.Fatalf("noncanonical near-limit binding was not accepted: err=%v", err)
+	}
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, strings.Repeat("f", 64)
+	t.Setenv("AGENT_SYMPHONY_WORKER_PROFILE_DIGEST", manifest.WorkerProfileDigest)
+	if err := permanentlyRemoveAttempt(t.Context(), request(publishedHead), root, true); err != nil {
+		t.Fatalf("first removal: %v", err)
+	}
+	// Simulate the external cleanup finishing before its effect marker and owner
+	// completion: compatibility cleanup deletes the original launch binding.
+	runtimeState := &agentruntime.Runtime{Root: root, StateRoot: root}
+	if err := runtimeState.ForgetCompatibility(manifest); err != nil {
+		t.Fatalf("forget compatibility resources: %v", err)
+	}
+	if _, err := agentruntime.ReadImplementationBinding(manifest); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("test did not remove original launch binding: %v", err)
+	}
+	proof, err := implementationStopProofPath(root, manifest, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(proof, proof+".held"); err != nil {
+		t.Fatal(err)
+	}
+	if err := permanentlyRemoveAttempt(t.Context(), request(publishedHead), root, true); err == nil {
+		t.Fatal("missing durable stop proof authorized replay")
+	}
+	if err := os.Rename(proof+".held", proof); err != nil {
+		t.Fatal(err)
+	}
+	changed := manifest
+	changed.WorkerGeneration = manifest.WorkerGeneration + 1
+	changedBody, _ := json.Marshal(permanentRemovalRequest{Manifest: changed, PublishedHead: publishedHead})
+	if err := permanentlyRemoveAttempt(t.Context(), changedBody, root, true); err == nil {
+		t.Fatal("stop proof for another generation authorized replay")
+	}
+	original, err := os.ReadFile(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var validProof implementationStopProof
+	if err := json.Unmarshal(original, &validProof); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		corrupt func(*implementationStopProof)
+	}{
+		{"manifest digest", func(p *implementationStopProof) { p.ManifestDigest = strings.Repeat("0", 64) }},
+		{"binding version", func(p *implementationStopProof) { p.Binding.Version = 0 }},
+		{"role", func(p *implementationStopProof) { p.Binding.Role = "invalid" }},
+		{"server PID", func(p *implementationStopProof) { p.Binding.ServerPID = 0 }},
+		{"server start", func(p *implementationStopProof) { p.Binding.ServerStart = 0 }},
+		{"session ID", func(p *implementationStopProof) { p.Binding.SessionID = "invalid" }},
+		{"pane ID", func(p *implementationStopProof) { p.Binding.PaneID = "invalid" }},
+		{"pane PID", func(p *implementationStopProof) { p.Binding.PanePID = 0 }},
+		{"command", func(p *implementationStopProof) { p.Binding.Command = "" }},
+	} {
+		t.Run("corrupt proof "+test.name, func(t *testing.T) {
+			corrupt := validProof
+			test.corrupt(&corrupt)
+			body, _ := json.Marshal(corrupt)
+			if err := os.Remove(proof); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_ = os.Remove(proof)
+				if err := writeImmutable(proof, original); err != nil {
+					t.Error(err)
+				}
+			})
+			if err := writeImmutable(proof, body); err != nil {
+				t.Fatal(err)
+			}
+			if proved, err := readImplementationStopProof(root, manifest); err == nil || proved {
+				t.Fatalf("corrupt stop proof authorized replay: proved=%t err=%v", proved, err)
+			}
+			if err := permanentlyRemoveAttempt(t.Context(), request(publishedHead), root, true); err == nil {
+				t.Fatal("corrupt stop proof authorized cleanup replay")
+			}
+		})
+	}
+	manifestJSON, _ := json.Marshal(manifest)
+	replay := exec.Command(os.Args[0], "-test.run=^TestImplementationStopProofFreshProcess$")
+	replay.Env = append(os.Environ(), "AGENT_SYMPHONY_STOP_PROOF_ROOT="+root, "AGENT_SYMPHONY_STOP_PROOF_MANIFEST="+string(manifestJSON), "AGENT_SYMPHONY_STOP_PROOF_HEAD="+publishedHead)
+	if output, err := replay.CombinedOutput(); err != nil {
+		t.Fatalf("fresh-process cleanup replay failed: %v: %s", err, output)
+	}
+	runtimeState.VerifyWorker = func(context.Context) error { return nil }
+	executor := agentruntime.EffectExecutor{
+		Runtime: runtimeState,
+		Cleanup: func(ctx context.Context, _ agentruntime.EffectRequest) error {
+			if err := permanentlyRemoveAttempt(ctx, request(publishedHead), root, true); err != nil {
+				return err
+			}
+			return runtimeState.ForgetCompatibility(manifest)
+		},
+		VerifyCleanup: func(ctx context.Context, _ agentruntime.EffectRequest) (bool, error) {
+			return runtimeState.VerifyResourcesGone(ctx, manifest) == nil, nil
+		},
+	}
+	effect, err := executor.BindRequest(agentruntime.EffectRequest{Action: agentruntime.EffectCleanup, Attempt: agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}, Manifest: manifest, Cleanup: agentruntime.EffectCleanupPolicy{Action: "remove", PublishedHead: publishedHead}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect.Identity = agentruntime.EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: strings.Repeat("e", 32)}
+	effect.Identity.RequestDigest, err = agentruntime.EffectRequestDigest(effect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(root, "runtime-effects", effect.Identity.EffectID+".done")
+	if _, err := os.Lstat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("effect marker exists before replay: %v", err)
+	}
+	result, err := executor.Execute(t.Context(), effect)
+	if err != nil || result.Disposition != agentruntime.EffectResultReady {
+		t.Fatalf("replay after external success did not complete effect: result=%#v err=%v", result, err)
+	}
+	if _, err := os.Lstat(marker); err != nil {
+		t.Fatalf("replay did not durably write effect marker: %v", err)
+	}
+	if output, err := exec.Command(tmuxBinary, "has-session", "-t", "=keeper").CombinedOutput(); err != nil {
+		t.Fatalf("cleanup killed unrelated keeper session: %v: %s", err, output)
 	}
 	if output, err := exec.Command(tmuxBinary, "has-session", "-t", "="+manifest.Session).CombinedOutput(); err == nil {
 		t.Fatalf("bound tmux session survived removal: %s", output)
 	}
 	if _, err := os.Stat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("worktree remains: %v", err)
+	}
+}
+
+func TestImplementationStopProofFreshProcess(t *testing.T) {
+	root := os.Getenv("AGENT_SYMPHONY_STOP_PROOF_ROOT")
+	if root == "" {
+		return
+	}
+	var manifest agentruntime.Manifest
+	if err := json.Unmarshal([]byte(os.Getenv("AGENT_SYMPHONY_STOP_PROOF_MANIFEST")), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if proved, err := readImplementationStopProof(root, manifest); err != nil || !proved {
+		t.Fatalf("durable proof unavailable after restart: proved=%t err=%v", proved, err)
+	}
+	body, _ := json.Marshal(permanentRemovalRequest{Manifest: manifest, PublishedHead: os.Getenv("AGENT_SYMPHONY_STOP_PROOF_HEAD")})
+	if err := permanentlyRemoveAttempt(t.Context(), body, root, true); err != nil {
+		t.Fatalf("fresh-process cleanup replay: %v", err)
 	}
 }
 
