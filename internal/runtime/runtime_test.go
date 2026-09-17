@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	goruntime "runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -36,13 +38,91 @@ type fakeRunner struct {
 	seen            []Command
 }
 
+func TestWorkerStatusRequestIsGenerationAndLaunchBound(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.Mkdir(PrivatePath(workspace), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{Worktree: workspace, LaunchID: strings.Repeat("a", 32)}
+	write := func(generation, sequence uint64, status, reason string) {
+		t.Helper()
+		body, _ := json.Marshal(workerStatusRequest{Type: "agent-symphony-status-v1", Generation: generation, LaunchID: manifest.LaunchID, Sequence: sequence, Status: status, Reason: reason})
+		if err := os.WriteFile(StatusPath(workspace), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(7, 1, "needs-attention", "operator decision required")
+	observed, err := observeWorkerStatus(manifest, 7)
+	if err != nil || observed.WorkerStatus != "needs-attention" || observed.WorkerStatusReason != "operator decision required" || observed.WorkerStatusSeq != 1 {
+		t.Fatalf("observed=%#v err=%v", observed, err)
+	}
+	write(6, 2, "clear", "stale worker")
+	unchanged, err := observeWorkerStatus(observed, 7)
+	if err != nil || unchanged.WorkerStatus != observed.WorkerStatus || unchanged.WorkerStatusReason != observed.WorkerStatusReason || unchanged.WorkerStatusSeq != observed.WorkerStatusSeq {
+		t.Fatalf("stale generation status blocked lifecycle or changed status: %#v err=%v", unchanged, err)
+	}
+	write(7, 1, "clear", "out of order")
+	unchanged, err = observeWorkerStatus(observed, 7)
+	if err != nil || unchanged.WorkerStatus != observed.WorkerStatus || unchanged.WorkerStatusSeq != observed.WorkerStatusSeq {
+		t.Fatalf("out-of-order request changed status: %#v err=%v", unchanged, err)
+	}
+}
+
+func TestWorkerEnvironmentUsesOnlyAttemptPrivateTempAndStatusPaths(t *testing.T) {
+	workspace := t.TempDir()
+	manifest := Manifest{Worktree: workspace, LaunchID: strings.Repeat("b", 32)}
+	environment, err := workspaceEnvironment([]string{"PATH=/bin", "TMPDIR=/host/tmp", "GOCACHE=/host/cache", "GH_TOKEN=secret"}, manifest, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range environment {
+		if strings.Contains(entry, "/host/") || strings.HasPrefix(entry, "GH_TOKEN=") {
+			t.Fatalf("host path or GitHub credential survived: %q", entry)
+		}
+	}
+	for _, want := range []string{WorkerStatusEnvironment + "=" + StatusPath(workspace), WorkerGenerationEnv + "=9", WorkerLaunchIDEnv + "=" + manifest.LaunchID, "TMPDIR=" + filepath.Join(PrivatePath(workspace), "tmp")} {
+		if !slices.Contains(environment, want) {
+			t.Fatalf("missing managed worker environment %q in %#v", want, environment)
+		}
+	}
+}
+
+type inheritedEnvironmentRunner struct{}
+
+func (inheritedEnvironmentRunner) Run(ctx context.Context, command Command) (Result, error) {
+	command.Env = append(os.Environ(), command.Env...)
+	return (ExecRunner{}).Run(ctx, command)
+}
+
+type swapOnGuardRunner struct {
+	mu   sync.Mutex
+	swap func() error
+}
+
+func (runner *swapOnGuardRunner) Run(ctx context.Context, command Command) (Result, error) {
+	runner.mu.Lock()
+	if len(command.Args) > 0 && command.Args[0] == "if-shell" && runner.swap != nil {
+		swap := runner.swap
+		runner.swap = nil
+		runner.mu.Unlock()
+		if err := swap(); err != nil {
+			return Result{}, err
+		}
+	} else {
+		runner.mu.Unlock()
+	}
+	return (inheritedEnvironmentRunner{}).Run(ctx, command)
+}
+
 type fakeSession struct {
-	dead, stopped, pending bool
-	status                 int
-	signal                 string
-	output                 string
-	context                string
-	agent                  []string
+	dead, stopped, pending  bool
+	status                  int
+	signal                  string
+	output                  string
+	context                 string
+	agent                   []string
+	startCommand            []string
+	token, worktree, paneID string
 }
 
 func newFakeRunner() *fakeRunner {
@@ -96,10 +176,24 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 		return Result{}, errors.New("missing tmux operation")
 	}
 	args := command.Args
-	if offset := slices.Index(args, ";"); offset >= 0 && offset+1 < len(args) {
+	if offset := slices.Index(args, "new-session"); offset >= 0 {
+		args = args[offset:]
+	} else if offset := slices.Index(args, ";"); offset >= 0 && offset+1 < len(args) {
 		args = args[offset+1:]
 	}
 	op := args[0]
+	guarded := op == "if-shell"
+	guardSession := ""
+	if guarded {
+		_, suffix, _ := strings.Cut(args[4], "#{==:#{session_name},")
+		guardSession, _, _ = strings.Cut(suffix, "}")
+		args = parseFakeTmuxCommand(args[5])
+		if len(args) == 0 {
+			return Result{}, errors.New("invalid guarded tmux command")
+		}
+		op = args[0]
+		f.seen = append(f.seen, Command{Name: command.Name, Args: args})
+	}
 	if f.fail == op {
 		output, err := f.failOutput, f.failErr
 		if output == "" {
@@ -114,15 +208,43 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 		return Result{Output: "canary failure detail", Code: code, Exited: true}, errors.New("fake exit")
 	}
 	session := valueAfter(args, "-s")
+	if guarded {
+		session = guardSession
+	}
 	if session == "" {
 		target := valueAfter(args, "-t")
-		if target != "" && !strings.HasPrefix(target, "=") {
-			return Result{}, errors.New("inexact tmux target")
+		if strings.HasPrefix(target, "%") {
+			for name, pane := range f.sessions {
+				if pane.paneID == target {
+					session = name
+					break
+				}
+			}
+		} else {
+			if target != "" && !strings.HasPrefix(target, "=") {
+				return Result{}, errors.New("inexact tmux target")
+			}
+			session = strings.TrimPrefix(target, "=")
+			session = strings.TrimSuffix(session, ":0.0")
 		}
-		session = strings.TrimPrefix(target, "=")
-		session = strings.TrimSuffix(session, ":0.0")
 	}
 	switch op {
+	case "list-panes":
+		var names []string
+		for name := range f.sessions {
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		var rows strings.Builder
+		if len(names) == 0 {
+			// The fake server remains independently observable after its
+			// attempt pane exits, so absence is not inferred from a name.
+			rows.WriteString("300|400|%999999\n")
+		}
+		for _, name := range names {
+			fmt.Fprintf(&rows, "300|400|%s\n", f.sessions[name].paneID)
+		}
+		return Result{Output: rows.String()}, nil
 	case "has-session":
 		if _, ok := f.sessions[session]; !ok {
 			return Result{Code: 1, Exited: true}, errors.New("missing session")
@@ -140,7 +262,22 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 		if _, ok := f.sessions[session]; ok {
 			return Result{}, errors.New("existing session")
 		}
-		f.sessions[session] = &fakeSession{}
+		launch := []string{"/bin/sh"}
+		if index := slices.Index(args, "implementation-gate"); index >= 1 {
+			index-- // Include the helper binary in the pane's immutable start command.
+			end := slices.Index(args[index:], ";")
+			if end >= 0 {
+				launch = slices.Clone(args[index : index+end])
+			}
+		}
+		s := &fakeSession{worktree: valueAfter(args, "-c"), agent: slices.Clone(launch), startCommand: slices.Clone(launch), paneID: fmt.Sprintf("%%%d", len(f.sessions))}
+		if index := slices.Index(args, "@agent-symphony-launch-token"); index >= 0 && index+1 < len(args) {
+			s.token = args[index+1]
+		}
+		f.sessions[session] = s
+		if slices.Contains(args, "-P") {
+			return Result{Output: fmt.Sprintf("%s|$0|%s|200|300|400|%s||%s", session, s.paneID, s.worktree, strings.Join(s.startCommand, " "))}, nil
+		}
 	case "set-option":
 		if (slices.Contains(args, "remain-on-exit") || slices.Contains(args, "history-limit")) && !slices.Contains(args, "-w") {
 			return Result{}, errors.New("window option missing -w")
@@ -151,6 +288,7 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 			return Result{}, errors.New("missing respawn command separator")
 		}
 		f.sessions[session].agent = slices.Clone(args[separator+1:])
+		f.sessions[session].startCommand = slices.Clone(f.sessions[session].agent)
 		if slices.Contains(f.sessions[session].agent, "fast-exit") {
 			f.sessions[session].dead, f.sessions[session].status = true, 42
 		}
@@ -162,10 +300,13 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 	case "display-message":
 		s := f.sessions[session]
 		if s == nil {
-			return Result{}, errors.New("missing session")
+			return Result{Code: 1, Exited: true}, errors.New("missing session")
 		}
 		if slices.Contains(args, "#{pane_start_command}") {
-			return Result{Output: strings.Join(s.agent, " ")}, nil
+			return Result{Output: strings.Join(s.startCommand, " ")}, nil
+		}
+		if slices.Contains(args, ImplementationPaneFormat) {
+			return Result{Output: fmt.Sprintf("%s|$0|%s|200|300|400|%s|%s|%s", session, s.paneID, s.worktree, s.token, strings.Join(s.startCommand, " "))}, nil
 		}
 		if slices.Contains(args, PaneStatusFormat) {
 			if !s.dead {
@@ -193,6 +334,27 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 		if !f.keepAfterKill {
 			delete(f.sessions, session)
 		}
+	case "kill-pane":
+		if !f.keepAfterKill {
+			delete(f.sessions, session)
+		}
+	case "wait-for":
+		if guarded && slices.Contains(args, "-U") {
+			s := f.sessions[session]
+			if s == nil {
+				return Result{}, errors.New("missing session")
+			}
+			if index := slices.Index(s.agent, "implementation-gate"); index >= 0 {
+				separator := slices.Index(s.agent[index:], "--")
+				if separator < 0 {
+					return Result{}, errors.New("missing implementation gate command")
+				}
+				s.agent = slices.Clone(s.agent[index+separator+1:])
+				if slices.Contains(s.agent, "fast-exit") {
+					s.dead, s.status = true, 42
+				}
+			}
+		}
 	}
 	return Result{}, nil
 }
@@ -204,6 +366,39 @@ func valueAfter(args []string, flag string) string {
 		}
 	}
 	return ""
+}
+
+func parseFakeTmuxCommand(input string) []string {
+	var args []string
+	var word strings.Builder
+	quoted, escaped, started := false, false, false
+	for _, char := range input {
+		switch {
+		case escaped:
+			word.WriteRune(char)
+			escaped = false
+		case char == '\\' && !quoted:
+			escaped, started = true, true
+		case char == '\'':
+			quoted, started = !quoted, true
+		case char == ' ' && !quoted:
+			if started {
+				args = append(args, word.String())
+				word.Reset()
+				started = false
+			}
+		default:
+			word.WriteRune(char)
+			started = true
+		}
+	}
+	if quoted || escaped {
+		return nil
+	}
+	if started {
+		args = append(args, word.String())
+	}
+	return args
 }
 
 func environmentValue(environment []string, name string) string {
@@ -385,18 +580,19 @@ func TestPaneExitStatusProcessHelper(t *testing.T) {
 	os.Exit(code)
 }
 
-func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *testing.T) {
+func TestLifecycleCreatesUncredentialedSessionWithoutCredentialedRepository(t *testing.T) {
 	r, fake, attempt, primary := testRuntime(t)
 	before := gitOutput(t, primary, "status", "--porcelain=v1", "--branch")
 	t.Setenv("GITHUB_TOKEN", "credential-canary")
-	manifest, err := r.PrepareAndStart(context.Background(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, context.Background(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.State != "running" || fake.buffers[manifest.Session] != attempt.Context {
+	buffer := "as-start-" + manifest.LaunchID
+	if manifest.State != "running" || fake.buffers[buffer] != attempt.Context || fake.buffers[manifest.Session] != "" {
 		t.Fatalf("unexpected launch: %#v, %#v", manifest, fake.sessions[manifest.Session])
 	}
-	want := PaneExitStatusCommand(r.Helper, "tmux", PromptCommand(r.Helper, "tmux", manifest.Session, ResultPath(manifest.Worktree), attempt.Command))
+	want := BoundPromptCommand(r.Helper, "tmux", buffer, ResultPath(manifest.Worktree), manifest, attempt.Command)
 	if !slices.Equal(fake.sessions[manifest.Session].agent, want) {
 		t.Fatalf("agent command = %#v, want %#v", fake.sessions[manifest.Session].agent, want)
 	}
@@ -409,7 +605,6 @@ func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *tes
 	if got := gitOutput(t, primary, "status", "--porcelain=v1", "--branch"); got != before {
 		t.Fatalf("primary checkout changed: before %q after %q", before, got)
 	}
-	credentialAvailable, repositoryBound := false, false
 	for _, command := range fake.seen {
 		if command.Name != "tmux" {
 			continue
@@ -418,17 +613,15 @@ func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *tes
 		if strings.Contains(args, "credential-canary") {
 			t.Fatal("GitHub credential reached tmux argv")
 		}
-		credentialAvailable = credentialAvailable || strings.Contains(env, "GITHUB_TOKEN=credential-canary")
-		repositoryBound = repositoryBound || strings.Contains(env, "GH_REPO=owner/repo")
-	}
-	if !credentialAvailable || !repositoryBound {
-		t.Fatal("GitHub CLI authentication or repository binding was unavailable in the implementation session")
+		if strings.Contains(env, "GITHUB_TOKEN=") || strings.Contains(env, "GH_REPO=") {
+			t.Fatal("GitHub authority reached the implementation session")
+		}
 	}
 	info, err := os.Stat(r.manifestPath(attempt))
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("manifest mode: %v, %v", info, err)
 	}
-	if _, err := r.PrepareAndStart(context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "already exist") {
+	if _, err := prepareAndStartFixture(t, r, context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "already exist") {
 		t.Fatalf("duplicate start = %v", err)
 	}
 	got, err := r.Discover()
@@ -441,6 +634,43 @@ func TestLifecycleCreatesCredentialedSessionWithoutCredentialedRepository(t *tes
 	}
 	if _, err := r.Discover(); err == nil || !strings.Contains(err.Error(), "deterministic") {
 		t.Fatalf("tampered manifest discovery = %v", err)
+	}
+}
+
+func TestDirectBoundRuntimeMutatorsCannotBypassOwner(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(r.manifestPath(attempt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func() error{
+		"prepare-start": func() error { _, err := r.PrepareAndStart(t.Context(), attempt); return err },
+		"handoff":       func() error { _, err := r.ResumeHandoff(t.Context(), attempt); return err },
+		"monitor":       func() error { _, err := r.Monitor(t.Context(), attempt); return err },
+		"cancel":        func() error { _, err := r.Cancel(t.Context(), attempt, "operator cancel"); return err },
+		"review": func() error {
+			_, err := r.RecordReview(attempt, "running", ReviewModePlan, "target", "", "", "", "")
+			return err
+		},
+		"findings": func() error {
+			_, err := r.RecordReviewFindings(attempt, manifest.BaseSHA, []string{"finding"}, true, false)
+			return err
+		},
+		"forget": func() error { return r.Forget(manifest) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := mutate(); err == nil {
+				t.Fatal("direct V2 mutation bypassed owner")
+			}
+			stored, err := os.ReadFile(r.manifestPath(attempt))
+			if err != nil || !bytes.Equal(stored, before) || fake.sessions[manifest.Session] == nil {
+				t.Fatalf("direct V2 mutation changed runtime: manifest=%q err=%v session=%#v", stored, err, fake.sessions[manifest.Session])
+			}
+		})
 	}
 }
 
@@ -457,12 +687,12 @@ func TestInteractiveLifecycleKeepsAgentOnTmuxAndRequiresResult(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			r, fake, attempt, _ := testRuntime(t)
 			attempt.Command, attempt.Interactive = []string{"interactive-agent", "--tty"}, true
-			manifest, err := r.PrepareAndStart(t.Context(), attempt)
+			manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := PaneExitStatusCommand(r.Helper, "tmux", []string{"interactive-agent", "--tty", attempt.Context})
-			if !manifest.Interactive || fake.buffers[manifest.Session] != "" || !slices.Equal(fake.sessions[manifest.Session].agent, want) {
+			want := BoundPaneExitStatusCommand(r.Helper, "tmux", manifest, []string{"interactive-agent", "--tty", attempt.Context})
+			if !manifest.Interactive || fake.buffers["as-start-"+manifest.LaunchID] != "" || !slices.Equal(fake.sessions[manifest.Session].agent, want) {
 				t.Fatalf("interactive launch manifest=%#v session=%#v buffers=%#v", manifest, fake.sessions[manifest.Session], fake.buffers)
 			}
 			info, err := os.Lstat(ResultPath(manifest.Worktree))
@@ -482,7 +712,7 @@ func TestInteractiveLifecycleKeepsAgentOnTmuxAndRequiresResult(t *testing.T) {
 				}
 			}
 			fake.sessions[manifest.Session].dead = true
-			got, err := r.Monitor(t.Context(), Attempt{Repository: attempt.Repository, Issue: attempt.Issue, Number: attempt.Number, BaseSHA: attempt.BaseSHA})
+			got, err := monitorFixture(t, r, t.Context(), Attempt{Repository: attempt.Repository, Issue: attempt.Issue, Number: attempt.Number, BaseSHA: attempt.BaseSHA})
 			if err != nil || got.State != test.wantState || !strings.Contains(got.Diagnostic, test.wantReason) {
 				t.Fatalf("monitored manifest=%#v err=%v", got, err)
 			}
@@ -492,7 +722,7 @@ func TestInteractiveLifecycleKeepsAgentOnTmuxAndRequiresResult(t *testing.T) {
 
 func TestResumeHandoffRefreshesTrustedSourceRefs(t *testing.T) {
 	r, fake, attempt, primary := testRuntime(t)
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,10 +734,10 @@ func TestResumeHandoffRefreshesTrustedSourceRefs(t *testing.T) {
 	want := gitOutput(t, primary, "rev-parse", "HEAD")
 	branch := gitOutput(t, primary, "branch", "--show-current")
 	fake.sessions[manifest.Session].dead = true
-	if _, err := r.Monitor(t.Context(), attempt); err != nil {
+	if _, err := monitorFixture(t, r, t.Context(), attempt); err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := r.ResumeHandoff(t.Context(), attempt)
+	resumed, err := resumeHandoffFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -519,20 +749,217 @@ func TestResumeHandoffRefreshesTrustedSourceRefs(t *testing.T) {
 	}
 }
 
+func TestReviewSessionNameIsTargetUniqueAndBounded(t *testing.T) {
+	maximum := int(^uint(0) >> 1)
+	first, err := ReviewSessionName("owner/repository", maximum, maximum, strings.Repeat("a", 40)+".."+strings.Repeat("b", 40))
+	if err != nil || len(first) > maxResourceName {
+		t.Fatalf("largest reviewer identity name=%q length=%d err=%v", first, len(first), err)
+	}
+	second, err := ReviewSessionName("owner/repository", maximum, maximum, strings.Repeat("a", 40)+".."+strings.Repeat("c", 40))
+	if err != nil || first == second {
+		t.Fatalf("distinct targets shared reviewer identity: first=%q second=%q err=%v", first, second, err)
+	}
+}
+
+func TestReviewRunSessionNameBindsTargetAndNeverReusedRun(t *testing.T) {
+	maximum := int(^uint(0) >> 1)
+	first, err := ReviewRunSessionName("owner/repository", maximum, maximum, "owner/repository#1 plan sha256:"+strings.Repeat("a", 64), strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	differentTarget, err := ReviewRunSessionName("owner/repository", maximum, maximum, "owner/repository#1 plan sha256:"+strings.Repeat("c", 64), strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	differentRun, err := ReviewRunSessionName("owner/repository", maximum, maximum, "owner/repository#1 plan sha256:"+strings.Repeat("a", 64), strings.Repeat("d", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == differentTarget || first == differentRun || differentTarget == differentRun || len(first) > maxResourceName {
+		t.Fatalf("run sessions are not unique and bounded: %q %q %q", first, differentTarget, differentRun)
+	}
+}
+
 func TestResumeHandoffRecreatesMissingSessionBeforeStateTransition(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fake.sessions[manifest.Session].dead = true
-	if manifest, err = r.Monitor(t.Context(), attempt); err != nil || manifest.State != "completed" {
+	if manifest, err = monitorFixture(t, r, t.Context(), attempt); err != nil || manifest.State != "completed" {
 		t.Fatalf("completed manifest=%#v err=%v", manifest, err)
 	}
 	delete(fake.sessions, manifest.Session)
-	resumed, err := r.ResumeHandoff(t.Context(), attempt)
+	fake.sessions["keeper"] = &fakeSession{paneID: "%999"}
+	resumed, err := resumeHandoffFixture(t, r, t.Context(), attempt)
 	if err != nil || resumed.State != "running" || fake.sessions[manifest.Session] == nil {
 		t.Fatalf("resumed=%#v session=%#v err=%v", resumed, fake.sessions[manifest.Session], err)
+	}
+	cancelled, err := cancelFixture(t, r, t.Context(), attempt, "operator stopped handoff")
+	if err != nil || cancelled.State != "cancelled" || fake.sessions[manifest.Session] != nil || fake.sessions["keeper"] == nil {
+		t.Fatalf("handoff cleanup left a running session: manifest=%#v session=%#v err=%v", cancelled, fake.sessions[manifest.Session], err)
+	}
+}
+
+func TestPersistedParkedBoundGateReleasesOnlyExactCandidate(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.sessions[manifest.Session].dead = true
+	if manifest, err = monitorFixture(t, r, t.Context(), attempt); err != nil || manifest.State != "completed" {
+		t.Fatalf("completed manifest=%#v err=%v", manifest, err)
+	}
+	delete(fake.sessions, manifest.Session)
+	manifest.LaunchToken, err = newLaunchToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.LaunchID = manifest.LaunchToken
+	command := BoundPaneExitStatusCommand(r.Helper, r.tmux(), manifest, []string{"/bin/sh"})
+	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, command); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.writeManifest(attempt, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(fake.sessions[manifest.Session].agent, "implementation-gate") {
+		t.Fatal("fixture did not park the candidate gate")
+	}
+	fake.sessions[manifest.Session].token = strings.Repeat("f", 32)
+	if _, err := resumeHandoffFixture(t, r, t.Context(), attempt); err == nil {
+		t.Fatal("resume released a same-name pane without the bound token")
+	}
+	if !slices.Contains(fake.sessions[manifest.Session].agent, "implementation-gate") {
+		t.Fatal("foreign pane observation released the candidate gate")
+	}
+	fake.sessions[manifest.Session].token = manifest.LaunchToken
+	binding, err := ReadImplementationBinding(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteImplementationPermit(manifest, binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.launchAgent(t.Context(), manifest); err != nil {
+		t.Fatalf("release exact parked gate: %v", err)
+	}
+	if slices.Contains(fake.sessions[manifest.Session].agent, "implementation-gate") {
+		t.Fatal("resume reported running while the worker gate remained parked")
+	}
+}
+
+func TestBoundHandoffShellStopsOnRealTmux(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-bound-handoff-shell-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	helper := filepath.Join(t.TempDir(), "agent-symphony")
+	if output, err := exec.Command("go", "build", "-o", helper, "../../cmd/agent-symphony").CombinedOutput(); err != nil {
+		t.Fatalf("build bound helper: %v: %s", err, output)
+	}
+	worktree, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{Version: ManifestVersion2, Session: "as-bound-handoff-shell", Worktree: worktree, LogPath: filepath.Join(t.TempDir(), "agent.log"), LaunchToken: strings.Repeat("a", 32), LaunchID: strings.Repeat("b", 32)}
+	r := &Runtime{Tmux: tmux, Helper: helper, Runner: inheritedEnvironmentRunner{}, StopWait: time.Second}
+	if output, err := exec.Command(tmux, "new-session", "-d", "-s", "keeper").CombinedOutput(); err != nil {
+		t.Fatalf("create unrelated keeper: %v: %s", err, output)
+	}
+	const ready = "as-bound-handoff-shell-ready"
+	if output, err := exec.Command(tmux, "wait-for", "-L", ready).CombinedOutput(); err != nil {
+		t.Fatalf("lock worker ready barrier: %v: %s", err, output)
+	}
+	command := BoundPaneExitStatusCommand(helper, tmux, manifest, []string{"/bin/sh", "-c", `"$1" wait-for -U "$2"; exec /bin/sh`, "worker", tmux, ready})
+	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, command); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := ReadImplementationBinding(manifest)
+	if err != nil || binding.Role != "interactive" {
+		t.Fatalf("handoff shell binding = %#v, %v", binding, err)
+	}
+	// Retire the isolated tmux server and join its exact bound wrapper before
+	// TempDir cleanup can race the wrapper's terminal proof write.
+	t.Cleanup(func() {
+		_ = exec.Command(tmux, "kill-server").Run()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if err := syscall.Kill(binding.PanePID, 0); errors.Is(err, syscall.ESRCH) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("bound handoff wrapper %d did not exit", binding.PanePID)
+				return
+			}
+			goruntime.Gosched()
+		}
+	})
+	if err := WriteImplementationPermit(manifest, binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.launchAgent(t.Context(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if output, err := exec.CommandContext(ctx, tmux, "wait-for", "-L", ready).CombinedOutput(); err != nil {
+		t.Fatalf("bound shell did not reach worker start: %v: %s", err, output)
+	}
+	if err := r.stop(t.Context(), manifest); err == nil || !strings.Contains(err.Error(), "descendants remain unproved") {
+		t.Fatalf("bound handoff shell incorrectly claimed physical cleanup: %v", err)
+	}
+	if _, exists := ReadImplementationBinding(manifest); exists != nil {
+		t.Fatalf("durable launch binding was lost after stop: %v", exists)
+	}
+	if output, err := exec.Command(tmux, "has-session", "-t", "=keeper").CombinedOutput(); err != nil {
+		t.Fatalf("unrelated keeper was stopped: %v: %s", err, output)
+	}
+}
+
+func TestBoundLastPaneStopReplaysAfterOriginalServerExits(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-bound-last-pane-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	worktree, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{Version: ManifestVersion2, Session: "as-bound-last-pane", Worktree: worktree, LogPath: filepath.Join(t.TempDir(), "agent.log"), LaunchToken: strings.Repeat("a", 32), LaunchID: strings.Repeat("b", 32)}
+	r := &Runtime{Tmux: tmux, Runner: inheritedEnvironmentRunner{}, StopWait: 20 * time.Millisecond}
+	// The initial gate is parked, so no worker group was ever released.
+	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, []string{"unused-helper", "pane-exit-status-bound"}); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := ReadImplementationBinding(manifest)
+	if err != nil || binding.Role != "interactive" {
+		t.Fatalf("parked gate binding = %#v, %v", binding, err)
+	}
+	_ = r.stop(t.Context(), manifest) // The guarded kill may precede server exit proof.
+	if err := syscall.Kill(binding.ServerPID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("fixture original tmux server is not proved dead: PID=%d err=%v", binding.ServerPID, err)
+	}
+	// A fresh runtime must complete exact cleanup without the vanished socket;
+	// a generic has-session exit status alone is never a sufficient proof.
+	restarted := &Runtime{Tmux: tmux, Runner: inheritedEnvironmentRunner{}}
+	if err := restarted.stop(t.Context(), manifest); err != nil {
+		t.Fatalf("restart could not finish stopped last-pane gate: %v", err)
 	}
 }
 
@@ -540,32 +967,42 @@ func TestValidationTraversalExistingAndLaunchFailureDiagnostics(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	bad := attempt
 	bad.Repository = "owner/../repo"
-	if _, err := r.PrepareAndStart(context.Background(), bad); err == nil {
+	if _, err := prepareAndStartFixture(t, r, context.Background(), bad); err == nil {
 		t.Fatal("accepted traversal identity")
 	}
 	fake.fail = "new-session"
-	manifest, err := r.PrepareAndStart(context.Background(), attempt)
-	if err == nil || manifest.State != "failed" || !strings.Contains(manifest.Diagnostic, "canary failure detail") {
+	manifest, err := prepareAndStartFixture(t, r, context.Background(), attempt)
+	if err == nil || manifest.State != "preparing" || !strings.Contains(err.Error(), "canary failure detail") {
 		t.Fatalf("launch failure = %#v, %v", manifest, err)
 	}
 	stored, readErr := readManifest(r.manifestPath(attempt))
-	if readErr != nil || stored.Diagnostic != manifest.Diagnostic {
-		t.Fatalf("stored diagnostic = %#v, %v", stored, readErr)
+	if readErr != nil || stored.State != "preparing" {
+		t.Fatalf("ambiguous Start was falsely terminalized: %#v, %v", stored, readErr)
 	}
 }
 
 func TestStaleWorkerResultBlocksLaunch(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
-	identity, err := AttemptIdentity(r.Root, attempt)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(7, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(ResultPath(identity.Worktree), []byte("stale"), 0o600); err != nil {
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "a")
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
-	if err == nil || manifest.State != "" || !strings.Contains(err.Error(), "worker result already exists") {
-		t.Fatalf("manifest=%#v err=%v", manifest, err)
+	if err := os.MkdirAll(PrivatePath(prepared.Manifest.Worktree), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ResultPath(prepared.Manifest.Worktree), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "b")
+	result, err := executor.Execute(t.Context(), start)
+	if err == nil || result.Manifest.State != "preparing" || !strings.Contains(err.Error(), "worker result already exists") {
+		t.Fatalf("manifest=%#v err=%v", result.Manifest, err)
 	}
 	if len(fake.sessions) != 0 {
 		t.Fatalf("agent launched with stale result: %#v", fake.sessions)
@@ -574,7 +1011,7 @@ func TestStaleWorkerResultBlocksLaunch(t *testing.T) {
 
 func TestAgentFailureCancelAndIneligibility(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(context.Background(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, context.Background(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -582,7 +1019,7 @@ func TestAgentFailureCancelAndIneligibility(t *testing.T) {
 	fake.sessions[manifest.Session].status = 7
 	fake.sessions[manifest.Session].output = "useful failure output\n"
 	recovered := Attempt{Repository: attempt.Repository, Issue: attempt.Issue, Number: attempt.Number, BaseSHA: attempt.BaseSHA}
-	manifest, err = r.Monitor(context.Background(), recovered)
+	manifest, err = monitorFixture(t, r, context.Background(), recovered)
 	if err != nil || manifest.State != "failed" || !strings.Contains(manifest.Diagnostic, "status 7") {
 		t.Fatalf("monitor = %#v, %v", manifest, err)
 	}
@@ -591,38 +1028,40 @@ func TestAgentFailureCancelAndIneligibility(t *testing.T) {
 	}
 
 	r2, fake2, attempt2, _ := testRuntime(t)
-	manifest2, err := r2.PrepareAndStart(context.Background(), attempt2)
+	manifest2, err := prepareAndStartFixture(t, r2, context.Background(), attempt2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	recovered2 := Attempt{Repository: attempt2.Repository, Issue: attempt2.Issue, Number: attempt2.Number, BaseSHA: attempt2.BaseSHA}
-	manifest2, err = r2.Cancel(context.Background(), recovered2, "issue closed")
+	manifest2, err = cancelFixture(t, r2, context.Background(), recovered2, "issue closed")
 	if _, live := fake2.sessions[manifest2.Session]; err != nil || manifest2.State != "cancelled" || live {
 		t.Fatalf("cancel = %#v, %v", manifest2, err)
 	}
 
 	r3, _, attempt3, _ := testRuntime(t)
 	attempt3.Eligible = func() bool { return false }
-	if _, err := r3.PrepareAndStart(context.Background(), attempt3); err == nil || !strings.Contains(err.Error(), "eligible") {
+	if _, err := prepareAndStartFixture(t, r3, context.Background(), attempt3); err == nil || !strings.Contains(err.Error(), "input is invalid") {
 		t.Fatalf("ineligible = %v", err)
 	}
 }
 
 func TestMonitorStopsAttemptThatBecomesIneligible(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
+	fake.sessions["keeper"] = &fakeSession{paneID: "%999"}
 	eligible := true
 	attempt.Eligible = func() bool { return eligible }
-	manifest, err := r.PrepareAndStart(context.Background(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, context.Background(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
+	session := manifest.Session
 	eligible = false
-	manifest, err = r.Monitor(context.Background(), attempt)
-	if err != nil || manifest.State != "cancelled" {
-		t.Fatalf("monitor = %#v, %v", manifest, err)
+	manifest, err = monitorFixture(t, r, context.Background(), attempt)
+	if err == nil || !strings.Contains(err.Error(), "input is invalid") {
+		t.Fatalf("ineligible monitor should defer to owner Stop: %#v, %v", manifest, err)
 	}
-	if _, live := fake.sessions[manifest.Session]; live {
-		t.Fatal("ineligible attempt session remains live")
+	if _, live := fake.sessions[session]; !live {
+		t.Fatal("ineligible monitor stopped a live attempt without owner invalidation")
 	}
 }
 
@@ -631,29 +1070,31 @@ func TestConcurrentDisjointAttempts(t *testing.T) {
 	second := first
 	second.Issue, second.Number, second.Context = 4, 1, "second"
 	var wg sync.WaitGroup
-	errs := make(chan error, 2)
+	type launched struct {
+		manifest Manifest
+		err      error
+	}
+	results := make(chan launched, 2)
 	for _, attempt := range []Attempt{first, second} {
 		wg.Add(1)
 		go func(a Attempt) {
 			defer wg.Done()
-			_, err := r.PrepareAndStart(context.Background(), a)
-			errs <- err
+			manifest, err := prepareAndStartFixture(t, r, context.Background(), a)
+			results <- launched{manifest, err}
 		}(attempt)
 	}
 	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatal(err)
+	close(results)
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if fake.buffers["as-start-"+result.manifest.LaunchID] == "" {
+			t.Fatalf("session %s lost context", result.manifest.Session)
 		}
 	}
 	if len(fake.sessions) != 2 {
 		t.Fatalf("sessions = %d, want 2", len(fake.sessions))
-	}
-	for name := range fake.sessions {
-		if fake.buffers[name] == "" {
-			t.Fatalf("session %s lost context", name)
-		}
 	}
 }
 
@@ -664,6 +1105,9 @@ func TestPromptCommandProvidesStdinBeforeFastConsumerStarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	resultPath := ResultPath(workspace)
+	if err := os.Mkdir(PrivatePath(workspace), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	canary := filepath.Join(dir, "outside-canary")
 	if err := os.WriteFile(canary, []byte("unchanged"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1245,7 +1689,7 @@ func TestPromptCommandDoesNotStartConsumerWhenBufferReadFails(t *testing.T) {
 
 func TestQueuedReviewHandoffTransitionsAreDurableAndImmutable(t *testing.T) {
 	r, _, attempt, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1258,7 +1702,7 @@ func TestQueuedReviewHandoffTransitionsAreDurableAndImmutable(t *testing.T) {
 		queued, acknowledged bool
 		state                string
 	}{{false, false, "completed"}, {true, false, "completed"}, {true, true, "running"}} {
-		if _, err := r.RecordReviewFindings(attempt, "abcdef1", findings, transition.queued, transition.acknowledged); err != nil {
+		if _, err := reviewFindingsFixture(t, r, attempt, "abcdef1", findings, transition.queued, transition.acknowledged); err != nil {
 			t.Fatal(err)
 		}
 		restarted := &Runtime{StateRoot: r.StateRoot}
@@ -1267,20 +1711,20 @@ func TestQueuedReviewHandoffTransitionsAreDurableAndImmutable(t *testing.T) {
 			t.Fatalf("transition %#v was not durable: %#v err=%v", transition, stored, err)
 		}
 	}
-	if _, err := r.RecordReviewFindings(attempt, "abcdef1", []string{"different"}, true, true); err == nil {
+	if _, err := reviewFindingsFixture(t, r, attempt, "abcdef1", []string{"different"}, true, true); err == nil {
 		t.Fatal("queued handoff was mutable")
 	}
 }
 
 func TestReviewModeAndTargetAreDurableAndValidated(t *testing.T) {
 	r, _, attempt, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	target := attempt.BaseSHA + ".." + strings.Repeat("b", 40)
 	reviewer, _ := AttemptSessionName(SessionRoleReviewer, attempt.Repository, attempt.Issue, attempt.Number)
-	stored, err := r.RecordReview(attempt, "running", ReviewModeImplementation, target, attempt.BaseSHA, strings.Repeat("b", 40), "/review/snapshot", reviewer)
+	stored, err := reviewFixture(t, r, attempt, ReviewTransition{State: "running", Mode: ReviewModeImplementation, Target: target, Base: attempt.BaseSHA, Head: strings.Repeat("b", 40), Snapshot: "/review/snapshot", Session: reviewer})
 	if err != nil || stored.ReviewMode != ReviewModeImplementation || stored.ReviewTarget != target {
 		t.Fatalf("review metadata was not persisted: %#v err=%v", stored, err)
 	}
@@ -1317,19 +1761,20 @@ func TestReviewModeAndTargetAreDurableAndValidated(t *testing.T) {
 
 func TestStopInterruptsPaneZeroWhenAnotherPaneIsActive(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.stop(t.Context(), manifest.Session); err != nil {
+	wantPaneID := fake.sessions[manifest.Session].paneID
+	if err := r.stop(t.Context(), manifest); err != nil {
 		t.Fatal(err)
 	}
 	interrupted := false
 	for _, command := range fake.seen {
 		if len(command.Args) > 0 && command.Args[0] == "send-keys" {
 			interrupted = true
-			if valueAfter(command.Args, "-t") != PaneTarget(manifest.Session) {
-				t.Fatalf("interrupt targeted %q, want %q", valueAfter(command.Args, "-t"), PaneTarget(manifest.Session))
+			if valueAfter(command.Args, "-t") != wantPaneID {
+				t.Fatalf("interrupt targeted %q, want bound pane %q", valueAfter(command.Args, "-t"), wantPaneID)
 			}
 		}
 	}
@@ -1338,28 +1783,518 @@ func TestStopInterruptsPaneZeroWhenAnotherPaneIsActive(t *testing.T) {
 	}
 }
 
-func TestForgetRemovesOnlyCleanedAttemptRecord(t *testing.T) {
-	r, _, attempt, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+func TestStopDoesNotKillReplacementOnReusedTmuxName(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-implementation-replacement-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Forget(manifest); err == nil || !strings.Contains(err.Error(), "resource still exists") {
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	const session = "implementation-replacement"
+	run := func(args ...string) string {
+		t.Helper()
+		output, err := exec.Command(tmux, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("tmux %v: %v: %s", args, err, output)
+		}
+		return strings.TrimSpace(string(output))
+	}
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	worktree, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{Version: boundManifestVersion, Session: session, Worktree: worktree, LogPath: filepath.Join(t.TempDir(), "agent.log"), LaunchToken: strings.Repeat("a", 32), LaunchID: strings.Repeat("b", 32)}
+	r := &Runtime{Tmux: tmux, Runner: inheritedEnvironmentRunner{}}
+	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, nil); err != nil {
+		t.Fatal(err)
+	}
+	run("new-session", "-d", "-s", "replacement-anchor", "sleep", "30")
+	run("kill-session", "-t", "="+session)
+	run("new-session", "-d", "-s", session, "sleep", "30")
+	if err := r.stop(t.Context(), manifest); err == nil {
+		t.Fatal("stop accepted an unbound replacement")
+	}
+	if output, err := exec.Command(tmux, "has-session", "-t", "="+session).CombinedOutput(); err != nil {
+		t.Fatalf("foreign replacement was killed: %v: %s", err, output)
+	}
+}
+
+func TestTmuxMissingExactPaneCanFallBackToAnotherPane(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-missing-pane-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	for _, name := range []string{"keep", "target"} {
+		if output, err := exec.Command(tmux, "new-session", "-d", "-s", name).CombinedOutput(); err != nil {
+			t.Fatalf("create %s: %v: %s", name, err, output)
+		}
+	}
+	if output, err := exec.Command(tmux, "has-session", "-t", "=keep").CombinedOutput(); err != nil {
+		t.Fatalf("control session exited before exact absence check: %v: %s", err, output)
+	}
+	output, err := exec.Command(tmux, "display-message", "-p", "-t", PaneTarget("target"), ImplementationPaneFormat).CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := ParseImplementationPane(string(output))
+	if err != nil {
+		t.Fatal(err)
+	}
+	paneID := pane.PaneID
+	if paneID == "" {
+		t.Fatal("target pane ID was empty")
+	}
+	if output, err := exec.Command(tmux, "kill-session", "-t", "=target").CombinedOutput(); err != nil {
+		t.Fatalf("kill target: %v: %s", err, output)
+	}
+	command := exec.Command(tmux, "display-message", "-p", "-t", paneID, ImplementationPaneFormat)
+	output, err = command.CombinedOutput()
+	if err != nil || strings.Contains(string(output), paneID) {
+		t.Fatalf("tmux missing-pane fallback changed: %v, output=%s", err, output)
+	}
+	inventory, err := exec.Command(tmux, "list-panes", "-a", "-F", ImplementationInventoryFormat).CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing, err := ImplementationPaneAbsentFromInventory(string(inventory), ImplementationLaunchBinding{ServerPID: pane.ServerPID, ServerStart: pane.ServerStart, PaneID: paneID})
+	if err != nil || !missing {
+		t.Fatalf("same-server exact pane absence was not proved: %v, output=%s", err, inventory)
+	}
+	if output, err := exec.Command(tmux, "has-session", "-t", "=keep").CombinedOutput(); err != nil {
+		t.Fatalf("control server did not remain live: %v: %s", err, output)
+	}
+}
+
+func TestTmuxLinkedPaneSurvivesSessionKillUntilExactPaneKill(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-linked-pane-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	run := func(args ...string) string {
+		t.Helper()
+		output, err := exec.Command(tmux, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("tmux %v: %v: %s", args, err, output)
+		}
+		return string(output)
+	}
+	run("new-session", "-d", "-s", "keeper")
+	run("new-session", "-d", "-s", "target")
+	pane, err := ParseImplementationPane(run("display-message", "-p", "-t", PaneTarget("target"), ImplementationPaneFormat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := ImplementationLaunchBinding{ServerPID: pane.ServerPID, ServerStart: pane.ServerStart, PaneID: pane.PaneID}
+	run("link-window", "-s", "=target:0", "-t", "=keeper:1")
+	run("kill-session", "-t", "=target")
+	inventory := run("list-panes", "-a", "-F", ImplementationInventoryFormat)
+	missing, err := ImplementationPaneAbsentFromInventory(inventory, binding)
+	if err != nil || missing {
+		t.Fatalf("linked worker vanished after only session kill: missing=%t err=%v inventory=%s", missing, err, inventory)
+	}
+	run("kill-pane", "-t", pane.PaneID)
+	inventory = run("list-panes", "-a", "-F", ImplementationInventoryFormat)
+	missing, err = ImplementationPaneAbsentFromInventory(inventory, binding)
+	if err != nil || !missing {
+		t.Fatalf("exact linked pane remained after pane kill: missing=%t err=%v inventory=%s", missing, err, inventory)
+	}
+}
+
+func TestStopRejectsBoundServerAfterSocketPathMoves(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-bound-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	worktree, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{Version: boundManifestVersion, Session: "bound-socket", Worktree: worktree, LogPath: filepath.Join(t.TempDir(), "agent.log"), LaunchToken: strings.Repeat("a", 32), LaunchID: strings.Repeat("b", 32)}
+	r := &Runtime{Tmux: tmux, Runner: inheritedEnvironmentRunner{}}
+	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, nil); err != nil {
+		t.Fatal(err)
+	}
+	oldSocket := filepath.Join(socketRoot, fmt.Sprintf("tmux-%d", os.Getuid()), "default")
+	orphanSocket := filepath.Join(socketRoot, "orphaned-s1")
+	if err := os.Rename(oldSocket, orphanSocket); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = exec.Command(tmux, "-S", orphanSocket, "kill-server").Run() })
+	if output, err := exec.Command(tmux, "-S", orphanSocket, "has-session", "-t", "="+manifest.Session).CombinedOutput(); err != nil {
+		t.Fatalf("old S1 was not live after socket move: %v: %s", err, output)
+	}
+	if err := r.stop(t.Context(), manifest); err == nil {
+		t.Fatal("socket absence falsely certified the live old S1 worker as stopped")
+	}
+	if output, err := exec.Command(tmux, "new-session", "-d", "-s", "foreign-s2").CombinedOutput(); err != nil {
+		t.Fatalf("create replacement S2: %v: %s", err, output)
+	}
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	if err := r.stop(t.Context(), manifest); err == nil {
+		t.Fatal("replacement S2 inventory falsely certified the live old S1 worker as stopped")
+	}
+	if output, err := exec.Command(tmux, "-S", orphanSocket, "has-session", "-t", "="+manifest.Session).CombinedOutput(); err != nil {
+		t.Fatalf("old S1 was touched by wrong-server cleanup: %v: %s", err, output)
+	}
+}
+
+func TestBoundImplementationRejectsSamePaneRespawn(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-same-pane-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	attemptRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := Attempt{Repository: "o/r", Issue: 310, Number: 1, BaseSHA: strings.Repeat("a", 40)}
+	manifest, err := AttemptIdentity(attemptRoot, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Version, manifest.State = boundManifestVersion, "running"
+	manifest.LaunchToken, manifest.LaunchID = strings.Repeat("a", 32), strings.Repeat("b", 32)
+	manifest.LogPath = filepath.Join(stateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository), "310-1", "agent.log")
+	r := &Runtime{Root: attemptRoot, StateRoot: stateRoot, Tmux: tmux, Runner: inheritedEnvironmentRunner{}, VerifyWorker: func(context.Context) error { return nil }}
+	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.writeManifest(attempt, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, nil); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := ReadImplementationBinding(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(tmux, "respawn-pane", "-k", "-t", PaneTarget(manifest.Session), "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("replace same pane: %v: %s", err, out)
+	}
+	if result, err := exec.Command(tmux, "display-message", "-p", "-t", PaneTarget(manifest.Session), ImplementationPaneFormat).CombinedOutput(); err != nil {
+		t.Fatal(err)
+	} else if pane, err := ParseImplementationPane(string(result)); err != nil || pane.PaneID != initial.PaneID || pane.PanePID == initial.PanePID {
+		t.Fatalf("replacement did not reuse pane with a new process: %#v, %v", pane, err)
+	}
+	if err := r.stop(t.Context(), manifest); err == nil {
+		t.Fatal("stop accepted a same-pane replacement")
+	}
+	if _, err := monitorFixture(t, r, t.Context(), attempt); err == nil {
+		t.Fatal("monitor accepted a same-pane replacement")
+	}
+	if err := r.Deliver(t.Context(), manifest, []byte("handoff")); err == nil {
+		t.Fatal("handoff delivery accepted a same-pane replacement")
+	}
+	if out, err := exec.Command(tmux, "has-session", "-t", "="+manifest.Session).CombinedOutput(); err != nil {
+		t.Fatalf("same-pane replacement was killed: %v: %s", err, out)
+	}
+}
+
+func TestNewImplementationSessionBindsBeforeAgentLaunch(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-implementation-binding-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	worktree, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := t.TempDir()
+	manifest := Manifest{Version: boundManifestVersion, Session: "implementation-binding", Worktree: worktree, LogPath: filepath.Join(state, "agent.log"), LaunchToken: strings.Repeat("a", 32)}
+	helper := filepath.Join(t.TempDir(), "agent-symphony")
+	if output, err := exec.Command("go", "build", "-o", helper, "../../cmd/agent-symphony").CombinedOutput(); err != nil {
+		t.Fatalf("build bound helper: %v: %s", err, output)
+	}
+	r := &Runtime{Tmux: tmux, Helper: helper, Runner: inheritedEnvironmentRunner{}}
+	manifest.LaunchID = strings.Repeat("b", 32)
+	marker := filepath.Join(worktree, "worker-released")
+	const signal = "implementation-worker-released"
+	worker := []string{"sh", "-c", fmt.Sprintf("printf 'quoted\\nargument' > %q; tmux wait-for -U %s; exec sleep 30", marker, signal)}
+	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, worker); err != nil {
+		if output, probeErr := exec.Command(tmux, "display-message", "-p", "-t", PaneTarget(manifest.Session), ImplementationPaneFormat).CombinedOutput(); probeErr == nil {
+			t.Logf("pane after failed binding: %q", output)
+		}
+		t.Fatal(err)
+	}
+	binding, err := ReadImplementationBinding(manifest)
+	if err != nil || binding.Token != manifest.LaunchToken || binding.EffectID != manifest.LaunchID {
+		t.Fatalf("durable binding = %#v, %v", binding, err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker ran before durable binding and owner release: %v", err)
+	}
+	if output, err := exec.Command(tmux, "wait-for", "-L", signal).CombinedOutput(); err != nil {
+		t.Fatalf("lock worker completion signal: %v: %s", err, output)
+	}
+	t.Cleanup(func() { _ = exec.Command(tmux, "wait-for", "-U", signal).Run() })
+	if err := WriteImplementationPermit(manifest, binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.launchAgent(t.Context(), manifest); err != nil {
+		t.Fatalf("guarded agent release: %v", err)
+	}
+	completion, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if output, err := exec.CommandContext(completion, tmux, "wait-for", "-L", signal).CombinedOutput(); err != nil {
+		t.Fatalf("wait for worker execution: %v: %s", err, output)
+	}
+	if body, err := os.ReadFile(marker); err != nil || string(body) != "quoted\nargument" {
+		t.Fatalf("worker output after release = %q, %v", body, err)
+	}
+	if output, err := exec.Command("ps", "-p", strconv.Itoa(binding.PanePID), "-o", "comm=").CombinedOutput(); err != nil || !strings.Contains(string(output), "sleep") {
+		t.Fatalf("gate did not exec worker with same PID %d: %q, %v", binding.PanePID, output, err)
+	}
+	if err := r.launchAgent(t.Context(), manifest); err != nil {
+		t.Fatalf("replaying release for same bound worker: %v", err)
+	}
+	status, err := r.observeBoundCommand(t.Context(), manifest, func(pane ImplementationPane) []string {
+		return []string{"display-message", "-p", "-t", pane.PaneID, PaneStatusFormat}
+	})
+	if err != nil || strings.TrimSpace(status.Output) != "0||||" {
+		t.Fatalf("guarded status observation = %q, %v", status.Output, err)
+	}
+	bound, pane, err := r.observeBound(t.Context(), manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	load, err := TmuxCommandString([]string{"load-buffer", "-b", "implementation-binding-test", "-"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.guardedBoundResult(t.Context(), bound, pane, load, strings.NewReader("guarded payload")); err != nil {
+		t.Fatalf("guarded buffer load: %v", err)
+	}
+	if output, err := exec.Command(tmux, "show-buffer", "-b", "implementation-binding-test").CombinedOutput(); err != nil || string(output) != "guarded payload" {
+		t.Fatalf("guarded buffer contents = %q, %v", output, err)
+	}
+	if _, pane, err := r.observeBound(t.Context(), manifest); err != nil || pane.PanePID != binding.PanePID || pane.Command != binding.Command || !strings.Contains(pane.Command, "quoted") {
+		t.Fatalf("released worker lost gate pane identity: %#v, %v", pane, err)
+	}
+	if err := r.stop(t.Context(), manifest); err == nil {
+		t.Fatal("raw test worker without a bound group was falsely certified stopped")
+	}
+}
+
+func TestImplementationIdentityRetainsBoundedWorkerContext(t *testing.T) {
+	dir := t.TempDir()
+	manifest := Manifest{
+		Version:     boundManifestVersion,
+		LaunchToken: strings.Repeat("a", 32),
+		LaunchID:    strings.Repeat("b", 32),
+		Session:     "bounded-worker-context",
+		Worktree:    dir,
+		LogPath:     filepath.Join(dir, "attempt", "agent.log"),
+	}
+	if err := os.MkdirAll(filepath.Dir(manifest.LogPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binding := ImplementationLaunchBinding{
+		Version: 1, Role: "interactive", Token: manifest.LaunchToken, EffectID: manifest.LaunchID,
+		ServerPID: 10, ServerStart: 11, SessionName: manifest.Session, SessionID: "$1",
+		PaneID: "%1", PanePID: 12, StartPath: manifest.Worktree, Command: strings.Repeat("worker-context-", 512),
+	}
+	if err := WriteImplementationBinding(manifest, binding); err != nil {
+		t.Fatalf("write bounded launch identity: %v", err)
+	}
+	if got, err := ReadImplementationBinding(manifest); err != nil || got != binding {
+		t.Fatalf("read bounded launch identity = %#v, %v", got, err)
+	}
+	if err := WriteImplementationPermit(manifest, binding); err != nil {
+		t.Fatalf("write bounded launch permit: %v", err)
+	}
+	if err := WriteImplementationRelease(manifest, binding); err != nil {
+		t.Fatalf("write bounded launch release: %v", err)
+	}
+}
+
+func TestGuardedStopDoesNotSignalReplacementBetweenProbeAndCommand(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-implementation-guard-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	worktree, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{Version: boundManifestVersion, Session: "implementation-guard", Worktree: worktree, LogPath: filepath.Join(t.TempDir(), "agent.log"), LaunchToken: strings.Repeat("a", 32), LaunchID: strings.Repeat("b", 32)}
+	runner := &swapOnGuardRunner{}
+	r := &Runtime{Tmux: tmux, Runner: runner}
+	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(tmux, "new-session", "-d", "-s", "guard-anchor", "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("create guard anchor: %v: %s", err, output)
+	}
+	runner.swap = func() error {
+		for _, args := range [][]string{{"kill-session", "-t", "=" + manifest.Session}, {"new-session", "-d", "-s", manifest.Session, "sleep", "30"}} {
+			if output, err := exec.Command(tmux, args...).CombinedOutput(); err != nil {
+				return fmt.Errorf("tmux %v: %w: %s", args, err, output)
+			}
+		}
+		return nil
+	}
+	if err := r.stop(t.Context(), manifest); err == nil {
+		t.Fatal("guarded stop accepted a replacement")
+	}
+	if output, err := exec.Command(tmux, "has-session", "-t", "="+manifest.Session).CombinedOutput(); err != nil {
+		t.Fatalf("guard killed foreign replacement: %v: %s", err, output)
+	}
+}
+
+func TestNewImplementationSessionCollisionNeverTagsForeignPane(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-implementation-collision-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	const session = "implementation-collision"
+	if output, err := exec.Command(tmux, "-f", "/dev/null", "new-session", "-d", "-s", session, "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("create foreign pane: %v: %s", err, output)
+	}
+	worktree, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{Version: boundManifestVersion, Session: session, Worktree: worktree, LogPath: filepath.Join(t.TempDir(), "agent.log"), LaunchToken: strings.Repeat("a", 32), LaunchID: strings.Repeat("b", 32)}
+	r := &Runtime{Tmux: tmux, Runner: inheritedEnvironmentRunner{}}
+	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, nil); err == nil {
+		t.Fatal("new-session collision was accepted")
+	}
+	probe, err := exec.Command(tmux, "display-message", "-p", "-t", "="+session, "#{@agent-symphony-launch-token}").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(probe)) != "" {
+		t.Fatalf("foreign pane was tagged: %q, %v", probe, err)
+	}
+	if _, err := os.Lstat(ImplementationBindingPath(manifest, manifest.LaunchID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("foreign pane acquired binding: %v", err)
+	}
+}
+
+func TestGuardedObservationRejectsReplacementBetweenProbeAndRead(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	socketRoot, err := os.MkdirTemp("/tmp", "as-implementation-observation-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
+	worktree, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := Manifest{Version: boundManifestVersion, Session: "implementation-observation", Worktree: worktree, LogPath: filepath.Join(t.TempDir(), "agent.log"), LaunchToken: strings.Repeat("a", 32), LaunchID: strings.Repeat("b", 32)}
+	runner := &swapOnGuardRunner{}
+	r := &Runtime{Tmux: tmux, Runner: runner}
+	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(tmux, "new-session", "-d", "-s", "observation-anchor", "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("create observation anchor: %v: %s", err, output)
+	}
+	runner.swap = func() error {
+		for _, args := range [][]string{{"kill-session", "-t", "=" + manifest.Session}, {"new-session", "-d", "-s", manifest.Session, "sleep", "30"}} {
+			if output, err := exec.Command(tmux, args...).CombinedOutput(); err != nil {
+				return fmt.Errorf("tmux %v: %w: %s", args, err, output)
+			}
+		}
+		return nil
+	}
+	if result, err := r.observeBoundCommand(t.Context(), manifest, func(pane ImplementationPane) []string {
+		return []string{"display-message", "-p", "-t", pane.PaneID, PaneStatusFormat}
+	}); err == nil || strings.TrimSpace(result.Output) == "0||||" {
+		t.Fatalf("stale status was accepted: %q, %v", result.Output, err)
+	}
+	if output, err := exec.Command(tmux, "has-session", "-t", "="+manifest.Session).CombinedOutput(); err != nil {
+		t.Fatalf("foreign replacement was killed by observation: %v: %s", err, output)
+	}
+}
+
+func TestForgetRemovesOnlyCleanedAttemptRecord(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := forgetFixture(t, r, manifest); err == nil || !strings.Contains(err.Error(), "resources remain") {
 		t.Fatalf("forgot live resources: %v", err)
 	}
 	if err := os.RemoveAll(manifest.Worktree); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Forget(manifest); err != nil {
+	delete(fake.sessions, manifest.Session)
+	if err := forgetFixture(t, r, manifest); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Forget(manifest); err != nil {
+	if err := forgetFixture(t, r, manifest); err != nil {
 		t.Fatalf("idempotent forget after restart-style retry: %v", err)
 	}
 	if err := os.MkdirAll(manifest.Worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Forget(manifest); err == nil || !strings.Contains(err.Error(), "resource still exists") {
+	if err := forgetFixture(t, r, manifest); err == nil || !strings.Contains(err.Error(), "resources remain") {
 		t.Fatalf("missing record accepted a reappeared worker resource: %v", err)
 	}
 	if err := os.RemoveAll(manifest.Worktree); err != nil {
@@ -1376,10 +2311,11 @@ func TestForgetRemovesOnlyCleanedAttemptRecord(t *testing.T) {
 func TestCredentialedSessionLaunchFailureIsRedacted(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	canary := "credential-canary"
-	t.Setenv("GITHUB_TOKEN", canary)
+	t.Setenv("MODEL_API_KEY", canary)
+	r.AllowEnv = append(r.AllowEnv, "MODEL_API_KEY")
 	fake.fail = "new-session"
 	fake.failOutput, fake.failErr = "launch output "+canary, errors.New("launch failure "+canary)
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err == nil || strings.Contains(err.Error(), canary) || strings.Contains(manifest.Diagnostic, canary) {
 		t.Fatal("credentialed launch failure was not safely redacted")
 	}
@@ -1393,31 +2329,23 @@ func TestCredentialedSessionLaunchFailureIsRedacted(t *testing.T) {
 		}
 	}
 	launch := fake.seen[slices.IndexFunc(fake.seen, func(command Command) bool { return slices.Contains(command.Args, "new-session") })]
-	if !slices.Contains(launch.Env, "GITHUB_TOKEN="+canary) || !strings.Contains(strings.Join(launch.Args, " "), "GITHUB_TOKEN") {
-		t.Fatal("tmux client did not receive the bounded credential environment")
+	if !slices.Contains(launch.Env, "MODEL_API_KEY="+canary) || !strings.Contains(strings.Join(launch.Args, " "), "MODEL_API_KEY") {
+		t.Fatal("tmux client did not receive the bounded model credential environment")
 	}
 }
 
-func TestImplementationAuthenticationCrossesRuntimeBoundary(t *testing.T) {
-	for _, test := range []struct {
-		name, token string
-		ok          bool
-	}{{"authenticated", "implementation-auth-canary", true}, {"missing", "", false}, {"invalid", "implementation-invalid-canary", false}} {
+func TestGitHubAuthenticationDoesNotCrossRuntimeBoundary(t *testing.T) {
+	for _, test := range []struct{ name, token string }{{"present", "implementation-auth-canary"}, {"missing", ""}} {
 		t.Run(test.name, func(t *testing.T) {
 			r, fake, attempt, _ := testRuntime(t)
-			fake.sessionAuth, fake.validAuth = true, "implementation-auth-canary"
 			t.Setenv("GH_TOKEN", test.token)
-			manifest, err := r.PrepareAndStart(t.Context(), attempt)
-			if test.ok {
-				if err != nil || manifest.State != "running" {
-					t.Fatal("authenticated implementation did not reach running state")
-				}
-			} else if err == nil || !strings.Contains(err.Error(), "GitHub CLI authentication") || test.token != "" && (strings.Contains(err.Error(), test.token) || strings.Contains(manifest.Diagnostic, test.token)) {
-				t.Fatal("implementation authentication failure was unclear or exposed its credential")
+			manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
+			if err != nil || manifest.State != "running" {
+				t.Fatalf("uncredentialed implementation did not reach running state: %#v %v", manifest, err)
 			}
 			for _, command := range fake.seen {
-				if test.token != "" && strings.Contains(strings.Join(command.Args, " "), test.token) {
-					t.Fatal("credential reached implementation command argv")
+				if strings.Contains(strings.Join(command.Args, " ")+strings.Join(command.Env, " "), "GH_TOKEN=") || test.token != "" && strings.Contains(strings.Join(command.Args, " ")+strings.Join(command.Env, " "), test.token) {
+					t.Fatal("GitHub credential reached implementation process")
 				}
 			}
 			body, readErr := os.ReadFile(r.manifestPath(attempt))
@@ -1431,14 +2359,15 @@ func TestImplementationAuthenticationCrossesRuntimeBoundary(t *testing.T) {
 func TestCredentialedPaneOutputIsRedactedBeforeLogPersistence(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	canary := "pane-credential-canary"
-	t.Setenv("GH_TOKEN", canary)
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	t.Setenv("MODEL_API_KEY", canary)
+	r.AllowEnv = append(r.AllowEnv, "MODEL_API_KEY")
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fake.sessions[manifest.Session].dead = true
 	fake.sessions[manifest.Session].output = "agent failure " + canary
-	if _, err := r.Monitor(t.Context(), attempt); err != nil {
+	if _, err := monitorFixture(t, r, t.Context(), attempt); err != nil {
 		t.Fatal(err)
 	}
 	log, err := os.ReadFile(manifest.LogPath)
@@ -1519,7 +2448,7 @@ func TestTmuxSessionImportsAuthenticationWithoutPuttingValuesInArgv(t *testing.T
 func TestWorkerIdentityFailsClosedBeforeMutation(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	r.VerifyWorker = nil
-	if _, err := r.PrepareAndStart(context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "identity") {
+	if _, err := prepareAndStartFixture(t, r, context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "identity") {
 		t.Fatalf("missing hook = %v", err)
 	}
 	if len(fake.seen) != 0 {
@@ -1529,17 +2458,17 @@ func TestWorkerIdentityFailsClosedBeforeMutation(t *testing.T) {
 		t.Fatalf("manifest created before identity verification: %v", err)
 	}
 	r.VerifyWorker = func(context.Context) error { return errors.New("wrong uid") }
-	if _, err := r.PrepareAndStart(context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "wrong uid") {
+	if _, err := prepareAndStartFixture(t, r, context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "wrong uid") {
 		t.Fatalf("failed hook = %v", err)
 	}
 	r.VerifyWorker = func(context.Context) error { return nil }
 	missingCommand := attempt
 	missingCommand.Command = nil
-	if _, err := r.PrepareAndStart(context.Background(), missingCommand); err == nil || !strings.Contains(err.Error(), "command") {
+	if _, err := prepareAndStartFixture(t, r, context.Background(), missingCommand); err == nil || !strings.Contains(err.Error(), "input is invalid") {
 		t.Fatalf("missing command = %v", err)
 	}
 	r.AllowEnv = []string{"SSH_AUTH_SOCK"}
-	if _, err := r.PrepareAndStart(context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "environment") {
+	if _, err := prepareAndStartFixture(t, r, context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "environment") {
 		t.Fatalf("environment filtering error = %v", err)
 	}
 	if len(fake.seen) != 0 {
@@ -1549,13 +2478,13 @@ func TestWorkerIdentityFailsClosedBeforeMutation(t *testing.T) {
 
 func TestExactTargetsExitCodesAndHistory(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(context.Background(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, context.Background(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fake.sessions[manifest.Session].dead = true
 	fake.sessions[manifest.Session].status = 127
-	manifest, err = r.Monitor(context.Background(), attempt)
+	manifest, err = monitorFixture(t, r, context.Background(), attempt)
 	if err != nil || manifest.State != "failed" || !strings.Contains(manifest.Diagnostic, "status 127") {
 		t.Fatalf("large exit status = %#v, %v", manifest, err)
 	}
@@ -1564,10 +2493,10 @@ func TestExactTargetsExitCodesAndHistory(t *testing.T) {
 		if command.Name != "tmux" {
 			continue
 		}
-		if target := valueAfter(command.Args, "-t"); target != "" && target != "="+manifest.Session && target != PaneTarget(manifest.Session) {
+		if target := valueAfter(command.Args, "-t"); target != "" && target != "="+manifest.Session && target != PaneTarget(manifest.Session) && target != "%0" {
 			t.Fatalf("inexact target %q in %#v", target, command.Args)
 		}
-		if command.Args[0] == "set-option" && slices.Contains(command.Args, "history-limit") && slices.Contains(command.Args, historyLimit) {
+		if slices.Contains(command.Args, "new-session") && slices.Contains(command.Args, "history-limit") && slices.Contains(command.Args, historyLimit) {
 			historyConfigured = true
 		}
 	}
@@ -1578,7 +2507,7 @@ func TestExactTargetsExitCodesAndHistory(t *testing.T) {
 
 func TestVerifyActiveAcceptsOnlyApprovedUnpublishedAncestryOrPublishedHead(t *testing.T) {
 	r, _, attempt, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1609,12 +2538,12 @@ func TestVerifyActiveAcceptsOnlyApprovedUnpublishedAncestryOrPublishedHead(t *te
 
 func TestResumeHandoffEligibilityOwnsStateTransition(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fake.sessions[manifest.Session].dead = true
-	if manifest, err = r.Monitor(t.Context(), attempt); err != nil || manifest.State != "completed" {
+	if manifest, err = monitorFixture(t, r, t.Context(), attempt); err != nil || manifest.State != "completed" {
 		t.Fatalf("completed manifest=%#v err=%v", manifest, err)
 	}
 	eligibilityChecked := false
@@ -1622,7 +2551,7 @@ func TestResumeHandoffEligibilityOwnsStateTransition(t *testing.T) {
 		eligibilityChecked = true
 		return false
 	}
-	if _, err := r.ResumeHandoff(t.Context(), attempt); err == nil || !strings.Contains(err.Error(), "no longer eligible") {
+	if _, err := resumeHandoffFixture(t, r, t.Context(), attempt); err == nil || !strings.Contains(err.Error(), "input is invalid") {
 		t.Fatalf("ineligible resume=%v", err)
 	}
 	current, err := r.Discover()
@@ -1634,11 +2563,11 @@ func TestResumeHandoffEligibilityOwnsStateTransition(t *testing.T) {
 func TestLaunchConfiguresEmptySessionBeforeAgentAndRetainsFastExit(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	attempt.Command = []string{"fast-exit"}
-	manifest, err := r.PrepareAndStart(context.Background(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, context.Background(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var newIndex, remainIndex, historyIndex, respawnIndex = -1, -1, -1, -1
+	var newIndex, releaseIndex = -1, -1
 	for i, command := range fake.seen {
 		if command.Name != "tmux" {
 			continue
@@ -1646,24 +2575,20 @@ func TestLaunchConfiguresEmptySessionBeforeAgentAndRetainsFastExit(t *testing.T)
 		switch {
 		case slices.Contains(command.Args, "new-session"):
 			newIndex = i
-			if slices.Contains(command.Args, "fast-exit") {
-				t.Fatalf("new session contains agent command: %#v", command.Args)
+			if !slices.Contains(command.Args, "remain-on-exit") || !slices.Contains(command.Args, "history-limit") {
+				t.Fatalf("session setup was not atomic with creation: %#v", command.Args)
 			}
-		case command.Args[0] == "set-option":
-			if slices.Contains(command.Args, "remain-on-exit") {
-				remainIndex = i
+			if !slices.Contains(command.Args, "implementation-gate") || !slices.Contains(command.Args, "fast-exit") {
+				t.Fatalf("new session did not park the authorized agent command: %#v", command.Args)
 			}
-			if slices.Contains(command.Args, "history-limit") {
-				historyIndex = i
-			}
-		case command.Args[0] == "respawn-pane":
-			respawnIndex = i
+		case command.Args[0] == "if-shell" && slices.Contains(command.Args, "wait-for -U "+ImplementationGateChannel(manifest.LaunchID)):
+			releaseIndex = i
 		}
 	}
-	if !(newIndex < remainIndex && remainIndex < historyIndex && historyIndex < respawnIndex) {
-		t.Fatalf("launch order new=%d remain=%d history=%d respawn=%d", newIndex, remainIndex, historyIndex, respawnIndex)
+	if !(newIndex >= 0 && newIndex < releaseIndex) {
+		t.Fatalf("launch order new=%d release=%d", newIndex, releaseIndex)
 	}
-	got, err := r.Monitor(context.Background(), attempt)
+	got, err := monitorFixture(t, r, context.Background(), attempt)
 	if err != nil || got.State != "failed" || !strings.Contains(got.Diagnostic, "status 42") || !fake.sessions[manifest.Session].dead {
 		t.Fatalf("fast exit = %#v, %v", got, err)
 	}
@@ -1671,18 +2596,18 @@ func TestLaunchConfiguresEmptySessionBeforeAgentAndRetainsFastExit(t *testing.T)
 
 func TestMonitorWaitsForPaneStatusThenReportsSignal(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(t.Context(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	session := fake.sessions[manifest.Session]
 	session.dead, session.pending = true, true
-	pending, err := r.Monitor(t.Context(), attempt)
+	pending, err := monitorFixture(t, r, t.Context(), attempt)
 	if err != nil || pending.State != "running" || !pending.UpdatedAt.Equal(manifest.UpdatedAt) {
 		t.Fatalf("pending pane status changed progress: manifest=%#v err=%v", pending, err)
 	}
 	session.pending, session.signal, session.output = false, "15", "terminated output\n"
-	failed, err := r.Monitor(t.Context(), attempt)
+	failed, err := monitorFixture(t, r, t.Context(), attempt)
 	if err != nil || failed.State != "failed" || !strings.Contains(failed.Diagnostic, "signal 15") {
 		t.Fatalf("signaled pane status=%#v err=%v", failed, err)
 	}
@@ -1700,7 +2625,7 @@ func TestStateContainmentRejectsEscapes(t *testing.T) {
 		if err := os.Symlink(t.TempDir(), filepath.Join(r.StateRoot, "attempts", internalgithub.RepositoryIdentifier(attempt.Repository))); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := r.PrepareAndStart(context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "symlink") {
+		if _, err := prepareAndStartFixture(t, r, context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "symlink") {
 			t.Fatalf("creation escape = %v", err)
 		}
 	})
@@ -1737,7 +2662,7 @@ func TestStateContainmentRejectsEscapes(t *testing.T) {
 		if err := os.Symlink(outside, r.manifestPath(attempt)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := r.Monitor(context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "symlink") {
+		if _, err := monitorFixture(t, r, context.Background(), attempt); err == nil || !strings.Contains(err.Error(), "symlink") {
 			t.Fatalf("read escape = %v", err)
 		}
 	})
@@ -1745,17 +2670,17 @@ func TestStateContainmentRejectsEscapes(t *testing.T) {
 
 func TestProbeAndCancellationErrorsPreserveState(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
-	_, err := r.PrepareAndStart(context.Background(), attempt)
+	_, err := prepareAndStartFixture(t, r, context.Background(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fake.failCode["display-message"] = 23
-	if got, err := r.Monitor(context.Background(), attempt); err == nil || got.State != "running" {
+	if got, err := monitorFixture(t, r, context.Background(), attempt); err == nil || got.State != "running" {
 		t.Fatalf("observation error = %#v, %v", got, err)
 	}
 	delete(fake.failCode, "display-message")
 	fake.ignoreInterrupt, fake.keepAfterKill = true, true
-	if got, err := r.Cancel(context.Background(), attempt, "stop"); err == nil || got.State != "running" {
+	if got, err := cancelFixture(t, r, context.Background(), attempt, "stop"); err == nil || got.State != "running" {
 		t.Fatalf("uncertain cancellation = %#v, %v", got, err)
 	}
 	stored, err := readManifest(r.manifestPath(attempt))
@@ -1764,30 +2689,30 @@ func TestProbeAndCancellationErrorsPreserveState(t *testing.T) {
 	}
 
 	r2, fake2, attempt2, _ := testRuntime(t)
-	if _, err := r2.PrepareAndStart(context.Background(), attempt2); err != nil {
+	if _, err := prepareAndStartFixture(t, r2, context.Background(), attempt2); err != nil {
 		t.Fatal(err)
 	}
 	fake2.failCode["has-session"] = 2
-	if got, err := r2.Cancel(context.Background(), attempt2, "stop"); err == nil || got.State != "running" {
+	if got, err := cancelFixture(t, r2, context.Background(), attempt2, "stop"); err == nil || got.State != "running" {
 		t.Fatalf("probe permission error = %#v, %v", got, err)
 	}
 
 	r3, fake3, attempt3, _ := testRuntime(t)
 	r3.StopWait = time.Second
-	if _, err := r3.PrepareAndStart(context.Background(), attempt3); err != nil {
+	if _, err := prepareAndStartFixture(t, r3, context.Background(), attempt3); err != nil {
 		t.Fatal(err)
 	}
 	fake3.ignoreInterrupt = true
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if got, err := r3.Cancel(cancelled, attempt3, "stop"); !errors.Is(err, context.Canceled) || got.State != "running" {
+	if got, err := cancelFixture(t, r3, cancelled, attempt3, "stop"); !errors.Is(err, context.Canceled) || got.State != "running" {
 		t.Fatalf("cancellation timeout = %#v, %v", got, err)
 	}
 }
 
-func TestCancelValidatesManifestAndWinsConcurrentMonitor(t *testing.T) {
+func TestCancelValidatesManifest(t *testing.T) {
 	r, _, attempt, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(context.Background(), attempt)
+	manifest, err := prepareAndStartFixture(t, r, context.Background(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1795,28 +2720,15 @@ func TestCancelValidatesManifestAndWinsConcurrentMonitor(t *testing.T) {
 	if err := r.writeManifest(attempt, manifest); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Cancel(context.Background(), attempt, "stop"); err == nil || !strings.Contains(err.Error(), "deterministic") {
+	if _, err := cancelFixture(t, r, context.Background(), attempt, "stop"); err == nil || !strings.Contains(err.Error(), "deterministic") {
 		t.Fatalf("tampered cancel = %v", err)
 	}
 
-	r2, _, attempt2, _ := testRuntime(t)
-	if _, err := r2.PrepareAndStart(context.Background(), attempt2); err != nil {
-		t.Fatal(err)
-	}
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = r2.Monitor(context.Background(), attempt2) }()
-	go func() { defer wg.Done(); _, _ = r2.Cancel(context.Background(), attempt2, "stop") }()
-	wg.Wait()
-	stored, err := readManifest(r2.manifestPath(attempt2))
-	if err != nil || stored.State != "cancelled" {
-		t.Fatalf("concurrent final state = %#v, %v", stored, err)
-	}
 }
 
 func TestRepositoryIdentityAndCaseCollision(t *testing.T) {
 	r, _, first, _ := testRuntime(t)
-	manifest, err := r.PrepareAndStart(context.Background(), first)
+	manifest, err := prepareAndStartFixture(t, r, context.Background(), first)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1825,7 +2737,7 @@ func TestRepositoryIdentityAndCaseCollision(t *testing.T) {
 	}
 	second := first
 	second.Repository, second.Number = "Owner/Repo", 2
-	if _, err := r.PrepareAndStart(context.Background(), second); err == nil || !strings.Contains(err.Error(), "case collision") {
+	if _, err := prepareAndStartFixture(t, r, context.Background(), second); err == nil || !strings.Contains(err.Error(), "case collision") {
 		t.Fatalf("case collision = %v", err)
 	}
 	long := first
@@ -1845,7 +2757,7 @@ func TestCaptureAndLogErrorsAreHonest(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			r, fake, attempt, _ := testRuntime(t)
-			manifest, err := r.PrepareAndStart(context.Background(), attempt)
+			manifest, err := prepareAndStartFixture(t, r, context.Background(), attempt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1853,7 +2765,7 @@ func TestCaptureAndLogErrorsAreHonest(t *testing.T) {
 			if err := test.breakOutput(fake, manifest); err != nil {
 				t.Fatal(err)
 			}
-			got, err := r.Monitor(context.Background(), attempt)
+			got, err := monitorFixture(t, r, context.Background(), attempt)
 			if err == nil || got.State != "failed" || !strings.Contains(got.Diagnostic, "not preserved") || strings.Contains(got.Diagnostic, "output preserved in") {
 				t.Fatalf("output failure = %#v, %v", got, err)
 			}
@@ -1888,10 +2800,293 @@ func testRuntime(t *testing.T) (*Runtime, *fakeRunner, Attempt, string) {
 	if err := os.MkdirAll(state, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = filepath.EvalSymlinks(state)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fake := newFakeRunner()
 	r := &Runtime{Root: root, StateRoot: state, Source: primary, Git: "git", Tmux: "tmux", Helper: "agent-symphony-helper", Runner: fake, AllowEnv: []string{"PATH"}, StopWait: time.Millisecond, VerifyWorker: func(context.Context) error { return nil }}
 	attempt := Attempt{Repository: "owner/repo", Issue: 3, Number: 1, BaseSHA: sha, Context: "issue context\n", Command: []string{"fake-agent"}}
 	return r, fake, attempt, primary
+}
+
+// prepareAndStartFixture exercises the runtime through typed effects while
+// emulating the owner grant only inside runtime-package tests. Production
+// callers must submit an owner Start intent and cannot use this fixture.
+func prepareAndStartFixture(t *testing.T, r *Runtime, ctx context.Context, attempt Attempt) (Manifest, error) {
+	t.Helper()
+	r.mu.Lock()
+	canonicalState, stateErr := filepath.EvalSymlinks(r.StateRoot)
+	if stateErr != nil {
+		r.mu.Unlock()
+		return Manifest{}, stateErr
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(r.Root)
+	if err != nil {
+		r.mu.Unlock()
+		return Manifest{}, err
+	}
+	if r.StateRoot != canonicalState {
+		r.StateRoot = canonicalState
+	}
+	if r.Root != canonicalRoot {
+		r.Root = canonicalRoot
+	}
+	r.mu.Unlock()
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Now())
+	if err != nil {
+		return Manifest{}, err
+	}
+	if existing, err := r.readManifest(attempt); err == nil {
+		return existing, errors.New("attempt resources already exist")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Manifest{}, err
+	}
+	eligible := attempt.Eligible == nil || attempt.Eligible()
+	effectAttempt := attempt
+	effectAttempt.Eligible = nil
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	bind := func(action EffectAction, current Manifest) (EffectRequest, error) {
+		request, err := executor.BindRequest(EffectRequest{Action: action, Attempt: effectAttempt, Manifest: current, Eligible: eligible})
+		if err != nil {
+			return EffectRequest{}, err
+		}
+		id, err := newLaunchToken()
+		if err != nil {
+			return EffectRequest{}, err
+		}
+		request.Identity = EffectIdentity{Repository: current.Repository, Issue: current.Issue, Attempt: current.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: id}
+		if action == EffectStart {
+			request.GateNonce = request.Identity.EffectID
+		}
+		request.Identity.RequestDigest, err = EffectRequestDigest(request)
+		return request, err
+	}
+	prepare, err := bind(EffectPrepare, manifest)
+	if err != nil {
+		return Manifest{}, err
+	}
+	prepared, err := executor.Execute(ctx, prepare)
+	if prepared.Manifest.Repository == "" {
+		return Manifest{}, err
+	}
+	if writeErr := r.writeManifest(attempt, prepared.Manifest); writeErr != nil {
+		return Manifest{}, errors.Join(err, writeErr)
+	}
+	if err != nil || prepared.Manifest.State != "preparing" {
+		return prepared.Manifest, err
+	}
+	start, err := bind(EffectStart, prepared.Manifest)
+	if err != nil {
+		return prepared.Manifest, err
+	}
+	started, err := executor.Execute(ctx, start)
+	if started.Manifest.Repository == "" {
+		return Manifest{}, err
+	}
+	if writeErr := r.writeManifest(attempt, started.Manifest); writeErr != nil {
+		return started.Manifest, errors.Join(err, writeErr)
+	}
+	return started.Manifest, err
+}
+
+func monitorFixture(t *testing.T, r *Runtime, ctx context.Context, attempt Attempt) (Manifest, error) {
+	t.Helper()
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if manifest.Version != boundManifestVersion {
+		return r.Monitor(ctx, attempt)
+	}
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		return Manifest{}, err
+	}
+	eligible := attempt.Eligible == nil || attempt.Eligible()
+	effectAttempt := attempt
+	effectAttempt.Eligible = nil
+	executor := EffectExecutor{Runtime: r}
+	request, err := executor.BindRequest(EffectRequest{Action: EffectMonitor, Attempt: effectAttempt, Manifest: manifest, Eligible: eligible})
+	if err != nil {
+		return manifest, err
+	}
+	id, err := newLaunchToken()
+	if err != nil {
+		return manifest, err
+	}
+	request.Identity = EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: id}
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		return manifest, err
+	}
+	result, effectErr := executor.Execute(ctx, request)
+	if result.Manifest.Repository == "" {
+		return manifest, effectErr
+	}
+	if writeErr := r.writeManifest(attempt, result.Manifest); writeErr != nil {
+		return result.Manifest, errors.Join(effectErr, writeErr)
+	}
+	return result.Manifest, effectErr
+}
+
+func cancelFixture(t *testing.T, r *Runtime, ctx context.Context, attempt Attempt, reason string) (Manifest, error) {
+	t.Helper()
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if manifest.Version != boundManifestVersion {
+		return r.Cancel(ctx, attempt, reason)
+	}
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		return Manifest{}, err
+	}
+	effectAttempt := attempt
+	effectAttempt.Eligible = nil
+	executor := EffectExecutor{Runtime: r}
+	request, err := executor.BindRequest(EffectRequest{Action: EffectStop, Attempt: effectAttempt, Manifest: manifest, Reason: reason})
+	if err != nil {
+		return manifest, err
+	}
+	id, err := newLaunchToken()
+	if err != nil {
+		return manifest, err
+	}
+	request.Identity = EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: id}
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		return manifest, err
+	}
+	result, effectErr := executor.Execute(ctx, request)
+	if result.Manifest.Repository == "" {
+		return manifest, effectErr
+	}
+	if effectErr == nil {
+		if writeErr := r.writeManifest(attempt, result.Manifest); writeErr != nil {
+			return result.Manifest, writeErr
+		}
+	}
+	return result.Manifest, effectErr
+}
+
+func reviewFixture(t *testing.T, r *Runtime, attempt Attempt, review ReviewTransition) (Manifest, error) {
+	t.Helper()
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if manifest.Version != boundManifestVersion {
+		return r.RecordReview(attempt, review.State, review.Mode, review.Target, review.Base, review.Head, review.Snapshot, review.Session)
+	}
+	executor := EffectExecutor{Runtime: r}
+	request, err := executor.BindRequest(EffectRequest{Action: EffectReview, Attempt: attempt, Manifest: manifest, Review: review})
+	if err != nil {
+		return manifest, err
+	}
+	id, err := newLaunchToken()
+	if err != nil {
+		return manifest, err
+	}
+	request.Identity = EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: id}
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		return manifest, err
+	}
+	result, effectErr := executor.Execute(t.Context(), request)
+	if effectErr != nil {
+		return manifest, effectErr
+	}
+	return result.Manifest, r.writeManifest(attempt, result.Manifest)
+}
+
+func reviewFindingsFixture(t *testing.T, r *Runtime, attempt Attempt, head string, findings []string, queued, acknowledged bool) (Manifest, error) {
+	t.Helper()
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if manifest.Version != boundManifestVersion {
+		return r.RecordReviewFindings(attempt, head, findings, queued, acknowledged)
+	}
+	return reviewFixture(t, r, attempt, ReviewTransition{State: "findings-queued", Mode: manifest.ReviewMode, Target: manifest.ReviewTarget, Base: manifest.ReviewBase, Head: head, Snapshot: manifest.ReviewSnapshot, Session: manifest.ReviewSession, Findings: slices.Clone(findings), HandoffQueued: queued, HandoffAcknowledged: acknowledged})
+}
+
+func forgetFixture(t *testing.T, r *Runtime, manifest Manifest) error {
+	t.Helper()
+	if manifest.Version != boundManifestVersion {
+		return r.Forget(manifest)
+	}
+	executor := EffectExecutor{
+		Runtime: r,
+		Cleanup: func(ctx context.Context, request EffectRequest) error {
+			if err := r.VerifyResourcesGone(ctx, request.Manifest); err != nil {
+				return err
+			}
+			return r.ForgetCompatibility(request.Manifest)
+		},
+		VerifyCleanup: func(ctx context.Context, request EffectRequest) (bool, error) {
+			return r.VerifyResourcesGone(ctx, request.Manifest) == nil, nil
+		},
+	}
+	request, err := executor.BindRequest(EffectRequest{Action: EffectCleanup, Attempt: Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}, Manifest: manifest, Cleanup: EffectCleanupPolicy{Action: "abandon"}})
+	if err != nil {
+		return err
+	}
+	id, err := newLaunchToken()
+	if err != nil {
+		return err
+	}
+	request.Identity = EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: id}
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		return err
+	}
+	_, err = executor.Execute(t.Context(), request)
+	return err
+}
+
+func resumeHandoffFixture(t *testing.T, r *Runtime, ctx context.Context, attempt Attempt) (Manifest, error) {
+	t.Helper()
+	manifest, err := r.readManifest(attempt)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if err := r.validateManifest(attempt, manifest); err != nil {
+		return Manifest{}, err
+	}
+	eligible := attempt.Eligible == nil || attempt.Eligible()
+	effectAttempt := attempt
+	effectAttempt.Eligible = nil
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	request, err := executor.BindRequest(EffectRequest{Action: EffectHandoff, Attempt: effectAttempt, Manifest: manifest, Eligible: eligible, CandidateLaunchToken: strings.Repeat("c", 32)})
+	if err != nil {
+		return Manifest{}, err
+	}
+	request.Identity = EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 2, IssueGeneration: 1, AttemptGeneration: 1, EffectID: strings.Repeat("d", 32)}
+	request.Identity.RequestDigest, err = EffectRequestDigest(request)
+	if err != nil {
+		return Manifest{}, err
+	}
+	result, err := executor.Execute(ctx, request)
+	if err != nil {
+		return result.Manifest, err
+	}
+	return result.Manifest, r.writeManifest(attempt, result.Manifest)
+}
+
+func startSessionFixture(t *testing.T, r *Runtime, ctx context.Context, manifest Manifest, env []string, effectID string, command []string) error {
+	t.Helper()
+	if r.Helper == "" {
+		r.Helper = filepath.Join(t.TempDir(), "agent-symphony")
+		if output, err := exec.Command("go", "build", "-o", r.Helper, "../../cmd/agent-symphony").CombinedOutput(); err != nil {
+			t.Fatalf("build gate helper: %v: %s", err, output)
+		}
+	}
+	return r.startSession(ctx, manifest, env, effectID, command)
 }
 
 func runGit(t *testing.T, dir string, args ...string) {

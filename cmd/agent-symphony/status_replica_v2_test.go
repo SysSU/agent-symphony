@@ -46,17 +46,21 @@ func TestOwnerStatusReplicaIsRevisionTaggedAndRejectsOlderWrites(t *testing.T) {
 func TestOwnerStatusProjectionMatchesRecoveryProjection(t *testing.T) {
 	for _, lifecycle := range []string{"preparing", "running", "failed", "cancelled", "completed"} {
 		t.Run(lifecycle, func(t *testing.T) {
-			owner := newReconciliationTestOwner(t)
-			manifest := ownerTestManifest(t, owner.stateRoot, 186, 1, lifecycle)
+			root := resolvedTempDir(t)
+			manifest := ownerTestManifest(t, root, 186, 1, lifecycle)
 			if lifecycle == "failed" {
 				manifest.Diagnostic = "test failure"
 			}
 			if lifecycle == "cancelled" {
 				manifest.Diagnostic = "test cancellation"
 			}
-			if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
+			state := runtimeEffectInitialState(manifest)
+			state.Epoch, state.Revision = 1, 1
+			owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { _ = owner.close(context.Background()) })
 			issue := issueFact(186, "projection")
 			issue.Eligible = true
 			input := repositoryInput(true, issue)
@@ -73,6 +77,12 @@ func TestOwnerStatusProjectionMatchesRecoveryProjection(t *testing.T) {
 			_, facts := recoveryAttemptFacts(input.Attempts, input.Issues)
 			committedLiveness := func(context.Context, agentruntime.Manifest, orchestrator.AttemptFact) error { return nil }
 			want, _ := projectRecoveryStatuses(context.Background(), facts, input.Issues, []agentruntime.Manifest{manifest}, 1, committedLiveness)
+			for index := range got.Statuses {
+				if !validDigest(got.Statuses[index].OwnerCausalityToken) {
+					t.Fatalf("owner projection lacks causality: %#v", got.Statuses[index])
+				}
+				got.Statuses[index].IssueGeneration, got.Statuses[index].AttemptGeneration, got.Statuses[index].MachineStatusSequence, got.Statuses[index].OwnerCausalityToken = 0, 0, 0, ""
+			}
 			if !reflect.DeepEqual(got.Statuses, want) {
 				t.Fatalf("owner projection=%#v\nv1 projection=%#v", got.Statuses, want)
 			}
@@ -116,7 +126,8 @@ func TestOwnerStatusProjectionMasksTombstonedAttempts(t *testing.T) {
 	owner, snapshot, request := reconciliationEffectTestOwner(t, request)
 	masked, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: request.Repository, Issue: request.Issue, Attempt: request.GitHubIssueUpdate.AttributionAttempt, ExpectedIssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(request.Repository, request.Issue)], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[ownerAttemptKey(request.Repository, request.Issue, request.GitHubIssueUpdate.AttributionAttempt)], Action: "dismissed", CleanupPhase: "completed"})
 	if err != nil {
-		t.Fatal(err)
+		current := mustOwnerSnapshot(t, owner)
+		t.Fatalf("invalidate tombstoned projection fixture: %v attempts=%#v effects=%#v proofs=%#v", err, current.State.Attempts, current.State.Effects, current.State.ReviewerProofs)
 	}
 	status, err := projectOwnerStatus(masked, 1, time.Unix(20, 0))
 	if err != nil {
@@ -126,6 +137,21 @@ func TestOwnerStatusProjectionMasksTombstonedAttempts(t *testing.T) {
 		if projected.Issue == request.Issue && projected.Attempt == request.GitHubIssueUpdate.AttributionAttempt && projected.PR != 0 {
 			t.Fatalf("tombstoned remote attempt was projected: %#v", projected)
 		}
+	}
+}
+
+func TestOwnerStatusProjectionKeepsDismissedAttemptHiddenWithUnresolvedGitHubMutation(t *testing.T) {
+	state := newRuntimeOwnerState("o/r")
+	state.Epoch, state.Revision = 1, 1
+	issueKey, attemptKey := ownerIssueKey("o/r", 330), ownerAttemptKey("o/r", 330, 1)
+	state.IssueGenerations[issueKey], state.AttemptGenerations[attemptKey] = 2, 2
+	state.Tombstones[attemptKey] = runtimeTombstone{Repository: "o/r", Issue: 330, Attempt: 1, Action: "dismissed", CleanupPhase: "completed", InvalidatedGeneration: 1, Generation: 2, Revision: 1}
+	request := reconciliationEffectRequest{Action: reconciliationGitHubPublish, Repository: "o/r", Issue: 330, Attempt: 1, GitHubPublish: &githubPublishEffectRequest{}}
+	state.Effects["ambiguous"] = runtimeEffectIntent{Repository: "o/r", Issue: 330, Attempt: 1, State: "invalidated", Dispatched: true, Reconciliation: &request}
+
+	projected, err := projectOwnerStatus(stateOwnerSnapshot{State: state}, 1, time.Unix(2, 0))
+	if err != nil || len(projected.Statuses) != 0 {
+		t.Fatalf("quarantine projection=%#v err=%v", projected.Statuses, err)
 	}
 }
 

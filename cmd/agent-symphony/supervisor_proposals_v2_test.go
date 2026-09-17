@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,7 +23,8 @@ import (
 func TestSupervisorRetryWaitsForCompletedCycleBeforeSuccess(t *testing.T) {
 	owner, manifest := retryProposalOwner(t, 371)
 	agent := proposalTestSupervisor(t)
-	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Action: orchestratoragent.ProposalActionRetry, RequestID: "retry-371-1"}
+	snapshot := mustOwnerSnapshot(t, owner)
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Action: orchestratoragent.ProposalActionRetry, RequestID: "retry-371-1", OwnerCausalityToken: ownerAttemptCausalityToken(snapshot.State, manifest.Repository, manifest.Issue, manifest.Attempt)}
 	writeProposalV2(t, agent, proposal)
 
 	started, release := make(chan struct{}), make(chan struct{})
@@ -66,16 +68,163 @@ func TestSupervisorInvalidRetryIsRefusedBeforeRunning(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
 	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: &runtimeEffectCoordinator{}, operator: &operatorMutationService{}, trigger: trigger, capacity: 1}
-	if err := service.process(t.Context()); err == nil {
-		t.Fatal("invalid retry unexpectedly succeeded")
+	if err := service.process(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	if status := readProposalStatusV2(t, agent); status.Resolution != "refused" || strings.Contains(status.Detail, "running") || triggered {
 		t.Fatalf("invalid retry status=%#v triggered=%v", status, triggered)
 	}
 }
 
-func TestSupervisorRecoverWaitsForTerminalDurableReceipt(t *testing.T) {
-	owner, manifest := operatorTestOwner(t, 373, "active", false)
+func TestSupervisorStatusProposalCannotRebindAfterDismiss(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 333, "active", false)
+	before := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey("o/r", 333), ownerAttemptKey("o/r", 333, 1)
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 333, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-333-1", Detail: "monitoring: stale heartbeat", IssueGeneration: before.State.IssueGenerations[issueKey], AttemptGeneration: before.State.AttemptGenerations[attemptKey], OwnerCausalityToken: ownerAttemptCausalityToken(before.State, "o/r", 333, 1)}
+	if _, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 333, Attempt: 1, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, Action: "dismissed", CleanupPhase: "completed", Manifest: &manifest}); err != nil {
+		t.Fatal(err)
+	}
+	agent := proposalTestSupervisor(t)
+	writeProposalV2(t, agent, proposal)
+	operator := operatorTestMutationService(t, owner)
+	trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
+	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
+	if err := service.process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if status := readProposalStatusV2(t, agent); status.Resolution != "refused" {
+		t.Fatalf("proposal status=%#v", status)
+	}
+	committed := mustOwnerSnapshot(t, owner).State.MachineStatuses[issueKey]
+	if committed.Status != "clear" || committed.Source != "destructive" || committed.Sequence != 1 {
+		t.Fatalf("stale proposal changed owner status: %#v", committed)
+	}
+}
+
+func TestSupervisorStatusProposalCannotOverwriteNewerStatus(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 334, "active", false)
+	before := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey("o/r", 334), ownerAttemptKey("o/r", 334, 1)
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 334, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-334-1", Detail: "monitoring: stale heartbeat", IssueGeneration: before.State.IssueGenerations[issueKey], AttemptGeneration: before.State.AttemptGenerations[attemptKey], MachineStatusSequence: 0, OwnerCausalityToken: ownerAttemptCausalityToken(before.State, "o/r", 334, 1)}
+	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 334, Attempt: 1, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, ExpectedStatusSequence: 0, Source: "worker", SourceID: "new-clear", SourceSequence: 1, Status: "clear", Reason: "monitoring: recovered"}); err != nil {
+		t.Fatal(err)
+	}
+	agent := proposalTestSupervisor(t)
+	writeProposalV2(t, agent, proposal)
+	operator := operatorTestMutationService(t, owner)
+	trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
+	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
+	if err := service.process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if status := readProposalStatusV2(t, agent); status.Resolution != "refused" {
+		t.Fatalf("proposal status=%#v", status)
+	}
+	committed := mustOwnerSnapshot(t, owner).State.MachineStatuses[issueKey]
+	if committed.Status != "clear" || committed.SourceID != "new-clear" || committed.Sequence != 1 || committed.Attempt != manifest.Attempt {
+		t.Fatalf("stale supervisor changed status: %#v", committed)
+	}
+}
+
+func TestSupervisorStatusAdmissionFailsTerminallyWithoutFreshObservation(t *testing.T) {
+	root := resolvedTempDir(t)
+	manifest := ownerTestManifest(t, root, 336, 1, "running")
+	state := runtimeEffectInitialState(manifest)
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	snapshot := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey("o/r", 336), ownerAttemptKey("o/r", 336, 1)
+	agent := proposalTestSupervisor(t)
+	writeProposalV2(t, agent, orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 336, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-336-1", Detail: "monitoring: awaiting observation", IssueGeneration: snapshot.State.IssueGenerations[issueKey], AttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], OwnerCausalityToken: ownerAttemptCausalityToken(snapshot.State, "o/r", 336, 1)})
+	operator := operatorTestMutationService(t, owner)
+	trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
+	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
+	if err := service.process(t.Context()); err == nil {
+		t.Fatal("status without a fresh observation unexpectedly succeeded")
+	}
+	if status := readProposalStatusV2(t, agent); status.Resolution != "failed" || status.ResolvedBinding == "" {
+		t.Fatalf("durably admitted proposal was not terminally failed: %#v", status)
+	}
+	if status := mustOwnerSnapshot(t, owner).State.MachineStatuses[issueKey]; status.Status != "needs-attention" || status.Sequence != 1 {
+		t.Fatalf("owner status=%#v", status)
+	}
+}
+
+func TestSupervisorStatusExecutionFailureIsTerminal(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 337, "active", false)
+	snapshot := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey("o/r", 337), ownerAttemptKey("o/r", 337, 1)
+	agent := proposalTestSupervisor(t)
+	writeProposalV2(t, agent, orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 337, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-337-1", Detail: "monitoring: needs operator", IssueGeneration: snapshot.State.IssueGenerations[issueKey], AttemptGeneration: snapshot.State.AttemptGenerations[attemptKey], OwnerCausalityToken: ownerAttemptCausalityToken(snapshot.State, "o/r", 337, 1)})
+	operator := operatorTestMutationService(t, owner)
+	trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
+	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
+	if err := service.process(t.Context()); err == nil {
+		t.Fatal("failed GitHub execution unexpectedly succeeded")
+	}
+	if status := readProposalStatusV2(t, agent); status.Resolution != "failed" {
+		t.Fatalf("execution failure was not terminal: %#v", status)
+	}
+}
+
+func TestSupervisorStatusProposalRejectsSameGenerationLifecycleDrift(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 338, "active", false)
+	before := mustOwnerSnapshot(t, owner)
+	issueKey, attemptKey := ownerIssueKey("o/r", 338), ownerAttemptKey("o/r", 338, 1)
+	proposal := orchestratoragent.MessageProposal{Version: 1, Repository: "o/r", Issue: 338, Attempt: 1, Action: orchestratoragent.ProposalActionStatusSet, RequestID: "status-338-1", Detail: "monitoring: stale lifecycle", IssueGeneration: before.State.IssueGenerations[issueKey], AttemptGeneration: before.State.AttemptGenerations[attemptKey], OwnerCausalityToken: ownerAttemptCausalityToken(before.State, "o/r", 338, 1)}
+	observation := before.State.Observations[issueKey]
+	issue := expandIssueFact(observation.Fact)
+	issue.Title += " changed"
+	var attempts []internalgithub.RecoveryAttemptFact
+	for _, attempt := range observation.Attempts {
+		attempts = append(attempts, expandAttemptFact(attempt.Fact))
+	}
+	applyReconciliationInput(t, owner, reconciliationInput{Scope: issueScope(338), Complete: true, Issues: []internalgithub.RecoveryIssueFact{issue}, Attempts: attempts})
+	after := mustOwnerSnapshot(t, owner)
+	if after.State.IssueGenerations[issueKey] != proposal.IssueGeneration || after.State.AttemptGenerations[attemptKey] != proposal.AttemptGeneration || after.State.MachineStatuses[issueKey].Sequence != proposal.MachineStatusSequence || ownerAttemptCausalityToken(after.State, "o/r", 338, 1) == proposal.OwnerCausalityToken {
+		t.Fatalf("test did not create same-generation lifecycle drift")
+	}
+	if _, err := owner.admitMachineStatus(t.Context(), admitMachineStatusCommand{Repository: "o/r", Issue: 338, Attempt: 1, ExpectedIssueGeneration: proposal.IssueGeneration, ExpectedAttemptGeneration: proposal.AttemptGeneration, ExpectedStatusSequence: proposal.MachineStatusSequence, ExpectedCausalityToken: proposal.OwnerCausalityToken, Source: "orchestrator", SourceID: strings.Repeat("a", 64), Status: "needs-attention", Reason: proposal.Detail}); !errors.Is(err, errStaleStateResult) {
+		t.Fatalf("owner accepted same-generation stale causality: %v", err)
+	}
+	agent := proposalTestSupervisor(t)
+	writeProposalV2(t, agent, proposal)
+	operator := operatorTestMutationService(t, owner)
+	trigger, err := newProductionReconciliationTriggerRunner(t.Context(), func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
+	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: operator.effects, operator: operator, trigger: trigger, capacity: 1}
+	if err := service.process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if status := readProposalStatusV2(t, agent); status.Resolution != "refused" {
+		t.Fatalf("same-generation stale proposal status=%#v", status)
+	}
+}
+
+func TestSupervisorRecoverWaitsForDurableReceipt(t *testing.T) {
+	owner, manifest := operatorNeverLaunchedOwner(t, 373, "failed", "failed", func(runtimeOwnerState) error { return nil })
 	snapshot, err := owner.reconciliationSnapshot(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -94,21 +243,33 @@ func TestSupervisorRecoverWaitsForTerminalDurableReceipt(t *testing.T) {
 	var collections int
 	service.collect = func(_ context.Context, _ stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
 		collections++
-		active := internalgithub.RecoveryAttemptFact{Repository: manifest.Repository, Issue: issue, Attempt: manifest.Attempt, BaseSHA: manifest.BaseSHA, State: "active", Checks: []string{}}
+		failed := internalgithub.RecoveryAttemptFact{Repository: manifest.Repository, Issue: issue, Attempt: manifest.Attempt, BaseSHA: manifest.BaseSHA, State: "failed", Checks: []string{}}
 		fact := issueFact(issue, "recover")
-		fact.Attempt, fact.CurrentAttempt, fact.NeedsAttention = manifest.Attempt, manifest.Attempt, true
-		if collections == 1 {
-			fact.Active, fact.ActiveAttempt = true, &active
-			return reconciliationV2Batch{Input: reconciliationInput{Scope: issueScope(issue), Complete: true, Issues: []internalgithub.RecoveryIssueFact{fact}, Attempts: []internalgithub.RecoveryAttemptFact{active}}}, nil
-		}
-		failed := active
-		failed.State = "failed"
-		fact.RecoveryAuthorized, fact.TerminalAttempts = true, []internalgithub.RecoveryAttemptFact{failed}
+		fact.Attempt, fact.CurrentAttempt, fact.RecoveryAttempt, fact.NeedsAttention, fact.RecoveryAuthorized = manifest.Attempt, manifest.Attempt, manifest.Attempt, true, true
+		fact.TerminalAttempts = []internalgithub.RecoveryAttemptFact{failed}
 		return reconciliationV2Batch{Input: reconciliationInput{Scope: issueScope(issue), Complete: true, Issues: []internalgithub.RecoveryIssueFact{fact}, Attempts: []internalgithub.RecoveryAttemptFact{failed}}}, nil
 	}
 	entered, release := make(chan struct{}), make(chan struct{})
 	first := true
+	jsonResponse := func(request *http.Request, value any) *http.Response {
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body)), Request: request}
+	}
 	service.collector.API = internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/user":
+			return jsonResponse(request, map[string]any{"id": 42, "login": "owner"}), nil
+		case "/repos/o/r/pulls":
+			return jsonResponse(request, []any{}), nil
+		case "/repos/o/r":
+			return jsonResponse(request, map[string]any{"full_name": "o/r", "default_branch": "main", "permissions": map[string]any{"pull": true}}), nil
+		case "/repos/o/r/branches/main":
+			return jsonResponse(request, map[string]any{"commit": map[string]any{"sha": manifest.BaseSHA}}), nil
+		case "/repos/o/r/issues/373":
+			return jsonResponse(request, map[string]any{"number": 373, "node_id": "I_373", "title": "recover", "body": "body", "state": "open", "created_at": "2026-09-14T00:00:00Z", "user": map[string]any{"id": 42}, "labels": []any{}}), nil
+		case "/repos/o/r/issues/373/timeline":
+			return jsonResponse(request, []any{}), nil
+		}
 		if !strings.Contains(request.URL.Path, "/comments") {
 			return nil, fmt.Errorf("unexpected GitHub request %s", request.URL.String())
 		}
@@ -183,6 +344,7 @@ func retryProposalOwner(t *testing.T, issue int) (*stateOwner, agentruntime.Mani
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, issue, 1, "completed")
 	manifest.ReviewState, manifest.ReviewHead = "clean", strings.Repeat("c", 40)
+	manifest.ReviewRunCleaned = true
 	state := runtimeEffectInitialState(manifest)
 	addOperatorObservation(&state, manifest, "active", false)
 	issueKey, attemptKey := ownerIssueKey(manifest.Repository, issue), ownerAttemptKey(manifest.Repository, issue, 1)

@@ -744,73 +744,11 @@ func (r *FileRecovery) write(states []PRState) error {
 	return dir.Sync()
 }
 
-// RunPRReconciliation is the one-shot production bootstrap; issue #4 owns its daemon lifecycle.
-func RunPRReconciliation(ctx context.Context, api API, cfg PRAdapterConfig, statePath string) error {
-	recovery := &FileRecovery{Path: statePath}
-	lock, err := openRegular(statePath+".governance.lock", os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return err
-	}
-	defer lock.Close()
-	if err := lock.Chmod(0o600); err != nil {
-		return err
-	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
-		return err
-	}
-	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
-	if err := api.VerifyRepository(ctx, cfg.Repository); err != nil {
-		return err
-	}
-	if _, err := os.Lstat(statePath); errors.Is(err, os.ErrNotExist) {
-		if err := recovery.write([]PRState{}); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	}
-	attempts, err := FetchAttemptFacts(ctx, api, cfg.Repository, cfg.ActorID)
-	if err != nil {
-		return err
-	}
-	if err := recovery.hydrateAttempts(cfg.Repository, attempts); err != nil {
-		return err
-	}
-	authorized := make(map[int]RecoveryAttemptFact, len(attempts))
-	for _, attempt := range attempts {
-		if attempt.State == "active" || attempt.State == "review-ready" {
-			authorized[attempt.PR] = attempt
-		}
-	}
-	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery, Attempts: authorized}
-	reconciler, err := NewPRReconciler(api, cfg, recovery, authorized, func() error {
-		states, err := recovery.read()
-		if err != nil {
-			return err
-		}
-		seen := map[int]bool{}
-		for _, state := range states {
-			if _, ok := authorized[state.Number]; !ok {
-				continue
-			}
-			if state.Repository != cfg.Repository || state.Issue <= 0 {
-				return errors.New("recovery state contains an invalid issue identity")
-			}
-			if seen[state.Issue] {
-				continue
-			}
-			seen[state.Issue] = true
-			var facts PRFacts
-			if err := source.readAuthorizedControls(ctx, state.Issue, &facts); err != nil {
-				return fmt.Errorf("preflight issue %d: %w", state.Issue, err)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	return reconciler.runOnce(ctx)
+// RunPRReconciliation is retained only to give callers of the removed
+// file-backed bootstrap an explicit failure. Runtime governance is committed
+// exclusively through RunPRGovernance and its authoritative phase recorder.
+func RunPRReconciliation(context.Context, API, PRAdapterConfig, string) error {
+	return errors.New("file-backed pull request reconciliation is retired; use the runtime state owner")
 }
 
 // RunPRGovernance runs the existing policy workflow for one already accepted
@@ -825,6 +763,11 @@ func RunPRGovernance(ctx context.Context, api API, cfg PRAdapterConfig, recovery
 	if err != nil {
 		return err
 	}
+	phases, ok := recovery.(GovernancePhaseRecorder)
+	if !ok {
+		return errors.New("PR governance requires durable phase recording")
+	}
+	reconciler.PullRequests.Phases = phases
 	return reconciler.PullRequests.reconcileOne(ctx, attempt.PR)
 }
 
@@ -905,7 +848,11 @@ func NewPRReconciler(api API, cfg PRAdapterConfig, recovery AttemptRecovery, att
 		return Reconciler{}, errors.New("PR reconciliation requires repository policy, recovery, and issue reconciliation")
 	}
 	source := &GitHubPRSource{API: api, Config: cfg, Recovery: recovery, Attempts: attempts}
-	return Reconciler{FullRead: fullRead, PullRequests: &PRCoordinator{API: api, Source: source, Signals: RecoverySignals{recovery}, Attempts: attempts, ReviewLabel: cfg.HumanReviewLabel, MergeMethod: cfg.MergeMethod, ActorID: cfg.ActorID}}, nil
+	coordinator := &PRCoordinator{API: api, Source: source, Signals: RecoverySignals{recovery}, Attempts: attempts, ReviewLabel: cfg.HumanReviewLabel, MergeMethod: cfg.MergeMethod, ActorID: cfg.ActorID}
+	if phases, ok := recovery.(GovernancePhaseRecorder); ok {
+		coordinator.Phases = phases
+	}
+	return Reconciler{FullRead: fullRead, PullRequests: coordinator}, nil
 }
 
 func (s *GitHubPRSource) OpenPullRequests(ctx context.Context) ([]int, error) {
@@ -1261,7 +1208,7 @@ func (s *GitHubPRSource) authorizedControlsWithProposal(ctx context.Context, num
 			if found && comment.ID == snapshotCommentID {
 				return Controls{}, false, nil, errors.New("duplicate control snapshot")
 			}
-			if !found || comment.ID > snapshotCommentID {
+			if !found || parsed.OwnerGeneration > snapshot.OwnerGeneration || parsed.OwnerGeneration == snapshot.OwnerGeneration && comment.ID > snapshotCommentID {
 				snapshot, snapshotCommentID, found = parsed, comment.ID, true
 			}
 		}

@@ -34,31 +34,35 @@ type AttemptFact struct {
 }
 
 type RecoveryStatus struct {
-	Repository          string           `json:"repository"`
-	Issue               int              `json:"issue"`
-	Title               string           `json:"title,omitempty"`
-	Attempt             int              `json:"attempt"`
-	State               string           `json:"state"`
-	Branch              string           `json:"branch,omitempty"`
-	Worktree            string           `json:"worktree,omitempty"`
-	Session             string           `json:"session,omitempty"`
-	Sessions            []AttemptSession `json:"sessions,omitempty"`
-	CurrentPhase        string           `json:"current_phase,omitempty"`
-	PR                  int              `json:"pr,omitempty"`
-	HeadSHA             string           `json:"head_sha,omitempty"`
-	Priority            int              `json:"priority,omitempty"`
-	Dependencies        []int            `json:"dependencies,omitempty"`
-	ImplementationAgent string           `json:"implementation_agent,omitempty"`
-	ReviewAgent         string           `json:"review_agent,omitempty"`
-	Checks              []string         `json:"checks,omitempty"`
-	Blockers            []string         `json:"blockers,omitempty"`
-	Diagnostic          string           `json:"diagnostic,omitempty"`
-	Action              string           `json:"next_action,omitempty"`
-	Retryable           bool             `json:"retryable,omitempty"`
-	DispatchAuthorized  bool             `json:"dispatch_authorized,omitempty"`
-	NeedsAttention      bool             `json:"needs_attention,omitempty"`
-	IssueClosed         bool             `json:"issue_closed,omitempty"`
-	OperatorBlocked     bool             `json:"operator_blocked,omitempty"`
+	Repository            string           `json:"repository"`
+	Issue                 int              `json:"issue"`
+	Title                 string           `json:"title,omitempty"`
+	Attempt               int              `json:"attempt"`
+	State                 string           `json:"state"`
+	Branch                string           `json:"branch,omitempty"`
+	Worktree              string           `json:"worktree,omitempty"`
+	Session               string           `json:"session,omitempty"`
+	Sessions              []AttemptSession `json:"sessions,omitempty"`
+	CurrentPhase          string           `json:"current_phase,omitempty"`
+	PR                    int              `json:"pr,omitempty"`
+	HeadSHA               string           `json:"head_sha,omitempty"`
+	Priority              int              `json:"priority,omitempty"`
+	Dependencies          []int            `json:"dependencies,omitempty"`
+	ImplementationAgent   string           `json:"implementation_agent,omitempty"`
+	ReviewAgent           string           `json:"review_agent,omitempty"`
+	Checks                []string         `json:"checks,omitempty"`
+	Blockers              []string         `json:"blockers,omitempty"`
+	Diagnostic            string           `json:"diagnostic,omitempty"`
+	Action                string           `json:"next_action,omitempty"`
+	Retryable             bool             `json:"retryable,omitempty"`
+	DispatchAuthorized    bool             `json:"dispatch_authorized,omitempty"`
+	NeedsAttention        bool             `json:"needs_attention,omitempty"`
+	IssueClosed           bool             `json:"issue_closed,omitempty"`
+	OperatorBlocked       bool             `json:"operator_blocked,omitempty"`
+	IssueGeneration       uint64           `json:"issue_generation,omitempty"`
+	AttemptGeneration     uint64           `json:"attempt_generation,omitempty"`
+	MachineStatusSequence uint64           `json:"machine_status_sequence,omitempty"`
+	OwnerCausalityToken   string           `json:"owner_causality_token,omitempty"`
 }
 
 type AttemptSession struct {
@@ -67,6 +71,7 @@ type AttemptSession struct {
 	State     string    `json:"state"`
 	Mode      string    `json:"mode,omitempty"`
 	Target    string    `json:"target,omitempty"`
+	RunID     string    `json:"run_id,omitempty"`
 	Current   bool      `json:"current,omitempty"`
 	CreatedAt time.Time `json:"created_at,omitzero"`
 	UpdatedAt time.Time `json:"updated_at,omitzero"`
@@ -201,6 +206,8 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 				if manifest.State == "failed" {
 					status.Diagnostic = manifest.Diagnostic
 				}
+			case manifest.State == "cancelled":
+				status.State, status.Diagnostic, status.Action, status.Retryable = "cancelled", manifest.Diagnostic, "none; cancelled work must not be resumed", false
 			case manifest.State == "failed":
 				status.State, status.Diagnostic, status.Action = "failed", manifest.Diagnostic, "inspect the retained log and retry with a new attempt"
 			case fact.State == "active" && fact.PR == 0 && manifest.State == "completed":
@@ -221,7 +228,7 @@ func RecoverChecked(ctx context.Context, facts []AttemptFact, local []agentrunti
 			projectAttemptLifecycle(&status, manifest)
 			break
 		}
-		if (fact.State == "active" || fact.State == "review-ready") && status.Session == "" {
+		if (status.State == "active" || status.State == "review-ready") && status.Session == "" {
 			status.State, status.CurrentPhase, status.Blockers, status.Diagnostic, status.Action = "blocked", "blocked", []string{"runtime resources missing"}, "GitHub says active but local attempt resources are missing", "reconstruct the resources or create a new traceable attempt"
 		}
 		if status.CurrentPhase == "" {
@@ -253,15 +260,18 @@ func projectAttemptLifecycle(status *RecoveryStatus, manifest agentruntime.Manif
 	if manifest.ReviewState == "failed" && manifest.ReviewDiagnostic != "" {
 		status.Diagnostic = manifest.ReviewDiagnostic
 	}
-	add := func(role, name, state, mode, target string, created time.Time) {
+	add := func(role, name, state, mode, target, runID string, created time.Time) {
 		want, err := agentruntime.AttemptSessionName(role, manifest.Repository, manifest.Issue, manifest.Attempt)
+		if role == agentruntime.SessionRoleReviewer {
+			want, err = agentruntime.ReviewRunSessionName(manifest.Repository, manifest.Issue, manifest.Attempt, target, runID)
+		}
 		if err == nil && name == want && state != "" {
-			status.Sessions = append(status.Sessions, AttemptSession{Role: role, Name: name, State: state, Mode: mode, Target: target, CreatedAt: created, UpdatedAt: manifest.UpdatedAt})
+			status.Sessions = append(status.Sessions, AttemptSession{Role: role, Name: name, State: state, Mode: mode, Target: target, RunID: runID, CreatedAt: created, UpdatedAt: manifest.UpdatedAt})
 		}
 	}
-	add(agentruntime.SessionRoleImplementation, manifest.Session, manifest.State, "", "", manifest.CreatedAt)
+	add(agentruntime.SessionRoleImplementation, manifest.Session, manifest.State, "", "", "", manifest.CreatedAt)
 	if manifest.ReviewSession != "" && agentruntime.ValidReviewBinding(manifest.ReviewMode, manifest.ReviewTarget, manifest.Repository, manifest.Issue, manifest.ReviewBase, manifest.ReviewHead, manifest.BaseSHA) {
-		add(agentruntime.SessionRoleReviewer, manifest.ReviewSession, manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget, time.Time{})
+		add(agentruntime.SessionRoleReviewer, manifest.ReviewSession, manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewRunID, time.Time{})
 	}
 
 	switch status.State {

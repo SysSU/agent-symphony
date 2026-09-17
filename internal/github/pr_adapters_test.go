@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -501,250 +502,21 @@ func TestPullRequestMergedFieldIsRequired(t *testing.T) {
 	}
 }
 
-func TestRunPRReconciliationConstructsAndExecutes(t *testing.T) {
+func TestRunPRReconciliationIsRetiredWithoutSideEffects(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	api := fixtureAPI(t, map[string]any{"/repos/o/r": map[string]any{"full_name": "o/r", "permissions": map[string]any{"pull": true}}, "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1": []any{}, "/repos/o/r/pulls?state=open&per_page=100&page=1": []any{}})
-	cfg := productionPRConfig()
-	if err := RunPRReconciliation(context.Background(), api, cfg, path); err != nil {
+	const original = "operator-owned state\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		t.Fatalf("initialized state info=%v err=%v", info, err)
-	}
-	if states, err := (&FileRecovery{Path: path}).read(); err != nil || len(states) != 0 {
-		t.Fatalf("initialized state=%#v err=%v", states, err)
-	}
-	if err := os.WriteFile(path, []byte("not json\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := RunPRReconciliation(context.Background(), api, cfg, path); err == nil {
-		t.Fatal("production reconciliation skipped its authoritative recovery-state read")
-	}
-	if b, err := os.ReadFile(path); err != nil || string(b) != "not json\n" {
-		t.Fatalf("invalid state was replaced: %q err=%v", b, err)
-	}
-	cfg.ApprovalCommand = ""
-	if err := RunPRReconciliation(context.Background(), api, cfg, path); err == nil {
-		t.Fatal("production reconciliation accepted no GitHub control verifier configuration")
-	}
-}
-
-func TestRunPRReconciliationHydratesPublishedAttemptAndHandsOffForHumanReview(t *testing.T) {
-	for _, precreate := range []bool{false, true} {
-		name := "absent state"
-		if precreate {
-			name = "empty state"
-		}
-		t.Run(name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "state.json")
-			if precreate {
-				if err := os.WriteFile(path, []byte("[]\n"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			cfg := productionPRConfig()
-			now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
-			body := "## Context\nx\n## Acceptance Criteria\nx\n## Checklist\n- [ ] x\n## Validation\nx\n## Dependencies\nnone\n"
-			controls := NormalizeIssue(IssueInput{Number: 10, State: "open", Body: body, Labels: []string{"ready", "P3"}}, ContractConfig{Ready: "ready", P1: "P1", P2: "P2", P3: "P3", DependencySection: "Dependencies", DefaultCompletion: "human-review", HumanReview: "review", AutonomousMerge: "auto"}, nil).Controls
-			provenance := []Provenance{
-				{Name: "ready", Value: "true", Source: "timeline", EventID: 20, ActorID: 5, CreatedAt: now},
-				{Name: "priority", Value: "3", Source: "timeline", EventID: 21, ActorID: 5, CreatedAt: now.Add(time.Second)},
-				{Name: "completion", Value: "human-review", Source: "creation", ActorID: 5, CreatedAt: now},
-				{Name: "closed", Value: "false", Source: "creation", ActorID: 5, CreatedAt: now},
-				{Name: "cancelled", Value: "false", Source: "creation", ActorID: 5, CreatedAt: now},
-				{Name: "retry", Value: "false", Source: "creation", ActorID: 5, CreatedAt: now},
-			}
-			approval := Approval{CommentID: 50, ActorID: 5, Body: "/approve", CreatedAt: now.Add(time.Minute)}
-			snapshot, err := NewSnapshot(controls, body, Anchor{IssueNodeID: "I_10", CreatedAt: now, ChangedAt: now, AuthorID: 5}, approval, provenance, cfg.ApprovalCommand, func(id int) bool { return id == 5 }, timelineFor(provenance))
-			if err != nil {
-				t.Fatal(err)
-			}
-			branch, _ := AttemptBranch("o/r", 10, 2)
-			marker, _ := AttemptMarker(10, 2, branch, "abcdef0", 3, "review")
-			prBody := "Closes #10\n\n<!-- agent-symphony:issue:10:attempt:2 -->\n\n" + marker
-			comments := []any{
-				map[string]any{"id": 60, "body": SnapshotComment(snapshot), "user": map[string]any{"id": 42}},
-				map[string]any{"id": 61, "body": marker, "user": map[string]any{"id": 42}},
-			}
-			responses := map[string]any{
-				"/repos/o/r": map[string]any{"full_name": "o/r", "permissions": map[string]any{"pull": true, "push": true}},
-				"/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1": []any{map[string]any{"number": 3, "body": prBody, "state": "open", "head": map[string]any{"sha": "abcdef0", "ref": branch}, "base": map[string]any{"sha": "bbbbbbb"}, "user": map[string]any{"id": 42}}},
-				"/repos/o/r/pulls?state=open&per_page=100&page=1":                           []any{map[string]any{"number": 3, "body": prBody}},
-				"/repos/o/r/issues/10": map[string]any{"number": 10, "node_id": "I_10", "state": "open", "body": body, "created_at": now, "user": map[string]any{"id": 5}, "labels": []any{map[string]any{"name": "ready"}, map[string]any{"name": "P3"}}},
-				"/repos/o/r/issues/10/timeline?per_page=100&page=1": []any{
-					map[string]any{"id": 20, "event": "labeled", "label": map[string]any{"name": "ready"}, "created_at": now, "actor": map[string]any{"id": 5}},
-					map[string]any{"id": 21, "event": "labeled", "label": map[string]any{"name": "P3"}, "created_at": now.Add(time.Second), "actor": map[string]any{"id": 5}},
-				},
-				"/repos/o/r/issues/comments/50": map[string]any{"id": 50, "body": "/approve", "created_at": approval.CreatedAt, "updated_at": approval.CreatedAt, "user": map[string]any{"id": 5}},
-				"/user/5":                       map[string]any{"login": "owner"},
-				"/repos/o/r/collaborators/owner/permission":                               map[string]any{"permission": "maintain"},
-				"/repos/o/r/commits/abcdef0/check-runs?filter=latest&per_page=100&page=1": map[string]any{"check_runs": []any{}},
-				"/repos/o/r/commits/abcdef0/check-runs?filter=all&per_page=100&page=1":    map[string]any{"check_runs": []any{}},
-				"/repos/o/r/commits/abcdef0/status":                                       map[string]any{"statuses": []any{}},
-				"/repos/o/r/branches/main/protection":                                     fixtureHTTP{http.StatusNotFound, `{"message":"not protected"}`},
-				"/repos/o/r/rules/branches/main?per_page=100&page=1":                      []any{},
-				"/repos/o/r/commits/abcdef0/statuses?per_page=100&page=1":                 []any{},
-				"/repos/o/r/issues/3/comments?per_page=100&page=1":                        []any{},
-				"/repos/o/r/pulls/3/comments?per_page=100&page=1":                         []any{},
-				"/repos/o/r/pulls/3/reviews?per_page=100&page=1":                          []any{},
-				"/graphql": map[string]any{"data": map[string]any{"repository": map[string]any{"issue": map[string]any{"userContentEdits": map[string]any{"nodes": []any{}}}, "pullRequest": map[string]any{"reviewDecision": nil}}}},
-			}
-			labelPresent, checkCreated, dropMarkerAfterFetch := false, false, false
-			freshMutation, policyComment := "", ""
-			commentReads, labelPosts, policyMutations := 0, 0, 0
-			api := API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				switch req.Method + " " + req.URL.RequestURI() {
-				case "GET /repos/o/r/pulls/3":
-					labels := []any{}
-					if labelPresent {
-						labels = append(labels, map[string]any{"name": "review"})
-					}
-					currentBody, headSHA, headRef := prBody, "abcdef0", branch
-					switch freshMutation {
-					case "marker head":
-						currentBody = strings.Replace(prBody, `"head":"abcdef0"`, `"head":"1234567"`, 1)
-					case "head SHA":
-						headSHA = "1234567"
-					case "head ref":
-						headRef = "other"
-					}
-					value := map[string]any{"number": 3, "body": currentBody, "state": "open", "merged": false, "mergeable": true, "head": map[string]any{"sha": headSHA, "ref": headRef}, "base": map[string]any{"ref": "main"}, "labels": labels}
-					b, _ := json.Marshal(value)
-					return httpResponse(http.StatusOK, string(b), nil), nil
-				case "GET /repos/o/r/issues/10/comments?per_page=100&page=1":
-					commentReads++
-					current := comments
-					if dropMarkerAfterFetch && commentReads > 1 {
-						current = comments[:1]
-					}
-					b, _ := json.Marshal(current)
-					return httpResponse(http.StatusOK, string(b), nil), nil
-				case "GET /repos/o/r/commits/abcdef0/statuses?per_page=100&page=1":
-					statuses := []any{}
-					if checkCreated {
-						statuses = append(statuses, map[string]any{"context": PolicyCheck, "state": "pending", "creator": map[string]any{"id": 42}})
-					}
-					b, _ := json.Marshal(statuses)
-					return httpResponse(http.StatusOK, string(b), nil), nil
-				case "POST /repos/o/r/issues/3/labels":
-					labelPresent, labelPosts = true, labelPosts+1
-					return httpResponse(http.StatusOK, `[]`, nil), nil
-				case "POST /repos/o/r/statuses/abcdef0":
-					checkCreated, policyMutations = true, policyMutations+1
-					return httpResponse(http.StatusCreated, `{}`, nil), nil
-				case "GET /repos/o/r/issues/3/comments?per_page=100&page=1":
-					if policyComment == "" {
-						return httpResponse(http.StatusOK, `[]`, nil), nil
-					}
-					body, _ := json.Marshal([]any{map[string]any{"body": policyComment, "user": map[string]any{"id": 42}}})
-					return httpResponse(http.StatusOK, string(body), nil), nil
-				case "POST /repos/o/r/issues/3/comments":
-					var payload struct{ Body string }
-					if json.NewDecoder(req.Body).Decode(&payload) != nil {
-						t.Fatal("invalid policy comment")
-					}
-					policyComment = payload.Body
-					return httpResponse(http.StatusCreated, `{}`, nil), nil
-				}
-				value, ok := responses[req.URL.RequestURI()]
-				if !ok {
-					return nil, fmt.Errorf("unexpected fixture request %s %s", req.Method, req.URL.RequestURI())
-				}
-				if response, ok := value.(fixtureHTTP); ok {
-					return httpResponse(response.status, response.body, nil), nil
-				}
-				b, _ := json.Marshal(value)
-				return httpResponse(http.StatusOK, string(b), nil), nil
-			})}}
-			for range 2 {
-				if err := RunPRReconciliation(context.Background(), api, cfg, path); err != nil {
-					t.Fatal(err)
-				}
-			}
-			states, err := (&FileRecovery{Path: path}).read()
-			if err != nil || len(states) != 1 || states[0].Number != 3 || states[0].Issue != 10 || states[0].Attempt != 2 || states[0].HeadSHA != "abcdef0" || labelPosts != 0 {
-				t.Fatalf("states=%#v label posts=%d err=%v", states, labelPosts, err)
-			}
-			labelPresent, dropMarkerAfterFetch, commentReads = false, true, 0
-			beforePolicy := policyMutations
-			if err := RunPRReconciliation(context.Background(), api, cfg, path); err == nil || labelPosts != 0 || policyMutations != beforePolicy {
-				t.Fatalf("post-fetch App marker removal governed PR: label posts=%d policy mutations=%d err=%v", labelPosts, policyMutations-beforePolicy, err)
-			}
-			dropMarkerAfterFetch = false
-			for _, freshMutation = range []string{"marker head", "head SHA", "head ref"} {
-				beforePolicy = policyMutations
-				if err := RunPRReconciliation(context.Background(), api, cfg, path); err == nil || labelPosts != 0 || policyMutations != beforePolicy {
-					t.Fatalf("%s drift governed PR: label posts=%d policy mutations=%d err=%v", freshMutation, labelPosts, policyMutations-beforePolicy, err)
-				}
-			}
-			unchanged, readErr := (&FileRecovery{Path: path}).read()
-			if readErr != nil || !reflect.DeepEqual(states, unchanged) {
-				t.Fatalf("authority loss changed durable state: before=%#v after=%#v err=%v", states, unchanged, readErr)
-			}
-		})
-	}
-}
-
-func TestRunPRReconciliationSerializesWholeRun(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	var mu sync.Mutex
-	inFlight, overlap, pulls := 0, false, 0
-	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/repos/o/r" {
-			return httpResponse(http.StatusOK, `{"full_name":"o/r","permissions":{"pull":true}}`, nil), nil
-		}
-		mu.Lock()
-		inFlight++
-		overlap = overlap || inFlight > 1
-		pulls++
-		mu.Unlock()
-		time.Sleep(20 * time.Millisecond)
-		mu.Lock()
-		inFlight--
-		mu.Unlock()
-		return httpResponse(http.StatusOK, `[]`, nil), nil
+	called := false
+	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		called = true
+		return nil, errors.New("unexpected GitHub request")
 	})}}
-	errCh := make(chan error, 2)
-	for range 2 {
-		go func() { errCh <- RunPRReconciliation(context.Background(), api, productionPRConfig(), path) }()
-	}
-	for range 2 {
-		if err := <-errCh; err != nil {
-			t.Fatal(err)
-		}
-	}
-	if overlap || pulls != 2 {
-		t.Fatalf("overlap=%v pull reads=%d", overlap, pulls)
-	}
-	if states, err := (&FileRecovery{Path: path}).read(); err != nil || len(states) != 0 {
-		t.Fatalf("concurrent initial state=%#v err=%v", states, err)
-	}
-}
-
-func TestRunPRReconciliationIgnoresUnverifiedDurableState(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	state := []PRState{{Repository: "o/r", Number: 3, Issue: 10, Attempt: 1}}
-	b, _ := json.Marshal(state)
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	pulls := 0
-	api := API{BaseURL: "https://example.test", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		switch r.URL.Path {
-		case "/repos/o/r":
-			return httpResponse(http.StatusOK, `{"full_name":"o/r","permissions":{"pull":true}}`, nil), nil
-		case "/repos/o/r/issues/10":
-			return httpResponse(http.StatusForbidden, `{"message":"denied"}`, nil), nil
-		default:
-			if r.URL.RawQuery == "state=open&per_page=100&page=1" {
-				pulls++
-			}
-			return httpResponse(http.StatusOK, `[]`, nil), nil
-		}
-	})}}
-	if err := RunPRReconciliation(context.Background(), api, productionPRConfig(), path); err != nil || pulls != 0 {
-		t.Fatalf("err=%v pulls=%d", err, pulls)
+	err := RunPRReconciliation(t.Context(), api, productionPRConfig(), path)
+	body, readErr := os.ReadFile(path)
+	if err == nil || !strings.Contains(err.Error(), "retired") || called || readErr != nil || string(body) != original {
+		t.Fatalf("err=%v called=%v body=%q read_err=%v", err, called, body, readErr)
 	}
 }
 
@@ -1278,16 +1050,13 @@ func TestFileRecoveryRejectsSymlinkLocks(t *testing.T) {
 	if err := os.WriteFile(target, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, suffix := range []string{".lock", ".governance.lock"} {
+	for _, suffix := range []string{".lock"} {
 		if err := os.Symlink(target, path+suffix); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := (&FileRecovery{Path: path}).update(func([]PRState) error { return nil }); err == nil {
 		t.Fatal("symlink recovery lock accepted")
-	}
-	if err := RunPRReconciliation(context.Background(), API{}, PRAdapterConfig{}, path); err == nil {
-		t.Fatal("symlink governance lock accepted")
 	}
 }
 

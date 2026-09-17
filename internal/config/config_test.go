@@ -1,31 +1,289 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+func TestBindWorkerExecutablePinsExactBinaryIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex")
+	write := func(marker string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n# "+marker+"\nprintf 'codex-cli 0.153.4\\n'\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("first")
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = path, path
+	first, err := BindWorkerExecutable(context.Background(), &commands)
+	canonical, _ := filepath.EvalSymlinks(path)
+	if err != nil || commands.Implementation[0] != canonical || len(first) != 64 {
+		t.Fatalf("first binding=%q commands=%#v err=%v", first, commands, err)
+	}
+	write("replacement")
+	second, err := BindWorkerExecutable(context.Background(), &commands)
+	if err != nil || first == second {
+		t.Fatalf("replacement binding=%q first=%q err=%v", second, first, err)
+	}
+}
+
+func TestWorkerSandboxArgsExposeAttestedCodexInstallation(t *testing.T) {
+	prefix := filepath.Join(t.TempDir(), "node")
+	executable := filepath.Join(prefix, "bin", "codex")
+	args := WorkerSandboxArgsForExecutable(t.TempDir(), executable, "probe")
+	index := slices.Index(args, "--sandbox-state-readable-root")
+	if index < 0 || index+1 >= len(args) || args[index+1] != prefix {
+		t.Fatalf("sandbox cannot read its attested installation root %q: %q", prefix, args)
+	}
+}
+
+func TestBindWorkerExecutableRejectsFakeCodexBasename(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'fake-codex 1\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = path, path
+	if _, err := BindWorkerExecutable(context.Background(), &commands); err == nil {
+		t.Fatal("accepted a basename-only fake Codex executable")
+	}
+}
+
+func TestPinWorkerExecutableSurvivesConfiguredPathSwap(t *testing.T) {
+	root := pinnedTestRoot(t)
+	source := filepath.Join(t.TempDir(), "codex")
+	write := func(path, marker string, mode os.FileMode) {
+		t.Helper()
+		buildNativeCodexFixture(t, path, marker)
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(source, "pinned", 0o700)
+	t.Setenv("PATH", filepath.Dir(source)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = source, source
+	digest, err := PinWorkerExecutable(t.Context(), root, &commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := source + ".replacement"
+	write(replacement, "replacement", 0o700)
+	if err := os.Rename(replacement, source); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command(commands.Implementation[0]).Output()
+	if err != nil || strings.TrimSpace(string(output)) != "pinned" || commands.Implementation[0] == source || commands.OrchestratorAudit[0] != commands.Implementation[0] {
+		t.Fatalf("pinned=%q audit=%q output=%q digest=%q err=%v", commands.Implementation[0], commands.OrchestratorAudit[0], output, digest, err)
+	}
+	if info, err := os.Stat(commands.Implementation[0]); err != nil || info.Mode().Perm() != 0o500 {
+		t.Fatalf("pinned artifact=%v err=%v", info, err)
+	}
+}
+
+func TestPinWorkerExecutableReusesOnlyValidatedArtifactOnRestart(t *testing.T) {
+	stateRoot, source := pinnedTestRoot(t), filepath.Join(t.TempDir(), "codex")
+	buildNativeCodexFixture(t, source, "original")
+	t.Setenv("PATH", filepath.Dir(source)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	pin := func() (string, Commands) {
+		t.Helper()
+		commands := Default("o/r").Commands
+		commands.Implementation[0], commands.Reviewer[0] = source, source
+		digest, err := PinWorkerExecutable(t.Context(), stateRoot, &commands)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return digest, commands
+	}
+	firstDigest, first := pin()
+	secondDigest, second := pin()
+	if firstDigest != secondDigest || first.Implementation[0] != second.Implementation[0] {
+		t.Fatalf("restart changed pinned identity: first=%q/%q second=%q/%q", firstDigest, first.Implementation[0], secondDigest, second.Implementation[0])
+	}
+	if info, err := os.Stat(filepath.Dir(first.Implementation[0])); err != nil || info.Mode().Perm() != 0o500 {
+		t.Fatalf("published pin directory=%v err=%v", info, err)
+	}
+	marker := filepath.Dir(first.Implementation[0]) + ".ready"
+	if info, err := os.Stat(marker); err != nil || info.Mode().Perm() != 0o400 {
+		t.Fatalf("atomic pin publication marker=%v err=%v", info, err)
+	}
+	if err := os.Chmod(first.Implementation[0], 0o700); err != nil {
+		t.Fatal(err)
+	}
+	substitute := []byte("#!/bin/sh\nprintf 'codex-cli 0.153.4\\n'\n# substituted artifact\n")
+	if err := os.WriteFile(first.Implementation[0], substitute, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(first.Implementation[0], 0o500); err != nil {
+		t.Fatal(err)
+	}
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = source, source
+	if _, err := PinWorkerExecutable(t.Context(), stateRoot, &commands); err == nil || !strings.Contains(err.Error(), "digest does not match") {
+		t.Fatalf("digest-path substitution was reused: %v", err)
+	}
+}
+
+func TestPinWorkerExecutableRecoversUnmarkedWritableCrashResidue(t *testing.T) {
+	stateRoot, source := pinnedTestRoot(t), filepath.Join(t.TempDir(), "codex")
+	buildNativeCodexFixture(t, source, "original")
+	t.Setenv("PATH", filepath.Dir(source)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = source, source
+	if _, err := PinWorkerExecutable(t.Context(), stateRoot, &commands); err != nil {
+		t.Fatal(err)
+	}
+	target, marker := filepath.Dir(commands.Implementation[0]), filepath.Dir(commands.Implementation[0])+".ready"
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(target, "unpublished-residue")
+	if err := os.WriteFile(sentinel, []byte("must not be reused\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted := Default("o/r").Commands
+	restarted.Implementation[0], restarted.Reviewer[0] = source, source
+	if _, err := PinWorkerExecutable(t.Context(), stateRoot, &restarted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(sentinel); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unmarked writable residue was reused: %v", err)
+	}
+	if info, err := os.Stat(marker); err != nil || info.Mode().Perm() != 0o400 {
+		t.Fatalf("recovered marker=%v err=%v", info, err)
+	}
+}
+
+func TestBindWorkerExecutableRejectsWritableArtifact(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'codex-cli 0.153.4\\n'\n"), 0o722); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o722); err != nil {
+		t.Fatal(err)
+	}
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = path, path
+	if _, err := BindWorkerExecutable(t.Context(), &commands); err == nil {
+		t.Fatal("group/world-writable worker executable was accepted")
+	}
+}
+
+func TestPinWorkerExecutableRejectsDifferentAuditorBinary(t *testing.T) {
+	worker, auditor := filepath.Join(t.TempDir(), "codex"), filepath.Join(t.TempDir(), "codex")
+	for _, path := range []string{worker, auditor} {
+		buildNativeCodexFixture(t, path, "original")
+	}
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0], commands.OrchestratorAudit[0] = worker, worker, auditor
+	if _, err := PinWorkerExecutable(t.Context(), pinnedTestRoot(t), &commands); err == nil || !strings.Contains(err.Error(), "same Codex executable") {
+		t.Fatalf("different auditor binary was accepted: %v", err)
+	}
+}
+
+func TestPinWorkerExecutableReplacesNPMNodeWrapperWithNativeBinary(t *testing.T) {
+	packageRoot := filepath.Join(t.TempDir(), "lib", "node_modules", "@openai", "codex")
+	wrapper := filepath.Join(packageRoot, "bin", "codex.js")
+	platform := map[string]string{"darwin/amd64": "darwin-x64", "darwin/arm64": "darwin-arm64", "linux/amd64": "linux-x64", "linux/arm64": "linux-arm64"}[runtime.GOOS+"/"+runtime.GOARCH]
+	if platform == "" {
+		t.Skip("fixture has no native package for this platform")
+	}
+	native := filepath.Join(packageRoot, "node_modules", "@openai", "codex-"+platform, "vendor", "fixture-triple", "bin", "codex")
+	for _, path := range []string{wrapper, native} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(packageRoot, "package.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wrapper, []byte("#!/usr/bin/env node\nprocess.exit(99)\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	buildNativeCodexFixture(t, native, "native")
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0], commands.OrchestratorAudit[0] = wrapper, wrapper, wrapper
+	if _, err := PinWorkerExecutable(t.Context(), pinnedTestRoot(t), &commands); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command(commands.Implementation[0]).Output()
+	if err != nil || strings.TrimSpace(string(output)) != "native" || commands.OrchestratorAudit[0] != commands.Implementation[0] || strings.Contains(commands.Implementation[0], "codex.js") {
+		t.Fatalf("npm wrapper remained executable: implementation=%q audit=%q output=%q err=%v", commands.Implementation[0], commands.OrchestratorAudit[0], output, err)
+	}
+}
+
+func TestPinWorkerExecutableRejectsVersionValidDelegatingShim(t *testing.T) {
+	shim := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.153.4\\n'; else exec /bin/echo delegated; fi\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = shim, shim
+	if _, err := PinWorkerExecutable(t.Context(), pinnedTestRoot(t), &commands); err == nil || !strings.Contains(err.Error(), "not a native") {
+		t.Fatalf("version-valid delegating shim was accepted: %v", err)
+	}
+}
+
+func buildNativeCodexFixture(t *testing.T, path, marker string) {
+	t.Helper()
+	source := filepath.Join(t.TempDir(), "main.go")
+	body := "package main\nimport (\"fmt\"; \"os\")\nfunc main() { if len(os.Args) > 1 && os.Args[1] == \"--version\" { fmt.Println(\"codex-cli 0.153.4\"); return }; fmt.Println(" + strconv.Quote(marker) + ") }\n"
+	if err := os.WriteFile(source, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("go", "build", "-o", path, source)
+	command.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build native Codex fixture: %v: %s", err, output)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func pinnedTestRoot(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+			if err == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+	return root
+}
 
 func TestLoadAndValidate(t *testing.T) {
 	c := Default("owner/repo")
 	if c.ReconciliationIntervalSeconds != 60 {
 		t.Fatalf("default reconciliation interval = %d", c.ReconciliationIntervalSeconds)
 	}
-	if !slices.Equal(c.Commands.Implementation, []string{"codex", "exec", "-c", `projects={"{managed_workspace}"={trust_level="trusted"}}`, "--dangerously-bypass-approvals-and-sandbox", "-"}) || !slices.Equal(c.Commands.Reviewer, []string{"codex", "-c", `projects={"{managed_workspace}"={trust_level="trusted"}}`, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}) {
+	if !slices.Equal(c.Commands.Implementation, defaultWorkerCommand(false)) || !slices.Equal(c.Commands.Reviewer, defaultWorkerCommand(true)) {
 		t.Fatalf("unexpected default commands: %#v", c.Commands)
 	}
 	wantOrchestrator := []string{"codex", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"}
 	if !slices.Equal(c.Commands.Orchestrator, wantOrchestrator) {
 		t.Fatalf("unexpected default orchestrator: %#v", c.Commands.Orchestrator)
 	}
-	wantAudit := []string{"codex", "--ask-for-approval", "never", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"}
+	wantAudit := defaultAuditorCommand()
 	if !slices.Equal(c.Commands.OrchestratorAudit, wantAudit) {
 		t.Fatalf("unexpected default orchestrator audit: %#v", c.Commands.OrchestratorAudit)
 	}
-	c.Commands.Implementation = []string{"custom-agent", "--flag"}
 	path := filepath.Join(t.TempDir(), DefaultPath)
 	if err := Write(path, c); err != nil {
 		t.Fatal(err)
@@ -34,8 +292,12 @@ func TestLoadAndValidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Repository != "owner/repo" || c.Concurrency != 1 || c.ReconciliationIntervalSeconds != 60 || c.CompletionPolicies.Default != "human-review" || !slices.Equal(c.Commands.Implementation, []string{"custom-agent", "--flag"}) {
+	if c.Repository != "owner/repo" || c.Concurrency != 1 || c.ReconciliationIntervalSeconds != 60 || c.CompletionPolicies.Default != "human-review" || !slices.Equal(c.Commands.Implementation, defaultWorkerCommand(false)) {
 		t.Fatalf("unexpected defaults: %#v", c)
+	}
+	c.Commands.Implementation = []string{"custom-agent", "--flag"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "managed rootless Codex worker profile") {
+		t.Fatalf("custom worker command accepted: %v", err)
 	}
 }
 
@@ -180,7 +442,7 @@ func TestExpandManagedWorkspaceUsesOneExactEscapedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoded, _ := json.Marshal(workspace)
-	want := `projects={` + string(encoded) + `={trust_level="trusted"}}`
+	want := `projects={` + string(encoded) + `={trust_level="untrusted"}}`
 	if !slices.Equal(expanded, []string{"codex", "-c", want, "--no-alt-screen"}) {
 		t.Fatalf("expanded command=%q, want exact workspace %q", expanded, want)
 	}
@@ -264,8 +526,8 @@ func TestValidateRejectsUnsafePathsAndPolicy(t *testing.T) {
 	}
 	c := Default("owner/repo")
 	c.Commands.Environment = []string{"GITHUB_TOKEN"}
-	if err := c.Validate(); err != nil {
-		t.Fatalf("GitHub CLI authentication environment rejected: %v", err)
+	if err := c.Validate(); err == nil {
+		t.Fatal("worker GitHub authentication environment accepted")
 	}
 }
 

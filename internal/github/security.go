@@ -37,12 +37,27 @@ func AgentEnvironment(environment []string) []string {
 }
 
 func AgentEnvironmentWith(environment []string, allowed ...string) ([]string, error) {
+	return filteredAgentEnvironment(environment, true, allowed...)
+}
+
+// WorkerEnvironmentWith excludes GitHub and host credentials from untrusted
+// implementation and reviewer processes. GitHub mutations belong to the owner.
+func WorkerEnvironmentWith(environment []string, allowed ...string) ([]string, error) {
+	return filteredAgentEnvironment(environment, false, allowed...)
+}
+
+func filteredAgentEnvironment(environment []string, github bool, allowed ...string) ([]string, error) {
 	safe := map[string]bool{"PATH": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "TERM": true, "COLORTERM": true, "NO_COLOR": true, "CODEX_HOME": true}
-	for _, name := range githubCLIEnvironment {
-		safe[name] = true
+	if !github {
+		delete(safe, "TMPDIR")
+	}
+	if github {
+		for _, name := range githubCLIEnvironment {
+			safe[name] = true
+		}
 	}
 	for _, name := range allowed {
-		if reservedAgentVariable(name) && !modelCredentialVariable(name) {
+		if (!github && GitHubCLIEnvironmentVariable(name)) || reservedAgentVariable(name) && !modelCredentialVariable(name) {
 			return nil, errors.New("reserved credential or coordinator variable " + name + " cannot be allowed")
 		}
 		safe[name] = true

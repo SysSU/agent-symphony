@@ -32,8 +32,24 @@ func cleanupControlSocket(t *testing.T, root string) {
 
 func resolvedTempDir(t *testing.T) string {
 	t.Helper()
-	root, err := filepath.EvalSymlinks(t.TempDir())
+	home, err := os.UserHomeDir()
 	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(home, ".as-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := removeFullSystemFixtureRoot(root); err != nil {
+			t.Errorf("remove private test root: %v", err)
+		}
+	})
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return root
@@ -56,6 +72,7 @@ func TestControlServeHelper(t *testing.T) {
 	if json.Unmarshal([]byte(os.Getenv("AGENT_SYMPHONY_CONTROL_ARGS")), &args) != nil {
 		os.Exit(2)
 	}
+	testRuntimeStateRootAllowed = func(string) bool { return true }
 	os.Exit(run(args, io.Discard, io.Discard))
 }
 
@@ -137,6 +154,16 @@ func TestControlOwnershipRejectsAnotherLocalIdentity(t *testing.T) {
 	}
 }
 
+func TestDirectControlSocketRejectsNonPrivateStateDirectory(t *testing.T) {
+	root := resolvedTempDir(t)
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateControlSocketParent(controlSocketPath(root), root, false); err == nil {
+		t.Fatal("direct control socket accepted a non-private state directory")
+	}
+}
+
 func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 	root := gitRepository(t)
 	root, err := filepath.EvalSymlinks(root)
@@ -152,7 +179,7 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 	runGit(t, root, "commit", "-m", "initial")
 	base := runGit(t, root, "rev-parse", "HEAD")
 	runGit(t, root, "update-ref", "refs/remotes/origin/main", base)
-	stateRoot := filepath.Join(root, "runtime")
+	stateRoot := filepath.Join(privateDiagnosticRoot(t), "runtime")
 	cleanupControlSocket(t, stateRoot)
 	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -217,16 +244,27 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 	}
 	args := []string{"serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", dashboardAddress, "--interval", "200ms"}
 	encodedArgs, _ := json.Marshal(args)
+	binDir := t.TempDir()
+	buildNativeCodexFixture(t, filepath.Join(binDir, "codex"), `#!/bin/sh
+if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
+if [ "$1" = sandbox ]; then
+  while [ "$1" != -- ]; do shift; done
+  shift
+  if [ "$2" = sandbox-probe ]; then printf '%s\n' '{"confined":true,"shared_temp_read":true,"shared_temp_write":true}' > "$3"; exit 0; fi
+fi
+exit 0
+`)
 	command := exec.Command(os.Args[0], "-test.run=^TestControlServeHelper$")
 	command.Dir = root
 	command.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"AGENT_SYMPHONY_CONTROL_SERVE_HELPER=1",
 		"AGENT_SYMPHONY_CONTROL_GITHUB_URL="+github.URL,
 		"AGENT_SYMPHONY_CONTROL_ARGS="+string(encodedArgs),
 		"CODEX_HOME="+t.TempDir(),
 	)
-	var childOutput bytes.Buffer
-	command.Stdout, command.Stderr = &childOutput, &childOutput
+	childOutput := &synchronizedBuffer{}
+	command.Stdout, command.Stderr = childOutput, childOutput
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +275,7 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 			_ = command.Wait()
 		}
 	})
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for {
 		info, err := os.Lstat(controlSocketPath(stateRoot))
 		if err == nil && info.Mode()&os.ModeSocket != 0 {
@@ -401,10 +439,12 @@ func TestChatSelectsExactReviewerAndRunningDaemonOrchestrator(t *testing.T) {
 		t.Fatal(err)
 	}
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 23, 4)
-	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 23, 4)
+	reviewTarget := "o/r#23 plan sha256:" + strings.Repeat("a", 64)
+	reviewRunID := digestText("chat reviewer run")
+	reviewer, _ := agentruntime.ReviewRunSessionName("o/r", 23, 4, reviewTarget, reviewRunID)
 	status := orchestrator.RecoveryStatus{Repository: "o/r", Issue: 23, Attempt: 4, State: "active", Session: implementation, Sessions: []orchestrator.AttemptSession{
 		{Role: agentruntime.SessionRoleImplementation, Name: implementation, State: "completed"},
-		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModePlan, Target: "o/r#23 plan sha256:" + strings.Repeat("a", 64), Current: true},
+		{Role: agentruntime.SessionRoleReviewer, Name: reviewer, State: "running", Mode: agentruntime.ReviewModePlan, Target: reviewTarget, RunID: reviewRunID, Current: true},
 	}}
 	if err := writeStatusSnapshot(root, []orchestrator.RecoveryStatus{status}); err != nil {
 		t.Fatal(err)

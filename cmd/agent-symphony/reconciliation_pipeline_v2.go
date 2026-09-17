@@ -156,8 +156,8 @@ func (c *runtimeEffectCoordinator) executePublication(_ context.Context, api int
 	if request.Action != reconciliationGitHubPublish || request.GitHubPublish == nil || material.Config.Repository != request.Repository || material.Config.ActorID < 1 || publicationExecutionDigest(request, material) != request.ExecutionDigest || material.Head != request.GitHubPublish.HeadSHA {
 		return reconciliationEffectResult{}, errStateConflict
 	}
-	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	key := ownerIssueKey(request.Repository, request.Issue)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -294,6 +294,20 @@ func planReconciliationHandoffs(snapshot stateOwnerSnapshot, command, humanInstr
 		if handoff == nil {
 			continue
 		}
+		if manifest.Version == agentruntime.ManifestVersion2 {
+			for _, effect := range snapshot.State.Effects {
+				if effect.State == "pending" && effect.Action == string(reconciliationHandoffDeliver) && effect.Repository == manifest.Repository && effect.Issue == manifest.Issue && effect.Attempt == manifest.Attempt && effect.Reconciliation != nil && effect.Reconciliation.Handoff != nil && effect.Reconciliation.Handoff.Kind == handoff.Kind && effect.Reconciliation.Handoff.Key == handoff.Key && reflect.DeepEqual(effect.Reconciliation.Manifest, &manifest) {
+					handoff.CandidateLaunchToken = effect.Reconciliation.Handoff.CandidateLaunchToken
+					break
+				}
+			}
+			if handoff.CandidateLaunchToken == "" {
+				handoff.CandidateLaunchToken, err = agentruntime.NewLaunchToken()
+				if err != nil {
+					return nil, nil, err
+				}
+			}
+		}
 		request := reconciliationEffectRequest{Action: reconciliationHandoffDeliver, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Manifest: ptrManifest(manifest), ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, Handoff: handoff}
 		value := handoffExecutionMaterial{Command: expanded}
 		request.ExecutionDigest = handoffExecutionDigest(request, value)
@@ -320,12 +334,12 @@ func (c *runtimeEffectCoordinator) executeHandoff(_ context.Context, boundary bo
 		return reconciliationEffectResult{}, errStateConflict
 	}
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
 	defer c.releaseKey(key, run)
-	payload, err := handoffBoundaryPayload(request, material.Command)
+	payload, err := handoffBoundaryPayload(request, plan.Identity.EffectID, material.Command)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -337,7 +351,20 @@ func (c *runtimeEffectCoordinator) executeHandoff(_ context.Context, boundary bo
 		return reconciliationEffectResult{}, err
 	}
 	if !applied {
-		accepted, err := boundary.call(run.ctx, "accept-handoff", agentruntime.Command{Stdin: bytes.NewReader(payload)})
+		operation := "accept-handoff"
+		if request.Manifest.Version == agentruntime.ManifestVersion2 {
+			operation = "prepare-handoff"
+		}
+		accepted, err := boundary.call(run.ctx, operation, agentruntime.Command{Stdin: bytes.NewReader(payload)})
+		if request.Manifest.Version == agentruntime.ManifestVersion2 && err == nil {
+			if strings.TrimSpace(accepted.Output) != plan.Identity.EffectID+":"+request.Handoff.CandidateLaunchToken {
+				return reconciliationEffectResult{}, errors.New("handoff candidate preparation binding mismatch")
+			}
+			if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
+				return reconciliationEffectResult{}, err
+			}
+			accepted, err = boundary.call(run.ctx, "release-handoff", agentruntime.Command{Stdin: bytes.NewReader(payload)})
+		}
 		if err != nil || !validHandoffAck(accepted.Output, request.Handoff) {
 			if err == nil {
 				err = errors.New("handoff acceptance binding mismatch")
@@ -353,13 +380,19 @@ func (c *runtimeEffectCoordinator) executeHandoff(_ context.Context, boundary bo
 		return reconciliationEffectResult{}, err
 	}
 	result := reconciliationEffectResult{Action: request.Action, Handoff: &handoffEffectResult{Kind: request.Handoff.Kind, Key: request.Handoff.Key, OutcomePath: request.Handoff.OutcomePath, OutcomeToken: request.Handoff.OutcomeToken, Observed: true}}
+	if request.Manifest.Version == agentruntime.ManifestVersion2 {
+		result.Handoff.LaunchToken, result.Handoff.LaunchID = request.Handoff.CandidateLaunchToken, plan.Identity.EffectID
+	}
 	if err := c.finishReconciliationWithMarker(plan.Identity, request, result); err != nil {
 		return reconciliationEffectResult{}, err
 	}
 	return result, nil
 }
 
-func handoffBoundaryPayload(request reconciliationEffectRequest, command []string) ([]byte, error) {
+func handoffBoundaryPayload(request reconciliationEffectRequest, effectID string, command []string) ([]byte, error) {
+	if request.Manifest.Version != agentruntime.ManifestVersion2 {
+		effectID = ""
+	}
 	var handoff []byte
 	if request.Handoff.Kind == "review-findings" {
 		handoff, _ = json.Marshal(struct {
@@ -377,12 +410,14 @@ func handoffBoundaryPayload(request reconciliationEffectRequest, command []strin
 		}{"agent-symphony-handoff-v1", value.Key, value.PR, value.HeadSHA, value.Validation, value.Feedback})
 	}
 	body, err := json.Marshal(struct {
-		Manifest     agentruntime.Manifest `json:"manifest"`
-		Handoff      json.RawMessage       `json:"handoff"`
-		OutcomePath  string                `json:"outcome_path"`
-		OutcomeToken string                `json:"outcome_token"`
-		Command      []string              `json:"command"`
-	}{*request.Manifest, handoff, request.Handoff.OutcomePath, request.Handoff.OutcomeToken, command})
+		Manifest             agentruntime.Manifest `json:"manifest"`
+		Handoff              json.RawMessage       `json:"handoff"`
+		OutcomePath          string                `json:"outcome_path"`
+		OutcomeToken         string                `json:"outcome_token"`
+		Command              []string              `json:"command"`
+		CandidateLaunchToken string                `json:"candidate_launch_token,omitempty"`
+		CandidateLaunchID    string                `json:"candidate_launch_id,omitempty"`
+	}{*request.Manifest, handoff, request.Handoff.OutcomePath, request.Handoff.OutcomeToken, command, request.Handoff.CandidateLaunchToken, effectID})
 	return body, err
 }
 
@@ -422,9 +457,12 @@ func planReconciliationReviewers(snapshot stateOwnerSnapshot, stateRoot string, 
 			continue
 		}
 		phase, mode, target, base, head := "run-observe", manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead
-		snapshotPath, session := reviewIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(stateRoot))
+		runID := ""
+		snapshotPath, session := "", ""
 		if (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued" || manifest.ReviewState == "failed") && (manifest.ReviewSnapshot != "" || manifest.ReviewSession != "") {
-			if manifest.ReviewSnapshot != snapshotPath || manifest.ReviewSession != session || !reviewerCleanupProved(snapshot.State, manifest.Repository, manifest.Issue, manifest.Attempt, manifest.ReviewMode, manifest.ReviewTarget) {
+			runID = manifest.ReviewRunID
+			snapshotPath, session = reviewRunIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(stateRoot), target, runID)
+			if snapshotPath == "" || manifest.ReviewSnapshot != snapshotPath || manifest.ReviewSession != session || !reviewerCleanupProved(snapshot.State, manifest.Repository, manifest.Issue, manifest.Attempt, manifest.ReviewMode, manifest.ReviewTarget, runID) {
 				continue
 			}
 			phase, mode, target, base, head, snapshotPath, session = "cleanup", manifest.ReviewMode, manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession
@@ -433,14 +471,25 @@ func planReconciliationReviewers(snapshot stateOwnerSnapshot, stateRoot string, 
 		} else if manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued" {
 			continue
 		} else if manifest.ReviewState == "preparing" || manifest.ReviewState == "running" {
-			expected := reviewerEffectRequest{Mode: mode, Target: target, BaseSHA: base, HeadSHA: head, Snapshot: snapshotPath, Session: session}
+			runID = manifest.ReviewRunID
+			snapshotPath, session = reviewRunIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(stateRoot), target, runID)
+			expected := reviewerEffectRequest{Mode: mode, Target: target, RunID: runID, BaseSHA: base, HeadSHA: head, Snapshot: snapshotPath, Session: session}
 			if !reviewManifestMatches(manifest, &expected) {
 				continue
 			}
 		} else {
 			continue
 		}
-		request := reconciliationEffectRequest{Action: reconciliationReviewer, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Manifest: ptrManifest(manifest), ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, Reviewer: &reviewerEffectRequest{Phase: phase, Mode: mode, Target: target, BaseSHA: base, HeadSHA: head, Snapshot: snapshotPath, Session: session}}
+		if phase == "run-observe" {
+			if runID == "" {
+				if snapshot.State.Revision == ^uint64(0) {
+					return nil, nil, errors.New("runtime revision overflow")
+				}
+				runID = reviewerRunID(snapshot.State.Epoch, snapshot.State.Revision+1, snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], snapshot.State.AttemptGenerations[key], manifest.Repository, manifest.Issue, manifest.Attempt, mode, target)
+			}
+			snapshotPath, session = reviewRunIdentity(agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt}, productionSnapshotRoot(stateRoot), target, runID)
+		}
+		request := reconciliationEffectRequest{Action: reconciliationReviewer, Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Manifest: ptrManifest(manifest), ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, Reviewer: &reviewerEffectRequest{Phase: phase, Mode: mode, Target: target, RunID: runID, BaseSHA: base, HeadSHA: head, Snapshot: snapshotPath, Session: session}}
 		if phase == "run-observe" && mode == agentruntime.ReviewModeImplementation {
 			request.Reviewer.DigestVersion = 1
 		}
@@ -462,6 +511,13 @@ func digestText(value string) string {
 
 func reviewerExecutionDigest(request reconciliationEffectRequest, material reviewerExecutionMaterial) string {
 	request.ExecutionDigest = ""
+	if request.Reviewer != nil {
+		reviewer := *request.Reviewer
+		request.Reviewer = &reviewer
+		request.Reviewer.RunID = ""
+		request.Reviewer.Snapshot = ""
+		request.Reviewer.Session = ""
+	}
 	if request.Reviewer != nil && (request.Reviewer.Mode == agentruntime.ReviewModePlan || request.Reviewer.DigestVersion == 1) {
 		// Status comments and labels do not change the reviewer prompt.
 		material.Issue = internalgithub.RecoveryIssueFact{Repository: material.Issue.Repository, Issue: material.Issue.Issue, Attempt: material.Issue.Attempt, BaseSHA: material.Issue.BaseSHA, Body: material.Issue.Body}
@@ -490,6 +546,16 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 	request := plan.Request
 	if request.Action != reconciliationReviewer || request.Reviewer == nil || reviewerExecutionDigest(request, material) != request.ExecutionDigest || digestText(material.Issue.Body) != request.BodyDigest {
 		return reconciliationEffectResult{}, false, errStateConflict
+	}
+	if request.Reviewer.Phase == "run-observe" {
+		current, err := c.owner.snapshot(c.lifecycle)
+		effect, ok := current.State.Effects[plan.Identity.EffectID]
+		if err != nil {
+			return reconciliationEffectResult{}, false, err
+		}
+		if !ok || effect.ReviewerConfinementVersion != reviewerConfinementVersion || current.State.LegacyReviewerQuarantines[ownerIssueKey(request.Repository, request.Issue)] != "" {
+			return reconciliationEffectResult{}, false, errStateConflict
+		}
 	}
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
 	observationGeneration := request.ObservationGeneration
@@ -532,14 +598,18 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 			return reconciliationEffectResult{}, false, snapshotErr
 		}
 		proof, proved := ownerSnapshot.State.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)]
-		if !proved || !proof.DeadProved {
+		activeProfileDigest := activeWorkerProfileDigest(ownerSnapshot.State)
+		if !proved || proof.AttemptGeneration == 0 || proof.AttemptGeneration > plan.Identity.AttemptGeneration || !reviewerCleanupAuthorized(proof, activeProfileDigest) {
 			return reconciliationEffectResult{}, false, errors.New("automatic reviewer cleanup lacks owner process-death certificate")
 		}
-		if err := cleanupCertifiedReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, request.Reviewer.Target, request.Reviewer.Snapshot, request.Reviewer.Session, productionSnapshotRoot(c.owner.stateRoot), proof); err != nil {
+		if proof.RunID != request.Reviewer.RunID {
+			return reconciliationEffectResult{}, false, errors.New("automatic reviewer cleanup run identity mismatches its owner certificate")
+		}
+		if err := cleanupBoundReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, request.Reviewer.Target, request.Reviewer.RunID, request.Reviewer.Snapshot, request.Reviewer.Session, productionSnapshotRoot(c.owner.stateRoot), activeProfileDigest, proof); err != nil {
 			return reconciliationEffectResult{}, false, err
 		}
 		session, sessionErr := boundary.call(run.ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + request.Reviewer.Session}, Dir: filepath.Dir(request.Reviewer.Snapshot), Env: material.Env})
-		if !session.Exited || session.Code != 1 {
+		if sessionErr == nil || !exactTmuxSessionAbsent(session, request.Reviewer.Session) {
 			if sessionErr == nil {
 				sessionErr = errors.New("reviewer session remains after cleanup")
 			}
@@ -550,7 +620,7 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 				return reconciliationEffectResult{}, false, errors.New("reviewer resources remain after cleanup")
 			}
 		}
-		result := reconciliationEffectResult{Action: request.Action, Reviewer: &reviewerEffectResult{Phase: request.Reviewer.Phase, Status: "cleaned", Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, BaseSHA: request.Reviewer.BaseSHA, HeadSHA: request.Reviewer.HeadSHA, Snapshot: request.Reviewer.Snapshot, Session: request.Reviewer.Session}}
+		result := reconciliationEffectResult{Action: request.Action, Reviewer: &reviewerEffectResult{Phase: request.Reviewer.Phase, Status: "cleaned", Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, RunID: request.Reviewer.RunID, BaseSHA: request.Reviewer.BaseSHA, HeadSHA: request.Reviewer.HeadSHA, Snapshot: request.Reviewer.Snapshot, Session: request.Reviewer.Session}}
 		if err := c.finishReconciliationMarker(plan.Identity, request, result, operator); err != nil {
 			return reconciliationEffectResult{}, false, err
 		}
@@ -558,6 +628,7 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 	}
 	executionManifest := cloneManifest(*request.Manifest)
 	executionManifest.ReviewState, executionManifest.ReviewMode, executionManifest.ReviewTarget = "running", request.Reviewer.Mode, request.Reviewer.Target
+	executionManifest.ReviewRunID = request.Reviewer.RunID
 	executionManifest.ReviewBase, executionManifest.ReviewHead = request.Reviewer.BaseSHA, request.Reviewer.HeadSHA
 	executionManifest.ReviewSnapshot, executionManifest.ReviewSession = request.Reviewer.Snapshot, request.Reviewer.Session
 	var binding *reviewerLaunchIdentity
@@ -581,9 +652,13 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		}
 		oldProofs := map[string]reviewerProcessProof{}
 		for _, proof := range ownerSnapshot.State.ReviewerProofs {
-			if proof.Repository == request.Repository && proof.Issue == request.Issue && proof.Attempt == request.Attempt && proof.DeadProved {
-				oldProofs[proof.Target] = proof
+			if proof.Repository != request.Repository || proof.Issue != request.Issue || proof.Attempt != request.Attempt {
+				continue
 			}
+			if proof.AttemptGeneration == 0 || proof.AttemptGeneration > plan.Identity.AttemptGeneration || !reviewerCleanupAuthorized(proof, activeWorkerProfileDigest(ownerSnapshot.State)) {
+				return reconciliationEffectResult{}, false, errStateConflict
+			}
+			oldProofs[proof.Target] = proof
 		}
 		oldTargets := make([]string, 0, len(oldProofs))
 		for target := range oldProofs {
@@ -591,12 +666,17 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		}
 		slices.Sort(oldTargets)
 		root := productionSnapshotRoot(c.owner.stateRoot)
+		activeProfileDigest := activeWorkerProfileDigest(ownerSnapshot.State)
 		if err := os.MkdirAll(root, 0o700); err != nil {
 			return reconciliationEffectResult{}, false, err
 		}
-		oldSnapshot, oldSession := reviewIdentity(attempt, root)
 		for _, target := range oldTargets {
-			if err := cleanupCertifiedReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, target, oldSnapshot, oldSession, root, oldProofs[target]); err != nil {
+			proof := oldProofs[target]
+			oldSnapshot, oldSession := persistedReviewIdentity(attempt, root, target, proof.RunID)
+			if err := cleanupBoundReviewResources(run.ctx, boundary, material.Env, attempt, request.Reviewer.HeadSHA, target, proof.RunID, oldSnapshot, oldSession, root, activeProfileDigest, proof); err != nil {
+				return reconciliationEffectResult{}, false, err
+			}
+			if _, err := c.owner.forgetReviewerProof(run.ctx, forgetReviewerProofCommand{Identity: plan.Identity, Proof: proof}); err != nil {
 				return reconciliationEffectResult{}, false, err
 			}
 		}
@@ -641,26 +721,30 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 	if err != nil || pending {
 		return reconciliationEffectResult{}, pending, err
 	}
+	var sealedPane reviewerPaneIdentity
+	var sealedTerminal reviewerTerminalRecord
 	if binding != nil && binding.ChildPID > 1 {
-		status, probeErr := boundary.call(run.ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(request.Reviewer.Session), agentruntime.PaneStatusFormat}, Env: material.Env})
+		status, probeErr := boundary.call(run.ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(request.Reviewer.Session), reviewerPaneIdentityFormat}, Env: material.Env})
 		if probeErr != nil {
 			return reconciliationEffectResult{}, true, probeErr
 		}
-		if !missingTmuxPaneStatus(status) {
-			pane, parseErr := agentruntime.ParsePaneStatus(status.Output)
-			if parseErr != nil || !pane.Dead {
-				return reconciliationEffectResult{}, true, errors.New("reviewer terminal pane death is unproved")
-			}
+		pane, parseErr := parseReviewerPaneIdentity(status.Output)
+		launchPath, terminalPath := reviewerLifecyclePaths(request.Reviewer.Snapshot, request.Reviewer.Target)
+		if parseErr != nil || !pane.Status.Dead || pane.Name != request.Reviewer.Session || !reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, *binding) {
+			return reconciliationEffectResult{}, true, errors.New("reviewer terminal pane death is unproved")
 		}
-		gone, proofErr := reviewerGroupGone(binding.ChildPID)
-		if proofErr != nil || !gone {
-			return reconciliationEffectResult{}, true, errors.New("reviewer process-group death is unproved")
+		terminal, terminalErr := readReviewerTerminal(launchPath, terminalPath, *binding)
+		if terminalErr != nil || terminal == nil {
+			return reconciliationEffectResult{}, true, errors.New("reviewer terminal identity is unavailable")
 		}
-		if _, proofErr := c.owner.proveReviewerDead(run.ctx, proveReviewerDeadCommand{Identity: plan.Identity, GroupPID: binding.ChildPID}); proofErr != nil {
-			return reconciliationEffectResult{}, false, proofErr
+		sealedPane, sealedTerminal = pane, *terminal
+	}
+	result := reconciliationEffectResult{Action: request.Action, Reviewer: &reviewerEffectResult{Phase: request.Reviewer.Phase, Status: review.Status, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, RunID: request.Reviewer.RunID, BaseSHA: request.Reviewer.BaseSHA, HeadSHA: request.Reviewer.HeadSHA, Snapshot: request.Reviewer.Snapshot, Session: request.Reviewer.Session, Findings: slices.Clone(review.Findings), Diagnostic: review.Diagnostic}}
+	if binding != nil && binding.ChildPID > 1 {
+		if _, sealErr := c.owner.sealReviewerResult(run.ctx, sealReviewerResultCommand{Identity: plan.Identity, Result: result, Pane: sealedPane, Terminal: sealedTerminal}); sealErr != nil {
+			return reconciliationEffectResult{}, false, sealErr
 		}
 	}
-	result := reconciliationEffectResult{Action: request.Action, Reviewer: &reviewerEffectResult{Phase: request.Reviewer.Phase, Status: review.Status, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, BaseSHA: request.Reviewer.BaseSHA, HeadSHA: request.Reviewer.HeadSHA, Snapshot: request.Reviewer.Snapshot, Session: request.Reviewer.Session, Findings: slices.Clone(review.Findings), Diagnostic: review.Diagnostic}}
 	if err := c.finishReconciliationMarker(plan.Identity, request, result, operator); err != nil {
 		return reconciliationEffectResult{}, false, err
 	}
@@ -713,7 +797,7 @@ func planReconciliationRetirements(snapshot stateOwnerSnapshot) []reconciliation
 		manifest := record.Manifest
 		observation, ok := snapshot.State.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)]
 		fact, observed := observedReconciliationAttempt(observation, manifest.Attempt)
-		if !ok || !observed || record.Generation != snapshot.State.AttemptGenerations[key] || fact.State != "completed" || fact.PR < 1 || fact.BaseSHA != manifest.BaseSHA || fact.HeadSHA == "" || manifest.ReviewHead != fact.HeadSHA || manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" {
+		if !ok || !observed || record.Generation != snapshot.State.AttemptGenerations[key] || fact.State != "completed" || fact.PR < 1 || fact.BaseSHA != manifest.BaseSHA || fact.HeadSHA == "" || manifest.ReviewHead != fact.HeadSHA || manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" || attemptHasReviewerProof(snapshot.State, manifest.Repository, manifest.Issue, manifest.Attempt) {
 			continue
 		}
 		mode := "cleanup"
@@ -734,7 +818,7 @@ func (c *runtimeEffectCoordinator) executeRetirement(_ context.Context, boundary
 		return reconciliationEffectResult{}, errStateConflict
 	}
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -780,7 +864,7 @@ func retiredResourcesGone(ctx context.Context, boundary boundaryCaller, manifest
 		}
 	}
 	result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + manifest.Session}, Dir: productionAttemptRoot(stateRoot)})
-	if result.Exited && result.Code == 1 {
+	if exactTmuxSessionAbsent(result, manifest.Session) {
 		return true, nil
 	}
 	if err == nil {
@@ -804,8 +888,8 @@ func (c *runtimeEffectCoordinator) executeGitHubBind(_ context.Context, api inte
 	if request.Action != reconciliationGitHubBind || request.GitHubBind == nil || githubBindExecutionDigest(request, cfg) != request.ExecutionDigest {
 		return reconciliationEffectResult{}, errStateConflict
 	}
-	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	key := ownerIssueKey(request.Repository, request.Issue)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -944,6 +1028,40 @@ func planReconciliationAttemptIssueUpdates(snapshot stateOwnerSnapshot, batch re
 	return plans, nil
 }
 
+func planMachineStatusUpdates(snapshot stateOwnerSnapshot, cfg internalgithub.PRAdapterConfig) ([]reconciliationPlannedEffect, error) {
+	if cfg.Repository == "" || cfg.Repository != snapshot.State.Repository || cfg.ActorID < 1 {
+		return nil, errors.New("machine status config does not match owner")
+	}
+	var plans []reconciliationPlannedEffect
+	for key, status := range snapshot.State.MachineStatuses {
+		observation, ok := snapshot.State.Observations[key]
+		if !ok || !observation.Present || observation.OwnerGeneration != status.IssueGeneration || status.IssueGeneration != snapshot.State.IssueGenerations[key] {
+			continue
+		}
+		needsAttention := status.Status == "needs-attention"
+		remoteCurrent := observation.Fact.NeedsAttention == needsAttention &&
+			observation.Fact.MachineStatusProtocol == 2 && observation.Fact.MachineStatusAttempt == status.Attempt &&
+			observation.Fact.MachineStatusSequence == status.Sequence && observation.Fact.MachineStatusNeedsAttention == needsAttention &&
+			observation.Fact.MachineStatusReason == status.Reason
+		if status.AppliedSequence == status.Sequence && remoteCurrent {
+			continue
+		}
+		update := &githubIssueUpdateEffectRequest{Kind: githubIssueMachineStatus, AttributionAttempt: status.Attempt, Status: status.Status, StatusReason: status.Reason, StatusSequence: status.Sequence, StatusSource: status.Source, StatusSourceSequence: status.SourceSequence}
+		request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: status.Repository, Issue: status.Issue, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, GitHubIssueUpdate: update}
+		material := reconciliationIssueUpdateMaterial{Config: cfg}
+		request.ExecutionDigest = issueUpdateExecutionDigest(request, material)
+		if !validReconciliationEffectRequest(snapshot.State.Repository, request) || !validReconciliationEffectStateBindings("", snapshot.State, request) {
+			return nil, errStateConflict
+		}
+		if status.AppliedSequence != status.Sequence && completedReconciliationRequest(snapshot.State, request) {
+			continue
+		}
+		plans = append(plans, reconciliationPlannedEffect{Identity: ownerReconciliationBeginIdentity(snapshot, request), Request: request, Material: material})
+	}
+	sortReconciliationPlans(plans)
+	return plans, nil
+}
+
 func sortReconciliationPlans(plans []reconciliationPlannedEffect) {
 	slices.SortFunc(plans, func(a, b reconciliationPlannedEffect) int {
 		if ordered := cmp.Compare(a.Request.Issue, b.Request.Issue); ordered != 0 {
@@ -1003,8 +1121,8 @@ func (c *runtimeEffectCoordinator) executeGovernance(ctx context.Context, api in
 	if request.Action != reconciliationGitHubPRGovernance || request.GitHubPRGovernance == nil || plan.Attempt == nil || governanceExecutionDigest(request, *plan.Attempt) != request.ExecutionDigest {
 		return reconciliationEffectResult{}, errStateConflict
 	}
-	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration)
+	key := ownerIssueKey(request.Repository, request.Issue)
+	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, plan.Identity.AttemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -1017,9 +1135,6 @@ func (c *runtimeEffectCoordinator) executeGovernance(ctx context.Context, api in
 		return reflect.DeepEqual(candidate, *plan.Attempt)
 	}) {
 		return reconciliationEffectResult{}, errStaleStateResult
-	}
-	if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
-		return reconciliationEffectResult{}, err
 	}
 	if err := internalgithub.RunPRGovernance(run.ctx, api, request.GitHubPRGovernance.Policy, ownerAttemptRecovery{owner: c.owner, identity: plan.Identity}, *plan.Attempt); err != nil {
 		return reconciliationEffectResult{}, err
@@ -1056,31 +1171,43 @@ func (c *runtimeEffectCoordinator) beginReconciliation(ctx context.Context, plan
 	return plan, nil
 }
 
-func (c *runtimeEffectCoordinator) executeIssueUpdate(_ context.Context, api internalgithub.API, plan reconciliationPlannedEffect) (reconciliationEffectResult, error) {
-	return c.executeIssueUpdateMode(api, plan, false)
+func (c *runtimeEffectCoordinator) executeIssueUpdate(ctx context.Context, api internalgithub.API, plan reconciliationPlannedEffect) (reconciliationEffectResult, error) {
+	return c.executeIssueUpdateMode(ctx, api, plan, false)
 }
 
 func (c *runtimeEffectCoordinator) executeOperatorIssueUpdate(api internalgithub.API, plan reconciliationPlannedEffect) (reconciliationEffectResult, error) {
-	return c.executeIssueUpdateMode(api, plan, true)
+	return c.executeIssueUpdateMode(c.lifecycle, api, plan, true)
 }
 
-func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API, plan reconciliationPlannedEffect, operator bool) (reconciliationEffectResult, error) {
+func (c *runtimeEffectCoordinator) executeIssueUpdateMode(ctx context.Context, api internalgithub.API, plan reconciliationPlannedEffect, operator bool) (reconciliationEffectResult, error) {
 	request := plan.Request
 	if request.Action != reconciliationGitHubIssueUpdate || request.GitHubIssueUpdate == nil || issueUpdateExecutionDigest(request, plan.Material) != request.ExecutionDigest {
 		return reconciliationEffectResult{}, errStateConflict
 	}
 	issueScoped := reconciliationEffectIssueScoped(request)
 	key, attemptGeneration := ownerIssueKey(request.Repository, request.Issue), uint64(0)
-	if !issueScoped {
-		key, attemptGeneration = ownerAttemptKey(request.Repository, request.Issue, request.Attempt), plan.Identity.AttemptGeneration
-	}
-	run, err := c.acquireKey(c.lifecycle, key, plan.Identity.IssueGeneration, attemptGeneration, request.ObservationGeneration)
+	run, err := c.acquireKey(ctx, key, plan.Identity.IssueGeneration, attemptGeneration, request.ObservationGeneration, plan.Identity.EffectID)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
 	defer c.releaseKey(key, run)
 	var applied bool
-	if issueScoped {
+	if request.ControlRepair {
+		if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
+			return reconciliationEffectResult{}, err
+		}
+		err = internalgithub.EnsureControlSnapshotRepair(run.ctx, api, plan.Material.Config, request.Repository, request.Issue, request.GitHubIssueUpdate.ControlSnapshotBody)
+		if err != nil {
+			applied, proofErr := internalgithub.ControlSnapshotRepairApplied(c.lifecycle, api, plan.Material.Config, request.Repository, request.Issue, request.GitHubIssueUpdate.ControlSnapshotBody)
+			if proofErr != nil || !applied {
+				return reconciliationEffectResult{}, errors.Join(err, proofErr)
+			}
+		}
+		applied = true
+	} else if request.GitHubIssueUpdate.Kind == githubIssueMachineStatus {
+		update := request.GitHubIssueUpdate
+		applied, err = api.OwnerStatusApplied(run.ctx, request.Repository, request.Issue, update.AttributionAttempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, plan.Material.Config.ActorID)
+	} else if issueScoped {
 		applied, err = internalgithub.RevalidateIssueUpdateProposal(run.ctx, api, plan.Material.Config, plan.issueUpdateProposal())
 	} else {
 		applied, err = revalidateAttemptIssueUpdate(run.ctx, api, request, plan.Material)
@@ -1088,11 +1215,16 @@ func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
-	if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
-		return reconciliationEffectResult{}, err
+	if !request.ControlRepair {
+		if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
+			return reconciliationEffectResult{}, err
+		}
 	}
 	if !applied {
-		if issueScoped {
+		if request.GitHubIssueUpdate.Kind == githubIssueMachineStatus {
+			update := request.GitHubIssueUpdate
+			err = api.EnsureOwnerStatus(run.ctx, request.Repository, request.Issue, update.AttributionAttempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, plan.Material.Config.ActorID)
+		} else if issueScoped {
 			err = internalgithub.ExecuteIssueUpdateProposal(run.ctx, api, plan.Material.Config, plan.issueUpdateProposal())
 		} else {
 			err = executeAttemptIssueUpdate(run.ctx, api, request, plan.Material.Config)
@@ -1109,7 +1241,16 @@ func (c *runtimeEffectCoordinator) executeIssueUpdateMode(api internalgithub.API
 			}
 		}
 	}
-	if !issueScoped {
+	if request.GitHubIssueUpdate.Kind == githubIssueMachineStatus {
+		update := request.GitHubIssueUpdate
+		applied, err = api.OwnerStatusApplied(run.ctx, request.Repository, request.Issue, update.AttributionAttempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, plan.Material.Config.ActorID)
+		if err != nil || !applied {
+			if err == nil {
+				err = errors.New("machine status update was not observable")
+			}
+			return reconciliationEffectResult{}, err
+		}
+	} else if !issueScoped {
 		proofContext := run.ctx
 		if request.GitHubIssueUpdate.Kind == githubIssueRetry {
 			proofContext = c.lifecycle
@@ -1176,6 +1317,8 @@ func executeAttemptIssueUpdate(ctx context.Context, api internalgithub.API, requ
 		return api.EnsureReviewFindings(ctx, request.Repository, request.Issue, request.Attempt, update.HeadSHA, update.Findings, cfg.ActorID)
 	case githubIssueRetry:
 		return internalgithub.EnsureRetryCommand(ctx, api, cfg, request.Issue, request.Attempt)
+	case githubIssueMachineStatus:
+		return api.EnsureOwnerStatus(ctx, request.Repository, request.Issue, request.Attempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, cfg.ActorID)
 	default:
 		return errStateConflict
 	}
@@ -1207,6 +1350,8 @@ func attemptIssueUpdateApplied(ctx context.Context, api internalgithub.API, requ
 		bodies = []string{body}
 	case githubIssueRetry:
 		return internalgithub.RetryCommandApplied(ctx, api, cfg, request.Issue, request.Attempt, time.Unix(0, update.FailedAtUnixNano))
+	case githubIssueMachineStatus:
+		return api.OwnerStatusApplied(ctx, request.Repository, request.Issue, request.Attempt, update.StatusSequence, update.Status == "needs-attention", update.StatusReason, cfg.ActorID)
 	default:
 		return false, errStateConflict
 	}
@@ -1354,6 +1499,9 @@ func planReconciliationIssueUpdates(snapshot stateOwnerSnapshot, batch reconcili
 	var plans []reconciliationPlannedEffect
 	for _, material := range batch.IssueUpdates {
 		proposal := material.Proposal
+		if proposal.Kind == githubIssueDependencyClear {
+			continue // Admitted into the owner's shared machine-status order first.
+		}
 		key := ownerIssueKey(proposal.Repository, proposal.Issue)
 		observation, ok := snapshot.State.Observations[key]
 		if !ok || !observation.Present || observation.OwnerGeneration != snapshot.State.IssueGenerations[key] || !slices.Contains(observation.IssueUpdates, proposal) {
@@ -1373,7 +1521,8 @@ func planReconciliationIssueUpdates(snapshot stateOwnerSnapshot, batch reconcili
 		request := reconciliationEffectRequest{
 			Action: reconciliationGitHubIssueUpdate, Repository: proposal.Repository, Issue: proposal.Issue,
 			ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest,
-			GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: proposal.Kind, ControlSnapshotDigest: proposal.ControlSnapshotDigest, AttributionAttempt: proposal.AttributionAttempt, Dependency: proposal.Dependency, PullRequest: proposal.PullRequest},
+			ControlGeneration: controlGeneration(snapshot.State, key),
+			GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: proposal.Kind, ControlSnapshotDigest: proposal.ControlSnapshotDigest, ControlSnapshotBody: material.ControlSnapshotBody, AttributionAttempt: proposal.AttributionAttempt, Dependency: proposal.Dependency, PullRequest: proposal.PullRequest},
 		}
 		request.ExecutionDigest = issueUpdateExecutionDigest(request, material)
 		if !validReconciliationEffectRequest(snapshot.State.Repository, request) {
@@ -1383,6 +1532,40 @@ func planReconciliationIssueUpdates(snapshot stateOwnerSnapshot, batch reconcili
 			Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: observation.OwnerGeneration},
 			Request:  request, Material: material,
 		})
+	}
+	return plans, nil
+}
+
+func planControlSnapshotRepairs(snapshot stateOwnerSnapshot, cfg internalgithub.PRAdapterConfig) ([]reconciliationPlannedEffect, error) {
+	keys := make([]string, 0, len(snapshot.State.ControlRepairs))
+	for key := range snapshot.State.ControlRepairs {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	var plans []reconciliationPlannedEffect
+	for _, key := range keys {
+		repair := snapshot.State.ControlRepairs[key]
+		observation, ok := snapshot.State.Observations[key]
+		if !ok || !observation.Present || repair.Generation != controlGeneration(snapshot.State, key) || repair.Body == "" || cfg.Repository != snapshot.State.Repository || cfg.ActorID < 1 {
+			continue
+		}
+		blocked := false
+		for _, effect := range snapshot.State.Effects {
+			if invalidatedEffectBlocksControlRepair(effect, snapshot.State.Repository, observation.Fact.Issue) {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
+		request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: snapshot.State.Repository, Issue: observation.Fact.Issue, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, ControlGeneration: repair.Generation, ControlRepair: true, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueControlSnapshot, ControlSnapshotDigest: digestText(repair.Body), ControlSnapshotBody: repair.Body}}
+		material := reconciliationIssueUpdateMaterial{Proposal: reconciliationIssueUpdateProposal{Repository: request.Repository, Issue: request.Issue, Kind: githubIssueControlSnapshot, ControlSnapshotDigest: request.GitHubIssueUpdate.ControlSnapshotDigest}, Config: cfg, ControlSnapshotBody: repair.Body}
+		request.ExecutionDigest = issueUpdateExecutionDigest(request, material)
+		if !validReconciliationEffectRequest(snapshot.State.Repository, request) || !validReconciliationEffectStateBindings("", snapshot.State, request) {
+			return nil, errors.New("control snapshot repair is invalid")
+		}
+		plans = append(plans, reconciliationPlannedEffect{Identity: stateResultIdentity{Epoch: snapshot.State.Epoch, SourceRevision: snapshot.State.Revision, IssueGeneration: snapshot.State.IssueGenerations[key]}, Request: request, Material: material})
 	}
 	return plans, nil
 }
