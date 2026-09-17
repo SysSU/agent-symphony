@@ -310,6 +310,9 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 			var reviewBarrierClaimed atomic.Bool
 			reconcileEntered, reconcileRelease := make(chan struct{}), make(chan struct{})
 			var releaseReconcile sync.Once
+			var archiveMerged, archiveFollowupClaimed atomic.Bool
+			archiveFollowupEntered, archiveFollowupRelease := make(chan struct{}), make(chan struct{})
+			var releaseArchiveFollowup sync.Once
 			var holdRestartReconcile atomic.Bool
 			restartReconcileEntered, restartReconcileRelease := make(chan struct{}), make(chan struct{})
 			var releaseRestartReconcile sync.Once
@@ -328,19 +331,22 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 					head := fixture.pr["head"].(map[string]any)["sha"].(string)
 					_ = exec.Command("git", "--git-dir", fixture.origin, "update-ref", "refs/heads/main", head).Run()
 					fixture.mu.Unlock()
+					archiveMerged.Store(true)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				if action == "review-plan-archive" && r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues" && r.URL.Query().Get("state") == "open" && r.URL.Query().Get("page") == "1" && archiveMerged.Load() {
 					current, err := readRuntimeOwnerState(stateRoot, "o/r")
-					if err != nil {
-						http.Error(w, err.Error(), http.StatusInternalServerError)
-						return
-					}
-					if seal := current.Attempts[ownerAttemptKey("o/r", 73, 1)].WorkerSeal; seal.Root != "" {
-						if err := os.RemoveAll(seal.Root); err != nil {
-							http.Error(w, err.Error(), http.StatusInternalServerError)
+					observation := current.Observations[ownerIssueKey("o/r", 73)]
+					attempt := observation.Attempts[ownerAttemptKey("o/r", 73, 1)]
+					if err == nil && observation.Fact.Completed && attempt.Fact.State == "completed" && archiveFollowupClaimed.CompareAndSwap(false, true) {
+						close(archiveFollowupEntered)
+						select {
+						case <-archiveFollowupRelease:
+						case <-r.Context().Done():
 							return
 						}
 					}
-					w.WriteHeader(http.StatusNoContent)
-					return
 				}
 				if overlap && r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/73/comments" && markerExposed.Load() {
 					markerObserved.Store(true)
@@ -402,6 +408,7 @@ func TestDashboardLifecycleFullSystemE2E(t *testing.T) {
 			defer github.Close()
 			defer releaseRetry.Do(func() { close(retryRelease) })
 			defer releaseReconcile.Do(func() { close(reconcileRelease) })
+			defer releaseArchiveFollowup.Do(func() { close(archiveFollowupRelease) })
 			defer releaseRestartReconcile.Do(func() { close(restartReconcileRelease) })
 			binDir := filepath.Join(root, "bin")
 			if err := os.Mkdir(binDir, 0o700); err != nil {
@@ -1024,6 +1031,15 @@ fi
 				if err != nil {
 					t.Fatal(err)
 				}
+				archiveRecord := beforeAction.Attempts[key]
+				if archiveRecord.WorkerSeal == nil {
+					t.Fatal("Archive precondition did not retain the selected worker seal")
+				}
+				archiveWorkerSeal := *archiveRecord.WorkerSeal
+				archiveExport := workerExport{Repository: archiveRecord.Manifest.Repository, Branch: archiveRecord.Manifest.Branch, BaseSHA: archiveRecord.Manifest.BaseSHA, HeadSHA: archiveWorkerSeal.HeadSHA, BundleSHA256: archiveWorkerSeal.BundleSHA256, Result: archiveWorkerSeal.Result}
+				if !validWorkerSealSelection(stateRoot, archiveRecord.Manifest, archiveRecord.Generation, archiveWorkerSeal) || validateWorkerSeal(t.Context(), archiveWorkerSeal.Root, archiveRecord.Generation, archiveRecord.Manifest, archiveExport) != nil {
+					t.Fatalf("Archive precondition selected an invalid worker seal: %#v", archiveWorkerSeal)
+				}
 				for _, proof := range beforeAction.ReviewerProofs {
 					if proof.Repository != "o/r" || proof.Issue != 73 || proof.Attempt != 1 {
 						continue
@@ -1162,14 +1178,33 @@ fi
 					return
 				}
 				releaseReconcile.Do(func() { close(reconcileRelease) })
+				select {
+				case <-archiveFollowupEntered:
+				case <-time.After(limit):
+					t.Fatal("Archive fixture did not block the next reconciliation cycle")
+				}
 				if !waitFor(limit, func() bool {
 					current, err := readRuntimeOwnerState(stateRoot, "o/r")
 					if err != nil {
 						return false
 					}
-					proof, ok := current.ReviewerProofs[reviewerProofKey("o/r", 73, 1, agentruntime.ReviewModeImplementation, archiveReviewerTarget)]
-					if !ok || proof.RunID != archiveReviewerRunID || !proof.DeadProved {
+					record, ok := current.Attempts[key]
+					if !ok || record.WorkerSeal == nil || *record.WorkerSeal != archiveWorkerSeal {
 						return false
+					}
+					proof, ok := current.ReviewerProofs[reviewerProofKey("o/r", 73, 1, agentruntime.ReviewModeImplementation, archiveReviewerTarget)]
+					if ok {
+						if proof.RunID != archiveReviewerRunID || !proof.DeadProved {
+							return false
+						}
+					} else {
+						if !record.Manifest.ReviewRunCleaned || record.Manifest.ReviewRunID != "" || record.Manifest.ReviewSnapshot != "" || record.Manifest.ReviewSession != "" {
+							return false
+						}
+						reviewSnapshot, reviewSession := persistedReviewIdentity(operatorEffectAttempt(manifest), productionSnapshotRoot(stateRoot), archiveReviewerTarget, archiveReviewerRunID)
+						if _, statErr := os.Lstat(reviewSnapshot); !errors.Is(statErr, os.ErrNotExist) || fullSystemTmuxSessionExists(environment, reviewSession) {
+							return false
+						}
 					}
 					response, err := http.Get("http://" + address + "/status.json")
 					if err != nil {
@@ -1189,6 +1224,15 @@ fi
 				}) {
 					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
 					t.Fatalf("reviewed attempt never became Archive-eligible: observation=%#v proofs=%#v cycle=%q serve=%s", current.Observations[ownerIssueKey("o/r", 73)], current.ReviewerProofs, current.CycleDiagnostic, output.String())
+				}
+				archiveState, err := readRuntimeOwnerState(stateRoot, "o/r")
+				if err != nil {
+					t.Fatal(err)
+				}
+				archiveRecord = archiveState.Attempts[key]
+				archiveExport = workerExport{Repository: archiveRecord.Manifest.Repository, Branch: archiveRecord.Manifest.Branch, BaseSHA: archiveRecord.Manifest.BaseSHA, HeadSHA: archiveWorkerSeal.HeadSHA, BundleSHA256: archiveWorkerSeal.BundleSHA256, Result: archiveWorkerSeal.Result}
+				if validateWorkerSeal(t.Context(), archiveWorkerSeal.Root, archiveRecord.Generation, archiveRecord.Manifest, archiveExport) != nil {
+					t.Fatal("selected worker seal became invalid before Archive cleanup")
 				}
 				if len(archiveReviewerProofs) == 0 || !validDigest(archiveReviewerRunID) || archiveReviewerTarget == "" || archiveReviewerSession == "" {
 					t.Fatalf("Archive precondition did not retain an exact completed reviewer proof: proofs=%#v target=%q run=%q session=%q", archiveReviewerProofs, archiveReviewerTarget, archiveReviewerRunID, archiveReviewerSession)

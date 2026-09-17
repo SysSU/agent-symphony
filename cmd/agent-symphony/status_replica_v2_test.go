@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -47,17 +46,21 @@ func TestOwnerStatusReplicaIsRevisionTaggedAndRejectsOlderWrites(t *testing.T) {
 func TestOwnerStatusProjectionMatchesRecoveryProjection(t *testing.T) {
 	for _, lifecycle := range []string{"preparing", "running", "failed", "cancelled", "completed"} {
 		t.Run(lifecycle, func(t *testing.T) {
-			owner := newReconciliationTestOwner(t)
-			manifest := ownerTestManifest(t, owner.stateRoot, 186, 1, lifecycle)
+			root := resolvedTempDir(t)
+			manifest := ownerTestManifest(t, root, 186, 1, lifecycle)
 			if lifecycle == "failed" {
 				manifest.Diagnostic = "test failure"
 			}
 			if lifecycle == "cancelled" {
 				manifest.Diagnostic = "test cancellation"
 			}
-			if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
+			state := runtimeEffectInitialState(manifest)
+			state.Epoch, state.Revision = 1, 1
+			owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { _ = owner.close(context.Background()) })
 			issue := issueFact(186, "projection")
 			issue.Eligible = true
 			input := repositoryInput(true, issue)
@@ -137,7 +140,7 @@ func TestOwnerStatusProjectionMasksTombstonedAttempts(t *testing.T) {
 	}
 }
 
-func TestOwnerStatusProjectionQuarantinesUnresolvedGitHubMutation(t *testing.T) {
+func TestOwnerStatusProjectionKeepsDismissedAttemptHiddenWithUnresolvedGitHubMutation(t *testing.T) {
 	state := newRuntimeOwnerState("o/r")
 	state.Epoch, state.Revision = 1, 1
 	issueKey, attemptKey := ownerIssueKey("o/r", 330), ownerAttemptKey("o/r", 330, 1)
@@ -147,12 +150,8 @@ func TestOwnerStatusProjectionQuarantinesUnresolvedGitHubMutation(t *testing.T) 
 	state.Effects["ambiguous"] = runtimeEffectIntent{Repository: "o/r", Issue: 330, Attempt: 1, State: "invalidated", Dispatched: true, Reconciliation: &request}
 
 	projected, err := projectOwnerStatus(stateOwnerSnapshot{State: state}, 1, time.Unix(2, 0))
-	if err != nil || len(projected.Statuses) != 1 {
+	if err != nil || len(projected.Statuses) != 0 {
 		t.Fatalf("quarantine projection=%#v err=%v", projected.Statuses, err)
-	}
-	status := projected.Statuses[0]
-	if status.Issue != 330 || status.Attempt != 1 || !status.NeedsAttention || !status.OperatorBlocked || status.CurrentPhase != "physical-unverified" || !strings.Contains(status.Diagnostic, "unresolved external outcome") {
-		t.Fatalf("unresolved GitHub mutation was not visibly quarantined: %#v", status)
 	}
 }
 

@@ -497,8 +497,12 @@ func TestOpenLocalOrphanDismissRejectsWithoutInvalidatingAndAbandonNeedsNoGitHub
 	}
 	after := mustOwnerSnapshot(t, owner).State
 	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
-	if after.Revision != before.Revision || after.AttemptGenerations[key] != before.AttemptGenerations[key] || !reflect.DeepEqual(after.Attempts[key], before.Attempts[key]) || len(after.Tombstones) != len(before.Tombstones) {
+	if after.AttemptGenerations[key] != before.AttemptGenerations[key] || !reflect.DeepEqual(after.Attempts[key], before.Attempts[key]) || len(after.Tombstones) != len(before.Tombstones) {
 		t.Fatalf("rejected dismissal changed owner state: before=%#v after=%#v", before, after)
+	}
+	receipt, ok := operatorReceiptByID(after, "open-orphan-dismiss")
+	if !ok || receipt.State != "completed" || receipt.Result == nil || receipt.Result.Status != http.StatusConflict {
+		t.Fatalf("rejected dismissal was not durably recorded: %#v", receipt)
 	}
 	abandon := service.perform(t.Context(), operatorRequest("open-orphan-abandon", "abandon", manifest, true))
 	if abandon.Status != http.StatusAccepted || !abandon.OK || reads != 1 || mustOwnerSnapshot(t, owner).State.Tombstones[key].Action != "abandoned" {
@@ -4762,9 +4766,11 @@ func TestV2PlanReviewRejectsBodyChangedDuringPreparationBeforeAdmission(t *testi
 func TestV2ConcurrentSameAttemptDismissHandlersConverge(t *testing.T) {
 	owner, manifest := operatorTestOwner(t, 334, "completed", true)
 	service := operatorTestMutationService(t, owner)
-	entered := make(chan struct{}, 2)
+	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
+	var reads atomic.Int32
 	service.issueClosed = func(context.Context, string, int) (bool, error) {
+		reads.Add(1)
 		entered <- struct{}{}
 		<-release
 		return true, nil
@@ -4782,7 +4788,6 @@ func TestV2ConcurrentSameAttemptDismissHandlersConverge(t *testing.T) {
 		}()
 	}
 	<-entered
-	<-entered
 	close(release)
 	for range 2 {
 		response := <-responses
@@ -4794,6 +4799,9 @@ func TestV2ConcurrentSameAttemptDismissHandlersConverge(t *testing.T) {
 	key := ownerAttemptKey("o/r", manifest.Issue, manifest.Attempt)
 	if len(state.ControlReceipts) != 2 || len(state.Tombstones) != 1 || state.AttemptGenerations[key] != 2 || len(state.Effects) != 1 {
 		t.Fatalf("state=%#v", state)
+	}
+	if got := reads.Load(); got != 1 {
+		t.Fatalf("GitHub issue reads=%d, want one coalesced admission read", got)
 	}
 }
 

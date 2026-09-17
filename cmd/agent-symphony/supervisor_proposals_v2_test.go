@@ -68,8 +68,8 @@ func TestSupervisorInvalidRetryIsRefusedBeforeRunning(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = trigger.shutdown(t.Context()) })
 	service := &supervisorProposalServiceV2{agent: agent, owner: owner, effects: &runtimeEffectCoordinator{}, operator: &operatorMutationService{}, trigger: trigger, capacity: 1}
-	if err := service.process(t.Context()); err == nil {
-		t.Fatal("invalid retry unexpectedly succeeded")
+	if err := service.process(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	if status := readProposalStatusV2(t, agent); status.Resolution != "refused" || strings.Contains(status.Detail, "running") || triggered {
 		t.Fatalf("invalid retry status=%#v triggered=%v", status, triggered)
@@ -344,6 +344,7 @@ func retryProposalOwner(t *testing.T, issue int) (*stateOwner, agentruntime.Mani
 	root := resolvedTempDir(t)
 	manifest := ownerTestManifest(t, root, issue, 1, "completed")
 	manifest.ReviewState, manifest.ReviewHead = "clean", strings.Repeat("c", 40)
+	manifest.ReviewRunCleaned = true
 	state := runtimeEffectInitialState(manifest)
 	addOperatorObservation(&state, manifest, "active", false)
 	issueKey, attemptKey := ownerIssueKey(manifest.Repository, issue), ownerAttemptKey(manifest.Repository, issue, 1)

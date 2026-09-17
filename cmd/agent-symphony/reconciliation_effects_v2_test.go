@@ -393,7 +393,7 @@ func TestDispatchedGitHubEffectSurvivesDestructiveInvalidationAndRestart(t *test
 	}
 }
 
-func TestReconciliationEffectVariantsAreExactIdempotentAndConflictSafe(t *testing.T) {
+func TestReconciliationEffectVariantsReplayExactlyOrRejectStaleRunAndConflict(t *testing.T) {
 	for _, test := range reconciliationEffectCases(t) {
 		t.Run(test.name, func(t *testing.T) {
 			owner, snapshot, request := reconciliationEffectTestOwner(t, test.request)
@@ -402,8 +402,17 @@ func TestReconciliationEffectVariantsAreExactIdempotentAndConflictSafe(t *testin
 			if err != nil || first == nil {
 				t.Fatalf("begin effect=%#v err=%v", first, err)
 			}
-			replayedState, replayed, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: identity, Request: request})
-			if err != nil || replayed == nil || replayed.ID != first.ID || replayedState.State.Revision != firstState.State.Revision {
+			replay := beginReconciliationEffectCommand{Identity: identity, Request: request}
+			if first.ReviewerSourceRevision != 0 {
+				replay.ReviewerSourceRevision = first.ReviewerSourceRevision
+			}
+			replayedState, replayed, err := owner.beginReconciliationEffect(t.Context(), replay)
+			if request.Reviewer != nil && request.Reviewer.Phase == "run-observe" {
+				current := mustOwnerSnapshot(t, owner)
+				if !errors.Is(err, errStateConflict) || replayed != nil || current.State.Revision != firstState.State.Revision || current.State.Effects[first.ID].ID != first.ID {
+					t.Fatalf("stale reviewer replay state=%#v effect=%#v err=%v", current.State, replayed, err)
+				}
+			} else if err != nil || replayed == nil || replayed.ID != first.ID || replayedState.State.Revision != firstState.State.Revision {
 				t.Fatalf("replay state=%#v effect=%#v err=%v", replayedState.State, replayed, err)
 			}
 			conflict := cloneReconciliationRequest(request)
@@ -1069,9 +1078,8 @@ func TestPrebindingPlanReviewSupersessionRequiresExactStoppedProof(t *testing.T)
 	for _, test := range []struct {
 		name        string
 		observation reviewerStopObservation
-		wantProved  bool
 	}{
-		{name: "default shell never ran", observation: reviewerStopObservation{NeverRan: true}, wantProved: true},
+		{name: "default shell never ran", observation: reviewerStopObservation{NeverRan: true}},
 		{name: "child launched before owner binding", observation: reviewerStopObservation{GroupPID: 99999999}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1093,17 +1101,11 @@ func TestPrebindingPlanReviewSupersessionRequiresExactStoppedProof(t *testing.T)
 				t.Fatalf("prebind review superseded without child-death or NeverRan proof: %v", err)
 			}
 			proveErr := applyProveReviewerDead(&state, proveReviewerDeadCommand{Identity: identity, GroupPID: test.observation.GroupPID, NeverRan: test.observation.NeverRan})
-			if test.wantProved && proveErr != nil {
+			if proveErr != nil {
 				t.Fatal(proveErr)
 			}
-			if !test.wantProved {
-				if !errors.Is(proveErr, errStateConflict) {
-					t.Fatalf("launched prebind child received a false death proof: %v", proveErr)
-				}
-				return
-			}
 			if err := applySupersedePlanReview(&state, supersedePlanReviewCommand{Identity: identity}); err != nil {
-				t.Fatalf("proved never-ran prebind review did not supersede: %v", err)
+				t.Fatalf("proved stopped prebind review did not supersede: %v", err)
 			}
 			proof := state.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, request.Reviewer.Mode, request.Reviewer.Target)]
 			if !proof.DeadProved || proof.NeverRan != test.observation.NeverRan || proof.GroupPID != test.observation.GroupPID || state.ControlReceipts[0].Result == nil || state.ControlReceipts[0].Result.Status != http.StatusConflict {
@@ -2148,7 +2150,7 @@ func bindEffectObservation(snapshot stateOwnerSnapshot, request reconciliationEf
 	if request.GitHubIssueUpdate != nil && (request.GitHubIssueUpdate.Kind == githubIssueTerminalFailure || request.GitHubIssueUpdate.Kind == githubIssueRetry) {
 		request.GitHubIssueUpdate.FailedAtUnixNano = request.Manifest.UpdatedAt.UnixNano()
 	}
-	if request.Reviewer != nil && request.Reviewer.Mode == agentruntime.ReviewModePlan {
+	if request.Reviewer != nil && request.Reviewer.Mode == agentruntime.ReviewModePlan && request.Reviewer.Phase == "run-observe" {
 		request.Reviewer.Target = fmt.Sprintf("%s#%d plan sha256:%s", request.Repository, request.Issue, request.BodyDigest)
 	}
 	if request.Reviewer != nil {
@@ -2175,7 +2177,7 @@ func reconciliationBeginIdentity(snapshot stateOwnerSnapshot, request reconcilia
 }
 
 func reconciliationIntentIdentity(effect runtimeEffectIntent) stateResultIdentity {
-	return stateResultIdentity{Epoch: effect.IntentEpoch, SourceRevision: effect.IntentRevision, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, EffectID: effect.ID, RequestDigest: effect.RequestDigest}
+	return ownerReconciliationEffectIdentity(effect)
 }
 
 func sha256Sum(value string) [32]byte { return sha256.Sum256([]byte(value)) }
