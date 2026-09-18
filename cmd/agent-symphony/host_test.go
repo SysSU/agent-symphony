@@ -1326,6 +1326,69 @@ func TestAbandonAttemptRetainsFailedLegacyWorktreeWithoutProcessProof(t *testing
 	}
 }
 
+func TestStopAttemptSessionProvesExactPaneGoneAfterTmuxProbeRace(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := cleanupTestManifest(t, root)
+	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, config.WorkerProfileDigest()
+	manifest.LogPath = filepath.Join(root, "attempts", internalgithub.RepositoryIdentifier(manifest.Repository), "23-1", "agent.log")
+	t.Setenv("AGENT_SYMPHONY_WORKER_PROFILE_DIGEST", manifest.WorkerProfileDigest)
+	pane := agentruntime.ImplementationPane{SessionName: manifest.Session, SessionID: "$1", PaneID: "%1", PanePID: os.Getpid(), ServerPID: os.Getpid(), ServerStart: 1, StartPath: manifest.Worktree, Token: manifest.LaunchToken, Command: "parked worker"}
+	binding, err := agentruntime.BindImplementationPane(manifest, manifest.LaunchID, "capture", pane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(agentruntime.ImplementationBindingPath(manifest, manifest.LaunchID)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := agentruntime.WriteImplementationBinding(manifest, binding); err != nil {
+		t.Fatal(err)
+	}
+	oldExec := hostExecRunner
+	t.Cleanup(func() { hostExecRunner = oldExec })
+	for _, test := range []struct {
+		name, failedCommand, inventory string
+		wantFailure, unconfined        bool
+	}{
+		{"session probe disappeared", "has-session", fmt.Sprintf("%d|1|%%2", os.Getpid()), false, false},
+		{"pane disappeared after live session", "display-message", fmt.Sprintf("%d|1|%%2", os.Getpid()), false, false},
+		{"exact pane remains", "display-message", fmt.Sprintf("%d|1|%%1", os.Getpid()), true, false},
+		{"unconfined worker remains", "display-message", fmt.Sprintf("%d|1|%%2", os.Getpid()), true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.unconfined {
+				t.Setenv("AGENT_SYMPHONY_WORKER_PROFILE_DIGEST", strings.Repeat("c", 64))
+				if _, err := agentruntime.WriteImplementationGroupStart(manifest, binding, "capture", os.Getpid(), os.Getpid()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+				switch command.Args[0] {
+				case test.failedCommand:
+					return agentruntime.Result{Code: 1, Exited: true, Output: "tmux pane vanished"}, errors.New("exit status 1")
+				case "has-session":
+					return agentruntime.Result{}, nil
+				case "list-panes":
+					return agentruntime.Result{Output: test.inventory}, nil
+				default:
+					return agentruntime.Result{}, fmt.Errorf("unexpected tmux command %v", command.Args)
+				}
+			}
+			err := stopAttemptSession(t.Context(), manifest)
+			if test.wantFailure {
+				if err == nil || !strings.Contains(err.Error(), "tmux pane vanished") || (!test.unconfined && !strings.Contains(err.Error(), "bound implementation pane may still exist")) || (test.unconfined && !strings.Contains(err.Error(), "group termination is unconfirmed")) {
+					t.Fatalf("ambiguous pane disappearance authorized cleanup: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("proved exact pane disappearance blocked cleanup: %v", err)
+			}
+		})
+	}
+}
+
 func TestPermanentRemovalRejectsDirtyOrUnpublishedWorkAndRetriesSafely(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
