@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -152,6 +153,51 @@ func TestOwnerStatusProjectionKeepsDismissedAttemptHiddenWithUnresolvedGitHubMut
 	projected, err := projectOwnerStatus(stateOwnerSnapshot{State: state}, 1, time.Unix(2, 0))
 	if err != nil || len(projected.Statuses) != 0 {
 		t.Fatalf("quarantine projection=%#v err=%v", projected.Statuses, err)
+	}
+}
+
+func TestOwnerStatusProjectionSeparatesArchivedAttemptFromExternalQuarantine(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 330, "completed", true)
+	state := cloneRuntimeOwnerState(mustOwnerSnapshot(t, owner).State)
+	issueKey, attemptKey := ownerIssueKey("o/r", 330), ownerAttemptKey("o/r", 330, 1)
+	body := internalgithub.SnapshotComment(internalgithub.Snapshot{Version: 2})
+	observation := state.Observations[issueKey]
+	observation.IssueUpdates = append(observation.IssueUpdates, reconciliationIssueUpdateProposal{Repository: "o/r", Issue: 330, Kind: githubIssueControlSnapshot, ControlSnapshotDigest: digestText(body)})
+	state.Observations[issueKey] = observation
+	request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 330, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, ExecutionDigest: strings.Repeat("a", 64), ControlGeneration: 1, GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueControlSnapshot, ControlSnapshotDigest: digestText(body), ControlSnapshotBody: body}}
+	effect := runtimeEffectIntent{Action: string(request.Action), Repository: "o/r", Issue: 330, IssueGeneration: state.IssueGenerations[issueKey], IntentEpoch: state.Epoch, IntentRevision: state.Revision, State: "pending", Dispatched: true, RequestDigest: reconciliationEffectDigest(request), Reconciliation: &request}
+	effect.ID = runtimeEffectID(effect)
+	state.Effects[effect.ID] = effect
+	if _, err := applyInvalidateAttempt(owner.attemptRoot, owner.stateRoot, &state, invalidateAttemptCommand{Repository: "o/r", Issue: 330, Attempt: 1, ExpectedIssueGeneration: state.IssueGenerations[issueKey], ExpectedAttemptGeneration: state.AttemptGenerations[attemptKey], Action: "archived", CleanupPhase: "completed"}); err != nil {
+		t.Fatal(err)
+	}
+	state.Revision++
+	tombstone := state.Tombstones[attemptKey]
+	tombstone.Revision = state.Revision
+	state.Tombstones[attemptKey] = tombstone
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(owner.stateRoot, "o/r")
+	if err != nil || loaded.Effects[effect.ID].State != "invalidated" {
+		t.Fatalf("restart lost valid external quarantine: effect=%#v err=%v", loaded.Effects[effect.ID], err)
+	}
+	projected, err := projectOwnerStatus(stateOwnerSnapshot{State: loaded}, 1, time.Unix(2, 0))
+	if err != nil || len(projected.Statuses) != 0 || len(projected.IssueQuarantines) != 1 || projected.IssueQuarantines[0].Issue != 330 || !issueHasUnresolvedExternalEffect(loaded, "o/r", 330) {
+		t.Fatalf("external issue quarantine resurrected archived attempt or lost owner safety: status=%#v warnings=%#v err=%v", projected.Statuses, projected.IssueQuarantines, err)
+	}
+	loaded.LegacyReviewerQuarantines[issueKey] = "legacy reviewer absence is unverified"
+	loaded.Revision++
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, loaded); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = readRuntimeOwnerState(owner.stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	projected, err = projectOwnerStatus(stateOwnerSnapshot{State: loaded}, 1, time.Unix(3, 0))
+	if err != nil || len(projected.Statuses) != 1 || projected.Statuses[0].CurrentPhase != "physical-unverified" || !projected.Statuses[0].NeedsAttention || len(projected.IssueQuarantines) != 1 {
+		t.Fatalf("attempt-local physical safety was hidden: status=%#v warnings=%#v err=%v", projected.Statuses, projected.IssueQuarantines, err)
 	}
 }
 

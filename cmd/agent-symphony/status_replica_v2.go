@@ -220,6 +220,15 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 			status.Action = "wait for verified physical cleanup before retrying or dispatching"
 		}
 	}
+	var issueQuarantines []dashboardIssueQuarantine
+	quarantinedIssues := map[int]bool{}
+	for _, effect := range snapshot.State.Effects {
+		if effect.Repository == snapshot.State.Repository && unresolvedExternalEffect(effect) && !quarantinedIssues[effect.Issue] {
+			quarantinedIssues[effect.Issue] = true
+			issueQuarantines = append(issueQuarantines, dashboardIssueQuarantine{Issue: effect.Issue, Diagnostic: "a GitHub mutation has an unresolved external outcome; new attempts remain blocked until it is verified"})
+		}
+	}
+	slices.SortFunc(issueQuarantines, func(a, b dashboardIssueQuarantine) int { return cmp.Compare(a.Issue, b.Issue) })
 	// A historical cleanup may have removed the attempt from ordinary recovery
 	// projection. Keep its unresolved physical safety lease visible anyway.
 	for _, tombstone := range snapshot.State.Tombstones {
@@ -229,12 +238,6 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 			continue
 		}
 		diagnostic := legacyReviewerDiagnostic(snapshot.State, tombstone.Repository, tombstone.Issue, tombstone.Attempt)
-		if issueHasUnresolvedExternalEffect(snapshot.State, tombstone.Repository, tombstone.Issue) {
-			if diagnostic != "" {
-				diagnostic += "; "
-			}
-			diagnostic += "an admitted GitHub mutation has an unresolved external outcome; same-issue reuse remains quarantined"
-		}
 		if tombstone.ReviewerLeaseID != "" || attemptHasUnprovedReviewer(snapshot.State, tombstone.Repository, tombstone.Issue, tombstone.Attempt) {
 			if diagnostic == "" {
 				diagnostic = "reviewer descendant absence is unproved; physical cleanup remains pending"
@@ -287,7 +290,7 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 		}
 		return cmp.Compare(a.Attempt, b.Attempt)
 	})
-	return dashboardStatusSnapshot{UpdatedAt: now.UTC(), OwnerEpoch: snapshot.State.Epoch, OwnerRevision: snapshot.State.Revision, Statuses: statuses, ReconciliationError: snapshot.State.CycleDiagnostic, ReconciliationErrorAt: snapshot.State.CycleDiagnosticAt}, nil
+	return dashboardStatusSnapshot{UpdatedAt: now.UTC(), OwnerEpoch: snapshot.State.Epoch, OwnerRevision: snapshot.State.Revision, Statuses: statuses, IssueQuarantines: issueQuarantines, ReconciliationError: snapshot.State.CycleDiagnostic, ReconciliationErrorAt: snapshot.State.CycleDiagnosticAt}, nil
 }
 
 func legacyReviewerDiagnostic(state runtimeOwnerState, repository string, issue, attempt int) string {
