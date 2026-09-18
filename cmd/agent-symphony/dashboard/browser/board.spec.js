@@ -60,7 +60,7 @@ async function mockDashboard(page, attempts, orchestrator = { enabled: true, sta
     hide(status, reason) {
       dashboardState = {
         version: 1,
-        hidden: [{ repository: status.repository, issue: status.issue, attempt: status.attempt, reason }],
+        hidden: [...dashboardState.hidden, { repository: status.repository, issue: status.issue, attempt: status.attempt, reason }],
       };
     },
   };
@@ -103,6 +103,27 @@ test("keeps the last projection visible when reconciliation is stale", async ({ 
   await expect(page.getByText("GitHub refresh timed out")).toBeVisible();
   await expect(page.getByRole("link", { name: "#161 Show attempt lanes" })).toBeVisible();
 });
+
+for (const action of ["dismissed", "abandoned", "archived", "removed"]) {
+  test(`shows ${action} physical quarantine without restoring the attempt card`, async ({ page }) => {
+    const status = { repository: "SysSU/agent-symphony", issue: 191, attempt: 1, state: "blocked", current_phase: "physical-unverified", needs_attention: true, diagnostic: "reviewer descendant absence is unverified" };
+    const dashboard = await mockDashboard(page, [status]);
+    dashboard.hide(status, action);
+    await page.goto("/");
+
+    const notice = page.getByRole("region", { name: "Physical cleanup needs attention" });
+    await expect(notice).toContainText("#191 attempt 1: reviewer descendant absence is unverified");
+    await expect(page.getByRole("heading", { name: "Agent Symphony needs attention" })).toBeVisible();
+    const board = page.getByRole("region", { name: "Issue status board" });
+    await expect(board.getByRole("link", { name: /#191/ })).toHaveCount(0);
+    await expect(board.getByRole("button", { name: /Dismiss|Abandon|Archive|Remove/ })).toHaveCount(0);
+    await expect(board.locator("article.card")).toHaveCount(0);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(notice).toBeVisible();
+    await expect(board.locator("article.card")).toHaveCount(0);
+  });
+}
 
 test("renders every board lane and keeps overflowing lanes keyboard reachable", async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 900 });
@@ -293,6 +314,91 @@ test("moves superseded terminal attempts into history", async ({ page }) => {
   await page.screenshot({ path: "test-results/board-attempt-history-mobile.png", fullPage: true });
 });
 
+for (const [reason, olderState] of [["abandoned", "failed"], ["dismissed", "completed"], ["archived", "completed"], ["removed", "cancelled"]]) {
+  test(`keeps earlier ${olderState} attempts in history after ${reason}, then shows a new retry`, async ({ page }) => {
+    const older = { repository: "SysSU/agent-symphony", issue: 191, attempt: 8, title: "Retained issue", state: olderState };
+    const latest = { ...older, attempt: 9, state: "orphaned" };
+    const attempts = [older, latest];
+    const dashboard = await mockDashboard(page, attempts);
+    await page.goto("/");
+    const board = page.getByRole("region", { name: "Issue status board" });
+    await expect(board).toContainText("Attempt 9");
+    await expect(board).not.toContainText("Attempt 8");
+
+    dashboard.hide(latest, reason);
+    attempts.pop(); // owner projection no longer includes the tombstoned attempt
+    await page.reload();
+    await expect(board.getByRole("link", { name: /#191\b/ })).toHaveCount(0);
+    const history = page.locator("details.attemptHistory");
+    await history.locator("summary").click();
+    await expect(history).toContainText("Attempt 8");
+    if (olderState === "completed") {
+      const archive = history.getByRole("button", { name: "Archive" });
+      await expect(archive).toBeVisible();
+      await page.route("**/actions/archive?*", (route) => {
+        expect(new URL(route.request().url()).searchParams.get("attempt")).toBe("8");
+        dashboard.hide(older, "archived");
+        attempts.shift();
+        return route.fulfill({ json: { ok: true } });
+      });
+      page.once("dialog", (dialog) => dialog.accept());
+      await archive.click();
+      await expect(history.getByRole("link", { name: /#191\b/ })).toHaveCount(0);
+    }
+
+    attempts.push({ ...latest, attempt: 10, state: "active" });
+    await page.reload();
+    await expect(board).toContainText("Attempt 10");
+    await expect(board).not.toContainText("Attempt 8");
+  });
+}
+
+test("an older periodic refresh cannot undo a newer dismissal", async ({ page }) => {
+  await page.clock.install();
+  const older = { repository: "SysSU/agent-symphony", issue: 191, attempt: 8, title: "Retained issue", state: "failed" };
+  const latest = { ...older, attempt: 9, state: "orphaned" };
+  const attempts = [older, latest];
+  await mockDashboard(page, attempts);
+  await page.goto("/");
+  const board = page.getByRole("region", { name: "Issue status board" });
+  await expect(board.getByRole("link", { name: /#191\b/ })).toBeVisible();
+
+  let capturedOldState;
+  const oldStateCaptured = new Promise((resolve) => { capturedOldState = resolve; });
+  let releaseOldState;
+  const oldStateReleased = new Promise((resolve) => { releaseOldState = resolve; });
+  let stateReads = 0;
+  await page.route("**/dashboard-state.json", async (route) => {
+    stateReads++;
+    if (stateReads === 1) {
+      capturedOldState();
+      await oldStateReleased;
+      return route.fulfill({ json: { version: 1, owner_revision: 1, hidden: [] } });
+    }
+    return route.fulfill({ json: { version: 1, owner_revision: 2, hidden: [{ repository: latest.repository, issue: latest.issue, attempt: latest.attempt, reason: "dismissed" }] } });
+  });
+  let projectReads = 0;
+  await page.route("**/projects.json", (route) => {
+    projectReads++;
+    return route.fulfill({ json: { version: 1, projects: [{ version: 1, repository: "Held refresh completed", local: true }] } });
+  });
+  await page.route("**/actions/dismiss?*", (route) => {
+    attempts.pop();
+    return route.fulfill({ json: { ok: true, owner_revision: 2 } });
+  });
+
+  await page.clock.fastForward(5000);
+  await oldStateCaptured;
+  page.once("dialog", (dialog) => dialog.accept());
+  await board.getByRole("button", { name: "Dismiss issue #191, attempt 9; keep diagnostics" }).click();
+  await expect(board.getByRole("link", { name: /#191\b/ })).toHaveCount(0);
+  releaseOldState();
+  await expect(page.getByRole("heading", { name: "Held refresh completed" })).toBeVisible();
+  expect({ stateReads, projectReads }).toEqual({ stateReads: 2, projectReads: 1 });
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  expect(await board.getByRole("link", { name: /#191\b/ }).count()).toBe(0);
+});
+
 test("dismisses one closed-issue attempt while retaining diagnostics", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 });
   const previous = {
@@ -315,12 +421,14 @@ test("dismisses one closed-issue attempt while retaining diagnostics", async ({ 
   const requests = [];
   await page.route("**/actions/dismiss?*", (route) => {
     const url = new URL(route.request().url());
+    const issue = url.searchParams.get("issue");
     requests.push({
       method: route.request().method(),
       repository: url.searchParams.get("repository"),
-      issue: url.searchParams.get("issue"),
+      issue,
       attempt: url.searchParams.get("attempt"),
     });
+    if (issue === "219") return route.fulfill({ status: 409, json: { ok: false, error: "GitHub issue is open" } });
     dashboard.hide(previous, "dismissed");
     return route.fulfill({ json: { ok: true } });
   });
@@ -331,8 +439,9 @@ test("dismisses one closed-issue attempt while retaining diagnostics", async ({ 
   const dismissPrevious = history.getByRole("button", { name: "Dismiss issue #218, attempt 1; keep diagnostics" });
   await expect(dismissPrevious).toBeVisible();
   await expect(page.getByRole("button", { name: "Dismiss issue #218, attempt 2; keep diagnostics" })).toBeVisible();
-  const openCard = page.locator(".card").filter({ has: page.getByRole("link", { name: "#219 Open issue" }) });
-  await expect(openCard.getByRole("button", { name: /dismiss/i })).toHaveCount(0);
+  const openCard = page.getByRole("listitem").filter({ has: page.getByRole("link", { name: "#219 Open issue" }) });
+  const dismissOpen = openCard.getByRole("button", { name: "Dismiss issue #219, attempt 1; keep diagnostics" });
+  await expect(dismissOpen).toBeVisible();
   await page.screenshot({ path: "test-results/closed-attempt-dismissal-desktop.png", fullPage: true });
 
   let confirmation = "";
@@ -349,6 +458,16 @@ test("dismisses one closed-issue attempt while retaining diagnostics", async ({ 
     log: "agent.log",
     worktree: "diagnostic.txt",
   });
+
+  const rejected = page.waitForResponse((response) => response.url().includes("/actions/dismiss?") && new URL(response.url()).searchParams.get("issue") === "219");
+  page.once("dialog", (dialog) => dialog.accept());
+  await dismissOpen.click();
+  expect((await rejected).status()).toBe(409);
+  await expect(page.getByRole("status").filter({ hasText: "GitHub issue is open" })).toBeVisible();
+  await expect(openCard).toBeVisible();
+  expect(requests.at(-1)).toEqual({ method: "POST", repository: open.repository, issue: "219", attempt: "1" });
+  expect(browserErrors.get(page).filter((message) => !message.includes("409"))).toEqual([]);
+  browserErrors.get(page).length = 0;
 
   await page.reload();
   await expect(page.getByText("attempt one diagnostic", { exact: true })).toHaveCount(0);

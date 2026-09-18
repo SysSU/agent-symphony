@@ -120,11 +120,13 @@ type handoffReceipt struct {
 }
 
 type handoffRequest struct {
-	Manifest     agentruntime.Manifest `json:"manifest"`
-	Handoff      json.RawMessage       `json:"handoff"`
-	OutcomePath  string                `json:"outcome_path"`
-	OutcomeToken string                `json:"outcome_token"`
-	Command      []string              `json:"command"`
+	Manifest             agentruntime.Manifest `json:"manifest"`
+	Handoff              json.RawMessage       `json:"handoff"`
+	OutcomePath          string                `json:"outcome_path"`
+	OutcomeToken         string                `json:"outcome_token"`
+	Command              []string              `json:"command"`
+	CandidateLaunchToken string                `json:"candidate_launch_token,omitempty"`
+	CandidateLaunchID    string                `json:"candidate_launch_id,omitempty"`
 }
 
 func (b workerBoundaryRunner) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
@@ -194,10 +196,7 @@ func implementationBoundary(stateRoot string) workerBoundaryRunner {
 		return workerBoundaryRunner{Command: command}
 	}
 	binary, _ := os.Executable()
-	if !hostIsolationInstalled() {
-		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "implementation"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localAttemptRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot)}}
-	}
-	return workerBoundaryRunner{Command: "sudo", Args: []string{"-n", "-u", workerUser, "-g", attemptGroup, binary, "agent-host", "implementation"}}
+	return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "implementation"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localAttemptRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot), "CODEX_HOME=" + workerCodexHome(stateRoot)}}
 }
 
 func reviewBoundary(stateRoot string) workerBoundaryRunner {
@@ -205,10 +204,7 @@ func reviewBoundary(stateRoot string) workerBoundaryRunner {
 		return workerBoundaryRunner{Command: command}
 	}
 	binary, _ := os.Executable()
-	if !hostIsolationInstalled() {
-		return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "review"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localSnapshotRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot)}}
-	}
-	return workerBoundaryRunner{Command: "sudo", Args: []string{"-n", "-u", reviewerUser, "-g", snapshotGroup, binary, "agent-host", "review"}}
+	return workerBoundaryRunner{Command: binary, Args: []string{"agent-host", "review"}, Env: []string{"AGENT_SYMPHONY_LOCAL_ROOT=" + localSnapshotRoot(stateRoot), "TMUX_TMPDIR=" + projectTmuxRoot(stateRoot), "CODEX_HOME=" + workerCodexHome(stateRoot)}}
 }
 
 // productionAttemptRoot and productionSnapshotRoot are the single source of
@@ -219,28 +215,14 @@ func productionAttemptRoot(stateRoot string) string {
 	if reviewSnapshotRoot != "" {
 		return filepath.Join(filepath.Dir(reviewSnapshotRoot), "attempts")
 	}
-	if !hostIsolationInstalled() {
-		return localAttemptRoot(stateRoot)
-	}
-	root := "/var/lib/agent-symphony/attempts"
-	if runtime.GOOS == "darwin" {
-		root = "/var/db/agent-symphony/attempts"
-	}
-	return root
+	return localAttemptRoot(stateRoot)
 }
 
 func productionSnapshotRoot(stateRoot string) string {
 	if reviewSnapshotRoot != "" {
 		return reviewSnapshotRoot
 	}
-	if !hostIsolationInstalled() {
-		return localSnapshotRoot(stateRoot)
-	}
-	root := "/var/lib/agent-symphony/snapshots"
-	if runtime.GOOS == "darwin" {
-		root = "/var/db/agent-symphony/snapshots"
-	}
-	return root
+	return localSnapshotRoot(stateRoot)
 }
 
 func projectTmuxRoot(stateRoot string) string { return filepath.Join(stateRoot, "tmux") }
@@ -274,13 +256,16 @@ func readDeploymentIdentityVersion(stateRoot string, supportedVersion int) (depl
 }
 
 func bindDeployment(stateRoot, repository string) error {
-	if info, err := os.Lstat(stateRoot); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return errors.New("runtime state root must be a non-symlink directory")
+	if _, err := os.Lstat(stateRoot); err == nil {
+		if err := validatePrivateOwnedDirectory(stateRoot); err != nil {
+			return fmt.Errorf("runtime state root is unsafe: %w", err)
 		}
 	} else if errors.Is(err, os.ErrNotExist) {
 		if err := os.MkdirAll(stateRoot, 0o700); err != nil {
 			return fmt.Errorf("prepare runtime state root: %w", err)
+		}
+		if err := validatePrivateOwnedDirectory(stateRoot); err != nil {
+			return fmt.Errorf("runtime state root is unsafe: %w", err)
 		}
 	} else {
 		return fmt.Errorf("inspect runtime state root: %w", err)
@@ -384,15 +369,138 @@ func configureProjectRuntimeState(stateRoot string) error {
 	if err := configureProjectTmux(stateRoot); err != nil {
 		return err
 	}
-	if !hostIsolationInstalled() {
-		if err := configureAgentCodexHome(stateRoot); err != nil {
-			return err
+	if err := configureAgentCodexHome(stateRoot); err != nil {
+		return err
+	}
+	if err := configureWorkerCodexHome(stateRoot); err != nil {
+		return err
+	}
+	return nil
+}
+
+// testRuntimeStateRootAllowed is assigned only by test-only source. A shipped
+// binary cannot enable the shared-temporary-state seam through argv or env.
+var testRuntimeStateRootAllowed func(string) bool
+
+func validateProductionStateRoot(stateRoot string) error {
+	if testRuntimeStateRootAllowed != nil && testRuntimeStateRootAllowed(stateRoot) {
+		return nil
+	}
+	return validatePrivateStateRoot(stateRoot)
+}
+
+func validatePrivateStateRoot(stateRoot string) error {
+	root, err := canonicalPathWithMissingLeaf(stateRoot)
+	if err != nil {
+		return fmt.Errorf("resolve runtime state root: %w", err)
+	}
+	if pathInSharedTemporaryStorage(root) {
+		return errors.New("runtime state root must not be inside shared temporary storage")
+	}
+	if _, err := os.Lstat(stateRoot); err == nil {
+		if err := validatePrivateOwnedDirectory(stateRoot); err != nil {
+			return fmt.Errorf("runtime state root is unsafe: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect runtime state root: %w", err)
+	}
+	return nil
+}
+
+// tightenPrivateStateRoot is a one-time compatibility migration used only by
+// daemon startup. Control clients never change permissions while connecting.
+func tightenPrivateStateRoot(stateRoot string) error {
+	info, err := os.Lstat(stateRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect runtime state root: %w", err)
+	}
+	abs, absErr := filepath.Abs(stateRoot)
+	resolved, resolveErr := filepath.EvalSymlinks(stateRoot)
+	if absErr != nil || filepath.Clean(stateRoot) != abs || resolveErr != nil || resolved != abs || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(info) {
+		return errors.New("runtime state root is unsafe")
+	}
+	if info.Mode().Perm() != 0o700 {
+		if err := os.Chmod(stateRoot, 0o700); err != nil {
+			return fmt.Errorf("tighten runtime state root permissions: %w", err)
 		}
 	}
 	return nil
 }
 
+func validatePrivateOwnedDirectory(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil || filepath.Clean(path) != abs {
+		return errors.New("directory must be canonical and absolute")
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil || resolved != abs {
+		return errors.New("directory must not contain symlinks")
+	}
+	info, err := os.Lstat(abs)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
+		return errors.New("directory must be owned by the current user with mode 0700")
+	}
+	return nil
+}
+
+func pathInSharedTemporaryStorage(path string) bool {
+	for _, shared := range []string{os.TempDir(), "/tmp", "/private/tmp", "/var/tmp", "/dev/shm"} {
+		lexical, lexicalErr := filepath.Abs(shared)
+		if lexicalErr == nil && pathWithinRoot(path, lexical) {
+			return true
+		}
+		resolved, resolveErr := filepath.EvalSymlinks(shared)
+		if resolveErr == nil && pathWithinRoot(path, resolved) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathWithinRoot(path, root string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && (relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+}
+
+func canonicalPathWithMissingLeaf(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	current := filepath.Clean(abs)
+	var missing []string
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			for index := len(missing) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, missing[index])
+			}
+			return filepath.Clean(resolved), nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", errors.New("runtime state root has no existing ancestor")
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
 func prepareProductionDeploymentLocked(stateRoot, repository string) error {
+	if err := tightenPrivateStateRoot(stateRoot); err != nil {
+		return err
+	}
+	if err := validateProductionStateRoot(stateRoot); err != nil {
+		return err
+	}
 	identity, err := readDeploymentIdentity(stateRoot)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := bindDeployment(stateRoot, repository); err != nil {
@@ -410,6 +518,9 @@ func prepareProductionDeploymentLocked(stateRoot, repository string) error {
 }
 
 var agentCodexAssets = []string{"auth.json", "config.toml", "AGENTS.md", "rules", "skills", "plugins", "cache", "installation_id"}
+var workerCodexAssets = []string{"auth.json", "installation_id"}
+
+func workerCodexHome(stateRoot string) string { return filepath.Join(stateRoot, "worker-codex-home") }
 
 func configureAgentCodexHome(stateRoot string) error {
 	source := strings.TrimSpace(os.Getenv("CODEX_HOME"))
@@ -452,6 +563,49 @@ func configureAgentCodexHome(stateRoot string) error {
 	}
 	if err := os.Setenv("CODEX_HOME", target); err != nil {
 		return fmt.Errorf("configure agent Codex home: %w", err)
+	}
+	return nil
+}
+
+func configureWorkerCodexHome(stateRoot string) error {
+	source := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if source == "" {
+		return errors.New("CODEX_HOME is required for rootless workers")
+	}
+	source, err := filepath.Abs(source)
+	if err != nil {
+		return fmt.Errorf("resolve Codex home: %w", err)
+	}
+	target, err := filepath.Abs(workerCodexHome(stateRoot))
+	if err != nil {
+		return fmt.Errorf("resolve worker Codex home: %w", err)
+	}
+	if filepath.Clean(source) == filepath.Clean(target) {
+		return errors.New("worker CODEX_HOME must be isolated from the coordinator")
+	}
+	if err := ensureLocalRoot(target); err != nil {
+		return fmt.Errorf("prepare worker Codex home: %w", err)
+	}
+	for _, forbidden := range []string{"config.toml", "AGENTS.md", "rules", "skills", "plugins", "cache", "hooks.json"} {
+		if _, err := os.Lstat(filepath.Join(target, forbidden)); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("worker Codex home contains forbidden capability %s", forbidden)
+		}
+	}
+	for _, name := range workerCodexAssets {
+		from, to := filepath.Join(source, name), filepath.Join(target, name)
+		if _, err := os.Lstat(from); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return fmt.Errorf("inspect Codex authentication asset %s: %w", name, err)
+		}
+		if destination, err := os.Readlink(to); err == nil && destination == from {
+			continue
+		} else if err == nil || !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("worker Codex authentication asset %s conflicts with managed link", name)
+		}
+		if err := os.Symlink(from, to); err != nil {
+			return fmt.Errorf("link worker Codex authentication asset %s: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -653,6 +807,29 @@ func chatExactSession(stateRoot, repository, role string, issue, attempt int, ti
 	return nil
 }
 
+func signalHandoffLaunch(tmux, channel string) error {
+	command := exec.CommandContext(context.Background(), tmux, "wait-for", "-S", channel)
+	command.Dir = "/tmp"
+	return command.Run()
+}
+
+func recordHandoffLaunch(path, recipient, channel, tmux string) error {
+	if err := writeImmutable(path, []byte(recipient)); err != nil {
+		return err
+	}
+	if err := signalHandoffLaunch(tmux, channel); err != nil {
+		signalErr := fmt.Errorf("launch signal: %w", err)
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return errors.Join(signalErr, fmt.Errorf("roll back launch marker: %w", removeErr))
+		}
+		if syncErr := immutableDirSync(filepath.Dir(path)); syncErr != nil {
+			return errors.Join(signalErr, fmt.Errorf("sync launch marker rollback: %w", syncErr))
+		}
+		return signalErr
+	}
+	return nil
+}
+
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == "--version" {
 		fmt.Fprintln(stdout, releaseVersion())
@@ -663,6 +840,76 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	command := args[0]
+	if command == "export-attempt" {
+		if len(args) != 2 {
+			fmt.Fprintln(stderr, "invalid export attempt invocation")
+			return 1
+		}
+		input, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20+1))
+		if err != nil || len(input) > 1<<20 {
+			fmt.Fprintln(stderr, "invalid export attempt input")
+			return 1
+		}
+		output, err := exportAttempt(context.Background(), input, args[1])
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprint(stdout, output)
+		return 0
+	}
+	if command == "sandbox-probe" || command == "sandbox-probe-child" {
+		if err := runSandboxProbe(args[1:], command == "sandbox-probe-child"); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
+	}
+	if command == "review-pane" {
+		code, childSignal, err := runReviewerPane(args[1:], stdout, stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "error: "+err.Error())
+		}
+		if childSignal != 0 {
+			signal.Reset(childSignal)
+			if killErr := syscall.Kill(os.Getpid(), childSignal); killErr == nil {
+				select {}
+			}
+		}
+		return code
+	}
+	if command == "implementation-gate" {
+		if len(args) < 9 || args[7] != "--" {
+			return misuse(stderr, false, command, "invalid implementation gate invocation")
+		}
+		manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, LogPath: args[2], Worktree: args[3], Session: args[4], LaunchToken: args[5], LaunchID: args[6]}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer stop()
+		if err := agentruntime.RunImplementationGate(ctx, manifest, args[1], args[8:]); err != nil {
+			fmt.Fprintln(stderr, "error: "+err.Error())
+			return 125
+		}
+		return 0
+	}
+	if command == "pane-exit-status-bound" {
+		if len(args) < 9 || args[7] != "--" {
+			return misuse(stderr, false, command, "invalid bound pane command invocation")
+		}
+		manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, LogPath: args[2], Worktree: args[3], Session: args[4], LaunchToken: args[5], LaunchID: args[6], Interactive: true}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer stop()
+		code, childSignal, err := agentruntime.RunBoundPaneCommand(ctx, manifest, args[1], args[8:], os.Stdin, stdout, stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "error: "+err.Error())
+		}
+		if childSignal != 0 {
+			signal.Reset(childSignal)
+			if killErr := syscall.Kill(os.Getpid(), childSignal); killErr == nil {
+				select {}
+			}
+		}
+		return code
+	}
 	if command == "pane-exit-status" {
 		if len(args) < 4 || args[2] != "--" {
 			return misuse(stderr, false, command, "invalid internal pane command invocation")
@@ -681,6 +928,40 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return code
 	}
+	if command == "worker-capture-bound" || command == "worker-capture-handoff-ready-bound" {
+		handoff := command == "worker-capture-handoff-ready-bound"
+		identityAt, separator := 4, 9
+		if handoff {
+			identityAt, separator = 7, 12
+		}
+		if len(args) < separator+2 || args[separator] != "--" {
+			return misuse(stderr, false, command, "invalid bound worker capture invocation")
+		}
+		manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, LogPath: args[identityAt], Worktree: args[identityAt+1], Session: args[identityAt+2], LaunchToken: args[identityAt+3], LaunchID: args[identityAt+4]}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer stop()
+		var afterStart func() error
+		if handoff {
+			afterStart = func() error {
+				return recordHandoffLaunch(args[4], args[5], args[6], args[1])
+			}
+		}
+		code, err := agentruntime.CaptureBoundWorker(ctx, manifest, args[1], args[2], args[3], args[separator+1:], stdout, stderr, handoff, afterStart)
+		if err != nil {
+			if handoff {
+				_ = signalHandoffLaunch(args[1], args[6])
+			}
+			fmt.Fprintln(stderr, "error: "+err.Error())
+			code = 1
+		}
+		statusCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if statusErr := agentruntime.RecordPaneExitStatus(statusCtx, args[1], code); statusErr != nil {
+			fmt.Fprintln(stderr, "error: "+statusErr.Error())
+			return 1
+		}
+		return code
+	}
 	if command == "worker-capture" || command == "worker-capture-replace" || command == "worker-capture-handoff" || command == "worker-capture-handoff-ready" {
 		if command == "worker-capture-handoff" || command == "worker-capture-handoff-ready" {
 			if len(args) < 9 || args[7] != "--" {
@@ -688,30 +969,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			}
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 			defer stop()
-			signalLaunch := func() error {
-				command := exec.CommandContext(context.Background(), args[1], "wait-for", "-S", args[6])
-				command.Dir = "/tmp"
-				return command.Run()
-			}
 			code, err := agentruntime.CaptureWorkerReplacingResultAfterStart(ctx, args[1], args[2], args[3], args[8:], stdout, stderr, func() error {
-				if err := writeImmutable(args[4], []byte(args[5])); err != nil {
-					return err
-				}
-				if err := signalLaunch(); err != nil {
-					signalErr := fmt.Errorf("launch signal: %w", err)
-					if removeErr := os.Remove(args[4]); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-						return errors.Join(signalErr, fmt.Errorf("roll back launch marker: %w", removeErr))
-					}
-					if syncErr := immutableDirSync(filepath.Dir(args[4])); syncErr != nil {
-						return errors.Join(signalErr, fmt.Errorf("sync launch marker rollback: %w", syncErr))
-					}
-					return signalErr
-				}
-				return nil
+				return recordHandoffLaunch(args[4], args[5], args[6], args[1])
 			})
 			if err != nil {
 				if command == "worker-capture-handoff-ready" {
-					_ = signalLaunch()
+					_ = signalHandoffLaunch(args[1], args[6])
 				}
 				fmt.Fprintln(stderr, "error: "+err.Error())
 			}
@@ -720,7 +983,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if len(args) < 6 || args[4] != "--" {
 			return misuse(stderr, false, command, "invalid internal worker capture invocation")
 		}
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 		defer stop()
 		capture := agentruntime.CaptureWorker
 		if command == "worker-capture-replace" {
@@ -762,15 +1025,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 	requestID := fs.String("request-id", "", "bounded control request identity")
 	controlTimeout := fs.Duration("timeout", 30*time.Second, "running-daemon control timeout (maximum 2m)")
 	interval := fs.Duration("interval", orchestrator.MaxReconcileInterval, "override configured serve reconciliation interval (maximum 60s)")
+	disablePeriodicReconciliation := fs.Bool("disable-periodic-reconciliation", false, "disable periodic reconciliation in serve (diagnostics/E2E only)")
 	dashboardAddress := fs.String("dashboard-address", "127.0.0.1:8080", "dashboard loopback listen address")
 	var dashboardProjects stringList
 	fs.Var(&dashboardProjects, "dashboard-project", "additional dashboard URL to present read-only (repeatable; serve only)")
 	allowUnsafeDashboardNetwork := fs.Bool("allow-unsafe-dashboard-network", false, "allow password-protected dashboard access outside loopback")
 	dashboardPasswordFile := fs.String("dashboard-password-file", "", "coordinator-only file containing the dashboard HTTP Basic authentication password")
 	offline := fs.Bool("offline", false, "skip network diagnostics")
-	coordinator := fs.String("coordinator", "", "coordinator OS user")
 	if err := fs.Parse(flagArgs); err != nil {
 		return misuse(stderr, wantsJSON, command, err.Error())
+	}
+	disablePeriodicSet, intervalSet := false, false
+	fs.Visit(func(f *flag.Flag) {
+		disablePeriodicSet = disablePeriodicSet || f.Name == "disable-periodic-reconciliation"
+		intervalSet = intervalSet || f.Name == "interval"
+	})
+	if command != "serve" && disablePeriodicSet {
+		return misuse(stderr, wantsJSON, command, "--disable-periodic-reconciliation is available only with serve")
 	}
 	if command != "serve" && len(dashboardProjects) > 0 {
 		return misuse(stderr, wantsJSON, command, "--dashboard-project is available only with serve")
@@ -778,13 +1049,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	switch command {
 	case "install-host":
-		if fs.NArg() != 0 || *coordinator == "" || !onlyFlags(fs, "coordinator", "json") {
-			return misuse(stderr, wantsJSON, command, "usage: agent-symphony install-host --coordinator USER")
+		if fs.NArg() != 0 || !onlyFlags(fs, "json") {
+			return misuse(stderr, wantsJSON, command, "usage: agent-symphony install-host [--json]")
 		}
-		if err := installHost(*coordinator); err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
+		legacy := hostIsolationInstalled()
+		message := "host installation is obsolete; Agent Symphony uses the current user's managed Codex sandbox"
+		if legacy {
+			message += "; legacy Agent Symphony host identities were detected but are unused"
 		}
-		return success(stdout, *jsonOutput, command, nil, "host isolation installed")
+		return success(stdout, *jsonOutput, command, map[string]bool{"legacy_host_identities_detected": legacy}, message)
 	case "agent-host":
 		if fs.NArg() != 1 || fs.NFlag() != 0 {
 			return misuse(stderr, wantsJSON, command, "usage: agent-symphony agent-host implementation|review|orchestrator|orchestrator-proposal|orchestrator-proposal-status")
@@ -855,6 +1128,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if fs.NArg() != 0 || *statePath == "" || *runtimeState == "" {
 			return misuse(stderr, wantsJSON, command, "serve requires --state and --runtime-state")
 		}
+		if *disablePeriodicReconciliation && intervalSet {
+			return misuse(stderr, wantsJSON, command, "--disable-periodic-reconciliation cannot be combined with --interval")
+		}
 		if *interval <= 0 || *interval > orchestrator.MaxReconcileInterval {
 			return misuse(stderr, wantsJSON, command, "--interval must be greater than zero and no more than 60s")
 		}
@@ -871,6 +1147,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		c, err := config.Load(*path)
 		if err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		if err := tightenPrivateStateRoot(*runtimeState); err != nil {
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		if err := validateProductionStateRoot(*runtimeState); err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		peerProjects, err := validateDashboardProjectURLs(dashboardProjects)
@@ -922,11 +1204,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
-		ticker := time.NewTicker(*interval)
+		ticker := newServeTicker(*interval, *disablePeriodicReconciliation)
+		var ticks <-chan time.Time
+		if ticker == nil {
+			fmt.Fprintln(stderr, "reconciliation: PERIODIC DISABLED; startup and explicit/event triggers remain active (diagnostics/E2E only)")
+		} else {
+			ticks = ticker.C
+		}
 		for {
 			select {
 			case <-ctx.Done():
-				ticker.Stop()
+				if ticker != nil {
+					ticker.Stop()
+				}
 				shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				dashboardDone, runtimeDone := make(chan error, 1), make(chan error, 1)
 				go func() { dashboardDone <- dashboard.shutdown(shutdown) }()
@@ -937,7 +1227,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 					return fail(stderr, *jsonOutput, command, err.Error())
 				}
 				return 0
-			case <-ticker.C:
+			case <-ticks:
 				if err := runtime.trigger.trigger(); err != nil && !errors.Is(err, errStateOwnerStopped) {
 					fmt.Fprintln(stderr, "reconcile: "+internalgithub.Redact(err.Error()))
 				}
@@ -1195,6 +1485,13 @@ func effectiveServeInterval(fs *flag.FlagSet, configuredSeconds int, override ti
 	return interval
 }
 
+func newServeTicker(interval time.Duration, disabled bool) *time.Ticker {
+	if disabled {
+		return nil
+	}
+	return time.NewTicker(interval)
+}
+
 func acquireDaemonLock(path string) (*os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -1380,6 +1677,11 @@ func joinIssueProjection(statuses []orchestrator.RecoveryStatus, issues []intern
 		if found {
 			continue
 		}
+		// A completed issue's Attempt is the next dispatch number. Only a
+		// published attempt fact can represent completed work.
+		if issue.Completed {
+			continue
+		}
 		decisionIndex := slices.IndexFunc(decisions, func(d orchestrator.Decision) bool { return d.Repository == issue.Repository && d.Number == issue.Issue })
 		if decisionIndex < 0 {
 			continue
@@ -1437,11 +1739,7 @@ func seedImmutableAttemptSource(ctx context.Context, checkout, repositoryName, a
 }
 
 func seedAttemptSourceMode(ctx context.Context, checkout, repositoryName, attemptRoot, baseBranch, baseSHA string, immutable bool) (string, error) {
-	mode := os.FileMode(0o770)
-	if !hostIsolationInstalled() {
-		mode = 0o700
-	}
-	if err := os.MkdirAll(attemptRoot, mode); err != nil {
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
 		return "", fmt.Errorf("open provisioned attempt root: %w", err)
 	}
 	if baseBranch != "" || baseSHA != "" {
@@ -1550,7 +1848,7 @@ func implementationPrompt(issue internalgithub.RecoveryIssueFact, identity agent
 	if interactive {
 		completion = "Before exiting, write exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence to the existing private file named by " + agentruntime.WorkerResultEnvironment + ". Write the file in place without replacing it. Terminal output is operator-visible conversation, not the result artifact."
 	}
-	return fmt.Sprintf("Project: %s\nIssue: #%d\nAttempt: %d\nBase branch: %s\nBranch: %s\nWorktree: %s\nSession: %s\n\n%s\n\nDirect status: use the installed gh CLI to post one unedited comment on issue #%d or its pull request: `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON`. A nonempty reason is required. Pair the comment with the `needs-attention` label on the bound issue: add it when setting status and remove it when clearing. Re-read both the comment and label before reporting the status changed; authentication, authorization, or partial-update errors are failures, never success. Other issue-authorized comments, labels, and Markdown links may also be updated directly with gh.\n\nCompletion contract: %s\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.BaseBranch, identity.Branch, identity.Worktree, identity.Session, issue.Body, issue.Issue, completion)
+	return fmt.Sprintf("Project: %s\nIssue: #%d\nAttempt: %d\nBase branch: %s\nBranch: %s\nWorktree: %s\nSession: %s\n\n%s\n\nGitHub and runtime-state mutations are owner-only. Do not use gh, GitHub credentials, coordinator control sockets, or paths outside this disposable workspace. To request needs-attention or clear it while running, atomically replace the path in %s with a 0600 regular file containing one JSON object: {\"type\":\"agent-symphony-status-v1\",\"generation\":<decimal from %s>,\"launch_id\":\"<exact %s>\",\"sequence\":<increasing positive integer>,\"status\":\"needs-attention|clear\",\"reason\":\"specific nonempty reason\"}. The owner validates and applies the request.\n\nCompletion contract: %s\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", issue.Repository, issue.Issue, issue.Attempt, issue.BaseBranch, identity.Branch, identity.Worktree, identity.Session, issue.Body, agentruntime.WorkerStatusEnvironment, agentruntime.WorkerGenerationEnv, agentruntime.WorkerLaunchIDEnv, completion)
 }
 
 type workerResult struct {
@@ -1572,7 +1870,24 @@ type workerExport struct {
 	Bundle       string       `json:"bundle"`
 }
 
-func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, manifest agentruntime.Manifest) (workerResult, string, string, error) {
+type workerSeal struct {
+	Version       int    `json:"version"`
+	Repository    string `json:"repository"`
+	Issue         int    `json:"issue"`
+	Attempt       int    `json:"attempt"`
+	Generation    uint64 `json:"generation"`
+	BaseSHA       string `json:"base_sha"`
+	HeadSHA       string `json:"head_sha"`
+	BundleSHA256  string `json:"bundle_sha256"`
+	ProfileDigest string `json:"profile_digest"`
+}
+
+var workerSealBeforeRename = func() {}
+
+func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, stateRoot string, generation uint64, manifest agentruntime.Manifest) (workerResult, string, string, error) {
+	if !filepath.IsAbs(stateRoot) || filepath.Clean(stateRoot) != stateRoot || generation == 0 {
+		return workerResult{}, "", "", errors.New("worker seal requires canonical owner state and generation")
+	}
 	request, _ := json.Marshal(manifest)
 	response, err := boundary.call(ctx, "export", agentruntime.Command{Stdin: bytes.NewReader(request)})
 	if err != nil {
@@ -1588,19 +1903,25 @@ func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, mani
 	if err != nil || len(bundle) == 0 || len(bundle) > 16<<20 || fmt.Sprintf("%x", sha256.Sum256(bundle)) != exported.BundleSHA256 {
 		return workerResult{}, "", "", errors.New("worker boundary returned invalid or oversized bundle")
 	}
-	temp, err := os.MkdirTemp("", "agent-symphony-import-")
+	root, err := config.GitRoot()
 	if err != nil {
 		return workerResult{}, "", "", err
 	}
-	defer os.RemoveAll(temp)
-	bundlePath := filepath.Join(temp, "attempt.bundle")
-	if err := os.WriteFile(bundlePath, bundle, 0o600); err != nil {
+	sealedPath := workerSealPath(stateRoot, generation, manifest, exported.HeadSHA)
+	if validWorkerSeal(sealedPath, generation, manifest, exported) {
+		if err := validateWorkerSeal(ctx, sealedPath, generation, manifest, exported); err != nil {
+			return workerResult{}, "", "", errors.New("existing worker seal is corrupt")
+		}
+		return exported.Result, exported.HeadSHA, sealedPath, nil
+	}
+	importedRepo, bundlePath, cleanup, err := prepareWorkerSeal(ctx, stateRoot, generation, manifest, exported, bundle, root)
+	if err != nil {
+		if validateWorkerSeal(ctx, sealedPath, generation, manifest, exported) == nil {
+			return exported.Result, exported.HeadSHA, sealedPath, nil
+		}
 		return workerResult{}, "", "", err
 	}
-	importedRepo := filepath.Join(temp, "repository.git")
-	if err := scanGit(ctx, temp, nil, []string{"init", "--bare", importedRepo}, nil); err != nil {
-		return workerResult{}, "", "", fmt.Errorf("create temporary import repository: %w", err)
-	}
+	defer cleanup()
 	if err := scanGit(ctx, importedRepo, nil, []string{"bundle", "verify", bundlePath}, nil); err != nil {
 		return workerResult{}, "", "", errors.New("worker bundle verification failed")
 	}
@@ -1634,14 +1955,143 @@ func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, mani
 	if err := validateWorkerTree(ctx, importedRepo, head); err != nil {
 		return workerResult{}, "", "", errors.New("worker bundle contains a symlink or result marker")
 	}
-	root, err := config.GitRoot()
+	sealed, err := installWorkerSeal(ctx, importedRepo, stateRoot, generation, manifest, exported)
 	if err != nil {
 		return workerResult{}, "", "", err
 	}
-	if err := scanGit(ctx, root, nil, []string{"fetch", "--no-tags", importedRepo, head}, nil); err != nil {
-		return workerResult{}, "", "", fmt.Errorf("import verified worker head: %w", err)
+	return exported.Result, head, sealed, nil
+}
+
+func workerSealPath(stateRoot string, generation uint64, manifest agentruntime.Manifest, head string) string {
+	return filepath.Join(stateRoot, "seals", internalgithub.RepositoryIdentifier(manifest.Repository), fmt.Sprintf("%d-%d-%d", manifest.Issue, manifest.Attempt, generation), head+".git")
+}
+
+func prepareWorkerSeal(ctx context.Context, stateRoot string, generation uint64, manifest agentruntime.Manifest, exported workerExport, bundle []byte, ownerRoot string) (string, string, func(), error) {
+	final := workerSealPath(stateRoot, generation, manifest, exported.HeadSHA)
+	parent := filepath.Dir(final)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", "", func() {}, err
 	}
-	return exported.Result, head, root, nil
+	if _, err := os.Lstat(final); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return "", "", func() {}, errors.New("existing worker seal conflicts with attested export")
+		}
+		return "", "", func() {}, err
+	}
+	temp, err := os.MkdirTemp(parent, ".seal-")
+	if err != nil {
+		return "", "", func() {}, err
+	}
+	cleanup := func() { _ = os.RemoveAll(temp) }
+	bundleFile, err := os.CreateTemp(parent, ".bundle-")
+	if err != nil {
+		cleanup()
+		return "", "", func() {}, err
+	}
+	bundlePath := bundleFile.Name()
+	cleanup = func() { _ = os.RemoveAll(temp); _ = os.Remove(bundlePath) }
+	if bundleFile.Chmod(0o600) != nil || func() error { _, err := bundleFile.Write(bundle); return err }() != nil || bundleFile.Sync() != nil || bundleFile.Close() != nil {
+		cleanup()
+		return "", "", func() {}, errors.New("write owner-private worker bundle")
+	}
+	if err := scanGit(ctx, parent, nil, []string{"init", "--bare", temp}, nil); err != nil {
+		cleanup()
+		return "", "", func() {}, fmt.Errorf("create owner-private seal: %w", err)
+	}
+	remote, err := gitSingleLine(ctx, ownerRoot, "remote", "get-url", "origin")
+	if err != nil || strings.TrimSpace(remote) == "" {
+		cleanup()
+		return "", "", func() {}, errors.New("owner publication remote is unavailable")
+	}
+	if err := scanGit(ctx, temp, nil, []string{"remote", "add", "origin", remote}, nil); err != nil {
+		cleanup()
+		return "", "", func() {}, err
+	}
+	return temp, bundlePath, cleanup, nil
+}
+
+func installWorkerSeal(ctx context.Context, temp, stateRoot string, generation uint64, manifest agentruntime.Manifest, exported workerExport) (string, error) {
+	final := workerSealPath(stateRoot, generation, manifest, exported.HeadSHA)
+	seal := workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, manifest.WorkerProfileDigest}
+	body, _ := json.Marshal(seal)
+	if err := os.WriteFile(filepath.Join(temp, "agent-symphony-seal.json"), body, 0o600); err != nil {
+		return "", err
+	}
+	if err := syncWorkerSeal(temp); err != nil {
+		return "", fmt.Errorf("sync owner-private worker seal: %w", err)
+	}
+	workerSealBeforeRename()
+	if err := os.Rename(temp, final); err != nil {
+		// POSIX platforms report concurrent directory installs differently
+		// (EEXIST or ENOTEMPTY). Accept only the complete expected object graph,
+		// never metadata alone.
+		if validationErr := validateWorkerSeal(ctx, final, generation, manifest, exported); validationErr != nil {
+			return "", errors.Join(errors.New("install owner-private worker seal"), err, validationErr)
+		}
+	}
+	if err := immutableDirSync(filepath.Dir(final)); err != nil {
+		return "", fmt.Errorf("sync installed worker seal: %w", err)
+	}
+	if err := validateWorkerSeal(ctx, final, generation, manifest, exported); err != nil {
+		return "", errors.New("installed worker seal failed validation")
+	}
+	return final, nil
+}
+
+func syncWorkerSeal(root string) error {
+	var directories []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			directories = append(directories, path)
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		err = errors.Join(file.Sync(), file.Close())
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	for index := len(directories) - 1; index >= 0; index-- {
+		if err := immutableDirSync(directories[index]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateWorkerSeal(ctx context.Context, path string, generation uint64, manifest agentruntime.Manifest, exported workerExport) error {
+	if !validWorkerSeal(path, generation, manifest, exported) {
+		return errors.New("worker seal metadata changed")
+	}
+	head, err := gitSingleLine(ctx, path, "rev-parse", exported.HeadSHA+"^{commit}")
+	if err != nil || head != exported.HeadSHA {
+		return errors.New("worker seal commit changed or is unavailable")
+	}
+	if err := validateWorkerTree(ctx, path, head); err != nil {
+		return errors.New("worker seal tree is invalid")
+	}
+	return nil
+}
+
+func validWorkerSeal(path string, generation uint64, manifest agentruntime.Manifest, exported workerExport) bool {
+	body, err := os.ReadFile(filepath.Join(path, "agent-symphony-seal.json"))
+	if err != nil {
+		return false
+	}
+	var seal workerSeal
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(&seal) == nil && decoder.Decode(&struct{}{}) == io.EOF && seal == (workerSeal{1, manifest.Repository, manifest.Issue, manifest.Attempt, generation, manifest.BaseSHA, exported.HeadSHA, exported.BundleSHA256, manifest.WorkerProfileDigest})
 }
 
 const (
@@ -1668,10 +2118,31 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func ownerGitCommand(ctx context.Context, args ...string) *exec.Cmd {
+	base := []string{
+		"--no-optional-locks",
+		"--no-replace-objects",
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.attributesFile=/dev/null",
+		"-c", "core.fsmonitor=false",
+		"-c", "credential.helper=",
+		"-c", "protocol.ext.allow=never",
+	}
+	cmd := exec.CommandContext(ctx, "git", append(base, args...)...)
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_TERMINAL_PROMPT=0",
+	}
+	return cmd
+}
+
 func scanGit(ctx context.Context, repo string, stdin io.Reader, args []string, line func([]byte) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", repo}, args...)...)
+	cmd := ownerGitCommand(ctx, append([]string{"-C", repo}, args...)...)
 	cmd.Stdin = stdin
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1887,35 +2358,158 @@ func reviewIdentity(attempt agentruntime.Attempt, snapshotRoot string) (string, 
 	return filepath.Join(snapshotRoot, fmt.Sprintf("%s-%d-%d", repository, attempt.Issue, attempt.Number)), session
 }
 
-func reviewResultPath(snapshot, target string) string {
-	sum := sha256.Sum256([]byte(target))
-	return filepath.Join(fmt.Sprintf("%s.result-%x", snapshot, sum[:8]), "result.json")
+func legacyReviewTargetIdentity(attempt agentruntime.Attempt, snapshotRoot, target string) (string, string) {
+	snapshot, _ := reviewIdentity(attempt, snapshotRoot)
+	targetDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(target)))[:16]
+	session, _ := agentruntime.ReviewSessionName(attempt.Repository, attempt.Issue, attempt.Number, target)
+	return snapshot + "-" + targetDigest, session
 }
 
-func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string) error {
-	expectedSnapshot, expectedSession := reviewIdentity(attempt, snapshotRoot)
+func persistedReviewIdentity(attempt agentruntime.Attempt, snapshotRoot, target, runID string) (string, string) {
+	if validDigest(runID) {
+		return reviewRunIdentity(attempt, snapshotRoot, target, runID)
+	}
+	return legacyReviewTargetIdentity(attempt, snapshotRoot, target)
+}
+
+func reviewerRunID(epoch, sourceRevision, issueGeneration, attemptGeneration uint64, repository string, issue, attempt int, mode, target string) string {
+	return digestText(fmt.Sprintf("agent-symphony-review-run-v1\x00%d\x00%d\x00%d\x00%d\x00%s\x00%d\x00%d\x00%s\x00%s", epoch, sourceRevision, issueGeneration, attemptGeneration, repository, issue, attempt, mode, target))
+}
+
+func reviewRunIdentity(attempt agentruntime.Attempt, snapshotRoot, target, runID string) (string, string) {
+	snapshot, _ := reviewIdentity(attempt, snapshotRoot)
+	if !validDigest(runID) {
+		return "", ""
+	}
+	targetDigest := sha256.Sum256([]byte(target))
+	session, _ := agentruntime.ReviewRunSessionName(attempt.Repository, attempt.Issue, attempt.Number, target, runID)
+	return snapshot + "-target-" + hex.EncodeToString(targetDigest[:24]) + "-run-" + runID, session
+}
+
+func reviewResultPath(snapshot, target string) string {
+	sum := sha256.Sum256([]byte(target))
+	return filepath.Join(snapshot, fmt.Sprintf(".agent-symphony-review-%x", sum[:8]), "result.json")
+}
+
+func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, runID, snapshot, session, snapshotRoot string) error {
+	return cleanupReviewResourcesWithProof(ctx, boundary, env, attempt, head, target, runID, snapshot, session, snapshotRoot, nil)
+}
+
+func cleanupCertifiedReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, snapshot, session, snapshotRoot string, proofs ...reviewerProcessProof) error {
+	if len(proofs) == 0 {
+		return errors.New("reviewer cleanup has no owner process-death certificate")
+	}
+	runID := ""
+	if len(proofs) == 1 {
+		runID = proofs[0].RunID
+	}
+	return cleanupBoundReviewResources(ctx, boundary, env, attempt, head, target, runID, snapshot, session, snapshotRoot, "", proofs...)
+}
+
+func cleanupReviewResourcesWithProof(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, runID, snapshot, session, snapshotRoot string, proofs []reviewerProcessProof) error {
+	return cleanupBoundReviewResources(ctx, boundary, env, attempt, head, target, runID, snapshot, session, snapshotRoot, "", proofs...)
+}
+
+func cleanupBoundReviewResources(ctx context.Context, boundary boundaryCaller, env []string, attempt agentruntime.Attempt, head, target, runID, snapshot, session, snapshotRoot, activeProfileDigest string, proofs ...reviewerProcessProof) error {
+	certified := len(proofs) > 0
+	for _, proof := range proofs {
+		if !reviewerCleanupAuthorized(proof, activeProfileDigest) || proof.Repository != attempt.Repository || proof.Issue != attempt.Issue || proof.Attempt != attempt.Number || target != "" && len(proofs) == 1 && proof.Target != target {
+			return errors.New("reviewer cleanup certificate does not match the attempt and target")
+		}
+	}
+	if len(proofs) == 1 && proofs[0].RunID != runID {
+		return errors.New("reviewer cleanup certificate does not match the run")
+	}
+	expectedSnapshot, expectedSession := persistedReviewIdentity(attempt, snapshotRoot, target, runID)
 	if (snapshot != "" && snapshot != expectedSnapshot) || (session != "" && session != expectedSession) {
 		return errors.New("persisted reviewer cleanup identity mismatch")
 	}
+	snapshotExists := false
 	if snapshot != "" {
 		info, err := os.Lstat(snapshot)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+		snapshotExists = err == nil
 		if (err == nil && info.Mode()&os.ModeSymlink != 0) || !belowRoot(snapshot, filepath.Dir(expectedSnapshot)) {
 			return errors.New("review snapshot cleanup path is not a non-symlink descendant of the snapshot root")
+		}
+	}
+	resultPath := reviewResultPath(expectedSnapshot, manifestReviewTarget(head, target))
+	resultRoot := filepath.Dir(resultPath)
+	if !certified {
+		for _, path := range []string{snapshot, resultRoot} {
+			if _, err := os.Lstat(path); err == nil {
+				return errors.New("unbound reviewer resources cannot be cleaned safely")
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
 		}
 	}
 	if session != "" {
 		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		result, err := boundary.call(cleanupCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"kill-session", "-t", "=" + session}, Dir: filepath.Dir(snapshot), Env: env})
-		if err != nil && !(result.Exited && result.Code == 1) {
+		status, err := boundary.call(cleanupCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerPaneIdentityFormat}, Dir: filepath.Dir(snapshot), Env: env})
+		sessionAbsent := false
+		if err != nil && !missingTmuxServer(status) {
+			if !certified {
+				return err
+			}
+			absent, absentErr := boundary.call(cleanupCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"has-session", "-t", "=" + session}, Dir: filepath.Dir(snapshot), Env: env})
+			if absentErr == nil || !exactTmuxSessionAbsent(absent, session) {
+				return err
+			}
+			sessionAbsent = true
+		}
+		if !sessionAbsent && !reviewerPaneAbsent(status.Output) && !missingTmuxServer(status) {
+			pane, err := parseReviewerPaneIdentity(status.Output)
+			if err != nil {
+				return err
+			}
+			if pane.Name != session {
+				return errors.New("reviewer pane name does not match exact session")
+			}
+			if !certified || !pane.Status.Dead {
+				return errors.New("reviewer pane remains; cleanup requires exact stopped-child proof and ownership")
+			}
+			matched := false
+			for _, proof := range proofs {
+				launchPath, terminalPath := reviewerLifecyclePaths(expectedSnapshot, proof.Target)
+				var launch reviewerLaunchIdentity
+				found, readErr := readReviewerRecord(launchPath, &launch)
+				if readErr == nil && found && launch.EffectID == proof.EffectID && launch.RunID == proof.RunID && launch.IssueGeneration == proof.IssueGeneration && launch.AttemptGeneration == proof.AttemptGeneration && reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, launch) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return errors.New("reviewer pane does not match an owner-certified lifecycle")
+			}
+			if err := guardedReviewerKillSession(cleanupCtx, boundary, pane, session, filepath.Dir(snapshot), env); err != nil {
+				return err
+			}
+		}
+	}
+	if !certified {
+		if _, err := os.Lstat(filepath.Join(resultRoot, "launch.json")); err == nil {
+			return errors.New("unbound reviewer launch cannot be cleaned safely")
+		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
-	resultPath := reviewResultPath(expectedSnapshot, manifestReviewTarget(head, target))
-	resultRoot := filepath.Dir(resultPath)
+	if certified && snapshotExists {
+		if err := filepath.WalkDir(snapshot, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return os.Chmod(path, 0o750)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
 	if info, err := os.Lstat(resultRoot); err == nil {
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || os.RemoveAll(resultRoot) != nil {
 			return errors.New("review result cleanup path is invalid")
@@ -1924,12 +2518,6 @@ func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []
 		return err
 	}
 	if snapshot != "" {
-		_ = filepath.WalkDir(snapshot, func(path string, entry os.DirEntry, err error) error {
-			if err == nil && entry.IsDir() {
-				_ = os.Chmod(path, 0o750)
-			}
-			return nil
-		})
 		if err := os.RemoveAll(snapshot); err != nil {
 			return err
 		}
@@ -1938,11 +2526,12 @@ func cleanupReviewResources(ctx context.Context, boundary boundaryCaller, env []
 }
 
 type independentReviewResult struct {
-	Type     string   `json:"type"`
-	Status   string   `json:"status"`
-	Findings []string `json:"findings"`
-	Snapshot string   `json:"-"`
-	Session  string   `json:"-"`
+	Type       string   `json:"type"`
+	Status     string   `json:"status"`
+	Findings   []string `json:"findings"`
+	Snapshot   string   `json:"-"`
+	Session    string   `json:"-"`
+	Diagnostic string   `json:"-"`
 }
 
 func reviewTarget(mode string, issue internalgithub.RecoveryIssueFact, base, head string) (string, error) {
@@ -1964,7 +2553,7 @@ func reviewTarget(mode string, issue internalgithub.RecoveryIssueFact, base, hea
 }
 
 func missingTmuxPaneStatus(result agentruntime.Result) bool {
-	return !result.Exited && result.Code == 0 && strings.TrimSpace(result.Output) == "|||"
+	return !result.Exited && result.Code == 0 && strings.TrimSpace(result.Output) == "||||"
 }
 
 func validReviewTarget(mode, target, repository string, issue int, head string) bool {
@@ -1992,16 +2581,30 @@ func reviewPrompt(mode, target string, issue internalgithub.RecoveryIssueFact) (
 	default:
 		return "", fmt.Errorf("invalid review mode %q", mode)
 	}
-	return fmt.Sprintf("Review mode: %s. %s Use the installed gh CLI to post direct status on the bound issue or pull request as one unedited `/agent-symphony status needs-attention: REASON` or `/agent-symphony status clear: REASON` comment; pair it with adding or removing the bound issue's `needs-attention` label. A nonempty reason and a fresh re-read of both comment and label are required before reporting the status changed. Authentication, authorization, or partial-update errors are failures, never success. Make the entire final response exactly one bounded JSON object on stdout: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings. Do not wrap it in Markdown, emit prose, or emit another object.\n\n%s", mode, task, issue.Body), nil
+	return fmt.Sprintf("Review mode: %s. %s GitHub and runtime-state mutations are owner-only. Do not use gh, GitHub credentials, coordinator control sockets, or paths outside this disposable snapshot. Report blockers as findings for the owner to validate and apply. Make the entire final response exactly one bounded JSON object on stdout: {\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]} or status findings with actionable finding strings. Do not wrap it in Markdown, emit prose, or emit another object.\n\n%s", mode, task, issue.Body), nil
 }
 
-func runIndependentReviewV2(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot, mode string) (independentReviewResult, bool, error) {
-	return runIndependentReviewCore(ctx, attempt, boundary, env, command, issue, manifest, source, head, snapshotRoot, mode)
+func runIndependentReviewV2(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot, mode string, binding *reviewerLaunchIdentity, replay bool, beforeSession ...func() error) (independentReviewResult, bool, error) {
+	return runIndependentReviewCore(ctx, attempt, boundary, env, command, issue, manifest, source, head, snapshotRoot, mode, binding, replay, beforeSession...)
 }
 
-func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot string, selectedMode ...string) (independentReviewResult, bool, error) {
+func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt, boundary boundaryCaller, env, command []string, issue internalgithub.RecoveryIssueFact, manifest agentruntime.Manifest, source, head, snapshotRoot, mode string, binding *reviewerLaunchIdentity, replay bool, beforeSession ...func() error) (review independentReviewResult, pending bool, err error) {
+	respawnRequested := false
+	priorResourcesCleared := false
+	defer func() {
+		if binding != nil && !respawnRequested && err != nil && !pending {
+			if !priorResourcesCleared {
+				pending = true // No new-effect certificate may authorize old same-target resources.
+			} else if !errors.Is(err, errReviewerTerminal) {
+				err = reviewerLifecycleError(err)
+			}
+		}
+	}()
 	if len(command) == 0 {
 		return independentReviewResult{}, false, errors.New("reviewer command is missing")
+	}
+	if binding != nil && binding.RunID != manifest.ReviewRunID {
+		return independentReviewResult{}, false, errors.New("reviewer launch identity does not match the persisted review run")
 	}
 	if issue.Repository != "" && issue.Repository != attempt.Repository || issue.Issue != 0 && issue.Issue != attempt.Issue || issue.Attempt != 0 && issue.Attempt != attempt.Number {
 		return independentReviewResult{}, false, errors.New("review issue target does not match the attempt")
@@ -2015,13 +2618,7 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if issue.Attempt == 0 {
 		issue.Attempt = attempt.Number
 	}
-	mode := agentruntime.ReviewModeImplementation
-	if len(selectedMode) == 1 {
-		mode = selectedMode[0]
-	} else if len(selectedMode) > 1 {
-		return independentReviewResult{}, false, errors.New("exactly one review mode is required")
-	}
-	env = append(slices.Clone(env), "GH_REPO="+issue.Repository)
+	env = slices.Clone(env)
 	reviewBase := attempt.BaseSHA
 	if preflightObjectID.MatchString(issue.BaseSHA) {
 		reviewBase = issue.BaseSHA
@@ -2037,7 +2634,10 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if mode == agentruntime.ReviewModePlan && (manifest.ReviewState == "preparing" || manifest.ReviewState == "running") && manifest.ReviewMode == mode && agentruntime.ValidReviewTarget(mode, manifest.ReviewTarget, attempt.Repository, attempt.Issue) {
 		target, reviewBase, head = manifest.ReviewTarget, manifest.ReviewBase, manifest.ReviewHead
 	}
-	snapshot, session := reviewIdentity(attempt, snapshotRoot)
+	snapshot, session := reviewRunIdentity(attempt, snapshotRoot, target, manifest.ReviewRunID)
+	if snapshot == "" || session == "" {
+		return independentReviewResult{}, false, errors.New("review run identity is missing or invalid")
+	}
 	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
 		return independentReviewResult{}, false, fmt.Errorf("prepare review snapshot root: %w", err)
 	}
@@ -2046,7 +2646,116 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	if manifestMode == "" && manifestTarget == "" {
 		manifestMode, manifestTarget = agentruntime.ReviewModeImplementation, target
 	}
-	if manifest.ReviewState == "running" && manifestMode == mode && manifestTarget == target && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
+	if binding != nil && replay {
+		launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
+		var launch reviewerLaunchIdentity
+		found, launchErr := readReviewerRecord(launchPath, &launch)
+		if launchErr != nil || !found || !sameReviewerIdentity(launch, *binding) {
+			if binding.ChildPID > 1 {
+				gone, proofErr := reviewerGroupGone(binding.ChildPID)
+				if proofErr != nil || !gone {
+					return independentReviewResult{}, true, fmt.Errorf("owner-bound reviewer group remains live with invalid launch record: %w", proofErr)
+				}
+				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("owner-bound reviewer launch record is invalid"))
+			}
+			if launchErr != nil || found {
+				return independentReviewResult{}, true, errors.New("unbound reviewer launch record is invalid")
+			}
+		}
+		if found && binding.ChildPID > 1 {
+			priorResourcesCleared = true // A bound launch belongs to this effect, not a prior same-target run.
+		}
+		if launchErr != nil {
+			return independentReviewResult{}, false, reviewerLifecycleError(launchErr)
+		}
+		if !found {
+			if binding.GateProtocol && binding.ChildPID == 0 {
+				if binding.SessionRequested {
+					return independentReviewResult{}, true, errors.New("reviewer session was requested but launch identity is missing; gated child death is unproved")
+				}
+				if cleanupErr := cleanupReviewResources(ctx, boundary, env, attempt, head, target, manifest.ReviewRunID, snapshot, session, snapshotRoot); cleanupErr != nil {
+					return independentReviewResult{}, true, fmt.Errorf("clean previous reviewer resources before no-run proof: %w", cleanupErr)
+				}
+				priorResourcesCleared = true
+				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer setup stopped before session creation"))
+			}
+			paneStatus, statusErr := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
+			if statusErr != nil {
+				return independentReviewResult{}, true, fmt.Errorf("probe unmarked reviewer pane: %w", statusErr)
+			}
+			if missingTmuxPaneStatus(paneStatus) {
+				return independentReviewResult{}, true, errors.New("unbound reviewer pane is missing; execution cannot be proved absent")
+			}
+			pane, parseErr := agentruntime.ParsePaneStatus(paneStatus.Output)
+			if parseErr != nil {
+				return independentReviewResult{}, true, fmt.Errorf("probe unmarked reviewer pane: %w", parseErr)
+			}
+			if pane.Dead {
+				return independentReviewResult{}, true, errors.New("unbound reviewer pane died before launch identity was recorded")
+			}
+			started, probeErr := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), "#{pane_start_command}"}, Dir: snapshot, Env: env})
+			if probeErr != nil || started.Exited {
+				return independentReviewResult{}, true, fmt.Errorf("probe unmarked reviewer pane: %w", errors.Join(probeErr, errors.New("tmux pane identity is unavailable")))
+			}
+			if reviewerPaneStartMatches(started.Output, launchPath, terminalPath, *binding) {
+				return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
+			}
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			cleanupErr := cleanupReviewResources(cleanupCtx, boundary, env, attempt, head, target, manifest.ReviewRunID, snapshot, session, snapshotRoot)
+			cancel()
+			if cleanupErr != nil {
+				return independentReviewResult{}, true, fmt.Errorf("stop unmarked reviewer pane: %w", cleanupErr)
+			}
+			return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer wrapper never started"))
+		}
+		if !sameReviewerIdentity(launch, *binding) {
+			return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer launch identity mismatched"))
+		}
+		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), reviewerPaneIdentityFormat}, Dir: snapshot, Env: env})
+		if err != nil {
+			return independentReviewResult{}, true, fmt.Errorf("observe launched reviewer: %w", err)
+		}
+		pane, err := parseReviewerPaneIdentity(result.Output)
+		if err != nil || pane.Name != session || !reviewerPaneStartMatches(pane.Start, launchPath, terminalPath, *binding) {
+			return independentReviewResult{}, true, errors.New("launched reviewer pane identity is unavailable")
+		}
+		if !pane.Status.Dead {
+			return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
+		}
+		if !pane.Status.Ready {
+			return independentReviewResult{}, true, errors.New("reviewer pane exit is not yet recorded")
+		}
+		if binding.ChildPID < 2 || launch.ChildPID != binding.ChildPID {
+			return independentReviewResult{}, true, errors.New("owner-bound reviewer process group is unavailable")
+		}
+		terminal, terminalErr := readReviewerTerminal(launchPath, terminalPath, *binding)
+		if terminalErr != nil {
+			return independentReviewResult{}, false, reviewerLifecycleError(terminalErr)
+		}
+		if terminal != nil {
+			if terminal.ExitCode == 0 && (pane.Status.Signal != "" || pane.Status.ExitStatus != 0) {
+				return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer terminal record conflicts with tmux pane exit"))
+			}
+			if terminal.ExitCode != 0 || terminal.Signal != 0 {
+				return independentReviewResult{}, false, reviewerLifecycleError(errors.New(reviewerTerminalDiagnostic(*terminal)))
+			}
+			request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, RunID: manifest.ReviewRunID, Head: head})
+			artifact, err := boundary.call(ctx, "review-result", agentruntime.Command{Stdin: bytes.NewReader(request)})
+			if err != nil {
+				if artifact.Exited && artifact.Code == reviewResultInvalidCode {
+					return independentReviewResult{}, false, reviewerLifecycleError(err)
+				}
+				return independentReviewResult{}, true, err
+			}
+			parsed, err := parseIndependentReview(artifact.Output)
+			if err != nil {
+				return independentReviewResult{}, false, reviewerLifecycleError(err)
+			}
+			return parsed, false, nil
+		}
+		return independentReviewResult{}, false, reviewerLifecycleError(errors.New("reviewer exited without terminal record"))
+	}
+	if binding == nil && manifest.ReviewState == "running" && manifestMode == mode && manifestTarget == target && manifest.ReviewBase == reviewBase && manifest.ReviewHead == head && manifest.ReviewSnapshot == snapshot && manifest.ReviewSession == session {
 		result, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.PaneStatusFormat}, Dir: snapshot, Env: env})
 		if err == nil {
 			// tmux reports a missing exact target as success with empty format
@@ -2067,7 +2776,7 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 			if pane.ExitStatus != 0 {
 				return independentReviewResult{}, false, fmt.Errorf("reviewer exited %d; inspect reviewer session %s and retry the attempt after correcting the failure", pane.ExitStatus, session)
 			} else {
-				request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, Head: head, LegacyHeadArtifact: legacyHeadArtifact})
+				request, _ := json.Marshal(reviewResultRequest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, Mode: mode, Target: target, RunID: manifest.ReviewRunID, Head: head, LegacyHeadArtifact: legacyHeadArtifact})
 				artifact, err := boundary.call(ctx, "review-result", agentruntime.Command{Stdin: bytes.NewReader(request)})
 				if err != nil {
 					if artifact.Exited && artifact.Code == reviewResultInvalidCode {
@@ -2088,16 +2797,20 @@ func runIndependentReviewCore(ctx context.Context, attempt agentruntime.Attempt,
 	}
 
 launch:
-	if err := cleanupReviewResources(ctx, boundary, env, attempt, head, target, snapshot, session, snapshotRoot); err != nil {
-		return independentReviewResult{}, true, nil
+	if err := cleanupReviewResources(ctx, boundary, env, attempt, head, target, manifest.ReviewRunID, snapshot, session, snapshotRoot); err != nil {
+		if binding != nil {
+			return independentReviewResult{}, true, fmt.Errorf("clean previous reviewer resources: %w", err)
+		}
+		return independentReviewResult{}, false, fmt.Errorf("clean previous reviewer resources: %w", err)
 	}
-	if out, err := exec.CommandContext(ctx, "git", "clone", "--no-local", "--no-checkout", source, snapshot).CombinedOutput(); err != nil {
+	priorResourcesCleared = true
+	if out, err := ownerGitCommand(ctx, "clone", "--no-local", "--no-checkout", source, snapshot).CombinedOutput(); err != nil {
 		return independentReviewResult{}, false, fmt.Errorf("create snapshot: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	if out, err := exec.CommandContext(ctx, "git", "-C", snapshot, "fetch", "--no-tags", source, head+":refs/agent-symphony/attested-review").CombinedOutput(); err != nil {
+	if out, err := ownerGitCommand(ctx, "-C", snapshot, "fetch", "--no-tags", source, head+":refs/agent-symphony/attested-review").CombinedOutput(); err != nil {
 		return independentReviewResult{}, false, fmt.Errorf("transfer attested head: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	if out, err := exec.CommandContext(ctx, "git", "-C", snapshot, "checkout", "--detach", head).CombinedOutput(); err != nil {
+	if out, err := ownerGitCommand(ctx, "-C", snapshot, "checkout", "--detach", head).CombinedOutput(); err != nil {
 		return independentReviewResult{}, false, fmt.Errorf("checkout attested head: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	if got, err := gitSingleLine(ctx, snapshot, "rev-parse", "HEAD"); err != nil || got != head {
@@ -2106,20 +2819,21 @@ launch:
 	if err := scanGit(ctx, snapshot, nil, []string{"merge-base", "--is-ancestor", reviewBase, "HEAD"}, nil); err != nil || mode == agentruntime.ReviewModeImplementation && strings.EqualFold(reviewBase, head) {
 		return independentReviewResult{}, false, errors.New("review base is unavailable or not an ancestor of attested HEAD")
 	}
-	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "remote", "remove", "origin").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "update-ref", "-d", "refs/agent-symphony/attested-review").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", snapshot, "config", "--local", "credential.helper", "").Run()
+	_ = ownerGitCommand(ctx, "-C", snapshot, "remote", "remove", "origin").Run()
+	_ = ownerGitCommand(ctx, "-C", snapshot, "update-ref", "-d", "refs/agent-symphony/attested-review").Run()
+	_ = ownerGitCommand(ctx, "-C", snapshot, "config", "--local", "credential.helper", "").Run()
 	reviewGID := -1
-	if reviewSnapshotRoot == "" && hostIsolationInstalled() {
-		group, err := user.LookupGroup(snapshotGroup)
-		if err != nil {
-			return independentReviewResult{}, false, err
-		}
-		reviewGID, _ = strconv.Atoi(group.Gid)
+	resultPath := reviewResultPath(snapshot, target)
+	resultRoot := filepath.Dir(resultPath)
+	if err := os.Mkdir(resultRoot, 0o700); err != nil {
+		return independentReviewResult{}, false, errors.New("prepare review result artifact")
 	}
 	if err := filepath.WalkDir(snapshot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
+		}
+		if path == resultRoot {
+			return filepath.SkipDir
 		}
 		if reviewGID >= 0 {
 			if err := os.Chown(path, -1, reviewGID); err != nil {
@@ -2133,19 +2847,14 @@ launch:
 	}); err != nil {
 		return independentReviewResult{}, false, err
 	}
-	resultPath := reviewResultPath(snapshot, target)
+	env, err = privateWorkerEnvironment(env, resultRoot)
+	if err != nil {
+		return independentReviewResult{}, false, err
+	}
 	env = append(env, "AGENT_SYMPHONY_REVIEW_RESULT="+resultPath)
-	resultRoot := filepath.Dir(resultPath)
-	if err := os.Mkdir(resultRoot, 0o770); err != nil || reviewGID >= 0 && os.Chown(resultRoot, -1, reviewGID) != nil || os.Chmod(resultRoot, 0o770) != nil {
+	if reviewGID >= 0 && os.Chown(resultRoot, -1, reviewGID) != nil || os.Chmod(resultRoot, 0o700) != nil {
 		_ = os.RemoveAll(resultRoot)
 		return independentReviewResult{}, false, errors.New("prepare review result artifact")
-	}
-	args := agentruntime.TmuxNewSessionArgs(session, snapshot, env)
-	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: args, Dir: snapshot, Env: env}); err != nil {
-		return independentReviewResult{}, false, err
-	}
-	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-w", "-t", agentruntime.PaneTarget(session), "remain-on-exit", "on"}, Dir: snapshot, Env: env}); err != nil {
-		return independentReviewResult{}, false, err
 	}
 	prompt, err := reviewPrompt(mode, target, issue)
 	if err != nil {
@@ -2163,14 +2872,93 @@ launch:
 		return independentReviewResult{}, false, err
 	}
 	command = append(slices.Clone(command), prompt)
-	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: append([]string{"respawn-pane", "-k", "-t", agentruntime.PaneTarget(session), "--"}, command...), Dir: snapshot, Env: env}); err != nil {
-		return independentReviewResult{}, false, err
+	armed := false
+	if binding != nil {
+		armed = true
+		defer func() {
+			if armed {
+				for _, channel := range []string{reviewerSignal(*binding), reviewerStartSignal(*binding)} {
+					unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+					_, _ = boundary.call(unlockCtx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-U", channel}, Dir: snapshot, Env: env})
+					cancel()
+				}
+			}
+		}()
+		for _, channel := range []string{reviewerSignal(*binding), reviewerStartSignal(*binding)} {
+			if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-L", channel}, Dir: snapshot, Env: env}); err != nil {
+				return independentReviewResult{}, false, err
+			}
+		}
+		help, err := os.Executable()
+		if err != nil {
+			return independentReviewResult{}, false, err
+		}
+		if binding.GateProtocol && !binding.SessionRequested {
+			if len(beforeSession) != 1 || beforeSession[0] == nil {
+				return independentReviewResult{}, false, errors.New("owner reviewer session reservation is unavailable")
+			}
+			if err := beforeSession[0](); err != nil {
+				return independentReviewResult{}, true, err
+			}
+		}
+		launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
+		encoded, _ := json.Marshal(binding)
+		command = append([]string{help, "review-pane", "tmux", launchPath, terminalPath, reviewerSignal(*binding), reviewerStartSignal(*binding), string(encoded), "--"}, command...)
+	}
+	if binding == nil {
+		return independentReviewResult{}, false, errors.New("reviewer owner binding is unavailable")
+	}
+	respawnRequested = true // A failed tmux response cannot prove the wrapper was not created.
+	args := append(agentruntime.TmuxNewSessionArgs(session, snapshot, env), "--")
+	args = append(args, command...)
+	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: args, Dir: snapshot, Env: env}); err != nil {
+		armed = false
+		return independentReviewResult{Snapshot: snapshot, Session: session}, true, fmt.Errorf("reviewer new-session outcome is uncertain: %w", err)
+	}
+	armed = false // The exact initial wrapper owns the latches after new-session succeeds.
+	if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-w", "-t", agentruntime.PaneTarget(session), "remain-on-exit", "on"}, Dir: snapshot, Env: env}); err != nil {
+		return independentReviewResult{Snapshot: snapshot, Session: session}, true, err
+	}
+	for _, option := range []string{agentruntime.PaneExitStatusOption, agentruntime.PaneExitSignalOption} {
+		if _, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"set-option", "-p", "-t", agentruntime.PaneTarget(session), option, ""}, Dir: snapshot, Env: env}); err != nil {
+			return independentReviewResult{Snapshot: snapshot, Session: session}, true, err
+		}
 	}
 	return independentReviewResult{Snapshot: snapshot, Session: session}, true, nil
 }
 
 func configuredAgentEnvironment(allow []string) ([]string, error) {
 	return internalgithub.AgentEnvironmentWith(os.Environ(), allow...)
+}
+
+func configuredWorkerEnvironment(allow []string, stateRoot string) ([]string, error) {
+	environment := append(os.Environ(), "CODEX_HOME="+workerCodexHome(stateRoot))
+	return internalgithub.WorkerEnvironmentWith(environment, allow...)
+}
+
+func privateWorkerEnvironment(environment []string, root string) ([]string, error) {
+	paths := map[string]string{
+		"TMPDIR":           filepath.Join(root, "tmp"),
+		"XDG_CACHE_HOME":   filepath.Join(root, "cache"),
+		"GOCACHE":          filepath.Join(root, "go-cache"),
+		"npm_config_cache": filepath.Join(root, "npm-cache"),
+	}
+	for _, path := range paths {
+		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("prepare worker-private cache: %w", err)
+		}
+	}
+	filtered := environment[:0]
+	for _, entry := range environment {
+		name, _, _ := strings.Cut(entry, "=")
+		if _, managed := paths[name]; !managed {
+			filtered = append(filtered, entry)
+		}
+	}
+	for name, path := range paths {
+		filtered = append(filtered, name+"="+path)
+	}
+	return filtered, nil
 }
 
 func parseIndependentReview(output string) (independentReviewResult, error) {
@@ -2430,7 +3218,14 @@ func doctor(c config.Config, offline bool, stateRoot string) []diagnostic {
 	} else {
 		result = append(result, githubDiagnostics(c.Repository)...)
 	}
-	result = append(result, hostDiagnostic(stateRoot))
+	bindCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, bindErr := config.BindWorkerExecutable(bindCtx, &c.Commands)
+	cancel()
+	if bindErr != nil {
+		result = append(result, diagnostic{"worker confinement", "fail", bindErr.Error(), "Install @openai/codex@0.153.0 and configure implementation and reviewer to use the same executable."})
+	} else {
+		result = append(result, hostDiagnostic(c.Commands.Implementation[0], stateRoot))
+	}
 	return result
 }
 
@@ -2654,14 +3449,14 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, `usage: agent-symphony <command> [options]
 
 commands:
-	install-host  provision the native worker/reviewer boundary (run as root)
+	install-host  report obsolete host provisioning and legacy identities
 	agent-host    execute the implementation, review, or orchestrator boundary
 	chat          attach to an exact implementation, reviewer, or orchestrator session
 	control       invoke a guarded action in the running daemon
 	init          create .agent-symphony.yaml with project defaults
 	validate      validate configuration
 	config view   print validated configuration
-	serve         reconcile at startup and at most every 60 seconds
+	serve         reconcile at startup and on a configured cadence
 	status        show recovered work
 	list          alias for status
 	inspect       show one issue (--issue number)
@@ -2685,12 +3480,12 @@ options:
 	--request-id id  bounded idempotency identity (control only)
 	--timeout duration  bounded running-daemon request timeout (maximum 2m)
 	--interval duration  override configured serve reconciliation interval (maximum 60s)
+	--disable-periodic-reconciliation  disable serve's periodic reconciliation (diagnostics/E2E only)
 	--dashboard-address address  dashboard listen address (serve only; loopback by default)
 	--dashboard-project URL  additional project dashboard to present read-only (serve only; repeatable)
 	--allow-unsafe-dashboard-network  permit non-loopback dashboard binding (requires password)
 	--dashboard-password-file path  coordinator-only HTTP Basic password file; username is agent-symphony
 	--offline     skip the GitHub probe in doctor or diagnostics
-	--coordinator user  coordinator OS user for install-host
 	--json        emit a versioned JSON envelope
 	-h, --help    show this help (top level only)
 	--version     show the release version`)

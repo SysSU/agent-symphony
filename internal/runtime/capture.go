@@ -24,7 +24,8 @@ var (
 	// ErrWorkerResultOverflow means the configured command exceeded the capture ceiling.
 	ErrWorkerResultOverflow = errors.New("worker stdout exceeds 64 KiB")
 	// ErrWorkerOutputOpen means an out-of-group process retained the worker output descriptor.
-	ErrWorkerOutputOpen = errors.New("worker stdout remained open after process-group termination")
+	ErrWorkerOutputOpen             = errors.New("worker stdout remained open after process-group termination")
+	errReviewerGroupAbsenceUnproved = errors.New("reviewer process group absence is unproved")
 )
 
 const (
@@ -52,6 +53,14 @@ code=$?
 printf '%d\n' "$code" >&3
 IFS= read -r _ <&4`
 
+const boundWorkerWrapper = `set +m
+IFS= read -r ready <&5 || exit 125
+[ "$ready" = go ] || exit 125
+"$@" 3>&- 4>&- 5>&-
+code=$?
+printf '%d\n' "$code" >&3
+IFS= read -r _ <&4`
+
 // CaptureWorker runs command with a tmux prompt and bounded result channel.
 func CaptureWorker(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer) (int, error) {
 	return captureWorker(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", false)
@@ -73,25 +82,149 @@ func CaptureWorkerReplacingResultAfterStart(ctx context.Context, tmux, buffer, r
 	return captureWorkerAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", true, afterStart)
 }
 
+// CaptureBoundWorker is the v2 pane process. It binds the sole worker group
+// before allowing any user command to execute.
+func CaptureBoundWorker(ctx context.Context, manifest Manifest, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, replace bool, afterStart func() error) (int, error) {
+	return captureWorkerBoundAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, "/tmp", replace, afterStart, &manifest)
+}
+
 // RunPaneCommand preserves normal exit status while leaving signaled exits for
 // the caller to re-raise, so tmux retains the signal identity.
 func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer) (int, syscall.Signal, error) {
+	return runPaneCommandAfterStart(ctx, tmux, command, stdin, stdout, stderr, nil, false)
+}
+
+// RunPaneCommandAfterStart records launch proof only after the child exists.
+func RunPaneCommandAfterStart(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, extraFiles ...*os.File) (int, syscall.Signal, error) {
+	return runReviewerPaneCommand(ctx, tmux, command, stdin, stdout, stderr, afterStart, extraFiles, func(pid int) error {
+		return syscall.Kill(-pid, 0)
+	})
+}
+
+// The group leader remains alive after the reviewer exits, pinning its PGID
+// until the wrapper has killed every remaining descendant. FD3 is the owner
+// start gate, FD4 reports the reviewer exit, and FD5 holds the leader.
+const reviewerWrapper = `set +m
+IFS= read -r ready <&3 || exit 125
+[ "$ready" = go ] || exit 125
+"$@" 3>&- 4>&- 5>&-
+code=$?
+printf '%d\n' "$code" >&4
+IFS= read -r _ <&5
+exit "$code"`
+
+func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, extraFiles []*os.File, probeGroup func(int) error) (int, syscall.Signal, error) {
+	if len(command) == 0 || command[0] == "" || len(extraFiles) != 1 || extraFiles[0] == nil {
+		return 125, 0, errors.New("reviewer pane command or start gate is missing")
+	}
+	statusReader, statusWriter, err := os.Pipe()
+	if err != nil {
+		return 125, 0, err
+	}
+	defer statusReader.Close()
+	defer statusWriter.Close()
+	holdReader, holdWriter, err := os.Pipe()
+	if err != nil {
+		return 125, 0, err
+	}
+	defer holdReader.Close()
+	defer holdWriter.Close()
+	child := exec.CommandContext(ctx, "/bin/sh", append([]string{"-c", reviewerWrapper, "reviewer-wrapper"}, command...)...)
+	child.Stdin, child.Stdout, child.Stderr = stdin, stdout, stderr
+	child.ExtraFiles = []*os.File{extraFiles[0], statusWriter, holdReader}
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(signals)
+	if err := child.Start(); err != nil {
+		return 125, 0, err
+	}
+	_ = statusWriter.Close()
+	_ = holdReader.Close()
+	stop := func() error {
+		killErr := killProcessGroup(child)
+		_ = holdWriter.Close()
+		_ = child.Wait()
+		if killErr != nil {
+			return killErr
+		}
+		if err := reviewerGroupAbsenceError(probeGroup(child.Process.Pid)); err != nil {
+			return err
+		}
+		return nil
+	}
+	if afterStart != nil {
+		if err := afterStart(child.Process.Pid); err != nil {
+			return 125, 0, errors.Join(err, stop())
+		}
+	}
+	type completion struct {
+		code int
+		err  error
+	}
+	done := make(chan completion, 1)
+	go func() { code, err := readWorkerStatus(statusReader); done <- completion{code, err} }()
+	var finished completion
+	select {
+	case finished = <-done:
+	case <-signals:
+		return 137, syscall.SIGKILL, stop()
+	case <-ctx.Done():
+		return 125, 0, errors.Join(ctx.Err(), stop())
+	}
+	cleanupErr := stop()
+	if cleanupErr != nil && !errors.Is(cleanupErr, errReviewerGroupAbsenceUnproved) {
+		return 125, 0, cleanupErr
+	}
+	if finished.err != nil {
+		return 125, 0, errors.Join(finished.err, cleanupErr)
+	}
+	// Cleanup uncertainty must not replace the command's durable exit result.
+	return finished.code, 0, errors.Join(cleanupErr, RecordPaneExitStatus(ctx, tmux, finished.code))
+}
+
+func reviewerGroupAbsenceError(probeErr error) error {
+	if errors.Is(probeErr, syscall.ESRCH) {
+		return nil
+	}
+	return fmt.Errorf("%w: group probe returned %v", errReviewerGroupAbsenceUnproved, probeErr)
+}
+
+func runPaneCommandAfterStart(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, reviewerGroup bool, extraFiles ...*os.File) (int, syscall.Signal, error) {
 	if len(command) == 0 || command[0] == "" {
 		return 1, 0, errors.New("pane command is missing")
 	}
-	record := func(code int) error {
+	record := func(option string, value int) error {
 		statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		defer cancel()
-		return RecordPaneExitStatus(statusCtx, tmux, code)
+		return recordPaneExitOption(statusCtx, tmux, option, value)
 	}
 	child := exec.CommandContext(ctx, command[0], command[1:]...)
 	child.Stdin, child.Stdout, child.Stderr = stdin, stdout, stderr
-	if err := child.Start(); err != nil {
-		return 1, 0, errors.Join(err, record(1))
+	child.ExtraFiles = extraFiles
+	if reviewerGroup {
+		child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(signals)
+	if err := child.Start(); err != nil {
+		return 1, 0, errors.Join(err, record(PaneExitStatusOption, 1))
+	}
+	stopChild := func() {
+		if reviewerGroup {
+			_ = syscall.Kill(-child.Process.Pid, syscall.SIGKILL)
+		} else {
+			_ = child.Process.Kill()
+		}
+	}
+	if afterStart != nil {
+		if err := afterStart(child.Process.Pid); err != nil {
+			stopChild()
+			_ = child.Wait()
+			return 1, 0, errors.Join(err, record(PaneExitStatusOption, 1))
+		}
+	}
 	waited := make(chan error, 1)
 	go func() { waited <- child.Wait() }()
 	var waitErr error
@@ -101,15 +234,24 @@ func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io
 		case waitErr = <-waited:
 			finished = true
 		case received := <-signals:
-			_ = child.Process.Signal(received)
+			if reviewerGroup {
+				stopChild()
+			} else {
+				_ = child.Process.Signal(received)
+			}
 		}
+	}
+	if reviewerGroup {
+		// The direct reviewer may fork an external writer and exit first.
+		// Terminate any remaining members before reporting a terminal result.
+		_ = syscall.Kill(-child.Process.Pid, syscall.SIGKILL)
 	}
 	status, ok := child.ProcessState.Sys().(syscall.WaitStatus)
 	if !ok {
 		return 1, 0, errors.New("pane command wait status is unavailable")
 	}
 	if status.Signaled() {
-		return 128 + int(status.Signal()), status.Signal(), nil
+		return 128 + int(status.Signal()), status.Signal(), record(PaneExitSignalOption, int(status.Signal()))
 	}
 	code := status.ExitStatus()
 	if code < 0 || code > 255 {
@@ -121,30 +263,45 @@ func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io
 			return code, 0, waitErr
 		}
 	}
-	return code, 0, record(code)
+	return code, 0, record(PaneExitStatusOption, code)
 }
 
 // RecordPaneExitStatus preserves a normal child status when tmux leaves its
 // native pane exit fields unset after a rapid exit.
 func RecordPaneExitStatus(ctx context.Context, tmux string, code int) error {
+	return recordPaneExitOption(ctx, tmux, PaneExitStatusOption, code)
+}
+
+func recordPaneExitOption(ctx context.Context, tmux, option string, value int) error {
 	pane := os.Getenv("TMUX_PANE")
 	if len(pane) < 2 || pane[0] != '%' {
 		return errors.New("tmux pane identity is unavailable")
 	}
-	if _, err := strconv.Atoi(pane[1:]); err != nil || code < 0 || code > 255 {
+	if _, err := strconv.Atoi(pane[1:]); err != nil || value < 0 || value > 255 || option == PaneExitSignalOption && (value == 0 || value > 127) {
 		return errors.New("tmux pane exit status binding is invalid")
 	}
-	set := exec.CommandContext(ctx, tmux, "set-option", "-p", "-t", pane, PaneExitStatusOption, strconv.Itoa(code))
+	set := exec.CommandContext(ctx, tmux, "set-option", "-p", "-t", pane, option, strconv.Itoa(value))
 	set.Dir = "/tmp"
 	if output, err := set.CombinedOutput(); err != nil {
-		return fmt.Errorf("record tmux pane exit status: %w: %s", err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("record tmux pane exit result: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
 
 func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, tempDir string, replace bool, afterStart func() error) (int, error) {
+	return captureWorkerBoundAfterStart(ctx, tmux, buffer, resultPath, command, stdout, stderr, tempDir, replace, afterStart, nil)
+}
+
+func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath string, command []string, stdout, stderr io.Writer, tempDir string, replace bool, afterStart func() error, manifest *Manifest) (code int, err error) {
 	if tmux == "" || buffer == "" || len(command) == 0 || command[0] == "" || (resultPath != "" && !filepath.IsAbs(resultPath)) {
 		return 1, errors.New("invalid worker capture request")
+	}
+	var binding ImplementationLaunchBinding
+	if manifest != nil {
+		binding, err = ReadImplementationBinding(*manifest)
+		if err != nil || os.Getenv("TMUX_PANE") != binding.PaneID || os.Getpid() != binding.PanePID {
+			return 1, errors.Join(err, errors.New("bound worker pane identity is unavailable"))
+		}
 	}
 	prompt, err := os.CreateTemp(tempDir, "agent-symphony-prompt-")
 	if err != nil {
@@ -193,13 +350,29 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 	defer holdReader.Close()
 	defer holdWriter.Close()
 
-	args := append([]string{"-c", workerWrapper, "agent-symphony-worker"}, command...)
+	wrapper := workerWrapper
+	if manifest != nil {
+		wrapper = boundWorkerWrapper
+	}
+	args := append([]string{"-c", wrapper, "agent-symphony-worker"}, command...)
 	child := exec.Command("/bin/sh", args...)
+	var gateReader, gateWriter *os.File
+	if manifest != nil {
+		gateReader, gateWriter, err = os.Pipe()
+		if err != nil {
+			return 1, err
+		}
+		defer gateReader.Close()
+		defer gateWriter.Close()
+	}
 	ready := make(chan struct{})
 	var readyOnce sync.Once
 	markReady := func() { readyOnce.Do(func() { close(ready) }) }
 	child.Stdin, child.Stderr, child.Env = prompt, readyWriter{Writer: stderr, ready: markReady}, captureEnvironment(os.Environ())
 	child.ExtraFiles = []*os.File{statusWriter, holdReader}
+	if gateReader != nil {
+		child.ExtraFiles = append(child.ExtraFiles, gateReader)
+	}
 	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var result *os.File
 	resultName := resultPath
@@ -233,6 +406,24 @@ func captureWorkerAfterStart(ctx context.Context, tmux, buffer, resultPath strin
 	}
 	if err := child.Start(); err != nil {
 		return 1, err
+	}
+	if gateReader != nil {
+		_ = gateReader.Close()
+	}
+	if manifest != nil {
+		start, startErr := WriteImplementationGroupStart(*manifest, binding, "capture", child.Process.Pid, child.Process.Pid)
+		if startErr != nil {
+			_ = killProcessGroup(child)
+			_ = child.Wait()
+			return 1, startErr
+		}
+		defer func() { err = errors.Join(err, WriteImplementationGroupDead(*manifest, binding, start)) }()
+		if _, writeErr := io.WriteString(gateWriter, "go\n"); writeErr != nil {
+			_ = killProcessGroup(child)
+			_ = child.Wait()
+			return 1, writeErr
+		}
+		_ = gateWriter.Close()
 	}
 	pipeFD := int(pipe.Fd())
 	if err := syscall.SetNonblock(pipeFD, true); err != nil {

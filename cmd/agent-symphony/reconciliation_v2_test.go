@@ -54,6 +54,35 @@ func TestReconciliationCompleteScopeRecordsUnobservedOwnerAbsence(t *testing.T) 
 	}
 }
 
+func TestReconciliationRefreshesUnchangedAbsenceAfterRestart(t *testing.T) {
+	root := resolvedTempDir(t)
+	issueKey := ownerIssueKey("o/r", 193)
+	state := newRuntimeOwnerState("o/r")
+	state.Epoch, state.Revision = 1, 1
+	state.IssueGenerations[issueKey] = 1
+	state.Observations[issueKey] = reconciliationObservation{
+		Generation: 1, OwnerGeneration: 1, ObservationEpoch: 1, LastCycleID: 1,
+		InputDigest: digestText("previous absence"), Attempts: map[string]reconciliationAttemptObservation{},
+	}
+	owner, err := startTestStateOwner(t, root, state, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	before, err := owner.snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.State.Epoch != 2 || before.State.Observations[issueKey].ObservationEpoch != 1 {
+		t.Fatalf("fixture is not a stale restarted observation: owner=%d observation=%d", before.State.Epoch, before.State.Observations[issueKey].ObservationEpoch)
+	}
+	after := applyReconciliationInput(t, owner, repositoryInput(true))
+	observation := after.State.Observations[issueKey]
+	if observation.Present || observation.ObservationEpoch != after.State.Epoch || observation.Generation != 1 || observation.OwnerGeneration != 1 {
+		t.Fatalf("unchanged absence was not refreshed without changing identity: epoch=%d observation=%#v", after.State.Epoch, observation)
+	}
+}
+
 func TestReconciliationRepositoryScopeIgnoresHistoricalGenerationOnlyKeys(t *testing.T) {
 	root := resolvedTempDir(t)
 	state := newRuntimeOwnerState("o/r")
@@ -213,9 +242,11 @@ func TestReconciliationRejectsStaleEpochAndDiscardsStaleGeneration(t *testing.T)
 	}
 	t.Cleanup(func() { _ = attemptOwner.close(context.Background()) })
 	manifest := ownerTestManifest(t, root, 176, 1, "running")
-	if _, err := attemptOwner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
+	created, err := attemptOwner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	if err != nil {
 		t.Fatal(err)
 	}
+	manifest = created.State.Attempts[ownerAttemptKey("o/r", 176, 1)].Manifest
 	attemptSnapshot, _ := attemptOwner.reconciliationSnapshot(t.Context())
 	attemptInput := repositoryInput(true, issueFact(176, "issue"))
 	attemptInput.Attempts = []internalgithub.RecoveryAttemptFact{attemptFact(176, 1, "stale")}
@@ -297,6 +328,55 @@ func TestReconciliationTombstoneMasksAttempt(t *testing.T) {
 	}
 }
 
+func TestReconciliationCollectionIgnoresConflictingTombstonedAttemptFacts(t *testing.T) {
+	for _, nestedKind := range []string{"active", "terminal"} {
+		t.Run(nestedKind, func(t *testing.T) {
+			root := resolvedTempDir(t)
+			owner, err := startTestStateOwner(t, root, newRuntimeOwnerState("o/r"), func(runtimeOwnerState) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = owner.close(context.Background()) })
+			manifest := ownerTestManifest(t, root, 79, 1, "running")
+			created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+			if err != nil {
+				t.Fatal(err)
+			}
+			issueKey, attemptKey := ownerIssueKey("o/r", 79), ownerAttemptKey("o/r", 79, 1)
+			invalidated, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: "o/r", Issue: 79, Attempt: 1, ExpectedIssueGeneration: created.State.IssueGenerations[issueKey], ExpectedAttemptGeneration: created.State.AttemptGenerations[attemptKey], Action: "dismissed", CleanupPhase: "completed"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := owner.reconciliationSnapshot(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			nested := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 79, Attempt: 1, PR: 90, BaseSHA: manifest.BaseSHA, HeadSHA: strings.Repeat("a", 40), State: "completed"}
+			topLevel := nested
+			topLevel.HeadSHA = strings.Repeat("b", 40)
+			issue := issueFact(79, "stale removed attempt")
+			if nestedKind == "active" {
+				issue.ActiveAttempt = &nested
+			} else {
+				issue.TerminalAttempts = []internalgithub.RecoveryAttemptFact{nested}
+			}
+			input := repositoryInput(true, issue)
+			input.Attempts = []internalgithub.RecoveryAttemptFact{topLevel}
+			collection, err := collectionFromSnapshot(snapshot, input)
+			if err != nil || len(collection.Issues) != 1 || collection.Issues[0].Fact.ActiveAttempt != nil || len(collection.Issues[0].Fact.TerminalAttempts) != 0 || len(collection.Issues[0].Attempts) != 0 {
+				t.Fatalf("tombstoned conflicting facts were not masked before deduplication: collection=%#v err=%v", collection, err)
+			}
+			applied := applyCollection(t, owner, collection)
+			if applied.State.Tombstones[attemptKey].Action != invalidated.State.Tombstones[attemptKey].Action {
+				t.Fatalf("reconciliation changed tombstone: %#v", applied.State.Tombstones[attemptKey])
+			}
+			if _, exists := applied.State.Attempts[attemptKey]; exists || applied.State.Observations[issueKey].Attempts[attemptKey].Present {
+				t.Fatalf("reconciliation resurrected tombstoned attempt: %#v", applied.State)
+			}
+		})
+	}
+}
+
 func TestReconciliationGenerationAdvanceMasksNestedAttemptFacts(t *testing.T) {
 	for _, nested := range []string{"active", "terminal"} {
 		t.Run(nested, func(t *testing.T) {
@@ -307,9 +387,11 @@ func TestReconciliationGenerationAdvanceMasksNestedAttemptFacts(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = owner.close(context.Background()) })
 			manifest := ownerTestManifest(t, root, 177, 1, "running")
-			if _, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest}); err != nil {
+			created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+			if err != nil {
 				t.Fatal(err)
 			}
+			manifest = created.State.Attempts[ownerAttemptKey("o/r", 177, 1)].Manifest
 			snapshot, _ := owner.reconciliationSnapshot(t.Context())
 			remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 177, Attempt: 1, PR: 9, BaseSHA: manifest.BaseSHA, HeadSHA: strings.Repeat("b", 40), State: "completed"}
 			issue := issueFact(177, "stale")
@@ -329,10 +411,42 @@ func TestReconciliationGenerationAdvanceMasksNestedAttemptFacts(t *testing.T) {
 			}
 			request := reconciliationEffectRequest{Action: reconciliationGitHubIssueUpdate, Repository: "o/r", Issue: 177, Attempt: 1, Manifest: &manifest, ObservationGeneration: observation.Generation, ObservationCycleID: observation.LastCycleID, BodyDigest: observation.Fact.BodyDigest, ExecutionDigest: strings.Repeat("a", 64), GitHubIssueUpdate: &githubIssueUpdateEffectRequest{Kind: githubIssueEvidence, HeadSHA: remote.HeadSHA}}
 			identity := stateResultIdentity{Epoch: applied.State.Epoch, SourceRevision: applied.State.Revision, IssueGeneration: 1, AttemptGeneration: 2}
-			if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: identity, Request: request}); !errors.Is(err, errStaleStateResult) {
-				t.Fatalf("stale nested fact admitted an effect: %v", err)
+			before := len(applied.State.Effects)
+			if _, _, err := owner.beginReconciliationEffect(t.Context(), beginReconciliationEffectCommand{Identity: identity, Request: request}); err == nil {
+				t.Fatal("stale nested fact admitted an effect")
+			}
+			after := mustOwnerSnapshot(t, owner)
+			if len(after.State.Effects) != before {
+				t.Fatalf("rejected stale nested fact changed effects: before=%d after=%d", before, len(after.State.Effects))
 			}
 		})
+	}
+}
+
+func TestReconciliationCollectionIncludesIssueAttemptMarkers(t *testing.T) {
+	owner := newReconciliationTestOwner(t)
+	snapshot, err := owner.reconciliationSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 78, Attempt: 2, BaseSHA: strings.Repeat("a", 40), State: "active"}
+	failed := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 78, Attempt: 1, BaseSHA: strings.Repeat("b", 40), State: "failed", Diagnostic: "worker exited"}
+	issue := issueFact(78, "bound attempts")
+	issue.ActiveAttempt = &active
+	issue.TerminalAttempts = []internalgithub.RecoveryAttemptFact{failed}
+
+	collection, err := collectionFromSnapshot(snapshot, repositoryInput(true, issue))
+	if err != nil || len(collection.Issues) != 1 || len(collection.Issues[0].Attempts) != 2 {
+		t.Fatalf("issue markers were not promoted to attempt observations: collection=%#v err=%v", collection, err)
+	}
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{active, failed}
+	if duplicate, err := collectionFromSnapshot(snapshot, input); err != nil || len(duplicate.Issues[0].Attempts) != 2 {
+		t.Fatalf("matching top-level attempt facts were not deduplicated: collection=%#v err=%v", duplicate, err)
+	}
+	input.Attempts[0].BaseSHA = strings.Repeat("c", 40)
+	if _, err := collectionFromSnapshot(snapshot, input); !errors.Is(err, errStateConflict) {
+		t.Fatalf("conflicting attempt facts err=%v", err)
 	}
 }
 

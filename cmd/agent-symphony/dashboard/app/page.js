@@ -7,7 +7,7 @@ import AttemptHistory from "./_components/attempt-history";
 import ProjectNavigation, { ProjectAgentConsole, ProjectHeader, ProjectHealthControl, projectBoard, projectView } from "./_components/project-navigation";
 import { getOrchestratorStatus, getRelease, operatorActionNotice, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
-import { attemptKey } from "./health.mjs";
+import { attemptKey, ownerVersionAtLeast } from "./health.mjs";
 
 const actionDetails = {
   abandon: ["Abandon", "This stops its tmux session and permanently deletes its local worktree, log, and retained attempt record.", "Abandoned"],
@@ -35,6 +35,8 @@ export default function Dashboard() {
   const [projects, setProjects] = useState([]);
   const [selectedRepository, setSelectedRepository] = useState("");
   const closeTerminal = useCallback(() => setTerminal(null), []);
+  const acceptSnapshot = useCallback((next) => setSnapshot((current) => ownerVersionAtLeast(next, current) ? next : current), []);
+  const acceptDashboardState = useCallback((next) => setDashboardState((current) => ownerVersionAtLeast(next, current) ? next : current), []);
 
   useEffect(() => {
     let active = true;
@@ -42,19 +44,20 @@ export default function Dashboard() {
       getRelease().then((value) => { if (active) setRelease(value); });
       try {
         const orchestratorRequest = getOrchestratorStatus();
-        const [response, stateResponse, projectsResponse, orchestratorResult] = await Promise.all([
+        const projectsRequest = fetch("/projects.json", { cache: "no-store" });
+        const [response, orchestratorResult] = await Promise.all([
           fetch("/status.json", { cache: "no-store" }),
-          fetch("/dashboard-state.json", { cache: "no-store" }),
-          fetch("/projects.json", { cache: "no-store" }),
           orchestratorRequest,
         ]);
         if (!response.ok) throw new Error(response.status === 404 ? "Waiting for the first reconciliation" : `Status request failed (${response.status})`);
+        const stateResponse = await fetch("/dashboard-state.json", { cache: "no-store" });
+        const projectsResponse = await projectsRequest;
         if (!stateResponse.ok) throw new Error(`Dashboard state request failed (${stateResponse.status})`);
         if (!projectsResponse.ok) throw new Error(`Project request failed (${projectsResponse.status})`);
         const [next, nextState, nextProjects] = await Promise.all([response.json(), stateResponse.json(), projectsResponse.json()]);
         if (active) {
-          setSnapshot(next);
-          setDashboardState(nextState);
+          acceptSnapshot(next);
+          acceptDashboardState(nextState);
           setProjects(nextProjects.projects ?? []);
           setOrchestratorStatus(orchestratorResult.status);
           setOrchestratorError(orchestratorResult.error);
@@ -71,7 +74,7 @@ export default function Dashboard() {
       active = false;
       clearInterval(timer);
     };
-  }, []);
+  }, [acceptSnapshot, acceptDashboardState]);
 
   const performAction = useCallback(async (action, status) => {
     const [verb, consequence, finished] = actionDetails[action] ?? actionDetails.abandon;
@@ -90,7 +93,7 @@ export default function Dashboard() {
       const notice = await operatorActionNotice(response, verb, finished, status.issue, status.attempt);
       const stateResponse = await fetch("/dashboard-state.json", { cache: "no-store" });
       if (!stateResponse.ok) throw new Error(`${verb} was accepted, but dashboard state could not be refreshed.`);
-      setDashboardState(await stateResponse.json());
+      acceptDashboardState(await stateResponse.json());
       setActionNotice(notice);
     } catch (reason) {
       setActionNotice(reason instanceof Error ? reason.message : `${verb} failed.`);
@@ -98,7 +101,7 @@ export default function Dashboard() {
       setBusy("");
       setWaiting(false);
     }
-  }, []);
+  }, [acceptDashboardState]);
 
   const performOrchestratorAction = useCallback(async (action, status) => {
     const confirmations = {
@@ -138,10 +141,14 @@ export default function Dashboard() {
 
   const view = projectView(projects, selectedRepository, snapshot, dashboardState, error);
   const { remote: remoteProject, snapshot: visibleSnapshot, error: visibleError } = view;
-  const { statuses, historical, counts, title, lanes, health } = projectBoard(view, now);
+  const { statuses, historical, quarantined, counts, title, lanes, health } = projectBoard(view, now);
   const remoteURL = remoteProject?.url || "";
   const openAttemptTerminal = (status, session) => {
     const selected = session ?? { role: "implementation", name: status.session }, route = { implementation: "/terminal", reviewer: "/reviewer/terminal" }[selected.role];
+    if (selected.role === "reviewer") {
+      setActionNotice("Reviewer terminal is unavailable until session identity can be verified safely.");
+      return;
+    }
     if (!remoteURL && route && selected.name) setTerminal({ endpoint: `${route}?${new URLSearchParams({ repository: status.repository, issue: String(status.issue), attempt: String(status.attempt) })}`, title: selected.name, eyebrow: `${selected.mode ?? selected.role} tmux session` });
   };
   const openOrchestratorTerminal = useCallback(() => {
@@ -161,7 +168,7 @@ export default function Dashboard() {
           <h2>{health.title}</h2>
           <p>{health.detail}</p>
         </div>
-        <ProjectHealthControl remote={remoteProject} onNotice={setActionNotice} onSnapshot={setSnapshot} />
+        <ProjectHealthControl remote={remoteProject} onNotice={setActionNotice} onSnapshot={acceptSnapshot} />
       </section>
 
       <ProjectAgentConsole
@@ -174,7 +181,11 @@ export default function Dashboard() {
       />
 
       {actionNotice ? <p className="notice" role="status">{actionNotice}</p> : null}
-      {!visibleError && visibleSnapshot && statuses.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
+      {quarantined.length ? <section className="notice" aria-label="Physical cleanup needs attention">
+        <h2>Physical cleanup needs attention</h2>
+        <ul>{quarantined.map((status) => <li key={attemptKey(status)}>{`#${status.issue} attempt ${status.attempt}: ${status.diagnostic || "Physical cleanup is unverified."}`}</li>)}</ul>
+      </section> : null}
+      {!visibleError && visibleSnapshot && statuses.length === 0 && quarantined.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
 
       <section className="board" aria-label="Issue status board" tabIndex={0} onKeyDown={(event) => {
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;

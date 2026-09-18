@@ -1,6 +1,6 @@
 const staleAfter = 2 * 60 * 1000;
 const attentionStates = new Set(["blocked", "failed", "conflicting", "orphaned"]);
-const historicalStates = new Set(["failed", "orphaned", "cancelled"]);
+const historicalStates = new Set(["failed", "orphaned", "cancelled", "completed"]);
 const laneDefinitions = [
   { id: "queue", title: "Queue", states: ["runnable", "queued"] },
   { id: "in-progress", title: "In progress", states: ["active"] },
@@ -23,9 +23,16 @@ export function attemptKey(status) {
   return `${status.repository}#${status.issue}/${status.attempt}`;
 }
 
-export function partitionAttemptHistory(statuses) {
+export function ownerVersionAtLeast(next, current) {
+  if (!current?.owner_revision) return true;
+  if (!next?.owner_revision) return false;
+  if (next.owner_epoch && current.owner_epoch && next.owner_epoch !== current.owner_epoch) return next.owner_epoch > current.owner_epoch;
+  return next.owner_revision >= current.owner_revision;
+}
+
+export function partitionAttemptHistory(statuses, hidden = []) {
   const latest = new Map();
-  for (const status of statuses) {
+  for (const status of [...statuses, ...hidden]) {
     if (!status.repository || !Number.isInteger(status.issue) || !Number.isInteger(status.attempt)) continue;
     const key = `${status.repository}#${status.issue}`;
     latest.set(key, Math.max(latest.get(key) ?? 0, status.attempt));
@@ -77,7 +84,7 @@ export function overallHealth(snapshot, error, statuses, now) {
     return {
       state: "attention",
       title: "Agent Symphony needs attention",
-      detail: `${attention} visible attempt${attention === 1 ? "" : "s"} need attention. See the status cards below.`,
+      detail: `${attention} attempt${attention === 1 ? "" : "s"} need attention. See the status cards and cleanup notices below.`,
     };
   }
 

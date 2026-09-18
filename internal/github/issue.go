@@ -437,13 +437,14 @@ type Approval struct {
 }
 
 type Snapshot struct {
-	Version       int          `json:"version"`
-	ControlsHash  string       `json:"controls_hash"`
-	BodyHash      string       `json:"body_hash"`
-	Anchor        Anchor       `json:"anchor"`
-	ApprovalID    int64        `json:"approval_id"`
-	ApprovalActor int          `json:"approval_actor"`
-	Provenance    []Provenance `json:"provenance"`
+	Version         int          `json:"version"`
+	OwnerGeneration uint64       `json:"owner_generation,omitempty"`
+	ControlsHash    string       `json:"controls_hash"`
+	BodyHash        string       `json:"body_hash"`
+	Anchor          Anchor       `json:"anchor"`
+	ApprovalID      int64        `json:"approval_id"`
+	ApprovalActor   int          `json:"approval_actor"`
+	Provenance      []Provenance `json:"provenance"`
 }
 
 type TimelineVerifier func(Provenance) bool
@@ -506,6 +507,7 @@ func NewSnapshot(controls Controls, body string, anchor Anchor, approval Approva
 
 func (s Snapshot) Valid(controls Controls, body string, anchor Anchor, approval Approval, provenance []Provenance, command string, authorized func(int) bool, timeline TimelineVerifier) bool {
 	want, err := NewSnapshot(controls, body, anchor, approval, provenance, command, authorized, timeline)
+	want.OwnerGeneration = s.OwnerGeneration
 	return err == nil && hashJSON(s) == hashJSON(want)
 }
 

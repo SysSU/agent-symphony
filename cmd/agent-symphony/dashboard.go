@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -583,7 +582,7 @@ func (s *dashboardServer) readRemovalState() (dashboardRemovalState, error) {
 		want, identityErr := agentruntime.AttemptIdentity(productionAttemptRoot(s.stateRoot), attempt)
 		wantLog := filepath.Join(s.stateRoot, "attempts", internalgithub.RepositoryIdentifier(manifest.Repository), fmt.Sprintf("%d-%d", manifest.Issue, manifest.Attempt), "agent.log")
 		key := fmt.Sprintf("%s#%d/%d", manifest.Repository, manifest.Issue, manifest.Attempt)
-		if identityErr != nil || !preflightObjectID.MatchString(intent.PublishedHead) || manifest.Version != want.Version || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session || manifest.LogPath != wantLog || !slices.Contains([]string{"completed", "failed", "cancelled"}, manifest.State) || seen[key] {
+		if identityErr != nil || !preflightObjectID.MatchString(intent.PublishedHead) || !agentruntime.ValidManifestVersion(manifest) || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session || manifest.LogPath != wantLog || !slices.Contains([]string{"completed", "failed", "cancelled"}, manifest.State) || seen[key] {
 			return dashboardRemovalState{}, errors.New("invalid permanent removal journal")
 		}
 		seen[key] = true
@@ -617,8 +616,34 @@ func githubIssueClosed(ctx context.Context, api internalgithub.API, repository s
 }
 
 func cleanupAttemptReviewResources(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool) error {
+	return cleanupAttemptReviewResourcesProved(ctx, stateRoot, boundary, manifest, remove, nil)
+}
+
+func cleanupAttemptReviewResourcesProved(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool, proofs map[string]reviewerProcessProof) error {
+	return cleanupAttemptReviewResourcesBound(ctx, stateRoot, boundary, manifest, remove, "", proofs)
+}
+
+func cleanupAttemptReviewResourcesBound(ctx context.Context, stateRoot string, boundary boundaryCaller, manifest agentruntime.Manifest, remove bool, activeProfileDigest string, proofs map[string]reviewerProcessProof) error {
 	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
 	snapshotRoot := productionSnapshotRoot(stateRoot)
+	targets := map[string]bool{}
+	if manifest.ReviewTarget != "" || manifest.ReviewSession != "" || manifest.ReviewSnapshot != "" {
+		targets[manifest.ReviewTarget] = true
+	}
+	for target, proof := range proofs {
+		if target == "" || target != proof.Target || proof.Repository != manifest.Repository || proof.Issue != manifest.Issue || proof.Attempt != manifest.Attempt {
+			return errors.New("reviewer cleanup certificate does not match the attempt and target")
+		}
+		targets[target] = true
+	}
+	if _, err := os.Lstat(snapshotRoot); errors.Is(err, os.ErrNotExist) {
+		if len(targets) == 0 || !remove {
+			return nil
+		}
+		if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
+			return err
+		}
+	}
 	if root, err := filepath.EvalSymlinks(snapshotRoot); err == nil {
 		if root != filepath.Clean(snapshotRoot) {
 			return errors.New("review snapshot root is unsafe")
@@ -630,44 +655,77 @@ func cleanupAttemptReviewResources(ctx context.Context, stateRoot string, bounda
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.New("review snapshot root is unsafe")
 	}
-	expectedSnapshot, expectedSession := reviewIdentity(attempt, snapshotRoot)
-	if manifest.ReviewSnapshot != "" && manifest.ReviewSnapshot != expectedSnapshot || manifest.ReviewSession != "" && manifest.ReviewSession != expectedSession || !belowRoot(expectedSnapshot, snapshotRoot) {
-		return errors.New("persisted reviewer cleanup identity mismatch")
+	orderedTargets := make([]string, 0, len(targets))
+	for target := range targets {
+		orderedTargets = append(orderedTargets, target)
 	}
-	if info, err := os.Lstat(expectedSnapshot); err == nil {
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return errors.New("review snapshot cleanup path is invalid")
+	slices.Sort(orderedTargets)
+	expectedTargets := make(map[string]string, len(orderedTargets))
+	for _, target := range orderedTargets {
+		runID := manifest.ReviewRunID
+		if proof, ok := proofs[target]; ok {
+			runID = proof.RunID
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+		expectedSnapshot, _ := persistedReviewIdentity(attempt, snapshotRoot, target, runID)
+		expectedTargets[expectedSnapshot] = target
 	}
+	baseSnapshot, _ := reviewIdentity(attempt, snapshotRoot)
 	entries, err := os.ReadDir(snapshotRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		entries = nil
-	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err != nil {
 		return err
 	}
-	prefix := filepath.Base(expectedSnapshot) + ".result-"
-	resultPaths := make([]string, 0)
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, prefix) || len(name) != len(prefix)+16 {
+		reserved := name == filepath.Base(baseSnapshot) || strings.HasPrefix(name, filepath.Base(baseSnapshot)+"-") || strings.HasPrefix(name, filepath.Base(baseSnapshot)+".result-")
+		if !reserved {
 			continue
 		}
-		if _, err := hex.DecodeString(strings.TrimPrefix(name, prefix)); err != nil || entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() {
-			return errors.New("review result cleanup path is invalid")
+		path := filepath.Join(snapshotRoot, name)
+		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() {
+			return errors.New("review snapshot cleanup path is invalid")
 		}
-		resultPaths = append(resultPaths, filepath.Join(snapshotRoot, name))
+		if _, known := expectedTargets[path]; !known && remove {
+			return errors.New("review snapshot has no owner process-death certificate")
+		}
 	}
-	if !remove {
-		return nil
-	}
-	if err := cleanupReviewResources(ctx, boundary, nil, attempt, manifest.ReviewHead, manifest.ReviewTarget, expectedSnapshot, expectedSession, snapshotRoot); err != nil {
-		return err
-	}
-	for _, path := range resultPaths {
-		if err := os.RemoveAll(path); err != nil {
+	for _, target := range orderedTargets {
+		runID := manifest.ReviewRunID
+		if proof, ok := proofs[target]; ok {
+			runID = proof.RunID
+		}
+		expectedSnapshot, expectedSession := persistedReviewIdentity(attempt, snapshotRoot, target, runID)
+		if !belowRoot(expectedSnapshot, snapshotRoot) {
+			return errors.New("persisted reviewer cleanup identity mismatch")
+		}
+		if target == manifest.ReviewTarget && (manifest.ReviewSnapshot != "" && manifest.ReviewSnapshot != expectedSnapshot || manifest.ReviewSession != "" && manifest.ReviewSession != expectedSession) {
+			return errors.New("persisted reviewer cleanup identity mismatch")
+		}
+		snapshotExists := false
+		if info, err := os.Lstat(expectedSnapshot); err == nil {
+			snapshotExists = true
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return errors.New("review snapshot cleanup path is invalid")
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if !remove {
+			continue
+		}
+		proof, certified := proofs[target]
+		if certified {
+			if !reviewerCleanupAuthorized(proof, activeProfileDigest) {
+				return errors.New("reviewer cleanup certificate is missing")
+			}
+			if err := cleanupBoundReviewResources(ctx, boundary, nil, attempt, manifest.ReviewHead, target, runID, expectedSnapshot, expectedSession, snapshotRoot, activeProfileDigest, proof); err != nil {
+				return err
+			}
+			continue
+		}
+		if snapshotExists || target == manifest.ReviewTarget && (manifest.ReviewSession != "" || manifest.ReviewSnapshot != "") {
+			return errors.New("unbound reviewer resources cannot be cleaned safely")
+		}
+		if err := cleanupReviewResources(ctx, boundary, nil, attempt, manifest.ReviewHead, target, runID, expectedSnapshot, expectedSession, snapshotRoot); err != nil {
 			return err
 		}
 	}
@@ -717,7 +775,11 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 		result, err = s.orchestrator.Rebuild(r.Context())
 	case "investigate":
 		orchestratorStatus, statusErr := s.orchestrator.Status(r.Context())
-		if statusErr != nil || !orchestratorStatus.Enabled || orchestratorStatus.State != "running" {
+		if statusErr != nil {
+			http.Error(w, "orchestrator status is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if !orchestratorStatus.Enabled || orchestratorStatus.State != "running" {
 			http.Error(w, "orchestrator is not running", http.StatusConflict)
 			return
 		}
@@ -729,7 +791,14 @@ func (s *dashboardServer) serveOrchestratorAction(w http.ResponseWriter, r *http
 		result, err = s.orchestrator.Investigate(r.Context(), status.Issue, status.Attempt)
 	}
 	if err != nil {
-		http.Error(w, "orchestrator action was refused", http.StatusConflict)
+		switch {
+		case errors.Is(err, orchestratoragent.ErrPrecondition):
+			http.Error(w, internalgithub.Redact(err.Error()), http.StatusConflict)
+		case errors.Is(err, orchestratoragent.ErrSupervisorStopped), errors.Is(err, orchestratoragent.ErrSupervisorBusy), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			http.Error(w, "orchestrator is temporarily unavailable", http.StatusServiceUnavailable)
+		default:
+			http.Error(w, "orchestrator action failed", http.StatusInternalServerError)
+		}
 		return
 	}
 	result.Diagnostic = internalgithub.Redact(result.Diagnostic)
@@ -806,6 +875,10 @@ func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request, 
 	}
 	if !sameDashboardOrigin(r) {
 		http.Error(w, "terminal requires the dashboard origin", http.StatusForbidden)
+		return
+	}
+	if role == agentruntime.SessionRoleReviewer {
+		http.Error(w, "Reviewer terminal is unavailable until session identity can be verified safely.", http.StatusConflict)
 		return
 	}
 	query := r.URL.Query()
@@ -937,7 +1010,11 @@ func (s *dashboardServer) projectedStatus(issue, attempt int) (orchestrator.Reco
 		seen := map[string]bool{}
 		for _, session := range status.Sessions {
 			want, sessionErr := agentruntime.AttemptSessionName(session.Role, status.Repository, issue, attempt)
-			metadataValid := session.Role != agentruntime.SessionRoleReviewer && session.Mode == "" && session.Target == "" || session.Role == agentruntime.SessionRoleReviewer && agentruntime.ValidReviewTarget(session.Mode, session.Target, status.Repository, status.Issue)
+			metadataValid := session.Role != agentruntime.SessionRoleReviewer && session.Mode == "" && session.Target == "" && session.RunID == ""
+			if session.Role == agentruntime.SessionRoleReviewer {
+				want, sessionErr = agentruntime.ReviewRunSessionName(status.Repository, issue, attempt, session.Target, session.RunID)
+				metadataValid = agentruntime.ValidReviewTarget(session.Mode, session.Target, status.Repository, status.Issue)
+			}
 			if sessionErr != nil || session.Name != want || session.State == "" || !metadataValid || seen[session.Role] {
 				validSessions = false
 				break
@@ -965,18 +1042,22 @@ func (s *dashboardServer) projectedSession(issue, attempt int, role string) (orc
 	if err != nil {
 		return orchestrator.AttemptSession{}, err
 	}
-	want, err := agentruntime.AttemptSessionName(role, status.Repository, issue, attempt)
-	if err != nil {
-		return orchestrator.AttemptSession{}, err
-	}
 	if len(status.Sessions) == 0 && role == agentruntime.SessionRoleImplementation {
 		return orchestrator.AttemptSession{}, errors.New("attempt session is not projected as current")
 	}
 	index := slices.IndexFunc(status.Sessions, func(session orchestrator.AttemptSession) bool { return session.Role == role })
-	if index < 0 || status.Sessions[index].Name != want || status.Sessions[index].State != "running" || !status.Sessions[index].Current {
+	if index < 0 {
 		return orchestrator.AttemptSession{}, errors.New("attempt session not found")
 	}
-	return status.Sessions[index], nil
+	session := status.Sessions[index]
+	want, err := agentruntime.AttemptSessionName(role, status.Repository, issue, attempt)
+	if role == agentruntime.SessionRoleReviewer {
+		want, err = agentruntime.ReviewRunSessionName(status.Repository, issue, attempt, session.Target, session.RunID)
+	}
+	if err != nil || session.Name != want || session.State != "running" || !session.Current {
+		return orchestrator.AttemptSession{}, errors.New("attempt session not found")
+	}
+	return session, nil
 }
 
 func (s *dashboardServer) terminalStatus(issue, attempt int) (orchestrator.RecoveryStatus, error) {

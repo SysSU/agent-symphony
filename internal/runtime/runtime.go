@@ -4,7 +4,9 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,10 +15,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	stdruntime "runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
@@ -25,15 +29,25 @@ import (
 // WorkerResultMaxBytes is the hard implementation stdout capture ceiling.
 const WorkerResultMaxBytes = 64 << 10
 
+// ManifestVersion2 identifies manifests with a durable implementation launch binding.
+const ManifestVersion2 = boundManifestVersion
+
 const (
 	manifestVersion         = 1
+	boundManifestVersion    = 2
 	maxResourceName         = 64
 	maxPathLength           = 4096
 	historyLimit            = "5000"
-	workerResultSuffix      = ".result.json"
+	workerPrivateDir        = ".agent-symphony"
+	workerResultName        = "result.json"
+	workerStatusName        = "status.json"
 	WorkerResultEnvironment = "AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
+	WorkerStatusEnvironment = "AGENT_SYMPHONY_STATUS_REQUEST"
+	WorkerGenerationEnv     = "AGENT_SYMPHONY_WORKER_GENERATION"
+	WorkerLaunchIDEnv       = "AGENT_SYMPHONY_WORKER_LAUNCH_ID"
 	PaneExitStatusOption    = "@agent-symphony-exit-status"
-	PaneStatusFormat        = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{@agent-symphony-exit-status}"
+	PaneExitSignalOption    = "@agent-symphony-exit-signal"
+	PaneStatusFormat        = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{@agent-symphony-exit-status}|#{@agent-symphony-exit-signal}"
 )
 
 const (
@@ -141,6 +155,8 @@ type Attempt struct {
 
 type Manifest struct {
 	Version             int       `json:"version"`
+	LaunchToken         string    `json:"launch_token,omitempty"`
+	LaunchID            string    `json:"launch_id,omitempty"`
 	Repository          string    `json:"repository"`
 	Issue               int       `json:"issue"`
 	Attempt             int       `json:"attempt"`
@@ -155,8 +171,12 @@ type Manifest struct {
 	ImplementationAgent string    `json:"implementation_agent,omitempty"`
 	ReviewAgent         string    `json:"review_agent,omitempty"`
 	ReviewState         string    `json:"review_state,omitempty"`
+	ReviewDiagnostic    string    `json:"review_diagnostic,omitempty"`
+	ReviewInvalidated   bool      `json:"review_invalidated,omitempty"`
 	ReviewMode          string    `json:"review_mode,omitempty"`
 	ReviewTarget        string    `json:"review_target,omitempty"`
+	ReviewRunID         string    `json:"review_run_id,omitempty"`
+	ReviewRunCleaned    bool      `json:"review_run_cleaned,omitempty"`
 	ReviewBase          string    `json:"review_base,omitempty"`
 	ReviewHead          string    `json:"review_head,omitempty"`
 	ReviewSnapshot      string    `json:"review_snapshot,omitempty"`
@@ -164,8 +184,62 @@ type Manifest struct {
 	ReviewFindings      []string  `json:"review_findings,omitempty"`
 	ReviewHandoffQueued bool      `json:"review_handoff_queued,omitempty"`
 	ReviewHandoffAck    bool      `json:"review_handoff_ack,omitempty"`
+	WorkerStatus        string    `json:"worker_status,omitempty"`
+	WorkerStatusReason  string    `json:"worker_status_reason,omitempty"`
+	WorkerStatusSeq     uint64    `json:"worker_status_sequence,omitempty"`
+	WorkerStatusApplied uint64    `json:"worker_status_applied_sequence,omitempty"`
+	WorkerGeneration    uint64    `json:"worker_generation,omitempty"`
+	WorkerProfileDigest string    `json:"worker_profile_digest,omitempty"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+}
+
+type workerStatusRequest struct {
+	Type       string `json:"type"`
+	Generation uint64 `json:"generation"`
+	LaunchID   string `json:"launch_id"`
+	Sequence   uint64 `json:"sequence"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason"`
+}
+
+func observeWorkerStatus(manifest Manifest, generation uint64) (Manifest, error) {
+	path := StatusPath(manifest.Worktree)
+	listed, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return manifest, nil
+	}
+	if err != nil || !listed.Mode().IsRegular() || listed.Mode()&os.ModeSymlink != 0 || listed.Mode().Perm()&0o077 != 0 || listed.Size() < 1 || listed.Size() > WorkerResultMaxBytes {
+		return manifest, errors.New("worker status request is not a bounded private regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return manifest, errors.New("worker status request is unavailable")
+	}
+	opened, statErr := file.Stat()
+	body, readErr := io.ReadAll(io.LimitReader(file, WorkerResultMaxBytes+1))
+	closeErr := file.Close()
+	current, finalErr := os.Lstat(path)
+	if statErr != nil || readErr != nil || closeErr != nil || finalErr != nil || len(body) > WorkerResultMaxBytes || !os.SameFile(listed, opened) || !os.SameFile(opened, current) || opened.Size() != current.Size() || !opened.ModTime().Equal(current.ModTime()) {
+		return manifest, errors.New("worker status request changed while reading")
+	}
+	var request workerStatusRequest
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&request) != nil || decoder.Decode(&struct{}{}) != io.EOF || request.Type != "agent-symphony-status-v1" {
+		return manifest, errors.New("worker status request is invalid or stale")
+	}
+	if request.Generation != generation || request.LaunchID != manifest.LaunchID {
+		return manifest, nil
+	}
+	if request.Sequence == 0 || request.Sequence > 1<<53 || !slices.Contains([]string{"needs-attention", "clear"}, request.Status) || strings.TrimSpace(request.Reason) == "" || len(request.Reason) > 1024 || strings.ContainsRune(request.Reason, 0) {
+		return manifest, errors.New("worker status request is invalid or stale")
+	}
+	if request.Sequence <= manifest.WorkerStatusSeq {
+		return manifest, nil
+	}
+	manifest.WorkerStatus, manifest.WorkerStatusReason, manifest.WorkerStatusSeq = request.Status, strings.TrimSpace(request.Reason), request.Sequence
+	return manifest, nil
 }
 
 func (r *Runtime) RecordReview(attempt Attempt, state, mode, target, base, head, snapshot, session string) (Manifest, error) {
@@ -175,7 +249,12 @@ func (r *Runtime) RecordReview(attempt Attempt, state, mode, target, base, head,
 	if err != nil {
 		return Manifest{}, err
 	}
+	if manifest.Version == boundManifestVersion {
+		return Manifest{}, errors.New("direct bound review mutation is unavailable; submit an owner Review effect")
+	}
 	manifest.ReviewState, manifest.ReviewMode, manifest.ReviewTarget = state, mode, target
+	manifest.ReviewRunID = ""
+	manifest.ReviewRunCleaned = false
 	manifest.ReviewBase, manifest.ReviewHead, manifest.ReviewSnapshot, manifest.ReviewSession = base, head, snapshot, session
 	if state != "findings-queued" {
 		manifest.ReviewFindings, manifest.ReviewHandoffQueued, manifest.ReviewHandoffAck = nil, false, false
@@ -190,6 +269,9 @@ func (r *Runtime) RecordReviewFindings(attempt Attempt, head string, findings []
 	manifest, err := r.readManifest(attempt)
 	if err != nil {
 		return Manifest{}, err
+	}
+	if manifest.Version == boundManifestVersion {
+		return Manifest{}, errors.New("direct bound review mutation is unavailable; submit an owner Review effect")
 	}
 	if manifest.ReviewHandoffQueued {
 		if manifest.ReviewHead != head || !slices.Equal(manifest.ReviewFindings, findings) {
@@ -208,60 +290,25 @@ func (r *Runtime) RecordReviewFindings(attempt Attempt, head string, findings []
 
 // ResumeHandoff refreshes source refs and returns a completed attempt to the
 // normal monitored worker lifecycle without granting the worker a remote.
-func (r *Runtime) ResumeHandoff(ctx context.Context, attempt Attempt) (Manifest, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.canonicalizeStateRoot(); err != nil {
-		return Manifest{}, err
-	}
-	manifest, err := r.readManifest(attempt)
-	if err != nil {
-		return Manifest{}, err
-	}
-	if err := r.validateManifest(attempt, manifest); err != nil {
-		return Manifest{}, err
-	}
-	if manifest.State != "completed" && manifest.State != "running" {
-		return Manifest{}, fmt.Errorf("cannot resume handoff from %s attempt", manifest.State)
-	}
-	if manifest.State == "completed" {
-		if strings.TrimSpace(r.Source) == "" {
-			return Manifest{}, errors.New("handoff source bundle is required")
-		}
-		if _, err := r.run(ctx, r.git(), []string{"-C", manifest.Worktree, "fetch", "--no-tags", r.Source, "+refs/heads/*:refs/remotes/agent-symphony/*"}, "", nil, nil); err != nil {
-			return Manifest{}, fmt.Errorf("refresh handoff source refs: %w", err)
-		}
-	}
-	if attempt.Eligible != nil && !attempt.Eligible() {
-		return Manifest{}, errors.New("attempt is no longer eligible")
-	}
-	live, err := r.session(ctx, manifest.Session)
-	if err != nil {
-		return Manifest{}, err
-	}
-	if !live {
-		env, err := r.agentEnvironment(manifest.Repository)
-		if err != nil {
-			return Manifest{}, err
-		}
-		if err := r.startSession(ctx, manifest, env); err != nil {
-			return Manifest{}, err
-		}
-	}
-	manifest.State, manifest.Diagnostic, manifest.UpdatedAt = "running", "", time.Now().UTC()
-	return manifest, r.writeManifest(attempt, manifest)
+func (r *Runtime) ResumeHandoff(context.Context, Attempt) (Manifest, error) {
+	return Manifest{}, errors.New("direct implementation relaunch is unavailable; submit an owner Handoff effect")
 }
 
 type Runtime struct {
-	Root      string
-	StateRoot string
-	Source    string
-	Git       string
-	Tmux      string
-	Helper    string
-	Runner    Runner
-	AllowEnv  []string
-	StopWait  time.Duration
+	Root       string
+	StateRoot  string
+	Source     string
+	Git        string
+	Tmux       string
+	Helper     string
+	Runner     Runner
+	AllowEnv   []string
+	WorkerHome string
+	// WorkerProfileDigest binds a launched worker to the owner-approved
+	// confinement configuration. An empty value preserves fail-closed legacy
+	// behavior for manifests created before confinement was enforced.
+	WorkerProfileDigest string
+	StopWait            time.Duration
 	// VerifyWorker verifies execution through the provisioned agent-host identity.
 	// agent-host supplies the target account HOME; the coordinator never does.
 	VerifyWorker func(context.Context) error
@@ -332,11 +379,48 @@ func AttemptSessionName(role, repository string, issue, attempt int) (string, er
 	return name, nil
 }
 
-func ResultPath(worktree string) string { return worktree + workerResultSuffix }
+// ReviewSessionName binds a reviewer tmux name to the full attempt and target
+// identity while staying below tmux's resource-name limit.
+func ReviewSessionName(repository string, issue, attempt int, target string) (string, error) {
+	base, err := AttemptSessionName(SessionRoleReviewer, repository, issue, attempt)
+	if err != nil || strings.TrimSpace(target) == "" || len(target) > 512 || strings.ContainsAny(target, "\x00\r\n") {
+		return "", errors.New("invalid target-bound reviewer session identity")
+	}
+	digest := sha256.Sum256([]byte(base + "\x00" + target))
+	return "as-r-" + hex.EncodeToString(digest[:24]), nil
+}
+
+// ReviewRunSessionName binds a reviewer tmux name to one never-reused owner run.
+func ReviewRunSessionName(repository string, issue, attempt int, target, runID string) (string, error) {
+	base, err := AttemptSessionName(SessionRoleReviewer, repository, issue, attempt)
+	if err != nil || strings.TrimSpace(target) == "" || len(target) > 4096 || strings.ContainsAny(target, "\x00\r\n") || len(runID) != 64 {
+		return "", errors.New("invalid reviewer run identity")
+	}
+	if _, err := hex.DecodeString(runID); err != nil {
+		return "", errors.New("invalid reviewer run identity")
+	}
+	digest := sha256.Sum256([]byte(base + "\x00target\x00" + target + "\x00run\x00" + runID))
+	return "as-r-" + hex.EncodeToString(digest[:24]), nil
+}
+
+func ResultPath(worktree string) string {
+	return filepath.Join(worktree, workerPrivateDir, workerResultName)
+}
+
+func StatusPath(worktree string) string {
+	return filepath.Join(worktree, workerPrivateDir, workerStatusName)
+}
+
+func PrivatePath(worktree string) string { return filepath.Join(worktree, workerPrivateDir) }
 
 // PromptCommand runs command through the descriptor-owning capture helper.
 func PromptCommand(helper, tmux, buffer, resultPath string, command []string) []string {
 	return append([]string{helper, "worker-capture", tmux, buffer, resultPath, "--"}, command...)
+}
+
+// BoundPromptCommand runs v2 capture directly as the bound tmux pane process.
+func BoundPromptCommand(helper, tmux, buffer, resultPath string, manifest Manifest, command []string) []string {
+	return append([]string{helper, "worker-capture-bound", tmux, buffer, resultPath, manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, manifest.LaunchID, "--"}, command...)
 }
 
 // HandoffPromptCommand records and signals worker-owned launch after the
@@ -345,140 +429,22 @@ func HandoffPromptCommand(helper, tmux, buffer, resultPath, launchedPath, recipi
 	return append([]string{helper, "worker-capture-handoff-ready", tmux, buffer, resultPath, launchedPath, recipient, signal, "--"}, command...)
 }
 
+func BoundHandoffPromptCommand(helper, tmux, buffer, resultPath, launchedPath, recipient, signal string, manifest Manifest, command []string) []string {
+	return append([]string{helper, "worker-capture-handoff-ready-bound", tmux, buffer, resultPath, launchedPath, recipient, signal, manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, manifest.LaunchID, "--"}, command...)
+}
+
 // PaneExitStatusCommand preserves a command's exit status in the pane before
 // the pane process exits. tmux 3.4 can otherwise leave pane_dead_status blank.
 func PaneExitStatusCommand(helper, tmux string, command []string) []string {
 	return append([]string{helper, "pane-exit-status", tmux, "--"}, command...)
 }
 
-func (r *Runtime) PrepareAndStart(ctx context.Context, attempt Attempt) (Manifest, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.canonicalizeStateRoot(); err != nil {
-		return Manifest{}, err
-	}
-	if r.VerifyWorker == nil {
-		return Manifest{}, errors.New("worker identity verification hook is required")
-	}
-	if err := r.VerifyWorker(ctx); err != nil {
-		return Manifest{}, fmt.Errorf("verify worker identity: %w", err)
-	}
-	if len(attempt.Command) == 0 || strings.TrimSpace(attempt.Command[0]) == "" {
-		return Manifest{}, errors.New("attempt command is required")
-	}
-	if attempt.Interactive && strings.TrimSpace(attempt.Context) == "" {
-		return Manifest{}, errors.New("interactive attempt context is required")
-	}
-	if attempt.Context != "" && !attempt.Interactive && strings.TrimSpace(r.Helper) == "" {
-		return Manifest{}, errors.New("attempt capture helper is required")
-	}
-	env, err := r.agentEnvironment(attempt.Repository, attempt.Env...)
-	if err != nil {
-		return Manifest{}, fmt.Errorf("build worker environment: %w", err)
-	}
-	manifest, err := r.identify(attempt)
-	if err != nil {
-		return Manifest{}, err
-	}
-	if attempt.Eligible != nil && !attempt.Eligible() {
-		return Manifest{}, fmt.Errorf("attempt is no longer eligible")
-	}
-	if existing, err := r.readManifest(attempt); err == nil {
-		return existing, fmt.Errorf("attempt resources already exist")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return Manifest{}, err
-	}
-	if err := r.rejectCaseCollision(attempt.Repository); err != nil {
-		return Manifest{}, err
-	}
-	if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
-		return Manifest{}, fmt.Errorf("worktree already exists: %s", manifest.Worktree)
-	}
-	if _, err := os.Lstat(ResultPath(manifest.Worktree)); err == nil {
-		return Manifest{}, fmt.Errorf("worker result already exists: %s", ResultPath(manifest.Worktree))
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return Manifest{}, err
-	}
-	if live, err := r.session(ctx, manifest.Session); err != nil {
-		return Manifest{}, err
-	} else if live {
-		return Manifest{}, fmt.Errorf("tmux session already exists: %s", manifest.Session)
-	}
-	if err := os.MkdirAll(filepath.Dir(manifest.Worktree), 0o770); err != nil {
-		return Manifest{}, err
-	}
-	if err := mkdirBelow(r.StateRoot, filepath.Dir(r.manifestPath(attempt)), 0o700); err != nil {
-		return Manifest{}, err
-	}
-	manifest.State = "preparing"
-	if err := r.writeManifest(attempt, manifest); err != nil {
-		return Manifest{}, err
-	}
-	fail := func(stage string, cause error) (Manifest, error) {
-		manifest.State, manifest.Diagnostic, manifest.UpdatedAt = "failed", stage+": "+diagnostic(cause), time.Now().UTC()
-		_ = r.writeManifest(attempt, manifest)
-		return manifest, fmt.Errorf("%s: %w", stage, cause)
-	}
-	failStop := func(stage string, cause error) (Manifest, error) {
-		return fail(stage, errors.Join(cause, r.stop(ctx, manifest.Session)))
-	}
-	if _, err := r.run(ctx, r.git(), []string{"clone", "--no-local", "--no-checkout", r.Source, manifest.Worktree}, "", nil, nil); err != nil {
-		return fail("clone", err)
-	}
-	git := func(args ...string) error {
-		_, err := r.run(ctx, r.git(), append([]string{"-C", manifest.Worktree}, args...), "", nil, nil)
-		return err
-	}
-	if err := git("checkout", "--detach", attempt.BaseSHA); err != nil {
-		return fail("checkout base", err)
-	}
-	if err := git("switch", "-c", manifest.Branch); err != nil {
-		return fail("create branch", err)
-	}
-	if err := git("remote", "remove", "origin"); err != nil {
-		return fail("remove remote", err)
-	}
-	if err := git("config", "--local", "credential.helper", ""); err != nil {
-		return fail("disable credentials", err)
-	}
-	if attempt.Eligible != nil && !attempt.Eligible() {
-		manifest.State, manifest.Diagnostic = "cancelled", "attempt became ineligible before launch"
-		_ = r.writeManifest(attempt, manifest)
-		return manifest, fmt.Errorf("attempt became ineligible before launch")
-	}
-	if attempt.Interactive {
-		result, err := os.OpenFile(ResultPath(manifest.Worktree), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if err != nil {
-			return fail("prepare worker result", err)
-		}
-		if err := result.Close(); err != nil {
-			return fail("prepare worker result", err)
-		}
-		env = append(env, WorkerResultEnvironment+"="+ResultPath(manifest.Worktree))
-	}
-	if err := r.startSession(ctx, manifest, env); err != nil {
-		return failStop("launch tmux", err)
-	}
-	target := PaneTarget(manifest.Session)
-	if attempt.Context != "" && !attempt.Interactive {
-		if _, err := r.run(ctx, r.tmux(), []string{"load-buffer", "-b", manifest.Session, "-"}, "", []string{}, strings.NewReader(attempt.Context)); err != nil {
-			return failStop("load agent context", err)
-		}
-	}
-	command := slices.Clone(attempt.Command)
-	if attempt.Interactive {
-		command = append(command, attempt.Context)
-	} else if attempt.Context != "" {
-		command = PromptCommand(r.Helper, r.tmux(), manifest.Session, ResultPath(manifest.Worktree), command)
-	}
-	if r.Helper != "" {
-		command = PaneExitStatusCommand(r.Helper, r.tmux(), command)
-	}
-	if _, err := r.run(ctx, r.tmux(), append([]string{"respawn-pane", "-k", "-t", target, "--"}, command...), "", []string{}, nil); err != nil {
-		return failStop("start agent", err)
-	}
-	manifest.State, manifest.UpdatedAt = "running", time.Now().UTC()
-	return manifest, r.writeManifest(attempt, manifest)
+func BoundPaneExitStatusCommand(helper, tmux string, manifest Manifest, command []string) []string {
+	return append([]string{helper, "pane-exit-status-bound", tmux, manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, manifest.LaunchID, "--"}, command...)
+}
+
+func (r *Runtime) PrepareAndStart(context.Context, Attempt) (Manifest, error) {
+	return Manifest{}, errors.New("direct implementation launch is unavailable; submit an owner Start effect")
 }
 
 func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error) {
@@ -491,13 +457,34 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 	if err != nil {
 		return Manifest{}, err
 	}
+	if manifest.Version == boundManifestVersion {
+		return Manifest{}, errors.New("direct bound monitor is unavailable; submit an owner Monitor effect")
+	}
 	if err := r.validateManifest(attempt, manifest); err != nil {
 		return Manifest{}, err
 	}
 	if attempt.Eligible != nil && !attempt.Eligible() {
 		return r.cancel(ctx, attempt, manifest, "attempt is no longer eligible")
 	}
-	result, runErr := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", PaneTarget(manifest.Session), PaneStatusFormat}, "", []string{}, nil)
+	if manifest.Version != boundManifestVersion {
+		live, err := r.session(ctx, manifest.Session)
+		if err != nil {
+			return manifest, err
+		}
+		if !live {
+			return manifest, nil // Absence is safe to observe; no completed state is inferred.
+		}
+		return manifest, errors.New("legacy implementation pane has no durable observation identity")
+	}
+	var result Result
+	var runErr error
+	if manifest.Version == boundManifestVersion {
+		result, runErr = r.observeBoundCommand(ctx, manifest, func(pane ImplementationPane) []string {
+			return []string{"display-message", "-p", "-t", pane.PaneID, PaneStatusFormat}
+		})
+	} else {
+		result, runErr = r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", PaneTarget(manifest.Session), PaneStatusFormat}, "", []string{}, nil)
+	}
 	if runErr != nil {
 		return manifest, fmt.Errorf("observe tmux session: %w", runErr)
 	}
@@ -510,7 +497,15 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 	}
 	if pane.Dead {
 		env, envErr := r.agentEnvironment(manifest.Repository, attempt.Env...)
-		capture, captureErr := r.run(ctx, r.tmux(), []string{"capture-pane", "-p", "-S", "-", "-t", PaneTarget(manifest.Session)}, "", []string{}, nil)
+		var capture Result
+		var captureErr error
+		if manifest.Version == boundManifestVersion {
+			capture, captureErr = r.observeBoundCommand(ctx, manifest, func(pane ImplementationPane) []string {
+				return []string{"capture-pane", "-p", "-S", "-", "-t", pane.PaneID}
+			})
+		} else {
+			capture, captureErr = r.run(ctx, r.tmux(), []string{"capture-pane", "-p", "-S", "-", "-t", PaneTarget(manifest.Session)}, "", []string{}, nil)
+		}
 		if envErr != nil {
 			captureErr = errors.Join(captureErr, envErr)
 		} else if captureErr != nil {
@@ -546,20 +541,139 @@ func (r *Runtime) Monitor(ctx context.Context, attempt Attempt) (Manifest, error
 	return manifest, r.writeManifest(attempt, manifest)
 }
 func (r *Runtime) agentEnvironment(repository string, extra ...string) ([]string, error) {
-	return internalgithub.AgentEnvironmentWith(append(append(os.Environ(), extra...), "GH_REPO="+repository), r.AllowEnv...)
+	environment := append(os.Environ(), extra...)
+	if r.WorkerHome != "" {
+		environment = append(environment, "CODEX_HOME="+r.WorkerHome)
+	}
+	return internalgithub.WorkerEnvironmentWith(environment, r.AllowEnv...)
 }
 
-func (r *Runtime) startSession(ctx context.Context, manifest Manifest, env []string) error {
+func workspaceEnvironment(environment []string, manifest Manifest, generation uint64) ([]string, error) {
+	for _, name := range []string{".agents", ".codex"} {
+		path := filepath.Join(manifest.Worktree, name)
+		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("prepare denied worker configuration path: %w", err)
+		}
+	}
+	private := PrivatePath(manifest.Worktree)
+	if err := os.Mkdir(private, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, fmt.Errorf("prepare worker-private directory: %w", err)
+	}
+	info, err := os.Lstat(private)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return nil, errors.New("worker-private directory is unsafe")
+	}
+	paths := map[string]string{
+		"TMPDIR":           filepath.Join(private, "tmp"),
+		"XDG_CACHE_HOME":   filepath.Join(private, "cache"),
+		"GOCACHE":          filepath.Join(private, "go-cache"),
+		"npm_config_cache": filepath.Join(private, "npm-cache"),
+	}
+	for _, path := range paths {
+		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("prepare worker-private cache: %w", err)
+		}
+	}
+	managed := map[string]bool{}
+	for name := range paths {
+		managed[name] = true
+	}
+	managed[WorkerStatusEnvironment], managed[WorkerGenerationEnv], managed[WorkerLaunchIDEnv] = true, true, true
+	filtered := environment[:0]
+	for _, entry := range environment {
+		name, _, _ := strings.Cut(entry, "=")
+		if !managed[name] && !internalgithub.GitHubCLIEnvironmentVariable(name) {
+			filtered = append(filtered, entry)
+		}
+	}
+	for name, path := range paths {
+		filtered = append(filtered, name+"="+path)
+	}
+	return append(filtered,
+		WorkerStatusEnvironment+"="+StatusPath(manifest.Worktree),
+		WorkerGenerationEnv+"="+strconv.FormatUint(generation, 10),
+		WorkerLaunchIDEnv+"="+manifest.LaunchID,
+	), nil
+}
+
+func (r *Runtime) startSession(ctx context.Context, manifest Manifest, env []string, effectID string, command []string) error {
+	if manifest.Version != boundManifestVersion || !ValidManifestVersion(manifest) {
+		return errors.New("implementation launch requires owner-committed token")
+	}
+	if strings.TrimSpace(r.Helper) == "" {
+		return errors.New("implementation gate helper is required")
+	}
 	env = append(slices.Clone(env), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
-	if _, err := r.run(ctx, r.tmux(), TmuxNewSessionArgs(manifest.Session, manifest.Worktree, env), "", env, nil); err != nil {
-		return err
+	args := TmuxNewSessionArgs(manifest.Session, manifest.Worktree, env)
+	args = slices.Insert(args, 7, "-P", "-F", ImplementationPaneFormat)
+	if len(command) == 0 {
+		command = []string{"/bin/sh"}
 	}
+	channel := ImplementationGateChannel(effectID)
+	args = append(args, r.Helper, "implementation-gate", r.tmux(), manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, effectID, "--")
+	args = append(args, command...)
+	args = append([]string{"wait-for", "-L", channel, ";"}, args...)
 	target := PaneTarget(manifest.Session)
-	if _, err := r.run(ctx, r.tmux(), []string{"set-option", "-w", "-t", target, "remain-on-exit", "on"}, "", []string{}, nil); err != nil {
+	args = append(args, ";", "set-option", "-p", "-t", target, "@agent-symphony-launch-token", manifest.LaunchToken,
+		";", "set-option", "-w", "-t", target, "remain-on-exit", "on",
+		";", "set-option", "-w", "-t", target, "history-limit", historyLimit,
+		";", "set-option", "-p", "-t", target, PaneExitStatusOption, "",
+		";", "set-option", "-p", "-t", target, PaneExitSignalOption, "")
+	created, err := r.run(ctx, r.tmux(), args, "", env, nil)
+	if err != nil {
 		return err
 	}
-	_, err := r.run(ctx, r.tmux(), []string{"set-option", "-w", "-t", target, "history-limit", historyLimit}, "", []string{}, nil)
-	return err
+	initial, err := ParseImplementationPane(created.Output)
+	if err != nil || initial.SessionName != manifest.Session || initial.StartPath != manifest.Worktree || initial.Token != "" {
+		return errors.New("created implementation pane identity is unavailable")
+	}
+	observed, err := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", target, ImplementationPaneFormat}, "", []string{}, nil)
+	if err != nil {
+		return err
+	}
+	pane, err := ParseImplementationPane(observed.Output)
+	if err != nil || pane.ServerPID != initial.ServerPID || pane.ServerStart != initial.ServerStart || pane.SessionID != initial.SessionID || pane.PaneID != initial.PaneID {
+		return errors.New("implementation pane changed before durable binding")
+	}
+	role := "unknown"
+	if len(command) > 1 {
+		switch command[1] {
+		case "worker-capture-bound", "worker-capture-handoff-ready-bound":
+			role = "capture"
+		case "pane-exit-status-bound":
+			role = "interactive"
+		}
+	}
+	binding, err := BindImplementationPane(manifest, effectID, role, pane)
+	if err != nil {
+		return err
+	}
+	return WriteImplementationBinding(manifest, binding)
+}
+
+func (r *Runtime) launchAgent(ctx context.Context, manifest Manifest) error {
+	binding, pane, err := r.observeBound(ctx, manifest)
+	if err != nil {
+		return err
+	}
+	if !implementationPermitMatches(manifest, binding) {
+		return errors.New("implementation launch lacks owner permit")
+	}
+	if err := WriteImplementationRelease(manifest, binding); err != nil {
+		return err
+	}
+	channel := ImplementationGateChannel(manifest.LaunchID)
+	result, err := r.guardedBoundResult(ctx, binding, pane, "wait-for -U "+channel, nil)
+	if err == nil {
+		return nil
+	}
+	if !result.Exited || result.Code != 1 || strings.TrimSpace(result.Output) != "channel "+channel+" not locked" || !implementationReleaseMatches(manifest, binding) {
+		return err
+	}
+	if _, _, proofErr := r.observeBound(ctx, manifest); proofErr != nil {
+		return errors.Join(err, proofErr)
+	}
+	return nil
 }
 
 // TmuxNewSessionArgs imports only the supplied environment names from the
@@ -581,7 +695,7 @@ func TmuxNewSessionArgs(session, dir string, environment []string) []string {
 // has published either its normal exit status or terminating signal.
 func ParsePaneStatus(output string) (PaneStatus, error) {
 	fields := strings.Split(strings.TrimSpace(output), "|")
-	if len(fields) != 4 || (fields[0] != "0" && fields[0] != "1") {
+	if len(fields) != 5 || (fields[0] != "0" && fields[0] != "1") {
 		return PaneStatus{}, fmt.Errorf("invalid pane status %q", strings.TrimSpace(output))
 	}
 	var recordedStatus *int
@@ -591,6 +705,17 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 			return PaneStatus{}, fmt.Errorf("invalid recorded pane exit status %q", fields[3])
 		}
 		recordedStatus = &status
+	}
+	var recordedSignal *int
+	if fields[4] != "" {
+		number, err := strconv.Atoi(fields[4])
+		if err != nil || number < 1 || number > 127 {
+			return PaneStatus{}, fmt.Errorf("invalid recorded pane signal %q", fields[4])
+		}
+		recordedSignal = &number
+	}
+	if recordedStatus != nil && recordedSignal != nil {
+		return PaneStatus{}, fmt.Errorf("conflicting recorded pane exit status and signal")
 	}
 	if fields[0] == "0" {
 		if fields[1] != "" || fields[2] != "" {
@@ -602,6 +727,8 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 	if fields[1] == "" && fields[2] == "" {
 		if recordedStatus != nil {
 			pane.Ready, pane.ExitStatus = true, *recordedStatus
+		} else if recordedSignal != nil {
+			pane.Ready, pane.Signal = true, strconv.Itoa(*recordedSignal)
 		}
 		return pane, nil
 	}
@@ -618,6 +745,9 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 		} else if !signalName.MatchString(signal) {
 			return PaneStatus{}, fmt.Errorf("invalid pane signal %q", fields[2])
 		}
+		if recordedStatus != nil || recordedSignal != nil && !nativePaneSignalMatches(signal, *recordedSignal) {
+			return PaneStatus{}, fmt.Errorf("pane signal conflicts with recorded result")
+		}
 		pane.Ready, pane.Signal = true, signal
 		return pane, nil
 	}
@@ -628,8 +758,45 @@ func ParsePaneStatus(output string) (PaneStatus, error) {
 	if recordedStatus != nil && status != *recordedStatus {
 		return PaneStatus{}, fmt.Errorf("pane exit status conflicts with recorded status %d", *recordedStatus)
 	}
+	if recordedSignal != nil {
+		if status == 0 {
+			return PaneStatus{}, fmt.Errorf("pane exit status conflicts with recorded signal %d", *recordedSignal)
+		}
+		// The native status belongs to the Go wrapper, which can exit nonzero
+		// instead of re-raising synchronous signals such as SIGSEGV. The pane
+		// option records the child signal before that wrapper exits.
+		pane.Ready, pane.Signal = true, strconv.Itoa(*recordedSignal)
+		return pane, nil
+	}
 	pane.Ready, pane.ExitStatus = true, status
 	return pane, nil
+}
+
+func nativePaneSignalMatches(native string, recorded int) bool {
+	if native == strconv.Itoa(recorded) {
+		return true
+	}
+	known := map[string]syscall.Signal{
+		"hup": syscall.SIGHUP, "int": syscall.SIGINT, "quit": syscall.SIGQUIT,
+		"ill": syscall.SIGILL, "trap": syscall.SIGTRAP, "abrt": syscall.SIGABRT,
+		"iot": syscall.SIGABRT, "bus": syscall.SIGBUS, "fpe": syscall.SIGFPE,
+		"kill": syscall.SIGKILL, "segv": syscall.SIGSEGV, "pipe": syscall.SIGPIPE,
+		"alrm": syscall.SIGALRM, "term": syscall.SIGTERM, "usr1": syscall.SIGUSR1,
+		"usr2": syscall.SIGUSR2, "chld": syscall.SIGCHLD, "cont": syscall.SIGCONT,
+		"stop": syscall.SIGSTOP, "tstp": syscall.SIGTSTP, "ttin": syscall.SIGTTIN,
+		"ttou": syscall.SIGTTOU, "sys": syscall.SIGSYS, "urg": syscall.SIGURG,
+		"xcpu": syscall.SIGXCPU, "xfsz": syscall.SIGXFSZ, "vtalrm": syscall.SIGVTALRM,
+		"prof": syscall.SIGPROF, "winch": syscall.SIGWINCH, "io": syscall.SIGIO,
+	}
+	name := strings.TrimPrefix(native, "sig")
+	value, ok := known[name]
+	if !ok && stdruntime.GOOS == "darwin" {
+		value, ok = map[string]syscall.Signal{"emt": 7, "info": 29}[name]
+	}
+	if !ok && stdruntime.GOOS == "linux" {
+		value, ok = map[string]syscall.Signal{"cld": 17, "poll": 29, "pwr": 30, "stkflt": 16, "unused": 31}[name]
+	}
+	return ok && int(value) == recorded
 }
 
 // Deliver sends one control-plane-framed handoff through the verified worker
@@ -647,36 +814,66 @@ func (r *Runtime) Deliver(ctx context.Context, manifest Manifest, payload []byte
 	if err := r.validateManifest(attempt, manifest); err != nil {
 		return err
 	}
+	if manifest.Version != boundManifestVersion {
+		return errors.New("legacy implementation pane has no durable handoff identity")
+	}
 	buffer := "as-handoff-" + fmt.Sprintf("%x", sha256.Sum256(payload))[:16]
-	if _, err := r.run(ctx, r.tmux(), []string{"load-buffer", "-b", buffer, "-"}, "", []string{}, bytes.NewReader(payload)); err != nil {
+	binding, pane, err := r.observeBound(ctx, manifest)
+	if err != nil {
 		return err
 	}
-	if _, err := r.run(ctx, r.tmux(), []string{"paste-buffer", "-d", "-b", buffer, "-t", PaneTarget(manifest.Session)}, "", []string{}, nil); err != nil {
+	load, err := TmuxCommandString([]string{"load-buffer", "-b", buffer, "-"})
+	if err != nil {
 		return err
 	}
-	_, err := r.run(ctx, r.tmux(), []string{"send-keys", "-t", PaneTarget(manifest.Session), "Enter"}, "", []string{}, nil)
-	return err
+	if _, err := r.guardedBoundResult(ctx, binding, pane, load, bytes.NewReader(payload)); err != nil {
+		return err
+	}
+	for _, command := range [][]string{{"paste-buffer", "-d", "-b", buffer, "-t"}, {"send-keys", "-t"}} {
+		binding, pane, err = r.observeBound(ctx, manifest)
+		if err != nil {
+			return err
+		}
+		command = append(command, pane.PaneID)
+		if command[0] == "send-keys" {
+			command = append(command, "Enter")
+		}
+		nested, err := TmuxCommandString(command)
+		if err != nil {
+			return err
+		}
+		if err := r.guardedBound(ctx, binding, pane, nested); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // VerifyOwned checks exact branch/session identity through the worker boundary
 // without comparing mutable worktree HEAD.
 func (r *Runtime) VerifyOwned(ctx context.Context, manifest Manifest) error {
-	return r.verifyActive(ctx, manifest, "", false, true)
+	return r.verifyActive(ctx, manifest, "", false, true, false)
 }
 
 // VerifyActive checks exact branch/head/session identity through the worker
 // boundary; it performs no coordinator-side worker command.
 func (r *Runtime) VerifyActive(ctx context.Context, manifest Manifest, head string) error {
-	return r.verifyActive(ctx, manifest, head, true, true)
+	return r.verifyActive(ctx, manifest, head, true, true, false)
 }
 
 // VerifyRetained checks a completed worktree and result without requiring its
 // previous tmux session; a follow-up implementation turn creates a fresh session.
 func (r *Runtime) VerifyRetained(ctx context.Context, manifest Manifest, head string) error {
-	return r.verifyActive(ctx, manifest, head, head != "", false)
+	return r.verifyActive(ctx, manifest, head, head != "", false, true)
 }
 
-func (r *Runtime) verifyActive(ctx context.Context, manifest Manifest, head string, verifyHead, verifySession bool) error {
+// VerifyWorkspace checks an active worktree without claiming ownership of its
+// process. It is safe for an isolated plan review of an unbound legacy attempt.
+func (r *Runtime) VerifyWorkspace(ctx context.Context, manifest Manifest) error {
+	return r.verifyActive(ctx, manifest, "", false, false, false)
+}
+
+func (r *Runtime) verifyActive(ctx context.Context, manifest Manifest, head string, verifyHead, verifySession, verifyResult bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.VerifyWorker == nil {
@@ -720,16 +917,23 @@ func (r *Runtime) verifyActive(ctx context.Context, manifest Manifest, head stri
 		}
 	}
 	if !verifySession {
-		result, err := os.Lstat(ResultPath(manifest.Worktree))
-		if err != nil || !result.Mode().IsRegular() || result.Mode()&os.ModeSymlink != 0 {
-			return errors.New("retained worker result is missing or unsafe")
+		if verifyResult {
+			result, err := os.Lstat(ResultPath(manifest.Worktree))
+			if err != nil || !result.Mode().IsRegular() || result.Mode()&os.ModeSymlink != 0 {
+				return errors.New("retained worker result is missing or unsafe")
+			}
 		}
 		return nil
 	}
-	if _, err := r.run(ctx, r.tmux(), []string{"has-session", "-t", "=" + manifest.Session}, "", nil, nil); err != nil {
-		return errors.New("exact tmux session is not live")
+	if manifest.Version == boundManifestVersion {
+		if _, err := r.observeBoundCommand(ctx, manifest, func(pane ImplementationPane) []string {
+			return []string{"display-message", "-p", "-t", pane.PaneID, "#{pane_dead}"}
+		}); err != nil {
+			return errors.New("exact bound implementation session is unavailable")
+		}
+		return nil
 	}
-	return nil
+	return errors.New("legacy implementation session has no durable launch identity")
 }
 
 func (r *Runtime) Cancel(ctx context.Context, attempt Attempt, reason string) (Manifest, error) {
@@ -742,6 +946,9 @@ func (r *Runtime) Cancel(ctx context.Context, attempt Attempt, reason string) (M
 	if err != nil {
 		return Manifest{}, err
 	}
+	if manifest.Version == boundManifestVersion {
+		return Manifest{}, errors.New("direct bound cancel is unavailable; submit an owner Stop effect")
+	}
 	if err := r.validateManifest(attempt, manifest); err != nil {
 		return Manifest{}, err
 	}
@@ -749,7 +956,7 @@ func (r *Runtime) Cancel(ctx context.Context, attempt Attempt, reason string) (M
 }
 
 func (r *Runtime) cancel(ctx context.Context, attempt Attempt, manifest Manifest, reason string) (Manifest, error) {
-	if err := r.stop(ctx, manifest.Session); err != nil {
+	if err := r.stop(ctx, manifest); err != nil {
 		return manifest, err
 	}
 	manifest.State, manifest.Diagnostic, manifest.UpdatedAt = "cancelled", reason, time.Now().UTC()
@@ -794,6 +1001,9 @@ func (r *Runtime) Discover() ([]Manifest, error) {
 // Forget removes one exact retained attempt record after its worker resources
 // have already been cleaned up by the implementation boundary.
 func (r *Runtime) Forget(manifest Manifest) error {
+	if manifest.Version == boundManifestVersion {
+		return errors.New("direct bound forget is unavailable; submit an owner Cleanup effect")
+	}
 	return r.forget(manifest, false)
 }
 
@@ -891,6 +1101,38 @@ func (r *Runtime) identify(a Attempt) (Manifest, error) {
 	return manifest, nil
 }
 
+func newLaunchToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(token[:]), nil
+}
+
+// NewLaunchToken mints a candidate before an owner commits a launch effect.
+func NewLaunchToken() (string, error) { return newLaunchToken() }
+
+func ValidLaunchToken(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 16
+}
+
+// ValidManifestVersion accepts historical unbound records and new bound ones.
+func ValidManifestVersion(manifest Manifest) bool {
+	if manifest.Version == manifestVersion {
+		return manifest.LaunchToken == "" && manifest.LaunchID == ""
+	}
+	decoded, err := hex.DecodeString(manifest.LaunchToken)
+	if manifest.Version != boundManifestVersion || err != nil || len(decoded) != 16 {
+		return false
+	}
+	if manifest.LaunchID == "" {
+		return true
+	}
+	decoded, err = hex.DecodeString(manifest.LaunchID)
+	return err == nil && len(decoded) == 16
+}
+
 // AttemptIdentity returns the exact boundary-visible resources for an attempt.
 func AttemptIdentity(root string, a Attempt) (Manifest, error) {
 	if !filepath.IsAbs(root) {
@@ -981,16 +1223,19 @@ func (r *Runtime) validateManifest(attempt Attempt, manifest Manifest) error {
 }
 
 func validateManifestIdentity(want, manifest Manifest) error {
-	if manifest.Version != want.Version || manifest.Repository != want.Repository || manifest.Issue != want.Issue || manifest.Attempt != want.Attempt ||
+	if !ValidManifestVersion(manifest) || manifest.Repository != want.Repository || manifest.Issue != want.Issue || manifest.Attempt != want.Attempt ||
 		manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session || manifest.BaseSHA != want.BaseSHA || manifest.LogPath != want.LogPath {
 		return fmt.Errorf("manifest does not match deterministic attempt resources")
 	}
+	if (manifest.WorkerGeneration == 0) != (manifest.WorkerProfileDigest == "") || manifest.WorkerProfileDigest != "" && !ValidEffectRequestDigest(manifest.WorkerProfileDigest) {
+		return errors.New("worker confinement proof is invalid")
+	}
 	switch manifest.ReviewState {
 	case "":
-		if manifest.ReviewMode != "" || manifest.ReviewTarget != "" || manifest.ReviewSession != "" {
+		if manifest.ReviewMode != "" || manifest.ReviewTarget != "" || manifest.ReviewRunID != "" || manifest.ReviewRunCleaned || manifest.ReviewSession != "" {
 			return errors.New("review metadata has no lifecycle state")
 		}
-	case "preparing", "running", "clean", "findings-queued":
+	case "preparing", "running", "clean", "findings-queued", "failed":
 		legacy := manifest.ReviewMode == "" && manifest.ReviewTarget == ""
 		if !legacy && (!ValidReviewMetadata(manifest.ReviewMode, manifest.ReviewTarget) || !ValidReviewTarget(manifest.ReviewMode, manifest.ReviewTarget, manifest.Repository, manifest.Issue)) {
 			return errors.New("review mode or target is invalid")
@@ -998,8 +1243,17 @@ func validateManifestIdentity(want, manifest Manifest) error {
 		if !legacy && !ValidReviewBinding(manifest.ReviewMode, manifest.ReviewTarget, manifest.Repository, manifest.Issue, manifest.ReviewBase, manifest.ReviewHead, manifest.BaseSHA) {
 			return errors.New("review target does not match persisted identity")
 		}
+		if manifest.ReviewState == "failed" && (manifest.ReviewDiagnostic == "" || len(manifest.ReviewDiagnostic) > 4096) {
+			return errors.New("failed review requires a bounded diagnostic")
+		}
 	default:
 		return fmt.Errorf("invalid review state %q", manifest.ReviewState)
+	}
+	if manifest.ReviewState != "failed" && manifest.ReviewDiagnostic != "" {
+		return errors.New("review diagnostic requires failed state")
+	}
+	if manifest.ReviewInvalidated && manifest.ReviewState != "failed" {
+		return errors.New("invalidated review requires failed state")
 	}
 	if manifest.ReviewBase != "" && !commitID.MatchString(manifest.ReviewBase) {
 		return errors.New("review base is invalid")
@@ -1008,10 +1262,21 @@ func validateManifestIdentity(want, manifest Manifest) error {
 		return errors.New("review head is invalid")
 	}
 	if manifest.ReviewSession != "" {
-		wantReview, err := AttemptSessionName(SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
-		if err != nil || manifest.ReviewSession != wantReview {
-			return errors.New("review session does not match deterministic attempt resources")
+		if manifest.ReviewRunID != "" {
+			runReview, runErr := ReviewRunSessionName(manifest.Repository, manifest.Issue, manifest.Attempt, manifest.ReviewTarget, manifest.ReviewRunID)
+			if runErr != nil || manifest.ReviewSession != runReview {
+				return errors.New("review session does not match deterministic run resources")
+			}
+		} else {
+			wantReview, err := AttemptSessionName(SessionRoleReviewer, manifest.Repository, manifest.Issue, manifest.Attempt)
+			targetReview, targetErr := ReviewSessionName(manifest.Repository, manifest.Issue, manifest.Attempt, manifest.ReviewTarget)
+			if targetErr != nil || manifest.ReviewSession != targetReview && (err != nil || manifest.ReviewSession != wantReview) {
+				return errors.New("review session does not match deterministic attempt resources")
+			}
 		}
+	}
+	if manifest.ReviewRunCleaned && (manifest.ReviewRunID != "" || manifest.ReviewSnapshot != "" || manifest.ReviewSession != "" || !slices.Contains([]string{"clean", "findings-queued", "failed"}, manifest.ReviewState)) {
+		return errors.New("cleaned review run retains physical identity")
 	}
 	switch manifest.State {
 	case "preparing", "running", "completed", "failed", "cancelled":
@@ -1019,6 +1284,30 @@ func validateManifestIdentity(want, manifest Manifest) error {
 	default:
 		return fmt.Errorf("invalid manifest state %q", manifest.State)
 	}
+}
+
+// BindWorkerConfinement records the exact generation and profile the owner
+// authorizes before any implementation process may be released.
+func BindWorkerConfinement(manifest Manifest, generation uint64, profileDigest string) (Manifest, error) {
+	if generation == 0 || !ValidEffectRequestDigest(profileDigest) || manifest.WorkerGeneration != 0 || manifest.WorkerProfileDigest != "" {
+		return Manifest{}, errors.New("worker confinement binding is invalid")
+	}
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = generation, profileDigest
+	return manifest, nil
+}
+
+// WorkerConfinementMatches proves that a launched worker was admitted under
+// the current rootless profile for this exact attempt generation.
+func WorkerConfinementMatches(manifest Manifest, generation uint64, profileDigest string) bool {
+	return WorkerConfinementBound(manifest, generation, profileDigest) && manifest.LaunchID != ""
+}
+
+// WorkerConfinementBound validates the durable owner authorization even when
+// a generation-invalidating action raced a Start before its LaunchID result
+// could be committed.
+func WorkerConfinementBound(manifest Manifest, generation uint64, profileDigest string) bool {
+	return manifest.Version == boundManifestVersion && generation != 0 && manifest.WorkerGeneration == generation &&
+		manifest.WorkerProfileDigest == profileDigest && ValidEffectRequestDigest(profileDigest)
 }
 
 // ValidateManifest verifies a persisted manifest against deterministic
@@ -1137,7 +1426,7 @@ func readManifest(path string) (Manifest, error) {
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return Manifest{}, fmt.Errorf("manifest contains multiple JSON values")
 	}
-	if manifest.Version != manifestVersion || manifest.Repository == "" || manifest.Issue < 1 || manifest.Attempt < 1 {
+	if !ValidManifestVersion(manifest) || manifest.Repository == "" || manifest.Issue < 1 || manifest.Attempt < 1 {
 		return Manifest{}, fmt.Errorf("invalid manifest")
 	}
 	return manifest, nil
@@ -1215,14 +1504,117 @@ func (r *Runtime) session(ctx context.Context, session string) (bool, error) {
 	return false, err
 }
 
-func (r *Runtime) stop(ctx context.Context, session string) error {
-	if live, err := r.session(ctx, session); err != nil {
-		return err
-	} else if !live {
-		return nil
+func (r *Runtime) stop(ctx context.Context, manifest Manifest) error {
+	return r.stopGeneration(ctx, manifest, 0)
+}
+
+func (r *Runtime) stopGeneration(ctx context.Context, manifest Manifest, generation uint64) error {
+	if manifest.Version != boundManifestVersion {
+		return errors.New("legacy implementation session has no durable launch identity")
 	}
-	pane := PaneTarget(session)
-	if _, err := r.run(ctx, r.tmux(), []string{"send-keys", "-t", pane, "C-c"}, "", []string{}, nil); err != nil {
+	confined := WorkerConfinementMatches(manifest, generation, r.WorkerProfileDigest)
+	binding, err := ReadImplementationBinding(manifest)
+	if err != nil {
+		return err
+	}
+	live, err := r.session(ctx, manifest.Session)
+	if err != nil {
+		return err
+	}
+	if !live {
+		// A renamed or unlinked session can keep the original worker
+		// alive. The inventory must come from the exact original server.
+		absent, probeErr := r.boundPaneAbsent(ctx, binding)
+		if probeErr == nil && absent {
+			if confined {
+				return nil
+			}
+			gone, groupErr := ImplementationWorkerGone(manifest, binding)
+			if groupErr == nil && gone {
+				return nil
+			}
+			return errors.Join(groupErr, errors.New("implementation worker group termination is unconfirmed"))
+		}
+		return errors.Join(probeErr, errors.New("bound implementation pane may still exist"))
+	}
+	return r.stopBound(ctx, manifest, confined)
+}
+
+func (r *Runtime) boundPaneAbsent(ctx context.Context, binding ImplementationLaunchBinding) (bool, error) {
+	result, err := r.run(ctx, r.tmux(), []string{"list-panes", "-a", "-F", ImplementationInventoryFormat}, "", []string{}, nil)
+	if err != nil {
+		if ImplementationOriginalServerGone(binding) {
+			return true, nil
+		}
+		return false, err
+	}
+	absent, err := ImplementationPaneAbsentFromInventory(result.Output, binding)
+	if err != nil && ImplementationOriginalServerGone(binding) {
+		return true, nil
+	}
+	return absent, err
+}
+
+func (r *Runtime) observeBound(ctx context.Context, manifest Manifest) (ImplementationLaunchBinding, ImplementationPane, error) {
+	binding, err := ReadImplementationBinding(manifest)
+	if err != nil {
+		return ImplementationLaunchBinding{}, ImplementationPane{}, err
+	}
+	result, err := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", PaneTarget(manifest.Session), ImplementationPaneFormat}, "", []string{}, nil)
+	if err != nil {
+		return ImplementationLaunchBinding{}, ImplementationPane{}, err
+	}
+	pane, err := ParseImplementationPane(result.Output)
+	if err != nil || !binding.Matches(manifest, pane) {
+		return ImplementationLaunchBinding{}, ImplementationPane{}, errors.New("implementation pane no longer matches durable launch identity")
+	}
+	return binding, pane, nil
+}
+
+func (r *Runtime) guardedBound(ctx context.Context, binding ImplementationLaunchBinding, pane ImplementationPane, command string) error {
+	result, err := r.guardedBoundResult(ctx, binding, pane, command, nil)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(result.Output) != "" {
+		return errors.New("guarded implementation command returned unexpected output")
+	}
+	return nil
+}
+
+func (r *Runtime) guardedBoundResult(ctx context.Context, binding ImplementationLaunchBinding, pane ImplementationPane, command string, stdin io.Reader) (Result, error) {
+	args, err := GuardedImplementationArgs(binding, pane, command)
+	if err != nil {
+		return Result{}, err
+	}
+	result, err := r.run(ctx, r.tmux(), args, "", []string{}, stdin)
+	if err != nil {
+		return result, err
+	}
+	if strings.TrimSpace(result.Output) == ImplementationGuardMismatch {
+		return result, errors.New("implementation pane changed before guarded command")
+	}
+	return result, nil
+}
+
+func (r *Runtime) observeBoundCommand(ctx context.Context, manifest Manifest, build func(ImplementationPane) []string) (Result, error) {
+	binding, pane, err := r.observeBound(ctx, manifest)
+	if err != nil {
+		return Result{}, err
+	}
+	nested, err := TmuxCommandString(build(pane))
+	if err != nil {
+		return Result{}, err
+	}
+	return r.guardedBoundResult(ctx, binding, pane, nested, nil)
+}
+
+func (r *Runtime) stopBound(ctx context.Context, manifest Manifest, confined bool) error {
+	binding, pane, err := r.observeBound(ctx, manifest)
+	if err != nil {
+		return err
+	}
+	if err := r.guardedBound(ctx, binding, pane, "send-keys -t "+pane.PaneID+" C-c"); err != nil {
 		return err
 	}
 	want := r.StopWait
@@ -1231,7 +1623,9 @@ func (r *Runtime) stop(ctx context.Context, session string) error {
 	}
 	deadline := time.Now().Add(want)
 	for time.Now().Before(deadline) {
-		result, err := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", pane, "#{pane_dead}"}, "", []string{}, nil)
+		result, err := r.observeBoundCommand(ctx, manifest, func(pane ImplementationPane) []string {
+			return []string{"display-message", "-p", "-t", pane.PaneID, "#{pane_dead}"}
+		})
 		if err != nil {
 			return err
 		}
@@ -1244,17 +1638,26 @@ func (r *Runtime) stop(ctx context.Context, session string) error {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	if _, err := r.run(ctx, r.tmux(), []string{"kill-session", "-t", "=" + session}, "", []string{}, nil); err != nil {
-		if live, probeErr := r.session(ctx, session); probeErr != nil || live {
-			return errors.Join(err, probeErr)
-		}
-	}
-	live, err := r.session(ctx, session)
+	_, pane, err = r.observeBound(ctx, manifest)
 	if err != nil {
 		return err
 	}
-	if live {
-		return errors.New("tmux session remained after cancellation")
+	if err := r.guardedBound(ctx, binding, pane, "kill-pane -t "+pane.PaneID); err != nil {
+		return err
+	}
+	absent, inventoryErr := r.boundPaneAbsent(ctx, binding)
+	if inventoryErr != nil {
+		return inventoryErr
+	}
+	if !absent {
+		return errors.New("bound implementation pane remained after guarded stop")
+	}
+	if confined {
+		return nil
+	}
+	workerGone, groupErr := ImplementationWorkerGone(manifest, binding)
+	if groupErr != nil || !workerGone {
+		return errors.Join(groupErr, errors.New("implementation worker group termination is unconfirmed"))
 	}
 	return nil
 }

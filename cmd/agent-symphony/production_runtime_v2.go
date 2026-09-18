@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
@@ -32,6 +33,9 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	if parent == nil || api.HTTP == nil || user.ID < 1 || cfg.Repository == "" || stateRoot == "" || legacyRecoveryPath == "" || checkout == "" || log == nil {
 		return nil, errors.New("production v2 runtime is incomplete")
 	}
+	if err := validateProductionStateRoot(stateRoot); err != nil {
+		return nil, err
+	}
 	identity, err := readDeploymentIdentity(stateRoot)
 	if err != nil || identity.Version != deploymentIdentityVersion || identity.Repository != cfg.Repository {
 		return nil, errors.New("production v2 deployment fence is not installed")
@@ -42,28 +46,29 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	}
 	api.Cache = cache
 	attemptRoot := productionAttemptRoot(stateRoot)
-	mode := os.FileMode(0o770)
-	if !hostIsolationInstalled() {
-		mode = 0o700
-	}
-	if err := os.MkdirAll(attemptRoot, mode); err != nil {
+	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("prepare attempt root: %w", err)
 	}
 	if err := prepareProductionMarkerDirectories(stateRoot); err != nil {
+		return nil, err
+	}
+	workerProfileDigest, err := config.PinWorkerExecutable(parent, stateRoot, &cfg.Commands)
+	if err != nil {
 		return nil, err
 	}
 	initial, _, err := loadOrMigrateRuntimeOwnerState(stateRoot, legacyRecoveryPath, cfg.Repository)
 	if err != nil {
 		return nil, err
 	}
+	initial.WorkerProfileDigest = workerProfileDigest
 	lifecycle, cancel := context.WithCancel(parent)
 	runtime := &productionRuntimeV2{cancel: cancel}
 	fail := func(err error) (*productionRuntimeV2, error) {
 		_ = runtime.shutdown(context.Background())
 		return nil, err
 	}
-	owner, err := startStateOwner(lifecycle, stateRoot, attemptRoot, initial, func(state runtimeOwnerState) error {
-		return writeRuntimeOwnerState(stateRoot, attemptRoot, state)
+	owner, err := startStateOwner(lifecycle, stateRoot, attemptRoot, initial, func(ctx context.Context, state runtimeOwnerState) error {
+		return writeRuntimeOwnerStateContext(ctx, stateRoot, attemptRoot, state)
 	})
 	if err != nil {
 		cancel()
@@ -89,12 +94,25 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	}
 	implementation := implementationBoundary(stateRoot)
 	reviewer := reviewBoundary(stateRoot)
+	for _, boundary := range []*workerBoundaryRunner{&implementation, &reviewer} {
+		boundary.Env = append(boundary.Env, "AGENT_SYMPHONY_CODEX_EXECUTABLE="+cfg.Commands.Implementation[0], "AGENT_SYMPHONY_WORKER_PROFILE_DIGEST="+workerProfileDigest)
+	}
+	var preflight successfulCheck
 	runtimeState := &agentruntime.Runtime{
 		Root: attemptRoot, StateRoot: stateRoot, Source: source, Git: "git", Tmux: "tmux", Helper: binary,
-		Runner: implementation, AllowEnv: cfg.Commands.Environment,
+		Runner: implementation, AllowEnv: cfg.Commands.Environment, WorkerHome: workerCodexHome(stateRoot),
+		WorkerProfileDigest: workerProfileDigest,
 		VerifyWorker: func(ctx context.Context) error {
-			_, err := implementation.call(ctx, "verify", agentruntime.Command{})
-			return err
+			if err := config.VerifyWorkerExecutable(ctx, cfg.Commands.Implementation[0], workerProfileDigest); err != nil {
+				return err
+			}
+			return preflight.Do(func() error {
+				if _, err := implementation.call(ctx, "verify", agentruntime.Command{}); err != nil {
+					return err
+				}
+				_, err := verifyRootlessCodex(ctx, attemptRoot, workerCodexHome(stateRoot), cfg.Commands.Implementation[0])
+				return err
+			})
 		},
 	}
 	effects, err := newRuntimeEffectCoordinator(lifecycle, owner, agentruntime.EffectExecutor{Runtime: runtimeState})
@@ -104,7 +122,7 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	runtime.effects = effects
 	prConfig := githubPRConfig(cfg, user.ID)
 	collector := reconciliationV2Collector{API: api, Config: prConfig, Scope: reconciliationScope{Kind: reconciliationRepositoryScope, Repository: cfg.Repository}}
-	reviewEnvironment, err := configuredAgentEnvironment(cfg.Commands.Environment)
+	reviewEnvironment, err := configuredWorkerEnvironment(cfg.Commands.Environment, stateRoot)
 	if err != nil {
 		return fail(err)
 	}
@@ -117,8 +135,9 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	cycle := &productionReconciliation{
 		owner: owner, effects: effects, collector: collector, config: cfg, api: api,
 		stateRoot: stateRoot, attemptRoot: attemptRoot, checkout: checkout,
-		implementation: implementation, reviewer: reviewer, reviewEnv: reviewEnvironment,
+		implementation: implementation, reviewer: reviewer, operator: operator, reviewEnv: reviewEnvironment,
 		supervisor: agent, capacity: cfg.Concurrency, log: log,
+		workerProfileDigest: workerProfileDigest,
 	}
 	runtime.cycle = cycle
 	status, err := startOwnerStatusReplica(lifecycle, owner, cfg.Concurrency, log)
@@ -147,6 +166,24 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	}
 	runtime.proposal = proposal
 	return runtime, nil
+}
+
+type successfulCheck struct {
+	mu   sync.Mutex
+	done bool
+}
+
+func (c *successfulCheck) Do(check func() error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.done {
+		return nil
+	}
+	if err := check(); err != nil {
+		return err
+	}
+	c.done = true
+	return nil
 }
 
 func prepareProductionMarkerDirectories(stateRoot string) error {

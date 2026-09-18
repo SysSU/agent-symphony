@@ -136,13 +136,12 @@ rm -rf "$pilot_root"
 : >"$log"
 rm -f "$log.date"
 report="$test_root/stuck.json"
-started=$(/bin/date +%s)
 set +e
 PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=stuck LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=stuck-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -eq 6
-test "$(( $(/bin/date +%s) - started ))" -lt 10
+test "$(cat "$log.date")" -ge 2
 ruby -rjson -e '
   r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]=="failed"
   abort unless r.dig("cleanup","processes_stopped")==false && r.dig("cleanup","tmux_stopped")==true && r.dig("cleanup","diagnostics_preserved")==true

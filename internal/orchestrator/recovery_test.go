@@ -184,7 +184,14 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 	created := time.Date(2026, 8, 20, 1, 2, 3, 0, time.UTC)
 	updated := created.Add(time.Minute)
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 4, 2)
-	reviewer, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleReviewer, "o/r", 4, 2)
+	reviewRunID := strings.Repeat("c", 64)
+	reviewerSession := func(target string) string {
+		name, err := agentruntime.ReviewRunSessionName("o/r", 4, 2, target, reviewRunID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return name
+	}
 	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "active"}
 	base := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: fact.BaseSHA, State: "completed", Session: implementation, CreatedAt: created, UpdatedAt: updated}
 
@@ -200,9 +207,16 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 		{"validation", base, "validation", "", 1, "validate"},
 		{"review running", func() agentruntime.Manifest {
 			m := base
-			m.ReviewState, m.ReviewSession = "running", reviewer
-			m.ReviewMode, m.ReviewTarget = agentruntime.ReviewModeImplementation, "aaaaaaa..bbbbbbb"
+			m.ReviewMode, m.ReviewTarget, m.ReviewRunID = agentruntime.ReviewModeImplementation, "aaaaaaa..bbbbbbb", reviewRunID
+			m.ReviewState, m.ReviewSession = "running", reviewerSession(m.ReviewTarget)
 			m.ReviewBase, m.ReviewHead = "aaaaaaa", "bbbbbbb"
+			return m
+		}(), "review", "reviewer", 2, "reviewer session"},
+		{"plan review running alongside implementation", func() agentruntime.Manifest {
+			m := base
+			m.ReviewMode, m.ReviewTarget, m.ReviewRunID = agentruntime.ReviewModePlan, "o/r#4 plan sha256:"+strings.Repeat("b", 64), reviewRunID
+			m.State, m.ReviewState, m.ReviewSession = "running", "running", reviewerSession(m.ReviewTarget)
+			m.ReviewBase, m.ReviewHead = fact.BaseSHA, fact.BaseSHA
 			return m
 		}(), "review", "reviewer", 2, "reviewer session"},
 		{"review session missing", func() agentruntime.Manifest { m := base; m.ReviewState = "running"; return m }(), "review", "", 1, "restore"},
@@ -231,7 +245,7 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 				if session.Name == implementation && (session.CreatedAt != created || session.UpdatedAt != updated) {
 					t.Fatalf("implementation timestamps = %#v", session)
 				}
-				if session.Name == reviewer && test.name == "review running" && (session.Mode != agentruntime.ReviewModeImplementation || session.Target != "aaaaaaa..bbbbbbb") {
+				if session.Role == agentruntime.SessionRoleReviewer && test.name == "review running" && (session.Mode != agentruntime.ReviewModeImplementation || session.Target != "aaaaaaa..bbbbbbb" || session.RunID != reviewRunID) {
 					t.Fatalf("review metadata = %#v", session)
 				}
 			}
@@ -242,12 +256,30 @@ func TestRecoverProjectsBoundedAttemptSessionsAndPhases(t *testing.T) {
 	}
 }
 
+func TestFailedPlanReviewProjectsActionableDiagnostic(t *testing.T) {
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "running", ReviewState: "failed", ReviewMode: agentruntime.ReviewModePlan, ReviewDiagnostic: "reviewer exited 17"}
+	status := RecoveryStatus{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, State: "active"}
+	projectAttemptLifecycle(&status, manifest)
+	if status.Diagnostic != manifest.ReviewDiagnostic {
+		t.Fatalf("failed review diagnostic not visible: %#v", status)
+	}
+}
+
 func TestRecoverOmitsUnknownSessionIdentityAndKeepsTerminalHistory(t *testing.T) {
 	implementation, _ := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 4, 2)
 	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "failed"}
 	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: fact.BaseSHA, State: "cancelled", Session: implementation, ReviewState: "running", ReviewSession: "as-r-forged"}
 	got := Recover([]AttemptFact{fact}, []agentruntime.Manifest{manifest})
 	if len(got) != 1 || got[0].CurrentPhase != "failed" || len(got[0].Sessions) != 1 || got[0].Sessions[0].Name != implementation || got[0].Sessions[0].State != "cancelled" {
+		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestRecoverProjectsCommittedCancellationOverStaleActiveFact(t *testing.T) {
+	fact := AttemptFact{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: "aaaaaaa", State: "active"}
+	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 4, Attempt: 2, BaseSHA: fact.BaseSHA, State: "cancelled", Diagnostic: "operator cancelled attempt"}
+	got := Recover([]AttemptFact{fact}, []agentruntime.Manifest{manifest})
+	if len(got) != 1 || got[0].State != "cancelled" || got[0].Retryable || got[0].Diagnostic != manifest.Diagnostic {
 		t.Fatalf("got %#v", got)
 	}
 }

@@ -16,34 +16,51 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/SysSU/agent-symphony/internal/config"
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
 type fullSystemGitHub struct {
-	mu              sync.Mutex
-	base            string
-	origin          string
-	comments        []map[string]any
-	labels          map[string]bool
-	requests        []string
-	failNext        bool
-	failedRequest   string
-	pr              map[string]any
-	merged          bool
-	closed          bool
-	denyMutations   bool
-	deniedMutations []string
+	mu                        sync.Mutex
+	base                      string
+	origin                    string
+	comments                  []map[string]any
+	prComments                []map[string]any
+	labels                    map[string]bool
+	requests                  []string
+	failNext                  bool
+	failedRequest             string
+	pr                        map[string]any
+	merged                    bool
+	closed                    bool
+	includeClosedIssue        bool
+	denyMutations             bool
+	expectedStatusBody        string
+	expectedControlBody       string
+	expectedControlGeneration uint64
+	deniedMutations           []string
+	removalRepairs            []string
+	historicalIssues          map[int]map[string]any
+	listedIssues              []map[string]any
+	historicalComments        map[int][]map[string]any
+	historicalPulls           []map[string]any
+	holdIssueList             atomic.Bool
+	issueListEntered          chan struct{}
+	issueListRelease          <-chan struct{}
 }
 
 type synchronizedBuffer struct {
 	mu     sync.Mutex
 	buffer bytes.Buffer
 }
+
+const fullSystemIssueBody = "## Context\nProtect the full operator journey.\n\n## Acceptance criteria\n- The change is visible.\n\n## Checklist\n- [ ] Implement and review.\n\n## Validation\nRun the deterministic full-system test.\n\n## Dependencies\n#72"
 
 func (b *synchronizedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
@@ -58,12 +75,37 @@ func (b *synchronizedBuffer) String() string {
 }
 
 func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues" && f.holdIssueList.CompareAndSwap(true, false) {
+		if f.issueListEntered != nil {
+			close(f.issueListEntered)
+		}
+		select {
+		case <-f.issueListRelease:
+		case <-r.Context().Done():
+			return
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests = append(f.requests, r.Method+" "+r.URL.RequestURI())
 	w.Header().Set("Content-Type", "application/json")
-	if f.denyMutations && githubMutationRequest(r) {
-		f.deniedMutations = append(f.deniedMutations, r.Method+" "+r.URL.RequestURI())
+	allowedRepair, mutationBody := false, ""
+	if f.denyMutations && r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/73/comments" {
+		body, readErr := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var input map[string]string
+		jsonErr := json.Unmarshal(body, &input)
+		mutationBody = input["body"]
+		if readErr == nil && jsonErr == nil && f.expectedControlBody != "" && input["body"] == f.expectedControlBody {
+			allowedRepair = true
+			f.removalRepairs = append(f.removalRepairs, fmt.Sprintf("control:%d", f.expectedControlGeneration))
+		} else if readErr == nil && jsonErr == nil && f.expectedStatusBody != "" && input["body"] == f.expectedStatusBody {
+			allowedRepair = true
+			f.removalRepairs = append(f.removalRepairs, "status")
+		}
+	}
+	if f.denyMutations && githubMutationRequest(r) && !allowedRepair {
+		f.deniedMutations = append(f.deniedMutations, r.Method+" "+r.URL.RequestURI()+": "+mutationBody)
 		http.Error(w, `{"message":"GitHub mutation forbidden during removal"}`, http.StatusInternalServerError)
 		return
 	}
@@ -74,7 +116,7 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := "2026-09-09T12:00:00Z"
-	body := "## Context\nProtect the full operator journey.\n\n## Acceptance criteria\n- The change is visible.\n\n## Checklist\n- [ ] Implement and review.\n\n## Validation\nRun the deterministic full-system test.\n\n## Dependencies\n#72"
+	body := fullSystemIssueBody
 	labels := make([]map[string]string, 0, len(f.labels))
 	for label, present := range f.labels {
 		if present {
@@ -87,6 +129,42 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	issue := map[string]any{"number": 73, "node_id": "I_73", "title": "Deterministic full-system journey", "body": body, "state": issueState, "created_at": now, "updated_at": now, "user": map[string]any{"id": 42}, "labels": labels}
 	path := r.URL.Path
+	if f.historicalIssues != nil {
+		if r.Method == http.MethodGet && path == "/repos/o/r/issues" {
+			writeFixtureJSON(w, append([]map[string]any{}, f.listedIssues...))
+			return
+		}
+		for number, historical := range f.historicalIssues {
+			prefix := fmt.Sprintf("/repos/o/r/issues/%d", number)
+			if r.Method == http.MethodGet && path == prefix {
+				writeFixtureJSON(w, historical)
+				return
+			}
+			if r.Method == http.MethodGet && path == prefix+"/comments" {
+				writeFixtureJSON(w, f.historicalComments[number])
+				return
+			}
+			if r.Method == http.MethodPost && path == prefix+"/comments" {
+				var input map[string]string
+				_ = json.NewDecoder(r.Body).Decode(&input)
+				created := time.Now().UTC().Format(time.RFC3339Nano)
+				comments := f.historicalComments[number]
+				comment := map[string]any{"id": nextFixtureCommentID(comments), "body": input["body"], "created_at": created, "updated_at": created, "user": map[string]any{"id": 42}}
+				f.historicalComments[number] = append(comments, comment)
+				writeFixtureStatusJSON(w, http.StatusCreated, comment)
+				return
+			}
+			if r.Method == http.MethodGet && (path == prefix+"/timeline" || path == prefix+"/events") {
+				writeFixtureJSON(w, []any{})
+				return
+			}
+			prComments := fmt.Sprintf("/repos/o/r/issues/%d/comments", number+800)
+			if r.Method == http.MethodGet && path == prComments {
+				writeFixtureJSON(w, []any{})
+				return
+			}
+		}
+	}
 	switch {
 	case r.Method == http.MethodGet && path == "/user":
 		writeFixtureJSON(w, map[string]any{"id": 42, "login": "coordinator"})
@@ -99,7 +177,7 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == "/repos/o/r/branches/main":
 		writeFixtureJSON(w, map[string]any{"name": "main", "commit": map[string]string{"sha": f.base}, "protected": false})
 	case r.Method == http.MethodGet && path == "/repos/o/r/issues":
-		if f.closed {
+		if f.closed && !f.includeClosedIssue {
 			writeFixtureJSON(w, []any{})
 		} else {
 			writeFixtureJSON(w, []any{issue})
@@ -111,13 +189,38 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == "/repos/o/r/issues/73/comments":
 		writeFixtureJSON(w, f.comments)
 	case r.Method == http.MethodGet && path == "/repos/o/r/issues/73/timeline":
-		writeFixtureJSON(w, []any{
-			map[string]any{"id": 731, "event": "labeled", "label": map[string]string{"name": "agent-ready"}, "created_at": now, "actor": map[string]any{"id": 42}},
-			map[string]any{"id": 732, "event": "labeled", "label": map[string]string{"name": "priority:P1"}, "created_at": now, "actor": map[string]any{"id": 42}},
-			map[string]any{"id": 733, "event": "labeled", "label": map[string]string{"name": "autonomous-merge"}, "created_at": now, "actor": map[string]any{"id": 42}},
-		})
+		events := []any{}
+		for _, item := range []struct {
+			id    int
+			label string
+		}{{731, "agent-ready"}, {732, "priority:P1"}, {733, "autonomous-merge"}} {
+			id, label := item.id, item.label
+			if f.labels[label] {
+				events = append(events, map[string]any{"id": id, "event": "labeled", "label": map[string]string{"name": label}, "created_at": now, "actor": map[string]any{"id": 42}})
+			}
+		}
+		if f.closed {
+			events = append(events, map[string]any{"id": 734, "event": "closed", "created_at": now, "actor": map[string]any{"id": 42}})
+		}
+		writeFixtureJSON(w, events)
+	case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/o/r/issues/comments/"):
+		id, _ := strconv.ParseInt(strings.TrimPrefix(path, "/repos/o/r/issues/comments/"), 10, 64)
+		for _, comment := range f.comments {
+			if commentID, ok := comment["id"].(int64); ok && commentID == id {
+				writeFixtureJSON(w, comment)
+				return
+			}
+			if commentID, ok := comment["id"].(int); ok && int64(commentID) == id {
+				writeFixtureJSON(w, comment)
+				return
+			}
+		}
+		http.Error(w, `{"message":"comment not found"}`, http.StatusNotFound)
 	case r.Method == http.MethodGet && path == "/repos/o/r/pulls":
 		pulls := []any{}
+		for _, pull := range f.historicalPulls {
+			pulls = append(pulls, pull)
+		}
 		if f.pr != nil {
 			pulls = append(pulls, f.pr)
 		}
@@ -138,7 +241,16 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&input)
 		f.pr["body"] = input["body"]
 		writeFixtureJSON(w, f.pr)
-	case r.Method == http.MethodGet && (path == "/repos/o/r/issues/91/comments" || path == "/repos/o/r/pulls/91/comments" || path == "/repos/o/r/pulls/91/reviews"):
+	case r.Method == http.MethodGet && path == "/repos/o/r/issues/91/comments":
+		writeFixtureJSON(w, f.prComments)
+	case r.Method == http.MethodPost && path == "/repos/o/r/issues/91/comments":
+		var input map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&input)
+		created := time.Now().UTC().Format(time.RFC3339Nano)
+		comment := map[string]any{"id": nextFixtureCommentID(f.prComments), "body": input["body"], "created_at": created, "updated_at": created, "user": map[string]any{"id": 42}}
+		f.prComments = append(f.prComments, comment)
+		writeFixtureStatusJSON(w, http.StatusCreated, comment)
+	case r.Method == http.MethodGet && (path == "/repos/o/r/pulls/91/comments" || path == "/repos/o/r/pulls/91/reviews"):
 		writeFixtureJSON(w, []any{})
 	case r.Method == http.MethodGet && strings.Contains(path, "/commits/") && strings.HasSuffix(path, "/check-runs"):
 		writeFixtureJSON(w, map[string]any{"check_runs": []any{map[string]any{"name": "full-system-ci", "status": "completed", "conclusion": "success"}}})
@@ -162,7 +274,7 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var input map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&input)
 		created := time.Now().UTC().Format(time.RFC3339Nano)
-		comment := map[string]any{"id": len(f.comments) + 1, "body": input["body"], "created_at": created, "updated_at": created, "user": map[string]any{"id": 42}}
+		comment := map[string]any{"id": nextFixtureCommentID(f.comments), "body": input["body"], "created_at": created, "updated_at": created, "user": map[string]any{"id": 42}}
 		f.comments = append(f.comments, comment)
 		writeFixtureStatusJSON(w, http.StatusCreated, comment)
 	case r.Method == http.MethodPost && path == "/repos/o/r/issues/73/labels":
@@ -182,6 +294,19 @@ func (f *fullSystemGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, fmt.Sprintf(`{"message":"unhandled fixture endpoint %s %s"}`, r.Method, r.URL.RequestURI()), http.StatusNotFound)
 	}
+}
+
+func nextFixtureCommentID(comments []map[string]any) int64 {
+	var latest int64
+	for _, comment := range comments {
+		switch id := comment["id"].(type) {
+		case int:
+			latest = max(latest, int64(id))
+		case int64:
+			latest = max(latest, id)
+		}
+	}
+	return latest + 1
 }
 
 func githubMutationRequest(r *http.Request) bool {
@@ -227,11 +352,19 @@ func TestFullSystemE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := os.MkdirTemp("/tmp", "agent-symphony-full-system-")
+	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root, err := os.MkdirTemp(home, ".agent-symphony-full-system-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := removeFullSystemFixtureRoot(root); err != nil {
+			t.Errorf("remove full-system fixture root: %v", err)
+		}
+	})
 	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
 		t.Fatal(err)
@@ -250,6 +383,10 @@ func TestFullSystemE2E(t *testing.T) {
 	runExternal(t, repository, "git", "remote", "add", "origin", origin)
 	runExternal(t, repository, "git", "push", "-q", "-u", "origin", "main")
 	base := strings.TrimSpace(runExternal(t, repository, "git", "rev-parse", "HEAD"))
+	firstLaunchRelease := filepath.Join(root, "first-launch-release")
+	runExternal(t, "", "mkfifo", firstLaunchRelease)
+	reviewRelease := filepath.Join(root, "review-release")
+	runExternal(t, "", "mkfifo", reviewRelease)
 
 	fixture := &fullSystemGitHub{base: base, origin: origin, labels: map[string]bool{"agent-ready": true, "priority:P1": true, "autonomous-merge": true}}
 	github := httptest.NewServer(fixture)
@@ -259,9 +396,9 @@ func TestFullSystemE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(binDir, "agent-symphony")
-	buildArgs := []string{"build", "-o", binary, "."}
+	buildArgs := []string{"build", "-tags", "agent_symphony_test", "-o", binary, "."}
 	if raceMode {
-		buildArgs = []string{"build", "-race", "-o", binary, "."}
+		buildArgs = []string{"build", "-race", "-tags", "agent_symphony_test", "-o", binary, "."}
 	}
 	runExternal(t, source, "go", buildArgs...)
 	writeExecutable(t, filepath.Join(binDir, "gh"), `#!/bin/sh
@@ -280,25 +417,23 @@ test "$endpoint" = graphql && endpoint=/graphql
 if [ "$input" -eq 1 ]; then exec curl -sS -i -X "$method" --data-binary @- "$FAKE_GITHUB_URL$endpoint"; fi
 exec curl -sS -i -X "$method" "$FAKE_GITHUB_URL$endpoint"
 `)
-	writeExecutable(t, filepath.Join(binDir, "codex"), `#!/bin/sh
+	buildNativeCodexFixture(t, filepath.Join(binDir, "codex"), `#!/bin/sh
+umask 077
+if [ "$1" = --version ]; then printf '%s\n' 'codex-cli 0.153.4'; exit 0; fi
+if [ "$1" = sandbox ]; then
+  while [ "$1" != -- ]; do shift; done
+  shift
+  if [ "$2" = sandbox-probe ]; then printf '%s\n' '{"confined":true,"shared_temp_read":true,"shared_temp_write":true}' > "$3"; exit 0; fi
+  exec "$@"
+fi
 HOME=$FULL_SYSTEM_FIXTURE/empty-git-home
 export HOME
 mkdir -p "$HOME"
-trusted=0
-bypass=0
-want_trust=$(printf 'projects={"%s"={trust_level="trusted"}}' "$PWD")
-for argument do
-  test "$argument" != "$want_trust" || trusted=1
-  test "$argument" != --dangerously-bypass-approvals-and-sandbox || bypass=1
-done
-test "$trusted" -eq 1 || { printf 'Do you trust the contents of this directory?\n' >&2; exit 18; }
-test "$bypass" -eq 1 || { printf 'Approval required\n' >&2; exit 19; }
 if [ -n "${AGENT_SYMPHONY_REVIEW_RESULT:-}" ]; then
-	  sleep 1
 	  if ! grep -qx reworked change.txt; then
 	    if [ ! -e "$FULL_SYSTEM_FIXTURE/reviewed-once" ]; then
 	    : >"$FULL_SYSTEM_FIXTURE/review-started"
-	    while [ ! -e "$FULL_SYSTEM_FIXTURE/allow-review" ]; do sleep 0.05; done
+	    IFS= read -r _ <"$FULL_SYSTEM_FIXTURE/review-release"
 	    fi
 	    : >"$FULL_SYSTEM_FIXTURE/reviewed-once"
 	    result='{"type":"agent-symphony-review-v1","status":"findings","findings":["append the reviewed marker"]}'
@@ -310,7 +445,9 @@ if [ -n "${AGENT_SYMPHONY_REVIEW_RESULT:-}" ]; then
 	  mv "$AGENT_SYMPHONY_REVIEW_RESULT.tmp" "$AGENT_SYMPHONY_REVIEW_RESULT"
 	  exit 0
 fi
-	if [ "$1" = exec ]; then
+	last=
+	for arg in "$@"; do last=$arg; done
+	if [ "$last" = - ]; then
 	  IFS= read -r prompt || exit 19
 	  case "$prompt" in
 	    *"Apply this authorized Agent Symphony handoff"*)
@@ -323,17 +460,20 @@ fi
 	fi
 if [ ! -e "$FULL_SYSTEM_FIXTURE/launched-once" ]; then
   : >"$FULL_SYSTEM_FIXTURE/launched-once"
+	IFS= read -r _ <"$FULL_SYSTEM_FIXTURE/first-launch-release"
   printf 'scripted launch failure\n' >&2
   exit 42
 fi
 printf 'implementation-ready\n'
 IFS= read -r message || exit 20
-printf '%s' '{"body":"/agent-symphony status needs-attention: waiting for operator decision"}' | gh api --method POST /repos/o/r/issues/73/comments --input - >/dev/null || exit 21
-printf '%s' '{"labels":["needs-attention"]}' | gh api --method POST /repos/o/r/issues/73/labels --input - >/dev/null || exit 22
+printf '{"type":"agent-symphony-status-v1","generation":%s,"launch_id":"%s","sequence":1,"status":"needs-attention","reason":"waiting for operator decision"}' "$AGENT_SYMPHONY_WORKER_GENERATION" "$AGENT_SYMPHONY_WORKER_LAUNCH_ID" >"$AGENT_SYMPHONY_STATUS_REQUEST.tmp" || exit 21
+chmod 0600 "$AGENT_SYMPHONY_STATUS_REQUEST.tmp" || exit 21
+mv "$AGENT_SYMPHONY_STATUS_REQUEST.tmp" "$AGENT_SYMPHONY_STATUS_REQUEST" || exit 22
 printf 'attention-status-set\n'
 IFS= read -r message || exit 23
-printf '%s' '{"body":"/agent-symphony status clear: operator supplied the decision"}' | gh api --method POST /repos/o/r/issues/73/comments --input - >/dev/null || exit 24
-gh api --method DELETE /repos/o/r/issues/73/labels/needs-attention >/dev/null || exit 25
+printf '{"type":"agent-symphony-status-v1","generation":%s,"launch_id":"%s","sequence":2,"status":"clear","reason":"operator supplied the decision"}' "$AGENT_SYMPHONY_WORKER_GENERATION" "$AGENT_SYMPHONY_WORKER_LAUNCH_ID" >"$AGENT_SYMPHONY_STATUS_REQUEST.tmp" || exit 24
+chmod 0600 "$AGENT_SYMPHONY_STATUS_REQUEST.tmp" || exit 24
+mv "$AGENT_SYMPHONY_STATUS_REQUEST.tmp" "$AGENT_SYMPHONY_STATUS_REQUEST" || exit 25
 printf 'operator-message-received:%s\n' "$message"
 printf 'reviewed\n' >>change.txt
 git add change.txt && git -c user.name='Full system fixture' -c user.email=fixture@example.invalid commit -qm 'implement fixture journey' || exit 26
@@ -364,14 +504,37 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	stopped := false
 	currentSession := "as-o-r-964584196b5c-73-1"
 	t.Cleanup(func() {
-		_ = stopFullSystemTmux(server.Env, currentSession)
-		_ = stopFullSystemProcesses(root)
 		if !stopped {
-			_ = server.Process.Kill()
-			_ = server.Wait()
+			if err := stopFullSystemDaemon(server); err != nil {
+				t.Errorf("join full-system daemon before resource cleanup: %v", err)
+			}
+			stopped = true
+		}
+		if err := stopFullSystemTmux(server.Env, currentSession); err != nil {
+			t.Errorf("stop full-system tmux: %v", err)
+		}
+		if fullSystemTmuxSessionExists(server.Env, currentSession) {
+			t.Errorf("full-system tmux session remained after cleanup: %s", currentSession)
+		}
+		if err := stopFullSystemProcesses(root); err != nil {
+			t.Errorf("stop full-system child processes: %v", err)
 		}
 	})
 	waitHTTP(t, "http://"+address+"/status.json", deadline(15*time.Second), output)
+	initialReconcile, err := http.NewRequest(http.MethodPost, "http://"+address+"/actions/reconcile", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialReconcile.Header.Set("Origin", "http://"+address)
+	initialResponse, err := http.DefaultClient.Do(initialReconcile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialBody, _ := io.ReadAll(initialResponse.Body)
+	_ = initialResponse.Body.Close()
+	if initialResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("initial reconciliation HTTP %d: %s\n%s", initialResponse.StatusCode, initialBody, output.String())
+	}
 	response, err := http.Get("http://" + address + "/status.json")
 	if err != nil {
 		t.Fatal(err)
@@ -381,6 +544,27 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	fixture.mu.Lock()
 	t.Logf("initial status=%s requests=%q", statusBody, fixture.requests)
 	fixture.mu.Unlock()
+	if !waitFor(deadline(15*time.Second), func() bool {
+		response, err := http.Get("http://" + address + "/status.json")
+		if err != nil {
+			return false
+		}
+		defer response.Body.Close()
+		var snapshot dashboardStatusSnapshot
+		return json.NewDecoder(response.Body).Decode(&snapshot) == nil && slices.ContainsFunc(snapshot.Statuses, func(status orchestrator.RecoveryStatus) bool {
+			return status.Attempt == 1 && status.State == "active" && status.CurrentPhase == "implementation"
+		})
+	}) {
+		t.Fatalf("first launch was not owner-committed before the failure barrier: %s\nserve=%s", fullSystemAttemptDiagnostics(address, stateRoot, currentSession, server.Env), output.String())
+	}
+	release, err := os.OpenFile(firstLaunchRelease, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := release.WriteString("release\n")
+	if closeErr := release.Close(); writeErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(writeErr, closeErr))
+	}
 	failureStarted := time.Now()
 	if !waitFor(deadline(15*time.Second), func() bool {
 		response, err := http.Get("http://" + address + "/status.json")
@@ -391,7 +575,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		var snapshot dashboardStatusSnapshot
 		return json.NewDecoder(response.Body).Decode(&snapshot) == nil && len(snapshot.Statuses) == 1 && snapshot.Statuses[0].State == "failed" && snapshot.Statuses[0].Retryable && snapshot.Statuses[0].Attempt == 1
 	}) {
-		t.Fatalf("scripted launch failure did not become recoverable: %s", output.String())
+		t.Fatalf("scripted launch failure did not become recoverable: %s\nserve=%s", fullSystemAttemptDiagnostics(address, stateRoot, currentSession, server.Env), output.String())
 	}
 	if elapsed := time.Since(failureStarted); elapsed >= latencyBudget {
 		t.Fatalf("launch failure projection latency=%s", elapsed)
@@ -505,7 +689,15 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	}
 	stopped = false
 	waitHTTP(t, "http://"+address+"/status.json", deadline(15*time.Second), output)
-	if err := os.WriteFile(filepath.Join(root, "allow-review"), nil, 0o600); err != nil {
+	reviewGate, err := os.OpenFile(reviewRelease, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(reviewGate, "continue\n"); err != nil {
+		_ = reviewGate.Close()
+		t.Fatal(err)
+	}
+	if err := reviewGate.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if !waitFor(deadline(30*time.Second), func() bool {
@@ -550,6 +742,14 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		})
 	}) {
 		t.Fatalf("merged state did not reach the owner projection: statuses=%#v serve=%s", completed.Statuses, output.String())
+	}
+	completedOwner, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedRecord, ok := completedOwner.Attempts[ownerAttemptKey("o/r", 73, 2)]
+	if !ok || attemptHasReviewerProof(completedOwner, "o/r", 73, 2) || !completedRecord.Manifest.ReviewRunCleaned || completedRecord.Manifest.ReviewRunID != "" || completedRecord.Manifest.ReviewSnapshot != "" || completedRecord.Manifest.ReviewSession != "" {
+		t.Fatalf("completed lifecycle did not automatically retire exact reviewer authority and resources: record=%#v proofs=%#v", completedRecord, completedOwner.ReviewerProofs)
 	}
 	if err := server.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
@@ -643,38 +843,104 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 			t.Fatal(err)
 		}
 	}
-	removedAttempt := agentruntime.Attempt{Repository: "o/r", Issue: 73, Number: 1, BaseSHA: removedManifest.BaseSHA}
 	snapshotRoot := productionSnapshotRoot(stateRoot)
 	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	removedSnapshot, removedReviewSession := reviewIdentity(removedAttempt, snapshotRoot)
 	unrelatedSnapshot := filepath.Join(snapshotRoot, "unrelated-snapshot")
-	removedReviewResult := removedSnapshot + ".result-0123456789abcdef"
-	for _, path := range []string{removedSnapshot, removedReviewResult, unrelatedSnapshot} {
+	for _, path := range []string{unrelatedSnapshot} {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 	tmuxEnvironment := append(os.Environ(), "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
 	unrelatedSession := "as-unrelated-permanent-removal"
-	for _, session := range []string{removedManifest.Session, removedReviewSession, unrelatedSession} {
+	for _, session := range []string{removedManifest.Session, unrelatedSession} {
 		ensureFullSystemTmuxSession(t, tmuxEnvironment, session, repository)
 	}
+	removeReconcileEntered, removeReconcileRelease := make(chan struct{}), make(chan struct{})
+	fixture.issueListEntered, fixture.issueListRelease = removeReconcileEntered, removeReconcileRelease
+	fixture.holdIssueList.Store(true)
+	removeReconcileDone := make(chan error, 1)
+	go func() {
+		request, requestErr := http.NewRequest(http.MethodPost, "http://"+restartAddress+"/actions/reconcile", nil)
+		if requestErr != nil {
+			removeReconcileDone <- requestErr
+			return
+		}
+		request.Header.Set("Origin", "http://"+restartAddress)
+		response, requestErr := http.DefaultClient.Do(request)
+		if requestErr != nil {
+			removeReconcileDone <- requestErr
+			return
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusNoContent {
+			body, _ := io.ReadAll(response.Body)
+			removeReconcileDone <- fmt.Errorf("reconciliation returned HTTP %d: %s", response.StatusCode, body)
+			return
+		}
+		removeReconcileDone <- nil
+	}()
+	select {
+	case <-removeReconcileEntered:
+	case err := <-removeReconcileDone:
+		t.Fatalf("reconciliation finished before the GitHub barrier: %v", err)
+	case <-time.After(deadline(15 * time.Second)):
+		t.Fatal("reconciliation did not reach the GitHub issue-list barrier")
+	}
 	fixture.mu.Lock()
-	fixture.denyMutations = true
+	removalMutationStart := len(fixture.requests)
 	fixture.mu.Unlock()
 	removalPlaywright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "removal-playwright"))
 	removalPlaywright.Dir = source
-	removalPlaywright.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+restartAddress)
+	removalPlaywright.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+restartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL)
 	if removalOutput, removalErr := removalPlaywright.CombinedOutput(); removalErr != nil {
+		close(removeReconcileRelease)
 		ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 		t.Fatalf("real permanent-removal Playwright: %v\n%s\nledger=%s\nserve:\n%s", removalErr, removalOutput, ledger, restartOutput.String())
 	}
-	removeCLI := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "remove", "--issue", "73", "--attempt", "1", "--confirm", "--request-id", "full-system-removal-retry", "--timeout", controlTimeout, "--json")
-	removeOutput, err := removeCLI.CombinedOutput()
-	if err != nil || !strings.Contains(string(removeOutput), `"ok":true`) {
-		t.Fatalf("idempotent permanent-removal CLI: %v output=%s serve=%s", err, removeOutput, restartOutput.String())
+	fixture.mu.Lock()
+	removalActionRequests := append([]string(nil), fixture.requests[removalMutationStart:]...)
+	fixture.mu.Unlock()
+	if slices.ContainsFunc(removalActionRequests, func(request string) bool {
+		return !strings.HasPrefix(request, "GET ") && !strings.HasPrefix(request, "HEAD ")
+	}) {
+		t.Fatalf("permanent removal performed GitHub mutation before committed repair admission: %q", removalActionRequests)
+	}
+	removedDuringBlock, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := removedDuringBlock.MachineStatuses[ownerIssueKey("o/r", 73)]
+	expectedStatusBody, err := internalgithub.AttributedBody(73, status.Attempt, fmt.Sprintf("/agent-symphony status clear: %s\n\n<!-- agent-symphony:status:v2:sequence:%d -->", status.Reason, status.Sequence))
+	if err != nil || status.Status != "clear" || status.Reason != "attempt invalidated" {
+		t.Fatalf("permanent removal did not commit an exact owner status repair: status=%#v err=%v", status, err)
+	}
+	repair, hasControlRepair := removedDuringBlock.ControlRepairs[ownerIssueKey("o/r", 73)]
+	fixture.mu.Lock()
+	fixture.expectedStatusBody = expectedStatusBody
+	if hasControlRepair {
+		fixture.expectedControlBody, fixture.expectedControlGeneration = repair.Body, repair.Generation
+	}
+	fixture.denyMutations = true
+	fixture.mu.Unlock()
+	select {
+	case err := <-removeReconcileDone:
+		t.Fatalf("permanent removal waited for blocked reconciliation: %v", err)
+	default:
+	}
+	close(removeReconcileRelease)
+	select {
+	case err := <-removeReconcileDone:
+		if err != nil {
+			fixture.mu.Lock()
+			denied := append([]string(nil), fixture.deniedMutations...)
+			fixture.mu.Unlock()
+			t.Fatalf("release blocked reconciliation after permanent removal: %v; denied=%q", err, denied)
+		}
+	case <-time.After(deadline(15 * time.Second)):
+		t.Fatal("blocked reconciliation did not finish after release")
 	}
 	var removedState runtimeOwnerState
 	var tombstone runtimeTombstone
@@ -682,19 +948,28 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		var readErr error
 		removedState, readErr = readRuntimeOwnerState(stateRoot, "o/r")
 		tombstone = removedState.Tombstones[removedKey]
-		return readErr == nil && tombstone.Action == "removed" && tombstone.CleanupPhase == "completed"
+		if readErr != nil || tombstone.Action != "removed" || tombstone.CleanupPhase != "completed" {
+			return false
+		}
+		for _, receipt := range removedState.ControlReceipts {
+			if receipt.Request.Action == "remove" && receipt.Request.Issue == 73 && receipt.Request.Attempt == 1 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK && receipt.EffectID != "" && removedState.Effects[receipt.EffectID].State == "completed" {
+				return true
+			}
+		}
+		return false
 	}) {
-		t.Fatalf("permanent removal was not durably completed: tombstone=%#v", tombstone)
+		roots, _ := os.ReadDir(productionSnapshotRoot(stateRoot))
+		t.Fatalf("permanent removal was not durably completed: tombstone=%#v effect=%#v proofs=%#v roots=%#v serve=%s", tombstone, removedState.Effects[tombstone.EffectID], removedState.ReviewerProofs, roots, restartOutput.String())
 	}
 	if _, exists := removedState.Attempts[removedKey]; exists {
 		t.Fatal("permanently removed attempt remains authoritative")
 	}
-	for _, path := range []string{removedManifest.Worktree, removedResult, filepath.Dir(removedManifest.LogPath), removedSnapshot, removedReviewResult} {
+	for _, path := range []string{removedManifest.Worktree, removedResult, filepath.Dir(removedManifest.LogPath)} {
 		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("selected resource remains after permanent removal: %s: %v", path, err)
 		}
 	}
-	for _, session := range []string{removedManifest.Session, removedReviewSession} {
+	for _, session := range []string{removedManifest.Session} {
 		if fullSystemTmuxSessionExists(tmuxEnvironment, session) {
 			t.Fatalf("selected tmux session remains after permanent removal: %s", session)
 		}
@@ -709,11 +984,26 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 			t.Fatalf("unrelated tmux session changed during permanent removal: %s", session)
 		}
 	}
+	removeCLI := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "remove", "--issue", "73", "--attempt", "1", "--confirm", "--request-id", "full-system-removal-retry", "--timeout", controlTimeout, "--json")
+	removeOutput, err := removeCLI.CombinedOutput()
+	if err != nil || !strings.Contains(string(removeOutput), `"ok":true`) {
+		t.Fatalf("idempotent permanent-removal CLI after dashboard cleanup: %v output=%s serve=%s", err, removeOutput, restartOutput.String())
+	}
 	fixture.mu.Lock()
 	deniedMutations := append([]string(nil), fixture.deniedMutations...)
+	removalRepairs := append([]string(nil), fixture.removalRepairs...)
 	fixture.mu.Unlock()
 	if len(deniedMutations) != 0 {
 		t.Fatalf("permanent removal attempted GitHub mutations: %q", deniedMutations)
+	}
+	expectedRepairs := []string{"status"}
+	if hasControlRepair {
+		expectedRepairs = append(expectedRepairs, fmt.Sprintf("control:%d", repair.Generation))
+	}
+	slices.Sort(removalRepairs)
+	slices.Sort(expectedRepairs)
+	if !slices.Equal(removalRepairs, expectedRepairs) {
+		t.Fatalf("permanent removal did not converge through only the exact generation-bound repairs: got=%v want=%v", removalRepairs, expectedRepairs)
 	}
 	if err := restarted.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
@@ -722,6 +1012,24 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatalf("restarted serve shutdown: %v output=%s", err, restartOutput.String())
 	}
 	restartedStopped = true
+	staleBranch, err := internalgithub.AttemptBranch("o/r", 73, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleMarker, err := internalgithub.AttemptMarker(73, 1, staleBranch, base, 90, "review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.mu.Lock()
+	fixture.historicalPulls = append(fixture.historicalPulls, map[string]any{"number": 90, "body": staleMarker, "state": "closed", "merged_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}, "head": map[string]any{"sha": base, "ref": staleBranch}, "base": map[string]any{"sha": base}})
+	fixture.comments = append(fixture.comments, map[string]any{"id": 90, "body": staleMarker, "created_at": "2026-09-09T12:00:00Z", "updated_at": "2026-09-09T12:00:00Z", "user": map[string]any{"id": 42}})
+	fixture.mu.Unlock()
+	staleFacts, err := internalgithub.FetchAttemptFacts(t.Context(), internalgithub.API{BaseURL: github.URL, HTTP: github.Client(), Retries: -1}, "o/r", 42)
+	if err != nil || !slices.ContainsFunc(staleFacts, func(fact internalgithub.RecoveryAttemptFact) bool {
+		return fact.Repository == "o/r" && fact.Issue == 73 && fact.Attempt == 1 && fact.PR == 90 && fact.HeadSHA == base
+	}) {
+		t.Fatalf("fake GitHub did not expose a parser-accepted stale removed attempt: facts=%#v err=%v", staleFacts, err)
+	}
 
 	removalRestartAddress := freeAddress(t)
 	removalRestarted := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", removalRestartAddress, "--interval", "30s")
@@ -739,10 +1047,45 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		}
 	})
 	waitHTTP(t, "http://"+removalRestartAddress+"/status.json", deadline(15*time.Second), &removalRestartOutput)
+	beforeRemovalCycle, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.mu.Lock()
+	if !slices.ContainsFunc(fixture.historicalPulls, func(pull map[string]any) bool {
+		return pull["body"] == staleMarker
+	}) || !slices.ContainsFunc(fixture.comments, func(comment map[string]any) bool {
+		return comment["body"] == staleMarker
+	}) {
+		fixture.mu.Unlock()
+		t.Fatal("fake GitHub lost the exact removed-attempt marker before post-removal reconciliation")
+	}
+	requestsBeforeRemovalCycle := len(fixture.requests)
+	fixture.mu.Unlock()
 	reconcileAfterRemoval := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "reconcile", "--request-id", "full-system-after-removal", "--timeout", controlTimeout, "--json")
 	reconcileOutput, err := reconcileAfterRemoval.CombinedOutput()
 	if err != nil || !strings.Contains(string(reconcileOutput), `"ok":true`) {
 		t.Fatalf("post-removal restart reconcile: %v output=%s serve=%s", err, reconcileOutput, removalRestartOutput.String())
+	}
+	afterRemovalCycle, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil || !fullSystemNewCycleAfter(afterRemovalCycle, beforeRemovalCycle) || afterRemovalCycle.CycleDiagnostic != "" {
+		t.Fatalf("post-removal fake-GitHub cycle did not commit cleanly: err=%v before=%d/%d after=%d/%d diagnostic=%q", err, beforeRemovalCycle.CycleOutcomeEpoch, beforeRemovalCycle.CycleOutcomeID, afterRemovalCycle.CycleOutcomeEpoch, afterRemovalCycle.CycleOutcomeID, afterRemovalCycle.CycleDiagnostic)
+	}
+	if _, exists := afterRemovalCycle.Attempts[removedKey]; exists {
+		t.Fatal("fake-GitHub reconciliation recreated permanently removed owner attempt")
+	}
+	if afterRemovalCycle.Observations[ownerIssueKey("o/r", 73)].Attempts[removedKey].Present {
+		t.Fatal("fake-GitHub reconciliation restored permanently removed owner observation")
+	}
+	fixture.mu.Lock()
+	removalCycleRequests := append([]string(nil), fixture.requests[requestsBeforeRemovalCycle:]...)
+	fixture.mu.Unlock()
+	if !slices.ContainsFunc(removalCycleRequests, func(request string) bool {
+		return request == "GET /repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1"
+	}) || !slices.ContainsFunc(removalCycleRequests, func(request string) bool {
+		return strings.HasPrefix(request, "GET /repos/o/r/issues/73/comments")
+	}) {
+		t.Fatalf("post-removal cycle did not consume fake-GitHub removed-attempt PR and comments: %q", removalCycleRequests)
 	}
 	response, err = http.Get("http://" + removalRestartAddress + "/dashboard-state.json")
 	if err != nil {
@@ -754,11 +1097,56 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	if decodeErr != nil || !slices.Contains(removalState.Hidden, dashboardHiddenAttempt{Repository: "o/r", Issue: 73, Attempt: 1, Reason: "removed"}) {
 		t.Fatalf("removed attempt did not persist after restart/reconcile: state=%#v err=%v", removalState, decodeErr)
 	}
+	removalRestartBrowser := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "removal-restart-playwright"))
+	removalRestartBrowser.Dir = source
+	removalRestartBrowser.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+removalRestartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_REMOVAL_E2E_PHASE=post-restart")
+	if browserOutput, browserErr := removalRestartBrowser.CombinedOutput(); browserErr != nil {
+		t.Fatalf("removed attempt reappeared in browser after restart/reconcile: %v\n%s\nserve=%s", browserErr, browserOutput, removalRestartOutput.String())
+	}
 	fixture.mu.Lock()
 	deniedMutations = append([]string(nil), fixture.deniedMutations...)
 	fixture.mu.Unlock()
 	if len(deniedMutations) != 0 {
 		t.Fatalf("restart/reconcile attempted GitHub mutations during removal proof: %q", deniedMutations)
+	}
+	generatedKey := ownerAttemptKey("o/r", 73, 2)
+	generated := implementationAttempt
+	if generated.Generation == 0 || generated.Manifest.Session == "" || generated.Manifest.Worktree == "" || !afterRemovalCycle.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey].Present {
+		t.Fatalf("real daemon-generated attempt is unavailable in owner observation for Archive: origin=%#v current=%#v", generated, afterRemovalCycle.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey])
+	}
+	fixture.mu.Lock()
+	fixture.denyMutations = false
+	fixture.mu.Unlock()
+	archiveBrowser := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "generated-archive-playwright"))
+	archiveBrowser.Dir = source
+	archiveBrowser.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+removalRestartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_REMOVAL_E2E_PHASE=archive-generated-click")
+	if browserOutput, browserErr := archiveBrowser.CombinedOutput(); browserErr != nil {
+		ledger, _ := readRuntimeOwnerState(stateRoot, "o/r")
+		fixture.mu.Lock()
+		archiveRequests := append([]string(nil), fixture.requests...)
+		fixture.mu.Unlock()
+		t.Fatalf("real generated-attempt Archive browser: %v\n%s\nowner_attempt=%#v observation=%#v tombstone=%#v receipts=%#v cycle=%q requests=%q serve=%s", browserErr, browserOutput, ledger.Attempts[generatedKey], ledger.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey], ledger.Tombstones[generatedKey], ledger.ControlReceipts, ledger.CycleDiagnostic, archiveRequests, removalRestartOutput.String())
+	}
+	if !waitFor(deadline(15*time.Second), func() bool {
+		current, readErr := readRuntimeOwnerState(stateRoot, "o/r")
+		if readErr != nil || current.Tombstones[generatedKey].Action != "archived" || current.Tombstones[generatedKey].CleanupPhase != "completed" || current.Attempts[generatedKey].Generation != 0 {
+			return false
+		}
+		for _, receipt := range current.ControlReceipts {
+			if receipt.Request.Action == "archive" && receipt.Request.Issue == 73 && receipt.Request.Attempt == 2 && receipt.State == "completed" && receipt.Result != nil && receipt.Result.OK && receipt.EffectID == "" && current.Tombstones[generatedKey].EffectID == "" && !attemptHasReviewerProof(current, "o/r", 73, 2) {
+				return true
+			}
+		}
+		return false
+	}) {
+		current, _ := readRuntimeOwnerState(stateRoot, "o/r")
+		t.Fatalf("generated-attempt Archive did not commit: tombstone=%#v receipts=%#v effects=%s serve=%s", current.Tombstones[generatedKey], current.ControlReceipts, fullSystemEffectSummary(current), removalRestartOutput.String())
+	}
+	if _, err := os.Lstat(generated.Manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Archive retained generated worktree %s: %v", generated.Manifest.Worktree, err)
+	}
+	if fullSystemTmuxSessionExists(tmuxEnvironment, generated.Manifest.Session) {
+		t.Fatalf("Archive retained generated session %s", generated.Manifest.Session)
 	}
 	if err := removalRestarted.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
@@ -767,13 +1155,67 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 		t.Fatalf("post-removal serve shutdown: %v output=%s", err, removalRestartOutput.String())
 	}
 	removalRestartStopped = true
+	staleFacts, err = internalgithub.FetchAttemptFacts(t.Context(), internalgithub.API{BaseURL: github.URL, HTTP: github.Client(), Retries: -1}, "o/r", 42)
+	if err != nil || !slices.ContainsFunc(staleFacts, func(fact internalgithub.RecoveryAttemptFact) bool {
+		return fact.Repository == "o/r" && fact.Issue == 73 && fact.Attempt == 2 && fact.PR == 91
+	}) {
+		t.Fatalf("fake GitHub did not expose a parser-accepted archived attempt: facts=%#v err=%v", staleFacts, err)
+	}
+	beforeArchiveRestart, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveRestartAddress := freeAddress(t)
+	archiveRestarted := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", archiveRestartAddress, "--interval", "30s")
+	archiveRestarted.Dir, archiveRestarted.Env = repository, server.Env
+	var archiveRestartOutput synchronizedBuffer
+	archiveRestarted.Stdout, archiveRestarted.Stderr = &archiveRestartOutput, &archiveRestartOutput
+	if err := archiveRestarted.Start(); err != nil {
+		t.Fatal(err)
+	}
+	archiveRestartStopped := false
+	t.Cleanup(func() {
+		if !archiveRestartStopped {
+			_ = archiveRestarted.Process.Kill()
+			_ = archiveRestarted.Wait()
+		}
+	})
+	waitHTTP(t, "http://"+archiveRestartAddress+"/status.json", deadline(15*time.Second), &archiveRestartOutput)
+	archiveReconcile := exec.Command(binary, "control", "--repository", "o/r", "--runtime-state", stateRoot, "--action", "reconcile", "--request-id", "full-system-after-generated-archive", "--timeout", controlTimeout, "--json")
+	archiveReconcileOutput, err := archiveReconcile.CombinedOutput()
+	if err != nil || !strings.Contains(string(archiveReconcileOutput), `"ok":true`) {
+		t.Fatalf("post-Archive restart reconcile: %v output=%s serve=%s", err, archiveReconcileOutput, archiveRestartOutput.String())
+	}
+	afterArchiveRestart, err := readRuntimeOwnerState(stateRoot, "o/r")
+	if err != nil || !fullSystemNewCycleAfter(afterArchiveRestart, beforeArchiveRestart) || afterArchiveRestart.CycleDiagnostic != "" || afterArchiveRestart.Tombstones[generatedKey].Action != "archived" || afterArchiveRestart.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey].Present {
+		t.Fatalf("stale fake-GitHub data restored archived generated attempt: err=%v before=%d/%d after=%d/%d tombstone=%#v observation=%#v diagnostic=%q", err, beforeArchiveRestart.CycleOutcomeEpoch, beforeArchiveRestart.CycleOutcomeID, afterArchiveRestart.CycleOutcomeEpoch, afterArchiveRestart.CycleOutcomeID, afterArchiveRestart.Tombstones[generatedKey], afterArchiveRestart.Observations[ownerIssueKey("o/r", 73)].Attempts[generatedKey], afterArchiveRestart.CycleDiagnostic)
+	}
+	if _, exists := afterArchiveRestart.Attempts[generatedKey]; exists {
+		t.Fatal("restart/reconcile recreated archived generated owner attempt")
+	}
+	if attemptHasReviewerProof(afterArchiveRestart, "o/r", 73, 2) {
+		t.Fatalf("restart restored archived reviewer proofs: %#v", afterArchiveRestart.ReviewerProofs)
+	}
+	archiveRestartBrowser := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/permanent-removal-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "generated-archive-restart-playwright"))
+	archiveRestartBrowser.Dir = source
+	archiveRestartBrowser.Env = append(os.Environ(), "AGENT_SYMPHONY_REMOVAL_E2E_URL=http://"+archiveRestartAddress, "AGENT_SYMPHONY_REMOVAL_E2E_FAKE_GITHUB_URL="+github.URL, "AGENT_SYMPHONY_REMOVAL_E2E_PHASE=post-archive-restart")
+	if browserOutput, browserErr := archiveRestartBrowser.CombinedOutput(); browserErr != nil {
+		t.Fatalf("archived generated attempt reappeared after restart: %v\n%s\nserve=%s", browserErr, browserOutput, archiveRestartOutput.String())
+	}
+	if err := archiveRestarted.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := archiveRestarted.Wait(); err != nil {
+		t.Fatalf("post-Archive serve shutdown: %v output=%s", err, archiveRestartOutput.String())
+	}
+	archiveRestartStopped = true
 	if err := stopFullSystemTmux(server.Env, currentSession); err != nil {
 		t.Fatal(err)
 	}
 	if err := stopFullSystemProcesses(root); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.RemoveAll(root); err != nil {
+	if err := removeFullSystemFixtureRoot(root); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(root); !os.IsNotExist(err) {
@@ -810,6 +1252,53 @@ func writeExecutable(t *testing.T, path, body string) {
 	}
 }
 
+func buildNativeCodexFixture(t *testing.T, path, script string) {
+	t.Helper()
+	source := filepath.Join(t.TempDir(), "main.go")
+	body := `package main
+import (
+	"os"
+	"os/exec"
+)
+const script = ` + strconv.Quote(script) + `
+func main() {
+	command := exec.Command("/bin/sh", append([]string{"-c", script, "codex"}, os.Args[1:]...)...)
+	command.Stdin, command.Stdout, command.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := command.Run(); err != nil {
+		if exit, ok := err.(*exec.ExitError); ok { os.Exit(exit.ExitCode()) }
+		os.Exit(127)
+	}
+}
+`
+	if err := os.WriteFile(source, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("go", "build", "-o", path, source)
+	command.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build native Codex fixture: %v: %s", err, output)
+	}
+}
+
+func removeFullSystemFixtureRoot(root string) error {
+	base := filepath.Base(root)
+	if !strings.HasPrefix(base, ".as-test-") && !strings.HasPrefix(base, ".as-lifecycle-") && !strings.HasPrefix(base, ".agent-symphony-full-system-") && !strings.HasPrefix(base, ".agent-symphony-orchestrator-e2e-") && !strings.HasPrefix(base, ".agent-symphony-historical-actions-") {
+		return fmt.Errorf("refusing to remove unexpected fixture root %q", root)
+	}
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return os.Chmod(path, 0o700)
+		}
+		return nil
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.RemoveAll(root)
+}
+
 func freeAddress(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -839,12 +1328,27 @@ func waitHTTP(t *testing.T, target string, timeout time.Duration, output fmt.Str
 	t.Fatalf("server did not become ready: %s", output.String())
 }
 
+func TestWaitForKeepsFirstSuccessfulSample(t *testing.T) {
+	calls := 0
+	if !waitFor(time.Second, func() bool {
+		calls++
+		return calls == 1
+	}) || calls != 1 {
+		t.Fatalf("successful sample was lost or evaluated twice: calls=%d", calls)
+	}
+}
+
 func waitFor(timeout time.Duration, ready func() bool) bool {
 	deadline := time.Now().Add(timeout)
-	for !ready() && time.Now().Before(deadline) {
+	for {
+		if ready() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	return ready()
 }
 
 func fullSystemAttemptDiagnostics(address, stateRoot, implementationSession string, environment []string) string {
@@ -914,11 +1418,52 @@ func stopFullSystemTmux(environment []string, session string) error {
 	return nil
 }
 
+func stopFullSystemDaemon(command *exec.Cmd) error {
+	if command == nil || command.Process == nil || command.ProcessState != nil {
+		return nil
+	}
+	killErr := command.Process.Kill()
+	waitErr := command.Wait()
+	if errors.Is(killErr, os.ErrProcessDone) {
+		killErr = nil
+	}
+	var exit *exec.ExitError
+	if killErr == nil && errors.As(waitErr, &exit) {
+		waitErr = nil
+	}
+	return errors.Join(killErr, waitErr)
+}
+
 func stopFullSystemProcesses(root string) error {
-	listed, err := exec.Command("ps", "-axo", "pid=,command=").Output()
+	pids, err := fullSystemProcessIDs(root)
 	if err != nil {
 		return err
 	}
+	for _, pid := range pids {
+		process, err := os.FindProcess(pid)
+		if err != nil {
+			return err
+		}
+		if err := process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return err
+		}
+	}
+	remaining, err := fullSystemProcessIDs(root)
+	if err != nil {
+		return err
+	}
+	if len(remaining) != 0 {
+		return fmt.Errorf("isolated processes remained after cleanup: %v", remaining)
+	}
+	return nil
+}
+
+func fullSystemProcessIDs(root string) ([]int, error) {
+	listed, err := exec.Command("ps", "-axo", "pid=,command=").Output()
+	if err != nil {
+		return nil, err
+	}
+	var pids []int
 	for _, line := range strings.Split(string(listed), "\n") {
 		if !strings.Contains(line, root) {
 			continue
@@ -929,13 +1474,9 @@ func stopFullSystemProcesses(root string) error {
 		}
 		pid, err := strconv.Atoi(fields[0])
 		if err != nil || pid <= 1 {
-			return fmt.Errorf("invalid isolated process identity %q", line)
+			return nil, fmt.Errorf("invalid isolated process identity %q", line)
 		}
-		process, err := os.FindProcess(pid)
-		if err != nil {
-			return err
-		}
-		_ = process.Kill()
+		pids = append(pids, pid)
 	}
-	return nil
+	return pids, nil
 }

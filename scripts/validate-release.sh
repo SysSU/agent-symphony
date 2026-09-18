@@ -37,8 +37,8 @@ runs = workflow.fetch("jobs").fetch("wsl2").fetch("steps").map { |step| step["ru
 snapshots = runs.flat_map(&:lines).grep(/commit -qm snapshot/)
 abort "expected one WSL snapshot command" unless snapshots.length == 1
 commands = snapshots.first.match(/bash -lc "(.*)"\s*$/)&.captures&.first&.split(/;\s*/)
-chmod = "chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/live-pilot.sh scripts/live-pilot-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh"
-abort "invalid WSL snapshot chmod" unless File.read(path).scan(/\bchmod\b/).length == 1 && commands&.count(chmod) == 1
+chmod = "chmod 0755 scripts/credential-scan.sh scripts/credential-scan-test.sh scripts/lint.sh scripts/live-pilot.sh scripts/live-pilot-test.sh scripts/release.sh scripts/smoke-release.sh scripts/validate-release.sh scripts/wsl-release-validation.sh"
+abort "invalid WSL snapshot chmod" unless commands&.grep(/\Achmod\b/)&.length == 1 && commands.count(chmod) == 1
 index = commands.index(chmod)
 abort "WSL snapshot chmod must immediately precede git init" unless index && commands[index + 1] == "git init -q"
 RUBY
@@ -52,21 +52,68 @@ git -C "$tmp/tag-binding" commit --allow-empty -qm second
 git -C "$tmp/tag-binding" tag -fam moved v0.0.0
 ! test "$(git -C "$tmp/tag-binding" rev-parse --verify 'v0.0.0^{commit}')" = "$event_sha"
 grep -qF 'wsl --install --distribution $distribution --web-download --no-launch' .github/workflows/release-validation.yml
-grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates curl git ruby tmux xz-utils' .github/workflows/release-validation.yml
+grep -qF 'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap build-essential ca-certificates curl git ruby tmux xz-utils' .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install WSL validation prerequisites'" .github/workflows/release-validation.yml
+grep -qF 'cache="$RUNNER_TEMP/agent-symphony-codex-npm-cache"' .github/workflows/release-validation.yml
+grep -qF 'sudo -H env "PATH=$PATH" npm install --global --prefix "$prefix" --cache "$cache" "@openai/codex@$CODEX_VERSION"' .github/workflows/release-validation.yml
+grep -qF 'Darwin/x86_64) package=codex-darwin-x64; target=x86_64-apple-darwin' .github/workflows/release-validation.yml
+grep -qF 'Darwin/arm64) package=codex-darwin-arm64; target=aarch64-apple-darwin' .github/workflows/release-validation.yml
+grep -qF 'Linux/x86_64) package=codex-linux-x64; target=x86_64-unknown-linux-musl' .github/workflows/release-validation.yml
+grep -qF 'Linux/aarch64) package=codex-linux-arm64; target=aarch64-unknown-linux-musl' .github/workflows/release-validation.yml
+grep -qF 'native_root="$prefix/lib/node_modules/@openai/codex/node_modules/@openai/$package"' .github/workflows/release-validation.yml
+grep -qF 'native="$native_root/vendor/$target/bin/codex"' .github/workflows/release-validation.yml
+grep -qF 'sudo chown -R 0:0 "$prefix"' .github/workflows/release-validation.yml
+grep -qF 'sudo chmod -R go-w "$prefix"' .github/workflows/release-validation.yml
+grep -qF 'test -f "$native" && test ! -L "$native" && test -x "$native"' .github/workflows/release-validation.yml
+grep -qF 'find "$native_root" ! -type d ! -type f -print -quit' .github/workflows/release-validation.yml
+grep -qF 'find "$native_root" \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \)' .github/workflows/release-validation.yml
+grep -qF 'printf '\''CODEX_NATIVE=%s\n'\'' "$native" >> "$GITHUB_ENV"' .github/workflows/release-validation.yml
+grep -qF 'dirname "$native" >> "$GITHUB_PATH"' .github/workflows/release-validation.yml
+grep -qF 'sed "s#\"codex\"#\"$CODEX_NATIVE\"#g" "$config" > "$config.native"' .github/workflows/release-validation.yml
+grep -qF "/usr/local/node/bin/npm install --global --prefix /usr/local/codex '@openai/codex@" .github/workflows/release-validation.yml
+grep -qF 'test "$(command -v node)" = /usr/local/node/bin/node' scripts/wsl-release-validation.sh
+grep -qF 'test "$(command -v codex)" = "$codex_native"' scripts/wsl-release-validation.sh
+grep -qF 'test "$(/usr/local/node/bin/node --version)" = v22.15.1' scripts/wsl-release-validation.sh
+grep -qF 'test "$("$codex_native" --version)" = "codex-cli 0.153.0"' scripts/wsl-release-validation.sh
+grep -qF 'sed "s#\"codex\"#\"$codex_native\"#g" "$config" > "$config.native"' scripts/wsl-release-validation.sh
+grep -qF 'kernel.unprivileged_userns_clone=1' .github/workflows/release-validation.yml
+grep -qF 'kernel.apparmor_restrict_unprivileged_userns=0' .github/workflows/release-validation.yml
+grep -qF "throw 'Failed to enable WSL unprivileged user namespaces'" .github/workflows/release-validation.yml
+grep -qF "\$validationUser = 'agent-symphony-ci'" .github/workflows/release-validation.yml
+grep -qF 'wsl -d $distribution --user root -- useradd --create-home --user-group --shell /bin/bash $validationUser' .github/workflows/release-validation.yml
+grep -qF "throw 'Failed to provision the WSL validation user'" .github/workflows/release-validation.yml
+grep -qF 'wsl -d $distribution --user $validationUser -- tar -xf - -C "/home/$validationUser/agent-symphony-ci"' .github/workflows/release-validation.yml
 grep -qF "\$goArchiveVersion = '1.26.0'" .github/workflows/release-validation.yml
 grep -qF 'https://go.dev/dl/go${goArchiveVersion}.linux-${goArch}.tar.gz' .github/workflows/release-validation.yml
 grep -qF "sha256sum -c -" .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install pinned Go toolchain in WSL'" .github/workflows/release-validation.yml
 grep -qF "\$nodeVersion = '22.15.1'" .github/workflows/release-validation.yml
 grep -qF 'https://nodejs.org/dist/v${nodeVersion}/node-v${nodeVersion}-linux-${nodeArch}.tar.xz' .github/workflows/release-validation.yml
-grep -qF "'x86_64' { \$goArch = 'amd64'; \$goSHA256 = 'aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235'; \$nodeArch = 'x64'; \$nodeSHA256 = '7dca2ab34ec817aa4781e2e99dfd34d349eff9be86e5d5fbaa7e96cae8ee3179' }" .github/workflows/release-validation.yml
-grep -qF "'aarch64' { \$goArch = 'arm64'; \$goSHA256 = 'bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd'; \$nodeArch = 'arm64'; \$nodeSHA256 = 'f4ae8ddf7487dfaf7da92fef463ee55cc29d8772d62891361dc3fc8b8e469205' }" .github/workflows/release-validation.yml
+grep -qF "\$codexPlatform = 'linux-x64'; \$codexTarget = 'x86_64-unknown-linux-musl'" .github/workflows/release-validation.yml
+grep -qF "\$codexPlatform = 'linux-arm64'; \$codexTarget = 'aarch64-unknown-linux-musl'" .github/workflows/release-validation.yml
 grep -qF "throw 'Failed to install pinned Node.js toolchain in WSL'" .github/workflows/release-validation.yml
-grep -qF 'sudo tar -C /usr/local/node --strip-components=1 -xJf /tmp/node.tar.xz' .github/workflows/release-validation.yml
-grep -qF "bash -lc 'cd ~/agent-symphony-ci && PATH=/usr/local/node/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin scripts/validate-release.sh 0.0.0-wsl'" .github/workflows/release-validation.yml
+! grep -qF -- '--prefix /usr/local/node' .github/workflows/release-validation.yml
+grep -qF "CODEX_VERSION: '0.153.0'" .github/workflows/release-validation.yml
+grep -qF "\$codexVersion = '0.153.0'" .github/workflows/release-validation.yml
+grep -qF "throw 'Failed to install pinned Codex CLI in WSL'" .github/workflows/release-validation.yml
+grep -qF '$codexRoot = "/usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-${codexPlatform}"' .github/workflows/release-validation.yml
+grep -qF '$codexNative = "/usr/local/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-${codexPlatform}/vendor/${codexTarget}/bin/codex"' .github/workflows/release-validation.yml
+grep -qF "test -f '\${codexNative}' && test ! -L '\${codexNative}' && test -x '\${codexNative}'" .github/workflows/release-validation.yml
+grep -qF "find '\${codexRoot}' ! -type d ! -type f -print -quit" .github/workflows/release-validation.yml
+grep -qF 'find '\''${codexRoot}'\'' \( -type d -o -type f \) \( ! -user root -o -perm -020 -o -perm -002 \)' .github/workflows/release-validation.yml
+grep -qF "throw 'Pinned WSL Codex installation is unsafe or invalid'" .github/workflows/release-validation.yml
+grep -qF "throw 'WSL rootless Codex confinement proof failed'" .github/workflows/release-validation.yml
+grep -qF -- '--user $validationUser --cd "/home/$validationUser" -- bash agent-symphony-ci/scripts/wsl-release-validation.sh proof "$codexNative"' .github/workflows/release-validation.yml
+grep -qF -- '--user $validationUser --cd "/home/$validationUser" -- bash agent-symphony-ci/scripts/wsl-release-validation.sh release "$codexNative"' .github/workflows/release-validation.yml
+! grep -F 'bash -lc' .github/workflows/release-validation.yml | grep -qF 'wsl-release-validation.sh'
+grep -qF 'codex_native=${2:-}' scripts/wsl-release-validation.sh
+grep -qF 'test -f "$codex_native" && test ! -L "$codex_native" && test -x "$codex_native"' scripts/wsl-release-validation.sh
+grep -qF 'test "$(id -u)" -ne 0' scripts/wsl-release-validation.sh
+grep -qF 'test "$(command -v codex)" = "$codex_native"' scripts/wsl-release-validation.sh
+test "$(grep -nF 'scripts/build-dashboard.sh' scripts/wsl-release-validation.sh | cut -d: -f1)" -lt "$(grep -nF 'go run ./cmd/agent-symphony init' scripts/wsl-release-validation.sh | cut -d: -f1)"
+grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl' scripts/wsl-release-validation.sh
 grep -qF "throw 'WSL release validation failed'" .github/workflows/release-validation.yml
-! grep -F '$PATH' .github/workflows/release-validation.yml | grep -qF 'scripts/validate-release.sh 0.0.0-wsl'
+! grep -F '$PATH' .github/workflows/release-validation.yml | grep -qF 'AGENT_SYMPHONY_REQUIRE_CODEX_SANDBOX=1 scripts/validate-release.sh 0.0.0-wsl'
 git diff --check
 CGO_ENABLED=0 go build -o "$tmp/agent-symphony" ./cmd/agent-symphony
 go test ./cmd/agent-symphony -run 'Test(PRGovernanceCommandWiresFakeGitHubAndRecoveryState|ProductionHandoffOutcomeIsCompletedWithoutRedelivery|DaemonLockIsSingleInstanceAndNoFollow|DaemonGitHubAuthenticationBoundary|ReviewAuthenticationCrossesIndependentReviewBoundary|SudoPolicyPreservesOnlyBoundedGitHubEnvironment|AdvancedAgentHostRejectsLocalRootSeamBeforeExecution)' -count=1
