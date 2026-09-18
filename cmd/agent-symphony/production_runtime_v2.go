@@ -36,6 +36,11 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	if err != nil || identity.Version != deploymentIdentityVersion || identity.Repository != cfg.Repository {
 		return nil, errors.New("production v2 deployment fence is not installed")
 	}
+	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
+	if err != nil {
+		return nil, fmt.Errorf("load GitHub cache: %w", err)
+	}
+	api.Cache = cache
 	attemptRoot := productionAttemptRoot(stateRoot)
 	mode := os.FileMode(0o770)
 	if !hostIsolationInstalled() {

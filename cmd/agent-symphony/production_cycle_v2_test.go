@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1042,6 +1043,69 @@ func TestProductionRuntimeFinishesOperatorMarkerBeforeAdmission(t *testing.T) {
 	receipt, ok := operatorReceiptByID(final, request.RequestID)
 	if !ok || receipt.State != "completed" || final.Effects[effect.ID].State != "completed" {
 		t.Fatalf("constructor returned before marker completion: receipt=%#v effect=%#v", receipt, final.Effects[effect.ID])
+	}
+}
+
+func TestProductionRuntimePersistsConditionalGitHubReads(t *testing.T) {
+	checkout := gitRepository(t)
+	runGit(t, checkout, "config", "user.email", "test@example.invalid")
+	runGit(t, checkout, "config", "user.name", "test")
+	runGit(t, checkout, "commit", "--allow-empty", "-m", "base")
+	stateRoot := resolvedTempDir(t)
+	if err := bindDeployment(stateRoot, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	if err := installDeploymentFence(stateRoot, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	var conditional atomic.Int64
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var value any
+		switch request.URL.RequestURI() {
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1", "/repos/o/r/issues?state=open&per_page=100&page=1":
+			value = []any{}
+		case "/repos/o/r":
+			value = map[string]any{"default_branch": "main"}
+		case "/repos/o/r/branches/main":
+			value = map[string]any{"commit": map[string]any{"sha": strings.Repeat("a", 40)}}
+		default:
+			return nil, fmt.Errorf("unexpected GitHub read %s", request.URL.String())
+		}
+		header := make(http.Header)
+		header.Set("ETag", `"unchanged"`)
+		if request.Header.Get("If-None-Match") == `"unchanged"` {
+			conditional.Add(1)
+			return &http.Response{StatusCode: http.StatusNotModified, Header: header, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+		}
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
+	})}}
+	lifecycle, cancel := context.WithCancel(t.Context())
+	runtime, err := startProductionRuntimeV2(lifecycle, config.Default("o/r"), api, internalgithub.AuthenticatedUser{ID: 42}, stateRoot, filepath.Join(stateRoot, "legacy-pr-state.json"), checkout, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		_ = runtime.shutdown(context.Background())
+	}()
+	for range 2 {
+		if err := runtime.trigger.triggerAndWait(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if conditional.Load() == 0 {
+		t.Fatal("second production reconciliation did not send a conditional GitHub read")
+	}
+	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
+	if err != nil {
+		t.Fatalf("production cache was not persisted: %v", err)
+	}
+	var repository struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if _, changed, err := (internalgithub.API{BaseURL: api.BaseURL, HTTP: api.HTTP, Cache: cache}).Read(t.Context(), "/repos/o/r", "", &repository); err != nil || changed || repository.DefaultBranch != "main" {
+		t.Fatalf("persisted cache did not restore GitHub facts: changed=%v repository=%#v err=%v", changed, repository, err)
 	}
 }
 

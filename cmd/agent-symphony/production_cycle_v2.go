@@ -149,6 +149,11 @@ func (p *productionReconciliation) runCycle(ctx context.Context) error {
 		return err
 	}
 	err = p.cycleFromSnapshot(ctx, cycleSnapshot)
+	if p.api.Cache != nil && (err == nil || errors.Is(err, errReconciliationRecollect)) {
+		if saveErr := p.api.Cache.Save(); saveErr != nil {
+			err = errors.Join(err, fmt.Errorf("save GitHub cache: %w", saveErr))
+		}
+	}
 	diagnostic := ""
 	var at time.Time
 	if err != nil && !errors.Is(err, errReconciliationRecollect) {
