@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -44,6 +45,7 @@ type operatorMutationService struct {
 	stopping          chan struct{}
 	stopped           bool
 	beforeAdmission   func()
+	cacheLog          io.Writer
 }
 
 type operatorWork struct {
@@ -727,6 +729,11 @@ func (s *operatorMutationService) collectIssue(ctx context.Context, issue int) (
 	}
 	s.effects.cancelInvalidated(committed)
 	s.cancelSupersededPlanWatchers(snapshot, committed)
+	if s.collector.API.Cache != nil {
+		if err := s.collector.API.Cache.Save(); err != nil && s.cacheLog != nil {
+			_, _ = fmt.Fprintln(s.cacheLog, "save GitHub cache after operator collection: "+internalgithub.Redact(err.Error()))
+		}
+	}
 	return committed, batch, nil
 }
 

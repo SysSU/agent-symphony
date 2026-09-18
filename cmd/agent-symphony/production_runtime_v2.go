@@ -134,6 +134,7 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		return fail(err)
 	}
 	runtime.operator = operator
+	operator.cacheLog = log
 	cycle := &productionReconciliation{
 		owner: owner, effects: effects, collector: collector, config: cfg, api: api,
 		stateRoot: stateRoot, attemptRoot: attemptRoot, checkout: checkout,
