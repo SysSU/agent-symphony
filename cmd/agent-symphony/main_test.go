@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -245,6 +246,55 @@ func TestAuthenticateProjectAfterQuotaStopsOnCancellation(t *testing.T) {
 	_, _, err := authenticateProjectAfterQuota(ctx, "owner/repo", io.Discard)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("authentication after cancellation = %v, want context.Canceled", err)
+	}
+}
+
+func TestStartupDashboardShutdownIsBoundedByContext(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = server.Serve(listener)
+	}()
+	running := &dashboardServerLifecycle{server: server, listener: listener, done: done}
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		response, err := http.Get("http://" + listener.Addr().String())
+		if err == nil {
+			response.Body.Close()
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dashboard request did not enter blocking handler")
+	}
+	start := time.Now()
+	if err := shutdownDashboardWithin(running, 50*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatalf("bounded dashboard shutdown = %v after %s", err, time.Since(start))
+	}
+	close(release)
+	select {
+	case <-requestDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dashboard request did not finish after release")
 	}
 }
 

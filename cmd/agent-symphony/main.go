@@ -400,6 +400,12 @@ func quotaRetryDelay(reset, now time.Time) time.Duration {
 	return max(delay+time.Second, time.Second)
 }
 
+func shutdownDashboardWithin(dashboard *dashboardServerLifecycle, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return dashboard.shutdown(ctx)
+}
+
 func configureProjectRuntimeState(stateRoot string) error {
 	if err := configureProjectTmux(stateRoot); err != nil {
 		return err
@@ -1234,23 +1240,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
 		api, user, err := authenticateProjectAfterQuota(ctx, c.Repository, stderr)
 		if err != nil || ctx.Err() != nil {
-			_ = dashboard.shutdown(context.Background())
+			_ = shutdownDashboardWithin(dashboard, 10*time.Second)
 			if ctx.Err() != nil {
 				return 0
 			}
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		if err := prepareProductionDeploymentLocked(*runtimeState, c.Repository); err != nil {
-			_ = dashboard.shutdown(context.Background())
+			_ = shutdownDashboardWithin(dashboard, 10*time.Second)
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		if ctx.Err() != nil {
-			_ = dashboard.shutdown(context.Background())
+			_ = shutdownDashboardWithin(dashboard, 10*time.Second)
 			return 0
 		}
 		runtime, err := startProductionRuntimeV2(ctx, c, api, user, *runtimeState, *statePath, checkout, stderr)
 		if err != nil {
-			_ = dashboard.shutdown(context.Background())
+			_ = shutdownDashboardWithin(dashboard, 10*time.Second)
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		live, err := newProjectDashboardServerV2(dashboardLifecycle, *runtimeState, c.Repository, peerProjects, "tmux", runtime.operator, c.Concurrency, *allowUnsafeDashboardNetwork, dashboardPassword)
@@ -1260,8 +1266,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 			err = dashboard.activate(live, stderr)
 		}
 		if err != nil {
-			_ = dashboard.shutdown(context.Background())
-			_ = runtime.shutdown(context.Background())
+			_ = shutdownDashboardWithin(dashboard, 10*time.Second)
+			runtimeShutdown, cancelRuntime := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = runtime.shutdown(runtimeShutdown)
+			cancelRuntime()
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		ticker := newServeTicker(*interval, *disablePeriodicReconciliation)

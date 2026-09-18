@@ -75,3 +75,15 @@ test("an equal-version old live response cannot clear degraded mode", async ({ p
   await expect(page.getByRole("button", { name: "Check now" })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Status refresh failed" })).toBeVisible();
 });
+
+test("degraded status disables controls even if auxiliary state fails", async ({ page }) => {
+  test.skip(process.env.AGENT_SYMPHONY_QUOTA_E2E_PHASE !== "live");
+  await page.goto(baseURL);
+  await expect(page.getByRole("button", { name: "Check now" })).toBeVisible();
+  const live = await page.evaluate(async () => (await fetch("/status.json")).json());
+  await page.route("**/status.json", (route) => route.fulfill({ headers: { "x-test-degraded": "1" }, json: { ...live, owner_epoch: live.owner_epoch + 1, owner_revision: 1, read_only: true, reconciliation_error: "GitHub authentication is unavailable" } }));
+  await page.route("**/dashboard-state.json", (route) => route.fulfill({ status: 503, body: "state unavailable" }));
+  await page.waitForResponse((response) => response.headers()["x-test-degraded"] === "1");
+  await expect(page.getByRole("button", { name: "Check now" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Agent Symphony is unavailable" })).toBeVisible();
+});

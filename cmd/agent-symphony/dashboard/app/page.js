@@ -57,18 +57,16 @@ export default function Dashboard() {
       try {
         const orchestratorRequest = getOrchestratorStatus();
         const projectsRequest = fetch("/projects.json", { cache: "no-store" });
-        const [response, orchestratorResult] = await Promise.all([
-          fetch("/status.json", { cache: "no-store" }),
-          orchestratorRequest,
-        ]);
+        const response = await fetch("/status.json", { cache: "no-store" });
         if (!response.ok) throw new Error(response.status === 404 ? "Waiting for the first reconciliation" : `Status request failed (${response.status})`);
+        const next = await response.json();
+        if (active) acceptSnapshot(next);
         const stateResponse = await fetch("/dashboard-state.json", { cache: "no-store" });
-        const projectsResponse = await projectsRequest;
+        const [projectsResponse, orchestratorResult] = await Promise.all([projectsRequest, orchestratorRequest]);
         if (!stateResponse.ok) throw new Error(`Dashboard state request failed (${stateResponse.status})`);
         if (!projectsResponse.ok) throw new Error(`Project request failed (${projectsResponse.status})`);
-        const [next, nextState, nextProjects] = await Promise.all([response.json(), stateResponse.json(), projectsResponse.json()]);
+        const [nextState, nextProjects] = await Promise.all([stateResponse.json(), projectsResponse.json()]);
         if (active) {
-          acceptSnapshot(next);
           acceptDashboardState(nextState);
           setProjects(nextProjects.projects ?? []);
           setOrchestratorStatus(orchestratorResult.status);
