@@ -1439,6 +1439,20 @@ func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) err
 	if err != nil {
 		return err
 	}
+	proveAbsent := func() error {
+		absent, proofErr := hostBoundImplementationPaneAbsent(ctx, binding)
+		if proofErr != nil || !absent {
+			return errors.Join(proofErr, errors.New("bound implementation pane may still exist"))
+		}
+		if confined {
+			return nil
+		}
+		gone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding)
+		if groupErr != nil || !gone {
+			return errors.Join(groupErr, errors.New("implementation worker group termination is unconfirmed"))
+		}
+		return nil
+	}
 	session := manifest.Session
 	probe := func() (bool, error) {
 		result, err := runHostTmux(ctx, []string{"has-session", "-t", "=" + session}, nil)
@@ -1448,29 +1462,24 @@ func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) err
 		if exactTmuxSessionAbsent(result, session) {
 			return false, nil
 		}
-		return false, err
+		return false, fmt.Errorf("tmux has-session: %w: %q", err, strings.TrimSpace(result.Output))
 	}
 	live, err := probe()
 	if err != nil {
-		return err
+		if proofErr := proveAbsent(); proofErr != nil {
+			return errors.Join(fmt.Errorf("probe implementation session: %w", err), proofErr)
+		}
+		return nil
 	}
 	if !live {
-		absent, probeErr := hostBoundImplementationPaneAbsent(ctx, binding)
-		if probeErr == nil && absent {
-			if confined {
-				return nil
-			}
-			gone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding)
-			if groupErr == nil && gone {
-				return nil
-			}
-			return errors.Join(groupErr, errors.New("implementation worker group termination is unconfirmed"))
-		}
-		return errors.Join(probeErr, errors.New("bound implementation pane may still exist"))
+		return proveAbsent()
 	}
 	observed, err := runHostTmux(ctx, []string{"display-message", "-p", "-t", agentruntime.PaneTarget(session), agentruntime.ImplementationPaneFormat}, nil)
 	if err != nil {
-		return err
+		if proofErr := proveAbsent(); proofErr != nil {
+			return errors.Join(fmt.Errorf("inspect implementation pane: %w: %q", err, strings.TrimSpace(observed.Output)), proofErr)
+		}
+		return nil
 	}
 	pane, err := agentruntime.ParseImplementationPane(observed.Output)
 	if err != nil || !binding.Matches(manifest, pane) {
