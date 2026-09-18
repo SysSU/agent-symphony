@@ -1218,10 +1218,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 					ticker.Stop()
 				}
 				shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				dashboardDone, runtimeDone := make(chan error, 1), make(chan error, 1)
-				go func() { dashboardDone <- dashboard.shutdown(shutdown) }()
-				go func() { runtimeDone <- runtime.shutdown(shutdown) }()
-				dashboardErr, runtimeErr := <-dashboardDone, <-runtimeDone
+				dashboardErr := dashboard.shutdown(shutdown)
+				runtimeErr := runtime.shutdown(shutdown)
 				cancel()
 				if err := errors.Join(dashboardErr, runtimeErr); err != nil {
 					return fail(stderr, *jsonOutput, command, err.Error())

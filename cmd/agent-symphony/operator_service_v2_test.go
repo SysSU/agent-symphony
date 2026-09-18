@@ -3779,6 +3779,46 @@ func TestOperatorShutdownDrainsCollectionStartedBeforeShutdown(t *testing.T) {
 	}
 }
 
+func TestOperatorShutdownDrainsAcceptedRecoveryCollection(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 361, "completed", true)
+	service := operatorTestMutationService(t, owner)
+	service.stopping = make(chan struct{})
+	service.collect = func(_ context.Context, snapshot stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
+		return reconciliationV2Batch{Input: reconciliationInput{Scope: reconciliationScope{Kind: reconciliationIssueScope, Repository: snapshot.State.Repository, Issue: issue}, Complete: true}}, nil
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	result := make(chan error, 1)
+	if !service.start("accepted-recovery", func() {
+		close(entered)
+		<-release
+		_, _, err := service.collectIssue(t.Context(), 362)
+		result <- err
+	}) {
+		t.Fatal("recovery worker was not accepted")
+	}
+	<-entered
+	before := mustOwnerSnapshot(t, owner).State.Revision
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- service.shutdown(t.Context()) }()
+	select {
+	case <-service.stopping:
+	case <-time.After(5 * time.Second):
+		t.Fatal("operator shutdown did not begin")
+	}
+	once.Do(func() { close(release) })
+	if err := <-result; err != nil {
+		t.Fatalf("accepted recovery could not collect during shutdown: %v", err)
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+	if after := mustOwnerSnapshot(t, owner).State.Revision; after <= before {
+		t.Fatalf("accepted recovery did not commit: before=%d after=%d", before, after)
+	}
+}
+
 func operatorNeverLaunchedOwner(t *testing.T, issue int, manifestState, observedState string, persist func(runtimeOwnerState) error) (*stateOwner, agentruntime.Manifest) {
 	t.Helper()
 	root := resolvedTempDir(t)
