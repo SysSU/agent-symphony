@@ -63,9 +63,12 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		return nil, err
 	}
 	initial.WorkerProfileDigest = workerProfileDigest
-	lifecycle, cancel := context.WithCancel(parent)
+	// A signal requests graceful shutdown; it must not pre-close the owner or
+	// cancel persistence before accepted operator work has drained.
+	lifecycle, cancel := context.WithCancel(context.WithoutCancel(parent))
 	runtime := &productionRuntimeV2{cancel: cancel}
 	fail := func(err error) (*productionRuntimeV2, error) {
+		cancel() // Startup did not reach the graceful serve drain.
 		_ = runtime.shutdown(context.Background())
 		return nil, err
 	}
@@ -86,7 +89,7 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	}
 	runtime.agent = agent
 
-	source, err := seedImmutableAttemptSource(lifecycle, checkout, cfg.Repository, attemptRoot, "", "")
+	source, err := seedImmutableAttemptSource(parent, checkout, cfg.Repository, attemptRoot, "", "")
 	if err != nil {
 		return fail(err)
 	}
@@ -148,10 +151,10 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		return fail(err)
 	}
 	runtime.status = status
-	if err := cycle.sweepPendingMarkers(lifecycle); err != nil {
+	if err := cycle.sweepPendingMarkers(parent); err != nil {
 		return fail(err)
 	}
-	if err := operator.resumePending(lifecycle); err != nil {
+	if err := operator.resumePending(parent); err != nil {
 		return fail(err)
 	}
 	trigger, err := newProductionReconciliationTriggerRunner(lifecycle, cycle.runCycle)
@@ -168,6 +171,9 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		return fail(err)
 	}
 	runtime.proposal = proposal
+	if err := parent.Err(); err != nil {
+		return fail(err)
+	}
 	return runtime, nil
 }
 
@@ -216,9 +222,6 @@ func (r *productionRuntimeV2) shutdown(ctx context.Context) error {
 	if r == nil {
 		return nil
 	}
-	if r.cancel != nil {
-		r.cancel()
-	}
 	joins := []func() error{}
 	if r.proposal != nil {
 		joins = append(joins, func() error { return r.proposal.shutdown(ctx) })
@@ -232,12 +235,6 @@ func (r *productionRuntimeV2) shutdown(ctx context.Context) error {
 	if r.effects != nil {
 		joins = append(joins, func() error { return r.effects.shutdown(ctx) })
 	}
-	if r.status != nil {
-		joins = append(joins, func() error { return r.status.wait(ctx) })
-	}
-	if r.agent != nil {
-		joins = append(joins, func() error { return r.agent.Shutdown(ctx) })
-	}
 	results := make(chan error, len(joins))
 	for _, join := range joins {
 		go func() { results <- join() }()
@@ -245,6 +242,15 @@ func (r *productionRuntimeV2) shutdown(ctx context.Context) error {
 	var result error
 	for range joins {
 		result = errors.Join(result, <-results)
+	}
+	if r.cancel != nil {
+		r.cancel()
+	}
+	if r.status != nil {
+		result = errors.Join(result, r.status.wait(ctx))
+	}
+	if r.agent != nil {
+		result = errors.Join(result, r.agent.Shutdown(ctx))
 	}
 	if r.owner != nil {
 		result = errors.Join(result, r.owner.close(ctx))
