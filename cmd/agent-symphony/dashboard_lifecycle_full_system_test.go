@@ -492,6 +492,8 @@ fi
 			if err != nil {
 				t.Fatal(err)
 			}
+			// The daemon must pin the same fixture source, not pin this pre-pinned copy again.
+			cfg.Commands.Implementation[0], cfg.Commands.Reviewer[0] = filepath.Join(binDir, "codex"), filepath.Join(binDir, "codex")
 			manifest.WorkerProfileDigest, state.WorkerProfileDigest = profileDigest, profileDigest
 			state.Attempts[key] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
 			body, _ = json.Marshal(manifest)
@@ -1340,18 +1342,20 @@ fi
 				if !waitFor(limit, func() bool {
 					current, err := readRuntimeOwnerState(stateRoot, "o/r")
 					replacement, ok := current.Attempts[ownerAttemptKey("o/r", 73, 2)]
-					if err != nil || !ok || replacement.Manifest.State != "running" || replacement.Manifest.Session != second || !fullSystemTmuxSessionExists(environment, second) {
+					// The owner's active profile is runtime-only; disk snapshots omit it.
+					if err != nil || !ok || replacement.Manifest.State != "running" || replacement.Manifest.Session != second || !agentruntime.WorkerConfinementMatches(replacement.Manifest, replacement.Generation, profileDigest) || !fullSystemTmuxSessionExists(environment, second) {
 						return false
 					}
 					for _, effect := range current.Effects {
-						if effect.Action == string(agentruntime.EffectStart) && effect.Issue == 73 && effect.Attempt == 2 && effect.AttemptGeneration == replacement.Generation && effect.State == "completed" {
-							return true
+						if (effect.Action == string(agentruntime.EffectStart) || effect.Action == string(agentruntime.EffectStop)) && effect.Issue == 73 && effect.Attempt == 2 && effect.State == "pending" {
+							return false
 						}
 					}
-					return false
+					return true
 				}) {
 					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
-					t.Fatalf("cancel successor Start did not settle before restart: attempt=%#v effects=%s pending_start=%s serve=%s", current.Attempts[ownerAttemptKey("o/r", 73, 2)], fullSystemEffectSummary(current), fullSystemPendingStartDiagnostic(current, stateRoot, environment), output.String())
+					replacement := current.Attempts[ownerAttemptKey("o/r", 73, 2)]
+					t.Fatalf("cancel successor Start did not settle before restart: attempt=%#v fixture_profile=%q confinement_matches=%t session_exists=%t effects=%s pending_start=%s serve=%s", replacement, profileDigest, agentruntime.WorkerConfinementMatches(replacement.Manifest, replacement.Generation, profileDigest), fullSystemTmuxSessionExists(environment, second), fullSystemEffectSummary(current), fullSystemPendingStartDiagnostic(current, stateRoot, environment), output.String())
 				}
 			}
 			if err := server.Process.Signal(os.Interrupt); err != nil {
