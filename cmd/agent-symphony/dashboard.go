@@ -85,8 +85,14 @@ type dashboardStatusSnapshot struct {
 	OwnerEpoch            uint64                        `json:"owner_epoch,omitempty"`
 	OwnerRevision         uint64                        `json:"owner_revision,omitempty"`
 	Statuses              []orchestrator.RecoveryStatus `json:"statuses"`
+	IssueQuarantines      []dashboardIssueQuarantine    `json:"issue_quarantines,omitempty"`
 	ReconciliationError   string                        `json:"reconciliation_error,omitempty"`
 	ReconciliationErrorAt time.Time                     `json:"reconciliation_error_at,omitzero"`
+}
+
+type dashboardIssueQuarantine struct {
+	Issue      int    `json:"issue"`
+	Diagnostic string `json:"diagnostic"`
 }
 
 type dashboardProject struct {

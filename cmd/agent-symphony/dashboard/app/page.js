@@ -18,6 +18,14 @@ const actionDetails = {
   recover: ["Recover", "If the attempt is stuck, this stops only its named tmux session. It preserves the worktree and diagnostics, records the failure on GitHub, and requests a new attempt.", "Recovery requested for"],
 };
 
+function IssueQuarantineNotice({ items }) {
+  if (!items.length) return null;
+  return <section className="notice" aria-label="GitHub outcomes need attention">
+    <h2>GitHub outcomes need attention</h2>
+    <ul>{items.map((item) => <li key={item.issue}>{`#${item.issue}: ${item.diagnostic}`}</li>)}</ul>
+  </section>;
+}
+
 export default function Dashboard() {
   const [snapshot, setSnapshot] = useState(null);
   const [dashboardState, setDashboardState] = useState({ hidden: [] });
@@ -142,6 +150,7 @@ export default function Dashboard() {
   const view = projectView(projects, selectedRepository, snapshot, dashboardState, error);
   const { remote: remoteProject, snapshot: visibleSnapshot, error: visibleError } = view;
   const { statuses, historical, quarantined, counts, title, lanes, health } = projectBoard(view, now);
+  const issueQuarantines = visibleSnapshot?.issue_quarantines ?? [];
   const remoteURL = remoteProject?.url || "";
   const openAttemptTerminal = (status, session) => {
     const selected = session ?? { role: "implementation", name: status.session }, route = { implementation: "/terminal", reviewer: "/reviewer/terminal" }[selected.role];
@@ -185,7 +194,8 @@ export default function Dashboard() {
         <h2>Physical cleanup needs attention</h2>
         <ul>{quarantined.map((status) => <li key={attemptKey(status)}>{`#${status.issue} attempt ${status.attempt}: ${status.diagnostic || "Physical cleanup is unverified."}`}</li>)}</ul>
       </section> : null}
-      {!visibleError && visibleSnapshot && statuses.length === 0 && quarantined.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
+      <IssueQuarantineNotice items={issueQuarantines} />
+      {!visibleError && visibleSnapshot && statuses.length === 0 && quarantined.length === 0 && issueQuarantines.length === 0 ? <p className="notice">No visible attempts in the current projection.</p> : null}
 
       <section className="board" aria-label="Issue status board" tabIndex={0} onKeyDown={(event) => {
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;

@@ -49,9 +49,9 @@ test.afterEach(async ({ page }) => {
   expect(browserErrors.get(page)).toEqual([]);
 });
 
-async function mockDashboard(page, attempts, orchestrator = { enabled: true, state: "running", session: "orchestrator" }) {
+async function mockDashboard(page, attempts, orchestrator = { enabled: true, state: "running", session: "orchestrator" }, issueQuarantines = []) {
   let dashboardState = { version: 1, hidden: [] };
-  const snapshot = () => ({ updated_at: new Date().toISOString(), statuses: attempts });
+  const snapshot = () => ({ updated_at: new Date().toISOString(), statuses: attempts, issue_quarantines: issueQuarantines });
   await page.route("**/orchestrator.json", (route) => route.fulfill({ json: orchestrator }));
   await page.route("**/dashboard-state.json", (route) => route.fulfill({ json: dashboardState }));
   await page.route("**/status.json", (route) => route.fulfill({ json: snapshot() }));
@@ -65,6 +65,20 @@ async function mockDashboard(page, attempts, orchestrator = { enabled: true, sta
     },
   };
 }
+
+test("shows issue-level GitHub quarantine without an archived attempt card", async ({ page }) => {
+  await mockDashboard(page, [], undefined, [{ issue: 330, diagnostic: "a GitHub mutation has an unresolved external outcome; new attempts remain blocked until it is verified" }]);
+  await page.goto("/");
+
+  const notice = page.getByRole("region", { name: "GitHub outcomes need attention" });
+  await expect(notice).toContainText("#330: a GitHub mutation has an unresolved external outcome");
+  await expect(page.getByRole("heading", { name: "Agent Symphony needs attention" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Physical cleanup needs attention" })).toHaveCount(0);
+  const board = page.getByRole("region", { name: "Issue status board" });
+  await expect(board.locator("article.card")).toHaveCount(0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(notice).toBeVisible();
+});
 
 test("shows loading then unavailable when the initial status request fails", async ({ page }) => {
   let releaseStatus;

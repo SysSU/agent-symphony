@@ -80,11 +80,17 @@ export function overallHealth(snapshot, error, statuses, now) {
   const attention = statuses.filter((status) => status.needs_attention || status.state !== "completed" && (
     (laneByState.get(status.state) ?? 3) === 3 || status.blockers?.length || status.diagnostic
   )).length;
-  if (attention) {
+  const quarantinedIssues = snapshot.issue_quarantines?.length ?? 0;
+  if (attention || quarantinedIssues) {
+    const detail = [
+      attention ? `${attention} attempt${attention === 1 ? "" : "s"} need attention.` : "",
+      quarantinedIssues ? `${quarantinedIssues} issue${quarantinedIssues === 1 ? "" : "s"} have unresolved GitHub outcomes.` : "",
+      "See the status cards and notices below.",
+    ].filter(Boolean).join(" ");
     return {
       state: "attention",
       title: "Agent Symphony needs attention",
-      detail: `${attention} attempt${attention === 1 ? "" : "s"} need attention. See the status cards and cleanup notices below.`,
+      detail,
     };
   }
 
