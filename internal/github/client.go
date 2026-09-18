@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"net/http"
 	"os/exec"
@@ -26,6 +27,7 @@ type API struct {
 	Sleep    func(context.Context, time.Duration) error
 	Retries  int
 	Metrics  *CycleMetrics
+	Usage    *RequestUsage
 
 	mutationSlots chan struct{}
 }
@@ -44,6 +46,70 @@ type CycleMetrics struct {
 	mutated  atomic.Bool
 	mu       sync.Mutex
 	error    string
+}
+
+// RequestUsage records bounded, credential-free physical request counts.
+// It is shared by API copies used by reconciliation and operator actions.
+type RequestUsage struct {
+	mu     sync.Mutex
+	counts map[string]uint64
+	rates  map[string]RateBudget
+}
+
+type RateBudget struct {
+	Remaining string `json:"remaining"`
+	Reset     string `json:"reset,omitempty"`
+}
+
+func (u *RequestUsage) Record(req *http.Request, resp *http.Response) {
+	if u == nil || req == nil {
+		return
+	}
+	parts := strings.Split(req.URL.Path, "/")
+	for i, part := range parts {
+		if _, err := strconv.ParseUint(part, 10, 64); err == nil || len(part) == 40 && strings.Trim(part, "0123456789abcdefABCDEF") == "" {
+			parts[i] = "{id}"
+		}
+	}
+	status := "transport-error"
+	if resp != nil {
+		status = strconv.Itoa(resp.StatusCode)
+	}
+	key := req.Method + " " + strings.Join(parts, "/") + " " + status
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.counts == nil {
+		u.counts = map[string]uint64{}
+	}
+	if len(u.counts) >= 128 && u.counts[key] == 0 {
+		key = "other"
+	}
+	u.counts[key]++
+	if resp != nil {
+		if remaining, err := strconv.ParseUint(resp.Header.Get("X-RateLimit-Remaining"), 10, 64); err == nil {
+			resource := resp.Header.Get("X-RateLimit-Resource")
+			if resource != "core" && resource != "graphql" {
+				resource = "other"
+			}
+			budget := RateBudget{Remaining: strconv.FormatUint(remaining, 10)}
+			if reset, err := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); err == nil && reset > 0 {
+				budget.Reset = strconv.FormatInt(reset, 10)
+			}
+			if u.rates == nil {
+				u.rates = map[string]RateBudget{}
+			}
+			u.rates[resource] = budget
+		}
+	}
+}
+
+func (u *RequestUsage) Snapshot() (map[string]uint64, map[string]RateBudget) {
+	if u == nil {
+		return nil, nil
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return maps.Clone(u.counts), maps.Clone(u.rates)
 }
 
 func (m *CycleMetrics) Snapshot() (requests, retries int64) {
@@ -234,6 +300,7 @@ type responseStatusError struct {
 	operation, message, githubMessage, documentationURL string
 	status                                              int
 	structured                                          bool
+	rateLimitReset                                      time.Time
 }
 
 func (e *responseStatusError) Error() string {
@@ -243,6 +310,15 @@ func (e *responseStatusError) Error() string {
 func isResponseStatus(err error, status int) bool {
 	var response *responseStatusError
 	return errors.As(err, &response) && response.status == status
+}
+
+// RateLimitReset reports a verified GitHub primary-quota reset, if present.
+func RateLimitReset(err error) (time.Time, bool) {
+	var response *responseStatusError
+	if !errors.As(err, &response) || response.status != http.StatusForbidden && response.status != http.StatusTooManyRequests || response.rateLimitReset.IsZero() {
+		return time.Time{}, false
+	}
+	return response.rateLimitReset, true
 }
 
 func IsAmbiguousMutation(err error) bool {
@@ -423,7 +499,9 @@ func (a API) do(ctx context.Context, method, path, etag string, body []byte, att
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return client.Do(req)
+	resp, err := client.Do(req)
+	a.Usage.Record(req, resp)
+	return resp, err
 }
 
 func (a API) sleep(ctx context.Context, d time.Duration) error {
@@ -467,7 +545,13 @@ func responseError(operation string, resp *http.Response) error {
 	}
 	structured := readErr == nil && len(body) <= 4096 && json.Unmarshal(body, &details) == nil
 	body = body[:min(len(body), 4096)]
-	return &responseStatusError{operation: operation, status: resp.StatusCode, message: fmt.Sprintf("%s: %s", resp.Status, Redact(string(body))), githubMessage: details.Message, documentationURL: details.DocumentationURL, structured: structured}
+	var reset time.Time
+	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+		if unix, err := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); err == nil && unix > 0 {
+			reset = time.Unix(unix, 0)
+		}
+	}
+	return &responseStatusError{operation: operation, status: resp.StatusCode, message: fmt.Sprintf("%s: %s", resp.Status, Redact(string(body))), githubMessage: details.Message, documentationURL: details.DocumentationURL, structured: structured, rateLimitReset: reset}
 }
 
 func decodeJSON(r io.Reader, dst any) error {

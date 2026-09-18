@@ -26,6 +26,10 @@ function IssueQuarantineNotice({ items }) {
   </section>;
 }
 
+function projectReadOnly(remote, snapshot) {
+  return Boolean(remote || snapshot?.read_only);
+}
+
 export default function Dashboard() {
   const [snapshot, setSnapshot] = useState(null);
   const [dashboardState, setDashboardState] = useState({ hidden: [] });
@@ -43,7 +47,7 @@ export default function Dashboard() {
   const [projects, setProjects] = useState([]);
   const [selectedRepository, setSelectedRepository] = useState("");
   const closeTerminal = useCallback(() => setTerminal(null), []);
-  const acceptSnapshot = useCallback((next) => setSnapshot((current) => ownerVersionAtLeast(next, current) ? next : current), []);
+  const acceptSnapshot = useCallback((next) => setSnapshot((current) => next?.read_only || ownerVersionAtLeast(next, current) ? next : current), []);
   const acceptDashboardState = useCallback((next) => setDashboardState((current) => ownerVersionAtLeast(next, current) ? next : current), []);
 
   useEffect(() => {
@@ -149,6 +153,7 @@ export default function Dashboard() {
 
   const view = projectView(projects, selectedRepository, snapshot, dashboardState, error);
   const { remote: remoteProject, snapshot: visibleSnapshot, error: visibleError } = view;
+  const readOnly = projectReadOnly(remoteProject, visibleSnapshot);
   const { statuses, historical, quarantined, counts, title, lanes, health } = projectBoard(view, now);
   const issueQuarantines = visibleSnapshot?.issue_quarantines ?? [];
   const remoteURL = remoteProject?.url || "";
@@ -177,11 +182,12 @@ export default function Dashboard() {
           <h2>{health.title}</h2>
           <p>{health.detail}</p>
         </div>
-        <ProjectHealthControl remote={remoteProject} onNotice={setActionNotice} onSnapshot={acceptSnapshot} />
+        <ProjectHealthControl remote={remoteProject} readOnly={readOnly} onNotice={setActionNotice} onSnapshot={acceptSnapshot} />
       </section>
 
       <ProjectAgentConsole
         remote={remoteProject}
+        readOnly={readOnly}
         status={orchestratorStatus}
         error={orchestratorError}
         busy={orchestratorBusy}
@@ -224,7 +230,7 @@ export default function Dashboard() {
                       investigating={investigating === attemptKey(status)}
                       waiting={waiting && busy === attemptKey(status)}
                       onNotice={setActionNotice}
-                      readOnly={Boolean(remoteProject)}
+                      readOnly={readOnly}
                     />
                   </li>
                 ))}
@@ -233,7 +239,7 @@ export default function Dashboard() {
           </section>
         )) : <p className="boardState" role="status">{visibleError ? "Issue status board unavailable." : "Loading issue status board…"}</p>}
       </section>
-      <AttemptHistory statuses={historical} onAction={performAction} busy={busy} waiting={waiting} readOnly={Boolean(remoteProject)} />
+      <AttemptHistory statuses={historical} onAction={performAction} busy={busy} waiting={waiting} readOnly={readOnly} />
       {terminal ? <TerminalPanel config={terminal} onClose={closeTerminal} /> : null}
     </main>
   );

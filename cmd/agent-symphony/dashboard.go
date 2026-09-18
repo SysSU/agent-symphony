@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
@@ -54,6 +55,8 @@ type dashboardServer struct {
 	issueClosed  func(context.Context, string, int) (bool, error)
 	operator     *operatorMutationService
 	capacity     int
+	degraded     bool
+	unbound      bool
 }
 
 type dashboardHiddenAttempt struct {
@@ -88,6 +91,7 @@ type dashboardStatusSnapshot struct {
 	IssueQuarantines      []dashboardIssueQuarantine    `json:"issue_quarantines,omitempty"`
 	ReconciliationError   string                        `json:"reconciliation_error,omitempty"`
 	ReconciliationErrorAt time.Time                     `json:"reconciliation_error_at,omitzero"`
+	ReadOnly              bool                          `json:"read_only,omitempty"`
 }
 
 type dashboardIssueQuarantine struct {
@@ -144,6 +148,10 @@ func (s *dashboardServer) handler(static http.Handler) http.Handler {
 			return
 		}
 		if !s.authenticate(w, r) {
+			return
+		}
+		if s.degraded && (r.Method != http.MethodGet && r.Method != http.MethodHead || strings.HasPrefix(r.URL.Path, "/actions/") || strings.HasSuffix(r.URL.Path, "/terminal")) {
+			http.Error(w, "GitHub authentication is unavailable; dashboard is read-only", http.StatusServiceUnavailable)
 			return
 		}
 		if r.URL.Path == "/actions/archive" || r.URL.Path == "/actions/abandon" || r.URL.Path == "/actions/dismiss" || r.URL.Path == "/actions/remove" || r.URL.Path == "/actions/cancel" || r.URL.Path == "/actions/recover" || r.URL.Path == "/actions/review-plan" {
@@ -330,6 +338,9 @@ func validateDashboardProjectURLs(values []string) ([]string, error) {
 }
 
 func (s *dashboardServer) readStatus() (dashboardStatusSnapshot, error) {
+	if s.degraded && s.unbound {
+		return dashboardStatusSnapshot{UpdatedAt: time.Now().UTC(), Statuses: []orchestrator.RecoveryStatus{}, ReadOnly: true, ReconciliationError: "GitHub authentication is unavailable; saved status is read-only"}, nil
+	}
 	if s.operator != nil && s.operator.owner != nil {
 		snapshot, err := s.operator.owner.snapshot(s.ctx)
 		if err != nil {
@@ -338,6 +349,9 @@ func (s *dashboardServer) readStatus() (dashboardStatusSnapshot, error) {
 		return projectOwnerStatus(snapshot, s.capacity, time.Now())
 	}
 	body, err := readDashboardStatus(filepath.Join(s.stateRoot, "status.json"))
+	if s.degraded && errors.Is(err, os.ErrNotExist) {
+		return dashboardStatusSnapshot{UpdatedAt: time.Now().UTC(), Statuses: []orchestrator.RecoveryStatus{}, ReadOnly: true, ReconciliationError: "GitHub authentication is unavailable; saved status is read-only"}, nil
+	}
 	if err != nil {
 		return dashboardStatusSnapshot{}, err
 	}
@@ -349,6 +363,10 @@ func (s *dashboardServer) readStatus() (dashboardStatusSnapshot, error) {
 	}
 	if s.repository != "" && slices.ContainsFunc(snapshot.Statuses, func(status orchestrator.RecoveryStatus) bool { return status.Repository != s.repository }) {
 		return dashboardStatusSnapshot{}, errors.New("status snapshot contains another project")
+	}
+	if s.degraded {
+		snapshot.ReadOnly = true
+		snapshot.ReconciliationError = "GitHub authentication is unavailable; saved status is read-only"
 	}
 	return snapshot, nil
 }
@@ -1094,9 +1112,14 @@ type dashboardServerLifecycle struct {
 	listener net.Listener
 	control  *controlServerLifecycle
 	done     chan struct{}
+	handler  atomic.Value // http.Handler; replaced only after live owner startup.
 }
 
 func startDashboardServerWaitable(address string, project *dashboardServer, allowNet bool, password string, log io.Writer) (string, *dashboardServerLifecycle, error) {
+	return startDashboardServerMode(address, project, allowNet, password, log, false)
+}
+
+func startDashboardServerMode(address string, project *dashboardServer, allowNet bool, password string, log io.Writer, degraded bool) (string, *dashboardServerLifecycle, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", nil, fmt.Errorf("dashboard address: %w", err)
@@ -1116,16 +1139,23 @@ func startDashboardServerWaitable(address string, project *dashboardServer, allo
 	if err != nil {
 		return "", nil, fmt.Errorf("listen for dashboard on %s: %w", address, err)
 	}
-	control, err := startControlServerWaitable(project, log)
-	if err != nil {
-		_ = listener.Close()
-		return "", nil, err
+	var control *controlServerLifecycle
+	if !degraded {
+		control, err = startControlServerWaitable(project, log)
+		if err != nil {
+			_ = listener.Close()
+			return "", nil, err
+		}
 	}
-	server := &http.Server{Handler: project.webHandler(), ReadHeaderTimeout: 5 * time.Second}
+	running := &dashboardServerLifecycle{listener: listener, control: control, done: make(chan struct{})}
+	running.handler.Store(project.webHandler())
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		running.handler.Load().(http.Handler).ServeHTTP(w, r)
+	}), ReadHeaderTimeout: 5 * time.Second}
 	if allowNet {
 		fmt.Fprintln(log, "WARNING: unsafe dashboard network access enabled; direct HTTP is unencrypted, the password and session data are exposed in transit, and anyone with the password can use terminals and cleanup controls")
 	}
-	running := &dashboardServerLifecycle{server: server, listener: listener, control: control, done: make(chan struct{})}
+	running.server = server
 	go func() {
 		defer close(running.done)
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -1135,11 +1165,24 @@ func startDashboardServerWaitable(address string, project *dashboardServer, allo
 	return "http://" + listener.Addr().String(), running, nil
 }
 
+func (s *dashboardServerLifecycle) activate(project *dashboardServer, log io.Writer) error {
+	control, err := startControlServerWaitable(project, log)
+	if err != nil {
+		return err
+	}
+	s.control = control
+	s.handler.Store(project.webHandler())
+	return nil
+}
+
 func (s *dashboardServerLifecycle) shutdown(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	controlErr := s.control.shutdown(ctx)
+	var controlErr error
+	if s.control != nil {
+		controlErr = s.control.shutdown(ctx)
+	}
 	err := s.server.Shutdown(ctx)
 	_ = s.listener.Close()
 	select {

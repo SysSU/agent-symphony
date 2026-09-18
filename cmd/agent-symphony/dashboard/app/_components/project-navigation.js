@@ -70,12 +70,14 @@ export function ProjectHeader({ title, snapshot, release, counts, now }) {
   );
 }
 
-export function ProjectHealthControl({ remote, onNotice, onSnapshot }) {
+export function ProjectHealthControl({ remote, readOnly, onNotice, onSnapshot }) {
   if (remote) return <a href={remote.url}>Open project dashboard</a>;
+  if (readOnly) return null;
   return <ReconcileButton onNotice={onNotice} onSnapshot={onSnapshot} />;
 }
 
-export function ProjectAgentConsole({ remote, ...props }) {
+export function ProjectAgentConsole({ remote, readOnly, ...props }) {
   if (remote) return <p className="notice">Peer status is read-only here. Open its project dashboard to use terminals or controls.</p>;
+  if (readOnly) return <p className="notice">GitHub authentication is unavailable. Controls and terminals are disabled until recovery.</p>;
   return <OrchestratorCard {...props} />;
 }

@@ -349,20 +349,45 @@ func installDeploymentFence(stateRoot, repository string) error {
 	return nil
 }
 
-func authenticateProjectDeployment(ctx context.Context, repository string, metrics ...*internalgithub.CycleMetrics) (internalgithub.API, internalgithub.AuthenticatedUser, error) {
-	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient}
-	if len(metrics) > 0 {
-		api.Metrics = metrics[0]
-	}
-	api = api.WithReadSnapshot()
-	user, err := api.AuthenticatedUser(ctx)
+func authenticateProjectDeployment(ctx context.Context, repository string, usage *internalgithub.RequestUsage) (internalgithub.API, internalgithub.AuthenticatedUser, error) {
+	api := internalgithub.API{BaseURL: githubAPI, HTTP: githubClient, Usage: usage}
+	auth := api.WithReadSnapshot()
+	auth.Retries = -1 // A quota response is scheduled at reset, not retried in place.
+	user, err := auth.AuthenticatedUser(ctx)
 	if err != nil {
 		return api, user, fmt.Errorf("authenticate GitHub: %w", err)
 	}
-	if err := api.VerifyRepository(ctx, repository); err != nil {
+	if err := auth.VerifyRepository(ctx, repository); err != nil {
 		return api, user, fmt.Errorf("verify GitHub repository: %w", err)
 	}
 	return api, user, nil
+}
+
+func authenticateProjectAfterQuota(ctx context.Context, repository string, log io.Writer) (internalgithub.API, internalgithub.AuthenticatedUser, error) {
+	usage := &internalgithub.RequestUsage{}
+	for {
+		api, user, err := authenticateProjectDeployment(ctx, repository, usage)
+		if err == nil || ctx.Err() != nil {
+			return api, user, err
+		}
+		reset, exhausted := internalgithub.RateLimitReset(err)
+		if !exhausted {
+			return api, user, err
+		}
+		delay := max(time.Until(reset)+time.Second, time.Second)
+		if !reset.After(time.Now()) {
+			delay = time.Minute // A stale header must not create a hot authentication loop.
+		}
+		delay = min(delay, time.Hour)
+		fmt.Fprintf(log, "GitHub quota exhausted; dashboard remains read-only until retry at %s\n", time.Now().Add(delay).UTC().Format(time.RFC3339))
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return api, user, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func configureProjectRuntimeState(stateRoot string) error {
@@ -1169,17 +1194,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return fail(stderr, *jsonOutput, command, rootErr.Error())
 			}
 		}
-		api, user, err := authenticateProjectDeployment(context.Background(), c.Repository)
-		if err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
 		lock, err := acquireDaemonLock(filepath.Join(*runtimeState, "daemon.lock"))
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		defer releaseDaemonLock(lock)
-		if err := prepareProductionDeploymentLocked(*runtimeState, c.Repository); err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
+		identity, identityErr := readDeploymentIdentity(*runtimeState)
+		if identityErr == nil && identity.Repository != c.Repository {
+			return fail(stderr, *jsonOutput, command, fmt.Sprintf("runtime state is bound to project %s, not %s", identity.Repository, c.Repository))
+		}
+		if identityErr != nil && !errors.Is(identityErr, os.ErrNotExist) {
+			return fail(stderr, *jsonOutput, command, identityErr.Error())
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
@@ -1187,25 +1212,44 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		runtime, err := startProductionRuntimeV2(ctx, c, api, user, *runtimeState, *statePath, checkout, stderr)
-		if err != nil {
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
 		dashboardLifecycle, stopDashboard := context.WithCancel(context.WithoutCancel(ctx))
 		defer stopDashboard()
-		project, err := newProjectDashboardServerV2(dashboardLifecycle, *runtimeState, c.Repository, peerProjects, "tmux", runtime.operator, c.Concurrency, *allowUnsafeDashboardNetwork, dashboardPassword)
+		project := newProjectDashboardServer(dashboardLifecycle, *runtimeState, c.Repository, peerProjects, "tmux", nil, nil, *allowUnsafeDashboardNetwork, dashboardPassword)
+		project.degraded = true
+		project.unbound = errors.Is(identityErr, os.ErrNotExist)
+		dashboardURL, dashboard, err := startDashboardServerMode(*dashboardAddress, project, *allowUnsafeDashboardNetwork, dashboardPassword, stderr, true)
 		if err != nil {
-			_ = runtime.shutdown(context.Background())
-			return fail(stderr, *jsonOutput, command, err.Error())
-		}
-		project.orchestrator = runtime.agent
-		project.reconcile = runtime.trigger.triggerAndWait
-		dashboardURL, dashboard, err := startDashboardServerWaitable(*dashboardAddress, project, *allowUnsafeDashboardNetwork, dashboardPassword, stderr)
-		if err != nil {
-			_ = runtime.shutdown(context.Background())
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
 		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
+		api, user, err := authenticateProjectAfterQuota(ctx, c.Repository, stderr)
+		if err != nil {
+			_ = dashboard.shutdown(context.Background())
+			if ctx.Err() != nil {
+				return 0
+			}
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		if err := prepareProductionDeploymentLocked(*runtimeState, c.Repository); err != nil {
+			_ = dashboard.shutdown(context.Background())
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		runtime, err := startProductionRuntimeV2(ctx, c, api, user, *runtimeState, *statePath, checkout, stderr)
+		if err != nil {
+			_ = dashboard.shutdown(context.Background())
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		live, err := newProjectDashboardServerV2(dashboardLifecycle, *runtimeState, c.Repository, peerProjects, "tmux", runtime.operator, c.Concurrency, *allowUnsafeDashboardNetwork, dashboardPassword)
+		if err == nil {
+			live.orchestrator = runtime.agent
+			live.reconcile = runtime.trigger.triggerAndWait
+			err = dashboard.activate(live, stderr)
+		}
+		if err != nil {
+			_ = dashboard.shutdown(context.Background())
+			_ = runtime.shutdown(context.Background())
+			return fail(stderr, *jsonOutput, command, err.Error())
+		}
 		ticker := newServeTicker(*interval, *disablePeriodicReconciliation)
 		var ticks <-chan time.Time
 		if ticker == nil {

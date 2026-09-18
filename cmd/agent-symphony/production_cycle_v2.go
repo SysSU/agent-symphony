@@ -195,6 +195,24 @@ func (p *productionReconciliation) runCycle(ctx context.Context) error {
 	if p == nil || p.owner == nil || p.effects == nil || p.collector.Config.Repository != p.config.Repository || p.stateRoot == "" || p.attemptRoot == "" || p.checkout == "" {
 		return errors.New("production reconciliation is incomplete")
 	}
+	before, _ := p.api.Usage.Snapshot()
+	defer func() {
+		if p.log == nil || p.api.Usage == nil {
+			return
+		}
+		after, rates := p.api.Usage.Snapshot()
+		counts := map[string]uint64{}
+		for endpoint, count := range after {
+			if count > before[endpoint] {
+				counts[endpoint] = count - before[endpoint]
+			}
+		}
+		body, _ := json.Marshal(struct {
+			Endpoints map[string]uint64                    `json:"endpoints"`
+			Rates     map[string]internalgithub.RateBudget `json:"rates,omitempty"`
+		}{counts, rates})
+		fmt.Fprintf(p.log, "GitHub physical requests during reconciliation (includes concurrent operator work): %s\n", body)
+	}()
 	cycleSnapshot, err := p.owner.reconciliationSnapshot(ctx)
 	if err != nil {
 		return err

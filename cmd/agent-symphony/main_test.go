@@ -197,11 +197,14 @@ func TestServeRepositoryVerificationFailureDoesNotBindDeployment(t *testing.T) {
 	})}
 	stateRoot := filepath.Join(privateDiagnosticRoot(t), "runtime-state")
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"serve", "--config", configPath, "--state", filepath.Join(root, "state.json"), "--runtime-state", stateRoot}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "verify GitHub repository") {
+	if code := run([]string{"serve", "--config", configPath, "--state", filepath.Join(root, "state.json"), "--runtime-state", stateRoot, "--dashboard-address", "127.0.0.1:0"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "verify GitHub repository") {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
 	}
-	if _, err := os.Lstat(stateRoot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("failed repository verification mutated runtime state: %v", err)
+	if _, err := os.Lstat(filepath.Join(stateRoot, "deployment.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed repository verification installed deployment identity: %v", err)
+	}
+	if _, err := os.Lstat(controlSocketPath(stateRoot)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed repository verification exposed control socket: %v", err)
 	}
 }
 
