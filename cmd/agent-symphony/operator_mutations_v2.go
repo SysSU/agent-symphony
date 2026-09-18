@@ -34,14 +34,14 @@ func applyReserveOperatorAdmission(state *runtimeOwnerState, command reserveOper
 		return errStateConflict
 	}
 	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
-	if (request.Action == "cancel" || request.Action == "recover") && state.Attempts[key].Manifest.State == "preparing" {
-		return errStateConflict
-	}
 	if receipt, ok := operatorReceiptByID(*state, request.RequestID); ok {
 		if receipt.Request != request {
 			return errStateConflict
 		}
 		return nil
+	}
+	if (request.Action == "cancel" || request.Action == "recover") && state.Attempts[key].Manifest.State == "preparing" {
+		return errStateConflict
 	}
 	for _, receipt := range state.ControlReceipts {
 		if receipt.State == "pending" && receipt.Phase == operatorPhaseAdmissionPending && ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt) == key {
