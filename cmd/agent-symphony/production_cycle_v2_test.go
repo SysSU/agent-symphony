@@ -733,6 +733,92 @@ func TestPermittedStartWithMissingSessionRemainsQuarantinedAfterRestart(t *testi
 	}
 }
 
+func TestPendingStartWithoutFreshInputKeepsStartupDiagnosticVisible(t *testing.T) {
+	owner := newReconciliationTestOwner(t)
+	manifest := ownerTestManifest(t, owner.stateRoot, 413, 1, "preparing")
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
+	created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest = created.State.Attempts[ownerAttemptKey("o/r", 413, 1)].Manifest
+	remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 413, Attempt: 1, BaseSHA: manifest.BaseSHA, State: "active"}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 413, Attempt: 1, Active: true, DispatchAuthorized: true, BaseSHA: manifest.BaseSHA, Body: "exact body", ActiveAttempt: &remote}
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{remote}
+	applyReconciliationInput(t, owner, input)
+	runner := &barrierEffectRunner{}
+	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: runner, Tmux: "tmux", Helper: "agent-symphony-helper", VerifyWorker: func(context.Context) error { return nil }}
+	effects, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := mustOwnerSnapshot(t, owner)
+	accepted := expandIssueFact(snapshot.State.Observations[ownerIssueKey("o/r", 413)].Fact)
+	accepted.Body, accepted.Attempt, accepted.BaseSHA = issue.Body, manifest.Attempt, manifest.BaseSHA
+	attempt, err := runtimeLaunchAttempt(config.Default("o/r"), accepted, manifest, owner.attemptRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := effects.beginWithSource(t.Context(), snapshot, agentruntime.EffectRequest{Action: agentruntime.EffectStart, Attempt: attempt, Manifest: manifest, Eligible: true}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := effects.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted := restartOwnerWithInput(t, owner, input)
+	recoveredEffects, err := newRuntimeEffectCoordinator(t.Context(), restarted, agentruntime.EffectExecutor{Runtime: runtimeState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	production := &productionReconciliation{owner: restarted, effects: recoveredEffects, config: config.Default("o/r"), attemptRoot: owner.attemptRoot, stateRoot: owner.stateRoot}
+	if err := production.sweepPendingMarkers(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	assertActionable := func(phase string) {
+		t.Helper()
+		status, err := projectOwnerStatus(mustOwnerSnapshot(t, restarted), 4, time.Now().UTC())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range status.Statuses {
+			if entry.Issue == 413 {
+				if !entry.NeedsAttention || !strings.Contains(entry.Action, "inspect") || entry.Diagnostic != "waiting for exact fresh input reconstruction" {
+					t.Fatalf("%s pending Start is not actionable: %#v", phase, entry)
+				}
+				return
+			}
+		}
+		t.Fatalf("%s pending Start status missing", phase)
+	}
+	assertActionable("before pending-effect phase")
+	for _, raw := range []reconciliationInput{repositoryInput(true), repositoryInput(true, func() internalgithub.RecoveryIssueFact {
+		changed := issue
+		changed.Body = "changed body"
+		return changed
+	}())} {
+		if err := production.resumePendingRuntime(t.Context(), reconciliationV2Batch{Input: raw}, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := recoveredEffects.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	after := mustOwnerSnapshot(t, restarted)
+	if runner.calls.Load() != 0 {
+		t.Fatalf("unproved pending Start dispatched %d times", runner.calls.Load())
+	}
+	for _, effect := range after.State.Effects {
+		if effect.Action != string(agentruntime.EffectStart) {
+			continue
+		}
+		if effect.State != "pending" || effect.Diagnostic != "waiting for exact fresh input reconstruction" {
+			t.Fatalf("fresh-input failure changed pending Start: %#v", effect)
+		}
+	}
+	assertActionable("after unavailable and changed fresh input")
+}
+
 func TestPendingLegacyStartAfterRestartIsQuarantinedWithoutReplaying(t *testing.T) {
 	root := resolvedTempDir(t)
 	attemptRoot := productionAttemptRoot(root)
