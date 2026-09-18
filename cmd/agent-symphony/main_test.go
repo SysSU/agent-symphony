@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -197,11 +198,103 @@ func TestServeRepositoryVerificationFailureDoesNotBindDeployment(t *testing.T) {
 	})}
 	stateRoot := filepath.Join(privateDiagnosticRoot(t), "runtime-state")
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"serve", "--config", configPath, "--state", filepath.Join(root, "state.json"), "--runtime-state", stateRoot}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "verify GitHub repository") {
+	if code := run([]string{"serve", "--config", configPath, "--state", filepath.Join(root, "state.json"), "--runtime-state", stateRoot, "--dashboard-address", "127.0.0.1:0"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "verify GitHub repository") {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
 	}
-	if _, err := os.Lstat(stateRoot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("failed repository verification mutated runtime state: %v", err)
+	if _, err := os.Lstat(filepath.Join(stateRoot, "deployment.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed repository verification installed deployment identity: %v", err)
+	}
+	if _, err := os.Lstat(controlSocketPath(stateRoot)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed repository verification exposed control socket: %v", err)
+	}
+}
+
+func TestQuotaRetryDelayBoundsUntrustedReset(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	for _, test := range []struct {
+		name  string
+		reset time.Time
+		want  time.Duration
+	}{
+		{"normal", now.Add(10 * time.Second), 11 * time.Second},
+		{"stale", now.Add(-time.Second), time.Minute},
+		{"extreme", time.Unix(1<<62, 0), time.Hour},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := quotaRetryDelay(test.reset, now); got != test.want {
+				t.Fatalf("quota retry delay = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAuthenticateProjectAfterQuotaStopsOnCancellation(t *testing.T) {
+	oldAPI, oldClient := githubAPI, githubClient
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	githubAPI = "https://example.invalid"
+	ctx, cancel := context.WithCancel(t.Context())
+	githubClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/repos/owner/repo" {
+			cancel()
+		}
+		body := `{"id":42,"login":"coordinator"}`
+		if r.URL.Path == "/repos/owner/repo" {
+			body = `{"full_name":"owner/repo","permissions":{"pull":true}}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	_, _, err := authenticateProjectAfterQuota(ctx, "owner/repo", io.Discard)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("authentication after cancellation = %v, want context.Canceled", err)
+	}
+}
+
+func TestStartupDashboardShutdownIsBoundedByContext(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = server.Serve(listener)
+	}()
+	running := &dashboardServerLifecycle{server: server, listener: listener, done: done}
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		response, err := http.Get("http://" + listener.Addr().String())
+		if err == nil {
+			response.Body.Close()
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dashboard request did not enter blocking handler")
+	}
+	start := time.Now()
+	if err := shutdownDashboardWithin(running, 50*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatalf("bounded dashboard shutdown = %v after %s", err, time.Since(start))
+	}
+	close(release)
+	select {
+	case <-requestDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dashboard request did not finish after release")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -57,6 +58,50 @@ func TestCLITransportUsesGitHubCLIAuthenticatedSession(t *testing.T) {
 	got := strings.Fields(string(args))
 	if len(got) != 9 || !slices.Equal(got[:5], []string{"api", "--include", "--method", "GET", "/user"}) || !slices.Contains(got, "Accept:application/vnd.github+json") || !slices.Contains(got, "X-Github-Api-Version:2022-11-28") {
 		t.Fatalf("gh args = %#v", got)
+	}
+}
+
+func TestRequestUsageCountsPhysicalEndpointsAndQuotaReset(t *testing.T) {
+	reset := time.Now().Add(time.Hour).Unix()
+	usage := &RequestUsage{}
+	api := API{BaseURL: "https://api.github.test", Retries: -1, Usage: usage, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		status, body := http.StatusOK, `{"number":17}`
+		if r.URL.Path == "/graphql" {
+			body = `{}`
+		} else if r.URL.Path == "/user" {
+			status, body = http.StatusForbidden, `{"message":"API rate limit exceeded"}`
+		}
+		header := make(http.Header)
+		header.Set("X-RateLimit-Remaining", "4000")
+		header.Set("X-RateLimit-Reset", fmt.Sprint(reset))
+		header.Set("X-RateLimit-Resource", "core")
+		if r.URL.Path == "/graphql" {
+			header.Set("X-RateLimit-Resource", "graphql")
+		}
+		if status == http.StatusForbidden {
+			header.Set("X-RateLimit-Remaining", "0")
+		}
+		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d %s", status, http.StatusText(status)), Header: header, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}}
+	for _, issue := range []int{17, 18} {
+		var value map[string]any
+		if _, _, err := api.Read(t.Context(), fmt.Sprintf("/repos/o/r/issues/%d", issue), "", &value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var graph map[string]any
+	if err := api.readGraphQL(t.Context(), map[string]any{"query": "{}"}, &graph); err != nil {
+		t.Fatal(err)
+	}
+	var user map[string]any
+	_, _, quotaErr := api.Read(t.Context(), "/user", "", &user)
+	if got, ok := RateLimitReset(quotaErr); !ok || got.Unix() != reset {
+		t.Fatalf("quota reset=%v detected=%t err=%v", got, ok, quotaErr)
+	}
+	counts, rates := usage.Snapshot()
+	want := map[string]uint64{"GET /repos/o/r/issues/{id} 200": 2, "POST /graphql 200": 1, "GET /user 403": 1}
+	if !maps.Equal(counts, want) || rates["core"] != (RateBudget{Remaining: "0", Reset: fmt.Sprint(reset)}) || rates["graphql"] != (RateBudget{Remaining: "4000", Reset: fmt.Sprint(reset)}) {
+		t.Fatalf("request usage=%v rates=%v", counts, rates)
 	}
 }
 

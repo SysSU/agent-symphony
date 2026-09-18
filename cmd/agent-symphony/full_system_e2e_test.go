@@ -1318,8 +1318,10 @@ func waitHTTP(t *testing.T, target string, timeout time.Duration, output fmt.Str
 	for time.Now().Before(deadline) {
 		response, err := http.Get(target)
 		if err == nil {
+			var status dashboardStatusSnapshot
+			decoded := json.NewDecoder(response.Body).Decode(&status) == nil
 			_ = response.Body.Close()
-			if response.StatusCode == http.StatusOK {
+			if response.StatusCode == http.StatusOK && decoded && !status.ReadOnly && status.OwnerEpoch > 0 {
 				return
 			}
 		}

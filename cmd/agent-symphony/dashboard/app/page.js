@@ -7,7 +7,7 @@ import AttemptHistory from "./_components/attempt-history";
 import ProjectNavigation, { ProjectAgentConsole, ProjectHeader, ProjectHealthControl, projectBoard, projectView } from "./_components/project-navigation";
 import { getOrchestratorStatus, getRelease, operatorActionNotice, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
-import { attemptKey, ownerVersionAtLeast } from "./health.mjs";
+import { attemptKey, ownerVersionAtLeast, statusSnapshotAtLeast } from "./health.mjs";
 
 const actionDetails = {
   abandon: ["Abandon", "This stops its tmux session and permanently deletes its local worktree, log, and retained attempt record.", "Abandoned"],
@@ -24,6 +24,10 @@ function IssueQuarantineNotice({ items }) {
     <h2>GitHub outcomes need attention</h2>
     <ul>{items.map((item) => <li key={item.issue}>{`#${item.issue}: ${item.diagnostic}`}</li>)}</ul>
   </section>;
+}
+
+function projectReadOnly(remote, snapshot) {
+  return Boolean(remote || snapshot?.read_only);
 }
 
 export default function Dashboard() {
@@ -43,7 +47,7 @@ export default function Dashboard() {
   const [projects, setProjects] = useState([]);
   const [selectedRepository, setSelectedRepository] = useState("");
   const closeTerminal = useCallback(() => setTerminal(null), []);
-  const acceptSnapshot = useCallback((next) => setSnapshot((current) => ownerVersionAtLeast(next, current) ? next : current), []);
+  const acceptSnapshot = useCallback((next) => setSnapshot((current) => statusSnapshotAtLeast(next, current) ? next : current), []);
   const acceptDashboardState = useCallback((next) => setDashboardState((current) => ownerVersionAtLeast(next, current) ? next : current), []);
 
   useEffect(() => {
@@ -53,18 +57,16 @@ export default function Dashboard() {
       try {
         const orchestratorRequest = getOrchestratorStatus();
         const projectsRequest = fetch("/projects.json", { cache: "no-store" });
-        const [response, orchestratorResult] = await Promise.all([
-          fetch("/status.json", { cache: "no-store" }),
-          orchestratorRequest,
-        ]);
+        const response = await fetch("/status.json", { cache: "no-store" });
         if (!response.ok) throw new Error(response.status === 404 ? "Waiting for the first reconciliation" : `Status request failed (${response.status})`);
+        const next = await response.json();
+        if (active) acceptSnapshot(next);
         const stateResponse = await fetch("/dashboard-state.json", { cache: "no-store" });
-        const projectsResponse = await projectsRequest;
+        const [projectsResponse, orchestratorResult] = await Promise.all([projectsRequest, orchestratorRequest]);
         if (!stateResponse.ok) throw new Error(`Dashboard state request failed (${stateResponse.status})`);
         if (!projectsResponse.ok) throw new Error(`Project request failed (${projectsResponse.status})`);
-        const [next, nextState, nextProjects] = await Promise.all([response.json(), stateResponse.json(), projectsResponse.json()]);
+        const [nextState, nextProjects] = await Promise.all([stateResponse.json(), projectsResponse.json()]);
         if (active) {
-          acceptSnapshot(next);
           acceptDashboardState(nextState);
           setProjects(nextProjects.projects ?? []);
           setOrchestratorStatus(orchestratorResult.status);
@@ -149,6 +151,7 @@ export default function Dashboard() {
 
   const view = projectView(projects, selectedRepository, snapshot, dashboardState, error);
   const { remote: remoteProject, snapshot: visibleSnapshot, error: visibleError } = view;
+  const readOnly = projectReadOnly(remoteProject, visibleSnapshot);
   const { statuses, historical, quarantined, counts, title, lanes, health } = projectBoard(view, now);
   const issueQuarantines = visibleSnapshot?.issue_quarantines ?? [];
   const remoteURL = remoteProject?.url || "";
@@ -177,11 +180,12 @@ export default function Dashboard() {
           <h2>{health.title}</h2>
           <p>{health.detail}</p>
         </div>
-        <ProjectHealthControl remote={remoteProject} onNotice={setActionNotice} onSnapshot={acceptSnapshot} />
+        <ProjectHealthControl remote={remoteProject} readOnly={readOnly} onNotice={setActionNotice} onSnapshot={acceptSnapshot} />
       </section>
 
       <ProjectAgentConsole
         remote={remoteProject}
+        readOnly={readOnly}
         status={orchestratorStatus}
         error={orchestratorError}
         busy={orchestratorBusy}
@@ -224,7 +228,7 @@ export default function Dashboard() {
                       investigating={investigating === attemptKey(status)}
                       waiting={waiting && busy === attemptKey(status)}
                       onNotice={setActionNotice}
-                      readOnly={Boolean(remoteProject)}
+                      readOnly={readOnly}
                     />
                   </li>
                 ))}
@@ -233,7 +237,7 @@ export default function Dashboard() {
           </section>
         )) : <p className="boardState" role="status">{visibleError ? "Issue status board unavailable." : "Loading issue status board…"}</p>}
       </section>
-      <AttemptHistory statuses={historical} onAction={performAction} busy={busy} waiting={waiting} readOnly={Boolean(remoteProject)} />
+      <AttemptHistory statuses={historical} onAction={performAction} busy={busy} waiting={waiting} readOnly={readOnly} />
       {terminal ? <TerminalPanel config={terminal} onClose={closeTerminal} /> : null}
     </main>
   );
