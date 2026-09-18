@@ -521,6 +521,83 @@ func TestReadCacheRecoversOnlySafeCorruptContent(t *testing.T) {
 	if cache, err := LoadReadCache(unsafe); cache != nil || err == nil || errors.Is(err, ErrReadCacheCorrupt) {
 		t.Fatalf("unsafe permissions were treated as recoverable: cache=%#v err=%v", cache, err)
 	}
+	oversized := filepath.Join(t.TempDir(), "oversized.json")
+	file, err := os.OpenFile(oversized, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxReadCacheFile + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := LoadReadCache(oversized)
+	if !errors.Is(err, ErrReadCacheCorrupt) || cache == nil {
+		t.Fatalf("safe oversized cache blocked recovery: cache=%#v err=%v", cache, err)
+	}
+	if err := cache.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if clean, err := LoadReadCache(oversized); err != nil || len(clean.entries) != 0 {
+		t.Fatalf("oversized cache was not atomically replaced: cache=%#v err=%v", clean, err)
+	}
+}
+
+func TestReadCacheSaveDoesNotAmplifyBoundedJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "github-etag-cache.json")
+	cache, err := LoadReadCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`"` + strings.Repeat("<", 900000) + `"`)
+	for n := range 13 {
+		if err := cache.put(fmt.Sprintf("/read/%d", n), `"etag"`, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cache.Save(); err != nil {
+		t.Fatalf("bounded JSON body expanded beyond cache file limit: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Size() > maxReadCacheFile {
+		t.Fatalf("saved cache exceeded file limit: info=%v err=%v", info, err)
+	}
+	reloaded, err := LoadReadCache(path)
+	if err != nil || len(reloaded.entries) != 13 {
+		t.Fatalf("bounded cache did not survive reload: entries=%d err=%v", len(reloaded.entries), err)
+	}
+}
+
+func TestReadCacheSaveDropsSnapshotWhenEncodedJSONExceedsLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "github-etag-cache.json")
+	cache, err := LoadReadCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Accepted path control bytes expand sixfold when JSON-encoded. The raw
+	// snapshot is bounded, but its serialized form exceeds 64 MiB.
+	body := []byte(`"ok"`)
+	for n := range 2800 {
+		path := fmt.Sprintf("/%04x%s", n, strings.Repeat("\x01", 4090))
+		if err := cache.put(path, "v", body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(cache.entries) != 2800 {
+		t.Fatalf("fixture did not fill bounded cache: %d entries", len(cache.entries))
+	}
+	if err := cache.Save(); err != nil {
+		t.Fatalf("optional over-expanded cache failed Save: %v", err)
+	}
+	if len(cache.entries) != 0 {
+		t.Fatalf("unpersistable snapshot was retained in memory: %d entries", len(cache.entries))
+	}
+	reloaded, err := LoadReadCache(path)
+	if err != nil || len(reloaded.entries) != 0 {
+		t.Fatalf("over-expanded cache did not persist empty fallback: cache=%#v err=%v", reloaded, err)
+	}
 }
 
 func TestIssueControlsApprovalAndCredentialExclusion(t *testing.T) {

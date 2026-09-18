@@ -40,6 +40,8 @@ type ReadCache struct {
 // Callers may use the returned empty cache and replace it on the next Save.
 var ErrReadCacheCorrupt = errors.New("GitHub ETag cache content is invalid")
 
+var errReadCacheSnapshotTooLarge = errors.New("GitHub ETag cache exceeds 64 MiB limit")
+
 func LoadReadCache(path string) (*ReadCache, error) {
 	cache := &ReadCache{path: path, entries: map[string]readCacheEntry{}, used: map[string]bool{}}
 	info, err := os.Lstat(path)
@@ -61,17 +63,20 @@ func LoadReadCache(path string) (*ReadCache, error) {
 	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
 		return nil, errors.New("GitHub ETag cache changed while opening")
 	}
+	corrupt := func(err error) (*ReadCache, error) {
+		cache.size = 0
+		cache.dirty = true
+		return cache, fmt.Errorf("%w: %v", ErrReadCacheCorrupt, err)
+	}
+	if opened.Size() > maxReadCacheFile {
+		return corrupt(errors.New("exceeds 64 MiB limit"))
+	}
 	body, err := io.ReadAll(io.LimitReader(f, maxReadCacheFile+1))
 	if err != nil {
 		return nil, err
 	}
 	if len(body) > maxReadCacheFile {
-		return nil, errors.New("GitHub ETag cache exceeds 64 MiB limit")
-	}
-	corrupt := func(err error) (*ReadCache, error) {
-		cache.size = 0
-		cache.dirty = true
-		return cache, fmt.Errorf("%w: %v", ErrReadCacheCorrupt, err)
+		return corrupt(errors.New("exceeds 64 MiB limit"))
 	}
 	var state struct {
 		Version int                       `json:"version"`
@@ -175,7 +180,22 @@ func (c *ReadCache) save(write func(string, map[string]readCacheEntry) error) er
 	}
 	entries, revision := maps.Clone(c.entries), c.revision
 	c.mu.Unlock()
-	if err := write(c.path, entries); err != nil {
+	if err := write(c.path, entries); errors.Is(err, errReadCacheSnapshotTooLarge) {
+		// The cache is optional: persist an empty valid snapshot rather than
+		// turning JSON encoding amplification into a failed cycle.
+		if err := writeReadCache(c.path, map[string]readCacheEntry{}); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		if c.revision == revision {
+			clear(c.entries)
+			clear(c.used)
+			c.size = 0
+			c.dirty = false
+		}
+		c.mu.Unlock()
+		return nil
+	} else if err != nil {
 		return err
 	}
 	c.mu.Lock()
@@ -195,15 +215,18 @@ func writeReadCache(path string, entries map[string]readCacheEntry) error {
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	body, err := json.MarshalIndent(struct {
+	var body bytes.Buffer
+	encoder := json.NewEncoder(&body)
+	encoder.SetEscapeHTML(false)
+	err := encoder.Encode(struct {
 		Version int                       `json:"version"`
 		Entries map[string]readCacheEntry `json:"entries"`
-	}{readCacheVersion, entries}, "", "  ")
+	}{readCacheVersion, entries})
 	if err != nil {
 		return err
 	}
-	if len(body) > maxReadCacheFile {
-		return errors.New("GitHub ETag cache exceeds 64 MiB limit")
+	if body.Len() > maxReadCacheFile {
+		return errReadCacheSnapshotTooLarge
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".github-etags-*")
 	if err != nil {
@@ -212,7 +235,7 @@ func writeReadCache(path string, entries map[string]readCacheEntry) error {
 	name := tmp.Name()
 	defer os.Remove(name)
 	if err = tmp.Chmod(0o600); err == nil {
-		_, err = tmp.Write(append(body, '\n'))
+		_, err = tmp.Write(body.Bytes())
 	}
 	if err == nil {
 		err = tmp.Sync()
