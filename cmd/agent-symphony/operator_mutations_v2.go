@@ -327,6 +327,9 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		}
 		return replayOperatorTombstone(state, request, manifest, command.PublishedHead, command.CleanupDigest, command.CleanupPolicy, tombstone)
 	}
+	if (request.Action == "cancel" || request.Action == "recover") && state.Attempts[attemptKey].Manifest.State == "preparing" {
+		return nil, errStateConflict
+	}
 	absentOrphan := ok && !observation.Present && (request.Action == "dismiss" && command.IssueClosed || request.Action == "abandon") && observation.ObservationEpoch <= state.Epoch
 	if !ok || !observation.Present && !absentOrphan || command.ObservationGeneration != observation.Generation || command.ObservationCycleID != observation.LastCycleID || command.ObservationBodyDigest != observation.Fact.BodyDigest {
 		return nil, errStaleStateResult

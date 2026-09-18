@@ -151,6 +151,9 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 	if result, ok := s.performTombstoneReplay(ctx, snapshot, request, synchronous); ok {
 		return result
 	}
+	if (request.Action == "cancel" || request.Action == "recover") && snapshot.State.Attempts[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)].Manifest.State == "preparing" {
+		return operatorErrorResult(request, http.StatusConflict, "pending Start has no proven physical cleanup path")
+	}
 	if attach, ok := s.recoveryAttachCommand(snapshot, request); ok {
 		committed, _, err := s.owner.beginOperatorMutation(ctx, attach)
 		if err != nil {
@@ -168,9 +171,6 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 			return operatorErrorResult(request, http.StatusInternalServerError, "operator receipt was not committed")
 		}
 		return operatorResultForReceipt(committed, receipt)
-	}
-	if (request.Action == "cancel" || request.Action == "recover") && snapshot.State.Attempts[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)].Manifest.State == "preparing" {
-		return operatorErrorResult(request, http.StatusConflict, "pending Start has no proven physical cleanup path")
 	}
 	if slices.Contains([]string{"dismiss", "archive", "abandon", "remove", "cancel", "recover"}, request.Action) {
 		reservation := reserveOperatorAdmissionCommand{Request: request}
