@@ -720,6 +720,9 @@ func TestPermittedStartWithMissingSessionRemainsQuarantinedAfterRestart(t *testi
 		t.Fatal(err)
 	}
 	p := &productionReconciliation{owner: restarted, effects: recoveredEffects, config: config.Default("o/r"), attemptRoot: owner.attemptRoot, stateRoot: owner.stateRoot}
+	if err := p.sweepPendingMarkers(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	if err := p.resumePendingRuntime(t.Context(), batch, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -801,22 +804,83 @@ func TestPendingStartWithoutFreshInputKeepsStartupDiagnosticVisible(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	if err := recoveredEffects.shutdown(t.Context()); err != nil {
-		t.Fatal(err)
-	}
 	after := mustOwnerSnapshot(t, restarted)
 	if runner.calls.Load() != 0 {
 		t.Fatalf("unproved pending Start dispatched %d times", runner.calls.Load())
 	}
+	var pending runtimeEffectIntent
 	for _, effect := range after.State.Effects {
 		if effect.Action != string(agentruntime.EffectStart) {
 			continue
 		}
+		pending = effect
 		if effect.State != "pending" || effect.Diagnostic != "waiting for exact fresh input reconstruction" {
 			t.Fatalf("fresh-input failure changed pending Start: %#v", effect)
 		}
 	}
 	assertActionable("after unavailable and changed fresh input")
+	if pending.ID == "" {
+		t.Fatal("pending Start effect missing")
+	}
+	if err := restarted.authorizeRuntimeEffect(t.Context(), authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(pending)), Action: agentruntime.EffectStart, GateNonce: pending.StartGateNonce}); err != nil {
+		t.Fatal(err)
+	}
+	candidate := manifest
+	candidate.LaunchID = pending.StartGateNonce
+	pane := boundRuntimeEffectTestPane(t, candidate)
+	binding, err := agentruntime.ReadImplementationBinding(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, write := range []func(agentruntime.Manifest, agentruntime.ImplementationLaunchBinding) error{agentruntime.WriteImplementationPermit, agentruntime.WriteImplementationRelease, agentruntime.WriteImplementationGateEntered} {
+		if err := write(candidate, binding); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recoveredEffects.executor.Runtime.Runner = &monitorFailureRunner{pane: pane}
+	fresh := mustOwnerSnapshot(t, restarted)
+	observation := fresh.State.Observations[ownerIssueKey("o/r", 413)]
+	if !currentReconciliationObservation(fresh.State, ownerIssueKey("o/r", 413), observation) || digestText(issue.Body) != observation.Fact.BodyDigest {
+		t.Fatalf("exact input is not current: observation=%#v epoch=%d", observation, fresh.State.Epoch)
+	}
+	if record := fresh.State.Attempts[ownerAttemptKey("o/r", 413, 1)]; record.Generation != pending.AttemptGeneration || recoveredEffects.effectActive(record.Manifest, pending.ID) {
+		t.Fatalf("pending effect cannot enter exact-input verification: record=%#v effect=%#v", record, pending)
+	}
+	if err := production.resumePendingRuntime(t.Context(), reconciliationV2Batch{Input: input}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoveredEffects.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	final := mustOwnerSnapshot(t, restarted)
+	actual := final.State.Effects[pending.ID]
+	if actual.State != "pending" || actual.Diagnostic != "pending Start launch identity or worker absence is unproved" {
+		t.Fatalf("exact fresh input retained stale diagnostic or certified gate entry: %#v", actual)
+	}
+	status, err := projectOwnerStatus(final, 4, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(status.Statuses, func(entry orchestrator.RecoveryStatus) bool {
+		return entry.Issue == 413 && entry.NeedsAttention && !entry.Retryable && entry.Diagnostic == actual.Diagnostic && entry.Action == "inspect the unproved implementation launch; no dashboard retry is safe"
+	}) {
+		t.Fatalf("verified ambiguity did not replace stale UI guidance: %#v", status.Statuses)
+	}
+	if final.State.Attempts[ownerAttemptKey("o/r", 413, 1)].Manifest.State != "preparing" {
+		t.Fatal("unproved worker Start changed the owner manifest")
+	}
+	newerIssue := issue
+	newerIssue.Body = "newer issue body"
+	newerInput := repositoryInput(true, newerIssue)
+	newerInput.Attempts = []internalgithub.RecoveryAttemptFact{remote}
+	applyReconciliationInput(t, restarted, newerInput)
+	if err := production.resumePendingRuntime(t.Context(), reconciliationV2Batch{Input: input}, ""); err != nil {
+		t.Fatal(err)
+	}
+	stale := mustOwnerSnapshot(t, restarted)
+	if stale.State.Attempts[ownerAttemptKey("o/r", 413, 1)].Manifest.State != "preparing" || stale.State.Effects[pending.ID].State == "completed" {
+		t.Fatalf("out-of-order issue body completed pending Start: %#v", stale.State.Effects[pending.ID])
+	}
 }
 
 func TestPendingLegacyStartAfterRestartIsQuarantinedWithoutReplaying(t *testing.T) {
@@ -916,7 +980,7 @@ func TestPendingLegacyStartAfterRestartIsQuarantinedWithoutReplaying(t *testing.
 			continue
 		}
 		foundUnproved = true
-		if entry.Diagnostic != effect.Diagnostic || !entry.NeedsAttention || entry.Action != "inspect the unproved implementation launch before retry" {
+		if entry.Diagnostic != effect.Diagnostic || !entry.NeedsAttention || entry.Action != "inspect the unproved implementation launch; no dashboard retry is safe" {
 			t.Fatalf("pending Start quarantine was not visible: %#v", entry)
 		}
 	}
@@ -930,7 +994,7 @@ func TestPendingLegacyStartAfterRestartIsQuarantinedWithoutReplaying(t *testing.
 		t.Fatal(err)
 	}
 	for _, entry := range status.Statuses {
-		if entry.Issue == 410 && (entry.Diagnostic == effect.Diagnostic || entry.Action == "inspect the unproved implementation launch before retry" || entry.Action == "manually migrate the legacy implementation launch identity") {
+		if entry.Issue == 410 && (entry.Diagnostic == effect.Diagnostic || entry.Action == "inspect the unproved implementation launch; no dashboard retry is safe" || entry.Action == "manually migrate the legacy implementation launch identity") {
 			t.Fatalf("stale Start diagnostic survived attempt-generation invalidation: %#v", entry)
 		}
 	}

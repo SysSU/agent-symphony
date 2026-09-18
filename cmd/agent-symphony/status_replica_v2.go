@@ -186,11 +186,12 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 				if effect.Diagnostic == "legacy launch identity unproved; manual migration required" {
 					status.Action = "manually migrate the legacy implementation launch identity"
 				} else if effect.Diagnostic == "waiting for exact fresh input reconstruction" {
-					status.Action = "inspect the current GitHub issue snapshot and original implementation launch before retry"
+					status.Action = "inspect the current GitHub issue snapshot and original implementation launch; no dashboard retry is safe"
 				} else {
-					status.Action = "inspect the unproved implementation launch before retry"
+					status.Action = "inspect the unproved implementation launch; no dashboard retry is safe"
 				}
 				status.NeedsAttention = true
+				status.Retryable = false
 				break
 			}
 		}

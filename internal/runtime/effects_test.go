@@ -151,6 +151,11 @@ func TestEnteredStartGateWithoutCompletionMarkerIsNotProofOfRunning(t *testing.T
 			t.Fatalf("entered gate without Start result certified running: %#v, %v", verification, err)
 		}
 	}
+	wrongCandidate := start
+	wrongCandidate.GateNonce = strings.Repeat("f", 32)
+	if verification, err := executor.VerifyPending(t.Context(), wrongCandidate); err != nil || verification.Disposition != EffectPending || verification.Result != nil {
+		t.Fatalf("foreign Start candidate adopted the entered pane: %#v, %v", verification, err)
+	}
 	for _, command := range fake.seen[before:] {
 		if slices.Contains(command.Args, "new-session") || slices.Contains(command.Args, "wait-for") && slices.Contains(command.Args, "-U") {
 			t.Fatalf("verification relaunched or released the entered gate: %#v", command)

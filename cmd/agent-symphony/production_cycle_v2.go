@@ -909,7 +909,7 @@ func (p *productionReconciliation) resumePendingRuntime(ctx context.Context, bat
 			if action == agentruntime.EffectStart && effect.StartMayRun {
 				// A permitted candidate may already have executed. Its missing
 				// session is not proof of death, so never rotate or redispatch it.
-				if effect.Diagnostic != "" {
+				if effect.Diagnostic != "" && effect.Diagnostic != "waiting for exact fresh input reconstruction" {
 					continue
 				}
 				if _, err := p.owner.diagnoseRuntimeEffect(ctx, diagnoseRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: action, Diagnostic: "pending Start launch identity or worker absence is unproved"}); err != nil {
@@ -933,7 +933,7 @@ func (p *productionReconciliation) resumePendingRuntime(ctx context.Context, bat
 				return err
 			}
 		case agentruntime.EffectPending:
-			if effect.Diagnostic != "" {
+			if effect.Diagnostic != "" && effect.Diagnostic != "waiting for exact fresh input reconstruction" {
 				continue
 			}
 			diagnostic := "external completion remains ambiguous"
