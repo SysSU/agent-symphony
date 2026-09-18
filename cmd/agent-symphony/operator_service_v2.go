@@ -708,6 +708,14 @@ func operatorAttempt(snapshot stateOwnerSnapshot, request controlRequest) (agent
 }
 
 func (s *operatorMutationService) collectIssue(ctx context.Context, issue int) (stateOwnerSnapshot, reconciliationV2Batch, error) {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return stateOwnerSnapshot{}, reconciliationV2Batch{}, fmt.Errorf("operator service stopped: %w", context.Canceled)
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	defer s.wg.Done()
 	snapshot, err := s.owner.reconciliationSnapshot(ctx)
 	if err != nil {
 		return stateOwnerSnapshot{}, reconciliationV2Batch{}, err
@@ -755,7 +763,7 @@ func (s *operatorMutationService) scheduleCacheSave() {
 	}
 	s.mu.Lock()
 	s.cachePending = true
-	if s.cacheSaving || s.stopped {
+	if s.cacheSaving {
 		s.mu.Unlock()
 		return
 	}
@@ -1382,13 +1390,6 @@ func (s *operatorMutationService) shutdown(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
-		s.mu.Lock()
-		pending := s.cachePending
-		s.cachePending = false
-		s.mu.Unlock()
-		if pending {
-			s.saveCache() // Flush a collection committed as shutdown began.
-		}
 		close(done)
 	}()
 	select {
