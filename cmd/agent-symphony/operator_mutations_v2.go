@@ -33,13 +33,16 @@ func applyReserveOperatorAdmission(state *runtimeOwnerState, command reserveOper
 	if !validOperatorRequest(request, state.Repository) || !slices.Contains([]string{"dismiss", "archive", "abandon", "remove", "cancel", "recover"}, request.Action) {
 		return errStateConflict
 	}
+	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
 	if receipt, ok := operatorReceiptByID(*state, request.RequestID); ok {
 		if receipt.Request != request {
 			return errStateConflict
 		}
 		return nil
 	}
-	key := ownerAttemptKey(request.Repository, request.Issue, request.Attempt)
+	if (request.Action == "cancel" || request.Action == "recover") && state.Attempts[key].Manifest.State == "preparing" {
+		return errStateConflict
+	}
 	for _, receipt := range state.ControlReceipts {
 		if receipt.State == "pending" && receipt.Phase == operatorPhaseAdmissionPending && ownerAttemptKey(receipt.Request.Repository, receipt.Request.Issue, receipt.Request.Attempt) == key {
 			if receipt.Request.Action != request.Action || receipt.Admission == nil {
@@ -324,6 +327,9 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		}
 		return replayOperatorTombstone(state, request, manifest, command.PublishedHead, command.CleanupDigest, command.CleanupPolicy, tombstone)
 	}
+	if (request.Action == "cancel" || request.Action == "recover") && state.Attempts[attemptKey].Manifest.State == "preparing" {
+		return nil, errStateConflict
+	}
 	absentOrphan := ok && !observation.Present && (request.Action == "dismiss" && command.IssueClosed || request.Action == "abandon") && observation.ObservationEpoch <= state.Epoch
 	if !ok || !observation.Present && !absentOrphan || command.ObservationGeneration != observation.Generation || command.ObservationCycleID != observation.LastCycleID || command.ObservationBodyDigest != observation.Fact.BodyDigest {
 		return nil, errStaleStateResult
@@ -430,7 +436,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		}
 		phase = operatorPhaseCleanupPending
 	case "cancel":
-		if command.Runtime == nil || command.Reconciliation != nil || command.CleanupDigest != "" || command.PublishedHead != "" || command.Runtime.Action != agentruntime.EffectStop || !reflect.DeepEqual(command.Runtime.Manifest, manifest) {
+		if manifest.State != "running" || command.Runtime == nil || command.Reconciliation != nil || command.CleanupDigest != "" || command.PublishedHead != "" || command.Runtime.Action != agentruntime.EffectStop || !reflect.DeepEqual(command.Runtime.Manifest, manifest) {
 			return nil, errStateConflict
 		}
 		begin := *command.Runtime

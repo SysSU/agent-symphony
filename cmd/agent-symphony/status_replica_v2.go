@@ -181,14 +181,17 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 			status.Action = "inspect inconsistent completed local attempt before recovery"
 		}
 		for id, effect := range snapshot.State.Effects {
-			if id == effect.ID && effect.State == "pending" && effect.Action == string(agentruntime.EffectStart) && effect.Repository == status.Repository && effect.Issue == status.Issue && effect.Attempt == status.Attempt && effect.IssueGeneration == snapshot.State.IssueGenerations[issueKey] && effect.AttemptGeneration == snapshot.State.AttemptGenerations[key] && owned && record.Generation == effect.AttemptGeneration && (effect.Diagnostic == "legacy launch identity unproved; manual migration required" || effect.Diagnostic == "pending Start launch identity or worker absence is unproved") {
+			if id == effect.ID && effect.State == "pending" && effect.Action == string(agentruntime.EffectStart) && effect.Repository == status.Repository && effect.Issue == status.Issue && effect.Attempt == status.Attempt && effect.IssueGeneration == snapshot.State.IssueGenerations[issueKey] && effect.AttemptGeneration == snapshot.State.AttemptGenerations[key] && owned && record.Generation == effect.AttemptGeneration && (effect.Diagnostic == "legacy launch identity unproved; manual migration required" || effect.Diagnostic == "pending Start launch identity or worker absence is unproved" || effect.Diagnostic == "waiting for exact fresh input reconstruction") {
 				status.Diagnostic = effect.Diagnostic
 				if effect.Diagnostic == "legacy launch identity unproved; manual migration required" {
 					status.Action = "manually migrate the legacy implementation launch identity"
+				} else if effect.Diagnostic == "waiting for exact fresh input reconstruction" {
+					status.Action = "inspect the current GitHub issue snapshot and original implementation launch; no dashboard retry is safe"
 				} else {
-					status.Action = "inspect the unproved implementation launch before retry"
+					status.Action = "inspect the unproved implementation launch; no dashboard retry is safe"
 				}
 				status.NeedsAttention = true
+				status.Retryable = false
 				break
 			}
 		}

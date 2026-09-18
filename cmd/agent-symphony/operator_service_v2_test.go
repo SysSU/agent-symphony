@@ -2069,6 +2069,73 @@ func TestOperatorServiceNewRecoveryRequestAttachesAcrossDurablePhases(t *testing
 	}
 }
 
+func TestPreparingAttemptRejectsNewRecoverAttachmentWithoutChangingPersistedOwner(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 534, "active", false)
+	original := operatorRequest("recover-original-preparing", "recover", manifest, false)
+	command := operatorCommand(mustOwnerSnapshot(t, owner), original, manifest)
+	command.LivenessFailed = true
+	command.Runtime = &beginRuntimeEffectCommand{Identity: command.Identity, Action: agentruntime.EffectStop, Manifest: manifest, Reason: "dashboard recovery: runtime liveness mismatch", RequestDigest: strings.Repeat("d", 64)}
+	_, effect, err := owner.beginOperatorMutation(t.Context(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	record := state.Attempts[key]
+	record.Manifest.State = "preparing"
+	state.Attempts[key] = record
+	if err := owner.close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, state); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, loaded, func(next runtimeOwnerState) error {
+		return writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+	if _, replayed, err := restarted.beginOperatorMutation(t.Context(), command); err != nil || replayed == nil || replayed.ID != effect.ID {
+		t.Fatalf("same-ID replay changed: effect=%#v err=%v", replayed, err)
+	}
+	service := operatorTestMutationService(t, restarted)
+	newRequest := operatorRequest("recover-new-preparing", "recover", manifest, false)
+	before := mustOwnerSnapshot(t, restarted).State
+	attach, ok := service.recoveryAttachCommand(stateOwnerSnapshot{State: before}, newRequest)
+	if !ok {
+		t.Fatal("fixture lacks a pending Recover attachment")
+	}
+	if _, _, err := restarted.beginOperatorMutation(t.Context(), attach); !errors.Is(err, errStateConflict) {
+		t.Fatalf("owner attachment error=%v", err)
+	}
+	server := &dashboardServer{ctx: t.Context(), stateRoot: restarted.stateRoot, repository: manifest.Repository, operator: service}
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/actions/recover?repository=o%2Fr&issue=534&attempt=1", nil)
+	request.Host = "localhost"
+	request.Header.Set("Origin", "http://localhost")
+	response := httptest.NewRecorder()
+	server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("new Recover status=%d body=%s", response.Code, response.Body.String())
+	}
+	after := mustOwnerSnapshot(t, restarted).State
+	if after.Revision != before.Revision || !reflect.DeepEqual(after.ControlReceipts, before.ControlReceipts) || !reflect.DeepEqual(after.Effects, before.Effects) {
+		t.Fatalf("new Recover changed persisted owner: before=%#v after=%#v", before, after)
+	}
+	disk, err := readRuntimeOwnerState(owner.stateRoot, manifest.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disk.Revision != before.Revision || !reflect.DeepEqual(disk.ControlReceipts, before.ControlReceipts) || !reflect.DeepEqual(disk.Effects, before.Effects) {
+		t.Fatalf("new Recover changed durable owner: before=%#v disk=%#v", before, disk)
+	}
+}
+
 func TestOperatorRecoverConvergesWithBackgroundRetry(t *testing.T) {
 	for _, backgroundFirst := range []bool{true, false} {
 		name := "operator-first"

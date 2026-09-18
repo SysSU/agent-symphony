@@ -115,6 +115,54 @@ func TestPendingStartReplaysOnlyExactParkedPane(t *testing.T) {
 	}
 }
 
+func TestEnteredStartGateWithoutCompletionMarkerIsNotProofOfRunning(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := EffectExecutor{Runtime: r, AuthorizeLaunch: func(context.Context, EffectRequest) error { return nil }}
+	prepare := effectTestRequest(t, executor, EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true}, "a")
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest = prepared.Manifest
+	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: manifest, Eligible: true}, "b")
+	start.GateNonce = start.Identity.EffectID
+	candidate := manifest
+	candidate.LaunchID = start.GateNonce
+	if err := r.startSession(t.Context(), candidate, nil, candidate.LaunchID, []string{"/bin/sh"}); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := ReadImplementationBinding(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, write := range []func(Manifest, ImplementationLaunchBinding) error{WriteImplementationPermit, WriteImplementationRelease, WriteImplementationGateEntered} {
+		if err := write(candidate, binding); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := len(fake.seen)
+	for range 2 {
+		verification, err := executor.VerifyPending(t.Context(), start)
+		if err != nil || verification.Disposition != EffectPending || verification.Result != nil {
+			t.Fatalf("entered gate without Start result certified running: %#v, %v", verification, err)
+		}
+	}
+	wrongCandidate := start
+	wrongCandidate.GateNonce = strings.Repeat("f", 32)
+	if verification, err := executor.VerifyPending(t.Context(), wrongCandidate); err != nil || verification.Disposition != EffectPending || verification.Result != nil {
+		t.Fatalf("foreign Start candidate adopted the entered pane: %#v, %v", verification, err)
+	}
+	for _, command := range fake.seen[before:] {
+		if slices.Contains(command.Args, "new-session") || slices.Contains(command.Args, "wait-for") && slices.Contains(command.Args, "-U") {
+			t.Fatalf("verification relaunched or released the entered gate: %#v", command)
+		}
+	}
+}
+
 func TestStartLoadsContextOnlyThroughBoundEffectBuffer(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(1, 0))
