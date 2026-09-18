@@ -960,6 +960,7 @@ func formatRuntimeEffectPane(pane *agentruntime.ImplementationPane) string {
 type barrierEffectRunner struct {
 	entered             chan struct{}
 	release             chan struct{}
+	cancelled           chan struct{}
 	calls               atomic.Int32
 	blocked             atomic.Int32
 	pane                *agentruntime.ImplementationPane
@@ -990,6 +991,9 @@ func (r *barrierEffectRunner) Run(ctx context.Context, command agentruntime.Comm
 		select {
 		case <-r.release:
 		case <-ctx.Done():
+			if r.cancelled != nil {
+				r.cancelled <- struct{}{}
+			}
 			return agentruntime.Result{}, ctx.Err()
 		}
 	}

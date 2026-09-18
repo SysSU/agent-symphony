@@ -2365,6 +2365,64 @@ func TestProductionRuntimeShutdownReportsIncompleteCacheDrain(t *testing.T) {
 	once.Do(func() { close(releaseSave) })
 }
 
+func TestProductionRuntimeShutdownDrainsAcceptedDashboardEffect(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 374, "active", false, true)
+	service := operatorTestMutationService(t, owner)
+	service.stopping = make(chan struct{})
+	runner := &barrierEffectRunner{entered: make(chan struct{}, 1), release: make(chan struct{}), cancelled: make(chan struct{}, 1), pane: boundRuntimeEffectTestPane(t, manifest), blockMissingSession: true}
+	service.effects.executor.Runtime.Runner = runner
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(runner.release) }) })
+	server := &dashboardServer{ctx: t.Context(), stateRoot: owner.stateRoot, repository: manifest.Repository, operator: service}
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/actions/cancel?repository=o%2Fr&issue=374&attempt=1", nil)
+	request.Host = "localhost"
+	request.Header.Set("Origin", "http://localhost")
+	response := httptest.NewRecorder()
+	server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("dashboard action was not accepted: status=%d body=%s", response.Code, response.Body.String())
+	}
+	var accepted controlResult
+	if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil || !accepted.OK || accepted.OwnerRevision == 0 {
+		t.Fatalf("dashboard action receipt=%#v err=%v", accepted, err)
+	}
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		state := mustOwnerSnapshot(t, owner).State
+		receipt, _ := operatorReceiptByID(state, accepted.RequestID)
+		t.Fatalf("accepted effect did not reach the runner: calls=%d receipt=%#v effect=%#v", runner.calls.Load(), receipt, state.Effects[receipt.EffectID])
+	}
+	runtime := &productionRuntimeV2{operator: service, effects: service.effects}
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- runtime.shutdown(t.Context()) }()
+	select {
+	case <-service.stopping:
+	case <-time.After(5 * time.Second):
+		t.Fatal("operator shutdown did not begin")
+	}
+	select {
+	case <-runner.cancelled:
+		t.Fatal("shutdown cancelled an admitted dashboard effect")
+	default:
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown canceled accepted dashboard effect: %v", err)
+	default:
+	}
+	once.Do(func() { close(runner.release) })
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	receipt, ok := operatorReceiptByID(state, accepted.RequestID)
+	effect := state.Effects[receipt.EffectID]
+	if !ok || receipt.State != "completed" || effect.State != "completed" || state.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Manifest.State != "cancelled" {
+		t.Fatalf("accepted dashboard effect was not completed: receipt=%#v effect=%#v", receipt, effect)
+	}
+}
+
 func TestV2DashboardReconcileAndServersDoNotUseLegacyOperationLock(t *testing.T) {
 	owner := newReconciliationTestOwner(t)
 	service := operatorTestMutationService(t, owner)

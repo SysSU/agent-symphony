@@ -222,26 +222,32 @@ func (r *productionRuntimeV2) shutdown(ctx context.Context) error {
 	if r == nil {
 		return nil
 	}
-	joins := []func() error{}
+	var proposalDone, triggerDone <-chan error
 	if r.proposal != nil {
-		joins = append(joins, func() error { return r.proposal.shutdown(ctx) })
+		done := make(chan error, 1)
+		proposalDone = done
+		go func() { done <- r.proposal.shutdown(ctx) }()
 	}
 	if r.trigger != nil {
-		joins = append(joins, func() error { return r.trigger.shutdown(ctx) })
-	}
-	if r.operator != nil {
-		joins = append(joins, func() error { return r.operator.shutdown(ctx) })
-	}
-	if r.effects != nil {
-		joins = append(joins, func() error { return r.effects.shutdown(ctx) })
-	}
-	results := make(chan error, len(joins))
-	for _, join := range joins {
-		go func() { results <- join() }()
+		done := make(chan error, 1)
+		triggerDone = done
+		go func() { done <- r.trigger.shutdown(ctx) }()
 	}
 	var result error
-	for range joins {
-		result = errors.Join(result, <-results)
+	if r.operator != nil {
+		result = errors.Join(result, r.operator.shutdown(ctx))
+	}
+	if ctx.Err() != nil && r.cancel != nil {
+		r.cancel() // Timed-out graceful drain becomes a forced stop.
+	}
+	if r.effects != nil {
+		result = errors.Join(result, r.effects.shutdown(ctx))
+	}
+	if proposalDone != nil {
+		result = errors.Join(result, <-proposalDone)
+	}
+	if triggerDone != nil {
+		result = errors.Join(result, <-triggerDone)
 	}
 	if r.cancel != nil {
 		r.cancel()
