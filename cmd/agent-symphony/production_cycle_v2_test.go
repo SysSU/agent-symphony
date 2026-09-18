@@ -874,6 +874,13 @@ func TestPendingStartWithoutFreshInputKeepsStartupDiagnosticVisible(t *testing.T
 	server := &dashboardServer{ctx: t.Context(), stateRoot: restarted.stateRoot, repository: "o/r", operator: service}
 	for _, action := range []string{"cancel", "recover"} {
 		before := mustOwnerSnapshot(t, restarted).State
+		if _, err := restarted.reserveOperatorAdmission(t.Context(), reserveOperatorAdmissionCommand{Request: operatorRequest(action+"-pending-start", action, manifest, false)}); !errors.Is(err, errStateConflict) {
+			t.Fatalf("%s preparing Start admission error=%v", action, err)
+		}
+		reserved := mustOwnerSnapshot(t, restarted).State
+		if reserved.Revision != before.Revision || !reflect.DeepEqual(reserved.ControlReceipts, before.ControlReceipts) || !reflect.DeepEqual(reserved.Effects, before.Effects) {
+			t.Fatalf("%s rejected reservation mutated owner state: before=%#v after=%#v", action, before, reserved)
+		}
 		request := httptest.NewRequest(http.MethodPost, "http://localhost/actions/"+action+"?repository=o%2Fr&issue=413&attempt=1", nil)
 		request.Host = "localhost"
 		request.Header.Set("Origin", "http://localhost")
