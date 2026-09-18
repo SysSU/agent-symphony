@@ -350,6 +350,7 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 		deadline *= 4
 	}
 	baseURL := "http://" + address
+	statusHTTP := &http.Client{Timeout: 5 * time.Second}
 	waitHTTP(t, baseURL+"/status.json", deadline, output)
 	reportPath := filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-"+internalgithub.RepositoryIdentifier("o/r"), orchestratoragent.HeartbeatReportFile)
 	readOrchestrator := func() (orchestratoragent.Status, error) {
@@ -370,7 +371,7 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 		if err != nil || status.State != "running" || status.Generation < 1 {
 			return false
 		}
-		response, err := http.Get(baseURL + "/status.json")
+		response, err := statusHTTP.Get(baseURL + "/status.json")
 		if err != nil {
 			return false
 		}
@@ -498,20 +499,18 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 		if err != nil || status.State != "running" || status.Generation != final.Generation || status.ContextMode != "rebuild" || status.Session != final.Session {
 			return false
 		}
-		heartbeat, err := os.ReadFile(reportPath)
-		if err != nil || !strings.Contains(string(heartbeat), `"state": "completed"`) {
-			return false
-		}
 		var persisted struct {
 			Handoff *struct {
-				State string `json:"state"`
+				Issue   int    `json:"issue"`
+				Attempt int    `json:"attempt"`
+				State   string `json:"state"`
 			} `json:"attention_handoff"`
 		}
 		persistedBody, err := os.ReadFile(filepath.Join(stateRoot, "orchestrator-agent.json"))
-		if err != nil || json.Unmarshal(persistedBody, &persisted) != nil || persisted.Handoff == nil || (persisted.Handoff.State != "waiting" && persisted.Handoff.State != "human-attention") {
+		if err != nil || json.Unmarshal(persistedBody, &persisted) != nil || persisted.Handoff == nil || persisted.Handoff.Issue != 191 || persisted.Handoff.Attempt != 9 || (persisted.Handoff.State != "waiting" && persisted.Handoff.State != "human-attention") {
 			return false
 		}
-		response, err := http.Get(baseURL + "/status.json")
+		response, err := statusHTTP.Get(baseURL + "/status.json")
 		if err != nil {
 			return false
 		}
@@ -529,13 +528,71 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 	}) {
 		t.Fatalf("orchestrator context did not survive restart: %s", output.String())
 	}
-	var priorReport struct {
-		StartedAt time.Time `json:"started_at"`
-		State     string    `json:"state"`
+	type auditReport struct {
+		StartedAt        time.Time `json:"started_at"`
+		ProjectionDigest string    `json:"projection_digest"`
+		State            string    `json:"state"`
 	}
-	priorBody, err := os.ReadFile(reportPath)
-	if err != nil || json.Unmarshal(priorBody, &priorReport) != nil || priorReport.State != "completed" {
-		t.Fatalf("startup audit did not complete before Investigate: %v %s", err, priorBody)
+	var priorReport auditReport
+	var priorBody []byte
+	var auditReadiness string
+	if !waitFor(deadline, func() bool {
+		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
+		if err != nil || ledger.CycleOutcomeEpoch != ledger.Epoch || ledger.CycleOutcomeID == 0 {
+			auditReadiness = fmt.Sprintf("owner cycle: epoch=%d outcome=%d/%d err=%v", ledger.Epoch, ledger.CycleOutcomeEpoch, ledger.CycleOutcomeID, err)
+			return false
+		}
+		response, err := statusHTTP.Get(baseURL + "/status.json")
+		if err != nil {
+			auditReadiness = fmt.Sprintf("status read: %v", err)
+			return false
+		}
+		var snapshot dashboardStatusSnapshot
+		decodeErr := json.NewDecoder(response.Body).Decode(&snapshot)
+		response.Body.Close()
+		if decodeErr != nil || snapshot.OwnerEpoch != ledger.Epoch || snapshot.OwnerRevision < ledger.Revision {
+			auditReadiness = fmt.Sprintf("status owner=%d/%d ledger=%d/%d decode=%v", snapshot.OwnerEpoch, snapshot.OwnerRevision, ledger.Epoch, ledger.Revision, decodeErr)
+			return false
+		}
+		actionable := false
+		for _, attempt := range snapshot.Statuses {
+			if attempt.Issue == 191 && attempt.Attempt == 9 && attempt.State == "orphaned" && !attempt.OperatorBlocked {
+				actionable = true
+				break
+			}
+		}
+		if !actionable {
+			auditReadiness = fmt.Sprintf("issue 191 attempt 9 is not actionable at owner revision %d", snapshot.OwnerRevision)
+			return false
+		}
+		var projection struct {
+			LastProjection string `json:"last_projection_digest"`
+			Handoff        *struct {
+				Issue            int    `json:"issue"`
+				Attempt          int    `json:"attempt"`
+				ProjectionDigest string `json:"projection_digest"`
+			} `json:"attention_handoff"`
+		}
+		stateBody, stateErr := os.ReadFile(filepath.Join(stateRoot, "orchestrator-agent.json"))
+		if stateErr != nil || json.Unmarshal(stateBody, &projection) != nil || projection.LastProjection == "" || projection.Handoff == nil || projection.Handoff.Issue != 191 || projection.Handoff.Attempt != 9 || projection.Handoff.ProjectionDigest != projection.LastProjection {
+			auditReadiness = fmt.Sprintf("orchestrator target projection unavailable: last=%q handoff=%+v err=%v", projection.LastProjection, projection.Handoff, stateErr)
+			return false
+		}
+		priorBody, err = os.ReadFile(reportPath)
+		priorReport = auditReport{}
+		if err != nil || json.Unmarshal(priorBody, &priorReport) != nil || priorReport.StartedAt.IsZero() || priorReport.ProjectionDigest != projection.LastProjection || priorReport.State != "completed" && priorReport.State != "running" {
+			auditReadiness = fmt.Sprintf("audit state=%q digest=%q projection=%q err=%v report=%s", priorReport.State, priorReport.ProjectionDigest, projection.LastProjection, err, priorBody)
+			return false
+		}
+		latest, err := readRuntimeOwnerState(stateRoot, "o/r")
+		if err != nil || latest.Epoch != ledger.Epoch || latest.Revision != ledger.Revision {
+			auditReadiness = fmt.Sprintf("owner changed while checking audit: before=%d/%d after=%d/%d err=%v", ledger.Epoch, ledger.Revision, latest.Epoch, latest.Revision, err)
+			return false
+		}
+		auditReadiness = ""
+		return true
+	}) {
+		t.Fatalf("pre-Investigate owner/projection/audit gate unmet: %s serve=%s", auditReadiness, output.String())
 	}
 	priorEvents, err := os.ReadFile(fixtureEvents)
 	if err != nil {
