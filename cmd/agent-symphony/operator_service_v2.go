@@ -169,6 +169,9 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		}
 		return operatorResultForReceipt(committed, receipt)
 	}
+	if (request.Action == "cancel" || request.Action == "recover") && snapshot.State.Attempts[ownerAttemptKey(request.Repository, request.Issue, request.Attempt)].Manifest.State == "preparing" {
+		return operatorErrorResult(request, http.StatusConflict, "pending Start has no proven physical cleanup path")
+	}
 	if slices.Contains([]string{"dismiss", "archive", "abandon", "remove", "cancel", "recover"}, request.Action) {
 		reservation := reserveOperatorAdmissionCommand{Request: request}
 		snapshot, err = s.owner.reserveOperatorAdmission(ctx, reservation)

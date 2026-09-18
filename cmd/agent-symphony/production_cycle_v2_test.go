@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -868,6 +869,23 @@ func TestPendingStartWithoutFreshInputKeepsStartupDiagnosticVisible(t *testing.T
 	}
 	if final.State.Attempts[ownerAttemptKey("o/r", 413, 1)].Manifest.State != "preparing" {
 		t.Fatal("unproved worker Start changed the owner manifest")
+	}
+	service := operatorTestMutationService(t, restarted)
+	server := &dashboardServer{ctx: t.Context(), stateRoot: restarted.stateRoot, repository: "o/r", operator: service}
+	for _, action := range []string{"cancel", "recover"} {
+		before := mustOwnerSnapshot(t, restarted).State
+		request := httptest.NewRequest(http.MethodPost, "http://localhost/actions/"+action+"?repository=o%2Fr&issue=413&attempt=1", nil)
+		request.Host = "localhost"
+		request.Header.Set("Origin", "http://localhost")
+		response := httptest.NewRecorder()
+		server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
+		if response.Code != http.StatusConflict {
+			t.Fatalf("%s pending Start status=%d body=%s", action, response.Code, response.Body.String())
+		}
+		after := mustOwnerSnapshot(t, restarted).State
+		if after.Revision != before.Revision || !reflect.DeepEqual(after.ControlReceipts, before.ControlReceipts) || !reflect.DeepEqual(after.Effects, before.Effects) {
+			t.Fatalf("%s rejection mutated owner state: before=%#v after=%#v", action, before, after)
+		}
 	}
 	newerIssue := issue
 	newerIssue.Body = "newer issue body"

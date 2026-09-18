@@ -430,7 +430,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		}
 		phase = operatorPhaseCleanupPending
 	case "cancel":
-		if command.Runtime == nil || command.Reconciliation != nil || command.CleanupDigest != "" || command.PublishedHead != "" || command.Runtime.Action != agentruntime.EffectStop || !reflect.DeepEqual(command.Runtime.Manifest, manifest) {
+		if manifest.State != "running" || command.Runtime == nil || command.Reconciliation != nil || command.CleanupDigest != "" || command.PublishedHead != "" || command.Runtime.Action != agentruntime.EffectStop || !reflect.DeepEqual(command.Runtime.Manifest, manifest) {
 			return nil, errStateConflict
 		}
 		begin := *command.Runtime

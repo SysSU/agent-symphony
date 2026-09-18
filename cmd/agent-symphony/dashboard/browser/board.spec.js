@@ -80,6 +80,33 @@ test("shows issue-level GitHub quarantine without an archived attempt card", asy
   await expect(notice).toBeVisible();
 });
 
+test("pending Start quarantine stays visible without unsafe recovery controls after refresh", async ({ page }) => {
+  const diagnostic = "pending Start launch identity or worker absence is unproved";
+  await mockDashboard(page, [{
+    repository: "SysSU/agent-symphony",
+    issue: 413,
+    attempt: 1,
+    title: "Unproved implementation launch",
+    state: "blocked",
+    current_phase: "blocked",
+    needs_attention: true,
+    retryable: false,
+    diagnostic,
+    next_action: "inspect the unproved implementation launch; no dashboard retry is safe",
+  }]);
+  await page.goto("/");
+
+  const board = page.getByRole("region", { name: "Issue status board" });
+  const assertQuarantine = async () => {
+    await expect(board).toContainText(diagnostic);
+    await expect(board).toContainText("no dashboard retry is safe");
+    await expect(board.getByRole("button", { name: /Recover attempt|Cancel issue #413/ })).toHaveCount(0);
+  };
+  await assertQuarantine();
+  await page.reload();
+  await assertQuarantine();
+});
+
 test("shows loading then unavailable when the initial status request fails", async ({ page }) => {
   let releaseStatus;
   const statusPending = new Promise((resolve) => { releaseStatus = resolve; });
