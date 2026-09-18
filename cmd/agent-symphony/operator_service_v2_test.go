@@ -3493,6 +3493,102 @@ func operatorTestMutationService(t *testing.T, owner *stateOwner) *operatorMutat
 	return &operatorMutationService{lifecycle: t.Context(), owner: owner, effects: effects, cleanup: cleanup, collector: reconciliationV2Collector{Config: internalgithub.PRAdapterConfig{Repository: "o/r", ActorID: 1}}, reviewer: boundary}
 }
 
+func TestOperatorCollectionPersistsConditionalGitHubReadsAcrossCacheReload(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 350, "completed", true)
+	cachePath := filepath.Join(owner.stateRoot, "github-etag-cache.json")
+	var conditional atomic.Int64
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var value any
+		switch request.URL.RequestURI() {
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1":
+			value = []any{}
+		case "/repos/o/r":
+			value = map[string]any{"default_branch": "main"}
+		case "/repos/o/r/branches/main":
+			value = map[string]any{"commit": map[string]any{"sha": strings.Repeat("a", 40)}}
+		case "/repos/o/r/issues/351":
+			value = map[string]any{"number": 351, "state": "closed"}
+		default:
+			return nil, fmt.Errorf("unexpected GitHub read %s", request.URL.String())
+		}
+		header := make(http.Header)
+		header.Set("ETag", `"operator-unchanged"`)
+		if request.Header.Get("If-None-Match") == `"operator-unchanged"` {
+			conditional.Add(1)
+			return &http.Response{StatusCode: http.StatusNotModified, Header: header, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+		}
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(bytes.NewReader(body)), Request: request}, nil
+	})}}
+	collect := func(cache *internalgithub.ReadCache) {
+		service := operatorTestMutationService(t, owner)
+		service.collector.API = api
+		service.collector.API.Cache = cache
+		service.collect = func(ctx context.Context, snapshot stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
+			bound := service.collector
+			bound.Scope = reconciliationScope{Kind: reconciliationIssueScope, Repository: snapshot.State.Repository, Issue: issue}
+			return bound.collect(ctx, snapshot)
+		}
+		if _, _, err := service.collectIssue(t.Context(), 351); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache, err := internalgithub.LoadReadCache(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collect(cache)
+	if conditional.Load() != 0 {
+		t.Fatal("first operator collection unexpectedly used a conditional read")
+	}
+	cache, err = internalgithub.LoadReadCache(cachePath)
+	if err != nil {
+		t.Fatalf("operator-only collection did not persist the cache: %v", err)
+	}
+	collect(cache)
+	if conditional.Load() != 4 {
+		t.Fatalf("reloaded operator cache did not reuse all four ETags: conditional reads=%d", conditional.Load())
+	}
+}
+
+func TestOperatorCollectionCommitsWhenGitHubCacheSaveFails(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 352, "completed", true)
+	cachePath := filepath.Join(owner.stateRoot, "github-etag-cache.json")
+	cache, err := internalgithub.LoadReadCache(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(cachePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	service := operatorTestMutationService(t, owner)
+	var warning bytes.Buffer
+	service.cacheLog = &warning
+	service.collector.API = internalgithub.API{Cache: cache}
+	// The cache is dirty only after a successful read; seed it through its API.
+	service.collector.API.BaseURL = "https://example.test"
+	service.collector.API.HTTP = &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Etag": []string{`"fresh"`}}, Body: io.NopCloser(strings.NewReader(`{"number":353}`)), Request: request}, nil
+	})}
+	service.collect = func(ctx context.Context, _ stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
+		var fact struct{ Number int }
+		if _, _, err := service.collector.API.Read(ctx, "/repos/o/r/issues/353", "", &fact); err != nil {
+			return reconciliationV2Batch{}, err
+		}
+		return reconciliationV2Batch{Input: reconciliationInput{Scope: reconciliationScope{Kind: reconciliationIssueScope, Repository: "o/r", Issue: issue}, Complete: true}}, nil
+	}
+	before := mustOwnerSnapshot(t, owner).State.Revision
+	if _, _, err := service.collectIssue(t.Context(), 353); err != nil {
+		t.Fatalf("cache persistence failure blocked operator collection: %v", err)
+	}
+	if after := mustOwnerSnapshot(t, owner).State.Revision; after <= before {
+		t.Fatalf("cache persistence failure blocked owner commit: before=%d after=%d", before, after)
+	}
+	if !strings.Contains(warning.String(), "save GitHub cache after operator collection") {
+		t.Fatalf("cache persistence failure was not logged: %q", warning.String())
+	}
+}
+
 func operatorNeverLaunchedOwner(t *testing.T, issue int, manifestState, observedState string, persist func(runtimeOwnerState) error) (*stateOwner, agentruntime.Manifest) {
 	t.Helper()
 	root := resolvedTempDir(t)
