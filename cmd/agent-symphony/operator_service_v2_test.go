@@ -3532,6 +3532,9 @@ func TestOperatorCollectionPersistsConditionalGitHubReadsAcrossCacheReload(t *te
 		if _, _, err := service.collectIssue(t.Context(), 351); err != nil {
 			t.Fatal(err)
 		}
+		if err := service.shutdown(t.Context()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cache, err := internalgithub.LoadReadCache(cachePath)
 	if err != nil {
@@ -3581,11 +3584,198 @@ func TestOperatorCollectionCommitsWhenGitHubCacheSaveFails(t *testing.T) {
 	if _, _, err := service.collectIssue(t.Context(), 353); err != nil {
 		t.Fatalf("cache persistence failure blocked operator collection: %v", err)
 	}
+	if err := service.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	if after := mustOwnerSnapshot(t, owner).State.Revision; after <= before {
 		t.Fatalf("cache persistence failure blocked owner commit: before=%d after=%d", before, after)
 	}
 	if !strings.Contains(warning.String(), "save GitHub cache after operator collection") {
 		t.Fatalf("cache persistence failure was not logged: %q", warning.String())
+	}
+}
+
+func TestOperatorCollectionDoesNotWaitForCacheSaveAndShutdownDrainsNewerReads(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 356, "completed", true)
+	cachePath := filepath.Join(owner.stateRoot, "github-etag-cache.json")
+	cache, err := internalgithub.LoadReadCache(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conditional, saves atomic.Int64
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, Cache: cache, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		issue := strings.TrimPrefix(request.URL.Path, "/repos/o/r/issues/")
+		if issue != "357" && issue != "358" {
+			return nil, fmt.Errorf("unexpected GitHub read %s", request.URL.String())
+		}
+		etag := `"` + issue + `"`
+		header := make(http.Header)
+		header.Set("ETag", etag)
+		if request.Header.Get("If-None-Match") == etag {
+			conditional.Add(1)
+			return &http.Response{StatusCode: http.StatusNotModified, Header: header, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(`{"number":` + issue + `}`)), Request: request}, nil
+	})}}
+	service := operatorTestMutationService(t, owner)
+	service.collector.API = api
+	service.collect = func(ctx context.Context, _ stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
+		var fact struct{ Number int }
+		if _, _, err := service.collector.API.Read(ctx, fmt.Sprintf("/repos/o/r/issues/%d", issue), "", &fact); err != nil || fact.Number != issue {
+			return reconciliationV2Batch{}, fmt.Errorf("operator GitHub fact %d: got=%d err=%v", issue, fact.Number, err)
+		}
+		return reconciliationV2Batch{Input: reconciliationInput{Scope: reconciliationScope{Kind: reconciliationIssueScope, Repository: "o/r", Issue: issue}, Complete: true}}, nil
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	service.cacheSave = func() error {
+		call := saves.Add(1)
+		err := cache.Save()
+		if call == 1 {
+			close(entered)
+			<-release
+		}
+		return err
+	}
+	collect := func(issue int) <-chan error {
+		result := make(chan error, 1)
+		go func() {
+			_, _, err := service.collectIssue(t.Context(), issue)
+			result <- err
+		}()
+		return result
+	}
+	before := mustOwnerSnapshot(t, owner).State.Revision
+	first := collect(357)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first cache save did not start")
+	}
+	select {
+	case err := <-first:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("operator collection waited for blocked cache save")
+	}
+	second := collect(358)
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second operator collection waited for blocked cache save")
+	}
+	if after := mustOwnerSnapshot(t, owner).State.Revision; after <= before {
+		t.Fatalf("blocked cache save prevented owner commits: before=%d after=%d", before, after)
+	}
+	if saves.Load() != 1 {
+		t.Fatalf("blocked cache save started extra writers: %d", saves.Load())
+	}
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- service.shutdown(t.Context()) }()
+	once.Do(func() { close(release) })
+	if err := <-shutdown; err != nil {
+		t.Fatal(err)
+	}
+	if saves.Load() < 2 {
+		t.Fatalf("second collection was not flushed after blocked save: saves=%d", saves.Load())
+	}
+	reloaded, err := internalgithub.LoadReadCache(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.Cache = reloaded
+	for _, issue := range []int{357, 358} {
+		var fact struct{ Number int }
+		if _, changed, err := api.Read(t.Context(), fmt.Sprintf("/repos/o/r/issues/%d", issue), "", &fact); err != nil || changed || fact.Number != issue {
+			t.Fatalf("reloaded operator read issue=%d changed=%v fact=%#v err=%v", issue, changed, fact, err)
+		}
+	}
+	if conditional.Load() != 2 {
+		t.Fatalf("persisted operator reads did not send two conditional GETs: %d", conditional.Load())
+	}
+}
+
+func TestOperatorShutdownDrainsCollectionStartedBeforeShutdown(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 359, "completed", true)
+	cachePath := filepath.Join(owner.stateRoot, "github-etag-cache.json")
+	cache, err := internalgithub.LoadReadCache(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conditional atomic.Bool
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, Cache: cache, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/repos/o/r/issues/360" {
+			return nil, fmt.Errorf("unexpected GitHub read %s", request.URL.String())
+		}
+		header := make(http.Header)
+		header.Set("ETag", `"shutdown"`)
+		if request.Header.Get("If-None-Match") == `"shutdown"` {
+			conditional.Store(true)
+			return &http.Response{StatusCode: http.StatusNotModified, Header: header, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(`{"number":360}`)), Request: request}, nil
+	})}}
+	service := operatorTestMutationService(t, owner)
+	service.collector.API = api
+	service.stopping = make(chan struct{})
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	service.collect = func(ctx context.Context, _ stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
+		var fact struct{ Number int }
+		if _, _, err := api.Read(ctx, "/repos/o/r/issues/360", "", &fact); err != nil || fact.Number != issue {
+			return reconciliationV2Batch{}, fmt.Errorf("operator GitHub fact %d: got=%d err=%v", issue, fact.Number, err)
+		}
+		close(entered)
+		<-release
+		return reconciliationV2Batch{Input: reconciliationInput{Scope: reconciliationScope{Kind: reconciliationIssueScope, Repository: "o/r", Issue: issue}, Complete: true}}, nil
+	}
+	collectDone := make(chan error, 1)
+	go func() {
+		_, _, err := service.collectIssue(t.Context(), 360)
+		collectDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("operator collection did not reach GitHub barrier")
+	}
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- service.shutdown(t.Context()) }()
+	select {
+	case <-service.stopping:
+	case <-time.After(5 * time.Second):
+		t.Fatal("operator shutdown did not begin")
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown returned before in-flight collection completed: %v", err)
+	case <-time.After(100 * time.Millisecond): // Bounded negative assertion; collection remains held at the barrier.
+	}
+	once.Do(func() { close(release) })
+	if err := <-collectDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := internalgithub.LoadReadCache(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.Cache = reloaded
+	var fact struct{ Number int }
+	if _, changed, err := api.Read(t.Context(), "/repos/o/r/issues/360", "", &fact); err != nil || changed || fact.Number != 360 || !conditional.Load() {
+		t.Fatalf("shutdown lost in-flight operator ETag: changed=%v fact=%#v conditional=%v err=%v", changed, fact, conditional.Load(), err)
+	}
+	if _, _, err := service.collectIssue(t.Context(), 360); !errors.Is(err, context.Canceled) {
+		t.Fatalf("collection began after shutdown: %v", err)
 	}
 }
 
