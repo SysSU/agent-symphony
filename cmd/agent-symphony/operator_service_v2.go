@@ -110,7 +110,7 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 		return operatorErrorResult(request, http.StatusRequestTimeout, "operator request was cancelled before admission")
 	}
 	s.mu.Lock()
-	if s.closing || s.stopped {
+	if s.closing {
 		s.mu.Unlock()
 		return operatorResultForError(request, fmt.Errorf("operator service stopped: %w", context.Canceled))
 	}
@@ -718,7 +718,7 @@ func operatorAttempt(snapshot stateOwnerSnapshot, request controlRequest) (agent
 
 func (s *operatorMutationService) collectIssue(ctx context.Context, issue int) (stateOwnerSnapshot, reconciliationV2Batch, error) {
 	s.mu.Lock()
-	if s.stopped {
+	if s.closing && s.stopped {
 		s.mu.Unlock()
 		return stateOwnerSnapshot{}, reconciliationV2Batch{}, fmt.Errorf("operator service stopped: %w", context.Canceled)
 	}
