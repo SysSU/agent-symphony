@@ -186,6 +186,9 @@ func TestOwnerStatusProjectionSeparatesArchivedAttemptFromExternalQuarantine(t *
 	if err != nil || len(projected.Statuses) != 0 || len(projected.IssueQuarantines) != 1 || projected.IssueQuarantines[0].Issue != 330 || !issueHasUnresolvedExternalEffect(loaded, "o/r", 330) {
 		t.Fatalf("external issue quarantine resurrected archived attempt or lost owner safety: status=%#v warnings=%#v err=%v", projected.Statuses, projected.IssueQuarantines, err)
 	}
+	if err := applyResolveInvalidatedReconciliationEffect(&loaded, resolveInvalidatedReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(loaded.Effects[effect.ID]), Outcome: invalidatedExternalOutcome{Action: reconciliationGitHubIssueUpdate, Observed: true}}); err != nil {
+		t.Fatal(err)
+	}
 	loaded.LegacyReviewerQuarantines[issueKey] = "legacy reviewer absence is unverified"
 	loaded.Revision++
 	if err := writeRuntimeOwnerState(owner.stateRoot, owner.attemptRoot, loaded); err != nil {
@@ -196,7 +199,7 @@ func TestOwnerStatusProjectionSeparatesArchivedAttemptFromExternalQuarantine(t *
 		t.Fatal(err)
 	}
 	projected, err = projectOwnerStatus(stateOwnerSnapshot{State: loaded}, 1, time.Unix(3, 0))
-	if err != nil || len(projected.Statuses) != 1 || projected.Statuses[0].CurrentPhase != "physical-unverified" || !projected.Statuses[0].NeedsAttention || len(projected.IssueQuarantines) != 1 {
+	if err != nil || len(projected.Statuses) != 1 || projected.Statuses[0].CurrentPhase != "physical-unverified" || !projected.Statuses[0].NeedsAttention || len(projected.IssueQuarantines) != 0 {
 		t.Fatalf("attempt-local physical safety was hidden: status=%#v warnings=%#v err=%v", projected.Statuses, projected.IssueQuarantines, err)
 	}
 }

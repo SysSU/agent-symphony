@@ -1332,6 +1332,28 @@ fi
 				}
 				return
 			}
+			if action == "review-plan-cancel" {
+				second, err := agentruntime.AttemptSessionName(agentruntime.SessionRoleImplementation, "o/r", 73, 2)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !waitFor(limit, func() bool {
+					current, err := readRuntimeOwnerState(stateRoot, "o/r")
+					replacement, ok := current.Attempts[ownerAttemptKey("o/r", 73, 2)]
+					if err != nil || !ok || replacement.Manifest.State != "running" || replacement.Manifest.Session != second || !fullSystemTmuxSessionExists(environment, second) {
+						return false
+					}
+					for _, effect := range current.Effects {
+						if effect.Action == string(agentruntime.EffectStart) && effect.Issue == 73 && effect.Attempt == 2 && effect.AttemptGeneration == replacement.Generation && effect.State == "completed" {
+							return true
+						}
+					}
+					return false
+				}) {
+					current, _ := readRuntimeOwnerState(stateRoot, "o/r")
+					t.Fatalf("cancel successor Start did not settle before restart: attempt=%#v effects=%s pending_start=%s serve=%s", current.Attempts[ownerAttemptKey("o/r", 73, 2)], fullSystemEffectSummary(current), fullSystemPendingStartDiagnostic(current, stateRoot, environment), output.String())
+				}
+			}
 			if err := server.Process.Signal(os.Interrupt); err != nil {
 				t.Fatal(err)
 			}
