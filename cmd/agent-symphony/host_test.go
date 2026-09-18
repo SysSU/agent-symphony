@@ -1354,6 +1354,7 @@ func TestStopAttemptSessionProvesExactPaneGoneAfterTmuxProbeRace(t *testing.T) {
 		wantFailure, unconfined        bool
 	}{
 		{"session probe disappeared", "has-session", fmt.Sprintf("%d|1|%%2", os.Getpid()), false, false},
+		{"session probe failed but exact pane remains", "has-session", fmt.Sprintf("%d|1|%%1", os.Getpid()), true, false},
 		{"pane disappeared after live session", "display-message", fmt.Sprintf("%d|1|%%2", os.Getpid()), false, false},
 		{"exact pane remains", "display-message", fmt.Sprintf("%d|1|%%1", os.Getpid()), true, false},
 		{"unconfined worker remains", "display-message", fmt.Sprintf("%d|1|%%2", os.Getpid()), true, true},
