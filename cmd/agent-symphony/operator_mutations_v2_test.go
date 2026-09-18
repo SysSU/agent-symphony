@@ -293,6 +293,26 @@ func TestOperatorSameSnapshotCancelRequestsShareOneGenerationAndEffect(t *testin
 	}
 }
 
+func TestPreparingOperatorReservationReplaysExistingReceipt(t *testing.T) {
+	manifest := ownerTestManifest(t, resolvedTempDir(t), 414, 1, "preparing")
+	for _, action := range []string{"cancel", "recover"} {
+		t.Run(action, func(t *testing.T) {
+			state := newRuntimeOwnerState(manifest.Repository)
+			state.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)] = runtimeAttemptRecord{Generation: 1, Manifest: manifest}
+			request := operatorRequest("existing-"+action, action, manifest, false)
+			receipt := controlReceipt{Request: request, State: "pending", Phase: operatorPhaseAdmissionPending, Admission: &operatorAdmission{Manifest: manifest}}
+			state.ControlReceipts = []controlReceipt{receipt}
+			before := cloneRuntimeOwnerState(state)
+			if err := applyReserveOperatorAdmission(&state, reserveOperatorAdmissionCommand{Request: request}); err != nil {
+				t.Fatalf("same request did not replay existing receipt: %v", err)
+			}
+			if !reflect.DeepEqual(state, before) {
+				t.Fatalf("same request changed existing receipt: before=%#v after=%#v", before.ControlReceipts, state.ControlReceipts)
+			}
+		})
+	}
+}
+
 func TestOperatorDifferentAttemptsAdmitFromOneSnapshot(t *testing.T) {
 	root := resolvedTempDir(t)
 	manifests := []agentruntime.Manifest{ownerTestManifest(t, root, 305, 1, "completed"), ownerTestManifest(t, root, 306, 1, "completed")}

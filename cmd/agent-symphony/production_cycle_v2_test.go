@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -720,6 +721,9 @@ func TestPermittedStartWithMissingSessionRemainsQuarantinedAfterRestart(t *testi
 		t.Fatal(err)
 	}
 	p := &productionReconciliation{owner: restarted, effects: recoveredEffects, config: config.Default("o/r"), attemptRoot: owner.attemptRoot, stateRoot: owner.stateRoot}
+	if err := p.sweepPendingMarkers(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	if err := p.resumePendingRuntime(t.Context(), batch, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -730,6 +734,177 @@ func TestPermittedStartWithMissingSessionRemainsQuarantinedAfterRestart(t *testi
 	effect := after.State.Effects[pending.ID]
 	if effect.State != "pending" || !effect.StartMayRun || effect.StartGateNonce != pending.StartGateNonce || effect.Diagnostic != "pending Start launch identity or worker absence is unproved" || runner.blocked.Load() != 0 {
 		t.Fatalf("permitted missing candidate was replayed or lost: effect=%#v external dispatches=%d", effect, runner.blocked.Load())
+	}
+}
+
+func TestPendingStartWithoutFreshInputKeepsStartupDiagnosticVisible(t *testing.T) {
+	owner := newReconciliationTestOwner(t)
+	manifest := ownerTestManifest(t, owner.stateRoot, 413, 1, "preparing")
+	manifest.Version, manifest.LaunchToken = agentruntime.ManifestVersion2, strings.Repeat("a", 32)
+	created, err := owner.upsertAttempt(t.Context(), upsertAttemptCommand{Manifest: manifest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest = created.State.Attempts[ownerAttemptKey("o/r", 413, 1)].Manifest
+	remote := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: 413, Attempt: 1, BaseSHA: manifest.BaseSHA, State: "active"}
+	issue := internalgithub.RecoveryIssueFact{Repository: "o/r", Issue: 413, Attempt: 1, Active: true, DispatchAuthorized: true, BaseSHA: manifest.BaseSHA, Body: "exact body", ActiveAttempt: &remote}
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{remote}
+	applyReconciliationInput(t, owner, input)
+	runner := &barrierEffectRunner{}
+	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: runner, Tmux: "tmux", Helper: "agent-symphony-helper", VerifyWorker: func(context.Context) error { return nil }}
+	effects, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := mustOwnerSnapshot(t, owner)
+	accepted := expandIssueFact(snapshot.State.Observations[ownerIssueKey("o/r", 413)].Fact)
+	accepted.Body, accepted.Attempt, accepted.BaseSHA = issue.Body, manifest.Attempt, manifest.BaseSHA
+	attempt, err := runtimeLaunchAttempt(config.Default("o/r"), accepted, manifest, owner.attemptRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := effects.beginWithSource(t.Context(), snapshot, agentruntime.EffectRequest{Action: agentruntime.EffectStart, Attempt: attempt, Manifest: manifest, Eligible: true}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := effects.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted := restartOwnerWithInput(t, owner, input)
+	recoveredEffects, err := newRuntimeEffectCoordinator(t.Context(), restarted, agentruntime.EffectExecutor{Runtime: runtimeState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	production := &productionReconciliation{owner: restarted, effects: recoveredEffects, config: config.Default("o/r"), attemptRoot: owner.attemptRoot, stateRoot: owner.stateRoot}
+	if err := production.sweepPendingMarkers(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	assertActionable := func(phase string) {
+		t.Helper()
+		status, err := projectOwnerStatus(mustOwnerSnapshot(t, restarted), 4, time.Now().UTC())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range status.Statuses {
+			if entry.Issue == 413 {
+				if !entry.NeedsAttention || !strings.Contains(entry.Action, "inspect") || entry.Diagnostic != "waiting for exact fresh input reconstruction" {
+					t.Fatalf("%s pending Start is not actionable: %#v", phase, entry)
+				}
+				return
+			}
+		}
+		t.Fatalf("%s pending Start status missing", phase)
+	}
+	assertActionable("before pending-effect phase")
+	for _, raw := range []reconciliationInput{repositoryInput(true), repositoryInput(true, func() internalgithub.RecoveryIssueFact {
+		changed := issue
+		changed.Body = "changed body"
+		return changed
+	}())} {
+		if err := production.resumePendingRuntime(t.Context(), reconciliationV2Batch{Input: raw}, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after := mustOwnerSnapshot(t, restarted)
+	if runner.calls.Load() != 0 {
+		t.Fatalf("unproved pending Start dispatched %d times", runner.calls.Load())
+	}
+	var pending runtimeEffectIntent
+	for _, effect := range after.State.Effects {
+		if effect.Action != string(agentruntime.EffectStart) {
+			continue
+		}
+		pending = effect
+		if effect.State != "pending" || effect.Diagnostic != "waiting for exact fresh input reconstruction" {
+			t.Fatalf("fresh-input failure changed pending Start: %#v", effect)
+		}
+	}
+	assertActionable("after unavailable and changed fresh input")
+	if pending.ID == "" {
+		t.Fatal("pending Start effect missing")
+	}
+	if err := restarted.authorizeRuntimeEffect(t.Context(), authorizeRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(pending)), Action: agentruntime.EffectStart, GateNonce: pending.StartGateNonce}); err != nil {
+		t.Fatal(err)
+	}
+	candidate := manifest
+	candidate.LaunchID = pending.StartGateNonce
+	pane := boundRuntimeEffectTestPane(t, candidate)
+	binding, err := agentruntime.ReadImplementationBinding(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, write := range []func(agentruntime.Manifest, agentruntime.ImplementationLaunchBinding) error{agentruntime.WriteImplementationPermit, agentruntime.WriteImplementationRelease, agentruntime.WriteImplementationGateEntered} {
+		if err := write(candidate, binding); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recoveredEffects.executor.Runtime.Runner = &monitorFailureRunner{pane: pane}
+	fresh := mustOwnerSnapshot(t, restarted)
+	observation := fresh.State.Observations[ownerIssueKey("o/r", 413)]
+	if !currentReconciliationObservation(fresh.State, ownerIssueKey("o/r", 413), observation) || digestText(issue.Body) != observation.Fact.BodyDigest {
+		t.Fatalf("exact input is not current: observation=%#v epoch=%d", observation, fresh.State.Epoch)
+	}
+	if record := fresh.State.Attempts[ownerAttemptKey("o/r", 413, 1)]; record.Generation != pending.AttemptGeneration || recoveredEffects.effectActive(record.Manifest, pending.ID) {
+		t.Fatalf("pending effect cannot enter exact-input verification: record=%#v effect=%#v", record, pending)
+	}
+	if err := production.resumePendingRuntime(t.Context(), reconciliationV2Batch{Input: input}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoveredEffects.shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	final := mustOwnerSnapshot(t, restarted)
+	actual := final.State.Effects[pending.ID]
+	if actual.State != "pending" || actual.Diagnostic != "pending Start launch identity or worker absence is unproved" {
+		t.Fatalf("exact fresh input retained stale diagnostic or certified gate entry: %#v", actual)
+	}
+	status, err := projectOwnerStatus(final, 4, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(status.Statuses, func(entry orchestrator.RecoveryStatus) bool {
+		return entry.Issue == 413 && entry.NeedsAttention && !entry.Retryable && entry.Diagnostic == actual.Diagnostic && entry.Action == "inspect the unproved implementation launch; no dashboard retry is safe"
+	}) {
+		t.Fatalf("verified ambiguity did not replace stale UI guidance: %#v", status.Statuses)
+	}
+	if final.State.Attempts[ownerAttemptKey("o/r", 413, 1)].Manifest.State != "preparing" {
+		t.Fatal("unproved worker Start changed the owner manifest")
+	}
+	service := operatorTestMutationService(t, restarted)
+	server := &dashboardServer{ctx: t.Context(), stateRoot: restarted.stateRoot, repository: "o/r", operator: service}
+	for _, action := range []string{"cancel", "recover"} {
+		before := mustOwnerSnapshot(t, restarted).State
+		if _, err := restarted.reserveOperatorAdmission(t.Context(), reserveOperatorAdmissionCommand{Request: operatorRequest(action+"-pending-start", action, manifest, false)}); !errors.Is(err, errStateConflict) {
+			t.Fatalf("%s preparing Start admission error=%v", action, err)
+		}
+		reserved := mustOwnerSnapshot(t, restarted).State
+		if reserved.Revision != before.Revision || !reflect.DeepEqual(reserved.ControlReceipts, before.ControlReceipts) || !reflect.DeepEqual(reserved.Effects, before.Effects) {
+			t.Fatalf("%s rejected reservation mutated owner state: before=%#v after=%#v", action, before, reserved)
+		}
+		request := httptest.NewRequest(http.MethodPost, "http://localhost/actions/"+action+"?repository=o%2Fr&issue=413&attempt=1", nil)
+		request.Host = "localhost"
+		request.Header.Set("Origin", "http://localhost")
+		response := httptest.NewRecorder()
+		server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
+		if response.Code != http.StatusConflict {
+			t.Fatalf("%s pending Start status=%d body=%s", action, response.Code, response.Body.String())
+		}
+		after := mustOwnerSnapshot(t, restarted).State
+		if after.Revision != before.Revision || !reflect.DeepEqual(after.ControlReceipts, before.ControlReceipts) || !reflect.DeepEqual(after.Effects, before.Effects) {
+			t.Fatalf("%s rejection mutated owner state: before=%#v after=%#v", action, before, after)
+		}
+	}
+	newerIssue := issue
+	newerIssue.Body = "newer issue body"
+	newerInput := repositoryInput(true, newerIssue)
+	newerInput.Attempts = []internalgithub.RecoveryAttemptFact{remote}
+	applyReconciliationInput(t, restarted, newerInput)
+	if err := production.resumePendingRuntime(t.Context(), reconciliationV2Batch{Input: input}, ""); err != nil {
+		t.Fatal(err)
+	}
+	stale := mustOwnerSnapshot(t, restarted)
+	if stale.State.Attempts[ownerAttemptKey("o/r", 413, 1)].Manifest.State != "preparing" || stale.State.Effects[pending.ID].State == "completed" {
+		t.Fatalf("out-of-order issue body completed pending Start: %#v", stale.State.Effects[pending.ID])
 	}
 }
 
@@ -830,7 +1005,7 @@ func TestPendingLegacyStartAfterRestartIsQuarantinedWithoutReplaying(t *testing.
 			continue
 		}
 		foundUnproved = true
-		if entry.Diagnostic != effect.Diagnostic || !entry.NeedsAttention || entry.Action != "inspect the unproved implementation launch before retry" {
+		if entry.Diagnostic != effect.Diagnostic || !entry.NeedsAttention || entry.Action != "inspect the unproved implementation launch; no dashboard retry is safe" {
 			t.Fatalf("pending Start quarantine was not visible: %#v", entry)
 		}
 	}
@@ -844,7 +1019,7 @@ func TestPendingLegacyStartAfterRestartIsQuarantinedWithoutReplaying(t *testing.
 		t.Fatal(err)
 	}
 	for _, entry := range status.Statuses {
-		if entry.Issue == 410 && (entry.Diagnostic == effect.Diagnostic || entry.Action == "inspect the unproved implementation launch before retry" || entry.Action == "manually migrate the legacy implementation launch identity") {
+		if entry.Issue == 410 && (entry.Diagnostic == effect.Diagnostic || entry.Action == "inspect the unproved implementation launch; no dashboard retry is safe" || entry.Action == "manually migrate the legacy implementation launch identity") {
 			t.Fatalf("stale Start diagnostic survived attempt-generation invalidation: %#v", entry)
 		}
 	}
