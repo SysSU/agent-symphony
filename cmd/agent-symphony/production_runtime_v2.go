@@ -41,7 +41,9 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		return nil, errors.New("production v2 deployment fence is not installed")
 	}
 	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
-	if err != nil {
+	if errors.Is(err, internalgithub.ErrReadCacheCorrupt) {
+		_, _ = fmt.Fprintln(log, "GitHub ETag cache was corrupt; rebuilding from fresh reads: "+internalgithub.Redact(err.Error()))
+	} else if err != nil {
 		return nil, fmt.Errorf("load GitHub cache: %w", err)
 	}
 	api.Cache = cache

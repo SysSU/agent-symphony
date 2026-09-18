@@ -1899,6 +1899,7 @@ func TestProductionRuntimePersistsConditionalGitHubReads(t *testing.T) {
 	runGit(t, checkout, "config", "user.name", "test")
 	runGit(t, checkout, "commit", "--allow-empty", "-m", "base")
 	stateRoot := resolvedTempDir(t)
+	cfg := productionETagTestConfig(t, stateRoot)
 	if err := bindDeployment(stateRoot, "o/r"); err != nil {
 		t.Fatal(err)
 	}
@@ -1928,7 +1929,7 @@ func TestProductionRuntimePersistsConditionalGitHubReads(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
 	})}}
 	lifecycle, cancel := context.WithCancel(t.Context())
-	runtime, err := startProductionRuntimeV2(lifecycle, config.Default("o/r"), api, internalgithub.AuthenticatedUser{ID: 42}, stateRoot, filepath.Join(stateRoot, "legacy-pr-state.json"), checkout, io.Discard)
+	runtime, err := startProductionRuntimeV2(lifecycle, cfg, api, internalgithub.AuthenticatedUser{ID: 42}, stateRoot, filepath.Join(stateRoot, "legacy-pr-state.json"), checkout, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1944,6 +1945,27 @@ func TestProductionRuntimePersistsConditionalGitHubReads(t *testing.T) {
 	if conditional.Load() == 0 {
 		t.Fatal("second production reconciliation did not send a conditional GitHub read")
 	}
+	beforeRestart := conditional.Load()
+	cancel()
+	if err := runtime.shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runtime = nil
+	restartedContext, stopRestart := context.WithCancel(t.Context())
+	restarted, err := startProductionRuntimeV2(restartedContext, cfg, api, internalgithub.AuthenticatedUser{ID: 42}, stateRoot, filepath.Join(stateRoot, "legacy-pr-state.json"), checkout, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopRestart()
+		_ = restarted.shutdown(context.Background())
+	}()
+	if err := restarted.trigger.triggerAndWait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if conditional.Load() <= beforeRestart {
+		t.Fatal("restarted production runtime did not reuse persisted ETags")
+	}
 	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
 	if err != nil {
 		t.Fatalf("production cache was not persisted: %v", err)
@@ -1953,6 +1975,81 @@ func TestProductionRuntimePersistsConditionalGitHubReads(t *testing.T) {
 	}
 	if _, changed, err := (internalgithub.API{BaseURL: api.BaseURL, HTTP: api.HTTP, Cache: cache}).Read(t.Context(), "/repos/o/r", "", &repository); err != nil || changed || repository.DefaultBranch != "main" {
 		t.Fatalf("persisted cache did not restore GitHub facts: changed=%v repository=%#v err=%v", changed, repository, err)
+	}
+}
+
+func productionETagTestConfig(t *testing.T, stateRoot string) config.Config {
+	t.Helper()
+	restorePinnedWorkerPermissions(t, stateRoot)
+	cfg := config.Default("o/r")
+	codex := filepath.Join(t.TempDir(), "codex")
+	buildNativeCodexFixture(t, codex, `if [ "$1" = --version ]; then printf 'codex-cli 0.153.4\n'; fi`)
+	cfg.Commands.Implementation[0], cfg.Commands.Reviewer[0], cfg.Commands.OrchestratorAudit[0] = codex, codex, codex
+	return cfg
+}
+
+func TestProductionRuntimeRecoversSafeCorruptGitHubCache(t *testing.T) {
+	checkout := gitRepository(t)
+	runGit(t, checkout, "config", "user.email", "test@example.invalid")
+	runGit(t, checkout, "config", "user.name", "test")
+	runGit(t, checkout, "commit", "--allow-empty", "-m", "base")
+	stateRoot := resolvedTempDir(t)
+	cfg := productionETagTestConfig(t, stateRoot)
+	if err := bindDeployment(stateRoot, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	if err := installDeploymentFence(stateRoot, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	cachePath := filepath.Join(stateRoot, "github-etag-cache.json")
+	if err := os.WriteFile(cachePath, []byte(`{"version":2,"entries":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("ETag", `"fresh"`)
+		if request.Header.Get("If-None-Match") == `"fresh"` {
+			return &http.Response{StatusCode: http.StatusNotModified, Header: header, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+		}
+		var value any
+		switch request.URL.RequestURI() {
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1", "/repos/o/r/issues?state=open&per_page=100&page=1":
+			value = []any{}
+		case "/repos/o/r":
+			value = map[string]any{"default_branch": "main"}
+		case "/repos/o/r/branches/main":
+			value = map[string]any{"commit": map[string]any{"sha": strings.Repeat("a", 40)}}
+		default:
+			return nil, fmt.Errorf("unexpected GitHub read %s", request.URL.String())
+		}
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
+	})}}
+	var log synchronizedBuffer
+	lifecycle, cancel := context.WithCancel(t.Context())
+	runtime, err := startProductionRuntimeV2(lifecycle, cfg, api, internalgithub.AuthenticatedUser{ID: 42}, stateRoot, filepath.Join(stateRoot, "legacy-pr-state.json"), checkout, &log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		_ = runtime.shutdown(context.Background())
+	}()
+	if !strings.Contains(log.String(), "GitHub ETag cache was corrupt") {
+		t.Fatalf("cache recovery was not diagnosed: %s", log.String())
+	}
+	for range 2 {
+		if err := runtime.trigger.triggerAndWait(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache, err := internalgithub.LoadReadCache(cachePath)
+	if err != nil {
+		t.Fatalf("fresh reconciliation did not replace corrupt cache: %v", err)
+	}
+	entry, changed, err := (internalgithub.API{BaseURL: api.BaseURL, HTTP: api.HTTP, Cache: cache}).Read(t.Context(), "/repos/o/r", "", &struct{}{})
+	if err != nil || entry != `"fresh"` || changed {
+		t.Fatalf("recovered cache did not serve conditional read: etag=%q changed=%v err=%v diagnostic=%q log=%s", entry, changed, err, mustOwnerSnapshot(t, runtime.owner).State.CycleDiagnostic, log.String())
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,13 +26,19 @@ type readCacheEntry struct {
 }
 
 type ReadCache struct {
-	mu      sync.Mutex
-	path    string
-	entries map[string]readCacheEntry
-	used    map[string]bool
-	size    int
-	dirty   bool
+	mu       sync.Mutex
+	saveMu   sync.Mutex
+	path     string
+	entries  map[string]readCacheEntry
+	used     map[string]bool
+	size     int
+	dirty    bool
+	revision uint64
 }
+
+// ErrReadCacheCorrupt marks invalid content in a safely opened private cache.
+// Callers may use the returned empty cache and replace it on the next Save.
+var ErrReadCacheCorrupt = errors.New("GitHub ETag cache content is invalid")
 
 func LoadReadCache(path string) (*ReadCache, error) {
 	cache := &ReadCache{path: path, entries: map[string]readCacheEntry{}, used: map[string]bool{}}
@@ -61,6 +68,11 @@ func LoadReadCache(path string) (*ReadCache, error) {
 	if len(body) > maxReadCacheFile {
 		return nil, errors.New("GitHub ETag cache exceeds 64 MiB limit")
 	}
+	corrupt := func(err error) (*ReadCache, error) {
+		cache.size = 0
+		cache.dirty = true
+		return cache, fmt.Errorf("%w: %v", ErrReadCacheCorrupt, err)
+	}
 	var state struct {
 		Version int                       `json:"version"`
 		Entries map[string]readCacheEntry `json:"entries"`
@@ -68,22 +80,22 @@ func LoadReadCache(path string) (*ReadCache, error) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&state); err != nil {
-		return nil, fmt.Errorf("decode GitHub ETag cache: %w", err)
+		return corrupt(fmt.Errorf("decode: %w", err))
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return nil, errors.New("GitHub ETag cache has trailing data")
+		return corrupt(errors.New("trailing data"))
 	}
 	if state.Version != readCacheVersion || state.Entries == nil || len(state.Entries) > maxReadCacheItems {
-		return nil, errors.New("GitHub ETag cache has an unsupported or invalid structure")
+		return corrupt(errors.New("unsupported or invalid structure"))
 	}
 	for path, entry := range state.Entries {
 		if err := validateReadCacheEntry(path, entry); err != nil {
-			return nil, err
+			return corrupt(err)
 		}
 		cache.size += readCacheEntrySize(path, entry)
 	}
 	if cache.size > maxReadCacheBytes {
-		return nil, errors.New("GitHub ETag cache content exceeds 32 MiB limit")
+		return corrupt(errors.New("content exceeds 32 MiB limit"))
 	}
 	cache.entries = state.Entries
 	return cache, nil
@@ -109,6 +121,7 @@ func (c *ReadCache) put(path, etag string, body []byte) error {
 			delete(c.entries, path)
 			c.size -= readCacheEntrySize(path, old)
 			c.dirty = true
+			c.revision++
 		}
 		return nil
 	}
@@ -126,6 +139,7 @@ func (c *ReadCache) put(path, etag string, body []byte) error {
 			delete(c.entries, path)
 			c.size -= readCacheEntrySize(path, old)
 			c.dirty = true
+			c.revision++
 		}
 		return nil
 	}
@@ -133,13 +147,19 @@ func (c *ReadCache) put(path, etag string, body []byte) error {
 		c.entries[path] = entry
 		c.size = size
 		c.dirty = true
+		c.revision++
 	}
 	return nil
 }
 
 func (c *ReadCache) Save() error {
+	return c.save(writeReadCache)
+}
+
+func (c *ReadCache) save(write func(string, map[string]readCacheEntry) error) error {
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for path, entry := range c.entries {
 		if c.used[path] {
 			continue
@@ -147,14 +167,30 @@ func (c *ReadCache) Save() error {
 		delete(c.entries, path)
 		c.size -= readCacheEntrySize(path, entry)
 		c.dirty = true
+		c.revision++
 	}
 	if !c.dirty {
+		c.mu.Unlock()
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
+	entries, revision := maps.Clone(c.entries), c.revision
+	c.mu.Unlock()
+	if err := write(c.path, entries); err != nil {
 		return err
 	}
-	if info, err := os.Lstat(c.path); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
+	c.mu.Lock()
+	if c.revision == revision {
+		c.dirty = false
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+func writeReadCache(path string, entries map[string]readCacheEntry) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600) {
 		return errors.New("GitHub ETag cache must be a regular non-symlink file")
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -162,14 +198,14 @@ func (c *ReadCache) Save() error {
 	body, err := json.MarshalIndent(struct {
 		Version int                       `json:"version"`
 		Entries map[string]readCacheEntry `json:"entries"`
-	}{readCacheVersion, c.entries}, "", "  ")
+	}{readCacheVersion, entries}, "", "  ")
 	if err != nil {
 		return err
 	}
 	if len(body) > maxReadCacheFile {
 		return errors.New("GitHub ETag cache exceeds 64 MiB limit")
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(c.path), ".github-etags-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".github-etags-*")
 	if err != nil {
 		return err
 	}
@@ -187,10 +223,10 @@ func (c *ReadCache) Save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(name, c.path); err != nil {
+	if err := os.Rename(name, path); err != nil {
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(c.path))
+	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
