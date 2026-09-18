@@ -2214,11 +2214,15 @@ func reviewerAdmissionBlocked(state runtimeOwnerState, request reconciliationEff
 
 func issueHasUnresolvedExternalEffect(state runtimeOwnerState, repository string, issue int) bool {
 	for _, effect := range state.Effects {
-		if effect.Repository == repository && effect.Issue == issue && effect.State == "invalidated" && effect.Dispatched && effect.Reconciliation != nil && reconciliationMutatesGitHub(effect.Reconciliation.Action) {
+		if effect.Repository == repository && effect.Issue == issue && unresolvedExternalEffect(effect) {
 			return true
 		}
 	}
 	return false
+}
+
+func unresolvedExternalEffect(effect runtimeEffectIntent) bool {
+	return effect.State == "invalidated" && effect.Dispatched && effect.Reconciliation != nil && reconciliationMutatesGitHub(effect.Reconciliation.Action)
 }
 
 // Older group-only death certificates and completed cleanup records cannot

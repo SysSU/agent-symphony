@@ -40,6 +40,13 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	if err != nil || identity.Version != deploymentIdentityVersion || identity.Repository != cfg.Repository {
 		return nil, errors.New("production v2 deployment fence is not installed")
 	}
+	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
+	if errors.Is(err, internalgithub.ErrReadCacheCorrupt) {
+		_, _ = fmt.Fprintln(log, "GitHub ETag cache was corrupt; rebuilding from fresh reads: "+internalgithub.Redact(err.Error()))
+	} else if err != nil {
+		return nil, fmt.Errorf("load GitHub cache: %w", err)
+	}
+	api.Cache = cache
 	attemptRoot := productionAttemptRoot(stateRoot)
 	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("prepare attempt root: %w", err)
@@ -56,9 +63,12 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		return nil, err
 	}
 	initial.WorkerProfileDigest = workerProfileDigest
-	lifecycle, cancel := context.WithCancel(parent)
+	// A signal requests graceful shutdown; it must not pre-close the owner or
+	// cancel persistence before accepted operator work has drained.
+	lifecycle, cancel := context.WithCancel(context.WithoutCancel(parent))
 	runtime := &productionRuntimeV2{cancel: cancel}
 	fail := func(err error) (*productionRuntimeV2, error) {
+		cancel() // Startup did not reach the graceful serve drain.
 		_ = runtime.shutdown(context.Background())
 		return nil, err
 	}
@@ -79,7 +89,7 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 	}
 	runtime.agent = agent
 
-	source, err := seedImmutableAttemptSource(lifecycle, checkout, cfg.Repository, attemptRoot, "", "")
+	source, err := seedImmutableAttemptSource(parent, checkout, cfg.Repository, attemptRoot, "", "")
 	if err != nil {
 		return fail(err)
 	}
@@ -127,6 +137,7 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		return fail(err)
 	}
 	runtime.operator = operator
+	operator.cacheLog = log
 	cycle := &productionReconciliation{
 		owner: owner, effects: effects, collector: collector, config: cfg, api: api,
 		stateRoot: stateRoot, attemptRoot: attemptRoot, checkout: checkout,
@@ -140,10 +151,10 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		return fail(err)
 	}
 	runtime.status = status
-	if err := cycle.sweepPendingMarkers(lifecycle); err != nil {
+	if err := cycle.sweepPendingMarkers(parent); err != nil {
 		return fail(err)
 	}
-	if err := operator.resumePending(lifecycle); err != nil {
+	if err := operator.resumePending(parent); err != nil {
 		return fail(err)
 	}
 	trigger, err := newProductionReconciliationTriggerRunner(lifecycle, cycle.runCycle)
@@ -160,6 +171,9 @@ func startProductionRuntimeV2(parent context.Context, cfg config.Config, api int
 		return fail(err)
 	}
 	runtime.proposal = proposal
+	if err := parent.Err(); err != nil {
+		return fail(err)
+	}
 	return runtime, nil
 }
 
@@ -208,35 +222,41 @@ func (r *productionRuntimeV2) shutdown(ctx context.Context) error {
 	if r == nil {
 		return nil
 	}
+	var proposalDone, triggerDone <-chan error
+	if r.proposal != nil {
+		done := make(chan error, 1)
+		proposalDone = done
+		go func() { done <- r.proposal.shutdown(ctx) }()
+	}
+	if r.trigger != nil {
+		done := make(chan error, 1)
+		triggerDone = done
+		go func() { done <- r.trigger.shutdown(ctx) }()
+	}
+	var result error
+	if r.operator != nil {
+		result = errors.Join(result, r.operator.shutdown(ctx))
+	}
+	if ctx.Err() != nil && r.cancel != nil {
+		r.cancel() // Timed-out graceful drain becomes a forced stop.
+	}
+	if r.effects != nil {
+		result = errors.Join(result, r.effects.shutdown(ctx))
+	}
+	if proposalDone != nil {
+		result = errors.Join(result, <-proposalDone)
+	}
+	if triggerDone != nil {
+		result = errors.Join(result, <-triggerDone)
+	}
 	if r.cancel != nil {
 		r.cancel()
 	}
-	joins := []func() error{}
-	if r.proposal != nil {
-		joins = append(joins, func() error { return r.proposal.shutdown(ctx) })
-	}
-	if r.trigger != nil {
-		joins = append(joins, func() error { return r.trigger.shutdown(ctx) })
-	}
-	if r.operator != nil {
-		joins = append(joins, func() error { return r.operator.shutdown(ctx) })
-	}
-	if r.effects != nil {
-		joins = append(joins, func() error { return r.effects.shutdown(ctx) })
-	}
 	if r.status != nil {
-		joins = append(joins, func() error { return r.status.wait(ctx) })
+		result = errors.Join(result, r.status.wait(ctx))
 	}
 	if r.agent != nil {
-		joins = append(joins, func() error { return r.agent.Shutdown(ctx) })
-	}
-	results := make(chan error, len(joins))
-	for _, join := range joins {
-		go func() { results <- join() }()
-	}
-	var result error
-	for range joins {
-		result = errors.Join(result, <-results)
+		result = errors.Join(result, r.agent.Shutdown(ctx))
 	}
 	if r.owner != nil {
 		result = errors.Join(result, r.owner.close(ctx))

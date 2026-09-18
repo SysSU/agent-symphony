@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -42,8 +43,13 @@ type operatorMutationService struct {
 	released          map[string]chan struct{}
 	watchers          map[string]context.CancelFunc
 	stopping          chan struct{}
+	closing           bool
 	stopped           bool
 	beforeAdmission   func()
+	cacheLog          io.Writer
+	cacheSave         func() error
+	cacheSaving       bool
+	cachePending      bool
 }
 
 type operatorWork struct {
@@ -103,6 +109,14 @@ func (s *operatorMutationService) performMode(ctx context.Context, request contr
 	if err := ctx.Err(); err != nil {
 		return operatorErrorResult(request, http.StatusRequestTimeout, "operator request was cancelled before admission")
 	}
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return operatorResultForError(request, fmt.Errorf("operator service stopped: %w", context.Canceled))
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	defer s.wg.Done()
 	if request.Action == "review-plan" {
 		if err := s.reservePlanAdmission(ctx, request.RequestID); err != nil {
 			return operatorResultForError(request, err)
@@ -703,6 +717,14 @@ func operatorAttempt(snapshot stateOwnerSnapshot, request controlRequest) (agent
 }
 
 func (s *operatorMutationService) collectIssue(ctx context.Context, issue int) (stateOwnerSnapshot, reconciliationV2Batch, error) {
+	s.mu.Lock()
+	if s.closing && s.stopped {
+		s.mu.Unlock()
+		return stateOwnerSnapshot{}, reconciliationV2Batch{}, fmt.Errorf("operator service stopped: %w", context.Canceled)
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	defer s.wg.Done()
 	snapshot, err := s.owner.reconciliationSnapshot(ctx)
 	if err != nil {
 		return stateOwnerSnapshot{}, reconciliationV2Batch{}, err
@@ -727,7 +749,50 @@ func (s *operatorMutationService) collectIssue(ctx context.Context, issue int) (
 	}
 	s.effects.cancelInvalidated(committed)
 	s.cancelSupersededPlanWatchers(snapshot, committed)
+	s.scheduleCacheSave()
 	return committed, batch, nil
+}
+
+func (s *operatorMutationService) saveCache() {
+	if s.collector.API.Cache == nil {
+		return
+	}
+	save := s.cacheSave
+	if save == nil {
+		save = s.collector.API.Cache.Save
+	}
+	if err := save(); err != nil && s.cacheLog != nil {
+		_, _ = fmt.Fprintln(s.cacheLog, "save GitHub cache after operator collection: "+internalgithub.Redact(err.Error()))
+	}
+}
+
+func (s *operatorMutationService) scheduleCacheSave() {
+	if s.collector.API.Cache == nil {
+		return
+	}
+	s.mu.Lock()
+	s.cachePending = true
+	if s.cacheSaving {
+		s.mu.Unlock()
+		return
+	}
+	s.cacheSaving = true
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.wg.Done()
+		for {
+			s.mu.Lock()
+			if !s.cachePending {
+				s.cacheSaving = false
+				s.mu.Unlock()
+				return
+			}
+			s.cachePending = false
+			s.mu.Unlock()
+			s.saveCache()
+		}
+	}()
 }
 
 func (s *operatorMutationService) prepareRecoveryAdmission(snapshot stateOwnerSnapshot, batch reconciliationV2Batch, request controlRequest, kind githubIssueUpdateKind) (beginOperatorMutationCommand, operatorWork, error) {
@@ -1222,7 +1287,7 @@ func (s *operatorMutationService) startReserved(key string, reserve, work func()
 		return false
 	}
 	s.mu.Lock()
-	if s.stopped || s.active[key] {
+	if s.closing || s.stopped || s.active[key] {
 		s.mu.Unlock()
 		return false
 	}
@@ -1255,7 +1320,7 @@ func (s *operatorMutationService) reserve(key string) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.stopped || s.active[key] {
+	if s.closing || s.stopped || s.active[key] {
 		return false
 	}
 	if s.active == nil {
@@ -1282,7 +1347,7 @@ func (s *operatorMutationService) reservePlanAdmission(ctx context.Context, requ
 		if s.stopping == nil {
 			s.stopping = make(chan struct{})
 		}
-		stopped := s.stopped
+		stopped := s.closing || s.stopped
 		stopping := s.stopping
 		s.mu.Unlock()
 		if stopped {
@@ -1324,8 +1389,8 @@ func (s *operatorMutationService) shutdown(ctx context.Context) error {
 		return nil
 	}
 	s.mu.Lock()
-	if !s.stopped {
-		s.stopped = true
+	if !s.closing {
+		s.closing = true
 		if s.stopping != nil {
 			close(s.stopping)
 		}
@@ -1334,6 +1399,9 @@ func (s *operatorMutationService) shutdown(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
+		s.mu.Lock()
+		s.stopped = true
+		s.mu.Unlock()
 		close(done)
 	}()
 	select {

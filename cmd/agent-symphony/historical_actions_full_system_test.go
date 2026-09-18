@@ -38,6 +38,7 @@ func TestHistoricalAttemptActionsFullSystemE2E(t *testing.T) {
 		}
 		return normal
 	}
+	statusHTTP := &http.Client{Timeout: deadline(5 * time.Second)}
 	source, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -288,7 +289,7 @@ exit 0
 	})
 	waitHTTP(t, "http://"+address+"/status.json", deadline(20*time.Second), output)
 	ready := waitFor(deadline(20*time.Second), func() bool {
-		response, err := http.Get("http://" + address + "/status.json")
+		response, err := statusHTTP.Get("http://" + address + "/status.json")
 		if err != nil {
 			return false
 		}
@@ -322,7 +323,7 @@ exit 0
 		return found[160] == "completed" && found[162] == "completed" && found[163] == "completed" && found[164] == "completed" && found[191] == "orphaned" && found[192] == "orphaned" && found[193] == "orphaned"
 	})
 	if !ready {
-		response, _ := http.Get("http://" + address + "/status.json")
+		response, _ := statusHTTP.Get("http://" + address + "/status.json")
 		var status any
 		if response != nil {
 			_ = json.NewDecoder(response.Body).Decode(&status)
@@ -417,41 +418,83 @@ exit 0
 	if reconcileResponse.StatusCode != http.StatusNoContent {
 		t.Fatalf("post-restart reconciliation barrier returned %d (%s): %s", reconcileResponse.StatusCode, reconcileBody, output.String())
 	}
-	var freshRevision uint64
+	var restartPredicate string
 	if !waitFor(deadline(20*time.Second), func() bool {
 		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
-		if err != nil || ledger.Epoch < 3 || ledger.Observations[ownerIssueKey("o/r", 163)].ObservationEpoch != ledger.Epoch {
+		if err != nil {
+			restartPredicate = fmt.Sprintf("owner read: %v", err)
+			return false
+		}
+		if ledger.Epoch < 3 {
+			restartPredicate = fmt.Sprintf("owner epoch=%d, want >=3", ledger.Epoch)
+			return false
+		}
+		observation := ledger.Observations[ownerIssueKey("o/r", 163)]
+		if observation.ObservationEpoch != ledger.Epoch {
+			restartPredicate = fmt.Sprintf("issue 163 observation epoch=%d, owner epoch=%d, generation=%d", observation.ObservationEpoch, ledger.Epoch, observation.Generation)
 			return false
 		}
 		for _, expected := range []struct {
 			issue, attempt int
 			action         string
-		}{{160, 1, "archived"}, {162, 1, "dismissed"}, {163, 1, "archived"}, {164, 2, "archived"}, {192, 9, "dismissed"}} {
+		}{{160, 1, "archived"}, {161, 1, "dismissed"}, {162, 1, "dismissed"}, {163, 1, "archived"}, {164, 2, "archived"}, {192, 9, "dismissed"}} {
 			key := ownerAttemptKey("o/r", expected.issue, expected.attempt)
 			if ledger.Tombstones[key].Action != expected.action || ledger.Attempts[key].Generation != 0 {
+				restartPredicate = fmt.Sprintf("issue %d attempt %d: tombstone action=%q, live generation=%d, want %q/absent", expected.issue, expected.attempt, ledger.Tombstones[key].Action, ledger.Attempts[key].Generation, expected.action)
 				return false
 			}
 		}
-		if freshRevision == 0 {
-			freshRevision = ledger.Revision
-		}
-		response, err := http.Get("http://" + address + "/status.json")
+		response, err := statusHTTP.Get("http://" + address + "/status.json")
 		if err != nil {
+			restartPredicate = fmt.Sprintf("status read: %v", err)
 			return false
 		}
 		defer response.Body.Close()
 		var status dashboardStatusSnapshot
-		if json.NewDecoder(response.Body).Decode(&status) != nil || status.OwnerEpoch != ledger.Epoch || status.OwnerRevision < freshRevision {
+		if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
+			restartPredicate = fmt.Sprintf("status decode: %v", err)
+			return false
+		}
+		if status.OwnerEpoch != ledger.Epoch || status.OwnerRevision < ledger.Revision {
+			restartPredicate = fmt.Sprintf("status owner epoch/revision=%d/%d, ledger=%d/%d", status.OwnerEpoch, status.OwnerRevision, ledger.Epoch, ledger.Revision)
 			return false
 		}
 		for _, attempt := range status.Statuses {
 			if attempt.Issue == 160 || attempt.Issue == 161 || attempt.Issue == 162 || attempt.Issue == 163 || attempt.Issue == 192 || attempt.Issue == 164 && attempt.Attempt == 2 {
+				tombstone := ledger.Tombstones[ownerAttemptKey("o/r", attempt.Issue, attempt.Attempt)]
+				var effects, proofs []string
+				for id, effect := range ledger.Effects {
+					if effect.Issue == attempt.Issue {
+						effects = append(effects, fmt.Sprintf("%s:%s/%s", id, effect.Action, effect.State))
+					}
+				}
+				for id, proof := range ledger.ReviewerProofs {
+					if proof.Issue == attempt.Issue && proof.Attempt == attempt.Attempt {
+						proofs = append(proofs, fmt.Sprintf("%s:dead=%t never=%t legacy=%t", id, proof.DeadProved, proof.NeverRan, proof.LegacyUnverified))
+					}
+				}
+				restartPredicate = fmt.Sprintf("hidden issue %d attempt %d reappeared: status state=%q phase=%q diagnostic=%q owner revision=%d tombstone action=%q cleanup=%q reviewer lease=%q invalidated start=%t invalidated handoff=%t handoff compensated=%t unresolved external=%t effects=%q proofs=%q", attempt.Issue, attempt.Attempt, attempt.State, attempt.CurrentPhase, attempt.Diagnostic, status.OwnerRevision, tombstone.Action, tombstone.CleanupPhase, tombstone.ReviewerLeaseID, tombstone.InvalidatedStart != nil, tombstone.InvalidatedHandoff != nil, tombstone.HandoffCompensated, issueHasUnresolvedExternalEffect(ledger, "o/r", attempt.Issue), effects, proofs)
 				return false
 			}
 		}
+		latest, err := readRuntimeOwnerState(stateRoot, "o/r")
+		if err != nil || latest.Epoch != ledger.Epoch || latest.Revision != ledger.Revision {
+			restartPredicate = fmt.Sprintf("owner changed while verifying status: before=%d/%d after=%d/%d err=%v", ledger.Epoch, ledger.Revision, latest.Epoch, latest.Revision, err)
+			return false
+		}
+		restartPredicate = ""
 		return true
 	}) {
-		t.Fatalf("restart restored hidden cards: %s", output.String())
+		fixture.mu.Lock()
+		requests := append([]string(nil), fixture.requests...)
+		fixture.mu.Unlock()
+		if len(requests) > 20 {
+			requests = requests[len(requests)-20:]
+		}
+		for i := range requests {
+			requests[i] = strings.SplitN(requests[i], "?", 2)[0]
+		}
+		t.Fatalf("restart hidden-card gate unmet: %s; recent GitHub paths=%q; serve=%s", restartPredicate, requests, output.String())
 	}
 	runBrowser("post-restart")
 	if !waitFor(deadline(20*time.Second), func() bool {
@@ -515,10 +558,10 @@ exit 0
 	waitHTTP(t, "http://"+address+"/status.json", deadline(20*time.Second), output)
 	if !waitFor(deadline(20*time.Second), func() bool {
 		ledger, err := readRuntimeOwnerState(stateRoot, "o/r")
-		if err != nil || ledger.Epoch <= beforeReconcile.Epoch || ledger.Observations[ownerIssueKey("o/r", 191)].ObservationEpoch != ledger.Epoch {
+		if err != nil || ledger.Epoch <= beforeReconcile.Epoch || ledger.Observations[ownerIssueKey("o/r", 191)].ObservationEpoch != ledger.Epoch || ledger.Observations[ownerIssueKey("o/r", 193)].ObservationEpoch != ledger.Epoch {
 			return false
 		}
-		response, err := http.Get("http://" + address + "/status.json")
+		response, err := statusHTTP.Get("http://" + address + "/status.json")
 		if err != nil {
 			return false
 		}
@@ -528,11 +571,21 @@ exit 0
 			return false
 		}
 		for _, attempt := range status.Statuses {
-			if (attempt.Issue == 191 || attempt.Issue == 193) && attempt.Attempt == 9 {
+			if attempt.Issue == 160 || attempt.Issue == 161 || attempt.Issue == 162 || attempt.Issue == 163 || attempt.Issue == 192 || attempt.Issue == 164 && attempt.Attempt == 2 || (attempt.Issue == 191 || attempt.Issue == 193) && attempt.Attempt == 9 {
 				return false
 			}
 		}
-		return ledger.Tombstones[ownerAttemptKey("o/r", 191, 9)].Action == "abandoned" && ledger.Tombstones[ownerAttemptKey("o/r", 193, 9)].Action == "dismissed"
+		for _, expected := range []struct {
+			issue, attempt int
+			action         string
+		}{{160, 1, "archived"}, {161, 1, "dismissed"}, {162, 1, "dismissed"}, {163, 1, "archived"}, {164, 2, "archived"}, {191, 9, "abandoned"}, {192, 9, "dismissed"}, {193, 9, "dismissed"}} {
+			key := ownerAttemptKey("o/r", expected.issue, expected.attempt)
+			if ledger.Tombstones[key].Action != expected.action || ledger.Attempts[key].Generation != 0 {
+				return false
+			}
+		}
+		latest, err := readRuntimeOwnerState(stateRoot, "o/r")
+		return err == nil && latest.Epoch == ledger.Epoch && latest.Revision == ledger.Revision
 	}) {
 		t.Fatalf("restart after actions did not preserve high-water tombstones: %s", output.String())
 	}

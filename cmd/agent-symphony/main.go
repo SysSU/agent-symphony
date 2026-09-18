@@ -1191,7 +1191,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, *jsonOutput, command, err.Error())
 		}
-		project, err := newProjectDashboardServerV2(ctx, *runtimeState, c.Repository, peerProjects, "tmux", runtime.operator, c.Concurrency, *allowUnsafeDashboardNetwork, dashboardPassword)
+		dashboardLifecycle, stopDashboard := context.WithCancel(context.WithoutCancel(ctx))
+		defer stopDashboard()
+		project, err := newProjectDashboardServerV2(dashboardLifecycle, *runtimeState, c.Repository, peerProjects, "tmux", runtime.operator, c.Concurrency, *allowUnsafeDashboardNetwork, dashboardPassword)
 		if err != nil {
 			_ = runtime.shutdown(context.Background())
 			return fail(stderr, *jsonOutput, command, err.Error())
@@ -1217,12 +1219,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 				if ticker != nil {
 					ticker.Stop()
 				}
-				shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				dashboardDone, runtimeDone := make(chan error, 1), make(chan error, 1)
-				go func() { dashboardDone <- dashboard.shutdown(shutdown) }()
-				go func() { runtimeDone <- runtime.shutdown(shutdown) }()
-				dashboardErr, runtimeErr := <-dashboardDone, <-runtimeDone
-				cancel()
+				stopDashboard() // Hijacked terminal sessions outlive HTTP Server.Shutdown.
+				dashboardShutdown, cancelDashboard := context.WithTimeout(context.Background(), 10*time.Second)
+				dashboardErr := dashboard.shutdown(dashboardShutdown)
+				cancelDashboard()
+				runtimeShutdown, cancelRuntime := context.WithTimeout(context.Background(), 10*time.Second)
+				runtimeErr := runtime.shutdown(runtimeShutdown)
+				cancelRuntime()
 				if err := errors.Join(dashboardErr, runtimeErr); err != nil {
 					return fail(stderr, *jsonOutput, command, err.Error())
 				}

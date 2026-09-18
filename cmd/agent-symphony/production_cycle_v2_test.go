@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1892,6 +1893,166 @@ func TestProductionRuntimeFinishesOperatorMarkerBeforeAdmission(t *testing.T) {
 	}
 }
 
+func TestProductionRuntimePersistsConditionalGitHubReads(t *testing.T) {
+	checkout := gitRepository(t)
+	runGit(t, checkout, "config", "user.email", "test@example.invalid")
+	runGit(t, checkout, "config", "user.name", "test")
+	runGit(t, checkout, "commit", "--allow-empty", "-m", "base")
+	stateRoot := resolvedTempDir(t)
+	cfg := productionETagTestConfig(t, stateRoot)
+	if err := bindDeployment(stateRoot, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	if err := installDeploymentFence(stateRoot, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	var conditional atomic.Int64
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var value any
+		switch request.URL.RequestURI() {
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1", "/repos/o/r/issues?state=open&per_page=100&page=1":
+			value = []any{}
+		case "/repos/o/r":
+			value = map[string]any{"default_branch": "main"}
+		case "/repos/o/r/branches/main":
+			value = map[string]any{"commit": map[string]any{"sha": strings.Repeat("a", 40)}}
+		default:
+			return nil, fmt.Errorf("unexpected GitHub read %s", request.URL.String())
+		}
+		header := make(http.Header)
+		header.Set("ETag", `"unchanged"`)
+		if request.Header.Get("If-None-Match") == `"unchanged"` {
+			conditional.Add(1)
+			return &http.Response{StatusCode: http.StatusNotModified, Header: header, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+		}
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
+	})}}
+	lifecycle, cancel := context.WithCancel(t.Context())
+	runtime, err := startProductionRuntimeV2(lifecycle, cfg, api, internalgithub.AuthenticatedUser{ID: 42}, stateRoot, filepath.Join(stateRoot, "legacy-pr-state.json"), checkout, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		_ = runtime.shutdown(context.Background())
+	}()
+	for range 2 {
+		if err := runtime.trigger.triggerAndWait(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if conditional.Load() == 0 {
+		t.Fatal("second production reconciliation did not send a conditional GitHub read")
+	}
+	beforeRestart := conditional.Load()
+	cancel()
+	if err := runtime.shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runtime = nil
+	restartedContext, stopRestart := context.WithCancel(t.Context())
+	restarted, err := startProductionRuntimeV2(restartedContext, cfg, api, internalgithub.AuthenticatedUser{ID: 42}, stateRoot, filepath.Join(stateRoot, "legacy-pr-state.json"), checkout, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		stopRestart()
+		_ = restarted.shutdown(context.Background())
+	}()
+	if err := restarted.trigger.triggerAndWait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if conditional.Load() <= beforeRestart {
+		t.Fatal("restarted production runtime did not reuse persisted ETags")
+	}
+	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
+	if err != nil {
+		t.Fatalf("production cache was not persisted: %v", err)
+	}
+	var repository struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if _, changed, err := (internalgithub.API{BaseURL: api.BaseURL, HTTP: api.HTTP, Cache: cache}).Read(t.Context(), "/repos/o/r", "", &repository); err != nil || changed || repository.DefaultBranch != "main" {
+		t.Fatalf("persisted cache did not restore GitHub facts: changed=%v repository=%#v err=%v", changed, repository, err)
+	}
+}
+
+func productionETagTestConfig(t *testing.T, stateRoot string) config.Config {
+	t.Helper()
+	restorePinnedWorkerPermissions(t, stateRoot)
+	cfg := config.Default("o/r")
+	codex := filepath.Join(t.TempDir(), "codex")
+	buildNativeCodexFixture(t, codex, `if [ "$1" = --version ]; then printf 'codex-cli 0.153.4\n'; fi`)
+	cfg.Commands.Implementation[0], cfg.Commands.Reviewer[0], cfg.Commands.OrchestratorAudit[0] = codex, codex, codex
+	return cfg
+}
+
+func TestProductionRuntimeRecoversSafeCorruptGitHubCache(t *testing.T) {
+	checkout := gitRepository(t)
+	runGit(t, checkout, "config", "user.email", "test@example.invalid")
+	runGit(t, checkout, "config", "user.name", "test")
+	runGit(t, checkout, "commit", "--allow-empty", "-m", "base")
+	stateRoot := resolvedTempDir(t)
+	cfg := productionETagTestConfig(t, stateRoot)
+	if err := bindDeployment(stateRoot, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	if err := installDeploymentFence(stateRoot, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	cachePath := filepath.Join(stateRoot, "github-etag-cache.json")
+	if err := os.WriteFile(cachePath, []byte(`{"version":2,"entries":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("ETag", `"fresh"`)
+		if request.Header.Get("If-None-Match") == `"fresh"` {
+			return &http.Response{StatusCode: http.StatusNotModified, Header: header, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+		}
+		var value any
+		switch request.URL.RequestURI() {
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1", "/repos/o/r/issues?state=open&per_page=100&page=1":
+			value = []any{}
+		case "/repos/o/r":
+			value = map[string]any{"default_branch": "main"}
+		case "/repos/o/r/branches/main":
+			value = map[string]any{"commit": map[string]any{"sha": strings.Repeat("a", 40)}}
+		default:
+			return nil, fmt.Errorf("unexpected GitHub read %s", request.URL.String())
+		}
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
+	})}}
+	var log synchronizedBuffer
+	lifecycle, cancel := context.WithCancel(t.Context())
+	runtime, err := startProductionRuntimeV2(lifecycle, cfg, api, internalgithub.AuthenticatedUser{ID: 42}, stateRoot, filepath.Join(stateRoot, "legacy-pr-state.json"), checkout, &log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		_ = runtime.shutdown(context.Background())
+	}()
+	if !strings.Contains(log.String(), "GitHub ETag cache was corrupt") {
+		t.Fatalf("cache recovery was not diagnosed: %s", log.String())
+	}
+	for range 2 {
+		if err := runtime.trigger.triggerAndWait(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache, err := internalgithub.LoadReadCache(cachePath)
+	if err != nil {
+		t.Fatalf("fresh reconciliation did not replace corrupt cache: %v", err)
+	}
+	entry, changed, err := (internalgithub.API{BaseURL: api.BaseURL, HTTP: api.HTTP, Cache: cache}).Read(t.Context(), "/repos/o/r", "", &struct{}{})
+	if err != nil || entry != `"fresh"` || changed {
+		t.Fatalf("recovered cache did not serve conditional read: etag=%q changed=%v err=%v diagnostic=%q log=%s", entry, changed, err, mustOwnerSnapshot(t, runtime.owner).State.CycleDiagnostic, log.String())
+	}
+}
+
 func TestProductionRuntimeAdmitsOwnerMutationWhileInitialCollectionIsBlocked(t *testing.T) {
 	checkout := gitRepository(t)
 	runGit(t, checkout, "config", "user.email", "test@example.invalid")
@@ -2050,6 +2211,215 @@ func TestProductionRuntimeShutdownCancelsEffectsWhilePersistenceDrains(t *testin
 	}
 	if err := <-shutdown; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProductionRuntimeSignalDrainsOperatorCollectionAndCacheSave(t *testing.T) {
+	checkout := gitRepository(t)
+	runGit(t, checkout, "config", "user.email", "test@example.invalid")
+	runGit(t, checkout, "config", "user.name", "test")
+	runGit(t, checkout, "commit", "--allow-empty", "-m", "base")
+	stateRoot := resolvedTempDir(t)
+	cfg := productionETagTestConfig(t, stateRoot)
+	if err := bindDeployment(stateRoot, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	if err := installDeploymentFence(stateRoot, "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	cycleEntered := make(chan struct{})
+	var firstPull, conditional atomic.Bool
+	api := internalgithub.API{BaseURL: "https://example.test", Retries: -1, HTTP: &http.Client{Transport: reconciliationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var value any
+		switch request.URL.RequestURI() {
+		case "/repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=25&page=1":
+			if !firstPull.Swap(true) {
+				close(cycleEntered)
+				<-request.Context().Done()
+				return nil, request.Context().Err()
+			}
+			value = []any{}
+		case "/repos/o/r":
+			value = map[string]any{"default_branch": "main"}
+		case "/repos/o/r/branches/main":
+			value = map[string]any{"commit": map[string]any{"sha": strings.Repeat("a", 40)}}
+		case "/repos/o/r/issues?state=open&per_page=100&page=1":
+			value = []any{}
+		case "/repos/o/r/issues/371":
+			value = map[string]any{"number": 371}
+		default:
+			return nil, fmt.Errorf("unexpected GitHub read %s", request.URL.String())
+		}
+		header := make(http.Header)
+		header.Set("ETag", `"signal"`)
+		if request.Header.Get("If-None-Match") == `"signal"` {
+			if request.URL.Path == "/repos/o/r/issues/371" {
+				conditional.Store(true)
+			}
+			return &http.Response{StatusCode: http.StatusNotModified, Header: header, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+		}
+		body, _ := json.Marshal(value)
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(bytes.NewReader(body)), Request: request}, nil
+	})}}
+	signalCtx, signalStop := context.WithCancel(t.Context())
+	runtime, err := startProductionRuntimeV2(signalCtx, cfg, api, internalgithub.AuthenticatedUser{ID: 42}, stateRoot, filepath.Join(stateRoot, "legacy-pr-state.json"), checkout, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collectEntered, releaseCollect := make(chan struct{}), make(chan struct{})
+	saveEntered, releaseSave := make(chan struct{}), make(chan struct{})
+	var releaseOnce, saveOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseCollect) })
+		saveOnce.Do(func() { close(releaseSave) })
+		signalStop()
+		_ = runtime.shutdown(context.Background())
+	})
+	<-cycleEntered
+	runtime.operator.collect = func(ctx context.Context, snapshot stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
+		var fact struct{ Number int }
+		if _, _, err := runtime.operator.collector.API.Read(ctx, "/repos/o/r/issues/371", "", &fact); err != nil || fact.Number != issue {
+			return reconciliationV2Batch{}, fmt.Errorf("operator GitHub fact %d: got=%d err=%v", issue, fact.Number, err)
+		}
+		close(collectEntered)
+		<-releaseCollect
+		return reconciliationV2Batch{Input: reconciliationInput{Scope: reconciliationScope{Kind: reconciliationIssueScope, Repository: snapshot.State.Repository, Issue: issue}, Complete: true}}, nil
+	}
+	runtime.operator.cacheSave = func() error {
+		close(saveEntered)
+		<-releaseSave
+		return runtime.operator.collector.API.Cache.Save()
+	}
+	collected := make(chan error, 1)
+	go func() {
+		_, _, err := runtime.operator.collectIssue(t.Context(), 371)
+		collected <- err
+	}()
+	<-collectEntered
+	signalStop()
+	if _, err := runtime.owner.snapshot(t.Context()); err != nil {
+		t.Fatalf("signal pre-closed owner before graceful drain: %v", err)
+	}
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- runtime.shutdown(t.Context()) }()
+	releaseOnce.Do(func() { close(releaseCollect) })
+	if err := <-collected; err != nil {
+		t.Fatalf("accepted operator collection after signal: %v", err)
+	}
+	<-saveEntered
+	if _, err := runtime.owner.snapshot(t.Context()); err != nil {
+		t.Fatalf("owner closed before cache save drained: %v", err)
+	}
+	saveOnce.Do(func() { close(releaseSave) })
+	if err := <-shutdown; err != nil {
+		t.Fatal(err)
+	}
+	cache, err := internalgithub.LoadReadCache(filepath.Join(stateRoot, "github-etag-cache.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.Cache = cache
+	var fact struct{ Number int }
+	if _, changed, err := api.Read(t.Context(), "/repos/o/r/issues/371", "", &fact); err != nil || changed || fact.Number != 371 || !conditional.Load() {
+		t.Fatalf("signal shutdown lost operator cache: changed=%v fact=%#v conditional=%v err=%v", changed, fact, conditional.Load(), err)
+	}
+}
+
+func TestProductionRuntimeShutdownReportsIncompleteCacheDrain(t *testing.T) {
+	owner, _ := operatorTestOwner(t, 372, "completed", true)
+	cache, err := internalgithub.LoadReadCache(filepath.Join(owner.stateRoot, "github-etag-cache.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := operatorTestMutationService(t, owner)
+	service.collector.API.Cache = cache
+	service.stopping = make(chan struct{})
+	service.collect = func(_ context.Context, snapshot stateOwnerSnapshot, issue int) (reconciliationV2Batch, error) {
+		return reconciliationV2Batch{Input: reconciliationInput{Scope: reconciliationScope{Kind: reconciliationIssueScope, Repository: snapshot.State.Repository, Issue: issue}, Complete: true}}, nil
+	}
+	saveEntered, releaseSave := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() {
+		once.Do(func() { close(releaseSave) })
+		_ = service.shutdown(context.Background())
+	})
+	service.cacheSave = func() error {
+		close(saveEntered)
+		<-releaseSave
+		return nil
+	}
+	if _, _, err := service.collectIssue(t.Context(), 373); err != nil {
+		t.Fatal(err)
+	}
+	<-saveEntered
+	_, cancelLifecycle := context.WithCancel(t.Context())
+	runtime := &productionRuntimeV2{cancel: cancelLifecycle, owner: owner, operator: service}
+	shutdownCtx, cancelShutdown := context.WithCancel(t.Context())
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- runtime.shutdown(shutdownCtx) }()
+	<-service.stopping
+	cancelShutdown()
+	if err := <-shutdownDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("incomplete cache drain was reported as success: %v", err)
+	}
+	once.Do(func() { close(releaseSave) })
+}
+
+func TestProductionRuntimeShutdownDrainsAcceptedDashboardEffect(t *testing.T) {
+	owner, manifest := operatorTestOwner(t, 374, "active", false, true)
+	service := operatorTestMutationService(t, owner)
+	service.stopping = make(chan struct{})
+	runner := &barrierEffectRunner{entered: make(chan struct{}, 1), release: make(chan struct{}), cancelled: make(chan struct{}, 1), pane: boundRuntimeEffectTestPane(t, manifest), blockMissingSession: true}
+	service.effects.executor.Runtime.Runner = runner
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(runner.release) }) })
+	server := &dashboardServer{ctx: t.Context(), stateRoot: owner.stateRoot, repository: manifest.Repository, operator: service}
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/actions/cancel?repository=o%2Fr&issue=374&attempt=1", nil)
+	request.Host = "localhost"
+	request.Header.Set("Origin", "http://localhost")
+	response := httptest.NewRecorder()
+	server.handler(http.NotFoundHandler()).ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("dashboard action was not accepted: status=%d body=%s", response.Code, response.Body.String())
+	}
+	var accepted controlResult
+	if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil || !accepted.OK || accepted.OwnerRevision == 0 {
+		t.Fatalf("dashboard action receipt=%#v err=%v", accepted, err)
+	}
+	select {
+	case <-runner.entered:
+	case <-time.After(5 * time.Second):
+		state := mustOwnerSnapshot(t, owner).State
+		receipt, _ := operatorReceiptByID(state, accepted.RequestID)
+		t.Fatalf("accepted effect did not reach the runner: calls=%d receipt=%#v effect=%#v", runner.calls.Load(), receipt, state.Effects[receipt.EffectID])
+	}
+	runtime := &productionRuntimeV2{operator: service, effects: service.effects}
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- runtime.shutdown(t.Context()) }()
+	select {
+	case <-service.stopping:
+	case <-time.After(5 * time.Second):
+		t.Fatal("operator shutdown did not begin")
+	}
+	select {
+	case <-runner.cancelled:
+		t.Fatal("shutdown cancelled an admitted dashboard effect")
+	default:
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown canceled accepted dashboard effect: %v", err)
+	default:
+	}
+	once.Do(func() { close(runner.release) })
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	receipt, ok := operatorReceiptByID(state, accepted.RequestID)
+	effect := state.Effects[receipt.EffectID]
+	if !ok || receipt.State != "completed" || effect.State != "completed" || state.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Manifest.State != "cancelled" {
+		t.Fatalf("accepted dashboard effect was not completed: receipt=%#v effect=%#v", receipt, effect)
 	}
 }
 

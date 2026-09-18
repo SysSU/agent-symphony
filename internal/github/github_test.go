@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -400,6 +401,202 @@ func TestReadCacheRejectsUnsafeState(t *testing.T) {
 	}
 	if _, err := LoadReadCache(link); err == nil {
 		t.Fatal("symlink cache accepted")
+	}
+}
+
+func TestReadCacheSaveSkipsUnchangedState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "github-etag-cache.json")
+	cache, err := LoadReadCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.put("/read", `"v1"`, []byte(`{"state":"first"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Save(); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Save(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.Stat(path)
+	if err != nil || !os.SameFile(first, second) {
+		t.Fatalf("unchanged cache was replaced: first=%v second=%v err=%v", first, second, err)
+	}
+}
+
+func TestReadCacheSaveDoesNotBlockReadsOrLoseConcurrentUpdates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "github-etag-cache.json")
+	cache, err := LoadReadCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.put("/read", `"v1"`, []byte(`{"state":"first"}`)); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	first := make(chan error, 1)
+	go func() {
+		first <- cache.save(func(path string, entries map[string]readCacheEntry) error {
+			close(entered)
+			<-release
+			return writeReadCache(path, entries)
+		})
+	}()
+	<-entered
+	read := make(chan readCacheEntry, 1)
+	go func() {
+		entry, _ := cache.get("/read")
+		read <- entry
+	}()
+	select {
+	case entry := <-read:
+		if entry.ETag != `"v1"` {
+			close(release)
+			<-first
+			t.Fatalf("read during Save returned %#v", entry)
+		}
+	case <-time.After(5 * time.Second):
+		close(release)
+		<-first
+		t.Fatal("cache read blocked on disk write")
+	}
+	if err := cache.put("/read", `"v2"`, []byte(`{"state":"second"}`)); err != nil {
+		close(release)
+		<-first
+		t.Fatal(err)
+	}
+	second := make(chan error, 1)
+	go func() { second <- cache.Save() }()
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadReadCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := reloaded.get("/read")
+	var body struct{ State string }
+	if err := json.Unmarshal(entry.Body, &body); err != nil || !ok || entry.ETag != `"v2"` || body.State != "second" {
+		t.Fatalf("newer update was overwritten by older Save: %#v", entry)
+	}
+}
+
+func TestReadCacheRecoversOnlySafeCorruptContent(t *testing.T) {
+	for name, body := range map[string]string{
+		"truncated": `{"version":1,"entries":`,
+		"version":   `{"version":2,"entries":{}}`,
+		"entry":     `{"version":1,"entries":{"/read":{"etag":"bad\nheader","body":{}}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "github-etag-cache.json")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cache, err := LoadReadCache(path)
+			if !errors.Is(err, ErrReadCacheCorrupt) || cache == nil {
+				t.Fatalf("safe corrupt cache was not recoverable: cache=%#v err=%v", cache, err)
+			}
+			if err := cache.Save(); err != nil {
+				t.Fatal(err)
+			}
+			clean, err := LoadReadCache(path)
+			if err != nil || len(clean.entries) != 0 {
+				t.Fatalf("corrupt cache was not atomically replaced: cache=%#v err=%v", clean, err)
+			}
+		})
+	}
+	unsafe := filepath.Join(t.TempDir(), "unsafe.json")
+	if err := os.WriteFile(unsafe, []byte(`{"version":2,"entries":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cache, err := LoadReadCache(unsafe); cache != nil || err == nil || errors.Is(err, ErrReadCacheCorrupt) {
+		t.Fatalf("unsafe permissions were treated as recoverable: cache=%#v err=%v", cache, err)
+	}
+	oversized := filepath.Join(t.TempDir(), "oversized.json")
+	file, err := os.OpenFile(oversized, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxReadCacheFile + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := LoadReadCache(oversized)
+	if !errors.Is(err, ErrReadCacheCorrupt) || cache == nil {
+		t.Fatalf("safe oversized cache blocked recovery: cache=%#v err=%v", cache, err)
+	}
+	if err := cache.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if clean, err := LoadReadCache(oversized); err != nil || len(clean.entries) != 0 {
+		t.Fatalf("oversized cache was not atomically replaced: cache=%#v err=%v", clean, err)
+	}
+}
+
+func TestReadCacheSaveDoesNotAmplifyBoundedJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "github-etag-cache.json")
+	cache, err := LoadReadCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`"` + strings.Repeat("<", 900000) + `"`)
+	for n := range 13 {
+		if err := cache.put(fmt.Sprintf("/read/%d", n), `"etag"`, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cache.Save(); err != nil {
+		t.Fatalf("bounded JSON body expanded beyond cache file limit: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Size() > maxReadCacheFile {
+		t.Fatalf("saved cache exceeded file limit: info=%v err=%v", info, err)
+	}
+	reloaded, err := LoadReadCache(path)
+	if err != nil || len(reloaded.entries) != 13 {
+		t.Fatalf("bounded cache did not survive reload: entries=%d err=%v", len(reloaded.entries), err)
+	}
+}
+
+func TestReadCacheSaveDropsSnapshotWhenEncodedJSONExceedsLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "github-etag-cache.json")
+	cache, err := LoadReadCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Accepted path control bytes expand sixfold when JSON-encoded. The raw
+	// snapshot is bounded, but its serialized form exceeds 64 MiB.
+	body := []byte(`"ok"`)
+	for n := range 2800 {
+		path := fmt.Sprintf("/%04x%s", n, strings.Repeat("\x01", 4090))
+		if err := cache.put(path, "v", body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(cache.entries) != 2800 {
+		t.Fatalf("fixture did not fill bounded cache: %d entries", len(cache.entries))
+	}
+	if err := cache.Save(); err != nil {
+		t.Fatalf("optional over-expanded cache failed Save: %v", err)
+	}
+	if len(cache.entries) != 0 {
+		t.Fatalf("unpersistable snapshot was retained in memory: %d entries", len(cache.entries))
+	}
+	reloaded, err := LoadReadCache(path)
+	if err != nil || len(reloaded.entries) != 0 {
+		t.Fatalf("over-expanded cache did not persist empty fallback: cache=%#v err=%v", reloaded, err)
 	}
 }
 
