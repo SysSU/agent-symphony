@@ -46,6 +46,9 @@ type operatorMutationService struct {
 	stopped           bool
 	beforeAdmission   func()
 	cacheLog          io.Writer
+	cacheSave         func() error
+	cacheSaving       bool
+	cachePending      bool
 }
 
 type operatorWork struct {
@@ -729,12 +732,50 @@ func (s *operatorMutationService) collectIssue(ctx context.Context, issue int) (
 	}
 	s.effects.cancelInvalidated(committed)
 	s.cancelSupersededPlanWatchers(snapshot, committed)
-	if s.collector.API.Cache != nil {
-		if err := s.collector.API.Cache.Save(); err != nil && s.cacheLog != nil {
-			_, _ = fmt.Fprintln(s.cacheLog, "save GitHub cache after operator collection: "+internalgithub.Redact(err.Error()))
-		}
-	}
+	s.scheduleCacheSave()
 	return committed, batch, nil
+}
+
+func (s *operatorMutationService) saveCache() {
+	if s.collector.API.Cache == nil {
+		return
+	}
+	save := s.cacheSave
+	if save == nil {
+		save = s.collector.API.Cache.Save
+	}
+	if err := save(); err != nil && s.cacheLog != nil {
+		_, _ = fmt.Fprintln(s.cacheLog, "save GitHub cache after operator collection: "+internalgithub.Redact(err.Error()))
+	}
+}
+
+func (s *operatorMutationService) scheduleCacheSave() {
+	if s.collector.API.Cache == nil {
+		return
+	}
+	s.mu.Lock()
+	s.cachePending = true
+	if s.cacheSaving || s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	s.cacheSaving = true
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.wg.Done()
+		for {
+			s.mu.Lock()
+			if !s.cachePending {
+				s.cacheSaving = false
+				s.mu.Unlock()
+				return
+			}
+			s.cachePending = false
+			s.mu.Unlock()
+			s.saveCache()
+		}
+	}()
 }
 
 func (s *operatorMutationService) prepareRecoveryAdmission(snapshot stateOwnerSnapshot, batch reconciliationV2Batch, request controlRequest, kind githubIssueUpdateKind) (beginOperatorMutationCommand, operatorWork, error) {
@@ -1341,6 +1382,13 @@ func (s *operatorMutationService) shutdown(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
+		s.mu.Lock()
+		pending := s.cachePending
+		s.cachePending = false
+		s.mu.Unlock()
+		if pending {
+			s.saveCache() // Flush a collection committed as shutdown began.
+		}
 		close(done)
 	}()
 	select {
