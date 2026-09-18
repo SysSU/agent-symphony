@@ -30,6 +30,10 @@ export function ownerVersionAtLeast(next, current) {
   return next.owner_revision >= current.owner_revision;
 }
 
+export function statusSnapshotAtLeast(next, current) {
+  return ownerVersionAtLeast(next, current) && (!current?.read_only || next?.read_only || !ownerVersionAtLeast(current, next));
+}
+
 export function partitionAttemptHistory(statuses, hidden = []) {
   const latest = new Map();
   for (const status of [...statuses, ...hidden]) {

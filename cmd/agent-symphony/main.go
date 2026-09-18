@@ -367,18 +367,17 @@ func authenticateProjectAfterQuota(ctx context.Context, repository string, log i
 	usage := &internalgithub.RequestUsage{}
 	for {
 		api, user, err := authenticateProjectDeployment(ctx, repository, usage)
-		if err == nil || ctx.Err() != nil {
+		if ctx.Err() != nil {
+			return api, user, ctx.Err()
+		}
+		if err == nil {
 			return api, user, err
 		}
 		reset, exhausted := internalgithub.RateLimitReset(err)
 		if !exhausted {
 			return api, user, err
 		}
-		delay := max(time.Until(reset)+time.Second, time.Second)
-		if !reset.After(time.Now()) {
-			delay = time.Minute // A stale header must not create a hot authentication loop.
-		}
-		delay = min(delay, time.Hour)
+		delay := quotaRetryDelay(reset, time.Now())
 		fmt.Fprintf(log, "GitHub quota exhausted; dashboard remains read-only until retry at %s\n", time.Now().Add(delay).UTC().Format(time.RFC3339))
 		timer := time.NewTimer(delay)
 		select {
@@ -388,6 +387,17 @@ func authenticateProjectAfterQuota(ctx context.Context, repository string, log i
 		case <-timer.C:
 		}
 	}
+}
+
+func quotaRetryDelay(reset, now time.Time) time.Duration {
+	if !reset.After(now) {
+		return time.Minute // A stale header must not create a hot authentication loop.
+	}
+	delay := reset.Sub(now)
+	if delay >= time.Hour {
+		return time.Hour
+	}
+	return max(delay+time.Second, time.Second)
 }
 
 func configureProjectRuntimeState(stateRoot string) error {
@@ -1223,7 +1233,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintln(stderr, "dashboard: "+dashboardURL)
 		api, user, err := authenticateProjectAfterQuota(ctx, c.Repository, stderr)
-		if err != nil {
+		if err != nil || ctx.Err() != nil {
 			_ = dashboard.shutdown(context.Background())
 			if ctx.Err() != nil {
 				return 0
@@ -1233,6 +1243,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err := prepareProductionDeploymentLocked(*runtimeState, c.Repository); err != nil {
 			_ = dashboard.shutdown(context.Background())
 			return fail(stderr, *jsonOutput, command, err.Error())
+		}
+		if ctx.Err() != nil {
+			_ = dashboard.shutdown(context.Background())
+			return 0
 		}
 		runtime, err := startProductionRuntimeV2(ctx, c, api, user, *runtimeState, *statePath, checkout, stderr)
 		if err != nil {

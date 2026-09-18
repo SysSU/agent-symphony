@@ -208,6 +208,46 @@ func TestServeRepositoryVerificationFailureDoesNotBindDeployment(t *testing.T) {
 	}
 }
 
+func TestQuotaRetryDelayBoundsUntrustedReset(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	for _, test := range []struct {
+		name  string
+		reset time.Time
+		want  time.Duration
+	}{
+		{"normal", now.Add(10 * time.Second), 11 * time.Second},
+		{"stale", now.Add(-time.Second), time.Minute},
+		{"extreme", time.Unix(1<<62, 0), time.Hour},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := quotaRetryDelay(test.reset, now); got != test.want {
+				t.Fatalf("quota retry delay = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAuthenticateProjectAfterQuotaStopsOnCancellation(t *testing.T) {
+	oldAPI, oldClient := githubAPI, githubClient
+	t.Cleanup(func() { githubAPI, githubClient = oldAPI, oldClient })
+	githubAPI = "https://example.invalid"
+	ctx, cancel := context.WithCancel(t.Context())
+	githubClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/repos/owner/repo" {
+			cancel()
+		}
+		body := `{"id":42,"login":"coordinator"}`
+		if r.URL.Path == "/repos/owner/repo" {
+			body = `{"full_name":"owner/repo","permissions":{"pull":true}}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	_, _, err := authenticateProjectAfterQuota(ctx, "owner/repo", io.Discard)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("authentication after cancellation = %v, want context.Canceled", err)
+	}
+}
+
 func TestForeignBoundDeploymentRemainsUnchanged(t *testing.T) {
 	root := gitRepository(t)
 	configPath := filepath.Join(root, config.DefaultPath)

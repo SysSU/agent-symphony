@@ -45,6 +45,8 @@ func TestQuotaDegradedStartupFullSystem(t *testing.T) {
 
 	var quota atomic.Bool
 	quota.Store(true)
+	quotaResponse := make(chan struct{})
+	quotaRejected := make(chan struct{}, 1)
 	requests := make(chan string, 128)
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
@@ -53,10 +55,16 @@ func TestQuotaDegradedStartupFullSystem(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/user" && quota.Load() {
+			select {
+			case <-quotaResponse:
+			case <-r.Context().Done():
+				return
+			}
 			w.Header().Set("X-RateLimit-Remaining", "0")
-			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Second).Unix(), 10))
+			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(5*time.Second).Unix(), 10))
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = io.WriteString(w, `{"message":"API rate limit exceeded"}`)
+			quotaRejected <- struct{}{}
 			return
 		}
 		w.Header().Set("X-RateLimit-Remaining", "4000")
@@ -72,7 +80,14 @@ func TestQuotaDegradedStartupFullSystem(t *testing.T) {
 			_, _ = io.WriteString(w, `[]`)
 		}
 	}))
-	defer github.Close()
+	defer func() {
+		select {
+		case <-quotaResponse:
+		default:
+			close(quotaResponse)
+		}
+		github.Close()
+	}()
 
 	binDir := filepath.Join(root, "bin")
 	if err := os.Mkdir(binDir, 0o700); err != nil {
@@ -200,6 +215,24 @@ exit 0
 	browser.Env = append(os.Environ(), "AGENT_SYMPHONY_QUOTA_E2E_URL=http://"+address)
 	if browserOutput, err := browser.CombinedOutput(); err != nil {
 		t.Fatalf("degraded dashboard browser: %v\n%s\nserve:\n%s", err, browserOutput, output.String())
+	}
+	close(quotaResponse)
+	select {
+	case <-quotaRejected:
+	case <-time.After(20 * time.Second):
+		t.Fatalf("quota response was not sent: %s", output.String())
+	}
+	response, err = dashboardRequest(http.MethodGet, "/status.json", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	degraded = dashboardStatusSnapshot{}
+	if err := json.NewDecoder(response.Body).Decode(&degraded); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !degraded.ReadOnly {
+		t.Fatalf("dashboard after quota response=%d snapshot=%#v", response.StatusCode, degraded)
 	}
 	quota.Store(false)
 	liveBrowser := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/quota-degraded-full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "live-playwright"))

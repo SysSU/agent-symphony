@@ -7,7 +7,7 @@ import AttemptHistory from "./_components/attempt-history";
 import ProjectNavigation, { ProjectAgentConsole, ProjectHeader, ProjectHealthControl, projectBoard, projectView } from "./_components/project-navigation";
 import { getOrchestratorStatus, getRelease, operatorActionNotice, postWithReconciliationRetry } from "./actions.mjs";
 import TerminalPanel from "./_components/terminal-panel";
-import { attemptKey, ownerVersionAtLeast } from "./health.mjs";
+import { attemptKey, ownerVersionAtLeast, statusSnapshotAtLeast } from "./health.mjs";
 
 const actionDetails = {
   abandon: ["Abandon", "This stops its tmux session and permanently deletes its local worktree, log, and retained attempt record.", "Abandoned"],
@@ -47,7 +47,7 @@ export default function Dashboard() {
   const [projects, setProjects] = useState([]);
   const [selectedRepository, setSelectedRepository] = useState("");
   const closeTerminal = useCallback(() => setTerminal(null), []);
-  const acceptSnapshot = useCallback((next) => setSnapshot((current) => next?.read_only || ownerVersionAtLeast(next, current) ? next : current), []);
+  const acceptSnapshot = useCallback((next) => setSnapshot((current) => statusSnapshotAtLeast(next, current) ? next : current), []);
   const acceptDashboardState = useCallback((next) => setDashboardState((current) => ownerVersionAtLeast(next, current) ? next : current), []);
 
   useEffect(() => {
