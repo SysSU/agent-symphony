@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -280,13 +281,11 @@ if [ "$1" = sandbox ]; then
   if [ "$2" = sandbox-probe ]; then printf '%s\n' '{"confined":true,"shared_temp_read":true,"shared_temp_write":true}' > "$3"; exit 0; fi
   exec "$@"
 fi
-audit_result=
-want_result=0
+audit_json=0
 for arg in "$@"; do
-  if [ "$want_result" -eq 1 ]; then audit_result=$arg; want_result=0; continue; fi
-  if [ "$arg" = --output-last-message ]; then want_result=1; fi
+  if [ "$arg" = --json ]; then audit_json=1; fi
 done
-if [ -n "$audit_result" ]; then
+if [ "$audit_json" -eq 1 ]; then
   audit_context=$(cat)
   case "$audit_context" in
     *'"issue":191,"attempt":9'*) printf 'audit:191:9\n' >> "@EVENTS@" ;;
@@ -295,13 +294,15 @@ if [ -n "$audit_result" ]; then
   if [ -f "@HOLD@" ]; then
     printf 'audit:blocked\n' >> "@EVENTS@"
     IFS= read -r release < "@RELEASE@"
+    printf 'audit:released\n' >> "@EVENTS@"
   fi
   if [ -f "@FAIL@" ]; then
     printf 'audit:failed\n' >> "@EVENTS@"
     printf 'fixture audit failed\n' >&2
     exit 17
   fi
-  printf 'fixture audit complete\n' > "$audit_result"
+  printf '%s\n' '{"type":"thread.started","thread_id":"fixture"}' '{"type":"turn.started"}' '{"type":"item.completed","item":{"id":"report","type":"agent_message","text":"fixture audit complete"}}' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+  printf 'audit:finished\n' >> "@EVENTS@"
   exit 0
 fi
 printf 'orchestrator-ready\n'
@@ -353,6 +354,29 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 	statusHTTP := &http.Client{Timeout: 5 * time.Second}
 	waitHTTP(t, baseURL+"/status.json", deadline, output)
 	reportPath := filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-"+internalgithub.RepositoryIdentifier("o/r"), orchestratoragent.HeartbeatReportFile)
+	auditParent := filepath.Join(productionSnapshotRoot(stateRoot), "orchestrator-audit-"+internalgithub.RepositoryIdentifier("o/r"))
+	for _, name := range []string{"orchestrator-audit-legacy", "unrelated"} {
+		path := filepath.Join(auditParent, name)
+		if err := os.MkdirAll(path, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "retain"), []byte(name), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertAuditArtifacts := func() {
+		t.Helper()
+		entries, err := os.ReadDir(auditParent)
+		if err != nil || len(entries) != 2 {
+			t.Fatalf("audit created per-run artifacts: entries=%v error=%v", entries, err)
+		}
+		for _, name := range []string{"orchestrator-audit-legacy", "unrelated"} {
+			body, err := os.ReadFile(filepath.Join(auditParent, name, "retain"))
+			if err != nil || string(body) != name {
+				t.Fatalf("legacy/unrelated child changed: %q error=%v", body, err)
+			}
+		}
+	}
 	readOrchestrator := func() (orchestratoragent.Status, error) {
 		response, err := http.Get(baseURL + "/orchestrator.json")
 		if err != nil {
@@ -720,4 +744,61 @@ while IFS= read -r line; do printf 'orchestrator-received:%s\n' "$line"; printf 
 	if err != nil || len(events) < beforeRetryEvents || !strings.Contains(string(events[beforeRetryEvents:]), "audit:191:9\n") || strings.Contains(string(events[beforeRetryEvents:]), "audit:failed\n") {
 		t.Fatalf("same-target retry did not launch a fresh successful subprocess: err=%v events=%q", err, events)
 	}
+	assertAuditArtifacts()
+
+	// Kill the real daemon while its old auditor is held at an explicit FIFO.
+	// The replacement daemon must complete a new audit before that old writer
+	// is released; neither invocation may create or remove a private child.
+	if err := os.WriteFile(holdAudit, []byte("hold across crash\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeCrashEvents := len(events)
+	runBrowser("start-held")
+	if !waitFor(deadline, func() bool {
+		body, err := os.ReadFile(fixtureEvents)
+		return err == nil && len(body) >= beforeCrashEvents && strings.Contains(string(body[beforeCrashEvents:]), "audit:blocked\n")
+	}) {
+		t.Fatal("old auditor did not enter the crash barrier")
+	}
+	if err := os.Remove(holdAudit); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = server.Wait()
+	stopped = true
+	assertAuditArtifacts()
+	address = freeAddress(t)
+	baseURL = "http://" + address
+	server, output = start()
+	stopped = false
+	waitHTTP(t, baseURL+"/status.json", deadline, output)
+	runBrowser("retry-manual")
+	var freshBody []byte
+	if !waitFor(deadline, func() bool {
+		var report auditReport
+		freshBody, err = os.ReadFile(reportPath)
+		return err == nil && json.Unmarshal(freshBody, &report) == nil && report.State == "completed"
+	}) {
+		t.Fatalf("replacement audit did not complete while old writer survived: %s", output.String())
+	}
+	beforeRelease, err := os.ReadFile(fixtureEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := releaseHeldAudit(); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(deadline, func() bool {
+		body, err := os.ReadFile(fixtureEvents)
+		return err == nil && len(body) >= len(beforeRelease) && strings.Contains(string(body[len(beforeRelease):]), "audit:released\naudit:finished\n")
+	}) {
+		t.Fatal("old auditor did not finish after the explicit crash release")
+	}
+	currentBody, err := os.ReadFile(reportPath)
+	if err != nil || !bytes.Equal(currentBody, freshBody) {
+		t.Fatalf("old crash survivor changed the new report: error=%v before=%s after=%s", err, freshBody, currentBody)
+	}
+	assertAuditArtifacts()
 }

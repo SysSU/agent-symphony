@@ -692,6 +692,138 @@ func TestHostOrchestratorLaunchContractIsReadOnlyAndCredentialFiltered(t *testin
 	}
 }
 
+func TestHostAuditStdinBoundary(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "orchestrator-audit-owner-repo")
+	if err := os.Mkdir(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(t.TempDir(), "codex")
+	buildNativeCodexFixture(t, executable, "prompt=$(cat)\n[ \"$prompt\" = 'audit prompt' ] || exit 12\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"report\"}}' '{\"type\":\"turn.completed\"}'\nprintf 'stderr is not JSONL\\n' >&2\n")
+	if err := os.Chmod(executable, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	command, err := config.ExpandManagedWorkspace(config.Default("o/r").Commands.OrchestratorAudit, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command[0] = executable
+	launch := orchestratoragent.AuditLaunch{Version: 1, Command: command, Context: "audit prompt", Timeout: 240}
+	body, _ := json.Marshal(launch)
+	oldGetwd, oldRunner := hostGetwd, hostExecRunner
+	t.Cleanup(func() { hostGetwd, hostExecRunner = oldGetwd, oldRunner })
+	hostGetwd = func() (string, error) { return dir, nil }
+	t.Setenv("AGENT_SYMPHONY_LOCAL_ROOT", root)
+	t.Setenv("AGENT_SYMPHONY_ORCHESTRATOR_ROOT", root)
+	t.Setenv("GH_TOKEN", "github-canary")
+	t.Setenv("SSH_AUTH_SOCK", "/forbidden/ssh")
+	t.Setenv("CODEX_HOME", filepath.Join(root, "model-home"))
+	calls := 0
+	hostExecRunner = func(ctx context.Context, got agentruntime.Command) (agentruntime.Result, error) {
+		calls++
+		prompt, _ := io.ReadAll(got.Stdin)
+		if string(prompt) != launch.Context || got.Dir != dir || got.Name != executable || !slices.Equal(got.Args, command[1:]) || !got.StdoutOnly || got.MaxOutputBytes != orchestratoragent.AuditOutputMaxBytes {
+			t.Fatalf("wrong audit command or prompt: %#v %q", got, prompt)
+		}
+		if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > 240*time.Second {
+			t.Fatalf("audit deadline missing or exceeds contract: %v %v", deadline, ok)
+		}
+		for _, value := range got.Env {
+			if strings.HasPrefix(value, "GH_TOKEN=") || strings.HasPrefix(value, "AGENT_SYMPHONY_") || strings.HasPrefix(value, "SSH_AUTH_SOCK=") {
+				t.Fatalf("audit inherited coordinator authority: %q", value)
+			}
+		}
+		if !slices.Contains(got.Env, "HOME="+filepath.Join(root, "model-home")) {
+			t.Fatalf("audit inherited coordinator home: %q", got.Env)
+		}
+		return agentruntime.Result{Output: "JSONL stdout\n"}, nil
+	}
+	var output bytes.Buffer
+	if err := agentHost(t.Context(), "orchestrator-audit", bytes.NewReader(body), &output); err != nil || output.String() != "JSONL stdout\n" || calls != 1 {
+		t.Fatalf("audit output=%q calls=%d error=%v", output.String(), calls, err)
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*orchestratoragent.AuditLaunch)
+	}{
+		{"version", func(l *orchestratoragent.AuditLaunch) { l.Version = 2 }},
+		{"empty prompt", func(l *orchestratoragent.AuditLaunch) { l.Context = "" }},
+		{"large prompt", func(l *orchestratoragent.AuditLaunch) { l.Context = strings.Repeat("x", 64<<10+1) }},
+		{"no timeout", func(l *orchestratoragent.AuditLaunch) { l.Timeout = 0 }},
+		{"long timeout", func(l *orchestratoragent.AuditLaunch) { l.Timeout = 301 }},
+		{"relative executable", func(l *orchestratoragent.AuditLaunch) { l.Command[0] = "codex" }},
+		{"custom flag", func(l *orchestratoragent.AuditLaunch) {
+			l.Command = append(l.Command, "--dangerously-bypass-approvals-and-sandbox")
+		}},
+		{"wrong workspace", func(l *orchestratoragent.AuditLaunch) { l.Command[5] = strings.ReplaceAll(l.Command[5], dir, root) }},
+		{"credential argument", func(l *orchestratoragent.AuditLaunch) { l.Command = append(l.Command, "token=canary") }},
+		{"newline argument", func(l *orchestratoragent.AuditLaunch) { l.Command[0] += "\n" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := launch
+			invalid.Command = slices.Clone(command)
+			test.change(&invalid)
+			payload, _ := json.Marshal(invalid)
+			if err := agentHost(t.Context(), "orchestrator-audit", bytes.NewReader(payload), &bytes.Buffer{}); err == nil {
+				t.Fatal("unsafe audit launch accepted")
+			}
+		})
+	}
+	for _, payload := range []string{string(body) + "{}", strings.Replace(string(body), `"version":1`, `"unknown":1,"version":1`, 1), strings.Repeat(" ", orchestratoragent.AuditLaunchMaxBytes+1), string(body[:len(body)-1])} {
+		if err := agentHost(t.Context(), "orchestrator-audit", strings.NewReader(payload), &bytes.Buffer{}); err == nil {
+			t.Fatal("invalid stdin contract accepted")
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("unsafe contract launched a process: calls=%d", calls)
+	}
+	alias := filepath.Join(root, "orchestrator-audit-alias")
+	if err := os.Symlink(dir, alias); err != nil {
+		t.Fatal(err)
+	}
+	hostGetwd = func() (string, error) { return alias, nil }
+	if err := agentHost(t.Context(), "orchestrator-audit", bytes.NewReader(body), &bytes.Buffer{}); err == nil {
+		t.Fatal("symlink audit workspace accepted")
+	}
+	nested := filepath.Join(dir, "orchestrator-audit-child")
+	if err := os.Mkdir(nested, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	hostGetwd = func() (string, error) { return nested, nil }
+	if err := agentHost(t.Context(), "orchestrator-audit", bytes.NewReader(body), &bytes.Buffer{}); err == nil {
+		t.Fatal("legacy private child accepted as stable audit parent")
+	}
+	hostGetwd = func() (string, error) { return dir, nil }
+	if err := os.Chmod(dir, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := agentHost(t.Context(), "orchestrator-audit", bytes.NewReader(body), &bytes.Buffer{}); err == nil {
+		t.Fatal("group-writable audit parent accepted")
+	}
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	hostExecRunner = oldRunner
+	output.Reset()
+	if err := agentHost(t.Context(), "orchestrator-audit", bytes.NewReader(body), &output); err != nil || !strings.Contains(output.String(), "turn.completed") || strings.Contains(output.String(), "stderr") {
+		t.Fatalf("native fixture prompt/output forwarding: %q error=%v", output.String(), err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := agentHost(ctx, "orchestrator-audit", bytes.NewReader(body), &bytes.Buffer{}); err == nil {
+		t.Fatal("canceled audit launched successfully")
+	}
+	hostExecRunner = func(ctx context.Context, _ agentruntime.Command) (agentruntime.Result, error) {
+		<-ctx.Done()
+		return agentruntime.Result{}, ctx.Err()
+	}
+	launch.Timeout = 1
+	body, _ = json.Marshal(launch)
+	if err := agentHost(t.Context(), "orchestrator-audit", bytes.NewReader(body), &bytes.Buffer{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("host did not enforce the audit timeout: %v", err)
+	}
+}
+
 func TestReviewResultArtifactFailsClosed(t *testing.T) {
 	const valid = `{"type":"agent-symphony-review-v1","status":"clean","findings":[]}`
 	request := reviewResultRequest{Repository: "o/r", Issue: 23, Attempt: 1, Mode: agentruntime.ReviewModeImplementation, Target: strings.Repeat("b", 40) + ".." + strings.Repeat("a", 40), RunID: strings.Repeat("c", 64), Head: strings.Repeat("a", 40)}

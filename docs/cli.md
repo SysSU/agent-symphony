@@ -89,7 +89,7 @@ Commands produce plain human-readable text by default and never depend on color.
 
 ## Configuration
 
-`.agent-symphony.yaml` uses the JSON subset of YAML so the single Go binary can parse it strictly without a dependency. The abbreviated shape below omits the generated implementation/reviewer arrays because those arrays contain the complete managed confinement profile; run `agent-symphony init` to write the valid current defaults rather than copying this excerpt.
+`.agent-symphony.yaml` uses the JSON subset of YAML so the single Go binary can parse it strictly without a dependency. The abbreviated shape below omits the generated implementation/reviewer/auditor arrays because those arrays contain the complete managed confinement profile; run `agent-symphony init` to write the valid current defaults rather than copying this excerpt.
 
 ```json
 {
@@ -115,7 +115,6 @@ Commands produce plain human-readable text by default and never depend on color.
   "docs_paths": ["README.md", "docs"],
   "commands": {
     "orchestrator": ["codex", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--no-alt-screen"],
-    "orchestrator_audit": ["codex", "--ask-for-approval", "never", "exec", "-c", "projects={\"{orchestrator_workspace}\"={trust_level=\"trusted\"}}", "-c", "model_reasoning_effort=\"medium\"", "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"],
     "environment_allowlist": ["LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"]
   },
   "status": {
@@ -137,7 +136,7 @@ The generated default omits `labels.issue_filter`, so no extra queue label is re
 
 An empty value also disables the filter. When configured, an issue must currently have this label in addition to `agent-ready` and one priority label; removing it makes the issue ineligible on the next reconciliation.
 
-New configuration created by `agent-symphony init` enables both generated orchestrator commands. Remove `commands.orchestrator` to disable the advisory console, heartbeat audits, and attention handoffs. Remove only `commands.orchestrator_audit` to keep the console and structured attention handoffs without periodic audit model usage. Agent Symphony replaces `{managed_workspace}` for implementation and review and `{orchestrator_workspace}` for orchestrator roles with that process's exact absolute managed workspace; it does not change global Codex trust. It replaces `{orchestrator_result}` with a transient result path. It appends bounded generated context to the primary command and sends the one-shot audit prompt on standard input. The default audit uses medium reasoning effort and Codex's final-message output so progress logs cannot displace the diagnosis. A custom audit may omit `{orchestrator_result}` and return one plain-text result on standard output instead. Agent Symphony bounds the result and stops the process after four minutes.
+New configuration created by `agent-symphony init` enables both generated orchestrator commands. Remove `commands.orchestrator` to disable the advisory console, heartbeat audits, and attention handoffs. Remove only `commands.orchestrator_audit` to keep the console and structured attention handoffs without periodic audit model usage. Agent Symphony replaces `{managed_workspace}` for implementation and review and `{orchestrator_workspace}` for orchestrator roles with that process's exact absolute managed workspace; it does not change global Codex trust. The primary command receives bounded generated context as an argument. The exact managed auditor command uses the read-only profile with `exec --json --ephemeral` and receives its prompt over stdin. The previous generated file-result command migrates automatically on configuration load; custom auditor commands are rejected. The dedicated `agent-host orchestrator-audit` boundary accepts one strict stdin launch contract (128 KiB maximum), checks the stable audit parent and command, and forwards only the prompt. The complete stdout JSONL stream is limited to 1 MiB; the final message is limited to 64 KiB and must precede successful turn completion. Stderr cannot supply a result. The process deadline is four minutes. No per-audit directory or result file is created.
 
 The optional orchestrator runs as the coordinator user without sudo. Its `danger-full-access` Codex command can use the authenticated `gh` CLI and inspect same-user tmux sessions, so use it only with a trusted model. It is advisory and separate from the rootless implementation/review boundary.
 

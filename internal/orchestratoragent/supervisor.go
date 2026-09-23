@@ -35,8 +35,6 @@ const (
 	maxAuditReportFileBytes   = 2*maxAuditReportBytes + 4096
 	maxPreviousReportBytes    = 8 << 10
 	maxAttentionDetailBytes   = 4096
-	auditResultFile           = "orchestrator-audit-result.txt"
-	auditResultPlaceholder    = "{orchestrator_result}"
 	historyLimit              = "65536"
 	heartbeatInterval         = 5 * time.Minute
 	auditProcessTimeout       = 4 * time.Minute
@@ -225,6 +223,7 @@ type Supervisor struct {
 	Command               []string
 	AuditCommand          []string
 	Launcher              []string
+	AuditLauncher         []string
 	ProposalCommand       []string
 	ProposalStatusCommand []string
 	Env                   []string
@@ -267,7 +266,7 @@ type reservationResult struct {
 	err        error
 }
 
-func (s *Supervisor) launchAudit(workspace string, startedAt time.Time, projectionDigest, manualTargetDigest, diagnostic string) error {
+func (s *Supervisor) launchAudit(launch string, startedAt time.Time, projectionDigest, manualTargetDigest, diagnostic string) error {
 	s.mu.Lock()
 	if s.stopped || s.auditGeneration == ^uint64(0) {
 		s.mu.Unlock()
@@ -285,7 +284,7 @@ func (s *Supervisor) launchAudit(workspace string, startedAt time.Time, projecti
 	s.auditTargetDigest = manualTargetDigest
 	s.wg.Add(1)
 	s.mu.Unlock()
-	go s.runAudit(ctx, cancel, workspace, generation, contextEpoch, startedAt, projectionDigest, diagnostic)
+	go s.runAudit(ctx, cancel, launch, generation, contextEpoch, startedAt, projectionDigest, diagnostic)
 	return nil
 }
 
@@ -466,9 +465,9 @@ func (s *Supervisor) setAuditRunning(running bool) {
 	s.mu.Unlock()
 }
 
-func (s *Supervisor) abortPreparedAudit(workspace string, cause error) error {
+func (s *Supervisor) abortPreparedAudit(cause error) error {
 	s.setAuditRunning(false)
-	return errors.Join(cause, os.RemoveAll(workspace), s.invalidateAuditReport("heartbeat audit did not launch", false))
+	return errors.Join(cause, s.invalidateAuditReport("heartbeat audit did not launch", false))
 }
 
 func (s *Supervisor) claimAuditCompletion(generation, contextEpoch uint64) (context.Context, uint64, bool) {
@@ -602,7 +601,7 @@ func (s *Supervisor) ObserveCycle(ctx context.Context, statuses []orchestrator.R
 	attentionChanged := s.reconcileAttention(&state, items, now)
 	write := attentionChanged
 	launchAudit := false
-	auditWorkspace := ""
+	auditLaunch := ""
 	changed := digest != state.LastProjection && (len(items) > 0 || state.LastProjection != "")
 	if changed && len(s.AuditCommand) == 0 {
 		state.LastProjection = digest
@@ -615,7 +614,7 @@ func (s *Supervisor) ObserveCycle(ctx context.Context, statuses []orchestrator.R
 		}
 		prompt, auditErr := auditPrompt(items, state.LastHeartbeatAt, diagnostic, s.previousHeartbeatReport())
 		if auditErr == nil {
-			auditWorkspace, auditErr = s.prepareAudit(prompt, now, digest, diagnostic)
+			auditLaunch, auditErr = s.prepareAudit(prompt, now, digest, diagnostic)
 		}
 		state.LastHeartbeatAt = now
 		if auditErr != nil {
@@ -630,14 +629,14 @@ func (s *Supervisor) ObserveCycle(ctx context.Context, statuses []orchestrator.R
 		state.UpdatedAt = now
 		if writeErr := s.writeState(state); writeErr != nil {
 			if launchAudit {
-				writeErr = s.abortPreparedAudit(auditWorkspace, writeErr)
+				writeErr = s.abortPreparedAudit(writeErr)
 			}
 			return statusOf(state, len(attention(items))), errors.Join(scheduleErr, writeErr)
 		}
 		if attentionChanged {
 			if handoffErr := s.writeAttentionHandoff(state.AttentionHandoff); handoffErr != nil {
 				if launchAudit {
-					handoffErr = s.abortPreparedAudit(auditWorkspace, handoffErr)
+					handoffErr = s.abortPreparedAudit(handoffErr)
 					state.LastProjection, state.LastHeartbeatAt = previousProjection, previousHeartbeat
 					handoffErr = errors.Join(handoffErr, s.writeState(state))
 				}
@@ -646,8 +645,8 @@ func (s *Supervisor) ObserveCycle(ctx context.Context, statuses []orchestrator.R
 		}
 	}
 	if launchAudit {
-		if err := s.launchAudit(auditWorkspace, now, digest, "", diagnostic); err != nil {
-			err = s.abortPreparedAudit(auditWorkspace, err)
+		if err := s.launchAudit(auditLaunch, now, digest, "", diagnostic); err != nil {
+			err = s.abortPreparedAudit(err)
 			state.LastProjection, state.LastHeartbeatAt = previousProjection, previousHeartbeat
 			err = errors.Join(err, s.writeState(state))
 			return statusOf(state, len(attention(items))), errors.Join(scheduleErr, err)
@@ -779,9 +778,9 @@ func (s *Supervisor) Investigate(ctx context.Context, issue, attemptNumber int) 
 	}
 	now := s.now()
 	prompt, err := auditPrompt([]sanitizedStatus{item}, state.LastHeartbeatAt, "", s.previousHeartbeatReport())
-	auditWorkspace := ""
+	auditLaunch := ""
 	if err == nil {
-		auditWorkspace, err = s.prepareAudit(prompt, now, digest, "")
+		auditLaunch, err = s.prepareAudit(prompt, now, digest, "")
 	}
 	if err != nil {
 		return statusOf(state, len(attention(s.projection))), err
@@ -789,11 +788,11 @@ func (s *Supervisor) Investigate(ctx context.Context, issue, attemptNumber int) 
 	s.setAuditRunning(true)
 	state.LastInvestigation, state.LastHeartbeatAt, state.UpdatedAt = digest, now, now
 	if err := s.writeState(state); err != nil {
-		err = s.abortPreparedAudit(auditWorkspace, err)
+		err = s.abortPreparedAudit(err)
 		return statusOf(state, len(attention(s.projection))), err
 	}
-	if err := s.launchAudit(auditWorkspace, now, digest, digest, ""); err != nil {
-		err = s.abortPreparedAudit(auditWorkspace, err)
+	if err := s.launchAudit(auditLaunch, now, digest, digest, ""); err != nil {
+		err = s.abortPreparedAudit(err)
 		state.LastInvestigation, state.LastHeartbeatAt = previousInvestigation, previousHeartbeat
 		err = errors.Join(err, s.writeState(state))
 		return statusOf(state, len(attention(s.projection))), err
@@ -1156,70 +1155,36 @@ func (s *Supervisor) stop(ctx context.Context, session string) error {
 }
 
 func (s *Supervisor) prepareAudit(prompt string, startedAt time.Time, projectionDigest, diagnostic string) (string, error) {
-	if s.AuditWorkspace == "" || !filepath.IsAbs(s.AuditWorkspace) || len(s.AuditCommand) == 0 || strings.TrimSpace(s.AuditCommand[0]) == "" || len(s.Launcher) == 0 || strings.TrimSpace(s.Launcher[0]) == "" {
+	if s.AuditWorkspace == "" || !filepath.IsAbs(s.AuditWorkspace) || len(s.AuditCommand) == 0 || strings.TrimSpace(s.AuditCommand[0]) == "" || len(s.AuditLauncher) == 0 || strings.TrimSpace(s.AuditLauncher[0]) == "" {
 		return "", errors.New("invalid orchestrator audit configuration")
 	}
 	if err := os.MkdirAll(s.AuditWorkspace, 0o750); err != nil {
 		return "", err
 	}
 	parent, err := os.Lstat(s.AuditWorkspace)
-	if err != nil || !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 {
+	if err != nil || !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 || parent.Mode().Perm()&0o022 != 0 {
 		return "", errors.New("orchestrator audit workspace is unsafe")
 	}
-	workspace, err := os.MkdirTemp(s.AuditWorkspace, "orchestrator-audit-")
+	command, err := config.ExpandManagedWorkspace(s.AuditCommand, s.AuditWorkspace)
 	if err != nil {
 		return "", err
 	}
-	prepared := false
-	defer func() {
-		if !prepared {
-			_ = os.RemoveAll(workspace)
-		}
-	}()
-	if err := os.Chmod(workspace, os.ModeSetgid|0o750); err != nil {
-		return "", err
-	}
-	child, err := os.Lstat(workspace)
+	launch, err := json.MarshalIndent(AuditLaunch{stateVersion, command, prompt, int(auditProcessTimeout / time.Second)}, "", "  ")
 	if err != nil {
 		return "", err
 	}
-	parentStat, parentOK := parent.Sys().(*syscall.Stat_t)
-	childStat, childOK := child.Sys().(*syscall.Stat_t)
-	if !child.IsDir() || child.Mode()&os.ModeSymlink != 0 || child.Mode()&(os.ModePerm|os.ModeSetgid) != os.ModeSetgid|0o750 || !parentOK || !childOK || parentStat.Gid != childStat.Gid {
-		return "", errors.New("orchestrator audit workspace ownership or mode is unsafe")
-	}
-	resultPath := filepath.Join(workspace, auditResultFile)
-	command, err := config.ExpandManagedWorkspace(s.AuditCommand, workspace)
-	if err != nil {
-		return "", err
-	}
-	for index := range command {
-		command[index] = strings.ReplaceAll(command[index], auditResultPlaceholder, resultPath)
-	}
-	launch, err := json.MarshalIndent(struct {
-		Version int      `json:"version"`
-		Command []string `json:"command"`
-		Context string   `json:"context"`
-		OneShot bool     `json:"one_shot"`
-		Timeout int      `json:"timeout_seconds"`
-	}{stateVersion, command, prompt, true, int(auditProcessTimeout / time.Second)}, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	if err := writeAtomic(filepath.Join(workspace, "orchestrator-launch.json"), append(launch, '\n'), 0o440); err != nil {
-		return "", err
+	if len(launch) > AuditLaunchMaxBytes || len(prompt) == 0 || len(prompt) > maxContextBytes {
+		return "", errors.New("orchestrator audit launch contract exceeds its bound")
 	}
 	if err := s.writeHeartbeatReport(heartbeatReport{Version: stateVersion, StartedAt: startedAt, ProjectionDigest: projectionDigest, State: "running", ReconciliationDiagnostic: diagnostic}); err != nil {
 		return "", err
 	}
-	prepared = true
-	return workspace, nil
+	return string(launch), nil
 }
 
-func (s *Supervisor) runAudit(ctx context.Context, cancel context.CancelFunc, workspace string, generation, contextEpoch uint64, startedAt time.Time, projectionDigest, diagnostic string) {
+func (s *Supervisor) runAudit(ctx context.Context, cancel context.CancelFunc, launch string, generation, contextEpoch uint64, startedAt time.Time, projectionDigest, diagnostic string) {
 	defer s.wg.Done()
 	defer cancel()
-	defer os.RemoveAll(workspace)
 	var completion uint64
 	reportPublished := false
 	defer func() {
@@ -1242,15 +1207,18 @@ func (s *Supervisor) runAudit(ctx context.Context, cancel context.CancelFunc, wo
 	if runner == nil {
 		runner = agentruntime.ExecRunner{}
 	}
-	result, runErr := runner.Run(ctx, agentruntime.Command{Name: s.Launcher[0], Args: slices.Clone(s.Launcher[1:]), Dir: workspace, Env: s.AuditEnv, MaxOutputBytes: maxAuditReportBytes})
-	resultPath := filepath.Join(workspace, auditResultFile)
-	if slices.ContainsFunc(s.AuditCommand, func(arg string) bool { return strings.Contains(arg, auditResultPlaceholder) }) {
-		if runErr == nil {
-			result.Output, runErr = readAuditResult(resultPath)
-		}
-		_ = os.Remove(resultPath)
+	result, runErr := runner.Run(ctx, agentruntime.Command{Name: s.AuditLauncher[0], Args: slices.Clone(s.AuditLauncher[1:]), Dir: s.AuditWorkspace, Env: s.AuditEnv, Stdin: strings.NewReader(launch), MaxOutputBytes: AuditOutputMaxBytes, StdoutOnly: true})
+	text := ""
+	if runErr == nil {
+		runErr = ctx.Err()
 	}
-	report := heartbeatReport{Version: stateVersion, StartedAt: startedAt, CompletedAt: s.now(), ProjectionDigest: projectionDigest, State: "completed", Report: clean(internalgithub.RedactEnvironment(result.Output, s.AuditEnv), maxAuditReportBytes), ReconciliationDiagnostic: diagnostic}
+	if runErr == nil && result.Code != 0 {
+		runErr = errors.New("audit launcher exited unsuccessfully")
+	}
+	if runErr == nil {
+		text, runErr = parseAuditOutput(result.Output)
+	}
+	report := heartbeatReport{Version: stateVersion, StartedAt: startedAt, CompletedAt: s.now(), ProjectionDigest: projectionDigest, State: "completed", Report: clean(internalgithub.RedactEnvironment(text, s.AuditEnv), maxAuditReportBytes), ReconciliationDiagnostic: diagnostic}
 	if runErr != nil {
 		report.State = "failed"
 		report.Diagnostic = bounded(internalgithub.RedactEnvironment(runErr.Error(), s.AuditEnv))
@@ -1281,27 +1249,6 @@ func (s *Supervisor) runAudit(ctx context.Context, cancel context.CancelFunc, wo
 			_ = s.writeState(state)
 		}
 	}
-}
-
-func readAuditResult(path string) (string, error) {
-	listed, err := os.Lstat(path)
-	if err != nil || !listed.Mode().IsRegular() || listed.Mode()&os.ModeSymlink != 0 || listed.Size() < 1 || listed.Size() > maxAuditReportBytes {
-		return "", errors.New("orchestrator audit result is unsafe")
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	opened, err := file.Stat()
-	if err != nil || !os.SameFile(listed, opened) {
-		return "", errors.New("orchestrator audit result changed while opening")
-	}
-	body, err := io.ReadAll(io.LimitReader(file, maxAuditReportBytes+1))
-	if err != nil || len(body) < 1 || len(body) > maxAuditReportBytes {
-		return "", errors.New("orchestrator audit result is missing or oversized")
-	}
-	return string(body), nil
 }
 
 func (s *Supervisor) writeHeartbeatReport(report heartbeatReport) error {

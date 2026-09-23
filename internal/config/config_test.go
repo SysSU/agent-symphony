@@ -37,6 +37,63 @@ func TestBindWorkerExecutablePinsExactBinaryIdentity(t *testing.T) {
 	}
 }
 
+func TestLegacyFileAuditorMigratesToJSONL(t *testing.T) {
+	cfg := Default("o/r")
+	want := slices.Clone(cfg.Commands.OrchestratorAudit)
+	want[0] = "/pinned/codex"
+	cfg.Commands.OrchestratorAudit = append(slices.Clone(want[:len(want)-2]), "--output-last-message", "{orchestrator_result}", "-")
+	normalizeLegacyCodexCommand(&cfg)
+	if !slices.Equal(cfg.Commands.OrchestratorAudit, want) || cfg.Validate() != nil {
+		t.Fatalf("legacy file-result command was not migrated: %q", cfg.Commands.OrchestratorAudit)
+	}
+	for _, flag := range []string{"--output-last-message", "--dangerously-bypass-approvals-and-sandbox"} {
+		cfg.Commands.OrchestratorAudit = append(slices.Clone(want), flag)
+		if cfg.Validate() == nil {
+			t.Fatalf("custom auditor command accepted: %q", cfg.Commands.OrchestratorAudit)
+		}
+	}
+}
+
+func TestAuditorLaunchRejectsUnsafeExecutable(t *testing.T) {
+	workspace := t.TempDir()
+	path := filepath.Join(t.TempDir(), "codex")
+	buildNativeCodexFixture(t, path, "audit")
+	if err := os.Chmod(path, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	command, err := ExpandManagedWorkspace(defaultAuditorCommand(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command[0] = path
+	if err := ValidateAuditorLaunch(command, workspace); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAuditorLaunch(command, workspace); err == nil {
+		t.Fatal("writable auditor executable accepted")
+	}
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAuditorLaunch(command, workspace); err == nil {
+		t.Fatal("script auditor executable accepted")
+	}
+	alias := filepath.Join(t.TempDir(), "codex")
+	if err := os.Symlink(path, alias); err != nil {
+		t.Fatal(err)
+	}
+	command[0] = alias
+	if err := ValidateAuditorLaunch(command, workspace); err == nil {
+		t.Fatal("symlink auditor executable accepted")
+	}
+}
+
 func TestWorkerSandboxArgsExposeAttestedCodexInstallation(t *testing.T) {
 	prefix := filepath.Join(t.TempDir(), "node")
 	executable := filepath.Join(prefix, "bin", "codex")

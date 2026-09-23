@@ -822,6 +822,60 @@ func runHostOrchestrator(ctx context.Context, root, home string, local bool) err
 	return hostOrchestratorRun(ctx, command)
 }
 
+func runHostOrchestratorAudit(ctx context.Context, root string, input io.Reader, output io.Writer) error {
+	dir, err := hostGetwd()
+	if err != nil || !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+		return errors.New("invalid audit working directory")
+	}
+	parent, err := os.Lstat(dir)
+	resolved, resolveErr := filepath.EvalSymlinks(dir)
+	resolvedRoot, rootErr := filepath.EvalSymlinks(root)
+	if err != nil || resolveErr != nil || rootErr != nil || !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 || parent.Mode().Perm()&0o022 != 0 || fileUID(parent) != hostEUID() || filepath.Dir(resolved) != resolvedRoot || !strings.HasPrefix(filepath.Base(dir), "orchestrator-audit-") {
+		return errors.New("audit workspace is outside the stable reviewer boundary")
+	}
+	body, err := io.ReadAll(io.LimitReader(input, orchestratoragent.AuditLaunchMaxBytes+1))
+	if err != nil || len(body) > orchestratoragent.AuditLaunchMaxBytes {
+		return errors.New("audit launch contract is oversized or unreadable")
+	}
+	var launch orchestratoragent.AuditLaunch
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&launch) != nil || decoder.Decode(&struct{}{}) != io.EOF || launch.Version != 1 || len(launch.Command) == 0 || len(launch.Command) > 128 || len(launch.Context) == 0 || len(launch.Context) > 64<<10 || launch.Timeout < 1 || launch.Timeout > 300 {
+		return errors.New("invalid audit launch contract")
+	}
+	for _, arg := range launch.Command {
+		if strings.ContainsAny(arg, "\x00\r\n") || credentialShapedArgument(arg) {
+			return errors.New("unsafe audit command argument")
+		}
+	}
+	if err := config.ValidateAuditorLaunch(launch.Command, dir); err != nil {
+		return err
+	}
+	env, err := internalgithub.WorkerEnvironmentWith(os.Environ())
+	if err != nil {
+		return err
+	}
+	auditHome := dir
+	for _, value := range env {
+		if strings.HasPrefix(value, "CODEX_HOME=") && strings.TrimPrefix(value, "CODEX_HOME=") != "" {
+			auditHome = strings.TrimPrefix(value, "CODEX_HOME=")
+			break
+		}
+	}
+	env = append(env, "HOME="+auditHome)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(launch.Timeout)*time.Second)
+	defer cancel()
+	result, err := hostExecRunner(ctx, agentruntime.Command{Name: launch.Command[0], Args: slices.Clone(launch.Command[1:]), Dir: dir, Env: env, Stdin: strings.NewReader(launch.Context), MaxOutputBytes: orchestratoragent.AuditOutputMaxBytes, StdoutOnly: true})
+	if err != nil {
+		return err
+	}
+	if result.Code != 0 || len(result.Output) > orchestratoragent.AuditOutputMaxBytes {
+		return errors.New("audit process failed or exceeded its output bound")
+	}
+	_, err = io.WriteString(output, result.Output)
+	return err
+}
+
 func writeHostOrchestratorProposal(root string, input io.Reader, output io.Writer) error {
 	dir, err := hostGetwd()
 	if err != nil || !belowRoot(dir, root) || !strings.HasPrefix(filepath.Base(dir), "orchestrator-") {
@@ -1002,16 +1056,17 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		root = "/var/db/agent-symphony/attempts"
 	}
 	orchestratorMode := mode == "orchestrator"
+	orchestratorAuditMode := mode == "orchestrator-audit"
 	orchestratorProposalMode := mode == "orchestrator-proposal"
 	orchestratorProposalStatusMode := mode == "orchestrator-proposal-status"
 	if (orchestratorProposalMode || orchestratorProposalStatusMode) && localRoot == "" {
 		localRoot = strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_ORCHESTRATOR_ROOT"))
 	}
-	if mode == "review" || orchestratorMode || orchestratorProposalMode || orchestratorProposalStatusMode {
+	if mode == "review" || orchestratorMode || orchestratorAuditMode || orchestratorProposalMode || orchestratorProposalStatusMode {
 		wantUser, wantGroup = reviewerUser, snapshotGroup
 		root = strings.Replace(root, "attempts", "snapshots", 1)
 	} else if mode != "implementation" {
-		return errors.New("agent-host mode must be implementation, review, orchestrator, orchestrator-proposal, or orchestrator-proposal-status")
+		return errors.New("agent-host mode must be implementation, review, orchestrator, orchestrator-audit, orchestrator-proposal, or orchestrator-proposal-status")
 	}
 	// AGENT_SYMPHONY_LOCAL_ROOT is set by the coordinator's rootless boundary;
 	// there is no separate OS identity to verify in that mode, only the same
@@ -1048,6 +1103,9 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 	}
 	if orchestratorMode {
 		return runHostOrchestrator(ctx, root, homeDir, localRoot != "")
+	}
+	if orchestratorAuditMode {
+		return runHostOrchestratorAudit(ctx, root, input, output)
 	}
 	if orchestratorProposalMode {
 		return writeHostOrchestratorProposal(root, input, output)

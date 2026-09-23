@@ -1367,9 +1367,6 @@ printf started`
 			if err != nil {
 				t.Fatal(err)
 			}
-			for index := range command {
-				command[index] = strings.ReplaceAll(command[index], "{orchestrator_result}", filepath.Join(role.workspace, "result"))
-			}
 			command[0] = fake
 			if role.promptArg {
 				command = append(command, "task")

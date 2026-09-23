@@ -143,6 +143,58 @@ func TestExecRunnerBoundsOutputToTail(t *testing.T) {
 	}
 }
 
+func TestExecRunnerProtocolOutputFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name, script, want string
+		limit              int
+		fail               bool
+	}{
+		{"stdout only", "printf report; printf noise >&2", "report", 6, false},
+		{"overflow", "printf prefix; printf '%*s' 1024 ''; printf success", "", 6, true},
+		{"failure", "printf report; exit 17", "", 64, true},
+		{"unbounded", "printf report", "", 0, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := (ExecRunner{}).Run(t.Context(), Command{Name: "sh", Args: []string{"-c", test.script}, MaxOutputBytes: test.limit, StdoutOnly: true})
+			if (err != nil) != test.fail || result.Output != test.want {
+				t.Fatalf("result=%#v error=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestExecRunnerProtocolDoesNotWaitForDetachedWriter(t *testing.T) {
+	root := t.TempDir()
+	gate, pidPath := filepath.Join(root, "gate"), filepath.Join(root, "child-pid")
+	if err := syscall.Mkfifo(gate, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The child holds stdout open while blocked on a FIFO; the direct shell
+	// exits. Cleanup signals only this fixture's recorded child.
+	defer func() {
+		body, err := os.ReadFile(pidPath)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(body)))
+		if err != nil || pid <= 0 {
+			t.Errorf("invalid fixture PID %q: %v", body, err)
+			return
+		}
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	result, err := (ExecRunner{}).Run(ctx, Command{
+		Name: "sh", Args: []string{"-c", `cat < "$1" & printf '%s\n' "$!" > "$2"; printf report`, "fixture", gate, pidPath},
+		MaxOutputBytes: 64, StdoutOnly: true,
+	})
+	if !errors.Is(err, exec.ErrWaitDelay) || result.Output != "" || ctx.Err() != nil {
+		t.Fatalf("retained stdout was accepted or waited until the process deadline: result=%#v error=%v context=%v", result, err, ctx.Err())
+	}
+}
+
 func TestExecRunnerCapturesConcurrentStdoutAndStderr(t *testing.T) {
 	result, err := (ExecRunner{}).Run(t.Context(), Command{
 		Name:           "sh",
