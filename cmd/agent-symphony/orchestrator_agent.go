@@ -22,6 +22,7 @@ func newOrchestratorAgent(cfg config.Config, stateRoot string) (*orchestratorage
 		Command:               cfg.Commands.Orchestrator,
 		AuditCommand:          cfg.Commands.OrchestratorAudit,
 		Launcher:              orchestratorBoundaryCommand(),
+		AuditLauncher:         orchestratorAuditBoundaryCommand(),
 		ProposalCommand:       orchestratorProposalCommand(),
 		ProposalStatusCommand: orchestratorProposalStatusCommand(),
 		Runner:                agentruntime.ExecRunner{},
@@ -67,4 +68,9 @@ func orchestratorProposalStatusCommand() []string {
 func orchestratorBoundaryCommand() []string {
 	binary, _ := os.Executable()
 	return []string{binary, "agent-host", "orchestrator"}
+}
+
+func orchestratorAuditBoundaryCommand() []string {
+	binary, _ := os.Executable()
+	return []string{binary, "agent-host", "orchestrator-audit"}
 }

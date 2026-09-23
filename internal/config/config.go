@@ -61,7 +61,7 @@ var workerSafetyArgs = []string{
 }
 
 func defaultAuditorCommand() []string {
-	return []string{"codex", "--strict-config", "--ask-for-approval", "never", "-c", `projects={"{orchestrator_workspace}"={trust_level="untrusted"}}`, "-c", `default_permissions="agent-symphony-auditor"`, "-c", auditorPermissions, "-c", workerEnvironment, "-c", `web_search="disabled"`, "--disable", "apps", "--disable", "browser_use", "--disable", "browser_use_external", "--disable", "computer_use", "--disable", "hooks", "--disable", "image_generation", "--disable", "in_app_browser", "--disable", "multi_agent", "--disable", "multi_agent_v2", "--disable", "plugins", "--disable", "skill_mcp_dependency_install", "--disable", "skill_search", "exec", "--ignore-user-config", "--ignore-rules", "--sandbox", auditorProfileName, "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"}
+	return []string{"codex", "--strict-config", "--ask-for-approval", "never", "-c", `projects={"{orchestrator_workspace}"={trust_level="untrusted"}}`, "-c", `default_permissions="agent-symphony-auditor"`, "-c", auditorPermissions, "-c", workerEnvironment, "-c", `web_search="disabled"`, "--disable", "apps", "--disable", "browser_use", "--disable", "browser_use_external", "--disable", "computer_use", "--disable", "hooks", "--disable", "image_generation", "--disable", "in_app_browser", "--disable", "multi_agent", "--disable", "multi_agent_v2", "--disable", "plugins", "--disable", "skill_mcp_dependency_install", "--disable", "skill_search", "exec", "--ignore-user-config", "--ignore-rules", "--sandbox", auditorProfileName, "--skip-git-repo-check", "--ephemeral", "--json", "-"}
 }
 
 func defaultWorkerCommand(interactive bool) []string {
@@ -675,6 +675,7 @@ func load(path, root string) (Config, error) {
 
 func normalizeLegacyCodexCommand(c *Config) {
 	defaults := Default(c.Repository).Commands
+	legacyAuditor := append(slices.Clone(defaults.OrchestratorAudit[1:len(defaults.OrchestratorAudit)-2]), "--output-last-message", "{orchestrator_result}", "-")
 	c.Commands.Implementation = upgradeCodexCommand(c.Commands.Implementation, defaults.Implementation,
 		[]string{"exec", "--dangerously-bypass-approvals-and-sandbox"},
 		[]string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-"},
@@ -684,6 +685,7 @@ func normalizeLegacyCodexCommand(c *Config) {
 		[]string{"--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"},
 		[]string{"-c", legacyWorkspaceTrust, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"})
 	c.Commands.OrchestratorAudit = upgradeCodexCommand(c.Commands.OrchestratorAudit, defaults.OrchestratorAudit,
+		legacyAuditor,
 		[]string{"--ask-for-approval", "never", "exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"},
 		[]string{"exec", "-c", `projects={"{orchestrator_workspace}"={trust_level="trusted"}}`, "-c", `model_reasoning_effort="medium"`, "--sandbox", "danger-full-access", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{orchestrator_result}", "-"})
 }
@@ -902,6 +904,24 @@ func validAuditorCommand(command []string) bool {
 	}
 	want := defaultAuditorCommand()
 	return slices.Equal(command[1:], want[1:])
+}
+
+// ValidateAuditorLaunch restricts the stdin host boundary to the exact managed
+// auditor profile and an immutable native executable prepared by the coordinator.
+func ValidateAuditorLaunch(command []string, workspace string) error {
+	want, err := ExpandManagedWorkspace(defaultAuditorCommand(), workspace)
+	if err != nil || len(command) == 0 || !slices.Equal(command[1:], want[1:]) {
+		return errors.New("audit command must use the exact managed auditor profile")
+	}
+	path := command[0]
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Base(path) != "codex" {
+		return errors.New("audit executable must be an absolute native Codex path")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o222 != 0 || info.Mode().Perm()&0o111 == 0 || !safeExecutableOwner(info) {
+		return errors.New("audit executable is unsafe")
+	}
+	return validateNativeExecutable(path)
 }
 
 func environmentName(name string) bool {

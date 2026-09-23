@@ -195,6 +195,9 @@ func TestConfiguredOrchestratorUsesZeroAdminBoundary(t *testing.T) {
 	if !slices.Equal(agent.Launcher, []string{binary, "agent-host", "orchestrator"}) {
 		t.Fatalf("zero-admin launcher=%#v", agent.Launcher)
 	}
+	if !slices.Equal(agent.AuditLauncher, []string{binary, "agent-host", "orchestrator-audit"}) {
+		t.Fatalf("audit did not select the stdin host boundary: %#v", agent.AuditLauncher)
+	}
 	root := localSnapshotRoot(stateRoot)
 	if !slices.Contains(agent.Env, "AGENT_SYMPHONY_LOCAL_ROOT="+root) || !slices.Contains(agent.Env, "GH_REPO="+cfg.Repository) || !slices.Equal(agent.ProposalCommand, []string{binary, "agent-host", "orchestrator-proposal"}) || !slices.Equal(agent.ProposalStatusCommand, []string{binary, "agent-host", "orchestrator-proposal-status"}) || agent.AuditWorkspace != filepath.Join(root, "orchestrator-audit-"+internalgithub.RepositoryIdentifier(cfg.Repository)) || len(agent.AuditCommand) == 0 {
 		t.Fatalf("zero-admin environment=%#v proposal=%#v status=%#v", agent.Env, agent.ProposalCommand, agent.ProposalStatusCommand)

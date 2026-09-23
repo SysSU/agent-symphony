@@ -68,6 +68,9 @@ type Command struct {
 	Env            []string
 	Stdin          io.Reader
 	MaxOutputBytes int
+	// StdoutOnly captures the complete bounded protocol stream and fails on
+	// overflow. Stderr is retained only as a bounded failure diagnostic.
+	StdoutOnly bool
 }
 
 type Result struct {
@@ -90,11 +93,31 @@ type Runner interface {
 type ExecRunner struct{}
 
 func (ExecRunner) Run(ctx context.Context, command Command) (Result, error) {
+	if command.StdoutOnly && command.MaxOutputBytes <= 0 {
+		return Result{}, errors.New("stdout protocol capture requires a positive bound")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, command.Name, command.Args...)
 	cmd.Dir, cmd.Env, cmd.Stdin = command.Dir, command.Env, command.Stdin
 	var out []byte
 	var err error
-	if command.MaxOutputBytes > 0 {
+	if command.StdoutOnly {
+		bounded := protocolBuffer{limit: command.MaxOutputBytes, cancel: cancel}
+		diagnostic := tailBuffer{limit: 4096}
+		cmd.Stdout, cmd.Stderr = &bounded, &diagnostic
+		// A detached descendant may retain a pipe after the direct child exits.
+		cmd.WaitDelay = time.Second
+		err = cmd.Run()
+		if bounded.overflow {
+			err = errors.Join(err, errors.New("stdout protocol exceeds its byte limit"))
+		}
+		if err == nil {
+			out = bounded.body.Bytes()
+		} else if detail := strings.TrimSpace(string(diagnostic.bytes())); detail != "" {
+			err = fmt.Errorf("%w: %s", err, detail)
+		}
+	} else if command.MaxOutputBytes > 0 {
 		bounded := tailBuffer{limit: command.MaxOutputBytes}
 		cmd.Stdout, cmd.Stderr = &bounded, &bounded
 		err = cmd.Run()
@@ -111,6 +134,22 @@ func (ExecRunner) Run(ctx context.Context, command Command) (Result, error) {
 		result.Code, result.Exited = exit.ExitCode(), true
 	}
 	return result, err
+}
+
+type protocolBuffer struct {
+	body     bytes.Buffer
+	limit    int
+	cancel   context.CancelFunc
+	overflow bool
+}
+
+func (b *protocolBuffer) Write(p []byte) (int, error) {
+	if b.overflow || len(p) > b.limit-b.body.Len() {
+		b.overflow = true
+		b.cancel()
+		return len(p), nil
+	}
+	return b.body.Write(p)
 }
 
 type tailBuffer struct {
