@@ -27,50 +27,23 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
-func ensureFullSystemParkedImplementation(t *testing.T, environment []string, helper string, manifest agentruntime.Manifest) {
+func ensureFullSystemParkedImplementation(t *testing.T, environment []string, helper, stateRoot string, manifest agentruntime.Manifest) (agentruntime.ImplementationLaunchBinding, agentruntime.TerminalBrokerBinding) {
 	t.Helper()
 	if manifest.Version != agentruntime.ManifestVersion2 || manifest.LaunchID == "" || manifest.LaunchToken == "" {
 		t.Fatal("parked implementation fixture requires a complete V2 identity")
 	}
-	args := agentruntime.TmuxNewSessionArgs(manifest.Session, manifest.Worktree, environment)
-	args = slices.Insert(args, 7, "-P", "-F", agentruntime.ImplementationPaneFormat)
-	args = append(args, helper, "implementation-gate", "tmux", manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, manifest.LaunchID, "--", "/bin/false")
-	args = append([]string{"wait-for", "-L", agentruntime.ImplementationGateChannel(manifest.LaunchID), ";"}, args...)
-	target := agentruntime.PaneTarget(manifest.Session)
-	args = append(args,
-		";", "set-option", "-p", "-t", target, "@agent-symphony-launch-token", manifest.LaunchToken,
-		";", "set-option", "-w", "-t", target, "remain-on-exit", "on",
-		";", "set-option", "-w", "-t", target, "history-limit", "5000",
-		";", "set-option", "-p", "-t", target, agentruntime.PaneExitStatusOption, "",
-		";", "set-option", "-p", "-t", target, agentruntime.PaneExitSignalOption, "",
-	)
-	command := exec.Command("tmux", args...)
-	command.Env = environment
-	created, err := command.CombinedOutput()
+	for _, entry := range environment {
+		if name, value, ok := strings.Cut(entry, "="); ok && name == "TMUX_TMPDIR" {
+			t.Setenv(name, value)
+			break
+		}
+	}
+	runtimeState := &agentruntime.Runtime{StateRoot: stateRoot, Helper: helper, Runner: agentruntime.ExecRunner{}}
+	binding, terminal, err := runtimeState.PrepareBoundTerminalBroker(t.Context(), manifest, environment, []string{"/bin/cat"})
 	if err != nil {
-		t.Fatalf("create parked V2 implementation: %v: %s", err, created)
+		t.Fatalf("prepare owner-certified implementation broker: %v", err)
 	}
-	initial, err := agentruntime.ParseImplementationPane(string(created))
-	if err != nil || initial.SessionName != manifest.Session || initial.StartPath != manifest.Worktree || initial.Token != "" {
-		t.Fatalf("created parked pane identity=%#v err=%v", initial, err)
-	}
-	inspect := exec.Command("tmux", "display-message", "-p", "-t", target, agentruntime.ImplementationPaneFormat)
-	inspect.Env = environment
-	observed, err := inspect.CombinedOutput()
-	if err != nil {
-		t.Fatalf("inspect parked V2 implementation: %v: %s", err, observed)
-	}
-	pane, err := agentruntime.ParseImplementationPane(string(observed))
-	if err != nil || pane.ServerPID != initial.ServerPID || pane.ServerStart != initial.ServerStart || pane.SessionID != initial.SessionID || pane.PaneID != initial.PaneID {
-		t.Fatalf("parked pane changed before binding: initial=%#v observed=%#v err=%v", initial, pane, err)
-	}
-	binding, err := agentruntime.BindImplementationPane(manifest, manifest.LaunchID, "capture", pane)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := agentruntime.WriteImplementationBinding(manifest, binding); err != nil {
-		t.Fatal(err)
-	}
+	return binding, terminal
 }
 
 func fullSystemControlSnapshot(t *testing.T, labels map[string]bool, closed bool) []map[string]any {
@@ -520,7 +493,16 @@ fi
 			address := freeAddress(t)
 			environment := append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_GITHUB_URL="+github.URL, "CODEX_HOME="+filepath.Join(root, "codex-home"), "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
 			if parkedImplementation {
-				ensureFullSystemParkedImplementation(t, environment, binary, manifest)
+				implementation, terminal := ensureFullSystemParkedImplementation(t, environment, binary, stateRoot, manifest)
+				record := state.Attempts[key]
+				record.ImplementationBinding, record.TerminalBroker = &implementation, &terminal
+				state.Attempts[key] = record
+				if err := writeRuntimeOwnerState(stateRoot, productionAttemptRoot(stateRoot), state); err != nil {
+					t.Fatal(err)
+				}
+				if err := agentruntime.ReleaseTerminalBroker(t.Context(), terminal); err != nil {
+					t.Fatalf("release owner-certified implementation broker: %v", err)
+				}
 			} else if action != "recover" && !overlap {
 				ensureFullSystemTmuxSession(t, environment, manifest.Session, manifest.Worktree)
 			}

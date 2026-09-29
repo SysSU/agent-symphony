@@ -30,7 +30,7 @@ func prepareTerminalBrokerDir(stateRoot string) (string, error) {
 		return "", err
 	}
 	info, err := os.Lstat(directory)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 || !runtimeOwnedByCurrentUser(info) {
 		return "", errors.New("terminal broker socket directory is unsafe")
 	}
 	return directory, nil

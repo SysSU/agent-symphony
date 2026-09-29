@@ -1173,7 +1173,7 @@ func (r *Runtime) stopEffect(ctx context.Context, request EffectRequest) (Manife
 	if manifest.LaunchID == "" && WorkerConfinementBound(manifest, request.Identity.AttemptGeneration, r.WorkerProfileDigest) {
 		return cancelledEffect(manifest, request.Reason), nil
 	}
-	if err := r.stopGeneration(ctx, manifest, request.Identity.AttemptGeneration); err != nil {
+	if err := r.stopGeneration(ctx, manifest); err != nil {
 		return manifest, err
 	}
 	return cancelledEffect(manifest, request.Reason), nil

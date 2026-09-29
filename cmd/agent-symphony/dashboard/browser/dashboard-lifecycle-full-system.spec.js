@@ -165,14 +165,17 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       return reviewer?.state;
     }, { timeout: 20_000 }).toBe("running");
     expect(reviewer.name).toMatch(/^as-/);
-    const reviewerButton = card.getByRole("button", { name: "Reviewer terminal unavailable; show why" });
+    await page.reload();
+    const reviewerButton = card.getByRole("button", { name: "Open reviewer terminal" });
     await expect(reviewerButton).toBeVisible();
     await reviewerButton.click();
-    await expect(page.getByRole("status").filter({ hasText: "Reviewer terminal is unavailable until session identity can be verified safely." })).toBeVisible();
-    await expect(page.getByRole("dialog")).toHaveCount(0);
-    const terminal = await page.request.get(`${baseURL}/reviewer/terminal?repository=o%2Fr&issue=73&attempt=1`, { headers: { Origin: baseURL } });
-    expect(terminal.status()).toBe(409);
-    expect(await terminal.text()).toContain("session identity can be verified safely");
+    const terminal = page.getByRole("dialog", { name: reviewer.name });
+    await expect(terminal).toBeVisible();
+    await expect(terminal.getByRole("status")).toHaveText("Connected");
+    await page.getByLabel(`Terminal for ${reviewer.name}`).click();
+    await page.keyboard.type("reviewer input");
+    await expect(terminal.getByRole("listitem").filter({ hasText: "reviewer input" })).toBeVisible();
+    await terminal.getByRole("button", { name: "Close" }).click();
 	if (action === "review-plan-cancel") {
 	  await writeFile(reviewerIdentity, JSON.stringify({ name: reviewer.name, target: reviewer.target, run_id: reviewer.run_id }), { mode: 0o600 });
       await expect.poll(async () => {

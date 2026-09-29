@@ -283,7 +283,7 @@ func readReviewerRecord(path string, value any) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 1 || info.Size() > 4096 {
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || info.Size() < 1 || info.Size() > 4096 {
 		return false, errors.New("reviewer lifecycle record is unsafe")
 	}
 	file, err := os.Open(path)
@@ -292,7 +292,7 @@ func readReviewerRecord(path string, value any) (bool, error) {
 	}
 	defer file.Close()
 	opened, err := file.Stat()
-	if err != nil || !os.SameFile(info, opened) {
+	if err != nil || !os.SameFile(info, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 {
 		return false, errors.New("reviewer lifecycle record changed while opening")
 	}
 	body, err := io.ReadAll(io.LimitReader(file, 4097))
@@ -319,7 +319,7 @@ func writeReviewerRecord(path string, value any) error {
 	}
 	temporary := file.Name()
 	defer os.Remove(temporary)
-	if err := file.Chmod(0o640); err != nil {
+	if err := file.Chmod(0o600); err != nil {
 		file.Close()
 		return err
 	}

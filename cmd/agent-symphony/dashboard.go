@@ -995,8 +995,8 @@ type dashboardReviewerTerminalPermit struct {
 	issue, attempt    int
 	issueGeneration   uint64
 	attemptGeneration uint64
-	manifest          agentruntime.Manifest
 	proof             reviewerProcessProof
+	effect            runtimeEffectIntent
 	terminal          agentruntime.TerminalBrokerBinding
 }
 
@@ -1004,29 +1004,44 @@ func (s *dashboardServer) reviewerTerminalPermit(snapshot stateOwnerSnapshot, is
 	key := ownerAttemptKey(s.repository, issue, attempt)
 	record, ok := snapshot.State.Attempts[key]
 	issueGeneration := snapshot.State.IssueGenerations[ownerIssueKey(s.repository, issue)]
-	if !ok || issue < 1 || attempt < 1 || record.Generation == 0 || record.Generation != snapshot.State.AttemptGenerations[key] || issueGeneration == 0 || record.Manifest.Repository != s.repository || record.Manifest.Issue != issue || record.Manifest.Attempt != attempt || record.Manifest.ReviewState != "running" || record.Manifest.ReviewMode == "" || record.Manifest.ReviewTarget == "" || record.Manifest.ReviewRunID == "" {
+	if !ok || issue < 1 || attempt < 1 || record.Generation == 0 || record.Generation != snapshot.State.AttemptGenerations[key] || issueGeneration == 0 || record.Manifest.Repository != s.repository || record.Manifest.Issue != issue || record.Manifest.Attempt != attempt {
 		return dashboardReviewerTerminalPermit{}, errors.New("reviewer terminal owner certificate is unavailable")
 	}
-	proof, ok := snapshot.State.ReviewerProofs[reviewerProofKey(s.repository, issue, attempt, record.Manifest.ReviewMode, record.Manifest.ReviewTarget)]
-	effect, effectOK := snapshot.State.Effects[proof.EffectID]
-	if _, tombstoned := snapshot.State.Tombstones[key]; tombstoned || !ok || proof.DeadProved || proof.LegacyUnverified || proof.NeverRan || proof.RunID != record.Manifest.ReviewRunID || proof.IssueGeneration != issueGeneration || proof.AttemptGeneration != record.Generation || !validReviewerTerminalCertificate(s.stateRoot, proof) || proof.Pane.SessionName != record.Manifest.ReviewSession || !effectOK || effect.State != "pending" || effect.IssueGeneration != issueGeneration || effect.AttemptGeneration != record.Generation || !effect.ReviewerLaunched || effect.ReviewerGroupPID != proof.GroupPID || effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.RunID != proof.RunID || effect.Reconciliation.Reviewer.Target != proof.Target || effect.Reconciliation.Reviewer.Mode != proof.Mode {
+	if _, tombstoned := snapshot.State.Tombstones[key]; tombstoned {
 		return dashboardReviewerTerminalPermit{}, errors.New("reviewer terminal owner certificate is stale")
 	}
-	return dashboardReviewerTerminalPermit{repository: s.repository, issue: issue, attempt: attempt, issueGeneration: issueGeneration, attemptGeneration: record.Generation, manifest: cloneManifest(record.Manifest), proof: proof, terminal: *proof.TerminalBroker}, nil
+	activeProfile := activeWorkerProfileDigest(snapshot.State)
+	var permit *dashboardReviewerTerminalPermit
+	for _, proof := range snapshot.State.ReviewerProofs {
+		if proof.Repository != s.repository || proof.Issue != issue || proof.Attempt != attempt || proof.DeadProved || proof.LegacyUnverified || proof.NeverRan || proof.IssueGeneration != issueGeneration || proof.AttemptGeneration != record.Generation || proof.ProfileDigest != activeProfile || proof.ConfinementVersion != reviewerConfinementVersion || !validReviewerTerminalCertificate(s.stateRoot, proof) {
+			continue
+		}
+		effect, effectOK := snapshot.State.Effects[proof.EffectID]
+		if !effectOK || effect.ID != proof.EffectID || effect.Action != string(reconciliationReviewer) || effect.Repository != s.repository || effect.Issue != issue || effect.Attempt != attempt || effect.State != "pending" || effect.IssueGeneration != issueGeneration || effect.AttemptGeneration != record.Generation || !effect.ReviewerLaunched || effect.ReviewerGroupPID != proof.GroupPID || effect.ReviewerProfileDigest != proof.ProfileDigest || effect.ReviewerConfinementVersion != proof.ConfinementVersion || effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.RunID != proof.RunID || effect.Reconciliation.Reviewer.Target != proof.Target || effect.Reconciliation.Reviewer.Mode != proof.Mode || effect.Reconciliation.Reviewer.Session != proof.Pane.SessionName {
+			continue
+		}
+		if permit != nil {
+			return dashboardReviewerTerminalPermit{}, errors.New("reviewer terminal owner certificate is ambiguous")
+		}
+		permit = &dashboardReviewerTerminalPermit{repository: s.repository, issue: issue, attempt: attempt, issueGeneration: issueGeneration, attemptGeneration: record.Generation, proof: proof, effect: effect, terminal: *proof.TerminalBroker}
+	}
+	if permit == nil {
+		return dashboardReviewerTerminalPermit{}, errors.New("reviewer terminal owner certificate is stale")
+	}
+	return *permit, nil
 }
 
 func (p dashboardReviewerTerminalPermit) current(snapshot stateOwnerSnapshot) bool {
 	key := ownerAttemptKey(p.repository, p.issue, p.attempt)
 	record, ok := snapshot.State.Attempts[key]
 	if !ok || snapshot.State.IssueGenerations[ownerIssueKey(p.repository, p.issue)] != p.issueGeneration || snapshot.State.AttemptGenerations[key] != p.attemptGeneration || record.Generation != p.attemptGeneration ||
-		record.Manifest.Repository != p.repository || record.Manifest.Issue != p.issue || record.Manifest.Attempt != p.attempt || record.Manifest.ReviewState != "running" ||
-		record.Manifest.ReviewMode != p.proof.Mode || record.Manifest.ReviewTarget != p.proof.Target || record.Manifest.ReviewRunID != p.proof.RunID || record.Manifest.ReviewSession != p.proof.Pane.SessionName {
+		record.Manifest.Repository != p.repository || record.Manifest.Issue != p.issue || record.Manifest.Attempt != p.attempt {
 		return false
 	}
 	proof, ok := snapshot.State.ReviewerProofs[reviewerProofKey(p.repository, p.issue, p.attempt, p.proof.Mode, p.proof.Target)]
 	effect, effectOK := snapshot.State.Effects[p.proof.EffectID]
 	_, tombstoned := snapshot.State.Tombstones[key]
-	return !tombstoned && ok && reflect.DeepEqual(proof, p.proof) && !proof.DeadProved && effectOK && effect.State == "pending" && effect.ReviewerLaunched && effect.ReviewerGroupPID == proof.GroupPID
+	return !tombstoned && ok && reflect.DeepEqual(proof, p.proof) && !proof.DeadProved && effectOK && reflect.DeepEqual(effect, p.effect)
 }
 
 func (s *dashboardServer) serveBrokerTerminal(w http.ResponseWriter, r *http.Request, client *agentruntime.TerminalBrokerClient, commits <-chan stateOwnerSnapshot, current func(stateOwnerSnapshot) bool) {

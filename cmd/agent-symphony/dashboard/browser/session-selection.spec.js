@@ -65,7 +65,7 @@ async function mockDashboard(page, closeReason = "", reviewPlanResponse = { stat
   return { sockets, reviewPlanRequests };
 }
 
-test("shows both review modes but rejects reviewer terminal while implementation stays usable", async ({ page }) => {
+test("opens current reviewer and implementation terminals", async ({ page }) => {
   const errors = [];
   page.on("console", (message) => {
     if (message.type() === "error") errors.push(message.text());
@@ -81,11 +81,16 @@ test("shows both review modes but rejects reviewer terminal while implementation
   await expect(page.getByText(implementationReview.sessions[1].target, { exact: true })).toBeVisible();
   await expect(page.getByText("ui-review", { exact: true })).toHaveCount(0);
   await page.screenshot({ path: "test-results/session-selection-card.png", fullPage: true });
-  for (const [index] of [attempt, implementationReview].entries()) {
-    await page.getByRole("button", { name: "Reviewer terminal unavailable; show why" }).nth(index).click();
-    await expect(page.getByRole("status").filter({ hasText: "Reviewer terminal is unavailable until session identity can be verified safely." })).toBeVisible();
-    await expect(page.getByRole("dialog")).toHaveCount(0);
-    expect(sockets).toHaveLength(0);
+  for (const [index, status] of [attempt, implementationReview].entries()) {
+    const reviewer = status.sessions[1];
+    await page.getByRole("button", { name: "Open reviewer terminal" }).nth(index).click();
+    const dialog = page.getByRole("dialog", { name: reviewer.name });
+    await expect(dialog).toBeVisible();
+    await expect.poll(() => sockets[index]?.url).toBeTruthy();
+    const target = new URL(sockets[index].url);
+    expect(target.pathname).toBe("/reviewer/terminal");
+    expect(Object.fromEntries(target.searchParams)).toEqual({ repository: status.repository, issue: String(status.issue), attempt: String(status.attempt) });
+    await dialog.getByRole("button", { name: "Close" }).click();
   }
   await page.getByRole("button", { name: "Start plan review" }).click();
   await expect.poll(() => reviewPlanRequests).toHaveLength(1);
@@ -97,12 +102,12 @@ test("shows both review modes but rejects reviewer terminal while implementation
   const terminalPane = page.getByLabel(`Terminal for ${attempt.sessions[0].name}`);
   await expect.poll(() => terminalPane.evaluate((element) => element.contains(document.activeElement))).toBe(true);
   await page.keyboard.type("implementation input");
-  await expect.poll(() => sockets[0]?.url).toBeTruthy();
-  const target = new URL(sockets[0].url);
+  await expect.poll(() => sockets[2]?.url).toBeTruthy();
+  const target = new URL(sockets[2].url);
   await expect(page.getByRole("dialog", { name: attempt.sessions[0].name }).getByRole("listitem").filter({ hasText: "agent: acknowledged" })).toBeVisible();
   expect(target.pathname).toBe("/terminal");
   expect(Object.fromEntries(target.searchParams)).toEqual({ repository: attempt.repository, issue: "163", attempt: "1" });
-  await expect.poll(() => Buffer.concat(sockets[0].messages.filter((message) => typeof message !== "string").map((message) => Buffer.from(message))).toString()).toContain("implementation input");
+  await expect.poll(() => Buffer.concat(sockets[2].messages.filter((message) => typeof message !== "string").map((message) => Buffer.from(message))).toString()).toContain("implementation input");
   expect(errors).toEqual([]);
 });
 
@@ -126,7 +131,7 @@ test("reports cleanup-pending plan review as not started", async ({ page }) => {
   await expect(page.getByRole("status").filter({ hasText: "Started plan review" })).toHaveCount(0);
 });
 
-test("keeps reviewer terminal warning usable on a mobile viewport", async ({ page }) => {
+test("keeps reviewer terminal usable on a mobile viewport", async ({ page }) => {
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
@@ -134,9 +139,9 @@ test("keeps reviewer terminal warning usable on a mobile viewport", async ({ pag
   await mockDashboard(page);
   await page.goto("/");
 
-  await expect(page.getByRole("button", { name: "Reviewer terminal unavailable; show why" }).first()).toBeVisible();
-  await page.getByRole("button", { name: "Reviewer terminal unavailable; show why" }).first().click();
-  const box = await page.getByRole("status").filter({ hasText: "Reviewer terminal is unavailable" }).boundingBox();
+  await expect(page.getByRole("button", { name: "Open reviewer terminal" }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Open reviewer terminal" }).first().click();
+  const box = await page.getByRole("dialog", { name: attempt.sessions[1].name }).boundingBox();
   expect(box).not.toBeNull();
   expect(box.x).toBeGreaterThanOrEqual(0);
   expect(box.x + box.width).toBeLessThanOrEqual(390);

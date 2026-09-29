@@ -82,6 +82,27 @@ func TestBoundHandoffCompensationRejectsUncertifiedCandidate(t *testing.T) {
 	}
 }
 
+func TestBoundHandoffRenamedCertifiedBrokerIsNotMistakenForAbsence(t *testing.T) {
+	tmux, root, request, _, _ := boundBrokerHandoffFixture(t)
+	input, _ := json.Marshal(request)
+	output, err := prepareHandoffV2(t.Context(), input, root)
+	var prepared handoffPreparedTerminal
+	if err != nil || json.Unmarshal([]byte(output), &prepared) != nil {
+		t.Fatalf("prepare bound handoff = %q, %v", output, err)
+	}
+	if output, err := exec.Command(tmux, "rename-session", "-t", prepared.Implementation.SessionID, "renamed-certified-candidate").CombinedOutput(); err != nil {
+		t.Fatalf("rename candidate session: %v: %s", err, output)
+	}
+	invalidation := handoffCandidateInvalidation{EffectID: request.CandidateLaunchID, Token: request.CandidateLaunchToken, Key: "test", Manifest: request.Manifest, Implementation: &prepared.Implementation, Terminal: &prepared.Terminal}
+	cleanup, _ := json.Marshal(handoffCompensationRequest{Candidate: invalidation})
+	if proof, err := compensateHandoffV2(t.Context(), cleanup, root); err == nil || proof != "" {
+		t.Fatalf("renamed candidate was mistaken for absence: proof=%q err=%v", proof, err)
+	}
+	if output, err := exec.Command(tmux, "has-session", "-t", "=renamed-certified-candidate").CombinedOutput(); err != nil {
+		t.Fatalf("renamed candidate session was touched ambiguously: %v: %s", err, output)
+	}
+}
+
 func boundBrokerHandoffFixture(t *testing.T) (string, string, handoffRequest, agentruntime.ImplementationLaunchBinding, agentruntime.TerminalBrokerBinding) {
 	t.Helper()
 	tmux, err := exec.LookPath("tmux")

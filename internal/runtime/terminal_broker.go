@@ -142,18 +142,19 @@ type terminalBroker struct {
 	master  *os.File
 	gate    *os.File
 
-	mu       sync.Mutex
-	replay   []byte
-	overflow bool
-	clients  map[*terminalBrokerClientState]struct{}
-	inputMu  sync.Mutex
-	release  sync.Once
-	stop     sync.Once
-	finish   sync.Once
-	innerEnd chan struct{}
-	stopped  chan struct{}
-	stopCall chan struct{}
-	stopAck  chan struct{}
+	mu         sync.Mutex
+	replay     []byte
+	overflow   bool
+	clients    map[*terminalBrokerClientState]struct{}
+	inputMu    sync.Mutex
+	release    sync.Once
+	releaseErr error
+	stop       sync.Once
+	finish     sync.Once
+	innerEnd   chan struct{}
+	stopped    chan struct{}
+	stopCall   chan struct{}
+	stopAck    chan struct{}
 }
 
 // RunTerminalBroker owns the only handle used to stop and reap the exact
@@ -163,11 +164,11 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 		return 125, 0, errors.New("terminal broker invocation is invalid")
 	}
 	info, err := os.Lstat(filepath.Dir(recordPath))
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !runtimeOwnedByCurrentUser(info) {
 		return 125, 0, errors.New("terminal broker directory is unsafe")
 	}
 	info, err = os.Lstat(socketDir)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 || !runtimeOwnedByCurrentUser(info) {
 		return 125, 0, errors.New("terminal broker socket directory is unsafe")
 	}
 	secretBytes := make([]byte, 32)
@@ -225,10 +226,26 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 		return 125, 0, err
 	}
 	if started != nil {
-		if err := started(binding); err != nil {
-			_ = syscall.Kill(-innerPGID, syscall.SIGKILL)
-			_ = inner.Wait()
-			return 125, 0, err
+		if startedErr := started(binding); startedErr != nil {
+			cleanupErr := syscall.Kill(-innerPGID, syscall.SIGKILL)
+			if errors.Is(cleanupErr, syscall.ESRCH) {
+				cleanupErr = nil
+			}
+			if waitErr := inner.Wait(); waitErr != nil {
+				var exit *exec.ExitError
+				if !errors.As(waitErr, &exit) {
+					cleanupErr = errors.Join(cleanupErr, waitErr)
+				}
+			}
+			terminated, groupErr := implementationGroupTerminated(innerPGID)
+			if groupErr != nil || !terminated {
+				cleanupErr = errors.Join(cleanupErr, groupErr, errors.New("terminal broker inner group death is unproved"))
+			}
+			if cleanupErr == nil {
+				deadBody, _ := json.Marshal(binding)
+				cleanupErr = writeImmutableImplementationGroup(terminalBrokerDeadPath(recordPath), deadBody)
+			}
+			return 125, 0, errors.Join(startedErr, cleanupErr)
 		}
 	}
 	broker := &terminalBroker{binding: binding, record: recordPath, master: master, gate: gateWriter, clients: map[*terminalBrokerClientState]struct{}{}, innerEnd: make(chan struct{}), stopped: make(chan struct{}), stopCall: make(chan struct{}, 1), stopAck: make(chan struct{}, 1)}
@@ -499,12 +516,11 @@ func (b *terminalBroker) handle(conn *net.UnixConn) {
 }
 
 func (b *terminalBroker) releaseInner() error {
-	var releaseErr error
 	b.release.Do(func() {
-		_, releaseErr = io.WriteString(b.gate, "go\n")
+		_, b.releaseErr = io.WriteString(b.gate, "go\n")
 		_ = b.gate.Close()
 	})
-	return releaseErr
+	return b.releaseErr
 }
 
 func (b *terminalBroker) killInner() {

@@ -691,6 +691,7 @@ func (r *Runtime) startSession(ctx context.Context, manifest Manifest, env []str
 		";", "set-option", "-p", "-t", target, PaneExitSignalOption, "")
 	created, err := r.run(ctx, r.tmux(), args, "", env, nil)
 	if err != nil {
+		_, _ = r.run(context.WithoutCancel(ctx), r.tmux(), []string{"kill-session", "-t", "=" + bootstrap}, "", []string{}, nil)
 		return err
 	}
 	defer func() {
@@ -792,7 +793,7 @@ func (r *Runtime) StopCertifiedImplementation(ctx context.Context, manifest Mani
 	if bindingErr != nil || terminalErr != nil || storedBinding != binding || storedTerminal != terminal || !ValidImplementationBinding(manifest, binding, manifest.LaunchID) || !ValidImplementationTerminalBinding(manifest, terminal) || terminal.OuterPID != binding.PanePID {
 		return errors.Join(bindingErr, terminalErr, errors.New("owner-certified implementation identity is unavailable"))
 	}
-	return r.stopGeneration(ctx, manifest, manifest.WorkerGeneration)
+	return r.stopGeneration(ctx, manifest)
 }
 
 // TmuxNewSessionArgs imports only the supplied environment names from the
@@ -1624,10 +1625,10 @@ func (r *Runtime) session(ctx context.Context, session string) (bool, error) {
 }
 
 func (r *Runtime) stop(ctx context.Context, manifest Manifest) error {
-	return r.stopGeneration(ctx, manifest, 0)
+	return r.stopGeneration(ctx, manifest)
 }
 
-func (r *Runtime) stopGeneration(ctx context.Context, manifest Manifest, generation uint64) error {
+func (r *Runtime) stopGeneration(ctx context.Context, manifest Manifest) error {
 	if manifest.Version != boundManifestVersion {
 		return errors.New("legacy implementation session has no durable launch identity")
 	}

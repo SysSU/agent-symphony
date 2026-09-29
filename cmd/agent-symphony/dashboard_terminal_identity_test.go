@@ -207,26 +207,6 @@ func TestDashboardReviewerTerminalUsesOwnerBoundBroker(t *testing.T) {
 	if err := agentruntime.ReleaseTerminalBroker(t.Context(), *proof.TerminalBroker); err != nil {
 		t.Fatal(err)
 	}
-	reviewerState := snapshot.State
-	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
-	record := reviewerState.Attempts[key]
-	record.Manifest.ReviewState = "running"
-	record.Manifest.ReviewMode = reviewer.Reconciliation.Reviewer.Mode
-	record.Manifest.ReviewTarget = reviewer.Reconciliation.Reviewer.Target
-	record.Manifest.ReviewRunID = reviewer.Reconciliation.Reviewer.RunID
-	record.Manifest.ReviewSession = reviewer.Reconciliation.Reviewer.Session
-	record.Manifest.ReviewBase = reviewer.Reconciliation.Reviewer.BaseSHA
-	record.Manifest.ReviewHead = reviewer.Reconciliation.Reviewer.HeadSHA
-	record.Manifest.ReviewSnapshot = reviewer.Reconciliation.Reviewer.Snapshot
-	reviewerState.Attempts[key] = record
-	if err := owner.close(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	owner, err := startTestStateOwner(t, owner.stateRoot, reviewerState, func(runtimeOwnerState) error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	dashboard := newProjectDashboardServer(t.Context(), owner.stateRoot, manifest.Repository, nil, "tmux", nil, nil, false, "")
 	dashboard.operator = &operatorMutationService{owner: owner}
 	if _, err := dashboard.reviewerTerminalPermit(mustOwnerSnapshot(t, owner), manifest.Issue, manifest.Attempt); err != nil {

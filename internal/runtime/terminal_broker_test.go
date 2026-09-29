@@ -56,6 +56,52 @@ func startTerminalBrokerFixture(t *testing.T, command ...string) (TerminalBroker
 	}
 }
 
+func TestTerminalBrokerStartedFailureRecordsExactDeath(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "as-terminal-broker-start-failure-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	record, sockets := filepath.Join(root, "broker.json"), filepath.Join(root, "sockets")
+	if err := os.Mkdir(sockets, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outerReader, outerWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerReader.Close()
+	defer outerWriter.Close()
+	var binding TerminalBrokerBinding
+	code, _, err := RunTerminalBroker(t.Context(), record, sockets, []string{"/bin/cat"}, outerReader, io.Discard, io.Discard, func(started TerminalBrokerBinding) error {
+		binding = started
+		return errors.New("owner persistence failed")
+	})
+	if code != 125 || err == nil || !strings.Contains(err.Error(), "owner persistence failed") {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if stored, readErr := ReadTerminalBrokerBinding(record); readErr != nil || stored != binding {
+		t.Fatalf("stored=%#v binding=%#v err=%v", stored, binding, readErr)
+	}
+	if dead, deadErr := TerminalBrokerDead(record, binding); deadErr != nil || !dead {
+		t.Fatalf("dead=%t err=%v", dead, deadErr)
+	}
+}
+
+func TestTerminalBrokerReleaseFailureIsStable(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.Close()
+	writer.Close()
+	broker := &terminalBroker{gate: writer}
+	first, second := broker.releaseInner(), broker.releaseInner()
+	if first == nil || second == nil || first.Error() != second.Error() {
+		t.Fatalf("release errors changed: first=%v second=%v", first, second)
+	}
+}
+
 func TestTerminalBrokerReplayInputReconnectAndExactStop(t *testing.T) {
 	binding, record, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `printf 'READY\n'; while IFS= read -r line; do printf 'ECHO:%s\n' "$line"; done`)
 	if stored, err := ReadTerminalBrokerBinding(record); err != nil || stored != binding {
@@ -290,7 +336,7 @@ func TestTerminalBrokerKeepsPreOverflowAdmissionComplete(t *testing.T) {
 }
 
 func TestTerminalBrokerSlowReaderDoesNotBlockOtherClients(t *testing.T) {
-	binding, _, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `head -c $((3 * 1024 * 1024)) /dev/zero; printf 'FAST-CLIENT-DONE\n'`)
+	binding, _, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `head -c $((12 * 1024 * 1024)) /dev/zero; printf 'FAST-CLIENT-DONE\n'`)
 	slow, err := DialTerminalBroker(t.Context(), binding)
 	if err != nil {
 		t.Fatal(err)
@@ -321,6 +367,18 @@ func TestTerminalBrokerSlowReaderDoesNotBlockOtherClients(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("slow reader blocked broker output to the fast client")
+		}
+	}
+	if err := slow.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := slow.ReadOutput(); err != nil {
+			var networkError net.Error
+			if errors.As(err, &networkError) && networkError.Timeout() {
+				t.Fatal("slow reader was not evicted after exceeding its queue")
+			}
+			break
 		}
 	}
 	select {

@@ -1380,6 +1380,28 @@ func TestUnboundReviewerSessionLossCannotForgeNeverRanProof(t *testing.T) {
 	}
 }
 
+func TestReviewerLifecycleRecordIsOwnerOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "launch.json")
+	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64)}
+	if err := writeReviewerRecord(path, identity); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode=%v", info.Mode().Perm())
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	var stored reviewerLaunchIdentity
+	if ok, err := readReviewerRecord(path, &stored); err == nil || ok {
+		t.Fatalf("group-readable reviewer identity was accepted: ok=%t err=%v", ok, err)
+	}
+}
+
 func TestUnboundReviewerCannotKillBeforeOwnerPIDBinding(t *testing.T) {
 	root := t.TempDir()
 	reviewerID := strings.Repeat("a", 32)

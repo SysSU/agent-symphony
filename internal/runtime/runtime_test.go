@@ -143,6 +143,18 @@ func TestExecRunnerBoundsOutputToTail(t *testing.T) {
 	}
 }
 
+func TestExecRunnerInheritsEnvironmentOnlyWhenUnspecified(t *testing.T) {
+	t.Setenv("AGENT_SYMPHONY_EXEC_RUNNER_TEST", "inherited")
+	result, err := (ExecRunner{}).Run(t.Context(), Command{Name: "sh", Args: []string{"-c", `printf %s "$AGENT_SYMPHONY_EXEC_RUNNER_TEST"`}})
+	if err != nil || result.Output != "inherited" {
+		t.Fatalf("inherited output=%q err=%v", result.Output, err)
+	}
+	result, err = (ExecRunner{}).Run(t.Context(), Command{Name: "sh", Args: []string{"-c", `printf %s "${AGENT_SYMPHONY_EXEC_RUNNER_TEST-unset}"`}, Env: []string{"PATH=" + os.Getenv("PATH")}})
+	if err != nil || result.Output != "unset" {
+		t.Fatalf("explicit output=%q err=%v", result.Output, err)
+	}
+}
+
 func TestExecRunnerProtocolOutputFailsClosed(t *testing.T) {
 	for _, test := range []struct {
 		name, script, want string
@@ -1028,6 +1040,13 @@ func TestValidationTraversalExistingAndLaunchFailureDiagnostics(t *testing.T) {
 	manifest, err := prepareAndStartFixture(t, r, context.Background(), attempt)
 	if err == nil || manifest.State != "preparing" || !strings.Contains(err.Error(), "canary failure detail") {
 		t.Fatalf("launch failure = %#v, %v", manifest, err)
+	}
+	launch := fake.seen[slices.IndexFunc(fake.seen, func(command Command) bool { return slices.Contains(command.Args, "new-session") })]
+	bootstrap := valueAfter(launch.Args, "-s")
+	if !slices.ContainsFunc(fake.seen, func(command Command) bool {
+		return strings.HasPrefix(bootstrap, "as-bootstrap-") && slices.Equal(command.Args, []string{"kill-session", "-t", "=" + bootstrap})
+	}) {
+		t.Fatalf("failed compound launch did not clean bootstrap %q: %#v", bootstrap, fake.seen)
 	}
 	stored, readErr := readManifest(r.manifestPath(attempt))
 	if readErr != nil || stored.State != "preparing" {
