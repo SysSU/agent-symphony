@@ -514,7 +514,8 @@ func TestReplacementLifecycleCommitsPrepareBindAndStartOnOneReservation(t *testi
 	}
 	running.State = "running"
 	running.LaunchID = startEffect.StartGateNonce
-	finished, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*startEffect)), Action: agentruntime.EffectStart, Manifest: running})
+	implementation, terminal := testImplementationTerminalBindings(running)
+	finished, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*startEffect)), Action: agentruntime.EffectStart, Manifest: running, ImplementationBinding: implementation, TerminalBroker: terminal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1338,7 +1339,7 @@ func TestUnmarkedPublicationAndReviewerReconstructExactWorkerExport(t *testing.T
 		reviewer := workerBoundaryRunner{Command: "/bin/sh", Args: []string{"-c", `payload=$(cat)
 case "$payload" in
   *'"operation":"review-result"'*) printf %s '{"Output":"{\"type\":\"agent-symphony-review-v1\",\"status\":\"clean\",\"findings\":[]}"}' ;;
-  *'display-message'*) printf %s '{"Output":"||||||||||\n"}' ;;
+  *'display-message'*) printf %s '{"Output":"|||||||||||\n"}' ;;
   *) exit 1 ;;
 esac`}}
 		production := &productionReconciliation{owner: owner, effects: coordinator, implementation: implementation, reviewer: reviewer, config: cfg, reviewEnv: []string{"REVIEW=1"}, stateRoot: owner.stateRoot}
@@ -1587,7 +1588,7 @@ func TestUnprovableReviewerDoesNotBlockUnrelatedReconciliation(t *testing.T) {
 	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: ownerReconciliationEffectIdentity(*reviewer)}); err != nil {
 		t.Fatal(err)
 	}
-	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
+	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||||||"}}
 	applyReconciliationInput(t, owner, repositoryInput(false, issueFact(476, "unrelated")))
 	checkout := gitRepository(t)
 	runGit(t, checkout, "config", "user.email", "test@example.invalid")
@@ -1654,7 +1655,7 @@ func TestImplementationReviewerFailureDoesNotBlockOtherEffect(t *testing.T) {
 				applyReconciliationInput(t, owner, input)
 			}
 			service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: request.Manifest.Worktree})
-			service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
+			service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||||||"}}
 			production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, implementation: workerBoundaryRunner{}, stateRoot: owner.stateRoot}
 			// Join an A-only pass before admitting B. This proves the failed
 			// reviewer is nonfatal without depending on hash-derived effect order.
@@ -1774,13 +1775,14 @@ func TestChangedExportHeadRejectsOlderReviewerMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	const stoppedGroup = 99999999
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: stoppedGroup}); err != nil {
+	if _, err := owner.markPlanReviewRunning(t.Context(), testMarkReviewerRunning(owner.stateRoot, mustOwnerSnapshot(t, owner).State, identity, stoppedGroup)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := owner.proveReviewerDead(t.Context(), proveReviewerDeadCommand{Identity: identity, GroupPID: stoppedGroup}); err != nil {
 		t.Fatal(err)
 	}
 	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(*old.Reconciliation)
+	sealTestReviewerResult(t, owner, *old, result)
 	if err := writeReconciliationEffectMarker(owner.stateRoot, ownerReconciliationEffectIdentity(*old), *old.Reconciliation, result); err != nil {
 		t.Fatal(err)
 	}
@@ -1788,11 +1790,12 @@ func TestChangedExportHeadRejectsOlderReviewerMarker(t *testing.T) {
 		t.Fatal("H1 marker lacked an otherwise finishable owner death certificate")
 	}
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
-	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||"}}
+	service.reviewer = &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||||||"}}
 	production := &productionReconciliation{owner: owner, effects: service.effects, operator: service, implementation: implementation, stateRoot: owner.stateRoot}
 	resumed, err := production.resumePendingReconciliation(t.Context(), internalgithub.API{}, reconciliationV2Batch{})
 	if err != nil || !resumed {
-		t.Fatalf("new exported head did not invalidate marked old review: resumed=%v err=%v", resumed, err)
+		current := mustOwnerSnapshot(t, owner).State
+		t.Fatalf("new exported head did not invalidate marked old review: resumed=%v err=%v effect=%#v proof=%#v", resumed, err, current.Effects[old.ID], current.ReviewerProofs[reviewerProofKey(old.Repository, old.Issue, old.Attempt, old.Reconciliation.Reviewer.Mode, old.Reconciliation.Reviewer.Target)])
 	}
 	final := mustOwnerSnapshot(t, owner).State
 	if effect := final.Effects[old.ID]; effect.State != "completed" || effect.ReconciliationResult != nil && effect.ReconciliationResult.Reviewer != nil && effect.ReconciliationResult.Reviewer.Status == "clean" || !final.Attempts[ownerAttemptKey("o/r", issue.Issue, issue.Attempt)].Manifest.ReviewInvalidated {
@@ -1892,9 +1895,6 @@ esac`}, Env: []string{"REPLAY_START=" + encode(parts[7]), "REPLAY_PID=" + encode
 	if final.Effects[reviewer.ID].State != "pending" || final.Effects[ready.ID].State != "completed" {
 		t.Fatalf("reviewer or other effect changed incorrectly: reviewer=%#v other=%#v", final.Effects[reviewer.ID], final.Effects[ready.ID])
 	}
-	if err := live.onKill(); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestStartupMarkerSweepLeavesOperatorEffectsToReceiptRecovery(t *testing.T) {
@@ -1983,7 +1983,8 @@ func TestProductionRuntimeFinishesOperatorMarkerBeforeAdmission(t *testing.T) {
 	manifest := ownerTestManifest(t, root, 48, 1, "running")
 	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
 	manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, profile
-	pane := boundRuntimeEffectTestPane(t, manifest)
+	manifest, pane, implementation, terminal := boundLiveRuntimeEffectTestManifest(t, root, manifest)
+	manifest.WorkerProfileDigest = profile
 	body, err := json.Marshal(manifest)
 	if err != nil {
 		t.Fatal(err)
@@ -1992,6 +1993,10 @@ func TestProductionRuntimeFinishesOperatorMarkerBeforeAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := runtimeEffectInitialState(manifest)
+	key := ownerAttemptKey("o/r", manifest.Issue, manifest.Attempt)
+	record := state.Attempts[key]
+	record.ImplementationBinding, record.TerminalBroker = &implementation, &terminal
+	state.Attempts[key] = record
 	state.WorkerProfileDigest = profile
 	addOperatorObservation(&state, manifest, "active", false)
 	state.Epoch, state.Revision = 1, 1
@@ -2002,7 +2007,7 @@ func TestProductionRuntimeFinishesOperatorMarkerBeforeAdmission(t *testing.T) {
 	t.Cleanup(func() { _ = owner.close(context.Background()) })
 	refreshOperatorObservation(t, owner)
 	service := operatorServiceWithCleanup(t, owner, t.Context(), &operatorCleanupBoundary{path: manifest.Worktree})
-	service.effects.executor.Runtime.Runner = &barrierEffectRunner{pane: pane}
+	service.effects.executor.Runtime.Runner = &barrierEffectRunner{pane: pane, brokerManifest: &manifest}
 	request := operatorRequest("startup-marker", "cancel", manifest, false)
 	command, work, err := service.prepareAdmission(t.Context(), mustOwnerSnapshot(t, owner), request)
 	if err != nil {

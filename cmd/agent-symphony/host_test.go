@@ -438,6 +438,29 @@ func TestImplementationBoundaryAcceptsOnlyBoundTmuxLaunchAndMutation(t *testing.
 	if !validTmuxBoundaryArgs(gated, env, root, root) {
 		t.Fatal("parked implementation launch was rejected by worker boundary")
 	}
+	brokerLaunch := slices.Clone(args)
+	brokerCommand := []string{helper, "terminal-broker-bound", "tmux", logPath, worktree, session, token, token, "interactive", "--", "/bin/sh"}
+	brokerLaunch = slices.Replace(brokerLaunch, 14, 15, append([]string{helper, "implementation-gate", "tmux", logPath, worktree, session, token, token, "--"}, brokerCommand...)...)
+	bootstrap := []string{"new-session", "-d", "-s", "as-bootstrap-" + token, "--", "/bin/sh", "-c", "sleep 30", ";", "wait-for", "-L", agentruntime.TerminalBrokerReadyChannel(token), ";", "wait-for", "-L", agentruntime.ImplementationGateChannel(token), ";"}
+	brokerLaunch = append(bootstrap, brokerLaunch...)
+	if !validTmuxBoundaryArgs(brokerLaunch, env, root, root) || tmuxNewSessionOffset(brokerLaunch) < 1 {
+		t.Fatal("broker-backed implementation launch was rejected by worker boundary")
+	}
+	for _, action := range []string{"-L", "-U"} {
+		if !validTmuxBoundaryArgs([]string{"wait-for", action, agentruntime.TerminalBrokerReadyChannel(token)}, nil, root, root) {
+			t.Fatalf("broker readiness %s was rejected by worker boundary", action)
+		}
+	}
+	offset := tmuxNewSessionOffset(brokerLaunch)
+	transported, ok := withTmuxSessionEnvironment(brokerLaunch, "HOME=/worker")
+	if !ok || !slices.Equal(transported[offset+9:offset+11], []string{"-e", "HOME=/worker"}) || transported[offset+11] != helper {
+		t.Fatalf("worker HOME was not inserted before the broker launch command: %#v", transported)
+	}
+	tamperedReady := slices.Clone(brokerLaunch)
+	tamperedReady[11] = agentruntime.TerminalBrokerReadyChannel(strings.Repeat("b", 32))
+	if validTmuxBoundaryArgs(tamperedReady, env, root, root) {
+		t.Fatal("worker boundary accepted a bootstrap for another broker readiness channel")
+	}
 	foreignLog := slices.Clone(gated)
 	foreignLog[21] = filepath.Join(stateRoot, "attempts", "o-r-0123456789ab", "310-2", "agent.log")
 	if validTmuxBoundaryArgs(foreignLog, env, root, root) {
@@ -489,7 +512,7 @@ func TestReviewBoundaryAcceptsOnlySnapshotLocalLifecyclePaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	resultRoot := filepath.Join(snapshot, ".agent-symphony-review-0123456789abcdef")
-	args := append(agentruntime.TmuxNewSessionArgs("as-r-0123456789abcdef-73-2", snapshot, nil), "--", helper, "review-pane", "tmux", filepath.Join(resultRoot, "launch.json"), filepath.Join(resultRoot, "terminal.json"), reviewerSignal(identity), reviewerStartSignal(identity), string(encoded), "--", "/bin/sh")
+	args := append(agentruntime.TmuxNewSessionArgs("as-r-0123456789abcdef-73-2", snapshot, nil), "--", helper, "review-pane", "tmux", filepath.Join(resultRoot, "launch.json"), filepath.Join(resultRoot, "terminal.json"), filepath.Join(resultRoot, "broker.json"), agentruntime.TerminalBrokerSocketDirForState(filepath.Dir(root)), reviewerSignal(identity), reviewerStartSignal(identity), string(encoded), "--", "/bin/sh")
 	if !validTmuxBoundaryArgs(args, nil, snapshot, root) {
 		t.Fatal("snapshot-local reviewer lifecycle paths were rejected")
 	}
@@ -1511,12 +1534,8 @@ func TestStopAttemptSessionProvesExactPaneGoneAfterTmuxProbeRace(t *testing.T) {
 				}
 			}
 			err := stopAttemptSession(t.Context(), manifest)
-			if test.wantFailure {
-				if err == nil || !strings.Contains(err.Error(), "tmux pane vanished") || (!test.unconfined && !strings.Contains(err.Error(), "bound implementation pane may still exist")) || (test.unconfined && !strings.Contains(err.Error(), "group termination is unconfirmed")) {
-					t.Fatalf("ambiguous pane disappearance authorized cleanup: %v", err)
-				}
-			} else if err != nil {
-				t.Fatalf("proved exact pane disappearance blocked cleanup: %v", err)
+			if err == nil || !strings.Contains(err.Error(), "terminal broker identity is unavailable") {
+				t.Fatalf("pane-only evidence authorized cleanup without a broker certificate: %v", err)
 			}
 		})
 	}
@@ -1560,6 +1579,8 @@ func TestPermanentRemovalRejectsDirtyOrUnpublishedWorkAndRetriesSafely(t *testin
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_PANE", "")
 	t.Setenv("TMUX_TMPDIR", socketRoot)
 	t.Cleanup(func() { _ = exec.Command(tmuxBinary, "kill-server").Run() })
 	if output, err := exec.Command(tmuxBinary, "new-session", "-d", "-s", "keeper").CombinedOutput(); err != nil {
@@ -1575,30 +1596,17 @@ func TestPermanentRemovalRejectsDirtyOrUnpublishedWorkAndRetriesSafely(t *testin
 		t.Fatal(err)
 	}
 	mustWriteFile(t, agentruntime.ResultPath(manifest.Worktree), `{"type":"agent-symphony-result-v1"}`)
-	gate := agentruntime.ImplementationGateChannel(manifest.LaunchID)
-	gateScript := `"$1" wait-for -L "$2" && "$1" wait-for -U "$2" && shift 2 && exec "$@" #` + strings.Repeat(`\`, 10<<10)
-	parked := []string{"wait-for", "-L", gate, ";", "new-session", "-d", "-s", manifest.Session, "-c", manifest.Worktree, "--", "/bin/sh", "-c", gateScript, "agent-symphony-gate", tmuxBinary, gate}
-	parked = append(parked, agentruntime.BoundPaneExitStatusCommand(os.Args[0], tmuxBinary, manifest, []string{"/bin/sh"})...)
-	if output, err := exec.Command(tmuxBinary, parked...).CombinedOutput(); err != nil {
-		t.Fatalf("create bound implementation pane: %v: %s", err, output)
+	helper := filepath.Join(t.TempDir(), "agent-symphony")
+	if output, err := exec.Command("go", "build", "-o", helper, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build terminal broker helper: %v: %s", err, output)
 	}
-	if output, err := exec.Command(tmuxBinary, "set-option", "-p", "-t", agentruntime.PaneTarget(manifest.Session), "@agent-symphony-launch-token", manifest.LaunchToken).CombinedOutput(); err != nil {
-		t.Fatalf("tag bound implementation pane: %v: %s", err, output)
-	}
-	observed, err := exec.Command(tmuxBinary, "display-message", "-p", "-t", agentruntime.PaneTarget(manifest.Session), agentruntime.ImplementationPaneFormat).CombinedOutput()
+	runtimeState := &agentruntime.Runtime{Root: root, StateRoot: root, Tmux: tmuxBinary, Helper: helper, Runner: agentruntime.ExecRunner{}}
+	binding, terminal, err := runtimeState.PrepareBoundTerminalBroker(t.Context(), manifest, os.Environ(), []string{"/bin/cat"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("prepare owner-certified implementation broker: %v", err)
 	}
-	pane, err := agentruntime.ParseImplementationPane(string(observed))
-	if err != nil {
-		t.Fatal(err)
-	}
-	binding, err := agentruntime.BindImplementationPane(manifest, manifest.LaunchID, "interactive", pane)
-	if err != nil || agentruntime.WriteImplementationBinding(manifest, binding) != nil {
-		t.Fatalf("bind implementation pane: %v, pane=%#v manifest=%#v", err, pane, manifest)
-	}
-	if body, err := json.Marshal(binding); err != nil || len(body) <= 16<<10 {
-		t.Fatalf("fixture binding is not large enough: %d %v", len(body), err)
+	if err := agentruntime.ReleaseTerminalBroker(t.Context(), terminal); err != nil {
+		t.Fatalf("release owner-certified implementation broker: %v", err)
 	}
 	oldExec := hostExecRunner
 	hostExecRunner = (agentruntime.ExecRunner{}).Run
@@ -1641,7 +1649,6 @@ func TestPermanentRemovalRejectsDirtyOrUnpublishedWorkAndRetriesSafely(t *testin
 	}
 	// Simulate the external cleanup finishing before its effect marker and owner
 	// completion: compatibility cleanup deletes the original launch binding.
-	runtimeState := &agentruntime.Runtime{Root: root, StateRoot: root}
 	if err := runtimeState.ForgetCompatibility(manifest); err != nil {
 		t.Fatalf("forget compatibility resources: %v", err)
 	}

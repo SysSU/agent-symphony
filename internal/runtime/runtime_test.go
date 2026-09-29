@@ -228,7 +228,15 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 		return Result{}, errors.New("missing tmux operation")
 	}
 	args := command.Args
-	if offset := slices.Index(args, "new-session"); offset >= 0 {
+	offset := slices.Index(args, "new-session")
+	if slices.Contains(args, "-P") {
+		for index, arg := range args {
+			if arg == "new-session" {
+				offset = index
+			}
+		}
+	}
+	if offset >= 0 {
 		args = args[offset:]
 	} else if offset := slices.Index(args, ";"); offset >= 0 && offset+1 < len(args) {
 		args = args[offset+1:]
@@ -402,6 +410,13 @@ func (f *fakeRunner) Run(ctx context.Context, command Command) (Result, error) {
 					return Result{}, errors.New("missing implementation gate command")
 				}
 				s.agent = slices.Clone(s.agent[index+separator+1:])
+				if broker := slices.Index(s.agent, "terminal-broker-bound"); broker >= 1 && len(s.agent) > broker+9 {
+					manifest := Manifest{Version: ManifestVersion2, LogPath: s.agent[broker+2], Worktree: s.agent[broker+3], Session: s.agent[broker+4], LaunchToken: s.agent[broker+5], LaunchID: s.agent[broker+6]}
+					binding := TerminalBrokerBinding{Version: terminalBrokerVersion, OuterPID: 200, InnerPID: 99999999, InnerPGID: 99999999, SocketPath: TerminalBrokerSocketPath(TerminalBrokerPath(manifest), TerminalBrokerSocketDir(manifest)), SocketDev: 1, SocketIno: 1, Secret: strings.Repeat("a", 64)}
+					if err := writeTerminalBrokerBinding(TerminalBrokerPath(manifest), binding); err != nil {
+						return Result{}, err
+					}
+				}
 				if slices.Contains(s.agent, "fast-exit") {
 					s.dead, s.status = true, 42
 				}
@@ -644,7 +659,8 @@ func TestLifecycleCreatesUncredentialedSessionWithoutCredentialedRepository(t *t
 	if manifest.State != "running" || fake.buffers[buffer] != attempt.Context || fake.buffers[manifest.Session] != "" {
 		t.Fatalf("unexpected launch: %#v, %#v", manifest, fake.sessions[manifest.Session])
 	}
-	want := BoundPromptCommand(r.Helper, "tmux", buffer, ResultPath(manifest.Worktree), manifest, attempt.Command)
+	inner := BoundPromptCommand(r.Helper, "tmux", buffer, ResultPath(manifest.Worktree), manifest, attempt.Command)
+	want := append([]string{r.Helper, "terminal-broker-bound", "tmux", manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, manifest.LaunchID, "capture", "--"}, inner...)
 	if !slices.Equal(fake.sessions[manifest.Session].agent, want) {
 		t.Fatalf("agent command = %#v, want %#v", fake.sessions[manifest.Session].agent, want)
 	}
@@ -743,7 +759,7 @@ func TestInteractiveLifecycleKeepsAgentOnTmuxAndRequiresResult(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := BoundPaneExitStatusCommand(r.Helper, "tmux", manifest, []string{"interactive-agent", "--tty", attempt.Context})
+			want := []string{r.Helper, "terminal-broker-bound", "tmux", manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, manifest.LaunchID, "interactive", "--", "interactive-agent", "--tty", attempt.Context}
 			if !manifest.Interactive || fake.buffers["as-start-"+manifest.LaunchID] != "" || !slices.Equal(fake.sessions[manifest.Session].agent, want) {
 				t.Fatalf("interactive launch manifest=%#v session=%#v buffers=%#v", manifest, fake.sessions[manifest.Session], fake.buffers)
 			}
@@ -849,8 +865,8 @@ func TestResumeHandoffRecreatesMissingSessionBeforeStateTransition(t *testing.T)
 		t.Fatalf("resumed=%#v session=%#v err=%v", resumed, fake.sessions[manifest.Session], err)
 	}
 	cancelled, err := cancelFixture(t, r, t.Context(), attempt, "operator stopped handoff")
-	if err != nil || cancelled.State != "cancelled" || fake.sessions[manifest.Session] != nil || fake.sessions["keeper"] == nil {
-		t.Fatalf("handoff cleanup left a running session: manifest=%#v session=%#v err=%v", cancelled, fake.sessions[manifest.Session], err)
+	if err == nil || cancelled.State != "running" || fake.sessions[manifest.Session] == nil || fake.sessions["keeper"] == nil || !strings.Contains(err.Error(), "terminal broker") {
+		t.Fatalf("uncertified handoff cleanup did not fail closed: manifest=%#v session=%#v err=%v", cancelled, fake.sessions[manifest.Session], err)
 	}
 }
 
@@ -961,13 +977,23 @@ func TestBoundHandoffShellStopsOnRealTmux(t *testing.T) {
 	if err := r.launchAgent(t.Context(), manifest); err != nil {
 		t.Fatal(err)
 	}
+	terminal, err := ReadTerminalBrokerBinding(TerminalBrokerPath(manifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ReleaseTerminalBroker(t.Context(), terminal); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	if output, err := exec.CommandContext(ctx, tmux, "wait-for", "-L", ready).CombinedOutput(); err != nil {
 		t.Fatalf("bound shell did not reach worker start: %v: %s", err, output)
 	}
-	if err := r.stop(t.Context(), manifest); err == nil || !strings.Contains(err.Error(), "descendants remain unproved") {
-		t.Fatalf("bound handoff shell incorrectly claimed physical cleanup: %v", err)
+	if err := r.stop(t.Context(), manifest); err != nil {
+		t.Fatalf("broker-owned handoff shell cleanup failed: %v", err)
+	}
+	if dead, err := TerminalBrokerDead(TerminalBrokerPath(manifest), terminal); err != nil || !dead {
+		t.Fatalf("broker-owned inner group death is unproved: dead=%t err=%v", dead, err)
 	}
 	if _, exists := ReadImplementationBinding(manifest); exists != nil {
 		t.Fatalf("durable launch binding was lost after stop: %v", exists)
@@ -977,41 +1003,17 @@ func TestBoundHandoffShellStopsOnRealTmux(t *testing.T) {
 	}
 }
 
-func TestBoundLastPaneStopReplaysAfterOriginalServerExits(t *testing.T) {
-	tmux, err := exec.LookPath("tmux")
-	if err != nil {
-		t.Skip("tmux is unavailable")
-	}
-	socketRoot, err := os.MkdirTemp("/tmp", "as-bound-last-pane-")
+func TestBoundLastPaneStopWithoutLiveBrokerFailsClosed(t *testing.T) {
+	r, fake, attempt, _ := testRuntime(t)
+	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
-	t.Setenv("TMUX_TMPDIR", socketRoot)
-	t.Cleanup(func() { _ = exec.Command(tmux, "kill-server").Run() })
-	worktree, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+	if err := r.stop(t.Context(), manifest); err == nil || !strings.Contains(err.Error(), "terminal broker") {
+		t.Fatalf("uncertified last-pane stop err=%v", err)
 	}
-	manifest := Manifest{Version: ManifestVersion2, Session: "as-bound-last-pane", Worktree: worktree, LogPath: filepath.Join(t.TempDir(), "agent.log"), LaunchToken: strings.Repeat("a", 32), LaunchID: strings.Repeat("b", 32)}
-	r := &Runtime{Tmux: tmux, Runner: inheritedEnvironmentRunner{}, StopWait: 20 * time.Millisecond}
-	// The initial gate is parked, so no worker group was ever released.
-	if err := startSessionFixture(t, r, t.Context(), manifest, nil, manifest.LaunchID, []string{"unused-helper", "pane-exit-status-bound"}); err != nil {
-		t.Fatal(err)
-	}
-	binding, err := ReadImplementationBinding(manifest)
-	if err != nil || binding.Role != "interactive" {
-		t.Fatalf("parked gate binding = %#v, %v", binding, err)
-	}
-	_ = r.stop(t.Context(), manifest) // The guarded kill may precede server exit proof.
-	if err := syscall.Kill(binding.ServerPID, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("fixture original tmux server is not proved dead: PID=%d err=%v", binding.ServerPID, err)
-	}
-	// A fresh runtime must complete exact cleanup without the vanished socket;
-	// a generic has-session exit status alone is never a sufficient proof.
-	restarted := &Runtime{Tmux: tmux, Runner: inheritedEnvironmentRunner{}}
-	if err := restarted.stop(t.Context(), manifest); err != nil {
-		t.Fatalf("restart could not finish stopped last-pane gate: %v", err)
+	if fake.sessions[manifest.Session] == nil {
+		t.Fatal("fail-closed stop removed the unproved session")
 	}
 }
 
@@ -1086,8 +1088,8 @@ func TestAgentFailureCancelAndIneligibility(t *testing.T) {
 	}
 	recovered2 := Attempt{Repository: attempt2.Repository, Issue: attempt2.Issue, Number: attempt2.Number, BaseSHA: attempt2.BaseSHA}
 	manifest2, err = cancelFixture(t, r2, context.Background(), recovered2, "issue closed")
-	if _, live := fake2.sessions[manifest2.Session]; err != nil || manifest2.State != "cancelled" || live {
-		t.Fatalf("cancel = %#v, %v", manifest2, err)
+	if _, live := fake2.sessions[manifest2.Session]; err == nil || manifest2.State != "running" || !live || !strings.Contains(err.Error(), "terminal broker") {
+		t.Fatalf("uncertified cancel = %#v, %v", manifest2, err)
 	}
 
 	r3, _, attempt3, _ := testRuntime(t)
@@ -1811,27 +1813,22 @@ func TestReviewModeAndTargetAreDurableAndValidated(t *testing.T) {
 	}
 }
 
-func TestStopInterruptsPaneZeroWhenAnotherPaneIsActive(t *testing.T) {
+func TestStopDoesNotSignalPaneWithoutLiveBroker(t *testing.T) {
 	r, fake, attempt, _ := testRuntime(t)
 	manifest, err := prepareAndStartFixture(t, r, t.Context(), attempt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPaneID := fake.sessions[manifest.Session].paneID
-	if err := r.stop(t.Context(), manifest); err != nil {
-		t.Fatal(err)
+	if err := r.stop(t.Context(), manifest); err == nil || !strings.Contains(err.Error(), "terminal broker") {
+		t.Fatalf("uncertified stop err=%v", err)
 	}
-	interrupted := false
 	for _, command := range fake.seen {
 		if len(command.Args) > 0 && command.Args[0] == "send-keys" {
-			interrupted = true
-			if valueAfter(command.Args, "-t") != wantPaneID {
-				t.Fatalf("interrupt targeted %q, want bound pane %q", valueAfter(command.Args, "-t"), wantPaneID)
-			}
+			t.Fatalf("uncertified stop signalled pane: %#v", command.Args)
 		}
 	}
-	if !interrupted {
-		t.Fatal("pane 0.0 did not receive C-c")
+	if fake.sessions[manifest.Session] == nil {
+		t.Fatal("fail-closed stop changed the unproved session")
 	}
 }
 
@@ -2132,16 +2129,25 @@ func TestNewImplementationSessionBindsBeforeAgentLaunch(t *testing.T) {
 	if err := r.launchAgent(t.Context(), manifest); err != nil {
 		t.Fatalf("guarded agent release: %v", err)
 	}
+	terminal, err := ReadTerminalBrokerBinding(TerminalBrokerPath(manifest))
+	if err != nil || terminal.OuterPID != binding.PanePID {
+		t.Fatalf("durable terminal broker = %#v, %v", terminal, err)
+	}
+	if err := ReleaseTerminalBroker(t.Context(), terminal); err != nil {
+		t.Fatalf("release owner-certified broker: %v", err)
+	}
 	completion, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	if output, err := exec.CommandContext(completion, tmux, "wait-for", "-L", signal).CombinedOutput(); err != nil {
-		t.Fatalf("wait for worker execution: %v: %s", err, output)
+		markerBody, markerErr := os.ReadFile(marker)
+		panes, panesErr := exec.Command(tmux, "list-panes", "-a", "-F", ImplementationPaneFormat).CombinedOutput()
+		t.Fatalf("wait for worker execution: %v: %s marker=%q markerErr=%v panes=%q panesErr=%v terminal=%#v", err, output, markerBody, markerErr, panes, panesErr, terminal)
 	}
 	if body, err := os.ReadFile(marker); err != nil || string(body) != "quoted\nargument" {
 		t.Fatalf("worker output after release = %q, %v", body, err)
 	}
-	if output, err := exec.Command("ps", "-p", strconv.Itoa(binding.PanePID), "-o", "comm=").CombinedOutput(); err != nil || !strings.Contains(string(output), "sleep") {
-		t.Fatalf("gate did not exec worker with same PID %d: %q, %v", binding.PanePID, output, err)
+	if output, err := exec.Command("ps", "-p", strconv.Itoa(terminal.InnerPID), "-o", "comm=").CombinedOutput(); err != nil || !strings.Contains(string(output), "sleep") {
+		t.Fatalf("broker did not retain the worker at inner PID %d: %q, %v", terminal.InnerPID, output, err)
 	}
 	if err := r.launchAgent(t.Context(), manifest); err != nil {
 		t.Fatalf("replaying release for same bound worker: %v", err)
@@ -2169,8 +2175,11 @@ func TestNewImplementationSessionBindsBeforeAgentLaunch(t *testing.T) {
 	if _, pane, err := r.observeBound(t.Context(), manifest); err != nil || pane.PanePID != binding.PanePID || pane.Command != binding.Command || !strings.Contains(pane.Command, "quoted") {
 		t.Fatalf("released worker lost gate pane identity: %#v, %v", pane, err)
 	}
-	if err := r.stop(t.Context(), manifest); err == nil {
-		t.Fatal("raw test worker without a bound group was falsely certified stopped")
+	if err := r.stop(t.Context(), manifest); err != nil {
+		t.Fatalf("owner-certified broker stop: %v", err)
+	}
+	if dead, err := TerminalBrokerDead(TerminalBrokerPath(manifest), terminal); err != nil || !dead {
+		t.Fatalf("owner-certified inner group death was not retained: dead=%t err=%v", dead, err)
 	}
 }
 
@@ -2545,7 +2554,7 @@ func TestExactTargetsExitCodesAndHistory(t *testing.T) {
 		if command.Name != "tmux" {
 			continue
 		}
-		if target := valueAfter(command.Args, "-t"); target != "" && target != "="+manifest.Session && target != PaneTarget(manifest.Session) && target != "%0" {
+		if target := valueAfter(command.Args, "-t"); target != "" && target != "="+manifest.Session && target != PaneTarget(manifest.Session) && target != "%0" && !strings.HasPrefix(target, "=as-bootstrap-") {
 			t.Fatalf("inexact target %q in %#v", target, command.Args)
 		}
 		if slices.Contains(command.Args, "new-session") && slices.Contains(command.Args, "history-limit") && slices.Contains(command.Args, historyLimit) {
@@ -2757,7 +2766,7 @@ func TestProbeAndCancellationErrorsPreserveState(t *testing.T) {
 	fake3.ignoreInterrupt = true
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if got, err := cancelFixture(t, r3, cancelled, attempt3, "stop"); !errors.Is(err, context.Canceled) || got.State != "running" {
+	if got, err := cancelFixture(t, r3, cancelled, attempt3, "stop"); err == nil || got.State != "running" {
 		t.Fatalf("cancellation timeout = %#v, %v", got, err)
 	}
 }

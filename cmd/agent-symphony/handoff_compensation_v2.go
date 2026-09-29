@@ -70,6 +70,21 @@ func compensateHandoffV2(ctx context.Context, input []byte, root string) (string
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
+	candidateManifest := candidate.Manifest
+	candidateManifest.LaunchToken, candidateManifest.LaunchID = candidate.Token, candidate.EffectID
+	if candidate.Implementation != nil && candidate.Terminal != nil {
+		stateRoot := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(candidate.Manifest.LogPath))))
+		runtime := &agentruntime.Runtime{Root: root, StateRoot: stateRoot, Tmux: "tmux"}
+		if err := runtime.StopCertifiedImplementation(ctx, candidateManifest, *candidate.Implementation, *candidate.Terminal); err != nil {
+			return "", err
+		}
+		return writeHandoffCompensationProof(request, old, "killed")
+	}
+	if _, err := agentruntime.ReadImplementationBinding(candidateManifest); err == nil {
+		return "", errors.New("handoff candidate exists without an owner certificate")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
 	status, err := runHostTmux(ctx, []string{"has-session", "-t", old.SessionID}, nil)
 	if err != nil {
 		if exactTmuxSessionAbsent(status, old.SessionID) {

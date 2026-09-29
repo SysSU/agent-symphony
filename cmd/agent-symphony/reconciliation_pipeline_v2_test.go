@@ -448,21 +448,12 @@ func TestFailedImplementationReviewPersistsDiagnosticWithoutAutomaticRetry(t *te
 	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+	if _, err := owner.markPlanReviewRunning(t.Context(), testMarkReviewerRunning(owner.stateRoot, mustOwnerSnapshot(t, owner).State, identity, 99999999)); err != nil {
 		t.Fatal(err)
 	}
 	result := test.result(request)
 	result.Reviewer.Status, result.Reviewer.Diagnostic = "failed", "reviewer exited without a valid result"
-	launchPath, terminalPath := reviewerLifecyclePaths(request.Reviewer.Snapshot, request.Reviewer.Target)
-	pane, err := parseReviewerPaneIdentity(reviewerPaneTestOutput("1|1|||", request.Reviewer.Session, "$9", os.Getpid(), "agent-symphony review-pane tmux "+launchPath+" "+terminalPath+" "+reviewerSignal(reviewerIdentity(identity))+" "+identity.RequestDigest))
-	if err != nil {
-		t.Fatal(err)
-	}
-	terminalIdentity := reviewerIdentity(identity)
-	terminalIdentity.GateProtocol, terminalIdentity.SessionRequested, terminalIdentity.ChildPID = true, true, 99999999
-	if _, err := owner.sealReviewerResult(t.Context(), sealReviewerResultCommand{Identity: identity, Result: result, Pane: pane, Terminal: reviewerTerminalRecord{Identity: terminalIdentity, ExitCode: 1}}); err != nil {
-		t.Fatal(err)
-	}
+	sealTestReviewerResult(t, owner, *effect, result)
 	finished, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: identity, Result: result})
 	if err != nil {
 		t.Fatal(err)
@@ -493,7 +484,7 @@ func TestInvalidatedImplementationSameHeadRequiresCertifiedCleanup(t *testing.T)
 	if _, err := oldOwner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := oldOwner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+	if _, err := oldOwner.markPlanReviewRunning(t.Context(), testMarkReviewerRunning(oldOwner.stateRoot, mustOwnerSnapshot(t, oldOwner).State, identity, 99999999)); err != nil {
 		t.Fatal(err)
 	}
 	state := mustOwnerSnapshot(t, oldOwner).State
@@ -557,7 +548,7 @@ func TestInvalidatedImplementationSameHeadRequiresCertifiedCleanup(t *testing.T)
 		}
 	}
 	proof := current.State.ReviewerProofs[reviewerProofKey(request.Repository, request.Issue, request.Attempt, old.Mode, old.Target)]
-	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||\n"}}
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||||||\n"}}
 	attempt := agentruntime.Attempt{Repository: request.Repository, Issue: request.Issue, Number: request.Attempt, BaseSHA: old.BaseSHA}
 	if err := cleanupBoundReviewResources(t.Context(), boundary, nil, attempt, old.HeadSHA, old.Target, old.RunID, old.Snapshot, old.Session, productionSnapshotRoot(root), activeWorkerProfileDigest(current.State), proof); err != nil {
 		t.Fatal(err)
@@ -598,7 +589,7 @@ func TestInvalidatedImplementationSameHeadRequiresCertifiedCleanup(t *testing.T)
 	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999998}); err != nil {
+	if _, err := owner.markPlanReviewRunning(t.Context(), testMarkReviewerRunning(owner.stateRoot, mustOwnerSnapshot(t, owner).State, identity, 99999998)); err != nil {
 		t.Fatal(err)
 	}
 	reviewResult := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(plans[0].Request)

@@ -121,7 +121,9 @@ type handoffEffectRequest struct {
 	Recovery                    *internalgithub.RecoveryHandoff
 	Outcome                     *internalgithub.HandoffOutcome
 	OutcomePath, OutcomeToken   string
-	CandidateLaunchToken        string `json:",omitempty"`
+	CandidateLaunchToken        string                                    `json:",omitempty"`
+	CurrentImplementation       *agentruntime.ImplementationLaunchBinding `json:",omitempty"`
+	CurrentTerminal             *agentruntime.TerminalBrokerBinding       `json:",omitempty"`
 }
 
 type retireCompletedEffectRequest struct {
@@ -540,6 +542,31 @@ func applyMarkReviewerSessionRequested(stateRoot string, state *runtimeOwnerStat
 	return nil
 }
 
+func applyMarkHandoffPrepared(stateRoot string, state *runtimeOwnerState, command markHandoffPreparedCommand) error {
+	effect, ok := state.Effects[command.Identity.EffectID]
+	if !ok || effect.State != "pending" || effect.Reconciliation == nil || effect.Reconciliation.Action != reconciliationHandoffDeliver || effect.Reconciliation.Handoff == nil || effect.Reconciliation.Manifest == nil || effect.Reconciliation.Manifest.Version != agentruntime.ManifestVersion2 || !reconciliationEffectIdentityMatches(effect, command.Identity) {
+		return errStaleStateResult
+	}
+	if err := reconciliationEffectCurrent(stateRoot, *state, effect); err != nil {
+		return err
+	}
+	manifest := *effect.Reconciliation.Manifest
+	manifest.LaunchToken, manifest.LaunchID = effect.Reconciliation.Handoff.CandidateLaunchToken, effect.ID
+	if !agentruntime.ValidImplementationBinding(manifest, command.Implementation, manifest.LaunchID) || !agentruntime.ValidImplementationTerminalBinding(manifest, command.Terminal) || command.Terminal.OuterPID != command.Implementation.PanePID {
+		return errStateConflict
+	}
+	if effect.HandoffImplementation != nil || effect.HandoffTerminal != nil {
+		if effect.HandoffImplementation != nil && effect.HandoffTerminal != nil && *effect.HandoffImplementation == command.Implementation && *effect.HandoffTerminal == command.Terminal {
+			return nil
+		}
+		return errStateConflict
+	}
+	implementation, terminal := command.Implementation, command.Terminal
+	effect.HandoffImplementation, effect.HandoffTerminal = &implementation, &terminal
+	state.Effects[effect.ID] = effect
+	return nil
+}
+
 func applyMarkPlanReviewRunning(stateRoot string, state *runtimeOwnerState, command markPlanReviewRunningCommand) error {
 	effect, ok := state.Effects[command.Identity.EffectID]
 	if !ok || effect.State != "pending" || effect.Reconciliation == nil || !reconciliationEffectIdentityMatches(effect, command.Identity) {
@@ -549,8 +576,19 @@ func applyMarkPlanReviewRunning(stateRoot string, state *runtimeOwnerState, comm
 	if request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe" || request.Manifest == nil || command.GroupPID < 2 || effect.ReviewerGateProtocol && !effect.ReviewerSessionRequested {
 		return errStateConflict
 	}
+	launchPath, terminalPath := reviewerLifecyclePaths(request.Reviewer.Snapshot, request.Reviewer.Target)
+	if command.Pane == nil || command.TerminalBroker == nil || command.BrokerPath != reviewerBrokerPath(request.Reviewer.Snapshot, request.Reviewer.Target) || command.Pane.Status.Dead || command.Pane.Name != request.Reviewer.Session || command.Pane.PID != command.TerminalBroker.OuterPID || command.GroupPID != command.TerminalBroker.InnerPGID || !reviewerPaneStartMatches(command.Pane.Start, launchPath, terminalPath, reviewerIdentity(command.Identity)) {
+		return errStateConflict
+	}
+	paneCertificate := reviewerPaneCertificateFrom(*command.Pane)
+	terminalBroker := *command.TerminalBroker
+	proof := reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, RunID: request.Reviewer.RunID, EffectID: effect.ID, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, GroupPID: command.GroupPID, ProfileDigest: effect.ReviewerProfileDigest, ConfinementVersion: effect.ReviewerConfinementVersion, Pane: &paneCertificate, TerminalBroker: &terminalBroker, BrokerPath: command.BrokerPath}
+	if !validReviewerTerminalCertificate(stateRoot, proof) {
+		return errStateConflict
+	}
 	if effect.ReviewerLaunched {
-		if effect.ReviewerGroupPID != command.GroupPID {
+		key := reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, request.Reviewer.Mode, request.Reviewer.Target)
+		if effect.ReviewerGroupPID != command.GroupPID || !reflect.DeepEqual(state.ReviewerProofs[key], proof) {
 			return errStateConflict
 		}
 		return nil
@@ -567,7 +605,7 @@ func applyMarkPlanReviewRunning(stateRoot string, state *runtimeOwnerState, comm
 			return errStateConflict
 		}
 	}
-	state.ReviewerProofs[key] = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: request.Reviewer.Mode, Target: request.Reviewer.Target, RunID: request.Reviewer.RunID, EffectID: effect.ID, IssueGeneration: effect.IssueGeneration, AttemptGeneration: effect.AttemptGeneration, GroupPID: command.GroupPID, ProfileDigest: effect.ReviewerProfileDigest, ConfinementVersion: effect.ReviewerConfinementVersion}
+	state.ReviewerProofs[key] = proof
 	effect.ReviewerLaunched = true
 	effect.ReviewerGroupPID = command.GroupPID
 	state.Effects[effect.ID] = effect
@@ -627,7 +665,7 @@ func applySealReviewerResult(stateRoot string, state *runtimeOwnerState, command
 	}
 	expected := reviewerIdentity(command.Identity)
 	expected.GateProtocol, expected.SessionRequested, expected.ChildPID = effect.ReviewerGateProtocol, effect.ReviewerSessionRequested, effect.ReviewerGroupPID
-	if command.Terminal.Identity != expected || command.Terminal.ExitCode == 0 && command.Terminal.Signal != 0 || command.Result.Reviewer.Status != "failed" && (command.Terminal.ExitCode != 0 || command.Terminal.Signal != 0) {
+	if !sameReviewerIdentity(command.Terminal.Identity, expected) || command.Terminal.Identity.ChildPID != expected.ChildPID || command.Terminal.Identity.Broker == nil || proof.TerminalBroker == nil || *command.Terminal.Identity.Broker != *proof.TerminalBroker || command.Terminal.ExitCode == 0 && command.Terminal.Signal != 0 || command.Result.Reviewer.Status != "failed" && (command.Terminal.ExitCode != 0 || command.Terminal.Signal != 0) {
 		return errStateConflict
 	}
 	digest := reviewerResultDigest(command.Result)
@@ -790,8 +828,22 @@ func applyFinishReconciliationEffect(stateRoot string, state *runtimeOwnerState,
 			return errStateConflict
 		}
 	}
+	boundHandoff := effect.Reconciliation.Action == reconciliationHandoffDeliver && effect.Reconciliation.Manifest != nil && effect.Reconciliation.Manifest.Version == agentruntime.ManifestVersion2
+	if boundHandoff && (effect.HandoffImplementation == nil || effect.HandoffTerminal == nil) {
+		return errStateConflict
+	}
 	if err := applyReconciliationEffectOutcome(state, *effect.Reconciliation, result); err != nil {
 		return err
+	}
+	if boundHandoff {
+		key := ownerAttemptKey(effect.Repository, effect.Issue, effect.Attempt)
+		record := state.Attempts[key]
+		implementation, terminal := *effect.HandoffImplementation, *effect.HandoffTerminal
+		if !agentruntime.ValidImplementationBinding(record.Manifest, implementation, record.Manifest.LaunchID) || !agentruntime.ValidImplementationTerminalBinding(record.Manifest, terminal) || terminal.OuterPID != implementation.PanePID {
+			return errStateConflict
+		}
+		record.ImplementationBinding, record.TerminalBroker = &implementation, &terminal
+		state.Attempts[key] = record
 	}
 	if effect.Reconciliation.Action == reconciliationReviewer && effect.Reconciliation.Reviewer != nil && effect.Reconciliation.Reviewer.Phase == "cleanup" {
 		key := reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, effect.Reconciliation.Reviewer.Mode, effect.Reconciliation.Reviewer.Target)
@@ -1004,6 +1056,17 @@ func validPersistedReconciliationEffect(state runtimeOwnerState, effect runtimeE
 	if request == nil || effect.Review != nil || effect.Reason != "" || effect.SupersededReviewerID != "" || !boundedText(effect.Diagnostic, maxReconciliationStringBytes, false) || effect.Action != string(request.Action) || effect.Repository != request.Repository || effect.Issue != request.Issue || effect.Attempt != request.Attempt || effect.RequestDigest != reconciliationEffectDigest(*request) || !validReconciliationEffectRequest(state.Repository, *request) || effect.IntentEpoch == 0 || effect.IntentEpoch > state.Epoch || effect.ReviewerLaunched != (effect.ReviewerGroupPID > 1) || effect.ReviewerSessionRequested && !effect.ReviewerGateProtocol || effect.ReviewerProfileDigest != "" && (!effect.ReviewerGateProtocol || !validDigest(effect.ReviewerProfileDigest)) || effect.ReviewerGateProtocol && effect.ReviewerConfinementVersion != reviewerConfinementVersion && state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] == "" || !effect.ReviewerGateProtocol && effect.ReviewerConfinementVersion != 0 || effect.ReviewerGateProtocol && effect.ReviewerSourceRevision == 0 && !legacyReviewerRun || !effect.ReviewerGateProtocol && effect.ReviewerSourceRevision != 0 || effect.ReviewerGateProtocol && effect.ReviewerSourceRevision != effect.IntentRevision && !legacyReviewerRun || (effect.ReviewerLaunched || effect.ReviewerGateProtocol) && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Phase != "run-observe") || effect.ReviewerRevoked && (request.Action != reconciliationReviewer || request.Reviewer == nil || request.Reviewer.Mode != agentruntime.ReviewModePlan || request.Reviewer.Phase != "run-observe") || effect.ReviewerResultDigest != "" && (!validDigest(effect.ReviewerResultDigest) || !effect.ReviewerLaunched) {
 		return false
 	}
+	prepared := effect.HandoffImplementation != nil || effect.HandoffTerminal != nil
+	if prepared {
+		if request.Action != reconciliationHandoffDeliver || request.Handoff == nil || request.Manifest == nil || effect.HandoffImplementation == nil || effect.HandoffTerminal == nil {
+			return false
+		}
+		manifest := *request.Manifest
+		manifest.LaunchToken, manifest.LaunchID = request.Handoff.CandidateLaunchToken, effect.ID
+		if !agentruntime.ValidImplementationBinding(manifest, *effect.HandoffImplementation, manifest.LaunchID) || !agentruntime.ValidImplementationTerminalBinding(manifest, *effect.HandoffTerminal) || effect.HandoffTerminal.OuterPID != effect.HandoffImplementation.PanePID {
+			return false
+		}
+	}
 	if request.Reviewer != nil && !legacyReviewerRun && ((request.Reviewer.Phase == "run-observe" && request.Reviewer.RunID != reviewerRunID(effect.IntentEpoch, effect.ReviewerSourceRevision, effect.IssueGeneration, effect.AttemptGeneration, effect.Repository, effect.Issue, effect.Attempt, request.Reviewer.Mode, request.Reviewer.Target)) || (request.Reviewer.Phase == "cleanup" && (request.Manifest == nil || request.Reviewer.RunID != request.Manifest.ReviewRunID))) {
 		return false
 	}
@@ -1104,10 +1167,10 @@ func validReconciliationEffectBindings(request reconciliationEffectRequest) bool
 			return false
 		}
 		if request.Manifest.Version == agentruntime.ManifestVersion2 {
-			if !agentruntime.ValidLaunchToken(request.Handoff.CandidateLaunchToken) || request.Handoff.CandidateLaunchToken == request.Manifest.LaunchToken {
+			if !agentruntime.ValidLaunchToken(request.Handoff.CandidateLaunchToken) || request.Handoff.CandidateLaunchToken == request.Manifest.LaunchToken || request.Handoff.CurrentImplementation == nil || request.Handoff.CurrentTerminal == nil || !agentruntime.ValidImplementationBinding(*request.Manifest, *request.Handoff.CurrentImplementation, request.Manifest.LaunchID) || !agentruntime.ValidImplementationTerminalBinding(*request.Manifest, *request.Handoff.CurrentTerminal) || request.Handoff.CurrentTerminal.OuterPID != request.Handoff.CurrentImplementation.PanePID {
 				return false
 			}
-		} else if request.Handoff.CandidateLaunchToken != "" {
+		} else if request.Handoff.CandidateLaunchToken != "" || request.Handoff.CurrentImplementation != nil || request.Handoff.CurrentTerminal != nil {
 			return false
 		}
 		if request.Handoff.Kind == "recovery" {
@@ -1753,6 +1816,14 @@ func cloneReconciliationRequest(request reconciliationEffectRequest) reconciliat
 		if handoff.Outcome != nil {
 			outcome := cloneHandoffOutcome(*handoff.Outcome)
 			handoff.Outcome = &outcome
+		}
+		if handoff.CurrentImplementation != nil {
+			binding := *handoff.CurrentImplementation
+			handoff.CurrentImplementation = &binding
+		}
+		if handoff.CurrentTerminal != nil {
+			binding := *handoff.CurrentTerminal
+			handoff.CurrentTerminal = &binding
 		}
 		request.Handoff = &handoff
 	}

@@ -297,9 +297,15 @@ func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath 
 		return 1, errors.New("invalid worker capture request")
 	}
 	var binding ImplementationLaunchBinding
+	var terminal TerminalBrokerBinding
+	brokered := false
 	if manifest != nil {
 		binding, err = ReadImplementationBinding(*manifest)
-		if err != nil || os.Getenv("TMUX_PANE") != binding.PaneID || os.Getpid() != binding.PanePID {
+		if err == nil && os.Getenv("TMUX_PANE") == binding.PaneID && os.Getpid() != binding.PanePID {
+			terminal, err = ReadTerminalBrokerBinding(TerminalBrokerPath(*manifest))
+			brokered = err == nil && terminal.OuterPID == binding.PanePID && terminal.InnerPID == os.Getpid() && terminal.InnerPGID == syscall.Getpgrp()
+		}
+		if err != nil || os.Getenv("TMUX_PANE") != binding.PaneID || os.Getpid() != binding.PanePID && !brokered {
 			return 1, errors.Join(err, errors.New("bound worker pane identity is unavailable"))
 		}
 	}
@@ -351,13 +357,13 @@ func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath 
 	defer holdWriter.Close()
 
 	wrapper := workerWrapper
-	if manifest != nil {
+	if manifest != nil && !brokered {
 		wrapper = boundWorkerWrapper
 	}
 	args := append([]string{"-c", wrapper, "agent-symphony-worker"}, command...)
 	child := exec.Command("/bin/sh", args...)
 	var gateReader, gateWriter *os.File
-	if manifest != nil {
+	if manifest != nil && !brokered {
 		gateReader, gateWriter, err = os.Pipe()
 		if err != nil {
 			return 1, err
@@ -374,6 +380,21 @@ func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath 
 		child.ExtraFiles = append(child.ExtraFiles, gateReader)
 	}
 	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if brokered {
+		child.SysProcAttr.Pgid = terminal.InnerPGID
+	}
+	stopWorker := func() error {
+		if !brokered {
+			return killProcessGroup(child)
+		}
+		if child.Process == nil {
+			return nil
+		}
+		if err := child.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return err
+		}
+		return nil
+	}
 	var result *os.File
 	resultName := resultPath
 	if resultPath != "" {
@@ -410,16 +431,16 @@ func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath 
 	if gateReader != nil {
 		_ = gateReader.Close()
 	}
-	if manifest != nil {
+	if manifest != nil && !brokered {
 		start, startErr := WriteImplementationGroupStart(*manifest, binding, "capture", child.Process.Pid, child.Process.Pid)
 		if startErr != nil {
-			_ = killProcessGroup(child)
+			_ = stopWorker()
 			_ = child.Wait()
 			return 1, startErr
 		}
 		defer func() { err = errors.Join(err, WriteImplementationGroupDead(*manifest, binding, start)) }()
 		if _, writeErr := io.WriteString(gateWriter, "go\n"); writeErr != nil {
-			_ = killProcessGroup(child)
+			_ = stopWorker()
 			_ = child.Wait()
 			return 1, writeErr
 		}
@@ -427,7 +448,7 @@ func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath 
 	}
 	pipeFD := int(pipe.Fd())
 	if err := syscall.SetNonblock(pipeFD, true); err != nil {
-		_ = killProcessGroup(child)
+		_ = stopWorker()
 		_ = child.Wait()
 		return 1, err
 	}
@@ -457,7 +478,7 @@ func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath 
 		case <-ready:
 			timer.Stop()
 			if err := afterStart(); err != nil {
-				_ = killProcessGroup(child)
+				_ = stopWorker()
 				close(stopped)
 				<-captured
 				_ = pipe.Close()
@@ -465,7 +486,7 @@ func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath 
 				return 1, err
 			}
 		case <-timer.C:
-			_ = killProcessGroup(child)
+			_ = stopWorker()
 			close(stopped)
 			<-captured
 			_ = pipe.Close()
@@ -473,7 +494,7 @@ func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath 
 			return 1, errors.New("worker produced no startup output within 15 seconds")
 		case <-ctx.Done():
 			timer.Stop()
-			_ = killProcessGroup(child)
+			_ = stopWorker()
 			close(stopped)
 			<-captured
 			_ = pipe.Close()
@@ -487,7 +508,7 @@ func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath 
 		case finished = <-completed:
 		case <-ctx.Done():
 		}
-		cleanupErr := killProcessGroup(child)
+		cleanupErr := stopWorker()
 		close(stopped)
 		captureErr := <-captured
 		_ = pipe.Close()
@@ -519,7 +540,7 @@ func captureWorkerBoundAfterStart(ctx context.Context, tmux, buffer, resultPath 
 			completed = nil
 		}
 	}
-	cleanupErr := killProcessGroup(child)
+	cleanupErr := stopWorker()
 	close(stopped)
 	if captured != nil {
 		captureErr = <-captured

@@ -91,7 +91,7 @@ func TestPendingStartReplaysOnlyExactParkedPane(t *testing.T) {
 	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "b")
 	candidate := start.Manifest
 	candidate.LaunchID = start.Identity.EffectID
-	if err := r.startSession(t.Context(), candidate, nil, candidate.LaunchID, []string{"/bin/sh"}); err != nil {
+	if err := r.startSession(t.Context(), candidate, nil, candidate.LaunchID, BoundPaneExitStatusCommand(r.Helper, r.tmux(), candidate, []string{"/bin/sh"})); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(fake.sessions[manifest.Session].agent, "implementation-gate") {
@@ -132,7 +132,7 @@ func TestEnteredStartGateWithoutCompletionMarkerIsNotProofOfRunning(t *testing.T
 	start.GateNonce = start.Identity.EffectID
 	candidate := manifest
 	candidate.LaunchID = start.GateNonce
-	if err := r.startSession(t.Context(), candidate, nil, candidate.LaunchID, []string{"/bin/sh"}); err != nil {
+	if err := r.startSession(t.Context(), candidate, nil, candidate.LaunchID, BoundPaneExitStatusCommand(r.Helper, r.tmux(), candidate, []string{"/bin/sh"})); err != nil {
 		t.Fatal(err)
 	}
 	binding, err := ReadImplementationBinding(candidate)
@@ -238,7 +238,7 @@ func TestPendingStartDoesNotDuplicateRenamedLivePane(t *testing.T) {
 	start := effectTestRequest(t, executor, EffectRequest{Action: EffectStart, Attempt: attempt, Manifest: prepared.Manifest, Eligible: true}, "d")
 	candidate := start.Manifest
 	candidate.LaunchID = start.Identity.EffectID
-	if err := r.startSession(t.Context(), candidate, nil, candidate.LaunchID, []string{"/bin/sh"}); err != nil {
+	if err := r.startSession(t.Context(), candidate, nil, candidate.LaunchID, BoundPaneExitStatusCommand(r.Helper, r.tmux(), candidate, []string{"/bin/sh"})); err != nil {
 		t.Fatal(err)
 	}
 	bound := fake.sessions[manifest.Session]

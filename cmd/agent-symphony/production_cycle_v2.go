@@ -912,8 +912,24 @@ func (p *productionReconciliation) resumePendingRuntime(ctx context.Context, bat
 			if verification.Result == nil {
 				return errStateConflict
 			}
-			if _, err := p.owner.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: action, Manifest: verification.Result.Manifest}); err != nil {
+			finish := finishRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: action, Manifest: verification.Result.Manifest}
+			var terminal *agentruntime.TerminalBrokerBinding
+			if verification.Result.Manifest.State == "running" && (action == agentruntime.EffectStart || action == agentruntime.EffectHandoff && verification.Result.Manifest.LaunchID != manifest.LaunchID) {
+				launch, launchErr := agentruntime.ReadImplementationBinding(verification.Result.Manifest)
+				binding, readErr := agentruntime.ReadTerminalBrokerBinding(agentruntime.TerminalBrokerPath(verification.Result.Manifest))
+				if launchErr != nil || readErr != nil {
+					return errors.Join(launchErr, readErr)
+				}
+				finish.ImplementationBinding = &launch
+				terminal, finish.TerminalBroker = &binding, &binding
+			}
+			if _, err := p.owner.finishRuntimeEffect(ctx, finish); err != nil {
 				return err
+			}
+			if terminal != nil {
+				if err := agentruntime.ReleaseTerminalBroker(ctx, *terminal); err != nil {
+					return err
+				}
 			}
 		case agentruntime.EffectRetry:
 			if err := p.effects.dispatch(bound, func() {

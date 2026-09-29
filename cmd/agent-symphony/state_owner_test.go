@@ -20,6 +20,12 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
+func testImplementationTerminalBindings(manifest agentruntime.Manifest) (*agentruntime.ImplementationLaunchBinding, *agentruntime.TerminalBrokerBinding) {
+	implementation := &agentruntime.ImplementationLaunchBinding{Version: 1, Role: "capture", Token: manifest.LaunchToken, EffectID: manifest.LaunchID, ServerPID: 9001, ServerStart: 1, SessionName: manifest.Session, SessionID: "$1", PaneID: "%1", PanePID: 9002, StartPath: manifest.Worktree, Command: "agent-symphony terminal-broker-bound"}
+	terminal := &agentruntime.TerminalBrokerBinding{Version: 1, OuterPID: implementation.PanePID, InnerPID: 9003, InnerPGID: 9003, SocketPath: agentruntime.TerminalBrokerSocketPath(agentruntime.TerminalBrokerPath(manifest), agentruntime.TerminalBrokerSocketDir(manifest)), SocketDev: 1, SocketIno: 1, Secret: strings.Repeat("a", 64)}
+	return implementation, terminal
+}
+
 func writeLegacyStateFixture(t *testing.T, root, name string, value any) {
 	t.Helper()
 	body, err := json.MarshalIndent(value, "", "  ")
@@ -1366,7 +1372,8 @@ func (o *stateOwner) upsertAttempt(ctx context.Context, command upsertAttemptCom
 	running.State, running.Diagnostic = "running", ""
 	running.LaunchID = effect.StartGateNonce
 	target.LaunchID = effect.StartGateNonce
-	committed, err = o.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectStart, Manifest: running})
+	implementation, terminal := testImplementationTerminalBindings(running)
+	committed, err = o.finishRuntimeEffect(ctx, finishRuntimeEffectCommand{Identity: ownerEffectIdentity(effectRequestIdentity(*effect)), Action: agentruntime.EffectStart, Manifest: running, ImplementationBinding: implementation, TerminalBroker: terminal})
 	if err != nil || target.State == "running" {
 		return committed, writeTestCommittedManifest(committed, key, err)
 	}
@@ -1517,7 +1524,8 @@ func TestStartRunningCommitRequiresExactDurableGrant(t *testing.T) {
 		t.Fatalf("retired candidate committed running: %v", err)
 	}
 	running.LaunchID = start.StartGateNonce
-	finished, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStart, Manifest: running})
+	implementation, terminal := testImplementationTerminalBindings(running)
+	finished, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: identity, Action: agentruntime.EffectStart, Manifest: running, ImplementationBinding: implementation, TerminalBroker: terminal})
 	if err != nil || finished.State.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Manifest.LaunchID != start.StartGateNonce {
 		t.Fatalf("exact granted Start did not commit: revision=%d err=%v", finished.State.Revision, err)
 	}

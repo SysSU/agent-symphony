@@ -22,6 +22,7 @@ import (
 type blockedOwnerHandoffBoundary struct {
 	plan          reconciliationPlannedEffect
 	old           agentruntime.ImplementationLaunchBinding
+	prepared      handoffPreparedTerminal
 	prepareStart  chan struct{}
 	prepareDone   chan struct{}
 	cleanupStart  chan struct{}
@@ -39,7 +40,8 @@ func (b *blockedOwnerHandoffBoundary) call(_ context.Context, operation string, 
 	case "prepare-handoff":
 		close(b.prepareStart)
 		<-b.prepareDone // Simulate host I/O that does not respond to cancellation.
-		return agentruntime.Result{Output: b.plan.Identity.EffectID + ":" + b.plan.Request.Handoff.CandidateLaunchToken}, nil
+		body, _ := json.Marshal(b.prepared)
+		return agentruntime.Result{Output: string(body)}, nil
 	case "release-handoff":
 		b.releases.Add(1)
 		return agentruntime.Result{}, errors.New("stale handoff release reached host")
@@ -73,6 +75,10 @@ func TestDashboardStopAdmitsWhileBoundHandoffHostIsBlocked(t *testing.T) {
 	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
 	manifest.ReviewState, manifest.ReviewHead, manifest.ReviewFindings, manifest.ReviewRunCleaned = "findings-queued", manifest.BaseSHA, []string{"apply review finding"}, true
 	state := runtimeEffectInitialState(manifest)
+	oldImplementation, oldTerminal := testImplementationTerminalBindings(manifest)
+	record := state.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]
+	record.ImplementationBinding, record.TerminalBroker = oldImplementation, oldTerminal
+	state.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)] = record
 	addOperatorObservation(&state, manifest, "active", false)
 	state.Epoch, state.Revision = 1, 1
 	owner, err := startTestStateOwner(t, root, state, func(next runtimeOwnerState) error {
@@ -92,14 +98,17 @@ func TestDashboardStopAdmitsWhileBoundHandoffHostIsBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := agentruntime.ImplementationLaunchBinding{Version: 1, Role: "unknown", Token: manifest.LaunchToken, EffectID: manifest.LaunchID, ServerPID: 100, ServerStart: 1, SessionName: manifest.Session, SessionID: "$1", PaneID: "%1", PanePID: 101, StartPath: manifest.Worktree, Command: "/bin/sh"}
+	old := *oldImplementation
 	if err := os.MkdirAll(filepath.Dir(agentruntime.ImplementationBindingPath(manifest, manifest.LaunchID)), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := agentruntime.WriteImplementationBinding(manifest, old); err != nil {
 		t.Fatal(err)
 	}
-	boundary := &blockedOwnerHandoffBoundary{plan: plan, old: old, prepareStart: make(chan struct{}), prepareDone: make(chan struct{}), cleanupStart: make(chan struct{}), cleanupDone: make(chan struct{})}
+	candidate := manifest
+	candidate.LaunchToken, candidate.LaunchID = plan.Request.Handoff.CandidateLaunchToken, plan.Identity.EffectID
+	preparedImplementation, preparedTerminal := testImplementationTerminalBindings(candidate)
+	boundary := &blockedOwnerHandoffBoundary{plan: plan, old: old, prepared: handoffPreparedTerminal{*preparedImplementation, *preparedTerminal}, prepareStart: make(chan struct{}), prepareDone: make(chan struct{}), cleanupStart: make(chan struct{}), cleanupDone: make(chan struct{})}
 	service.cleanup.implementation = boundary
 	t.Cleanup(func() {
 		select {
@@ -252,6 +261,10 @@ func TestDashboardDismissAdmitsWhileBoundHandoffHostIsBlocked(t *testing.T) {
 	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
 	manifest.ReviewState, manifest.ReviewHead, manifest.ReviewFindings, manifest.ReviewRunCleaned = "findings-queued", manifest.BaseSHA, []string{"apply review finding"}, true
 	state := runtimeEffectInitialState(manifest)
+	oldImplementation, oldTerminal := testImplementationTerminalBindings(manifest)
+	record := state.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]
+	record.ImplementationBinding, record.TerminalBroker = oldImplementation, oldTerminal
+	state.Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)] = record
 	addOperatorObservation(&state, manifest, "orphaned", true)
 	state.Epoch, state.Revision = 1, 1
 	owner, err := startTestStateOwner(t, root, state, func(next runtimeOwnerState) error {
@@ -273,14 +286,17 @@ func TestDashboardDismissAdmitsWhileBoundHandoffHostIsBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := agentruntime.ImplementationLaunchBinding{Version: 1, Role: "unknown", Token: manifest.LaunchToken, EffectID: manifest.LaunchID, ServerPID: 100, ServerStart: 1, SessionName: manifest.Session, SessionID: "$1", PaneID: "%1", PanePID: 101, StartPath: manifest.Worktree, Command: "/bin/sh"}
+	old := *oldImplementation
 	if err := os.MkdirAll(filepath.Dir(agentruntime.ImplementationBindingPath(manifest, manifest.LaunchID)), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := agentruntime.WriteImplementationBinding(manifest, old); err != nil {
 		t.Fatal(err)
 	}
-	boundary := &blockedOwnerHandoffBoundary{plan: plan, old: old, prepareStart: make(chan struct{}), prepareDone: make(chan struct{}), cleanupStart: make(chan struct{}), cleanupDone: make(chan struct{})}
+	candidate := manifest
+	candidate.LaunchToken, candidate.LaunchID = plan.Request.Handoff.CandidateLaunchToken, plan.Identity.EffectID
+	preparedImplementation, preparedTerminal := testImplementationTerminalBindings(candidate)
+	boundary := &blockedOwnerHandoffBoundary{plan: plan, old: old, prepared: handoffPreparedTerminal{*preparedImplementation, *preparedTerminal}, prepareStart: make(chan struct{}), prepareDone: make(chan struct{}), cleanupStart: make(chan struct{}), cleanupDone: make(chan struct{})}
 	boundary.cleanupErr.Store(true)
 	service.cleanup.implementation = boundary
 	t.Cleanup(func() {

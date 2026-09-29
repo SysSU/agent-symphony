@@ -21,16 +21,17 @@ import (
 // The files are durable proof from the exact reviewer wrapper. They are not
 // owner state; the owner still validates every completion before committing it.
 type reviewerLaunchIdentity struct {
-	EffectID           string `json:"effect_id"`
-	RunID              string `json:"run_id"`
-	IssueGeneration    uint64 `json:"issue_generation"`
-	AttemptGeneration  uint64 `json:"attempt_generation"`
-	RequestDigest      string `json:"request_digest"`
-	ProfileDigest      string `json:"profile_digest"`
-	ConfinementVersion uint64 `json:"confinement_version"`
-	GateProtocol       bool   `json:"gate_protocol,omitempty"`
-	SessionRequested   bool   `json:"session_requested,omitempty"`
-	ChildPID           int    `json:"child_pid,omitempty"`
+	EffectID           string                              `json:"effect_id"`
+	RunID              string                              `json:"run_id"`
+	IssueGeneration    uint64                              `json:"issue_generation"`
+	AttemptGeneration  uint64                              `json:"attempt_generation"`
+	RequestDigest      string                              `json:"request_digest"`
+	ProfileDigest      string                              `json:"profile_digest"`
+	ConfinementVersion uint64                              `json:"confinement_version"`
+	GateProtocol       bool                                `json:"gate_protocol,omitempty"`
+	SessionRequested   bool                                `json:"session_requested,omitempty"`
+	ChildPID           int                                 `json:"child_pid,omitempty"`
+	Broker             *agentruntime.TerminalBrokerBinding `json:"broker,omitempty"`
 }
 
 type reviewerTerminalRecord struct {
@@ -48,6 +49,8 @@ func reviewerIdentity(identity stateResultIdentity) reviewerLaunchIdentity {
 func sameReviewerIdentity(actual, expected reviewerLaunchIdentity) bool {
 	actual.ChildPID = 0
 	expected.ChildPID = 0
+	actual.Broker = nil
+	expected.Broker = nil
 	return reflect.DeepEqual(actual, expected)
 }
 
@@ -56,25 +59,49 @@ func reviewerLifecyclePaths(snapshot, target string) (string, string) {
 	return filepath.Join(root, "launch.json"), filepath.Join(root, "terminal.json")
 }
 
+func reviewerBrokerPath(snapshot, target string) string {
+	return filepath.Join(filepath.Dir(reviewResultPath(snapshot, target)), "broker.json")
+}
+
+func validReviewerTerminalCertificate(stateRoot string, proof reviewerProcessProof) bool {
+	if proof.Pane == nil || proof.TerminalBroker == nil || proof.BrokerPath == "" || !filepath.IsAbs(proof.BrokerPath) || filepath.Clean(proof.BrokerPath) != proof.BrokerPath || filepath.Base(proof.BrokerPath) != "broker.json" {
+		return false
+	}
+	root := productionSnapshotRoot(stateRoot)
+	relative, err := filepath.Rel(root, proof.BrokerPath)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) || filepath.IsAbs(relative) {
+		return false
+	}
+	pane := proof.Pane
+	if pane.ServerPID < 2 || pane.ServerStart == 0 || pane.SessionName == "" || pane.PanePID < 2 || !strings.HasPrefix(pane.SessionID, "$") || !strings.HasPrefix(pane.PaneID, "%") {
+		return false
+	}
+	if _, err := strconv.Atoi(strings.TrimPrefix(pane.SessionID, "$")); err != nil {
+		return false
+	}
+	if _, err := strconv.Atoi(strings.TrimPrefix(pane.PaneID, "%")); err != nil {
+		return false
+	}
+	return proof.TerminalBroker.OuterPID == pane.PanePID && proof.TerminalBroker.InnerPGID == proof.GroupPID && agentruntime.ValidTerminalBrokerAt(proof.BrokerPath, agentruntime.TerminalBrokerSocketDirForState(stateRoot), *proof.TerminalBroker)
+}
+
 func reviewerSignal(identity reviewerLaunchIdentity) string { return "review-" + identity.EffectID }
 func reviewerStartSignal(identity reviewerLaunchIdentity) string {
 	return reviewerSignal(identity) + "-start"
-}
-func reviewerGoSignal(identity reviewerLaunchIdentity) string {
-	return reviewerSignal(identity) + "-go"
 }
 
 func reviewerPaneStartMatches(start, launchPath, terminalPath string, identity reviewerLaunchIdentity) bool {
 	return strings.Contains(start, " review-pane tmux ") && strings.Contains(start, launchPath) && strings.Contains(start, terminalPath) && strings.Contains(start, reviewerSignal(identity)) && strings.Contains(start, identity.RequestDigest)
 }
 
-const reviewerPaneIdentityFormat = agentruntime.PaneStatusFormat + "|#{session_id}|#{pane_pid}|#{pid}|#{start_time}|#{session_name}|#{pane_start_command}"
+const reviewerPaneIdentityFormat = agentruntime.PaneStatusFormat + "|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{start_time}|#{session_name}|#{pane_start_command}"
 const reviewerSessionsFormat = "#{pid}|#{start_time}|#{session_name}"
 const reviewerGuardMismatch = "reviewer-guard-mismatch"
 
 type reviewerPaneIdentity struct {
 	Status    agentruntime.PaneStatus
 	SessionID string
+	PaneID    string
 	PID       int
 	ServerPID int
 	StartTime uint64
@@ -83,8 +110,8 @@ type reviewerPaneIdentity struct {
 }
 
 func parseReviewerPaneIdentity(output string) (reviewerPaneIdentity, error) {
-	fields := strings.SplitN(strings.TrimSpace(output), "|", 11)
-	if len(fields) != 11 || !strings.HasPrefix(fields[5], "$") || len(fields[5]) < 2 {
+	fields := strings.SplitN(strings.TrimSpace(output), "|", 12)
+	if len(fields) != 12 || !strings.HasPrefix(fields[5], "$") || len(fields[5]) < 2 || !strings.HasPrefix(fields[6], "%") || len(fields[6]) < 2 {
 		return reviewerPaneIdentity{}, errors.New("exact reviewer pane/session identity is unavailable")
 	}
 	if _, err := strconv.Atoi(strings.TrimPrefix(fields[5], "$")); err != nil {
@@ -94,42 +121,45 @@ func parseReviewerPaneIdentity(output string) (reviewerPaneIdentity, error) {
 	if err != nil {
 		return reviewerPaneIdentity{}, err
 	}
-	pid, err := reviewerPanePID(fields[6])
+	if _, err := strconv.Atoi(strings.TrimPrefix(fields[6], "%")); err != nil {
+		return reviewerPaneIdentity{}, errors.New("exact reviewer pane ID is unavailable")
+	}
+	pid, err := reviewerPanePID(fields[7])
 	if err != nil {
 		return reviewerPaneIdentity{}, err
 	}
-	serverPID, err := reviewerPanePID(fields[7])
+	serverPID, err := reviewerPanePID(fields[8])
 	if err != nil {
 		return reviewerPaneIdentity{}, err
 	}
-	startTime, err := strconv.ParseUint(fields[8], 10, 64)
-	if err != nil || startTime == 0 || fields[9] == "" {
+	startTime, err := strconv.ParseUint(fields[9], 10, 64)
+	if err != nil || startTime == 0 || fields[10] == "" {
 		return reviewerPaneIdentity{}, errors.New("exact reviewer server/session identity is unavailable")
 	}
-	return reviewerPaneIdentity{Status: status, SessionID: fields[5], PID: pid, ServerPID: serverPID, StartTime: startTime, Name: fields[9], Start: fields[10]}, nil
+	return reviewerPaneIdentity{Status: status, SessionID: fields[5], PaneID: fields[6], PID: pid, ServerPID: serverPID, StartTime: startTime, Name: fields[10], Start: fields[11]}, nil
 }
 
 // A missing pane can still expose server-global format fields on a live tmux
 // server. Require every pane/session field to be empty before treating it as
 // absent; malformed or partially populated identities remain ambiguous.
 func reviewerPaneAbsent(output string) bool {
-	fields := strings.SplitN(strings.TrimSpace(output), "|", 11)
-	if len(fields) != 11 {
+	fields := strings.SplitN(strings.TrimSpace(output), "|", 12)
+	if len(fields) != 12 {
 		return false
 	}
-	for _, index := range []int{0, 1, 2, 3, 4, 5, 6, 9, 10} {
+	for _, index := range []int{0, 1, 2, 3, 4, 5, 6, 7, 10, 11} {
 		if fields[index] != "" {
 			return false
 		}
 	}
-	if fields[7] == "" && fields[8] == "" {
+	if fields[8] == "" && fields[9] == "" {
 		return true
 	}
-	serverPID, err := reviewerPanePID(fields[7])
+	serverPID, err := reviewerPanePID(fields[8])
 	if err != nil || serverPID < 2 {
 		return false
 	}
-	startTime, err := strconv.ParseUint(fields[8], 10, 64)
+	startTime, err := strconv.ParseUint(fields[9], 10, 64)
 	return err == nil && startTime > 0
 }
 
@@ -200,28 +230,23 @@ func exactTmuxSessionAbsent(result agentruntime.Result, session string) bool {
 	return missingTmuxServer(result) || result.Exited && result.Code == 1 && message == "can't find session: "+session
 }
 
-func verifyReviewerChildBinding(ctx context.Context, boundary boundaryCaller, env []string, session, launchPath, terminalPath string, identity reviewerLaunchIdentity, candidate int) error {
+func observeReviewerChildBinding(ctx context.Context, boundary boundaryCaller, env []string, session, launchPath, terminalPath string, identity reviewerLaunchIdentity, candidate int) (reviewerPaneIdentity, error) {
 	if candidate < 2 {
-		return errors.New("reviewer child process identity is missing")
+		return reviewerPaneIdentity{}, errors.New("reviewer child process identity is missing")
 	}
 	pane := agentruntime.PaneTarget(session)
-	started, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", pane, "#{pane_start_command}"}, Env: env})
-	matching := reviewerPaneStartMatches(started.Output, launchPath, terminalPath, identity)
-	if launchPath == "" && terminalPath == "" {
-		matching = strings.Contains(started.Output, " review-pane tmux ") && strings.Contains(started.Output, reviewerSignal(identity))
+	observed, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", pane, reviewerPaneIdentityFormat}, Env: env})
+	if err != nil || observed.Exited {
+		return reviewerPaneIdentity{}, errors.New("exact reviewer wrapper identity is unavailable")
 	}
-	if err != nil || started.Exited || !matching {
-		return errors.New("exact reviewer wrapper is not live")
+	parsed, err := parseReviewerPaneIdentity(observed.Output)
+	if err != nil || parsed.Name != session || parsed.Status.Dead {
+		return reviewerPaneIdentity{}, errors.Join(err, errors.New("exact reviewer wrapper is not live"))
 	}
-	pidResult, err := boundary.call(ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"display-message", "-p", "-t", pane, "#{pane_pid}"}, Env: env})
-	if err != nil || pidResult.Exited {
-		return errors.New("exact reviewer wrapper PID is unavailable")
+	if err := verifyReviewerChildAtPane(ctx, parsed, launchPath, terminalPath, identity, candidate); err != nil {
+		return reviewerPaneIdentity{}, err
 	}
-	wrapperPID, err := reviewerPanePID(pidResult.Output)
-	if err != nil {
-		return err
-	}
-	return verifyReviewerChildAtPane(ctx, reviewerPaneIdentity{PID: wrapperPID, Start: started.Output}, launchPath, terminalPath, identity, candidate)
+	return parsed, nil
 }
 
 func verifyReviewerChildAtPane(ctx context.Context, pane reviewerPaneIdentity, launchPath, terminalPath string, identity reviewerLaunchIdentity, candidate int) error {
@@ -323,62 +348,38 @@ func writeReviewerRecord(path string, value any) error {
 
 // runReviewerPane is an internal tmux command, not an operator action.
 func runReviewerPane(args []string, stdout, stderr io.Writer) (int, syscall.Signal, error) {
-	if len(args) < 8 || args[6] != "--" || args[0] == "" || !filepath.IsAbs(args[1]) || !filepath.IsAbs(args[2]) || args[7] == "" {
+	if len(args) < 10 || args[8] != "--" || args[0] == "" || !filepath.IsAbs(args[1]) || !filepath.IsAbs(args[2]) || !filepath.IsAbs(args[3]) || !filepath.IsAbs(args[4]) || args[9] == "" {
 		return 125, 0, errors.New("invalid internal reviewer pane invocation")
 	}
 	var identity reviewerLaunchIdentity
-	if json.Unmarshal([]byte(args[5]), &identity) != nil || identity.EffectID == "" || !validDigest(identity.RunID) || identity.IssueGeneration == 0 || identity.AttemptGeneration == 0 || identity.RequestDigest == "" || !validDigest(identity.ProfileDigest) || identity.ConfinementVersion != reviewerConfinementVersion || reviewerSignal(identity) != args[3] || reviewerStartSignal(identity) != args[4] {
+	if json.Unmarshal([]byte(args[7]), &identity) != nil || identity.EffectID == "" || !validDigest(identity.RunID) || identity.IssueGeneration == 0 || identity.AttemptGeneration == 0 || identity.RequestDigest == "" || !validDigest(identity.ProfileDigest) || identity.ConfinementVersion != reviewerConfinementVersion || identity.ChildPID != 0 || identity.Broker != nil || reviewerSignal(identity) != args[5] || reviewerStartSignal(identity) != args[6] {
 		return 125, 0, errors.New("invalid reviewer launch identity")
 	}
-	launchPath, terminalPath := args[1], args[2]
-	if filepath.Dir(launchPath) != filepath.Dir(terminalPath) || filepath.Base(launchPath) != "launch.json" || filepath.Base(terminalPath) != "terminal.json" {
+	launchPath, terminalPath, brokerPath, socketDir := args[1], args[2], args[3], args[4]
+	if filepath.Dir(launchPath) != filepath.Dir(terminalPath) || filepath.Dir(launchPath) != filepath.Dir(brokerPath) || filepath.Base(launchPath) != "launch.json" || filepath.Base(terminalPath) != "terminal.json" || filepath.Base(brokerPath) != "broker.json" {
 		return 125, 0, errors.New("reviewer lifecycle paths do not match")
 	}
 	defer func() {
-		unlock := exec.Command("tmux", "wait-for", "-U", args[3])
+		unlock := exec.Command("tmux", "wait-for", "-U", args[5])
 		unlock.Dir = "/tmp"
 		_ = unlock.Run()
-		unlockStart := exec.Command("tmux", "wait-for", "-U", args[4])
+		unlockStart := exec.Command("tmux", "wait-for", "-U", args[6])
 		unlockStart.Dir = "/tmp"
 		_ = unlockStart.Run()
 	}()
-	lock := exec.Command(args[0], "wait-for", "-L", reviewerGoSignal(identity))
-	lock.Dir = "/tmp"
-	if err := lock.Run(); err != nil {
-		return 125, 0, fmt.Errorf("lock reviewer start gate: %w", err)
-	}
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		return 125, 0, err
-	}
-	defer reader.Close()
-	defer writer.Close()
-	gateCtx, cancelGate := context.WithCancel(context.Background())
-	defer cancelGate()
-	code, childSignal, err := agentruntime.RunPaneCommandAfterStart(context.Background(), args[0], args[7:], os.Stdin, stdout, stderr, func(pid int) error {
-		identity.ChildPID = pid
+	code, childSignal, err := agentruntime.RunTerminalBroker(context.Background(), brokerPath, socketDir, args[9:], os.Stdin, stdout, stderr, func(broker agentruntime.TerminalBrokerBinding) error {
+		if broker.OuterPID != os.Getpid() || !agentruntime.ValidTerminalBrokerAt(brokerPath, socketDir, broker) {
+			return errors.New("reviewer terminal broker identity is invalid")
+		}
+		identity.ChildPID = broker.InnerPGID
+		identity.Broker = &broker
 		if err := writeReviewerRecord(launchPath, identity); err != nil {
 			return err
 		}
-		_ = reader.Close()
-		unlock := exec.Command("tmux", "wait-for", "-U", args[4])
+		unlock := exec.Command("tmux", "wait-for", "-U", args[6])
 		unlock.Dir = "/tmp"
-		if err := unlock.Run(); err != nil {
-			return err
-		}
-		go func() {
-			wait := exec.CommandContext(gateCtx, args[0], "wait-for", "-L", reviewerGoSignal(identity))
-			wait.Dir = "/tmp"
-			if wait.Run() == nil {
-				_, _ = io.WriteString(writer, "go\n")
-				unlock := exec.Command(args[0], "wait-for", "-U", reviewerGoSignal(identity))
-				unlock.Dir = "/tmp"
-				_ = unlock.Run()
-			}
-			_ = writer.Close()
-		}()
-		return nil
-	}, reader)
+		return unlock.Run()
+	})
 	record := reviewerTerminalRecord{Identity: identity, ExitCode: code, Signal: int(childSignal)}
 	if writeErr := writeReviewerRecord(terminalPath, record); writeErr != nil {
 		return 126, 0, errors.Join(err, fmt.Errorf("record reviewer terminal result: %w", writeErr))
@@ -388,7 +389,7 @@ func runReviewerPane(args []string, stdout, stderr io.Writer) (int, syscall.Sign
 
 func readReviewerTerminal(launchPath, terminalPath string, identity reviewerLaunchIdentity) (*reviewerTerminalRecord, error) {
 	var launch reviewerLaunchIdentity
-	if exists, err := readReviewerRecord(launchPath, &launch); err != nil || !exists || !sameReviewerIdentity(launch, identity) {
+	if exists, err := readReviewerRecord(launchPath, &launch); err != nil || !exists || !sameReviewerIdentity(launch, identity) || launch.ChildPID < 2 || launch.Broker == nil || launch.Broker.InnerPGID != launch.ChildPID {
 		if err != nil {
 			return nil, err
 		}
@@ -399,7 +400,7 @@ func readReviewerTerminal(launchPath, terminalPath string, identity reviewerLaun
 	if err != nil || !exists {
 		return nil, err
 	}
-	if !sameReviewerIdentity(terminal.Identity, identity) || terminal.ExitCode < 0 || terminal.ExitCode > 255 || terminal.Signal < 0 || terminal.Signal > 127 || terminal.Signal != 0 && terminal.ExitCode != 128+terminal.Signal {
+	if !sameReviewerIdentity(terminal.Identity, identity) || terminal.Identity.ChildPID != launch.ChildPID || terminal.Identity.Broker == nil || *terminal.Identity.Broker != *launch.Broker || terminal.ExitCode < 0 || terminal.ExitCode > 255 || terminal.Signal < 0 || terminal.Signal > 127 || terminal.Signal != 0 && terminal.ExitCode != 128+terminal.Signal {
 		return nil, errors.New("reviewer terminal identity or exit result is invalid")
 	}
 	return &terminal, nil

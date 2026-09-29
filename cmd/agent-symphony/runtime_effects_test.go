@@ -374,7 +374,8 @@ func TestConcurrentIdenticalStartDispatchDoesNotLaunchAfterCompletion(t *testing
 	}
 	running := cloneManifest(manifest)
 	running.State, running.LaunchID = "running", request.GateNonce
-	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: agentruntime.EffectStart, Manifest: running}); err != nil {
+	implementation, terminal := testImplementationTerminalBindings(running)
+	if _, err := owner.finishRuntimeEffect(t.Context(), finishRuntimeEffectCommand{Identity: ownerEffectIdentity(request.Identity), Action: agentruntime.EffectStart, Manifest: running, ImplementationBinding: implementation, TerminalBroker: terminal}); err != nil {
 		t.Fatal(err)
 	}
 	coordinator.release(request, first)
@@ -964,6 +965,7 @@ type barrierEffectRunner struct {
 	calls               atomic.Int32
 	blocked             atomic.Int32
 	pane                *agentruntime.ImplementationPane
+	brokerManifest      *agentruntime.Manifest
 	blockMissingSession bool
 }
 
@@ -973,15 +975,35 @@ func (r *barrierEffectRunner) Run(ctx context.Context, command agentruntime.Comm
 		return agentruntime.Result{Output: formatRuntimeEffectPane(r.pane)}, nil
 	}
 	if r.pane != nil && slices.Contains(command.Args, "new-session") {
+		if index := slices.Index(command.Args, "terminal-broker-bound"); index >= 1 && len(command.Args) > index+7 {
+			manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, LogPath: command.Args[index+2], Worktree: command.Args[index+3], Session: command.Args[index+4], LaunchToken: command.Args[index+5], LaunchID: command.Args[index+6]}
+			r.brokerManifest = &manifest
+		}
 		initial := *r.pane
 		initial.Token = ""
 		return agentruntime.Result{Output: formatRuntimeEffectPane(&initial)}, nil
 	}
 	if r.pane != nil && len(command.Args) > 0 && command.Args[0] == "list-panes" {
+		if r.brokerManifest != nil {
+			terminal, err := agentruntime.ReadTerminalBrokerBinding(agentruntime.TerminalBrokerPath(*r.brokerManifest))
+			if err == nil {
+				if dead, _ := agentruntime.TerminalBrokerDead(agentruntime.TerminalBrokerPath(*r.brokerManifest), terminal); dead {
+					return agentruntime.Result{}, nil
+				}
+			}
+		}
 		return agentruntime.Result{Output: fmt.Sprintf("%d|%d|%%999\n", r.pane.ServerPID, r.pane.ServerStart)}, nil
 	}
 	if len(command.Args) > 0 && command.Args[0] == "has-session" && !r.blockMissingSession {
 		return missingTmuxSession(command), errors.New("missing session")
+	}
+	if r.pane != nil && r.brokerManifest != nil && len(command.Args) == 3 && command.Args[0] == "wait-for" && command.Args[1] == "-L" && command.Args[2] == agentruntime.TerminalBrokerReadyChannel(r.brokerManifest.LaunchID) {
+		binding := agentruntime.TerminalBrokerBinding{Version: 1, OuterPID: r.pane.PanePID, InnerPID: 9003, InnerPGID: 9003, SocketPath: agentruntime.TerminalBrokerSocketPath(agentruntime.TerminalBrokerPath(*r.brokerManifest), agentruntime.TerminalBrokerSocketDir(*r.brokerManifest)), SocketDev: 1, SocketIno: 1, Secret: strings.Repeat("a", 64)}
+		body, _ := json.Marshal(binding)
+		if err := os.WriteFile(agentruntime.TerminalBrokerPath(*r.brokerManifest), body, 0o600); err != nil {
+			return agentruntime.Result{}, err
+		}
+		return agentruntime.Result{}, nil
 	}
 	r.blocked.Add(1)
 	if r.entered != nil {
@@ -1048,6 +1070,29 @@ func boundRuntimeEffectTestManifest(t *testing.T, manifest agentruntime.Manifest
 		t.Fatal(err)
 	}
 	return manifest, pane
+}
+
+func boundLiveRuntimeEffectTestManifest(t *testing.T, stateRoot string, manifest agentruntime.Manifest) (agentruntime.Manifest, *agentruntime.ImplementationPane, agentruntime.ImplementationLaunchBinding, agentruntime.TerminalBrokerBinding) {
+	t.Helper()
+	manifest.Version, manifest.LaunchToken, manifest.LaunchID = agentruntime.ManifestVersion2, strings.Repeat("a", 32), strings.Repeat("b", 32)
+	manifest.WorkerGeneration, manifest.WorkerProfileDigest = 1, config.WorkerProfileDigest()
+	terminal := startTestTerminalBroker(t, stateRoot, agentruntime.TerminalBrokerPath(manifest))
+	pane := &agentruntime.ImplementationPane{SessionName: manifest.Session, SessionID: "$1", PaneID: "%1", PanePID: terminal.OuterPID, ServerPID: 2345, ServerStart: 1, StartPath: manifest.Worktree, Token: manifest.LaunchToken, Command: "agent-symphony terminal-broker-bound"}
+	binding, err := agentruntime.BindImplementationPane(manifest, manifest.LaunchID, "capture", *pane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agentruntime.WriteImplementationBinding(manifest, binding); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return manifest, pane, binding, terminal
 }
 
 func boundRuntimeEffectTestPane(t *testing.T, manifest agentruntime.Manifest) *agentruntime.ImplementationPane {

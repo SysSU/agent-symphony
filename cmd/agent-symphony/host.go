@@ -1162,8 +1162,8 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			if tmuxRoot := os.Getenv("TMUX_TMPDIR"); localRoot != "" && tmuxRoot != "" {
 				env = append(env, "TMUX_TMPDIR="+tmuxRoot)
 			}
-			if tmuxNewSessionOffset(args) >= 0 {
-				args = append(slices.Clone(args), "-e", "HOME="+homeDir)
+			if updated, ok := withTmuxSessionEnvironment(args, "HOME="+homeDir); ok {
+				args = updated
 			}
 		}
 		result, err = hostExecRunner(ctx, agentruntime.Command{Name: request.Command.Name, Args: args, Dir: dir, Env: env, Stdin: bytes.NewReader(request.Command.Input)})
@@ -1488,26 +1488,24 @@ func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) err
 	if manifest.Version != agentruntime.ManifestVersion2 {
 		return errors.New("legacy implementation session has no durable launch identity")
 	}
-	profileDigest := strings.TrimSpace(os.Getenv("AGENT_SYMPHONY_WORKER_PROFILE_DIGEST"))
-	confined := agentruntime.WorkerConfinementBound(manifest, manifest.WorkerGeneration, profileDigest)
-	if manifest.LaunchID == "" && confined {
-		return nil
+	if manifest.LaunchID == "" {
+		return errors.New("implementation cleanup lacks launch identity")
 	}
 	binding, err := agentruntime.ReadImplementationBinding(manifest)
 	if err != nil {
+		return err
+	}
+	terminal, err := agentruntime.ReadTerminalBrokerBinding(agentruntime.TerminalBrokerPath(manifest))
+	if err != nil || !agentruntime.ValidImplementationTerminalBinding(manifest, terminal) || terminal.OuterPID != binding.PanePID {
+		return errors.Join(err, errors.New("implementation terminal broker identity is unavailable"))
+	}
+	if err := agentruntime.StopAndProveTerminalBroker(ctx, agentruntime.TerminalBrokerPath(manifest), terminal); err != nil {
 		return err
 	}
 	proveAbsent := func() error {
 		absent, proofErr := hostBoundImplementationPaneAbsent(ctx, binding)
 		if proofErr != nil || !absent {
 			return errors.Join(proofErr, errors.New("bound implementation pane may still exist"))
-		}
-		if confined {
-			return nil
-		}
-		gone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding)
-		if groupErr != nil || !gone {
-			return errors.Join(groupErr, errors.New("implementation worker group termination is unconfirmed"))
 		}
 		return nil
 	}
@@ -1557,13 +1555,6 @@ func stopAttemptSession(ctx context.Context, manifest agentruntime.Manifest) err
 	}
 	if !absent {
 		return errors.New("bound implementation pane remained after guarded cleanup")
-	}
-	if confined {
-		return nil
-	}
-	workerGone, groupErr := agentruntime.ImplementationWorkerGone(manifest, binding)
-	if groupErr != nil || !workerGone {
-		return errors.Join(groupErr, errors.New("implementation worker group termination is unconfirmed"))
 	}
 	return nil
 }
@@ -1785,7 +1776,9 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 		return false
 	}
 	gate := ""
-	if len(args) >= 4 && slices.Equal(args[:2], []string{"wait-for", "-L"}) && args[3] == ";" {
+	if rest, bootstrapGate, ok := implementationBootstrapArgs(args); ok {
+		gate, args = bootstrapGate, rest
+	} else if len(args) >= 4 && slices.Equal(args[:2], []string{"wait-for", "-L"}) && args[3] == ";" {
 		gate, args = args[2], args[4:]
 		if !validImplementationGateChannel(gate) {
 			return false
@@ -1811,19 +1804,19 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 		if gate != "" {
 			return validBoundImplementationNewSession(args, gate, dir, root)
 		}
-		if len(args) >= 17 && args[8] == "review-pane" {
-			if args[1] != "-d" || args[2] != "-s" || args[4] != "-c" || !boundedCommandPath(args[5], dir, root) || args[6] != "--" || args[9] != "tmux" || args[15] != "--" || args[16] == "" {
+		if len(args) >= 19 && args[8] == "review-pane" {
+			if args[1] != "-d" || args[2] != "-s" || args[4] != "-c" || !boundedCommandPath(args[5], dir, root) || args[6] != "--" || args[9] != "tmux" || args[17] != "--" || args[18] == "" {
 				return false
 			}
 			helper, err := os.Executable()
 			resultRoot := filepath.Dir(args[10])
 			resultName := strings.TrimPrefix(filepath.Base(resultRoot), ".agent-symphony-review-")
 			resultDigest, digestErr := hex.DecodeString(resultName)
-			if err != nil || args[7] != helper || filepath.Base(args[10]) != "launch.json" || filepath.Base(args[11]) != "terminal.json" || resultRoot != filepath.Dir(args[11]) || filepath.Dir(resultRoot) != args[5] || digestErr != nil || len(resultDigest) != 8 || strings.ToLower(resultName) != resultName {
+			if err != nil || args[7] != helper || filepath.Base(args[10]) != "launch.json" || filepath.Base(args[11]) != "terminal.json" || filepath.Base(args[12]) != "broker.json" || resultRoot != filepath.Dir(args[11]) || resultRoot != filepath.Dir(args[12]) || filepath.Dir(resultRoot) != args[5] || args[13] != agentruntime.TerminalBrokerSocketDirForState(filepath.Dir(root)) || digestErr != nil || len(resultDigest) != 8 || strings.ToLower(resultName) != resultName {
 				return false
 			}
 			var identity reviewerLaunchIdentity
-			return json.Unmarshal([]byte(args[14]), &identity) == nil && identity.GateProtocol && identity.SessionRequested && identity.EffectID != "" && identity.IssueGeneration > 0 && identity.AttemptGeneration > 0 && validDigest(identity.RequestDigest) && args[12] == reviewerSignal(identity) && args[13] == reviewerStartSignal(identity)
+			return json.Unmarshal([]byte(args[16]), &identity) == nil && identity.GateProtocol && identity.SessionRequested && identity.EffectID != "" && identity.IssueGeneration > 0 && identity.AttemptGeneration > 0 && validDigest(identity.RequestDigest) && identity.ChildPID == 0 && identity.Broker == nil && args[14] == reviewerSignal(identity) && args[15] == reviewerStartSignal(identity)
 		}
 		return validBoundImplementationNewSession(args, "", dir, root)
 	case "has-session", "kill-session":
@@ -1837,7 +1830,7 @@ func validTmuxBoundaryArgs(args, environment []string, dir, root string) bool {
 	case "list-panes":
 		return len(args) == 4 && slices.Equal(args[1:3], []string{"-a", "-F"}) && args[3] == agentruntime.ImplementationInventoryFormat
 	case "wait-for":
-		return len(args) == 3 && (args[1] == "-L" || args[1] == "-U") && (validReviewerWaitChannel(args[2]) || validImplementationGateChannel(args[2]))
+		return len(args) == 3 && (args[1] == "-L" || args[1] == "-U") && (validReviewerWaitChannel(args[2]) || validImplementationGateChannel(args[2]) || validTerminalBrokerReadyChannel(args[2]))
 	case "capture-pane":
 		return len(args) == 6 && slices.Equal(args[1:5], []string{"-p", "-S", "-", "-t"}) && validTmuxTarget(args[5], true)
 	case "set-option":
@@ -1898,6 +1891,10 @@ func validReviewerWaitChannel(channel string) bool {
 
 func validImplementationGateChannel(channel string) bool {
 	return strings.HasPrefix(channel, "implementation-") && agentruntime.ValidLaunchToken(strings.TrimPrefix(channel, "implementation-"))
+}
+
+func validTerminalBrokerReadyChannel(channel string) bool {
+	return strings.HasPrefix(channel, "terminal-broker-") && agentruntime.ValidLaunchToken(strings.TrimPrefix(channel, "terminal-broker-"))
 }
 
 func validBoundImplementationNewSession(args []string, gate, dir, root string) bool {
@@ -2051,6 +2048,12 @@ func parseCanonicalTmuxWords(command string) ([]string, bool) {
 }
 
 func tmuxNewSessionOffset(args []string) int {
+	if rest, _, ok := implementationBootstrapArgs(args); ok {
+		if offset := tmuxNewSessionOffset(rest); offset >= 0 {
+			return len(args) - len(rest) + offset
+		}
+		return -1
+	}
 	if len(args) > 5 && slices.Equal(args[:3], []string{"set-option", "-g", "update-environment"}) && args[4] == ";" && args[5] == "new-session" {
 		return 5
 	}
@@ -2058,6 +2061,36 @@ func tmuxNewSessionOffset(args []string) int {
 		return 0
 	}
 	return -1
+}
+
+func withTmuxSessionEnvironment(args []string, entry string) ([]string, bool) {
+	offset := tmuxNewSessionOffset(args)
+	if offset < 0 {
+		return args, false
+	}
+	insert := offset + 6
+	if len(args) >= offset+9 && slices.Equal(args[offset+1:offset+4], []string{"-d", "-P", "-F"}) {
+		insert = offset + 9
+	}
+	if insert > len(args) {
+		return args, false
+	}
+	return slices.Insert(slices.Clone(args), insert, "-e", entry), true
+}
+
+func implementationBootstrapArgs(args []string) ([]string, string, bool) {
+	if len(args) < 18 || !slices.Equal(args[:3], []string{"new-session", "-d", "-s"}) || !strings.HasPrefix(args[3], "as-bootstrap-") ||
+		!slices.Equal(args[4:9], []string{"--", "/bin/sh", "-c", "sleep 30", ";"}) ||
+		!slices.Equal(args[9:11], []string{"wait-for", "-L"}) || args[12] != ";" ||
+		!slices.Equal(args[13:15], []string{"wait-for", "-L"}) || args[16] != ";" {
+		return nil, "", false
+	}
+	effectID := strings.TrimPrefix(args[3], "as-bootstrap-")
+	gate := agentruntime.ImplementationGateChannel(effectID)
+	if !agentruntime.ValidLaunchToken(effectID) || args[11] != agentruntime.TerminalBrokerReadyChannel(effectID) || args[15] != gate {
+		return nil, "", false
+	}
+	return args[17:], gate, true
 }
 
 func environmentNames(environment []string) []string {
@@ -2297,10 +2330,15 @@ func decodeHandoffRequest(input []byte, root string) (handoffRequest, struct{ Ty
 	}
 	if request.Manifest.Version == agentruntime.ManifestVersion2 {
 		decodedID, idErr := hex.DecodeString(request.CandidateLaunchID)
-		if !agentruntime.ValidManifestVersion(request.Manifest) || !agentruntime.ValidLaunchToken(request.CandidateLaunchToken) || request.CandidateLaunchToken == request.Manifest.LaunchToken || idErr != nil || len(decodedID) != 16 {
+		candidate := request.Manifest
+		candidate.LaunchToken, candidate.LaunchID = request.CandidateLaunchToken, request.CandidateLaunchID
+		currentValid := request.CurrentImplementation != nil && request.CurrentTerminal != nil && agentruntime.ValidImplementationBinding(request.Manifest, *request.CurrentImplementation, request.Manifest.LaunchID) && agentruntime.ValidImplementationTerminalBinding(request.Manifest, *request.CurrentTerminal) && request.CurrentTerminal.OuterPID == request.CurrentImplementation.PanePID
+		preparedAbsent := request.PreparedImplementation == nil && request.PreparedTerminal == nil
+		preparedValid := request.PreparedImplementation != nil && request.PreparedTerminal != nil && agentruntime.ValidImplementationBinding(candidate, *request.PreparedImplementation, candidate.LaunchID) && agentruntime.ValidImplementationTerminalBinding(candidate, *request.PreparedTerminal) && request.PreparedTerminal.OuterPID == request.PreparedImplementation.PanePID
+		if !agentruntime.ValidManifestVersion(request.Manifest) || !agentruntime.ValidLaunchToken(request.CandidateLaunchToken) || request.CandidateLaunchToken == request.Manifest.LaunchToken || idErr != nil || len(decodedID) != 16 || !currentValid || !preparedAbsent && !preparedValid {
 			return request, h, errors.New("invalid handoff candidate identity")
 		}
-	} else if request.CandidateLaunchToken != "" || request.CandidateLaunchID != "" {
+	} else if request.CandidateLaunchToken != "" || request.CandidateLaunchID != "" || request.CurrentImplementation != nil || request.CurrentTerminal != nil || request.PreparedImplementation != nil || request.PreparedTerminal != nil {
 		return request, h, errors.New("unexpected handoff candidate identity")
 	}
 	return request, h, nil
@@ -2313,9 +2351,11 @@ func handoffBinding(request handoffRequest) ([]byte, string) {
 		Handoff                    json.RawMessage
 		OutcomePath, OutcomeToken  string
 		Command                    []string
-		CandidateLaunchToken       string `json:",omitempty"`
-		CandidateLaunchID          string `json:",omitempty"`
-	}{"pending", request.Manifest.Worktree, request.Manifest.Session, request.Manifest.LogPath, request.Handoff, request.OutcomePath, request.OutcomeToken, request.Command, request.CandidateLaunchToken, request.CandidateLaunchID})
+		CandidateLaunchToken       string                                    `json:",omitempty"`
+		CandidateLaunchID          string                                    `json:",omitempty"`
+		CurrentImplementation      *agentruntime.ImplementationLaunchBinding `json:",omitempty"`
+		CurrentTerminal            *agentruntime.TerminalBrokerBinding       `json:",omitempty"`
+	}{"pending", request.Manifest.Worktree, request.Manifest.Session, request.Manifest.LogPath, request.Handoff, request.OutcomePath, request.OutcomeToken, request.Command, request.CandidateLaunchToken, request.CandidateLaunchID, request.CurrentImplementation, request.CurrentTerminal})
 	return binding, fmt.Sprintf("%x", sha256.Sum256(binding))
 }
 

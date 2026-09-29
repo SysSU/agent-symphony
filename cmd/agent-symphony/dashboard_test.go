@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SysSU/agent-symphony/internal/config"
 	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	"github.com/SysSU/agent-symphony/internal/orchestratoragent"
@@ -398,7 +399,7 @@ func TestDashboardUnsafeNetworkRequiresPassword(t *testing.T) {
 	authorized := httptest.NewRequest(http.MethodGet, server.URL, nil)
 	authorized.Header.Set("Origin", server.URL)
 	authorized.SetBasicAuth("agent-symphony", password)
-	if connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: authorized.Header}); err == nil || response == nil || response.StatusCode != http.StatusNotFound {
+	if connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: authorized.Header}); err == nil || response == nil || response.StatusCode != http.StatusConflict {
 		if connection != nil {
 			connection.CloseNow()
 		}
@@ -771,7 +772,7 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 		t.Fatal(err)
 	}
 	helper := filepath.Join(t.TempDir(), "review-boundary")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '{\"output\":\"||||||||||\",\"code\":0,\"exited\":false}\\n'\n"), 0o700); err != nil {
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '{\"output\":\"|||||||||||\",\"code\":0,\"exited\":false}\\n'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENT_SYMPHONY_REVIEW_BOUNDARY", helper)
@@ -875,7 +876,7 @@ func TestPermanentRemovalCleansExactReviewerArtifactsAndRejectsSymlinks(t *testi
 	}
 }
 
-func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
+func TestDashboardTerminalRejectsProjectedNameWithoutOwnerCertificate(t *testing.T) {
 	root := t.TempDir()
 	repository, issue, attempt := "o/r", 23, 2
 	session := "as-" + internalgithub.RepositoryIdentifier(repository) + "-23-2"
@@ -904,36 +905,18 @@ func TestDashboardTerminalAttachesOnlyProjectedSameOriginSession(t *testing.T) {
 		}
 		t.Fatalf("cross-origin terminal response=%v err=%v", response, err)
 	}
-	if connection, response, err := dial(server.URL, issue+1); err == nil || response == nil || response.StatusCode != http.StatusNotFound {
+	if connection, response, err := dial(server.URL, issue+1); err == nil || response == nil || response.StatusCode != http.StatusConflict {
 		if connection != nil {
 			connection.CloseNow()
 		}
 		t.Fatalf("unprojected terminal response=%v err=%v", response, err)
 	}
 
-	connection, response, err := dial(server.URL, issue)
-	if err != nil {
-		t.Fatalf("terminal dial response=%v err=%v", response, err)
-	}
-	defer connection.CloseNow()
-	if err := connection.Write(t.Context(), websocket.MessageText, []byte(`{"type":"resize","cols":120,"rows":40}`)); err != nil {
-		t.Fatal(err)
-	}
-	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("hello\n")); err != nil {
-		t.Fatal(err)
-	}
-	var output strings.Builder
-	deadline, cancel := context.WithTimeout(t.Context(), 3*time.Second)
-	defer cancel()
-	for !strings.Contains(output.String(), "got:hello") {
-		kind, message, err := connection.Read(deadline)
-		if err != nil || kind != websocket.MessageBinary {
-			t.Fatalf("terminal output=%q kind=%v err=%v", output.String(), kind, err)
+	if connection, response, err := dial(server.URL, issue); err == nil || response == nil || response.StatusCode != http.StatusConflict {
+		if connection != nil {
+			connection.CloseNow()
 		}
-		output.Write(message)
-	}
-	if !strings.Contains(output.String(), "40 120") {
-		t.Fatalf("terminal did not resize: %q", output.String())
+		t.Fatalf("name-only terminal response=%v err=%v", response, err)
 	}
 }
 
@@ -958,7 +941,8 @@ func TestDashboardRoutesOperatorInputDirectlyToLaunchedImplementationWithoutOrch
 		}
 	}
 	baseSHA := runGit(t, source, "rev-parse", "HEAD")
-	stateRoot, attemptRoot := resolvedTempDir(t), filepath.Join(resolvedTempDir(t), "attempts")
+	stateRoot := resolvedTempDir(t)
+	attemptRoot := productionAttemptRoot(stateRoot)
 	if err := os.MkdirAll(attemptRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -992,35 +976,47 @@ printf 'implementation-finished\r\n'
 	if output, err := exec.Command("go", "build", "-o", helper, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build gate helper: %v: %s", err, output)
 	}
-	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Git: "git", Tmux: tmux, Helper: helper, Runner: agentruntime.ExecRunner{}, AllowEnv: []string{"PATH", "TERM"}, VerifyWorker: func(context.Context) error { return nil }}
+	profileDigest := config.WorkerProfileDigest()
+	runtimeState := &agentruntime.Runtime{Root: attemptRoot, StateRoot: stateRoot, Source: source, Git: "git", Tmux: tmux, Helper: helper, Runner: agentruntime.ExecRunner{}, AllowEnv: []string{"PATH", "TERM"}, WorkerProfileDigest: profileDigest, VerifyWorker: func(context.Context) error { return nil }}
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 214, Number: 1, BaseSHA: baseSHA, Context: "Issue: #214\nSession: " + identity.Session, Command: []string{agent}, Interactive: true}
 	manifest, err := agentruntime.PreparingManifest(attemptRoot, stateRoot, attempt, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := agentruntime.EffectExecutor{Runtime: runtimeState, AuthorizeLaunch: func(context.Context, agentruntime.EffectRequest) error { return nil }}
-	for _, step := range []struct {
-		action agentruntime.EffectAction
-		id     string
-	}{{agentruntime.EffectPrepare, strings.Repeat("a", 32)}, {agentruntime.EffectStart, strings.Repeat("b", 32)}} {
-		request, err := executor.BindRequest(agentruntime.EffectRequest{Action: step.action, Attempt: attempt, Manifest: manifest, Eligible: true})
-		if err != nil {
-			t.Fatal(err)
-		}
-		request.Identity = agentruntime.EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 1, IssueGeneration: 1, AttemptGeneration: 1, EffectID: step.id}
-		if step.action == agentruntime.EffectStart {
-			request.GateNonce = step.id
-		}
-		request.Identity.RequestDigest, err = agentruntime.EffectRequestDigest(request)
-		if err != nil {
-			t.Fatal(err)
-		}
-		result, err := executor.Execute(t.Context(), request)
-		if err != nil {
-			t.Fatal(err)
-		}
-		manifest = result.Manifest
+	manifest, err = agentruntime.BindWorkerConfinement(manifest, 1, profileDigest)
+	if err != nil {
+		t.Fatal(err)
 	}
+	executor := agentruntime.EffectExecutor{Runtime: runtimeState, AuthorizeLaunch: func(context.Context, agentruntime.EffectRequest) error { return nil }}
+	prepare, err := executor.BindRequest(agentruntime.EffectRequest{Action: agentruntime.EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepare.Identity = agentruntime.EffectIdentity{Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt, Epoch: 1, SourceRevision: 1, IssueGeneration: 1, AttemptGeneration: 1, EffectID: strings.Repeat("a", 32)}
+	prepare.Identity.RequestDigest, err = agentruntime.EffectRequestDigest(prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := executor.Execute(t.Context(), prepare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest = prepared.Manifest
+	owner, err := startTestStateOwner(t, stateRoot, runtimeEffectInitialState(manifest), func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.close(context.Background()) })
+	coordinator, err := newRuntimeEffectCoordinator(t.Context(), owner, agentruntime.EffectExecutor{Runtime: runtimeState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := beginRuntimeTestEffectRequest(t, coordinator, owner, agentruntime.EffectRequest{Action: agentruntime.EffectStart, Attempt: attempt, Manifest: manifest, Eligible: true})
+	started, err := coordinator.execute(t.Context(), start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest = started.Manifest
 	manifestPath := filepath.Join(filepath.Dir(manifest.LogPath), "manifest.json")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
 		t.Fatal(err)
@@ -1037,9 +1033,23 @@ printf 'implementation-finished\r\n'
 	if err := writeStatusSnapshot(stateRoot, []orchestrator.RecoveryStatus{status}); err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(newDashboardHandler(t.Context(), stateRoot, tmux))
+	dashboard := newProjectDashboardServer(t.Context(), stateRoot, manifest.Repository, nil, tmux, nil, nil, false, "")
+	dashboard.operator = &operatorMutationService{owner: owner}
+	permit, err := dashboard.implementationTerminalPermit(mustOwnerSnapshot(t, owner), manifest.Issue, manifest.Attempt)
+	if err != nil {
+		t.Fatalf("owner terminal permit: %v", err)
+	}
+	probe, err := agentruntime.DialTerminalBroker(t.Context(), permit.terminal)
+	if err != nil {
+		t.Fatalf("broker probe: %v", err)
+	}
+	_ = probe.Close()
+	if !permit.current(mustOwnerSnapshot(t, owner)) {
+		t.Fatal("owner terminal permit was not current after admission")
+	}
+	server := httptest.NewServer(dashboard.webHandler())
 	defer server.Close()
-	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/terminal?issue=214&attempt=1"
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/terminal?repository=o%2Fr&issue=214&attempt=1"
 	connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
 	if err != nil {
 		t.Fatalf("terminal dial response=%v err=%v", response, err)
@@ -1164,14 +1174,11 @@ func TestDashboardAndCLIRejectRetainedDeadImplementationPane(t *testing.T) {
 	defer server.Close()
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/terminal?issue=214&attempt=1"
 	connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
-	if err != nil {
-		t.Fatalf("retained-dead terminal dial response=%v err=%v", response, err)
+	if connection != nil {
+		connection.CloseNow()
 	}
-	defer connection.CloseNow()
-	_, _, err = connection.Read(t.Context())
-	var closeErr websocket.CloseError
-	if !errors.As(err, &closeErr) || closeErr.Code != websocket.StatusNormalClosure || closeErr.Reason != "Session ended." {
-		t.Fatalf("retained-dead terminal close=%#v err=%v", closeErr, err)
+	if err == nil || response == nil || response.StatusCode != http.StatusConflict {
+		t.Fatalf("retained-dead terminal was not rejected before upgrade: response=%v err=%v", response, err)
 	}
 }
 
@@ -1203,8 +1210,8 @@ func TestDashboardImplementationTerminalRequiresRunningCurrentProjection(t *test
 				t.Fatal(err)
 			}
 			response.Body.Close()
-			if response.StatusCode != http.StatusNotFound {
-				t.Fatalf("terminal status=%d, want %d", response.StatusCode, http.StatusNotFound)
+			if response.StatusCode != http.StatusConflict {
+				t.Fatalf("terminal status=%d, want %d", response.StatusCode, http.StatusConflict)
 			}
 		})
 	}
@@ -1305,7 +1312,7 @@ func TestDashboardRejectsReviewerTerminalWithoutBlockingImplementation(t *testin
 		}
 		return websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
 	}
-	if connection, response, err := dial("/terminal", "role=future"); err == nil || response == nil || response.StatusCode != http.StatusNotFound {
+	if connection, response, err := dial("/terminal", "role=future"); err == nil || response == nil || response.StatusCode != http.StatusConflict {
 		if connection != nil {
 			connection.CloseNow()
 		}
@@ -1320,29 +1327,15 @@ func TestDashboardRejectsReviewerTerminalWithoutBlockingImplementation(t *testin
 	}
 	message, readErr := io.ReadAll(response.Body)
 	response.Body.Close()
-	if readErr != nil || !strings.Contains(string(message), "session identity can be verified safely") {
+	if readErr != nil || !strings.Contains(string(message), "terminal identity is unavailable") {
 		t.Fatalf("reviewer terminal reason=%q err=%v", message, readErr)
 	}
 	connection, response, err = dial("/terminal", "")
-	if err != nil {
-		t.Fatalf("implementation terminal dial response=%v err=%v", response, err)
+	if connection != nil {
+		connection.CloseNow()
 	}
-	defer connection.CloseNow()
-	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("review the dependency edge\n")); err != nil {
-		t.Fatal(err)
-	}
-	var output strings.Builder
-	for {
-		kind, message, readErr := connection.Read(t.Context())
-		if readErr != nil {
-			t.Fatalf("implementation terminal output=%q err=%v", output.String(), readErr)
-		}
-		if kind == websocket.MessageBinary {
-			output.Write(message)
-		}
-		if strings.Contains(output.String(), "got:review the dependency edge") {
-			break
-		}
+	if err == nil || response == nil || response.StatusCode != http.StatusConflict {
+		t.Fatalf("implementation without an owner certificate was not rejected: response=%v err=%v", response, err)
 	}
 
 	status.Sessions[1].Name = "as-r-forged"
@@ -1390,32 +1383,13 @@ func TestDashboardTerminalRejectsTamperedIdentityAndInvalidMessages(t *testing.T
 	}
 	server := httptest.NewServer(newDashboardHandler(t.Context(), root, script))
 	defer server.Close()
-	parsed, _ := url.Parse(server.URL)
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/terminal?issue=8&attempt=1"
-	connection, _, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
-	if err != nil {
-		t.Fatal(err)
+	connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
+	if connection != nil {
+		connection.CloseNow()
 	}
-	defer connection.CloseNow()
-	if err := connection.Write(t.Context(), websocket.MessageText, []byte(`{"type":"resize","cols":0,"rows":40}`)); err != nil {
-		t.Fatal(err)
-	}
-	_, _, err = connection.Read(t.Context())
-	if websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
-		t.Fatalf("invalid resize from %s close=%v err=%v", parsed.Host, websocket.CloseStatus(err), err)
-	}
-
-	connection, _, err = websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.CloseNow()
-	if err := connection.Write(t.Context(), websocket.MessageBinary, make([]byte, maxTerminalInputBytes+1)); err != nil {
-		t.Fatal(err)
-	}
-	_, _, err = connection.Read(t.Context())
-	if websocket.CloseStatus(err) != websocket.StatusMessageTooBig {
-		t.Fatalf("oversized input close=%v err=%v", websocket.CloseStatus(err), err)
+	if err == nil || response == nil || response.StatusCode != http.StatusConflict {
+		t.Fatalf("name-only terminal was not rejected before upgrade: response=%v err=%v", response, err)
 	}
 }
 
@@ -1463,13 +1437,10 @@ func TestDashboardTerminalAttachRaceClosesWithExplicitReason(t *testing.T) {
 	defer server.Close()
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/terminal?issue=8&attempt=1"
 	connection, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
-	if err != nil {
-		t.Fatalf("terminal dial response=%v err=%v", response, err)
+	if connection != nil {
+		connection.CloseNow()
 	}
-	defer connection.CloseNow()
-	_, _, err = connection.Read(t.Context())
-	var closeErr websocket.CloseError
-	if !errors.As(err, &closeErr) || closeErr.Code != websocket.StatusNormalClosure || closeErr.Reason != "Session ended." {
-		t.Fatalf("attach race close=%#v err=%v", closeErr, err)
+	if err == nil || response == nil || response.StatusCode != http.StatusConflict {
+		t.Fatalf("uncertified attach race was not rejected before upgrade: response=%v err=%v", response, err)
 	}
 }

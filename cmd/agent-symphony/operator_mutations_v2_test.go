@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -951,7 +952,7 @@ func TestCancelBindsObservedReviewerGroupBeforeStopAndSurvivesRestart(t *testing
 	if _, err := bindingOwner.markReviewerStopped(t.Context(), markReviewerStoppedCommand{Identity: identity, Observation: reviewerStopObservation{GroupPID: 12345}}); !errors.Is(err, errStateConflict) {
 		t.Fatalf("stop completed before durable group bind: %v", err)
 	}
-	bound, err := bindingOwner.bindReviewerStopping(t.Context(), bindReviewerStoppingCommand{Identity: identity, GroupPID: 12345})
+	bound, err := bindingOwner.bindReviewerStopping(t.Context(), testBindReviewerStopping(owner.stateRoot, identity, 12345, *review.Reviewer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1133,22 +1134,26 @@ func TestBindReviewerStoppingRequiresPriorRunProofToBeForgotten(t *testing.T) {
 				effect.SupersededReviewerAttemptGeneration = 2
 			}
 			state.Effects[effect.ID] = effect
-			command := bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), GroupPID: 22222}
-			if err := applyBindReviewerStopping(&state, command); !errors.Is(err, errStateConflict) {
+			stateRoot := resolvedTempDir(t)
+			brokerPath := filepath.Join(productionSnapshotRoot(stateRoot), "reviews", "broker.json")
+			pane := reviewerPaneIdentity{SessionID: "$1", PaneID: "%1", PID: 9002, ServerPID: 9001, StartTime: 1, Name: "reviewer"}
+			broker := agentruntime.TerminalBrokerBinding{Version: 1, OuterPID: pane.PID, InnerPID: 22222, InnerPGID: 22222, SocketPath: agentruntime.TerminalBrokerSocketPath(brokerPath, agentruntime.TerminalBrokerSocketDirForState(stateRoot)), SocketDev: 1, SocketIno: 1, Secret: strings.Repeat("a", 64)}
+			command := bindReviewerStoppingCommand{Identity: ownerEffectIdentity(effectRequestIdentity(effect)), GroupPID: 22222, Pane: &pane, TerminalBroker: &broker, BrokerPath: brokerPath}
+			if err := applyBindReviewerStopping(stateRoot, &state, command); !errors.Is(err, errStateConflict) {
 				t.Fatalf("different prior run proof was replaced: %v", err)
 			}
 			if !reflect.DeepEqual(state.ReviewerProofs[key], old) {
 				t.Fatalf("rejected binding changed the prior run proof: %#v", state.ReviewerProofs[key])
 			}
 			delete(state.ReviewerProofs, key) // Physical cleanup plus owner forget occurs before a new run can bind.
-			if err := applyBindReviewerStopping(&state, command); err != nil {
+			if err := applyBindReviewerStopping(stateRoot, &state, command); err != nil {
 				t.Fatalf("new reviewer could not bind after prior proof was forgotten: %v", err)
 			}
 			bound := state.ReviewerProofs[key]
 			if bound.RunID != review.Reviewer.RunID || bound.GroupPID != 22222 || bound.DeadProved {
 				t.Fatalf("new live reviewer proof was not bound exactly: %#v", bound)
 			}
-			if err := applyBindReviewerStopping(&state, command); err != nil || !reflect.DeepEqual(state.ReviewerProofs[key], bound) {
+			if err := applyBindReviewerStopping(stateRoot, &state, command); err != nil || !reflect.DeepEqual(state.ReviewerProofs[key], bound) {
 				t.Fatalf("exact reviewer binding replay changed state: proof=%#v err=%v", state.ReviewerProofs[key], err)
 			}
 		})
