@@ -996,8 +996,12 @@ type dashboardReviewerTerminalPermit struct {
 	issueGeneration   uint64
 	attemptGeneration uint64
 	proof             reviewerProcessProof
-	effect            runtimeEffectIntent
 	terminal          agentruntime.TerminalBrokerBinding
+}
+
+func reviewerTerminalEffectCurrent(effect runtimeEffectIntent, proof reviewerProcessProof, repository string, issue, attempt int, issueGeneration, attemptGeneration uint64) bool {
+	reviewer := effect.Reconciliation
+	return proof.Pane != nil && effect.ID == proof.EffectID && effect.Action == string(reconciliationReviewer) && effect.Repository == repository && effect.Issue == issue && effect.Attempt == attempt && effect.State == "pending" && effect.IssueGeneration == issueGeneration && effect.AttemptGeneration == attemptGeneration && effect.ReviewerLaunched && !effect.ReviewerRevoked && effect.ReviewerGateProtocol && effect.ReviewerSessionRequested && effect.ReviewerGroupPID == proof.GroupPID && effect.ReviewerProfileDigest == proof.ProfileDigest && effect.ReviewerConfinementVersion == proof.ConfinementVersion && reviewer != nil && reviewer.Reviewer != nil && reviewer.Reviewer.RunID == proof.RunID && reviewer.Reviewer.Target == proof.Target && reviewer.Reviewer.Mode == proof.Mode && reviewer.Reviewer.Session == proof.Pane.SessionName
 }
 
 func (s *dashboardServer) reviewerTerminalPermit(snapshot stateOwnerSnapshot, issue, attempt int) (dashboardReviewerTerminalPermit, error) {
@@ -1017,13 +1021,13 @@ func (s *dashboardServer) reviewerTerminalPermit(snapshot stateOwnerSnapshot, is
 			continue
 		}
 		effect, effectOK := snapshot.State.Effects[proof.EffectID]
-		if !effectOK || effect.ID != proof.EffectID || effect.Action != string(reconciliationReviewer) || effect.Repository != s.repository || effect.Issue != issue || effect.Attempt != attempt || effect.State != "pending" || effect.IssueGeneration != issueGeneration || effect.AttemptGeneration != record.Generation || !effect.ReviewerLaunched || effect.ReviewerGroupPID != proof.GroupPID || effect.ReviewerProfileDigest != proof.ProfileDigest || effect.ReviewerConfinementVersion != proof.ConfinementVersion || effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.RunID != proof.RunID || effect.Reconciliation.Reviewer.Target != proof.Target || effect.Reconciliation.Reviewer.Mode != proof.Mode || effect.Reconciliation.Reviewer.Session != proof.Pane.SessionName {
+		if !effectOK || !reviewerTerminalEffectCurrent(effect, proof, s.repository, issue, attempt, issueGeneration, record.Generation) {
 			continue
 		}
 		if permit != nil {
 			return dashboardReviewerTerminalPermit{}, errors.New("reviewer terminal owner certificate is ambiguous")
 		}
-		permit = &dashboardReviewerTerminalPermit{repository: s.repository, issue: issue, attempt: attempt, issueGeneration: issueGeneration, attemptGeneration: record.Generation, proof: proof, effect: effect, terminal: *proof.TerminalBroker}
+		permit = &dashboardReviewerTerminalPermit{repository: s.repository, issue: issue, attempt: attempt, issueGeneration: issueGeneration, attemptGeneration: record.Generation, proof: proof, terminal: *proof.TerminalBroker}
 	}
 	if permit == nil {
 		return dashboardReviewerTerminalPermit{}, errors.New("reviewer terminal owner certificate is stale")
@@ -1041,7 +1045,7 @@ func (p dashboardReviewerTerminalPermit) current(snapshot stateOwnerSnapshot) bo
 	proof, ok := snapshot.State.ReviewerProofs[reviewerProofKey(p.repository, p.issue, p.attempt, p.proof.Mode, p.proof.Target)]
 	effect, effectOK := snapshot.State.Effects[p.proof.EffectID]
 	_, tombstoned := snapshot.State.Tombstones[key]
-	return !tombstoned && ok && reflect.DeepEqual(proof, p.proof) && !proof.DeadProved && effectOK && reflect.DeepEqual(effect, p.effect)
+	return !tombstoned && ok && reflect.DeepEqual(proof, p.proof) && !proof.DeadProved && proof.ProfileDigest == activeWorkerProfileDigest(snapshot.State) && effectOK && reviewerTerminalEffectCurrent(effect, proof, p.repository, p.issue, p.attempt, p.issueGeneration, p.attemptGeneration)
 }
 
 func (s *dashboardServer) serveBrokerTerminal(w http.ResponseWriter, r *http.Request, client *agentruntime.TerminalBrokerClient, commits <-chan stateOwnerSnapshot, current func(stateOwnerSnapshot) bool) {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/SysSU/agent-symphony/internal/config"
+	internalgithub "github.com/SysSU/agent-symphony/internal/github"
 	"github.com/SysSU/agent-symphony/internal/orchestrator"
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 	"github.com/coder/websocket"
@@ -199,6 +200,23 @@ func TestDashboardReviewerTerminalUsesOwnerBoundBroker(t *testing.T) {
 	service := operatorTestMutationService(t, owner)
 	reviewer := admitPendingGatedPlanReviewer(t, owner, service, manifest)
 	_ = bindLiveReviewerForService(t, owner, reviewer)
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable")
+	}
+	foreignSocket := filepath.Join(owner.stateRoot, "foreign-tmux.sock")
+	foreignInput := filepath.Join(owner.stateRoot, "foreign-reviewer-input")
+	foreignScript := filepath.Join(owner.stateRoot, "foreign-reviewer")
+	if err := os.WriteFile(foreignScript, []byte("#!/bin/sh\nprintf 'FOREIGN_REVIEWER_S2\\r\\n'\nIFS= read -r line\nprintf '%s\\n' \"$line\" > "+strconv.Quote(foreignInput)+"\nexec cat\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runForeign := func(args ...string) error {
+		return exec.Command(tmux, append([]string{"-S", foreignSocket, "-f", "/dev/null"}, args...)...).Run()
+	}
+	if err := runForeign("new-session", "-d", "-s", reviewer.Reconciliation.Reviewer.Session, foreignScript); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runForeign("kill-server") })
 	snapshot := mustOwnerSnapshot(t, owner)
 	proof := snapshot.State.ReviewerProofs[reviewerProofKey(manifest.Repository, manifest.Issue, manifest.Attempt, reviewer.Reconciliation.Reviewer.Mode, reviewer.Reconciliation.Reviewer.Target)]
 	if proof.TerminalBroker == nil {
@@ -209,8 +227,31 @@ func TestDashboardReviewerTerminalUsesOwnerBoundBroker(t *testing.T) {
 	}
 	dashboard := newProjectDashboardServer(t.Context(), owner.stateRoot, manifest.Repository, nil, "tmux", nil, nil, false, "")
 	dashboard.operator = &operatorMutationService{owner: owner}
-	if _, err := dashboard.reviewerTerminalPermit(mustOwnerSnapshot(t, owner), manifest.Issue, manifest.Attempt); err != nil {
+	permit, err := dashboard.reviewerTerminalPermit(mustOwnerSnapshot(t, owner), manifest.Issue, manifest.Attempt)
+	if err != nil {
 		t.Fatalf("reviewer terminal permit: %v proof=%#v effect=%#v", err, proof, snapshot.State.Effects[reviewer.ID])
+	}
+	diagnosticOnly := stateOwnerSnapshot{State: cloneRuntimeOwnerState(snapshot.State)}
+	effect := diagnosticOnly.State.Effects[reviewer.ID]
+	effect.Diagnostic = "unrelated reconciliation diagnostic"
+	diagnosticOnly.State.Effects[reviewer.ID] = effect
+	if !permit.current(diagnosticOnly) {
+		t.Fatal("diagnostic-only owner commit revoked the current reviewer terminal")
+	}
+	profileChanged := stateOwnerSnapshot{State: cloneRuntimeOwnerState(snapshot.State)}
+	profileChanged.State.WorkerProfileDigest = strings.Repeat("f", 64)
+	if profileChanged.State.WorkerProfileDigest == proof.ProfileDigest {
+		profileChanged.State.WorkerProfileDigest = strings.Repeat("e", 64)
+	}
+	if permit.current(profileChanged) {
+		t.Fatal("worker profile change left the reviewer terminal current")
+	}
+	revoked := stateOwnerSnapshot{State: cloneRuntimeOwnerState(snapshot.State)}
+	effect = revoked.State.Effects[reviewer.ID]
+	effect.ReviewerRevoked = true
+	revoked.State.Effects[reviewer.ID] = effect
+	if permit.current(revoked) {
+		t.Fatal("reviewer revocation left the reviewer terminal current")
 	}
 	server := httptest.NewServer(dashboard.webHandler())
 	defer server.Close()
@@ -232,5 +273,46 @@ func TestDashboardReviewerTerminalUsesOwnerBoundBroker(t *testing.T) {
 			t.Fatalf("reviewer terminal output=%q kind=%v err=%v", output.String(), kind, err)
 		}
 		output.Write(message)
+	}
+	if _, err := os.Stat(foreignInput); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reviewer input reached same-name replacement: %v", err)
+	}
+	if err := runForeign("has-session", "-t", "="+reviewer.Reconciliation.Reviewer.Session); err != nil {
+		t.Fatalf("same-name replacement was not left alive: %v", err)
+	}
+	if _, err := owner.diagnoseReconciliationEffect(t.Context(), diagnoseReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(*reviewer), Action: reconciliationReviewer, Diagnostic: "informational reviewer diagnostic"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.Write(t.Context(), websocket.MessageBinary, []byte("after-diagnostic\n")); err != nil {
+		t.Fatalf("diagnostic-only commit revoked reviewer terminal: %v", err)
+	}
+	diagnosticCtx, diagnosticCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer diagnosticCancel()
+	for !strings.Contains(output.String(), "after-diagnostic") {
+		kind, message, err := connection.Read(diagnosticCtx)
+		if err != nil || kind != websocket.MessageBinary {
+			t.Fatalf("reviewer terminal after diagnostic output=%q kind=%v err=%v", output.String(), kind, err)
+		}
+		output.Write(message)
+	}
+	current := mustOwnerSnapshot(t, owner).State
+	issue := expandIssueFact(current.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Fact)
+	issue.Body = "changed after reviewer terminal admission"
+	attempt := expandAttemptFact(current.Observations[ownerIssueKey(manifest.Repository, manifest.Issue)].Attempts[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)].Fact)
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{attempt}
+	applyReconciliationInput(t, owner, input)
+	if !mustOwnerSnapshot(t, owner).State.Effects[reviewer.ID].ReviewerRevoked {
+		t.Fatal("changed plan input did not revoke the reviewer")
+	}
+	closed, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	for {
+		if _, _, err := connection.Read(closed); err != nil {
+			if errors.Is(closed.Err(), context.DeadlineExceeded) {
+				t.Fatal("invalidating owner commit left reviewer terminal open")
+			}
+			break
+		}
 	}
 }

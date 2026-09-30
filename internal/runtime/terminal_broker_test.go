@@ -102,6 +102,19 @@ func TestTerminalBrokerReleaseFailureIsStable(t *testing.T) {
 	}
 }
 
+func TestTerminalBrokerStopWaitsForExactDeathProof(t *testing.T) {
+	binding, record, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `trap '' TERM HUP; while :; do sleep 1; done`)
+	if err := ReleaseTerminalBroker(t.Context(), binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := StopAndProveTerminalBroker(t.Context(), record, binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTerminalBrokerReplayInputReconnectAndExactStop(t *testing.T) {
 	binding, record, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `printf 'READY\n'; while IFS= read -r line; do printf 'ECHO:%s\n' "$line"; done`)
 	if stored, err := ReadTerminalBrokerBinding(record); err != nil || stored != binding {

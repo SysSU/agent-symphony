@@ -26,6 +26,7 @@ const (
 	terminalReplayLimit      = 4 << 20
 	terminalClientQueueLimit = 4 << 20
 	terminalFrameLimit       = 64 << 10
+	terminalBrokerStopWait   = 15 * time.Second
 
 	terminalFrameAuth   byte = 1
 	terminalFrameStatus byte = 2
@@ -656,11 +657,11 @@ func StopAndProveTerminalBroker(ctx context.Context, recordPath string, binding 
 	}
 	var stopErr error
 	if !dead {
-		stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		stopCtx, cancel := context.WithTimeout(ctx, terminalBrokerStopWait)
 		stopErr = StopTerminalBroker(stopCtx, binding)
 		cancel()
 	}
-	deadline := time.NewTimer(5 * time.Second)
+	deadline := time.NewTimer(terminalBrokerStopWait)
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()

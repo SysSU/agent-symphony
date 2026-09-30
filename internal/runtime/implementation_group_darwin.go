@@ -11,6 +11,11 @@ import (
 	"time"
 )
 
+const (
+	darwinImplementationGroupExitWait = 10 * time.Second
+	darwinImplementationGroupPoll     = 100 * time.Millisecond
+)
+
 // Darwin keeps killed orphaned descendants as zombies until launchd reaps
 // them. Zombies have no execution authority, so enumerate the exact process
 // group instead of treating kill(0)'s zombie visibility as liveness.
@@ -20,7 +25,7 @@ func implementationGroupTerminated(pgid int) (bool, error) {
 	} else if err != nil {
 		return false, err
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(darwinImplementationGroupExitWait)
 	for {
 		active, err := activeDarwinProcessGroupMembers(pgid)
 		if err != nil || !active {
@@ -29,7 +34,7 @@ func implementationGroupTerminated(pgid int) (bool, error) {
 		if time.Now().After(deadline) {
 			return false, nil
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(darwinImplementationGroupPoll)
 	}
 }
 
