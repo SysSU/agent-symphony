@@ -1927,6 +1927,48 @@ func TestReviewerPaneRecordsExactLaunchAndTerminalIdentity(t *testing.T) {
 	if err != nil || !strings.Contains(string(tmuxCalls), "set-option -p -t %123 "+agentruntime.PaneExitStatusOption+" 0\n") {
 		t.Fatalf("reviewer pane exit fallback was not recorded: %q err=%v", tmuxCalls, err)
 	}
+	signaled := identity
+	signaled.RunID = strings.Repeat("e", 64)
+	signalRoot := filepath.Join(root, "signal")
+	if err := os.Mkdir(signalRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	signalLaunch, signalTerminal, signalBroker := filepath.Join(signalRoot, "launch.json"), filepath.Join(signalRoot, "terminal.json"), filepath.Join(signalRoot, "broker.json")
+	signalJSON, err := json.Marshal(signaled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signalDone := make(chan wrapperResult, 1)
+	go func() {
+		code, signal, runErr := runReviewerPane([]string{"tmux", signalLaunch, signalTerminal, signalBroker, socketDir, reviewerSignal(signaled), reviewerStartSignal(signaled), string(signalJSON), "--", "sh", "-c", "kill -TERM $$"}, io.Discard, io.Discard)
+		signalDone <- wrapperResult{code: code, signal: signal, err: runErr}
+	}()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		broker, err = agentruntime.ReadTerminalBrokerBinding(signalBroker)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := agentruntime.ReleaseTerminalBroker(t.Context(), broker); err != nil {
+		t.Fatal(err)
+	}
+	signalResult := <-signalDone
+	if signalResult.code != 128+int(syscall.SIGTERM) || signalResult.signal != syscall.SIGTERM || signalResult.err != nil {
+		t.Fatalf("signaled reviewer result=%#v", signalResult)
+	}
+	tmuxCalls, err = os.ReadFile(tmuxLog)
+	if err != nil || !strings.Contains(string(tmuxCalls), "set-option -p -t %123 "+agentruntime.PaneExitSignalOption+" "+strconv.Itoa(int(syscall.SIGTERM))+"\n") {
+		t.Fatalf("reviewer pane signal fallback was not recorded: %q err=%v", tmuxCalls, err)
+	}
+	signalRecord, err := readReviewerTerminal(signalLaunch, signalTerminal, signaled)
+	if err != nil || signalRecord == nil || signalRecord.Signal != int(syscall.SIGTERM) || signalRecord.ExitCode != 128+int(syscall.SIGTERM) {
+		t.Fatalf("signaled terminal record=%#v err=%v", signalRecord, err)
+	}
 	changed := identity
 	changed.AttemptGeneration++
 	if _, err := readReviewerTerminal(launch, terminal, changed); err == nil {

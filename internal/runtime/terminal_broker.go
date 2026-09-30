@@ -26,6 +26,7 @@ const (
 	terminalReplayLimit      = 4 << 20
 	terminalClientQueueLimit = 4 << 20
 	terminalFrameLimit       = 64 << 10
+	terminalOutputDrainWait  = 2 * time.Second
 	terminalBrokerStopWait   = 45 * time.Second
 
 	terminalFrameAuth   byte = 1
@@ -255,7 +256,11 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 	defer broker.closeClients()
 	go broker.accept(listener)
 	go broker.copyOuterInput(outerIn)
-	go broker.copyOutput(outerOut)
+	outputDone := make(chan struct{})
+	go func() {
+		defer close(outputDone)
+		broker.copyOutput(outerOut)
+	}()
 	go func() {
 		<-ctx.Done()
 		broker.killInner()
@@ -283,6 +288,14 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 		terminated, groupErr := implementationGroupTerminated(innerPGID)
 		if groupErr != nil || !terminated {
 			cleanupErr = errors.Join(groupErr, errors.New("terminal broker inner group death is unproved"))
+		}
+	}
+	if cleanupErr == nil {
+		select {
+		case <-outputDone:
+			broker.waitClientDrain(terminalOutputDrainWait)
+		case <-time.After(terminalOutputDrainWait):
+			cleanupErr = errors.New("terminal broker output drain is unproved")
 		}
 	}
 	if cleanupErr == nil {
@@ -555,6 +568,32 @@ func (b *terminalBroker) closeClients() {
 		client.closed = true
 		close(client.notify)
 		_ = client.conn.Close()
+	}
+}
+
+func (b *terminalBroker) waitClientDrain(timeout time.Duration) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		b.mu.Lock()
+		drained := true
+		for client := range b.clients {
+			if client.inFlight != 0 || len(client.pending) != 0 {
+				drained = false
+				break
+			}
+		}
+		b.mu.Unlock()
+		if drained {
+			return
+		}
+		select {
+		case <-deadline.C:
+			return
+		case <-ticker.C:
+		}
 	}
 }
 

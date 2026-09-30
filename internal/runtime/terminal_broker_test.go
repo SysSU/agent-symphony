@@ -174,6 +174,40 @@ func TestTerminalBrokerReplayInputReconnectAndExactStop(t *testing.T) {
 	}
 }
 
+func TestTerminalBrokerDeliversRapidExitTail(t *testing.T) {
+	for range 10 {
+		binding, _, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `printf 'FINAL-TAIL\n'`)
+		client, err := DialTerminalBroker(t.Context(), binding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if err := ReleaseTerminalBroker(t.Context(), binding); err != nil {
+			t.Fatal(err)
+		}
+		var output bytes.Buffer
+		for {
+			chunk, err := client.ReadOutput()
+			if err != nil {
+				break
+			}
+			output.Write(chunk)
+		}
+		_ = client.Close()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(output.String(), "FINAL-TAIL") {
+			t.Fatalf("rapid-exit terminal tail was lost: %q", output.String())
+		}
+	}
+}
+
 func TestTerminalBrokerResizeAndInputLimit(t *testing.T) {
 	binding, _, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `printf 'READY\n'; while IFS= read -r line; do stty size; printf 'ECHO:%s\n' "$line"; done`)
 	defer func() {

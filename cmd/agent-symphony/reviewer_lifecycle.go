@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
@@ -380,15 +381,17 @@ func runReviewerPane(args []string, stdout, stderr io.Writer) (int, syscall.Sign
 		unlock.Dir = "/tmp"
 		return unlock.Run()
 	})
-	var paneErr error
-	if childSignal != 0 {
-		paneErr = agentruntime.RecordPaneExitSignal(context.Background(), args[0], childSignal)
-	} else {
-		paneErr = agentruntime.RecordPaneExitStatus(context.Background(), args[0], code)
-	}
 	record := reviewerTerminalRecord{Identity: identity, ExitCode: code, Signal: int(childSignal)}
 	if writeErr := writeReviewerRecord(terminalPath, record); writeErr != nil {
-		return 126, 0, errors.Join(err, paneErr, fmt.Errorf("record reviewer terminal result: %w", writeErr))
+		return 126, 0, errors.Join(err, fmt.Errorf("record reviewer terminal result: %w", writeErr))
+	}
+	statusCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var paneErr error
+	if childSignal != 0 {
+		paneErr = agentruntime.RecordPaneExitSignal(statusCtx, args[0], childSignal)
+	} else {
+		paneErr = agentruntime.RecordPaneExitStatus(statusCtx, args[0], code)
 	}
 	return code, childSignal, errors.Join(err, paneErr)
 }
