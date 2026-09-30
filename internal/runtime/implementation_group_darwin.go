@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	darwinImplementationGroupExitWait = 10 * time.Second
-	darwinImplementationGroupPoll     = 100 * time.Millisecond
+	darwinImplementationGroupExitWait = 30 * time.Second
+	darwinImplementationGroupPoll     = 250 * time.Millisecond
 )
 
 // Darwin keeps killed orphaned descendants as zombies until launchd reaps

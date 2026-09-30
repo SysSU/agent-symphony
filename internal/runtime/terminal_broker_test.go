@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -444,6 +446,82 @@ func TestTerminalBrokerRejectsSameUIDSocketReplacementAndLeavesItAlive(t *testin
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("original broker did not stop")
+	}
+}
+
+func TestTerminalBrokerRejectsReplacementByKernelPeerPID(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("kernel peer PID verification is unsupported")
+	}
+	binding, _, done, cancel := startTerminalBrokerFixture(t, "/bin/sh", "-c", `while :; do sleep 1; done`)
+	if err := os.Remove(binding.SocketPath); err != nil {
+		t.Fatal(err)
+	}
+	ready := binding.SocketPath + ".ready"
+	ctx, stopHelper := context.WithTimeout(t.Context(), 10*time.Second)
+	defer stopHelper()
+	helper := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestTerminalBrokerReplacementPeerHelper$")
+	helper.Env = append(os.Environ(), "AGENT_SYMPHONY_TERMINAL_REPLACEMENT_HELPER=1", "AGENT_SYMPHONY_TERMINAL_REPLACEMENT_SOCKET="+binding.SocketPath, "AGENT_SYMPHONY_TERMINAL_REPLACEMENT_READY="+ready)
+	if err := helper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("replacement helper did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	info, err := os.Lstat(binding.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding.SocketDev, binding.SocketIno, err = terminalSocketIdentity(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DialTerminalBroker(t.Context(), binding); err == nil || !strings.Contains(err.Error(), "peer PID mismatch") {
+		t.Fatalf("replacement peer PID was admitted: %v", err)
+	}
+	connection, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: binding.SocketPath, Net: "unix"})
+	if err != nil {
+		t.Fatalf("replacement did not survive peer rejection: %v", err)
+	}
+	_ = connection.Close()
+	if err := helper.Wait(); err != nil {
+		t.Fatalf("replacement helper: %v", err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTerminalBrokerReplacementPeerHelper(t *testing.T) {
+	if os.Getenv("AGENT_SYMPHONY_TERMINAL_REPLACEMENT_HELPER") != "1" {
+		return
+	}
+	path, ready := os.Getenv("AGENT_SYMPHONY_TERMINAL_REPLACEMENT_SOCKET"), os.Getenv("AGENT_SYMPHONY_TERMINAL_REPLACEMENT_READY")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ready, []byte("ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		connection, err := listener.AcceptUnix()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = connection.Close()
 	}
 }
 

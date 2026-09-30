@@ -26,7 +26,7 @@ const (
 	terminalReplayLimit      = 4 << 20
 	terminalClientQueueLimit = 4 << 20
 	terminalFrameLimit       = 64 << 10
-	terminalBrokerStopWait   = 15 * time.Second
+	terminalBrokerStopWait   = 45 * time.Second
 
 	terminalFrameAuth   byte = 1
 	terminalFrameStatus byte = 2
@@ -718,6 +718,9 @@ func terminalBrokerControl(ctx context.Context, binding TerminalBrokerBinding, a
 		return err
 	}
 	if !status.OK {
+		if status.Error != "" {
+			return errors.New(status.Error)
+		}
 		return errors.New("terminal broker rejected control")
 	}
 	return nil

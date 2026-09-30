@@ -315,4 +315,14 @@ func TestDashboardReviewerTerminalUsesOwnerBoundBroker(t *testing.T) {
 			break
 		}
 	}
+	rejected, response, err := websocket.Dial(t.Context(), endpoint, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
+	if rejected != nil {
+		rejected.CloseNow()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusConflict {
+		t.Fatalf("revoked reviewer replacement was not rejected before upgrade: response=%v err=%v", response, err)
+	}
+	if err := runForeign("has-session", "-t", "="+reviewer.Reconciliation.Reviewer.Session); err != nil {
+		t.Fatalf("same-name replacement was touched after revocation: %v", err)
+	}
 }

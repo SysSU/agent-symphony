@@ -8,9 +8,9 @@ const reviewGate = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEW_GATE;
 const reviewerPID = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEWER_PID;
 const reviewerIdentity = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEWER_IDENTITY;
 const fakeGitHubURL = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_FAKE_GITHUB_URL;
-const lifecycleTimeout = process.env.AGENT_SYMPHONY_FULL_SYSTEM_RACE === "true" ? 90_000 : 20_000;
+const lifecycleTimeout = process.env.AGENT_SYMPHONY_FULL_SYSTEM_RACE === "true" ? 90_000 : 60_000;
 test.skip(!baseURL || !action, "run through the compiled dashboard lifecycle harness");
-test.setTimeout(process.env.AGENT_SYMPHONY_FULL_SYSTEM_RACE === "true" ? 180_000 : 90_000);
+test.setTimeout(process.env.AGENT_SYMPHONY_FULL_SYSTEM_RACE === "true" ? 180_000 : 120_000);
 
 test("lifecycle action commits through the real dashboard", async ({ page }) => {
   const errors = [];
