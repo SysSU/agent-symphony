@@ -131,11 +131,12 @@ func TerminalBrokerDead(path string, binding TerminalBrokerBinding) (bool, error
 }
 
 type terminalBrokerClientState struct {
-	conn     *net.UnixConn
-	notify   chan struct{}
-	pending  []byte
-	inFlight int
-	closed   bool
+	conn      *net.UnixConn
+	notify    chan struct{}
+	pending   []byte
+	inFlight  int
+	replaying bool
+	closed    bool
 }
 
 type terminalBroker struct {
@@ -440,7 +441,7 @@ func (b *terminalBroker) handle(conn *net.UnixConn) {
 		var replay []byte
 		if !overflow {
 			replay = bytes.Clone(b.replay)
-			client.inFlight = len(replay)
+			client.replaying = len(replay) != 0
 			b.clients[client] = struct{}{}
 		}
 		b.mu.Unlock()
@@ -478,7 +479,7 @@ func (b *terminalBroker) handle(conn *net.UnixConn) {
 				replay = replay[n:]
 			}
 			b.mu.Lock()
-			client.inFlight = 0
+			client.replaying = false
 			b.mu.Unlock()
 			for {
 				b.mu.Lock()
@@ -584,7 +585,7 @@ func (b *terminalBroker) waitClientDrain(timeout time.Duration) {
 		b.mu.Lock()
 		drained := true
 		for client := range b.clients {
-			if client.inFlight != 0 || len(client.pending) != 0 {
+			if client.replaying || client.inFlight != 0 || len(client.pending) != 0 {
 				drained = false
 				break
 			}
