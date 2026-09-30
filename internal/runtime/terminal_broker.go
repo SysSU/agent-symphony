@@ -440,6 +440,7 @@ func (b *terminalBroker) handle(conn *net.UnixConn) {
 		var replay []byte
 		if !overflow {
 			replay = bytes.Clone(b.replay)
+			client.inFlight = len(replay)
 			b.clients[client] = struct{}{}
 		}
 		b.mu.Unlock()
@@ -476,6 +477,9 @@ func (b *terminalBroker) handle(conn *net.UnixConn) {
 				}
 				replay = replay[n:]
 			}
+			b.mu.Lock()
+			client.inFlight = 0
+			b.mu.Unlock()
 			for {
 				b.mu.Lock()
 				if client.closed {

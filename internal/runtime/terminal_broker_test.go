@@ -208,6 +208,59 @@ func TestTerminalBrokerDeliversRapidExitTail(t *testing.T) {
 	}
 }
 
+func TestTerminalBrokerDrainsLateAttachReplay(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "as-terminal-replay-drain-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	trigger := filepath.Join(root, "trigger")
+	command := []string{"/bin/sh", "-c", `head -c $((3 * 1024 * 1024)) /dev/zero; printf 'REPLAY-END\n'; while [ ! -e "$1" ]; do sleep 0.01; done`, "broker", trigger}
+	binding, _, done, _ := startTerminalBrokerFixture(t, command...)
+	if err := ReleaseTerminalBroker(t.Context(), binding); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := DialTerminalBroker(t.Context(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := probe.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	for !strings.Contains(output.String(), "REPLAY-END") {
+		chunk, err := probe.ReadOutput()
+		if err != nil {
+			t.Fatal(err)
+		}
+		output.Write(chunk)
+	}
+	probe.Close()
+
+	client, err := DialTerminalBroker(t.Context(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trigger, []byte("go\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	for !strings.Contains(output.String(), "REPLAY-END") {
+		chunk, err := client.ReadOutput()
+		if err != nil {
+			t.Fatalf("late attach lost replay during broker exit: %v", err)
+		}
+		output.Write(chunk)
+	}
+	client.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTerminalBrokerResizeAndInputLimit(t *testing.T) {
 	binding, _, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `printf 'READY\n'; while IFS= read -r line; do stty size; printf 'ECHO:%s\n' "$line"; done`)
 	defer func() {
