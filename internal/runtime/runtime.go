@@ -99,7 +99,10 @@ func (ExecRunner) Run(ctx context.Context, command Command) (Result, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, command.Name, command.Args...)
-	cmd.Dir, cmd.Env, cmd.Stdin = command.Dir, command.Env, command.Stdin
+	cmd.Dir, cmd.Stdin = command.Dir, command.Stdin
+	if len(command.Env) != 0 {
+		cmd.Env = command.Env
+	}
 	var out []byte
 	var err error
 	if command.StdoutOnly {
@@ -643,15 +646,43 @@ func (r *Runtime) startSession(ctx context.Context, manifest Manifest, env []str
 		return errors.New("implementation gate helper is required")
 	}
 	env = append(slices.Clone(env), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
+	brokerStateRoot := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(manifest.LogPath))))
+	if r.StateRoot != "" && filepath.Clean(r.StateRoot) != brokerStateRoot {
+		return errors.New("implementation terminal broker state root mismatches manifest")
+	}
+	if socketDir, err := prepareTerminalBrokerDir(brokerStateRoot); err != nil {
+		return err
+	} else if socketDir != TerminalBrokerSocketDir(manifest) {
+		return errors.New("implementation terminal broker socket directory mismatches manifest")
+	}
+	role := "interactive"
+	if len(command) > 1 {
+		switch command[1] {
+		case "worker-capture-bound", "worker-capture-handoff-ready-bound":
+			role = "capture"
+		case "pane-exit-status-bound":
+			role = "interactive"
+			if len(command) < 10 || command[8] != "--" {
+				return errors.New("bound interactive command is invalid")
+			}
+			command = slices.Clone(command[9:])
+		}
+	}
 	args := TmuxNewSessionArgs(manifest.Session, manifest.Worktree, env)
 	args = slices.Insert(args, 7, "-P", "-F", ImplementationPaneFormat)
 	if len(command) == 0 {
 		command = []string{"/bin/sh"}
 	}
 	channel := ImplementationGateChannel(effectID)
+	ready := TerminalBrokerReadyChannel(effectID)
+	bootstrap := "as-bootstrap-" + effectID
+	if len(bootstrap) > 48 {
+		bootstrap = bootstrap[:48]
+	}
+	command = append([]string{r.Helper, "terminal-broker-bound", r.tmux(), manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, effectID, role, "--"}, command...)
 	args = append(args, r.Helper, "implementation-gate", r.tmux(), manifest.LogPath, manifest.Worktree, manifest.Session, manifest.LaunchToken, effectID, "--")
 	args = append(args, command...)
-	args = append([]string{"wait-for", "-L", channel, ";"}, args...)
+	args = append([]string{"new-session", "-d", "-s", bootstrap, "--", "/bin/sh", "-c", "sleep 30", ";", "wait-for", "-L", ready, ";", "wait-for", "-L", channel, ";"}, args...)
 	target := PaneTarget(manifest.Session)
 	args = append(args, ";", "set-option", "-p", "-t", target, "@agent-symphony-launch-token", manifest.LaunchToken,
 		";", "set-option", "-w", "-t", target, "remain-on-exit", "on",
@@ -660,28 +691,24 @@ func (r *Runtime) startSession(ctx context.Context, manifest Manifest, env []str
 		";", "set-option", "-p", "-t", target, PaneExitSignalOption, "")
 	created, err := r.run(ctx, r.tmux(), args, "", env, nil)
 	if err != nil {
+		_, _ = r.run(context.WithoutCancel(ctx), r.tmux(), []string{"kill-session", "-t", "=" + bootstrap}, "", []string{}, nil)
 		return err
 	}
+	defer func() {
+		_, _ = r.run(context.WithoutCancel(ctx), r.tmux(), []string{"kill-session", "-t", "=" + bootstrap}, "", []string{}, nil)
+	}()
 	initial, err := ParseImplementationPane(created.Output)
 	if err != nil || initial.SessionName != manifest.Session || initial.StartPath != manifest.Worktree || initial.Token != "" {
 		return errors.New("created implementation pane identity is unavailable")
 	}
 	observed, err := r.run(ctx, r.tmux(), []string{"display-message", "-p", "-t", target, ImplementationPaneFormat}, "", []string{}, nil)
 	if err != nil {
-		return err
+		inventory, inventoryErr := r.run(context.WithoutCancel(ctx), r.tmux(), []string{"list-panes", "-a", "-F", ImplementationPaneFormat}, "", []string{}, nil)
+		return errors.Join(err, inventoryErr, fmt.Errorf("implementation pane inventory: %.1024q", strings.TrimSpace(inventory.Output)))
 	}
 	pane, err := ParseImplementationPane(observed.Output)
 	if err != nil || pane.ServerPID != initial.ServerPID || pane.ServerStart != initial.ServerStart || pane.SessionID != initial.SessionID || pane.PaneID != initial.PaneID {
 		return errors.New("implementation pane changed before durable binding")
-	}
-	role := "unknown"
-	if len(command) > 1 {
-		switch command[1] {
-		case "worker-capture-bound", "worker-capture-handoff-ready-bound":
-			role = "capture"
-		case "pane-exit-status-bound":
-			role = "interactive"
-		}
 	}
 	binding, err := BindImplementationPane(manifest, effectID, role, pane)
 	if err != nil {
@@ -703,16 +730,70 @@ func (r *Runtime) launchAgent(ctx context.Context, manifest Manifest) error {
 	}
 	channel := ImplementationGateChannel(manifest.LaunchID)
 	result, err := r.guardedBoundResult(ctx, binding, pane, "wait-for -U "+channel, nil)
-	if err == nil {
-		return nil
-	}
-	if !result.Exited || result.Code != 1 || strings.TrimSpace(result.Output) != "channel "+channel+" not locked" || !implementationReleaseMatches(manifest, binding) {
+	if err != nil && (!result.Exited || result.Code != 1 || strings.TrimSpace(result.Output) != "channel "+channel+" not locked" || !implementationReleaseMatches(manifest, binding)) {
 		return err
 	}
+	readyCtx, cancelReady := context.WithTimeout(ctx, 5*time.Second)
+	readyResult, readyErr := r.run(readyCtx, r.tmux(), []string{"wait-for", "-L", TerminalBrokerReadyChannel(manifest.LaunchID)}, "", []string{}, nil)
+	cancelReady()
+	if readyErr != nil {
+		diagnosticCtx, cancelDiagnostic := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancelDiagnostic()
+		capture, captureErr := r.observeBoundCommand(diagnosticCtx, manifest, func(pane ImplementationPane) []string {
+			return []string{"capture-pane", "-p", "-S", "-", "-t", pane.PaneID}
+		})
+		return errors.Join(readyErr, captureErr, fmt.Errorf("terminal broker readiness failed: %.512q", strings.TrimSpace(capture.Output)))
+	}
+	_, unlockErr := r.run(context.WithoutCancel(ctx), r.tmux(), []string{"wait-for", "-U", TerminalBrokerReadyChannel(manifest.LaunchID)}, "", []string{}, nil)
+	if unlockErr != nil {
+		return unlockErr
+	}
+	terminal, terminalErr := ReadTerminalBrokerBinding(TerminalBrokerPath(manifest))
+	if terminalErr != nil || terminal.OuterPID != binding.PanePID || terminal.InnerPID < 2 {
+		return errors.Join(terminalErr, errors.New("implementation terminal broker identity is unavailable"))
+	}
+	if strings.TrimSpace(readyResult.Output) != "" {
+		return errors.New("terminal broker readiness returned unexpected output")
+	}
 	if _, _, proofErr := r.observeBound(ctx, manifest); proofErr != nil {
-		return errors.Join(err, proofErr)
+		return proofErr
 	}
 	return nil
+}
+
+// PrepareBoundTerminalBroker creates one exact implementation pane and starts
+// its broker while leaving the inner worker behind the broker-owned gate. The
+// caller must durably commit the returned certificate before releasing it.
+func (r *Runtime) PrepareBoundTerminalBroker(ctx context.Context, manifest Manifest, env, command []string) (ImplementationLaunchBinding, TerminalBrokerBinding, error) {
+	if err := r.startSession(ctx, manifest, env, manifest.LaunchID, command); err != nil {
+		return ImplementationLaunchBinding{}, TerminalBrokerBinding{}, err
+	}
+	binding, _, err := r.observeBound(ctx, manifest)
+	if err != nil {
+		return ImplementationLaunchBinding{}, TerminalBrokerBinding{}, err
+	}
+	if err := WriteImplementationPermit(manifest, binding); err != nil {
+		return ImplementationLaunchBinding{}, TerminalBrokerBinding{}, err
+	}
+	if err := r.launchAgent(ctx, manifest); err != nil {
+		return ImplementationLaunchBinding{}, TerminalBrokerBinding{}, err
+	}
+	terminal, err := ReadTerminalBrokerBinding(TerminalBrokerPath(manifest))
+	if err != nil || !ValidImplementationTerminalBinding(manifest, terminal) || terminal.OuterPID != binding.PanePID {
+		return ImplementationLaunchBinding{}, TerminalBrokerBinding{}, errors.Join(err, errors.New("implementation terminal broker identity is unavailable"))
+	}
+	return binding, terminal, nil
+}
+
+// StopCertifiedImplementation stops only the exact owner-certified broker and
+// pane. Artifact replacement or an unproved death fails closed.
+func (r *Runtime) StopCertifiedImplementation(ctx context.Context, manifest Manifest, binding ImplementationLaunchBinding, terminal TerminalBrokerBinding) error {
+	storedBinding, bindingErr := ReadImplementationBinding(manifest)
+	storedTerminal, terminalErr := ReadTerminalBrokerBinding(TerminalBrokerPath(manifest))
+	if bindingErr != nil || terminalErr != nil || storedBinding != binding || storedTerminal != terminal || !ValidImplementationBinding(manifest, binding, manifest.LaunchID) || !ValidImplementationTerminalBinding(manifest, terminal) || terminal.OuterPID != binding.PanePID {
+		return errors.Join(bindingErr, terminalErr, errors.New("owner-certified implementation identity is unavailable"))
+	}
+	return r.stopGeneration(ctx, manifest)
 }
 
 // TmuxNewSessionArgs imports only the supplied environment names from the
@@ -1544,14 +1625,13 @@ func (r *Runtime) session(ctx context.Context, session string) (bool, error) {
 }
 
 func (r *Runtime) stop(ctx context.Context, manifest Manifest) error {
-	return r.stopGeneration(ctx, manifest, 0)
+	return r.stopGeneration(ctx, manifest)
 }
 
-func (r *Runtime) stopGeneration(ctx context.Context, manifest Manifest, generation uint64) error {
+func (r *Runtime) stopGeneration(ctx context.Context, manifest Manifest) error {
 	if manifest.Version != boundManifestVersion {
 		return errors.New("legacy implementation session has no durable launch identity")
 	}
-	confined := WorkerConfinementMatches(manifest, generation, r.WorkerProfileDigest)
 	binding, err := ReadImplementationBinding(manifest)
 	if err != nil {
 		return err
@@ -1561,22 +1641,20 @@ func (r *Runtime) stopGeneration(ctx context.Context, manifest Manifest, generat
 		return err
 	}
 	if !live {
-		// A renamed or unlinked session can keep the original worker
-		// alive. The inventory must come from the exact original server.
+		terminal, terminalErr := ReadTerminalBrokerBinding(TerminalBrokerPath(manifest))
+		if terminalErr != nil || !ValidImplementationTerminalBinding(manifest, terminal) || terminal.OuterPID != binding.PanePID {
+			return errors.Join(terminalErr, errors.New("implementation terminal broker identity is unavailable"))
+		}
+		if stopErr := StopAndProveTerminalBroker(ctx, TerminalBrokerPath(manifest), terminal); stopErr != nil {
+			return stopErr
+		}
 		absent, probeErr := r.boundPaneAbsent(ctx, binding)
 		if probeErr == nil && absent {
-			if confined {
-				return nil
-			}
-			gone, groupErr := ImplementationWorkerGone(manifest, binding)
-			if groupErr == nil && gone {
-				return nil
-			}
-			return errors.Join(groupErr, errors.New("implementation worker group termination is unconfirmed"))
+			return nil
 		}
 		return errors.Join(probeErr, errors.New("bound implementation pane may still exist"))
 	}
-	return r.stopBound(ctx, manifest, confined)
+	return r.stopBound(ctx, manifest)
 }
 
 func (r *Runtime) boundPaneAbsent(ctx context.Context, binding ImplementationLaunchBinding) (bool, error) {
@@ -1648,12 +1726,16 @@ func (r *Runtime) observeBoundCommand(ctx context.Context, manifest Manifest, bu
 	return r.guardedBoundResult(ctx, binding, pane, nested, nil)
 }
 
-func (r *Runtime) stopBound(ctx context.Context, manifest Manifest, confined bool) error {
+func (r *Runtime) stopBound(ctx context.Context, manifest Manifest) error {
 	binding, pane, err := r.observeBound(ctx, manifest)
 	if err != nil {
 		return err
 	}
-	if err := r.guardedBound(ctx, binding, pane, "send-keys -t "+pane.PaneID+" C-c"); err != nil {
+	terminal, err := ReadTerminalBrokerBinding(TerminalBrokerPath(manifest))
+	if err != nil || !ValidImplementationTerminalBinding(manifest, terminal) || terminal.OuterPID != binding.PanePID {
+		return errors.Join(err, errors.New("implementation terminal broker identity is unavailable"))
+	}
+	if err := StopAndProveTerminalBroker(ctx, TerminalBrokerPath(manifest), terminal); err != nil {
 		return err
 	}
 	want := r.StopWait
@@ -1690,13 +1772,6 @@ func (r *Runtime) stopBound(ctx context.Context, manifest Manifest, confined boo
 	}
 	if !absent {
 		return errors.New("bound implementation pane remained after guarded stop")
-	}
-	if confined {
-		return nil
-	}
-	workerGone, groupErr := ImplementationWorkerGone(manifest, binding)
-	if groupErr != nil || !workerGone {
-		return errors.Join(groupErr, errors.New("implementation worker group termination is unconfirmed"))
 	}
 	return nil
 }

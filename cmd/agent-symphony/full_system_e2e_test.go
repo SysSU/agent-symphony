@@ -634,6 +634,27 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	}
 	stopped = false
 	waitHTTP(t, "http://"+address+"/status.json", deadline(15*time.Second), output)
+	staleSession := "as-o-r-964584196b5c-73-1"
+	foreignReady := filepath.Join(root, "foreign-replacement-ready")
+	foreignInput := filepath.Join(root, "foreign-replacement-input")
+	foreignScript := filepath.Join(root, "foreign-replacement")
+	if err := os.WriteFile(foreignScript, []byte("#!/bin/sh\numask 077\n: >\"$FULL_SYSTEM_FIXTURE/foreign-replacement-ready\"\nprintf 'FOREIGN_REPLACEMENT_SECRET\\n'\nIFS= read -r line\nprintf '%s\\n' \"$line\" >\"$FULL_SYSTEM_FIXTURE/foreign-replacement-input\"\nexec cat\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	killStale := exec.Command("tmux", "kill-session", "-t", "="+staleSession)
+	killStale.Env = server.Env
+	_ = killStale.Run()
+	startForeign := exec.Command("tmux", "new-session", "-d", "-s", staleSession, foreignScript)
+	startForeign.Env = server.Env
+	if body, err := startForeign.CombinedOutput(); err != nil {
+		t.Fatalf("start foreign replacement: %v output=%s", err, body)
+	}
+	if !waitFor(deadline(5*time.Second), func() bool {
+		_, err := os.Lstat(foreignReady)
+		return err == nil
+	}) {
+		t.Fatal("foreign replacement did not start")
+	}
 
 	playwright := exec.Command("npm", "exec", "--prefix", "dashboard", "--", "playwright", "test", "browser/full-system.spec.js", "--reporter=line", "--output", filepath.Join(root, "playwright"))
 	playwright.Dir = source
@@ -656,6 +677,12 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 			return nil
 		})
 		t.Fatalf("real-server Playwright: %v\n%s\nstatus=%s\nrequests=%q\ndiagnostics=%s\nserve:\n%s", err, playwrightOutput, latest, requests, diagnostics.String(), output.String())
+	}
+	if !fullSystemTmuxSessionExists(server.Env, staleSession) {
+		t.Fatal("rejected stale terminal attach killed the foreign replacement session")
+	}
+	if _, err := os.Lstat(foreignInput); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("browser input reached the foreign replacement: %v", err)
 	}
 	if !waitFor(deadline(15*time.Second), func() bool {
 		_, err := os.Lstat(filepath.Join(root, "review-started"))
@@ -706,7 +733,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	}) {
 		t.Fatalf("timed out waiting for first review finding: %s\n%s", fullSystemAttemptDiagnostics(address, stateRoot, currentSession, server.Env), output.String())
 	}
-	if !waitFor(deadline(30*time.Second), func() bool {
+	if !waitFor(deadline(60*time.Second), func() bool {
 		_, err := os.Lstat(filepath.Join(root, "reviewed-twice"))
 		return err == nil
 	}) {

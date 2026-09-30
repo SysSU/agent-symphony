@@ -235,6 +235,20 @@ exit 0
 	}
 	address := freeAddress(t)
 	environment := append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_GITHUB_URL="+github.URL, "CODEX_HOME="+filepath.Join(root, "codex-home"), "TMUX_TMPDIR="+projectTmuxRoot(stateRoot))
+	bindImplementation := func(issue int) {
+		manifest := manifests[issue]
+		implementation, terminal := ensureFullSystemParkedImplementation(t, environment, binary, stateRoot, manifest)
+		key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+		record := state.Attempts[key]
+		record.ImplementationBinding, record.TerminalBroker = &implementation, &terminal
+		state.Attempts[key] = record
+		if err := writeRuntimeOwnerState(stateRoot, attemptRoot, state); err != nil {
+			t.Fatal(err)
+		}
+		if err := agentruntime.ReleaseTerminalBroker(t.Context(), terminal); err != nil {
+			t.Fatalf("release owner-certified implementation broker: %v", err)
+		}
+	}
 	start := func(address string) (*exec.Cmd, *synchronizedBuffer) {
 		command := exec.Command(binary, "serve", "--config", configPath, "--state", statePath, "--runtime-state", stateRoot, "--dashboard-address", address, "--interval", "1s")
 		command.Dir, command.Env = repository, environment
@@ -249,7 +263,7 @@ exit 0
 	// has already disappeared. Preserve its immutable launch binding while
 	// removing only the pane, so the archive can prove the absence rather than
 	// failing closed on an unbound V2 manifest.
-	ensureFullSystemParkedImplementation(t, environment, binary, manifests[164])
+	bindImplementation(164)
 	if err := stopFullSystemTmux(environment, manifests[164].Session); err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +272,7 @@ exit 0
 	}
 	// The post-restart Abandon case has the same exact-bound, already-absent
 	// implementation shape.
-	ensureFullSystemParkedImplementation(t, environment, binary, manifests[191])
+	bindImplementation(191)
 	if err := stopFullSystemTmux(environment, manifests[191].Session); err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +281,7 @@ exit 0
 	}
 	// stopFullSystemTmux tears down the fixture's isolated tmux server, so start
 	// the live attempt only after establishing attempt 164's absent-pane proof.
-	ensureFullSystemParkedImplementation(t, environment, binary, manifests[160])
+	bindImplementation(160)
 	server, output := start(address)
 	stopped := false
 	t.Cleanup(func() {

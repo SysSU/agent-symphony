@@ -295,6 +295,11 @@ func planReconciliationHandoffs(snapshot stateOwnerSnapshot, command, humanInstr
 			continue
 		}
 		if manifest.Version == agentruntime.ManifestVersion2 {
+			if record.ImplementationBinding == nil || record.TerminalBroker == nil || !agentruntime.ValidImplementationBinding(manifest, *record.ImplementationBinding, manifest.LaunchID) || !agentruntime.ValidImplementationTerminalBinding(manifest, *record.TerminalBroker) || record.TerminalBroker.OuterPID != record.ImplementationBinding.PanePID {
+				return nil, nil, errors.New("handoff current terminal certificate is unavailable")
+			}
+			implementation, terminal := *record.ImplementationBinding, *record.TerminalBroker
+			handoff.CurrentImplementation, handoff.CurrentTerminal = &implementation, &terminal
 			for _, effect := range snapshot.State.Effects {
 				if effect.State == "pending" && effect.Action == string(reconciliationHandoffDeliver) && effect.Repository == manifest.Repository && effect.Issue == manifest.Issue && effect.Attempt == manifest.Attempt && effect.Reconciliation != nil && effect.Reconciliation.Handoff != nil && effect.Reconciliation.Handoff.Kind == handoff.Kind && effect.Reconciliation.Handoff.Key == handoff.Key && reflect.DeepEqual(effect.Reconciliation.Manifest, &manifest) {
 					handoff.CandidateLaunchToken = effect.Reconciliation.Handoff.CandidateLaunchToken
@@ -339,7 +344,7 @@ func (c *runtimeEffectCoordinator) executeHandoff(_ context.Context, boundary bo
 		return reconciliationEffectResult{}, err
 	}
 	defer c.releaseKey(key, run)
-	payload, err := handoffBoundaryPayload(request, plan.Identity.EffectID, material.Command)
+	payload, err := handoffBoundaryPayload(request, plan.Identity.EffectID, material.Command, nil, nil)
 	if err != nil {
 		return reconciliationEffectResult{}, err
 	}
@@ -357,13 +362,27 @@ func (c *runtimeEffectCoordinator) executeHandoff(_ context.Context, boundary bo
 		}
 		accepted, err := boundary.call(run.ctx, operation, agentruntime.Command{Stdin: bytes.NewReader(payload)})
 		if request.Manifest.Version == agentruntime.ManifestVersion2 && err == nil {
-			if strings.TrimSpace(accepted.Output) != plan.Identity.EffectID+":"+request.Handoff.CandidateLaunchToken {
+			var prepared handoffPreparedTerminal
+			decoder := json.NewDecoder(strings.NewReader(accepted.Output))
+			decoder.DisallowUnknownFields()
+			if decoder.Decode(&prepared) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 				return reconciliationEffectResult{}, errors.New("handoff candidate preparation binding mismatch")
+			}
+			candidate := *request.Manifest
+			candidate.LaunchToken, candidate.LaunchID = request.Handoff.CandidateLaunchToken, plan.Identity.EffectID
+			if !agentruntime.ValidImplementationBinding(candidate, prepared.Implementation, candidate.LaunchID) || !agentruntime.ValidImplementationTerminalBinding(candidate, prepared.Terminal) || prepared.Terminal.OuterPID != prepared.Implementation.PanePID {
+				return reconciliationEffectResult{}, errors.New("handoff candidate preparation binding mismatch")
+			}
+			if _, markErr := c.owner.markHandoffPrepared(run.ctx, markHandoffPreparedCommand{Identity: plan.Identity, Implementation: prepared.Implementation, Terminal: prepared.Terminal}); markErr != nil {
+				return reconciliationEffectResult{}, markErr
 			}
 			if err := c.owner.authorizeReconciliationEffect(run.ctx, authorizeReconciliationEffectCommand{Identity: plan.Identity, Action: request.Action}); err != nil {
 				return reconciliationEffectResult{}, err
 			}
-			accepted, err = boundary.call(run.ctx, "release-handoff", agentruntime.Command{Stdin: bytes.NewReader(payload)})
+			payload, err = handoffBoundaryPayload(request, plan.Identity.EffectID, material.Command, &prepared.Implementation, &prepared.Terminal)
+			if err == nil {
+				accepted, err = boundary.call(run.ctx, "release-handoff", agentruntime.Command{Stdin: bytes.NewReader(payload)})
+			}
 		}
 		if err != nil || !validHandoffAck(accepted.Output, request.Handoff) {
 			if err == nil {
@@ -389,7 +408,7 @@ func (c *runtimeEffectCoordinator) executeHandoff(_ context.Context, boundary bo
 	return result, nil
 }
 
-func handoffBoundaryPayload(request reconciliationEffectRequest, effectID string, command []string) ([]byte, error) {
+func handoffBoundaryPayload(request reconciliationEffectRequest, effectID string, command []string, preparedImplementation *agentruntime.ImplementationLaunchBinding, preparedTerminal *agentruntime.TerminalBrokerBinding) ([]byte, error) {
 	if request.Manifest.Version != agentruntime.ManifestVersion2 {
 		effectID = ""
 	}
@@ -410,14 +429,18 @@ func handoffBoundaryPayload(request reconciliationEffectRequest, effectID string
 		}{"agent-symphony-handoff-v1", value.Key, value.PR, value.HeadSHA, value.Validation, value.Feedback})
 	}
 	body, err := json.Marshal(struct {
-		Manifest             agentruntime.Manifest `json:"manifest"`
-		Handoff              json.RawMessage       `json:"handoff"`
-		OutcomePath          string                `json:"outcome_path"`
-		OutcomeToken         string                `json:"outcome_token"`
-		Command              []string              `json:"command"`
-		CandidateLaunchToken string                `json:"candidate_launch_token,omitempty"`
-		CandidateLaunchID    string                `json:"candidate_launch_id,omitempty"`
-	}{*request.Manifest, handoff, request.Handoff.OutcomePath, request.Handoff.OutcomeToken, command, request.Handoff.CandidateLaunchToken, effectID})
+		Manifest               agentruntime.Manifest                     `json:"manifest"`
+		Handoff                json.RawMessage                           `json:"handoff"`
+		OutcomePath            string                                    `json:"outcome_path"`
+		OutcomeToken           string                                    `json:"outcome_token"`
+		Command                []string                                  `json:"command"`
+		CandidateLaunchToken   string                                    `json:"candidate_launch_token,omitempty"`
+		CandidateLaunchID      string                                    `json:"candidate_launch_id,omitempty"`
+		CurrentImplementation  *agentruntime.ImplementationLaunchBinding `json:"current_implementation,omitempty"`
+		CurrentTerminal        *agentruntime.TerminalBrokerBinding       `json:"current_terminal,omitempty"`
+		PreparedImplementation *agentruntime.ImplementationLaunchBinding `json:"prepared_implementation,omitempty"`
+		PreparedTerminal       *agentruntime.TerminalBrokerBinding       `json:"prepared_terminal,omitempty"`
+	}{*request.Manifest, handoff, request.Handoff.OutcomePath, request.Handoff.OutcomeToken, command, request.Handoff.CandidateLaunchToken, effectID, request.Handoff.CurrentImplementation, request.Handoff.CurrentTerminal, preparedImplementation, preparedTerminal})
 	return body, err
 }
 
@@ -708,14 +731,20 @@ func (c *runtimeEffectCoordinator) executeReviewerMode(boundary boundaryCaller, 
 		if exists, readErr := readReviewerRecord(launchPath, &launch); readErr != nil || !exists || !sameReviewerIdentity(launch, *binding) {
 			return reconciliationEffectResult{}, true, errors.New("reviewer launch proof is unavailable")
 		}
-		if verifyErr := verifyReviewerChildBinding(run.ctx, boundary, material.Env, review.Session, launchPath, terminalPath, *binding, launch.ChildPID); verifyErr != nil {
+		pane, verifyErr := observeReviewerChildBinding(run.ctx, boundary, material.Env, review.Session, launchPath, terminalPath, *binding, launch.ChildPID)
+		if verifyErr != nil {
 			return reconciliationEffectResult{}, true, verifyErr
 		}
-		if _, markErr := c.owner.markPlanReviewRunning(run.ctx, markPlanReviewRunningCommand{Identity: plan.Identity, GroupPID: launch.ChildPID}); markErr != nil {
+		brokerPath := reviewerBrokerPath(request.Reviewer.Snapshot, request.Reviewer.Target)
+		broker, brokerErr := agentruntime.ReadTerminalBrokerBinding(brokerPath)
+		if brokerErr != nil || launch.Broker == nil || broker != *launch.Broker || broker.OuterPID != pane.PID || broker.InnerPGID != launch.ChildPID {
+			return reconciliationEffectResult{}, true, errors.Join(brokerErr, errors.New("reviewer terminal broker identity is unavailable"))
+		}
+		if _, markErr := c.owner.markPlanReviewRunning(run.ctx, markPlanReviewRunningCommand{Identity: plan.Identity, GroupPID: launch.ChildPID, Pane: &pane, TerminalBroker: &broker, BrokerPath: brokerPath}); markErr != nil {
 			return reconciliationEffectResult{}, false, markErr
 		}
-		if _, unlockErr := boundary.call(run.ctx, "run", agentruntime.Command{Name: "tmux", Args: []string{"wait-for", "-U", reviewerGoSignal(*binding)}, Env: material.Env}); unlockErr != nil {
-			return reconciliationEffectResult{}, true, unlockErr
+		if releaseErr := agentruntime.ReleaseTerminalBroker(run.ctx, broker); releaseErr != nil {
+			return reconciliationEffectResult{}, true, releaseErr
 		}
 	}
 	if err != nil || pending {

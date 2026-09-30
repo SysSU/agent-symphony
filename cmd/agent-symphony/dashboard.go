@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -901,19 +902,214 @@ func (s *dashboardServer) serveTerminal(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "terminal requires the dashboard origin", http.StatusForbidden)
 		return
 	}
-	if role == agentruntime.SessionRoleReviewer {
-		http.Error(w, "Reviewer terminal is unavailable until session identity can be verified safely.", http.StatusConflict)
-		return
-	}
 	query := r.URL.Query()
 	issue, issueErr := strconv.Atoi(query.Get("issue"))
 	attempt, attemptErr := strconv.Atoi(query.Get("attempt"))
-	session, err := s.projectedSession(issue, attempt, role)
-	if issueErr != nil || attemptErr != nil || err != nil || !s.validProjectQuery(query, "issue", "attempt") {
-		http.Error(w, "terminal session is not available", http.StatusNotFound)
+	if issueErr != nil || attemptErr != nil || !s.validProjectQuery(query, "issue", "attempt") || s.operator == nil || s.operator.owner == nil {
+		http.Error(w, "terminal identity is unavailable", http.StatusConflict)
 		return
 	}
-	s.serveTerminalSession(w, r, session.Name)
+	snapshot, commits, unsubscribe, err := s.operator.owner.snapshotAndSubscribe(r.Context())
+	if err != nil {
+		http.Error(w, "terminal identity is unavailable", http.StatusConflict)
+		return
+	}
+	defer unsubscribe()
+	var terminal agentruntime.TerminalBrokerBinding
+	var permitCurrent func(stateOwnerSnapshot) bool
+	switch role {
+	case agentruntime.SessionRoleImplementation:
+		permit, permitErr := s.implementationTerminalPermit(snapshot, issue, attempt)
+		if permitErr == nil {
+			terminal, permitCurrent = permit.terminal, permit.current
+		}
+		err = permitErr
+	case agentruntime.SessionRoleReviewer:
+		permit, permitErr := s.reviewerTerminalPermit(snapshot, issue, attempt)
+		if permitErr == nil {
+			terminal, permitCurrent = permit.terminal, permit.current
+		}
+		err = permitErr
+	default:
+		err = errors.New("terminal role is invalid")
+	}
+	if err != nil {
+		http.Error(w, "terminal identity is unavailable", http.StatusConflict)
+		return
+	}
+	client, err := agentruntime.DialTerminalBroker(r.Context(), terminal)
+	if err != nil {
+		http.Error(w, "terminal broker is unavailable", http.StatusConflict)
+		return
+	}
+	defer client.Close()
+	current, err := s.operator.owner.snapshot(r.Context())
+	if err != nil || !permitCurrent(current) {
+		http.Error(w, "terminal identity changed", http.StatusConflict)
+		return
+	}
+	s.serveBrokerTerminal(w, r, client, commits, permitCurrent)
+}
+
+type dashboardTerminalPermit struct {
+	repository        string
+	issue, attempt    int
+	issueGeneration   uint64
+	attemptGeneration uint64
+	manifest          agentruntime.Manifest
+	implementation    agentruntime.ImplementationLaunchBinding
+	terminal          agentruntime.TerminalBrokerBinding
+}
+
+func (s *dashboardServer) implementationTerminalPermit(snapshot stateOwnerSnapshot, issue, attempt int) (dashboardTerminalPermit, error) {
+	key := ownerAttemptKey(s.repository, issue, attempt)
+	record, ok := snapshot.State.Attempts[key]
+	issueGeneration := snapshot.State.IssueGenerations[ownerIssueKey(s.repository, issue)]
+	if !ok || issue < 1 || attempt < 1 || record.Generation == 0 || record.Generation != snapshot.State.AttemptGenerations[key] || issueGeneration == 0 || record.Manifest.Repository != s.repository || record.Manifest.Issue != issue || record.Manifest.Attempt != attempt || record.Manifest.State != "running" || record.ImplementationBinding == nil || record.TerminalBroker == nil {
+		return dashboardTerminalPermit{}, errors.New("implementation terminal owner certificate is unavailable")
+	}
+	if _, tombstoned := snapshot.State.Tombstones[key]; tombstoned || !agentruntime.WorkerConfinementMatches(record.Manifest, record.Generation, activeWorkerProfileDigest(snapshot.State)) || !agentruntime.ValidImplementationBinding(record.Manifest, *record.ImplementationBinding, record.Manifest.LaunchID) || !agentruntime.ValidImplementationTerminalBinding(record.Manifest, *record.TerminalBroker) || record.TerminalBroker.OuterPID != record.ImplementationBinding.PanePID {
+		return dashboardTerminalPermit{}, errors.New("implementation terminal owner certificate is stale")
+	}
+	return dashboardTerminalPermit{repository: s.repository, issue: issue, attempt: attempt, issueGeneration: issueGeneration, attemptGeneration: record.Generation, manifest: cloneManifest(record.Manifest), implementation: *record.ImplementationBinding, terminal: *record.TerminalBroker}, nil
+}
+
+func (p dashboardTerminalPermit) current(snapshot stateOwnerSnapshot) bool {
+	key := ownerAttemptKey(p.repository, p.issue, p.attempt)
+	record, ok := snapshot.State.Attempts[key]
+	if !ok || snapshot.State.IssueGenerations[ownerIssueKey(p.repository, p.issue)] != p.issueGeneration || snapshot.State.AttemptGenerations[key] != p.attemptGeneration || record.Generation != p.attemptGeneration ||
+		record.Manifest.Repository != p.repository || record.Manifest.Issue != p.issue || record.Manifest.Attempt != p.attempt || record.Manifest.State != "running" ||
+		record.ImplementationBinding == nil || *record.ImplementationBinding != p.implementation || record.TerminalBroker == nil || *record.TerminalBroker != p.terminal {
+		return false
+	}
+	_, tombstoned := snapshot.State.Tombstones[key]
+	return !tombstoned &&
+		agentruntime.WorkerConfinementMatches(record.Manifest, record.Generation, activeWorkerProfileDigest(snapshot.State)) &&
+		agentruntime.ValidImplementationBinding(record.Manifest, p.implementation, record.Manifest.LaunchID) &&
+		agentruntime.ValidImplementationTerminalBinding(record.Manifest, p.terminal) &&
+		p.terminal.OuterPID == p.implementation.PanePID
+}
+
+type dashboardReviewerTerminalPermit struct {
+	repository        string
+	issue, attempt    int
+	issueGeneration   uint64
+	attemptGeneration uint64
+	proof             reviewerProcessProof
+	terminal          agentruntime.TerminalBrokerBinding
+}
+
+func reviewerTerminalEffectCurrent(effect runtimeEffectIntent, proof reviewerProcessProof, repository string, issue, attempt int, issueGeneration, attemptGeneration uint64) bool {
+	reviewer := effect.Reconciliation
+	return proof.Pane != nil && effect.ID == proof.EffectID && effect.Action == string(reconciliationReviewer) && effect.Repository == repository && effect.Issue == issue && effect.Attempt == attempt && effect.State == "pending" && effect.IssueGeneration == issueGeneration && effect.AttemptGeneration == attemptGeneration && effect.ReviewerLaunched && !effect.ReviewerRevoked && effect.ReviewerGateProtocol && effect.ReviewerSessionRequested && effect.ReviewerGroupPID == proof.GroupPID && effect.ReviewerProfileDigest == proof.ProfileDigest && effect.ReviewerConfinementVersion == proof.ConfinementVersion && reviewer != nil && reviewer.Reviewer != nil && reviewer.Reviewer.RunID == proof.RunID && reviewer.Reviewer.Target == proof.Target && reviewer.Reviewer.Mode == proof.Mode && reviewer.Reviewer.Session == proof.Pane.SessionName
+}
+
+func (s *dashboardServer) reviewerTerminalPermit(snapshot stateOwnerSnapshot, issue, attempt int) (dashboardReviewerTerminalPermit, error) {
+	key := ownerAttemptKey(s.repository, issue, attempt)
+	record, ok := snapshot.State.Attempts[key]
+	issueGeneration := snapshot.State.IssueGenerations[ownerIssueKey(s.repository, issue)]
+	if !ok || issue < 1 || attempt < 1 || record.Generation == 0 || record.Generation != snapshot.State.AttemptGenerations[key] || issueGeneration == 0 || record.Manifest.Repository != s.repository || record.Manifest.Issue != issue || record.Manifest.Attempt != attempt {
+		return dashboardReviewerTerminalPermit{}, errors.New("reviewer terminal owner certificate is unavailable")
+	}
+	if _, tombstoned := snapshot.State.Tombstones[key]; tombstoned {
+		return dashboardReviewerTerminalPermit{}, errors.New("reviewer terminal owner certificate is stale")
+	}
+	activeProfile := activeWorkerProfileDigest(snapshot.State)
+	var permit *dashboardReviewerTerminalPermit
+	for _, proof := range snapshot.State.ReviewerProofs {
+		if proof.Repository != s.repository || proof.Issue != issue || proof.Attempt != attempt || proof.DeadProved || proof.LegacyUnverified || proof.NeverRan || proof.IssueGeneration != issueGeneration || proof.AttemptGeneration != record.Generation || proof.ProfileDigest != activeProfile || proof.ConfinementVersion != reviewerConfinementVersion || !validReviewerTerminalCertificate(s.stateRoot, proof) {
+			continue
+		}
+		effect, effectOK := snapshot.State.Effects[proof.EffectID]
+		if !effectOK || !reviewerTerminalEffectCurrent(effect, proof, s.repository, issue, attempt, issueGeneration, record.Generation) {
+			continue
+		}
+		if permit != nil {
+			return dashboardReviewerTerminalPermit{}, errors.New("reviewer terminal owner certificate is ambiguous")
+		}
+		permit = &dashboardReviewerTerminalPermit{repository: s.repository, issue: issue, attempt: attempt, issueGeneration: issueGeneration, attemptGeneration: record.Generation, proof: proof, terminal: *proof.TerminalBroker}
+	}
+	if permit == nil {
+		return dashboardReviewerTerminalPermit{}, errors.New("reviewer terminal owner certificate is stale")
+	}
+	return *permit, nil
+}
+
+func (p dashboardReviewerTerminalPermit) current(snapshot stateOwnerSnapshot) bool {
+	key := ownerAttemptKey(p.repository, p.issue, p.attempt)
+	record, ok := snapshot.State.Attempts[key]
+	if !ok || snapshot.State.IssueGenerations[ownerIssueKey(p.repository, p.issue)] != p.issueGeneration || snapshot.State.AttemptGenerations[key] != p.attemptGeneration || record.Generation != p.attemptGeneration ||
+		record.Manifest.Repository != p.repository || record.Manifest.Issue != p.issue || record.Manifest.Attempt != p.attempt {
+		return false
+	}
+	proof, ok := snapshot.State.ReviewerProofs[reviewerProofKey(p.repository, p.issue, p.attempt, p.proof.Mode, p.proof.Target)]
+	effect, effectOK := snapshot.State.Effects[p.proof.EffectID]
+	_, tombstoned := snapshot.State.Tombstones[key]
+	return !tombstoned && ok && reflect.DeepEqual(proof, p.proof) && !proof.DeadProved && proof.ProfileDigest == activeWorkerProfileDigest(snapshot.State) && effectOK && reviewerTerminalEffectCurrent(effect, proof, p.repository, p.issue, p.attempt, p.issueGeneration, p.attemptGeneration)
+}
+
+func (s *dashboardServer) serveBrokerTerminal(w http.ResponseWriter, r *http.Request, client *agentruntime.TerminalBrokerClient, commits <-chan stateOwnerSnapshot, current func(stateOwnerSnapshot) bool) {
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(maxTerminalInputBytes)
+	ctx, cancel := context.WithCancel(s.ctx)
+	defer cancel()
+	go func() {
+		for {
+			select {
+			case snapshot, ok := <-commits:
+				if !ok || !current(snapshot) {
+					cancel()
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	if err := client.Start(); err != nil {
+		_ = conn.Close(websocket.StatusInternalError, "Terminal broker failed.")
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer cancel()
+		for {
+			output, readErr := client.ReadOutput()
+			if readErr != nil || conn.Write(ctx, websocket.MessageBinary, output) != nil {
+				return
+			}
+		}
+	}()
+	for {
+		kind, message, readErr := conn.Read(ctx)
+		if readErr != nil {
+			break
+		}
+		if kind == websocket.MessageBinary {
+			if len(message) > maxTerminalInputBytes || client.WriteInput(message) != nil {
+				break
+			}
+			continue
+		}
+		var resize struct {
+			Type       string `json:"type"`
+			Cols, Rows uint16
+		}
+		decoder := json.NewDecoder(strings.NewReader(string(message)))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&resize) != nil || decoder.Decode(&struct{}{}) != io.EOF || resize.Type != "resize" || resize.Cols < 2 || resize.Rows < 2 || resize.Cols > 500 || resize.Rows > 300 || client.Resize(resize.Cols, resize.Rows) != nil {
+			_ = conn.Close(websocket.StatusPolicyViolation, "invalid terminal message")
+			break
+		}
+	}
+	cancel()
+	_ = client.Close()
+	<-done
 }
 
 func (s *dashboardServer) serveOrchestratorTerminal(w http.ResponseWriter, r *http.Request) {

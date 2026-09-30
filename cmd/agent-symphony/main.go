@@ -120,13 +120,17 @@ type handoffReceipt struct {
 }
 
 type handoffRequest struct {
-	Manifest             agentruntime.Manifest `json:"manifest"`
-	Handoff              json.RawMessage       `json:"handoff"`
-	OutcomePath          string                `json:"outcome_path"`
-	OutcomeToken         string                `json:"outcome_token"`
-	Command              []string              `json:"command"`
-	CandidateLaunchToken string                `json:"candidate_launch_token,omitempty"`
-	CandidateLaunchID    string                `json:"candidate_launch_id,omitempty"`
+	Manifest               agentruntime.Manifest                     `json:"manifest"`
+	Handoff                json.RawMessage                           `json:"handoff"`
+	OutcomePath            string                                    `json:"outcome_path"`
+	OutcomeToken           string                                    `json:"outcome_token"`
+	Command                []string                                  `json:"command"`
+	CandidateLaunchToken   string                                    `json:"candidate_launch_token,omitempty"`
+	CandidateLaunchID      string                                    `json:"candidate_launch_id,omitempty"`
+	CurrentImplementation  *agentruntime.ImplementationLaunchBinding `json:"current_implementation,omitempty"`
+	CurrentTerminal        *agentruntime.TerminalBrokerBinding       `json:"current_terminal,omitempty"`
+	PreparedImplementation *agentruntime.ImplementationLaunchBinding `json:"prepared_implementation,omitempty"`
+	PreparedTerminal       *agentruntime.TerminalBrokerBinding       `json:"prepared_terminal,omitempty"`
 }
 
 func (b workerBoundaryRunner) call(ctx context.Context, operation string, command agentruntime.Command) (agentruntime.Result, error) {
@@ -931,6 +935,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 125
 		}
 		return 0
+	}
+	if command == "terminal-broker-bound" {
+		if len(args) < 10 || args[8] != "--" || (args[7] != "capture" && args[7] != "interactive") {
+			return misuse(stderr, false, command, "invalid bound terminal broker invocation")
+		}
+		manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, LogPath: args[2], Worktree: args[3], Session: args[4], LaunchToken: args[5], LaunchID: args[6]}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer stop()
+		code, childSignal, err := agentruntime.RunBoundTerminalBroker(ctx, manifest, args[1], args[7], args[9:], os.Stdin, stdout, stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "error: "+err.Error())
+		}
+		if childSignal != 0 {
+			signal.Reset(childSignal)
+			if killErr := syscall.Kill(os.Getpid(), childSignal); killErr == nil {
+				select {}
+			}
+		}
+		return code
 	}
 	if command == "pane-exit-status-bound" {
 		if len(args) < 9 || args[7] != "--" {
@@ -2971,8 +2994,13 @@ launch:
 			}
 		}
 		launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
+		brokerPath := reviewerBrokerPath(snapshot, target)
+		socketDir, socketErr := agentruntime.PrepareTerminalBrokerDir(filepath.Dir(snapshotRoot))
+		if socketErr != nil {
+			return independentReviewResult{}, false, socketErr
+		}
 		encoded, _ := json.Marshal(binding)
-		command = append([]string{help, "review-pane", "tmux", launchPath, terminalPath, reviewerSignal(*binding), reviewerStartSignal(*binding), string(encoded), "--"}, command...)
+		command = append([]string{help, "review-pane", "tmux", launchPath, terminalPath, brokerPath, socketDir, reviewerSignal(*binding), reviewerStartSignal(*binding), string(encoded), "--"}, command...)
 	}
 	if binding == nil {
 		return independentReviewResult{}, false, errors.New("reviewer owner binding is unavailable")

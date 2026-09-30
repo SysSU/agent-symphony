@@ -49,7 +49,7 @@ func (b *directReviewerSessionBoundary) call(_ context.Context, operation string
 	}
 	switch command.Args[0] {
 	case "display-message":
-		return agentruntime.Result{Output: "||||||||||"}, nil
+		return agentruntime.Result{Output: "|||||||||||"}, nil
 	case "wait-for":
 		return agentruntime.Result{}, nil
 	case "set-option":
@@ -75,6 +75,7 @@ func (b *directReviewerSessionBoundary) call(_ context.Context, operation string
 
 type reviewerSessionStopBoundary struct {
 	status           agentruntime.Result
+	stoppedStatus    agentruntime.Result
 	err              error
 	hasSessionStatus agentruntime.Result
 	hasSessionErr    error
@@ -561,8 +562,8 @@ func TestReviewerMissingSessionWithLiveTmuxServerReturnsOnlyPhysicalGroupObserva
 	if _, err := service.stopReviewerSessionAt(t.Context(), session, strings.Repeat("a", 32), "", "", syscall.Getpgrp(), false, false, "", "", 1, 1); err == nil {
 		t.Fatal("live or ambiguous group was certified from missing tmux session")
 	}
-	if observed, err := service.stopReviewerSessionAt(t.Context(), session, strings.Repeat("a", 32), "", "", 99999999, false, false, "", "", 1, 1); err != nil || observed != (reviewerStopObservation{GroupPID: 99999999}) {
-		t.Fatalf("dead group did not return its limited physical observation: observation=%#v err=%v", observed, err)
+	if observed, err := service.stopReviewerSessionAt(t.Context(), session, strings.Repeat("a", 32), "", "", 99999999, false, false, "", "", 1, 1); err == nil || observed != (reviewerStopObservation{}) {
+		t.Fatalf("stored group without broker certificate was accepted: observation=%#v err=%v", observed, err)
 	}
 	root := t.TempDir()
 	attempt := agentruntime.Attempt{Repository: "o/r", Issue: 300, Number: 1, BaseSHA: strings.Repeat("a", 40)}
@@ -653,7 +654,7 @@ func TestDismissWithPendingReviewerDoesNotCompletePhysicalCleanup(t *testing.T) 
 	if group, err := syscall.Getpgid(liveReviewer.Process.Pid); err != nil || group != liveReviewer.Process.Pid {
 		t.Fatalf("fixture reviewer is not its process-group leader: group=%d err=%v", group, err)
 	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: liveReviewer.Process.Pid}); err != nil {
+	if _, err := owner.markPlanReviewRunning(t.Context(), testMarkReviewerRunning(owner.stateRoot, mustOwnerSnapshot(t, owner).State, identity, liveReviewer.Process.Pid)); err != nil {
 		t.Fatal(err)
 	}
 	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(request)
@@ -1215,7 +1216,7 @@ func TestCertifiedReviewerCleanupGuardsDeadPaneAcrossServerReplacement(t *testin
 }
 
 func reviewerPaneTestOutput(status, session, id string, pid int, start string) string {
-	return fmt.Sprintf("%s|%s|%d|99999|1789286706|%s|%s", status, id, pid, session, start)
+	return fmt.Sprintf("%s|%s|%%1|%d|99999|1789286706|%s|%s", status, id, pid, session, start)
 }
 
 type preRespawnReviewerBoundary struct {
@@ -1286,13 +1287,18 @@ func (b *reviewerSessionStopBoundary) call(_ context.Context, operation string, 
 	}
 	switch command.Args[0] {
 	case "display-message":
+		if b.stoppedStatus != (agentruntime.Result{}) {
+			if pane, err := parseReviewerPaneIdentity(b.status.Output); err == nil && errors.Is(syscall.Kill(pane.PID, 0), syscall.ESRCH) {
+				return b.stoppedStatus, b.err
+			}
+		}
 		return b.status, b.err
 	case "if-shell":
 		b.killed = append(b.killed, strings.TrimPrefix(command.Args[5], "kill-session -t "))
 		if pane, err := parseReviewerPaneIdentity(b.status.Output); err == nil {
 			b.inventory = fmt.Sprintf("%d|%d|anchor\n", pane.ServerPID, pane.StartTime)
 		}
-		b.status = agentruntime.Result{Output: "||||||||||\n"}
+		b.status = agentruntime.Result{Output: "|||||||||||\n"}
 		if b.onKill != nil {
 			return agentruntime.Result{}, b.onKill()
 		}
@@ -1324,7 +1330,7 @@ func TestReviewerSessionStopRequiresExactPaneEvidence(t *testing.T) {
 		wantKill  bool
 		wantError bool
 	}{
-		{name: "exact missing pane", status: agentruntime.Result{Output: "||||||||||\n"}},
+		{name: "exact missing pane", status: agentruntime.Result{Output: "|||||||||||\n"}, wantError: true},
 		{name: "unverified live pane", status: agentruntime.Result{Output: "0||||\n"}, wantError: true},
 		{name: "ambiguous tmux exit one", status: agentruntime.Result{Exited: true, Code: 1, Output: "permission denied"}, err: errors.New("tmux failed"), wantError: true},
 	} {
@@ -1347,7 +1353,7 @@ func TestUnboundReviewerSessionLossCannotForgeNeverRanProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||\n"}}
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||||||\n"}}
 	service := &operatorMutationService{reviewer: boundary, lifecycle: t.Context()}
 	if _, err := service.stopReviewerSessionAt(t.Context(), session, strings.Repeat("a", 32), "", "", 0, false, false, "", "", 1, 1); err == nil {
 		t.Fatal("missing tmux pane falsely proved an unbound reviewer never executed")
@@ -1371,6 +1377,28 @@ func TestUnboundReviewerSessionLossCannotForgeNeverRanProof(t *testing.T) {
 	}
 	if _, err := service.stopReviewerSessionAt(t.Context(), session, forged.EffectID, forged.RunID, forged.RequestDigest, 0, true, true, launchPath, terminalPath, 1, 1); err == nil || len(boundary.killed) != 0 {
 		t.Fatalf("group-writable launch file forged a death certificate after pane loss: err=%v killed=%v", err, boundary.killed)
+	}
+}
+
+func TestReviewerLifecycleRecordIsOwnerOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "launch.json")
+	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64)}
+	if err := writeReviewerRecord(path, identity); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode=%v", info.Mode().Perm())
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	var stored reviewerLaunchIdentity
+	if ok, err := readReviewerRecord(path, &stored); err == nil || ok {
+		t.Fatalf("group-readable reviewer identity was accepted: ok=%t err=%v", ok, err)
 	}
 }
 
@@ -1475,7 +1503,7 @@ func TestReviewerStopDoesNotTrustTmuxKillAck(t *testing.T) {
 		t.Fatal(err)
 	}
 	boundary.session = session
-	if err := service.stopReviewerSession(t.Context(), session, reviewerID, child.Process.Pid); err == nil || boundary.kills != 1 {
+	if err := service.stopReviewerSession(t.Context(), session, reviewerID, child.Process.Pid); err == nil || boundary.kills != 0 {
 		t.Fatalf("forged terminal or kill ACK completed cancellation: err=%v kills=%d", err, boundary.kills)
 	}
 	if err := syscall.Kill(-child.Process.Pid, 0); err != nil {
@@ -1509,6 +1537,7 @@ func TestPlanReviewerForgedTerminalCannotFinishLivePane(t *testing.T) {
 	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "running", ReviewState: "running", ReviewMode: agentruntime.ReviewModePlan, ReviewTarget: target, ReviewRunID: runID, ReviewBase: attempt.BaseSHA, ReviewHead: attempt.BaseSHA, ReviewSnapshot: snapshot, ReviewSession: session}
 	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), RunID: runID, IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64), GateProtocol: true, SessionRequested: true, ChildPID: 99999999}
 	launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
+	identity.Broker = &agentruntime.TerminalBrokerBinding{Version: 1, OuterPID: os.Getpid(), InnerPID: identity.ChildPID, InnerPGID: identity.ChildPID, SocketPath: filepath.Join(root, "broker.sock"), SocketDev: 1, SocketIno: 1, Secret: strings.Repeat("c", 64)}
 	if err := os.MkdirAll(filepath.Dir(launchPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1534,7 +1563,7 @@ func TestReviewCleanupFailsClosedOnAmbiguousTmuxFailure(t *testing.T) {
 		wantError bool
 		wantKill  bool
 	}{
-		{name: "exact missing", status: agentruntime.Result{Output: "||||||||||\n"}},
+		{name: "exact missing", status: agentruntime.Result{Output: "|||||||||||\n"}},
 		{name: "no server", status: agentruntime.Result{Exited: true, Code: 1, Output: "no server running on /private/tmp/tmux-501/test"}, err: errors.New("worker boundary command exited 1")},
 		{name: "live", status: agentruntime.Result{Output: "0|||||$1|12345|/bin/sh\n"}, wantError: true},
 		{name: "exit one is ambiguous", status: agentruntime.Result{Exited: true, Code: 1, Output: "permission denied"}, err: errors.New("tmux unavailable"), wantError: true},
@@ -1568,7 +1597,7 @@ func TestReviewCleanupRetainsUnboundSnapshotWhenSessionIsMissing(t *testing.T) {
 	if err := os.MkdirAll(snapshot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||\n"}}
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||||||\n"}}
 	if err := cleanupReviewResources(t.Context(), boundary, nil, attempt, attempt.BaseSHA, "", "", snapshot, session, root); err == nil {
 		t.Fatal("unbound reviewer snapshot was deleted from a missing pane")
 	}
@@ -1583,7 +1612,7 @@ func TestReviewCleanupWithHistoricalMetadataButNoResourcesSucceeds(t *testing.T)
 		t.Fatal(err)
 	}
 	manifest := agentruntime.Manifest{Repository: "o/r", Issue: 91, Attempt: 1, BaseSHA: strings.Repeat("a", 40), ReviewState: "clean"}
-	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "||||||||||\n"}}
+	boundary := &reviewerSessionStopBoundary{status: agentruntime.Result{Output: "|||||||||||\n"}}
 	if err := cleanupAttemptReviewResourcesProved(t.Context(), stateRoot, boundary, manifest, true, nil); err != nil {
 		t.Fatalf("historical review metadata with no session or resources blocked cleanup: %v", err)
 	}
@@ -1807,7 +1836,7 @@ func TestAmbiguousReviewerPaneProbeKeepsPendingIntentWithDiagnostic(t *testing.T
 	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: ownerReconciliationEffectIdentity(*effect)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: ownerReconciliationEffectIdentity(*effect), GroupPID: 99999999}); err != nil {
+	if _, err := owner.markPlanReviewRunning(t.Context(), testMarkReviewerRunning(owner.stateRoot, mustOwnerSnapshot(t, owner).State, ownerReconciliationEffectIdentity(*effect), 99999999)); err != nil {
 		t.Fatal(err)
 	}
 	current := mustOwnerSnapshot(t, owner)
@@ -1839,20 +1868,52 @@ func (b *invalidReviewArtifactBoundary) call(_ context.Context, operation string
 
 func TestReviewerPaneRecordsExactLaunchAndTerminalIdentity(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "tmux"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	tmuxLog := filepath.Join(root, "tmux.log")
+	if err := os.WriteFile(filepath.Join(root, "tmux"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AS_TEST_TMUX_LOG\"\nif [ \"$AS_TEST_TMUX_BLOCK\" = 1 ] && [ \"$1\" = set-option ]; then while :; do :; done; fi\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AS_TEST_TMUX_LOG", tmuxLog)
 	t.Setenv("TMUX_PANE", "%123")
 	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), RunID: strings.Repeat("c", 64), IssueGeneration: 2, AttemptGeneration: 4, RequestDigest: strings.Repeat("b", 64), ProfileDigest: strings.Repeat("d", 64), ConfinementVersion: reviewerConfinementVersion}
-	launch, terminal := filepath.Join(root, "launch.json"), filepath.Join(root, "terminal.json")
+	launch, terminal, brokerPath := filepath.Join(root, "launch.json"), filepath.Join(root, "terminal.json"), filepath.Join(root, "broker.json")
+	socketDir, err := agentruntime.PrepareTerminalBrokerDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	encodedJSON, err := json.Marshal(identity)
 	if err != nil {
 		t.Fatal(err)
 	}
 	encoded := string(encodedJSON)
-	args := []string{"tmux", launch, terminal, reviewerSignal(identity), reviewerStartSignal(identity), encoded, "--", "sh", "-c", "exit 0"}
-	code, signal, err := runReviewerPane(args, io.Discard, io.Discard)
+	args := []string{"tmux", launch, terminal, brokerPath, socketDir, reviewerSignal(identity), reviewerStartSignal(identity), encoded, "--", "sh", "-c", "exit 0"}
+	type wrapperResult struct {
+		code   int
+		signal syscall.Signal
+		err    error
+	}
+	done := make(chan wrapperResult, 1)
+	go func() {
+		code, signal, runErr := runReviewerPane(args, io.Discard, io.Discard)
+		done <- wrapperResult{code: code, signal: signal, err: runErr}
+	}()
+	var broker agentruntime.TerminalBrokerBinding
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		broker, err = agentruntime.ReadTerminalBrokerBinding(brokerPath)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := agentruntime.ReleaseTerminalBroker(t.Context(), broker); err != nil {
+		t.Fatal(err)
+	}
+	result := <-done
+	code, signal, err := result.code, result.signal, result.err
 	if err != nil || code != 0 || signal != 0 {
 		t.Fatalf("reviewer wrapper result code=%d signal=%d err=%v", code, signal, err)
 	}
@@ -1861,6 +1922,121 @@ func TestReviewerPaneRecordsExactLaunchAndTerminalIdentity(t *testing.T) {
 	launchedOK, launchErr := readReviewerRecord(launch, &launched)
 	if err != nil || record == nil || record.ExitCode != 0 || record.Signal != 0 || launchErr != nil || !launchedOK || launched.ChildPID < 2 || record.Identity.ChildPID != launched.ChildPID {
 		t.Fatalf("exact terminal record=%#v err=%v", record, err)
+	}
+	tmuxCalls, err := os.ReadFile(tmuxLog)
+	if err != nil || !strings.Contains(string(tmuxCalls), "set-option -p -t %123 "+agentruntime.PaneExitStatusOption+" 0\n") {
+		t.Fatalf("reviewer pane exit fallback was not recorded: %q err=%v", tmuxCalls, err)
+	}
+	signaled := identity
+	signaled.RunID = strings.Repeat("e", 64)
+	signalRoot := filepath.Join(root, "signal")
+	if err := os.Mkdir(signalRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	signalLaunch, signalTerminal, signalBroker := filepath.Join(signalRoot, "launch.json"), filepath.Join(signalRoot, "terminal.json"), filepath.Join(signalRoot, "broker.json")
+	signalJSON, err := json.Marshal(signaled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signalDone := make(chan wrapperResult, 1)
+	go func() {
+		code, signal, runErr := runReviewerPane([]string{"tmux", signalLaunch, signalTerminal, signalBroker, socketDir, reviewerSignal(signaled), reviewerStartSignal(signaled), string(signalJSON), "--", "sh", "-c", "kill -TERM $$"}, io.Discard, io.Discard)
+		signalDone <- wrapperResult{code: code, signal: signal, err: runErr}
+	}()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		broker, err = agentruntime.ReadTerminalBrokerBinding(signalBroker)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := agentruntime.ReleaseTerminalBroker(t.Context(), broker); err != nil {
+		t.Fatal(err)
+	}
+	signalResult := <-signalDone
+	if signalResult.code != 128+int(syscall.SIGTERM) || signalResult.signal != syscall.SIGTERM || signalResult.err != nil {
+		t.Fatalf("signaled reviewer result=%#v", signalResult)
+	}
+	tmuxCalls, err = os.ReadFile(tmuxLog)
+	if err != nil || !strings.Contains(string(tmuxCalls), "set-option -p -t %123 "+agentruntime.PaneExitSignalOption+" "+strconv.Itoa(int(syscall.SIGTERM))+"\n") {
+		t.Fatalf("reviewer pane signal fallback was not recorded: %q err=%v", tmuxCalls, err)
+	}
+	signalRecord, err := readReviewerTerminal(signalLaunch, signalTerminal, signaled)
+	if err != nil || signalRecord == nil || signalRecord.Signal != int(syscall.SIGTERM) || signalRecord.ExitCode != 128+int(syscall.SIGTERM) {
+		t.Fatalf("signaled terminal record=%#v err=%v", signalRecord, err)
+	}
+	blocked := identity
+	blocked.RunID = strings.Repeat("f", 64)
+	blockedRoot := filepath.Join(root, "blocked")
+	if err := os.Mkdir(blockedRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	blockedLaunch, blockedTerminal, blockedBroker := filepath.Join(blockedRoot, "launch.json"), filepath.Join(blockedRoot, "terminal.json"), filepath.Join(blockedRoot, "broker.json")
+	blockedJSON, err := json.Marshal(blocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AS_TEST_TMUX_BLOCK", "1")
+	blockedDone := make(chan wrapperResult, 1)
+	go func() {
+		code, signal, runErr := runReviewerPane([]string{"tmux", blockedLaunch, blockedTerminal, blockedBroker, socketDir, reviewerSignal(blocked), reviewerStartSignal(blocked), string(blockedJSON), "--", "sh", "-c", "exit 7"}, io.Discard, io.Discard)
+		blockedDone <- wrapperResult{code: code, signal: signal, err: runErr}
+	}()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		broker, err = agentruntime.ReadTerminalBrokerBinding(blockedBroker)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := agentruntime.ReleaseTerminalBroker(t.Context(), broker); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	blockedCall := "set-option -p -t %123 " + agentruntime.PaneExitStatusOption + " 7\n"
+	for {
+		calls, readErr := os.ReadFile(tmuxLog)
+		if readErr == nil && strings.Contains(string(calls), blockedCall) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("blocked tmux fallback did not start: %q err=%v", calls, readErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for {
+		blockedRecord, recordErr := readReviewerTerminal(blockedLaunch, blockedTerminal, blocked)
+		if recordErr == nil && blockedRecord != nil {
+			if blockedRecord.ExitCode != 7 || blockedRecord.Signal != 0 {
+				t.Fatalf("blocked tmux terminal record=%#v", blockedRecord)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("terminal result was not persisted before blocked tmux fallback: %v", recordErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case result := <-blockedDone:
+		t.Fatalf("reviewer wrapper returned before blocked tmux deadline: %#v", result)
+	default:
+	}
+	select {
+	case result := <-blockedDone:
+		if result.code != 7 || result.signal != 0 || result.err == nil {
+			t.Fatalf("blocked tmux reviewer result=%#v", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked tmux fallback exceeded its deadline")
 	}
 	changed := identity
 	changed.AttemptGeneration++
@@ -2014,6 +2190,7 @@ func TestPlanReviewerInvalidArtifactIsTerminalFailure(t *testing.T) {
 	manifest := agentruntime.Manifest{Repository: attempt.Repository, Issue: attempt.Issue, Attempt: attempt.Number, BaseSHA: attempt.BaseSHA, State: "running", ReviewState: "running", ReviewMode: agentruntime.ReviewModePlan, ReviewTarget: target, ReviewRunID: runID, ReviewBase: attempt.BaseSHA, ReviewHead: attempt.BaseSHA, ReviewSnapshot: snapshot, ReviewSession: session}
 	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), RunID: runID, IssueGeneration: 1, AttemptGeneration: 1, RequestDigest: strings.Repeat("b", 64), GateProtocol: true, SessionRequested: true, ChildPID: 99999999}
 	launchPath, terminalPath := reviewerLifecyclePaths(snapshot, target)
+	identity.Broker = &agentruntime.TerminalBrokerBinding{Version: 1, OuterPID: os.Getpid(), InnerPID: identity.ChildPID, InnerPGID: identity.ChildPID, SocketPath: filepath.Join(root, "broker.sock"), SocketDev: 1, SocketIno: 1, Secret: strings.Repeat("c", 64)}
 	if err := os.MkdirAll(filepath.Dir(launchPath), 0o700); err != nil {
 		t.Fatal(err)
 	}

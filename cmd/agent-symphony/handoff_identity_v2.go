@@ -9,10 +9,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"syscall"
-	"time"
 
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
@@ -30,10 +28,6 @@ func handoffCandidateManifest(request handoffRequest) agentruntime.Manifest {
 	manifest := request.Manifest
 	manifest.LaunchToken, manifest.LaunchID = request.CandidateLaunchToken, request.CandidateLaunchID
 	return manifest
-}
-
-func handoffPhasePath(request handoffRequest, key string) string {
-	return filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs", key+"-"+request.CandidateLaunchID+".phase")
 }
 
 func readHandoffPhase(path string) ([]byte, error) {
@@ -77,15 +71,6 @@ func guardedHandoffCandidateArgs(binding agentruntime.ImplementationLaunchBindin
 	return []string{"if-shell", "-F", "-t", pane.PaneID, condition, command, "display-message -p " + agentruntime.ImplementationGuardMismatch}, nil
 }
 
-func handoffGateCommand(request handoffRequest, key, recipient, helper string) []string {
-	buffer := "as-handoff-" + recipient[:16]
-	launchedPath := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs", key+".launched")
-	signal := buffer + "-launched"
-	bound := handoffCandidateManifest(request)
-	worker := agentruntime.BoundHandoffPromptCommand(helper, "tmux", buffer, agentruntime.ResultPath(request.Manifest.Worktree), launchedPath, recipient, signal, bound, request.Command)
-	return append([]string{helper, "implementation-gate", "tmux", bound.LogPath, bound.Worktree, bound.Session, bound.LaunchToken, bound.LaunchID, "--"}, worker...)
-}
-
 func prepareHandoffV2(ctx context.Context, input []byte, root string) (string, error) {
 	request, handoff, err := decodeHandoffRequest(input, root)
 	if err != nil || request.Manifest.Version != agentruntime.ManifestVersion2 {
@@ -99,132 +84,48 @@ func prepareHandoffV2(ctx context.Context, input []byte, root string) (string, e
 	if err := writeImmutable(filepath.Join(inbox, handoff.Key+".json"), bindingBytes); err != nil {
 		return "", err
 	}
-	prepared := request.CandidateLaunchID + ":" + request.CandidateLaunchToken
-	if _, _, err := handoffCandidateBinding(ctx, request); err == nil {
-		return prepared, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", err
-	}
-	oldBinding, err := agentruntime.ReadImplementationBinding(request.Manifest)
-	if err != nil {
-		return "", fmt.Errorf("old handoff launch is unbound: %w", err)
-	}
-	observed, err := runHostTmux(ctx, []string{"display-message", "-p", "-t", oldBinding.PaneID, agentruntime.ImplementationPaneFormat}, nil)
-	if err != nil {
-		return "", err
-	}
-	oldPane, err := agentruntime.ParseImplementationPane(observed.Output)
-	if err != nil {
-		return "", err
-	}
-	phasePath := handoffPhasePath(request, handoff.Key)
-	phaseBody, phaseErr := readHandoffPhase(phasePath)
-	phaseExists := phaseErr == nil
-	if phaseErr != nil && !errors.Is(phaseErr, os.ErrNotExist) {
-		return "", phaseErr
-	}
-	var prior handoffLaunchPhase
-	if phaseExists {
-		if json.Unmarshal(phaseBody, &prior) != nil || prior.Old != oldBinding || prior.Candidate != request.CandidateLaunchToken || prior.EffectID != request.CandidateLaunchID || len(prior.Gate) < 10 || !reflect.DeepEqual(prior.Gate, handoffGateCommand(request, handoff.Key, recipient, prior.Gate[0])) {
-			return "", errors.New("handoff phase identity conflicts with owner intent")
-		}
-		if oldPane.Token == request.CandidateLaunchToken && oldPane.ServerPID == oldBinding.ServerPID && oldPane.ServerStart == oldBinding.ServerStart && oldPane.SessionID == oldBinding.SessionID && oldPane.PaneID == oldBinding.PaneID && oldPane.PanePID != oldBinding.PanePID && strings.Contains(oldPane.Command, request.CandidateLaunchID) && strings.Contains(oldPane.Command, "implementation-gate") {
-			candidate, err := agentruntime.BindImplementationPane(handoffCandidateManifest(request), request.CandidateLaunchID, "capture", oldPane)
-			if err != nil {
-				return "", err
-			}
-			if err := agentruntime.WriteImplementationBinding(handoffCandidateManifest(request), candidate); err != nil {
-				return "", err
-			}
-			return prepared, nil
-		}
-	}
-	guardBinding := oldBinding
-	if !oldBinding.Matches(request.Manifest, oldPane) {
-		if !phaseExists || oldPane.Token != request.CandidateLaunchToken || oldPane.PanePID != oldBinding.PanePID || oldPane.Command != oldBinding.Command || oldPane.ServerPID != oldBinding.ServerPID || oldPane.ServerStart != oldBinding.ServerStart || oldPane.SessionID != oldBinding.SessionID || oldPane.PaneID != oldBinding.PaneID {
-			return "", errors.New("old handoff pane identity changed")
-		}
-		guardBinding.Token = request.CandidateLaunchToken // Retag completed; respawn did not.
-	}
 	helper, err := hostExecutable()
 	if err != nil {
 		return "", err
 	}
-	gate := handoffGateCommand(request, handoff.Key, recipient, helper)
-	if phaseExists {
-		gate = prior.Gate
-	}
-	phase, _ := json.Marshal(handoffLaunchPhase{Old: oldBinding, Candidate: request.CandidateLaunchToken, EffectID: request.CandidateLaunchID, Gate: gate})
 	buffer := "as-handoff-" + recipient[:16]
 	prompt := fmt.Appendf(nil, "Apply this authorized Agent Symphony handoff in the current worktree. It may contain review feedback or confirmed human instructions. %s Current source refs are available under refs/remotes/agent-symphony/. Do not push; Agent Symphony will publish the captured result.\n\n%s\n\nCompletion contract: Make stdout exactly one JSON line of at most 64 KiB with nonempty validation and documentation evidence; progress and diagnostics belong on stderr. Do not wrap it in Markdown fences or emit another stdout object.\n{\"type\":\"agent-symphony-result-v1\",\"validation\":\"tests run and results\",\"documentation\":\"documentation impact or none\"}", humanInstructionPrecedence, request.Handoff)
 	if _, err := runHostTmux(ctx, []string{"load-buffer", "-b", buffer, "-"}, bytes.NewReader(prompt)); err != nil {
 		return "", err
 	}
-	if !phaseExists {
-		if err := writeImmutable(phasePath, phase); err != nil {
-			return "", err
+	candidateManifest := handoffCandidateManifest(request)
+	if binding, _, candidateErr := handoffCandidateBinding(ctx, request); candidateErr == nil {
+		terminal, terminalErr := agentruntime.ReadTerminalBrokerBinding(agentruntime.TerminalBrokerPath(candidateManifest))
+		if terminalErr != nil || !agentruntime.ValidImplementationTerminalBinding(candidateManifest, terminal) || terminal.OuterPID != binding.PanePID {
+			return "", errors.Join(terminalErr, errors.New("prepared handoff broker identity is unavailable"))
 		}
-	} else {
-		// No candidate gate exists in either old-pane phase. A crashed host
-		// may have left this exact channel locked; retire it before reacquiring.
-		unlocked, unlockErr := runHostTmux(ctx, []string{"wait-for", "-U", agentruntime.ImplementationGateChannel(request.CandidateLaunchID)}, nil)
-		if unlockErr != nil && (!unlocked.Exited || unlocked.Code != 1 || strings.TrimSpace(unlocked.Output) != "channel "+agentruntime.ImplementationGateChannel(request.CandidateLaunchID)+" not locked") {
-			return "", unlockErr
-		}
+		prepared, _ := json.Marshal(handoffPreparedTerminal{binding, terminal})
+		return string(prepared), nil
+	} else if !errors.Is(candidateErr, os.ErrNotExist) {
+		return "", candidateErr
 	}
-	// Acquire the gate before checking the old pane. A blocked lock must never
-	// resume inside a previously authorized tmux if-shell branch.
-	if _, err := runHostTmux(ctx, []string{"wait-for", "-L", agentruntime.ImplementationGateChannel(request.CandidateLaunchID)}, nil); err != nil {
+	oldBinding, oldTerminal := *request.CurrentImplementation, *request.CurrentTerminal
+	stateRoot := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(request.Manifest.LogPath))))
+	runtime := &agentruntime.Runtime{Root: root, StateRoot: stateRoot, Tmux: "tmux", Helper: helper}
+	keeper := "as-handoff-keeper-" + request.CandidateLaunchID
+	if _, err := runHostTmux(ctx, []string{"new-session", "-d", "-s", keeper, "--", "/bin/sh", "-c", "sleep 30"}, nil); err != nil {
 		return "", err
 	}
-	condition, err := agentruntime.ImplementationGuardCondition(guardBinding, oldPane)
+	defer func() {
+		_, _ = runHostTmux(context.WithoutCancel(ctx), []string{"kill-session", "-t", "=" + keeper}, nil)
+	}()
+	if err := runtime.StopCertifiedImplementation(ctx, request.Manifest, oldBinding, oldTerminal); err != nil {
+		return "", fmt.Errorf("stop current handoff worker: %w", err)
+	}
+	launchedPath := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs", handoff.Key+".launched")
+	signal := buffer + "-launched"
+	worker := agentruntime.BoundHandoffPromptCommand(helper, "tmux", buffer, agentruntime.ResultPath(request.Manifest.Worktree), launchedPath, recipient, signal, candidateManifest, request.Command)
+	binding, terminal, err := runtime.PrepareBoundTerminalBroker(ctx, candidateManifest, os.Environ(), worker)
 	if err != nil {
 		return "", err
 	}
-	condition = "#{&&:" + condition + ",#{==:#{@agent-symphony-handoff-invalidated},}}"
-	commands := [][]string{
-		{"set-option", "-w", "-t", oldPane.PaneID, "remain-on-exit", "on"},
-		{"set-option", "-p", "-t", oldPane.PaneID, "@agent-symphony-launch-token", request.CandidateLaunchToken},
-		{"set-option", "-p", "-t", oldPane.PaneID, agentruntime.PaneExitStatusOption, ""},
-		{"set-option", "-p", "-t", oldPane.PaneID, agentruntime.PaneExitSignalOption, ""},
-		append([]string{"respawn-pane", "-k", "-t", oldPane.PaneID, "-c", request.Manifest.Worktree, "--"}, gate...),
-	}
-	parts := make([]string, 0, len(commands))
-	for _, command := range commands {
-		part, err := agentruntime.TmuxCommandString(command)
-		if err != nil {
-			return "", err
-		}
-		parts = append(parts, part)
-	}
-	queued, err := runHostTmux(ctx, []string{"if-shell", "-F", "-t", oldPane.PaneID, condition, strings.Join(parts, " ; "), "display-message -p " + agentruntime.ImplementationGuardMismatch}, nil)
-	if strings.Contains(queued.Output, agentruntime.ImplementationGuardMismatch) {
-		// The false branch proves no gate was created, so this exact lock can
-		// be retired. On ambiguous command failure, retain it for recovery.
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		_, unlockErr := runHostTmux(cleanupCtx, []string{"wait-for", "-U", agentruntime.ImplementationGateChannel(request.CandidateLaunchID)}, nil)
-		return "", errors.Join(err, unlockErr, errors.New("handoff pane guard rejected candidate transition"))
-	}
-	if err != nil {
-		return "", errors.Join(err, errors.New("handoff pane guard rejected candidate transition"))
-	}
-	observed, err = runHostTmux(ctx, []string{"display-message", "-p", "-t", oldPane.PaneID, agentruntime.ImplementationPaneFormat}, nil)
-	if err != nil {
-		return "", err
-	}
-	pane, err := agentruntime.ParseImplementationPane(observed.Output)
-	if err != nil || pane.ServerPID != oldBinding.ServerPID || pane.ServerStart != oldBinding.ServerStart || pane.SessionID != oldBinding.SessionID || pane.PaneID != oldBinding.PaneID || pane.PanePID == oldBinding.PanePID || pane.Token != request.CandidateLaunchToken || !strings.Contains(pane.Command, request.CandidateLaunchID) || !strings.Contains(pane.Command, "implementation-gate") {
-		return "", errors.New("parked handoff gate identity is unavailable")
-	}
-	candidate, err := agentruntime.BindImplementationPane(handoffCandidateManifest(request), request.CandidateLaunchID, "capture", pane)
-	if err != nil {
-		return "", err
-	}
-	if err := agentruntime.WriteImplementationBinding(handoffCandidateManifest(request), candidate); err != nil {
-		return "", err
-	}
-	return prepared, nil
+	prepared, _ := json.Marshal(handoffPreparedTerminal{binding, terminal})
+	return string(prepared), nil
 }
 
 func releaseHandoffV2(ctx context.Context, input []byte, root string) (string, error) {
@@ -237,25 +138,12 @@ func releaseHandoffV2(ctx context.Context, input []byte, root string) (string, e
 		return "", err
 	}
 	manifest := handoffCandidateManifest(request)
-	priorRelease := agentruntime.ImplementationReleaseMatches(manifest, binding)
-	if err := agentruntime.WriteImplementationPermit(manifest, binding); err != nil {
-		return "", err
+	terminal, err := agentruntime.ReadTerminalBrokerBinding(agentruntime.TerminalBrokerPath(manifest))
+	if err != nil || request.PreparedImplementation == nil || request.PreparedTerminal == nil || binding != *request.PreparedImplementation || terminal != *request.PreparedTerminal || terminal.OuterPID != pane.PanePID {
+		return "", errors.Join(err, errors.New("owner-certified handoff broker identity changed"))
 	}
-	if err := agentruntime.WriteImplementationRelease(manifest, binding); err != nil {
+	if err := agentruntime.ReleaseTerminalBroker(ctx, terminal); err != nil {
 		return "", err
-	}
-	channel := agentruntime.ImplementationGateChannel(request.CandidateLaunchID)
-	unlock, _ := agentruntime.TmuxCommandString([]string{"wait-for", "-U", channel})
-	args, err := guardedHandoffCandidateArgs(binding, pane, unlock)
-	if err != nil {
-		return "", err
-	}
-	result, err := runHostTmux(ctx, args, nil)
-	if err != nil && (!priorRelease || !result.Exited || result.Code != 1 || strings.TrimSpace(result.Output) != "channel "+channel+" not locked") {
-		return "", err
-	}
-	if strings.Contains(result.Output, agentruntime.ImplementationGuardMismatch) {
-		return "", errors.New("handoff candidate guard rejected release")
 	}
 	_, recipient := handoffBinding(request)
 	launchedPath := filepath.Join(request.Manifest.Worktree, ".agent-symphony", "handoffs", handoff.Key+".launched")
@@ -278,11 +166,11 @@ func releaseHandoffV2(ctx context.Context, input []byte, root string) (string, e
 	}
 	option := "@agent-symphony-handoff-" + recipient[:16]
 	set, _ := agentruntime.TmuxCommandString([]string{"set-option", "-p", "-t", pane.PaneID, option, recipient})
-	args, err = guardedHandoffCandidateArgs(binding, pane, set)
+	args, err := guardedHandoffCandidateArgs(binding, pane, set)
 	if err != nil {
 		return "", err
 	}
-	result, err = runHostTmux(ctx, args, nil)
+	result, err := runHostTmux(ctx, args, nil)
 	if err != nil || strings.Contains(result.Output, agentruntime.ImplementationGuardMismatch) {
 		return "", errors.Join(err, errors.New("handoff candidate guard rejected receipt"))
 	}
@@ -291,4 +179,9 @@ func releaseHandoffV2(ctx context.Context, input []byte, root string) (string, e
 		return "", err
 	}
 	return string(ack), nil
+}
+
+type handoffPreparedTerminal struct {
+	Implementation agentruntime.ImplementationLaunchBinding `json:"implementation"`
+	Terminal       agentruntime.TerminalBrokerBinding       `json:"terminal"`
 }

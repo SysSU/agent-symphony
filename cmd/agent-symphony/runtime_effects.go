@@ -178,12 +178,25 @@ func (c *runtimeEffectCoordinator) executeWithRun(request agentruntime.EffectReq
 	if result.Disposition != agentruntime.EffectResultReady {
 		return result, err
 	}
+	var implementation *agentruntime.ImplementationLaunchBinding
+	var terminal *agentruntime.TerminalBrokerBinding
+	if result.Manifest.State == "running" && (result.Action == agentruntime.EffectStart || result.Action == agentruntime.EffectHandoff && result.Manifest.LaunchID != request.Manifest.LaunchID) {
+		launch, launchErr := agentruntime.ReadImplementationBinding(result.Manifest)
+		binding, readErr := agentruntime.ReadTerminalBrokerBinding(agentruntime.TerminalBrokerPath(result.Manifest))
+		if launchErr != nil || readErr != nil {
+			return result, errors.Join(err, launchErr, readErr)
+		}
+		implementation, terminal = &launch, &binding
+	}
 	if _, finishErr := c.owner.finishRuntimeEffect(c.lifecycle, finishRuntimeEffectCommand{
-		Identity: ownerEffectIdentity(result.Identity),
-		Action:   result.Action,
-		Manifest: result.Manifest,
+		Identity: ownerEffectIdentity(result.Identity), Action: result.Action, Manifest: result.Manifest, ImplementationBinding: implementation, TerminalBroker: terminal,
 	}); finishErr != nil {
 		return result, errors.Join(err, finishErr)
+	}
+	if terminal != nil {
+		if releaseErr := agentruntime.ReleaseTerminalBroker(c.lifecycle, *terminal); releaseErr != nil {
+			return result, errors.Join(err, releaseErr)
+		}
 	}
 	if markerErr := c.executor.Runtime.RemoveEffectMarker(result.Identity); markerErr != nil {
 		return result, errors.Join(err, markerErr)
@@ -293,6 +306,17 @@ func (c *runtimeEffectCoordinator) verifyPendingMode(ctx context.Context, snapsh
 		Action:   result.Action,
 		Manifest: result.Manifest,
 	}
+	var terminal *agentruntime.TerminalBrokerBinding
+	if result.Action == agentruntime.EffectStart && result.Manifest.State == "running" {
+		launch, launchErr := agentruntime.ReadImplementationBinding(result.Manifest)
+		binding, readErr := agentruntime.ReadTerminalBrokerBinding(agentruntime.TerminalBrokerPath(result.Manifest))
+		if launchErr != nil || readErr != nil {
+			return agentruntime.EffectVerification{}, errors.Join(launchErr, readErr)
+		}
+		terminal = &binding
+		finish.ImplementationBinding = &launch
+		finish.TerminalBroker = terminal
+	}
 	var finishErr error
 	if operator {
 		_, finishErr = c.owner.finishOperatorRuntimeEffect(ctx, finishOperatorRuntimeEffectCommand{Finish: finish})
@@ -301,6 +325,11 @@ func (c *runtimeEffectCoordinator) verifyPendingMode(ctx context.Context, snapsh
 	}
 	if finishErr != nil {
 		return agentruntime.EffectVerification{}, finishErr
+	}
+	if terminal != nil {
+		if releaseErr := agentruntime.ReleaseTerminalBroker(ctx, *terminal); releaseErr != nil {
+			return agentruntime.EffectVerification{}, releaseErr
+		}
 	}
 	if markerErr := c.executor.Runtime.RemoveEffectMarker(result.Identity); markerErr != nil {
 		return agentruntime.EffectVerification{}, markerErr

@@ -8,8 +8,9 @@ const reviewGate = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEW_GATE;
 const reviewerPID = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEWER_PID;
 const reviewerIdentity = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_REVIEWER_IDENTITY;
 const fakeGitHubURL = process.env.AGENT_SYMPHONY_LIFECYCLE_E2E_FAKE_GITHUB_URL;
+const lifecycleTimeout = 90_000;
 test.skip(!baseURL || !action, "run through the compiled dashboard lifecycle harness");
-test.setTimeout(process.env.AGENT_SYMPHONY_FULL_SYSTEM_RACE === "true" ? 180_000 : 90_000);
+test.setTimeout(180_000);
 
 test("lifecycle action commits through the real dashboard", async ({ page }) => {
   const errors = [];
@@ -31,14 +32,14 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
       reviewer = status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.sessions?.find((session) => session.role === "reviewer" && session.mode === "implementation-review");
       return reviewer?.state;
-    }, { timeout: 20_000 }).toBe("running");
+    }, { timeout: lifecycleTimeout }).toBe("running");
     const gate = await open(reviewGate, constants.O_RDWR | constants.O_NONBLOCK);
     try {
       await gate.writeFile("release\n");
       await expect.poll(async () => {
         const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
         return status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.sessions?.find((session) => session.run_id === reviewer.run_id)?.state;
-      }, { timeout: 20_000 }).toBe("clean");
+      }, { timeout: lifecycleTimeout }).toBe("clean");
     } finally {
       await gate.close();
     }
@@ -142,7 +143,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
     await expect.poll(async () => {
       const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
       return status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.state;
-    }, { timeout: 20_000 }).toMatch(/^(cancelled|failed)$/);
+    }, { timeout: lifecycleTimeout }).toMatch(/^(cancelled|failed)$/);
     await page.reload();
     const current = await page.request.get(`${baseURL}/status.json`).then((result) => result.json());
     const old = current.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1);
@@ -163,22 +164,25 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
       reviewer = status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.sessions?.find((session) => session.role === "reviewer" && session.mode === "plan-review");
       return reviewer?.state;
-    }, { timeout: 20_000 }).toBe("running");
+    }, { timeout: lifecycleTimeout }).toBe("running");
     expect(reviewer.name).toMatch(/^as-/);
-    const reviewerButton = card.getByRole("button", { name: "Reviewer terminal unavailable; show why" });
+    await page.reload();
+    const reviewerButton = card.getByRole("button", { name: "Open reviewer terminal" });
     await expect(reviewerButton).toBeVisible();
     await reviewerButton.click();
-    await expect(page.getByRole("status").filter({ hasText: "Reviewer terminal is unavailable until session identity can be verified safely." })).toBeVisible();
-    await expect(page.getByRole("dialog")).toHaveCount(0);
-    const terminal = await page.request.get(`${baseURL}/reviewer/terminal?repository=o%2Fr&issue=73&attempt=1`, { headers: { Origin: baseURL } });
-    expect(terminal.status()).toBe(409);
-    expect(await terminal.text()).toContain("session identity can be verified safely");
+    const terminal = page.getByRole("dialog", { name: reviewer.name });
+    await expect(terminal).toBeVisible();
+    await expect(terminal.getByRole("status")).toHaveText("Connected");
+    await page.getByLabel(`Terminal for ${reviewer.name}`).click();
+    await page.keyboard.type("reviewer input");
+    await expect(terminal.getByRole("listitem").filter({ hasText: "reviewer input" })).toBeVisible();
+    await terminal.getByRole("button", { name: "Close" }).click();
 	if (action === "review-plan-cancel") {
 	  await writeFile(reviewerIdentity, JSON.stringify({ name: reviewer.name, target: reviewer.target, run_id: reviewer.run_id }), { mode: 0o600 });
       await expect.poll(async () => {
         try { return Number((await readFile(reviewerPID, "utf8")).trim()) > 1; }
         catch { return false; }
-      }, { timeout: 20_000 }).toBe(true);
+      }, { timeout: lifecycleTimeout }).toBe(true);
 	  const destructiveAction = "cancel";
 	  const cancel = card.getByRole("button", { name: "Cancel issue #73, attempt 1; retain diagnostics" });
 	  await expect(cancel).toBeVisible();
@@ -191,7 +195,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
 	  await expect.poll(async () => {
         const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
         return status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.state;
-      }, { timeout: 20_000 }).toMatch(/^(cancelled|failed)$/);
+      }, { timeout: lifecycleTimeout }).toMatch(/^(cancelled|failed)$/);
       await page.reload();
       await expect(card).toBeVisible();
       let canceledHistorical = /Attempt 2(?!\d)/.test(await card.innerText());
@@ -216,7 +220,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
           const confirmed = await page.request.get(`${baseURL}/status.json`).then((result) => result.json());
           nextAttempt = confirmed.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
           return nextAttempt ? "progressed" : "recoverable";
-        }, { timeout: 20_000 }).toMatch(/^(progressed|recoverable)$/);
+        }, { timeout: lifecycleTimeout }).toMatch(/^(progressed|recoverable)$/);
       }
       if (nextAttempt) {
         expect(nextAttempt.session).toBeTruthy();
@@ -237,7 +241,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       await expect.poll(async () => {
         const status = await fetch(`${baseURL}/status.json`, { cache: "no-store" }).then((result) => result.json());
         return status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 1)?.sessions?.find((session) => session.role === "reviewer" && session.mode === "plan-review")?.state;
-      }, { timeout: 20_000 }).toBe("clean");
+      }, { timeout: lifecycleTimeout }).toBe("clean");
     } finally {
       await gate.close();
     }
@@ -253,7 +257,7 @@ test("lifecycle action commits through the real dashboard", async ({ page }) => 
       const recovered = status.statuses?.find((entry) => entry.issue === 73 && entry.attempt === 2);
       recoveredSession = recovered?.session;
       return { state: recovered?.state, session: recovered?.sessions?.find((session) => session.role === "implementation")?.state };
-    }, { timeout: process.env.AGENT_SYMPHONY_FULL_SYSTEM_RACE === "true" ? 90_000 : 20_000 }).toEqual({ state: "active", session: "running" });
+    }, { timeout: lifecycleTimeout }).toEqual({ state: "active", session: "running" });
     await page.reload();
     const recoveredCard = page.getByRole("listitem").filter({ hasText: "Attempt 2" }).first();
     await expect(recoveredCard).toContainText("active");

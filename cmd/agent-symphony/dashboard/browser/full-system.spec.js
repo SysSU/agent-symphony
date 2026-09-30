@@ -8,13 +8,34 @@ test.skip(!baseURL, "run through the compiled full-system harness");
 test.setTimeout(raceMode ? 180_000 : 60_000);
 
 test("operator reaches the real implementation session and sees prompt status clear", async ({ page }) => {
+  await page.goto(baseURL);
+
+  const staleAttach = await page.evaluate((dashboardURL) => new Promise((resolve) => {
+    const endpoint = new URL("/terminal?repository=o%2Fr&issue=73&attempt=1", dashboardURL);
+    endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(endpoint);
+    const timer = setTimeout(() => {
+      socket.close();
+      resolve("timeout");
+    }, 5_000);
+    socket.addEventListener("open", () => {
+      clearTimeout(timer);
+      socket.send("browser-must-not-reach-foreign-replacement");
+      resolve("opened");
+    }, { once: true });
+    socket.addEventListener("error", () => {
+      clearTimeout(timer);
+      resolve("rejected");
+    }, { once: true });
+  }), baseURL);
+  expect(staleAttach).toBe("rejected");
+
   const errors = [];
   page.on("console", (message) => {
     if (message.type() === "error") errors.push(message.text());
   });
   page.on("pageerror", (error) => errors.push(error.message));
 
-  await page.goto(baseURL);
   const board = page.getByRole("region", { name: "Issue status board" });
   const inProgress = page.locator(".lane").filter({ has: page.locator("#lane-in-progress") });
   const issue = inProgress.getByRole("link", { name: /#73 Deterministic full-system journey/ });

@@ -28,6 +28,114 @@ import (
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
 )
 
+func testMarkReviewerRunning(stateRoot string, state runtimeOwnerState, identity stateResultIdentity, groupPID int) markPlanReviewRunningCommand {
+	effect := state.Effects[identity.EffectID]
+	reviewer := effect.Reconciliation.Reviewer
+	launchPath, terminalPath := reviewerLifecyclePaths(reviewer.Snapshot, reviewer.Target)
+	launch := reviewerIdentity(identity)
+	launch.GateProtocol, launch.SessionRequested = effect.ReviewerGateProtocol, effect.ReviewerSessionRequested
+	pane := reviewerPaneIdentity{SessionID: "$1", PaneID: "%1", PID: 9002, ServerPID: 99999, StartTime: 1789286706, Name: reviewer.Session, Start: "agent-symphony review-pane tmux " + launchPath + " " + terminalPath + " " + reviewerSignal(launch) + " " + identity.RequestDigest}
+	brokerPath := reviewerBrokerPath(reviewer.Snapshot, reviewer.Target)
+	broker := agentruntime.TerminalBrokerBinding{Version: 1, OuterPID: pane.PID, InnerPID: groupPID, InnerPGID: groupPID, SocketPath: agentruntime.TerminalBrokerSocketPath(brokerPath, agentruntime.TerminalBrokerSocketDirForState(stateRoot)), SocketDev: 1, SocketIno: 1, Secret: strings.Repeat("a", 64)}
+	return markPlanReviewRunningCommand{Identity: identity, GroupPID: groupPID, Pane: &pane, TerminalBroker: &broker, BrokerPath: brokerPath}
+}
+
+func testBindReviewerStopping(stateRoot string, identity stateResultIdentity, groupPID int, reviewer reviewerEffectRequest) bindReviewerStoppingCommand {
+	brokerPath := reviewerBrokerPath(reviewer.Snapshot, reviewer.Target)
+	pane := reviewerPaneIdentity{SessionID: "$1", PaneID: "%1", PID: 9002, ServerPID: 99999, StartTime: 1789286706, Name: reviewer.Session}
+	broker := agentruntime.TerminalBrokerBinding{Version: 1, OuterPID: pane.PID, InnerPID: groupPID, InnerPGID: groupPID, SocketPath: agentruntime.TerminalBrokerSocketPath(brokerPath, agentruntime.TerminalBrokerSocketDirForState(stateRoot)), SocketDev: 1, SocketIno: 1, Secret: strings.Repeat("a", 64)}
+	return bindReviewerStoppingCommand{Identity: identity, GroupPID: groupPID, Pane: &pane, TerminalBroker: &broker, BrokerPath: brokerPath}
+}
+
+func startTestTerminalBroker(t *testing.T, stateRoot, recordPath string, childCommand ...string) agentruntime.TerminalBrokerBinding {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(recordPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socketDir, err := agentruntime.PrepareTerminalBrokerDir(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(childCommand) == 0 {
+		childCommand = []string{"/bin/cat"}
+	}
+	encodedCommand, err := json.Marshal(childCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestTerminalBrokerSubprocess$")
+	command.Env = append(os.Environ(), "AGENT_SYMPHONY_TEST_TERMINAL_BROKER=1", "AGENT_SYMPHONY_TEST_TERMINAL_RECORD="+recordPath, "AGENT_SYMPHONY_TEST_TERMINAL_SOCKET_DIR="+socketDir, "AGENT_SYMPHONY_TEST_TERMINAL_COMMAND="+string(encodedCommand))
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Stderr = os.Stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	ready := make(chan error, 1)
+	go func() {
+		line, readErr := bufio.NewReader(stdout).ReadString('\n')
+		if readErr == nil && strings.TrimSpace(line) != "ready" {
+			readErr = fmt.Errorf("unexpected terminal broker readiness %q", line)
+		}
+		ready <- readErr
+	}()
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case err := <-done:
+		t.Fatalf("terminal broker exited before binding: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal broker did not publish its binding")
+	}
+	binding, err := agentruntime.ReadTerminalBrokerBinding(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agentruntime.ReleaseTerminalBroker(t.Context(), binding); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		default:
+			_ = command.Process.Kill()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Error("terminal broker did not exit during cleanup")
+			}
+		}
+	})
+	return binding
+}
+
+func TestTerminalBrokerSubprocess(t *testing.T) {
+	if os.Getenv("AGENT_SYMPHONY_TEST_TERMINAL_BROKER") != "1" {
+		return
+	}
+	recordPath := os.Getenv("AGENT_SYMPHONY_TEST_TERMINAL_RECORD")
+	socketDir := os.Getenv("AGENT_SYMPHONY_TEST_TERMINAL_SOCKET_DIR")
+	var command []string
+	if json.Unmarshal([]byte(os.Getenv("AGENT_SYMPHONY_TEST_TERMINAL_COMMAND")), &command) != nil || len(command) == 0 {
+		os.Exit(126)
+	}
+	code, _, err := agentruntime.RunTerminalBroker(context.Background(), recordPath, socketDir, command, os.Stdin, io.Discard, os.Stderr, func(agentruntime.TerminalBrokerBinding) error {
+		_, writeErr := fmt.Fprintln(os.Stdout, "ready")
+		return writeErr
+	})
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		os.Exit(125)
+	}
+	os.Exit(code)
+}
+
 func TestBlockedMachineStatusConvergesAfterDestructiveActionsAndRetry(t *testing.T) {
 	for _, status := range []string{"needs-attention", "clear"} {
 		for _, action := range []string{"dismiss", "abandon", "remove", "retry"} {
@@ -429,7 +537,7 @@ func TestReconciliationEffectVariantsReplayExactlyOrRejectStaleRunAndConflict(t 
 				if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: finishIdentity}); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: finishIdentity, GroupPID: 99999999}); err != nil {
+				if _, err := owner.markPlanReviewRunning(t.Context(), testMarkReviewerRunning(owner.stateRoot, mustOwnerSnapshot(t, owner).State, finishIdentity, 99999999)); err != nil {
 					t.Fatal(err)
 				}
 				sealTestReviewerResult(t, owner, *first, result)
@@ -463,7 +571,8 @@ func TestPlanReviewRunningTransitionRequiresExactPendingEffect(t *testing.T) {
 	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
 		t.Fatal(err)
 	}
-	running, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999})
+	command := testMarkReviewerRunning(owner.stateRoot, mustOwnerSnapshot(t, owner).State, identity, 99999999)
+	running, err := owner.markPlanReviewRunning(t.Context(), command)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,7 +586,7 @@ func TestPlanReviewRunningTransitionRequiresExactPendingEffect(t *testing.T) {
 	}) {
 		t.Fatalf("launched effect was not projected as current reviewer: status=%#v err=%v", projected.Statuses, err)
 	}
-	again, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999})
+	again, err := owner.markPlanReviewRunning(t.Context(), command)
 	if err != nil || again.State.Revision != running.State.Revision {
 		t.Fatalf("idempotent running transition revision=%d want=%d err=%v", again.State.Revision, running.State.Revision, err)
 	}
@@ -487,10 +596,11 @@ func TestPlanReviewRunningTransitionRequiresExactPendingEffect(t *testing.T) {
 	observation.Generation++
 	advanced.Observations[ownerIssueKey(request.Repository, request.Issue)] = observation
 	beforeReplay := cloneRuntimeOwnerState(advanced)
-	if err := applyMarkPlanReviewRunning(owner.stateRoot, &advanced, markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil || !reflect.DeepEqual(advanced, beforeReplay) {
+	if err := applyMarkPlanReviewRunning(owner.stateRoot, &advanced, command); err != nil || !reflect.DeepEqual(advanced, beforeReplay) {
 		t.Fatalf("exact launch replay after observation advance changed state or failed: changed=%v err=%v", !reflect.DeepEqual(advanced, beforeReplay), err)
 	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999998}); !errors.Is(err, errStateConflict) {
+	different := testMarkReviewerRunning(owner.stateRoot, running.State, identity, 99999998)
+	if _, err := owner.markPlanReviewRunning(t.Context(), different); !errors.Is(err, errStateConflict) {
 		t.Fatalf("different process group replaced committed reviewer binding: %v", err)
 	}
 	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(request)
@@ -505,13 +615,11 @@ func TestPlanReviewRunningTransitionRequiresExactPendingEffect(t *testing.T) {
 	if !proof.DeadProved || proof.RunID != request.Reviewer.RunID || proof.ProfileDigest != activeWorkerProfileDigest(proved.State) {
 		t.Fatalf("group death lost never-reused confinement binding: %#v", proof)
 	}
-	launchPath, terminalPath := reviewerLifecyclePaths(request.Reviewer.Snapshot, request.Reviewer.Target)
-	pane, err := parseReviewerPaneIdentity(reviewerPaneTestOutput("1|0|||", request.Reviewer.Session, "$9", os.Getpid(), "agent-symphony review-pane tmux "+launchPath+" "+terminalPath+" "+reviewerSignal(reviewerIdentity(identity))+" "+identity.RequestDigest))
-	if err != nil {
-		t.Fatal(err)
-	}
+	pane := *command.Pane
+	pane.Status = agentruntime.PaneStatus{Dead: true, Ready: true}
 	terminalIdentity := reviewerIdentity(identity)
 	terminalIdentity.GateProtocol, terminalIdentity.SessionRequested, terminalIdentity.ChildPID = true, true, 99999999
+	terminalIdentity.Broker = command.TerminalBroker
 	if _, err := owner.sealReviewerResult(t.Context(), sealReviewerResultCommand{Identity: identity, Result: result, Pane: pane, Terminal: reviewerTerminalRecord{Identity: terminalIdentity}}); err != nil {
 		t.Fatalf("seal exact business result: %v", err)
 	}
@@ -615,7 +723,7 @@ func TestSealedReviewerResultReplaysAfterRestartWithBoundProcessProof(t *testing
 	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+	if _, err := owner.markPlanReviewRunning(t.Context(), testMarkReviewerRunning(owner.stateRoot, mustOwnerSnapshot(t, owner).State, identity, 99999999)); err != nil {
 		t.Fatal(err)
 	}
 	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(request)
@@ -679,7 +787,8 @@ func TestPlanReviewRunningTransitionCannotRestoreInvalidatedAttempt(t *testing.T
 	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: ownerReconciliationEffectIdentity(*effect)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: ownerReconciliationEffectIdentity(*effect), GroupPID: 99999999}); err != nil {
+	identity := ownerReconciliationEffectIdentity(*effect)
+	if _, err := owner.markPlanReviewRunning(t.Context(), testMarkReviewerRunning(owner.stateRoot, mustOwnerSnapshot(t, owner).State, identity, 99999999)); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{Repository: request.Repository, Issue: request.Issue, Attempt: request.Attempt, ExpectedIssueGeneration: effect.IssueGeneration, ExpectedAttemptGeneration: effect.AttemptGeneration, Action: "dismissed", CleanupPhase: "completed"}); err != nil {
@@ -716,7 +825,7 @@ func TestIssueGenerationCannotDiscardUnprovedReviewerProcess(t *testing.T) {
 	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+	if _, err := owner.markPlanReviewRunning(t.Context(), testMarkReviewerRunning(owner.stateRoot, mustOwnerSnapshot(t, owner).State, identity, 99999999)); err != nil {
 		t.Fatal(err)
 	}
 	command := advanceIssueGenerationCommand{Repository: request.Repository, Issue: request.Issue, ExpectedGeneration: effect.IssueGeneration}
@@ -838,7 +947,7 @@ func TestPlanReviewSupersessionRequiresFreshOwnerInvalidation(t *testing.T) {
 			if err := applyMarkReviewerSessionRequested(owner.stateRoot, &state, markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
 				t.Fatal(err)
 			}
-			if err := applyMarkPlanReviewRunning(owner.stateRoot, &state, markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+			if err := applyMarkPlanReviewRunning(owner.stateRoot, &state, testMarkReviewerRunning(owner.stateRoot, state, identity, 99999999)); err != nil {
 				t.Fatal(err)
 			}
 			issueKey := ownerIssueKey(request.Repository, request.Issue)
@@ -876,7 +985,7 @@ func TestImplementationReviewerCompatibleObservationDriftFinishes(t *testing.T) 
 	if _, err := owner.markReviewerSessionRequested(t.Context(), markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := owner.markPlanReviewRunning(t.Context(), markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+	if _, err := owner.markPlanReviewRunning(t.Context(), testMarkReviewerRunning(owner.stateRoot, mustOwnerSnapshot(t, owner).State, identity, 99999999)); err != nil {
 		t.Fatal(err)
 	}
 	result := reconciliationEffectCaseNamed(t, "reviewer-run-observe").result(request)
@@ -979,7 +1088,7 @@ func TestImplementationReviewerChangedBodyRequiresDeadProofBeforeSupersession(t 
 	if err := applyMarkReviewerSessionRequested(owner.stateRoot, &state, markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyMarkPlanReviewRunning(owner.stateRoot, &state, markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+	if err := applyMarkPlanReviewRunning(owner.stateRoot, &state, testMarkReviewerRunning(owner.stateRoot, state, identity, 99999999)); err != nil {
 		t.Fatal(err)
 	}
 	issueKey := ownerIssueKey(request.Repository, request.Issue)
@@ -1039,7 +1148,7 @@ func TestImplementationReviewerChangedLocalExportHeadSupersedesAfterDeath(t *tes
 	if err := applyMarkReviewerSessionRequested(owner.stateRoot, &state, markReviewerSessionRequestedCommand{Identity: identity}); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyMarkPlanReviewRunning(owner.stateRoot, &state, markPlanReviewRunningCommand{Identity: identity, GroupPID: 99999999}); err != nil {
+	if err := applyMarkPlanReviewRunning(owner.stateRoot, &state, testMarkReviewerRunning(owner.stateRoot, state, identity, 99999999)); err != nil {
 		t.Fatal(err)
 	}
 	newHead := strings.Repeat("f", 40)
@@ -1931,16 +2040,17 @@ func reconciliationEffectTestOwner(t *testing.T, request reconciliationEffectReq
 
 func sealTestReviewerResult(t *testing.T, owner *stateOwner, effect runtimeEffectIntent, result reconciliationEffectResult) {
 	t.Helper()
-	current := mustOwnerSnapshot(t, owner).State.Effects[effect.ID]
+	snapshot := mustOwnerSnapshot(t, owner)
+	current := snapshot.State.Effects[effect.ID]
 	identity := ownerReconciliationEffectIdentity(current)
 	reviewer := current.Reconciliation.Reviewer
+	proof := snapshot.State.ReviewerProofs[reviewerProofKey(current.Repository, current.Issue, current.Attempt, reviewer.Mode, reviewer.Target)]
+	pane := reviewerPaneIdentity{Status: agentruntime.PaneStatus{Dead: true, Ready: true}, SessionID: proof.Pane.SessionID, PaneID: proof.Pane.PaneID, PID: proof.Pane.PanePID, ServerPID: proof.Pane.ServerPID, StartTime: proof.Pane.ServerStart, Name: proof.Pane.SessionName}
 	launchPath, terminalPath := reviewerLifecyclePaths(reviewer.Snapshot, reviewer.Target)
-	pane, err := parseReviewerPaneIdentity(reviewerPaneTestOutput("1|0|||", reviewer.Session, "$9", os.Getpid(), "agent-symphony review-pane tmux "+launchPath+" "+terminalPath+" "+reviewerSignal(reviewerIdentity(identity))+" "+identity.RequestDigest))
-	if err != nil {
-		t.Fatal(err)
-	}
+	pane.Start = "agent-symphony review-pane tmux " + launchPath + " " + terminalPath + " " + reviewerSignal(reviewerIdentity(identity)) + " " + identity.RequestDigest
 	terminalIdentity := reviewerIdentity(identity)
 	terminalIdentity.GateProtocol, terminalIdentity.SessionRequested, terminalIdentity.ChildPID = current.ReviewerGateProtocol, current.ReviewerSessionRequested, current.ReviewerGroupPID
+	terminalIdentity.Broker = proof.TerminalBroker
 	if _, err := owner.sealReviewerResult(t.Context(), sealReviewerResultCommand{Identity: identity, Result: result, Pane: pane, Terminal: reviewerTerminalRecord{Identity: terminalIdentity}}); err != nil {
 		t.Fatal(err)
 	}

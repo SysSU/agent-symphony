@@ -100,13 +100,15 @@ type controlSnapshotRepair struct {
 }
 
 type runtimeAttemptRecord struct {
-	Generation                   uint64                `json:"generation"`
-	ObservationEpoch             uint64                `json:"observation_epoch,omitempty"`
-	LastCycleID                  uint64                `json:"last_cycle_id,omitempty"`
-	StopEffectID                 string                `json:"stop_effect_id,omitempty"`
-	WorkerAuthorityRevokedDigest string                `json:"worker_authority_revoked_digest,omitempty"`
-	Manifest                     agentruntime.Manifest `json:"manifest"`
-	WorkerSeal                   *workerSealSelection  `json:"worker_seal,omitempty"`
+	Generation                   uint64                                    `json:"generation"`
+	ObservationEpoch             uint64                                    `json:"observation_epoch,omitempty"`
+	LastCycleID                  uint64                                    `json:"last_cycle_id,omitempty"`
+	StopEffectID                 string                                    `json:"stop_effect_id,omitempty"`
+	WorkerAuthorityRevokedDigest string                                    `json:"worker_authority_revoked_digest,omitempty"`
+	Manifest                     agentruntime.Manifest                     `json:"manifest"`
+	WorkerSeal                   *workerSealSelection                      `json:"worker_seal,omitempty"`
+	ImplementationBinding        *agentruntime.ImplementationLaunchBinding `json:"implementation_binding,omitempty"`
+	TerminalBroker               *agentruntime.TerminalBrokerBinding       `json:"terminal_broker,omitempty"`
 }
 
 type workerSealSelection struct {
@@ -121,21 +123,41 @@ type workerSealSelection struct {
 // A completed review's filesystem root outlives bounded operator receipts.
 // This owner-held certificate is retained until destructive cleanup commits.
 type reviewerProcessProof struct {
-	Repository         string `json:"repository"`
-	Issue              int    `json:"issue"`
-	Attempt            int    `json:"attempt"`
-	Target             string `json:"target"`
-	RunID              string `json:"run_id,omitempty"`
-	Mode               string `json:"mode"`
-	EffectID           string `json:"effect_id"`
-	IssueGeneration    uint64 `json:"issue_generation"`
-	AttemptGeneration  uint64 `json:"attempt_generation"`
-	GroupPID           int    `json:"group_pid"`
-	DeadProved         bool   `json:"dead_proved,omitempty"`
-	NeverRan           bool   `json:"never_ran,omitempty"`
-	LegacyUnverified   bool   `json:"legacy_unverified,omitempty"`
-	ProfileDigest      string `json:"profile_digest,omitempty"`
-	ConfinementVersion uint64 `json:"confinement_version,omitempty"`
+	Repository         string                              `json:"repository"`
+	Issue              int                                 `json:"issue"`
+	Attempt            int                                 `json:"attempt"`
+	Target             string                              `json:"target"`
+	RunID              string                              `json:"run_id,omitempty"`
+	Mode               string                              `json:"mode"`
+	EffectID           string                              `json:"effect_id"`
+	IssueGeneration    uint64                              `json:"issue_generation"`
+	AttemptGeneration  uint64                              `json:"attempt_generation"`
+	GroupPID           int                                 `json:"group_pid"`
+	DeadProved         bool                                `json:"dead_proved,omitempty"`
+	NeverRan           bool                                `json:"never_ran,omitempty"`
+	LegacyUnverified   bool                                `json:"legacy_unverified,omitempty"`
+	ProfileDigest      string                              `json:"profile_digest,omitempty"`
+	ConfinementVersion uint64                              `json:"confinement_version,omitempty"`
+	Pane               *reviewerPaneCertificate            `json:"pane,omitempty"`
+	TerminalBroker     *agentruntime.TerminalBrokerBinding `json:"terminal_broker,omitempty"`
+	BrokerPath         string                              `json:"broker_path,omitempty"`
+}
+
+type reviewerPaneCertificate struct {
+	ServerPID   int    `json:"server_pid"`
+	ServerStart uint64 `json:"server_start"`
+	SessionName string `json:"session_name"`
+	SessionID   string `json:"session_id"`
+	PaneID      string `json:"pane_id"`
+	PanePID     int    `json:"pane_pid"`
+}
+
+func reviewerPaneCertificateFrom(pane reviewerPaneIdentity) reviewerPaneCertificate {
+	return reviewerPaneCertificate{ServerPID: pane.ServerPID, ServerStart: pane.StartTime, SessionName: pane.Name, SessionID: pane.SessionID, PaneID: pane.PaneID, PanePID: pane.PID}
+}
+
+func (certificate reviewerPaneCertificate) matches(pane reviewerPaneIdentity) bool {
+	return certificate == reviewerPaneCertificateFrom(pane)
 }
 
 // reviewerConfinementVersion attests the sandbox guarantees that make an old
@@ -200,15 +222,26 @@ type startCandidateInvalidation struct {
 // The owner retains this candidate after deleting its pending handoff intent.
 // External cleanup may act only on its exact durable pane binding.
 type handoffCandidateInvalidation struct {
-	EffectID string                `json:"effect_id"`
-	Token    string                `json:"token"`
-	Key      string                `json:"key"`
-	Manifest agentruntime.Manifest `json:"manifest"`
+	EffectID       string                                    `json:"effect_id"`
+	Token          string                                    `json:"token"`
+	Key            string                                    `json:"key"`
+	Manifest       agentruntime.Manifest                     `json:"manifest"`
+	Implementation *agentruntime.ImplementationLaunchBinding `json:"implementation,omitempty"`
+	Terminal       *agentruntime.TerminalBrokerBinding       `json:"terminal,omitempty"`
 }
 
 func validHandoffCandidateInvalidation(candidate handoffCandidateInvalidation, manifest agentruntime.Manifest) bool {
 	decoded, err := hex.DecodeString(candidate.EffectID)
-	return err == nil && len(decoded) == 16 && agentruntime.ValidLaunchToken(candidate.Token) && candidate.Token != manifest.LaunchToken && candidate.Key != "" && filepath.Base(candidate.Key) == candidate.Key && !strings.ContainsAny(candidate.Key, "/\\\x00\r\n") && candidate.Manifest.Version == agentruntime.ManifestVersion2 && sameAttemptIdentity(candidate.Manifest, manifest) && candidate.Manifest.LaunchToken == manifest.LaunchToken && candidate.Manifest.LaunchID == manifest.LaunchID
+	base := err == nil && len(decoded) == 16 && agentruntime.ValidLaunchToken(candidate.Token) && candidate.Token != manifest.LaunchToken && candidate.Key != "" && filepath.Base(candidate.Key) == candidate.Key && !strings.ContainsAny(candidate.Key, "/\\\x00\r\n") && candidate.Manifest.Version == agentruntime.ManifestVersion2 && sameAttemptIdentity(candidate.Manifest, manifest) && candidate.Manifest.LaunchToken == manifest.LaunchToken && candidate.Manifest.LaunchID == manifest.LaunchID
+	if !base || (candidate.Implementation == nil) != (candidate.Terminal == nil) {
+		return false
+	}
+	if candidate.Implementation == nil {
+		return true
+	}
+	prepared := candidate.Manifest
+	prepared.LaunchToken, prepared.LaunchID = candidate.Token, candidate.EffectID
+	return agentruntime.ValidImplementationBinding(prepared, *candidate.Implementation, prepared.LaunchID) && agentruntime.ValidImplementationTerminalBinding(prepared, *candidate.Terminal) && candidate.Terminal.OuterPID == candidate.Implementation.PanePID
 }
 
 func validStartCandidates(candidates []startGateCandidate) bool {
@@ -230,54 +263,56 @@ func validStartCandidateInvalidation(candidate startCandidateInvalidation, manif
 }
 
 type runtimeEffectIntent struct {
-	ID                                   string                           `json:"id"`
-	Action                               string                           `json:"action"`
-	Repository                           string                           `json:"repository"`
-	Issue                                int                              `json:"issue"`
-	Attempt                              int                              `json:"attempt"`
-	IssueGeneration                      uint64                           `json:"issue_generation"`
-	AttemptGeneration                    uint64                           `json:"attempt_generation"`
-	IntentEpoch                          uint64                           `json:"intent_epoch,omitempty"`
-	IntentRevision                       uint64                           `json:"intent_revision"`
-	State                                string                           `json:"state"`
-	Dispatched                           bool                             `json:"dispatched,omitempty"`
-	GovernancePhases                     []internalgithub.GovernancePhase `json:"governance_phases,omitempty"`
-	RequestDigest                        string                           `json:"request_digest"`
-	MachineStatusSequence                uint64                           `json:"machine_status_sequence,omitempty"`
-	CandidateLaunchToken                 string                           `json:"candidate_launch_token,omitempty"`
-	StartGateNonce                       string                           `json:"start_gate_nonce,omitempty"`
-	StartMayRun                          bool                             `json:"start_may_run,omitempty"`
-	StartCandidates                      []startGateCandidate             `json:"start_candidates,omitempty"`
-	Reason                               string                           `json:"reason,omitempty"`
-	Review                               *agentruntime.ReviewTransition   `json:"review,omitempty"`
-	Reconciliation                       *reconciliationEffectRequest     `json:"reconciliation,omitempty"`
-	ReconciliationResult                 *reconciliationEffectResult      `json:"reconciliation_result,omitempty"`
-	ReviewerLaunched                     bool                             `json:"reviewer_launched,omitempty"`
-	ReviewerSourceRevision               uint64                           `json:"reviewer_source_revision,omitempty"`
-	ReviewerGateProtocol                 bool                             `json:"reviewer_gate_protocol,omitempty"`
-	ReviewerSessionRequested             bool                             `json:"reviewer_session_requested,omitempty"`
-	ReviewerGroupPID                     int                              `json:"reviewer_group_pid,omitempty"`
-	ReviewerResultDigest                 string                           `json:"reviewer_result_digest,omitempty"`
-	ReviewerProfileDigest                string                           `json:"reviewer_profile_digest,omitempty"`
-	ReviewerConfinementVersion           uint64                           `json:"reviewer_confinement_version,omitempty"`
-	ReviewerStopped                      bool                             `json:"reviewer_stopped,omitempty"`
-	ReviewerRevoked                      bool                             `json:"reviewer_revoked,omitempty"`
-	SupersededReviewerID                 string                           `json:"superseded_reviewer_id,omitempty"`
-	SupersededReviewerGroupPID           int                              `json:"superseded_reviewer_group_pid,omitempty"`
-	SupersededReviewerGateProtocol       bool                             `json:"superseded_reviewer_gate_protocol,omitempty"`
-	SupersededReviewerSessionRequested   bool                             `json:"superseded_reviewer_session_requested,omitempty"`
-	SupersededReviewerRequestDigest      string                           `json:"superseded_reviewer_request_digest,omitempty"`
-	SupersededReviewerProfileDigest      string                           `json:"superseded_reviewer_profile_digest,omitempty"`
-	SupersededReviewerConfinementVersion uint64                           `json:"superseded_reviewer_confinement_version,omitempty"`
-	SupersededReviewerTarget             string                           `json:"superseded_reviewer_target,omitempty"`
-	SupersededReviewerRunID              string                           `json:"superseded_reviewer_run_id,omitempty"`
-	SupersededReviewerMode               string                           `json:"superseded_reviewer_mode,omitempty"`
-	SupersededReviewerIssueGeneration    uint64                           `json:"superseded_reviewer_issue_generation,omitempty"`
-	SupersededReviewerAttemptGeneration  uint64                           `json:"superseded_reviewer_attempt_generation,omitempty"`
-	ReviewerCleanupDigest                string                           `json:"reviewer_cleanup_digest,omitempty"`
-	Diagnostic                           string                           `json:"diagnostic,omitempty"`
-	InvalidatedHandoff                   *handoffCandidateInvalidation    `json:"invalidated_handoff,omitempty"`
-	InvalidatedStart                     *startCandidateInvalidation      `json:"invalidated_start,omitempty"`
+	ID                                   string                                    `json:"id"`
+	Action                               string                                    `json:"action"`
+	Repository                           string                                    `json:"repository"`
+	Issue                                int                                       `json:"issue"`
+	Attempt                              int                                       `json:"attempt"`
+	IssueGeneration                      uint64                                    `json:"issue_generation"`
+	AttemptGeneration                    uint64                                    `json:"attempt_generation"`
+	IntentEpoch                          uint64                                    `json:"intent_epoch,omitempty"`
+	IntentRevision                       uint64                                    `json:"intent_revision"`
+	State                                string                                    `json:"state"`
+	Dispatched                           bool                                      `json:"dispatched,omitempty"`
+	GovernancePhases                     []internalgithub.GovernancePhase          `json:"governance_phases,omitempty"`
+	RequestDigest                        string                                    `json:"request_digest"`
+	MachineStatusSequence                uint64                                    `json:"machine_status_sequence,omitempty"`
+	CandidateLaunchToken                 string                                    `json:"candidate_launch_token,omitempty"`
+	StartGateNonce                       string                                    `json:"start_gate_nonce,omitempty"`
+	StartMayRun                          bool                                      `json:"start_may_run,omitempty"`
+	StartCandidates                      []startGateCandidate                      `json:"start_candidates,omitempty"`
+	Reason                               string                                    `json:"reason,omitempty"`
+	Review                               *agentruntime.ReviewTransition            `json:"review,omitempty"`
+	Reconciliation                       *reconciliationEffectRequest              `json:"reconciliation,omitempty"`
+	ReconciliationResult                 *reconciliationEffectResult               `json:"reconciliation_result,omitempty"`
+	ReviewerLaunched                     bool                                      `json:"reviewer_launched,omitempty"`
+	ReviewerSourceRevision               uint64                                    `json:"reviewer_source_revision,omitempty"`
+	ReviewerGateProtocol                 bool                                      `json:"reviewer_gate_protocol,omitempty"`
+	ReviewerSessionRequested             bool                                      `json:"reviewer_session_requested,omitempty"`
+	ReviewerGroupPID                     int                                       `json:"reviewer_group_pid,omitempty"`
+	ReviewerResultDigest                 string                                    `json:"reviewer_result_digest,omitempty"`
+	ReviewerProfileDigest                string                                    `json:"reviewer_profile_digest,omitempty"`
+	ReviewerConfinementVersion           uint64                                    `json:"reviewer_confinement_version,omitempty"`
+	ReviewerStopped                      bool                                      `json:"reviewer_stopped,omitempty"`
+	ReviewerRevoked                      bool                                      `json:"reviewer_revoked,omitempty"`
+	SupersededReviewerID                 string                                    `json:"superseded_reviewer_id,omitempty"`
+	SupersededReviewerGroupPID           int                                       `json:"superseded_reviewer_group_pid,omitempty"`
+	SupersededReviewerGateProtocol       bool                                      `json:"superseded_reviewer_gate_protocol,omitempty"`
+	SupersededReviewerSessionRequested   bool                                      `json:"superseded_reviewer_session_requested,omitempty"`
+	SupersededReviewerRequestDigest      string                                    `json:"superseded_reviewer_request_digest,omitempty"`
+	SupersededReviewerProfileDigest      string                                    `json:"superseded_reviewer_profile_digest,omitempty"`
+	SupersededReviewerConfinementVersion uint64                                    `json:"superseded_reviewer_confinement_version,omitempty"`
+	SupersededReviewerTarget             string                                    `json:"superseded_reviewer_target,omitempty"`
+	SupersededReviewerRunID              string                                    `json:"superseded_reviewer_run_id,omitempty"`
+	SupersededReviewerMode               string                                    `json:"superseded_reviewer_mode,omitempty"`
+	SupersededReviewerIssueGeneration    uint64                                    `json:"superseded_reviewer_issue_generation,omitempty"`
+	SupersededReviewerAttemptGeneration  uint64                                    `json:"superseded_reviewer_attempt_generation,omitempty"`
+	ReviewerCleanupDigest                string                                    `json:"reviewer_cleanup_digest,omitempty"`
+	Diagnostic                           string                                    `json:"diagnostic,omitempty"`
+	InvalidatedHandoff                   *handoffCandidateInvalidation             `json:"invalidated_handoff,omitempty"`
+	InvalidatedStart                     *startCandidateInvalidation               `json:"invalidated_start,omitempty"`
+	HandoffImplementation                *agentruntime.ImplementationLaunchBinding `json:"handoff_implementation,omitempty"`
+	HandoffTerminal                      *agentruntime.TerminalBrokerBinding       `json:"handoff_terminal,omitempty"`
 }
 
 type stateResultIdentity struct {
@@ -349,9 +384,11 @@ type beginRuntimeEffectCommand struct {
 }
 
 type finishRuntimeEffectCommand struct {
-	Identity stateResultIdentity
-	Action   agentruntime.EffectAction
-	Manifest agentruntime.Manifest
+	Identity              stateResultIdentity
+	Action                agentruntime.EffectAction
+	Manifest              agentruntime.Manifest
+	ImplementationBinding *agentruntime.ImplementationLaunchBinding
+	TerminalBroker        *agentruntime.TerminalBrokerBinding
 }
 
 type authorizeRuntimeEffectCommand struct {
@@ -411,8 +448,17 @@ type resolveInvalidatedReconciliationEffectCommand struct {
 }
 
 type markPlanReviewRunningCommand struct {
-	Identity stateResultIdentity
-	GroupPID int
+	Identity       stateResultIdentity
+	GroupPID       int
+	Pane           *reviewerPaneIdentity
+	TerminalBroker *agentruntime.TerminalBrokerBinding
+	BrokerPath     string
+}
+
+type markHandoffPreparedCommand struct {
+	Identity       stateResultIdentity
+	Implementation agentruntime.ImplementationLaunchBinding
+	Terminal       agentruntime.TerminalBrokerBinding
 }
 
 type markReviewerSessionRequestedCommand struct {
@@ -438,8 +484,11 @@ type markReviewerStoppedCommand struct {
 }
 
 type bindReviewerStoppingCommand struct {
-	Identity stateResultIdentity
-	GroupPID int
+	Identity       stateResultIdentity
+	GroupPID       int
+	Pane           *reviewerPaneIdentity
+	TerminalBroker *agentruntime.TerminalBrokerBinding
+	BrokerPath     string
 }
 
 type forgetReviewerProofCommand struct {
@@ -570,6 +619,7 @@ const (
 	stateOwnerResolveInvalidatedReconciliationEffect
 	stateOwnerSelectWorkerSeal
 	stateOwnerAdmitMachineStatus
+	stateOwnerMarkHandoffPrepared
 	stateOwnerMarkPlanReviewRunning
 	stateOwnerMarkReviewerSessionRequested
 	stateOwnerProveReviewerDead
@@ -614,6 +664,7 @@ type stateOwnerCommand struct {
 	resolveInvalidatedReconcile  resolveInvalidatedReconciliationEffectCommand
 	selectWorkerSeal             selectWorkerSealCommand
 	machineStatus                admitMachineStatusCommand
+	markHandoffPrepared          markHandoffPreparedCommand
 	markPlanReviewRunning        markPlanReviewRunningCommand
 	markReviewerSessionRequested markReviewerSessionRequestedCommand
 	proveReviewerDead            proveReviewerDeadCommand
@@ -661,12 +712,15 @@ type stateOwnerResult struct {
 	snapshot            stateOwnerSnapshot
 	effect              *runtimeEffectIntent
 	reconciliationStale bool
+	subscriptionID      uint64
+	subscription        <-chan stateOwnerSnapshot
 	err                 error
 }
 
 type stateOwnerSnapshotRequest struct {
-	cycle bool
-	reply chan stateOwnerResult
+	cycle     bool
+	subscribe bool
+	reply     chan stateOwnerResult
 }
 
 type statePersistenceRequest struct {
@@ -697,6 +751,7 @@ type stateOwner struct {
 	attemptRoot string
 	commands    chan stateOwnerCommand
 	snapshots   chan stateOwnerSnapshotRequest
+	unsubscribe chan uint64
 	stop        chan struct{}
 	stopOnce    sync.Once
 	persistStop context.CancelFunc
@@ -726,6 +781,7 @@ func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial
 		attemptRoot: attempts,
 		commands:    make(chan stateOwnerCommand),
 		snapshots:   make(chan stateOwnerSnapshotRequest),
+		unsubscribe: make(chan uint64, stateOwnerQueueSize),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
 		commits:     make(chan stateOwnerSnapshot, 1),
@@ -767,6 +823,13 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 	stopping := false
 	var poisoned error
 	var cycleID uint64
+	var subscriptionID uint64
+	subscribers := map[uint64]chan stateOwnerSnapshot{}
+	defer func() {
+		for _, subscriber := range subscribers {
+			close(subscriber)
+		}
+	}()
 	appliedCycles := map[string]appliedReconciliationCycle{}
 	publish := func() {
 		snapshot := stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed)}
@@ -778,6 +841,17 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 			default:
 			}
 			o.commits <- snapshot
+		}
+		for _, subscriber := range subscribers {
+			select {
+			case subscriber <- snapshot:
+			default:
+				select {
+				case <-subscriber:
+				default:
+				}
+				subscriber <- snapshot
+			}
 		}
 	}
 
@@ -863,7 +937,19 @@ func (o *stateOwner) run(initial runtimeOwnerState, persistence chan statePersis
 				cycleID++
 				id = cycleID
 			}
-			request.reply <- stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed), CycleID: id}}
+			result := stateOwnerResult{snapshot: stateOwnerSnapshot{State: cloneRuntimeOwnerState(committed), CycleID: id}}
+			if request.subscribe {
+				subscriptionID++
+				updates := make(chan stateOwnerSnapshot, 1)
+				subscribers[subscriptionID] = updates
+				result.subscriptionID, result.subscription = subscriptionID, updates
+			}
+			request.reply <- result
+		case id := <-o.unsubscribe:
+			if subscriber := subscribers[id]; subscriber != nil {
+				delete(subscribers, id)
+				close(subscriber)
+			}
 		case err := <-persistenceResult:
 			if err == nil {
 				committed = inFlight.candidate
@@ -914,6 +1000,49 @@ func (o *stateOwner) closeSignal() {
 
 func (o *stateOwner) snapshot(ctx context.Context) (stateOwnerSnapshot, error) {
 	return o.requestSnapshot(ctx, false)
+}
+
+func (o *stateOwner) snapshotAndSubscribe(ctx context.Context) (stateOwnerSnapshot, <-chan stateOwnerSnapshot, func(), error) {
+	reply := make(chan stateOwnerResult, 1)
+	select {
+	case <-o.done:
+		return stateOwnerSnapshot{}, nil, nil, errStateOwnerStopped
+	case o.snapshots <- stateOwnerSnapshotRequest{subscribe: true, reply: reply}:
+	case <-ctx.Done():
+		return stateOwnerSnapshot{}, nil, nil, ctx.Err()
+	}
+	select {
+	case result := <-reply:
+		if result.err != nil {
+			return stateOwnerSnapshot{}, nil, nil, result.err
+		}
+		var once sync.Once
+		cancel := func() {
+			once.Do(func() {
+				select {
+				case o.unsubscribe <- result.subscriptionID:
+				case <-o.done:
+				}
+			})
+		}
+		return result.snapshot, result.subscription, cancel, nil
+	case <-o.done:
+		return stateOwnerSnapshot{}, nil, nil, errStateOwnerStopped
+	case <-ctx.Done():
+		go func() {
+			select {
+			case result := <-reply:
+				if result.subscriptionID != 0 {
+					select {
+					case o.unsubscribe <- result.subscriptionID:
+					case <-o.done:
+					}
+				}
+			case <-o.done:
+			}
+		}()
+		return stateOwnerSnapshot{}, nil, nil, ctx.Err()
+	}
 }
 
 func (o *stateOwner) reconciliationSnapshot(ctx context.Context) (stateOwnerSnapshot, error) {
@@ -1095,6 +1224,11 @@ func (o *stateOwner) finishOperatorReconciliationEffect(ctx context.Context, com
 
 func (o *stateOwner) markPlanReviewRunning(ctx context.Context, command markPlanReviewRunningCommand) (stateOwnerSnapshot, error) {
 	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerMarkPlanReviewRunning, markPlanReviewRunning: command})
+	return result.snapshot, err
+}
+
+func (o *stateOwner) markHandoffPrepared(ctx context.Context, command markHandoffPreparedCommand) (stateOwnerSnapshot, error) {
+	result, err := o.submit(ctx, stateOwnerCommand{kind: stateOwnerMarkHandoffPrepared, markHandoffPrepared: command})
 	return result.snapshot, err
 }
 
@@ -1323,6 +1457,10 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		if err := applyAdmitMachineStatus(&candidate, command.machineStatus); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
+	case stateOwnerMarkHandoffPrepared:
+		if err := applyMarkHandoffPrepared(stateRoot, &candidate, command.markHandoffPrepared); err != nil {
+			return runtimeOwnerState{}, nil, err
+		}
 	case stateOwnerMarkPlanReviewRunning:
 		if err := applyMarkPlanReviewRunning(stateRoot, &candidate, command.markPlanReviewRunning); err != nil {
 			return runtimeOwnerState{}, nil, err
@@ -1344,7 +1482,7 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerBindReviewerStopping:
-		if err := applyBindReviewerStopping(&candidate, command.bindReviewerStopping); err != nil {
+		if err := applyBindReviewerStopping(stateRoot, &candidate, command.bindReviewerStopping); err != nil {
 			return runtimeOwnerState{}, nil, err
 		}
 	case stateOwnerForgetReviewerProof:
@@ -1717,7 +1855,17 @@ func applyFinishRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwner
 			return errStateConflict
 		}
 		previousWorkerSequence := record.Manifest.WorkerStatusSeq
+		launchChanged := record.Manifest.LaunchID != manifest.LaunchID
 		record.Manifest = manifest
+		if manifest.State == "running" && (command.Action == agentruntime.EffectStart || command.Action == agentruntime.EffectHandoff && launchChanged) {
+			if command.ImplementationBinding == nil || command.TerminalBroker == nil || !agentruntime.ValidImplementationBinding(manifest, *command.ImplementationBinding, manifest.LaunchID) || !agentruntime.ValidImplementationTerminalBinding(manifest, *command.TerminalBroker) || command.TerminalBroker.OuterPID != command.ImplementationBinding.PanePID {
+				return errStateConflict
+			}
+			implementation := *command.ImplementationBinding
+			terminal := *command.TerminalBroker
+			record.ImplementationBinding = &implementation
+			record.TerminalBroker = &terminal
+		}
 		if command.Action == agentruntime.EffectStop {
 			// This owner-only credential records that the exact confined launch
 			// lost authority before its generation was invalidated. Keep the
@@ -1845,7 +1993,7 @@ func applyMarkReviewerStopped(state *runtimeOwnerState, command markReviewerStop
 
 // Bind the externally verified live group before signalling it. This is not
 // death proof: a crash after the signal can replay from the durable group ID.
-func applyBindReviewerStopping(state *runtimeOwnerState, command bindReviewerStoppingCommand) error {
+func applyBindReviewerStopping(stateRoot string, state *runtimeOwnerState, command bindReviewerStoppingCommand) error {
 	effect, ok := state.Effects[command.Identity.EffectID]
 	if !ok || effect.State != "pending" || command.GroupPID < 2 || effect.IntentEpoch != command.Identity.Epoch || effect.IntentRevision != command.Identity.SourceRevision || effect.IssueGeneration != command.Identity.IssueGeneration || effect.AttemptGeneration != command.Identity.AttemptGeneration || effect.RequestDigest != command.Identity.RequestDigest {
 		return errStaleStateResult
@@ -1865,6 +2013,14 @@ func applyBindReviewerStopping(state *runtimeOwnerState, command bindReviewerSto
 		proof = reviewerProcessProof{Repository: effect.Repository, Issue: effect.Issue, Attempt: effect.Attempt, Mode: effect.SupersededReviewerMode, Target: effect.SupersededReviewerTarget, RunID: effect.SupersededReviewerRunID, EffectID: effect.SupersededReviewerID, IssueGeneration: effect.SupersededReviewerIssueGeneration, AttemptGeneration: effect.SupersededReviewerAttemptGeneration, GroupPID: command.GroupPID, ProfileDigest: effect.SupersededReviewerProfileDigest, ConfinementVersion: effect.SupersededReviewerConfinementVersion}
 		effect.SupersededReviewerGroupPID = command.GroupPID
 	} else {
+		return errStateConflict
+	}
+	if command.Pane == nil || command.TerminalBroker == nil {
+		return errStateConflict
+	}
+	pane, terminal := reviewerPaneCertificateFrom(*command.Pane), *command.TerminalBroker
+	proof.Pane, proof.TerminalBroker, proof.BrokerPath = &pane, &terminal, command.BrokerPath
+	if command.Pane.PID != terminal.OuterPID || command.GroupPID != terminal.InnerPGID || !validReviewerTerminalCertificate(stateRoot, proof) {
 		return errStateConflict
 	}
 	key := reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target)
@@ -2502,7 +2658,7 @@ func pendingHandoffCandidate(state runtimeOwnerState, repository string, issue, 
 		if candidate != nil || !agentruntime.ValidLaunchToken(effect.Reconciliation.Handoff.CandidateLaunchToken) {
 			return nil, errStateConflict
 		}
-		candidate = &handoffCandidateInvalidation{EffectID: effect.ID, Token: effect.Reconciliation.Handoff.CandidateLaunchToken, Key: effect.Reconciliation.Handoff.Key, Manifest: cloneManifest(manifest)}
+		candidate = &handoffCandidateInvalidation{EffectID: effect.ID, Token: effect.Reconciliation.Handoff.CandidateLaunchToken, Key: effect.Reconciliation.Handoff.Key, Manifest: cloneManifest(manifest), Implementation: effect.HandoffImplementation, Terminal: effect.HandoffTerminal}
 	}
 	return candidate, nil
 }
@@ -3040,10 +3196,13 @@ func migrateLegacyDismissCleanup(state *runtimeOwnerState) {
 		if tombstone.Manifest != nil && tombstone.Manifest.ReviewState != "" && !tombstone.Manifest.ReviewRunCleaned {
 			unresolved = true
 		}
-		for _, proof := range state.ReviewerProofs {
+		for proofKey, proof := range state.ReviewerProofs {
 			if proof.Repository == tombstone.Repository && proof.Issue == tombstone.Issue && proof.Attempt == tombstone.Attempt {
 				unresolved = true
-				break
+				if proof.Pane == nil || proof.TerminalBroker == nil || proof.BrokerPath == "" {
+					proof.DeadProved, proof.LegacyUnverified = false, true
+					state.ReviewerProofs[proofKey] = proof
+				}
 			}
 		}
 		tombstone.CleanupPhase = "completed"
@@ -3470,6 +3629,12 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if record.WorkerSeal != nil && !validWorkerSealSelection(stateRoot, record.Manifest, record.Generation, *record.WorkerSeal) {
 			return errors.New("runtime owner worker seal selection is invalid")
 		}
+		if (record.ImplementationBinding == nil) != (record.TerminalBroker == nil) {
+			return errors.New("runtime owner terminal broker certificate is incomplete")
+		}
+		if record.ImplementationBinding != nil && (!agentruntime.ValidImplementationBinding(record.Manifest, *record.ImplementationBinding, record.Manifest.LaunchID) || !agentruntime.ValidImplementationTerminalBinding(record.Manifest, *record.TerminalBroker) || record.TerminalBroker.OuterPID != record.ImplementationBinding.PanePID) {
+			return errors.New("runtime owner terminal broker binding is invalid")
+		}
 		if record.StopEffectID != "" {
 			effect, ok := state.Effects[record.StopEffectID]
 			if !ok || effect.Action != string(agentruntime.EffectStop) || effect.State != "pending" || effect.Repository != record.Manifest.Repository || effect.Issue != record.Manifest.Issue || effect.Attempt != record.Manifest.Attempt || effect.AttemptGeneration != record.Generation || effect.IssueGeneration != state.IssueGenerations[ownerIssueKey(effect.Repository, effect.Issue)] {
@@ -3620,6 +3785,10 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || proof.RunID != "" && !validDigest(proof.RunID) || state.ReviewerRunTracked && !proof.NeverRan && !proof.LegacyUnverified && !validDigest(proof.RunID) && state.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] == "" || (proof.GroupPID < 2 && !(proof.GroupPID == 0 && (!proof.DeadProved || proof.NeverRan))) || proof.NeverRan && (proof.GroupPID != 0 || !proof.DeadProved || proof.LegacyUnverified || proof.ConfinementVersion != 0 && proof.ConfinementVersion != reviewerConfinementVersion) || proof.LegacyUnverified && proof.DeadProved || proof.ProfileDigest != "" && !validDigest(proof.ProfileDigest) || state.ReviewerPolicyTracked && !proof.NeverRan && !proof.LegacyUnverified && proof.ConfinementVersion != reviewerConfinementVersion && state.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] == "" || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] {
 			return errors.New("runtime owner reviewer process proof is invalid")
 		}
+		certificatePresent := proof.Pane != nil || proof.TerminalBroker != nil || proof.BrokerPath != ""
+		if certificatePresent && !validReviewerTerminalCertificate(stateRoot, proof) || !certificatePresent && !proof.DeadProved && !proof.NeverRan && !proof.LegacyUnverified {
+			return errors.New("runtime owner reviewer terminal certificate is invalid")
+		}
 	}
 	if len(state.ControlReceipts) > maxControlReceipts {
 		return errors.New("runtime owner control receipts are invalid")
@@ -3733,6 +3902,14 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 			selection := *record.WorkerSeal
 			record.WorkerSeal = &selection
 		}
+		if record.TerminalBroker != nil {
+			terminal := *record.TerminalBroker
+			record.TerminalBroker = &terminal
+		}
+		if record.ImplementationBinding != nil {
+			binding := *record.ImplementationBinding
+			record.ImplementationBinding = &binding
+		}
 		clone.Attempts[key] = record
 	}
 	clone.Observations = make(map[string]reconciliationObservation, len(state.Observations))
@@ -3767,10 +3944,26 @@ func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
 		effect.InvalidatedStart = cloneStartInvalidation(effect.InvalidatedStart)
 		effect.StartCandidates = slices.Clone(effect.StartCandidates)
 		effect.GovernancePhases = slices.Clone(effect.GovernancePhases)
+		if effect.HandoffImplementation != nil {
+			binding := *effect.HandoffImplementation
+			effect.HandoffImplementation = &binding
+		}
+		if effect.HandoffTerminal != nil {
+			binding := *effect.HandoffTerminal
+			effect.HandoffTerminal = &binding
+		}
 		clone.Effects[key] = effect
 	}
 	clone.ReviewerProofs = make(map[string]reviewerProcessProof, len(state.ReviewerProofs))
 	for key, proof := range state.ReviewerProofs {
+		if proof.Pane != nil {
+			pane := *proof.Pane
+			proof.Pane = &pane
+		}
+		if proof.TerminalBroker != nil {
+			broker := *proof.TerminalBroker
+			proof.TerminalBroker = &broker
+		}
 		clone.ReviewerProofs[key] = proof
 	}
 	clone.LegacyReviewerQuarantines = make(map[string]string, len(state.LegacyReviewerQuarantines))
@@ -3831,6 +4024,14 @@ func cloneEffect(effect *runtimeEffectIntent) *runtimeEffectIntent {
 	clone.InvalidatedStart = cloneStartInvalidation(effect.InvalidatedStart)
 	clone.StartCandidates = slices.Clone(effect.StartCandidates)
 	clone.GovernancePhases = slices.Clone(effect.GovernancePhases)
+	if effect.HandoffImplementation != nil {
+		binding := *effect.HandoffImplementation
+		clone.HandoffImplementation = &binding
+	}
+	if effect.HandoffTerminal != nil {
+		binding := *effect.HandoffTerminal
+		clone.HandoffTerminal = &binding
+	}
 	return &clone
 }
 
@@ -3850,6 +4051,14 @@ func cloneHandoffInvalidation(candidate *handoffCandidateInvalidation) *handoffC
 	}
 	clone := *candidate
 	clone.Manifest = cloneManifest(clone.Manifest)
+	if candidate.Implementation != nil {
+		binding := *candidate.Implementation
+		clone.Implementation = &binding
+	}
+	if candidate.Terminal != nil {
+		binding := *candidate.Terminal
+		clone.Terminal = &binding
+	}
 	return &clone
 }
 
