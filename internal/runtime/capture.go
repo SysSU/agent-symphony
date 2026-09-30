@@ -272,6 +272,12 @@ func RecordPaneExitStatus(ctx context.Context, tmux string, code int) error {
 	return recordPaneExitOption(ctx, tmux, PaneExitStatusOption, code)
 }
 
+// RecordPaneExitSignal preserves a terminating signal when tmux omits its
+// native dead-pane signal field.
+func RecordPaneExitSignal(ctx context.Context, tmux string, signal syscall.Signal) error {
+	return recordPaneExitOption(ctx, tmux, PaneExitSignalOption, int(signal))
+}
+
 func recordPaneExitOption(ctx context.Context, tmux, option string, value int) error {
 	pane := os.Getenv("TMUX_PANE")
 	if len(pane) < 2 || pane[0] != '%' {

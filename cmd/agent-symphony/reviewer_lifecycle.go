@@ -380,11 +380,17 @@ func runReviewerPane(args []string, stdout, stderr io.Writer) (int, syscall.Sign
 		unlock.Dir = "/tmp"
 		return unlock.Run()
 	})
+	var paneErr error
+	if childSignal != 0 {
+		paneErr = agentruntime.RecordPaneExitSignal(context.Background(), args[0], childSignal)
+	} else {
+		paneErr = agentruntime.RecordPaneExitStatus(context.Background(), args[0], code)
+	}
 	record := reviewerTerminalRecord{Identity: identity, ExitCode: code, Signal: int(childSignal)}
 	if writeErr := writeReviewerRecord(terminalPath, record); writeErr != nil {
-		return 126, 0, errors.Join(err, fmt.Errorf("record reviewer terminal result: %w", writeErr))
+		return 126, 0, errors.Join(err, paneErr, fmt.Errorf("record reviewer terminal result: %w", writeErr))
 	}
-	return code, childSignal, err
+	return code, childSignal, errors.Join(err, paneErr)
 }
 
 func readReviewerTerminal(launchPath, terminalPath string, identity reviewerLaunchIdentity) (*reviewerTerminalRecord, error) {

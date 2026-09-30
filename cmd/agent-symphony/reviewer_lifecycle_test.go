@@ -1868,10 +1868,12 @@ func (b *invalidReviewArtifactBoundary) call(_ context.Context, operation string
 
 func TestReviewerPaneRecordsExactLaunchAndTerminalIdentity(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "tmux"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	tmuxLog := filepath.Join(root, "tmux.log")
+	if err := os.WriteFile(filepath.Join(root, "tmux"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AS_TEST_TMUX_LOG\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AS_TEST_TMUX_LOG", tmuxLog)
 	t.Setenv("TMUX_PANE", "%123")
 	identity := reviewerLaunchIdentity{EffectID: strings.Repeat("a", 32), RunID: strings.Repeat("c", 64), IssueGeneration: 2, AttemptGeneration: 4, RequestDigest: strings.Repeat("b", 64), ProfileDigest: strings.Repeat("d", 64), ConfinementVersion: reviewerConfinementVersion}
 	launch, terminal, brokerPath := filepath.Join(root, "launch.json"), filepath.Join(root, "terminal.json"), filepath.Join(root, "broker.json")
@@ -1920,6 +1922,10 @@ func TestReviewerPaneRecordsExactLaunchAndTerminalIdentity(t *testing.T) {
 	launchedOK, launchErr := readReviewerRecord(launch, &launched)
 	if err != nil || record == nil || record.ExitCode != 0 || record.Signal != 0 || launchErr != nil || !launchedOK || launched.ChildPID < 2 || record.Identity.ChildPID != launched.ChildPID {
 		t.Fatalf("exact terminal record=%#v err=%v", record, err)
+	}
+	tmuxCalls, err := os.ReadFile(tmuxLog)
+	if err != nil || !strings.Contains(string(tmuxCalls), "set-option -p -t %123 "+agentruntime.PaneExitStatusOption+" 0\n") {
+		t.Fatalf("reviewer pane exit fallback was not recorded: %q err=%v", tmuxCalls, err)
 	}
 	changed := identity
 	changed.AttemptGeneration++
