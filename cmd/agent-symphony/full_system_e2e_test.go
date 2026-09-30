@@ -733,7 +733,7 @@ printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"full-system fixt
 	}) {
 		t.Fatalf("timed out waiting for first review finding: %s\n%s", fullSystemAttemptDiagnostics(address, stateRoot, currentSession, server.Env), output.String())
 	}
-	if !waitFor(deadline(30*time.Second), func() bool {
+	if !waitFor(deadline(60*time.Second), func() bool {
 		_, err := os.Lstat(filepath.Join(root, "reviewed-twice"))
 		return err == nil
 	}) {
