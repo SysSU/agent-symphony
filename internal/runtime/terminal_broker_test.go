@@ -261,6 +261,62 @@ func TestTerminalBrokerDrainsLateAttachReplay(t *testing.T) {
 	}
 }
 
+func TestTerminalBrokerRejectsAttachAfterDrainStarts(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "as-terminal-drain-admission-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	trigger := filepath.Join(root, "trigger")
+	command := []string{"/bin/sh", "-c", `head -c $((1024 * 1024)) /dev/zero; printf 'REPLAY-READY\n'; while [ ! -e "$1" ]; do sleep 0.01; done`, "broker", trigger}
+	binding, _, done, _ := startTerminalBrokerFixture(t, command...)
+	if err := ReleaseTerminalBroker(t.Context(), binding); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := DialTerminalBroker(t.Context(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := probe.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	for !strings.Contains(output.String(), "REPLAY-READY") {
+		chunk, err := probe.ReadOutput()
+		if err != nil {
+			t.Fatal(err)
+		}
+		output.Write(chunk)
+	}
+	probe.Close()
+	held, err := DialTerminalBroker(t.Context(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trigger, []byte("go\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		client, err := DialTerminalBroker(t.Context(), binding)
+		if client != nil {
+			client.Close()
+		}
+		if err != nil && strings.Contains(err.Error(), "rejected attachment") {
+			break
+		}
+		if time.Now().After(deadline) {
+			held.Close()
+			t.Fatalf("terminal broker did not close attach admission: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	held.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTerminalBrokerResizeAndInputLimit(t *testing.T) {
 	binding, _, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `printf 'READY\n'; while IFS= read -r line; do stty size; printf 'ECHO:%s\n' "$line"; done`)
 	defer func() {

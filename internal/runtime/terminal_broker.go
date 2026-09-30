@@ -148,6 +148,7 @@ type terminalBroker struct {
 	mu         sync.Mutex
 	replay     []byte
 	overflow   bool
+	draining   bool
 	clients    map[*terminalBrokerClientState]struct{}
 	inputMu    sync.Mutex
 	release    sync.Once
@@ -294,6 +295,9 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 	if cleanupErr == nil {
 		select {
 		case <-outputDone:
+			broker.mu.Lock()
+			broker.draining = true
+			broker.mu.Unlock()
 			broker.waitClientDrain(terminalOutputDrainWait)
 		case <-time.After(terminalOutputDrainWait):
 			cleanupErr = errors.New("terminal broker output drain is unproved")
@@ -438,8 +442,9 @@ func (b *terminalBroker) handle(conn *net.UnixConn) {
 		client := &terminalBrokerClientState{conn: conn, notify: make(chan struct{}, 1)}
 		b.mu.Lock()
 		overflow := b.overflow
+		draining := b.draining
 		var replay []byte
-		if !overflow {
+		if !overflow && !draining {
 			replay = bytes.Clone(b.replay)
 			client.replaying = len(replay) != 0
 			b.clients[client] = struct{}{}
@@ -447,6 +452,10 @@ func (b *terminalBroker) handle(conn *net.UnixConn) {
 		b.mu.Unlock()
 		if overflow {
 			_ = writeTerminalStatus(conn, terminalBrokerStatus{Overflow: true, Error: "terminal replay limit exceeded"})
+			return
+		}
+		if draining {
+			_ = writeTerminalStatus(conn, terminalBrokerStatus{Error: "terminal broker is closing"})
 			return
 		}
 		removeClient := func() {
