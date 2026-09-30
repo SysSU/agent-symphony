@@ -1869,7 +1869,7 @@ func (b *invalidReviewArtifactBoundary) call(_ context.Context, operation string
 func TestReviewerPaneRecordsExactLaunchAndTerminalIdentity(t *testing.T) {
 	root := t.TempDir()
 	tmuxLog := filepath.Join(root, "tmux.log")
-	if err := os.WriteFile(filepath.Join(root, "tmux"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AS_TEST_TMUX_LOG\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "tmux"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AS_TEST_TMUX_LOG\"\nif [ \"$AS_TEST_TMUX_BLOCK\" = 1 ] && [ \"$1\" = set-option ]; then while :; do :; done; fi\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1968,6 +1968,75 @@ func TestReviewerPaneRecordsExactLaunchAndTerminalIdentity(t *testing.T) {
 	signalRecord, err := readReviewerTerminal(signalLaunch, signalTerminal, signaled)
 	if err != nil || signalRecord == nil || signalRecord.Signal != int(syscall.SIGTERM) || signalRecord.ExitCode != 128+int(syscall.SIGTERM) {
 		t.Fatalf("signaled terminal record=%#v err=%v", signalRecord, err)
+	}
+	blocked := identity
+	blocked.RunID = strings.Repeat("f", 64)
+	blockedRoot := filepath.Join(root, "blocked")
+	if err := os.Mkdir(blockedRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	blockedLaunch, blockedTerminal, blockedBroker := filepath.Join(blockedRoot, "launch.json"), filepath.Join(blockedRoot, "terminal.json"), filepath.Join(blockedRoot, "broker.json")
+	blockedJSON, err := json.Marshal(blocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AS_TEST_TMUX_BLOCK", "1")
+	blockedDone := make(chan wrapperResult, 1)
+	go func() {
+		code, signal, runErr := runReviewerPane([]string{"tmux", blockedLaunch, blockedTerminal, blockedBroker, socketDir, reviewerSignal(blocked), reviewerStartSignal(blocked), string(blockedJSON), "--", "sh", "-c", "exit 7"}, io.Discard, io.Discard)
+		blockedDone <- wrapperResult{code: code, signal: signal, err: runErr}
+	}()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		broker, err = agentruntime.ReadTerminalBrokerBinding(blockedBroker)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := agentruntime.ReleaseTerminalBroker(t.Context(), broker); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	blockedCall := "set-option -p -t %123 " + agentruntime.PaneExitStatusOption + " 7\n"
+	for {
+		calls, readErr := os.ReadFile(tmuxLog)
+		if readErr == nil && strings.Contains(string(calls), blockedCall) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("blocked tmux fallback did not start: %q err=%v", calls, readErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for {
+		blockedRecord, recordErr := readReviewerTerminal(blockedLaunch, blockedTerminal, blocked)
+		if recordErr == nil && blockedRecord != nil {
+			if blockedRecord.ExitCode != 7 || blockedRecord.Signal != 0 {
+				t.Fatalf("blocked tmux terminal record=%#v", blockedRecord)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("terminal result was not persisted before blocked tmux fallback: %v", recordErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case result := <-blockedDone:
+		t.Fatalf("reviewer wrapper returned before blocked tmux deadline: %#v", result)
+	default:
+	}
+	select {
+	case result := <-blockedDone:
+		if result.code != 7 || result.signal != 0 || result.err == nil {
+			t.Fatalf("blocked tmux reviewer result=%#v", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked tmux fallback exceeded its deadline")
 	}
 	changed := identity
 	changed.AttemptGeneration++
