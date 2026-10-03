@@ -396,6 +396,10 @@ func (s *operatorMutationService) resultForCommittedAdmission(ctx context.Contex
 		s.dispatchResume(request.RequestID)
 		return operatorResultForReceipt(committed, receipt)
 	}
+	if work.runtime == nil && work.plan == nil && effect != nil {
+		result, _ := s.resultForConcurrentAdmission(ctx, committed, request, synchronous)
+		return result
+	}
 	deferredCleanup := receipt.Phase == operatorPhaseHandoffCleanup || receipt.Phase == operatorPhaseStartCleanup
 	if effect != nil {
 		work.requestID = request.RequestID
@@ -477,6 +481,9 @@ func (s *operatorMutationService) recoveryAttachCommand(snapshot stateOwnerSnaps
 			continue
 		}
 		if receipt.Phase == operatorPhaseAdmissionPending {
+			if receipt.Request == request {
+				continue
+			}
 			return beginOperatorMutationCommand{}, false
 		}
 		effect, exists := snapshot.State.Effects[receipt.EffectID]
@@ -664,6 +671,11 @@ func (s *operatorMutationService) prepareAdmission(ctx context.Context, snapshot
 			refreshed, err := s.owner.refreshOperatorAdmission(ctx, request.RequestID, collection)
 			if err != nil {
 				return beginOperatorMutationCommand{}, operatorWork{}, fmt.Errorf("refresh Recover admission: %w", err)
+			}
+			// Publication can finish while the fresh read is in flight. Join its
+			// existing effect before the planner suppresses a duplicate retry.
+			if attach, ok := s.recoveryAttachCommand(refreshed, request); ok {
+				return attach, operatorWork{}, nil
 			}
 			command, work, err := s.prepareRecoveryAdmission(refreshed, batch, request, githubIssueRetry)
 			if err != nil {
@@ -1482,6 +1494,9 @@ func (s *operatorMutationService) resumeReceiptReserved(ctx context.Context, req
 		}
 		if current.Phase == operatorPhaseStartCleanup || effect == nil {
 			return nil
+		}
+		if work.runtime == nil && work.plan == nil {
+			return s.resumeReceiptReserved(ctx, requestID, reserved)
 		}
 		work.requestID = requestID
 		bindOperatorWorkIdentity(&work, *effect)
