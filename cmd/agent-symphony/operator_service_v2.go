@@ -1835,13 +1835,13 @@ func (s *operatorMutationService) stopReviewerSessionAtBoundWithProof(ctx contex
 		return reviewerStopObservation{}, ctx.Err()
 	}
 	if groupPID > 1 {
-		if proof == nil || proof.GroupPID != groupPID || proof.EffectID != reviewerID || proof.RunID != runID || proof.IssueGeneration != issueGeneration || proof.AttemptGeneration != attemptGeneration || proof.DeadProved || proof.Pane == nil || proof.TerminalBroker == nil || proof.BrokerPath != reviewerBrokerPath(filepath.Dir(filepath.Dir(launchPath)), proof.Target) {
+		if proof == nil || proof.GroupPID != groupPID || proof.EffectID != reviewerID || proof.RunID != runID || proof.IssueGeneration != issueGeneration || proof.AttemptGeneration != attemptGeneration || proof.DeadProved || proof.Pane == nil || proof.TerminalBroker == nil || proof.TerminalBroker.OuterPID != proof.Pane.PanePID || proof.BrokerPath != reviewerBrokerPath(filepath.Dir(filepath.Dir(launchPath)), proof.Target) {
 			return reviewerStopObservation{}, errors.New("owner-bound reviewer terminal certificate is unavailable")
 		}
 		if err := agentruntime.StopAndProveTerminalBroker(ctx, proof.BrokerPath, *proof.TerminalBroker); err != nil {
 			return reviewerStopObservation{}, fmt.Errorf("stop exact reviewer broker: %w", err)
 		}
-		if err := waitReviewerOuterGone(ctx, proof.Pane.PanePID); err != nil {
+		if err := waitReviewerOuterGone(ctx, *proof.TerminalBroker); err != nil {
 			return reviewerStopObservation{}, err
 		}
 	}
@@ -1868,7 +1868,7 @@ func (s *operatorMutationService) stopReviewerSessionAtBoundWithProof(ctx contex
 			s.cancelPlanWatcher(reviewerID)
 			return reviewerStopObservation{NeverRan: true}, nil
 		}
-		if proof == nil || proof.Pane == nil || !errors.Is(syscall.Kill(proof.Pane.PanePID, 0), syscall.ESRCH) {
+		if dead, err := agentruntime.TerminalBrokerOuterDead(*proof.TerminalBroker); err != nil || !dead {
 			return reviewerStopObservation{}, errors.New("reviewer broker outer death is unproved after session loss")
 		}
 		s.cancelPlanWatcher(reviewerID)
@@ -1882,7 +1882,7 @@ func (s *operatorMutationService) stopReviewerSessionAtBoundWithProof(ctx contex
 		return reviewerStopObservation{}, errors.New("reviewer pane name does not match exact session")
 	}
 	if groupPID > 1 && !proof.Pane.matches(pane) {
-		outerGone := errors.Is(syscall.Kill(proof.Pane.PanePID, 0), syscall.ESRCH)
+		outerGone, _ := agentruntime.TerminalBrokerOuterDead(*proof.TerminalBroker)
 		serverGone := errors.Is(syscall.Kill(proof.Pane.ServerPID, 0), syscall.ESRCH)
 		if outerGone && serverGone {
 			s.cancelPlanWatcher(reviewerID)
@@ -1927,14 +1927,18 @@ func (s *operatorMutationService) stopReviewerSessionAtBoundWithProof(ctx contex
 			if err := agentruntime.StopAndProveTerminalBroker(ctx, brokerPath, broker); err != nil {
 				return reviewerStopObservation{}, fmt.Errorf("stop exact newly-bound reviewer broker: %w", err)
 			}
-			if err := waitReviewerOuterGone(ctx, wrapperPID); err != nil {
+			if err := waitReviewerOuterGone(ctx, broker); err != nil {
 				return reviewerStopObservation{}, err
 			}
 		}
 		if err := guardedReviewerKillSession(ctx, s.reviewer, pane, session, "", nil); err != nil {
 			return reviewerStopObservation{}, err
 		}
-		if err := syscall.Kill(wrapperPID, 0); !errors.Is(err, syscall.ESRCH) {
+		outerDead := errors.Is(syscall.Kill(wrapperPID, 0), syscall.ESRCH)
+		if candidate > 1 {
+			outerDead, _ = agentruntime.TerminalBrokerOuterDead(*launch.Broker)
+		}
+		if !outerDead {
 			return reviewerStopObservation{}, errors.New("unbound reviewer wrapper death is unproved")
 		}
 		if candidate > 1 {
@@ -1946,29 +1950,28 @@ func (s *operatorMutationService) stopReviewerSessionAtBoundWithProof(ctx contex
 		s.cancelPlanWatcher(reviewerID)
 		return reviewerStopObservation{GroupPID: candidate, NeverRan: candidate == 0}, nil
 	}
-	if !pane.Status.Dead {
-		return reviewerStopObservation{}, errors.New("reviewer broker stopped without terminating its outer pane")
-	}
+	// Kernel-proved outer death above is authoritative even before tmux reaps
+	// its child and updates pane_dead. The exact pane guard still applies.
 	if groupPID > 1 {
 		if err := guardedReviewerKillSession(ctx, s.reviewer, pane, session, "", nil); err != nil {
 			return reviewerStopObservation{}, fmt.Errorf("stop exact reviewer session %s: %w", session, err)
 		}
 	}
-	if proof == nil || proof.Pane == nil || !errors.Is(syscall.Kill(proof.Pane.PanePID, 0), syscall.ESRCH) {
+	if dead, err := agentruntime.TerminalBrokerOuterDead(*proof.TerminalBroker); err != nil || !dead {
 		return reviewerStopObservation{}, errors.New("reviewer broker outer death is unproved")
 	}
 	s.cancelPlanWatcher(reviewerID)
 	return reviewerStopObservation{GroupPID: groupPID}, nil
 }
 
-func waitReviewerOuterGone(ctx context.Context, pid int) error {
+func waitReviewerOuterGone(ctx context.Context, binding agentruntime.TerminalBrokerBinding) error {
 	deadline := time.NewTimer(5 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		err := syscall.Kill(pid, 0)
-		if errors.Is(err, syscall.ESRCH) {
+		dead, err := agentruntime.TerminalBrokerOuterDead(binding)
+		if dead && err == nil {
 			return nil
 		}
 		if err != nil {
@@ -1979,9 +1982,9 @@ func waitReviewerOuterGone(ctx context.Context, pid int) error {
 			return ctx.Err()
 		case <-deadline.C:
 			probeCtx, cancel := context.WithTimeout(ctx, time.Second)
-			process, probeErr := (agentruntime.ExecRunner{}).Run(probeCtx, agentruntime.Command{Name: "ps", Args: []string{"-p", strconv.Itoa(pid), "-o", "pid=,ppid=,stat=,comm="}, StdoutOnly: true, MaxOutputBytes: 256})
+			process, probeErr := (agentruntime.ExecRunner{}).Run(probeCtx, agentruntime.Command{Name: "ps", Args: []string{"-p", strconv.Itoa(binding.OuterPID), "-o", "pid=,ppid=,stat=,comm="}, StdoutOnly: true, MaxOutputBytes: 256})
 			cancel()
-			return fmt.Errorf("reviewer broker outer death is unproved (pid=%d; process=%q; probe=%v)", pid, strings.TrimSpace(process.Output), probeErr)
+			return fmt.Errorf("reviewer broker outer death is unproved (pid=%d; process=%q; probe=%v)", binding.OuterPID, strings.TrimSpace(process.Output), probeErr)
 		case <-ticker.C:
 		}
 	}

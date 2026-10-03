@@ -9,6 +9,30 @@ import (
 	"syscall"
 )
 
+func terminalProcessExited(pid int) (bool, error) {
+	fd, err := openLinuxPIDFD(pid)
+	if errors.Is(err, syscall.ESRCH) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer syscall.Close(fd)
+	var ready syscall.FdSet
+	if fd >= len(ready.Bits)*64 {
+		return false, errors.New("terminal pidfd exceeds select capacity")
+	}
+	ready.Bits[fd/64] |= 1 << uint(fd%64)
+	timeout := syscall.Timeval{}
+	// A readable pidfd is positive kernel evidence of exit, even while the
+	// tmux parent has not reaped the zombie. A live replacement stays unproved.
+	n, err := syscall.Select(fd+1, &ready, nil, nil, &timeout)
+	if errors.Is(err, syscall.EINTR) {
+		return false, nil
+	}
+	return err == nil && n == 1, err
+}
+
 func terminalSocketIdentity(info os.FileInfo) (uint64, uint64, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Dev == 0 || stat.Ino == 0 {

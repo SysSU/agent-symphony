@@ -130,6 +130,15 @@ func TerminalBrokerDead(path string, binding TerminalBrokerBinding) (bool, error
 	return err == nil && bytes.Equal(body, want), err
 }
 
+// TerminalBrokerOuterDead proves only that the bound outer process terminated.
+// Callers must separately prove inner-group death and validate the pane binding.
+func TerminalBrokerOuterDead(binding TerminalBrokerBinding) (bool, error) {
+	if !ValidTerminalBrokerBinding(binding) {
+		return false, errors.New("terminal broker binding is invalid")
+	}
+	return terminalProcessExited(binding.OuterPID)
+}
+
 type terminalBrokerClientState struct {
 	conn      *net.UnixConn
 	notify    chan struct{}
