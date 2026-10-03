@@ -834,6 +834,20 @@ func TestPriorPolicyPendingReviewerRestartLaunchesNoExternalWork(t *testing.T) {
 	if _, err := os.Lstat(request.Reviewer.Snapshot); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("prior-policy reviewer created a snapshot: %v", err)
 	}
+	if err := restarted.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	current = restartLegacyBootOwner(t, root, current, testBootA)
+	current = restartLegacyBootOwner(t, root, current, testBootB)
+	current = restartLegacyBootOwner(t, root, current, testBootB)
+	if len(current.LegacyReviewerQuarantines) != 0 || current.Effects[legacy.ID].State != "pending" || current.Effects[legacy.ID].RequestDigest != legacy.RequestDigest || !validPersistedReconciliationEffect(current, current.Effects[legacy.ID]) {
+		t.Fatal("reboot release lost historical reconciliation identity or its pending obligation")
+	}
+	current.ReviewerPolicyTracked = false
+	migrateReviewerPolicy(&current)
+	if len(current.LegacyReviewerQuarantines) != 0 {
+		t.Fatal("policy migration recreated covered quarantine")
+	}
 }
 
 func TestReviewerCleanupRequiresExactSessionAbsenceBeforeFinish(t *testing.T) {
