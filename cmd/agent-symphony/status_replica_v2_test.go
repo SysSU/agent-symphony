@@ -186,6 +186,13 @@ func TestOwnerStatusProjectionSeparatesArchivedAttemptFromExternalQuarantine(t *
 	if err != nil || len(projected.Statuses) != 0 || len(projected.IssueQuarantines) != 1 || projected.IssueQuarantines[0].Issue != 330 || !issueHasUnresolvedExternalEffect(loaded, "o/r", 330) {
 		t.Fatalf("external issue quarantine resurrected archived attempt or lost owner safety: status=%#v warnings=%#v err=%v", projected.Statuses, projected.IssueQuarantines, err)
 	}
+	admitLegacyReviewerQuarantine(&loaded, issueKey, "legacy reviewer absence unknown")
+	loaded = restartLegacyBootOwner(t, owner.stateRoot, loaded, testBootA)
+	loaded = restartLegacyBootOwner(t, owner.stateRoot, loaded, testBootB)
+	projected, err = projectOwnerStatus(stateOwnerSnapshot{State: loaded}, 1, time.Unix(2, 0))
+	if err != nil || len(loaded.LegacyReviewerQuarantines) != 0 || len(projected.IssueQuarantines) != 1 || !issueHasUnresolvedExternalEffect(loaded, "o/r", 330) {
+		t.Fatalf("reboot release erased unresolved GitHub outcome: %#v err=%v", projected, err)
+	}
 	if err := applyResolveInvalidatedReconciliationEffect(&loaded, resolveInvalidatedReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(loaded.Effects[effect.ID]), Outcome: invalidatedExternalOutcome{Action: reconciliationGitHubIssueUpdate, Observed: true}}); err != nil {
 		t.Fatal(err)
 	}

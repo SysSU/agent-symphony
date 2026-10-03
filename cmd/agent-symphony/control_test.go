@@ -184,6 +184,30 @@ func TestCompiledServeProcessAcceptsControlWhileOwningDaemonLock(t *testing.T) {
 	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// Seed two historical issues: the native current boot must retain one;
+	// a simulated older boot may release the other through real serve startup.
+	boot := readHostBootIdentity()
+	if !boot.valid() {
+		t.Fatal("compiled startup recovery requires a native boot identity")
+	}
+	legacy := legacyBootFixture(t, stateRoot)
+	reconcileLegacyReviewerBoot(&legacy, boot)
+	old := legacy.Tombstones[ownerAttemptKey("o/r", 353, 1)]
+	old.Issue = 354
+	legacy.Tombstones[ownerAttemptKey("o/r", 354, 1)] = old
+	legacy.IssueGenerations[ownerIssueKey("o/r", 354)] = 1
+	legacy.AttemptGenerations[ownerAttemptKey("o/r", 354, 1)] = 2
+	legacy.LegacyReviewerQuarantines[ownerIssueKey("o/r", 354)] = "legacy reviewer absence unknown"
+	reconcileLegacyReviewerBoot(&legacy, boot)
+	baseline := legacy.LegacyReviewerBaselines[ownerIssueKey("o/r", 354)]
+	baseline.Boot.UUID = testBootA.UUID
+	if baseline.Boot.UUID == boot.UUID {
+		baseline.Boot.UUID = testBootB.UUID
+	}
+	legacy.LegacyReviewerBaselines[ownerIssueKey("o/r", 354)] = baseline
+	if err := writeRuntimeOwnerState(stateRoot, runtimeOwnerAttemptRoot(stateRoot), legacy); err != nil {
+		t.Fatal(err)
+	}
 	legacyFiles := map[string]any{
 		"dashboard-state.json": dashboardState{Version: dashboardStateVersion, Hidden: []dashboardHiddenAttempt{}},
 		"removal-state.json":   dashboardRemovalState{Version: removalStateVersion, Intents: []dashboardRemovalIntent{}},
@@ -307,7 +331,7 @@ exit 0
 	}
 	for {
 		statuses, err := readStatuses()
-		if err == nil && len(statuses) == 0 {
+		if err == nil && len(statuses) == 1 && statuses[0].Issue == 353 && statuses[0].CurrentPhase == "physical-unverified" {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -320,7 +344,7 @@ exit 0
 	propagationDeadline := changedAt.Add(2200 * time.Millisecond)
 	for {
 		statuses, err := readStatuses()
-		if err == nil && len(statuses) == 1 && statuses[0].Issue == 9 && statuses[0].Title == "Externally visible issue" {
+		if err == nil && len(statuses) == 2 && statuses[0].Issue == 9 && statuses[0].Title == "Externally visible issue" && statuses[1].Issue == 353 {
 			if elapsed := time.Since(changedAt); elapsed > 2200*time.Millisecond {
 				t.Fatalf("compiled dashboard propagation=%s", elapsed)
 			} else {
@@ -338,6 +362,9 @@ exit 0
 	beforeControl, err := readRuntimeOwnerState(stateRoot, "o/r")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if beforeControl.LegacyReviewerQuarantines[ownerIssueKey("o/r", 353)] == "" || beforeControl.LegacyReviewerQuarantines[ownerIssueKey("o/r", 354)] != "" || len(beforeControl.Tombstones) != 2 || len(beforeControl.LegacyReviewerReleases) == 0 {
+		t.Fatal("compiled serve did not durably release only the changed-boot quarantine")
 	}
 	var result controlResult
 	for attempt := 1; ; attempt++ {

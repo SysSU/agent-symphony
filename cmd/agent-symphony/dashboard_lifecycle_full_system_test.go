@@ -656,6 +656,16 @@ fi
 				ledger, _ := os.ReadFile(filepath.Join(stateRoot, runtimeOwnerStateFile))
 				reviewerArtifact := ""
 				if current, readErr := readRuntimeOwnerState(stateRoot, "o/r"); readErr == nil {
+					for _, proof := range current.ReviewerProofs {
+						if proof.Pane == nil || proof.TerminalBroker == nil {
+							continue
+						}
+						probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+						pane, paneErr := (agentruntime.ExecRunner{}).Run(probeCtx, agentruntime.Command{Name: "tmux", Args: []string{"capture-pane", "-p", "-t", "=" + proof.Pane.SessionName + ":0.0", "-S", "-20"}, Env: environment, MaxOutputBytes: 2048})
+						cancel()
+						dead, deadErr := agentruntime.TerminalBrokerDead(proof.BrokerPath, *proof.TerminalBroker)
+						reviewerArtifact += internalgithub.RedactEnvironment(fmt.Sprintf(" retained reviewer pid=%d pgid=%d dead=%t dead_err=%v pane=%q pane_err=%v", proof.Pane.PanePID, proof.GroupPID, dead, deadErr, pane.Output, paneErr), environment)
+					}
 					for _, effect := range current.Effects {
 						if effect.Reconciliation != nil && effect.Reconciliation.Reviewer != nil {
 							reviewer := effect.Reconciliation.Reviewer
@@ -663,7 +673,7 @@ fi
 							inspect := exec.Command("tmux", "display-message", "-p", "-t", "="+reviewer.Session+":0.0", "#{pane_dead}|#{pane_pid}|#{pane_current_command}")
 							inspect.Env = environment
 							pane, paneErr := inspect.CombinedOutput()
-							reviewerArtifact = fmt.Sprintf("path=%s body=%q err=%v session=%s has_session=%t pane=%q pane_err=%v", reviewResultPath(reviewer.Snapshot, reviewer.Target), artifact, artifactErr, reviewer.Session, fullSystemTmuxSessionExists(environment, reviewer.Session), pane, paneErr)
+							reviewerArtifact += fmt.Sprintf("path=%s body=%q err=%v session=%s has_session=%t pane=%q pane_err=%v", reviewResultPath(reviewer.Snapshot, reviewer.Target), artifact, artifactErr, reviewer.Session, fullSystemTmuxSessionExists(environment, reviewer.Session), pane, paneErr)
 						}
 					}
 				}

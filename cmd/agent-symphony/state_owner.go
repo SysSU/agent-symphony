@@ -61,6 +61,9 @@ type runtimeOwnerState struct {
 	ReviewerPolicyVersion      uint64                               `json:"reviewer_policy_version,omitempty"`
 	DismissCleanupTracked      bool                                 `json:"dismiss_cleanup_tracked,omitempty"`
 	LegacyReviewerQuarantines  map[string]string                    `json:"legacy_reviewer_quarantines"`
+	LegacyReviewerBaselines    map[string]legacyReviewerBaseline    `json:"legacy_reviewer_baselines,omitempty"`
+	LegacyReviewerReleases     map[string]legacyReviewerRelease     `json:"legacy_reviewer_releases,omitempty"`
+	LegacyBootUnavailable      bool                                 `json:"-"`
 	ReviewerRevocationTracked  bool                                 `json:"reviewer_revocation_tracked,omitempty"`
 	ExternalDispatchTracked    bool                                 `json:"external_dispatch_tracked,omitempty"`
 	ControlReceipts            []controlReceipt                     `json:"control_receipts"`
@@ -649,6 +652,7 @@ const (
 
 type stateOwnerCommand struct {
 	kind                         stateOwnerCommandKind
+	bootIdentity                 hostBootIdentity
 	issue                        advanceIssueGenerationCommand
 	invalidate                   invalidateAttemptCommand
 	record                       recordEffectCommand
@@ -760,6 +764,12 @@ type stateOwner struct {
 }
 
 func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial runtimeOwnerState, persist func(context.Context, runtimeOwnerState) error) (*stateOwner, error) {
+	return startStateOwnerWithBootIdentity(ctx, stateRoot, attemptRoot, initial, persist, readHostBootIdentity())
+}
+
+func startStateOwnerWithBootIdentity(ctx context.Context, stateRoot, attemptRoot string, initial runtimeOwnerState, persist func(context.Context, runtimeOwnerState) error, boot hostBootIdentity) (*stateOwner, error) {
+	initial.LegacyReviewerQuarantines = maps.Clone(initial.LegacyReviewerQuarantines)
+	initial.LegacyReviewerBaselines = maps.Clone(initial.LegacyReviewerBaselines)
 	if persist == nil {
 		return nil, errors.New("state persistence is required")
 	}
@@ -799,7 +809,7 @@ func startStateOwner(ctx context.Context, stateRoot, attemptRoot string, initial
 		case <-owner.done:
 		}
 	}()
-	if _, err := owner.submit(ctx, stateOwnerCommand{kind: stateOwnerStart}); err != nil {
+	if _, err := owner.submit(ctx, stateOwnerCommand{kind: stateOwnerStart, bootIdentity: boot}); err != nil {
 		_ = owner.close(context.Background())
 		return nil, err
 	}
@@ -1294,7 +1304,7 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 		}
 		if !candidate.ReviewerConfinementTracked {
 			for key, proof := range candidate.ReviewerProofs {
-				if !proof.NeverRan {
+				if !proof.NeverRan && !legacyRecordReleased(candidate, legacyReviewerDigest("proof", proof)) {
 					proof.ProfileDigest = ""
 					proof.LegacyUnverified = true
 					candidate.ReviewerProofs[key] = proof
@@ -1307,31 +1317,35 @@ func applyStateOwnerCommand(attemptRoot, stateRoot string, committed runtimeOwne
 				candidate.LegacyReviewerQuarantines = map[string]string{}
 			}
 			for key, proof := range candidate.ReviewerProofs {
-				if !proof.NeverRan && !validDigest(proof.RunID) {
+				if !proof.NeverRan && !validDigest(proof.RunID) && !legacyRecordReleased(candidate, legacyReviewerDigest("proof", proof)) {
 					proof.DeadProved, proof.LegacyUnverified = false, true
 					candidate.ReviewerProofs[key] = proof
-					candidate.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] = "legacy reviewer run identity is missing; physical cleanup cannot be certified"
+					admitLegacyReviewerQuarantine(&candidate, ownerIssueKey(proof.Repository, proof.Issue), "legacy reviewer run identity is missing; physical cleanup cannot be certified")
 				}
 			}
 			for _, record := range candidate.Attempts {
 				manifest := record.Manifest
-				if manifest.ReviewState != "" && !manifest.ReviewRunCleaned && !validDigest(manifest.ReviewRunID) {
-					candidate.LegacyReviewerQuarantines[ownerIssueKey(manifest.Repository, manifest.Issue)] = "legacy reviewer run identity is missing; physical cleanup cannot be certified"
+				if manifest.ReviewState != "" && !manifest.ReviewRunCleaned && !validDigest(manifest.ReviewRunID) && !legacyRecordReleased(candidate, legacyManifestDigest(manifest, record.Generation)) {
+					admitLegacyReviewerQuarantine(&candidate, ownerIssueKey(manifest.Repository, manifest.Issue), "legacy reviewer run identity is missing; physical cleanup cannot be certified")
 				}
 			}
 			for _, tombstone := range candidate.Tombstones {
-				if tombstone.Manifest != nil && tombstone.Manifest.ReviewState != "" && !tombstone.Manifest.ReviewRunCleaned && !validDigest(tombstone.Manifest.ReviewRunID) {
-					candidate.LegacyReviewerQuarantines[ownerIssueKey(tombstone.Repository, tombstone.Issue)] = "legacy reviewer run identity is missing; physical cleanup cannot be certified"
+				if tombstone.Manifest != nil && tombstone.Manifest.ReviewState != "" && !tombstone.Manifest.ReviewRunCleaned && !validDigest(tombstone.Manifest.ReviewRunID) && !legacyRecordReleased(candidate, legacyManifestDigest(*tombstone.Manifest, tombstone.InvalidatedGeneration)) {
+					admitLegacyReviewerQuarantine(&candidate, ownerIssueKey(tombstone.Repository, tombstone.Issue), "legacy reviewer run identity is missing; physical cleanup cannot be certified")
 				}
 			}
 			for _, effect := range candidate.Effects {
+				if legacyRecordReleased(candidate, legacyEffectDigest(effect)) {
+					continue
+				}
 				if effect.Reconciliation != nil && effect.Reconciliation.Reviewer != nil && !validDigest(effect.Reconciliation.Reviewer.RunID) || effect.SupersededReviewerID != "" && !validDigest(effect.SupersededReviewerRunID) {
-					candidate.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] = "legacy reviewer run identity is missing; physical cleanup cannot be certified"
+					admitLegacyReviewerQuarantine(&candidate, ownerIssueKey(effect.Repository, effect.Issue), "legacy reviewer run identity is missing; physical cleanup cannot be certified")
 				}
 			}
 			candidate.ReviewerRunTracked = true
 		}
 		migrateReviewerPolicy(&candidate)
+		reconcileLegacyReviewerBoot(&candidate, command.bootIdentity)
 		if !candidate.ExternalDispatchTracked {
 			for id, effect := range candidate.Effects {
 				if effect.State == "pending" && effect.Reconciliation != nil && reconciliationMutatesGitHub(effect.Reconciliation.Action) {
@@ -1757,11 +1771,17 @@ func applyBeginRuntimeEffect(attemptRoot, stateRoot string, state *runtimeOwnerS
 		if reviewerErr != nil || supersededReviewer.ID != command.SupersededReviewerID {
 			return nil, errStateConflict
 		}
+		legacyDigest := legacyManifestDigest(manifest, record.Generation)
 		if err := applyUpsertAttemptAllowingReviewer(attemptRoot, stateRoot, state, upsertAttemptCommand{Manifest: manifest, ExpectedIssueGeneration: identity.IssueGeneration, ExpectedAttemptGeneration: identity.AttemptGeneration}, supersededReviewer.ID); err != nil {
 			return nil, err
 		}
 		identity.IssueGeneration = state.IssueGenerations[issueKey]
 		identity.AttemptGeneration = state.AttemptGenerations[attemptKey]
+		// Stop retains this exact manifest while advancing its owner generation.
+		// Carry only its historical format exception, never physical completion.
+		if legacyRecordReleased(*state, legacyDigest) {
+			state.LegacyReviewerReleases[legacyManifestDigest(manifest, identity.AttemptGeneration)] = state.LegacyReviewerReleases[legacyDigest]
+		}
 	default:
 		record, exists := state.Attempts[attemptKey]
 		if !exists || record.Generation != identity.AttemptGeneration || !reflect.DeepEqual(record.Manifest, manifest) {
@@ -2392,7 +2412,7 @@ func migrateLegacyReviewerSafety(state *runtimeOwnerState) {
 		state.ReviewerProofs = map[string]reviewerProcessProof{}
 	}
 	for key, proof := range state.ReviewerProofs {
-		if proof.NeverRan {
+		if proof.NeverRan || legacyRecordReleased(*state, legacyReviewerDigest("proof", proof)) {
 			continue
 		}
 		proof.DeadProved = false
@@ -2400,19 +2420,19 @@ func migrateLegacyReviewerSafety(state *runtimeOwnerState) {
 		state.ReviewerProofs[key] = proof
 	}
 	for _, effect := range state.Effects {
-		if !effect.ReviewerLaunched {
+		if !effect.ReviewerLaunched || legacyRecordReleased(*state, legacyEffectDigest(effect)) {
 			continue
 		}
 		issueKey := ownerIssueKey(effect.Repository, effect.Issue)
 		if effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.ReviewerGroupPID < 2 {
-			state.LegacyReviewerQuarantines[issueKey] = "legacy reviewer identity is incomplete; physical cleanup cannot be certified"
+			admitLegacyReviewerQuarantine(state, issueKey, "legacy reviewer identity is incomplete; physical cleanup cannot be certified")
 			continue
 		}
 		reviewer := effect.Reconciliation.Reviewer
 		key := reviewerProofKey(effect.Repository, effect.Issue, effect.Attempt, reviewer.Mode, reviewer.Target)
 		if existing, ok := state.ReviewerProofs[key]; ok {
 			if existing.EffectID != effect.ID {
-				state.LegacyReviewerQuarantines[issueKey] = "legacy reviewer identity conflicts; physical cleanup cannot be certified"
+				admitLegacyReviewerQuarantine(state, issueKey, "legacy reviewer identity conflicts; physical cleanup cannot be certified")
 			}
 			continue
 		}
@@ -2420,7 +2440,7 @@ func migrateLegacyReviewerSafety(state *runtimeOwnerState) {
 	}
 	for _, record := range state.Attempts {
 		manifest := record.Manifest
-		if manifest.ReviewState == "" {
+		if manifest.ReviewState == "" || legacyRecordReleased(*state, legacyManifestDigest(manifest, record.Generation)) {
 			continue
 		}
 		found := false
@@ -2431,10 +2451,13 @@ func migrateLegacyReviewerSafety(state *runtimeOwnerState) {
 			}
 		}
 		if !found {
-			state.LegacyReviewerQuarantines[ownerIssueKey(manifest.Repository, manifest.Issue)] = "legacy reviewer history is incomplete; physical cleanup cannot be certified"
+			admitLegacyReviewerQuarantine(state, ownerIssueKey(manifest.Repository, manifest.Issue), "legacy reviewer history is incomplete; physical cleanup cannot be certified")
 		}
 	}
 	for _, tombstone := range state.Tombstones {
+		if legacyRecordReleased(*state, legacyTombstoneDigest(tombstone)) {
+			continue
+		}
 		bound := false
 		for _, proof := range state.ReviewerProofs {
 			if proof.Repository == tombstone.Repository && proof.Issue == tombstone.Issue && proof.Attempt == tombstone.Attempt && !proof.NeverRan {
@@ -2445,7 +2468,7 @@ func migrateLegacyReviewerSafety(state *runtimeOwnerState) {
 			continue
 		}
 		if !bound {
-			state.LegacyReviewerQuarantines[ownerIssueKey(tombstone.Repository, tombstone.Issue)] = "legacy reviewer absence unknown; physical cleanup cannot be certified"
+			admitLegacyReviewerQuarantine(state, ownerIssueKey(tombstone.Repository, tombstone.Issue), "legacy reviewer absence unknown; physical cleanup cannot be certified")
 		}
 	}
 }
@@ -3160,18 +3183,24 @@ func migrateReviewerPolicyTo(state *runtimeOwnerState, current uint64) {
 		state.LegacyReviewerQuarantines = map[string]string{}
 	}
 	for key, proof := range state.ReviewerProofs {
+		if legacyRecordReleased(*state, legacyReviewerDigest("proof", proof)) {
+			continue
+		}
 		if proof.NeverRan && proof.ConfinementVersion != 0 && proof.ConfinementVersion != current {
 			proof.ConfinementVersion = 0
 			state.ReviewerProofs[key] = proof
 		} else if !proof.NeverRan && proof.ConfinementVersion != current {
 			proof.DeadProved, proof.LegacyUnverified = false, true
 			state.ReviewerProofs[key] = proof
-			state.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] = "legacy reviewer confinement policy is unknown; physical cleanup cannot be certified"
+			admitLegacyReviewerQuarantine(state, ownerIssueKey(proof.Repository, proof.Issue), "legacy reviewer confinement policy is unknown; physical cleanup cannot be certified")
 		}
 	}
 	for _, effect := range state.Effects {
+		if legacyRecordReleased(*state, legacyEffectDigest(effect)) {
+			continue
+		}
 		if effect.ReviewerGateProtocol && effect.ReviewerConfinementVersion != current || effect.SupersededReviewerID != "" && effect.SupersededReviewerConfinementVersion != current {
-			state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] = "legacy reviewer confinement policy is unknown; physical cleanup cannot be certified"
+			admitLegacyReviewerQuarantine(state, ownerIssueKey(effect.Repository, effect.Issue), "legacy reviewer confinement policy is unknown; physical cleanup cannot be certified")
 		}
 	}
 	state.ReviewerPolicyTracked = true
@@ -3192,6 +3221,9 @@ func migrateLegacyDismissCleanup(state *runtimeOwnerState) {
 		if tombstone.Action != "dismissed" || tombstone.EffectID != "" {
 			continue
 		}
+		if legacyRecordReleased(*state, legacyTombstoneDigest(tombstone)) {
+			continue
+		}
 		unresolved := tombstone.ReviewerLeaseID != "" || tombstone.InvalidatedStart != nil
 		if tombstone.Manifest != nil && tombstone.Manifest.ReviewState != "" && !tombstone.Manifest.ReviewRunCleaned {
 			unresolved = true
@@ -3210,7 +3242,7 @@ func migrateLegacyDismissCleanup(state *runtimeOwnerState) {
 		tombstone.ReviewerLeaseID = ""
 		if unresolved {
 			tombstone.Diagnostic = "legacy Dismiss cleanup authority is unavailable; reviewer resources are quarantined"
-			state.LegacyReviewerQuarantines[ownerIssueKey(tombstone.Repository, tombstone.Issue)] = tombstone.Diagnostic
+			admitLegacyReviewerQuarantine(state, ownerIssueKey(tombstone.Repository, tombstone.Issue), tombstone.Diagnostic)
 		}
 		state.Tombstones[key] = tombstone
 
@@ -3558,6 +3590,9 @@ func writeRuntimeOwnerStateContext(ctx context.Context, stateRoot, attemptRoot s
 }
 
 func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot string, persisted bool) error {
+	if err := validateLegacyReviewerBoot(state); err != nil {
+		return err
+	}
 	if state.Version != runtimeOwnerStateVersion || strings.TrimSpace(state.Repository) == "" || state.IssueGenerations == nil || state.AttemptGenerations == nil || state.Attempts == nil || state.Observations == nil || state.Recoveries == nil || state.Tombstones == nil || state.Effects == nil || state.ControlReceipts == nil || persisted && (state.Epoch == 0 || state.Revision == 0) {
 		return errors.New("runtime owner ledger is invalid")
 	}
@@ -3614,7 +3649,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, record.Manifest); err != nil {
 			return err
 		}
-		if state.ReviewerRunTracked && record.Manifest.ReviewState != "" && !validDigest(record.Manifest.ReviewRunID) && !record.Manifest.ReviewRunCleaned && state.LegacyReviewerQuarantines[ownerIssueKey(record.Manifest.Repository, record.Manifest.Issue)] == "" {
+		if state.ReviewerRunTracked && record.Manifest.ReviewState != "" && !validDigest(record.Manifest.ReviewRunID) && !record.Manifest.ReviewRunCleaned && state.LegacyReviewerQuarantines[ownerIssueKey(record.Manifest.Repository, record.Manifest.Issue)] == "" && !legacyRecordReleased(state, legacyManifestDigest(record.Manifest, record.Generation)) {
 			return errors.New("runtime owner attempt reviewer run identity is invalid")
 		}
 		if record.WorkerAuthorityRevokedDigest != "" && !revokedWorkerCredentialCurrent(record) {
@@ -3659,7 +3694,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 			if err := validateOwnerManifest(state.Repository, attemptRoot, stateRoot, *tombstone.Manifest); err != nil || tombstone.Manifest.Issue != tombstone.Issue || tombstone.Manifest.Attempt != tombstone.Attempt {
 				return errors.New("runtime owner tombstone manifest is invalid")
 			}
-			if state.ReviewerRunTracked && tombstone.Manifest.ReviewState != "" && !validDigest(tombstone.Manifest.ReviewRunID) && !tombstone.Manifest.ReviewRunCleaned && state.LegacyReviewerQuarantines[ownerIssueKey(tombstone.Repository, tombstone.Issue)] == "" {
+			if state.ReviewerRunTracked && tombstone.Manifest.ReviewState != "" && !validDigest(tombstone.Manifest.ReviewRunID) && !tombstone.Manifest.ReviewRunCleaned && state.LegacyReviewerQuarantines[ownerIssueKey(tombstone.Repository, tombstone.Issue)] == "" && !legacyRecordReleased(state, legacyManifestDigest(*tombstone.Manifest, tombstone.InvalidatedGeneration)) {
 				return errors.New("runtime owner tombstone reviewer run identity is invalid")
 			}
 			if tombstone.WorkerAuthorityRevokedDigest != "" && !revokedWorkerTombstoneCredentialCurrent(tombstone) {
@@ -3749,7 +3784,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		if effect.RequestDigest != "" && (!agentruntime.ValidEffectRequestDigest(effect.RequestDigest) || effect.IntentEpoch == 0 || effect.IntentEpoch > maxEpoch || !validRuntimeEffectInput(agentruntime.EffectAction(effect.Action), effect.Reason) || (effect.Action == string(agentruntime.EffectReview)) != (effect.Review != nil)) {
 			return errors.New("runtime owner typed effect intent is invalid")
 		}
-		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID) || !agentruntime.ValidReviewTarget(effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.Repository, effect.Issue) || state.ReviewerRunTracked && !validDigest(effect.SupersededReviewerRunID) && state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] == "" || effect.SupersededReviewerIssueGeneration == 0 || effect.SupersededReviewerAttemptGeneration == 0 || effect.SupersededReviewerSessionRequested && !effect.SupersededReviewerGateProtocol || effect.SupersededReviewerGateProtocol && (!validDigest(effect.SupersededReviewerRequestDigest) || !validDigest(effect.SupersededReviewerProfileDigest) && state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] == "" || state.ReviewerPolicyTracked && effect.SupersededReviewerConfinementVersion != reviewerConfinementVersion && state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] == "")) || effect.SupersededReviewerID == "" && (effect.SupersededReviewerTarget != "" || effect.SupersededReviewerRunID != "" || effect.SupersededReviewerMode != "" || effect.SupersededReviewerIssueGeneration != 0 || effect.SupersededReviewerAttemptGeneration != 0 || effect.ReviewerStopped || effect.SupersededReviewerGateProtocol || effect.SupersededReviewerSessionRequested || effect.SupersededReviewerRequestDigest != "" || effect.SupersededReviewerProfileDigest != "" || effect.SupersededReviewerConfinementVersion != 0) || effect.ReviewerCleanupDigest != "" && (effect.Action != string(agentruntime.EffectStop) || !validDigest(effect.ReviewerCleanupDigest)) {
+		if effect.SupersededReviewerGroupPID != 0 && (effect.SupersededReviewerID == "" || effect.SupersededReviewerGroupPID < 2) || effect.SupersededReviewerID != "" && (effect.Action != string(agentruntime.EffectStop) && effect.Action != string(agentruntime.EffectCleanup) || !validReviewerWaitChannel("review-"+effect.SupersededReviewerID) || !agentruntime.ValidReviewTarget(effect.SupersededReviewerMode, effect.SupersededReviewerTarget, effect.Repository, effect.Issue) || state.ReviewerRunTracked && !validDigest(effect.SupersededReviewerRunID) && state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] == "" && !legacyRecordReleased(state, legacyEffectDigest(effect)) || effect.SupersededReviewerIssueGeneration == 0 || effect.SupersededReviewerAttemptGeneration == 0 || effect.SupersededReviewerSessionRequested && !effect.SupersededReviewerGateProtocol || effect.SupersededReviewerGateProtocol && (!validDigest(effect.SupersededReviewerRequestDigest) || !validDigest(effect.SupersededReviewerProfileDigest) && state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] == "" && !legacyRecordReleased(state, legacyEffectDigest(effect)) || state.ReviewerPolicyTracked && effect.SupersededReviewerConfinementVersion != reviewerConfinementVersion && state.LegacyReviewerQuarantines[ownerIssueKey(effect.Repository, effect.Issue)] == "" && !legacyRecordReleased(state, legacyEffectDigest(effect)))) || effect.SupersededReviewerID == "" && (effect.SupersededReviewerTarget != "" || effect.SupersededReviewerRunID != "" || effect.SupersededReviewerMode != "" || effect.SupersededReviewerIssueGeneration != 0 || effect.SupersededReviewerAttemptGeneration != 0 || effect.ReviewerStopped || effect.SupersededReviewerGateProtocol || effect.SupersededReviewerSessionRequested || effect.SupersededReviewerRequestDigest != "" || effect.SupersededReviewerProfileDigest != "" || effect.SupersededReviewerConfinementVersion != 0) || effect.ReviewerCleanupDigest != "" && (effect.Action != string(agentruntime.EffectStop) || !validDigest(effect.ReviewerCleanupDigest)) {
 			return errors.New("runtime owner superseded reviewer binding is invalid")
 		}
 		if effect.InvalidatedHandoff != nil {
@@ -3782,7 +3817,7 @@ func validateRuntimeOwnerState(state runtimeOwnerState, attemptRoot, stateRoot s
 		}
 	}
 	for key, proof := range state.ReviewerProofs {
-		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || proof.RunID != "" && !validDigest(proof.RunID) || state.ReviewerRunTracked && !proof.NeverRan && !proof.LegacyUnverified && !validDigest(proof.RunID) && state.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] == "" || (proof.GroupPID < 2 && !(proof.GroupPID == 0 && (!proof.DeadProved || proof.NeverRan))) || proof.NeverRan && (proof.GroupPID != 0 || !proof.DeadProved || proof.LegacyUnverified || proof.ConfinementVersion != 0 && proof.ConfinementVersion != reviewerConfinementVersion) || proof.LegacyUnverified && proof.DeadProved || proof.ProfileDigest != "" && !validDigest(proof.ProfileDigest) || state.ReviewerPolicyTracked && !proof.NeverRan && !proof.LegacyUnverified && proof.ConfinementVersion != reviewerConfinementVersion && state.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] == "" || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] {
+		if key != reviewerProofKey(proof.Repository, proof.Issue, proof.Attempt, proof.Mode, proof.Target) || proof.Repository != state.Repository || proof.Issue < 1 || proof.Attempt < 1 || !agentruntime.ValidReviewTarget(proof.Mode, proof.Target, proof.Repository, proof.Issue) || !validReviewerWaitChannel("review-"+proof.EffectID) || proof.RunID != "" && !validDigest(proof.RunID) || state.ReviewerRunTracked && !proof.NeverRan && !proof.LegacyUnverified && !validDigest(proof.RunID) && state.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] == "" && !legacyRecordReleased(state, legacyReviewerDigest("proof", proof)) || (proof.GroupPID < 2 && !(proof.GroupPID == 0 && (!proof.DeadProved || proof.NeverRan))) || proof.NeverRan && (proof.GroupPID != 0 || !proof.DeadProved || proof.LegacyUnverified || proof.ConfinementVersion != 0 && proof.ConfinementVersion != reviewerConfinementVersion) || proof.LegacyUnverified && proof.DeadProved || proof.ProfileDigest != "" && !validDigest(proof.ProfileDigest) || state.ReviewerPolicyTracked && !proof.NeverRan && !proof.LegacyUnverified && proof.ConfinementVersion != reviewerConfinementVersion && state.LegacyReviewerQuarantines[ownerIssueKey(proof.Repository, proof.Issue)] == "" && !legacyRecordReleased(state, legacyReviewerDigest("proof", proof)) || proof.IssueGeneration == 0 || proof.AttemptGeneration == 0 || proof.IssueGeneration > state.IssueGenerations[ownerIssueKey(proof.Repository, proof.Issue)] || proof.AttemptGeneration > state.AttemptGenerations[ownerAttemptKey(proof.Repository, proof.Issue, proof.Attempt)] {
 			return errors.New("runtime owner reviewer process proof is invalid")
 		}
 		certificatePresent := proof.Pane != nil || proof.TerminalBroker != nil || proof.BrokerPath != ""
@@ -3883,6 +3918,8 @@ func activeWorkerProfileDigest(state runtimeOwnerState) string {
 }
 
 func cloneRuntimeOwnerState(state runtimeOwnerState) runtimeOwnerState {
+	state.LegacyReviewerBaselines = maps.Clone(state.LegacyReviewerBaselines)
+	state.LegacyReviewerReleases = maps.Clone(state.LegacyReviewerReleases)
 	clone := state
 	clone.IssueGenerations = cloneMap(state.IssueGenerations)
 	clone.AttemptGenerations = cloneMap(state.AttemptGenerations)

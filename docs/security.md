@@ -28,7 +28,9 @@ Owner-issued GitHub effects are serialized per attempt and generation-bound. Can
 
 ## Legacy records
 
-Pane disappearance and process-group absence do not prove that an old unconfined descendant is dead. Legacy records without positive evidence are quarantined per issue, survive restart, block publication and resource reuse, and appear as physical cleanup pending rather than as an active attempt. A verified later boot may release process quarantine because an old process cannot survive reboot; missing boot identity remains fail closed.
+Pane disappearance and process-group absence do not prove that an old unconfined descendant is dead. Legacy reviewer records without positive evidence are quarantined per issue, survive daemon restart, block publication and resource reuse, and appear as physical cleanup pending. The owner binds each quarantine to a valid host boot identity and its historical evidence. Existing unbound ledgers require installing the fixed binary, starting once to persist a baseline, rebooting the host/WSL kernel, then starting again and verifying the projection. See [the recovery procedure](troubleshooting.md#recover-legacy-reviewer-quarantine-after-a-verified-reboot).
+
+A different valid identity from the same kernel source releases only unchanged legacy reviewer quarantine. Missing/malformed identity, incompatible sources, and new evidence never authorize release. The source is read-only `kern.bootsessionuuid` on macOS and `/proc/sys/kernel/random/boot_id` on Linux/WSL2; there is no timestamp fallback or production override. Release certificates are bound to historical reviewer identities and generations, not future work on the issue. They relax only historical format validation; they do not synthesize run identities, grant cleanup or launch authority, or remove retained reviewer proofs, current worker leases, pending cleanup, or unresolved external effects. Reboot recovery never authorizes deleting historical paths.
 
 ## Daemon and dashboard boundary
 

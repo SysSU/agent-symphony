@@ -202,14 +202,14 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 			status.Diagnostic = "reviewer descendant absence is unproved; physical cleanup remains pending"
 			status.Action = "archive, abandon, remove, or dismiss can hide the attempt while physical cleanup remains pending"
 		}
-		if diagnostic := snapshot.State.LegacyReviewerQuarantines[issueKey]; diagnostic != "" {
+		if diagnostic := legacyQuarantineDiagnostic(snapshot.State, issueKey); diagnostic != "" {
 			status.NeedsAttention = true
 			status.OperatorBlocked = true
 			status.DispatchAuthorized = false
 			status.Retryable = false
 			status.CurrentPhase = "physical-unverified"
 			status.Diagnostic = diagnostic
-			status.Action = "inspect legacy reviewer descendants before reusing this issue"
+			status.Action = "start once to persist the boot baseline, reboot the host, then start and verify recovery"
 		}
 		if record.StopEffectID != "" {
 			status.State = "blocked"
@@ -261,6 +261,10 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 		if diagnostic == "" {
 			continue
 		}
+		action := "inspect pending physical cleanup obligations before reusing this issue"
+		if snapshot.State.LegacyReviewerQuarantines[ownerIssueKey(tombstone.Repository, tombstone.Issue)] != "" {
+			action = "start once to persist the boot baseline, reboot the host, then start and verify recovery"
+		}
 		found := false
 		for index := range statuses {
 			if statuses[index].Repository == tombstone.Repository && statuses[index].Issue == tombstone.Issue && statuses[index].Attempt == tombstone.Attempt {
@@ -269,11 +273,12 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 				statuses[index].DispatchAuthorized = false
 				statuses[index].CurrentPhase = "physical-unverified"
 				statuses[index].Diagnostic = diagnostic
+				statuses[index].Action = action
 				found = true
 			}
 		}
 		if !found {
-			statuses = append(statuses, orchestrator.RecoveryStatus{Repository: tombstone.Repository, Issue: tombstone.Issue, Attempt: tombstone.Attempt, State: "blocked", CurrentPhase: "physical-unverified", NeedsAttention: true, OperatorBlocked: true, Diagnostic: diagnostic, Action: "inspect legacy reviewer descendants before reusing this issue"})
+			statuses = append(statuses, orchestrator.RecoveryStatus{Repository: tombstone.Repository, Issue: tombstone.Issue, Attempt: tombstone.Attempt, State: "blocked", CurrentPhase: "physical-unverified", NeedsAttention: true, OperatorBlocked: true, Diagnostic: diagnostic, Action: action})
 		}
 	}
 	for index := range statuses {
@@ -297,7 +302,7 @@ func projectOwnerStatus(snapshot stateOwnerSnapshot, capacity int, now time.Time
 }
 
 func legacyReviewerDiagnostic(state runtimeOwnerState, repository string, issue, attempt int) string {
-	if diagnostic := state.LegacyReviewerQuarantines[ownerIssueKey(repository, issue)]; diagnostic != "" {
+	if diagnostic := legacyQuarantineDiagnostic(state, ownerIssueKey(repository, issue)); diagnostic != "" {
 		return diagnostic
 	}
 	for _, proof := range state.ReviewerProofs {

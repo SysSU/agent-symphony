@@ -2193,6 +2193,59 @@ func TestOperatorRecoverConvergesWithBackgroundRetry(t *testing.T) {
 	}
 }
 
+func TestOperatorRecoverAttachesToRetryPublishedDuringRefresh(t *testing.T) {
+	owner, manifest := operatorNeverLaunchedOwner(t, 353, "failed", "failed", func(runtimeOwnerState) error { return nil })
+	service := operatorTestMutationService(t, owner)
+	service.collector.Config.ActorID = 42
+	service.collector.Config.RetryCommand = "/agent-symphony retry"
+	service.stopped = true
+	failed := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: manifest.Issue, Attempt: 1, BaseSHA: manifest.BaseSHA, State: "failed", Checks: []string{}}
+	issue := issueFact(manifest.Issue, "recover")
+	issue.Attempt, issue.CurrentAttempt, issue.RecoveryAttempt, issue.RecoveryAuthorized = 1, 1, 1, true
+	issue.TerminalAttempts = []internalgithub.RecoveryAttemptFact{failed}
+	input := repositoryInput(true, issue)
+	input.Attempts = []internalgithub.RecoveryAttemptFact{failed}
+	plan := applyAndPlanRecover(t, owner, input, input.Attempts, githubIssueRetry)
+	input.Scope = issueScope(manifest.Issue)
+	// Background dispatch won just after the initial operator snapshot, before
+	// the operator reserved admission. GitHub sees the retry before its owner
+	// completion commits, so a fresh read must not plan another retry.
+	admitted, err := service.effects.beginReconciliation(t.Context(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effectID := admitted.Identity.EffectID
+	service.collect = func(context.Context, stateOwnerSnapshot, int) (reconciliationV2Batch, error) {
+		input.Issues[0].Retry = true
+		return reconciliationV2Batch{Input: input}, nil
+	}
+	request := operatorRequest("recover-published-during-refresh", "recover", manifest, false)
+	reserved, err := owner.reserveOperatorAdmission(t.Context(), reserveOperatorAdmissionCommand{Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, effect, work, err := service.finishReservedAdmission(t.Context(), reserved, request)
+	if err != nil {
+		t.Fatalf("Recover must join the published retry: %v", err)
+	}
+	result := service.resultForCommittedAdmission(t.Context(), request, reserved, committed, effect, work, false)
+	if !result.OK || result.Status != http.StatusAccepted {
+		t.Fatalf("attached Recover was not accepted: %#v", result)
+	}
+	state := mustOwnerSnapshot(t, owner).State
+	receipt, _ := operatorReceiptByID(state, request.RequestID)
+	if receipt.State != "pending" || receipt.Phase != operatorPhaseRetryPending || receipt.EffectID != effectID || len(state.Effects) != 1 {
+		t.Fatalf("Recover did not converge on the single retry: %#v", receipt)
+	}
+	if _, err := owner.finishReconciliationEffect(t.Context(), finishReconciliationEffectCommand{Identity: ownerReconciliationEffectIdentity(*effect), Result: reconciliationEffectResult{Action: reconciliationGitHubIssueUpdate, GitHubIssueUpdate: &githubIssueUpdateEffectResult{Kind: githubIssueRetry, Observed: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	receipt, _ = operatorReceiptByID(mustOwnerSnapshot(t, owner).State, request.RequestID)
+	if receipt.State != "completed" || receipt.Result == nil || !receipt.Result.OK {
+		t.Fatalf("published retry did not complete Recover: %#v", receipt)
+	}
+}
+
 func TestOperatorRecoverDefersOlderCollectionAfterContradictoryNewerCycle(t *testing.T) {
 	owner, manifest := operatorNeverLaunchedOwner(t, 460, "failed", "failed", func(runtimeOwnerState) error { return nil })
 	failed := internalgithub.RecoveryAttemptFact{Repository: "o/r", Issue: manifest.Issue, Attempt: 1, BaseSHA: manifest.BaseSHA, State: "failed", Checks: []string{}}
