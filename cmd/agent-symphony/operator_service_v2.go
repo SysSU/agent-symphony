@@ -1978,7 +1978,10 @@ func waitReviewerOuterGone(ctx context.Context, pid int) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return errors.New("reviewer broker outer death is unproved")
+			probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+			process, probeErr := (agentruntime.ExecRunner{}).Run(probeCtx, agentruntime.Command{Name: "ps", Args: []string{"-p", strconv.Itoa(pid), "-o", "pid=,ppid=,stat=,comm="}, StdoutOnly: true, MaxOutputBytes: 256})
+			cancel()
+			return fmt.Errorf("reviewer broker outer death is unproved (pid=%d; process=%q; probe=%v)", pid, strings.TrimSpace(process.Output), probeErr)
 		case <-ticker.C:
 		}
 	}
