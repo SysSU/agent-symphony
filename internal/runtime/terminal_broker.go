@@ -574,6 +574,8 @@ func (b *terminalBroker) releaseInner() error {
 	return b.releaseErr
 }
 
+func killTerminalBrokerForeground(pid int) error { return syscall.Kill(pid, syscall.SIGKILL) }
+
 func (b *terminalBroker) killInner() {
 	b.stop.Do(func() {
 		select {
@@ -587,7 +589,7 @@ func (b *terminalBroker) killInner() {
 			select {
 			case <-b.innerEnd:
 			case <-time.After(2 * time.Second):
-				_ = syscall.Kill(-b.binding.InnerPGID, syscall.SIGKILL)
+				_ = killTerminalBrokerForeground(b.binding.InnerPID)
 			}
 		}()
 	})
