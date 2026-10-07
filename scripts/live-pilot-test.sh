@@ -4,6 +4,9 @@ set -eu
 project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/agent-symphony-live-pilot-test.XXXXXX")
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
+test_home="$test_root/home"
+private_root="$test_home/.local/state/agent-symphony/live-pilot"
+mkdir -m 700 "$test_home"
 fake_bin="$test_root/bin"
 mkdir -m 700 "$fake_bin"
 log="$test_root/gh.log"
@@ -98,7 +101,7 @@ chmod 0700 "$fake_bin/gh" "$fake_bin/go" "$fake_bin/git" "$fake_bin/tmux" "$fake
 
 report="$test_root/pagination.json"
 set +e
-PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=pagination LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=pagination-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=pagination LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=pagination-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -eq 3
@@ -108,7 +111,7 @@ ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]
 : >"$log"
 report="$test_root/duplicate.json"
 set +e
-PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=duplicate LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=duplicate-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=duplicate LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=duplicate-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -eq 3
@@ -118,7 +121,7 @@ ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]
 : >"$log"
 report="$test_root/failure.json"
 set +e
-PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=failure-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=failure-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -eq 17
@@ -130,14 +133,14 @@ ruby -rjson -e '
 grep -q '^issue create' "$log"
 runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
 pilot_root=${runtime%/runtime}
-case "$pilot_root" in /tmp/agent-symphony-failure-run.*) ;; *) exit 95;; esac
+case "$pilot_root" in "$private_root"/failure-run.*) ;; *) exit 95;; esac
 rm -rf "$pilot_root"
 
 : >"$log"
 rm -f "$log.date"
 report="$test_root/stuck.json"
 set +e
-PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=stuck LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=stuck-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=stuck LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=stuck-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -eq 6
@@ -154,7 +157,7 @@ while kill -0 "$server_pid" 2>/dev/null && [ "$attempts" -lt 20 ]; do sleep 0.1;
 ! kill -0 "$server_pid" 2>/dev/null
 runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
 pilot_root=${runtime%/runtime}
-case "$pilot_root" in /tmp/agent-symphony-stuck-run.*) ;; *) exit 96;; esac
+case "$pilot_root" in "$private_root"/stuck-run.*) ;; *) exit 96;; esac
 rm -rf "$pilot_root"
 
 echo "live pilot safety tests passed"

@@ -40,7 +40,9 @@ if [ -n "$report" ]; then umask 077; printf '%s\n' "$result" >"$report"; fi
 if [ "$status" = blocked ]; then exit 3; fi
 
 project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-pilot_root=$(mktemp -d "/tmp/agent-symphony-${run_id}.XXXXXX")
+pilot_parent="$HOME/.local/state/agent-symphony/live-pilot"
+mkdir -p -m 700 "$pilot_parent"
+pilot_root=$(mktemp -d "$pilot_parent/${run_id}.XXXXXX")
 checkout="$pilot_root/repository"
 runtime="$pilot_root/runtime"
 binary="$pilot_root/agent-symphony"
