@@ -140,7 +140,7 @@ git -C "$checkout" config user.email "live-pilot@example.invalid"
   cd "$checkout"
   "$binary" init
 )
-ruby -rjson -e 'path=ARGV.fetch(0); config=JSON.parse(File.read(path)); config["reconciliation_interval_seconds"]=1; config["commands"]["orchestrator"]=nil; config["commands"]["orchestrator_audit"]=nil; File.write(path,JSON.pretty_generate(config)+"\n")' "$checkout/.agent-symphony.yaml"
+ruby -rjson -e 'path=ARGV.fetch(0); config=JSON.parse(File.read(path)); config["reconciliation_interval_seconds"]=1; config["commands"]["orchestrator"]=nil; config["commands"]["orchestrator_audit"]=nil; environment=Array(config["commands"]["environment_allowlist"]); environment << "AGENT_SYMPHONY_LIVE_RUN_ID" unless environment.include?("AGENT_SYMPHONY_LIVE_RUN_ID"); config["commands"]["environment_allowlist"]=environment; File.write(path,JSON.pretty_generate(config)+"\n")' "$checkout/.agent-symphony.yaml"
 go build -o "$fake_bin/codex" "$project_root/scripts/live_pilot_codex.go"
 
 body=$(printf '## Context\n\nAuthenticated isolated pilot `%s`.\n\n## Acceptance criteria\n\n- Complete one implementation, review, pull request, checks, merge, and closure lifecycle.\n\n## Checklist\n\n- [ ] Run the isolated lifecycle.\n\n## Validation\n\nValidate GitHub state, dashboard projection, and exact cleanup.\n\n## Dependencies\n\nNone\n' "$run_id")

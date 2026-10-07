@@ -135,6 +135,7 @@ grep -q "^go build -o .*\/bin\/codex .*\/scripts\/live_pilot_codex.go$" "$log"
 runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
 pilot_root=${runtime%/runtime}
 case "$pilot_root" in "$private_root"/failure-run.*) ;; *) exit 95;; esac
+ruby -rjson -e 'config=JSON.parse(File.read(ARGV.fetch(0))); abort unless config.dig("commands","environment_allowlist").include?("AGENT_SYMPHONY_LIVE_RUN_ID")' "$pilot_root/repository/.agent-symphony.yaml"
 tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
 test "${#tmux_socket}" -le 100
 rm -rf "$pilot_root"
