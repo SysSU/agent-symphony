@@ -18,8 +18,14 @@ case "$1 $2" in
   'repo view') printf 'SysSU/agent-symphony-sample\ttrue\n' ;;
   'repo clone') mkdir -p "$4" ;;
   'issue create') printf 'https://github.com/SysSU/agent-symphony-sample/issues/99\n' ;;
-  'issue view') printf 'OPEN\n' ;;
-  'pr list') printf '[]\n' ;;
+  'issue view') if [ "$LIVE_PILOT_TEST_SCENARIO" = success ]; then printf 'CLOSED\n'; else printf 'OPEN\n'; fi ;;
+  'pr list')
+    if [ "$LIVE_PILOT_TEST_SCENARIO" = success ]; then
+      printf '%s\n' '[{"number":100,"url":"https://example.invalid/pulls/100","state":"MERGED","isDraft":false,"headRefName":"agent-symphony/success","mergedAt":"2026-10-07T00:00:00Z"}]'
+    else
+      printf '[]\n'
+    fi
+    ;;
   'api --paginate')
     case " $* " in
       *' --slurp '*) ;;
@@ -64,6 +70,16 @@ case "$1" in
     printf '%s\n' '{"commands":{"orchestrator":[],"orchestrator_audit":[]}}' >.agent-symphony.yaml
     ;;
   serve)
+    if [ "$LIVE_PILOT_TEST_SCENARIO" = success ]; then
+      runtime=
+      while [ "$#" -gt 0 ]; do
+        if [ "$1" = --runtime-state ]; then shift; runtime=$1; fi
+        shift
+      done
+      mkdir -p "$runtime/worker-executable/pinned"
+      : >"$runtime/worker-executable/pinned/codex"
+      chmod 0500 "$runtime/worker-executable/pinned" "$runtime/worker-executable/pinned/codex"
+    fi
     if [ "$LIVE_PILOT_TEST_SCENARIO" = stuck ]; then exec ruby -e 'Signal.trap("INT") {}; sleep 30'; fi
     exec ruby -e 'Signal.trap("INT") { exit }; sleep'
     ;;
@@ -75,6 +91,7 @@ EOF
 
 cat >"$fake_bin/git" <<'EOF'
 #!/bin/sh
+if [ "$LIVE_PILOT_TEST_SCENARIO" = success ] && [ "$1" = -C ] && [ "$3" = ls-remote ]; then exit 1; fi
 exit 0
 EOF
 
@@ -122,6 +139,17 @@ set -e
 test "$status" -eq 3
 ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]=="blocked" && r["blocker"].include?("already used") && r.dig("preflight","used_run_id").length==1' "$report"
 ! grep -q '^issue create' "$log"
+
+: >"$log"
+report="$test_root/success.json"
+set +e
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=success LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=success-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 0
+ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]=="passed" && r.dig("cleanup","verified")=={"remote_branch_absent"=>true,"tmux_server_absent"=>true,"runtime_root_absent"=>true}' "$report"
+runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
+test ! -e "${runtime%/runtime}"
 
 : >"$log"
 report="$test_root/failure.json"

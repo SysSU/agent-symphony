@@ -10,7 +10,7 @@ if [ "${AGENT_SYMPHONY_LIVE_PILOT:-}" != 1 ]; then
   exit 2
 fi
 case "$run_id" in *[!A-Za-z0-9._-]*|'') echo "invalid live pilot run ID" >&2; exit 2;; esac
-for command in codex gh git go id ps ruby tmux; do command -v "$command" >/dev/null; done
+for command in codex find gh git go id ps ruby tmux; do command -v "$command" >/dev/null; done
 sandbox_codex=$(command -v codex)
 case "$sandbox_codex" in *[[:space:]]*) echo "Codex path contains unsupported whitespace" >&2; exit 2;; esac
 
@@ -99,6 +99,12 @@ stop_tmux() {
   if TMUX_TMPDIR="$runtime/tmux" tmux list-sessions >/dev/null 2>&1; then tmux_stopped=false; return 1; fi
 }
 
+remove_pilot_root() {
+  pinned="$pilot_root/runtime/worker-executable"
+  if [ -d "$pinned" ]; then find "$pinned" -type d -exec chmod u+w {} +; fi
+  rm -rf "$pilot_root"
+}
+
 report_failure() {
   exit_status=$1
   trap - EXIT HUP INT TERM
@@ -120,6 +126,8 @@ report_failure() {
     commands << "gh issue close #{ENV.fetch("ISSUE")} --repo #{ENV.fetch("REPOSITORY")}" unless ENV.fetch("ISSUE","").empty?
     prs.each { |item| commands << "gh pr close #{item.fetch("number")} --repo #{ENV.fetch("REPOSITORY")}" unless item["state"]=="MERGED" }
     (resources.fetch("branches",[])+prs.map { |item| item["headRefName"] }).compact.uniq.each { |branch| commands << "git -C #{Shellwords.escape(ENV.fetch("ROOT")+"/repository")} push origin --delete #{Shellwords.escape(branch)}" }
+    pinned=ENV.fetch("ROOT")+"/runtime/worker-executable"
+    commands << "find #{Shellwords.escape(pinned)} -type d -exec chmod u+w {} + # restore owner cleanup authority" if File.directory?(pinned)
     commands << "rm -rf -- #{Shellwords.escape(ENV.fetch("ROOT"))} # only after preserving diagnostics"
     issues=ENV.fetch("ISSUE","").empty? ? [] : [{number:ENV.fetch("ISSUE").to_i,url:ENV.fetch("ISSUE_URL")}]
     puts JSON.generate({schema:"agent-symphony-live-pilot-v1",run_id:ENV.fetch("RUN_ID"),repository:ENV.fetch("REPOSITORY"),status:"failed",exit_status:ENV.fetch("EXIT_STATUS").to_i,created:resources.merge(issues:issues,pull_requests:prs),cleanup:{performed:false,processes_stopped:ENV.fetch("PROCESSES_STOPPED")=="true",tmux_stopped:ENV.fetch("TMUX_STOPPED")=="true",diagnostics_preserved:ENV.fetch("DIAGNOSTICS_PRESERVED")=="true",commands:commands}})')
@@ -187,7 +195,7 @@ if TMUX_TMPDIR="$runtime/tmux" tmux list-sessions >/dev/null 2>&1; then
   exit 6
 fi
 elapsed=$(($(date +%s) - started))
-rm -rf "$pilot_root"
+remove_pilot_root
 test ! -e "$pilot_root"
 result=$(RUN_ID="$run_id" REPOSITORY="$repository" ISSUE="$issue" ISSUE_URL="$issue_url" PR="$pr" BRANCH="$branch" ELAPSED="$elapsed" RESOURCES="$resources" ruby -rjson -e '
   resources=JSON.parse(ENV.fetch("RESOURCES"))
