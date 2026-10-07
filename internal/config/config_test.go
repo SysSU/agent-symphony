@@ -148,6 +148,27 @@ func TestPinWorkerExecutableSurvivesConfiguredPathSwap(t *testing.T) {
 	}
 }
 
+func TestPinWorkerExecutablePublishesPackageTree(t *testing.T) {
+	packageRoot := filepath.Join(t.TempDir(), "codex-package")
+	source := filepath.Join(packageRoot, "bin", "codex")
+	if err := os.MkdirAll(filepath.Dir(source), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(packageRoot, "package.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	buildNativeCodexFixture(t, source, "package")
+	t.Setenv("PATH", filepath.Dir(source)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = source, source
+	if _, err := PinWorkerExecutable(t.Context(), pinnedTestRoot(t), &commands); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(commands.Implementation[0]).Output(); err != nil || strings.TrimSpace(string(output)) != "package" {
+		t.Fatalf("pinned package output=%q err=%v", output, err)
+	}
+}
+
 func TestPinWorkerExecutableReusesOnlyValidatedArtifactOnRestart(t *testing.T) {
 	stateRoot, source := pinnedTestRoot(t), filepath.Join(t.TempDir(), "codex")
 	buildNativeCodexFixture(t, source, "original")

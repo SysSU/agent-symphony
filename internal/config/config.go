@@ -433,8 +433,8 @@ func copyPinnedTree(ctx context.Context, root, executable, destination string) (
 				if err := os.Mkdir(target, 0o700); err != nil {
 					return err
 				}
+				directories = append(directories, target)
 			}
-			directories = append(directories, target)
 			return nil
 		}
 		input, err := os.Open(path)
