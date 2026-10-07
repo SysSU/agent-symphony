@@ -10,7 +10,7 @@ if [ "${AGENT_SYMPHONY_LIVE_PILOT:-}" != 1 ]; then
   exit 2
 fi
 case "$run_id" in *[!A-Za-z0-9._-]*|'') echo "invalid live pilot run ID" >&2; exit 2;; esac
-for command in gh git go ps ruby tmux; do command -v "$command" >/dev/null; done
+for command in gh git go id ps ruby tmux; do command -v "$command" >/dev/null; done
 
 identity=$(gh repo view "$repository" --json nameWithOwner,isPrivate --jq '[.nameWithOwner,.isPrivate] | @tsv')
 if [ "$identity" != "$(printf '%s\ttrue' "$repository")" ]; then
@@ -40,11 +40,17 @@ if [ -n "$report" ]; then umask 077; printf '%s\n' "$result" >"$report"; fi
 if [ "$status" = blocked ]; then exit 3; fi
 
 project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-pilot_parent="$HOME/.local/state/agent-symphony/live-pilot"
+pilot_parent="$HOME/.as-live-pilot"
 mkdir -p -m 700 "$pilot_parent"
 pilot_root=$(mktemp -d "$pilot_parent/${run_id}.XXXXXX")
 checkout="$pilot_root/repository"
 runtime="$pilot_root/runtime"
+tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
+if ! ruby -e 'exit ARGV.fetch(0).bytesize <= 100 ? 0 : 1' "$tmux_socket"; then
+  rmdir "$pilot_root"
+  echo "live pilot tmux socket path is too long" >&2
+  exit 2
+fi
 binary="$pilot_root/agent-symphony"
 fake_bin="$pilot_root/bin"
 issue=

@@ -3,10 +3,9 @@ set -eu
 
 project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/agent-symphony-live-pilot-test.XXXXXX")
-trap 'rm -rf "$test_root"' EXIT HUP INT TERM
-test_home="$test_root/home"
-private_root="$test_home/.local/state/agent-symphony/live-pilot"
-mkdir -m 700 "$test_home"
+test_home=$(mktemp -d "/tmp/aslp-home.XXXXXX")
+trap 'rm -rf "$test_root" "$test_home"' EXIT HUP INT TERM
+private_root="$test_home/.as-live-pilot"
 fake_bin="$test_root/bin"
 mkdir -m 700 "$fake_bin"
 log="$test_root/gh.log"
@@ -134,6 +133,8 @@ grep -q '^issue create' "$log"
 runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
 pilot_root=${runtime%/runtime}
 case "$pilot_root" in "$private_root"/failure-run.*) ;; *) exit 95;; esac
+tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
+test "${#tmux_socket}" -le 100
 rm -rf "$pilot_root"
 
 : >"$log"
@@ -158,6 +159,8 @@ while kill -0 "$server_pid" 2>/dev/null && [ "$attempts" -lt 20 ]; do sleep 0.1;
 runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
 pilot_root=${runtime%/runtime}
 case "$pilot_root" in "$private_root"/stuck-run.*) ;; *) exit 96;; esac
+tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
+test "${#tmux_socket}" -le 100
 rm -rf "$pilot_root"
 
 echo "live pilot safety tests passed"
