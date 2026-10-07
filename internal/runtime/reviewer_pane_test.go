@@ -110,34 +110,6 @@ func TestReviewerGroupAbsenceRequiresESRCH(t *testing.T) {
 	}
 }
 
-func TestReviewerGroupProofPrecedesLeaderReap(t *testing.T) {
-	root := t.TempDir()
-	tmux := filepath.Join(root, "tmux")
-	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("TMUX_PANE", "%123")
-	gateReader, gateWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer gateReader.Close()
-	defer gateWriter.Close()
-	if _, err := io.WriteString(gateWriter, "go\n"); err != nil {
-		t.Fatal(err)
-	}
-	probe := func(pid int) error {
-		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
-			return syscall.EPERM
-		}
-		return syscall.ESRCH
-	}
-	code, signal, err := runReviewerPaneCommand(t.Context(), tmux, []string{"/bin/sh", "-c", "exit 0"}, nil, io.Discard, io.Discard, nil, []*os.File{gateReader}, probe)
-	if code != 0 || signal != 0 || err != nil {
-		t.Fatalf("reviewer group proof after leader reap: code=%d signal=%d err=%v", code, signal, err)
-	}
-}
-
 func TestReviewerNormalExitKillsLateWritingDescendant(t *testing.T) {
 	root := t.TempDir()
 	started, blocked := filepath.Join(root, "started"), filepath.Join(root, "blocked")

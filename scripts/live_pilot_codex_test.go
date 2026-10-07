@@ -67,14 +67,15 @@ func TestLivePilotCodexVersionAndSandboxDelegation(t *testing.T) {
 
 	root := t.TempDir()
 	log := filepath.Join(root, "sandbox.log")
-	delegate := filepath.Join(root, "codex")
+	worker := filepath.Join(root, "codex")
+	delegate := filepath.Join(root, "sandbox-codex")
 	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >\"$LIVE_PILOT_SANDBOX_LOG\"\n"
 	if err := os.WriteFile(delegate, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	previousDelegate := livePilotSandboxCodex
-	livePilotSandboxCodex = delegate
-	t.Cleanup(func() { livePilotSandboxCodex = previousDelegate })
+	previousExecutable := livePilotExecutable
+	livePilotExecutable = func() (string, error) { return worker, nil }
+	t.Cleanup(func() { livePilotExecutable = previousExecutable })
 	t.Setenv("LIVE_PILOT_SANDBOX_LOG", log)
 	if err := runLivePilotCodex([]string{"sandbox", "--", "probe", "sandbox-probe"}, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
@@ -82,5 +83,14 @@ func TestLivePilotCodexVersionAndSandboxDelegation(t *testing.T) {
 	body, err := os.ReadFile(log)
 	if err != nil || string(body) != "sandbox -- probe sandbox-probe\n" {
 		t.Fatalf("sandbox delegation = %q, err = %v", body, err)
+	}
+	if err := os.Remove(delegate); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/bin/echo", delegate); err != nil {
+		t.Fatal(err)
+	}
+	if err := runLivePilotCodex([]string{"sandbox", "--", "probe"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+		t.Fatal("symlinked sandbox delegate was accepted")
 	}
 }

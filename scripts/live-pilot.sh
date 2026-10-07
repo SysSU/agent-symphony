@@ -10,9 +10,16 @@ if [ "${AGENT_SYMPHONY_LIVE_PILOT:-}" != 1 ]; then
   exit 2
 fi
 case "$run_id" in *[!A-Za-z0-9._-]*|'') echo "invalid live pilot run ID" >&2; exit 2;; esac
-for command in codex find gh git go id ps ruby tmux; do command -v "$command" >/dev/null; done
+for command in codex cp find gh git go id ps ruby tmux; do command -v "$command" >/dev/null; done
 sandbox_codex=$(command -v codex)
 case "$sandbox_codex" in *[[:space:]]*) echo "Codex path contains unsupported whitespace" >&2; exit 2;; esac
+project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+pilot_parent="$HOME/.as-live-pilot"
+if [ ! -e "$pilot_parent" ] && [ ! -L "$pilot_parent" ]; then mkdir -m 700 "$pilot_parent"; fi
+if ! ruby -e 'path=File.expand_path(ARGV.fetch(0)); stat=File.lstat(path); exit(stat.directory? && !stat.symlink? && stat.uid==Process.uid && (stat.mode & 0777)==0700 && File.realpath(path)==path ? 0 : 1)' "$pilot_parent"; then
+  echo "live pilot parent must be a canonical owned mode-0700 directory" >&2
+  exit 2
+fi
 
 identity=$(gh repo view "$repository" --json nameWithOwner,isPrivate --jq '[.nameWithOwner,.isPrivate] | @tsv')
 if [ "$identity" != "$(printf '%s\ttrue' "$repository")" ]; then
@@ -41,9 +48,6 @@ printf '%s\n' "$result"
 if [ -n "$report" ]; then umask 077; printf '%s\n' "$result" >"$report"; fi
 if [ "$status" = blocked ]; then exit 3; fi
 
-project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-pilot_parent="$HOME/.as-live-pilot"
-mkdir -p -m 700 "$pilot_parent"
 pilot_root=$(mktemp -d "$pilot_parent/${run_id}.XXXXXX")
 checkout="$pilot_root/repository"
 runtime="$pilot_root/runtime"
@@ -54,7 +58,8 @@ if ! ruby -e 'exit ARGV.fetch(0).bytesize <= 100 ? 0 : 1' "$tmux_socket"; then
   exit 2
 fi
 binary="$pilot_root/agent-symphony"
-fake_bin="$pilot_root/bin"
+worker_root="$pilot_root/worker-package"
+fake_bin="$worker_root/bin"
 issue=
 issue_url=
 server_pid=
@@ -141,7 +146,10 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-mkdir -m 700 "$fake_bin"
+mkdir -m 700 "$worker_root" "$fake_bin"
+printf '%s\n' '{"private":true}' >"$worker_root/package.json"
+cp "$sandbox_codex" "$fake_bin/sandbox-codex"
+chmod 0500 "$fake_bin/sandbox-codex"
 (cd "$project_root" && go build -o "$binary" ./cmd/agent-symphony)
 gh repo clone "$repository" "$checkout" -- --quiet
 git -C "$checkout" config user.name "Agent Symphony live pilot"
@@ -151,7 +159,7 @@ git -C "$checkout" config user.email "live-pilot@example.invalid"
   "$binary" init
 )
 ruby -rjson -e 'path=ARGV.fetch(0); config=JSON.parse(File.read(path)); config["reconciliation_interval_seconds"]=1; config["commands"]["orchestrator"]=nil; config["commands"]["orchestrator_audit"]=nil; File.write(path,JSON.pretty_generate(config)+"\n")' "$checkout/.agent-symphony.yaml"
-go build -ldflags "-X=main.livePilotRunID=$run_id -X=main.livePilotSandboxCodex=$sandbox_codex" -o "$fake_bin/codex" "$project_root/scripts/live_pilot_codex.go"
+go build -ldflags "-X=main.livePilotRunID=$run_id" -o "$fake_bin/codex" "$project_root/scripts/live_pilot_codex.go"
 
 body=$(printf '## Context\n\nAuthenticated isolated pilot `%s`.\n\n## Acceptance criteria\n\n- Complete one implementation, review, pull request, checks, merge, and closure lifecycle.\n\n## Checklist\n\n- [ ] Run the isolated lifecycle.\n\n## Validation\n\nValidate GitHub state, dashboard projection, and exact cleanup.\n\n## Dependencies\n\nNone\n' "$run_id")
 mutation_started=true
@@ -183,13 +191,20 @@ pr=$(gh pr list --repo "$repository" --state all --search "$run_id in:title" --l
 if [ "$closed" != true ] || [ "$(printf '%s' "$pr" | ruby -rjson -e 'rows=JSON.parse(STDIN.read); puts rows.length==1 && rows[0]["state"]=="MERGED" ? "true" : "false"')" != true ]; then exit 5; fi
 
 branch=$(printf '%s' "$pr" | ruby -rjson -e 'puts JSON.parse(STDIN.read).fetch(0).fetch("headRefName")')
-if git -C "$checkout" ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null 2>&1; then
-  git -C "$checkout" push --quiet origin --delete "$branch"
-fi
-if git -C "$checkout" ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null 2>&1; then
-  echo "live pilot branch remains after exact cleanup: $branch" >&2
-  exit 6
-fi
+branch_status=0
+git -C "$checkout" ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null 2>&1 || branch_status=$?
+case "$branch_status" in
+  0) git -C "$checkout" push --quiet origin --delete "$branch" ;;
+  2) ;;
+  *) echo "live pilot remote branch query failed" >&2; exit 6 ;;
+esac
+branch_status=0
+git -C "$checkout" ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null 2>&1 || branch_status=$?
+case "$branch_status" in
+  2) ;;
+  0) echo "live pilot branch remains after exact cleanup: $branch" >&2; exit 6 ;;
+  *) echo "live pilot remote branch verification failed" >&2; exit 6 ;;
+esac
 if TMUX_TMPDIR="$runtime/tmux" tmux list-sessions >/dev/null 2>&1; then
   echo "live pilot tmux server remains after exact cleanup" >&2
   exit 6

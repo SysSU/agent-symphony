@@ -11,9 +11,49 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func TestTerminalBrokerWrapperPinsGroupAfterCommandExit(t *testing.T) {
+	gateReader, gateWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateWriter.Close()
+	holdReader, holdWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holdWriter.Close()
+	command := exec.Command("/bin/sh", "-c", terminalBrokerWrapper, "terminal-broker", "/bin/sh", "-c", "exit 0")
+	command.ExtraFiles = []*os.File{gateReader, holdReader}
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_ = gateReader.Close()
+	_ = holdReader.Close()
+	if _, err := io.WriteString(gateWriter, "go\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = gateWriter.Close()
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(-command.Process.Pid, 0); err != nil {
+		t.Fatalf("process group identity was not pinned after command exit: %v", err)
+	}
+	if err := syscall.Kill(-command.Process.Pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	_ = holdWriter.Close()
+	terminated, err := implementationGroupTerminated(command.Process.Pid)
+	if err != nil || !terminated {
+		t.Fatalf("pinned process group terminated=%t err=%v", terminated, err)
+	}
+}
 
 func startTerminalBrokerFixture(t *testing.T, command ...string) (TerminalBrokerBinding, string, <-chan error, context.CancelFunc) {
 	t.Helper()

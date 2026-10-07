@@ -37,6 +37,14 @@ const (
 	terminalFrameResize byte = 6
 )
 
+// A silent member keeps the process-group identity allocated after the
+// foreground command exits, until the broker can signal that exact group.
+const terminalBrokerWrapper = `set +m
+IFS= read -r ready <&3 || exit 125
+[ "$ready" = go ] || exit 125
+(exec 0<&4 1>/dev/null 2>/dev/null 3>&- 4<&-; IFS= read -r _) &
+exec "$@" 3>&- 4>&-`
+
 // TerminalBrokerBinding is the immutable, owner-persisted identity needed to
 // reach one broker. Secret is intentionally excluded from public projections.
 type TerminalBrokerBinding struct {
@@ -215,8 +223,14 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 	}
 	defer gateReader.Close()
 	defer gateWriter.Close()
-	inner := exec.Command("/bin/sh", append([]string{"-c", `IFS= read -r ready <&3 || exit 125; [ "$ready" = go ] || exit 125; exec "$@" 3>&-`, "terminal-broker"}, command...)...)
-	inner.ExtraFiles = []*os.File{gateReader}
+	holdReader, holdWriter, err := os.Pipe()
+	if err != nil {
+		return 125, 0, err
+	}
+	defer holdReader.Close()
+	defer holdWriter.Close()
+	inner := exec.Command("/bin/sh", append([]string{"-c", terminalBrokerWrapper, "terminal-broker"}, command...)...)
+	inner.ExtraFiles = []*os.File{gateReader, holdReader}
 	size := &pty.Winsize{Rows: 24, Cols: 80}
 	if current, sizeErr := pty.GetsizeFull(outerIn); sizeErr == nil && current.Rows >= 2 && current.Cols >= 2 {
 		size = current
@@ -226,33 +240,42 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 		return 125, 0, err
 	}
 	_ = gateReader.Close()
+	_ = holdReader.Close()
 	innerPGID, err := syscall.Getpgid(inner.Process.Pid)
 	if err != nil || innerPGID != inner.Process.Pid {
-		_ = inner.Process.Kill()
+		_ = syscall.Kill(-inner.Process.Pid, syscall.SIGKILL)
+		_ = holdWriter.Close()
 		_ = inner.Wait()
 		return 125, 0, errors.New("terminal broker inner session identity is unavailable")
 	}
+	stopInnerGroup := func() error {
+		killErr := syscall.Kill(-innerPGID, syscall.SIGKILL)
+		_ = holdWriter.Close()
+		terminated, groupErr := implementationGroupTerminated(innerPGID)
+		if groupErr != nil || !terminated {
+			return errors.Join(killErr, groupErr, errors.New("terminal broker inner group death is unproved"))
+		}
+		// Darwin reports EPERM for some zombie-only groups. Exact inventory has
+		// already proved that such a group has no remaining execution authority.
+		if killErr != nil && !errors.Is(killErr, syscall.ESRCH) && !errors.Is(killErr, syscall.EPERM) {
+			return killErr
+		}
+		return nil
+	}
 	binding := TerminalBrokerBinding{Version: terminalBrokerVersion, OuterPID: os.Getpid(), InnerPID: inner.Process.Pid, InnerPGID: innerPGID, SocketPath: socketPath, SocketDev: dev, SocketIno: ino, Secret: hex.EncodeToString(secretBytes)}
 	if err := writeTerminalBrokerBinding(recordPath, binding); err != nil {
-		_ = syscall.Kill(-innerPGID, syscall.SIGKILL)
+		_ = stopInnerGroup()
 		_ = inner.Wait()
 		return 125, 0, err
 	}
 	if started != nil {
 		if startedErr := started(binding); startedErr != nil {
-			cleanupErr := syscall.Kill(-innerPGID, syscall.SIGKILL)
-			if errors.Is(cleanupErr, syscall.ESRCH) {
-				cleanupErr = nil
-			}
+			cleanupErr := stopInnerGroup()
 			if waitErr := inner.Wait(); waitErr != nil {
 				var exit *exec.ExitError
 				if !errors.As(waitErr, &exit) {
 					cleanupErr = errors.Join(cleanupErr, waitErr)
 				}
-			}
-			terminated, groupErr := implementationGroupTerminated(innerPGID)
-			if groupErr != nil || !terminated {
-				cleanupErr = errors.Join(cleanupErr, groupErr, errors.New("terminal broker inner group death is unproved"))
 			}
 			if cleanupErr == nil {
 				deadBody, _ := json.Marshal(binding)
@@ -291,16 +314,7 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 	}()
 	waitErr := inner.Wait()
 	close(broker.innerEnd)
-	var cleanupErr error
-	if killErr := syscall.Kill(-innerPGID, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
-		cleanupErr = killErr
-	}
-	if cleanupErr == nil {
-		terminated, groupErr := implementationGroupTerminated(innerPGID)
-		if groupErr != nil || !terminated {
-			cleanupErr = errors.Join(groupErr, errors.New("terminal broker inner group death is unproved"))
-		}
-	}
+	cleanupErr := stopInnerGroup()
 	if cleanupErr == nil {
 		select {
 		case <-outputDone:

@@ -9,7 +9,8 @@ import (
 	"path/filepath"
 )
 
-var livePilotRunID, livePilotSandboxCodex string
+var livePilotRunID string
+var livePilotExecutable = os.Executable
 
 func main() {
 	if err := runLivePilotCodex(os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -24,10 +25,16 @@ func runLivePilotCodex(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if len(args) > 0 && args[0] == "sandbox" {
-		if !filepath.IsAbs(livePilotSandboxCodex) {
-			return errors.New("live pilot sandbox Codex path is invalid")
+		executable, err := livePilotExecutable()
+		if err != nil || !filepath.IsAbs(executable) {
+			return errors.New("live pilot executable path is invalid")
 		}
-		command := exec.Command(livePilotSandboxCodex, args...)
+		delegate := filepath.Join(filepath.Dir(executable), "sandbox-codex")
+		info, err := os.Lstat(delegate)
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 {
+			return errors.New("live pilot pinned sandbox Codex is invalid")
+		}
+		command := exec.Command(delegate, args...)
 		command.Stdin, command.Stdout, command.Stderr = os.Stdin, stdout, stderr
 		if err := command.Run(); err != nil {
 			return fmt.Errorf("delegate Codex sandbox: %w", err)
