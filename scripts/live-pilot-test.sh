@@ -78,6 +78,11 @@ cat >"$fake_bin/git" <<'EOF'
 exit 0
 EOF
 
+cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+
 cat >"$fake_bin/tmux" <<'EOF'
 #!/bin/sh
 exit 1
@@ -97,7 +102,7 @@ if [ "$LIVE_PILOT_TEST_SCENARIO" = stuck ]; then
 fi
 exec /bin/date "$@"
 EOF
-chmod 0700 "$fake_bin/gh" "$fake_bin/go" "$fake_bin/git" "$fake_bin/tmux" "$fake_bin/date"
+chmod 0700 "$fake_bin/gh" "$fake_bin/go" "$fake_bin/git" "$fake_bin/codex" "$fake_bin/tmux" "$fake_bin/date"
 
 report="$test_root/pagination.json"
 set +e
@@ -131,11 +136,10 @@ ruby -rjson -e '
   abort unless r.dig("cleanup","diagnostics_preserved") && commands.any? { |command| command.include?("gh issue close 99") } && commands.any? { |command| command.include?("only after preserving diagnostics") }
 ' "$report"
 grep -q '^issue create' "$log"
-grep -q "^go build -o .*\/bin\/codex .*\/scripts\/live_pilot_codex.go$" "$log"
+grep -q "^go build -ldflags -X=main.livePilotRunID=failure-run -X=main.livePilotSandboxCodex=.*\/bin\/codex -o .*\/bin\/codex .*\/scripts\/live_pilot_codex.go$" "$log"
 runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
 pilot_root=${runtime%/runtime}
 case "$pilot_root" in "$private_root"/failure-run.*) ;; *) exit 95;; esac
-ruby -rjson -e 'config=JSON.parse(File.read(ARGV.fetch(0))); abort unless config.dig("commands","environment_allowlist").include?("AGENT_SYMPHONY_LIVE_RUN_ID")' "$pilot_root/repository/.agent-symphony.yaml"
 tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
 test "${#tmux_socket}" -le 100
 rm -rf "$pilot_root"

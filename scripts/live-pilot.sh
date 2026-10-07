@@ -10,7 +10,9 @@ if [ "${AGENT_SYMPHONY_LIVE_PILOT:-}" != 1 ]; then
   exit 2
 fi
 case "$run_id" in *[!A-Za-z0-9._-]*|'') echo "invalid live pilot run ID" >&2; exit 2;; esac
-for command in gh git go id ps ruby tmux; do command -v "$command" >/dev/null; done
+for command in codex gh git go id ps ruby tmux; do command -v "$command" >/dev/null; done
+sandbox_codex=$(command -v codex)
+case "$sandbox_codex" in *[[:space:]]*) echo "Codex path contains unsupported whitespace" >&2; exit 2;; esac
 
 identity=$(gh repo view "$repository" --json nameWithOwner,isPrivate --jq '[.nameWithOwner,.isPrivate] | @tsv')
 if [ "$identity" != "$(printf '%s\ttrue' "$repository")" ]; then
@@ -140,8 +142,8 @@ git -C "$checkout" config user.email "live-pilot@example.invalid"
   cd "$checkout"
   "$binary" init
 )
-ruby -rjson -e 'path=ARGV.fetch(0); config=JSON.parse(File.read(path)); config["reconciliation_interval_seconds"]=1; config["commands"]["orchestrator"]=nil; config["commands"]["orchestrator_audit"]=nil; environment=Array(config["commands"]["environment_allowlist"]); environment << "AGENT_SYMPHONY_LIVE_RUN_ID" unless environment.include?("AGENT_SYMPHONY_LIVE_RUN_ID"); config["commands"]["environment_allowlist"]=environment; File.write(path,JSON.pretty_generate(config)+"\n")' "$checkout/.agent-symphony.yaml"
-go build -o "$fake_bin/codex" "$project_root/scripts/live_pilot_codex.go"
+ruby -rjson -e 'path=ARGV.fetch(0); config=JSON.parse(File.read(path)); config["reconciliation_interval_seconds"]=1; config["commands"]["orchestrator"]=nil; config["commands"]["orchestrator_audit"]=nil; File.write(path,JSON.pretty_generate(config)+"\n")' "$checkout/.agent-symphony.yaml"
+go build -ldflags "-X=main.livePilotRunID=$run_id -X=main.livePilotSandboxCodex=$sandbox_codex" -o "$fake_bin/codex" "$project_root/scripts/live_pilot_codex.go"
 
 body=$(printf '## Context\n\nAuthenticated isolated pilot `%s`.\n\n## Acceptance criteria\n\n- Complete one implementation, review, pull request, checks, merge, and closure lifecycle.\n\n## Checklist\n\n- [ ] Run the isolated lifecycle.\n\n## Validation\n\nValidate GitHub state, dashboard projection, and exact cleanup.\n\n## Dependencies\n\nNone\n' "$run_id")
 mutation_started=true
@@ -153,7 +155,7 @@ printf '[]\n' >"$state"
 started=$(date +%s)
 (
   cd "$checkout"
-  exec env PATH="$fake_bin:$PATH" CODEX_HOME="$pilot_root/codex-home" TMUX_TMPDIR="$runtime/tmux" AGENT_SYMPHONY_LIVE_RUN_ID="$run_id" "$binary" serve --config "$checkout/.agent-symphony.yaml" --state "$state" --runtime-state "$runtime" --dashboard-address "127.0.0.1:$port" --interval 200ms
+  exec env PATH="$fake_bin:$PATH" CODEX_HOME="$pilot_root/codex-home" TMUX_TMPDIR="$runtime/tmux" "$binary" serve --config "$checkout/.agent-symphony.yaml" --state "$state" --runtime-state "$runtime" --dashboard-address "127.0.0.1:$port" --interval 200ms
 ) >"$pilot_root/serve.log" 2>&1 &
 server_pid=$!
 
