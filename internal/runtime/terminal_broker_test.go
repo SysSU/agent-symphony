@@ -55,6 +55,65 @@ func TestTerminalBrokerWrapperPinsGroupAfterCommandExit(t *testing.T) {
 	}
 }
 
+func TestTerminalBrokerWrapperAnchorSurvivesGracefulGroupStop(t *testing.T) {
+	gateReader, gateWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateWriter.Close()
+	holdReader, holdWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holdWriter.Close()
+	ready := filepath.Join(t.TempDir(), "ready")
+	command := exec.Command("/bin/sh", "-c", terminalBrokerWrapper, "terminal-broker", "/bin/sh", "-c", `trap 'exit 0' TERM; : >"$1"; while :; do sleep 1; done`, "reviewer", ready)
+	command.ExtraFiles = []*os.File{gateReader, holdReader}
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_ = gateReader.Close()
+	_ = holdReader.Close()
+	t.Cleanup(func() {
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		_ = holdWriter.Close()
+	})
+	if _, err := io.WriteString(gateWriter, "go\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = gateWriter.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reviewer did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := syscall.Kill(-command.Process.Pid, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(-command.Process.Pid, 0); err != nil {
+		t.Fatalf("graceful group stop removed the process-group anchor: %v", err)
+	}
+	if err := syscall.Kill(-command.Process.Pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	_ = holdWriter.Close()
+	terminated, err := implementationGroupTerminated(command.Process.Pid)
+	if err != nil || !terminated {
+		t.Fatalf("pinned process group terminated=%t err=%v", terminated, err)
+	}
+}
+
 func startTerminalBrokerFixture(t *testing.T, command ...string) (TerminalBrokerBinding, string, <-chan error, context.CancelFunc) {
 	t.Helper()
 	root, err := os.MkdirTemp("/tmp", "as-terminal-broker-")

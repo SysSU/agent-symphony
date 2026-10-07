@@ -42,7 +42,7 @@ const (
 const terminalBrokerWrapper = `set +m
 IFS= read -r ready <&3 || exit 125
 [ "$ready" = go ] || exit 125
-(exec 0<&4 1>/dev/null 2>/dev/null 3>&- 4<&-; IFS= read -r _) &
+(trap '' HUP INT TERM; exec 0<&4 1>/dev/null 2>/dev/null 3>&- 4<&-; IFS= read -r _) &
 exec "$@" 3>&- 4>&-`
 
 // TerminalBrokerBinding is the immutable, owner-persisted identity needed to

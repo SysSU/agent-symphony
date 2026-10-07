@@ -58,6 +58,7 @@ cat >"$fake_bin/go" <<'EOF'
 #!/bin/sh
 set -eu
 printf 'go %s\n' "$*" >>"$LIVE_PILOT_TEST_LOG"
+if [ "$LIVE_PILOT_TEST_SCENARIO" = setup-failure ]; then exit 18; fi
 output=
 while [ "$#" -gt 0 ]; do
   if [ "$1" = -o ]; then shift; output=$1; fi
@@ -164,9 +165,25 @@ ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]
 ! grep -q '^issue create' "$log"
 
 : >"$log"
+report="$test_root/setup-failure.json"
+set +e
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=setup-failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=sf "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 18
+ruby -rjson -e '
+  r=JSON.parse(File.read(ARGV.fetch(0)))
+  abort unless r["status"]=="failed" && r["exit_status"]==18 && r.dig("cleanup","performed")==true
+  abort unless r.dig("cleanup","verified")=={"runtime_root_absent"=>true} && r.dig("created","issues")==[]
+' "$report"
+runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
+test ! -e "${runtime%/runtime}"
+! grep -q '^issue create' "$log"
+
+: >"$log"
 report="$test_root/success.json"
 set +e
-HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=success LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=success-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=success LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=live-20261007T200000Z-1234 "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -eq 0
@@ -201,7 +218,7 @@ grep -q '^issue create' "$log"
 grep -q "^go build -ldflags -X=main.livePilotRunID=failure-run -o .*\/worker-package\/bin\/codex .*\/scripts\/live_pilot_codex.go$" "$log"
 runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
 pilot_root=${runtime%/runtime}
-case "$pilot_root" in "$private_root"/failure-run.*) ;; *) exit 95;; esac
+case "$pilot_root" in "$private_root"/run.*) ;; *) exit 95;; esac
 tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
 test "${#tmux_socket}" -le 100
 rm -rf "$pilot_root"
@@ -227,7 +244,7 @@ while kill -0 "$server_pid" 2>/dev/null && [ "$attempts" -lt 20 ]; do sleep 0.1;
 ! kill -0 "$server_pid" 2>/dev/null
 runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
 pilot_root=${runtime%/runtime}
-case "$pilot_root" in "$private_root"/stuck-run.*) ;; *) exit 96;; esac
+case "$pilot_root" in "$private_root"/run.*) ;; *) exit 96;; esac
 tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
 test "${#tmux_socket}" -le 100
 rm -rf "$pilot_root"

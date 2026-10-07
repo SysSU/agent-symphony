@@ -48,7 +48,7 @@ printf '%s\n' "$result"
 if [ -n "$report" ]; then umask 077; printf '%s\n' "$result" >"$report"; fi
 if [ "$status" = blocked ]; then exit 3; fi
 
-pilot_root=$(mktemp -d "$pilot_parent/${run_id}.XXXXXX")
+pilot_root=$(mktemp -d "$pilot_parent/run.XXXXXX")
 checkout="$pilot_root/repository"
 runtime="$pilot_root/runtime"
 tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
@@ -114,7 +114,20 @@ report_failure() {
   exit_status=$1
   trap - EXIT HUP INT TERM
   set +e
-  if [ "$completed" = true ] || [ "$mutation_started" != true ]; then exit "$exit_status"; fi
+  if [ "$completed" = true ]; then exit "$exit_status"; fi
+  if [ "$mutation_started" != true ]; then
+    remove_pilot_root
+    root_absent=false
+    if [ ! -e "$pilot_root" ] && [ ! -L "$pilot_root" ]; then root_absent=true; fi
+    result=$(RUN_ID="$run_id" REPOSITORY="$repository" EXIT_STATUS="$exit_status" RUNTIME="$runtime" ROOT_ABSENT="$root_absent" ruby -rjson -rshellwords -e '
+      root_absent=ENV.fetch("ROOT_ABSENT")=="true"
+      commands=[]
+      commands << "rm -rf -- #{Shellwords.escape(File.dirname(ENV.fetch("RUNTIME")))}" unless root_absent
+      puts JSON.generate({schema:"agent-symphony-live-pilot-v1",run_id:ENV.fetch("RUN_ID"),repository:ENV.fetch("REPOSITORY"),status:"failed",exit_status:ENV.fetch("EXIT_STATUS").to_i,created:{issues:[],pull_requests:[],branches:[],sessions:[],worktrees:[],review_snapshots:[],runtime_roots:[ENV.fetch("RUNTIME")]},cleanup:{performed:root_absent,verified:{runtime_root_absent:root_absent},commands:commands}})')
+    printf '%s\n' "$result" >&2
+    if [ -n "$report" ]; then umask 077; printf '%s\n' "$result" >"$report"; fi
+    exit "$exit_status"
+  fi
   latest=$(collect_resources 2>/dev/null)
   if [ -n "$latest" ]; then resources=$latest; fi
   stop_server || true
