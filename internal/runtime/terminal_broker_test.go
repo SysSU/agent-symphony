@@ -16,6 +16,34 @@ import (
 	"time"
 )
 
+func TestTerminalBrokerIdentityFailureKillsExactGatedChild(t *testing.T) {
+	gateReader, gateWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	holdReader, holdWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/sh", "-c", terminalBrokerWrapper, "terminal-broker", "/bin/cat")
+	command.ExtraFiles = []*os.File{gateReader, holdReader}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_ = gateReader.Close()
+	_ = holdReader.Close()
+	done := make(chan error, 1)
+	go func() {
+		stopUnverifiedTerminalBrokerChild(command, gateWriter, holdWriter)
+		done <- nil
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("exact gated child did not exit after identity failure cleanup")
+	}
+}
+
 func TestTerminalBrokerWrapperPinsGroupAfterCommandExit(t *testing.T) {
 	gateReader, gateWriter, err := os.Pipe()
 	if err != nil {

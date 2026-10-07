@@ -166,11 +166,10 @@ func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Comman
 		if err == nil {
 			path, err = resolveNativeCodex(path)
 		}
-		info, statErr := os.Stat(path)
-		if err != nil || statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 || !safeExecutableOwner(info) {
-			return "", errors.New("codex worker executable is unsafe")
+		if err != nil {
+			return "", fmt.Errorf("canonicalize Codex worker executable: %w", err)
 		}
-		if err := validateNativeExecutable(path); err != nil {
+		if err := ValidateNativeCodexExecutable(path); err != nil {
 			return "", err
 		}
 		if source != "" && source != path {
@@ -350,6 +349,16 @@ func resolveNativeCodex(path string) (string, error) {
 		return "", errors.New("codex npm wrapper has no exact native worker executable")
 	}
 	return filepath.EvalSymlinks(matches[0])
+}
+
+// ValidateNativeCodexExecutable applies the ownership, mode, and native-binary
+// checks required before a Codex executable can enforce a managed sandbox.
+func ValidateNativeCodexExecutable(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 || !safeExecutableOwner(info) {
+		return errors.New("codex worker executable is unsafe")
+	}
+	return validateNativeExecutable(path)
 }
 
 func validateNativeExecutable(path string) error {

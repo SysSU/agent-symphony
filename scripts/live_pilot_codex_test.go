@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -29,9 +30,7 @@ func TestResolveLivePilotCodexNPMWrapper(t *testing.T) {
 	if err := os.WriteFile(wrapper, []byte("#!/usr/bin/env node\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(native, []byte("native\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	buildLivePilotNativeFixture(t, native)
 	launcher := filepath.Join(root, "bin", "codex")
 	if err := os.Symlink(wrapper, launcher); err != nil {
 		t.Fatal(err)
@@ -46,6 +45,16 @@ func TestResolveLivePilotCodexNPMWrapper(t *testing.T) {
 	}
 	if resolved, err = resolveLivePilotCodex(native); err != nil || resolved != want {
 		t.Fatalf("standalone resolved=%q want=%q err=%v", resolved, want, err)
+	}
+}
+
+func TestResolveLivePilotCodexRejectsScript(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'codex-cli 0.153.0\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveLivePilotCodex(path); err == nil {
+		t.Fatal("version-compatible script was accepted as native Codex")
 	}
 }
 
@@ -107,23 +116,27 @@ func TestLivePilotCodexVersionAndSandboxDelegation(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	log := filepath.Join(root, "sandbox.log")
 	worker := filepath.Join(root, "codex")
 	delegate := filepath.Join(root, "sandbox-codex")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >\"$LIVE_PILOT_SANDBOX_LOG\"\n"
-	if err := os.WriteFile(delegate, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	buildLivePilotNativeFixture(t, delegate)
 	previousExecutable := livePilotExecutable
+	previousDelegateExec := livePilotDelegateExec
 	livePilotExecutable = func() (string, error) { return worker, nil }
-	t.Cleanup(func() { livePilotExecutable = previousExecutable })
-	t.Setenv("LIVE_PILOT_SANDBOX_LOG", log)
+	var gotPath string
+	var gotArgs, gotEnv []string
+	livePilotDelegateExec = func(path string, args, env []string) error {
+		gotPath, gotArgs, gotEnv = path, append([]string(nil), args...), append([]string(nil), env...)
+		return nil
+	}
+	t.Cleanup(func() {
+		livePilotExecutable = previousExecutable
+		livePilotDelegateExec = previousDelegateExec
+	})
 	if err := runLivePilotCodex([]string{"sandbox", "--", "probe", "sandbox-probe"}, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	body, err := os.ReadFile(log)
-	if err != nil || string(body) != "sandbox -- probe sandbox-probe\n" {
-		t.Fatalf("sandbox delegation = %q, err = %v", body, err)
+	if gotPath != delegate || strings.Join(gotArgs, " ") != delegate+" sandbox -- probe sandbox-probe" || len(gotEnv) == 0 {
+		t.Fatalf("sandbox delegation path=%q args=%q env=%d", gotPath, gotArgs, len(gotEnv))
 	}
 	if err := os.Remove(delegate); err != nil {
 		t.Fatal(err)
@@ -133,5 +146,21 @@ func TestLivePilotCodexVersionAndSandboxDelegation(t *testing.T) {
 	}
 	if err := runLivePilotCodex([]string{"sandbox", "--", "probe"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
 		t.Fatal("symlinked sandbox delegate was accepted")
+	}
+}
+
+func buildLivePilotNativeFixture(t *testing.T, path string) {
+	t.Helper()
+	source := filepath.Join(t.TempDir(), "main.go")
+	if err := os.WriteFile(source, []byte("package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"codex-cli 0.153.0\") }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("go", "build", "-o", path, source)
+	command.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build native Codex fixture: %v: %s", err, output)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
 	}
 }

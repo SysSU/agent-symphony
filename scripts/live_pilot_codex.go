@@ -8,10 +8,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"syscall"
+
+	"github.com/SysSU/agent-symphony/internal/config"
 )
 
 var livePilotRunID string
 var livePilotExecutable = os.Executable
+var livePilotDelegateExec = syscall.Exec
 
 func main() {
 	if err := runLivePilotCodex(os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -39,13 +43,10 @@ func runLivePilotCodex(args []string, stdout, stderr io.Writer) error {
 			return errors.New("live pilot executable path is invalid")
 		}
 		delegate := filepath.Join(filepath.Dir(executable), "sandbox-codex")
-		info, err := os.Lstat(delegate)
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 {
+		if err := config.ValidateNativeCodexExecutable(delegate); err != nil {
 			return errors.New("live pilot pinned sandbox Codex is invalid")
 		}
-		command := exec.Command(delegate, args...)
-		command.Stdin, command.Stdout, command.Stderr = os.Stdin, stdout, stderr
-		if err := command.Run(); err != nil {
+		if err := livePilotDelegateExec(delegate, append([]string{delegate}, args...), os.Environ()); err != nil {
 			return fmt.Errorf("delegate Codex sandbox: %w", err)
 		}
 		return nil
@@ -97,8 +98,7 @@ func resolveLivePilotCodex(path string) (string, error) {
 			return "", err
 		}
 	}
-	info, err := os.Lstat(canonical)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 {
+	if err := config.ValidateNativeCodexExecutable(canonical); err != nil {
 		return "", errors.New("live pilot native Codex is invalid")
 	}
 	return canonical, nil

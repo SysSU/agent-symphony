@@ -45,6 +45,13 @@ IFS= read -r ready <&3 || exit 125
 (trap '' HUP INT TERM; exec 0<&4 1>/dev/null 2>/dev/null 3>&- 4<&-; IFS= read -r _) &
 exec "$@" 3>&- 4>&-`
 
+func stopUnverifiedTerminalBrokerChild(inner *exec.Cmd, gate, hold *os.File) {
+	_ = inner.Process.Kill()
+	_ = gate.Close()
+	_ = hold.Close()
+	_ = inner.Wait()
+}
+
 // TerminalBrokerBinding is the immutable, owner-persisted identity needed to
 // reach one broker. Secret is intentionally excluded from public projections.
 type TerminalBrokerBinding struct {
@@ -243,9 +250,7 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 	_ = holdReader.Close()
 	innerPGID, err := syscall.Getpgid(inner.Process.Pid)
 	if err != nil || innerPGID != inner.Process.Pid {
-		_ = syscall.Kill(-inner.Process.Pid, syscall.SIGKILL)
-		_ = holdWriter.Close()
-		_ = inner.Wait()
+		stopUnverifiedTerminalBrokerChild(inner, gateWriter, holdWriter)
 		return 125, 0, errors.New("terminal broker inner session identity is unavailable")
 	}
 	stopInnerGroup := func() error {
