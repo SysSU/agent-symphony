@@ -2,7 +2,32 @@
 
 package runtime
 
-import "testing"
+import (
+	"errors"
+	"syscall"
+	"testing"
+)
+
+func TestDarwinProcessGroupPermissionProbeUsesExactInventory(t *testing.T) {
+	checked := false
+	terminated, err := waitForDarwinProcessGroup(20, func(int) error { return syscall.EPERM }, func(pgid int) (bool, error) {
+		checked = true
+		if pgid != 20 {
+			t.Fatalf("inventory pgid = %d, want 20", pgid)
+		}
+		return false, nil
+	})
+	if err != nil || !terminated || !checked {
+		t.Fatalf("EPERM fallback terminated=%t checked=%t err=%v", terminated, checked, err)
+	}
+	denied := errors.New("inventory unavailable")
+	if terminated, err = waitForDarwinProcessGroup(20, func(int) error { return denied }, func(int) (bool, error) {
+		t.Fatal("inventory ran after an unknown probe failure")
+		return false, nil
+	}); terminated || !errors.Is(err, denied) {
+		t.Fatalf("unknown probe terminated=%t err=%v", terminated, err)
+	}
+}
 
 func TestParseDarwinProcessGroupIgnoresZombies(t *testing.T) {
 	for _, test := range []struct {

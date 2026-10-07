@@ -97,7 +97,14 @@ func RunPaneCommand(ctx context.Context, tmux string, command []string, stdin io
 // RunPaneCommandAfterStart records launch proof only after the child exists.
 func RunPaneCommandAfterStart(ctx context.Context, tmux string, command []string, stdin io.Reader, stdout, stderr io.Writer, afterStart func(int) error, extraFiles ...*os.File) (int, syscall.Signal, error) {
 	return runReviewerPaneCommand(ctx, tmux, command, stdin, stdout, stderr, afterStart, extraFiles, func(pid int) error {
-		return syscall.Kill(-pid, 0)
+		terminated, err := implementationGroupTerminated(pid)
+		if err != nil {
+			return err
+		}
+		if terminated {
+			return syscall.ESRCH
+		}
+		return nil
 	})
 }
 
@@ -144,11 +151,17 @@ func runReviewerPaneCommand(ctx context.Context, tmux string, command []string, 
 	stop := func() error {
 		killErr := killProcessGroup(child)
 		_ = holdWriter.Close()
+		var probeErr error
+		if killErr == nil {
+			// The wrapper pins its PGID until Wait; prove termination before
+			// reaping it so a reused numeric group cannot affect the result.
+			probeErr = probeGroup(child.Process.Pid)
+		}
 		_ = child.Wait()
 		if killErr != nil {
 			return killErr
 		}
-		if err := reviewerGroupAbsenceError(probeGroup(child.Process.Pid)); err != nil {
+		if err := reviewerGroupAbsenceError(probeErr); err != nil {
 			return err
 		}
 		return nil
