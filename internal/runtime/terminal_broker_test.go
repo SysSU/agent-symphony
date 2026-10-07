@@ -55,26 +55,20 @@ func TestTerminalBrokerWrapperPinsGroupAfterCommandExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer holdWriter.Close()
-	statusReader, statusWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer statusReader.Close()
 	command := exec.Command("/bin/sh", "-c", terminalBrokerWrapper, "terminal-broker", "/bin/sh", "-c", "exit 0")
-	command.ExtraFiles = []*os.File{gateReader, holdReader, statusWriter}
+	command.ExtraFiles = []*os.File{gateReader, holdReader}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
 	_ = gateReader.Close()
 	_ = holdReader.Close()
-	_ = statusWriter.Close()
 	if _, err := io.WriteString(gateWriter, "go\n"); err != nil {
 		t.Fatal(err)
 	}
 	_ = gateWriter.Close()
-	if status, err := readTerminalBrokerWorkerStatus(statusReader); err != nil || status != 0 {
-		t.Fatalf("worker status=%d err=%v", status, err)
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
 	}
 	if err := syscall.Kill(-command.Process.Pid, 0); err != nil {
 		t.Fatalf("process group identity was not pinned after command exit: %v", err)
@@ -83,9 +77,6 @@ func TestTerminalBrokerWrapperPinsGroupAfterCommandExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = holdWriter.Close()
-	if err := command.Wait(); err == nil {
-		t.Fatal("group anchor was not killed")
-	}
 	terminated, err := implementationGroupTerminated(command.Process.Pid)
 	if err != nil || !terminated {
 		t.Fatalf("pinned process group terminated=%t err=%v", terminated, err)
@@ -103,21 +94,15 @@ func TestTerminalBrokerWrapperAnchorSurvivesGracefulGroupStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer holdWriter.Close()
-	statusReader, statusWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer statusReader.Close()
 	ready := filepath.Join(t.TempDir(), "ready")
 	command := exec.Command("/bin/sh", "-c", terminalBrokerWrapper, "terminal-broker", "/bin/sh", "-c", `trap 'exit 0' TERM; : >"$1"; while :; do sleep 1; done`, "reviewer", ready)
-	command.ExtraFiles = []*os.File{gateReader, holdReader, statusWriter}
+	command.ExtraFiles = []*os.File{gateReader, holdReader}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
 	_ = gateReader.Close()
 	_ = holdReader.Close()
-	_ = statusWriter.Close()
 	t.Cleanup(func() {
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 		_ = holdWriter.Close()
@@ -141,8 +126,8 @@ func TestTerminalBrokerWrapperAnchorSurvivesGracefulGroupStop(t *testing.T) {
 	if err := syscall.Kill(-command.Process.Pid, syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
-	if status, err := readTerminalBrokerWorkerStatus(statusReader); err != nil || status != 0 {
-		t.Fatalf("worker status=%d err=%v", status, err)
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
 	}
 	if err := syscall.Kill(-command.Process.Pid, 0); err != nil && !errors.Is(err, syscall.EPERM) {
 		t.Fatalf("graceful group stop removed the process-group anchor: %v", err)
@@ -151,9 +136,6 @@ func TestTerminalBrokerWrapperAnchorSurvivesGracefulGroupStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = holdWriter.Close()
-	if err := command.Wait(); err == nil {
-		t.Fatal("group anchor was not killed")
-	}
 	terminated, err := implementationGroupTerminated(command.Process.Pid)
 	if err != nil || !terminated {
 		t.Fatalf("pinned process group terminated=%t err=%v", terminated, err)
@@ -171,20 +153,14 @@ func TestTerminalBrokerWrapperPinsGroupAfterWorkerSelfKill(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer holdWriter.Close()
-	statusReader, statusWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer statusReader.Close()
-	command := exec.Command("/bin/sh", "-c", terminalBrokerWrapper, "terminal-broker", "/bin/sh", "-c", `group=$(ps -o pgid= -p $$); kill -KILL -"$group"`)
-	command.ExtraFiles = []*os.File{gateReader, holdReader, statusWriter}
+	command := exec.Command("/bin/sh", "-c", terminalBrokerWrapper, "terminal-broker", "/bin/sh", "-c", `kill -KILL 0`)
+	command.ExtraFiles = []*os.File{gateReader, holdReader}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
 	_ = gateReader.Close()
 	_ = holdReader.Close()
-	_ = statusWriter.Close()
 	t.Cleanup(func() {
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 		_ = holdWriter.Close()
@@ -193,13 +169,23 @@ func TestTerminalBrokerWrapperPinsGroupAfterWorkerSelfKill(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = gateWriter.Close()
-	if _, err := readTerminalBrokerWorkerStatus(statusReader); err == nil {
-		t.Fatal("self-killed worker reported a normal status")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		terminated, err := implementationGroupTerminated(command.Process.Pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if terminated {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("self-killed worker did not stop executing")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if err := syscall.Kill(-command.Process.Pid, 0); err != nil && !errors.Is(err, syscall.EPERM) {
 		t.Fatalf("unreaped group leader did not pin the self-killed PGID: %v", err)
 	}
-	_ = holdWriter.Close()
 	if err := command.Wait(); err == nil {
 		t.Fatal("self-killed group leader reported success")
 	}
@@ -312,7 +298,7 @@ func TestTerminalBrokerStopWaitsForExactDeathProof(t *testing.T) {
 }
 
 func TestTerminalBrokerWorkerSelfKillRecordsExactDeath(t *testing.T) {
-	binding, record, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `group=$(ps -o pgid= -p $$); kill -KILL -"$group"`)
+	binding, record, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `kill -KILL 0`)
 	if err := ReleaseTerminalBroker(t.Context(), binding); err != nil {
 		t.Fatal(err)
 	}

@@ -6,7 +6,13 @@ test_root=$(mktemp -d "${TMPDIR:-/tmp}/agent-symphony-live-pilot-test.XXXXXX")
 test_home=$(mktemp -d "$HOME/.aslp-home.XXXXXX")
 unsafe_home=$(mktemp -d "$HOME/.aslp-unsafe-home.XXXXXX")
 linked_home=$(mktemp -d "$HOME/.aslp-linked-home.XXXXXX")
-trap 'rm -rf "$test_root" "$test_home" "$unsafe_home" "$linked_home"' EXIT HUP INT TERM
+cleanup() {
+  for root in "$test_home" "$unsafe_home" "$linked_home"; do
+    if [ -d "$root" ]; then find "$root" -type d -exec chmod u+w {} + 2>/dev/null || true; fi
+  done
+  rm -rf "$test_root" "$test_home" "$unsafe_home" "$linked_home"
+}
+trap cleanup EXIT HUP INT TERM
 private_root="$test_home/.as-live-pilot"
 fake_bin="$test_root/bin"
 mkdir -m 700 "$fake_bin"

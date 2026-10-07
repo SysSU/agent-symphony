@@ -33,6 +33,29 @@ func terminalProcessExited(pid int) (bool, error) {
 	return err == nil && n == 1, err
 }
 
+func terminalWaitProcessExit(pid int) error {
+	fd, err := openLinuxPIDFD(pid)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	if fd >= len((syscall.FdSet{}).Bits)*64 {
+		return errors.New("terminal pidfd exceeds select capacity")
+	}
+	for {
+		var ready syscall.FdSet
+		ready.Bits[fd/64] |= 1 << uint(fd%64)
+		_, err := syscall.Select(fd+1, &ready, nil, nil, nil)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		return err
+	}
+}
+
 func terminalSocketIdentity(info os.FileInfo) (uint64, uint64, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Dev == 0 || stat.Ino == 0 {
