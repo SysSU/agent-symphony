@@ -141,20 +141,7 @@ git -C "$checkout" config user.email "live-pilot@example.invalid"
   "$binary" init
 )
 ruby -rjson -e 'path=ARGV.fetch(0); config=JSON.parse(File.read(path)); config["reconciliation_interval_seconds"]=1; config["commands"]["orchestrator"]=nil; config["commands"]["orchestrator_audit"]=nil; File.write(path,JSON.pretty_generate(config)+"\n")' "$checkout/.agent-symphony.yaml"
-cat >"$fake_bin/codex" <<'EOF'
-#!/bin/sh
-set -eu
-if [ -n "${AGENT_SYMPHONY_REVIEW_RESULT:-}" ]; then
-  printf '%s' '{"type":"agent-symphony-review-v1","status":"clean","findings":[]}' >"$AGENT_SYMPHONY_REVIEW_RESULT"
-  exit 0
-fi
-printf 'isolated live pilot %s\n' '__AGENT_SYMPHONY_LIVE_RUN_ID__' >LIVE_PILOT.md
-git add LIVE_PILOT.md
-git commit -qm "test: isolated live pilot"
-printf '%s\n' '{"type":"agent-symphony-result-v1","validation":"live pilot commit and review lifecycle","documentation":"temporary live pilot marker"}' >"$AGENT_SYMPHONY_IMPLEMENTATION_RESULT"
-EOF
-ruby -e 'path,run_id=ARGV; marker="__AGENT_SYMPHONY_LIVE_RUN_ID__"; body=File.read(path); abort "missing or duplicate live run marker" unless body.scan(marker).length==1; File.write(path,body.sub(marker,run_id))' "$fake_bin/codex" "$run_id"
-chmod 0700 "$fake_bin/codex"
+go build -o "$fake_bin/codex" "$project_root/scripts/live_pilot_codex.go"
 
 body=$(printf '## Context\n\nAuthenticated isolated pilot `%s`.\n\n## Acceptance criteria\n\n- Complete one implementation, review, pull request, checks, merge, and closure lifecycle.\n\n## Checklist\n\n- [ ] Run the isolated lifecycle.\n\n## Validation\n\nValidate GitHub state, dashboard projection, and exact cleanup.\n\n## Dependencies\n\nNone\n' "$run_id")
 mutation_started=true
@@ -166,7 +153,7 @@ printf '[]\n' >"$state"
 started=$(date +%s)
 (
   cd "$checkout"
-  exec env PATH="$fake_bin:$PATH" CODEX_HOME="$pilot_root/codex-home" TMUX_TMPDIR="$runtime/tmux" "$binary" serve --config "$checkout/.agent-symphony.yaml" --state "$state" --runtime-state "$runtime" --dashboard-address "127.0.0.1:$port" --interval 200ms
+  exec env PATH="$fake_bin:$PATH" CODEX_HOME="$pilot_root/codex-home" TMUX_TMPDIR="$runtime/tmux" AGENT_SYMPHONY_LIVE_RUN_ID="$run_id" "$binary" serve --config "$checkout/.agent-symphony.yaml" --state "$state" --runtime-state "$runtime" --dashboard-address "127.0.0.1:$port" --interval 200ms
 ) >"$pilot_root/serve.log" 2>&1 &
 server_pid=$!
 

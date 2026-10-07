@@ -49,6 +49,7 @@ EOF
 cat >"$fake_bin/go" <<'EOF'
 #!/bin/sh
 set -eu
+printf 'go %s\n' "$*" >>"$LIVE_PILOT_TEST_LOG"
 output=
 while [ "$#" -gt 0 ]; do
   if [ "$1" = -o ]; then shift; output=$1; fi
@@ -130,6 +131,7 @@ ruby -rjson -e '
   abort unless r.dig("cleanup","diagnostics_preserved") && commands.any? { |command| command.include?("gh issue close 99") } && commands.any? { |command| command.include?("only after preserving diagnostics") }
 ' "$report"
 grep -q '^issue create' "$log"
+grep -q "^go build -o .*\/bin\/codex .*\/scripts\/live_pilot_codex.go$" "$log"
 runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
 pilot_root=${runtime%/runtime}
 case "$pilot_root" in "$private_root"/failure-run.*) ;; *) exit 95;; esac
