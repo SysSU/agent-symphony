@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 )
 
 var livePilotRunID string
@@ -20,6 +21,14 @@ func main() {
 }
 
 func runLivePilotCodex(args []string, stdout, stderr io.Writer) error {
+	if len(args) == 2 && args[0] == "--live-pilot-resolve-native" {
+		path, err := resolveLivePilotCodex(args[1])
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(stdout, path)
+		return err
+	}
 	if len(args) == 1 && args[0] == "--version" {
 		_, err := fmt.Fprintln(stdout, "codex-cli 0.153.0")
 		return err
@@ -60,4 +69,37 @@ func runLivePilotCodex(args []string, stdout, stderr io.Writer) error {
 		}
 	}
 	return os.WriteFile(result, []byte("{\"type\":\"agent-symphony-result-v1\",\"validation\":\"live pilot commit and review lifecycle\",\"documentation\":\"temporary live pilot marker\"}\n"), 0o600)
+}
+
+func resolveLivePilotCodex(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return "", errors.New("live pilot Codex path is not absolute")
+	}
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	if filepath.Base(canonical) == "codex.js" {
+		platform := map[string]string{
+			"darwin/amd64": "darwin-x64", "darwin/arm64": "darwin-arm64",
+			"linux/amd64": "linux-x64", "linux/arm64": "linux-arm64",
+		}[runtime.GOOS+"/"+runtime.GOARCH]
+		if platform == "" {
+			return "", errors.New("live pilot Codex npm wrapper has no supported native executable")
+		}
+		packageRoot := filepath.Dir(filepath.Dir(canonical))
+		matches, globErr := filepath.Glob(filepath.Join(packageRoot, "node_modules", "@openai", "codex-"+platform, "vendor", "*", "bin", "codex"))
+		if globErr != nil || len(matches) != 1 {
+			return "", errors.New("live pilot Codex npm wrapper has no exact native executable")
+		}
+		canonical, err = filepath.EvalSymlinks(matches[0])
+		if err != nil {
+			return "", err
+		}
+	}
+	info, err := os.Lstat(canonical)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 {
+		return "", errors.New("live pilot native Codex is invalid")
+	}
+	return canonical, nil
 }

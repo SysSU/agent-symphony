@@ -161,6 +161,9 @@ trap 'exit 143' TERM
 
 mkdir -m 700 "$worker_root" "$fake_bin"
 printf '%s\n' '{"private":true}' >"$worker_root/package.json"
+go build -ldflags "-X=main.livePilotRunID=$run_id" -o "$fake_bin/codex" "$project_root/scripts/live_pilot_codex.go"
+sandbox_codex=$("$fake_bin/codex" --live-pilot-resolve-native "$sandbox_codex")
+test "$("$sandbox_codex" --version)" = "codex-cli 0.153.0"
 cp "$sandbox_codex" "$fake_bin/sandbox-codex"
 chmod 0500 "$fake_bin/sandbox-codex"
 (cd "$project_root" && go build -o "$binary" ./cmd/agent-symphony)
@@ -172,7 +175,6 @@ git -C "$checkout" config user.email "live-pilot@example.invalid"
   "$binary" init
 )
 ruby -rjson -e 'path=ARGV.fetch(0); config=JSON.parse(File.read(path)); config["reconciliation_interval_seconds"]=1; config["commands"]["orchestrator"]=nil; config["commands"]["orchestrator_audit"]=nil; File.write(path,JSON.pretty_generate(config)+"\n")' "$checkout/.agent-symphony.yaml"
-go build -ldflags "-X=main.livePilotRunID=$run_id" -o "$fake_bin/codex" "$project_root/scripts/live_pilot_codex.go"
 
 body=$(printf '## Context\n\nAuthenticated isolated pilot `%s`.\n\n## Acceptance criteria\n\n- Complete one implementation, review, pull request, checks, merge, and closure lifecycle.\n\n## Checklist\n\n- [ ] Run the isolated lifecycle.\n\n## Validation\n\nValidate GitHub state, dashboard projection, and exact cleanup.\n\n## Dependencies\n\nNone\n' "$run_id")
 mutation_started=true

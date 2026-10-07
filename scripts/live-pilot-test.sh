@@ -69,6 +69,9 @@ cat >"$output" <<'SCRIPT'
 #!/bin/sh
 set -eu
 case "$1" in
+  --live-pilot-resolve-native)
+    printf '%s\n' "$2"
+    ;;
   init)
     printf '%s\n' '{"commands":{"orchestrator":[],"orchestrator_audit":[]}}' >.agent-symphony.yaml
     ;;
@@ -103,6 +106,7 @@ EOF
 
 cat >"$fake_bin/codex" <<'EOF'
 #!/bin/sh
+if [ "$1" = --version ]; then printf 'codex-cli 0.153.0\n'; fi
 exit 0
 EOF
 

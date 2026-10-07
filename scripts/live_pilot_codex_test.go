@@ -4,9 +4,50 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestResolveLivePilotCodexNPMWrapper(t *testing.T) {
+	platform := map[string]string{
+		"darwin/amd64": "darwin-x64", "darwin/arm64": "darwin-arm64",
+		"linux/amd64": "linux-x64", "linux/arm64": "linux-arm64",
+	}[runtime.GOOS+"/"+runtime.GOARCH]
+	if platform == "" {
+		t.Skip("platform has no supported live pilot Codex package")
+	}
+	root := t.TempDir()
+	packageRoot := filepath.Join(root, "lib", "node_modules", "@openai", "codex")
+	wrapper := filepath.Join(packageRoot, "bin", "codex.js")
+	native := filepath.Join(packageRoot, "node_modules", "@openai", "codex-"+platform, "vendor", "test-target", "bin", "codex")
+	for _, dir := range []string{filepath.Dir(wrapper), filepath.Dir(native), filepath.Join(root, "bin")} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(wrapper, []byte("#!/usr/bin/env node\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(native, []byte("native\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	launcher := filepath.Join(root, "bin", "codex")
+	if err := os.Symlink(wrapper, launcher); err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveLivePilotCodex(launcher)
+	if err != nil || resolved != want {
+		t.Fatalf("resolved=%q want=%q err=%v", resolved, want, err)
+	}
+	if resolved, err = resolveLivePilotCodex(native); err != nil || resolved != want {
+		t.Fatalf("standalone resolved=%q want=%q err=%v", resolved, want, err)
+	}
+}
 
 func TestLivePilotCodexReview(t *testing.T) {
 	result := filepath.Join(t.TempDir(), "review.json")
