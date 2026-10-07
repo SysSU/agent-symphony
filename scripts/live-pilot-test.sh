@@ -58,13 +58,19 @@ cat >"$fake_bin/go" <<'EOF'
 #!/bin/sh
 set -eu
 printf 'go %s\n' "$*" >>"$LIVE_PILOT_TEST_LOG"
-if [ "$LIVE_PILOT_TEST_SCENARIO" = setup-failure ]; then exit 18; fi
 output=
 while [ "$#" -gt 0 ]; do
   if [ "$1" = -o ]; then shift; output=$1; fi
   shift
 done
 test -n "$output"
+case "$output" in
+  */worker-package/bin/codex)
+    package_root=$(dirname "$(dirname "$output")")
+    ruby -e 'exit((File.stat(ARGV.fetch(0)).mode & 0777)==0600 ? 0 : 1)' "$package_root/package.json"
+    ;;
+esac
+if [ "$LIVE_PILOT_TEST_SCENARIO" = setup-failure ]; then exit 18; fi
 cat >"$output" <<'SCRIPT'
 #!/bin/sh
 set -eu
@@ -106,7 +112,7 @@ EOF
 
 cat >"$fake_bin/codex" <<'EOF'
 #!/bin/sh
-if [ "$1" = --version ]; then printf 'codex-cli 0.153.0\n'; fi
+if [ "$1" = --version ]; then printf 'codex-cli 0.153.4\n'; fi
 exit 0
 EOF
 
@@ -167,6 +173,14 @@ set -e
 test "$status" -eq 3
 ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]=="blocked" && r["blocker"].include?("already used") && r.dig("preflight","used_run_id").length==1' "$report"
 ! grep -q '^issue create' "$log"
+
+: >"$log"
+set +e
+(umask 002; HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=setup-failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=sf-no-report "$project_root/scripts/live-pilot.sh" >/dev/null 2>&1)
+status=$?
+set -e
+test "$status" -eq 18
+grep -q '^go build' "$log"
 
 : >"$log"
 report="$test_root/setup-failure.json"

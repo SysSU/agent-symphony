@@ -9,6 +9,7 @@ if [ "${AGENT_SYMPHONY_LIVE_PILOT:-}" != 1 ]; then
   echo "set AGENT_SYMPHONY_LIVE_PILOT=1 to authorize the isolated sample-repository pilot" >&2
   exit 2
 fi
+umask 077
 case "$run_id" in *[!A-Za-z0-9._-]*|'') echo "invalid live pilot run ID" >&2; exit 2;; esac
 for command in codex cp find gh git go id ps ruby tmux; do command -v "$command" >/dev/null; done
 sandbox_codex=$(command -v codex)
@@ -163,7 +164,7 @@ mkdir -m 700 "$worker_root" "$fake_bin"
 printf '%s\n' '{"private":true}' >"$worker_root/package.json"
 go build -ldflags "-X=main.livePilotRunID=$run_id" -o "$fake_bin/codex" "$project_root/scripts/live_pilot_codex.go"
 sandbox_codex=$("$fake_bin/codex" --live-pilot-resolve-native "$sandbox_codex")
-test "$("$sandbox_codex" --version)" = "codex-cli 0.153.0"
+case "$("$sandbox_codex" --version)" in 'codex-cli 0.153.'*) ;; *) echo "unsupported Codex live pilot version" >&2; exit 2;; esac
 cp "$sandbox_codex" "$fake_bin/sandbox-codex"
 chmod 0500 "$fake_bin/sandbox-codex"
 (cd "$project_root" && go build -o "$binary" ./cmd/agent-symphony)

@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -37,19 +39,39 @@ const (
 	terminalFrameResize byte = 6
 )
 
-// A silent member keeps the process-group identity allocated after the
-// foreground command exits, until the broker can signal that exact group.
+// The direct child remains the process-group leader until the broker has
+// signaled the exact group and proved that no active member remains. Keeping
+// the leader unreaped also pins the PGID if the worker kills its whole group.
 const terminalBrokerWrapper = `set +m
+trap '' HUP INT TERM
 IFS= read -r ready <&3 || exit 125
 [ "$ready" = go ] || exit 125
-(trap '' HUP INT TERM; exec 0<&4 1>/dev/null 2>/dev/null 3>&- 4<&-; IFS= read -r _) &
-exec "$@" 3>&- 4>&-`
+(trap - HUP INT TERM; exec "$@" 3>&- 4>&- 5>&-) 0<&0 1>&1 2>&2 &
+worker=$!
+wait "$worker"
+status=$?
+printf '%s\n' "$status" >&5
+exec 0</dev/null 1>/dev/null 2>/dev/null 3>&- 5>&-
+IFS= read -r _ <&4
+exit "$status"`
 
 func stopUnverifiedTerminalBrokerChild(inner *exec.Cmd, gate, hold *os.File) {
 	_ = inner.Process.Kill()
 	_ = gate.Close()
 	_ = hold.Close()
 	_ = inner.Wait()
+}
+
+func readTerminalBrokerWorkerStatus(reader io.Reader) (int, error) {
+	body, err := io.ReadAll(io.LimitReader(reader, 5))
+	if err != nil {
+		return 0, err
+	}
+	status, err := strconv.Atoi(strings.TrimSpace(string(body)))
+	if err != nil || status < 0 || status > 255 {
+		return 0, errors.New("terminal broker worker status is unavailable")
+	}
+	return status, nil
 }
 
 // TerminalBrokerBinding is the immutable, owner-persisted identity needed to
@@ -236,8 +258,14 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 	}
 	defer holdReader.Close()
 	defer holdWriter.Close()
+	statusReader, statusWriter, err := os.Pipe()
+	if err != nil {
+		return 125, 0, err
+	}
+	defer statusReader.Close()
+	defer statusWriter.Close()
 	inner := exec.Command("/bin/sh", append([]string{"-c", terminalBrokerWrapper, "terminal-broker"}, command...)...)
-	inner.ExtraFiles = []*os.File{gateReader, holdReader}
+	inner.ExtraFiles = []*os.File{gateReader, holdReader, statusWriter}
 	size := &pty.Winsize{Rows: 24, Cols: 80}
 	if current, sizeErr := pty.GetsizeFull(outerIn); sizeErr == nil && current.Rows >= 2 && current.Cols >= 2 {
 		size = current
@@ -248,6 +276,7 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 	}
 	_ = gateReader.Close()
 	_ = holdReader.Close()
+	_ = statusWriter.Close()
 	innerPGID, err := syscall.Getpgid(inner.Process.Pid)
 	if err != nil || innerPGID != inner.Process.Pid {
 		stopUnverifiedTerminalBrokerChild(inner, gateWriter, holdWriter)
@@ -317,9 +346,10 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 			}
 		}
 	}()
+	workerStatus, workerStatusErr := readTerminalBrokerWorkerStatus(statusReader)
+	cleanupErr := stopInnerGroup()
 	waitErr := inner.Wait()
 	close(broker.innerEnd)
-	cleanupErr := stopInnerGroup()
 	if cleanupErr == nil {
 		select {
 		case <-outputDone:
@@ -348,9 +378,19 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 	if cleanupErr != nil {
 		return 125, 0, cleanupErr
 	}
+	if inner.ProcessState == nil {
+		return 125, 0, errors.Join(workerStatusErr, waitErr, errors.New("terminal broker child wait status is unavailable"))
+	}
 	status, ok := inner.ProcessState.Sys().(syscall.WaitStatus)
 	if !ok {
 		return 125, 0, errors.New("terminal broker child wait status is unavailable")
+	}
+	if workerStatusErr == nil {
+		if workerStatus > 128 {
+			signal := syscall.Signal(workerStatus - 128)
+			return workerStatus, signal, nil
+		}
+		return workerStatus, 0, nil
 	}
 	if status.Signaled() {
 		return 128 + int(status.Signal()), status.Signal(), nil
@@ -359,7 +399,7 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 	if waitErr != nil {
 		var exit *exec.ExitError
 		if !errors.As(waitErr, &exit) {
-			return code, 0, waitErr
+			return 125, 0, errors.Join(workerStatusErr, waitErr)
 		}
 	}
 	return code, 0, nil
@@ -579,8 +619,6 @@ func (b *terminalBroker) releaseInner() error {
 	return b.releaseErr
 }
 
-func killTerminalBrokerForeground(pid int) error { return syscall.Kill(pid, syscall.SIGKILL) }
-
 func (b *terminalBroker) killInner() {
 	b.stop.Do(func() {
 		select {
@@ -594,7 +632,7 @@ func (b *terminalBroker) killInner() {
 			select {
 			case <-b.innerEnd:
 			case <-time.After(2 * time.Second):
-				_ = killTerminalBrokerForeground(b.binding.InnerPID)
+				_ = syscall.Kill(-b.binding.InnerPGID, syscall.SIGKILL)
 			}
 		}()
 	})
