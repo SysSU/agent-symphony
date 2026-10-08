@@ -84,7 +84,7 @@ type EffectCleanupPolicy struct {
 	PublishedHead             string
 	CompatibilityManifestSeen bool
 	CompatibilityLogSeen      bool
-	Unlaunched                bool
+	Unlaunched                bool `json:",omitempty"`
 }
 
 // EffectRuntime is the process configuration and environment snapshot used by

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -819,6 +820,20 @@ func TestEffectVerificationSettlesGenerationBoundConfinedStopAfterRestart(t *tes
 }
 
 func TestEffectCleanupPolicyIsClosedAndDigestBound(t *testing.T) {
+	legacyJSON, err := json.Marshal(EffectCleanupPolicy{Action: "abandon"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(legacyJSON), "Unlaunched") {
+		t.Fatalf("false unlaunched bit changed the legacy digest shape: %s", legacyJSON)
+	}
+	unlaunchedJSON, err := json.Marshal(EffectCleanupPolicy{Action: "abandon", Unlaunched: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(unlaunchedJSON), `"Unlaunched":true`) {
+		t.Fatalf("true unlaunched bit was not digest-bound: %s", unlaunchedJSON)
+	}
 	r, _, attempt, _ := testRuntime(t)
 	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(4, 0))
 	if err != nil {
