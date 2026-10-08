@@ -500,7 +500,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		if command.Reconciliation == nil || command.Runtime != nil || command.CleanupDigest != "" || command.PublishedHead != "" {
 			return nil, errors.Join(errors.New("review-plan command shape"), errStateConflict)
 		}
-		if manifest.State != "running" || command.Reconciliation.Request.Action != reconciliationReviewer || command.Reconciliation.Request.Reviewer == nil || command.Reconciliation.Request.Reviewer.Mode != agentruntime.ReviewModePlan {
+		if !slices.Contains([]string{"running", "completed"}, manifest.State) || command.Reconciliation.Request.Action != reconciliationReviewer || command.Reconciliation.Request.Reviewer == nil || command.Reconciliation.Request.Reviewer.Mode != agentruntime.ReviewModePlan {
 			return nil, errors.Join(errors.New("review-plan runtime state"), errStateConflict)
 		}
 		begin := *command.Reconciliation
