@@ -35,6 +35,7 @@ const (
 	attemptGroup           = "agent-symphony-attempt"
 	snapshotGroup          = "agent-symphony-snapshot"
 	orchestratorLaunchFile = "orchestrator-launch.json"
+	workerGitExecutableEnv = "AGENT_SYMPHONY_GIT_EXECUTABLE"
 )
 
 var (
@@ -72,6 +73,30 @@ var (
 
 func runHostTmux(ctx context.Context, args []string, stdin io.Reader) (agentruntime.Result, error) {
 	return hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: args, Dir: "/tmp", Stdin: stdin})
+}
+
+func workerGitExecutable() (string, error) {
+	name := "git"
+	if hostGOOS == "darwin" {
+		output, err := hostOutput("/usr/bin/xcrun", "--find", "git")
+		if err != nil {
+			return "", fmt.Errorf("resolve Xcode git: %w", err)
+		}
+		name = strings.TrimSpace(string(output))
+	}
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return "", fmt.Errorf("resolve git executable: %w", err)
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil || !filepath.IsAbs(path) {
+		return "", errors.New("resolved git executable is invalid")
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", errors.New("resolved git executable is not executable")
+	}
+	return path, nil
 }
 
 func nativeRoot(path string) string { return filepath.Join(hostRoot, path) }
@@ -1193,7 +1218,11 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if err := config.VerifyWorkerExecutable(ctx, codexExecutable, profileDigest); err != nil {
 			return err
 		}
-		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgsForExecutable(manifest.Worktree, codexExecutable, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp}, Stdin: bytes.NewReader(request.Command.Input)})
+		gitExecutable, gitErr := workerGitExecutable()
+		if gitErr != nil {
+			return gitErr
+		}
+		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgsForExecutable(manifest.Worktree, codexExecutable, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp, workerGitExecutableEnv + "=" + gitExecutable}, Stdin: bytes.NewReader(request.Command.Input)})
 	case "validate-cleanup", "cleanup":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot clean implementation attempts")
@@ -2180,8 +2209,12 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if identityErr != nil || !agentruntime.ValidManifestVersion(manifest) || manifest.State != "completed" || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session {
 		return "", errors.New("invalid export manifest")
 	}
+	gitExecutable := strings.TrimSpace(os.Getenv(workerGitExecutableEnv))
+	if !filepath.IsAbs(gitExecutable) {
+		return "", errors.New("worker git executable is unavailable")
+	}
 	run := func(args ...string) (string, error) {
-		cmd := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", manifest.Worktree}, args...)...)
+		cmd := exec.CommandContext(ctx, gitExecutable, append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", manifest.Worktree}, args...)...)
 		cmd.Env = append(minimalBoundaryEnvironment(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr

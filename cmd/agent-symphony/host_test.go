@@ -1052,6 +1052,8 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 if [ "$1" = sandbox ]; then
   while [ "$1" != -- ]; do shift; done
   shift
+  PATH=/nonexistent
+  export PATH
   exec "$@"
 fi
 exit 1`)
@@ -2634,9 +2636,13 @@ func TestSandboxedWorkerExportCannotRunGitConfigWithOwnerAuthority(t *testing.T)
 	}
 	manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, Repository: "o/r", Issue: 329, Attempt: 1, Branch: runGit(t, workspace, "branch", "--show-current"), Worktree: workspace, BaseSHA: baseSHA, State: "completed", WorkerGeneration: 1, WorkerProfileDigest: config.WorkerProfileDigest()}
 	input, _ := json.Marshal(manifest)
+	gitExecutable, err := workerGitExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
 	command := exec.CommandContext(t.Context(), codexExecutable, config.WorkerSandboxArgsForExecutable(workspace, codexExecutable, binary, "export-attempt", attemptRoot)...)
 	command.Dir = workspace
-	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(workspace, ".agent-symphony")}
+	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(workspace, ".agent-symphony"), workerGitExecutableEnv + "=" + gitExecutable}
 	command.Stdin = bytes.NewReader(input)
 	_, _ = command.CombinedOutput() // A hostile filter may make export fail closed.
 	if _, err := os.Lstat(canary); !errors.Is(err, os.ErrNotExist) {
