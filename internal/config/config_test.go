@@ -379,6 +379,16 @@ func TestLoadAndValidate(t *testing.T) {
 	}
 }
 
+func TestDefaultWorkersDisableBundledSkills(t *testing.T) {
+	for _, command := range [][]string{defaultWorkerCommand(false), defaultWorkerCommand(true)} {
+		setting := slices.Index(command, `skills.bundled.enabled=false`)
+		exec := slices.Index(command, "exec")
+		if setting < 1 || command[setting-1] != "-c" || exec < 0 || setting > exec {
+			t.Fatalf("worker may materialize bundled skills: %q", command)
+		}
+	}
+}
+
 func TestReconciliationIntervalConfiguration(t *testing.T) {
 	c := Default("owner/repo")
 	c.ReconciliationIntervalSeconds = 20

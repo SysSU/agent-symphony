@@ -46,6 +46,7 @@ var workerSafetyArgs = []string{
 	"-c", workerPermissions,
 	"-c", workerEnvironment,
 	"-c", `web_search="disabled"`,
+	"-c", `skills.bundled.enabled=false`,
 	"--disable", "apps",
 	"--disable", "browser_use",
 	"--disable", "browser_use_external",
