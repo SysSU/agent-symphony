@@ -4088,6 +4088,13 @@ func TestPendingLegacyUnlaunchedAbandonUsesProvedCleanupBoundary(t *testing.T) {
 	if !slices.Equal(implementation.operations(), []string{"abandon-unlaunched"}) {
 		t.Fatalf("legacy pending cleanup operations=%v", implementation.operations())
 	}
+	legacyManifest := manifest
+	legacyManifest.Version, legacyManifest.LaunchToken = 1, ""
+	legacyRequest, legacyTombstone := request, committed.State.Tombstones[key]
+	legacyRequest.Manifest, legacyTombstone.Manifest = legacyManifest, &legacyManifest
+	if legacyUnlaunchedAbandon(legacyRequest, legacyTombstone) {
+		t.Fatal("legacy v1 manifest gained unlaunched cleanup authority")
+	}
 }
 
 func TestMachineStatusAdmissionRecollectsAfterDestructiveAction(t *testing.T) {

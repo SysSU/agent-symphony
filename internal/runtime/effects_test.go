@@ -872,6 +872,12 @@ func TestEffectCleanupPolicyIsClosedAndDigestBound(t *testing.T) {
 			t.Fatalf("accepted cleanup policy %#v", policy)
 		}
 	}
+	legacyUnlaunched := base
+	legacyUnlaunched.Manifest.Version, legacyUnlaunched.Manifest.LaunchToken = 1, ""
+	legacyUnlaunched.Cleanup = EffectCleanupPolicy{Action: "abandon", Unlaunched: true}
+	if err := executor.ValidateRequest(legacyUnlaunched); err == nil {
+		t.Fatal("accepted unlaunched cleanup for a legacy v1 manifest")
+	}
 	prepare := EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true, Cleanup: EffectCleanupPolicy{Action: "archive"}}
 	prepare, err = executor.BindRequest(prepare)
 	if err != nil {

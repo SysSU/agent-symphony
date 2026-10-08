@@ -1320,7 +1320,7 @@ func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.M
 	if publishedHead != "" && manifest.State != "completed" && manifest.State != "failed" && manifest.State != "cancelled" {
 		return errors.New("permanent removal requires a terminal attempt")
 	}
-	if unlaunched && (completed || publishedHead != "" || manifest.State != "preparing" || manifest.LaunchID != "") {
+	if unlaunched && (completed || publishedHead != "" || manifest.Version != agentruntime.ManifestVersion2 || manifest.State != "preparing" || manifest.LaunchID != "") {
 		return errors.New("unlaunched cleanup requires a preparing attempt without launch identity")
 	}
 

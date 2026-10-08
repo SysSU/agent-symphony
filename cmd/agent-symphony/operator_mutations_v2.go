@@ -412,7 +412,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		}
 		if command.CleanupPolicy.Unlaunched {
 			pending, pendingErr := pendingStartCandidate(*state, manifest)
-			if request.Action != "abandon" || manifest.State != "preparing" || manifest.LaunchID != "" || pendingErr != nil || pending != nil {
+			if request.Action != "abandon" || manifest.Version != agentruntime.ManifestVersion2 || manifest.State != "preparing" || manifest.LaunchID != "" || pendingErr != nil || pending != nil {
 				return nil, errStateConflict
 			}
 		}

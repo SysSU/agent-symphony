@@ -686,7 +686,7 @@ func (e EffectExecutor) ValidateRequest(request EffectRequest) error {
 			return errors.New("handoff effect input is invalid")
 		}
 	case EffectCleanup:
-		if e.Cleanup == nil || e.VerifyCleanup == nil || !validEffectCleanupPolicy(request.Cleanup) || request.Cleanup.Unlaunched && (request.Manifest.State != "preparing" || request.Manifest.LaunchID != "") {
+		if e.Cleanup == nil || e.VerifyCleanup == nil || !validEffectCleanupPolicy(request.Cleanup) || request.Cleanup.Unlaunched && (request.Manifest.Version != ManifestVersion2 || request.Manifest.State != "preparing" || request.Manifest.LaunchID != "") {
 			return errors.New("cleanup effect policy is invalid")
 		}
 	}

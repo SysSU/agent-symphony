@@ -1511,6 +1511,12 @@ func TestAbandonUnlaunchedPreparingAttempt(t *testing.T) {
 		t.Fatalf("failed preflight changed worktree: %v", err)
 	}
 	live = false
+	legacy := manifest
+	legacy.Version, legacy.LaunchToken = 1, ""
+	legacyBody, _ := json.Marshal(legacy)
+	if err := validateOrAbandonUnlaunchedAttempt(t.Context(), legacyBody, root, false); err == nil {
+		t.Fatal("legacy v1 manifest passed unlaunched cleanup preflight")
+	}
 	if err := validateOrAbandonUnlaunchedAttempt(t.Context(), body, root, false); err != nil {
 		t.Fatalf("unlaunched preflight: %v", err)
 	}

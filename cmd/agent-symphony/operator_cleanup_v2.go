@@ -114,7 +114,7 @@ func (e operatorCleanupExecutor) execute(ctx context.Context, request agentrunti
 // already proved that no Start candidate or reviewer authority survived.
 func legacyUnlaunchedAbandon(request agentruntime.EffectRequest, tombstone runtimeTombstone) bool {
 	return request.Cleanup.Action == "abandon" && !request.Cleanup.Unlaunched &&
-		request.Manifest.State == "preparing" && request.Manifest.LaunchID == "" &&
+		request.Manifest.Version == agentruntime.ManifestVersion2 && request.Manifest.State == "preparing" && request.Manifest.LaunchID == "" &&
 		tombstone.Action == "abandoned" && tombstone.Manifest != nil && reflect.DeepEqual(*tombstone.Manifest, request.Manifest) &&
 		tombstone.CleanupPolicy != nil && *tombstone.CleanupPolicy == request.Cleanup && tombstone.InvalidatedStart == nil
 }

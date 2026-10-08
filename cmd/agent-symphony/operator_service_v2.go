@@ -602,7 +602,7 @@ func (s *operatorMutationService) prepareAdmission(ctx context.Context, snapshot
 		work.runtime = &cleanup
 	case "archive", "abandon", "remove":
 		cleanup := agentruntime.EffectRequest{Action: agentruntime.EffectCleanup, Attempt: operatorEffectAttempt(manifest), Manifest: manifest, Cleanup: agentruntime.EffectCleanupPolicy{Action: request.Action}}
-		if request.Action == "abandon" && manifest.State == "preparing" && manifest.LaunchID == "" {
+		if request.Action == "abandon" && manifest.Version == agentruntime.ManifestVersion2 && manifest.State == "preparing" && manifest.LaunchID == "" {
 			pending, pendingErr := pendingStartCandidate(snapshot.State, manifest)
 			if pendingErr != nil {
 				return beginOperatorMutationCommand{}, operatorWork{}, pendingErr
