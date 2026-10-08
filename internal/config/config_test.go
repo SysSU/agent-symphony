@@ -148,6 +148,38 @@ func TestPinWorkerExecutableSurvivesConfiguredPathSwap(t *testing.T) {
 	}
 }
 
+func TestPinWorkerExecutableIncludesStandaloneCodeModeHost(t *testing.T) {
+	sourceRoot := t.TempDir()
+	source := filepath.Join(sourceRoot, "codex")
+	host := filepath.Join(sourceRoot, "codex-code-mode-host")
+	buildNativeCodexFixture(t, source, "codex")
+	buildNativeCodexFixture(t, host, "host-one")
+	t.Setenv("PATH", sourceRoot+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stateRoot := pinnedTestRoot(t)
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = source, source
+	firstDigest, err := PinWorkerExecutable(t.Context(), stateRoot, &commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedHost := filepath.Join(filepath.Dir(commands.Implementation[0]), filepath.Base(host))
+	output, err := exec.Command(pinnedHost).Output()
+	if info, statErr := os.Stat(pinnedHost); err != nil || statErr != nil || strings.TrimSpace(string(output)) != "host-one" || info.Mode().Perm() != 0o500 {
+		t.Fatalf("pinned host=%q mode=%v output=%q err=%v stat=%v", pinnedHost, info, output, err, statErr)
+	}
+
+	buildNativeCodexFixture(t, host, "host-two")
+	restarted := Default("o/r").Commands
+	restarted.Implementation[0], restarted.Reviewer[0] = source, source
+	secondDigest, err := PinWorkerExecutable(t.Context(), stateRoot, &restarted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstDigest == secondDigest || filepath.Dir(commands.Implementation[0]) == filepath.Dir(restarted.Implementation[0]) {
+		t.Fatalf("changed code-mode host retained pinned identity: %q/%q %q/%q", firstDigest, commands.Implementation[0], secondDigest, restarted.Implementation[0])
+	}
+}
+
 func TestPinWorkerExecutablePublishesPackageTree(t *testing.T) {
 	packageRoot := filepath.Join(t.TempDir(), "codex-package")
 	source := filepath.Join(packageRoot, "bin", "codex")
