@@ -1678,7 +1678,7 @@ func isExitCode(err error, code int) bool {
 }
 
 func validateBoundaryCommand(c boundaryCommand, root string) error {
-	if (c.Name != "git" && c.Name != "tmux") || len(c.Args) > 128 || len(c.Env) > 64 || len(c.Input) > 1<<20 {
+	if (c.Name != "git" && c.Name != "tmux") || len(c.Args) > 130 || len(c.Env) > 64 || len(c.Input) > 1<<20 {
 		return errors.New("boundary command is not allowed")
 	}
 	if c.Dir != "" {
