@@ -1477,6 +1477,7 @@ func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
 	runGit(t, worker, "add", "file")
 	runGit(t, worker, "commit", "-m", "base")
 	base := runGit(t, worker, "rev-parse", "HEAD")
+	runGit(t, coordinator, "fetch", "--no-tags", worker, base)
 	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("head"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1514,12 +1515,6 @@ func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
 		return importWorkerExport(t.Context(), workerBoundaryRunner{Command: script}, filepath.Join(coordinator, "state"), 1, manifest)
 	}
 
-	if _, _, _, err := importBundle(head, "HEAD", "^"+base); err == nil || !strings.Contains(err.Error(), "worker bundle verification failed") {
-		t.Fatalf("prerequisite-dependent bundle err=%v", err)
-	}
-	if err := exec.Command("git", "-C", coordinator, "cat-file", "-e", head).Run(); err == nil {
-		t.Fatal("failed import changed the configured repository")
-	}
 	if _, _, _, err := importBundle(intermediate, "HEAD"); err == nil || !strings.Contains(err.Error(), "worker head is not advertised by bundle") {
 		t.Fatalf("unadvertised intermediate head err=%v", err)
 	}
@@ -1530,7 +1525,7 @@ func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
 	if _, _, _, err := importBundle(base, "unchanged"); err == nil || !strings.Contains(err.Error(), "worker produced no repository changes") {
 		t.Fatalf("unchanged worker head err=%v", err)
 	}
-	result, importedHead, root, err := importBundle(head, "HEAD")
+	result, importedHead, root, err := importBundle(head, "HEAD", "^"+base)
 	if err != nil || result.Validation != "ok" || importedHead != head || root != workerSealPath(filepath.Join(coordinator, "state"), 1, manifest, head) {
 		t.Fatalf("result=%#v head=%q root=%q err=%v", result, importedHead, root, err)
 	}
@@ -1734,7 +1729,7 @@ func TestBundlePreflightRejectsCompressedSmallExpandedLargeDeletedHistory(t *tes
 	}
 	bare := filepath.Join(t.TempDir(), "check.git")
 	runGit(t, repo, "init", "--bare", bare)
-	if err := preflightBundle(t.Context(), bundle, bundlePath, bare); err == nil || !strings.Contains(err.Error(), "oversized expanded object") {
+	if err := preflightBundle(t.Context(), bundle, bundlePath, bare, ""); err == nil || !strings.Contains(err.Error(), "oversized expanded object") {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -1751,7 +1746,7 @@ func TestBundlePreflightRejectsManySmallObjectsBeforeBufferingOutput(t *testing.
 	if err := os.MkdirAll(filepath.Join(repo, "objects", "pack"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	err := preflightBundle(t.Context(), []byte("header\nPACKdata"), filepath.Join(dir, "bundle"), repo)
+	err := preflightBundle(t.Context(), []byte("header\nPACKdata"), filepath.Join(dir, "bundle"), repo, "")
 	if err == nil || !strings.Contains(err.Error(), "expanded object count or bytes exceeded") {
 		t.Fatalf("err=%v", err)
 	}

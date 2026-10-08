@@ -1995,6 +1995,9 @@ func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, stat
 	if err != nil || len(bundle) == 0 || len(bundle) > 16<<20 || fmt.Sprintf("%x", sha256.Sum256(bundle)) != exported.BundleSHA256 {
 		return workerResult{}, "", "", errors.New("worker boundary returned invalid or oversized bundle")
 	}
+	if strings.EqualFold(exported.HeadSHA, manifest.BaseSHA) {
+		return workerResult{}, "", "", errors.New("worker produced no repository changes")
+	}
 	root, err := config.GitRoot()
 	if err != nil {
 		return workerResult{}, "", "", err
@@ -2028,7 +2031,7 @@ func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, stat
 	}); err != nil || !advertised {
 		return workerResult{}, "", "", errors.New("worker head is not advertised by bundle")
 	}
-	if err := preflightBundle(ctx, bundle, bundlePath, importedRepo); err != nil {
+	if err := preflightBundle(ctx, bundle, bundlePath, importedRepo, manifest.BaseSHA); err != nil {
 		return workerResult{}, "", "", fmt.Errorf("worker bundle object bounds: %w", err)
 	}
 	if err := scanGit(ctx, importedRepo, nil, []string{"fetch", "--no-tags", bundlePath, exported.HeadSHA}, nil); err != nil {
@@ -2098,6 +2101,10 @@ func prepareWorkerSeal(ctx context.Context, stateRoot string, generation uint64,
 	if err := scanGit(ctx, temp, nil, []string{"remote", "add", "origin", remote}, nil); err != nil {
 		cleanup()
 		return "", "", func() {}, err
+	}
+	if err := scanGit(ctx, temp, nil, []string{"fetch", "--no-tags", ownerRoot, manifest.BaseSHA}, nil); err != nil {
+		cleanup()
+		return "", "", func() {}, errors.New("approved base is unavailable to worker import")
 	}
 	return temp, bundlePath, cleanup, nil
 }
@@ -2310,7 +2317,7 @@ func validateWorkerTree(ctx context.Context, repo, head string) error {
 	})
 }
 
-func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string) error {
+func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo, baseSHA string) error {
 	start := bytes.Index(bundle, []byte("\nPACK"))
 	if start < 0 {
 		return errors.New("pack payload missing")
@@ -2374,7 +2381,14 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string
 	defer os.Remove(objects.Name())
 	defer objects.Close()
 	count = 0
-	err = scanGit(ctx, repo, nil, append([]string{"rev-list", "--objects"}, refs...), func(line []byte) error {
+	revListArgs := append([]string{"rev-list", "--objects"}, refs...)
+	if baseSHA != "" {
+		if !preflightObjectID.MatchString(baseSHA) {
+			return errors.New("invalid bundle base")
+		}
+		revListArgs = append(revListArgs, "^"+baseSHA)
+	}
+	err = scanGit(ctx, repo, nil, revListArgs, func(line []byte) error {
 		fields := bytes.Fields(line)
 		if len(fields) == 0 || !preflightObjectID.Match(fields[0]) {
 			return errors.New("malformed reachable object")

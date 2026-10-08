@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1180,6 +1181,10 @@ exit 1`)
 		var exported workerExport
 		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != validation || exported.Result.Documentation != "[REDACTED]" || strings.Contains(result.Output, credential) || exported.HeadSHA == base {
 			t.Fatalf("export=%#v err=%v", exported, err)
+		}
+		bundle, err := base64.StdEncoding.DecodeString(exported.Bundle)
+		if err != nil || !bytes.Contains(bundle, []byte("-"+base+" ")) {
+			t.Fatalf("export bundle does not declare the approved base prerequisite: %v", err)
 		}
 		pullBody, err := internalgithub.PullRequestBody(23, 1, exported.Result.Validation, exported.Result.Documentation, exported.Result.Decisions)
 		if err != nil || strings.Contains(pullBody, credential) || !strings.Contains(pullBody, "[REDACTED]") {

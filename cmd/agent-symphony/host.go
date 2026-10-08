@@ -2291,7 +2291,7 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 		return "", err
 	}
 	defer os.Remove(name)
-	if out, err := run("bundle", "create", name, "HEAD"); err != nil {
+	if out, err := run("bundle", "create", name, "HEAD", "^"+manifest.BaseSHA); err != nil {
 		return "", fmt.Errorf("create export bundle: %w: %s", err, out)
 	}
 	bundle, err := os.ReadFile(name)
