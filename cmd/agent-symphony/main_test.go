@@ -1471,14 +1471,17 @@ func TestWorkerExportVerifiesRealBundleInIsolatedRepository(t *testing.T) {
 		runGit(t, repo, "config", "user.name", "test")
 	}
 	runGit(t, coordinator, "remote", "add", "origin", "https://example.invalid/o/r.git")
-	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("base"), 0o600); err != nil {
+	baseBody := bytes.Repeat([]byte("base-content-"), 32<<10)
+	if err := os.WriteFile(filepath.Join(worker, "file"), baseBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	runGit(t, worker, "add", "file")
 	runGit(t, worker, "commit", "-m", "base")
 	base := runGit(t, worker, "rev-parse", "HEAD")
 	runGit(t, coordinator, "fetch", "--no-tags", worker, base)
-	if err := os.WriteFile(filepath.Join(worker, "file"), []byte("head"), 0o600); err != nil {
+	headBody := slices.Clone(baseBody)
+	copy(headBody[len(headBody)/2:], []byte("reviewed-head"))
+	if err := os.WriteFile(filepath.Join(worker, "file"), headBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	runGit(t, worker, "commit", "-am", "head")

@@ -2322,15 +2322,23 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo, baseS
 	if start < 0 {
 		return errors.New("pack payload missing")
 	}
+	thinPack := filepath.Join(repo, "objects", "pack", "incoming-thin.pack")
 	pack := filepath.Join(repo, "objects", "pack", "incoming.pack")
-	if err := os.WriteFile(pack, bundle[start+1:], 0o600); err != nil {
+	if err := os.WriteFile(thinPack, bundle[start+1:], 0o600); err != nil {
 		return err
 	}
-	if err := scanGit(ctx, repo, nil, []string{"index-pack", "--strict", pack}, nil); err != nil {
+	defer os.Remove(thinPack)
+	input, err := os.Open(thinPack)
+	if err != nil {
+		return err
+	}
+	indexErr := scanGit(ctx, repo, input, []string{"index-pack", "--strict", "--fix-thin", "--stdin", pack}, nil)
+	closeErr := input.Close()
+	if indexErr != nil || closeErr != nil {
 		return errors.New("invalid pack")
 	}
 	var count, total int64
-	err := scanGit(ctx, repo, nil, []string{"verify-pack", "-v", strings.TrimSuffix(pack, ".pack") + ".idx"}, func(line []byte) error {
+	err = scanGit(ctx, repo, nil, []string{"verify-pack", "-v", strings.TrimSuffix(pack, ".pack") + ".idx"}, func(line []byte) error {
 		fields := bytes.Fields(line)
 		if len(fields) < 5 || !preflightObjectID.Match(fields[0]) {
 			return nil
