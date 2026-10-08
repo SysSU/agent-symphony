@@ -162,7 +162,7 @@ trap 'exit 143' TERM
 
 mkdir -m 700 "$worker_root" "$fake_bin"
 printf '%s\n' '{"private":true}' >"$worker_root/package.json"
-go build -ldflags "-X=main.livePilotRunID=$run_id" -o "$fake_bin/codex" "$project_root/scripts/live_pilot_codex.go"
+(cd "$project_root" && go build -ldflags "-X=main.livePilotRunID=$run_id" -o "$fake_bin/codex" "$project_root/scripts/live_pilot_codex.go")
 sandbox_codex=$("$fake_bin/codex" --live-pilot-resolve-native "$sandbox_codex")
 case "$("$sandbox_codex" --version)" in 'codex-cli 0.153.'*) ;; *) echo "unsupported Codex live pilot version" >&2; exit 2;; esac
 cp "$sandbox_codex" "$fake_bin/sandbox-codex"

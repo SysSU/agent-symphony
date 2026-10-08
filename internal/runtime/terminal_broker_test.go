@@ -297,6 +297,60 @@ func TestTerminalBrokerStopWaitsForExactDeathProof(t *testing.T) {
 	}
 }
 
+func TestTerminalBrokerPendingEscalationStopsAtFinalization(t *testing.T) {
+	root := t.TempDir()
+	ready, heartbeat := filepath.Join(root, "ready"), filepath.Join(root, "heartbeat")
+	command := exec.Command("/bin/sh", "-c", `trap '' TERM; : >"$1"; while :; do printf x >>"$2"; sleep 0.05; done`, "worker", ready, heartbeat)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		_ = command.Wait()
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	gateReader, gateWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateReader.Close()
+	broker := &terminalBroker{
+		binding:  TerminalBrokerBinding{InnerPGID: command.Process.Pid},
+		gate:     gateWriter,
+		innerEnd: make(chan struct{}),
+	}
+	broker.killInner()
+	broker.signalMu.Lock()
+	time.Sleep(2200 * time.Millisecond)
+	before, err := os.Stat(heartbeat)
+	if err != nil {
+		broker.signalMu.Unlock()
+		t.Fatal(err)
+	}
+	close(broker.innerEnd)
+	broker.signalMu.Unlock()
+	time.Sleep(200 * time.Millisecond)
+	after, err := os.Stat(heartbeat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() <= before.Size() {
+		t.Fatal("pending escalation signaled the finalized process group")
+	}
+}
+
 func TestTerminalBrokerWorkerSelfKillRecordsExactDeath(t *testing.T) {
 	binding, record, done, _ := startTerminalBrokerFixture(t, "/bin/sh", "-c", `kill -KILL 0`)
 	if err := ReleaseTerminalBroker(t.Context(), binding); err != nil {

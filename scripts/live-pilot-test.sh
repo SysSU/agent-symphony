@@ -64,6 +64,7 @@ cat >"$fake_bin/go" <<'EOF'
 #!/bin/sh
 set -eu
 printf 'go %s\n' "$*" >>"$LIVE_PILOT_TEST_LOG"
+printf 'go-pwd %s\n' "$PWD" >>"$LIVE_PILOT_TEST_LOG"
 output=
 while [ "$#" -gt 0 ]; do
   if [ "$1" = -o ]; then shift; output=$1; fi
@@ -182,11 +183,12 @@ ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]
 
 : >"$log"
 set +e
-(umask 002; HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=setup-failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=sf-no-report "$project_root/scripts/live-pilot.sh" >/dev/null 2>&1)
+(cd "$test_root"; umask 002; HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=setup-failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=sf-no-report "$project_root/scripts/live-pilot.sh" >/dev/null 2>&1)
 status=$?
 set -e
 test "$status" -eq 18
 grep -q '^go build' "$log"
+grep -q "^go-pwd $project_root$" "$log"
 
 : >"$log"
 report="$test_root/setup-failure.json"

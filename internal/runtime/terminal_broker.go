@@ -177,6 +177,7 @@ type terminalBroker struct {
 	draining   bool
 	clients    map[*terminalBrokerClientState]struct{}
 	inputMu    sync.Mutex
+	signalMu   sync.Mutex
 	release    sync.Once
 	releaseErr error
 	stop       sync.Once
@@ -320,9 +321,11 @@ func RunTerminalBroker(ctx context.Context, recordPath, socketDir string, comman
 		}
 	}()
 	exitErr := terminalWaitProcessExit(inner.Process.Pid)
+	broker.signalMu.Lock()
 	cleanupErr := errors.Join(exitErr, stopInnerGroup())
 	waitErr := inner.Wait()
 	close(broker.innerEnd)
+	broker.signalMu.Unlock()
 	if cleanupErr == nil {
 		select {
 		case <-outputDone:
@@ -584,18 +587,28 @@ func (b *terminalBroker) releaseInner() error {
 
 func (b *terminalBroker) killInner() {
 	b.stop.Do(func() {
+		b.signalMu.Lock()
 		select {
 		case <-b.innerEnd:
+			b.signalMu.Unlock()
 			return
 		default:
 		}
 		_ = syscall.Kill(-b.binding.InnerPGID, syscall.SIGTERM)
 		_ = b.gate.Close()
+		b.signalMu.Unlock()
 		go func() {
 			select {
 			case <-b.innerEnd:
 			case <-time.After(2 * time.Second):
-				_ = syscall.Kill(-b.binding.InnerPGID, syscall.SIGKILL)
+				b.signalMu.Lock()
+				defer b.signalMu.Unlock()
+				select {
+				case <-b.innerEnd:
+					return
+				default:
+					_ = syscall.Kill(-b.binding.InnerPGID, syscall.SIGKILL)
+				}
 			}
 		}()
 	})
