@@ -4052,6 +4052,44 @@ func TestOperatorAbandonBindsUnlaunchedPreparingCleanup(t *testing.T) {
 	}
 }
 
+func TestPendingLegacyUnlaunchedAbandonUsesProvedCleanupBoundary(t *testing.T) {
+	owner, manifest := operatorNeverLaunchedOwner(t, 359, "preparing", "orphaned", func(runtimeOwnerState) error { return nil })
+	implementation := &operatorBoundaryRecorder{}
+	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: &barrierEffectRunner{}, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
+	executor := operatorCleanupExecutor{stateRoot: owner.stateRoot, owner: owner, implementation: implementation, reviewer: &operatorBoundaryRecorder{}, runtime: runtimeState}
+	request := agentruntime.EffectRequest{Action: agentruntime.EffectCleanup, Attempt: operatorEffectAttempt(manifest), Manifest: manifest, Cleanup: agentruntime.EffectCleanupPolicy{Action: "abandon"}}
+	var err error
+	if request, err = executor.bindPolicy(request); err != nil {
+		t.Fatal(err)
+	}
+	request, err = (agentruntime.EffectExecutor{Runtime: runtimeState}).BindRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := agentruntime.EffectRequestDigest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := mustOwnerSnapshot(t, owner)
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	committed, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{
+		Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt,
+		ExpectedIssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[key],
+		Action: "abandoned", CleanupPhase: "cleanup-started", Manifest: &manifest, CleanupPolicy: &request.Cleanup,
+		EffectAction: string(agentruntime.EffectCleanup), EffectRequestDigest: digest,
+	})
+	if err != nil || effect == nil || committed.State.Tombstones[key].CleanupPolicy == nil || committed.State.Tombstones[key].CleanupPolicy.Unlaunched {
+		t.Fatalf("legacy cleanup fixture effect=%#v tombstone=%#v err=%v", effect, committed.State.Tombstones[key], err)
+	}
+	request.Identity = effectRequestIdentity(*effect)
+	if err := executor.execute(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(implementation.operations(), []string{"abandon-unlaunched"}) {
+		t.Fatalf("legacy pending cleanup operations=%v", implementation.operations())
+	}
+}
+
 func TestMachineStatusAdmissionRecollectsAfterDestructiveAction(t *testing.T) {
 	for _, action := range []string{"archive", "abandon", "dismiss", "remove"} {
 		t.Run(action, func(t *testing.T) {
