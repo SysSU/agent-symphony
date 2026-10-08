@@ -2952,7 +2952,11 @@ launch:
 	if err != nil {
 		return independentReviewResult{}, false, err
 	}
-	prompt += "\n\nBefore exiting, atomically write the final JSON object to the path in AGENT_SYMPHONY_REVIEW_RESULT. The result file is the lifecycle authority; terminal text is only operator-visible conversation."
+	relativeResultPath, err := filepath.Rel(snapshot, resultPath)
+	if err != nil || relativeResultPath == "." || strings.HasPrefix(relativeResultPath, ".."+string(filepath.Separator)) || filepath.IsAbs(relativeResultPath) {
+		return independentReviewResult{}, false, errors.New("review result artifact escapes the snapshot")
+	}
+	prompt += fmt.Sprintf("\n\nBefore exiting, atomically write the final JSON object to the exact workspace-relative path %q (also exported as AGENT_SYMPHONY_REVIEW_RESULT). The result file is the lifecycle authority; terminal text is only operator-visible conversation.", filepath.ToSlash(relativeResultPath))
 	legacy := []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-"}
 	if len(command) > 0 && filepath.Base(command[0]) == "codex" && slices.Equal(command[1:], legacy) {
 		reviewer := config.Default(attempt.Repository).Commands.Reviewer
