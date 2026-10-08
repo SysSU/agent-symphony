@@ -836,7 +836,7 @@ func TestEffectCleanupPolicyIsClosedAndDigestBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, policy := range []EffectCleanupPolicy{{Action: "abandon"}, {Action: "dismiss"}, {Action: "remove", PublishedHead: strings.Repeat("a", 40)}} {
+	for _, policy := range []EffectCleanupPolicy{{Action: "abandon"}, {Action: "abandon", Unlaunched: true}, {Action: "dismiss"}, {Action: "remove", PublishedHead: strings.Repeat("a", 40)}} {
 		changed := base
 		changed.Cleanup = policy
 		if err := executor.ValidateRequest(changed); err != nil {
@@ -850,7 +850,7 @@ func TestEffectCleanupPolicyIsClosedAndDigestBound(t *testing.T) {
 			t.Fatalf("cleanup policy was not digest-bound: %#v", policy)
 		}
 	}
-	for _, policy := range []EffectCleanupPolicy{{}, {Action: "dismiss", PublishedHead: "unexpected"}, {Action: "archive", PublishedHead: "unexpected"}, {Action: "remove"}, {Action: "remove", PublishedHead: strings.Repeat("A", 40)}} {
+	for _, policy := range []EffectCleanupPolicy{{}, {Action: "dismiss", PublishedHead: "unexpected"}, {Action: "archive", PublishedHead: "unexpected"}, {Action: "archive", Unlaunched: true}, {Action: "remove"}, {Action: "remove", PublishedHead: strings.Repeat("a", 40), Unlaunched: true}, {Action: "remove", PublishedHead: strings.Repeat("A", 40)}} {
 		invalid := base
 		invalid.Cleanup = policy
 		if err := executor.ValidateRequest(invalid); err == nil {

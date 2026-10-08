@@ -1481,6 +1481,47 @@ func TestAbandonAttemptRetainsFailedLegacyWorktreeWithoutProcessProof(t *testing
 	}
 }
 
+func TestAbandonUnlaunchedPreparingAttempt(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := cleanupTestManifest(t, root)
+	manifest.Version, manifest.State = agentruntime.ManifestVersion2, "preparing"
+	manifest.LaunchToken, manifest.LaunchID = strings.Repeat("a", 32), ""
+	body, _ := json.Marshal(manifest)
+
+	oldExec := hostExecRunner
+	live := true
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		if len(command.Args) > 0 && command.Args[0] == "has-session" {
+			if live {
+				return agentruntime.Result{}, nil
+			}
+			return agentruntime.Result{Code: 1, Exited: true, Output: "can't find session: " + manifest.Session}, errors.New("missing session")
+		}
+		return agentruntime.Result{}, fmt.Errorf("unexpected tmux command %v", command.Args)
+	}
+	t.Cleanup(func() { hostExecRunner = oldExec })
+
+	if err := validateOrAbandonUnlaunchedAttempt(t.Context(), body, root, false); err == nil {
+		t.Fatal("live deterministic session passed unlaunched cleanup preflight")
+	}
+	if _, err := os.Lstat(manifest.Worktree); err != nil {
+		t.Fatalf("failed preflight changed worktree: %v", err)
+	}
+	live = false
+	if err := validateOrAbandonUnlaunchedAttempt(t.Context(), body, root, false); err != nil {
+		t.Fatalf("unlaunched preflight: %v", err)
+	}
+	if err := validateOrAbandonUnlaunchedAttempt(t.Context(), body, root, true); err != nil {
+		t.Fatalf("unlaunched cleanup: %v", err)
+	}
+	if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unlaunched worktree remains: %v", err)
+	}
+}
+
 func TestStopAttemptSessionProvesExactPaneGoneAfterTmuxProbeRace(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {

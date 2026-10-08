@@ -4023,6 +4023,35 @@ func TestOperatorCleanupExecutesExactArchiveAbandonAndRemovePolicies(t *testing.
 	}
 }
 
+func TestOperatorAbandonBindsUnlaunchedPreparingCleanup(t *testing.T) {
+	owner, manifest := operatorNeverLaunchedOwner(t, 359, "preparing", "orphaned", func(runtimeOwnerState) error { return nil })
+	service := operatorTestMutationService(t, owner)
+	implementation := &operatorBoundaryRecorder{}
+	cleanup := service.cleanup
+	cleanup.implementation = implementation
+	service.cleanup = cleanup
+
+	request := operatorRequest("abandon-unlaunched", "abandon", manifest, true)
+	command, work, err := service.prepareAdmission(t.Context(), mustOwnerSnapshot(t, owner), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !command.CleanupPolicy.Unlaunched || work.runtime == nil || !work.runtime.Cleanup.Unlaunched {
+		t.Fatalf("unlaunched cleanup was not bound: command=%#v work=%#v", command.CleanupPolicy, work.runtime)
+	}
+	if !slices.Equal(implementation.operations(), []string{"validate-abandon-unlaunched"}) {
+		t.Fatalf("preflight operations=%v", implementation.operations())
+	}
+	committed, effect, err := owner.beginOperatorMutation(t.Context(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstone := committed.State.Tombstones[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]
+	if effect == nil || tombstone.InvalidatedStart != nil || tombstone.CleanupPolicy == nil || !tombstone.CleanupPolicy.Unlaunched {
+		t.Fatalf("unlaunched proof was not persisted: effect=%#v tombstone=%#v", effect, tombstone)
+	}
+}
+
 func TestMachineStatusAdmissionRecollectsAfterDestructiveAction(t *testing.T) {
 	for _, action := range []string{"archive", "abandon", "dismiss", "remove"} {
 		t.Run(action, func(t *testing.T) {

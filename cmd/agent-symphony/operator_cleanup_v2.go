@@ -261,8 +261,11 @@ func cleanupBoundaryInput(request agentruntime.EffectRequest, validate bool) (st
 		}
 	case "abandon":
 		operation = "abandon"
+		if request.Cleanup.Unlaunched {
+			operation = "abandon-unlaunched"
+		}
 		if validate {
-			operation = "validate-abandon"
+			operation = "validate-" + operation
 		}
 	case "remove":
 		operation = "remove"
