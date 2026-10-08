@@ -343,6 +343,27 @@ func TestConfiguredReviewerEnvironmentRetainsManagedGitHardening(t *testing.T) {
 	}
 }
 
+func TestConfiguredWorkerEnvironmentPrependsResolvedGit(t *testing.T) {
+	gitExecutable, err := workerGitExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := configuredWorkerEnvironment(nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Dir(gitExecutable)
+	for _, entry := range env {
+		if path, ok := strings.CutPrefix(entry, "PATH="); ok {
+			if first := strings.Split(path, string(os.PathListSeparator))[0]; first != want {
+				t.Fatalf("worker PATH starts with %q, want %q", first, want)
+			}
+			return
+		}
+	}
+	t.Fatal("worker environment omitted PATH")
+}
+
 func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
 	fakeHostIdentity(t, 1234, 5678)
 	oldGOOS, oldRoot, oldExec := hostGOOS, hostRoot, hostExecRunner

@@ -3056,7 +3056,22 @@ func configuredAgentEnvironment(allow []string) ([]string, error) {
 
 func configuredWorkerEnvironment(allow []string, stateRoot string) ([]string, error) {
 	environment := append(os.Environ(), "CODEX_HOME="+workerCodexHome(stateRoot))
-	return internalgithub.WorkerEnvironmentWith(environment, allow...)
+	filtered, err := internalgithub.WorkerEnvironmentWith(environment, allow...)
+	if err != nil {
+		return nil, err
+	}
+	gitExecutable, err := workerGitExecutable()
+	if err != nil {
+		return nil, err
+	}
+	gitDir := filepath.Dir(gitExecutable)
+	for i, entry := range filtered {
+		if path, ok := strings.CutPrefix(entry, "PATH="); ok {
+			filtered[i] = "PATH=" + gitDir + string(os.PathListSeparator) + path
+			return filtered, nil
+		}
+	}
+	return append(filtered, "PATH="+gitDir), nil
 }
 
 func privateWorkerEnvironment(environment []string, root string) ([]string, error) {
