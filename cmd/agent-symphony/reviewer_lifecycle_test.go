@@ -40,6 +40,7 @@ type directReviewerSessionBoundary struct {
 	setupError      bool
 	requested       bool
 	directCommand   bool
+	launchArgs      []string
 	killed          bool
 }
 
@@ -56,6 +57,7 @@ func (b *directReviewerSessionBoundary) call(_ context.Context, operation string
 		if len(command.Args) > 5 && command.Args[4] == ";" && command.Args[5] == "new-session" {
 			b.requested = true
 			b.directCommand = strings.Contains(strings.Join(command.Args, " "), " review-pane tmux ")
+			b.launchArgs = append([]string(nil), command.Args...)
 			if b.newSessionError {
 				return agentruntime.Result{}, errors.New("tmux new-session response failed")
 			}
@@ -2150,6 +2152,12 @@ func TestPlanReviewerDirectSessionSetupFailureRemainsPending(t *testing.T) {
 	_, pending, err := runIndependentReviewCore(t.Context(), attempt, boundary, nil, []string{"review"}, issue, manifest, source, base, root, agentruntime.ReviewModePlan, &identity, false, func() error { identity.SessionRequested = true; return nil })
 	if !pending || err == nil || !boundary.requested || !boundary.directCommand || boundary.killed {
 		t.Fatalf("setup error falsely completed or killed uncertain direct wrapper: pending=%v err=%v boundary=%#v", pending, err, boundary)
+	}
+	target, targetErr := reviewTarget(agentruntime.ReviewModePlan, issue, base, base)
+	snapshot, _ := reviewRunIdentity(attempt, root, target, runID)
+	relativeResult, relativeErr := filepath.Rel(snapshot, reviewResultPath(snapshot, target))
+	if targetErr != nil || relativeErr != nil || len(boundary.launchArgs) == 0 || !strings.Contains(boundary.launchArgs[len(boundary.launchArgs)-1], filepath.ToSlash(relativeResult)) {
+		t.Fatalf("reviewer prompt omitted exact relative result path %q: target_err=%v relative_err=%v args=%q", relativeResult, targetErr, relativeErr, boundary.launchArgs)
 	}
 }
 

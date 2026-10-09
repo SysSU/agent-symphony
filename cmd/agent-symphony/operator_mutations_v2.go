@@ -410,6 +410,12 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		if !command.CleanupValid || !validDestructiveOperatorStatus(request.Action, status, statuses) || !agentruntime.ValidEffectRequestDigest(command.CleanupDigest) || command.CleanupPolicy.Action != request.Action || command.CleanupPolicy.PublishedHead != command.PublishedHead || command.Runtime != nil || command.Reconciliation != nil || request.Action == "archive" && manifest.State != "completed" {
 			return nil, errStateConflict
 		}
+		if command.CleanupPolicy.Unlaunched {
+			pending, pendingErr := pendingStartCandidate(*state, manifest)
+			if request.Action != "abandon" || manifest.Version != agentruntime.ManifestVersion2 || manifest.State != "preparing" || manifest.LaunchID != "" || pendingErr != nil || pending != nil {
+				return nil, errStateConflict
+			}
+		}
 		publishedHead := ""
 		if request.Action == "remove" {
 			publishedHead = command.PublishedHead
@@ -494,7 +500,7 @@ func applyBeginOperatorMutation(attemptRoot, stateRoot string, state *runtimeOwn
 		if command.Reconciliation == nil || command.Runtime != nil || command.CleanupDigest != "" || command.PublishedHead != "" {
 			return nil, errors.Join(errors.New("review-plan command shape"), errStateConflict)
 		}
-		if manifest.State != "running" || command.Reconciliation.Request.Action != reconciliationReviewer || command.Reconciliation.Request.Reviewer == nil || command.Reconciliation.Request.Reviewer.Mode != agentruntime.ReviewModePlan {
+		if !slices.Contains([]string{"running", "completed"}, manifest.State) || command.Reconciliation.Request.Action != reconciliationReviewer || command.Reconciliation.Request.Reviewer == nil || command.Reconciliation.Request.Reviewer.Mode != agentruntime.ReviewModePlan {
 			return nil, errors.Join(errors.New("review-plan runtime state"), errStateConflict)
 		}
 		begin := *command.Reconciliation

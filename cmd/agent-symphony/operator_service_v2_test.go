@@ -4023,6 +4023,80 @@ func TestOperatorCleanupExecutesExactArchiveAbandonAndRemovePolicies(t *testing.
 	}
 }
 
+func TestOperatorAbandonBindsUnlaunchedPreparingCleanup(t *testing.T) {
+	owner, manifest := operatorNeverLaunchedOwner(t, 359, "preparing", "orphaned", func(runtimeOwnerState) error { return nil })
+	service := operatorTestMutationService(t, owner)
+	implementation := &operatorBoundaryRecorder{}
+	cleanup := service.cleanup
+	cleanup.implementation = implementation
+	service.cleanup = cleanup
+
+	request := operatorRequest("abandon-unlaunched", "abandon", manifest, true)
+	command, work, err := service.prepareAdmission(t.Context(), mustOwnerSnapshot(t, owner), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !command.CleanupPolicy.Unlaunched || work.runtime == nil || !work.runtime.Cleanup.Unlaunched {
+		t.Fatalf("unlaunched cleanup was not bound: command=%#v work=%#v", command.CleanupPolicy, work.runtime)
+	}
+	if !slices.Equal(implementation.operations(), []string{"validate-abandon-unlaunched"}) {
+		t.Fatalf("preflight operations=%v", implementation.operations())
+	}
+	committed, effect, err := owner.beginOperatorMutation(t.Context(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstone := committed.State.Tombstones[ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)]
+	if effect == nil || tombstone.InvalidatedStart != nil || tombstone.CleanupPolicy == nil || !tombstone.CleanupPolicy.Unlaunched {
+		t.Fatalf("unlaunched proof was not persisted: effect=%#v tombstone=%#v", effect, tombstone)
+	}
+}
+
+func TestPendingLegacyUnlaunchedAbandonUsesProvedCleanupBoundary(t *testing.T) {
+	owner, manifest := operatorNeverLaunchedOwner(t, 359, "preparing", "orphaned", func(runtimeOwnerState) error { return nil })
+	implementation := &operatorBoundaryRecorder{}
+	runtimeState := &agentruntime.Runtime{Root: owner.attemptRoot, StateRoot: owner.stateRoot, Runner: &barrierEffectRunner{}, Tmux: "tmux", VerifyWorker: func(context.Context) error { return nil }}
+	executor := operatorCleanupExecutor{stateRoot: owner.stateRoot, owner: owner, implementation: implementation, reviewer: &operatorBoundaryRecorder{}, runtime: runtimeState}
+	request := agentruntime.EffectRequest{Action: agentruntime.EffectCleanup, Attempt: operatorEffectAttempt(manifest), Manifest: manifest, Cleanup: agentruntime.EffectCleanupPolicy{Action: "abandon"}}
+	var err error
+	if request, err = executor.bindPolicy(request); err != nil {
+		t.Fatal(err)
+	}
+	request, err = (agentruntime.EffectExecutor{Runtime: runtimeState}).BindRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := agentruntime.EffectRequestDigest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := mustOwnerSnapshot(t, owner)
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	committed, effect, err := owner.invalidateAttempt(t.Context(), invalidateAttemptCommand{
+		Repository: manifest.Repository, Issue: manifest.Issue, Attempt: manifest.Attempt,
+		ExpectedIssueGeneration: snapshot.State.IssueGenerations[ownerIssueKey(manifest.Repository, manifest.Issue)], ExpectedAttemptGeneration: snapshot.State.AttemptGenerations[key],
+		Action: "abandoned", CleanupPhase: "cleanup-started", Manifest: &manifest, CleanupPolicy: &request.Cleanup,
+		EffectAction: string(agentruntime.EffectCleanup), EffectRequestDigest: digest,
+	})
+	if err != nil || effect == nil || committed.State.Tombstones[key].CleanupPolicy == nil || committed.State.Tombstones[key].CleanupPolicy.Unlaunched {
+		t.Fatalf("legacy cleanup fixture effect=%#v tombstone=%#v err=%v", effect, committed.State.Tombstones[key], err)
+	}
+	request.Identity = effectRequestIdentity(*effect)
+	if err := executor.execute(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(implementation.operations(), []string{"abandon-unlaunched"}) {
+		t.Fatalf("legacy pending cleanup operations=%v", implementation.operations())
+	}
+	legacyManifest := manifest
+	legacyManifest.Version, legacyManifest.LaunchToken = 1, ""
+	legacyRequest, legacyTombstone := request, committed.State.Tombstones[key]
+	legacyRequest.Manifest, legacyTombstone.Manifest = legacyManifest, &legacyManifest
+	if legacyUnlaunchedAbandon(legacyRequest, legacyTombstone) {
+		t.Fatal("legacy v1 manifest gained unlaunched cleanup authority")
+	}
+}
+
 func TestMachineStatusAdmissionRecollectsAfterDestructiveAction(t *testing.T) {
 	for _, action := range []string{"archive", "abandon", "dismiss", "remove"} {
 		t.Run(action, func(t *testing.T) {

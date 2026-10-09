@@ -12,6 +12,10 @@ func terminalProcessExited(int) (bool, error) {
 	return false, errors.New("terminal process exit verification is unsupported")
 }
 
+func terminalWaitProcessExit(int) error {
+	return errors.New("terminal process exit verification is unsupported")
+}
+
 func terminalSocketIdentity(os.FileInfo) (uint64, uint64, error) {
 	return 0, 0, errors.New("terminal socket identity is unsupported")
 }

@@ -1995,6 +1995,9 @@ func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, stat
 	if err != nil || len(bundle) == 0 || len(bundle) > 16<<20 || fmt.Sprintf("%x", sha256.Sum256(bundle)) != exported.BundleSHA256 {
 		return workerResult{}, "", "", errors.New("worker boundary returned invalid or oversized bundle")
 	}
+	if strings.EqualFold(exported.HeadSHA, manifest.BaseSHA) {
+		return workerResult{}, "", "", errors.New("worker produced no repository changes")
+	}
 	root, err := config.GitRoot()
 	if err != nil {
 		return workerResult{}, "", "", err
@@ -2028,7 +2031,7 @@ func importWorkerExport(ctx context.Context, boundary workerBoundaryRunner, stat
 	}); err != nil || !advertised {
 		return workerResult{}, "", "", errors.New("worker head is not advertised by bundle")
 	}
-	if err := preflightBundle(ctx, bundle, bundlePath, importedRepo); err != nil {
+	if err := preflightBundle(ctx, bundle, bundlePath, importedRepo, manifest.BaseSHA); err != nil {
 		return workerResult{}, "", "", fmt.Errorf("worker bundle object bounds: %w", err)
 	}
 	if err := scanGit(ctx, importedRepo, nil, []string{"fetch", "--no-tags", bundlePath, exported.HeadSHA}, nil); err != nil {
@@ -2098,6 +2101,10 @@ func prepareWorkerSeal(ctx context.Context, stateRoot string, generation uint64,
 	if err := scanGit(ctx, temp, nil, []string{"remote", "add", "origin", remote}, nil); err != nil {
 		cleanup()
 		return "", "", func() {}, err
+	}
+	if err := scanGit(ctx, temp, nil, []string{"fetch", "--no-tags", ownerRoot, manifest.BaseSHA}, nil); err != nil {
+		cleanup()
+		return "", "", func() {}, errors.New("approved base is unavailable to worker import")
 	}
 	return temp, bundlePath, cleanup, nil
 }
@@ -2310,22 +2317,47 @@ func validateWorkerTree(ctx context.Context, repo, head string) error {
 	})
 }
 
-func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string) error {
+func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo, baseSHA string) error {
 	start := bytes.Index(bundle, []byte("\nPACK"))
 	if start < 0 {
 		return errors.New("pack payload missing")
 	}
+	if baseSHA != "" && !preflightObjectID.MatchString(baseSHA) {
+		return errors.New("invalid bundle base")
+	}
+	packPayload := bundle[start+1:]
+	// --fix-thin appends approved prerequisite objects immediately before a
+	// replacement trailer. Their offsets start where the original trailer did.
+	originalPackEnd := int64(len(packPayload))
+	if baseSHA != "" {
+		originalPackEnd -= int64(len(baseSHA) / 2)
+	}
+	thinPack := filepath.Join(repo, "objects", "pack", "incoming-thin.pack")
 	pack := filepath.Join(repo, "objects", "pack", "incoming.pack")
-	if err := os.WriteFile(pack, bundle[start+1:], 0o600); err != nil {
+	if err := os.WriteFile(thinPack, packPayload, 0o600); err != nil {
 		return err
 	}
-	if err := scanGit(ctx, repo, nil, []string{"index-pack", "--strict", pack}, nil); err != nil {
+	defer os.Remove(thinPack)
+	input, err := os.Open(thinPack)
+	if err != nil {
+		return err
+	}
+	indexErr := scanGit(ctx, repo, input, []string{"index-pack", "--strict", "--fix-thin", "--stdin", pack}, nil)
+	closeErr := input.Close()
+	if indexErr != nil || closeErr != nil {
 		return errors.New("invalid pack")
 	}
 	var count, total int64
-	err := scanGit(ctx, repo, nil, []string{"verify-pack", "-v", strings.TrimSuffix(pack, ".pack") + ".idx"}, func(line []byte) error {
+	err = scanGit(ctx, repo, nil, []string{"verify-pack", "-v", strings.TrimSuffix(pack, ".pack") + ".idx"}, func(line []byte) error {
 		fields := bytes.Fields(line)
 		if len(fields) < 5 || !preflightObjectID.Match(fields[0]) {
+			return nil
+		}
+		offset, parseErr := strconv.ParseInt(string(fields[4]), 10, 64)
+		if parseErr != nil || offset < 0 {
+			return errors.New("invalid expanded object offset")
+		}
+		if baseSHA != "" && offset >= originalPackEnd {
 			return nil
 		}
 		count++
@@ -2374,7 +2406,11 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo string
 	defer os.Remove(objects.Name())
 	defer objects.Close()
 	count = 0
-	err = scanGit(ctx, repo, nil, append([]string{"rev-list", "--objects"}, refs...), func(line []byte) error {
+	revListArgs := append([]string{"rev-list", "--objects"}, refs...)
+	if baseSHA != "" {
+		revListArgs = append(revListArgs, "^"+baseSHA)
+	}
+	err = scanGit(ctx, repo, nil, revListArgs, func(line []byte) error {
 		fields := bytes.Fields(line)
 		if len(fields) == 0 || !preflightObjectID.Match(fields[0]) {
 			return errors.New("malformed reachable object")
@@ -2952,7 +2988,11 @@ launch:
 	if err != nil {
 		return independentReviewResult{}, false, err
 	}
-	prompt += "\n\nBefore exiting, atomically write the final JSON object to the path in AGENT_SYMPHONY_REVIEW_RESULT. The result file is the lifecycle authority; terminal text is only operator-visible conversation."
+	relativeResultPath, err := filepath.Rel(snapshot, resultPath)
+	if err != nil || relativeResultPath == "." || strings.HasPrefix(relativeResultPath, ".."+string(filepath.Separator)) || filepath.IsAbs(relativeResultPath) {
+		return independentReviewResult{}, false, errors.New("review result artifact escapes the snapshot")
+	}
+	prompt += fmt.Sprintf("\n\nBefore exiting, atomically write the final JSON object to the exact workspace-relative path %q (also exported as AGENT_SYMPHONY_REVIEW_RESULT). The result file is the lifecycle authority; terminal text is only operator-visible conversation.", filepath.ToSlash(relativeResultPath))
 	legacy := []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-"}
 	if len(command) > 0 && filepath.Base(command[0]) == "codex" && slices.Equal(command[1:], legacy) {
 		reviewer := config.Default(attempt.Repository).Commands.Reviewer
@@ -3030,7 +3070,22 @@ func configuredAgentEnvironment(allow []string) ([]string, error) {
 
 func configuredWorkerEnvironment(allow []string, stateRoot string) ([]string, error) {
 	environment := append(os.Environ(), "CODEX_HOME="+workerCodexHome(stateRoot))
-	return internalgithub.WorkerEnvironmentWith(environment, allow...)
+	filtered, err := internalgithub.WorkerEnvironmentWith(environment, allow...)
+	if err != nil {
+		return nil, err
+	}
+	gitExecutable, err := workerGitExecutable()
+	if err != nil {
+		return nil, err
+	}
+	gitDir := filepath.Dir(gitExecutable)
+	for i, entry := range filtered {
+		if path, ok := strings.CutPrefix(entry, "PATH="); ok {
+			filtered[i] = "PATH=" + gitDir + string(os.PathListSeparator) + path
+			return filtered, nil
+		}
+	}
+	return append(filtered, "PATH="+gitDir), nil
 }
 
 func privateWorkerEnvironment(environment []string, root string) ([]string, error) {

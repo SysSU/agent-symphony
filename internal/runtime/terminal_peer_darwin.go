@@ -17,6 +17,34 @@ func terminalProcessExited(pid int) (bool, error) {
 	return false, err
 }
 
+func terminalWaitProcessExit(pid int) error {
+	kqueue, err := syscall.Kqueue()
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(kqueue)
+	change := syscall.Kevent_t{
+		Ident:  uint64(pid),
+		Filter: syscall.EVFILT_PROC,
+		Flags:  syscall.EV_ADD | syscall.EV_ONESHOT,
+		Fflags: syscall.NOTE_EXIT,
+	}
+	if _, err := syscall.Kevent(kqueue, []syscall.Kevent_t{change}, nil, nil); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	events := make([]syscall.Kevent_t, 1)
+	for {
+		if _, err := syscall.Kevent(kqueue, nil, events, nil); errors.Is(err, syscall.EINTR) {
+			continue
+		} else {
+			return err
+		}
+	}
+}
+
 func terminalSocketIdentity(info os.FileInfo) (uint64, uint64, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Dev == 0 || stat.Ino == 0 {

@@ -84,6 +84,7 @@ type EffectCleanupPolicy struct {
 	PublishedHead             string
 	CompatibilityManifestSeen bool
 	CompatibilityLogSeen      bool
+	Unlaunched                bool `json:",omitempty"`
 }
 
 // EffectRuntime is the process configuration and environment snapshot used by
@@ -685,7 +686,7 @@ func (e EffectExecutor) ValidateRequest(request EffectRequest) error {
 			return errors.New("handoff effect input is invalid")
 		}
 	case EffectCleanup:
-		if e.Cleanup == nil || e.VerifyCleanup == nil || !validEffectCleanupPolicy(request.Cleanup) {
+		if e.Cleanup == nil || e.VerifyCleanup == nil || !validEffectCleanupPolicy(request.Cleanup) || request.Cleanup.Unlaunched && (request.Manifest.Version != ManifestVersion2 || request.Manifest.State != "preparing" || request.Manifest.LaunchID != "") {
 			return errors.New("cleanup effect policy is invalid")
 		}
 	}
@@ -699,10 +700,12 @@ var effectObjectID = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
 
 func validEffectCleanupPolicy(policy EffectCleanupPolicy) bool {
 	switch policy.Action {
-	case "archive", "abandon", "dismiss":
+	case "abandon":
 		return policy.PublishedHead == ""
+	case "archive", "dismiss":
+		return policy.PublishedHead == "" && !policy.Unlaunched
 	case "remove":
-		return effectObjectID.MatchString(policy.PublishedHead)
+		return effectObjectID.MatchString(policy.PublishedHead) && !policy.Unlaunched
 	default:
 		return false
 	}

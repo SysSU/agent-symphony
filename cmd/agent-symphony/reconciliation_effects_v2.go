@@ -1268,7 +1268,7 @@ func validReconciliationEffectStateBindings(stateRoot string, state runtimeOwner
 			return (manifest.ReviewState == "clean" || manifest.ReviewState == "findings-queued" || manifest.ReviewState == "failed") && reviewManifestMatches(manifest, reviewer) && reviewerCleanupProved(state, request.Repository, request.Issue, request.Attempt, reviewer.Mode, reviewer.Target, reviewer.RunID)
 		}
 		if reviewer.Mode == agentruntime.ReviewModePlan {
-			if manifest.State != "running" || !observation.Fact.DispatchAuthorized || reviewer.Target != fmt.Sprintf("%s#%d plan sha256:%s", request.Repository, request.Issue, request.BodyDigest) || reviewer.BaseSHA != manifest.BaseSHA || reviewer.HeadSHA != manifest.BaseSHA || !remotelyObserved || fact.BaseSHA != manifest.BaseSHA || fact.State != "active" && fact.State != "review-ready" {
+			if !slices.Contains([]string{"running", "completed"}, manifest.State) || !observation.Fact.DispatchAuthorized || reviewer.Target != fmt.Sprintf("%s#%d plan sha256:%s", request.Repository, request.Issue, request.BodyDigest) || reviewer.BaseSHA != manifest.BaseSHA || reviewer.HeadSHA != manifest.BaseSHA || !remotelyObserved || fact.BaseSHA != manifest.BaseSHA || fact.State != "active" && fact.State != "review-ready" {
 				return false
 			}
 		} else if manifest.State != "completed" || reviewer.Target != reviewer.BaseSHA+".."+reviewer.HeadSHA || reviewer.BaseSHA != observation.Fact.BaseSHA {
