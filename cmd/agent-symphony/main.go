@@ -2322,9 +2322,19 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo, baseS
 	if start < 0 {
 		return errors.New("pack payload missing")
 	}
+	if baseSHA != "" && !preflightObjectID.MatchString(baseSHA) {
+		return errors.New("invalid bundle base")
+	}
+	packPayload := bundle[start+1:]
+	// --fix-thin appends approved prerequisite objects immediately before a
+	// replacement trailer. Their offsets start where the original trailer did.
+	originalPackEnd := int64(len(packPayload))
+	if baseSHA != "" {
+		originalPackEnd -= int64(len(baseSHA) / 2)
+	}
 	thinPack := filepath.Join(repo, "objects", "pack", "incoming-thin.pack")
 	pack := filepath.Join(repo, "objects", "pack", "incoming.pack")
-	if err := os.WriteFile(thinPack, bundle[start+1:], 0o600); err != nil {
+	if err := os.WriteFile(thinPack, packPayload, 0o600); err != nil {
 		return err
 	}
 	defer os.Remove(thinPack)
@@ -2341,6 +2351,13 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo, baseS
 	err = scanGit(ctx, repo, nil, []string{"verify-pack", "-v", strings.TrimSuffix(pack, ".pack") + ".idx"}, func(line []byte) error {
 		fields := bytes.Fields(line)
 		if len(fields) < 5 || !preflightObjectID.Match(fields[0]) {
+			return nil
+		}
+		offset, parseErr := strconv.ParseInt(string(fields[4]), 10, 64)
+		if parseErr != nil || offset < 0 {
+			return errors.New("invalid expanded object offset")
+		}
+		if baseSHA != "" && offset >= originalPackEnd {
 			return nil
 		}
 		count++
@@ -2391,9 +2408,6 @@ func preflightBundle(ctx context.Context, bundle []byte, bundlePath, repo, baseS
 	count = 0
 	revListArgs := append([]string{"rev-list", "--objects"}, refs...)
 	if baseSHA != "" {
-		if !preflightObjectID.MatchString(baseSHA) {
-			return errors.New("invalid bundle base")
-		}
 		revListArgs = append(revListArgs, "^"+baseSHA)
 	}
 	err = scanGit(ctx, repo, nil, revListArgs, func(line []byte) error {

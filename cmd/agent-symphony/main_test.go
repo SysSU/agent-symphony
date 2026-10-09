@@ -1737,6 +1737,38 @@ func TestBundlePreflightRejectsCompressedSmallExpandedLargeDeletedHistory(t *tes
 	}
 }
 
+func TestBundlePreflightAllowsOversizedApprovedDeltaBase(t *testing.T) {
+	repo := gitRepository(t)
+	runGit(t, repo, "config", "user.email", "test@example.test")
+	runGit(t, repo, "config", "user.name", "Test")
+	path := filepath.Join(repo, "large")
+	baseBody := bytes.Repeat([]byte("0123456789abcdef"), (9<<20)/16)
+	if err := os.WriteFile(path, baseBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "large")
+	runGit(t, repo, "commit", "-m", "large approved base")
+	base := runGit(t, repo, "rev-parse", "HEAD")
+	headBody := slices.Clone(baseBody[:7<<20])
+	headBody[len(headBody)-1] = 'x'
+	if err := os.WriteFile(path, headBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "commit", "-am", "bounded worker change")
+	bundlePath := filepath.Join(t.TempDir(), "worker.bundle")
+	runGit(t, repo, "bundle", "create", bundlePath, "HEAD", "^"+base)
+	bundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare := filepath.Join(t.TempDir(), "check.git")
+	runGit(t, repo, "init", "--bare", bare)
+	runGit(t, bare, "fetch", "--no-tags", repo, base)
+	if err := preflightBundle(t.Context(), bundle, bundlePath, bare, base); err != nil {
+		t.Fatalf("approved base prerequisite was charged to worker limits: %v", err)
+	}
+}
+
 func TestBundlePreflightRejectsManySmallObjectsBeforeBufferingOutput(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "git")
