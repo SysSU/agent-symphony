@@ -150,7 +150,7 @@ func TestPinWorkerExecutableSurvivesConfiguredPathSwap(t *testing.T) {
 
 func TestPinWorkerExecutableIncludesStandaloneCodeModeHost(t *testing.T) {
 	sourceRoot := t.TempDir()
-	source := filepath.Join(sourceRoot, "codex")
+	source := filepath.Join(sourceRoot, "codex-real")
 	host := filepath.Join(sourceRoot, "codex-code-mode-host")
 	buildNativeCodexFixture(t, source, "codex")
 	buildNativeCodexFixture(t, host, "host-one")
@@ -158,6 +158,7 @@ func TestPinWorkerExecutableIncludesStandaloneCodeModeHost(t *testing.T) {
 	stateRoot := pinnedTestRoot(t)
 	commands := Default("o/r").Commands
 	commands.Implementation[0], commands.Reviewer[0] = source, source
+	commands.OrchestratorAudit[0] = source
 	firstDigest, err := PinWorkerExecutable(t.Context(), stateRoot, &commands)
 	if err != nil {
 		t.Fatal(err)
@@ -171,6 +172,7 @@ func TestPinWorkerExecutableIncludesStandaloneCodeModeHost(t *testing.T) {
 	buildNativeCodexFixture(t, host, "host-two")
 	restarted := Default("o/r").Commands
 	restarted.Implementation[0], restarted.Reviewer[0] = source, source
+	restarted.OrchestratorAudit[0] = source
 	secondDigest, err := PinWorkerExecutable(t.Context(), stateRoot, &restarted)
 	if err != nil {
 		t.Fatal(err)

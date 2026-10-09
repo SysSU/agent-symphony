@@ -491,6 +491,11 @@ func copyPinnedTree(ctx context.Context, root, executable, destination string, c
 }
 
 func copyPinnedFiles(ctx context.Context, sources []string, destination string) (string, string, error) {
+	primary := filepath.Base(sources[0])
+	sources = slices.Clone(sources)
+	slices.SortFunc(sources, func(left, right string) int {
+		return strings.Compare(filepath.Base(left), filepath.Base(right))
+	})
 	hash := sha256.New()
 	names := make(map[string]struct{}, len(sources))
 	for _, source := range sources {
@@ -531,7 +536,7 @@ func copyPinnedFiles(ctx context.Context, sources []string, destination string) 
 			return "", "", err
 		}
 	}
-	return fmt.Sprintf("%x", hash.Sum(nil)), filepath.Base(sources[0]), nil
+	return fmt.Sprintf("%x", hash.Sum(nil)), primary, nil
 }
 
 func validatePinnedDirectory(path string, mode os.FileMode) error {
