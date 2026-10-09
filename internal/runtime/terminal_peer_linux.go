@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"syscall"
+	"time"
 )
 
 func terminalProcessExited(pid int) (bool, error) {
@@ -18,15 +19,9 @@ func terminalProcessExited(pid int) (bool, error) {
 		return false, err
 	}
 	defer syscall.Close(fd)
-	var ready syscall.FdSet
-	if fd >= len(ready.Bits)*64 {
-		return false, errors.New("terminal pidfd exceeds select capacity")
-	}
-	ready.Bits[fd/64] |= 1 << uint(fd%64)
-	timeout := syscall.Timeval{}
 	// A readable pidfd is positive kernel evidence of exit, even while the
 	// tmux parent has not reaped the zombie. A live replacement stays unproved.
-	n, err := syscall.Select(fd+1, &ready, nil, nil, &timeout)
+	n, err := pollLinuxPIDFDs([]int{fd}, 0)
 	if errors.Is(err, syscall.EINTR) {
 		return false, nil
 	}
@@ -42,18 +37,32 @@ func terminalWaitProcessExit(pid int) error {
 		return err
 	}
 	defer syscall.Close(fd)
-	if fd >= len((syscall.FdSet{}).Bits)*64 {
-		return errors.New("terminal pidfd exceeds select capacity")
-	}
 	for {
-		var ready syscall.FdSet
-		ready.Bits[fd/64] |= 1 << uint(fd%64)
-		_, err := syscall.Select(fd+1, &ready, nil, nil, nil)
+		_, err := pollLinuxPIDFDs([]int{fd}, -1)
 		if errors.Is(err, syscall.EINTR) {
 			continue
 		}
 		return err
 	}
+}
+
+func pollLinuxPIDFDs(fds []int, timeout time.Duration) (int, error) {
+	epollFD, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
+	if err != nil {
+		return 0, err
+	}
+	defer syscall.Close(epollFD)
+	for _, fd := range fds {
+		event := syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: int32(fd)}
+		if err := syscall.EpollCtl(epollFD, syscall.EPOLL_CTL_ADD, fd, &event); err != nil {
+			return 0, err
+		}
+	}
+	waitMilliseconds := -1
+	if timeout >= 0 {
+		waitMilliseconds = int((timeout + time.Millisecond - 1) / time.Millisecond)
+	}
+	return syscall.EpollWait(epollFD, make([]syscall.EpollEvent, len(fds)), waitMilliseconds)
 }
 
 func terminalSocketIdentity(info os.FileInfo) (uint64, uint64, error) {

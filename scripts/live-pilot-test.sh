@@ -153,6 +153,18 @@ set -e
 test "$status" -eq 2
 ! grep -q '^issue create' "$log"
 
+: >"$log"
+long_home="$test_home/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+mkdir -m 700 "$long_home"
+report="$test_root/long-path.json"
+set +e
+HOME="$long_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=long-path "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 2
+ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]=="failed" && r["exit_status"]==2 && r.dig("cleanup","performed")==true' "$report"
+! grep -q '^issue create' "$log"
+
 ln -s "$test_root" "$linked_home/.as-live-pilot"
 : >"$log"
 set +e

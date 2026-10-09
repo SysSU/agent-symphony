@@ -52,12 +52,6 @@ if [ "$status" = blocked ]; then exit 3; fi
 pilot_root=$(mktemp -d "$pilot_parent/run.XXXXXX")
 checkout="$pilot_root/repository"
 runtime="$pilot_root/runtime"
-tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
-if ! ruby -e 'exit ARGV.fetch(0).bytesize <= 100 ? 0 : 1' "$tmux_socket"; then
-  rmdir "$pilot_root"
-  echo "live pilot tmux socket path is too long" >&2
-  exit 2
-fi
 binary="$pilot_root/agent-symphony"
 worker_root="$pilot_root/worker-package"
 fake_bin="$worker_root/bin"
@@ -159,6 +153,12 @@ trap 'report_failure $?' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
+if ! ruby -e 'exit ARGV.fetch(0).bytesize <= 100 ? 0 : 1' "$tmux_socket"; then
+  echo "live pilot tmux socket path is too long" >&2
+  exit 2
+fi
 
 mkdir -m 700 "$worker_root" "$fake_bin"
 printf '%s\n' '{"private":true}' >"$worker_root/package.json"

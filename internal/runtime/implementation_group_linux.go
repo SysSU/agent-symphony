@@ -77,19 +77,7 @@ func openLinuxPIDFD(pid int) (int, error) {
 }
 
 func waitLinuxPIDFDs(fds []int, remaining time.Duration) error {
-	var ready syscall.FdSet
-	maxFD := 0
-	for _, fd := range fds {
-		if fd >= len(ready.Bits)*64 {
-			return errors.New("implementation pidfd exceeds select capacity")
-		}
-		ready.Bits[fd/64] |= 1 << uint(fd%64)
-		if fd > maxFD {
-			maxFD = fd
-		}
-	}
-	timeout := syscall.NsecToTimeval(remaining.Nanoseconds())
-	_, err := syscall.Select(maxFD+1, &ready, nil, nil, &timeout)
+	_, err := pollLinuxPIDFDs(fds, remaining)
 	return err
 }
 
