@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -819,6 +820,20 @@ func TestEffectVerificationSettlesGenerationBoundConfinedStopAfterRestart(t *tes
 }
 
 func TestEffectCleanupPolicyIsClosedAndDigestBound(t *testing.T) {
+	legacyJSON, err := json.Marshal(EffectCleanupPolicy{Action: "abandon"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(legacyJSON), "Unlaunched") {
+		t.Fatalf("false unlaunched bit changed the legacy digest shape: %s", legacyJSON)
+	}
+	unlaunchedJSON, err := json.Marshal(EffectCleanupPolicy{Action: "abandon", Unlaunched: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(unlaunchedJSON), `"Unlaunched":true`) {
+		t.Fatalf("true unlaunched bit was not digest-bound: %s", unlaunchedJSON)
+	}
 	r, _, attempt, _ := testRuntime(t)
 	manifest, err := PreparingManifest(r.Root, r.StateRoot, attempt, time.Unix(4, 0))
 	if err != nil {
@@ -836,7 +851,7 @@ func TestEffectCleanupPolicyIsClosedAndDigestBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, policy := range []EffectCleanupPolicy{{Action: "abandon"}, {Action: "dismiss"}, {Action: "remove", PublishedHead: strings.Repeat("a", 40)}} {
+	for _, policy := range []EffectCleanupPolicy{{Action: "abandon"}, {Action: "abandon", Unlaunched: true}, {Action: "dismiss"}, {Action: "remove", PublishedHead: strings.Repeat("a", 40)}} {
 		changed := base
 		changed.Cleanup = policy
 		if err := executor.ValidateRequest(changed); err != nil {
@@ -850,12 +865,18 @@ func TestEffectCleanupPolicyIsClosedAndDigestBound(t *testing.T) {
 			t.Fatalf("cleanup policy was not digest-bound: %#v", policy)
 		}
 	}
-	for _, policy := range []EffectCleanupPolicy{{}, {Action: "dismiss", PublishedHead: "unexpected"}, {Action: "archive", PublishedHead: "unexpected"}, {Action: "remove"}, {Action: "remove", PublishedHead: strings.Repeat("A", 40)}} {
+	for _, policy := range []EffectCleanupPolicy{{}, {Action: "dismiss", PublishedHead: "unexpected"}, {Action: "archive", PublishedHead: "unexpected"}, {Action: "archive", Unlaunched: true}, {Action: "remove"}, {Action: "remove", PublishedHead: strings.Repeat("a", 40), Unlaunched: true}, {Action: "remove", PublishedHead: strings.Repeat("A", 40)}} {
 		invalid := base
 		invalid.Cleanup = policy
 		if err := executor.ValidateRequest(invalid); err == nil {
 			t.Fatalf("accepted cleanup policy %#v", policy)
 		}
+	}
+	legacyUnlaunched := base
+	legacyUnlaunched.Manifest.Version, legacyUnlaunched.Manifest.LaunchToken = 1, ""
+	legacyUnlaunched.Cleanup = EffectCleanupPolicy{Action: "abandon", Unlaunched: true}
+	if err := executor.ValidateRequest(legacyUnlaunched); err == nil {
+		t.Fatal("accepted unlaunched cleanup for a legacy v1 manifest")
 	}
 	prepare := EffectRequest{Action: EffectPrepare, Attempt: attempt, Manifest: manifest, Eligible: true, Cleanup: EffectCleanupPolicy{Action: "archive"}}
 	prepare, err = executor.BindRequest(prepare)

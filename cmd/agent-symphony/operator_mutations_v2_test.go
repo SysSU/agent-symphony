@@ -880,6 +880,42 @@ func TestOwnerProjectionAndAdmissionRejectRemoteFailedLocalCompletedRecovery(t *
 	}
 }
 
+func TestCompletedImplementationAcceptsPlanReview(t *testing.T) {
+	test := reconciliationEffectCaseNamed(t, "reviewer-run-observe")
+	owner, snapshot, review := reconciliationEffectTestOwner(t, test.request)
+	manifest := *review.Manifest
+	persisted := cloneRuntimeOwnerState(snapshot.State)
+	key := ownerAttemptKey(manifest.Repository, manifest.Issue, manifest.Attempt)
+	record := persisted.Attempts[key]
+	manifest.State = "completed"
+	record.Manifest = manifest
+	persisted.Attempts[key] = record
+	if err := owner.close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startTestStateOwner(t, owner.stateRoot, persisted, func(runtimeOwnerState) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.close(context.Background()) })
+
+	refreshOperatorObservation(t, restarted)
+	current := mustOwnerSnapshot(t, restarted)
+	review = bindEffectObservation(current, review)
+	review.Manifest = &manifest
+	request := operatorRequest("review-completed-implementation", "review-plan", manifest, false)
+	command := operatorCommand(current, request, manifest)
+	command.Reconciliation = &beginReconciliationEffectCommand{Identity: command.Identity, Request: review}
+	committed, effect, err := restarted.beginOperatorMutation(t.Context(), command)
+	if err != nil || effect == nil || effect.Reconciliation == nil || effect.Reconciliation.Reviewer == nil || effect.Reconciliation.Reviewer.Mode != agentruntime.ReviewModePlan {
+		t.Fatalf("completed implementation plan effect=%#v err=%v", effect, err)
+	}
+	receipt, ok := operatorReceiptByID(committed.State, request.RequestID)
+	if !ok || receipt.State != "pending" || receipt.Phase != operatorPhaseReviewPending || receipt.EffectID != effect.ID {
+		t.Fatalf("completed implementation plan receipt=%#v", receipt)
+	}
+}
+
 func TestOperatorCancelSupersedesPendingPlanReview(t *testing.T) {
 	test := reconciliationEffectCaseNamed(t, "reviewer-run-observe")
 	owner, snapshot, review := reconciliationEffectTestOwner(t, test.request)

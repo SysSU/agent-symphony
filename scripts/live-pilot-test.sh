@@ -3,7 +3,17 @@ set -eu
 
 project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/agent-symphony-live-pilot-test.XXXXXX")
-trap 'rm -rf "$test_root"' EXIT HUP INT TERM
+test_home=$(mktemp -d "$HOME/.aslp-home.XXXXXX")
+unsafe_home=$(mktemp -d "$HOME/.aslp-unsafe-home.XXXXXX")
+linked_home=$(mktemp -d "$HOME/.aslp-linked-home.XXXXXX")
+cleanup() {
+  for root in "$test_home" "$unsafe_home" "$linked_home"; do
+    if [ -d "$root" ]; then find "$root" -type d -exec chmod u+w {} + 2>/dev/null || true; fi
+  done
+  rm -rf "$test_root" "$test_home" "$unsafe_home" "$linked_home"
+}
+trap cleanup EXIT HUP INT TERM
+private_root="$test_home/.as-live-pilot"
 fake_bin="$test_root/bin"
 mkdir -m 700 "$fake_bin"
 log="$test_root/gh.log"
@@ -16,8 +26,14 @@ case "$1 $2" in
   'repo view') printf 'SysSU/agent-symphony-sample\ttrue\n' ;;
   'repo clone') mkdir -p "$4" ;;
   'issue create') printf 'https://github.com/SysSU/agent-symphony-sample/issues/99\n' ;;
-  'issue view') printf 'OPEN\n' ;;
-  'pr list') printf '[]\n' ;;
+  'issue view') case "$LIVE_PILOT_TEST_SCENARIO" in success|branch-query-error) printf 'CLOSED\n' ;; *) printf 'OPEN\n' ;; esac ;;
+  'pr list')
+    if [ "$LIVE_PILOT_TEST_SCENARIO" = success ] || [ "$LIVE_PILOT_TEST_SCENARIO" = branch-query-error ]; then
+      printf '%s\n' '[{"number":100,"url":"https://example.invalid/pulls/100","state":"MERGED","isDraft":false,"headRefName":"agent-symphony/success","mergedAt":"2026-10-07T00:00:00Z"}]'
+    else
+      printf '[]\n'
+    fi
+    ;;
   'api --paginate')
     case " $* " in
       *' --slurp '*) ;;
@@ -47,20 +63,43 @@ EOF
 cat >"$fake_bin/go" <<'EOF'
 #!/bin/sh
 set -eu
+printf 'go %s\n' "$*" >>"$LIVE_PILOT_TEST_LOG"
+printf 'go-pwd %s\n' "$PWD" >>"$LIVE_PILOT_TEST_LOG"
 output=
 while [ "$#" -gt 0 ]; do
   if [ "$1" = -o ]; then shift; output=$1; fi
   shift
 done
 test -n "$output"
+case "$output" in
+  */worker-package/bin/codex)
+    package_root=$(dirname "$(dirname "$output")")
+    ruby -e 'exit((File.stat(ARGV.fetch(0)).mode & 0777)==0600 ? 0 : 1)' "$package_root/package.json"
+    ;;
+esac
+if [ "$LIVE_PILOT_TEST_SCENARIO" = setup-failure ]; then exit 18; fi
 cat >"$output" <<'SCRIPT'
 #!/bin/sh
 set -eu
 case "$1" in
+  --live-pilot-resolve-native)
+    printf '%s\n' "$2"
+    ;;
   init)
     printf '%s\n' '{"commands":{"orchestrator":[],"orchestrator_audit":[]}}' >.agent-symphony.yaml
     ;;
   serve)
+	runtime=
+	while [ "$#" -gt 0 ]; do
+	  if [ "$1" = --runtime-state ]; then shift; runtime=$1; fi
+	  shift
+	done
+	case "$runtime" in /tmp/*|/private/tmp/*|/var/tmp/*|/dev/shm/*) exit 95;; esac
+    if [ "$LIVE_PILOT_TEST_SCENARIO" = success ]; then
+      mkdir -p "$runtime/worker-executable/pinned"
+      : >"$runtime/worker-executable/pinned/codex"
+      chmod 0500 "$runtime/worker-executable/pinned" "$runtime/worker-executable/pinned/codex"
+    fi
     if [ "$LIVE_PILOT_TEST_SCENARIO" = stuck ]; then exec ruby -e 'Signal.trap("INT") {}; sleep 30'; fi
     exec ruby -e 'Signal.trap("INT") { exit }; sleep'
     ;;
@@ -72,6 +111,15 @@ EOF
 
 cat >"$fake_bin/git" <<'EOF'
 #!/bin/sh
+if [ "$1" = -C ] && [ "$3" = ls-remote ]; then
+  case "$LIVE_PILOT_TEST_SCENARIO" in success) exit 2 ;; branch-query-error) exit 128 ;; esac
+fi
+exit 0
+EOF
+
+cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+if [ "$1" = --version ]; then printf 'codex-cli 0.153.4\n'; fi
 exit 0
 EOF
 
@@ -94,11 +142,41 @@ if [ "$LIVE_PILOT_TEST_SCENARIO" = stuck ]; then
 fi
 exec /bin/date "$@"
 EOF
-chmod 0700 "$fake_bin/gh" "$fake_bin/go" "$fake_bin/git" "$fake_bin/tmux" "$fake_bin/date"
+chmod 0700 "$fake_bin/gh" "$fake_bin/go" "$fake_bin/git" "$fake_bin/codex" "$fake_bin/tmux" "$fake_bin/date"
+
+mkdir -m 755 "$unsafe_home/.as-live-pilot"
+: >"$log"
+set +e
+HOME="$unsafe_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=unsafe-parent "$project_root/scripts/live-pilot.sh" >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 2
+! grep -q '^issue create' "$log"
+
+: >"$log"
+long_home="$test_home/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+mkdir -m 700 "$long_home"
+report="$test_root/long-path.json"
+set +e
+HOME="$long_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=long-path "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 2
+ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]=="failed" && r["exit_status"]==2 && r.dig("cleanup","performed")==true' "$report"
+! grep -q '^issue create' "$log"
+
+ln -s "$test_root" "$linked_home/.as-live-pilot"
+: >"$log"
+set +e
+HOME="$linked_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=linked-parent "$project_root/scripts/live-pilot.sh" >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 2
+! grep -q '^issue create' "$log"
 
 report="$test_root/pagination.json"
 set +e
-PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=pagination LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=pagination-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=pagination LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=pagination-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -eq 3
@@ -108,7 +186,7 @@ ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]
 : >"$log"
 report="$test_root/duplicate.json"
 set +e
-PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=duplicate LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=duplicate-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=duplicate LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=duplicate-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -eq 3
@@ -116,9 +194,56 @@ ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]
 ! grep -q '^issue create' "$log"
 
 : >"$log"
+set +e
+(cd "$test_root"; umask 002; HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=setup-failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=sf-no-report "$project_root/scripts/live-pilot.sh" >/dev/null 2>&1)
+status=$?
+set -e
+test "$status" -eq 18
+grep -q '^go build' "$log"
+grep -q "^go-pwd $project_root$" "$log"
+
+: >"$log"
+report="$test_root/setup-failure.json"
+set +e
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=setup-failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=sf "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 18
+ruby -rjson -e '
+  r=JSON.parse(File.read(ARGV.fetch(0)))
+  abort unless r["status"]=="failed" && r["exit_status"]==18 && r.dig("cleanup","performed")==true
+  abort unless r.dig("cleanup","verified")=={"runtime_root_absent"=>true} && r.dig("created","issues")==[]
+' "$report"
+runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
+test ! -e "${runtime%/runtime}"
+! grep -q '^issue create' "$log"
+
+: >"$log"
+report="$test_root/success.json"
+set +e
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=success LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=live-20261007T200000Z-1234 "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 0
+ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]=="passed" && r.dig("cleanup","verified")=={"remote_branch_absent"=>true,"tmux_server_absent"=>true,"runtime_root_absent"=>true}' "$report"
+runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
+test ! -e "${runtime%/runtime}"
+
+: >"$log"
+report="$test_root/branch-query-error.json"
+set +e
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=branch-query-error LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=bqerr "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 6
+ruby -rjson -e 'r=JSON.parse(File.read(ARGV.fetch(0))); abort unless r["status"]=="failed" && r.dig("cleanup","diagnostics_preserved")==true' "$report"
+runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
+rm -rf "${runtime%/runtime}"
+
+: >"$log"
 report="$test_root/failure.json"
 set +e
-PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=failure-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=failure LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=failure-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -eq 17
@@ -128,16 +253,19 @@ ruby -rjson -e '
   abort unless r.dig("cleanup","diagnostics_preserved") && commands.any? { |command| command.include?("gh issue close 99") } && commands.any? { |command| command.include?("only after preserving diagnostics") }
 ' "$report"
 grep -q '^issue create' "$log"
+grep -q "^go build -ldflags -X=main.livePilotRunID=failure-run -o .*\/worker-package\/bin\/codex .*\/scripts\/live_pilot_codex.go$" "$log"
 runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
 pilot_root=${runtime%/runtime}
-case "$pilot_root" in /tmp/agent-symphony-failure-run.*) ;; *) exit 95;; esac
+case "$pilot_root" in "$private_root"/run.*) ;; *) exit 95;; esac
+tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
+test "${#tmux_socket}" -le 100
 rm -rf "$pilot_root"
 
 : >"$log"
 rm -f "$log.date"
 report="$test_root/stuck.json"
 set +e
-PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=stuck LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=stuck-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
+HOME="$test_home" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" LIVE_PILOT_TEST_SCENARIO=stuck LIVE_PILOT_TEST_LOG="$log" AGENT_SYMPHONY_LIVE_PILOT=1 AGENT_SYMPHONY_LIVE_RUN_ID=stuck-run "$project_root/scripts/live-pilot.sh" "$report" >/dev/null 2>&1
 status=$?
 set -e
 test "$status" -eq 6
@@ -154,7 +282,9 @@ while kill -0 "$server_pid" 2>/dev/null && [ "$attempts" -lt 20 ]; do sleep 0.1;
 ! kill -0 "$server_pid" 2>/dev/null
 runtime=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).dig("created","runtime_roots",0)' "$report")
 pilot_root=${runtime%/runtime}
-case "$pilot_root" in /tmp/agent-symphony-stuck-run.*) ;; *) exit 96;; esac
+case "$pilot_root" in "$private_root"/run.*) ;; *) exit 96;; esac
+tmux_socket="$runtime/tmux/tmux-$(id -u)/default"
+test "${#tmux_socket}" -le 100
 rm -rf "$pilot_root"
 
 echo "live pilot safety tests passed"

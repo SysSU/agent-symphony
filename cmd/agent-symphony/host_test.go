@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -340,6 +341,27 @@ func TestConfiguredReviewerEnvironmentRetainsManagedGitHardening(t *testing.T) {
 			t.Fatalf("reviewer environment omitted %q", entry)
 		}
 	}
+}
+
+func TestConfiguredWorkerEnvironmentPrependsResolvedGit(t *testing.T) {
+	gitExecutable, err := workerGitExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := configuredWorkerEnvironment(nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Dir(gitExecutable)
+	for _, entry := range env {
+		if path, ok := strings.CutPrefix(entry, "PATH="); ok {
+			if first := strings.Split(path, string(os.PathListSeparator))[0]; first != want {
+				t.Fatalf("worker PATH starts with %q, want %q", first, want)
+			}
+			return
+		}
+	}
+	t.Fatal("worker environment omitted PATH")
 }
 
 func TestAgentHostAllowsWorkerRuntimeHistoryLimitCommand(t *testing.T) {
@@ -1052,6 +1074,8 @@ func TestHandoffPersistenceAndExportStayBounded(t *testing.T) {
 if [ "$1" = sandbox ]; then
   while [ "$1" != -- ]; do shift; done
   shift
+  PATH=/nonexistent
+  export PATH
   exec "$@"
 fi
 exit 1`)
@@ -1178,6 +1202,10 @@ exit 1`)
 		var exported workerExport
 		if err := json.Unmarshal([]byte(result.Output), &exported); err != nil || exported.Result.Validation != validation || exported.Result.Documentation != "[REDACTED]" || strings.Contains(result.Output, credential) || exported.HeadSHA == base {
 			t.Fatalf("export=%#v err=%v", exported, err)
+		}
+		bundle, err := base64.StdEncoding.DecodeString(exported.Bundle)
+		if err != nil || !bytes.Contains(bundle, []byte("-"+base+" ")) {
+			t.Fatalf("export bundle does not declare the approved base prerequisite: %v", err)
 		}
 		pullBody, err := internalgithub.PullRequestBody(23, 1, exported.Result.Validation, exported.Result.Documentation, exported.Result.Decisions)
 		if err != nil || strings.Contains(pullBody, credential) || !strings.Contains(pullBody, "[REDACTED]") {
@@ -1478,6 +1506,53 @@ func TestAbandonAttemptRetainsFailedLegacyWorktreeWithoutProcessProof(t *testing
 	}
 	if _, err := os.Stat(manifest.Worktree); err != nil {
 		t.Fatalf("unsafe abandon removed worktree: %v", err)
+	}
+}
+
+func TestAbandonUnlaunchedPreparingAttempt(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := cleanupTestManifest(t, root)
+	manifest.Version, manifest.State = agentruntime.ManifestVersion2, "preparing"
+	manifest.LaunchToken, manifest.LaunchID = strings.Repeat("a", 32), ""
+	body, _ := json.Marshal(manifest)
+
+	oldExec := hostExecRunner
+	live := true
+	hostExecRunner = func(_ context.Context, command agentruntime.Command) (agentruntime.Result, error) {
+		if len(command.Args) > 0 && command.Args[0] == "has-session" {
+			if live {
+				return agentruntime.Result{}, nil
+			}
+			return agentruntime.Result{Code: 1, Exited: true, Output: "can't find session: " + manifest.Session}, errors.New("missing session")
+		}
+		return agentruntime.Result{}, fmt.Errorf("unexpected tmux command %v", command.Args)
+	}
+	t.Cleanup(func() { hostExecRunner = oldExec })
+
+	if err := validateOrAbandonUnlaunchedAttempt(t.Context(), body, root, false); err == nil {
+		t.Fatal("live deterministic session passed unlaunched cleanup preflight")
+	}
+	if _, err := os.Lstat(manifest.Worktree); err != nil {
+		t.Fatalf("failed preflight changed worktree: %v", err)
+	}
+	live = false
+	legacy := manifest
+	legacy.Version, legacy.LaunchToken = 1, ""
+	legacyBody, _ := json.Marshal(legacy)
+	if err := validateOrAbandonUnlaunchedAttempt(t.Context(), legacyBody, root, false); err == nil {
+		t.Fatal("legacy v1 manifest passed unlaunched cleanup preflight")
+	}
+	if err := validateOrAbandonUnlaunchedAttempt(t.Context(), body, root, false); err != nil {
+		t.Fatalf("unlaunched preflight: %v", err)
+	}
+	if err := validateOrAbandonUnlaunchedAttempt(t.Context(), body, root, true); err != nil {
+		t.Fatalf("unlaunched cleanup: %v", err)
+	}
+	if _, err := os.Lstat(manifest.Worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unlaunched worktree remains: %v", err)
 	}
 }
 
@@ -2587,9 +2662,13 @@ func TestSandboxedWorkerExportCannotRunGitConfigWithOwnerAuthority(t *testing.T)
 	}
 	manifest := agentruntime.Manifest{Version: agentruntime.ManifestVersion2, Repository: "o/r", Issue: 329, Attempt: 1, Branch: runGit(t, workspace, "branch", "--show-current"), Worktree: workspace, BaseSHA: baseSHA, State: "completed", WorkerGeneration: 1, WorkerProfileDigest: config.WorkerProfileDigest()}
 	input, _ := json.Marshal(manifest)
+	gitExecutable, err := workerGitExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
 	command := exec.CommandContext(t.Context(), codexExecutable, config.WorkerSandboxArgsForExecutable(workspace, codexExecutable, binary, "export-attempt", attemptRoot)...)
 	command.Dir = workspace
-	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(workspace, ".agent-symphony")}
+	command.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + codexHome, "TMPDIR=" + filepath.Join(workspace, ".agent-symphony"), workerGitExecutableEnv + "=" + gitExecutable}
 	command.Stdin = bytes.NewReader(input)
 	_, _ = command.CombinedOutput() // A hostile filter may make export fail closed.
 	if _, err := os.Lstat(canary); !errors.Is(err, os.ErrNotExist) {

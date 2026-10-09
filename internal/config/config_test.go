@@ -148,6 +148,61 @@ func TestPinWorkerExecutableSurvivesConfiguredPathSwap(t *testing.T) {
 	}
 }
 
+func TestPinWorkerExecutableIncludesStandaloneCodeModeHost(t *testing.T) {
+	sourceRoot := t.TempDir()
+	source := filepath.Join(sourceRoot, "codex-real")
+	host := filepath.Join(sourceRoot, "codex-code-mode-host")
+	buildNativeCodexFixture(t, source, "codex")
+	buildNativeCodexFixture(t, host, "host-one")
+	t.Setenv("PATH", sourceRoot+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stateRoot := pinnedTestRoot(t)
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = source, source
+	commands.OrchestratorAudit[0] = source
+	firstDigest, err := PinWorkerExecutable(t.Context(), stateRoot, &commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedHost := filepath.Join(filepath.Dir(commands.Implementation[0]), filepath.Base(host))
+	output, err := exec.Command(pinnedHost).Output()
+	if info, statErr := os.Stat(pinnedHost); err != nil || statErr != nil || strings.TrimSpace(string(output)) != "host-one" || info.Mode().Perm() != 0o500 {
+		t.Fatalf("pinned host=%q mode=%v output=%q err=%v stat=%v", pinnedHost, info, output, err, statErr)
+	}
+
+	buildNativeCodexFixture(t, host, "host-two")
+	restarted := Default("o/r").Commands
+	restarted.Implementation[0], restarted.Reviewer[0] = source, source
+	restarted.OrchestratorAudit[0] = source
+	secondDigest, err := PinWorkerExecutable(t.Context(), stateRoot, &restarted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstDigest == secondDigest || filepath.Dir(commands.Implementation[0]) == filepath.Dir(restarted.Implementation[0]) {
+		t.Fatalf("changed code-mode host retained pinned identity: %q/%q %q/%q", firstDigest, commands.Implementation[0], secondDigest, restarted.Implementation[0])
+	}
+}
+
+func TestPinWorkerExecutablePublishesPackageTree(t *testing.T) {
+	packageRoot := filepath.Join(t.TempDir(), "codex-package")
+	source := filepath.Join(packageRoot, "bin", "codex")
+	if err := os.MkdirAll(filepath.Dir(source), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(packageRoot, "package.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	buildNativeCodexFixture(t, source, "package")
+	t.Setenv("PATH", filepath.Dir(source)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	commands := Default("o/r").Commands
+	commands.Implementation[0], commands.Reviewer[0] = source, source
+	if _, err := PinWorkerExecutable(t.Context(), pinnedTestRoot(t), &commands); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(commands.Implementation[0]).Output(); err != nil || strings.TrimSpace(string(output)) != "package" {
+		t.Fatalf("pinned package output=%q err=%v", output, err)
+	}
+}
+
 func TestPinWorkerExecutableReusesOnlyValidatedArtifactOnRestart(t *testing.T) {
 	stateRoot, source := pinnedTestRoot(t), filepath.Join(t.TempDir(), "codex")
 	buildNativeCodexFixture(t, source, "original")
@@ -355,6 +410,16 @@ func TestLoadAndValidate(t *testing.T) {
 	c.Commands.Implementation = []string{"custom-agent", "--flag"}
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "managed rootless Codex worker profile") {
 		t.Fatalf("custom worker command accepted: %v", err)
+	}
+}
+
+func TestDefaultWorkersDisableBundledSkills(t *testing.T) {
+	for _, command := range [][]string{defaultWorkerCommand(false), defaultWorkerCommand(true)} {
+		setting := slices.Index(command, `skills.bundled.enabled=false`)
+		exec := slices.Index(command, "exec")
+		if setting < 1 || command[setting-1] != "-c" || exec < 0 || setting > exec {
+			t.Fatalf("worker may materialize bundled skills: %q", command)
+		}
 	}
 }
 

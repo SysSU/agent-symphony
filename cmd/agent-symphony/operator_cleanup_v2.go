@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	agentruntime "github.com/SysSU/agent-symphony/internal/runtime"
@@ -68,16 +69,18 @@ func (e operatorCleanupExecutor) execute(ctx context.Context, request agentrunti
 		return errors.New("review cleanup boundary is missing")
 	}
 	proofs := map[string]reviewerProcessProof{}
+	legacyUnlaunched := false
 	if e.owner != nil {
 		snapshot, err := e.owner.snapshot(ctx)
 		if err != nil {
 			return err
 		}
-		proofs, _, err = cleanupReviewerProofs(snapshot.State, request)
+		var tombstone runtimeTombstone
+		proofs, tombstone, err = cleanupReviewerProofs(snapshot.State, request)
 		if err != nil {
 			return err
 		}
-		tombstone := snapshot.State.Tombstones[ownerAttemptKey(request.Identity.Repository, request.Identity.Issue, request.Identity.Attempt)]
+		legacyUnlaunched = legacyUnlaunchedAbandon(request, tombstone)
 		if tombstone.InvalidatedStart != nil && !agentruntime.WorkerConfinementBound(tombstone.InvalidatedStart.Manifest, tombstone.InvalidatedGeneration, e.runtime.WorkerProfileDigest) {
 			return fmt.Errorf("start candidate cleanup remains unproved: %w", agentruntime.ErrRuntimeResourcesRemain)
 		}
@@ -90,6 +93,9 @@ func (e operatorCleanupExecutor) execute(ctx context.Context, request agentrunti
 	if request.Cleanup.Action == "dismiss" {
 		return nil
 	}
+	if legacyUnlaunched {
+		request.Cleanup.Unlaunched = true
+	}
 	operation, body, err := cleanupBoundaryInput(request, false)
 	if err != nil {
 		return err
@@ -101,6 +107,16 @@ func (e operatorCleanupExecutor) execute(ctx context.Context, request agentrunti
 		return freshRuntime(e.runtime, e.runtime.Source).ForgetCompatibility(request.Manifest)
 	}
 	return nil
+}
+
+// legacyUnlaunchedAbandon upgrades only a pending intent written before the
+// unlaunched policy bit existed. The owner-bound effect and tombstone have
+// already proved that no Start candidate or reviewer authority survived.
+func legacyUnlaunchedAbandon(request agentruntime.EffectRequest, tombstone runtimeTombstone) bool {
+	return request.Cleanup.Action == "abandon" && !request.Cleanup.Unlaunched &&
+		request.Manifest.Version == agentruntime.ManifestVersion2 && request.Manifest.State == "preparing" && request.Manifest.LaunchID == "" &&
+		tombstone.Action == "abandoned" && tombstone.Manifest != nil && reflect.DeepEqual(*tombstone.Manifest, request.Manifest) &&
+		tombstone.CleanupPolicy != nil && *tombstone.CleanupPolicy == request.Cleanup && tombstone.InvalidatedStart == nil
 }
 
 func (e operatorCleanupExecutor) verify(ctx context.Context, request agentruntime.EffectRequest) (bool, error) {
@@ -261,8 +277,11 @@ func cleanupBoundaryInput(request agentruntime.EffectRequest, validate bool) (st
 		}
 	case "abandon":
 		operation = "abandon"
+		if request.Cleanup.Unlaunched {
+			operation = "abandon-unlaunched"
+		}
 		if validate {
-			operation = "validate-abandon"
+			operation = "validate-" + operation
 		}
 	case "remove":
 		operation = "remove"

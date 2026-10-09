@@ -20,14 +20,20 @@ const (
 // them. Zombies have no execution authority, so enumerate the exact process
 // group instead of treating kill(0)'s zombie visibility as liveness.
 func implementationGroupTerminated(pgid int) (bool, error) {
-	if err := syscall.Kill(-pgid, 0); errors.Is(err, syscall.ESRCH) {
+	return waitForDarwinProcessGroup(pgid, func(pgid int) error { return syscall.Kill(-pgid, 0) }, activeDarwinProcessGroupMembers)
+}
+
+func waitForDarwinProcessGroup(pgid int, probe func(int) error, activeMembers func(int) (bool, error)) (bool, error) {
+	if err := probe(pgid); errors.Is(err, syscall.ESRCH) {
 		return true, nil
-	} else if err != nil {
+	} else if err != nil && !errors.Is(err, syscall.EPERM) {
 		return false, err
 	}
+	// Darwin may return EPERM for a killed, zombie-only group. Inventory is
+	// still authoritative: any active member keeps termination unproved.
 	deadline := time.Now().Add(darwinImplementationGroupExitWait)
 	for {
-		active, err := activeDarwinProcessGroupMembers(pgid)
+		active, err := activeMembers(pgid)
 		if err != nil || !active {
 			return !active, err
 		}

@@ -35,6 +35,7 @@ const (
 	attemptGroup           = "agent-symphony-attempt"
 	snapshotGroup          = "agent-symphony-snapshot"
 	orchestratorLaunchFile = "orchestrator-launch.json"
+	workerGitExecutableEnv = "AGENT_SYMPHONY_GIT_EXECUTABLE"
 )
 
 var (
@@ -72,6 +73,30 @@ var (
 
 func runHostTmux(ctx context.Context, args []string, stdin io.Reader) (agentruntime.Result, error) {
 	return hostExecRunner(ctx, agentruntime.Command{Name: "tmux", Args: args, Dir: "/tmp", Stdin: stdin})
+}
+
+func workerGitExecutable() (string, error) {
+	name := "git"
+	if hostGOOS == "darwin" {
+		output, err := hostOutput("/usr/bin/xcrun", "--find", "git")
+		if err != nil {
+			return "", fmt.Errorf("resolve Xcode git: %w", err)
+		}
+		name = strings.TrimSpace(string(output))
+	}
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return "", fmt.Errorf("resolve git executable: %w", err)
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil || !filepath.IsAbs(path) {
+		return "", errors.New("resolved git executable is invalid")
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", errors.New("resolved git executable is not executable")
+	}
+	return path, nil
 }
 
 func nativeRoot(path string) string { return filepath.Join(hostRoot, path) }
@@ -1193,7 +1218,11 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 		if err := config.VerifyWorkerExecutable(ctx, codexExecutable, profileDigest); err != nil {
 			return err
 		}
-		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgsForExecutable(manifest.Worktree, codexExecutable, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp}, Stdin: bytes.NewReader(request.Command.Input)})
+		gitExecutable, gitErr := workerGitExecutable()
+		if gitErr != nil {
+			return gitErr
+		}
+		result, err = hostExecRunner(ctx, agentruntime.Command{Name: codexExecutable, Args: config.WorkerSandboxArgsForExecutable(manifest.Worktree, codexExecutable, binary, "export-attempt", root), Dir: manifest.Worktree, Env: []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + os.Getenv("CODEX_HOME"), "TMPDIR=" + tmp, workerGitExecutableEnv + "=" + gitExecutable}, Stdin: bytes.NewReader(request.Command.Input)})
 	case "validate-cleanup", "cleanup":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot clean implementation attempts")
@@ -1204,6 +1233,11 @@ func agentHost(ctx context.Context, mode string, input io.Reader, output io.Writ
 			return errors.New("review boundary cannot abandon implementation attempts")
 		}
 		err = validateOrAbandonAttempt(ctx, request.Command.Input, root, request.Operation == "abandon")
+	case "validate-abandon-unlaunched", "abandon-unlaunched":
+		if mode != "implementation" {
+			return errors.New("review boundary cannot abandon implementation attempts")
+		}
+		err = validateOrAbandonUnlaunchedAttempt(ctx, request.Command.Input, root, request.Operation == "abandon-unlaunched")
 	case "validate-remove", "remove":
 		if mode != "implementation" {
 			return errors.New("review boundary cannot permanently remove implementation attempts")
@@ -1268,6 +1302,16 @@ func validateOrAbandonAttempt(ctx context.Context, input []byte, root string, re
 	return removeAttemptResources(ctx, input, root, false, remove)
 }
 
+func validateOrAbandonUnlaunchedAttempt(ctx context.Context, input []byte, root string, remove bool) error {
+	var manifest agentruntime.Manifest
+	decoder := json.NewDecoder(bytes.NewReader(input))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("invalid attempt manifest")
+	}
+	return removeVerifiedAttemptResources(ctx, manifest, root, false, "", remove, true)
+}
+
 type permanentRemovalRequest struct {
 	Manifest      agentruntime.Manifest `json:"manifest"`
 	PublishedHead string                `json:"published_head,omitempty"`
@@ -1280,7 +1324,7 @@ func permanentlyRemoveAttempt(ctx context.Context, input []byte, root string, re
 	if decoder.Decode(&request) != nil || decoder.Decode(&struct{}{}) != io.EOF || !preflightObjectID.MatchString(request.PublishedHead) {
 		return errors.New("invalid permanent removal request")
 	}
-	return removeVerifiedAttemptResources(ctx, request.Manifest, root, false, request.PublishedHead, remove)
+	return removeVerifiedAttemptResources(ctx, request.Manifest, root, false, request.PublishedHead, remove, false)
 }
 
 func removeAttemptResources(ctx context.Context, input []byte, root string, completed, remove bool) error {
@@ -1290,10 +1334,10 @@ func removeAttemptResources(ctx context.Context, input []byte, root string, comp
 	if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return errors.New("invalid attempt manifest")
 	}
-	return removeVerifiedAttemptResources(ctx, manifest, root, completed, "", remove)
+	return removeVerifiedAttemptResources(ctx, manifest, root, completed, "", remove, false)
 }
 
-func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.Manifest, root string, completed bool, publishedHead string, remove bool) error {
+func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.Manifest, root string, completed bool, publishedHead string, remove, unlaunched bool) error {
 	attempt := agentruntime.Attempt{Repository: manifest.Repository, Issue: manifest.Issue, Number: manifest.Attempt, BaseSHA: manifest.BaseSHA}
 	want, err := agentruntime.AttemptIdentity(root, attempt)
 	validState := manifest.State == "preparing" || manifest.State == "running" || manifest.State == "completed" || manifest.State == "failed" || manifest.State == "cancelled"
@@ -1304,6 +1348,9 @@ func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.M
 	}
 	if publishedHead != "" && manifest.State != "completed" && manifest.State != "failed" && manifest.State != "cancelled" {
 		return errors.New("permanent removal requires a terminal attempt")
+	}
+	if unlaunched && (completed || publishedHead != "" || manifest.Version != agentruntime.ManifestVersion2 || manifest.State != "preparing" || manifest.LaunchID != "") {
+		return errors.New("unlaunched cleanup requires a preparing attempt without launch identity")
 	}
 
 	worktreeInfo, worktreeErr := os.Lstat(want.Worktree)
@@ -1352,27 +1399,35 @@ func removeVerifiedAttemptResources(ctx context.Context, manifest agentruntime.M
 	if privateErr == nil && (!privateInfo.IsDir() || privateInfo.Mode()&os.ModeSymlink != 0 || privateInfo.Mode().Perm()&0o077 != 0) {
 		return errors.New("cleanup worker-private path is unsafe")
 	}
+	if unlaunched {
+		result, sessionErr := runHostTmux(ctx, []string{"has-session", "-t", "=" + manifest.Session}, nil)
+		if sessionErr == nil || !exactTmuxSessionAbsent(result, manifest.Session) {
+			return errors.Join(sessionErr, errors.New("unlaunched implementation session may exist"))
+		}
+	}
 	if !remove {
 		return nil
 	}
-	if err := stopAttemptSession(ctx, manifest); err != nil {
-		if !errors.Is(err, os.ErrNotExist) || worktreeErr == nil {
-			return err
-		}
-		if _, bindingErr := os.Lstat(agentruntime.ImplementationBindingPath(manifest, manifest.LaunchID)); !errors.Is(bindingErr, os.ErrNotExist) {
-			return errors.Join(err, bindingErr)
-		}
-		proved, proofErr := readImplementationStopProof(root, manifest)
-		if proofErr != nil || !proved {
-			return errors.Join(err, proofErr)
-		}
-		result, sessionErr := runHostTmux(ctx, []string{"has-session", "-t", "=" + manifest.Session}, nil)
-		if sessionErr == nil || !exactTmuxSessionAbsent(result, manifest.Session) {
-			return errors.Join(sessionErr, errors.New("implementation session may still exist"))
-		}
-	} else if manifest.LaunchID != "" {
-		if err := writeImplementationStopProof(root, manifest); err != nil {
-			return err
+	if !unlaunched {
+		if err := stopAttemptSession(ctx, manifest); err != nil {
+			if !errors.Is(err, os.ErrNotExist) || worktreeErr == nil {
+				return err
+			}
+			if _, bindingErr := os.Lstat(agentruntime.ImplementationBindingPath(manifest, manifest.LaunchID)); !errors.Is(bindingErr, os.ErrNotExist) {
+				return errors.Join(err, bindingErr)
+			}
+			proved, proofErr := readImplementationStopProof(root, manifest)
+			if proofErr != nil || !proved {
+				return errors.Join(err, proofErr)
+			}
+			result, sessionErr := runHostTmux(ctx, []string{"has-session", "-t", "=" + manifest.Session}, nil)
+			if sessionErr == nil || !exactTmuxSessionAbsent(result, manifest.Session) {
+				return errors.Join(sessionErr, errors.New("implementation session may still exist"))
+			}
+		} else if manifest.LaunchID != "" {
+			if err := writeImplementationStopProof(root, manifest); err != nil {
+				return err
+			}
 		}
 	}
 	if worktreeErr == nil {
@@ -1652,7 +1707,7 @@ func isExitCode(err error, code int) bool {
 }
 
 func validateBoundaryCommand(c boundaryCommand, root string) error {
-	if (c.Name != "git" && c.Name != "tmux") || len(c.Args) > 128 || len(c.Env) > 64 || len(c.Input) > 1<<20 {
+	if (c.Name != "git" && c.Name != "tmux") || len(c.Args) > 130 || len(c.Env) > 64 || len(c.Input) > 1<<20 {
 		return errors.New("boundary command is not allowed")
 	}
 	if c.Dir != "" {
@@ -2154,8 +2209,12 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 	if identityErr != nil || !agentruntime.ValidManifestVersion(manifest) || manifest.State != "completed" || manifest.Branch != want.Branch || manifest.Worktree != want.Worktree || manifest.Session != want.Session {
 		return "", errors.New("invalid export manifest")
 	}
+	gitExecutable := strings.TrimSpace(os.Getenv(workerGitExecutableEnv))
+	if !filepath.IsAbs(gitExecutable) {
+		return "", errors.New("worker git executable is unavailable")
+	}
 	run := func(args ...string) (string, error) {
-		cmd := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", manifest.Worktree}, args...)...)
+		cmd := exec.CommandContext(ctx, gitExecutable, append([]string{"--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-C", manifest.Worktree}, args...)...)
 		cmd.Env = append(minimalBoundaryEnvironment(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
@@ -2232,7 +2291,7 @@ func exportAttempt(ctx context.Context, input []byte, root string) (string, erro
 		return "", err
 	}
 	defer os.Remove(name)
-	if out, err := run("bundle", "create", name, "HEAD"); err != nil {
+	if out, err := run("bundle", "create", name, "HEAD", "^"+manifest.BaseSHA); err != nil {
 		return "", fmt.Errorf("create export bundle: %w: %s", err, out)
 	}
 	bundle, err := os.ReadFile(name)

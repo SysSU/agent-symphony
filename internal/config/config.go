@@ -46,6 +46,7 @@ var workerSafetyArgs = []string{
 	"-c", workerPermissions,
 	"-c", workerEnvironment,
 	"-c", `web_search="disabled"`,
+	"-c", `skills.bundled.enabled=false`,
 	"--disable", "apps",
 	"--disable", "browser_use",
 	"--disable", "browser_use_external",
@@ -166,11 +167,10 @@ func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Comman
 		if err == nil {
 			path, err = resolveNativeCodex(path)
 		}
-		info, statErr := os.Stat(path)
-		if err != nil || statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 || !safeExecutableOwner(info) {
-			return "", errors.New("codex worker executable is unsafe")
+		if err != nil {
+			return "", fmt.Errorf("canonicalize Codex worker executable: %w", err)
 		}
-		if err := validateNativeExecutable(path); err != nil {
+		if err := ValidateNativeCodexExecutable(path); err != nil {
 			return "", err
 		}
 		if source != "" && source != path {
@@ -188,6 +188,18 @@ func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Comman
 			root = candidate
 		}
 	}
+	var companions []string
+	if root == source {
+		companion := filepath.Join(filepath.Dir(source), "codex-code-mode-host")
+		if _, err := os.Lstat(companion); err == nil {
+			if err := ValidateNativeCodexExecutable(companion); err != nil {
+				return "", fmt.Errorf("validate Codex code-mode host: %w", err)
+			}
+			companions = append(companions, companion)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("inspect Codex code-mode host: %w", err)
+		}
+	}
 	pinRoot := filepath.Join(stateRoot, "worker-executable")
 	if err := os.MkdirAll(pinRoot, 0o700); err != nil {
 		return "", fmt.Errorf("prepare pinned worker executable: %w", err)
@@ -203,7 +215,7 @@ func PinWorkerExecutable(ctx context.Context, stateRoot string, commands *Comman
 	if err := os.Chmod(stage, 0o700); err != nil {
 		return "", err
 	}
-	treeDigest, relative, err := copyPinnedTree(ctx, root, source, stage)
+	treeDigest, relative, err := copyPinnedTree(ctx, root, source, stage, companions...)
 	if err != nil {
 		return "", err
 	}
@@ -352,6 +364,16 @@ func resolveNativeCodex(path string) (string, error) {
 	return filepath.EvalSymlinks(matches[0])
 }
 
+// ValidateNativeCodexExecutable applies the ownership, mode, and native-binary
+// checks required before a Codex executable can enforce a managed sandbox.
+func ValidateNativeCodexExecutable(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 || !safeExecutableOwner(info) {
+		return errors.New("codex worker executable is unsafe")
+	}
+	return validateNativeExecutable(path)
+}
+
 func validateNativeExecutable(path string) error {
 	if testNativeWorkerExecutableAllowed(path) {
 		return nil
@@ -383,9 +405,12 @@ func validateNativeExecutable(path string) error {
 // A build-tagged full-system fixture replaces this hook in test binaries only.
 var testNativeWorkerExecutableAllowed = func(string) bool { return false }
 
-func copyPinnedTree(ctx context.Context, root, executable, destination string) (string, string, error) {
+func copyPinnedTree(ctx context.Context, root, executable, destination string, companions ...string) (string, string, error) {
 	single := root == executable
 	relative := filepath.Base(executable)
+	if single && len(companions) > 0 {
+		return copyPinnedFiles(ctx, append([]string{executable}, companions...), destination)
+	}
 	if !single {
 		var err error
 		relative, err = filepath.Rel(root, executable)
@@ -424,8 +449,8 @@ func copyPinnedTree(ctx context.Context, root, executable, destination string) (
 				if err := os.Mkdir(target, 0o700); err != nil {
 					return err
 				}
+				directories = append(directories, target)
 			}
-			directories = append(directories, target)
 			return nil
 		}
 		input, err := os.Open(path)
@@ -463,6 +488,55 @@ func copyPinnedTree(ctx context.Context, root, executable, destination string) (
 		}
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil)), relative, nil
+}
+
+func copyPinnedFiles(ctx context.Context, sources []string, destination string) (string, string, error) {
+	primary := filepath.Base(sources[0])
+	sources = slices.Clone(sources)
+	slices.SortFunc(sources, func(left, right string) int {
+		return strings.Compare(filepath.Base(left), filepath.Base(right))
+	})
+	hash := sha256.New()
+	names := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		if err := ctx.Err(); err != nil {
+			return "", "", err
+		}
+		name := filepath.Base(source)
+		if _, exists := names[name]; exists {
+			return "", "", errors.New("codex worker installation has duplicate executable names")
+		}
+		names[name] = struct{}{}
+		info, err := os.Lstat(source)
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || !safeExecutableOwner(info) {
+			return "", "", errors.New("codex worker installation is unsafe")
+		}
+		_, _ = io.WriteString(hash, name+"\x00")
+		input, err := os.Open(source)
+		if err != nil {
+			return "", "", err
+		}
+		opened, statErr := input.Stat()
+		if statErr != nil || !os.SameFile(info, opened) {
+			_ = input.Close()
+			return "", "", errors.New("codex worker installation changed while opening")
+		}
+		output, err := os.OpenFile(filepath.Join(destination, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, err = io.Copy(io.MultiWriter(output, hash), input)
+		}
+		closeInput, closeOutput := input.Close(), error(nil)
+		if output != nil {
+			closeOutput = output.Close()
+		}
+		if err = errors.Join(err, closeInput, closeOutput); err != nil {
+			return "", "", err
+		}
+		if err := os.Chmod(filepath.Join(destination, name), 0o500); err != nil {
+			return "", "", err
+		}
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), primary, nil
 }
 
 func validatePinnedDirectory(path string, mode os.FileMode) error {
