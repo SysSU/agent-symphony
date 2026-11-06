@@ -793,7 +793,7 @@ func (r *Runtime) StopCertifiedImplementation(ctx context.Context, manifest Mani
 	if bindingErr != nil || terminalErr != nil || storedBinding != binding || storedTerminal != terminal || !ValidImplementationBinding(manifest, binding, manifest.LaunchID) || !ValidImplementationTerminalBinding(manifest, terminal) || terminal.OuterPID != binding.PanePID {
 		return errors.Join(bindingErr, terminalErr, errors.New("owner-certified implementation identity is unavailable"))
 	}
-	return r.stopGeneration(ctx, manifest)
+	return r.stopCertifiedGeneration(ctx, manifest, binding, terminal)
 }
 
 // TmuxNewSessionArgs imports only the supplied environment names from the
@@ -1636,15 +1636,19 @@ func (r *Runtime) stopGeneration(ctx context.Context, manifest Manifest) error {
 	if err != nil {
 		return err
 	}
+	terminal, err := ReadTerminalBrokerBinding(TerminalBrokerPath(manifest))
+	if err != nil {
+		return errors.Join(err, errors.New("implementation terminal broker identity is unavailable"))
+	}
+	return r.StopCertifiedImplementation(ctx, manifest, binding, terminal)
+}
+
+func (r *Runtime) stopCertifiedGeneration(ctx context.Context, manifest Manifest, binding ImplementationLaunchBinding, terminal TerminalBrokerBinding) error {
 	live, err := r.session(ctx, manifest.Session)
 	if err != nil {
 		return err
 	}
 	if !live {
-		terminal, terminalErr := ReadTerminalBrokerBinding(TerminalBrokerPath(manifest))
-		if terminalErr != nil || !ValidImplementationTerminalBinding(manifest, terminal) || terminal.OuterPID != binding.PanePID {
-			return errors.Join(terminalErr, errors.New("implementation terminal broker identity is unavailable"))
-		}
 		if stopErr := StopAndProveTerminalBroker(ctx, TerminalBrokerPath(manifest), terminal); stopErr != nil {
 			return stopErr
 		}
@@ -1654,7 +1658,7 @@ func (r *Runtime) stopGeneration(ctx context.Context, manifest Manifest) error {
 		}
 		return errors.Join(probeErr, errors.New("bound implementation pane may still exist"))
 	}
-	return r.stopBound(ctx, manifest)
+	return r.stopBound(ctx, manifest, binding, terminal)
 }
 
 func (r *Runtime) boundPaneAbsent(ctx context.Context, binding ImplementationLaunchBinding) (bool, error) {
@@ -1726,14 +1730,14 @@ func (r *Runtime) observeBoundCommand(ctx context.Context, manifest Manifest, bu
 	return r.guardedBoundResult(ctx, binding, pane, nested, nil)
 }
 
-func (r *Runtime) stopBound(ctx context.Context, manifest Manifest) error {
-	binding, pane, err := r.observeBound(ctx, manifest)
-	if err != nil {
-		return err
+func (r *Runtime) stopBound(ctx context.Context, manifest Manifest, binding ImplementationLaunchBinding, terminal TerminalBrokerBinding) error {
+	observed, pane, err := r.observeBound(ctx, manifest)
+	if err != nil || observed != binding {
+		return errors.Join(err, errors.New("owner-certified implementation pane identity changed"))
 	}
-	terminal, err := ReadTerminalBrokerBinding(TerminalBrokerPath(manifest))
-	if err != nil || !ValidImplementationTerminalBinding(manifest, terminal) || terminal.OuterPID != binding.PanePID {
-		return errors.Join(err, errors.New("implementation terminal broker identity is unavailable"))
+	storedTerminal, err := ReadTerminalBrokerBinding(TerminalBrokerPath(manifest))
+	if err != nil || storedTerminal != terminal {
+		return errors.Join(err, errors.New("owner-certified implementation terminal broker identity changed"))
 	}
 	if err := StopAndProveTerminalBroker(ctx, TerminalBrokerPath(manifest), terminal); err != nil {
 		return err
